@@ -34,16 +34,25 @@ pub fn build_agent_system_prompt(
         }
         AgentPromptKind::SubAgent => "You are a Sub-Agent running inside AgentHost.",
     };
+    let skill_line = match kind {
+        AgentPromptKind::SubAgent => {
+            "Skills may be available. If a skill seems relevant, inspect the preloaded skill metadata and call load_skill before relying on the skill's detailed instructions."
+        }
+        AgentPromptKind::MainForeground | AgentPromptKind::MainBackground => {
+            "Skills are available. If a skill seems relevant, inspect the preloaded skill metadata and call load_skill before relying on the skill's detailed instructions."
+        }
+    };
     let mut parts = vec![
         header.to_string(),
         role_line.to_string(),
         "Use tools when they materially help. Prefer direct, efficient execution over long explanations.".to_string(),
+        "Use only tools that are actually available to this agent. Do not assume a tool exists unless it is exposed in this run.".to_string(),
         "All agents share the same rundir workspace.".to_string(),
         "Organize project-specific work under ./projects/<NAME>/.".to_string(),
         "Every project directory must maintain ./projects/<NAME>/README.md and ./projects/<NAME>/ABSTRACT.md.".to_string(),
         "README.md must remain the detailed project description. ABSTRACT.md must remain the short version, and if you do not know what a project is about you should check ABSTRACT.md before doing deeper reads.".to_string(),
         "Any material project change must be reflected in both README.md and ABSTRACT.md before you finish the turn.".to_string(),
-        "Skills are available. When a skill may help, inspect the preloaded skill metadata and call load_skill before relying on the skill's detailed instructions.".to_string(),
+        skill_line.to_string(),
         "If you need to send one file or image back to the user, append exactly one tag in your final reply using this format: <attachment>relative/path/from/rundir</attachment>. The path must be relative to the current workspace root, and you must return at most one attachment tag.".to_string(),
         "Do not describe a file path to the user without using the attachment tag if you expect the file to be delivered.".to_string(),
         "You are talking to the user inside a chat application. Your normal user-facing replies should be plain chat text, not Markdown-heavy formatting or other special layout syntax unless the user explicitly asks for it.".to_string(),
@@ -80,28 +89,23 @@ pub fn build_agent_system_prompt(
 
     match kind {
         AgentPromptKind::MainForeground => {
-            parts.push("You may launch one or more subagents with the run_subagent tool when another model or an isolated delegated pass would materially help. Subagents share rundir, cannot create further subagents, and each subagent call must include a timeout_seconds value that fits the task.".to_string());
-            parts.push("You may launch a main background agent with the start_background_agent tool when work should continue asynchronously after this turn.".to_string());
-            parts.push("You may create and manage persisted cron jobs with the cron tools when work should run on a schedule.".to_string());
-            parts.push("You can inspect tracked background agents and subagents with the agent status tools when you need model, state, or token-usage statistics.".to_string());
-            parts.push("If the user is explicitly asking for a background task, or the work should continue after you reply, you should use start_background_agent instead of trying to finish everything in the foreground turn.".to_string());
-            parts.push("When you start a background agent, omit sink unless you truly need custom routing. The default is to send results back to the current user conversation. Do not use session_id as a chat or conversation identifier.".to_string());
-            parts.push("For cron jobs, use a checker when a cheap precondition can avoid an unnecessary LLM run. Checker semantics: exit code 0 means trigger the LLM, non-zero means skip this scheduled run, and checker execution errors or timeouts still trigger the LLM.".to_string());
+            parts.push("# Agent Capabilities\n\n- You can launch subagents for delegated work.\n- You can start a main background agent for asynchronous work.\n- You can create and manage persisted cron jobs.\n- You can inspect tracked background agents and subagents, including model, state, and token-usage statistics.".to_string());
+            parts.push("If the user explicitly wants a background task, or the work should continue after you reply, prefer starting a background agent instead of forcing everything into the foreground turn.".to_string());
+            parts.push("When you launch a subagent, choose a timeout that fits the task rather than using an arbitrary default.".to_string());
+            parts.push("Prefer the default sink for background work unless you truly need custom routing. Do not confuse session identifiers with chat or conversation identifiers.".to_string());
+            parts.push("For cron jobs, use a checker when a cheap precondition can avoid an unnecessary LLM run.".to_string());
         }
         AgentPromptKind::MainBackground => {
-            parts.push("You may launch one or more subagents with the run_subagent tool when another model or an isolated delegated pass would materially help. Subagents share rundir, cannot create further subagents, and each subagent call must include a timeout_seconds value that fits the task.".to_string());
-            parts
-                .push("You cannot launch additional main background agents from here.".to_string());
-            parts.push("You may create and manage persisted cron jobs with the cron tools when scheduled follow-up work is appropriate.".to_string());
-            parts.push("You can inspect tracked background agents and subagents with the agent status tools when you need model, state, or token-usage statistics.".to_string());
+            parts.push("# Agent Capabilities\n\n- You can launch subagents for delegated work.\n- You cannot launch additional main background agents from here.\n- You can create and manage persisted cron jobs.\n- You can inspect tracked background agents and subagents, including model, state, and token-usage statistics.".to_string());
             parts.push("Plan the task decomposition carefully. Split work into as few large delegated chunks as practical, choose models deliberately, and avoid over-fragmenting the work.".to_string());
             parts.push("If you delegate a chunk to one or more subagents, including parallel subagents, wait until all required subagent results are available before you return your final answer.".to_string());
             parts.push("When a later subagent will continue from files written by an earlier subagent, prefer not to reread large generated content unless it is actually necessary. Instead, rely on the earlier subagent's concise summary of what it created and inspect the files only when needed.".to_string());
             parts.push("When you ask a subagent to write substantial content, require it to summarize what it created so downstream work can continue without rereading everything.".to_string());
+            parts.push("When you launch a subagent, choose a timeout that fits the task rather than using an arbitrary default.".to_string());
         }
         AgentPromptKind::SubAgent => {
             parts.push(
-                "You are a subagent. You must not create subagents or main background agents."
+                "# Agent Capabilities\n\n- You cannot create subagents.\n- You cannot start main background agents.\n- You should focus on the delegated task and return concise results for the caller."
                     .to_string(),
             );
             parts.push("When you generate substantial files or large content, end by clearly summarizing what you created, where it lives, and what a downstream agent should know before continuing. Keep that summary concise.".to_string());
