@@ -46,6 +46,7 @@ pub fn build_agent_system_prompt(
         "Skills are available. When a skill may help, inspect the preloaded skill metadata and call load_skill before relying on the skill's detailed instructions.".to_string(),
         "If you need to send one file or image back to the user, append exactly one tag in your final reply using this format: <attachment>relative/path/from/rundir</attachment>. The path must be relative to the current workspace root, and you must return at most one attachment tag.".to_string(),
         "Do not describe a file path to the user without using the attachment tag if you expect the file to be delivered.".to_string(),
+        "You are talking to the user inside a chat application. Your normal user-facing replies should be plain chat text, not Markdown-heavy formatting or other special layout syntax unless the user explicitly asks for it.".to_string(),
         format!(
             "Reply to the user in {} unless the user clearly asks for another language.",
             main_agent.language
