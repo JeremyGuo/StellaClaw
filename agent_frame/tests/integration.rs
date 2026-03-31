@@ -107,6 +107,18 @@ fn handle_stream(
     let path = parts.next().expect("path");
 
     if method == "GET" {
+        if path == "/binary" {
+            let body = b"\x89PNG\r\n\x1a\nbinary-body";
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(header.as_bytes())
+                .expect("write binary get response header");
+            stream.write_all(body).expect("write binary get response body");
+            return;
+        }
         let body = json!({"ok": true, "path": path}).to_string();
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -223,6 +235,7 @@ fn builtin_tools_work() -> Result<()> {
             "apply_patch".to_string(),
             "exec".to_string(),
             "process".to_string(),
+            "download_file".to_string(),
             "web_fetch".to_string(),
             "web_search".to_string(),
             "image".to_string(),
@@ -316,6 +329,19 @@ fn builtin_tools_work() -> Result<()> {
     );
     assert!(fetch_result.contains("\"status\": 200"));
     assert!(fetch_result.contains("/ping"));
+
+    let download_result = execute_tool_call(
+        &registry,
+        "download_file",
+        Some(&format!(
+            r#"{{"url":"{}/binary","path":"downloads/cat.png","timeout_seconds":2}}"#,
+            server.address
+        )),
+    );
+    assert!(download_result.contains("\"content_type\": \"image/png\""));
+    let downloaded = temp_dir.path().join("downloads/cat.png");
+    assert!(downloaded.exists());
+    assert!(fs::read(&downloaded)?.starts_with(b"\x89PNG"));
 
     let search_result = execute_tool_call(
         &registry,

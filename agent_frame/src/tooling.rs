@@ -944,6 +944,97 @@ fn web_fetch_tool() -> Tool {
     )
 }
 
+fn download_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>) -> Tool {
+    Tool::new(
+        "download_file",
+        "Download an HTTP resource and save it to a local file. Use this for binary files such as images or PDFs. The model must choose timeout_seconds.",
+        json!({
+            "type": "object",
+            "properties": {
+                "url": {"type": "string"},
+                "path": {"type": "string"},
+                "timeout_seconds": {"type": "number"},
+                "headers": {"type": "object"},
+                "overwrite": {"type": "boolean"}
+            },
+            "required": ["url", "path", "timeout_seconds"],
+            "additionalProperties": false
+        }),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let url = string_arg(arguments, "url")?;
+            let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
+            let timeout_seconds = f64_arg(arguments, "timeout_seconds")?;
+            let overwrite = arguments
+                .get("overwrite")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let headers = arguments
+                .get("headers")
+                .and_then(Value::as_object)
+                .cloned()
+                .unwrap_or_default();
+
+            with_timeout_and_cancel(timeout_seconds, cancel_flag.clone(), move || {
+                if path.exists() && !overwrite {
+                    return Err(anyhow!(
+                        "destination already exists and overwrite=false: {}",
+                        path.display()
+                    ));
+                }
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("failed to create parent directory {}", parent.display())
+                    })?;
+                }
+
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(Duration::from_secs_f64(timeout_seconds))
+                    .build()
+                    .context("failed to construct http client")?;
+                let mut request = client.get(&url);
+                for (key, value) in headers {
+                    if let Some(value) = value.as_str() {
+                        request = request.header(&key, value);
+                    }
+                }
+                let response = request.send().context("download request failed")?;
+                let status = response.status();
+                let final_url = response.url().to_string();
+                if !status.is_success() {
+                    let status_text = status.to_string();
+                    let body = response
+                        .text()
+                        .unwrap_or_else(|_| "<unreadable error body>".to_string());
+                    return Err(anyhow!(
+                        "download failed with {}: {}",
+                        status_text,
+                        body
+                    ));
+                }
+                let content_type = response
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let bytes = response.bytes().context("failed to read downloaded body")?;
+                fs::write(&path, &bytes)
+                    .with_context(|| format!("failed to write downloaded file {}", path.display()))?;
+                Ok(json!({
+                    "status": status.as_u16(),
+                    "url": final_url,
+                    "content_type": content_type,
+                    "path": path.display().to_string(),
+                    "size_bytes": bytes.len(),
+                }))
+            })
+        },
+    )
+}
+
 fn default_external_web_search_config() -> ExternalWebSearchConfig {
     ExternalWebSearchConfig {
         base_url: "https://openrouter.ai/api/v1".to_string(),
@@ -1220,6 +1311,10 @@ pub fn build_tool_registry_with_cancel(
                 image_tool_upstream.cloned(),
                 cancel_flag.clone(),
             ),
+        ),
+        (
+            "download_file".to_string(),
+            download_file_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
         ),
         ("web_fetch".to_string(), web_fetch_tool()),
         ("http_request".to_string(), http_request_tool()),

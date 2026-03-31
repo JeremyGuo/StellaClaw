@@ -1,7 +1,7 @@
 {
   "models": {
     "main": {
-      "backend": "zgent",
+      "backend": "agent_frame",
       "api_endpoint": "https://openrouter.ai/api/v1",
       "model": "anthropic/claude-sonnet-4.6",
       "supports_vision_input": true,
