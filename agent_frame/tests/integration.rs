@@ -645,6 +645,110 @@ fn run_session_auto_compacts_before_next_turn() -> Result<()> {
 }
 
 #[test]
+fn pending_prefix_rewrite_is_applied_before_next_model_call() -> Result<()> {
+    let server = TestServer::start();
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "rewrite_prefix",
+                        "arguments": "{}"
+                    }
+                }]
+            }
+        }]
+    }));
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "done"
+            }
+        }]
+    }));
+
+    let control = SessionExecutionControl::new();
+    let rewrite_control = control.clone();
+    let rewrite_tool = agent_frame::Tool::new(
+        "rewrite_prefix",
+        "Rewrite the stable prefix for the current run.",
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        move |_| {
+            let expected_prefix = rewrite_control.stable_prefix_snapshot();
+            let replacement_prefix = vec![
+                expected_prefix
+                    .first()
+                    .cloned()
+                    .expect("system message should exist"),
+                ChatMessage::text("assistant", format!("{}\n\ncompressed prefix", COMPACTION_MARKER)),
+            ];
+            rewrite_control.request_prefix_rewrite(
+                expected_prefix,
+                replacement_prefix,
+                agent_frame::TokenUsage {
+                    llm_calls: 1,
+                    prompt_tokens: 120,
+                    completion_tokens: 8,
+                    total_tokens: 128,
+                    cache_hit_tokens: 40,
+                    cache_miss_tokens: 80,
+                    cache_read_tokens: 40,
+                    cache_write_tokens: 60,
+                },
+            );
+            Ok(json!({"ok": true}))
+        },
+    );
+
+    let config = load_config_value(
+        json!({
+            "enabled_tools": [],
+            "upstream": {"base_url": server.address, "model": "fake-model"},
+            "system_prompt": "Test system prompt."
+        }),
+        ".",
+    )?;
+
+    let report = run_session_with_report_controlled(
+        vec![
+            ChatMessage::text("user", "old question"),
+            ChatMessage::text("assistant", "old answer"),
+        ],
+        "new question",
+        config,
+        vec![rewrite_tool],
+        Some(control),
+    )?;
+
+    assert_eq!(extract_assistant_text(&report.messages), "done");
+    assert_eq!(report.usage.llm_calls, 3);
+    assert_eq!(report.usage.cache_write_tokens, 60);
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let second_messages = requests[1]["messages"].as_array().unwrap();
+    assert_eq!(second_messages[1]["role"], "assistant");
+    assert!(
+        second_messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains(COMPACTION_MARKER)
+    );
+    assert_eq!(second_messages[2]["role"], "tool");
+    Ok(())
+}
+
+
+#[test]
 fn compact_session_messages_with_report_compacts_and_reports_usage() -> Result<()> {
     let server = TestServer::start();
     server.push_response(json!({

@@ -80,26 +80,23 @@ impl TelegramChannel {
                     ))
                 )
             })?;
-        let envelope: TelegramEnvelope<T> = response
-            .json()
-            .await
-            .map_err(|error| {
-                anyhow!(
-                    "{}",
-                    self.redact_sensitive_text(&format!(
-                        "telegram API {} returned invalid JSON: {error:#}",
-                        method
-                    ))
-                )
-            })?;
+        let envelope: TelegramEnvelope<T> = response.json().await.map_err(|error| {
+            anyhow!(
+                "{}",
+                self.redact_sensitive_text(&format!(
+                    "telegram API {} returned invalid JSON: {error:#}",
+                    method
+                ))
+            )
+        })?;
         if !envelope.ok {
             return Err(anyhow!(
                 "telegram API {} failed: {}",
                 method,
                 self.redact_sensitive_text(
                     &envelope
-                    .description
-                    .unwrap_or_else(|| "unknown error".to_string()),
+                        .description
+                        .unwrap_or_else(|| "unknown error".to_string()),
                 )
             ));
         }
@@ -124,10 +121,8 @@ impl TelegramChannel {
                     ))
                 )
             })?;
-        let envelope: TelegramEnvelope<serde_json::Value> = response
-            .json()
-            .await
-            .map_err(|error| {
+        let envelope: TelegramEnvelope<serde_json::Value> =
+            response.json().await.map_err(|error| {
                 anyhow!(
                     "{}",
                     self.redact_sensitive_text(&format!(
@@ -142,8 +137,8 @@ impl TelegramChannel {
                 method,
                 self.redact_sensitive_text(
                     &envelope
-                    .description
-                    .unwrap_or_else(|| "unknown error".to_string()),
+                        .description
+                        .unwrap_or_else(|| "unknown error".to_string()),
                 )
             ));
         }
@@ -493,7 +488,8 @@ impl Channel for TelegramChannel {
             "sending message to telegram user"
         );
         if images.len() >= 2 {
-            self.send_media_group_with_caption(address, images, text).await?;
+            self.send_media_group_with_caption(address, images, text)
+                .await?;
         } else {
             let mut images = images;
             let has_images = !images.is_empty();
@@ -702,7 +698,8 @@ fn translate_markdown_to_telegram_html(input: &str) -> TelegramFormattedText {
                 if let Some(buffer) = code_block_buffer.as_mut() {
                     buffer.push_str(&text);
                 } else {
-                    if blockquote_depth > 0 && starts_new_block_line(&output) && !pending_list_item {
+                    if blockquote_depth > 0 && starts_new_block_line(&output) && !pending_list_item
+                    {
                         output.push_str(&"&gt; ".repeat(blockquote_depth));
                     }
                     output.push_str(&escape_html_text(&text));
@@ -799,7 +796,7 @@ fn escape_html_attribute(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{poll_backoff_seconds, translate_markdown_to_telegram_html, TelegramChannel};
+    use super::{TelegramChannel, poll_backoff_seconds, translate_markdown_to_telegram_html};
     use reqwest::Client;
 
     #[test]
@@ -822,11 +819,14 @@ mod tests {
 
     #[test]
     fn translates_code_blocks_and_escapes_html() {
-        let translated = translate_markdown_to_telegram_html(
-            "```rust\nlet x = 1 < 2;\n```\n\n`inline <tag>`",
-        );
+        let translated =
+            translate_markdown_to_telegram_html("```rust\nlet x = 1 < 2;\n```\n\n`inline <tag>`");
 
-        assert!(translated.text.contains("<pre><code class=\"language-rust\">"));
+        assert!(
+            translated
+                .text
+                .contains("<pre><code class=\"language-rust\">")
+        );
         assert!(translated.text.contains("let x = 1 &lt; 2;"));
         assert!(translated.text.contains("<code>inline &lt;tag&gt;</code>"));
     }
@@ -860,9 +860,8 @@ mod tests {
             client: Client::new(),
         };
 
-        let redacted = channel.redact_sensitive_text(
-            "https://api.telegram.org/botsecret-token/getUpdates failed",
-        );
+        let redacted = channel
+            .redact_sensitive_text("https://api.telegram.org/botsecret-token/getUpdates failed");
         assert!(!redacted.contains("secret-token"));
         assert!(redacted.contains("[REDACTED_TELEGRAM_BOT_TOKEN]"));
     }

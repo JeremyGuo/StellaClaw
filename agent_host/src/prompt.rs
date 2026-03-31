@@ -97,7 +97,10 @@ pub fn build_agent_system_prompt(
             parts.push("When you ask a subagent to write substantial content, require it to summarize what it created so downstream work can continue without rereading everything.".to_string());
         }
         AgentPromptKind::SubAgent => {
-            parts.push("Focus on the delegated task and return concise results for the caller.".to_string());
+            parts.push(
+                "Focus on the delegated task and return concise results for the caller."
+                    .to_string(),
+            );
             parts.push("When you generate substantial files or large content, end by clearly summarizing what you created, where it lives, and what a downstream agent should know before continuing. Keep that summary concise.".to_string());
         }
     }

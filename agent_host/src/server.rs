@@ -1,7 +1,8 @@
 use crate::agent_status::{AgentRegistry, ManagedAgentKind, ManagedAgentRecord, ManagedAgentState};
 use crate::agents::{ForegroundAgent, SubAgentSpec};
 use crate::backend::{
-    backend_supports_native_multimodal_input, compact_session_messages_with_report as run_backend_compaction,
+    backend_supports_native_multimodal_input,
+    compact_session_messages_with_report as run_backend_compaction,
     run_session_with_report_controlled as run_backend_session,
 };
 use crate::bootstrap::AgentWorkspace;
@@ -276,10 +277,13 @@ impl ServerRuntime {
                     chat_completions_path: image_model.chat_completions_path.clone(),
                     timeout_seconds: image_model.timeout_seconds,
                     context_window_tokens: image_model.context_window_tokens,
-                    cache_control: image_model.cache_ttl.as_ref().map(|ttl| CacheControlConfig {
-                        cache_type: "ephemeral".to_string(),
-                        ttl: Some(ttl.clone()),
-                    }),
+                    cache_control: image_model
+                        .cache_ttl
+                        .as_ref()
+                        .map(|ttl| CacheControlConfig {
+                            cache_type: "ephemeral".to_string(),
+                            ttl: Some(ttl.clone()),
+                        }),
                     reasoning: image_model.reasoning.clone(),
                     headers: image_model.headers.clone(),
                     native_web_search: image_model.native_web_search.clone(),
@@ -1011,13 +1015,7 @@ impl ServerRuntime {
             let runtime = self.clone();
             let session = session.clone();
             let handle = std::thread::spawn(move || {
-                runtime.run_subagent(
-                    parent_agent_id,
-                    session,
-                    model_key,
-                    task,
-                    timeout_seconds,
-                )
+                runtime.run_subagent(parent_agent_id, session, model_key, task, timeout_seconds)
             });
             handles.push(handle);
         }
@@ -1232,8 +1230,10 @@ impl ServerRuntime {
             "background failure recovery agent started"
         );
 
-        let recovery_timeout =
-            background_recovery_timeout_seconds(self.main_agent_timeout_seconds(&job.model_key)?, error);
+        let recovery_timeout = background_recovery_timeout_seconds(
+            self.main_agent_timeout_seconds(&job.model_key)?,
+            error,
+        );
         let recovery_prompt = format!(
             "A previous main background agent failed before completing its work.\n\nOriginal task:\n{}\n\nFailure:\n{}\n\nYour job now:\n1. Diagnose the failure.\n2. If it is recoverable without user intervention, continue or retry the original task yourself now and produce the final user-facing result. Do not mention the failure unless it is relevant.\n3. If it is not recoverable, produce a concise user-facing explanation of the problem and what the user should do next.\n4. Do not say that you will continue later. Either complete the work now or explain the blocker clearly.",
             job.prompt, error
@@ -2222,7 +2222,8 @@ fn build_user_turn_message(
         .filter(|attachment| attachment.kind != AttachmentKind::Image)
         .collect::<Vec<_>>();
     if !file_attachments.is_empty() {
-        let mut attachment_lines = vec!["Non-image attachments available for this turn:".to_string()];
+        let mut attachment_lines =
+            vec!["Non-image attachments available for this turn:".to_string()];
         for attachment in file_attachments {
             attachment_lines.push(format!(
                 "- kind={:?}, path={}, original_name={}, media_type={}",
@@ -2269,8 +2270,12 @@ fn build_user_turn_message(
 }
 
 fn build_image_data_url(attachment: &StoredAttachment) -> Result<String> {
-    let bytes = std::fs::read(&attachment.path)
-        .with_context(|| format!("failed to read image attachment {}", attachment.path.display()))?;
+    let bytes = std::fs::read(&attachment.path).with_context(|| {
+        format!(
+            "failed to read image attachment {}",
+            attachment.path.display()
+        )
+    })?;
     let mime_type = attachment
         .media_type
         .as_deref()
@@ -2411,8 +2416,7 @@ fn build_outgoing_message_for_session(
     assistant_text: &str,
     workspace_root: &Path,
 ) -> Result<OutgoingMessage> {
-    let (clean_text, attachments) =
-        extract_attachment_references(assistant_text, workspace_root)?;
+    let (clean_text, attachments) = extract_attachment_references(assistant_text, workspace_root)?;
     let mut outgoing = OutgoingMessage {
         text: if clean_text.trim().is_empty() {
             None
@@ -2814,13 +2818,12 @@ mod tests {
         SinkTarget, background_agent_timeout_seconds, background_recovery_timeout_seconds,
         background_timeout_with_active_children_text, build_user_turn_message,
         channel_restart_backoff_seconds, extract_attachment_references, is_timeout_like,
-        parse_sink_target,
-        should_attempt_idle_context_compaction,
+        parse_sink_target, should_attempt_idle_context_compaction,
     };
     use crate::backend::AgentBackendKind;
     use crate::config::ModelConfig;
-    use crate::domain::{AttachmentKind, StoredAttachment};
     use crate::domain::ChannelAddress;
+    use crate::domain::{AttachmentKind, StoredAttachment};
     use crate::session::SessionSnapshot;
     use anyhow::anyhow;
     use chrono::{Duration as ChronoDuration, Utc};

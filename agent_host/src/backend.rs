@@ -1,6 +1,8 @@
 use agent_frame::compaction::ContextCompactionReport;
 use agent_frame::config::AgentConfig as FrameAgentConfig;
-use agent_frame::message::{ChatMessage, FunctionCall as FrameFunctionCall, ToolCall as FrameToolCall};
+use agent_frame::message::{
+    ChatMessage, FunctionCall as FrameFunctionCall, ToolCall as FrameToolCall,
+};
 use agent_frame::skills::{build_skills_meta_prompt, discover_skills};
 use agent_frame::tooling::build_tool_registry_with_cancel;
 use agent_frame::{
@@ -9,18 +11,14 @@ use agent_frame::{
     run_session_with_report_controlled as frame_run_session_with_report_controlled,
 };
 use anyhow::{Context, Result, anyhow};
-use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use zgent_core::llm::{
-    ChatCompletionRequest as ZgentChatCompletionRequest,
-    ChatMessage as ZgentChatMessage, FunctionCall as ZgentFunctionCall,
-    FunctionDefinition as ZgentFunctionDefinition, OpenAiClient, OpenAiConfig,
+    ChatCompletionRequest as ZgentChatCompletionRequest, ChatMessage as ZgentChatMessage,
+    FunctionCall as ZgentFunctionCall, FunctionDefinition as ZgentFunctionDefinition,
     ToolCall as ZgentToolCall, ToolDefinition as ZgentToolDefinition,
 };
-use zgent_core::tools::{ToolHandler as ZgentToolHandler, ToolRegistry as ZgentToolRegistry};
 
 const ZGENT_COMPAT_MARKER: &str = "[AgentHost ZGent Compatibility Runtime]";
 
@@ -52,9 +50,13 @@ pub fn run_session_with_report_controlled(
             extra_tools,
             control,
         ),
-        AgentBackendKind::Zgent => {
-            run_zgent_session_with_report_controlled(previous_messages, prompt.into(), config, extra_tools, control)
-        }
+        AgentBackendKind::Zgent => run_zgent_session_with_report_controlled(
+            previous_messages,
+            prompt.into(),
+            config,
+            extra_tools,
+            control,
+        ),
     }
 }
 
@@ -86,119 +88,157 @@ fn run_zgent_session_with_report_controlled(
     extra_tools: Vec<Tool>,
     control: Option<SessionExecutionControl>,
 ) -> Result<SessionRunReport> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
+    let discovered_skills = discover_skills(&config.skills_dirs)?;
+    let system_prompt = compose_zgent_system_prompt(&config, &discovered_skills);
+    let mut messages = ensure_system_message(&previous_messages, &system_prompt);
+    if let Some(control) = &control {
+        ensure_not_cancelled(control)?;
+    }
+
+    let mut tool_config = config.clone();
+    tool_config.upstream.native_web_search = None;
+    let registry = build_tool_registry_with_cancel(
+        &tool_config.enabled_tools,
+        &tool_config.workspace_root,
+        &tool_config.upstream,
+        tool_config.image_tool_upstream.as_ref(),
+        &discovered_skills,
+        &extra_tools,
+        control.as_ref().map(SessionExecutionControl::cancel_flag),
+    )?;
+    let tool_definitions = build_zgent_tool_definitions(&registry);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs_f64(
+            tool_config.upstream.timeout_seconds,
+        ))
         .build()
-        .context("failed to build zgent compatibility runtime")?;
-    runtime.block_on(async move {
-        let discovered_skills = discover_skills(&config.skills_dirs)?;
-        let system_prompt = compose_zgent_system_prompt(&config, &discovered_skills);
-        let mut messages = ensure_system_message(&previous_messages, &system_prompt);
+        .context("failed to construct zgent compatibility HTTP client")?;
+
+    if !prompt.trim().is_empty() {
+        messages.push(ChatMessage::text("user", prompt));
+    }
+
+    let mut usage = TokenUsage::default();
+    for _round_index in 0..tool_config.max_tool_roundtrips {
         if let Some(control) = &control {
             ensure_not_cancelled(control)?;
         }
 
-        let mut tool_config = config.clone();
-        tool_config.upstream.native_web_search = None;
-        let registry = build_tool_registry_with_cancel(
-            &tool_config.enabled_tools,
-            &tool_config.workspace_root,
-            &tool_config.upstream,
-            tool_config.image_tool_upstream.as_ref(),
-            &discovered_skills,
-            &extra_tools,
-            control.as_ref().map(SessionExecutionControl::cancel_flag),
-        )?;
-        let tool_definitions = build_zgent_tool_definitions(&registry);
-        let zgent_registry = build_zgent_registry(&registry);
-        let llm = OpenAiClient::new(OpenAiConfig {
-            base_url: tool_config.upstream.base_url.clone(),
-            api_key: tool_config
-                .upstream
-                .api_key
-                .clone()
-                .or_else(|| std::env::var(&tool_config.upstream.api_key_env).ok())
-                .unwrap_or_default(),
+        let request = ZgentChatCompletionRequest {
             model: tool_config.upstream.model.clone(),
-            extra_headers: tool_config
-                .upstream
-                .headers
+            messages: messages
                 .iter()
-                .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_string())))
-                .collect(),
-        });
+                .map(host_message_to_zgent)
+                .collect::<Vec<_>>(),
+            tools: if tool_definitions.is_empty() {
+                None
+            } else {
+                Some(tool_definitions.clone())
+            },
+            temperature: Some(0.0),
+            max_tokens: Some(4096),
+            stream: false,
+        };
+        let response = send_zgent_chat_completion(&client, &tool_config, &request)
+            .context("zgent chat completion failed")?;
+        usage.add_assign(&token_usage_from_zgent(response.usage.as_ref()));
 
-        if !prompt.trim().is_empty() {
-            messages.push(ChatMessage::text("user", prompt));
+        let assistant = response
+            .choices
+            .into_iter()
+            .next()
+            .map(|choice| choice.message)
+            .ok_or_else(|| anyhow!("zgent chat completion response missing choices[0].message"))?;
+        let assistant_host = zgent_message_to_host(&assistant);
+        messages.push(assistant_host);
+
+        let tool_calls = match assistant {
+            ZgentChatMessage::Assistant { tool_calls, .. } => tool_calls.unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if tool_calls.is_empty() {
+            return Ok(SessionRunReport { messages, usage });
         }
 
-        let mut usage = TokenUsage::default();
-        for _round_index in 0..tool_config.max_tool_roundtrips {
+        for tool_call in tool_calls {
             if let Some(control) = &control {
                 ensure_not_cancelled(control)?;
             }
-
-            let request = ZgentChatCompletionRequest {
-                model: tool_config.upstream.model.clone(),
-                messages: messages
-                    .iter()
-                    .map(host_message_to_zgent)
-                    .collect::<Vec<_>>(),
-                tools: if tool_definitions.is_empty() {
-                    None
-                } else {
-                    Some(tool_definitions.clone())
-                },
-                temperature: Some(0.0),
-                max_tokens: Some(4096),
-                stream: false,
-            };
-            let response = llm
-                .chat_completion(&request)
-                .await
-                .context("zgent chat completion failed")?;
-            usage.add_assign(&token_usage_from_zgent(response.usage.as_ref()));
-
-            let assistant = response
-                .choices
-                .into_iter()
-                .next()
-                .map(|choice| choice.message)
-                .ok_or_else(|| anyhow!("zgent chat completion response missing choices[0].message"))?;
-            let assistant_host = zgent_message_to_host(&assistant);
-            messages.push(assistant_host);
-
-            let tool_calls = match assistant {
-                ZgentChatMessage::Assistant { tool_calls, .. } => tool_calls.unwrap_or_default(),
-                _ => Vec::new(),
-            };
-            if tool_calls.is_empty() {
-                return Ok(SessionRunReport { messages, usage });
-            }
-
-            for tool_call in tool_calls {
-                if let Some(control) = &control {
-                    ensure_not_cancelled(control)?;
-                }
-                let arguments = serde_json::from_str::<Value>(&tool_call.function.arguments)
-                    .unwrap_or(Value::Null);
-                let result = match zgent_registry.execute(&tool_call.function.name, arguments).await {
+            let arguments =
+                serde_json::from_str::<Value>(&tool_call.function.arguments).unwrap_or(Value::Null);
+            let result = match registry.get(&tool_call.function.name) {
+                Some(tool) => match tool.invoke(arguments) {
                     Ok(value) => value,
                     Err(error) => json!({ "error": format!("{error:#}") }),
-                };
-                messages.push(ChatMessage::tool_output(
-                    tool_call.id,
-                    tool_call.function.name,
-                    normalize_tool_result(result),
-                ));
-            }
+                },
+                None => json!({ "error": format!("Unknown tool: {}", tool_call.function.name) }),
+            };
+            messages.push(ChatMessage::tool_output(
+                tool_call.id,
+                tool_call.function.name,
+                normalize_tool_result(result),
+            ));
         }
+    }
 
-        Err(anyhow!(
-            "Agent stopped after exceeding max_tool_roundtrips={}",
-            tool_config.max_tool_roundtrips
-        ))
-    })
+    Err(anyhow!(
+        "Agent stopped after exceeding max_tool_roundtrips={}",
+        tool_config.max_tool_roundtrips
+    ))
+}
+
+fn send_zgent_chat_completion(
+    client: &reqwest::blocking::Client,
+    config: &FrameAgentConfig,
+    request: &ZgentChatCompletionRequest,
+) -> Result<zgent_core::llm::ChatCompletionResponse> {
+    let url = build_zgent_chat_completions_url(config);
+    let mut payload = serde_json::to_value(request)
+        .context("failed to serialize zgent chat completion request")?;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "model".to_string(),
+            Value::String(config.upstream.model.clone()),
+        );
+    }
+
+    let mut builder = client.post(url).json(&payload);
+    if let Some(api_key) = config
+        .upstream
+        .api_key
+        .clone()
+        .or_else(|| std::env::var(&config.upstream.api_key_env).ok())
+    {
+        builder = builder.bearer_auth(api_key);
+    }
+    for (key, value) in &config.upstream.headers {
+        if let Some(value) = value.as_str() {
+            builder = builder.header(key, value);
+        }
+    }
+
+    let response = builder
+        .send()
+        .context("failed to send zgent chat completion request")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .context("failed to read zgent chat completion response body")?;
+    if !status.is_success() {
+        return Err(anyhow!("Chat completion failed (HTTP {status}): {body}"));
+    }
+
+    serde_json::from_str(&body).context("failed to parse zgent chat completion response")
+}
+
+fn build_zgent_chat_completions_url(config: &FrameAgentConfig) -> String {
+    let base = config.upstream.base_url.trim_end_matches('/');
+    let path = if config.upstream.chat_completions_path.starts_with('/') {
+        config.upstream.chat_completions_path.clone()
+    } else {
+        format!("/{}", config.upstream.chat_completions_path)
+    };
+    format!("{base}{path}")
 }
 
 fn compose_zgent_system_prompt(
@@ -263,7 +303,8 @@ fn host_message_to_zgent(message: &ChatMessage) -> ZgentChatMessage {
                 .as_ref()
                 .map(|value| content_to_text(&Some(value.clone()))),
             tool_calls: message.tool_calls.as_ref().map(|calls| {
-                calls.iter()
+                calls
+                    .iter()
                     .map(|call| ZgentToolCall {
                         id: call.id.clone(),
                         call_type: call.kind.clone(),
@@ -282,7 +323,11 @@ fn host_message_to_zgent(message: &ChatMessage) -> ZgentChatMessage {
             timestamp: None,
         },
         other => ZgentChatMessage::User {
-            content: format!("[unsupported role {}]\n{}", other, content_to_text(&message.content)),
+            content: format!(
+                "[unsupported role {}]\n{}",
+                other,
+                content_to_text(&message.content)
+            ),
             timestamp: None,
         },
     }
@@ -302,7 +347,8 @@ fn zgent_message_to_host(message: &ZgentChatMessage) -> ChatMessage {
             name: None,
             tool_call_id: None,
             tool_calls: tool_calls.as_ref().map(|calls| {
-                calls.iter()
+                calls
+                    .iter()
                     .map(|call| FrameToolCall {
                         id: call.id.clone(),
                         kind: call.call_type.clone(),
@@ -380,17 +426,6 @@ fn token_usage_from_zgent(usage: Option<&zgent_core::llm::Usage>) -> TokenUsage 
     }
 }
 
-struct WrappedZgentTool {
-    tool: Tool,
-}
-
-#[async_trait]
-impl ZgentToolHandler for WrappedZgentTool {
-    async fn execute(&self, arguments: Value) -> Result<Value> {
-        self.tool.invoke(arguments)
-    }
-}
-
 fn build_zgent_tool_definitions(registry: &BTreeMap<String, Tool>) -> Vec<ZgentToolDefinition> {
     registry
         .values()
@@ -403,25 +438,6 @@ fn build_zgent_tool_definitions(registry: &BTreeMap<String, Tool>) -> Vec<ZgentT
             },
         })
         .collect()
-}
-
-fn build_zgent_registry(registry: &BTreeMap<String, Tool>) -> ZgentToolRegistry {
-    let mut zgent_registry = ZgentToolRegistry::new();
-    for tool in registry.values() {
-        let definition = ZgentToolDefinition {
-            tool_type: "function".to_string(),
-            function: ZgentFunctionDefinition {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
-            },
-        };
-        zgent_registry.register(
-            definition,
-            Arc::new(WrappedZgentTool { tool: tool.clone() }),
-        );
-    }
-    zgent_registry
 }
 
 #[cfg(test)]
@@ -453,23 +469,27 @@ mod tests {
     impl TestServer {
         fn start() -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-            listener.set_nonblocking(true).expect("nonblocking listener");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
             let address = format!("http://{}", listener.local_addr().expect("local addr"));
             let responses = Arc::new(Mutex::new(VecDeque::new()));
             let shutdown = Arc::new(AtomicBool::new(false));
             let handle = {
                 let responses = Arc::clone(&responses);
                 let shutdown = Arc::clone(&shutdown);
-                thread::spawn(move || loop {
-                    if shutdown.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    match listener.accept() {
-                        Ok((stream, _)) => handle_stream(stream, &responses),
-                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            thread::sleep(std::time::Duration::from_millis(10));
+                thread::spawn(move || {
+                    loop {
+                        if shutdown.load(Ordering::Relaxed) {
+                            break;
                         }
-                        Err(error) => panic!("accept failed: {error}"),
+                        match listener.accept() {
+                            Ok((stream, _)) => handle_stream(stream, &responses),
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(std::time::Duration::from_millis(10));
+                            }
+                            Err(error) => panic!("accept failed: {error}"),
+                        }
                     }
                 })
             };
@@ -502,7 +522,11 @@ mod tests {
         let mut buffer = vec![0_u8; 64 * 1024];
         let bytes_read = stream.read(&mut buffer).expect("read request");
         let request_text = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
-        let response_json = responses.lock().unwrap().pop_front().expect("queued response");
+        let response_json = responses
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("queued response");
         let body = response_json.to_string();
         let response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -510,7 +534,9 @@ mod tests {
             body
         );
         if request_text.starts_with("POST ") {
-            stream.write_all(response.as_bytes()).expect("write response");
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
         }
     }
 
@@ -652,17 +678,55 @@ mod tests {
         assert_eq!(extract_assistant_text(&report.messages), "done");
         assert_eq!(report.usage.llm_calls, 2);
         assert_eq!(report.usage.total_tokens, 36);
-        assert!(
-            report
-                .messages
-                .iter()
-                .any(|message| message.role == "tool")
-        );
+        assert!(report.messages.iter().any(|message| message.role == "tool"));
     }
 
     #[test]
     fn only_agent_frame_backend_supports_native_multimodal_input() {
-        assert!(backend_supports_native_multimodal_input(AgentBackendKind::AgentFrame));
-        assert!(!backend_supports_native_multimodal_input(AgentBackendKind::Zgent));
+        assert!(backend_supports_native_multimodal_input(
+            AgentBackendKind::AgentFrame
+        ));
+        assert!(!backend_supports_native_multimodal_input(
+            AgentBackendKind::Zgent
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn zgent_backend_is_safe_inside_tokio_context() {
+        let server = TestServer::start();
+        server.push_response(json!({
+            "id": "resp-1",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "async-ok"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 8,
+                "completion_tokens": 2,
+                "total_tokens": 10
+            }
+        }));
+
+        let temp_dir = TempDir::new().unwrap();
+        let report = tokio::task::spawn_blocking(move || {
+            run_session_with_report_controlled(
+                AgentBackendKind::Zgent,
+                vec![agent_frame::ChatMessage::text("user", "hello")],
+                "",
+                test_config(&server.address, temp_dir.path().to_path_buf()),
+                Vec::new(),
+                None,
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(extract_assistant_text(&report.messages), "async-ok");
+        assert_eq!(report.usage.total_tokens, 10);
     }
 }

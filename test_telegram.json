@@ -1,12 +1,13 @@
 {
   "models": {
     "main": {
+      "backend": "zgent",
       "api_endpoint": "https://openrouter.ai/api/v1",
       "model": "anthropic/claude-sonnet-4.6",
       "supports_vision_input": true,
       "api_key_env": "OPENROUTER_API_KEY",
       "cache_ttl": "5m",
-      "context_window_tokens": 128000,
+      "context_window_tokens": 262144,
       "native_web_search": {
         "enabled": false,
         "payload": {
@@ -26,7 +27,37 @@
           "X-Title": "AgentHost External Search"
         }
       },
+      "image_tool_model": "qwen35-27B",
       "description": "Fast general-purpose chat model for the foreground agent."
+    },
+    "qwen35-27B": {
+      "backend": "agent_frame",
+      "api_endpoint": "https://openrouter.ai/api/v1",
+      "model": "qwen/qwen3.5-27b",
+      "supports_vision_input": true,
+      "api_key_env": "OPENROUTER_API_KEY",
+      "cache_ttl": "5m",
+      "context_window_tokens": 262144,
+      "native_web_search": {
+        "enabled": false,
+        "payload": {
+          "web_search_options": {
+            "search_context_size": "medium"
+          }
+        }
+      },
+      "external_web_search": {
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "perplexity/sonar-pro",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "chat_completions_path": "/chat/completions",
+        "timeout_seconds": 60,
+        "headers": {
+          "HTTP-Referer": "https://example.com",
+          "X-Title": "AgentHost External Search"
+        }
+      },
+      "description": "A cheap model for background long context processing and web search."
     }
   },
   "main_agent": {
