@@ -723,7 +723,10 @@ fn translate_markdown_to_telegram_html(input: &str) -> TelegramFormattedText {
                     pending_list_item = false;
                 }
             }
-            Event::HardBreak => output.push_str("<br/>"),
+            Event::HardBreak => {
+                output.push('\n');
+                pending_list_item = false;
+            }
             Event::Rule => {
                 ensure_block_break(&mut output, &mut need_paragraph_break);
                 output.push_str("──────────");
@@ -826,6 +829,15 @@ mod tests {
         assert!(translated.text.contains("<pre><code class=\"language-rust\">"));
         assert!(translated.text.contains("let x = 1 &lt; 2;"));
         assert!(translated.text.contains("<code>inline &lt;tag&gt;</code>"));
+    }
+
+    #[test]
+    fn does_not_emit_unsupported_br_tags() {
+        let translated = translate_markdown_to_telegram_html("line one  \nline two");
+
+        assert!(translated.text.contains("line one\nline two"));
+        assert!(!translated.text.contains("<br/>"));
+        assert!(!translated.text.contains("<br>"));
     }
 
     #[test]
