@@ -84,6 +84,8 @@ pub struct AgentConfig {
     pub enabled_tools: Vec<String>,
     pub upstream: UpstreamConfig,
     #[serde(default)]
+    pub image_tool_upstream: Option<UpstreamConfig>,
+    #[serde(default)]
     pub skills_dirs: Vec<PathBuf>,
     #[serde(default)]
     pub system_prompt: String,
@@ -105,6 +107,8 @@ struct AgentConfigRaw {
     #[serde(default)]
     enabled_tools: Vec<String>,
     upstream: UpstreamConfigRaw,
+    #[serde(default)]
+    image_tool_upstream: Option<UpstreamConfigRaw>,
     #[serde(default)]
     skills_dirs: Vec<String>,
     #[serde(default)]
@@ -218,6 +222,33 @@ fn resolve_path(path: &str, base_dir: &Path) -> PathBuf {
     }
 }
 
+fn resolve_upstream(raw: UpstreamConfigRaw) -> UpstreamConfig {
+    let reasoning = match (&raw.reasoning, &raw.reasoning_effort) {
+        (Some(reasoning), _) => Some(reasoning.clone()),
+        (None, Some(effort)) => Some(ReasoningConfig {
+            effort: Some(effort.clone()),
+            ..ReasoningConfig::default()
+        }),
+        (None, None) => None,
+    };
+
+    UpstreamConfig {
+        base_url: raw.base_url,
+        model: raw.model,
+        supports_vision_input: raw.supports_vision_input,
+        api_key: raw.api_key,
+        api_key_env: raw.api_key_env,
+        chat_completions_path: raw.chat_completions_path,
+        timeout_seconds: raw.timeout_seconds,
+        context_window_tokens: raw.context_window_tokens,
+        cache_control: raw.cache_control,
+        reasoning,
+        headers: raw.headers,
+        native_web_search: raw.native_web_search,
+        external_web_search: raw.external_web_search,
+    }
+}
+
 pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Result<AgentConfig> {
     let base_dir = base_dir.as_ref();
     let raw: AgentConfigRaw =
@@ -226,15 +257,14 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
     if raw.upstream.base_url.trim().is_empty() || raw.upstream.model.trim().is_empty() {
         return Err(anyhow!("config.upstream must include base_url and model"));
     }
-
-    let reasoning = match (&raw.upstream.reasoning, &raw.upstream.reasoning_effort) {
-        (Some(reasoning), _) => Some(reasoning.clone()),
-        (None, Some(effort)) => Some(ReasoningConfig {
-            effort: Some(effort.clone()),
-            ..ReasoningConfig::default()
-        }),
-        (None, None) => None,
-    };
+    if let Some(image_tool_upstream) = &raw.image_tool_upstream
+        && (image_tool_upstream.base_url.trim().is_empty()
+            || image_tool_upstream.model.trim().is_empty())
+    {
+        return Err(anyhow!(
+            "config.image_tool_upstream must include base_url and model when provided"
+        ));
+    }
 
     let workspace_root = raw
         .workspace_root
@@ -244,21 +274,8 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
 
     Ok(AgentConfig {
         enabled_tools: raw.enabled_tools,
-        upstream: UpstreamConfig {
-            base_url: raw.upstream.base_url,
-            model: raw.upstream.model,
-            supports_vision_input: raw.upstream.supports_vision_input,
-            api_key: raw.upstream.api_key,
-            api_key_env: raw.upstream.api_key_env,
-            chat_completions_path: raw.upstream.chat_completions_path,
-            timeout_seconds: raw.upstream.timeout_seconds,
-            context_window_tokens: raw.upstream.context_window_tokens,
-            cache_control: raw.upstream.cache_control,
-            reasoning,
-            headers: raw.upstream.headers,
-            native_web_search: raw.upstream.native_web_search,
-            external_web_search: raw.upstream.external_web_search,
-        },
+        upstream: resolve_upstream(raw.upstream),
+        image_tool_upstream: raw.image_tool_upstream.map(resolve_upstream),
         skills_dirs: raw
             .skills_dirs
             .iter()

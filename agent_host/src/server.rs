@@ -260,6 +260,30 @@ impl ServerRuntime {
         upstream_timeout_seconds: Option<f64>,
     ) -> Result<FrameAgentConfig> {
         let model = self.model_config(model_key)?;
+        let image_tool_upstream = match model.image_tool_model.as_deref() {
+            None | Some("self") => None,
+            Some(other_model_key) => {
+                let image_model = self.model_config(other_model_key)?;
+                Some(UpstreamConfig {
+                    base_url: image_model.api_endpoint.clone(),
+                    model: image_model.model.clone(),
+                    supports_vision_input: image_model.supports_vision_input,
+                    api_key: image_model.api_key.clone(),
+                    api_key_env: image_model.api_key_env.clone(),
+                    chat_completions_path: image_model.chat_completions_path.clone(),
+                    timeout_seconds: image_model.timeout_seconds,
+                    context_window_tokens: image_model.context_window_tokens,
+                    cache_control: image_model.cache_ttl.as_ref().map(|ttl| CacheControlConfig {
+                        cache_type: "ephemeral".to_string(),
+                        ttl: Some(ttl.clone()),
+                    }),
+                    reasoning: image_model.reasoning.clone(),
+                    headers: image_model.headers.clone(),
+                    native_web_search: image_model.native_web_search.clone(),
+                    external_web_search: image_model.external_web_search.clone(),
+                })
+            }
+        };
         let commands = self
             .command_catalog
             .get(&session.address.channel_id)
@@ -288,6 +312,7 @@ impl ServerRuntime {
                 native_web_search: model.native_web_search.clone(),
                 external_web_search: model.external_web_search.clone(),
             },
+            image_tool_upstream,
             skills_dirs: vec![self.agent_workspace.skills_dir.clone()],
             system_prompt: build_agent_system_prompt(
                 &self.agent_workspace,
@@ -2822,6 +2847,7 @@ mod tests {
             api_endpoint: "https://example.com/v1".to_string(),
             model: "demo-vision".to_string(),
             supports_vision_input: true,
+            image_tool_model: None,
             api_key: None,
             api_key_env: "TEST_API_KEY".to_string(),
             chat_completions_path: "/chat/completions".to_string(),

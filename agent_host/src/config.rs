@@ -43,6 +43,8 @@ pub struct ModelConfig {
     #[serde(default)]
     pub supports_vision_input: bool,
     #[serde(default)]
+    pub image_tool_model: Option<String>,
+    #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default = "default_api_key_env")]
     pub api_key_env: String,
@@ -263,6 +265,16 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
                 model_name
             ));
         }
+        if let Some(image_tool_model) = &model.image_tool_model
+            && image_tool_model != "self"
+            && !config.models.contains_key(image_tool_model)
+        {
+            return Err(anyhow!(
+                "model '{}' references unknown image_tool_model '{}'",
+                model_name,
+                image_tool_model
+            ));
+        }
     }
     Ok(config)
 }
@@ -417,5 +429,39 @@ mod tests {
 
         let error = load_server_config_file(&config_path).unwrap_err();
         assert!(error.to_string().contains("main_agent.timeout_seconds"));
+    }
+
+    #[test]
+    fn image_tool_model_must_reference_existing_model_or_self() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "models": {
+                "main": {
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-model",
+                  "description": "demo",
+                  "image_tool_model": "vision"
+                }
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let error = load_server_config_file(&config_path).unwrap_err();
+        assert!(error.to_string().contains("unknown image_tool_model"));
     }
 }

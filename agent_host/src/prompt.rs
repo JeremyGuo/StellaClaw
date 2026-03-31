@@ -218,6 +218,7 @@ mod tests {
             api_endpoint: "https://example.com/v1".to_string(),
             model: "example-model".to_string(),
             supports_vision_input: false,
+            image_tool_model: None,
             api_key: None,
             api_key_env: "TEST_API_KEY".to_string(),
             chat_completions_path: "/chat/completions".to_string(),

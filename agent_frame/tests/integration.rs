@@ -229,6 +229,7 @@ fn builtin_tools_work() -> Result<()> {
         ],
         temp_dir.path(),
         &upstream,
+        None,
         &[],
         &[],
     )?;
@@ -377,6 +378,7 @@ fn load_skill_tool_hides_paths_but_can_read_skill_content() -> Result<()> {
         &[],
         temp_dir.path(),
         &test_upstream("http://127.0.0.1:1"),
+        None,
         &skills,
         &[],
     )?;
@@ -404,6 +406,7 @@ fn native_web_search_disables_external_web_search_tool() -> Result<()> {
         &["web_search".to_string(), "web_fetch".to_string()],
         temp_dir.path(),
         &upstream,
+        None,
         &[],
         &[],
     )?;

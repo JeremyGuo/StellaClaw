@@ -800,6 +800,7 @@ fn chat_message_text(message: &ChatMessage) -> String {
 fn image_tool(
     workspace_root: PathBuf,
     upstream: UpstreamConfig,
+    image_tool_upstream: Option<UpstreamConfig>,
     cancel_flag: Option<Arc<AtomicBool>>,
 ) -> Tool {
     Tool::new(
@@ -822,7 +823,9 @@ fn image_tool(
             let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
             let question = string_arg(arguments, "question")?;
             let timeout_seconds = f64_arg(arguments, "timeout_seconds")?;
-            let upstream = upstream.clone();
+            let upstream = image_tool_upstream
+                .clone()
+                .unwrap_or_else(|| upstream.clone());
 
             with_timeout_and_cancel(timeout_seconds, cancel_flag.clone(), move || {
                 if !upstream.supports_vision_input {
@@ -1156,6 +1159,7 @@ pub fn build_tool_registry(
     enabled_tools: &[String],
     workspace_root: &Path,
     upstream: &UpstreamConfig,
+    image_tool_upstream: Option<&UpstreamConfig>,
     skills: &[SkillMetadata],
     extra_tools: &[Tool],
 ) -> Result<BTreeMap<String, Tool>> {
@@ -1163,6 +1167,7 @@ pub fn build_tool_registry(
         enabled_tools,
         workspace_root,
         upstream,
+        image_tool_upstream,
         skills,
         extra_tools,
         None,
@@ -1173,6 +1178,7 @@ pub fn build_tool_registry_with_cancel(
     enabled_tools: &[String],
     workspace_root: &Path,
     upstream: &UpstreamConfig,
+    image_tool_upstream: Option<&UpstreamConfig>,
     skills: &[SkillMetadata],
     extra_tools: &[Tool],
     cancel_flag: Option<Arc<AtomicBool>>,
@@ -1211,6 +1217,7 @@ pub fn build_tool_registry_with_cancel(
             image_tool(
                 workspace_root.to_path_buf(),
                 upstream.clone(),
+                image_tool_upstream.cloned(),
                 cancel_flag.clone(),
             ),
         ),

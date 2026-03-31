@@ -195,6 +195,7 @@ pub fn run_session_with_report_controlled(
         &config.enabled_tools,
         &config.workspace_root,
         &config.upstream,
+        config.image_tool_upstream.as_ref(),
         &discovered_skills,
         &extra_tools,
         control.as_ref().map(SessionExecutionControl::cancel_flag),
@@ -278,6 +279,7 @@ pub fn compact_session_messages_with_report(
         &config.enabled_tools,
         &config.workspace_root,
         &config.upstream,
+        config.image_tool_upstream.as_ref(),
         &discovered_skills,
         &extra_tools,
     )?;
