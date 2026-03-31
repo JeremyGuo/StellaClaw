@@ -9,6 +9,8 @@ pub struct UpstreamConfig {
     pub base_url: String,
     pub model: String,
     #[serde(default)]
+    pub supports_vision_input: bool,
+    #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default = "default_api_key_env")]
     pub api_key_env: String,
@@ -125,6 +127,8 @@ struct AgentConfigRaw {
 struct UpstreamConfigRaw {
     base_url: String,
     model: String,
+    #[serde(default)]
+    supports_vision_input: bool,
     #[serde(default)]
     api_key: Option<String>,
     #[serde(default = "default_api_key_env")]
@@ -243,6 +247,7 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
         upstream: UpstreamConfig {
             base_url: raw.upstream.base_url,
             model: raw.upstream.model,
+            supports_vision_input: raw.upstream.supports_vision_input,
             api_key: raw.upstream.api_key,
             api_key_env: raw.upstream.api_key_env,
             chat_completions_path: raw.upstream.chat_completions_path,

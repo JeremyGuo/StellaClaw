@@ -143,6 +143,7 @@ pub fn default_enabled_tools() -> Vec<String> {
         "process".to_string(),
         "web_fetch".to_string(),
         "web_search".to_string(),
+        "image".to_string(),
     ]
 }
 

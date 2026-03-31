@@ -145,6 +145,7 @@ fn test_upstream(base_url: &str) -> UpstreamConfig {
     UpstreamConfig {
         base_url: base_url.to_string(),
         model: "test-model".to_string(),
+        supports_vision_input: false,
         api_key: None,
         api_key_env: "TEST_API_KEY".to_string(),
         chat_completions_path: "/chat/completions".to_string(),
@@ -195,7 +196,16 @@ fn builtin_tools_work() -> Result<()> {
             "https://example.com/b"
         ]
     }));
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "The image shows a handwritten note."
+            }
+        }]
+    }));
     let mut upstream = test_upstream(&server.address);
+    upstream.supports_vision_input = true;
     upstream.external_web_search = Some(ExternalWebSearchConfig {
         base_url: server.address.clone(),
         model: "perplexity/sonar".to_string(),
@@ -215,6 +225,7 @@ fn builtin_tools_work() -> Result<()> {
             "process".to_string(),
             "web_fetch".to_string(),
             "web_search".to_string(),
+            "image".to_string(),
         ],
         temp_dir.path(),
         &upstream,
@@ -312,6 +323,28 @@ fn builtin_tools_work() -> Result<()> {
     );
     assert!(search_result.contains("Search answer"));
     assert!(search_result.contains("example.com/a"));
+
+    let image_path = temp_dir.path().join("diagram.png");
+    fs::write(&image_path, [1_u8, 2, 3, 4])?;
+    let image_result = execute_tool_call(
+        &registry,
+        "image",
+        Some(r#"{"path":"diagram.png","question":"What does this image show?","timeout_seconds":2}"#),
+    );
+    assert!(image_result.contains("handwritten note"));
+
+    let requests = server.requests();
+    let image_request = requests.last().expect("image request");
+    let messages = image_request["messages"].as_array().expect("messages array");
+    let user_content = messages[1]["content"].as_array().expect("multimodal content");
+    assert_eq!(user_content[0]["type"], "text");
+    assert_eq!(user_content[1]["type"], "image_url");
+    assert!(
+        user_content[1]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,")
+    );
 
     let timeout_target = temp_dir.path().join("timeout-side-effect.txt");
     let timeout_result = execute_tool_call(

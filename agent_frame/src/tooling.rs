@@ -1,6 +1,9 @@
 use crate::config::{ExternalWebSearchConfig, UpstreamConfig};
+use crate::llm::create_chat_completion;
+use crate::message::ChatMessage;
 use crate::skills::{SkillMetadata, build_skill_index, load_skill_by_name};
 use anyhow::{Context, Result, anyhow};
+use base64::Engine;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -744,6 +747,134 @@ fn strip_html_tags(body: &str) -> String {
     output.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn infer_image_media_type(path: &Path) -> String {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        _ => "image/png",
+    }
+    .to_string()
+}
+
+fn image_to_data_url(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!(
+        "data:{};base64,{}",
+        infer_image_media_type(path),
+        encoded
+    ))
+}
+
+fn chat_message_text(message: &ChatMessage) -> String {
+    match &message.content {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| {
+                let object = item.as_object()?;
+                let item_type = object.get("type")?.as_str()?;
+                match item_type {
+                    "text" | "input_text" | "output_text" => {
+                        object.get("text")?.as_str().map(ToOwned::to_owned)
+                    }
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
+fn image_tool(
+    workspace_root: PathBuf,
+    upstream: UpstreamConfig,
+    cancel_flag: Option<Arc<AtomicBool>>,
+) -> Tool {
+    Tool::new(
+        "image",
+        "Inspect a local image with the model's multimodal capability and answer a focused question about it. The model must choose timeout_seconds.",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "question": {"type": "string"},
+                "timeout_seconds": {"type": "number"}
+            },
+            "required": ["path", "question", "timeout_seconds"],
+            "additionalProperties": false
+        }),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
+            let question = string_arg(arguments, "question")?;
+            let timeout_seconds = f64_arg(arguments, "timeout_seconds")?;
+            let upstream = upstream.clone();
+
+            with_timeout_and_cancel(timeout_seconds, cancel_flag.clone(), move || {
+                if !upstream.supports_vision_input {
+                    return Err(anyhow!(
+                        "the configured upstream model does not support multimodal image input"
+                    ));
+                }
+                let data_url = image_to_data_url(&path)?;
+                let outcome = create_chat_completion(
+                    &UpstreamConfig {
+                        timeout_seconds,
+                        ..upstream.clone()
+                    },
+                    &[
+                        ChatMessage::text(
+                            "system",
+                            "You inspect a local image for an agent runtime. Answer the user's question about the image directly and concisely. If relevant visible text appears in the image, quote or transcribe it accurately.",
+                        ),
+                        ChatMessage {
+                            role: "user".to_string(),
+                            content: Some(Value::Array(vec![
+                                json!({
+                                    "type": "text",
+                                    "text": question
+                                }),
+                                json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": data_url
+                                    }
+                                }),
+                            ])),
+                            name: None,
+                            tool_call_id: None,
+                            tool_calls: None,
+                        },
+                    ],
+                    &[],
+                    Some(Map::from_iter([(
+                        "max_completion_tokens".to_string(),
+                        Value::from(800_u64),
+                    )])),
+                )?;
+                Ok(json!({
+                    "path": path.display().to_string(),
+                    "answer": chat_message_text(&outcome.message),
+                }))
+            })
+        },
+    )
+}
+
 fn web_fetch_tool() -> Tool {
     Tool::new(
         "web_fetch",
@@ -874,6 +1005,7 @@ fn web_search_tool(search_config: ExternalWebSearchConfig) -> Tool {
             let config = UpstreamConfig {
                 base_url: search_config.base_url.clone(),
                 model: search_config.model.clone(),
+                supports_vision_input: false,
                 api_key: search_config.api_key.clone(),
                 api_key_env: search_config.api_key_env.clone(),
                 chat_completions_path: search_config.chat_completions_path.clone(),
@@ -1073,6 +1205,14 @@ pub fn build_tool_registry_with_cancel(
         (
             "apply_patch".to_string(),
             apply_patch_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+        ),
+        (
+            "image".to_string(),
+            image_tool(
+                workspace_root.to_path_buf(),
+                upstream.clone(),
+                cancel_flag.clone(),
+            ),
         ),
         ("web_fetch".to_string(), web_fetch_tool()),
         ("http_request".to_string(), http_request_tool()),

@@ -271,6 +271,7 @@ impl ServerRuntime {
             upstream: UpstreamConfig {
                 base_url: model.api_endpoint.clone(),
                 model: model.model.clone(),
+                supports_vision_input: model.supports_vision_input,
                 api_key: model.api_key.clone(),
                 api_key_env: model.api_key_env.clone(),
                 chat_completions_path: model.chat_completions_path.clone(),
