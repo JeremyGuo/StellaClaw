@@ -601,7 +601,7 @@ impl WorkspaceManager {
         })?;
         fs::create_dir_all(&record.mounts_dir)
             .with_context(|| format!("failed to create {}", record.mounts_dir.display()))?;
-        self.ensure_skill_memory_link(record)?;
+        self.normalize_skill_memory_layout(record)?;
         fs::create_dir_all(&record.host_dir)
             .with_context(|| format!("failed to create {}", record.host_dir.display()))?;
         if !record.summary_path.exists() {
@@ -624,6 +624,9 @@ impl WorkspaceManager {
         {
             let entry = entry?;
             let source_path = entry.path();
+            if entry.file_name() == "skill_memory" {
+                continue;
+            }
             let target_path = record.files_dir.join(entry.file_name());
             if target_path.exists() {
                 continue;
@@ -633,10 +636,16 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    fn ensure_skill_memory_link(&self, record: &WorkspaceRecord) -> Result<()> {
+    fn normalize_skill_memory_layout(&self, record: &WorkspaceRecord) -> Result<()> {
         let source = self.template_root.join("skill_memory");
         fs::create_dir_all(&source)
             .with_context(|| format!("failed to create {}", source.display()))?;
+        let legacy = record.files_dir.join("skill_memory");
+        if legacy.exists() {
+            merge_directory_contents_if_missing(&legacy, &source)?;
+            fs::remove_dir_all(&legacy)
+                .with_context(|| format!("failed to remove legacy {}", legacy.display()))?;
+        }
         let target = record.files_dir.join(".skill_memory");
         if target.exists() {
             return Ok(());
@@ -750,7 +759,7 @@ impl WorkspaceManager {
     ) -> WorkspaceRecord {
         let root_dir = self.workspaces_root.join(&id);
         let files_dir = root_dir.join("files");
-        let mounts_dir = root_dir.join("mounts");
+        let mounts_dir = files_dir.join("mounts");
         let host_dir = self.meta_root.join(&id);
         let summary_path = host_dir.join("summary.md");
         WorkspaceRecord {
@@ -835,6 +844,28 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
         let entry = entry?;
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
+        copy_path_recursive(&source_path, &target_path)?;
+    }
+    Ok(())
+}
+
+fn merge_directory_contents_if_missing(source: &Path, target: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(source)
+        .with_context(|| format!("failed to stat {}", source.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(());
+    }
+    fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
+    for entry in fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        if target_path.exists() {
+            if source_path.is_dir() && target_path.is_dir() {
+                merge_directory_contents_if_missing(&source_path, &target_path)?;
+            }
+            continue;
+        }
         copy_path_recursive(&source_path, &target_path)?;
     }
     Ok(())
