@@ -1,1 +1,3 @@
-
+[submodule "zgent"]
+	path = zgent
+	url = https://github.com/Hineven/zgent.git
