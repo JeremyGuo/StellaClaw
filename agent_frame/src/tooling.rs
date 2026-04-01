@@ -1282,7 +1282,7 @@ fn image_tool(
 ) -> Tool {
     Tool::new(
         "image",
-        "Inspect a local image with the model's multimodal capability and answer a focused question about it. The model must choose timeout_seconds.",
+        "Inspect a local image file with the model's multimodal capability and answer a focused question about it. Use this for local images that are not already directly visible in the current user turn. The model must choose timeout_seconds.",
         json!({
             "type": "object",
             "properties": {

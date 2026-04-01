@@ -3156,6 +3156,11 @@ fn build_user_turn_message(
             "The user attached {} image(s). Inspect the images directly.",
             image_attachments.len()
         ));
+    } else {
+        text_sections.push(format!(
+            "The user attached {} image(s), and those images are already directly visible in this request. Inspect them directly here instead of calling the image tool again for the same current-turn attachments.",
+            image_attachments.len()
+        ));
     }
 
     let mut content = vec![json!({
@@ -4393,6 +4398,9 @@ mod tests {
         let content = message.content.unwrap();
         let items = content.as_array().unwrap();
         assert_eq!(items[0]["type"], "text");
+        let text = items[0]["text"].as_str().unwrap();
+        assert!(text.contains("already directly visible in this request"));
+        assert!(text.contains("instead of calling the image tool again"));
         assert_eq!(items[1]["type"], "image_url");
         let url = items[1]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("data:image/png;base64,"));
