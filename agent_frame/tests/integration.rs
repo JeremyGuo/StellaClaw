@@ -2,11 +2,13 @@ use agent_frame::compaction::COMPACTION_MARKER;
 use agent_frame::message::ChatMessage;
 use agent_frame::skills::{build_skills_meta_prompt, discover_skills};
 use agent_frame::tool;
-use agent_frame::tooling::{build_tool_registry, execute_tool_call};
+use agent_frame::tooling::{
+    build_tool_registry, execute_tool_call, terminate_all_managed_processes,
+};
 use agent_frame::{
-    ExternalWebSearchConfig, NativeWebSearchConfig, SessionExecutionControl, UpstreamConfig,
-    compact_session_messages_with_report, extract_assistant_text, load_config_value, run_session,
-    run_session_with_report, run_session_with_report_controlled,
+    ExternalWebSearchConfig, NativeWebSearchConfig, SessionEvent, SessionExecutionControl,
+    UpstreamConfig, compact_session_messages_with_report, extract_assistant_text,
+    load_config_value, run_session, run_session_with_report, run_session_with_report_controlled,
 };
 use anyhow::Result;
 use assert_cmd::Command;
@@ -17,8 +19,9 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
+use std::time::Duration;
 use tempfile::TempDir;
 
 struct TestServer {
@@ -27,6 +30,17 @@ struct TestServer {
     requests: Arc<Mutex<Vec<Value>>>,
     shutdown: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
+}
+
+fn process_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn acquire_process_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    process_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl TestServer {
@@ -116,7 +130,9 @@ fn handle_stream(
             stream
                 .write_all(header.as_bytes())
                 .expect("write binary get response header");
-            stream.write_all(body).expect("write binary get response body");
+            stream
+                .write_all(body)
+                .expect("write binary get response body");
             return;
         }
         let body = json!({"ok": true, "path": path}).to_string();
@@ -194,6 +210,7 @@ fn discover_skills_and_build_meta_prompt() -> Result<()> {
 
 #[test]
 fn builtin_tools_work() -> Result<()> {
+    let _guard = acquire_process_test_lock();
     let temp_dir = TempDir::new()?;
     let server = TestServer::start();
     server.push_response(json!({
@@ -233,8 +250,10 @@ fn builtin_tools_work() -> Result<()> {
             "write_file".to_string(),
             "edit".to_string(),
             "apply_patch".to_string(),
-            "exec".to_string(),
-            "process".to_string(),
+            "exec_start".to_string(),
+            "exec_observe".to_string(),
+            "exec_wait".to_string(),
+            "exec_kill".to_string(),
             "download_file".to_string(),
             "web_fetch".to_string(),
             "web_search".to_string(),
@@ -278,27 +297,74 @@ fn builtin_tools_work() -> Result<()> {
 
     let shell_result = execute_tool_call(
         &registry,
-        "exec",
-        Some(r#"{"command":"printf 123","timeout_seconds":2}"#),
+        "exec_start",
+        Some(r#"{"command":"printf 123","wait_timeout_seconds":2}"#),
     );
     assert!(shell_result.contains("\"stdout\": \"123\""));
 
     let background_process = execute_tool_call(
         &registry,
-        "exec",
-        Some(r#"{"command":"printf bg","timeout_seconds":2,"wait":false}"#),
+        "exec_start",
+        Some(r#"{"command":"sleep 0.2; printf bg","wait_timeout_seconds":0.05}"#),
     );
-    assert!(background_process.contains("process_id"));
     let background_json: Value = serde_json::from_str(&background_process)?;
+    let background_exec_id = background_json
+        .get("exec_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            background_json
+                .get("process")
+                .and_then(Value::as_object)
+                .and_then(|process| process.get("exec_id"))
+                .and_then(Value::as_str)
+        })
+        .expect("background exec id");
     let process_result = execute_tool_call(
         &registry,
-        "process",
+        "exec_wait",
         Some(&format!(
-            r#"{{"action":"inspect","process_id":"{}","tail_bytes":1000}}"#,
-            background_json["process_id"].as_str().unwrap()
+            r#"{{"exec_id":"{}","wait_timeout_seconds":1,"start":0,"limit":10}}"#,
+            background_exec_id
         )),
     );
-    assert!(process_result.contains("\"process_id\""));
+    assert!(process_result.contains("\"exec_id\""));
+    assert!(process_result.contains("\"stdout\": \"bg\""));
+
+    let cat_process = execute_tool_call(
+        &registry,
+        "exec_start",
+        Some(r#"{"command":"cat","wait_timeout_seconds":0.05,"include_stdout":false}"#),
+    );
+    let cat_json: Value = serde_json::from_str(&cat_process)?;
+    let cat_wait = execute_tool_call(
+        &registry,
+        "exec_wait",
+        Some(&format!(
+            r#"{{"exec_id":"{}","wait_timeout_seconds":0.2,"input":"hello\n","start":0,"limit":10}}"#,
+            cat_json["exec_id"].as_str().unwrap()
+        )),
+    );
+    assert!(
+        cat_wait.contains("\"wait_timed_out\": true") || cat_wait.contains("\"stdout\": \"hello\"")
+    );
+    let cat_observe = execute_tool_call(
+        &registry,
+        "exec_observe",
+        Some(&format!(
+            r#"{{"exec_id":"{}","start":0,"limit":10}}"#,
+            cat_json["exec_id"].as_str().unwrap()
+        )),
+    );
+    assert!(cat_observe.contains("hello"));
+    let cat_kill = execute_tool_call(
+        &registry,
+        "exec_kill",
+        Some(&format!(
+            r#"{{"exec_id":"{}"}}"#,
+            cat_json["exec_id"].as_str().unwrap()
+        )),
+    );
+    assert!(cat_kill.contains("\"killed\": true"));
 
     let patch_path = temp_dir.path().join("patch.txt");
     fs::write(&patch_path, "before\n")?;
@@ -356,14 +422,20 @@ fn builtin_tools_work() -> Result<()> {
     let image_result = execute_tool_call(
         &registry,
         "image",
-        Some(r#"{"path":"diagram.png","question":"What does this image show?","timeout_seconds":2}"#),
+        Some(
+            r#"{"path":"diagram.png","question":"What does this image show?","timeout_seconds":2}"#,
+        ),
     );
     assert!(image_result.contains("handwritten note"));
 
     let requests = server.requests();
     let image_request = requests.last().expect("image request");
-    let messages = image_request["messages"].as_array().expect("messages array");
-    let user_content = messages[1]["content"].as_array().expect("multimodal content");
+    let messages = image_request["messages"]
+        .as_array()
+        .expect("messages array");
+    let user_content = messages[1]["content"]
+        .as_array()
+        .expect("multimodal content");
     assert_eq!(user_content[0]["type"], "text");
     assert_eq!(user_content[1]["type"], "image_url");
     assert!(
@@ -376,15 +448,64 @@ fn builtin_tools_work() -> Result<()> {
     let timeout_target = temp_dir.path().join("timeout-side-effect.txt");
     let timeout_result = execute_tool_call(
         &registry,
-        "exec",
+        "exec_start",
         Some(&format!(
-            r#"{{"command":"sleep 1; printf late > {}","timeout_seconds":0.1}}"#,
+            r#"{{"command":"sleep 1; printf late > {}","wait_timeout_seconds":0.1}}"#,
             timeout_target.display()
         )),
     );
-    assert!(timeout_result.contains("timed out"));
+    assert!(timeout_result.contains("\"wait_timed_out\": true"));
     thread::sleep(std::time::Duration::from_millis(1200));
-    assert!(!timeout_target.exists());
+    assert!(timeout_target.exists());
+    Ok(())
+}
+
+#[test]
+fn exec_processes_report_clear_error_after_runtime_shutdown() -> Result<()> {
+    let _guard = acquire_process_test_lock();
+    let temp_dir = TempDir::new()?;
+    let registry = build_tool_registry(
+        &[
+            "exec_start".to_string(),
+            "exec_observe".to_string(),
+            "exec_wait".to_string(),
+        ],
+        temp_dir.path(),
+        &test_upstream("http://127.0.0.1:1"),
+        None,
+        &[],
+        &[],
+    )?;
+
+    let started = execute_tool_call(
+        &registry,
+        "exec_start",
+        Some(r#"{"command":"sleep 10","wait_timeout_seconds":0.05,"include_stdout":false}"#),
+    );
+    let started_json: Value = serde_json::from_str(&started)?;
+    let exec_id = started_json["exec_id"].as_str().unwrap();
+
+    terminate_all_managed_processes()?;
+
+    let observe = execute_tool_call(
+        &registry,
+        "exec_observe",
+        Some(&format!(
+            r#"{{"exec_id":"{}","start":0,"limit":5}}"#,
+            exec_id
+        )),
+    );
+    assert!(observe.contains("no longer exists"));
+
+    let wait = execute_tool_call(
+        &registry,
+        "exec_wait",
+        Some(&format!(
+            r#"{{"exec_id":"{}","wait_timeout_seconds":0.1}}"#,
+            exec_id
+        )),
+    );
+    assert!(wait.contains("no longer exists"));
     Ok(())
 }
 
@@ -715,7 +836,10 @@ fn pending_prefix_rewrite_is_applied_before_next_model_call() -> Result<()> {
                     .first()
                     .cloned()
                     .expect("system message should exist"),
-                ChatMessage::text("assistant", format!("{}\n\ncompressed prefix", COMPACTION_MARKER)),
+                ChatMessage::text(
+                    "assistant",
+                    format!("{}\n\ncompressed prefix", COMPACTION_MARKER),
+                ),
             ];
             rewrite_control.request_prefix_rewrite(
                 expected_prefix,
@@ -772,7 +896,6 @@ fn pending_prefix_rewrite_is_applied_before_next_model_call() -> Result<()> {
     assert_eq!(second_messages[2]["role"], "tool");
     Ok(())
 }
-
 
 #[test]
 fn compact_session_messages_with_report_compacts_and_reports_usage() -> Result<()> {
@@ -1033,7 +1156,11 @@ fn controlled_run_emits_checkpoint_and_honors_cancellation() -> Result<()> {
         let control_holder = Arc::clone(&control_holder);
         SessionExecutionControl::with_checkpoint_callback(move |report| {
             checkpoints.lock().unwrap().push(report);
-            if let Some(control) = control_holder.lock().unwrap().as_ref() {
+        })
+        .with_event_callback(move |event| {
+            if matches!(event, SessionEvent::ToolCallStarted { .. })
+                && let Some(control) = control_holder.lock().unwrap().as_ref()
+            {
                 control.request_cancel();
             }
         })
@@ -1050,9 +1177,353 @@ fn controlled_run_emits_checkpoint_and_honors_cancellation() -> Result<()> {
     .unwrap_err();
     assert!(error.to_string().contains("cancelled"));
     let checkpoints = checkpoints.lock().unwrap();
+    assert_eq!(checkpoints.len(), 0);
+    Ok(())
+}
+
+#[test]
+fn controlled_run_emits_process_events() -> Result<()> {
+    let server = TestServer::start();
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "draft answer",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "multiply",
+                        "arguments": "{\"a\":6,\"b\":7}"
+                    }
+                }]
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 21,
+            "completion_tokens": 5,
+            "total_tokens": 26
+        }
+    }));
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "final answer"
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 30,
+            "completion_tokens": 7,
+            "total_tokens": 37
+        }
+    }));
+
+    let multiply = tool! {
+        description: "Multiply two integers.",
+        fn multiply(a: i64, b: i64) -> i64 {
+            a * b
+        }
+    };
+
+    let config = load_config_value(
+        json!({
+            "enabled_tools": [],
+            "upstream": {"base_url": server.address, "model": "fake-model"},
+            "system_prompt": "Test system prompt."
+        }),
+        ".",
+    )?;
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let control = {
+        let events = Arc::clone(&events);
+        SessionExecutionControl::new().with_event_callback(move |event| {
+            events.lock().unwrap().push(event);
+        })
+    };
+
+    let report = run_session_with_report_controlled(
+        Vec::new(),
+        "What is 6 times 7?",
+        config,
+        vec![multiply],
+        Some(control),
+    )?;
+    assert_eq!(extract_assistant_text(&report.messages), "final answer");
+    let events = events.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::ModelCallStarted { .. }))
+    );
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::ToolCallStarted { tool_name, .. } if tool_name == "multiply")));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::ToolCallCompleted { tool_name, errored, .. } if tool_name == "multiply" && !errored)));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::SessionCompleted { .. }))
+    );
+    Ok(())
+}
+
+#[test]
+fn controlled_run_does_not_emit_checkpoint_for_assistant_messages_with_tool_calls() -> Result<()> {
+    let server = TestServer::start();
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "draft answer",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "multiply",
+                        "arguments": "{\"a\":6,\"b\":7}"
+                    }
+                }]
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 21,
+            "completion_tokens": 5,
+            "total_tokens": 26
+        }
+    }));
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "final answer"
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 30,
+            "completion_tokens": 7,
+            "total_tokens": 37
+        }
+    }));
+
+    let multiply = tool! {
+        description: "Multiply two integers.",
+        fn multiply(a: i64, b: i64) -> i64 {
+            a * b
+        }
+    };
+
+    let config = load_config_value(
+        json!({
+            "enabled_tools": [],
+            "upstream": {"base_url": server.address, "model": "fake-model"},
+            "system_prompt": "Test system prompt."
+        }),
+        ".",
+    )?;
+
+    let checkpoints = Arc::new(Mutex::new(Vec::new()));
+    let control = {
+        let checkpoints = Arc::clone(&checkpoints);
+        SessionExecutionControl::with_checkpoint_callback(move |report| {
+            checkpoints.lock().unwrap().push(report);
+        })
+    };
+
+    let report = run_session_with_report_controlled(
+        Vec::new(),
+        "What is 6 times 7?",
+        config,
+        vec![multiply],
+        Some(control),
+    )?;
+    assert_eq!(extract_assistant_text(&report.messages), "final answer");
+    let checkpoints = checkpoints.lock().unwrap();
     assert_eq!(checkpoints.len(), 1);
-    assert_eq!(extract_assistant_text(&checkpoints[0].messages), "draft answer");
-    assert_eq!(checkpoints[0].usage.total_tokens, 26);
+    assert_eq!(
+        extract_assistant_text(&checkpoints[0].messages),
+        "final answer"
+    );
+    Ok(())
+}
+
+#[test]
+fn tool_calls_in_one_round_execute_in_parallel() -> Result<()> {
+    let server = TestServer::start();
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "working",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "slow_a",
+                            "arguments": "{}"
+                        }
+                    },
+                    {
+                        "id": "call-2",
+                        "type": "function",
+                        "function": {
+                            "name": "slow_b",
+                            "arguments": "{}"
+                        }
+                    }
+                ]
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 21,
+            "completion_tokens": 5,
+            "total_tokens": 26
+        }
+    }));
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "done"
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 30,
+            "completion_tokens": 7,
+            "total_tokens": 37
+        }
+    }));
+
+    let slow_a = tool! {
+        description: "Sleep briefly and return A.",
+        fn slow_a() -> String {
+            thread::sleep(Duration::from_millis(250));
+            "A".to_string()
+        }
+    };
+    let slow_b = tool! {
+        description: "Sleep briefly and return B.",
+        fn slow_b() -> String {
+            thread::sleep(Duration::from_millis(250));
+            "B".to_string()
+        }
+    };
+
+    let config = load_config_value(
+        json!({
+            "enabled_tools": [],
+            "upstream": {"base_url": server.address, "model": "fake-model"},
+            "system_prompt": "Test system prompt."
+        }),
+        ".",
+    )?;
+
+    let started = std::time::Instant::now();
+    let report = run_session_with_report_controlled(
+        Vec::new(),
+        "Run both tools.",
+        config,
+        vec![slow_a, slow_b],
+        None,
+    )?;
+    let elapsed = started.elapsed();
+    assert_eq!(extract_assistant_text(&report.messages), "done");
+    assert!(elapsed < Duration::from_millis(430));
+    Ok(())
+}
+
+#[test]
+fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -> Result<()> {
+    let _guard = acquire_process_test_lock();
+    let server = TestServer::start();
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "checking environment",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "exec",
+                        "arguments": "{\"command\":\"sleep 10\",\"wait_timeout_seconds\":30}"
+                    }
+                }]
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 21,
+            "completion_tokens": 5,
+            "total_tokens": 26
+        }
+    }));
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "the tool timed out; please retry with a longer timeout if needed"
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 30,
+            "completion_tokens": 9,
+            "total_tokens": 39
+        }
+    }));
+
+    let config = load_config_value(
+        json!({
+            "enabled_tools": ["exec"],
+            "upstream": {"base_url": server.address, "model": "fake-model"},
+            "system_prompt": "Test system prompt."
+        }),
+        ".",
+    )?;
+
+    let control_holder = Arc::new(Mutex::new(None::<SessionExecutionControl>));
+    let control = {
+        let control_holder = Arc::clone(&control_holder);
+        SessionExecutionControl::new().with_event_callback(move |event| {
+            if matches!(event, SessionEvent::ToolCallStarted { .. })
+                && let Some(control) = control_holder.lock().unwrap().as_ref()
+            {
+                let control = control.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(100));
+                    control.request_timeout_observation();
+                });
+            }
+        })
+    };
+    *control_holder.lock().unwrap() = Some(control.clone());
+
+    let report = run_session_with_report_controlled(
+        Vec::new(),
+        "Check the environment",
+        config,
+        Vec::new(),
+        Some(control),
+    )?;
+    let assistant_text = extract_assistant_text(&report.messages);
+    assert!(assistant_text.contains("tool timed out"));
+    let tool_messages = report
+        .messages
+        .iter()
+        .filter(|message| message.role == "tool")
+        .collect::<Vec<_>>();
+    assert_eq!(tool_messages.len(), 1);
+    let tool_content = tool_messages[0]
+        .content
+        .as_ref()
+        .and_then(|value| value.as_str())
+        .unwrap();
+    let tool_json: Value = serde_json::from_str(tool_content)?;
+    assert_eq!(tool_json["timed_out"], json!(true));
+    assert!(tool_content.contains("\"tool\":\"exec\""));
     Ok(())
 }
 

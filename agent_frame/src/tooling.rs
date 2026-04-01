@@ -4,6 +4,7 @@ use crate::message::ChatMessage;
 use crate::skills::{SkillMetadata, build_skill_index, load_skill_by_name};
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use crossbeam_channel::{self, Receiver};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -11,11 +12,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
-use std::sync::Arc;
+use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use uuid::Uuid;
 
 type ToolHandler = dyn Fn(Value) -> Result<Value> + Send + Sync + 'static;
@@ -122,52 +123,99 @@ fn resolve_path(path: &str, workspace_root: &Path) -> PathBuf {
     }
 }
 
+#[derive(Default)]
+pub struct InterruptSignal {
+    flag: AtomicBool,
+    subscribers: Mutex<Vec<crossbeam_channel::Sender<()>>>,
+}
+
+impl InterruptSignal {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn request(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        let mut subscribers = self.subscribers.lock().unwrap();
+        subscribers.retain(|subscriber| subscriber.try_send(()).is_ok());
+    }
+
+    pub fn clear(&self) {
+        self.flag.store(false, Ordering::SeqCst);
+    }
+
+    pub fn is_requested(&self) -> bool {
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    pub fn subscribe(&self) -> Receiver<()> {
+        let (sender, receiver) = crossbeam_channel::bounded(1);
+        if self.is_requested() {
+            let _ = sender.try_send(());
+        } else {
+            self.subscribers.lock().unwrap().push(sender);
+        }
+        receiver
+    }
+}
+
 fn with_timeout_and_cancel<T: Send + 'static>(
     timeout_seconds: f64,
-    cancel_flag: Option<Arc<AtomicBool>>,
+    cancel_flag: Option<Arc<InterruptSignal>>,
     operation: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    let (sender, receiver) = std::sync::mpsc::channel();
+    enum OperationEvent<T> {
+        Completed(Result<T>),
+    }
+
+    let (sender, receiver) = crossbeam_channel::bounded(1);
     thread::spawn(move || {
-        let _ = sender.send(operation());
+        let _ = sender.send(OperationEvent::Completed(operation()));
     });
 
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout_seconds);
-    loop {
-        if let Some(cancel_flag) = &cancel_flag
-            && cancel_flag.load(Ordering::SeqCst)
-        {
-            return Err(anyhow!("operation cancelled"));
+    let cancel_receiver = cancel_flag.as_ref().map(|signal| signal.subscribe());
+    let timeout_receiver = crossbeam_channel::after(Duration::from_secs_f64(timeout_seconds));
+    match cancel_receiver {
+        Some(cancel_receiver) => {
+            crossbeam_channel::select! {
+                recv(receiver) -> result => match result {
+                    Ok(OperationEvent::Completed(result)) => result,
+                    Err(_) => Err(anyhow!("operation worker disconnected")),
+                },
+                recv(cancel_receiver) -> _ => Err(anyhow!("operation cancelled")),
+                recv(timeout_receiver) -> _ => Err(anyhow!(
+                    "operation timed out after {} seconds",
+                    timeout_seconds
+                )),
+            }
         }
-        let now = Instant::now();
-        if now >= deadline {
-            return Err(anyhow!("operation timed out after {} seconds", timeout_seconds));
-        }
-        let remaining = deadline.saturating_duration_since(now);
-        let slice = remaining.min(Duration::from_millis(25));
-        match receiver.recv_timeout(slice) {
-            Ok(result) => return result,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(anyhow!("operation worker disconnected"));
+        None => {
+            crossbeam_channel::select! {
+                recv(receiver) -> result => match result {
+                    Ok(OperationEvent::Completed(result)) => result,
+                    Err(_) => Err(anyhow!("operation worker disconnected")),
+                },
+                recv(timeout_receiver) -> _ => Err(anyhow!(
+                    "operation timed out after {} seconds",
+                    timeout_seconds
+                )),
             }
         }
     }
 }
 
 fn wait_for_child_with_timeout(
-    child: &mut Child,
+    child: Child,
     timeout_seconds: f64,
     timeout_label: &str,
-    cancel_flag: Option<&Arc<AtomicBool>>,
+    cancel_flag: Option<&Arc<InterruptSignal>>,
 ) -> Result<Output> {
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout_seconds);
-    loop {
-        if child
-            .try_wait()
-            .context("failed to poll child process status")?
-            .is_some()
-        {
+    let pid = child.id();
+    let (result_sender, result_receiver) = crossbeam_channel::bounded(1);
+    thread::spawn(move || {
+        let mut child = child;
+        let result = (|| -> Result<Output> {
+            let status = child.wait().context("failed to finalize child process")?;
             let mut stdout = Vec::new();
             let mut stderr = Vec::new();
             if let Some(pipe) = child.stdout.as_mut() {
@@ -178,34 +226,55 @@ fn wait_for_child_with_timeout(
                 pipe.read_to_end(&mut stderr)
                     .context("failed to read child stderr")?;
             }
-            let status = child.wait().context("failed to finalize child process")?;
-            return Ok(Output {
+            Ok(Output {
                 status,
                 stdout,
                 stderr,
-            });
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(anyhow!(
-                "{} timed out after {} seconds",
-                timeout_label,
-                timeout_seconds
-            ));
-        }
-        if let Some(cancel_flag) = cancel_flag
-            && cancel_flag.load(Ordering::SeqCst)
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(anyhow!("{} cancelled", timeout_label));
-        }
-        thread::sleep(Duration::from_millis(25));
+            })
+        })();
+        let _ = result_sender.send(result);
+    });
+
+    let cancel_receiver = cancel_flag.map(|signal| signal.subscribe());
+    let timeout_receiver = crossbeam_channel::after(Duration::from_secs_f64(timeout_seconds));
+    let outcome = match cancel_receiver {
+        Some(cancel_receiver) => crossbeam_channel::select! {
+            recv(result_receiver) -> result => Some(result),
+            recv(cancel_receiver) -> _ => {
+                terminate_process_pid(pid);
+                None
+            }
+            recv(timeout_receiver) -> _ => {
+                terminate_process_pid(pid);
+                None
+            }
+        },
+        None => crossbeam_channel::select! {
+            recv(result_receiver) -> result => Some(result),
+            recv(timeout_receiver) -> _ => {
+                terminate_process_pid(pid);
+                None
+            }
+        },
+    };
+
+    if let Some(result) = outcome {
+        return result.context("child process worker disconnected")?;
+    }
+
+    let _ = result_receiver.recv_timeout(Duration::from_secs(5));
+    if cancel_flag.is_some_and(|signal| signal.is_requested()) {
+        Err(anyhow!("{} cancelled", timeout_label))
+    } else {
+        Err(anyhow!(
+            "{} timed out after {} seconds",
+            timeout_label,
+            timeout_seconds
+        ))
     }
 }
 
-fn read_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>) -> Tool {
+fn read_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "read_file",
         "Read a UTF-8 text file. The model must choose timeout_seconds.",
@@ -259,7 +328,7 @@ fn read_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>)
     )
 }
 
-fn write_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>) -> Tool {
+fn write_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "write_file",
         "Write a UTF-8 text file. The model must choose timeout_seconds.",
@@ -316,7 +385,7 @@ fn write_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>
     )
 }
 
-fn edit_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>) -> Tool {
+fn edit_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "edit",
         "Edit a UTF-8 text file by replacing old_text with new_text. The model must choose timeout_seconds.",
@@ -406,7 +475,7 @@ fn ensure_process_state_dir(workspace_root: &Path) -> Result<PathBuf> {
 
 #[derive(Serialize, serde::Deserialize)]
 struct ProcessMetadata {
-    process_id: String,
+    exec_id: String,
     pid: u32,
     command: String,
     cwd: String,
@@ -415,12 +484,24 @@ struct ProcessMetadata {
     exit_code_path: String,
 }
 
-fn process_meta_path(dir: &Path, process_id: &str) -> PathBuf {
-    dir.join(format!("{}.json", process_id))
+struct LiveManagedProcess {
+    stdin: Option<ChildStdin>,
+    metadata: ProcessMetadata,
+    completion_receiver: Option<Receiver<i32>>,
 }
 
-fn read_process_metadata(dir: &Path, process_id: &str) -> Result<ProcessMetadata> {
-    let path = process_meta_path(dir, process_id);
+static LIVE_PROCESSES: OnceLock<Mutex<BTreeMap<String, LiveManagedProcess>>> = OnceLock::new();
+
+fn live_processes() -> &'static Mutex<BTreeMap<String, LiveManagedProcess>> {
+    LIVE_PROCESSES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn process_meta_path(dir: &Path, exec_id: &str) -> PathBuf {
+    dir.join(format!("{}.json", exec_id))
+}
+
+fn read_process_metadata(dir: &Path, exec_id: &str) -> Result<ProcessMetadata> {
+    let path = process_meta_path(dir, exec_id);
     let raw =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_str(&raw).context("failed to parse process metadata")
@@ -429,49 +510,346 @@ fn read_process_metadata(dir: &Path, process_id: &str) -> Result<ProcessMetadata
 fn write_process_metadata(dir: &Path, metadata: &ProcessMetadata) -> Result<()> {
     let raw =
         serde_json::to_string_pretty(metadata).context("failed to serialize process metadata")?;
-    fs::write(process_meta_path(dir, &metadata.process_id), raw).with_context(|| {
-        format!(
-            "failed to write process metadata for {}",
-            metadata.process_id
-        )
-    })
+    fs::write(process_meta_path(dir, &metadata.exec_id), raw)
+        .with_context(|| format!("failed to write process metadata for {}", metadata.exec_id))
 }
 
-fn read_file_tail(path: &Path, max_bytes: usize) -> Result<String> {
-    if !path.exists() {
+fn read_file_lines_window(path: &Path, start: usize, limit: usize) -> Result<String> {
+    if !path.exists() || limit == 0 {
         return Ok(String::new());
     }
-    let mut file =
-        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer)
-        .with_context(|| format!("failed to read {}", path.display()))?;
-    let start = buffer.len().saturating_sub(max_bytes);
-    Ok(String::from_utf8_lossy(&buffer[start..]).to_string())
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let lines = text.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
+    let end = lines.len().saturating_sub(start);
+    let begin = end.saturating_sub(limit);
+    Ok(lines[begin..end].join("\n"))
+}
+
+fn read_exit_code(path: &Path) -> Option<i32> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
 }
 
 fn process_is_running(pid: u32) -> bool {
     Command::new("sh")
         .arg("-c")
-        .arg(format!("kill -0 {}", pid))
+        .arg(format!("kill -0 {} 2>/dev/null", pid))
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
 }
 
-fn exec_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>) -> Tool {
+fn terminate_process_pid(pid: u32) {
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(pid.to_string())
+        .status();
+}
+
+fn spawn_pipe_copy_thread<R>(mut reader: R, path: PathBuf)
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        if let Ok(mut file) = fs::File::create(&path) {
+            let _ = std::io::copy(&mut reader, &mut file);
+            let _ = file.flush();
+        }
+    });
+}
+
+fn record_exit_code(path: &Path, code: i32) -> Result<()> {
+    fs::write(path, code.to_string())
+        .with_context(|| format!("failed to write exit code to {}", path.display()))
+}
+
+fn spawn_managed_process(state_dir: &Path, command: &str, cwd: &Path) -> Result<ProcessMetadata> {
+    let exec_id = Uuid::new_v4().to_string();
+    let stdout_path = state_dir.join(format!("{}.stdout", exec_id));
+    let stderr_path = state_dir.join(format!("{}.stderr", exec_id));
+    let exit_code_path = state_dir.join(format!("{}.exit", exec_id));
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn shell in {}", cwd.display()))?;
+    let stdin = child.stdin.take();
+    let pid = child.id();
+    if let Some(stdout) = child.stdout.take() {
+        spawn_pipe_copy_thread(stdout, stdout_path.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_pipe_copy_thread(stderr, stderr_path.clone());
+    }
+    let metadata = ProcessMetadata {
+        exec_id: exec_id.clone(),
+        pid,
+        command: command.to_string(),
+        cwd: cwd.display().to_string(),
+        stdout_path: stdout_path.display().to_string(),
+        stderr_path: stderr_path.display().to_string(),
+        exit_code_path: exit_code_path.display().to_string(),
+    };
+    write_process_metadata(state_dir, &metadata)?;
+    let completion_receiver = {
+        let (completion_sender, completion_receiver) = crossbeam_channel::bounded(1);
+        let exec_id = metadata.exec_id.clone();
+        let exit_code_path = metadata.exit_code_path.clone();
+        thread::spawn(move || {
+            let code = child
+                .wait()
+                .ok()
+                .and_then(|status| status.code())
+                .unwrap_or(-1);
+            let _ = record_exit_code(Path::new(&exit_code_path), code);
+            let _ = completion_sender.send(code);
+            let mut registry = live_processes().lock().unwrap();
+            if let Some(process) = registry.get_mut(&exec_id) {
+                process.completion_receiver = None;
+            }
+            registry.remove(&exec_id);
+        });
+        completion_receiver
+    };
+    live_processes().lock().unwrap().insert(
+        exec_id,
+        LiveManagedProcess {
+            stdin,
+            metadata: ProcessMetadata {
+                exec_id: metadata.exec_id.clone(),
+                pid: metadata.pid,
+                command: metadata.command.clone(),
+                cwd: metadata.cwd.clone(),
+                stdout_path: metadata.stdout_path.clone(),
+                stderr_path: metadata.stderr_path.clone(),
+                exit_code_path: metadata.exit_code_path.clone(),
+            },
+            completion_receiver: Some(completion_receiver),
+        },
+    );
+    Ok(metadata)
+}
+
+fn process_missing_error(exec_id: &str) -> anyhow::Error {
+    anyhow!(
+        "exec process {} no longer exists; it may have already finished, been killed, or been terminated when the main runtime shut down",
+        exec_id
+    )
+}
+
+fn read_process_snapshot(
+    state_dir: &Path,
+    exec_id: &str,
+    start: usize,
+    limit: usize,
+) -> Result<Value> {
+    let metadata = match read_process_metadata(state_dir, exec_id) {
+        Ok(metadata) => metadata,
+        Err(_) => return Err(process_missing_error(exec_id)),
+    };
+    let exit_code = read_exit_code(Path::new(&metadata.exit_code_path));
+    let running = if exit_code.is_some() {
+        false
+    } else {
+        process_is_running(metadata.pid)
+    };
+    if !running && exit_code.is_none() {
+        return Err(process_missing_error(exec_id));
+    }
+    Ok(json!({
+        "exec_id": metadata.exec_id,
+        "pid": metadata.pid,
+        "command": metadata.command,
+        "cwd": metadata.cwd,
+        "running": running,
+        "completed": !running,
+        "returncode": exit_code,
+        "stdout": read_file_lines_window(Path::new(&metadata.stdout_path), start, limit)?,
+        "stderr": read_file_lines_window(Path::new(&metadata.stderr_path), start, limit)?,
+    }))
+}
+
+pub fn terminate_all_managed_processes() -> Result<()> {
+    let mut registry = live_processes().lock().unwrap();
+    let processes = std::mem::take(&mut *registry)
+        .into_values()
+        .collect::<Vec<_>>();
+    drop(registry);
+    for process in processes {
+        let meta_path = process_meta_path(
+            Path::new(&process.metadata.stdout_path)
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+            &process.metadata.exec_id,
+        );
+        let _ = fs::remove_file(meta_path);
+        let _ = fs::remove_file(&process.metadata.exit_code_path);
+        let _ = fs::remove_file(&process.metadata.stdout_path);
+        let _ = fs::remove_file(&process.metadata.stderr_path);
+        terminate_process_pid(process.metadata.pid);
+    }
+    Ok(())
+}
+
+fn wait_for_managed_process(
+    state_dir: &Path,
+    exec_id: &str,
+    wait_timeout_seconds: f64,
+    input: Option<&str>,
+    start: usize,
+    limit: usize,
+    cancel_flag: Option<&Arc<InterruptSignal>>,
+) -> Result<Value> {
+    let mut pending_input = input.map(ToOwned::to_owned);
+    if let Some(cancel_flag) = cancel_flag
+        && cancel_flag.is_requested()
+    {
+        let snapshot = read_process_snapshot(state_dir, exec_id, start, limit)?;
+        return Ok(json!({
+            "interrupted": true,
+            "reason": "agent_turn_timeout_observation_requested",
+            "process": snapshot
+        }));
+    }
+
+    let (metadata, completion_receiver) = {
+        let mut registry = live_processes().lock().unwrap();
+        let Some(process) = registry.get_mut(exec_id) else {
+            drop(registry);
+            return read_process_snapshot(state_dir, exec_id, start, limit)
+                .or_else(|_| Err(process_missing_error(exec_id)));
+        };
+        if let Some(input) = pending_input.take()
+            && let Some(stdin) = process.stdin.as_mut()
+        {
+            stdin
+                .write_all(input.as_bytes())
+                .with_context(|| format!("failed to write stdin for exec process {}", exec_id))?;
+            stdin
+                .flush()
+                .with_context(|| format!("failed to flush stdin for exec process {}", exec_id))?;
+        }
+        let metadata = ProcessMetadata {
+            exec_id: process.metadata.exec_id.clone(),
+            pid: process.metadata.pid,
+            command: process.metadata.command.clone(),
+            cwd: process.metadata.cwd.clone(),
+            stdout_path: process.metadata.stdout_path.clone(),
+            stderr_path: process.metadata.stderr_path.clone(),
+            exit_code_path: process.metadata.exit_code_path.clone(),
+        };
+        let completion_receiver = process
+            .completion_receiver
+            .take()
+            .ok_or_else(|| anyhow!("exec process {} is already being awaited", exec_id))?;
+        (metadata, completion_receiver)
+    };
+
+    let timeout_receiver = crossbeam_channel::after(Duration::from_secs_f64(wait_timeout_seconds));
+    let cancel_receiver = cancel_flag.map(|signal| signal.subscribe());
+    let completed = match cancel_receiver {
+        Some(cancel_receiver) => crossbeam_channel::select! {
+            recv(completion_receiver) -> exit_code => Some(exit_code),
+            recv(cancel_receiver) -> _ => None,
+            recv(timeout_receiver) -> _ => None,
+        },
+        None => crossbeam_channel::select! {
+            recv(completion_receiver) -> exit_code => Some(exit_code),
+            recv(timeout_receiver) -> _ => None,
+        },
+    };
+
+    if let Some(exit_code) = completed {
+        let code = exit_code.context("exec process worker disconnected")?;
+        return Ok(json!({
+            "exec_id": metadata.exec_id,
+            "pid": metadata.pid,
+            "command": metadata.command,
+            "cwd": metadata.cwd,
+            "running": false,
+            "completed": true,
+            "returncode": code,
+            "stdout": read_file_lines_window(Path::new(&metadata.stdout_path), start, limit)?,
+            "stderr": read_file_lines_window(Path::new(&metadata.stderr_path), start, limit)?,
+        }));
+    }
+
+    if let Ok(code) = completion_receiver.try_recv() {
+        return Ok(json!({
+            "exec_id": metadata.exec_id,
+            "pid": metadata.pid,
+            "command": metadata.command,
+            "cwd": metadata.cwd,
+            "running": false,
+            "completed": true,
+            "returncode": code,
+            "stdout": read_file_lines_window(Path::new(&metadata.stdout_path), start, limit)?,
+            "stderr": read_file_lines_window(Path::new(&metadata.stderr_path), start, limit)?,
+        }));
+    }
+
+    {
+        let mut registry = live_processes().lock().unwrap();
+        if let Some(process) = registry.get_mut(exec_id) {
+            process.completion_receiver = Some(completion_receiver);
+        }
+    }
+
+    let snapshot = json!({
+        "exec_id": metadata.exec_id,
+        "pid": metadata.pid,
+        "command": metadata.command,
+        "cwd": metadata.cwd,
+        "running": true,
+        "completed": false,
+        "returncode": Value::Null,
+        "stdout": read_file_lines_window(Path::new(&metadata.stdout_path), start, limit)?,
+        "stderr": read_file_lines_window(Path::new(&metadata.stderr_path), start, limit)?,
+    });
+
+    if cancel_flag.is_some_and(|signal| signal.is_requested()) {
+        return Ok(json!({
+            "interrupted": true,
+            "reason": "agent_turn_timeout_observation_requested",
+            "process": snapshot
+        }));
+    }
+
+    Ok(json!({
+        "exec_id": metadata.exec_id,
+        "pid": metadata.pid,
+        "command": metadata.command,
+        "cwd": metadata.cwd,
+        "running": true,
+        "completed": false,
+        "returncode": Value::Null,
+        "wait_timed_out": true,
+        "stdout": read_file_lines_window(Path::new(&metadata.stdout_path), start, limit)?,
+        "stderr": read_file_lines_window(Path::new(&metadata.stderr_path), start, limit)?,
+    }))
+}
+
+fn exec_start_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
-        "exec",
-        "Execute a shell command. Use wait=false to start a background process that can later be inspected with the process tool. The model must choose timeout_seconds.",
+        "exec_start",
+        "Start a shell command. Wait for at most wait_timeout_seconds before returning. If it finishes in time, return the result immediately. Otherwise keep it running and return an exec_id.",
         json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
-                "timeout_seconds": {"type": "number"},
+                "wait_timeout_seconds": {"type": "number"},
                 "cwd": {"type": "string"},
-                "wait": {"type": "boolean"}
+                "include_stdout": {"type": "boolean"},
+                "start": {"type": "integer"},
+                "limit": {"type": "integer"}
             },
-            "required": ["command", "timeout_seconds"],
+            "required": ["command", "wait_timeout_seconds"],
             "additionalProperties": false
         }),
         move |arguments| {
@@ -479,102 +857,197 @@ fn exec_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>) -> T
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let command = string_arg(arguments, "command")?;
-            let timeout_seconds = f64_arg(arguments, "timeout_seconds")?;
-            let wait = arguments
-                .get("wait")
+            let wait_timeout_seconds = f64_arg(arguments, "wait_timeout_seconds")?;
+            let include_stdout = arguments
+                .get("include_stdout")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
+            let start = usize_arg_with_default(arguments, "start", 0)?;
+            let limit = usize_arg_with_default(arguments, "limit", 20)?;
             let cwd = arguments
                 .get("cwd")
                 .and_then(Value::as_str)
                 .map(|value| resolve_path(value, &workspace_root))
                 .unwrap_or_else(|| workspace_root.clone());
-
-            if wait {
-                let exec_cancel_flag = cancel_flag.clone();
-                return with_timeout_and_cancel(timeout_seconds + 1.0, cancel_flag.clone(), move || {
-                    let mut child = Command::new("sh")
-                        .arg("-c")
-                        .arg(&command)
-                        .current_dir(&cwd)
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .with_context(|| format!("failed to execute shell in {}", cwd.display()))?;
-                    let output = wait_for_child_with_timeout(
-                        &mut child,
-                        timeout_seconds,
-                        "command",
-                        exec_cancel_flag.as_ref(),
-                    )?;
-                    Ok(json!({
-                        "command": command,
-                        "cwd": cwd.display().to_string(),
-                        "wait": true,
-                        "returncode": output.status.code().unwrap_or(-1),
-                        "stdout": String::from_utf8_lossy(&output.stdout),
-                        "stderr": String::from_utf8_lossy(&output.stderr)
-                    }))
-                });
-            }
-
             let state_dir = ensure_process_state_dir(&workspace_root)?;
-            let process_id = Uuid::new_v4().to_string();
-            let stdout_path = state_dir.join(format!("{}.stdout", process_id));
-            let stderr_path = state_dir.join(format!("{}.stderr", process_id));
-            let exit_code_path = state_dir.join(format!("{}.exit", process_id));
-            let wrapped_command = format!(
-                "{}\nstatus=$?\nprintf '%s' \"$status\" > {}\nexit \"$status\"",
-                command,
-                shell_escape_path(&exit_code_path)
-            );
-            let stdout_file = fs::File::create(&stdout_path)
-                .with_context(|| format!("failed to create {}", stdout_path.display()))?;
-            let stderr_file = fs::File::create(&stderr_path)
-                .with_context(|| format!("failed to create {}", stderr_path.display()))?;
-            let child = Command::new("sh")
-                .arg("-c")
-                .arg(&wrapped_command)
-                .current_dir(&cwd)
-                .stdin(Stdio::null())
-                .stdout(Stdio::from(stdout_file))
-                .stderr(Stdio::from(stderr_file))
-                .spawn()
-                .with_context(|| format!("failed to spawn shell in {}", cwd.display()))?;
-            let metadata = ProcessMetadata {
-                process_id: process_id.clone(),
-                pid: child.id(),
-                command,
-                cwd: cwd.display().to_string(),
-                stdout_path: stdout_path.display().to_string(),
-                stderr_path: stderr_path.display().to_string(),
-                exit_code_path: exit_code_path.display().to_string(),
+            let metadata = spawn_managed_process(&state_dir, &command, &cwd)?;
+            let mut result = wait_for_managed_process(
+                &state_dir,
+                &metadata.exec_id,
+                wait_timeout_seconds,
+                None,
+                start,
+                limit,
+                cancel_flag.as_ref(),
+            )?;
+            if !include_stdout && let Some(object) = result.as_object_mut() {
+                object.remove("stdout");
+                object.remove("stderr");
+                if let Some(process) = object.get_mut("process").and_then(Value::as_object_mut) {
+                    process.remove("stdout");
+                    process.remove("stderr");
+                }
+            }
+            Ok(result)
+        },
+    )
+}
+
+fn exec_observe_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+    Tool::new(
+        "exec_observe",
+        "Observe the latest output of a previously started exec process by exec_id. start=0 and limit=2 means the last two lines.",
+        json!({
+            "type": "object",
+            "properties": {
+                "exec_id": {"type": "string"},
+                "start": {"type": "integer"},
+                "limit": {"type": "integer"}
+            },
+            "required": ["exec_id"],
+            "additionalProperties": false
+        }),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let exec_id = string_arg(arguments, "exec_id")?;
+            let start = usize_arg_with_default(arguments, "start", 0)?;
+            let limit = usize_arg_with_default(arguments, "limit", 20)?;
+            let state_dir = ensure_process_state_dir(&workspace_root)?;
+            let _ = &cancel_flag;
+            read_process_snapshot(&state_dir, &exec_id, start, limit)
+        },
+    )
+}
+
+fn exec_wait_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+    Tool::new(
+        "exec_wait",
+        "Wait on a previously started exec process by exec_id. Optionally write input to stdin before waiting. If the process does not finish before wait_timeout_seconds, return immediately and leave it running.",
+        json!({
+            "type": "object",
+            "properties": {
+                "exec_id": {"type": "string"},
+                "wait_timeout_seconds": {"type": "number"},
+                "input": {"type": "string"},
+                "include_stdout": {"type": "boolean"},
+                "start": {"type": "integer"},
+                "limit": {"type": "integer"}
+            },
+            "required": ["exec_id", "wait_timeout_seconds"],
+            "additionalProperties": false
+        }),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let exec_id = string_arg(arguments, "exec_id")?;
+            let wait_timeout_seconds = f64_arg(arguments, "wait_timeout_seconds")?;
+            let include_stdout = arguments
+                .get("include_stdout")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let start = usize_arg_with_default(arguments, "start", 0)?;
+            let limit = usize_arg_with_default(arguments, "limit", 20)?;
+            let input = arguments
+                .get("input")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let mut result = wait_for_managed_process(
+                &ensure_process_state_dir(&workspace_root)?,
+                &exec_id,
+                wait_timeout_seconds,
+                input.as_deref(),
+                start,
+                limit,
+                cancel_flag.as_ref(),
+            )?;
+            if !include_stdout && let Some(object) = result.as_object_mut() {
+                object.remove("stdout");
+                object.remove("stderr");
+                if let Some(process) = object.get_mut("process").and_then(Value::as_object_mut) {
+                    process.remove("stdout");
+                    process.remove("stderr");
+                }
+            }
+            Ok(result)
+        },
+    )
+}
+
+fn exec_kill_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+    Tool::new(
+        "exec_kill",
+        "Immediately stop a previously started exec process by exec_id.",
+        json!({
+            "type": "object",
+            "properties": {
+                "exec_id": {"type": "string"}
+            },
+            "required": ["exec_id"],
+            "additionalProperties": false
+        }),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let exec_id = string_arg(arguments, "exec_id")?;
+            let _state_dir = ensure_process_state_dir(&workspace_root)?;
+            let _ = &cancel_flag;
+            let metadata = {
+                let mut registry = live_processes().lock().unwrap();
+                let Some(process) = registry.remove(&exec_id) else {
+                    return Err(process_missing_error(&exec_id));
+                };
+                ProcessMetadata {
+                    exec_id: process.metadata.exec_id,
+                    pid: process.metadata.pid,
+                    command: process.metadata.command,
+                    cwd: process.metadata.cwd,
+                    stdout_path: process.metadata.stdout_path,
+                    stderr_path: process.metadata.stderr_path,
+                    exit_code_path: process.metadata.exit_code_path,
+                }
             };
-            write_process_metadata(&state_dir, &metadata)?;
+            terminate_process_pid(metadata.pid);
+            record_exit_code(Path::new(&metadata.exit_code_path), -9)?;
             Ok(json!({
-                "process_id": metadata.process_id,
+                "exec_id": metadata.exec_id,
                 "pid": metadata.pid,
+                "command": metadata.command,
                 "cwd": metadata.cwd,
-                "stdout_path": metadata.stdout_path,
-                "stderr_path": metadata.stderr_path,
-                "wait": false,
-                "running": true
+                "running": false,
+                "completed": true,
+                "killed": true,
+                "returncode": -9,
             }))
         },
     )
 }
 
-fn process_tool(workspace_root: PathBuf) -> Tool {
+fn exec_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+    let exec_start = exec_start_tool(workspace_root, cancel_flag);
+    Tool::new(
+        "exec",
+        "Deprecated alias for exec_start. Start a shell command and optionally wait for completion.",
+        exec_start.parameters.clone(),
+        move |arguments| exec_start.invoke(arguments),
+    )
+}
+
+fn process_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "process",
-        "Inspect, list, or terminate background processes started by exec(wait=false).",
+        "Deprecated compatibility wrapper around exec_observe and exec_kill.",
         json!({
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["list", "inspect", "terminate"]},
+                "exec_id": {"type": "string"},
                 "process_id": {"type": "string"},
-                "tail_bytes": {"type": "integer"},
-                "signal": {"type": "string", "enum": ["TERM", "KILL"]}
+                "start": {"type": "integer"},
+                "limit": {"type": "integer"}
             },
             "required": ["action"],
             "additionalProperties": false
@@ -583,8 +1056,13 @@ fn process_tool(workspace_root: PathBuf) -> Tool {
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
-            let state_dir = ensure_process_state_dir(&workspace_root)?;
             let action = string_arg(arguments, "action")?;
+            let exec_id = arguments
+                .get("exec_id")
+                .and_then(Value::as_str)
+                .or_else(|| arguments.get("process_id").and_then(Value::as_str))
+                .map(ToOwned::to_owned);
+            let state_dir = ensure_process_state_dir(&workspace_root)?;
             match action.as_str() {
                 "list" => {
                     let mut items = Vec::new();
@@ -596,56 +1074,42 @@ fn process_tool(workspace_root: PathBuf) -> Tool {
                         if path.extension().and_then(|value| value.to_str()) != Some("json") {
                             continue;
                         }
-                        let raw = fs::read_to_string(&path)
-                            .with_context(|| format!("failed to read {}", path.display()))?;
-                        let metadata: ProcessMetadata = serde_json::from_str(&raw)
-                            .context("failed to parse process metadata")?;
-                        let exit_code = fs::read_to_string(&metadata.exit_code_path)
-                            .ok()
-                            .and_then(|value| value.trim().parse::<i32>().ok());
+                        let metadata = read_process_metadata(
+                            &state_dir,
+                            path.file_stem()
+                                .and_then(|value| value.to_str())
+                                .unwrap_or_default(),
+                        )?;
+                        let exit_code = read_exit_code(Path::new(&metadata.exit_code_path));
+                        let running = if exit_code.is_some() {
+                            false
+                        } else {
+                            process_is_running(metadata.pid)
+                        };
                         items.push(json!({
-                            "process_id": metadata.process_id,
+                            "exec_id": metadata.exec_id,
                             "pid": metadata.pid,
                             "command": metadata.command,
                             "cwd": metadata.cwd,
-                            "running": process_is_running(metadata.pid),
-                            "exit_code": exit_code
+                            "running": running,
+                            "completed": !running,
+                            "returncode": exit_code
                         }));
                     }
                     Ok(json!({ "processes": items }))
                 }
                 "inspect" => {
-                    let process_id = string_arg(arguments, "process_id")?;
-                    let tail_bytes = usize_arg_with_default(arguments, "tail_bytes", 4000)?;
-                    let metadata = read_process_metadata(&state_dir, &process_id)?;
-                    let exit_code = fs::read_to_string(&metadata.exit_code_path)
-                        .ok()
-                        .and_then(|value| value.trim().parse::<i32>().ok());
-                    Ok(json!({
-                        "process_id": metadata.process_id,
-                        "pid": metadata.pid,
-                        "command": metadata.command,
-                        "cwd": metadata.cwd,
-                        "running": process_is_running(metadata.pid),
-                        "exit_code": exit_code,
-                        "stdout_tail": read_file_tail(Path::new(&metadata.stdout_path), tail_bytes)?,
-                        "stderr_tail": read_file_tail(Path::new(&metadata.stderr_path), tail_bytes)?
+                    let exec_id = exec_id.ok_or_else(|| anyhow!("missing exec_id"))?;
+                    exec_observe_tool(workspace_root.clone(), cancel_flag.clone()).invoke(json!({
+                        "exec_id": exec_id,
+                        "start": usize_arg_with_default(arguments, "start", 0)?,
+                        "limit": usize_arg_with_default(arguments, "limit", 20)?,
                     }))
                 }
                 "terminate" => {
-                    let process_id = string_arg(arguments, "process_id")?;
-                    let signal = string_arg_with_default(arguments, "signal", "TERM")?;
-                    let metadata = read_process_metadata(&state_dir, &process_id)?;
-                    let status = Command::new("kill")
-                        .arg(format!("-{}", signal))
-                        .arg(metadata.pid.to_string())
-                        .status()
-                        .context("failed to execute kill")?;
-                    Ok(json!({
-                        "process_id": metadata.process_id,
-                        "pid": metadata.pid,
-                        "signal": signal,
-                        "kill_succeeded": status.success()
+                    let exec_id = exec_id.ok_or_else(|| anyhow!("missing exec_id"))?;
+                    exec_kill_tool(workspace_root.clone(), cancel_flag.clone()).invoke(json!({
+                        "exec_id": exec_id,
                     }))
                 }
                 _ => Err(anyhow!("unsupported process action {}", action)),
@@ -654,7 +1118,7 @@ fn process_tool(workspace_root: PathBuf) -> Tool {
     )
 }
 
-fn apply_patch_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>) -> Tool {
+fn apply_patch_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "apply_patch",
         "Apply a unified diff patch inside the workspace using git apply. The patch must be a valid unified diff. The model must choose timeout_seconds.",
@@ -714,7 +1178,7 @@ fn apply_patch_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>
                     .context("failed to write patch to git apply stdin")?;
                 let _ = child.stdin.take();
                 let output = wait_for_child_with_timeout(
-                    &mut child,
+                    child,
                     timeout_seconds,
                     "git apply",
                     patch_cancel_flag.as_ref(),
@@ -801,7 +1265,7 @@ fn image_tool(
     workspace_root: PathBuf,
     upstream: UpstreamConfig,
     image_tool_upstream: Option<UpstreamConfig>,
-    cancel_flag: Option<Arc<AtomicBool>>,
+    cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
     Tool::new(
         "image",
@@ -944,7 +1408,7 @@ fn web_fetch_tool() -> Tool {
     )
 }
 
-fn download_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>) -> Tool {
+fn download_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "download_file",
         "Download an HTTP resource and save it to a local file. Use this for binary files such as images or PDFs. The model must choose timeout_seconds.",
@@ -1008,11 +1472,7 @@ fn download_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBoo
                     let body = response
                         .text()
                         .unwrap_or_else(|_| "<unreadable error body>".to_string());
-                    return Err(anyhow!(
-                        "download failed with {}: {}",
-                        status_text,
-                        body
-                    ));
+                    return Err(anyhow!("download failed with {}: {}", status_text, body));
                 }
                 let content_type = response
                     .headers()
@@ -1021,8 +1481,9 @@ fn download_file_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBoo
                     .unwrap_or("")
                     .to_string();
                 let bytes = response.bytes().context("failed to read downloaded body")?;
-                fs::write(&path, &bytes)
-                    .with_context(|| format!("failed to write downloaded file {}", path.display()))?;
+                fs::write(&path, &bytes).with_context(|| {
+                    format!("failed to write downloaded file {}", path.display())
+                })?;
                 Ok(json!({
                     "status": status.as_u16(),
                     "url": final_url,
@@ -1184,7 +1645,7 @@ fn web_search_tool(search_config: ExternalWebSearchConfig) -> Tool {
     )
 }
 
-fn run_shell_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<AtomicBool>>) -> Tool {
+fn run_shell_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     let exec = exec_tool(workspace_root, cancel_flag);
     Tool::new(
         "run_shell",
@@ -1204,14 +1665,9 @@ fn http_request_tool() -> Tool {
     )
 }
 
-fn shell_escape_path(path: &Path) -> String {
-    let raw = path.display().to_string();
-    format!("'{}'", raw.replace('\'', "'\\''"))
-}
-
 fn load_skill_tool(
     skills: &[SkillMetadata],
-    cancel_flag: Option<Arc<AtomicBool>>,
+    cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Result<Tool> {
     let skill_index = build_skill_index(skills)?;
     let available_skills = skill_index.keys().cloned().collect::<Vec<_>>();
@@ -1272,7 +1728,7 @@ pub fn build_tool_registry_with_cancel(
     image_tool_upstream: Option<&UpstreamConfig>,
     skills: &[SkillMetadata],
     extra_tools: &[Tool],
-    cancel_flag: Option<Arc<AtomicBool>>,
+    cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Result<BTreeMap<String, Tool>> {
     let mut builtins = BTreeMap::from([
         (
@@ -1292,12 +1748,28 @@ pub fn build_tool_registry_with_cancel(
             edit_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
         ),
         (
+            "exec_start".to_string(),
+            exec_start_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+        ),
+        (
+            "exec_observe".to_string(),
+            exec_observe_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+        ),
+        (
+            "exec_wait".to_string(),
+            exec_wait_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+        ),
+        (
+            "exec_kill".to_string(),
+            exec_kill_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+        ),
+        (
             "exec".to_string(),
             exec_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
         ),
         (
             "process".to_string(),
-            process_tool(workspace_root.to_path_buf()),
+            process_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
         ),
         (
             "apply_patch".to_string(),
@@ -1366,6 +1838,10 @@ pub fn execute_tool_call(
         return normalize_tool_result(json!({"error": format!("unknown tool: {}", tool_name)}));
     };
 
+    execute_tool(tool, raw_arguments)
+}
+
+pub fn execute_tool(tool: &Tool, raw_arguments: Option<&str>) -> String {
     let arguments = match raw_arguments {
         Some(text) if !text.trim().is_empty() => match serde_json::from_str::<Value>(text) {
             Ok(value) => value,
@@ -1380,7 +1856,7 @@ pub fn execute_tool_call(
 
     match tool.invoke(arguments) {
         Ok(result) => normalize_tool_result(result),
-        Err(error) => normalize_tool_result(json!({"error": error.to_string(), "tool": tool_name})),
+        Err(error) => normalize_tool_result(json!({"error": error.to_string(), "tool": tool.name})),
     }
 }
 

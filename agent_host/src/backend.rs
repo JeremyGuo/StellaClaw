@@ -22,6 +22,31 @@ use zgent_core::llm::{
 
 const ZGENT_COMPAT_MARKER: &str = "[AgentHost ZGent Compatibility Runtime]";
 
+fn upstream_error_from_value(value: &Value) -> Option<String> {
+    let error = value.get("error")?;
+    match error {
+        Value::String(text) => Some(text.clone()),
+        Value::Object(object) => {
+            let message = object
+                .get("message")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let code = object.get("code").map(|value| match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                other => other.to_string(),
+            });
+            match (message, code) {
+                (Some(message), Some(code)) => Some(format!("{message} (code: {code})")),
+                (Some(message), None) => Some(message),
+                (None, Some(code)) => Some(format!("upstream error code: {code}")),
+                (None, None) => Some(error.to_string()),
+            }
+        }
+        other => Some(other.to_string()),
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentBackendKind {
@@ -104,7 +129,9 @@ fn run_zgent_session_with_report_controlled(
         tool_config.image_tool_upstream.as_ref(),
         &discovered_skills,
         &extra_tools,
-        control.as_ref().map(SessionExecutionControl::cancel_flag),
+        control
+            .as_ref()
+            .map(SessionExecutionControl::tool_interrupt_flag),
     )?;
     let tool_definitions = build_zgent_tool_definitions(&registry);
     let client = reqwest::blocking::Client::builder()
@@ -228,7 +255,15 @@ fn send_zgent_chat_completion(
         return Err(anyhow!("Chat completion failed (HTTP {status}): {body}"));
     }
 
-    serde_json::from_str(&body).context("failed to parse zgent chat completion response")
+    let value: Value =
+        serde_json::from_str(&body).context("failed to parse zgent chat completion response")?;
+    if let Some(error_message) = upstream_error_from_value(&value) {
+        return Err(anyhow!(
+            "zgent chat completion returned an error payload: {}",
+            error_message
+        ));
+    }
+    serde_json::from_value(value).context("failed to parse zgent chat completion response")
 }
 
 fn build_zgent_chat_completions_url(config: &FrameAgentConfig) -> String {
@@ -728,5 +763,31 @@ mod tests {
 
         assert_eq!(extract_assistant_text(&report.messages), "async-ok");
         assert_eq!(report.usage.total_tokens, 10);
+    }
+
+    #[test]
+    fn zgent_backend_reports_error_payloads_in_success_responses() {
+        let server = TestServer::start();
+        server.push_response(json!({
+            "error": {
+                "message": "Insufficient credits",
+                "code": 402
+            }
+        }));
+
+        let temp_dir = TempDir::new().unwrap();
+        let error = run_session_with_report_controlled(
+            AgentBackendKind::Zgent,
+            vec![agent_frame::ChatMessage::text("user", "hello")],
+            "",
+            test_config(&server.address, temp_dir.path().to_path_buf()),
+            Vec::new(),
+            None,
+        )
+        .unwrap_err();
+
+        let rendered = format!("{error:#}");
+        assert!(rendered.contains("zgent chat completion returned an error payload"));
+        assert!(rendered.contains("Insufficient credits"));
     }
 }

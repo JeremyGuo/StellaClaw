@@ -38,9 +38,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use tokio::select;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{Notify, RwLock, mpsc, oneshot};
 use tokio::time::{Duration, MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 
@@ -71,11 +71,12 @@ struct ServerRuntime {
     sink_router: Arc<RwLock<SinkRouter>>,
     cron_manager: Arc<Mutex<CronManager>>,
     agent_registry: Arc<Mutex<AgentRegistry>>,
+    agent_registry_notify: Arc<Notify>,
     max_global_sub_agents: usize,
     subagent_count: Arc<AtomicUsize>,
     cron_poll_interval_seconds: u64,
     background_job_sender: mpsc::Sender<BackgroundJobRequest>,
-    summary_in_progress: Arc<AtomicUsize>,
+    summary_tracker: Arc<SummaryTracker>,
 }
 
 struct SubAgentSlot {
@@ -83,7 +84,12 @@ struct SubAgentSlot {
 }
 
 struct SummaryInProgressGuard {
-    counter: Arc<AtomicUsize>,
+    tracker: Arc<SummaryTracker>,
+}
+
+struct SummaryTracker {
+    count: Mutex<usize>,
+    condvar: Condvar,
 }
 
 enum TimedRunOutcome {
@@ -102,14 +108,36 @@ impl Drop for SubAgentSlot {
 
 impl Drop for SummaryInProgressGuard {
     fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::SeqCst);
+        let mut count = self.tracker.count.lock().unwrap();
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.tracker.condvar.notify_all();
+        }
     }
 }
 
 impl SummaryInProgressGuard {
-    fn new(counter: Arc<AtomicUsize>) -> Self {
-        counter.fetch_add(1, Ordering::SeqCst);
-        Self { counter }
+    fn new(tracker: Arc<SummaryTracker>) -> Self {
+        let mut count = tracker.count.lock().unwrap();
+        *count += 1;
+        drop(count);
+        Self { tracker }
+    }
+}
+
+impl SummaryTracker {
+    fn new() -> Self {
+        Self {
+            count: Mutex::new(0),
+            condvar: Condvar::new(),
+        }
+    }
+
+    fn wait_for_zero(&self) {
+        let mut count = self.count.lock().unwrap();
+        while *count > 0 {
+            count = self.condvar.wait(count).unwrap();
+        }
     }
 }
 
@@ -177,6 +205,7 @@ impl ServerRuntime {
                 );
             }
         }
+        self.agent_registry_notify.notify_waiters();
     }
 
     fn mark_managed_agent_running(&self, id: uuid::Uuid) {
@@ -191,6 +220,7 @@ impl ServerRuntime {
                 );
             }
         }
+        self.agent_registry_notify.notify_waiters();
     }
 
     fn mark_managed_agent_completed(&self, id: uuid::Uuid, usage: &TokenUsage) {
@@ -205,6 +235,7 @@ impl ServerRuntime {
                 );
             }
         }
+        self.agent_registry_notify.notify_waiters();
     }
 
     fn mark_managed_agent_failed(&self, id: uuid::Uuid, usage: &TokenUsage, error: &anyhow::Error) {
@@ -221,6 +252,7 @@ impl ServerRuntime {
                 );
             }
         }
+        self.agent_registry_notify.notify_waiters();
     }
 
     fn mark_managed_agent_timed_out(
@@ -242,6 +274,7 @@ impl ServerRuntime {
                 );
             }
         }
+        self.agent_registry_notify.notify_waiters();
     }
 
     fn list_managed_agents(&self, kind: ManagedAgentKind) -> Result<Value> {
@@ -265,9 +298,7 @@ impl ServerRuntime {
     }
 
     fn list_workspaces(&self, query: Option<String>, include_archived: bool) -> Result<Value> {
-        while self.summary_in_progress.load(Ordering::SeqCst) > 0 {
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        self.summary_tracker.wait_for_zero();
         let items = self
             .workspace_manager
             .list_workspaces(query.as_deref(), include_archived)?
@@ -380,7 +411,7 @@ impl ServerRuntime {
 
     async fn wait_for_child_agents_to_finish(&self, parent_agent_id: uuid::Uuid) {
         while self.has_active_child_agents(parent_agent_id) {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            self.agent_registry_notify.notified().await;
         }
     }
 
@@ -1061,6 +1092,14 @@ impl ServerRuntime {
         timeout_label: &str,
         join_label: &str,
     ) -> Result<TimedRunOutcome> {
+        enum DriverEvent {
+            Checkpoint(SessionRunReport),
+            Runtime(SessionEvent),
+            Completed(Result<SessionRunReport>),
+            SoftDeadline,
+            HardDeadline,
+        }
+
         let runtime = self.clone();
         let timeout_label = timeout_label.to_string();
         let join_label = join_label.to_string();
@@ -1089,30 +1128,68 @@ impl ServerRuntime {
                 Some(execution_control),
             )
         });
+        let (driver_sender, mut driver_receiver) = mpsc::unbounded_channel();
+        let mut relay_tasks = Vec::new();
+        {
+            let driver_sender = driver_sender.clone();
+            relay_tasks.push(tokio::spawn(async move {
+                while let Some(checkpoint) = checkpoint_receiver.recv().await {
+                    let _ = driver_sender.send(DriverEvent::Checkpoint(checkpoint));
+                }
+            }));
+        }
+        {
+            let driver_sender = driver_sender.clone();
+            relay_tasks.push(tokio::spawn(async move {
+                while let Some(event) = event_receiver.recv().await {
+                    let _ = driver_sender.send(DriverEvent::Runtime(event));
+                }
+            }));
+        }
+        {
+            let driver_sender = driver_sender.clone();
+            relay_tasks.push(tokio::spawn(async move {
+                let result = join_handle
+                    .await
+                    .context(join_label)
+                    .and_then(|report| report.context("agent turn failed"));
+                let _ = driver_sender.send(DriverEvent::Completed(result));
+            }));
+        }
         let soft_deadline = timeout_seconds
             .map(|seconds| tokio::time::Instant::now() + Duration::from_secs_f64(seconds));
         let hard_deadline = timeout_seconds.map(|seconds| {
             tokio::time::Instant::now()
                 + Duration::from_secs_f64(seconds + tool_phase_timeout_grace_seconds())
         });
+        if let Some(deadline) = soft_deadline {
+            let driver_sender = driver_sender.clone();
+            relay_tasks.push(tokio::spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                let _ = driver_sender.send(DriverEvent::SoftDeadline);
+            }));
+        }
+        if let Some(deadline) = hard_deadline {
+            let driver_sender = driver_sender.clone();
+            relay_tasks.push(tokio::spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                let _ = driver_sender.send(DriverEvent::HardDeadline);
+            }));
+        }
+        drop(driver_sender);
         let mut latest_checkpoint = None;
         let mut soft_timeout_error = None;
-        tokio::pin!(join_handle);
-        loop {
-            select! {
-                checkpoint = checkpoint_receiver.recv() => {
-                    if checkpoint.is_none() {
-                        continue;
-                    }
-                    latest_checkpoint = checkpoint;
+        while let Some(driver_event) = driver_receiver.recv().await {
+            match driver_event {
+                DriverEvent::Checkpoint(checkpoint) => latest_checkpoint = Some(checkpoint),
+                DriverEvent::Runtime(event) => {
+                    log_agent_frame_event(agent_id, &event_session, kind, &event_model_key, &event);
                 }
-                event = event_receiver.recv() => {
-                    if let Some(event) = event {
-                        log_agent_frame_event(agent_id, &event_session, kind, &event_model_key, &event);
+                DriverEvent::Completed(result) => {
+                    for task in relay_tasks {
+                        task.abort();
                     }
-                }
-                join_result = &mut join_handle => {
-                    let report = join_result.context(join_label)?.context("agent turn failed")?;
+                    let report = result?;
                     if let Some(error) = soft_timeout_error {
                         return Ok(TimedRunOutcome::TimedOut {
                             checkpoint: Some(report),
@@ -1121,10 +1198,8 @@ impl ServerRuntime {
                     }
                     return Ok(TimedRunOutcome::Completed(report));
                 }
-                _ = tokio::time::sleep(Duration::from_millis(25)) => {
-                    if soft_timeout_error.is_none()
-                        && soft_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
-                    {
+                DriverEvent::SoftDeadline => {
+                    if soft_timeout_error.is_none() {
                         let timeout_seconds = timeout_seconds.expect("soft deadline exists");
                         soft_timeout_error = Some(anyhow!(
                             "{} timed out after {:.1} seconds",
@@ -1133,21 +1208,25 @@ impl ServerRuntime {
                         ));
                         cancellation_handle.request_timeout_observation();
                     }
-                    if hard_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-                        let timeout_seconds = timeout_seconds.expect("hard deadline exists");
-                        cancellation_handle.request_cancel();
-                        return Ok(TimedRunOutcome::TimedOut {
-                            checkpoint: latest_checkpoint,
-                            error: anyhow!(
-                                "{} hard timed out after {:.1} seconds",
-                                timeout_label,
-                                timeout_seconds + tool_phase_timeout_grace_seconds()
-                            ),
-                        });
+                }
+                DriverEvent::HardDeadline => {
+                    let timeout_seconds = timeout_seconds.expect("hard deadline exists");
+                    cancellation_handle.request_cancel();
+                    for task in relay_tasks {
+                        task.abort();
                     }
+                    return Ok(TimedRunOutcome::TimedOut {
+                        checkpoint: latest_checkpoint,
+                        error: anyhow!(
+                            "{} hard timed out after {:.1} seconds",
+                            timeout_label,
+                            timeout_seconds + tool_phase_timeout_grace_seconds()
+                        ),
+                    });
                 }
             }
         }
+        Err(anyhow!("agent turn driver channel closed unexpectedly"))
     }
 
     fn run_agent_turn_with_timeout_blocking(
@@ -1162,6 +1241,14 @@ impl ServerRuntime {
         upstream_timeout_seconds: Option<f64>,
         timeout_label: &str,
     ) -> Result<TimedRunOutcome> {
+        enum DriverEvent {
+            Checkpoint(SessionRunReport),
+            Runtime(SessionEvent),
+            Completed(Result<SessionRunReport>),
+            SoftDeadline,
+            HardDeadline,
+        }
+
         let event_session = session.clone();
         let event_model_key = model_key.clone();
         let (checkpoint_sender, checkpoint_receiver) = std::sync::mpsc::channel();
@@ -1189,63 +1276,108 @@ impl ServerRuntime {
                 Some(execution_control),
             )
         });
+        let (driver_sender, driver_receiver) = std::sync::mpsc::channel();
+        {
+            let driver_sender = driver_sender.clone();
+            std::thread::spawn(move || {
+                while let Ok(report) = checkpoint_receiver.recv() {
+                    if driver_sender.send(DriverEvent::Checkpoint(report)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        {
+            let driver_sender = driver_sender.clone();
+            std::thread::spawn(move || {
+                while let Ok(event) = event_receiver.recv() {
+                    if driver_sender.send(DriverEvent::Runtime(event)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        {
+            let driver_sender = driver_sender.clone();
+            std::thread::spawn(move || {
+                let result = handle
+                    .join()
+                    .map_err(|_| anyhow!("agent worker thread panicked"))
+                    .and_then(|report| report.context("agent turn failed"));
+                let _ = driver_sender.send(DriverEvent::Completed(result));
+            });
+        }
         let soft_deadline = timeout_seconds
             .map(|seconds| std::time::Instant::now() + Duration::from_secs_f64(seconds));
         let hard_deadline = timeout_seconds.map(|seconds| {
             std::time::Instant::now()
                 + Duration::from_secs_f64(seconds + tool_phase_timeout_grace_seconds())
         });
+        if let Some(deadline) = soft_deadline {
+            let driver_sender = driver_sender.clone();
+            std::thread::spawn(move || {
+                let now = std::time::Instant::now();
+                if deadline > now {
+                    std::thread::sleep(deadline.duration_since(now));
+                }
+                let _ = driver_sender.send(DriverEvent::SoftDeadline);
+            });
+        }
+        if let Some(deadline) = hard_deadline {
+            let driver_sender = driver_sender.clone();
+            std::thread::spawn(move || {
+                let now = std::time::Instant::now();
+                if deadline > now {
+                    std::thread::sleep(deadline.duration_since(now));
+                }
+                let _ = driver_sender.send(DriverEvent::HardDeadline);
+            });
+        }
+        drop(driver_sender);
         let mut latest_checkpoint = None;
         let mut soft_timeout_error = None;
-        loop {
-            match event_receiver.recv_timeout(Duration::from_millis(1)) {
-                Ok(event) => {
+        while let Ok(driver_event) = driver_receiver.recv() {
+            match driver_event {
+                DriverEvent::Checkpoint(report) => latest_checkpoint = Some(report),
+                DriverEvent::Runtime(event) => {
                     log_agent_frame_event(agent_id, &event_session, kind, &event_model_key, &event)
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
-            }
-            match checkpoint_receiver.recv_timeout(Duration::from_millis(25)) {
-                Ok(report) => latest_checkpoint = Some(report),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
-            }
-            if handle.is_finished() {
-                let report = handle
-                    .join()
-                    .map_err(|_| anyhow!("agent worker thread panicked"))??;
-                if let Some(error) = soft_timeout_error {
+                DriverEvent::Completed(result) => {
+                    let report = result?;
+                    if let Some(error) = soft_timeout_error {
+                        return Ok(TimedRunOutcome::TimedOut {
+                            checkpoint: Some(report),
+                            error,
+                        });
+                    }
+                    return Ok(TimedRunOutcome::Completed(report));
+                }
+                DriverEvent::SoftDeadline => {
+                    if soft_timeout_error.is_none() {
+                        let timeout_seconds = timeout_seconds.expect("soft deadline exists");
+                        soft_timeout_error = Some(anyhow!(
+                            "{} timed out after {:.1} seconds",
+                            timeout_label,
+                            timeout_seconds
+                        ));
+                        cancellation_handle.request_timeout_observation();
+                    }
+                }
+                DriverEvent::HardDeadline => {
+                    let timeout_seconds = timeout_seconds.expect("hard deadline exists");
+                    cancellation_handle.request_cancel();
                     return Ok(TimedRunOutcome::TimedOut {
-                        checkpoint: Some(report),
-                        error,
+                        checkpoint: latest_checkpoint,
+                        error: anyhow!(
+                            "{} hard timed out after {:.1} seconds",
+                            timeout_label,
+                            timeout_seconds + tool_phase_timeout_grace_seconds()
+                        ),
                     });
                 }
-                return Ok(TimedRunOutcome::Completed(report));
-            }
-            if soft_timeout_error.is_none()
-                && soft_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline)
-            {
-                let timeout_seconds = timeout_seconds.expect("soft deadline exists");
-                soft_timeout_error = Some(anyhow!(
-                    "{} timed out after {:.1} seconds",
-                    timeout_label,
-                    timeout_seconds
-                ));
-                cancellation_handle.request_timeout_observation();
-            }
-            if hard_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-                let timeout_seconds = timeout_seconds.expect("hard deadline exists");
-                cancellation_handle.request_cancel();
-                return Ok(TimedRunOutcome::TimedOut {
-                    checkpoint: latest_checkpoint,
-                    error: anyhow!(
-                        "{} hard timed out after {:.1} seconds",
-                        timeout_label,
-                        timeout_seconds + tool_phase_timeout_grace_seconds()
-                    ),
-                });
             }
         }
+        Err(anyhow!("agent turn driver channel closed unexpectedly"))
     }
 
     fn run_subagent(
@@ -1868,12 +2000,13 @@ pub struct Server {
     sink_router: Arc<RwLock<SinkRouter>>,
     cron_manager: Arc<Mutex<CronManager>>,
     agent_registry: Arc<Mutex<AgentRegistry>>,
+    agent_registry_notify: Arc<Notify>,
     max_global_sub_agents: usize,
     subagent_count: Arc<AtomicUsize>,
     cron_poll_interval_seconds: u64,
     background_job_sender: mpsc::Sender<BackgroundJobRequest>,
     background_job_receiver: Option<mpsc::Receiver<BackgroundJobRequest>>,
-    summary_in_progress: Arc<AtomicUsize>,
+    summary_tracker: Arc<SummaryTracker>,
 }
 
 impl Server {
@@ -1918,6 +2051,7 @@ impl Server {
         let (background_job_sender, background_job_receiver) = mpsc::channel(64);
         let cron_manager = Arc::new(Mutex::new(CronManager::load_or_create(&workdir)?));
         let agent_registry = Arc::new(Mutex::new(AgentRegistry::load_or_create(&workdir)?));
+        let agent_registry_notify = Arc::new(Notify::new());
 
         Ok(Self {
             sessions: SessionManager::new(&workdir, workspace_manager.clone())?,
@@ -1931,12 +2065,13 @@ impl Server {
             sink_router: Arc::new(RwLock::new(SinkRouter::new())),
             cron_manager,
             agent_registry,
+            agent_registry_notify,
             max_global_sub_agents: config.max_global_sub_agents,
             subagent_count: Arc::new(AtomicUsize::new(0)),
             cron_poll_interval_seconds: config.cron_poll_interval_seconds,
             background_job_sender,
             background_job_receiver: Some(background_job_receiver),
-            summary_in_progress: Arc::new(AtomicUsize::new(0)),
+            summary_tracker: Arc::new(SummaryTracker::new()),
         })
     }
 
@@ -2126,11 +2261,12 @@ impl Server {
             sink_router: Arc::clone(&self.sink_router),
             cron_manager: Arc::clone(&self.cron_manager),
             agent_registry: Arc::clone(&self.agent_registry),
+            agent_registry_notify: Arc::clone(&self.agent_registry_notify),
             max_global_sub_agents: self.max_global_sub_agents,
             subagent_count: Arc::clone(&self.subagent_count),
             cron_poll_interval_seconds: self.cron_poll_interval_seconds,
             background_job_sender: self.background_job_sender.clone(),
-            summary_in_progress: Arc::clone(&self.summary_in_progress),
+            summary_tracker: Arc::clone(&self.summary_tracker),
         }
     }
 
@@ -2601,7 +2737,7 @@ impl Server {
         &mut self,
         session: &SessionSnapshot,
     ) -> Result<()> {
-        let _summary_guard = SummaryInProgressGuard::new(Arc::clone(&self.summary_in_progress));
+        let _summary_guard = SummaryInProgressGuard::new(Arc::clone(&self.summary_tracker));
         let entries =
             self.workspace_manager
                 .list_workspace_contents(&session.workspace_id, None, 3, 200)?;

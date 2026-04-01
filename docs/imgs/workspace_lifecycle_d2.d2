@@ -1,0 +1,323 @@
+# ──────────────────────────────────────────────
+# Workspace Sandbox — Lifecycle & Cross-Agent Reuse
+# ──────────────────────────────────────────────
+
+direction: right
+
+title: |md
+  # Workspace Sandbox — Lifecycle & Cross-Agent Reuse
+  How workspaces are created, used, archived, and reused across agents
+| {
+  near: top-center
+  style: {
+    font-size: 22
+    font-color: "#f8fafc"
+    bold: true
+  }
+}
+
+# ═══════════════ LEFT: LIFECYCLE FLOW ═══════════════
+
+lifecycle: WORKSPACE LIFECYCLE FLOW {
+  direction: down
+
+  style: {
+    fill: "#1e293b"
+    stroke: "#334155"
+    border-radius: 12
+    font-color: "#94a3b8"
+    font-size: 14
+    bold: true
+  }
+
+  s1: "① New Session" {
+    style: {
+      fill: "#22c55e"
+      font-color: "#052e16"
+      font-size: 16
+      bold: true
+      border-radius: 8
+      stroke: "transparent"
+    }
+  }
+
+  s2: "② Initialize workspace from rundir template" {
+    style: {
+      fill: "#22c55e"
+      font-color: "#052e16"
+      font-size: 14
+      bold: true
+      border-radius: 8
+      stroke: "transparent"
+    }
+  }
+
+  s3: |md
+    **③ Main Agent works in**
+    workspaces/\<id\>/files/
+  | {
+    style: {
+      fill: "#22c55e"
+      font-color: "#052e16"
+      font-size: 14
+      border-radius: 8
+      stroke: "transparent"
+    }
+  }
+
+  s4: "④ Session Closes" {
+    style: {
+      fill: "#16a34a"
+      font-color: "#052e16"
+      font-size: 16
+      bold: true
+      border-radius: 8
+      stroke: "transparent"
+    }
+  }
+
+  s5: "⑤ Summary Generated (summary.md written)" {
+    style: {
+      fill: "#06b6d4"
+      font-color: "#083344"
+      font-size: 14
+      bold: true
+      border-radius: 8
+      stroke: "transparent"
+    }
+  }
+
+  s6: "⑥ Workspace enters History Pool" {
+    style: {
+      fill: "#3b82f6"
+      font-color: "#f8fafc"
+      font-size: 14
+      bold: true
+      border-radius: 8
+      stroke: "transparent"
+    }
+  }
+
+  s1 -> s2: {
+    style: { stroke: "#475569"; stroke-width: 2 }
+  }
+  s2 -> s3: {
+    style: { stroke: "#475569"; stroke-width: 2 }
+  }
+  s3 -> s4: {
+    style: { stroke: "#475569"; stroke-width: 2 }
+  }
+  s4 -> s5: {
+    style: { stroke: "#475569"; stroke-width: 2 }
+  }
+  s5 -> s6: {
+    style: { stroke: "#475569"; stroke-width: 2 }
+  }
+}
+
+# ═══════════════ RIGHT-TOP: REUSE TOOLS ═══════════════
+
+tools: CROSS-WORKSPACE REUSE TOOLS {
+  direction: down
+
+  style: {
+    fill: "#1e293b"
+    stroke: "#334155"
+    border-radius: 12
+    font-color: "#94a3b8"
+    font-size: 14
+    bold: true
+  }
+
+  t1: |md
+    **workspaces_list**
+    List all history workspaces
+  | {
+    style: {
+      fill: "#3b82f6"
+      font-color: "#ffffff"
+      font-size: 14
+      border-radius: 8
+      stroke: "transparent"
+    }
+  }
+
+  t2: |md
+    **workspace_content_list**
+    Browse workspace contents
+  | {
+    style: {
+      fill: "#3b82f6"
+      font-color: "#ffffff"
+      font-size: 14
+      border-radius: 8
+      stroke: "transparent"
+    }
+  }
+
+  t3: |md
+    **workspace_mount**
+    Read-only snapshot mount
+  | {
+    style: {
+      fill: "#3b82f6"
+      font-color: "#ffffff"
+      font-size: 14
+      border-radius: 8
+      stroke: "transparent"
+    }
+  }
+
+  t4: |md
+    **workspace_content_move**
+    Move content across workspaces
+  | {
+    style: {
+      fill: "#3b82f6"
+      font-color: "#ffffff"
+      font-size: 14
+      border-radius: 8
+      stroke: "transparent"
+    }
+  }
+
+  t1 -> t2: {
+    style: { stroke: "#475569"; stroke-width: 1; stroke-dash: 3 }
+  }
+  t2 -> t3: {
+    style: { stroke: "#475569"; stroke-width: 1; stroke-dash: 3 }
+  }
+  t3 -> t4: {
+    style: { stroke: "#475569"; stroke-width: 1; stroke-dash: 3 }
+  }
+}
+
+# ═══════════════ RIGHT-BOTTOM: FILESYSTEM LAYOUT ═══════════════
+
+filesystem: FILESYSTEM LAYOUT {
+  direction: down
+
+  style: {
+    fill: "#1e293b"
+    stroke: "#334155"
+    border-radius: 12
+    font-color: "#94a3b8"
+    font-size: 14
+    bold: true
+  }
+
+  f1: "workdir/sandbox/workspaces.json" {
+    style: {
+      fill: "#0f172a"
+      font-color: "#94a3b8"
+      font-size: 13
+      border-radius: 6
+      stroke: "#334155"
+      stroke-width: 1
+    }
+  }
+
+  f2: "workdir/sandbox/workspace_meta/" {
+    style: {
+      fill: "#0f172a"
+      font-color: "#94a3b8"
+      font-size: 13
+      border-radius: 6
+      stroke: "#334155"
+      stroke-width: 1
+    }
+  }
+
+  f3: "    <id>/summary.md" {
+    style: {
+      fill: "#0f172a"
+      font-color: "#cbd5e1"
+      font-size: 13
+      border-radius: 6
+      stroke: "#334155"
+      stroke-width: 1
+    }
+  }
+
+  f4: "workdir/workspaces/" {
+    style: {
+      fill: "#0f172a"
+      font-color: "#94a3b8"
+      font-size: 13
+      border-radius: 6
+      stroke: "#334155"
+      stroke-width: 1
+    }
+  }
+
+  f5: "    <id>/files/  ← agent workdir" {
+    style: {
+      fill: "#0f172a"
+      font-color: "#22c55e"
+      font-size: 13
+      border-radius: 6
+      stroke: "#334155"
+      stroke-width: 1
+    }
+  }
+
+  f6: "    <id>/mounts/ ← snapshots" {
+    style: {
+      fill: "#0f172a"
+      font-color: "#06b6d4"
+      font-size: 13
+      border-radius: 6
+      stroke: "#334155"
+      stroke-width: 1
+    }
+  }
+
+  f1 -> f2: {
+    style: { stroke: "#334155"; stroke-width: 1; stroke-dash: 3 }
+  }
+  f2 -> f3: {
+    style: { stroke: "#334155"; stroke-width: 1; stroke-dash: 3 }
+  }
+  f3 -> f4: {
+    style: { stroke: "#334155"; stroke-width: 1; stroke-dash: 3 }
+  }
+  f4 -> f5: {
+    style: { stroke: "#334155"; stroke-width: 1; stroke-dash: 3 }
+  }
+  f5 -> f6: {
+    style: { stroke: "#334155"; stroke-width: 1; stroke-dash: 3 }
+  }
+}
+
+# ═══════════════ CONNECTIONS ═══════════════
+
+lifecycle.s6 -> tools: "reuse via tools" {
+  style: {
+    stroke: "#64748b"
+    stroke-width: 3
+    font-color: "#94a3b8"
+    font-size: 14
+    italic: true
+    bold: true
+  }
+}
+
+tools -> filesystem: {
+  style: {
+    stroke: "#64748b"
+    stroke-width: 2
+    stroke-dash: 4
+  }
+}
+
+# ═══════════════ BOTTOM NOTE ═══════════════
+
+note: |md
+  *Each workspace is isolated. Reuse is explicit and tool-mediated.*
+| {
+  near: bottom-center
+  style: {
+    font-size: 14
+    font-color: "#475569"
+  }
+}

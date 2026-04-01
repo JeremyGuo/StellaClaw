@@ -47,6 +47,31 @@ pub struct ChatCompletionOutcome {
     pub usage: TokenUsage,
 }
 
+fn upstream_error_from_value(value: &Value) -> Option<String> {
+    let error = value.get("error")?;
+    match error {
+        Value::String(text) => Some(text.clone()),
+        Value::Object(object) => {
+            let message = object
+                .get("message")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            let code = object.get("code").map(|value| match value {
+                Value::String(text) => text.clone(),
+                Value::Number(number) => number.to_string(),
+                other => other.to_string(),
+            });
+            match (message, code) {
+                (Some(message), Some(code)) => Some(format!("{message} (code: {code})")),
+                (Some(message), None) => Some(message),
+                (None, Some(code)) => Some(format!("upstream error code: {code}")),
+                (None, None) => Some(error.to_string()),
+            }
+        }
+        other => Some(other.to_string()),
+    }
+}
+
 fn build_chat_completions_url(config: &UpstreamConfig) -> String {
     let base = config.base_url.trim_end_matches('/');
     let path = if config.chat_completions_path.starts_with('/') {
@@ -141,6 +166,12 @@ pub fn create_chat_completion(
 
     let value: Value =
         serde_json::from_str(&body).context("failed to parse chat completion response")?;
+    if let Some(error_message) = upstream_error_from_value(&value) {
+        return Err(anyhow!(
+            "upstream chat completion returned an error payload: {}",
+            error_message
+        ));
+    }
     let usage = parse_usage(&value);
     let parsed: ChatCompletionResponse =
         serde_json::from_value(value).context("failed to decode chat completion response")?;
@@ -234,4 +265,24 @@ fn nested_u64(object: &Map<String, Value>, path: &[&str]) -> Option<u64> {
         current = current.as_object()?.get(*segment)?;
     }
     current.as_u64()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upstream_error_from_value;
+    use serde_json::json;
+
+    #[test]
+    fn extracts_error_payloads_before_choices_decoding() {
+        let body = json!({
+            "error": {
+                "message": "Insufficient credits",
+                "code": 402
+            }
+        });
+        assert_eq!(
+            upstream_error_from_value(&body).as_deref(),
+            Some("Insufficient credits (code: 402)")
+        );
+    }
 }

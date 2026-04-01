@@ -1,0 +1,9 @@
+{
+  "exec_id": "e9b2a974-89a9-4d50-b5ad-55e45afca588",
+  "pid": 21791,
+  "command": "sleep 10",
+  "cwd": ".",
+  "stdout_path": "./.agent_frame/processes/e9b2a974-89a9-4d50-b5ad-55e45afca588.stdout",
+  "stderr_path": "./.agent_frame/processes/e9b2a974-89a9-4d50-b5ad-55e45afca588.stderr",
+  "exit_code_path": "./.agent_frame/processes/e9b2a974-89a9-4d50-b5ad-55e45afca588.exit"
+}

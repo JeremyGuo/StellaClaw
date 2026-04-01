@@ -1,0 +1,9 @@
+{
+  "exec_id": "7c487e9f-9a9e-4814-ae3c-be538c024c18",
+  "pid": 63122,
+  "command": "sleep 10",
+  "cwd": ".",
+  "stdout_path": "./.agent_frame/processes/7c487e9f-9a9e-4814-ae3c-be538c024c18.stdout",
+  "stderr_path": "./.agent_frame/processes/7c487e9f-9a9e-4814-ae3c-be538c024c18.stderr",
+  "exit_code_path": "./.agent_frame/processes/7c487e9f-9a9e-4814-ae3c-be538c024c18.exit"
+}

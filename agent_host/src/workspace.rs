@@ -373,10 +373,7 @@ impl WorkspaceManager {
         let target = self.ensure_workspace_exists(target_workspace_id)?;
         let source_files_dir = source.files_dir.clone();
         let target_files_dir = target.files_dir.clone();
-        let target_base = match target_dir
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
+        let target_base = match target_dir.map(str::trim).filter(|value| !value.is_empty()) {
             Some(dir) => resolve_workspace_path(&target_files_dir, dir)?,
             None => target_files_dir.clone(),
         };
@@ -391,7 +388,10 @@ impl WorkspaceManager {
             }
             let source_path = resolve_workspace_path(&source.files_dir, relative)?;
             if !source_path.exists() {
-                return Err(anyhow!("source path does not exist: {}", source_path.display()));
+                return Err(anyhow!(
+                    "source path does not exist: {}",
+                    source_path.display()
+                ));
             }
             let target_path = target_base.join(
                 source_path
@@ -581,9 +581,12 @@ pub struct MovedPath {
 
 fn resolve_workspace_path(workspace_root: &Path, relative: &str) -> Result<PathBuf> {
     let candidate = workspace_root.join(relative);
-    let root = workspace_root
-        .canonicalize()
-        .with_context(|| format!("failed to resolve workspace root {}", workspace_root.display()))?;
+    let root = workspace_root.canonicalize().with_context(|| {
+        format!(
+            "failed to resolve workspace root {}",
+            workspace_root.display()
+        )
+    })?;
     let canonical_parent = candidate
         .parent()
         .unwrap_or(workspace_root)
@@ -599,10 +602,13 @@ fn compute_latest_workspace_mtime(path: &Path) -> Result<Option<DateTime<Utc>>> 
     if !path.exists() {
         return Ok(None);
     }
-    let metadata = fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
     let mut latest = metadata.modified().ok().map(DateTime::<Utc>::from);
     if metadata.is_dir() {
-        for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
+        for entry in
+            fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?
+        {
             let entry = entry?;
             if let Some(child_latest) = compute_latest_workspace_mtime(&entry.path())? {
                 latest = Some(match latest {
@@ -617,7 +623,9 @@ fn compute_latest_workspace_mtime(path: &Path) -> Result<Option<DateTime<Utc>>> 
 
 fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
     fs::create_dir_all(target).with_context(|| format!("failed to create {}", target.display()))?;
-    for entry in fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))? {
+    for entry in
+        fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
+    {
         let entry = entry?;
         let source_path = entry.path();
         let target_path = target.join(entry.file_name());
@@ -627,7 +635,8 @@ fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
 }
 
 fn copy_path_recursive(source: &Path, target: &Path) -> Result<()> {
-    let metadata = fs::metadata(source).with_context(|| format!("failed to stat {}", source.display()))?;
+    let metadata =
+        fs::metadata(source).with_context(|| format!("failed to stat {}", source.display()))?;
     if metadata.is_dir() {
         copy_dir_recursive(source, target)
     } else {
@@ -636,20 +645,27 @@ fn copy_path_recursive(source: &Path, target: &Path) -> Result<()> {
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         fs::copy(source, target).with_context(|| {
-            format!("failed to copy {} to {}", source.display(), target.display())
+            format!(
+                "failed to copy {} to {}",
+                source.display(),
+                target.display()
+            )
         })?;
         Ok(())
     }
 }
 
 fn set_readonly_recursive(path: &Path) -> Result<()> {
-    let metadata = fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
     let mut permissions = metadata.permissions();
     permissions.set_readonly(true);
     fs::set_permissions(path, permissions)
         .with_context(|| format!("failed to mark {} readonly", path.display()))?;
     if metadata.is_dir() {
-        for entry in fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))? {
+        for entry in
+            fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?
+        {
             let entry = entry?;
             set_readonly_recursive(&entry.path())?;
         }

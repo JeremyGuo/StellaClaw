@@ -5,12 +5,14 @@ use crate::config::AgentConfig;
 use crate::llm::{TokenUsage, create_chat_completion};
 use crate::message::ChatMessage;
 use crate::skills::{SkillMetadata, build_skills_meta_prompt, discover_skills};
-use crate::tooling::{Tool, build_tool_registry, build_tool_registry_with_cancel, execute_tool_call};
+use crate::tooling::{
+    InterruptSignal, Tool, build_tool_registry, build_tool_registry_with_cancel, execute_tool,
+};
 use anyhow::{Result, anyhow};
 use humantime::parse_duration;
-use serde_json::Value;
-use std::sync::Mutex;
+use serde_json::{Value, json};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -112,10 +114,89 @@ pub struct SessionRunReport {
     pub usage: TokenUsage,
 }
 
+#[derive(Clone, Debug)]
+pub enum SessionEvent {
+    SessionStarted {
+        previous_message_count: usize,
+        prompt_len: usize,
+        tool_definition_count: usize,
+        skill_count: usize,
+    },
+    CompactionStarted {
+        phase: &'static str,
+        message_count: usize,
+    },
+    CompactionCompleted {
+        phase: &'static str,
+        compacted: bool,
+        estimated_tokens_before: usize,
+        estimated_tokens_after: usize,
+        token_limit: usize,
+    },
+    RoundStarted {
+        round_index: usize,
+        message_count: usize,
+    },
+    ModelCallStarted {
+        round_index: usize,
+        message_count: usize,
+    },
+    ModelCallCompleted {
+        round_index: usize,
+        tool_call_count: usize,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+    },
+    CheckpointEmitted {
+        message_count: usize,
+        total_tokens: u64,
+    },
+    ToolWaitCompactionScheduled {
+        tool_name: String,
+        stable_prefix_message_count: usize,
+        delay_ms: u64,
+    },
+    ToolWaitCompactionStarted {
+        tool_name: String,
+        stable_prefix_message_count: usize,
+    },
+    ToolWaitCompactionCompleted {
+        tool_name: String,
+        compacted: bool,
+        estimated_tokens_before: usize,
+        estimated_tokens_after: usize,
+        token_limit: usize,
+    },
+    ToolCallStarted {
+        round_index: usize,
+        tool_name: String,
+        tool_call_id: String,
+    },
+    ToolCallCompleted {
+        round_index: usize,
+        tool_name: String,
+        tool_call_id: String,
+        output_len: usize,
+        errored: bool,
+    },
+    PrefixRewriteApplied {
+        previous_prefix_message_count: usize,
+        replacement_prefix_message_count: usize,
+    },
+    SessionCompleted {
+        message_count: usize,
+        total_tokens: u64,
+    },
+}
+
 #[derive(Clone)]
 pub struct SessionExecutionControl {
     cancel_flag: Arc<AtomicBool>,
+    tool_interrupt_flag: Arc<InterruptSignal>,
+    timeout_observation_requested: Arc<AtomicBool>,
     checkpoint_callback: Option<Arc<dyn Fn(SessionRunReport) + Send + Sync>>,
+    event_callback: Option<Arc<dyn Fn(SessionEvent) + Send + Sync>>,
     stable_prefix_messages: Arc<Mutex<Vec<ChatMessage>>>,
     pending_prefix_rewrite: Arc<Mutex<Option<PendingPrefixRewrite>>>,
 }
@@ -132,11 +213,20 @@ struct PendingToolWaitCompaction {
     join_handle: thread::JoinHandle<Result<Option<PendingPrefixRewrite>>>,
 }
 
+struct CompletedToolCall {
+    tool_call_id: String,
+    tool_name: String,
+    result: String,
+}
+
 impl SessionExecutionControl {
     pub fn new() -> Self {
         Self {
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            tool_interrupt_flag: Arc::new(InterruptSignal::new()),
+            timeout_observation_requested: Arc::new(AtomicBool::new(false)),
             checkpoint_callback: None,
+            event_callback: None,
             stable_prefix_messages: Arc::new(Mutex::new(Vec::new())),
             pending_prefix_rewrite: Arc::new(Mutex::new(None)),
         }
@@ -147,22 +237,50 @@ impl SessionExecutionControl {
     ) -> Self {
         Self {
             cancel_flag: Arc::new(AtomicBool::new(false)),
+            tool_interrupt_flag: Arc::new(InterruptSignal::new()),
+            timeout_observation_requested: Arc::new(AtomicBool::new(false)),
             checkpoint_callback: Some(Arc::new(callback)),
+            event_callback: None,
             stable_prefix_messages: Arc::new(Mutex::new(Vec::new())),
             pending_prefix_rewrite: Arc::new(Mutex::new(None)),
         }
     }
 
+    pub fn with_event_callback(
+        mut self,
+        callback: impl Fn(SessionEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.event_callback = Some(Arc::new(callback));
+        self
+    }
+
     pub fn request_cancel(&self) {
         self.cancel_flag.store(true, Ordering::SeqCst);
+        self.tool_interrupt_flag.request();
     }
 
     pub fn is_cancelled(&self) -> bool {
         self.cancel_flag.load(Ordering::SeqCst)
     }
 
-    pub fn cancel_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.cancel_flag)
+    pub fn request_timeout_observation(&self) {
+        self.timeout_observation_requested
+            .store(true, Ordering::SeqCst);
+        self.tool_interrupt_flag.request();
+    }
+
+    pub fn tool_interrupt_flag(&self) -> Arc<InterruptSignal> {
+        Arc::clone(&self.tool_interrupt_flag)
+    }
+
+    fn take_timeout_observation_requested(&self) -> bool {
+        let requested = self
+            .timeout_observation_requested
+            .swap(false, Ordering::SeqCst);
+        if requested {
+            self.tool_interrupt_flag.clear();
+        }
+        requested
     }
 
     pub fn stable_prefix_snapshot(&self) -> Vec<ChatMessage> {
@@ -201,6 +319,10 @@ impl SessionExecutionControl {
                 usage: usage.clone(),
             });
         }
+        self.emit_event(SessionEvent::CheckpointEmitted {
+            message_count: messages.len(),
+            total_tokens: usage.total_tokens,
+        });
     }
 
     fn set_stable_prefix_messages(&self, messages: &[ChatMessage]) {
@@ -214,6 +336,12 @@ impl SessionExecutionControl {
             .lock()
             .ok()
             .and_then(|mut pending| pending.take())
+    }
+
+    fn emit_event(&self, event: SessionEvent) {
+        if let Some(callback) = &self.event_callback {
+            callback(event);
+        }
     }
 }
 
@@ -256,12 +384,35 @@ pub fn run_session_with_report_controlled(
         config.image_tool_upstream.as_ref(),
         &discovered_skills,
         &extra_tools,
-        control.as_ref().map(SessionExecutionControl::cancel_flag),
+        control
+            .as_ref()
+            .map(SessionExecutionControl::tool_interrupt_flag),
     )?;
     let tool_definitions = registry.values().cloned().collect::<Vec<_>>();
+    if let Some(control) = &control {
+        control.emit_event(SessionEvent::SessionStarted {
+            previous_message_count: previous_messages.len(),
+            prompt_len: prompt.len(),
+            tool_definition_count: tool_definitions.len(),
+            skill_count: discovered_skills.len(),
+        });
+        control.emit_event(SessionEvent::CompactionStarted {
+            phase: "initial",
+            message_count: messages.len(),
+        });
+    }
 
     let initial_compaction =
         maybe_compact_messages_with_report(&config, &messages, &tool_definitions, &prompt)?;
+    if let Some(control) = &control {
+        control.emit_event(SessionEvent::CompactionCompleted {
+            phase: "initial",
+            compacted: initial_compaction.compacted,
+            estimated_tokens_before: initial_compaction.estimated_tokens_before,
+            estimated_tokens_after: initial_compaction.estimated_tokens_after,
+            token_limit: initial_compaction.token_limit,
+        });
+    }
     usage.add_assign(&initial_compaction.usage);
     messages = initial_compaction.messages;
     if let Some(control) = &control {
@@ -275,63 +426,157 @@ pub fn run_session_with_report_controlled(
         if let Some(control) = &control {
             control.ensure_not_cancelled()?;
             apply_pending_prefix_rewrite(control, &mut messages, &mut usage);
+            control.emit_event(SessionEvent::RoundStarted {
+                round_index,
+                message_count: messages.len(),
+            });
         }
         if round_index > 0 {
+            if let Some(control) = &control {
+                control.emit_event(SessionEvent::CompactionStarted {
+                    phase: "round",
+                    message_count: messages.len(),
+                });
+            }
             let compaction =
                 maybe_compact_messages_with_report(&config, &messages, &tool_definitions, "")?;
+            if let Some(control) = &control {
+                control.emit_event(SessionEvent::CompactionCompleted {
+                    phase: "round",
+                    compacted: compaction.compacted,
+                    estimated_tokens_before: compaction.estimated_tokens_before,
+                    estimated_tokens_after: compaction.estimated_tokens_after,
+                    token_limit: compaction.token_limit,
+                });
+            }
             usage.add_assign(&compaction.usage);
             messages = compaction.messages;
         }
         if let Some(control) = &control {
             control.ensure_not_cancelled()?;
+            control.emit_event(SessionEvent::ModelCallStarted {
+                round_index,
+                message_count: messages.len(),
+            });
         }
         let outcome = create_chat_completion(&config.upstream, &messages, &tool_definitions, None)?;
         usage.add_assign(&outcome.usage);
         let last_model_response_at = Instant::now();
         let tool_calls = outcome.message.tool_calls.clone().unwrap_or_default();
+        if let Some(control) = &control {
+            control.emit_event(SessionEvent::ModelCallCompleted {
+                round_index,
+                tool_call_count: tool_calls.len(),
+                prompt_tokens: outcome.usage.prompt_tokens,
+                completion_tokens: outcome.usage.completion_tokens,
+                total_tokens: outcome.usage.total_tokens,
+            });
+        }
         messages.push(outcome.message);
         if let Some(control) = &control
+            && tool_calls.is_empty()
             && !extract_assistant_text(&messages).trim().is_empty()
         {
             control.emit_checkpoint(&messages, &usage);
         }
         if tool_calls.is_empty() {
+            if let Some(control) = &control {
+                control.emit_event(SessionEvent::SessionCompleted {
+                    message_count: messages.len(),
+                    total_tokens: usage.total_tokens,
+                });
+            }
             return Ok(SessionRunReport { messages, usage });
         }
 
-        for tool_call in tool_calls {
-            if let Some(control) = &control {
-                control.ensure_not_cancelled()?;
-                apply_pending_prefix_rewrite(control, &mut messages, &mut usage);
-                control.set_stable_prefix_messages(&messages);
+        if let Some(control) = &control {
+            control.ensure_not_cancelled()?;
+            apply_pending_prefix_rewrite(control, &mut messages, &mut usage);
+            control.set_stable_prefix_messages(&messages);
+            for tool_call in &tool_calls {
+                control.emit_event(SessionEvent::ToolCallStarted {
+                    round_index,
+                    tool_name: tool_call.function.name.clone(),
+                    tool_call_id: tool_call.id.clone(),
+                });
             }
-            let pending_compaction = start_pending_tool_wait_compaction(
-                &config,
-                &messages,
-                &extra_tools,
-                control.as_ref(),
-                Some(last_model_response_at),
-            )?;
-            let result = execute_tool_call(
-                &registry,
-                &tool_call.function.name,
-                tool_call.function.arguments.as_deref(),
+        }
+        let pending_compaction = start_pending_tool_wait_compaction(
+            &config,
+            &messages,
+            &extra_tools,
+            control.as_ref(),
+            "tool_batch",
+            Some(last_model_response_at),
+        )?;
+        let mut handles = Vec::with_capacity(tool_calls.len());
+        for tool_call in &tool_calls {
+            let tool_name = tool_call.function.name.clone();
+            let tool_call_id = tool_call.id.clone();
+            let raw_arguments = tool_call.function.arguments.clone();
+            let maybe_tool = registry.get(&tool_name).cloned();
+            handles.push(thread::spawn(move || -> CompletedToolCall {
+                let result = match maybe_tool {
+                    Some(tool) => execute_tool(&tool, raw_arguments.as_deref()),
+                    None => {
+                        json!({"error": format!("unknown tool: {}", tool_name), "tool": tool_name})
+                            .to_string()
+                    }
+                };
+                CompletedToolCall {
+                    tool_call_id,
+                    tool_name,
+                    result,
+                }
+            }));
+        }
+
+        let mut completed = Vec::with_capacity(handles.len());
+        for handle in handles {
+            completed.push(
+                handle
+                    .join()
+                    .map_err(|_| anyhow!("tool worker thread panicked"))?,
             );
-            if let Some(control) = &control
-                && let Some(rewrite) = finish_pending_tool_wait_compaction(pending_compaction)?
-            {
-                control.request_prefix_rewrite(
-                    rewrite.expected_prefix,
-                    rewrite.replacement_prefix,
-                    rewrite.usage,
-                );
-                apply_pending_prefix_rewrite(control, &mut messages, &mut usage);
-            }
+        }
+        if let Some(control) = &control
+            && let Some(rewrite) = finish_pending_tool_wait_compaction(pending_compaction)?
+        {
+            control.request_prefix_rewrite(
+                rewrite.expected_prefix,
+                rewrite.replacement_prefix,
+                rewrite.usage,
+            );
+            apply_pending_prefix_rewrite(control, &mut messages, &mut usage);
+        }
+
+        let timeout_observation_requested = control
+            .as_ref()
+            .is_some_and(SessionExecutionControl::take_timeout_observation_requested);
+        for completed_tool in completed {
+            let result = if timeout_observation_requested {
+                synthesize_tool_timeout_observation(
+                    &completed_tool.tool_name,
+                    &completed_tool.result,
+                    round_index,
+                )
+            } else {
+                completed_tool.result
+            };
             messages.push(ChatMessage::tool_output(
-                tool_call.id,
-                tool_call.function.name,
-                result,
+                completed_tool.tool_call_id.clone(),
+                completed_tool.tool_name.clone(),
+                result.clone(),
             ));
+            if let Some(control) = &control {
+                control.emit_event(SessionEvent::ToolCallCompleted {
+                    round_index,
+                    tool_name: completed_tool.tool_name,
+                    tool_call_id: completed_tool.tool_call_id,
+                    output_len: result.len(),
+                    errored: tool_result_looks_like_error(&result),
+                });
+            }
         }
     }
 
@@ -346,6 +591,7 @@ fn start_pending_tool_wait_compaction(
     stable_prefix: &[ChatMessage],
     extra_tools: &[Tool],
     control: Option<&SessionExecutionControl>,
+    tool_name: &str,
     last_model_response_at: Option<Instant>,
 ) -> Result<Option<PendingToolWaitCompaction>> {
     if !config.enable_context_compression {
@@ -369,10 +615,19 @@ fn start_pending_tool_wait_compaction(
         return Ok(None);
     };
     let delay = idle_threshold.saturating_sub(last_model_response_at.elapsed());
+    let control = control.cloned();
+    if let Some(control) = &control {
+        control.emit_event(SessionEvent::ToolWaitCompactionScheduled {
+            tool_name: tool_name.to_string(),
+            stable_prefix_message_count: stable_prefix.len(),
+            delay_ms: delay.as_millis().min(u128::from(u64::MAX)) as u64,
+        });
+    }
 
     let config = config.clone();
     let stable_prefix = stable_prefix.to_vec();
     let extra_tools = extra_tools.to_vec();
+    let tool_name = tool_name.to_string();
     let (cancel_sender, cancel_receiver) = mpsc::channel();
     let join_handle = thread::spawn(move || -> Result<Option<PendingPrefixRewrite>> {
         if !delay.is_zero() {
@@ -381,8 +636,23 @@ fn start_pending_tool_wait_compaction(
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
+        if let Some(control) = &control {
+            control.emit_event(SessionEvent::ToolWaitCompactionStarted {
+                tool_name: tool_name.clone(),
+                stable_prefix_message_count: stable_prefix.len(),
+            });
+        }
         let report =
             compact_session_messages_with_report(stable_prefix.clone(), config, extra_tools)?;
+        if let Some(control) = &control {
+            control.emit_event(SessionEvent::ToolWaitCompactionCompleted {
+                tool_name: tool_name.clone(),
+                compacted: report.compacted,
+                estimated_tokens_before: report.estimated_tokens_before,
+                estimated_tokens_after: report.estimated_tokens_after,
+                token_limit: report.token_limit,
+            });
+        }
         if !report.compacted {
             return Ok(None);
         }
@@ -428,7 +698,40 @@ fn apply_pending_prefix_rewrite(
     next_messages.extend(tail);
     *messages = next_messages;
     usage.add_assign(&rewrite.usage);
+    control.emit_event(SessionEvent::PrefixRewriteApplied {
+        previous_prefix_message_count: rewrite.expected_prefix.len(),
+        replacement_prefix_message_count: rewrite.replacement_prefix.len(),
+    });
     control.set_stable_prefix_messages(&rewrite.replacement_prefix);
+}
+
+fn tool_result_looks_like_error(result: &str) -> bool {
+    serde_json::from_str::<Value>(result)
+        .ok()
+        .and_then(|value| value.get("error").cloned())
+        .is_some()
+}
+
+fn synthesize_tool_timeout_observation(
+    tool_name: &str,
+    observed_result: &str,
+    round_index: usize,
+) -> String {
+    let observed = serde_json::from_str::<Value>(observed_result)
+        .unwrap_or_else(|_| Value::String(observed_result.to_string()));
+    json!({
+        "error": format!("tool execution was interrupted because the overall agent turn hit its timeout budget while waiting for {}", tool_name),
+        "tool": tool_name,
+        "timed_out": true,
+        "round_index": round_index,
+        "observed_result": observed,
+        "next_step_options": [
+            "retry the tool with a longer timeout_seconds",
+            "inspect the partial observation and continue with a different tool",
+            "explain the timeout to the user"
+        ]
+    })
+    .to_string()
 }
 
 #[cfg(test)]
@@ -534,7 +837,9 @@ mod tests {
             response_body.len(),
             response_body
         );
-        stream.write_all(response.as_bytes()).expect("write response");
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
     }
 
     #[test]
@@ -603,6 +908,7 @@ mod tests {
             &stable_prefix,
             &Vec::<Tool>::new(),
             Some(&SessionExecutionControl::new()),
+            "test_tool",
             Some(Instant::now() - Duration::from_secs(2)),
         )
         .unwrap();
@@ -611,15 +917,13 @@ mod tests {
             .unwrap()
             .expect("expected compaction rewrite");
         assert!(rewrite.usage.llm_calls >= 1);
-        assert!(
-            rewrite.replacement_prefix.iter().any(|message| {
-                message
-                    .content
-                    .as_ref()
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| text.contains(COMPACTION_MARKER))
-            })
-        );
+        assert!(rewrite.replacement_prefix.iter().any(|message| {
+            message
+                .content
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains(COMPACTION_MARKER))
+        }));
     }
 }
 
