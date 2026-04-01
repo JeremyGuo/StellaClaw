@@ -26,8 +26,8 @@ use crate::sink::{SinkRouter, SinkTarget};
 use crate::workspace::WorkspaceManager;
 use agent_frame::config::{AgentConfig as FrameAgentConfig, CacheControlConfig, UpstreamConfig};
 use agent_frame::{
-    ChatMessage, SessionEvent, SessionExecutionControl, SessionRunReport, TokenUsage, Tool,
-    extract_assistant_text,
+    ChatMessage, SessionCompactionStats, SessionEvent, SessionExecutionControl, SessionRunReport,
+    TokenUsage, Tool, extract_assistant_text,
 };
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -2223,8 +2223,9 @@ impl Server {
                 continue;
             }
 
+            let compaction_stats = compaction_stats_from_report(&report);
             self.sessions
-                .record_idle_compaction(&session.address, report.messages)
+                .record_idle_compaction(&session.address, report.messages, &compaction_stats)
                 .with_context(|| format!("failed to persist idle compaction for {}", session.id))?;
             info!(
                 log_stream = "session",
@@ -2525,10 +2526,10 @@ impl Server {
             self.send_user_error_message(&channel, &incoming.address, error)
                 .await;
         }
-        let (messages, outgoing, usage, timed_out) = turn_result?;
+        let (messages, outgoing, usage, compaction, timed_out) = turn_result?;
 
         self.sessions
-            .record_agent_turn(&incoming.address, messages, &usage)
+            .record_agent_turn(&incoming.address, messages, &usage, &compaction)
             .context("failed to persist agent_frame messages")?;
         self.sessions.append_user_message(
             &incoming.address,
@@ -2686,12 +2687,12 @@ impl Server {
         show_reply: bool,
     ) -> Result<OutgoingMessage> {
         let greeting = ChatMessage::text("user", greeting_for_language(&self.main_agent.language));
-        let (messages, outgoing, usage, timed_out) = self
+        let (messages, outgoing, usage, compaction, timed_out) = self
             .run_main_agent_turn(session, greeting)
             .await
             .context("failed to initialize foreground session")?;
         self.sessions
-            .record_agent_turn(&session.address, messages, &usage)?;
+            .record_agent_turn(&session.address, messages, &usage, &compaction)?;
         self.log_turn_usage(session, &usage, true);
         if timed_out {
             warn!(
@@ -2883,7 +2884,13 @@ impl Server {
         &self,
         session: &SessionSnapshot,
         next_user_message: ChatMessage,
-    ) -> Result<(Vec<ChatMessage>, OutgoingMessage, TokenUsage, bool)> {
+    ) -> Result<(
+        Vec<ChatMessage>,
+        OutgoingMessage,
+        TokenUsage,
+        SessionCompactionStats,
+        bool,
+    )> {
         let workspace_root = session.workspace_root.clone();
         let mut previous_messages = session.agent_messages.clone();
         previous_messages.push(next_user_message);
@@ -2912,14 +2919,26 @@ impl Server {
                 let assistant_text = extract_assistant_text(&report.messages);
                 let outgoing =
                     build_outgoing_message_for_session(session, &assistant_text, &workspace_root)?;
-                Ok((report.messages, outgoing, report.usage, false))
+                Ok((
+                    report.messages,
+                    outgoing,
+                    report.usage,
+                    report.compaction,
+                    false,
+                ))
             }
             TimedRunOutcome::TimedOut { checkpoint, error } => {
                 let report = checkpoint.ok_or(error)?;
                 let assistant_text = extract_assistant_text(&report.messages);
                 let outgoing =
                     build_outgoing_message_for_session(session, &assistant_text, &workspace_root)?;
-                Ok((report.messages, outgoing, report.usage, true))
+                Ok((
+                    report.messages,
+                    outgoing,
+                    report.usage,
+                    report.compaction,
+                    true,
+                ))
             }
         }
     }
@@ -3137,6 +3156,11 @@ fn build_user_turn_message(
     if text_sections.is_empty() {
         text_sections.push(format!(
             "The user attached {} image(s). Inspect the images directly.",
+            image_attachments.len()
+        ));
+    } else {
+        text_sections.push(format!(
+            "The user attached {} image(s), and those images are already directly visible in this request. Inspect them directly here instead of calling the image tool again for the same current-turn attachments.",
             image_attachments.len()
         ));
     }
@@ -3613,6 +3637,7 @@ fn create_detached_session_snapshot(
         turn_count: 0,
         last_compacted_turn_count: 0,
         cumulative_usage: TokenUsage::default(),
+        cumulative_compaction: SessionCompactionStats::default(),
         api_timeout_override_seconds: None,
         pending_workspace_summary: false,
         close_after_summary: false,
@@ -3714,12 +3739,14 @@ fn format_session_status(
     timeout_source: &str,
 ) -> String {
     let usage = &session.cumulative_usage;
+    let compaction = &session.cumulative_compaction;
     let cache_hit_rate = if usage.prompt_tokens == 0 {
         0.0
     } else {
         (usage.cache_hit_tokens as f64 / usage.prompt_tokens as f64) * 100.0
     };
     let pricing = estimate_cost_usd(model, usage);
+    let compaction_pricing = estimate_compaction_savings_usd(model, compaction);
     let language = language.to_ascii_lowercase();
     if language.starts_with("zh") {
         let mut lines = vec![
@@ -3751,6 +3778,43 @@ fn format_session_status(
         } else {
             lines.push(String::new());
             lines.push("价格估算：当前模型没有内置价格表，无法直接估算。".to_string());
+        }
+        lines.push(String::new());
+        lines.push("自动上下文压缩节省估算：".to_string());
+        lines.push(format!("- compaction_runs: {}", compaction.run_count));
+        lines.push(format!(
+            "- compacted_runs: {}",
+            compaction.compacted_run_count
+        ));
+        lines.push(format!(
+            "- estimated_tokens_before: {}",
+            compaction.estimated_tokens_before
+        ));
+        lines.push(format!(
+            "- estimated_tokens_after: {}",
+            compaction.estimated_tokens_after
+        ));
+        lines.push(format!(
+            "- estimated_tokens_saved: {}",
+            compaction
+                .estimated_tokens_before
+                .saturating_sub(compaction.estimated_tokens_after)
+        ));
+        if let Some((formula, gross_usd, compaction_cost_usd, net_usd)) = compaction_pricing {
+            lines.push(format!("- formula: {}", formula));
+            lines.push(format!(
+                "- estimated_cold_start_gross_usd: ${:.6}",
+                gross_usd
+            ));
+            lines.push(format!(
+                "- estimated_compaction_cost_usd: ${:.6}",
+                compaction_cost_usd
+            ));
+            lines.push(format!("- estimated_net_usd: ${:.6}", net_usd));
+        } else {
+            lines.push(
+                "- estimated_net_usd: unavailable for the current model pricing table.".to_string(),
+            );
         }
         lines.join("\n")
     } else {
@@ -3786,20 +3850,77 @@ fn format_session_status(
                 "Estimated cost: unavailable for the current model pricing table.".to_string(),
             );
         }
+        lines.push(String::new());
+        lines.push("Automatic context compaction savings estimate:".to_string());
+        lines.push(format!("- compaction_runs: {}", compaction.run_count));
+        lines.push(format!(
+            "- compacted_runs: {}",
+            compaction.compacted_run_count
+        ));
+        lines.push(format!(
+            "- estimated_tokens_before: {}",
+            compaction.estimated_tokens_before
+        ));
+        lines.push(format!(
+            "- estimated_tokens_after: {}",
+            compaction.estimated_tokens_after
+        ));
+        lines.push(format!(
+            "- estimated_tokens_saved: {}",
+            compaction
+                .estimated_tokens_before
+                .saturating_sub(compaction.estimated_tokens_after)
+        ));
+        if let Some((formula, gross_usd, compaction_cost_usd, net_usd)) = compaction_pricing {
+            lines.push(format!("- formula: {}", formula));
+            lines.push(format!(
+                "- estimated_cold_start_gross_usd: ${:.6}",
+                gross_usd
+            ));
+            lines.push(format!(
+                "- estimated_compaction_cost_usd: ${:.6}",
+                compaction_cost_usd
+            ));
+            lines.push(format!("- estimated_net_usd: ${:.6}", net_usd));
+        } else {
+            lines.push(
+                "- estimated_net_usd: unavailable for the current model pricing table.".to_string(),
+            );
+        }
         lines.join("\n")
     }
 }
 
-fn estimate_cost_usd(model: &ModelConfig, usage: &TokenUsage) -> Option<(String, f64)> {
-    let (input_per_million, output_per_million) = match (
+struct ModelPricing {
+    input_per_million: f64,
+    output_per_million: f64,
+}
+
+fn model_pricing(model: &ModelConfig) -> Option<ModelPricing> {
+    match (
         model.api_endpoint.contains("openrouter.ai"),
         model.model.as_str(),
     ) {
-        (true, "anthropic/claude-opus-4.6") => (15.0, 75.0),
-        (true, "anthropic/claude-sonnet-4.6") => (3.0, 15.0),
-        (true, "qwen/qwen3.5-27b") => (0.195, 1.56),
-        _ => return None,
-    };
+        (true, "anthropic/claude-opus-4.6") => Some(ModelPricing {
+            input_per_million: 15.0,
+            output_per_million: 75.0,
+        }),
+        (true, "anthropic/claude-sonnet-4.6") => Some(ModelPricing {
+            input_per_million: 3.0,
+            output_per_million: 15.0,
+        }),
+        (true, "qwen/qwen3.5-27b") => Some(ModelPricing {
+            input_per_million: 0.195,
+            output_per_million: 1.56,
+        }),
+        _ => None,
+    }
+}
+
+fn estimate_cost_usd(model: &ModelConfig, usage: &TokenUsage) -> Option<(String, f64)> {
+    let pricing = model_pricing(model)?;
+    let input_per_million = pricing.input_per_million;
+    let output_per_million = pricing.output_per_million;
     let cache_read_per_million = input_per_million * 0.1;
     let cache_write_per_million = input_per_million * 1.25;
     let uncached_input_tokens = usage
@@ -3813,6 +3934,36 @@ fn estimate_cost_usd(model: &ModelConfig, usage: &TokenUsage) -> Option<(String,
         "cache_read_tokens * ${cache_read_per_million:.6}/1M + cache_write_tokens * ${cache_write_per_million:.6}/1M + (cache_miss_tokens - cache_write_tokens) * ${input_per_million:.6}/1M + completion_tokens * ${output_per_million:.6}/1M"
     );
     Some((formula, total_usd))
+}
+
+fn estimate_compaction_savings_usd(
+    model: &ModelConfig,
+    compaction: &SessionCompactionStats,
+) -> Option<(String, f64, f64, f64)> {
+    let pricing = model_pricing(model)?;
+    let saved_tokens = compaction
+        .estimated_tokens_before
+        .saturating_sub(compaction.estimated_tokens_after);
+    let cold_start_gross_usd = (saved_tokens as f64 / 1_000_000.0) * pricing.input_per_million;
+    let (_, compaction_cost_usd) = estimate_cost_usd(model, &compaction.usage)?;
+    let net_usd = cold_start_gross_usd - compaction_cost_usd;
+    let formula = format!(
+        "(estimated_tokens_before - estimated_tokens_after) * ${:.6}/1M - compaction_run_cost",
+        pricing.input_per_million
+    );
+    Some((formula, cold_start_gross_usd, compaction_cost_usd, net_usd))
+}
+
+fn compaction_stats_from_report(
+    report: &agent_frame::ContextCompactionReport,
+) -> SessionCompactionStats {
+    let mut stats = SessionCompactionStats::default();
+    stats.run_count = 1;
+    stats.compacted_run_count = u64::from(report.compacted);
+    stats.estimated_tokens_before = report.estimated_tokens_before as u64;
+    stats.estimated_tokens_after = report.estimated_tokens_after as u64;
+    stats.usage = report.usage.clone();
+    stats
 }
 
 fn format_api_timeout_update(
@@ -4172,8 +4323,8 @@ mod tests {
     use super::{
         SinkTarget, TokenUsage, background_agent_timeout_seconds,
         background_recovery_timeout_seconds, background_timeout_with_active_children_text,
-        build_user_turn_message, channel_restart_backoff_seconds, estimate_cost_usd,
-        extract_attachment_references, is_timeout_like, parse_oldspace_command,
+        build_user_turn_message, channel_restart_backoff_seconds, estimate_compaction_savings_usd,
+        estimate_cost_usd, extract_attachment_references, is_timeout_like, parse_oldspace_command,
         parse_set_api_timeout_command, parse_sink_target, should_attempt_idle_context_compaction,
         workspace_visible_in_list,
     };
@@ -4182,6 +4333,7 @@ mod tests {
     use crate::domain::ChannelAddress;
     use crate::domain::{AttachmentKind, StoredAttachment};
     use crate::session::SessionSnapshot;
+    use agent_frame::SessionCompactionStats;
     use anyhow::anyhow;
     use chrono::{Duration as ChronoDuration, Utc};
     use serde_json::json;
@@ -4248,6 +4400,9 @@ mod tests {
         let content = message.content.unwrap();
         let items = content.as_array().unwrap();
         assert_eq!(items[0]["type"], "text");
+        let text = items[0]["text"].as_str().unwrap();
+        assert!(text.contains("already directly visible in this request"));
+        assert!(text.contains("instead of calling the image tool again"));
         assert_eq!(items[1]["type"], "image_url");
         let url = items[1]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("data:image/png;base64,"));
@@ -4328,6 +4483,7 @@ mod tests {
             turn_count: 2,
             last_compacted_turn_count: 1,
             cumulative_usage: TokenUsage::default(),
+            cumulative_compaction: agent_frame::SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             pending_workspace_summary: false,
             close_after_summary: false,
@@ -4449,6 +4605,51 @@ mod tests {
         let (formula, total_usd) = estimate_cost_usd(&model, &usage).unwrap();
         assert!(formula.contains("cache_read_tokens"));
         assert!(total_usd > 0.0);
+    }
+
+    #[test]
+    fn estimates_compaction_savings_from_token_delta_and_compaction_cost() {
+        let model = ModelConfig {
+            api_endpoint: "https://openrouter.ai/api/v1".to_string(),
+            model: "anthropic/claude-sonnet-4.6".to_string(),
+            backend: AgentBackendKind::AgentFrame,
+            supports_vision_input: true,
+            image_tool_model: None,
+            api_key: None,
+            api_key_env: "OPENROUTER_API_KEY".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            timeout_seconds: 300.0,
+            context_window_tokens: 262_144,
+            cache_ttl: Some("5m".to_string()),
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            description: "demo".to_string(),
+            native_web_search: None,
+            external_web_search: None,
+        };
+        let compaction = SessionCompactionStats {
+            run_count: 2,
+            compacted_run_count: 2,
+            estimated_tokens_before: 90_000,
+            estimated_tokens_after: 50_000,
+            usage: TokenUsage {
+                llm_calls: 2,
+                prompt_tokens: 10_000,
+                completion_tokens: 500,
+                total_tokens: 10_500,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 10_000,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+            },
+        };
+
+        let (formula, gross_usd, compaction_cost_usd, net_usd) =
+            estimate_compaction_savings_usd(&model, &compaction).unwrap();
+        assert!(formula.contains("estimated_tokens_before"));
+        assert!(gross_usd > 0.0);
+        assert!(compaction_cost_usd > 0.0);
+        assert!(net_usd < gross_usd);
     }
 
     #[test]

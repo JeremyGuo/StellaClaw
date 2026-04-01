@@ -37,10 +37,10 @@ pub fn build_agent_system_prompt(
     };
     let skill_line = match kind {
         AgentPromptKind::SubAgent => {
-            "Skills may be available. If a skill seems relevant, inspect the preloaded skill metadata and call load_skill before relying on the skill's detailed instructions."
+            "Skills may be available. If a skill seems relevant, inspect the preloaded skill metadata and call skill_load before relying on the skill's detailed instructions."
         }
         AgentPromptKind::MainForeground | AgentPromptKind::MainBackground => {
-            "Skills are available. If a skill seems relevant, inspect the preloaded skill metadata and call load_skill before relying on the skill's detailed instructions."
+            "Skills are available. If a skill seems relevant, inspect the preloaded skill metadata and call skill_load before relying on the skill's detailed instructions."
         }
     };
     let mut parts = vec![
@@ -224,6 +224,7 @@ mod tests {
             turn_count: 0,
             last_compacted_turn_count: 0,
             cumulative_usage: agent_frame::TokenUsage::default(),
+            cumulative_compaction: agent_frame::SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             pending_workspace_summary: false,
             close_after_summary: false,

@@ -10,6 +10,7 @@ use crate::tooling::{
 };
 use anyhow::{Result, anyhow};
 use humantime::parse_duration;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -112,6 +113,32 @@ pub fn run_session(
 pub struct SessionRunReport {
     pub messages: Vec<ChatMessage>,
     pub usage: TokenUsage,
+    pub compaction: SessionCompactionStats,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionCompactionStats {
+    pub run_count: u64,
+    pub compacted_run_count: u64,
+    pub estimated_tokens_before: u64,
+    pub estimated_tokens_after: u64,
+    pub usage: TokenUsage,
+}
+
+impl SessionCompactionStats {
+    fn record_report(&mut self, report: &ContextCompactionReport) {
+        self.run_count = self.run_count.saturating_add(1);
+        self.estimated_tokens_before = self
+            .estimated_tokens_before
+            .saturating_add(report.estimated_tokens_before as u64);
+        self.estimated_tokens_after = self
+            .estimated_tokens_after
+            .saturating_add(report.estimated_tokens_after as u64);
+        if report.compacted {
+            self.compacted_run_count = self.compacted_run_count.saturating_add(1);
+        }
+        self.usage.add_assign(&report.usage);
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -206,6 +233,7 @@ struct PendingPrefixRewrite {
     expected_prefix: Vec<ChatMessage>,
     replacement_prefix: Vec<ChatMessage>,
     usage: TokenUsage,
+    compaction: SessionCompactionStats,
 }
 
 struct PendingToolWaitCompaction {
@@ -295,12 +323,14 @@ impl SessionExecutionControl {
         expected_prefix: Vec<ChatMessage>,
         replacement_prefix: Vec<ChatMessage>,
         usage: TokenUsage,
+        compaction: SessionCompactionStats,
     ) {
         if let Ok(mut pending) = self.pending_prefix_rewrite.lock() {
             *pending = Some(PendingPrefixRewrite {
                 expected_prefix,
                 replacement_prefix,
                 usage,
+                compaction,
             });
         }
     }
@@ -317,6 +347,7 @@ impl SessionExecutionControl {
             callback(SessionRunReport {
                 messages: messages.to_vec(),
                 usage: usage.clone(),
+                compaction: SessionCompactionStats::default(),
             });
         }
         self.emit_event(SessionEvent::CheckpointEmitted {
@@ -372,6 +403,7 @@ pub fn run_session_with_report_controlled(
     let system_prompt = compose_system_prompt(&config, &discovered_skills);
     let mut messages = ensure_system_message(&previous_messages, &system_prompt);
     let mut usage = TokenUsage::default();
+    let mut compaction_stats = SessionCompactionStats::default();
 
     if let Some(control) = &control {
         control.ensure_not_cancelled()?;
@@ -383,6 +415,7 @@ pub fn run_session_with_report_controlled(
         &config.runtime_state_root,
         &config.upstream,
         config.image_tool_upstream.as_ref(),
+        &config.skills_dirs,
         &discovered_skills,
         &extra_tools,
         control
@@ -415,6 +448,7 @@ pub fn run_session_with_report_controlled(
         });
     }
     usage.add_assign(&initial_compaction.usage);
+    compaction_stats.record_report(&initial_compaction);
     messages = initial_compaction.messages;
     if let Some(control) = &control {
         control.set_stable_prefix_messages(&messages);
@@ -426,7 +460,7 @@ pub fn run_session_with_report_controlled(
     for round_index in 0..config.max_tool_roundtrips {
         if let Some(control) = &control {
             control.ensure_not_cancelled()?;
-            apply_pending_prefix_rewrite(control, &mut messages, &mut usage);
+            apply_pending_prefix_rewrite(control, &mut messages, &mut usage, &mut compaction_stats);
             control.emit_event(SessionEvent::RoundStarted {
                 round_index,
                 message_count: messages.len(),
@@ -439,19 +473,20 @@ pub fn run_session_with_report_controlled(
                     message_count: messages.len(),
                 });
             }
-            let compaction =
+            let round_compaction =
                 maybe_compact_messages_with_report(&config, &messages, &tool_definitions, "")?;
             if let Some(control) = &control {
                 control.emit_event(SessionEvent::CompactionCompleted {
                     phase: "round",
-                    compacted: compaction.compacted,
-                    estimated_tokens_before: compaction.estimated_tokens_before,
-                    estimated_tokens_after: compaction.estimated_tokens_after,
-                    token_limit: compaction.token_limit,
+                    compacted: round_compaction.compacted,
+                    estimated_tokens_before: round_compaction.estimated_tokens_before,
+                    estimated_tokens_after: round_compaction.estimated_tokens_after,
+                    token_limit: round_compaction.token_limit,
                 });
             }
-            usage.add_assign(&compaction.usage);
-            messages = compaction.messages;
+            usage.add_assign(&round_compaction.usage);
+            compaction_stats.record_report(&round_compaction);
+            messages = round_compaction.messages;
         }
         if let Some(control) = &control {
             control.ensure_not_cancelled()?;
@@ -487,12 +522,16 @@ pub fn run_session_with_report_controlled(
                     total_tokens: usage.total_tokens,
                 });
             }
-            return Ok(SessionRunReport { messages, usage });
+            return Ok(SessionRunReport {
+                messages,
+                usage,
+                compaction: compaction_stats,
+            });
         }
 
         if let Some(control) = &control {
             control.ensure_not_cancelled()?;
-            apply_pending_prefix_rewrite(control, &mut messages, &mut usage);
+            apply_pending_prefix_rewrite(control, &mut messages, &mut usage, &mut compaction_stats);
             control.set_stable_prefix_messages(&messages);
             for tool_call in &tool_calls {
                 control.emit_event(SessionEvent::ToolCallStarted {
@@ -547,8 +586,9 @@ pub fn run_session_with_report_controlled(
                 rewrite.expected_prefix,
                 rewrite.replacement_prefix,
                 rewrite.usage,
+                rewrite.compaction,
             );
-            apply_pending_prefix_rewrite(control, &mut messages, &mut usage);
+            apply_pending_prefix_rewrite(control, &mut messages, &mut usage, &mut compaction_stats);
         }
 
         let timeout_observation_requested = control
@@ -657,10 +697,13 @@ fn start_pending_tool_wait_compaction(
         if !report.compacted {
             return Ok(None);
         }
+        let mut compaction = SessionCompactionStats::default();
+        compaction.record_report(&report);
         Ok(Some(PendingPrefixRewrite {
             expected_prefix: stable_prefix,
             replacement_prefix: report.messages,
             usage: report.usage,
+            compaction,
         }))
     });
 
@@ -687,6 +730,7 @@ fn apply_pending_prefix_rewrite(
     control: &SessionExecutionControl,
     messages: &mut Vec<ChatMessage>,
     usage: &mut TokenUsage,
+    compaction_stats: &mut SessionCompactionStats,
 ) {
     let Some(rewrite) = control.take_pending_prefix_rewrite() else {
         return;
@@ -699,6 +743,19 @@ fn apply_pending_prefix_rewrite(
     next_messages.extend(tail);
     *messages = next_messages;
     usage.add_assign(&rewrite.usage);
+    compaction_stats.run_count = compaction_stats
+        .run_count
+        .saturating_add(rewrite.compaction.run_count);
+    compaction_stats.compacted_run_count = compaction_stats
+        .compacted_run_count
+        .saturating_add(rewrite.compaction.compacted_run_count);
+    compaction_stats.estimated_tokens_before = compaction_stats
+        .estimated_tokens_before
+        .saturating_add(rewrite.compaction.estimated_tokens_before);
+    compaction_stats.estimated_tokens_after = compaction_stats
+        .estimated_tokens_after
+        .saturating_add(rewrite.compaction.estimated_tokens_after);
+    compaction_stats.usage.add_assign(&rewrite.compaction.usage);
     control.emit_event(SessionEvent::PrefixRewriteApplied {
         previous_prefix_message_count: rewrite.expected_prefix.len(),
         replacement_prefix_message_count: rewrite.replacement_prefix.len(),
@@ -952,6 +1009,7 @@ pub fn compact_session_messages_with_report(
         &config.runtime_state_root,
         &config.upstream,
         config.image_tool_upstream.as_ref(),
+        &config.skills_dirs,
         &discovered_skills,
         &extra_tools,
     )?;

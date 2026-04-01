@@ -1,4 +1,5 @@
 use agent_frame::ChatMessage;
+use agent_frame::SessionCompactionStats;
 use agent_host::agent_status::{
     AgentRegistry, ManagedAgentKind, ManagedAgentRecord, ManagedAgentState,
 };
@@ -131,6 +132,22 @@ fn session_manager_restores_persisted_foreground_session_after_restart() {
                 &address,
                 vec![ChatMessage::text("assistant", "persist me")],
                 &usage,
+                &SessionCompactionStats {
+                    run_count: 1,
+                    compacted_run_count: 1,
+                    estimated_tokens_before: 1000,
+                    estimated_tokens_after: 600,
+                    usage: agent_frame::TokenUsage {
+                        llm_calls: 1,
+                        prompt_tokens: 120,
+                        completion_tokens: 20,
+                        total_tokens: 140,
+                        cache_hit_tokens: 0,
+                        cache_miss_tokens: 120,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                    },
+                },
             )
             .unwrap();
         manager.get_snapshot(&address).unwrap()
@@ -150,6 +167,10 @@ fn session_manager_restores_persisted_foreground_session_after_restart() {
     assert_eq!(restored.cumulative_usage.prompt_tokens, 123);
     assert_eq!(restored.cumulative_usage.completion_tokens, 45);
     assert_eq!(restored.cumulative_usage.total_tokens, 168);
+    assert_eq!(restored.cumulative_compaction.run_count, 1);
+    assert_eq!(restored.cumulative_compaction.compacted_run_count, 1);
+    assert_eq!(restored.cumulative_compaction.estimated_tokens_before, 1000);
+    assert_eq!(restored.cumulative_compaction.estimated_tokens_after, 600);
     assert!(restored.last_agent_returned_at.is_some());
     assert_eq!(
         restored.agent_messages,
@@ -176,6 +197,7 @@ fn session_manager_persists_idle_compaction_metadata_after_restart() {
                 &address,
                 vec![ChatMessage::text("assistant", "before compact")],
                 &agent_frame::TokenUsage::default(),
+                &SessionCompactionStats::default(),
             )
             .unwrap();
         manager
@@ -185,6 +207,7 @@ fn session_manager_persists_idle_compaction_metadata_after_restart() {
                     "assistant",
                     "[AgentFrame Context Compression]\n\ncompressed",
                 )],
+                &SessionCompactionStats::default(),
             )
             .unwrap();
         manager.get_snapshot(&address).unwrap()

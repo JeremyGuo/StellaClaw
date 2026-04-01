@@ -1,6 +1,6 @@
 use crate::domain::{ChannelAddress, MessageRole, SessionMessage, StoredAttachment};
 use crate::workspace::WorkspaceManager;
-use agent_frame::{ChatMessage, TokenUsage};
+use agent_frame::{ChatMessage, SessionCompactionStats, TokenUsage};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,7 @@ pub struct SessionSnapshot {
     pub turn_count: u64,
     pub last_compacted_turn_count: u64,
     pub cumulative_usage: TokenUsage,
+    pub cumulative_compaction: SessionCompactionStats,
     pub api_timeout_override_seconds: Option<f64>,
     pub pending_workspace_summary: bool,
     pub close_after_summary: bool,
@@ -48,6 +49,7 @@ struct Session {
     turn_count: u64,
     last_compacted_turn_count: u64,
     cumulative_usage: TokenUsage,
+    cumulative_compaction: SessionCompactionStats,
     api_timeout_override_seconds: Option<f64>,
     pending_workspace_summary: bool,
     close_after_summary: bool,
@@ -76,6 +78,7 @@ impl Session {
             turn_count: self.turn_count,
             last_compacted_turn_count: self.last_compacted_turn_count,
             cumulative_usage: self.cumulative_usage.clone(),
+            cumulative_compaction: self.cumulative_compaction.clone(),
             api_timeout_override_seconds: self.api_timeout_override_seconds,
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
@@ -108,6 +111,7 @@ impl Session {
             turn_count: self.turn_count,
             last_compacted_turn_count: self.last_compacted_turn_count,
             cumulative_usage: self.cumulative_usage.clone(),
+            cumulative_compaction: self.cumulative_compaction.clone(),
             api_timeout_override_seconds: self.api_timeout_override_seconds,
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
@@ -145,6 +149,7 @@ impl Session {
             turn_count: persisted.turn_count,
             last_compacted_turn_count: persisted.last_compacted_turn_count,
             cumulative_usage: persisted.cumulative_usage,
+            cumulative_compaction: persisted.cumulative_compaction,
             api_timeout_override_seconds: persisted.api_timeout_override_seconds,
             pending_workspace_summary: persisted.pending_workspace_summary,
             close_after_summary: persisted.close_after_summary,
@@ -174,6 +179,8 @@ struct PersistedSession {
     last_compacted_turn_count: u64,
     #[serde(default)]
     cumulative_usage: TokenUsage,
+    #[serde(default)]
+    cumulative_compaction: SessionCompactionStats,
     #[serde(default)]
     api_timeout_override_seconds: Option<f64>,
     #[serde(default)]
@@ -393,6 +400,7 @@ impl SessionManager {
         address: &ChannelAddress,
         messages: Vec<ChatMessage>,
         usage: &TokenUsage,
+        compaction: &SessionCompactionStats,
     ) -> Result<()> {
         let key = address.session_key();
         let session = self
@@ -403,6 +411,26 @@ impl SessionManager {
         session.last_agent_returned_at = Some(Utc::now());
         session.turn_count = session.turn_count.saturating_add(1);
         session.cumulative_usage.add_assign(usage);
+        session.cumulative_compaction.run_count = session
+            .cumulative_compaction
+            .run_count
+            .saturating_add(compaction.run_count);
+        session.cumulative_compaction.compacted_run_count = session
+            .cumulative_compaction
+            .compacted_run_count
+            .saturating_add(compaction.compacted_run_count);
+        session.cumulative_compaction.estimated_tokens_before = session
+            .cumulative_compaction
+            .estimated_tokens_before
+            .saturating_add(compaction.estimated_tokens_before);
+        session.cumulative_compaction.estimated_tokens_after = session
+            .cumulative_compaction
+            .estimated_tokens_after
+            .saturating_add(compaction.estimated_tokens_after);
+        session
+            .cumulative_compaction
+            .usage
+            .add_assign(&compaction.usage);
         info!(
             log_stream = "session",
             log_key = %session.id,
@@ -419,6 +447,7 @@ impl SessionManager {
         &mut self,
         address: &ChannelAddress,
         messages: Vec<ChatMessage>,
+        compaction: &SessionCompactionStats,
     ) -> Result<()> {
         let key = address.session_key();
         let session = self
@@ -428,6 +457,26 @@ impl SessionManager {
         session.agent_messages = messages;
         session.last_compacted_at = Some(Utc::now());
         session.last_compacted_turn_count = session.turn_count;
+        session.cumulative_compaction.run_count = session
+            .cumulative_compaction
+            .run_count
+            .saturating_add(compaction.run_count);
+        session.cumulative_compaction.compacted_run_count = session
+            .cumulative_compaction
+            .compacted_run_count
+            .saturating_add(compaction.compacted_run_count);
+        session.cumulative_compaction.estimated_tokens_before = session
+            .cumulative_compaction
+            .estimated_tokens_before
+            .saturating_add(compaction.estimated_tokens_before);
+        session.cumulative_compaction.estimated_tokens_after = session
+            .cumulative_compaction
+            .estimated_tokens_after
+            .saturating_add(compaction.estimated_tokens_after);
+        session
+            .cumulative_compaction
+            .usage
+            .add_assign(&compaction.usage);
         info!(
             log_stream = "session",
             log_key = %session.id,
@@ -498,6 +547,7 @@ impl SessionManager {
             turn_count: 0,
             last_compacted_turn_count: 0,
             cumulative_usage: TokenUsage::default(),
+            cumulative_compaction: SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             pending_workspace_summary: false,
             close_after_summary: false,
@@ -542,6 +592,7 @@ impl SessionManager {
             turn_count: 0,
             last_compacted_turn_count: 0,
             cumulative_usage: TokenUsage::default(),
+            cumulative_compaction: SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             pending_workspace_summary: false,
             close_after_summary: false,

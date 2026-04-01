@@ -39,6 +39,26 @@ fn parse_frontmatter(text: &str) -> Vec<(String, String)> {
     pairs
 }
 
+pub fn validate_skill_markdown(text: &str) -> Result<(String, String)> {
+    let frontmatter = parse_frontmatter(text);
+    if frontmatter.is_empty() {
+        return Err(anyhow!(
+            "SKILL.md must begin with YAML frontmatter delimited by ---"
+        ));
+    }
+    let name = frontmatter
+        .iter()
+        .find_map(|(key, value)| (key == "name").then_some(value.clone()))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("SKILL.md frontmatter must include a non-empty name"))?;
+    let description = frontmatter
+        .iter()
+        .find_map(|(key, value)| (key == "description").then_some(value.clone()))
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow!("SKILL.md frontmatter must include a non-empty description"))?;
+    Ok((name, description))
+}
+
 fn iter_skill_dirs(candidate_roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut discovered = Vec::new();
     for root in candidate_roots {
@@ -101,7 +121,7 @@ pub fn build_skills_meta_prompt(skills: &[SkillMetadata]) -> String {
     let mut lines = vec![
         "[AgentFrame Skills]".to_string(),
         "Codex-style skills are available. Only metadata is preloaded here.".to_string(),
-        "When a request matches a skill by name or description, call load_skill before using it."
+        "When a request matches a skill by name or description, call skill_load before using it."
             .to_string(),
         "After opening a skill, follow its instructions and only read referenced files that are actually needed."
             .to_string(),

@@ -7,6 +7,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+fn zgent_checkout_available() -> bool {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../zgent/crates/zgent-core/Cargo.toml")
+        .is_file()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BotCommandConfig {
     pub command: String,
@@ -296,6 +302,21 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
                 model_name
             ));
         }
+        if model.backend == AgentBackendKind::Zgent {
+            if !zgent_checkout_available() {
+                return Err(anyhow!(
+                    "model '{}' uses zgent backend but the local zgent checkout is unavailable",
+                    model_name
+                ));
+            }
+            if model.chat_completions_path != default_chat_completions_path() {
+                return Err(anyhow!(
+                    "model '{}' uses zgent backend but chat_completions_path must be '{}'",
+                    model_name,
+                    default_chat_completions_path()
+                ));
+            }
+        }
         if let Some(image_tool_model) = &model.image_tool_model
             && image_tool_model != "self"
             && !config.models.contains_key(image_tool_model)
@@ -389,6 +410,7 @@ fn validate_bot_commands(commands: &[BotCommandConfig]) -> Result<()> {
 mod tests {
     use super::{
         ChannelConfig, default_bot_commands, load_server_config_file, resolve_model_api_keys,
+        zgent_checkout_available,
     };
     use crate::backend::AgentBackendKind;
     use std::fs;
@@ -606,6 +628,49 @@ mod tests {
 
         let config = load_server_config_file(&config_path).unwrap();
         assert_eq!(config.models["main"].backend, AgentBackendKind::AgentFrame);
+    }
+
+    #[test]
+    fn zgent_backend_rejects_custom_chat_completions_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "models": {
+                "main": {
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-model",
+                  "backend": "zgent",
+                  "chat_completions_path": "/custom/chat",
+                  "description": "demo"
+                }
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let error = load_server_config_file(&config_path).unwrap_err();
+        if zgent_checkout_available() {
+            assert!(error.to_string().contains("chat_completions_path"));
+        } else {
+            assert!(
+                error
+                    .to_string()
+                    .contains("local zgent checkout is unavailable")
+            );
+        }
     }
 
     #[test]
