@@ -125,6 +125,7 @@ fn run_zgent_session_with_report_controlled(
     let registry = build_tool_registry_with_cancel(
         &tool_config.enabled_tools,
         &tool_config.workspace_root,
+        &tool_config.runtime_state_root,
         &tool_config.upstream,
         tool_config.image_tool_upstream.as_ref(),
         &discovered_skills,
@@ -597,6 +598,7 @@ mod tests {
             skills_dirs: Vec::new(),
             system_prompt: "You are a test backend.".to_string(),
             max_tool_roundtrips: 4,
+            runtime_state_root: workspace_root.clone(),
             workspace_root,
             enable_context_compression: false,
             effective_context_window_percent: 0.9,

@@ -1,9 +1,0 @@
-{
-  "exec_id": "8cc5153e-7766-4e3a-ae3d-cfef34db4815",
-  "pid": 35766,
-  "command": "sleep 10",
-  "cwd": ".",
-  "stdout_path": "./.agent_frame/processes/8cc5153e-7766-4e3a-ae3d-cfef34db4815.stdout",
-  "stderr_path": "./.agent_frame/processes/8cc5153e-7766-4e3a-ae3d-cfef34db4815.stderr",
-  "exit_code_path": "./.agent_frame/processes/8cc5153e-7766-4e3a-ae3d-cfef34db4815.exit"
-}

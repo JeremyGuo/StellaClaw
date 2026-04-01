@@ -92,6 +92,7 @@ pub struct AgentConfig {
     #[serde(default = "default_max_tool_roundtrips")]
     pub max_tool_roundtrips: usize,
     pub workspace_root: PathBuf,
+    pub runtime_state_root: PathBuf,
     #[serde(default = "default_enable_context_compression")]
     pub enable_context_compression: bool,
     #[serde(default = "default_effective_context_window_percent")]
@@ -117,6 +118,8 @@ struct AgentConfigRaw {
     max_tool_roundtrips: usize,
     #[serde(default)]
     workspace_root: Option<String>,
+    #[serde(default)]
+    runtime_state_root: Option<String>,
     #[serde(default = "default_enable_context_compression")]
     enable_context_compression: bool,
     #[serde(default = "default_effective_context_window_percent")]
@@ -266,11 +269,23 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
         ));
     }
 
+    let workspace_root_explicit = raw.workspace_root.is_some();
     let workspace_root = raw
         .workspace_root
         .as_deref()
         .map(|value| resolve_path(value, base_dir))
         .unwrap_or_else(|| base_dir.to_path_buf());
+    let runtime_state_root = raw
+        .runtime_state_root
+        .as_deref()
+        .map(|value| resolve_path(value, base_dir))
+        .unwrap_or_else(|| {
+            if workspace_root_explicit {
+                workspace_root.clone()
+            } else {
+                std::env::temp_dir().join("agent_frame")
+            }
+        });
 
     Ok(AgentConfig {
         enabled_tools: raw.enabled_tools,
@@ -284,6 +299,7 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
         system_prompt: raw.system_prompt,
         max_tool_roundtrips: raw.max_tool_roundtrips,
         workspace_root,
+        runtime_state_root,
         enable_context_compression: raw.enable_context_compression,
         effective_context_window_percent: raw.effective_context_window_percent,
         auto_compact_token_limit: raw.auto_compact_token_limit,

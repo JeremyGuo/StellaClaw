@@ -260,6 +260,7 @@ fn builtin_tools_work() -> Result<()> {
             "image".to_string(),
         ],
         temp_dir.path(),
+        temp_dir.path(),
         &upstream,
         None,
         &[],
@@ -471,6 +472,7 @@ fn exec_processes_report_clear_error_after_runtime_shutdown() -> Result<()> {
             "exec_wait".to_string(),
         ],
         temp_dir.path(),
+        temp_dir.path(),
         &test_upstream("http://127.0.0.1:1"),
         None,
         &[],
@@ -524,6 +526,7 @@ fn load_skill_tool_hides_paths_but_can_read_skill_content() -> Result<()> {
     let registry = build_tool_registry(
         &[],
         temp_dir.path(),
+        temp_dir.path(),
         &test_upstream("http://127.0.0.1:1"),
         None,
         &skills,
@@ -551,6 +554,7 @@ fn native_web_search_disables_external_web_search_tool() -> Result<()> {
     });
     let registry = build_tool_registry(
         &["web_search".to_string(), "web_fetch".to_string()],
+        temp_dir.path(),
         temp_dir.path(),
         &upstream,
         None,

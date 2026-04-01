@@ -463,12 +463,12 @@ fn edit_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>)
     )
 }
 
-fn process_state_dir(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".agent_frame").join("processes")
+fn process_state_dir(runtime_state_root: &Path) -> PathBuf {
+    runtime_state_root.join("agent_frame").join("processes")
 }
 
-fn ensure_process_state_dir(workspace_root: &Path) -> Result<PathBuf> {
-    let path = process_state_dir(workspace_root);
+fn ensure_process_state_dir(runtime_state_root: &Path) -> Result<PathBuf> {
+    let path = process_state_dir(runtime_state_root);
     fs::create_dir_all(&path).with_context(|| format!("failed to create {}", path.display()))?;
     Ok(path)
 }
@@ -835,7 +835,11 @@ fn wait_for_managed_process(
     }))
 }
 
-fn exec_start_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+fn exec_start_tool(
+    workspace_root: PathBuf,
+    runtime_state_root: PathBuf,
+    cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
     Tool::new(
         "exec_start",
         "Start a shell command. Wait for at most wait_timeout_seconds before returning. If it finishes in time, return the result immediately. Otherwise keep it running and return an exec_id.",
@@ -869,7 +873,7 @@ fn exec_start_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSig
                 .and_then(Value::as_str)
                 .map(|value| resolve_path(value, &workspace_root))
                 .unwrap_or_else(|| workspace_root.clone());
-            let state_dir = ensure_process_state_dir(&workspace_root)?;
+            let state_dir = ensure_process_state_dir(&runtime_state_root)?;
             let metadata = spawn_managed_process(&state_dir, &command, &cwd)?;
             let mut result = wait_for_managed_process(
                 &state_dir,
@@ -893,7 +897,10 @@ fn exec_start_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSig
     )
 }
 
-fn exec_observe_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+fn exec_observe_tool(
+    runtime_state_root: PathBuf,
+    cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
     Tool::new(
         "exec_observe",
         "Observe the latest output of a previously started exec process by exec_id. start=0 and limit=2 means the last two lines.",
@@ -914,14 +921,14 @@ fn exec_observe_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptS
             let exec_id = string_arg(arguments, "exec_id")?;
             let start = usize_arg_with_default(arguments, "start", 0)?;
             let limit = usize_arg_with_default(arguments, "limit", 20)?;
-            let state_dir = ensure_process_state_dir(&workspace_root)?;
+            let state_dir = ensure_process_state_dir(&runtime_state_root)?;
             let _ = &cancel_flag;
             read_process_snapshot(&state_dir, &exec_id, start, limit)
         },
     )
 }
 
-fn exec_wait_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+fn exec_wait_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "exec_wait",
         "Wait on a previously started exec process by exec_id. Optionally write input to stdin before waiting. If the process does not finish before wait_timeout_seconds, return immediately and leave it running.",
@@ -955,7 +962,7 @@ fn exec_wait_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSign
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
             let mut result = wait_for_managed_process(
-                &ensure_process_state_dir(&workspace_root)?,
+                &ensure_process_state_dir(&runtime_state_root)?,
                 &exec_id,
                 wait_timeout_seconds,
                 input.as_deref(),
@@ -976,7 +983,7 @@ fn exec_wait_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSign
     )
 }
 
-fn exec_kill_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+fn exec_kill_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "exec_kill",
         "Immediately stop a previously started exec process by exec_id.",
@@ -993,7 +1000,7 @@ fn exec_kill_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSign
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let exec_id = string_arg(arguments, "exec_id")?;
-            let _state_dir = ensure_process_state_dir(&workspace_root)?;
+            let _state_dir = ensure_process_state_dir(&runtime_state_root)?;
             let _ = &cancel_flag;
             let metadata = {
                 let mut registry = live_processes().lock().unwrap();
@@ -1026,8 +1033,12 @@ fn exec_kill_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSign
     )
 }
 
-fn exec_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    let exec_start = exec_start_tool(workspace_root, cancel_flag);
+fn exec_tool(
+    workspace_root: PathBuf,
+    runtime_state_root: PathBuf,
+    cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
+    let exec_start = exec_start_tool(workspace_root, runtime_state_root, cancel_flag);
     Tool::new(
         "exec",
         "Deprecated alias for exec_start. Start a shell command and optionally wait for completion.",
@@ -1036,7 +1047,7 @@ fn exec_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>)
     )
 }
 
-fn process_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+fn process_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "process",
         "Deprecated compatibility wrapper around exec_observe and exec_kill.",
@@ -1062,7 +1073,7 @@ fn process_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal
                 .and_then(Value::as_str)
                 .or_else(|| arguments.get("process_id").and_then(Value::as_str))
                 .map(ToOwned::to_owned);
-            let state_dir = ensure_process_state_dir(&workspace_root)?;
+            let state_dir = ensure_process_state_dir(&runtime_state_root)?;
             match action.as_str() {
                 "list" => {
                     let mut items = Vec::new();
@@ -1100,15 +1111,17 @@ fn process_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal
                 }
                 "inspect" => {
                     let exec_id = exec_id.ok_or_else(|| anyhow!("missing exec_id"))?;
-                    exec_observe_tool(workspace_root.clone(), cancel_flag.clone()).invoke(json!({
-                        "exec_id": exec_id,
-                        "start": usize_arg_with_default(arguments, "start", 0)?,
-                        "limit": usize_arg_with_default(arguments, "limit", 20)?,
-                    }))
+                    exec_observe_tool(runtime_state_root.clone(), cancel_flag.clone()).invoke(
+                        json!({
+                            "exec_id": exec_id,
+                            "start": usize_arg_with_default(arguments, "start", 0)?,
+                            "limit": usize_arg_with_default(arguments, "limit", 20)?,
+                        }),
+                    )
                 }
                 "terminate" => {
                     let exec_id = exec_id.ok_or_else(|| anyhow!("missing exec_id"))?;
-                    exec_kill_tool(workspace_root.clone(), cancel_flag.clone()).invoke(json!({
+                    exec_kill_tool(runtime_state_root.clone(), cancel_flag.clone()).invoke(json!({
                         "exec_id": exec_id,
                     }))
                 }
@@ -1645,8 +1658,12 @@ fn web_search_tool(search_config: ExternalWebSearchConfig) -> Tool {
     )
 }
 
-fn run_shell_tool(workspace_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
-    let exec = exec_tool(workspace_root, cancel_flag);
+fn run_shell_tool(
+    workspace_root: PathBuf,
+    runtime_state_root: PathBuf,
+    cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
+    let exec = exec_tool(workspace_root, runtime_state_root, cancel_flag);
     Tool::new(
         "run_shell",
         "Deprecated alias for exec. Execute a shell command. The model must choose timeout_seconds.",
@@ -1705,6 +1722,7 @@ fn load_skill_tool(
 pub fn build_tool_registry(
     enabled_tools: &[String],
     workspace_root: &Path,
+    runtime_state_root: &Path,
     upstream: &UpstreamConfig,
     image_tool_upstream: Option<&UpstreamConfig>,
     skills: &[SkillMetadata],
@@ -1713,6 +1731,7 @@ pub fn build_tool_registry(
     build_tool_registry_with_cancel(
         enabled_tools,
         workspace_root,
+        runtime_state_root,
         upstream,
         image_tool_upstream,
         skills,
@@ -1724,6 +1743,7 @@ pub fn build_tool_registry(
 pub fn build_tool_registry_with_cancel(
     enabled_tools: &[String],
     workspace_root: &Path,
+    runtime_state_root: &Path,
     upstream: &UpstreamConfig,
     image_tool_upstream: Option<&UpstreamConfig>,
     skills: &[SkillMetadata],
@@ -1741,7 +1761,11 @@ pub fn build_tool_registry_with_cancel(
         ),
         (
             "run_shell".to_string(),
-            run_shell_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            run_shell_tool(
+                workspace_root.to_path_buf(),
+                runtime_state_root.to_path_buf(),
+                cancel_flag.clone(),
+            ),
         ),
         (
             "edit".to_string(),
@@ -1749,27 +1773,35 @@ pub fn build_tool_registry_with_cancel(
         ),
         (
             "exec_start".to_string(),
-            exec_start_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            exec_start_tool(
+                workspace_root.to_path_buf(),
+                runtime_state_root.to_path_buf(),
+                cancel_flag.clone(),
+            ),
         ),
         (
             "exec_observe".to_string(),
-            exec_observe_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            exec_observe_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
         ),
         (
             "exec_wait".to_string(),
-            exec_wait_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            exec_wait_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
         ),
         (
             "exec_kill".to_string(),
-            exec_kill_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            exec_kill_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
         ),
         (
             "exec".to_string(),
-            exec_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            exec_tool(
+                workspace_root.to_path_buf(),
+                runtime_state_root.to_path_buf(),
+                cancel_flag.clone(),
+            ),
         ),
         (
             "process".to_string(),
-            process_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            process_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
         ),
         (
             "apply_patch".to_string(),

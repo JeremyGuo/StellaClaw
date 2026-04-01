@@ -380,6 +380,7 @@ pub fn run_session_with_report_controlled(
     let registry = build_tool_registry_with_cancel(
         &config.enabled_tools,
         &config.workspace_root,
+        &config.runtime_state_root,
         &config.upstream,
         config.image_tool_upstream.as_ref(),
         &discovered_skills,
@@ -884,6 +885,7 @@ mod tests {
             system_prompt: "Test system prompt.".to_string(),
             max_tool_roundtrips: 4,
             workspace_root: PathBuf::from("."),
+            runtime_state_root: std::env::temp_dir().join("agent_frame_tests"),
             enable_context_compression: true,
             effective_context_window_percent: 0.9,
             auto_compact_token_limit: Some(40),
@@ -946,6 +948,7 @@ pub fn compact_session_messages_with_report(
     let registry = build_tool_registry(
         &config.enabled_tools,
         &config.workspace_root,
+        &config.runtime_state_root,
         &config.upstream,
         config.image_tool_upstream.as_ref(),
         &discovered_skills,

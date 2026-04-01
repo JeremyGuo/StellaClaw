@@ -1,9 +1,0 @@
-{
-  "exec_id": "3e13ab01-c697-4de3-8205-0b96d02bcc71",
-  "pid": 62813,
-  "command": "sleep 10",
-  "cwd": ".",
-  "stdout_path": "./.agent_frame/processes/3e13ab01-c697-4de3-8205-0b96d02bcc71.stdout",
-  "stderr_path": "./.agent_frame/processes/3e13ab01-c697-4de3-8205-0b96d02bcc71.stderr",
-  "exit_code_path": "./.agent_frame/processes/3e13ab01-c697-4de3-8205-0b96d02bcc71.exit"
-}

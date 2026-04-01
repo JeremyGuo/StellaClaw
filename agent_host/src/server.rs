@@ -506,6 +506,11 @@ impl ServerRuntime {
             ),
             max_tool_roundtrips: self.main_agent.max_tool_roundtrips,
             workspace_root: workspace_root.to_path_buf(),
+            runtime_state_root: self
+                .agent_workspace
+                .root_dir
+                .join("runtime")
+                .join(&session.workspace_id),
             enable_context_compression: self.main_agent.enable_context_compression,
             effective_context_window_percent: self.main_agent.effective_context_window_percent,
             auto_compact_token_limit: self.main_agent.auto_compact_token_limit,

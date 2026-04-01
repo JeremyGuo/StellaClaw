@@ -1,9 +1,0 @@
-{
-  "exec_id": "920a623e-67d7-42ab-99f0-2707ec2be1a4",
-  "pid": 62542,
-  "command": "sleep 10",
-  "cwd": ".",
-  "stdout_path": "./.agent_frame/processes/920a623e-67d7-42ab-99f0-2707ec2be1a4.stdout",
-  "stderr_path": "./.agent_frame/processes/920a623e-67d7-42ab-99f0-2707ec2be1a4.stderr",
-  "exit_code_path": "./.agent_frame/processes/920a623e-67d7-42ab-99f0-2707ec2be1a4.exit"
-}
