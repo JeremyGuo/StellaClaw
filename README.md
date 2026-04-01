@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🦀 ClawParty 2.0
+# 🦀 ClawParty
 
 **A Rust-based multi-agent host and next-generation agentic framework.**
 
@@ -28,7 +28,7 @@
 ## 📦 Repository Structure
 
 ```
-ClawParty2.0/
+ClawParty/
 ├── agent_frame/    # 🔧 Standalone agent runtime (tools, skills, compaction)
 ├── agent_host/     # 🚀 Long-running service host (channels, sessions, cron, recovery)
 ├── zgent/          # 🔌 Compatibility layer for zgent-core
