@@ -1,6 +1,6 @@
 use crate::domain::{ChannelAddress, MessageRole, SessionMessage, StoredAttachment};
 use crate::workspace::WorkspaceManager;
-use agent_frame::ChatMessage;
+use agent_frame::{ChatMessage, TokenUsage};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,8 @@ pub struct SessionSnapshot {
     pub last_compacted_at: Option<DateTime<Utc>>,
     pub turn_count: u64,
     pub last_compacted_turn_count: u64,
+    pub cumulative_usage: TokenUsage,
+    pub api_timeout_override_seconds: Option<f64>,
     pub pending_workspace_summary: bool,
     pub close_after_summary: bool,
 }
@@ -45,6 +47,8 @@ struct Session {
     last_compacted_at: Option<DateTime<Utc>>,
     turn_count: u64,
     last_compacted_turn_count: u64,
+    cumulative_usage: TokenUsage,
+    api_timeout_override_seconds: Option<f64>,
     pending_workspace_summary: bool,
     close_after_summary: bool,
     closed_at: Option<DateTime<Utc>>,
@@ -71,6 +75,8 @@ impl Session {
             last_compacted_at: self.last_compacted_at,
             turn_count: self.turn_count,
             last_compacted_turn_count: self.last_compacted_turn_count,
+            cumulative_usage: self.cumulative_usage.clone(),
+            api_timeout_override_seconds: self.api_timeout_override_seconds,
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
         }
@@ -101,6 +107,8 @@ impl Session {
             last_compacted_at: self.last_compacted_at,
             turn_count: self.turn_count,
             last_compacted_turn_count: self.last_compacted_turn_count,
+            cumulative_usage: self.cumulative_usage.clone(),
+            api_timeout_override_seconds: self.api_timeout_override_seconds,
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
             closed_at: self.closed_at,
@@ -136,6 +144,8 @@ impl Session {
             last_compacted_at: persisted.last_compacted_at,
             turn_count: persisted.turn_count,
             last_compacted_turn_count: persisted.last_compacted_turn_count,
+            cumulative_usage: persisted.cumulative_usage,
+            api_timeout_override_seconds: persisted.api_timeout_override_seconds,
             pending_workspace_summary: persisted.pending_workspace_summary,
             close_after_summary: persisted.close_after_summary,
             closed_at: persisted.closed_at,
@@ -162,6 +172,10 @@ struct PersistedSession {
     turn_count: u64,
     #[serde(default)]
     last_compacted_turn_count: u64,
+    #[serde(default)]
+    cumulative_usage: TokenUsage,
+    #[serde(default)]
+    api_timeout_override_seconds: Option<f64>,
     #[serde(default)]
     pending_workspace_summary: bool,
     #[serde(default)]
@@ -359,10 +373,26 @@ impl SessionManager {
         Ok(())
     }
 
+    pub fn set_api_timeout_override(
+        &mut self,
+        address: &ChannelAddress,
+        timeout_seconds: Option<f64>,
+    ) -> Result<()> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        session.api_timeout_override_seconds = timeout_seconds;
+        session.persist()?;
+        Ok(())
+    }
+
     pub fn record_agent_turn(
         &mut self,
         address: &ChannelAddress,
         messages: Vec<ChatMessage>,
+        usage: &TokenUsage,
     ) -> Result<()> {
         let key = address.session_key();
         let session = self
@@ -372,6 +402,7 @@ impl SessionManager {
         session.agent_messages = messages;
         session.last_agent_returned_at = Some(Utc::now());
         session.turn_count = session.turn_count.saturating_add(1);
+        session.cumulative_usage.add_assign(usage);
         info!(
             log_stream = "session",
             log_key = %session.id,
@@ -466,6 +497,8 @@ impl SessionManager {
             last_compacted_at: None,
             turn_count: 0,
             last_compacted_turn_count: 0,
+            cumulative_usage: TokenUsage::default(),
+            api_timeout_override_seconds: None,
             pending_workspace_summary: false,
             close_after_summary: false,
             closed_at: None,
@@ -481,7 +514,9 @@ impl SessionManager {
     ) -> Result<Session> {
         let session_id = Uuid::new_v4();
         let agent_id = Uuid::new_v4();
-        let workspace = self.workspace_manager.ensure_workspace_exists(workspace_id)?;
+        let workspace = self
+            .workspace_manager
+            .ensure_workspace_exists(workspace_id)?;
         let root_dir = self.sessions_root.join(session_id.to_string());
         fs::create_dir_all(&root_dir)
             .with_context(|| format!("failed to create session root {}", root_dir.display()))?;
@@ -506,6 +541,8 @@ impl SessionManager {
             last_compacted_at: None,
             turn_count: 0,
             last_compacted_turn_count: 0,
+            cumulative_usage: TokenUsage::default(),
+            api_timeout_override_seconds: None,
             pending_workspace_summary: false,
             close_after_summary: false,
             closed_at: None,
@@ -583,7 +620,9 @@ fn load_single_session(
     let (workspace_id, workspace_root) = match persisted.workspace_id.as_deref() {
         Some(workspace_id) => (
             workspace_id.to_string(),
-            workspace_manager.ensure_workspace_exists(workspace_id)?.files_dir,
+            workspace_manager
+                .ensure_workspace_exists(workspace_id)?
+                .files_dir,
         ),
         None => {
             let workspace = workspace_manager.create_workspace(

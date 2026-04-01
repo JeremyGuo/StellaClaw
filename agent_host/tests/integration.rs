@@ -42,8 +42,15 @@ async fn session_uploads_are_materialized_into_workspace_upload_directory() {
         .await
         .unwrap();
     assert!(stored.path.exists());
-    assert_eq!(session.attachments_dir, session.workspace_root.join("upload"));
-    assert!(stored.path.starts_with(session.workspace_root.join("upload")));
+    assert_eq!(
+        session.attachments_dir,
+        session.workspace_root.join("upload")
+    );
+    assert!(
+        stored
+            .path
+            .starts_with(session.workspace_root.join("upload"))
+    );
 }
 
 #[test]
@@ -113,7 +120,18 @@ fn session_manager_restores_persisted_foreground_session_after_restart() {
             .append_user_message(&address, Some("hello".to_string()), Vec::new())
             .unwrap();
         manager
-            .record_agent_turn(&address, vec![ChatMessage::text("assistant", "persist me")])
+            .set_api_timeout_override(&address, Some(321.0))
+            .unwrap();
+        let mut usage = agent_frame::TokenUsage::default();
+        usage.prompt_tokens = 123;
+        usage.completion_tokens = 45;
+        usage.total_tokens = 168;
+        manager
+            .record_agent_turn(
+                &address,
+                vec![ChatMessage::text("assistant", "persist me")],
+                &usage,
+            )
             .unwrap();
         manager.get_snapshot(&address).unwrap()
     };
@@ -128,6 +146,10 @@ fn session_manager_restores_persisted_foreground_session_after_restart() {
     assert_eq!(restored.message_count, 1);
     assert_eq!(restored.agent_message_count, 1);
     assert_eq!(restored.turn_count, 1);
+    assert_eq!(restored.api_timeout_override_seconds, Some(321.0));
+    assert_eq!(restored.cumulative_usage.prompt_tokens, 123);
+    assert_eq!(restored.cumulative_usage.completion_tokens, 45);
+    assert_eq!(restored.cumulative_usage.total_tokens, 168);
     assert!(restored.last_agent_returned_at.is_some());
     assert_eq!(
         restored.agent_messages,
@@ -153,6 +175,7 @@ fn session_manager_persists_idle_compaction_metadata_after_restart() {
             .record_agent_turn(
                 &address,
                 vec![ChatMessage::text("assistant", "before compact")],
+                &agent_frame::TokenUsage::default(),
             )
             .unwrap();
         manager
@@ -252,7 +275,10 @@ fn session_manager_migrates_legacy_session_without_workspace_id() {
         user_id: Some("user-1".to_string()),
         display_name: Some("Telegram User".to_string()),
     };
-    let session_dir = temp_dir.path().join("sessions").join(session_id.to_string());
+    let session_dir = temp_dir
+        .path()
+        .join("sessions")
+        .join(session_id.to_string());
     std::fs::create_dir_all(&session_dir).unwrap();
     std::fs::write(
         session_dir.join("session.json"),

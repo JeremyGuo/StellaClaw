@@ -6,6 +6,7 @@
       "model": "anthropic/claude-opus-4.6",
       "supports_vision_input": true,
       "api_key_env": "OPENROUTER_API_KEY",
+      "timeout_seconds": 300,
       "cache_ttl": "5m",
       "context_window_tokens": 262144,
       "native_web_search": {

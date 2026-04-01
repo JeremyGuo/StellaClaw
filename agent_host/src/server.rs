@@ -2285,6 +2285,55 @@ impl Server {
             return Ok(());
         }
 
+        if incoming
+            .text
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|text| text == "/status")
+        {
+            let session = self.sessions.ensure_foreground(&incoming.address)?;
+            let status_text = self.status_text_for_session(&session)?;
+            channel
+                .send(&incoming.address, OutgoingMessage::text(status_text))
+                .await?;
+            return Ok(());
+        }
+
+        if incoming
+            .text
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|text| text.starts_with("/set_api_timeout"))
+            && parse_set_api_timeout_command(incoming.text.as_deref()).is_none()
+        {
+            let usage = "Usage: /set_api_timeout <seconds|default>\nExamples:\n/set_api_timeout 300\n/set_api_timeout default";
+            channel
+                .send(&incoming.address, OutgoingMessage::text(usage))
+                .await?;
+            return Ok(());
+        }
+
+        if let Some(argument) = parse_set_api_timeout_command(incoming.text.as_deref()) {
+            let session = self.sessions.ensure_foreground(&incoming.address)?;
+            let model_timeout_seconds =
+                self.model_upstream_timeout_seconds(&self.main_agent.model)?;
+            let (override_timeout, status_text) =
+                match format_api_timeout_update(&session, model_timeout_seconds, &argument) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.send_user_error_message(&channel, &incoming.address, &error)
+                            .await;
+                        return Err(error);
+                    }
+                };
+            self.sessions
+                .set_api_timeout_override(&incoming.address, override_timeout)?;
+            channel
+                .send(&incoming.address, OutgoingMessage::text(status_text))
+                .await?;
+            return Ok(());
+        }
+
         let session = self.sessions.ensure_foreground(&incoming.address)?;
         if session.agent_message_count == 0 {
             if let Err(error) = self.initialize_foreground_session(&session, false).await {
@@ -2336,7 +2385,7 @@ impl Server {
         let (messages, outgoing, usage, timed_out) = turn_result?;
 
         self.sessions
-            .record_agent_turn(&incoming.address, messages)
+            .record_agent_turn(&incoming.address, messages, &usage)
             .context("failed to persist agent_frame messages")?;
         self.sessions.append_user_message(
             &incoming.address,
@@ -2426,6 +2475,26 @@ impl Server {
         lines.join("\n")
     }
 
+    fn status_text_for_session(&self, session: &SessionSnapshot) -> Result<String> {
+        let model = self.main_model()?;
+        let effective_api_timeout = session
+            .api_timeout_override_seconds
+            .unwrap_or(model.timeout_seconds);
+        let timeout_source = if session.api_timeout_override_seconds.is_some() {
+            "session override"
+        } else {
+            "model default"
+        };
+        Ok(format_session_status(
+            &self.main_agent.language,
+            &self.main_agent.model,
+            model,
+            session,
+            effective_api_timeout,
+            timeout_source,
+        ))
+    }
+
     fn archive_stale_workspaces_if_needed(&self) -> Result<()> {
         let protected = self
             .sessions
@@ -2479,7 +2548,7 @@ impl Server {
             .await
             .context("failed to initialize foreground session")?;
         self.sessions
-            .record_agent_turn(&session.address, messages)?;
+            .record_agent_turn(&session.address, messages, &usage)?;
         self.log_turn_usage(session, &usage, true);
         if timed_out {
             warn!(
@@ -2676,8 +2745,9 @@ impl Server {
         let mut previous_messages = session.agent_messages.clone();
         previous_messages.push(next_user_message);
         let timeout_seconds = self.main_agent_timeout_seconds(&self.main_agent.model)?;
-        let upstream_timeout_seconds =
-            self.model_upstream_timeout_seconds(&self.main_agent.model)?;
+        let upstream_timeout_seconds = session
+            .api_timeout_override_seconds
+            .unwrap_or(self.model_upstream_timeout_seconds(&self.main_agent.model)?);
         let runtime = self.tool_runtime();
         let run_result = runtime
             .run_agent_turn_with_timeout(
@@ -3399,6 +3469,8 @@ fn create_detached_session_snapshot(
         last_compacted_at: None,
         turn_count: 0,
         last_compacted_turn_count: 0,
+        cumulative_usage: TokenUsage::default(),
+        api_timeout_override_seconds: None,
         pending_workspace_summary: false,
         close_after_summary: false,
     })
@@ -3460,13 +3532,29 @@ fn background_timeout_with_active_children_text(language: &str) -> String {
 
 fn user_facing_error_text(language: &str, error: &anyhow::Error) -> String {
     let language = language.to_ascii_lowercase();
+    let error_text = format!("{error:#}").to_ascii_lowercase();
     let timeout_like = is_timeout_like(error);
+    let upstream_timeout = timeout_like
+        && (error_text.contains("upstream")
+            || error_text.contains("response body")
+            || error_text.contains("chat completion")
+            || error_text.contains("operation timed out"));
+    let upstream_error = error_text.contains("upstream");
     if language.starts_with("zh") {
-        if timeout_like {
+        if upstream_timeout {
+            "这一轮请求上游模型超时了。通常是模型响应过慢或网络波动导致的。请稍后重试；如果反复出现，可以发送 /new 重新开始。".to_string()
+        } else if upstream_error {
+            "这一轮请求上游模型时失败了。请稍后重试；如果反复出现，可以发送 /new 重新开始。"
+                .to_string()
+        } else if timeout_like {
             "这一轮处理超时了。请稍后重试，或者发送 /new 重新开始。".to_string()
         } else {
             "这一轮处理失败了。请稍后重试，或者发送 /new 重新开始。".to_string()
         }
+    } else if upstream_timeout {
+        "This turn failed because the upstream model request timed out. Please try again; if it keeps happening, send /new to start over.".to_string()
+    } else if upstream_error {
+        "This turn failed while calling the upstream model. Please try again; if it keeps happening, send /new to start over.".to_string()
     } else if timeout_like {
         "This turn timed out. Please try again, or send /new to start over.".to_string()
     } else {
@@ -3474,9 +3562,162 @@ fn user_facing_error_text(language: &str, error: &anyhow::Error) -> String {
     }
 }
 
+fn format_session_status(
+    language: &str,
+    model_key: &str,
+    model: &ModelConfig,
+    session: &SessionSnapshot,
+    effective_api_timeout_seconds: f64,
+    timeout_source: &str,
+) -> String {
+    let usage = &session.cumulative_usage;
+    let cache_hit_rate = if usage.prompt_tokens == 0 {
+        0.0
+    } else {
+        (usage.cache_hit_tokens as f64 / usage.prompt_tokens as f64) * 100.0
+    };
+    let pricing = estimate_cost_usd(model, usage);
+    let language = language.to_ascii_lowercase();
+    if language.starts_with("zh") {
+        let mut lines = vec![
+            format!("Session: {}", session.id),
+            format!("Workspace: {}", session.workspace_id),
+            format!("Model: {} ({})", model_key, model.model),
+            format!(
+                "API timeout: {:.1}s ({})",
+                effective_api_timeout_seconds, timeout_source
+            ),
+            format!("Turns: {}", session.turn_count),
+            String::new(),
+            "Token 用量：".to_string(),
+            format!("- llm_calls: {}", usage.llm_calls),
+            format!("- prompt_tokens: {}", usage.prompt_tokens),
+            format!("- completion_tokens: {}", usage.completion_tokens),
+            format!("- total_tokens: {}", usage.total_tokens),
+            format!("- cache_hit_tokens: {}", usage.cache_hit_tokens),
+            format!("- cache_miss_tokens: {}", usage.cache_miss_tokens),
+            format!("- cache_read_tokens: {}", usage.cache_read_tokens),
+            format!("- cache_write_tokens: {}", usage.cache_write_tokens),
+            format!("- cache_hit_rate: {:.2}%", cache_hit_rate),
+        ];
+        if let Some((formula, total_usd)) = pricing {
+            lines.push(String::new());
+            lines.push("价格估算：".to_string());
+            lines.push(format!("- formula: {}", formula));
+            lines.push(format!("- estimated_total_usd: ${:.6}", total_usd));
+        } else {
+            lines.push(String::new());
+            lines.push("价格估算：当前模型没有内置价格表，无法直接估算。".to_string());
+        }
+        lines.join("\n")
+    } else {
+        let mut lines = vec![
+            format!("Session: {}", session.id),
+            format!("Workspace: {}", session.workspace_id),
+            format!("Model: {} ({})", model_key, model.model),
+            format!(
+                "API timeout: {:.1}s ({})",
+                effective_api_timeout_seconds, timeout_source
+            ),
+            format!("Turns: {}", session.turn_count),
+            String::new(),
+            "Token usage:".to_string(),
+            format!("- llm_calls: {}", usage.llm_calls),
+            format!("- prompt_tokens: {}", usage.prompt_tokens),
+            format!("- completion_tokens: {}", usage.completion_tokens),
+            format!("- total_tokens: {}", usage.total_tokens),
+            format!("- cache_hit_tokens: {}", usage.cache_hit_tokens),
+            format!("- cache_miss_tokens: {}", usage.cache_miss_tokens),
+            format!("- cache_read_tokens: {}", usage.cache_read_tokens),
+            format!("- cache_write_tokens: {}", usage.cache_write_tokens),
+            format!("- cache_hit_rate: {:.2}%", cache_hit_rate),
+        ];
+        if let Some((formula, total_usd)) = pricing {
+            lines.push(String::new());
+            lines.push("Estimated cost:".to_string());
+            lines.push(format!("- formula: {}", formula));
+            lines.push(format!("- estimated_total_usd: ${:.6}", total_usd));
+        } else {
+            lines.push(String::new());
+            lines.push(
+                "Estimated cost: unavailable for the current model pricing table.".to_string(),
+            );
+        }
+        lines.join("\n")
+    }
+}
+
+fn estimate_cost_usd(model: &ModelConfig, usage: &TokenUsage) -> Option<(String, f64)> {
+    let (input_per_million, output_per_million) = match (
+        model.api_endpoint.contains("openrouter.ai"),
+        model.model.as_str(),
+    ) {
+        (true, "anthropic/claude-opus-4.6") => (15.0, 75.0),
+        (true, "anthropic/claude-sonnet-4.6") => (3.0, 15.0),
+        (true, "qwen/qwen3.5-27b") => (0.195, 1.56),
+        _ => return None,
+    };
+    let cache_read_per_million = input_per_million * 0.1;
+    let cache_write_per_million = input_per_million * 1.25;
+    let uncached_input_tokens = usage
+        .cache_miss_tokens
+        .saturating_sub(usage.cache_write_tokens);
+    let total_usd = (usage.cache_read_tokens as f64 / 1_000_000.0) * cache_read_per_million
+        + (usage.cache_write_tokens as f64 / 1_000_000.0) * cache_write_per_million
+        + (uncached_input_tokens as f64 / 1_000_000.0) * input_per_million
+        + (usage.completion_tokens as f64 / 1_000_000.0) * output_per_million;
+    let formula = format!(
+        "cache_read_tokens * ${cache_read_per_million:.6}/1M + cache_write_tokens * ${cache_write_per_million:.6}/1M + (cache_miss_tokens - cache_write_tokens) * ${input_per_million:.6}/1M + completion_tokens * ${output_per_million:.6}/1M"
+    );
+    Some((formula, total_usd))
+}
+
+fn format_api_timeout_update(
+    session: &SessionSnapshot,
+    model_timeout_seconds: f64,
+    argument: &str,
+) -> Result<(Option<f64>, String)> {
+    let normalized = argument.trim().to_ascii_lowercase();
+    if normalized == "default" || normalized == "reset" || normalized == "0" {
+        return Ok((
+            None,
+            format!(
+                "API timeout reset for session {}. Effective timeout is now {:.1}s (model default).",
+                session.id, model_timeout_seconds
+            ),
+        ));
+    }
+    let timeout_seconds: f64 = argument
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid timeout value '{}'", argument.trim()))?;
+    if timeout_seconds <= 0.0 {
+        return Err(anyhow!(
+            "API timeout must be greater than 0 seconds, or use 0/default/reset to restore the model default"
+        ));
+    }
+    Ok((
+        Some(timeout_seconds),
+        format!(
+            "API timeout updated for session {}. Effective timeout is now {:.1}s (session override).",
+            session.id, timeout_seconds
+        ),
+    ))
+}
+
 fn parse_oldspace_command(text: Option<&str>) -> Option<String> {
     let text = text?.trim();
     let suffix = text.strip_prefix("/oldspace")?.trim();
+    if suffix.is_empty() {
+        None
+    } else {
+        Some(suffix.to_string())
+    }
+}
+
+fn parse_set_api_timeout_command(text: Option<&str>) -> Option<String> {
+    let text = text?.trim();
+    let suffix = text.strip_prefix("/set_api_timeout")?.trim();
     if suffix.is_empty() {
         None
     } else {
@@ -3786,10 +4027,11 @@ fn log_agent_frame_event(
 #[cfg(test)]
 mod tests {
     use super::{
-        SinkTarget, background_agent_timeout_seconds, background_recovery_timeout_seconds,
-        background_timeout_with_active_children_text, build_user_turn_message,
-        channel_restart_backoff_seconds, extract_attachment_references, is_timeout_like,
-        parse_oldspace_command, parse_sink_target, should_attempt_idle_context_compaction,
+        SinkTarget, TokenUsage, background_agent_timeout_seconds,
+        background_recovery_timeout_seconds, background_timeout_with_active_children_text,
+        build_user_turn_message, channel_restart_backoff_seconds, estimate_cost_usd,
+        extract_attachment_references, is_timeout_like, parse_oldspace_command,
+        parse_set_api_timeout_command, parse_sink_target, should_attempt_idle_context_compaction,
         workspace_visible_in_list,
     };
     use crate::backend::AgentBackendKind;
@@ -3942,6 +4184,8 @@ mod tests {
             last_compacted_at: None,
             turn_count: 2,
             last_compacted_turn_count: 1,
+            cumulative_usage: TokenUsage::default(),
+            api_timeout_override_seconds: None,
             pending_workspace_summary: false,
             close_after_summary: false,
         };
@@ -4009,6 +4253,59 @@ mod tests {
         );
         assert_eq!(parse_oldspace_command(Some("/oldspace")), None);
         assert_eq!(parse_oldspace_command(Some("hello")), None);
+    }
+
+    #[test]
+    fn parses_set_api_timeout_command_argument() {
+        assert_eq!(
+            parse_set_api_timeout_command(Some("/set_api_timeout 300")),
+            Some("300".to_string())
+        );
+        assert_eq!(
+            parse_set_api_timeout_command(Some("  /set_api_timeout   default ")),
+            Some("default".to_string())
+        );
+        assert_eq!(
+            parse_set_api_timeout_command(Some("/set_api_timeout")),
+            None
+        );
+        assert_eq!(parse_set_api_timeout_command(Some("hello")), None);
+    }
+
+    #[test]
+    fn estimates_openrouter_opus_cost_with_cache_formula() {
+        let model = ModelConfig {
+            api_endpoint: "https://openrouter.ai/api/v1".to_string(),
+            model: "anthropic/claude-opus-4.6".to_string(),
+            backend: AgentBackendKind::AgentFrame,
+            supports_vision_input: true,
+            image_tool_model: None,
+            api_key: None,
+            api_key_env: "OPENROUTER_API_KEY".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            timeout_seconds: 300.0,
+            context_window_tokens: 262_144,
+            cache_ttl: Some("5m".to_string()),
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            description: "demo".to_string(),
+            native_web_search: None,
+            external_web_search: None,
+        };
+        let usage = TokenUsage {
+            llm_calls: 1,
+            prompt_tokens: 10_000,
+            completion_tokens: 2_000,
+            total_tokens: 12_000,
+            cache_hit_tokens: 8_000,
+            cache_miss_tokens: 2_000,
+            cache_read_tokens: 8_000,
+            cache_write_tokens: 1_500,
+        };
+
+        let (formula, total_usd) = estimate_cost_usd(&model, &usage).unwrap();
+        assert!(formula.contains("cache_read_tokens"));
+        assert!(total_usd > 0.0);
     }
 
     #[test]

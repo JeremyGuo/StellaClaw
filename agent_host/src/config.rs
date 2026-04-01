@@ -212,6 +212,14 @@ pub fn default_bot_commands() -> Vec<BotCommandConfig> {
             command: "help".to_string(),
             description: "Show available commands".to_string(),
         },
+        BotCommandConfig {
+            command: "status".to_string(),
+            description: "Show current session usage and timeout settings".to_string(),
+        },
+        BotCommandConfig {
+            command: "set_api_timeout".to_string(),
+            description: "Set session API timeout in seconds".to_string(),
+        },
     ]
 }
 
