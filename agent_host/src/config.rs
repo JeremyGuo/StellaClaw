@@ -7,6 +7,12 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+fn zgent_checkout_available() -> bool {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../zgent/crates/zgent-core/Cargo.toml")
+        .is_file()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BotCommandConfig {
     pub command: String,
@@ -293,14 +299,12 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
             ));
         }
         if model.backend == AgentBackendKind::Zgent {
-            #[cfg(not(feature = "zgent-backend"))]
-            {
+            if !zgent_checkout_available() {
                 return Err(anyhow!(
-                    "model '{}' uses zgent backend but this build of agent_host does not include the 'zgent-backend' feature",
+                    "model '{}' uses zgent backend but the local zgent checkout is unavailable",
                     model_name
                 ));
             }
-            #[cfg(feature = "zgent-backend")]
             if model.chat_completions_path != default_chat_completions_path() {
                 return Err(anyhow!(
                     "model '{}' uses zgent backend but chat_completions_path must be '{}'",
@@ -402,6 +406,7 @@ fn validate_bot_commands(commands: &[BotCommandConfig]) -> Result<()> {
 mod tests {
     use super::{
         ChannelConfig, default_bot_commands, load_server_config_file, resolve_model_api_keys,
+        zgent_checkout_available,
     };
     use crate::backend::AgentBackendKind;
     use std::fs;
@@ -653,14 +658,15 @@ mod tests {
         .unwrap();
 
         let error = load_server_config_file(&config_path).unwrap_err();
-        #[cfg(feature = "zgent-backend")]
-        assert!(error.to_string().contains("chat_completions_path"));
-        #[cfg(not(feature = "zgent-backend"))]
-        assert!(
-            error
-                .to_string()
-                .contains("does not include the 'zgent-backend' feature")
-        );
+        if zgent_checkout_available() {
+            assert!(error.to_string().contains("chat_completions_path"));
+        } else {
+            assert!(
+                error
+                    .to_string()
+                    .contains("local zgent checkout is unavailable")
+            );
+        }
     }
 
     #[test]

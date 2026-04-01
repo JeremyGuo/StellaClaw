@@ -198,12 +198,12 @@ fn discover_skills_and_build_meta_prompt() -> Result<()> {
         "---\nname: demo-skill\ndescription: Demo workflow\n---\n\n# Demo\n",
     )?;
 
-    let skills = discover_skills(&[skill_root])?;
+    let skills = discover_skills(&[skill_root.clone()])?;
     assert_eq!(skills.len(), 1);
     assert_eq!(skills[0].name, "demo-skill");
     let prompt = build_skills_meta_prompt(&skills);
     assert!(prompt.contains("demo-skill"));
-    assert!(prompt.contains("load_skill"));
+    assert!(prompt.contains("skill_load"));
     assert!(!prompt.contains(&skill_dir.display().to_string()));
     Ok(())
 }
@@ -263,6 +263,7 @@ fn builtin_tools_work() -> Result<()> {
         temp_dir.path(),
         &upstream,
         None,
+        &[],
         &[],
         &[],
     )?;
@@ -477,6 +478,7 @@ fn exec_processes_report_clear_error_after_runtime_shutdown() -> Result<()> {
         None,
         &[],
         &[],
+        &[],
     )?;
 
     let started = execute_tool_call(
@@ -522,25 +524,108 @@ fn load_skill_tool_hides_paths_but_can_read_skill_content() -> Result<()> {
         "---\nname: demo-skill\ndescription: Demo workflow\n---\n\n# Demo\nUse this skill carefully.\n",
     )?;
 
-    let skills = discover_skills(&[skill_root])?;
+    let skills = discover_skills(&[skill_root.clone()])?;
     let registry = build_tool_registry(
         &[],
         temp_dir.path(),
         temp_dir.path(),
         &test_upstream("http://127.0.0.1:1"),
         None,
+        &[skill_root.clone()],
         &skills,
         &[],
     )?;
     let result = execute_tool_call(
         &registry,
-        "load_skill",
+        "skill_load",
         Some(r#"{"skill_name":"demo-skill","timeout_seconds":2}"#),
     );
 
     assert!(result.contains("\"name\": \"demo-skill\""));
     assert!(result.contains("Use this skill carefully."));
     assert!(!result.contains(&skill_dir.display().to_string()));
+    Ok(())
+}
+
+#[test]
+fn skill_create_persists_staged_skill_directory() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let skill_root = temp_dir.path().join("runtime-skills");
+    let staged_dir = temp_dir.path().join(".skills").join("demo-skill");
+    fs::create_dir_all(staged_dir.join("references"))?;
+    fs::write(
+        staged_dir.join("SKILL.md"),
+        "---\nname: demo-skill\ndescription: Demo workflow\n---\n\n# Demo\nUse this skill carefully.\n",
+    )?;
+    fs::write(staged_dir.join("references").join("note.txt"), "hello")?;
+
+    let registry = build_tool_registry(
+        &[],
+        temp_dir.path(),
+        temp_dir.path(),
+        &test_upstream("http://127.0.0.1:1"),
+        None,
+        &[skill_root.clone()],
+        &[],
+        &[],
+    )?;
+    let result = execute_tool_call(
+        &registry,
+        "skill_create",
+        Some(r#"{"skill_name":"demo-skill"}"#),
+    );
+
+    assert!(result.contains("\"created\": true"));
+    assert!(skill_root.join("demo-skill").join("SKILL.md").exists());
+    assert!(
+        skill_root
+            .join("demo-skill")
+            .join("references")
+            .join("note.txt")
+            .exists()
+    );
+    Ok(())
+}
+
+#[test]
+fn skill_update_validates_and_replaces_existing_skill_directory() -> Result<()> {
+    let temp_dir = TempDir::new()?;
+    let skill_root = temp_dir.path().join("runtime-skills");
+    let existing_dir = skill_root.join("demo-skill");
+    fs::create_dir_all(&existing_dir)?;
+    fs::write(
+        existing_dir.join("SKILL.md"),
+        "---\nname: demo-skill\ndescription: Old workflow\n---\n\n# Old\n",
+    )?;
+
+    let staged_dir = temp_dir.path().join(".skills").join("demo-skill");
+    fs::create_dir_all(&staged_dir)?;
+    fs::write(
+        staged_dir.join("SKILL.md"),
+        "---\nname: demo-skill\ndescription: New workflow\n---\n\n# New\nUpdated instructions.\n",
+    )?;
+
+    let skills = discover_skills(&[skill_root.clone()])?;
+    let registry = build_tool_registry(
+        &[],
+        temp_dir.path(),
+        temp_dir.path(),
+        &test_upstream("http://127.0.0.1:1"),
+        None,
+        &[skill_root.clone()],
+        &skills,
+        &[],
+    )?;
+    let result = execute_tool_call(
+        &registry,
+        "skill_update",
+        Some(r#"{"skill_name":"demo-skill"}"#),
+    );
+
+    assert!(result.contains("\"updated\": true"));
+    let persisted = fs::read_to_string(skill_root.join("demo-skill").join("SKILL.md"))?;
+    assert!(persisted.contains("New workflow"));
+    assert!(persisted.contains("Updated instructions."));
     Ok(())
 }
 
@@ -558,6 +643,7 @@ fn native_web_search_disables_external_web_search_tool() -> Result<()> {
         temp_dir.path(),
         &upstream,
         None,
+        &[],
         &[],
         &[],
     )?;
@@ -603,9 +689,16 @@ fn run_session_registers_load_skill_without_exposing_skill_paths() -> Result<()>
     assert_eq!(requests.len(), 1);
     let system_prompt = requests[0]["messages"][0]["content"].as_str().unwrap();
     assert!(system_prompt.contains("demo-skill"));
-    assert!(system_prompt.contains("load_skill"));
+    assert!(system_prompt.contains("skill_load"));
     assert!(!system_prompt.contains(&skill_dir.display().to_string()));
-    assert_eq!(requests[0]["tools"][0]["function"]["name"], "load_skill");
+    let tool_names = requests[0]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(tool_names.contains(&"skill_load".to_string()));
+    assert!(tool_names.contains(&"load_skill".to_string()));
     Ok(())
 }
 

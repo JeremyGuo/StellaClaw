@@ -3,13 +3,8 @@ name = "agent_host"
 version = "0.1.0"
 edition = "2024"
 
-[features]
-default = []
-zgent-backend = ["dep:zgent-core"]
-
 [dependencies]
 agent_frame = { path = "../agent_frame" }
-zgent-core = { path = "../zgent/crates/zgent-core", optional = true }
 anyhow = "1.0"
 async-trait = "0.1"
 base64 = "0.22"

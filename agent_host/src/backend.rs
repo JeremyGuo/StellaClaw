@@ -1,40 +1,31 @@
-#[cfg(feature = "zgent-backend")]
 use agent_frame::SessionCompactionStats;
 use agent_frame::compaction::ContextCompactionReport;
 use agent_frame::config::AgentConfig as FrameAgentConfig;
 use agent_frame::message::ChatMessage;
-#[cfg(feature = "zgent-backend")]
 use agent_frame::message::{FunctionCall as FrameFunctionCall, ToolCall as FrameToolCall};
-#[cfg(feature = "zgent-backend")]
 use agent_frame::skills::{build_skills_meta_prompt, discover_skills};
-#[cfg(feature = "zgent-backend")]
 use agent_frame::tooling::build_tool_registry_with_cancel;
 use agent_frame::{
     SessionExecutionControl, SessionRunReport, TokenUsage, Tool,
     compact_session_messages_with_report as frame_compact_session_messages_with_report,
     run_session_with_report_controlled as frame_run_session_with_report_controlled,
 };
-#[cfg(feature = "zgent-backend")]
 use anyhow::Context;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "zgent-backend")]
 use serde_json::Value;
-#[cfg(feature = "zgent-backend")]
 use serde_json::json;
-#[cfg(feature = "zgent-backend")]
 use std::collections::BTreeMap;
-#[cfg(feature = "zgent-backend")]
-use zgent_core::llm::{
-    ChatCompletionRequest as ZgentChatCompletionRequest, ChatMessage as ZgentChatMessage,
-    FunctionCall as ZgentFunctionCall, FunctionDefinition as ZgentFunctionDefinition,
-    ToolCall as ZgentToolCall, ToolDefinition as ZgentToolDefinition,
-};
+use std::path::Path;
 
-#[cfg(feature = "zgent-backend")]
 const ZGENT_COMPAT_MARKER: &str = "[AgentHost ZGent Compatibility Runtime]";
 
-#[cfg(feature = "zgent-backend")]
+fn zgent_checkout_available() -> bool {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../zgent/crates/zgent-core/Cargo.toml")
+        .is_file()
+}
+
 fn upstream_error_from_value(value: &Value) -> Option<String> {
     let error = value.get("error")?;
     match error {
@@ -58,6 +49,99 @@ fn upstream_error_from_value(value: &Value) -> Option<String> {
         }
         other => Some(other.to_string()),
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ZgentChatCompletionRequest {
+    model: String,
+    messages: Vec<ZgentChatMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ZgentToolDefinition>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    stream: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ZgentChatCompletionResponse {
+    choices: Vec<ZgentChoice>,
+    #[serde(default)]
+    usage: Option<ZgentUsage>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ZgentChoice {
+    message: ZgentChatMessage,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "role")]
+enum ZgentChatMessage {
+    #[serde(rename = "system")]
+    System {
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp: Option<String>,
+    },
+    #[serde(rename = "user")]
+    User {
+        content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp: Option<String>,
+    },
+    #[serde(rename = "assistant")]
+    Assistant {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        content: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tool_calls: Option<Vec<ZgentToolCall>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp: Option<String>,
+    },
+    #[serde(rename = "tool")]
+    Tool {
+        content: String,
+        tool_call_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        timestamp: Option<String>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ZgentToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    call_type: String,
+    function: ZgentFunctionCall,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ZgentFunctionCall {
+    name: String,
+    arguments: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ZgentToolDefinition {
+    #[serde(rename = "type")]
+    tool_type: String,
+    function: ZgentFunctionDefinition,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ZgentFunctionDefinition {
+    name: String,
+    description: String,
+    parameters: Value,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ZgentUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -88,13 +172,20 @@ pub fn run_session_with_report_controlled(
             extra_tools,
             control,
         ),
-        AgentBackendKind::Zgent => run_zgent_session_with_report_controlled(
-            previous_messages,
-            prompt.into(),
-            config,
-            extra_tools,
-            control,
-        ),
+        AgentBackendKind::Zgent => {
+            if !zgent_checkout_available() {
+                return Err(anyhow!(
+                    "the zgent backend is unavailable because the local zgent checkout is missing"
+                ));
+            }
+            run_zgent_session_with_report_controlled(
+                previous_messages,
+                prompt.into(),
+                config,
+                extra_tools,
+                control,
+            )
+        }
     }
 }
 
@@ -108,18 +199,24 @@ pub fn compact_session_messages_with_report(
         AgentBackendKind::AgentFrame => {
             frame_compact_session_messages_with_report(previous_messages, config, extra_tools)
         }
-        AgentBackendKind::Zgent => Ok(ContextCompactionReport {
-            messages: previous_messages,
-            usage: TokenUsage::default(),
-            compacted: false,
-            token_limit: config.auto_compact_token_limit.unwrap_or_default(),
-            estimated_tokens_before: 0,
-            estimated_tokens_after: 0,
-        }),
+        AgentBackendKind::Zgent => {
+            if !zgent_checkout_available() {
+                return Err(anyhow!(
+                    "the zgent backend is unavailable because the local zgent checkout is missing"
+                ));
+            }
+            Ok(ContextCompactionReport {
+                messages: previous_messages,
+                usage: TokenUsage::default(),
+                compacted: false,
+                token_limit: config.auto_compact_token_limit.unwrap_or_default(),
+                estimated_tokens_before: 0,
+                estimated_tokens_after: 0,
+            })
+        }
     }
 }
 
-#[cfg(feature = "zgent-backend")]
 fn run_zgent_session_with_report_controlled(
     previous_messages: Vec<ChatMessage>,
     prompt: String,
@@ -142,6 +239,7 @@ fn run_zgent_session_with_report_controlled(
         &tool_config.runtime_state_root,
         &tool_config.upstream,
         tool_config.image_tool_upstream.as_ref(),
+        &tool_config.skills_dirs,
         &discovered_skills,
         &extra_tools,
         control
@@ -233,25 +331,11 @@ fn run_zgent_session_with_report_controlled(
     ))
 }
 
-#[cfg(not(feature = "zgent-backend"))]
-fn run_zgent_session_with_report_controlled(
-    _previous_messages: Vec<ChatMessage>,
-    _prompt: String,
-    _config: FrameAgentConfig,
-    _extra_tools: Vec<Tool>,
-    _control: Option<SessionExecutionControl>,
-) -> Result<SessionRunReport> {
-    Err(anyhow!(
-        "the zgent backend is not available in this build; recompile agent_host with the 'zgent-backend' feature"
-    ))
-}
-
-#[cfg(feature = "zgent-backend")]
 fn send_zgent_chat_completion(
     client: &reqwest::blocking::Client,
     config: &FrameAgentConfig,
     request: &ZgentChatCompletionRequest,
-) -> Result<zgent_core::llm::ChatCompletionResponse> {
+) -> Result<ZgentChatCompletionResponse> {
     let url = build_zgent_chat_completions_url(config);
     let mut payload = serde_json::to_value(request)
         .context("failed to serialize zgent chat completion request")?;
@@ -299,7 +383,6 @@ fn send_zgent_chat_completion(
     serde_json::from_value(value).context("failed to parse zgent chat completion response")
 }
 
-#[cfg(feature = "zgent-backend")]
 fn build_zgent_chat_completions_url(config: &FrameAgentConfig) -> String {
     let base = config.upstream.base_url.trim_end_matches('/');
     let path = if config.upstream.chat_completions_path.starts_with('/') {
@@ -310,7 +393,6 @@ fn build_zgent_chat_completions_url(config: &FrameAgentConfig) -> String {
     format!("{base}{path}")
 }
 
-#[cfg(feature = "zgent-backend")]
 fn compose_zgent_system_prompt(
     config: &FrameAgentConfig,
     skills: &[agent_frame::skills::SkillMetadata],
@@ -330,7 +412,6 @@ fn compose_zgent_system_prompt(
     parts.join("\n\n")
 }
 
-#[cfg(feature = "zgent-backend")]
 fn ensure_system_message(messages: &[ChatMessage], system_prompt: &str) -> Vec<ChatMessage> {
     let mut cloned = messages.to_vec();
     if let Some(first) = cloned.first_mut()
@@ -344,7 +425,6 @@ fn ensure_system_message(messages: &[ChatMessage], system_prompt: &str) -> Vec<C
     with_system
 }
 
-#[cfg(feature = "zgent-backend")]
 fn ensure_not_cancelled(control: &SessionExecutionControl) -> Result<()> {
     if control.is_cancelled() {
         return Err(anyhow!("session execution cancelled"));
@@ -352,7 +432,6 @@ fn ensure_not_cancelled(control: &SessionExecutionControl) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "zgent-backend")]
 fn normalize_tool_result(result: Value) -> String {
     match result {
         Value::String(text) => text,
@@ -360,7 +439,6 @@ fn normalize_tool_result(result: Value) -> String {
     }
 }
 
-#[cfg(feature = "zgent-backend")]
 fn host_message_to_zgent(message: &ChatMessage) -> ZgentChatMessage {
     match message.role.as_str() {
         "system" => ZgentChatMessage::System {
@@ -407,7 +485,6 @@ fn host_message_to_zgent(message: &ChatMessage) -> ZgentChatMessage {
     }
 }
 
-#[cfg(feature = "zgent-backend")]
 fn zgent_message_to_host(message: &ZgentChatMessage) -> ChatMessage {
     match message {
         ZgentChatMessage::System { content, .. } => ChatMessage::text("system", content),
@@ -449,7 +526,6 @@ fn zgent_message_to_host(message: &ZgentChatMessage) -> ChatMessage {
     }
 }
 
-#[cfg(feature = "zgent-backend")]
 fn content_to_text(content: &Option<Value>) -> String {
     match content {
         Some(Value::String(text)) => text.clone(),
@@ -486,8 +562,7 @@ fn content_to_text(content: &Option<Value>) -> String {
     }
 }
 
-#[cfg(feature = "zgent-backend")]
-fn token_usage_from_zgent(usage: Option<&zgent_core::llm::Usage>) -> TokenUsage {
+fn token_usage_from_zgent(usage: Option<&ZgentUsage>) -> TokenUsage {
     let Some(usage) = usage else {
         return TokenUsage::default();
     };
@@ -503,7 +578,6 @@ fn token_usage_from_zgent(usage: Option<&zgent_core::llm::Usage>) -> TokenUsage 
     }
 }
 
-#[cfg(feature = "zgent-backend")]
 fn build_zgent_tool_definitions(registry: &BTreeMap<String, Tool>) -> Vec<ZgentToolDefinition> {
     registry
         .values()
@@ -532,10 +606,10 @@ mod tests {
         ));
     }
 
-    #[cfg(feature = "zgent-backend")]
     mod zgent_tests {
         use super::AgentBackendKind;
         use crate::backend::run_session_with_report_controlled;
+        use crate::backend::zgent_checkout_available;
         use agent_frame::config::UpstreamConfig;
         use agent_frame::{Tool, extract_assistant_text};
         use serde_json::{Value, json};
@@ -663,6 +737,9 @@ mod tests {
 
         #[test]
         fn zgent_backend_returns_text_response() {
+            if !zgent_checkout_available() {
+                return;
+            }
             let server = TestServer::start();
             server.push_response(json!({
                 "id": "resp-1",
@@ -699,6 +776,9 @@ mod tests {
 
         #[test]
         fn zgent_backend_executes_wrapped_tools() {
+            if !zgent_checkout_available() {
+                return;
+            }
             let server = TestServer::start();
             server.push_response(json!({
                 "id": "resp-1",
@@ -774,6 +854,9 @@ mod tests {
 
         #[tokio::test(flavor = "current_thread")]
         async fn zgent_backend_is_safe_inside_tokio_context() {
+            if !zgent_checkout_available() {
+                return;
+            }
             let server = TestServer::start();
             server.push_response(json!({
                 "id": "resp-1",
@@ -813,6 +896,9 @@ mod tests {
 
         #[test]
         fn zgent_backend_reports_error_payloads_in_success_responses() {
+            if !zgent_checkout_available() {
+                return;
+            }
             let server = TestServer::start();
             server.push_response(json!({
                 "error": {

@@ -415,6 +415,7 @@ pub fn run_session_with_report_controlled(
         &config.runtime_state_root,
         &config.upstream,
         config.image_tool_upstream.as_ref(),
+        &config.skills_dirs,
         &discovered_skills,
         &extra_tools,
         control
@@ -1007,6 +1008,7 @@ pub fn compact_session_messages_with_report(
         &config.runtime_state_root,
         &config.upstream,
         config.image_tool_upstream.as_ref(),
+        &config.skills_dirs,
         &discovered_skills,
         &extra_tools,
     )?;
