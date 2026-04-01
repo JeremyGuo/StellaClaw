@@ -292,14 +292,22 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
                 model_name
             ));
         }
-        if model.backend == AgentBackendKind::Zgent
-            && model.chat_completions_path != default_chat_completions_path()
-        {
-            return Err(anyhow!(
-                "model '{}' uses zgent backend but chat_completions_path must be '{}'",
-                model_name,
-                default_chat_completions_path()
-            ));
+        if model.backend == AgentBackendKind::Zgent {
+            #[cfg(not(feature = "zgent-backend"))]
+            {
+                return Err(anyhow!(
+                    "model '{}' uses zgent backend but this build of agent_host does not include the 'zgent-backend' feature",
+                    model_name
+                ));
+            }
+            #[cfg(feature = "zgent-backend")]
+            if model.chat_completions_path != default_chat_completions_path() {
+                return Err(anyhow!(
+                    "model '{}' uses zgent backend but chat_completions_path must be '{}'",
+                    model_name,
+                    default_chat_completions_path()
+                ));
+            }
         }
         if let Some(image_tool_model) = &model.image_tool_model
             && image_tool_model != "self"
@@ -645,7 +653,14 @@ mod tests {
         .unwrap();
 
         let error = load_server_config_file(&config_path).unwrap_err();
+        #[cfg(feature = "zgent-backend")]
         assert!(error.to_string().contains("chat_completions_path"));
+        #[cfg(not(feature = "zgent-backend"))]
+        assert!(
+            error
+                .to_string()
+                .contains("does not include the 'zgent-backend' feature")
+        );
     }
 
     #[test]

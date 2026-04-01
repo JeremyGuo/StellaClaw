@@ -1,27 +1,40 @@
+#[cfg(feature = "zgent-backend")]
+use agent_frame::SessionCompactionStats;
 use agent_frame::compaction::ContextCompactionReport;
 use agent_frame::config::AgentConfig as FrameAgentConfig;
-use agent_frame::message::{
-    ChatMessage, FunctionCall as FrameFunctionCall, ToolCall as FrameToolCall,
-};
+use agent_frame::message::ChatMessage;
+#[cfg(feature = "zgent-backend")]
+use agent_frame::message::{FunctionCall as FrameFunctionCall, ToolCall as FrameToolCall};
+#[cfg(feature = "zgent-backend")]
 use agent_frame::skills::{build_skills_meta_prompt, discover_skills};
+#[cfg(feature = "zgent-backend")]
 use agent_frame::tooling::build_tool_registry_with_cancel;
 use agent_frame::{
-    SessionCompactionStats, SessionExecutionControl, SessionRunReport, TokenUsage, Tool,
+    SessionExecutionControl, SessionRunReport, TokenUsage, Tool,
     compact_session_messages_with_report as frame_compact_session_messages_with_report,
     run_session_with_report_controlled as frame_run_session_with_report_controlled,
 };
-use anyhow::{Context, Result, anyhow};
+#[cfg(feature = "zgent-backend")]
+use anyhow::Context;
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+#[cfg(feature = "zgent-backend")]
+use serde_json::Value;
+#[cfg(feature = "zgent-backend")]
+use serde_json::json;
+#[cfg(feature = "zgent-backend")]
 use std::collections::BTreeMap;
+#[cfg(feature = "zgent-backend")]
 use zgent_core::llm::{
     ChatCompletionRequest as ZgentChatCompletionRequest, ChatMessage as ZgentChatMessage,
     FunctionCall as ZgentFunctionCall, FunctionDefinition as ZgentFunctionDefinition,
     ToolCall as ZgentToolCall, ToolDefinition as ZgentToolDefinition,
 };
 
+#[cfg(feature = "zgent-backend")]
 const ZGENT_COMPAT_MARKER: &str = "[AgentHost ZGent Compatibility Runtime]";
 
+#[cfg(feature = "zgent-backend")]
 fn upstream_error_from_value(value: &Value) -> Option<String> {
     let error = value.get("error")?;
     match error {
@@ -106,6 +119,7 @@ pub fn compact_session_messages_with_report(
     }
 }
 
+#[cfg(feature = "zgent-backend")]
 fn run_zgent_session_with_report_controlled(
     previous_messages: Vec<ChatMessage>,
     prompt: String,
@@ -219,6 +233,20 @@ fn run_zgent_session_with_report_controlled(
     ))
 }
 
+#[cfg(not(feature = "zgent-backend"))]
+fn run_zgent_session_with_report_controlled(
+    _previous_messages: Vec<ChatMessage>,
+    _prompt: String,
+    _config: FrameAgentConfig,
+    _extra_tools: Vec<Tool>,
+    _control: Option<SessionExecutionControl>,
+) -> Result<SessionRunReport> {
+    Err(anyhow!(
+        "the zgent backend is not available in this build; recompile agent_host with the 'zgent-backend' feature"
+    ))
+}
+
+#[cfg(feature = "zgent-backend")]
 fn send_zgent_chat_completion(
     client: &reqwest::blocking::Client,
     config: &FrameAgentConfig,
@@ -271,6 +299,7 @@ fn send_zgent_chat_completion(
     serde_json::from_value(value).context("failed to parse zgent chat completion response")
 }
 
+#[cfg(feature = "zgent-backend")]
 fn build_zgent_chat_completions_url(config: &FrameAgentConfig) -> String {
     let base = config.upstream.base_url.trim_end_matches('/');
     let path = if config.upstream.chat_completions_path.starts_with('/') {
@@ -281,6 +310,7 @@ fn build_zgent_chat_completions_url(config: &FrameAgentConfig) -> String {
     format!("{base}{path}")
 }
 
+#[cfg(feature = "zgent-backend")]
 fn compose_zgent_system_prompt(
     config: &FrameAgentConfig,
     skills: &[agent_frame::skills::SkillMetadata],
@@ -300,6 +330,7 @@ fn compose_zgent_system_prompt(
     parts.join("\n\n")
 }
 
+#[cfg(feature = "zgent-backend")]
 fn ensure_system_message(messages: &[ChatMessage], system_prompt: &str) -> Vec<ChatMessage> {
     let mut cloned = messages.to_vec();
     if let Some(first) = cloned.first_mut()
@@ -313,6 +344,7 @@ fn ensure_system_message(messages: &[ChatMessage], system_prompt: &str) -> Vec<C
     with_system
 }
 
+#[cfg(feature = "zgent-backend")]
 fn ensure_not_cancelled(control: &SessionExecutionControl) -> Result<()> {
     if control.is_cancelled() {
         return Err(anyhow!("session execution cancelled"));
@@ -320,6 +352,7 @@ fn ensure_not_cancelled(control: &SessionExecutionControl) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "zgent-backend")]
 fn normalize_tool_result(result: Value) -> String {
     match result {
         Value::String(text) => text,
@@ -327,6 +360,7 @@ fn normalize_tool_result(result: Value) -> String {
     }
 }
 
+#[cfg(feature = "zgent-backend")]
 fn host_message_to_zgent(message: &ChatMessage) -> ZgentChatMessage {
     match message.role.as_str() {
         "system" => ZgentChatMessage::System {
@@ -373,6 +407,7 @@ fn host_message_to_zgent(message: &ChatMessage) -> ZgentChatMessage {
     }
 }
 
+#[cfg(feature = "zgent-backend")]
 fn zgent_message_to_host(message: &ZgentChatMessage) -> ChatMessage {
     match message {
         ZgentChatMessage::System { content, .. } => ChatMessage::text("system", content),
@@ -414,6 +449,7 @@ fn zgent_message_to_host(message: &ZgentChatMessage) -> ChatMessage {
     }
 }
 
+#[cfg(feature = "zgent-backend")]
 fn content_to_text(content: &Option<Value>) -> String {
     match content {
         Some(Value::String(text)) => text.clone(),
@@ -450,6 +486,7 @@ fn content_to_text(content: &Option<Value>) -> String {
     }
 }
 
+#[cfg(feature = "zgent-backend")]
 fn token_usage_from_zgent(usage: Option<&zgent_core::llm::Usage>) -> TokenUsage {
     let Some(usage) = usage else {
         return TokenUsage::default();
@@ -466,6 +503,7 @@ fn token_usage_from_zgent(usage: Option<&zgent_core::llm::Usage>) -> TokenUsage 
     }
 }
 
+#[cfg(feature = "zgent-backend")]
 fn build_zgent_tool_definitions(registry: &BTreeMap<String, Tool>) -> Vec<ZgentToolDefinition> {
     registry
         .values()
@@ -482,245 +520,7 @@ fn build_zgent_tool_definitions(registry: &BTreeMap<String, Tool>) -> Vec<ZgentT
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AgentBackendKind, backend_supports_native_multimodal_input,
-        run_session_with_report_controlled,
-    };
-    use agent_frame::config::UpstreamConfig;
-    use agent_frame::{Tool, extract_assistant_text};
-    use serde_json::{Value, json};
-    use std::collections::VecDeque;
-    use std::fs;
-    use std::io::{Read, Write};
-    use std::net::{TcpListener, TcpStream};
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-    use tempfile::TempDir;
-
-    struct TestServer {
-        address: String,
-        responses: Arc<Mutex<VecDeque<Value>>>,
-        shutdown: Arc<AtomicBool>,
-        handle: Option<thread::JoinHandle<()>>,
-    }
-
-    impl TestServer {
-        fn start() -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
-            listener
-                .set_nonblocking(true)
-                .expect("nonblocking listener");
-            let address = format!("http://{}", listener.local_addr().expect("local addr"));
-            let responses = Arc::new(Mutex::new(VecDeque::new()));
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let handle = {
-                let responses = Arc::clone(&responses);
-                let shutdown = Arc::clone(&shutdown);
-                thread::spawn(move || {
-                    loop {
-                        if shutdown.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        match listener.accept() {
-                            Ok((stream, _)) => handle_stream(stream, &responses),
-                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                                thread::sleep(std::time::Duration::from_millis(10));
-                            }
-                            Err(error) => panic!("accept failed: {error}"),
-                        }
-                    }
-                })
-            };
-
-            Self {
-                address,
-                responses,
-                shutdown,
-                handle: Some(handle),
-            }
-        }
-
-        fn push_response(&self, value: Value) {
-            self.responses.lock().unwrap().push_back(value);
-        }
-    }
-
-    impl Drop for TestServer {
-        fn drop(&mut self) {
-            self.shutdown.store(true, Ordering::Relaxed);
-            let _ = TcpStream::connect(self.address.trim_start_matches("http://"));
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
-        }
-    }
-
-    fn handle_stream(mut stream: TcpStream, responses: &Arc<Mutex<VecDeque<Value>>>) {
-        stream.set_nonblocking(false).expect("blocking stream");
-        let mut buffer = vec![0_u8; 64 * 1024];
-        let bytes_read = stream.read(&mut buffer).expect("read request");
-        let request_text = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
-        let response_json = responses
-            .lock()
-            .unwrap()
-            .pop_front()
-            .expect("queued response");
-        let body = response_json.to_string();
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        if request_text.starts_with("POST ") {
-            stream
-                .write_all(response.as_bytes())
-                .expect("write response");
-        }
-    }
-
-    fn test_config(base_url: &str, workspace_root: PathBuf) -> agent_frame::AgentConfig {
-        agent_frame::AgentConfig {
-            enabled_tools: vec!["read_file".to_string()],
-            upstream: UpstreamConfig {
-                base_url: base_url.to_string(),
-                model: "test-model".to_string(),
-                supports_vision_input: false,
-                api_key: None,
-                api_key_env: "TEST_API_KEY".to_string(),
-                chat_completions_path: "/chat/completions".to_string(),
-                timeout_seconds: 10.0,
-                context_window_tokens: 128_000,
-                cache_control: None,
-                reasoning: None,
-                headers: serde_json::Map::new(),
-                native_web_search: None,
-                external_web_search: None,
-            },
-            image_tool_upstream: None,
-            skills_dirs: Vec::new(),
-            system_prompt: "You are a test backend.".to_string(),
-            max_tool_roundtrips: 4,
-            runtime_state_root: workspace_root.clone(),
-            workspace_root,
-            enable_context_compression: false,
-            effective_context_window_percent: 0.9,
-            auto_compact_token_limit: None,
-            retain_recent_messages: 8,
-        }
-    }
-
-    #[test]
-    fn zgent_backend_returns_text_response() {
-        let server = TestServer::start();
-        server.push_response(json!({
-            "id": "resp-1",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "zgent-ok"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": 12,
-                "completion_tokens": 3,
-                "total_tokens": 15
-            }
-        }));
-
-        let temp_dir = TempDir::new().unwrap();
-        let report = run_session_with_report_controlled(
-            AgentBackendKind::Zgent,
-            vec![agent_frame::ChatMessage::text("user", "hello")],
-            "",
-            test_config(&server.address, temp_dir.path().to_path_buf()),
-            Vec::new(),
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(extract_assistant_text(&report.messages), "zgent-ok");
-        assert_eq!(report.usage.llm_calls, 1);
-        assert_eq!(report.usage.total_tokens, 15);
-    }
-
-    #[test]
-    fn zgent_backend_executes_wrapped_tools() {
-        let server = TestServer::start();
-        server.push_response(json!({
-            "id": "resp-1",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "tool_calls": [{
-                        "id": "call-1",
-                        "type": "function",
-                        "function": {
-                            "name": "echo",
-                            "arguments": "{\"value\":\"ok\"}"
-                        }
-                    }]
-                },
-                "finish_reason": "tool_calls"
-            }],
-            "usage": {
-                "prompt_tokens": 10,
-                "completion_tokens": 4,
-                "total_tokens": 14
-            }
-        }));
-        server.push_response(json!({
-            "id": "resp-2",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "done"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": 20,
-                "completion_tokens": 2,
-                "total_tokens": 22
-            }
-        }));
-
-        let temp_dir = TempDir::new().unwrap();
-        fs::write(temp_dir.path().join("dummy.txt"), "hello").unwrap();
-        let echo = Tool::new(
-            "echo",
-            "Echo a value.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "value": {"type": "string"}
-                },
-                "required": ["value"],
-                "additionalProperties": false
-            }),
-            |arguments| Ok(json!({ "echo": arguments["value"].clone() })),
-        );
-
-        let report = run_session_with_report_controlled(
-            AgentBackendKind::Zgent,
-            vec![agent_frame::ChatMessage::text("user", "hello")],
-            "",
-            test_config(&server.address, temp_dir.path().to_path_buf()),
-            vec![echo],
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(extract_assistant_text(&report.messages), "done");
-        assert_eq!(report.usage.llm_calls, 2);
-        assert_eq!(report.usage.total_tokens, 36);
-        assert!(report.messages.iter().any(|message| message.role == "tool"));
-    }
+    use super::{AgentBackendKind, backend_supports_native_multimodal_input};
 
     #[test]
     fn only_agent_frame_backend_supports_native_multimodal_input() {
@@ -732,29 +532,157 @@ mod tests {
         ));
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn zgent_backend_is_safe_inside_tokio_context() {
-        let server = TestServer::start();
-        server.push_response(json!({
-            "id": "resp-1",
-            "choices": [{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": "async-ok"
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": 8,
-                "completion_tokens": 2,
-                "total_tokens": 10
-            }
-        }));
+    #[cfg(feature = "zgent-backend")]
+    mod zgent_tests {
+        use super::AgentBackendKind;
+        use crate::backend::run_session_with_report_controlled;
+        use agent_frame::config::UpstreamConfig;
+        use agent_frame::{Tool, extract_assistant_text};
+        use serde_json::{Value, json};
+        use std::collections::VecDeque;
+        use std::fs;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+        use tempfile::TempDir;
 
-        let temp_dir = TempDir::new().unwrap();
-        let report = tokio::task::spawn_blocking(move || {
-            run_session_with_report_controlled(
+        struct TestServer {
+            address: String,
+            responses: Arc<Mutex<VecDeque<Value>>>,
+            shutdown: Arc<AtomicBool>,
+            handle: Option<thread::JoinHandle<()>>,
+        }
+
+        impl TestServer {
+            fn start() -> Self {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+                listener
+                    .set_nonblocking(true)
+                    .expect("nonblocking listener");
+                let address = format!("http://{}", listener.local_addr().expect("local addr"));
+                let responses = Arc::new(Mutex::new(VecDeque::new()));
+                let shutdown = Arc::new(AtomicBool::new(false));
+                let handle = {
+                    let responses = Arc::clone(&responses);
+                    let shutdown = Arc::clone(&shutdown);
+                    thread::spawn(move || {
+                        loop {
+                            if shutdown.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            match listener.accept() {
+                                Ok((stream, _)) => handle_stream(stream, &responses),
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                    thread::sleep(std::time::Duration::from_millis(10));
+                                }
+                                Err(error) => panic!("accept failed: {error}"),
+                            }
+                        }
+                    })
+                };
+
+                Self {
+                    address,
+                    responses,
+                    shutdown,
+                    handle: Some(handle),
+                }
+            }
+
+            fn push_response(&self, value: Value) {
+                self.responses.lock().unwrap().push_back(value);
+            }
+        }
+
+        impl Drop for TestServer {
+            fn drop(&mut self) {
+                self.shutdown.store(true, Ordering::Relaxed);
+                let _ = TcpStream::connect(self.address.trim_start_matches("http://"));
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
+
+        fn handle_stream(mut stream: TcpStream, responses: &Arc<Mutex<VecDeque<Value>>>) {
+            stream.set_nonblocking(false).expect("blocking stream");
+            let mut buffer = vec![0_u8; 64 * 1024];
+            let bytes_read = stream.read(&mut buffer).expect("read request");
+            let request_text = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+            let response_json = responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("queued response");
+            let body = response_json.to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            if request_text.starts_with("POST ") {
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+            }
+        }
+
+        fn test_config(base_url: &str, workspace_root: PathBuf) -> agent_frame::AgentConfig {
+            agent_frame::AgentConfig {
+                enabled_tools: vec!["read_file".to_string()],
+                upstream: UpstreamConfig {
+                    base_url: base_url.to_string(),
+                    model: "test-model".to_string(),
+                    supports_vision_input: false,
+                    api_key: None,
+                    api_key_env: "TEST_API_KEY".to_string(),
+                    chat_completions_path: "/chat/completions".to_string(),
+                    timeout_seconds: 10.0,
+                    context_window_tokens: 128_000,
+                    cache_control: None,
+                    reasoning: None,
+                    headers: serde_json::Map::new(),
+                    native_web_search: None,
+                    external_web_search: None,
+                },
+                image_tool_upstream: None,
+                skills_dirs: Vec::new(),
+                system_prompt: "You are a test backend.".to_string(),
+                max_tool_roundtrips: 4,
+                runtime_state_root: workspace_root.clone(),
+                workspace_root,
+                enable_context_compression: false,
+                effective_context_window_percent: 0.9,
+                auto_compact_token_limit: None,
+                retain_recent_messages: 8,
+            }
+        }
+
+        #[test]
+        fn zgent_backend_returns_text_response() {
+            let server = TestServer::start();
+            server.push_response(json!({
+                "id": "resp-1",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "zgent-ok"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 12,
+                    "completion_tokens": 3,
+                    "total_tokens": 15
+                }
+            }));
+
+            let temp_dir = TempDir::new().unwrap();
+            let report = run_session_with_report_controlled(
                 AgentBackendKind::Zgent,
                 vec![agent_frame::ChatMessage::text("user", "hello")],
                 "",
@@ -762,38 +690,151 @@ mod tests {
                 Vec::new(),
                 None,
             )
-        })
-        .await
-        .unwrap()
-        .unwrap();
+            .unwrap();
 
-        assert_eq!(extract_assistant_text(&report.messages), "async-ok");
-        assert_eq!(report.usage.total_tokens, 10);
-    }
+            assert_eq!(extract_assistant_text(&report.messages), "zgent-ok");
+            assert_eq!(report.usage.llm_calls, 1);
+            assert_eq!(report.usage.total_tokens, 15);
+        }
 
-    #[test]
-    fn zgent_backend_reports_error_payloads_in_success_responses() {
-        let server = TestServer::start();
-        server.push_response(json!({
-            "error": {
-                "message": "Insufficient credits",
-                "code": 402
-            }
-        }));
+        #[test]
+        fn zgent_backend_executes_wrapped_tools() {
+            let server = TestServer::start();
+            server.push_response(json!({
+                "id": "resp-1",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "echo",
+                                "arguments": "{\"value\":\"ok\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 4,
+                    "total_tokens": 14
+                }
+            }));
+            server.push_response(json!({
+                "id": "resp-2",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "done"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 20,
+                    "completion_tokens": 2,
+                    "total_tokens": 22
+                }
+            }));
 
-        let temp_dir = TempDir::new().unwrap();
-        let error = run_session_with_report_controlled(
-            AgentBackendKind::Zgent,
-            vec![agent_frame::ChatMessage::text("user", "hello")],
-            "",
-            test_config(&server.address, temp_dir.path().to_path_buf()),
-            Vec::new(),
-            None,
-        )
-        .unwrap_err();
+            let temp_dir = TempDir::new().unwrap();
+            fs::write(temp_dir.path().join("dummy.txt"), "hello").unwrap();
+            let echo = Tool::new(
+                "echo",
+                "Echo a value.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "value": {"type": "string"}
+                    },
+                    "required": ["value"],
+                    "additionalProperties": false
+                }),
+                |arguments| Ok(json!({ "echo": arguments["value"].clone() })),
+            );
 
-        let rendered = format!("{error:#}");
-        assert!(rendered.contains("zgent chat completion returned an error payload"));
-        assert!(rendered.contains("Insufficient credits"));
+            let report = run_session_with_report_controlled(
+                AgentBackendKind::Zgent,
+                vec![agent_frame::ChatMessage::text("user", "hello")],
+                "",
+                test_config(&server.address, temp_dir.path().to_path_buf()),
+                vec![echo],
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(extract_assistant_text(&report.messages), "done");
+            assert_eq!(report.usage.llm_calls, 2);
+            assert_eq!(report.usage.total_tokens, 36);
+            assert!(report.messages.iter().any(|message| message.role == "tool"));
+        }
+
+        #[tokio::test(flavor = "current_thread")]
+        async fn zgent_backend_is_safe_inside_tokio_context() {
+            let server = TestServer::start();
+            server.push_response(json!({
+                "id": "resp-1",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "async-ok"
+                    },
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 8,
+                    "completion_tokens": 2,
+                    "total_tokens": 10
+                }
+            }));
+
+            let temp_dir = TempDir::new().unwrap();
+            let report = tokio::task::spawn_blocking(move || {
+                run_session_with_report_controlled(
+                    AgentBackendKind::Zgent,
+                    vec![agent_frame::ChatMessage::text("user", "hello")],
+                    "",
+                    test_config(&server.address, temp_dir.path().to_path_buf()),
+                    Vec::new(),
+                    None,
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(extract_assistant_text(&report.messages), "async-ok");
+            assert_eq!(report.usage.total_tokens, 10);
+        }
+
+        #[test]
+        fn zgent_backend_reports_error_payloads_in_success_responses() {
+            let server = TestServer::start();
+            server.push_response(json!({
+                "error": {
+                    "message": "Insufficient credits",
+                    "code": 402
+                }
+            }));
+
+            let temp_dir = TempDir::new().unwrap();
+            let error = run_session_with_report_controlled(
+                AgentBackendKind::Zgent,
+                vec![agent_frame::ChatMessage::text("user", "hello")],
+                "",
+                test_config(&server.address, temp_dir.path().to_path_buf()),
+                Vec::new(),
+                None,
+            )
+            .unwrap_err();
+
+            let rendered = format!("{error:#}");
+            assert!(rendered.contains("zgent chat completion returned an error payload"));
+            assert!(rendered.contains("Insufficient credits"));
+        }
     }
 }
