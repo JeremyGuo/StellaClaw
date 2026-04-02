@@ -13,9 +13,7 @@ use crate::config::{
     BotCommandConfig, ChannelConfig, MainAgentConfig, ModelConfig, SandboxConfig, SandboxMode,
     ServerConfig, default_bot_commands,
 };
-use crate::conversation::{
-    ConversationCheckpointBundle, ConversationManager, ConversationSettings,
-};
+use crate::conversation::{ConversationManager, ConversationSettings};
 use crate::cron::{
     ClaimedCronTask, CronCheckerConfig, CronCreateRequest, CronManager, CronUpdateRequest,
 };
@@ -27,6 +25,7 @@ use crate::prompt::{AgentPromptKind, build_agent_system_prompt, greeting_for_lan
 use crate::sandbox::run_turn_in_child_process;
 use crate::session::{SessionManager, SessionSkillObservation, SessionSnapshot, SkillChangeNotice};
 use crate::sink::{SinkRouter, SinkTarget};
+use crate::snapshot::{SnapshotBundle, SnapshotManager};
 use crate::workspace::{WorkspaceManager, WorkspaceMountMaterialization};
 use agent_frame::config::{AgentConfig as FrameAgentConfig, CacheControlConfig, UpstreamConfig};
 use agent_frame::skills::discover_skills;
@@ -2065,6 +2064,7 @@ pub struct Server {
     main_agent: MainAgentConfig,
     sandbox: SandboxConfig,
     conversations: ConversationManager,
+    snapshots: SnapshotManager,
     sessions: SessionManager,
     sink_router: Arc<RwLock<SinkRouter>>,
     cron_manager: Arc<Mutex<CronManager>>,
@@ -2134,6 +2134,7 @@ impl Server {
             main_agent: config.main_agent,
             sandbox: config.sandbox,
             conversations: ConversationManager::new(&workdir)?,
+            snapshots: SnapshotManager::new(&workdir)?,
             sink_router: Arc::new(RwLock::new(SinkRouter::new())),
             cron_manager,
             agent_registry,
@@ -2710,12 +2711,13 @@ impl Server {
         if let Some(checkpoint_name) = parse_snap_save_command(incoming.text.as_deref()) {
             let session = self.sessions.ensure_foreground(&incoming.address)?;
             let checkpoint = self.sessions.export_checkpoint(&incoming.address)?;
-            let bundle = ConversationCheckpointBundle {
+            let bundle = SnapshotBundle {
                 saved_at: Utc::now(),
+                source_address: incoming.address.clone(),
                 settings: self.effective_conversation_settings(&incoming.address)?,
                 session: checkpoint,
             };
-            let record = self.conversations.save_checkpoint(
+            let record = self.snapshots.save_snapshot(
                 &incoming.address,
                 &checkpoint_name,
                 bundle,
@@ -2725,7 +2727,7 @@ impl Server {
                 &channel,
                 &incoming.address,
                 OutgoingMessage::text(format!(
-                    "Saved checkpoint `{}` for this conversation at {}.",
+                    "Saved global snapshot `{}` at {}.",
                     record.name, record.saved_at
                 )),
             )
@@ -2739,26 +2741,29 @@ impl Server {
                 Some(None)
             )
         {
-            let conversation = self.conversations.ensure_conversation(&incoming.address)?;
-            if conversation.checkpoints.is_empty() {
+            let snapshots = self.snapshots.list_snapshots();
+            if snapshots.is_empty() {
                 self.send_channel_message(
                     &channel,
                     &incoming.address,
                     OutgoingMessage::text(
-                        "This conversation has no saved checkpoints yet. Use `/snap_save <name>` first."
+                        "There are no saved snapshots yet. Use `/snap_save <name>` first."
                             .to_string(),
                     ),
                 )
                 .await?;
                 return Ok(());
             }
-            let lines = conversation
-                .checkpoints
+            let lines = snapshots
                 .iter()
-                .map(|record| format!("- `{}` ({})", record.name, record.saved_at))
+                .map(|record| {
+                    format!(
+                        "- `{}` ({}, from `{}`)",
+                        record.name, record.saved_at, record.source_conversation_id
+                    )
+                })
                 .collect::<Vec<_>>();
-            let options = conversation
-                .checkpoints
+            let options = snapshots
                 .iter()
                 .map(|record| ShowOption {
                     label: record.name.clone(),
@@ -2770,10 +2775,10 @@ impl Server {
                 &incoming.address,
                 OutgoingMessage::with_options(
                     format!(
-                        "Saved checkpoints for this conversation:\n{}\n\nChoose one below or send `/snap_load <name>`.",
+                        "Saved global snapshots:\n{}\n\nChoose one below or send `/snap_load <name>`.",
                         lines.join("\n")
                     ),
-                    "Choose a checkpoint to load",
+                    "Choose a snapshot to load",
                     options,
                 ),
             )
@@ -2782,10 +2787,7 @@ impl Server {
         }
 
         if let Some(checkpoint_name) = parse_snap_load_command(incoming.text.as_deref()) {
-            let loaded = match self
-                .conversations
-                .load_checkpoint(&incoming.address, &checkpoint_name)
-            {
+            let loaded = match self.snapshots.load_snapshot(&checkpoint_name) {
                 Ok(loaded) => loaded,
                 Err(error) => {
                     self.send_user_error_message(&channel, &incoming.address, &error)
@@ -2800,7 +2802,7 @@ impl Server {
             let workspace = self.workspace_manager.create_workspace(
                 uuid::Uuid::new_v4(),
                 uuid::Uuid::new_v4(),
-                Some(&format!("checkpoint-{}", loaded.name)),
+                Some(&format!("snapshot-{}", loaded.record.name)),
             )?;
             replace_directory_contents(&workspace.files_dir, &loaded.workspace_dir)?;
             let restored = self.sessions.restore_foreground_from_checkpoint(
@@ -2813,8 +2815,8 @@ impl Server {
                 &channel,
                 &incoming.address,
                 OutgoingMessage::text(format!(
-                    "Loaded checkpoint `{}` into a new session with workspace `{}`.",
-                    loaded.name, restored.workspace_id
+                    "Loaded snapshot `{}` into a new session with workspace `{}`.",
+                    loaded.record.name, restored.workspace_id
                 )),
             )
             .await?;

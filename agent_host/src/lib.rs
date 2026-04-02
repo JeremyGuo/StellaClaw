@@ -16,6 +16,7 @@ pub mod sandbox;
 pub mod server;
 pub mod session;
 pub mod sink;
+pub mod snapshot;
 pub mod workspace;
 
 pub use server::Server;
