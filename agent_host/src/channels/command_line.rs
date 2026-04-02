@@ -122,6 +122,7 @@ impl Channel for CommandLineChannel {
             has_text = message.text.is_some(),
             image_count = message.images.len() as u64,
             attachment_count = message.attachments.len() as u64,
+            has_options = message.options.is_some(),
             "sending message to CLI user"
         );
         let mut stdout = io::stdout();
@@ -135,6 +136,19 @@ impl Channel for CommandLineChannel {
             stdout
                 .write_all(format!("agent> [file] {}\n", attachment.path.display()).as_bytes())
                 .await?;
+        }
+        if let Some(options) = message.options {
+            stdout
+                .write_all(format!("agent> {}\n", options.prompt).as_bytes())
+                .await?;
+            for option in options.options {
+                stdout
+                    .write_all(
+                        format!("agent> [option] {} -> {}\n", option.label, option.value)
+                            .as_bytes(),
+                    )
+                    .await?;
+            }
         }
         stdout.flush().await?;
         self.print_prompt().await?;

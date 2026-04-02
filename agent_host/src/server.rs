@@ -10,15 +10,18 @@ use crate::channel::{Channel, IncomingMessage};
 use crate::channels::command_line::CommandLineChannel;
 use crate::channels::telegram::TelegramChannel;
 use crate::config::{
-    BotCommandConfig, ChannelConfig, MainAgentConfig, ModelConfig, SandboxConfig, ServerConfig,
-    default_bot_commands,
+    BotCommandConfig, ChannelConfig, MainAgentConfig, ModelConfig, SandboxConfig, SandboxMode,
+    ServerConfig, default_bot_commands,
+};
+use crate::conversation::{
+    ConversationCheckpointBundle, ConversationManager, ConversationSettings,
 };
 use crate::cron::{
     ClaimedCronTask, CronCheckerConfig, CronCreateRequest, CronManager, CronUpdateRequest,
 };
 use crate::domain::{
     AttachmentKind, ChannelAddress, OutgoingAttachment, OutgoingMessage, ProcessingState,
-    StoredAttachment,
+    ShowOption, StoredAttachment,
 };
 use crate::prompt::{AgentPromptKind, build_agent_system_prompt, greeting_for_language};
 use crate::sandbox::run_turn_in_child_process;
@@ -2060,6 +2063,7 @@ pub struct Server {
     models: BTreeMap<String, ModelConfig>,
     main_agent: MainAgentConfig,
     sandbox: SandboxConfig,
+    conversations: ConversationManager,
     sessions: SessionManager,
     sink_router: Arc<RwLock<SinkRouter>>,
     cron_manager: Arc<Mutex<CronManager>>,
@@ -2120,7 +2124,7 @@ impl Server {
 
         Ok(Self {
             sessions: SessionManager::new(&workdir, workspace_manager.clone())?,
-            workdir,
+            workdir: workdir.clone(),
             agent_workspace,
             workspace_manager,
             channels: Arc::new(channels),
@@ -2128,6 +2132,7 @@ impl Server {
             models: config.models,
             main_agent: config.main_agent,
             sandbox: config.sandbox,
+            conversations: ConversationManager::new(&workdir)?,
             sink_router: Arc::new(RwLock::new(SinkRouter::new())),
             cron_manager,
             agent_registry,
@@ -2240,21 +2245,22 @@ impl Server {
     }
 
     async fn run_idle_context_compaction_once(&mut self) -> Result<()> {
-        let model = self.main_model()?.clone();
-        let Some(ttl) = model.cache_ttl.as_deref() else {
-            return Ok(());
-        };
-        let ttl = parse_duration(ttl)
-            .with_context(|| format!("failed to parse model cache_ttl '{}'", ttl))?;
         let lead_time = Duration::from_secs(30);
-        let Some(idle_threshold) = ttl.checked_sub(lead_time) else {
-            return Ok(());
-        };
         let now = Utc::now();
-        let runtime = self.tool_runtime();
         let snapshots = self.sessions.list_foreground_snapshots();
 
         for session in snapshots {
+            let model_key = self.effective_main_model_key(&session.address)?;
+            let model = self.model_config_or_main(&model_key)?.clone();
+            let runtime = self.tool_runtime_for_address(&session.address)?;
+            let Some(ttl) = model.cache_ttl.as_deref() else {
+                continue;
+            };
+            let ttl = parse_duration(ttl)
+                .with_context(|| format!("failed to parse model cache_ttl '{}'", ttl))?;
+            let Some(idle_threshold) = ttl.checked_sub(lead_time) else {
+                continue;
+            };
             if !should_attempt_idle_context_compaction(&session, now, idle_threshold) {
                 continue;
             }
@@ -2263,7 +2269,7 @@ impl Server {
                 &session,
                 &session.workspace_root,
                 AgentPromptKind::MainForeground,
-                &self.main_agent.model,
+                &model_key,
                 None,
             )?;
             let extra_tools = runtime.build_extra_tools(
@@ -2338,6 +2344,17 @@ impl Server {
         }
     }
 
+    fn tool_runtime_for_sandbox_mode(&self, sandbox_mode: SandboxMode) -> ServerRuntime {
+        let mut runtime = self.tool_runtime();
+        runtime.sandbox.mode = sandbox_mode;
+        runtime
+    }
+
+    fn tool_runtime_for_address(&self, address: &ChannelAddress) -> Result<ServerRuntime> {
+        let sandbox_mode = self.effective_sandbox_mode(address)?;
+        Ok(self.tool_runtime_for_sandbox_mode(sandbox_mode))
+    }
+
     pub fn workdir(&self) -> &Path {
         &self.workdir
     }
@@ -2352,6 +2369,7 @@ impl Server {
     }
 
     async fn handle_incoming(&mut self, incoming: IncomingMessage) -> Result<()> {
+        self.conversations.ensure_conversation(&incoming.address)?;
         if let Err(error) = self.archive_stale_workspaces_if_needed() {
             warn!(
                 log_stream = "server",
@@ -2518,11 +2536,222 @@ impl Server {
             .is_some_and(|text| command_matches(text, "/status"))
         {
             let session = self.sessions.ensure_foreground(&incoming.address)?;
-            let status_text = self.status_text_for_session(&session)?;
+            let effective_model_key = self.effective_main_model_key(&incoming.address)?;
+            let status_text = self.status_text_for_session(&session, &effective_model_key)?;
             self.send_channel_message(
                 &channel,
                 &incoming.address,
                 OutgoingMessage::text(status_text),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if let Some(argument) = parse_model_command(incoming.text.as_deref()) {
+            if let Some(model_key) = argument {
+                let selected_model = if model_key == "default" {
+                    None
+                } else {
+                    if !self.models.contains_key(&model_key) {
+                        let error = anyhow!("unknown model {}", model_key);
+                        self.send_user_error_message(&channel, &incoming.address, &error)
+                            .await;
+                        return Err(error);
+                    }
+                    Some(model_key.clone())
+                };
+                let previous_model_key = self.effective_main_model_key(&incoming.address)?;
+                let session = self.sessions.ensure_foreground(&incoming.address)?;
+                let compacted = self
+                    .compact_session_now(&session, &previous_model_key)
+                    .await
+                    .unwrap_or(false);
+                let conversation = self
+                    .conversations
+                    .set_main_model(&incoming.address, selected_model.clone())?;
+                let effective_model_key = conversation
+                    .settings
+                    .main_model
+                    .clone()
+                    .unwrap_or_else(|| self.main_agent.model.clone());
+                self.send_channel_message(
+                    &channel,
+                    &incoming.address,
+                    OutgoingMessage::text(format!(
+                        "Conversation model updated to `{}`.{}",
+                        effective_model_key,
+                        if compacted {
+                            " Existing context was compacted before the switch."
+                        } else {
+                            ""
+                        }
+                    )),
+                )
+                .await?;
+                return Ok(());
+            }
+            let current_model_key = self.effective_main_model_key(&incoming.address)?;
+            let options = self
+                .models
+                .keys()
+                .cloned()
+                .map(|model_key| ShowOption {
+                    label: model_key.clone(),
+                    value: format!("/model {}", model_key),
+                })
+                .chain(std::iter::once(ShowOption {
+                    label: "default".to_string(),
+                    value: "/model default".to_string(),
+                }))
+                .collect::<Vec<_>>();
+            self.send_channel_message(
+                &channel,
+                &incoming.address,
+                OutgoingMessage::with_options(
+                    format!(
+                        "Current conversation model: `{}`\nChoose a model below or send `/model <name>`.",
+                        current_model_key
+                    ),
+                    "Choose a model",
+                    options,
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if let Some(argument) = parse_sandbox_command(incoming.text.as_deref()) {
+            if let Some(mode_name) = argument {
+                let selected_mode = if mode_name == "default" {
+                    None
+                } else {
+                    let parsed = parse_sandbox_mode_value(&mode_name)
+                        .ok_or_else(|| anyhow!("unknown sandbox mode {}", mode_name));
+                    let parsed = match parsed {
+                        Ok(mode) => mode,
+                        Err(error) => {
+                            self.send_user_error_message(&channel, &incoming.address, &error)
+                                .await;
+                            return Err(error);
+                        }
+                    };
+                    if !self.available_sandbox_modes().contains(&parsed) {
+                        let error =
+                            anyhow!("sandbox mode {} is not available on this system", mode_name);
+                        self.send_user_error_message(&channel, &incoming.address, &error)
+                            .await;
+                        return Err(error);
+                    }
+                    Some(parsed)
+                };
+                let conversation = self
+                    .conversations
+                    .set_sandbox_mode(&incoming.address, selected_mode)?;
+                let effective_mode = conversation
+                    .settings
+                    .sandbox_mode
+                    .unwrap_or(self.sandbox.mode);
+                self.send_channel_message(
+                    &channel,
+                    &incoming.address,
+                    OutgoingMessage::text(format!(
+                        "Conversation sandbox mode updated to `{}`.",
+                        sandbox_mode_label(effective_mode)
+                    )),
+                )
+                .await?;
+                return Ok(());
+            }
+            let current_mode = self.effective_sandbox_mode(&incoming.address)?;
+            let options = self
+                .available_sandbox_modes()
+                .into_iter()
+                .map(|mode| ShowOption {
+                    label: sandbox_mode_label(mode).to_string(),
+                    value: format!("/sandbox {}", sandbox_mode_value(mode)),
+                })
+                .chain(std::iter::once(ShowOption {
+                    label: "default".to_string(),
+                    value: "/sandbox default".to_string(),
+                }))
+                .collect::<Vec<_>>();
+            self.send_channel_message(
+                &channel,
+                &incoming.address,
+                OutgoingMessage::with_options(
+                    format!(
+                        "Current conversation sandbox mode: `{}`\nChoose a mode below or send `/sandbox <mode>`.",
+                        sandbox_mode_label(current_mode)
+                    ),
+                    "Choose a sandbox mode",
+                    options,
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if let Some(checkpoint_name) = parse_save_command(incoming.text.as_deref()) {
+            let session = self.sessions.ensure_foreground(&incoming.address)?;
+            let checkpoint = self.sessions.export_checkpoint(&incoming.address)?;
+            let bundle = ConversationCheckpointBundle {
+                saved_at: Utc::now(),
+                settings: self.effective_conversation_settings(&incoming.address)?,
+                session: checkpoint,
+            };
+            let record = self.conversations.save_checkpoint(
+                &incoming.address,
+                &checkpoint_name,
+                bundle,
+                &session.workspace_root,
+            )?;
+            self.send_channel_message(
+                &channel,
+                &incoming.address,
+                OutgoingMessage::text(format!(
+                    "Saved checkpoint `{}` for this conversation at {}.",
+                    record.name, record.saved_at
+                )),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if let Some(checkpoint_name) = parse_load_command(incoming.text.as_deref()) {
+            let loaded = match self
+                .conversations
+                .load_checkpoint(&incoming.address, &checkpoint_name)
+            {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    self.send_user_error_message(&channel, &incoming.address, &error)
+                        .await;
+                    return Err(error);
+                }
+            };
+            self.conversations
+                .set_main_model(&incoming.address, loaded.bundle.settings.main_model.clone())?;
+            self.conversations
+                .set_sandbox_mode(&incoming.address, loaded.bundle.settings.sandbox_mode)?;
+            let workspace = self.workspace_manager.create_workspace(
+                uuid::Uuid::new_v4(),
+                uuid::Uuid::new_v4(),
+                Some(&format!("checkpoint-{}", loaded.name)),
+            )?;
+            replace_directory_contents(&workspace.files_dir, &loaded.workspace_dir)?;
+            let restored = self.sessions.restore_foreground_from_checkpoint(
+                &incoming.address,
+                loaded.bundle.session,
+                workspace.id.clone(),
+                workspace.files_dir.clone(),
+            )?;
+            self.send_channel_message(
+                &channel,
+                &incoming.address,
+                OutgoingMessage::text(format!(
+                    "Loaded checkpoint `{}` into a new session with workspace `{}`.",
+                    loaded.name, restored.workspace_id
+                )),
             )
             .await?;
             return Ok(());
@@ -2543,8 +2772,9 @@ impl Server {
 
         if let Some(argument) = parse_set_api_timeout_command(incoming.text.as_deref()) {
             let session = self.sessions.ensure_foreground(&incoming.address)?;
+            let effective_model_key = self.effective_main_model_key(&incoming.address)?;
             let model_timeout_seconds =
-                self.model_upstream_timeout_seconds(&self.main_agent.model)?;
+                self.model_upstream_timeout_seconds(&effective_model_key)?;
             let (override_timeout, status_text) =
                 match format_api_timeout_update(&session, model_timeout_seconds, &argument) {
                     Ok(result) => result,
@@ -2582,12 +2812,14 @@ impl Server {
             .materialize_attachments(&session.attachments_dir, incoming.attachments)
             .await?;
         let skill_updates_prefix = self.observe_runtime_skill_changes(&session)?;
+        let effective_model_key = self.effective_main_model_key(&incoming.address)?;
+        let effective_model = self.model_config_or_main(&effective_model_key)?.clone();
         let user_message = build_user_turn_message(
             incoming.text.as_deref(),
             skill_updates_prefix.as_deref(),
             &stored_attachments,
-            self.main_model()?,
-            backend_supports_native_multimodal_input(self.main_model()?.backend),
+            &effective_model,
+            backend_supports_native_multimodal_input(effective_model.backend),
         )?;
 
         channel
@@ -2601,7 +2833,7 @@ impl Server {
         );
 
         let turn_result = self
-            .run_main_agent_turn(&session, user_message)
+            .run_main_agent_turn(&session, &effective_model_key, user_message)
             .await
             .context("foreground agent turn failed");
         if let Some(stop_sender) = typing_guard {
@@ -2634,7 +2866,7 @@ impl Server {
             Vec::new(),
         )?;
 
-        let foreground = self.build_foreground_agent(&session)?;
+        let foreground = self.build_foreground_agent(&session, &effective_model_key)?;
         self.log_turn_usage(&session, &usage, false);
         info!(
             log_stream = "agent",
@@ -2712,8 +2944,12 @@ impl Server {
         lines.join("\n")
     }
 
-    fn status_text_for_session(&self, session: &SessionSnapshot) -> Result<String> {
-        let model = self.main_model()?;
+    fn status_text_for_session(
+        &mut self,
+        session: &SessionSnapshot,
+        model_key: &str,
+    ) -> Result<String> {
+        let model = self.model_config_or_main(model_key)?;
         let effective_api_timeout = session
             .api_timeout_override_seconds
             .unwrap_or(model.timeout_seconds);
@@ -2724,7 +2960,7 @@ impl Server {
         };
         Ok(format_session_status(
             &self.main_agent.language,
-            &self.main_agent.model,
+            model_key,
             model,
             session,
             effective_api_timeout,
@@ -2774,14 +3010,60 @@ impl Server {
         Ok(session)
     }
 
+    async fn compact_session_now(
+        &mut self,
+        session: &SessionSnapshot,
+        model_key: &str,
+    ) -> Result<bool> {
+        if !self.main_agent.enable_context_compression || session.agent_message_count == 0 {
+            return Ok(false);
+        }
+        let runtime = self.tool_runtime_for_address(&session.address)?;
+        let config = runtime.build_agent_frame_config(
+            session,
+            &session.workspace_root,
+            AgentPromptKind::MainForeground,
+            model_key,
+            None,
+        )?;
+        let extra_tools =
+            runtime.build_extra_tools(session, AgentPromptKind::MainForeground, session.agent_id);
+        let model = self.model_config_or_main(model_key)?;
+        let report = run_backend_compaction(
+            model.backend,
+            session.agent_messages.clone(),
+            config,
+            extra_tools,
+        )?;
+        if !report.compacted {
+            return Ok(false);
+        }
+        let compaction_stats = compaction_stats_from_report(&report);
+        self.sessions.record_idle_compaction(
+            &session.address,
+            report.messages,
+            &compaction_stats,
+        )?;
+        Ok(true)
+    }
+
+    fn available_sandbox_modes(&self) -> Vec<SandboxMode> {
+        let mut modes = vec![SandboxMode::Disabled, SandboxMode::Subprocess];
+        if cfg!(target_os = "linux") {
+            modes.push(SandboxMode::Bubblewrap);
+        }
+        modes
+    }
+
     async fn initialize_foreground_session(
         &mut self,
         session: &SessionSnapshot,
         show_reply: bool,
     ) -> Result<OutgoingMessage> {
         let greeting = ChatMessage::text("user", greeting_for_language(&self.main_agent.language));
+        let effective_model_key = self.effective_main_model_key(&session.address)?;
         let (messages, outgoing, usage, compaction, timed_out) = self
-            .run_main_agent_turn(session, greeting)
+            .run_main_agent_turn(session, &effective_model_key, greeting)
             .await
             .context("failed to initialize foreground session")?;
         self.sessions
@@ -2849,6 +3131,8 @@ impl Server {
         }
 
         let mut previous_messages = session.agent_messages.clone();
+        let effective_model_key = self.effective_main_model_key(&session.address)?;
+        let effective_model = self.model_config_or_main(&effective_model_key)?.clone();
         if self.main_agent.enable_context_compression
             && session.agent_message_count > self.main_agent.retain_recent_messages
         {
@@ -2857,7 +3141,7 @@ impl Server {
                 session,
                 &session.workspace_root,
                 AgentPromptKind::MainForeground,
-                &self.main_agent.model,
+                &effective_model_key,
                 None,
             )?;
             let extra_tools = runtime.build_extra_tools(
@@ -2866,7 +3150,7 @@ impl Server {
                 session.agent_id,
             );
             let compaction = run_backend_compaction(
-                self.main_model()?.backend,
+                effective_model.backend,
                 previous_messages.clone(),
                 config,
                 extra_tools,
@@ -2893,16 +3177,15 @@ impl Server {
                 &tree
             }
         );
-        let timeout_seconds = self.main_agent_timeout_seconds(&self.main_agent.model)?;
-        let upstream_timeout_seconds =
-            self.model_upstream_timeout_seconds(&self.main_agent.model)?;
-        let runtime = self.tool_runtime();
+        let timeout_seconds = self.main_agent_timeout_seconds(&effective_model_key)?;
+        let upstream_timeout_seconds = self.model_upstream_timeout_seconds(&effective_model_key)?;
+        let runtime = self.tool_runtime_for_address(&session.address)?;
         let outcome = runtime
             .run_agent_turn_with_timeout(
                 session.clone(),
                 AgentPromptKind::MainForeground,
                 session.agent_id,
-                self.main_agent.model.clone(),
+                effective_model_key.clone(),
                 previous_messages,
                 prompt,
                 timeout_seconds,
@@ -2976,6 +3259,7 @@ impl Server {
     async fn run_main_agent_turn(
         &self,
         session: &SessionSnapshot,
+        model_key: &str,
         next_user_message: ChatMessage,
     ) -> Result<(
         Vec<ChatMessage>,
@@ -2987,17 +3271,17 @@ impl Server {
         let workspace_root = session.workspace_root.clone();
         let mut previous_messages = session.agent_messages.clone();
         previous_messages.push(next_user_message);
-        let timeout_seconds = self.main_agent_timeout_seconds(&self.main_agent.model)?;
+        let timeout_seconds = self.main_agent_timeout_seconds(model_key)?;
         let upstream_timeout_seconds = session
             .api_timeout_override_seconds
-            .unwrap_or(self.model_upstream_timeout_seconds(&self.main_agent.model)?);
-        let runtime = self.tool_runtime();
+            .unwrap_or(self.model_upstream_timeout_seconds(model_key)?);
+        let runtime = self.tool_runtime_for_address(&session.address)?;
         let run_result = runtime
             .run_agent_turn_with_timeout(
                 session.clone(),
                 AgentPromptKind::MainForeground,
                 session.agent_id,
-                self.main_agent.model.clone(),
+                model_key.to_string(),
                 previous_messages,
                 String::new(),
                 timeout_seconds,
@@ -3036,10 +3320,33 @@ impl Server {
         }
     }
 
-    fn main_model(&self) -> Result<&ModelConfig> {
+    fn effective_conversation_settings(
+        &self,
+        address: &ChannelAddress,
+    ) -> Result<ConversationSettings> {
+        Ok(self
+            .conversations
+            .get_snapshot(address)
+            .map(|snapshot| snapshot.settings)
+            .unwrap_or_default())
+    }
+
+    fn effective_main_model_key(&self, address: &ChannelAddress) -> Result<String> {
+        let settings = self.effective_conversation_settings(address)?;
+        Ok(settings
+            .main_model
+            .unwrap_or_else(|| self.main_agent.model.clone()))
+    }
+
+    fn effective_sandbox_mode(&self, address: &ChannelAddress) -> Result<SandboxMode> {
+        let settings = self.effective_conversation_settings(address)?;
+        Ok(settings.sandbox_mode.unwrap_or(self.sandbox.mode))
+    }
+
+    fn model_config_or_main(&self, model_key: &str) -> Result<&ModelConfig> {
         self.models
-            .get(&self.main_agent.model)
-            .with_context(|| format!("unknown main_agent model {}", self.main_agent.model))
+            .get(model_key)
+            .with_context(|| format!("unknown model {}", model_key))
     }
 
     fn main_agent_timeout_seconds(&self, model_key: &str) -> Result<Option<f64>> {
@@ -3062,8 +3369,12 @@ impl Server {
             .timeout_seconds)
     }
 
-    fn build_foreground_agent(&self, session: &SessionSnapshot) -> Result<ForegroundAgent> {
-        let model = self.main_model()?;
+    fn build_foreground_agent(
+        &self,
+        session: &SessionSnapshot,
+        model_key: &str,
+    ) -> Result<ForegroundAgent> {
+        let model = self.model_config_or_main(model_key)?;
         let commands = self
             .command_catalog
             .get(&session.address.channel_id)
@@ -3082,7 +3393,7 @@ impl Server {
                     .map(|workspace| workspace.summary)
                     .unwrap_or_default(),
                 AgentPromptKind::MainForeground,
-                &self.main_agent.model,
+                model_key,
                 model,
                 &self.models,
                 &self.main_agent,
@@ -3587,6 +3898,7 @@ fn build_outgoing_message_for_session(
         },
         images: Vec::new(),
         attachments: Vec::new(),
+        options: None,
     };
     for attachment in attachments {
         let attachment = persist_outgoing_attachment(session, attachment)?;
@@ -4264,6 +4576,45 @@ fn parse_set_api_timeout_command(text: Option<&str>) -> Option<String> {
     }
 }
 
+fn parse_model_command(text: Option<&str>) -> Option<Option<String>> {
+    parse_optional_command_argument(text, "/model")
+}
+
+fn parse_sandbox_command(text: Option<&str>) -> Option<Option<String>> {
+    parse_optional_command_argument(text, "/sandbox")
+}
+
+fn parse_save_command(text: Option<&str>) -> Option<String> {
+    parse_required_command_argument(text, "/save")
+}
+
+fn parse_load_command(text: Option<&str>) -> Option<String> {
+    parse_required_command_argument(text, "/load")
+}
+
+fn parse_optional_command_argument(text: Option<&str>, command: &str) -> Option<Option<String>> {
+    let text = normalized_command_text(text?)?;
+    if text == command {
+        return Some(None);
+    }
+    let suffix = text.strip_prefix(command)?.trim();
+    if suffix.is_empty() {
+        Some(None)
+    } else {
+        Some(Some(suffix.to_string()))
+    }
+}
+
+fn parse_required_command_argument(text: Option<&str>, command: &str) -> Option<String> {
+    let text = normalized_command_text(text?)?;
+    let suffix = text.strip_prefix(command)?.trim();
+    if suffix.is_empty() {
+        None
+    } else {
+        Some(suffix.to_string())
+    }
+}
+
 fn normalized_command_text(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -4292,6 +4643,86 @@ fn command_starts_with(text: &str, command: &str) -> bool {
     normalized_command_text(text)
         .as_deref()
         .is_some_and(|normalized| normalized.starts_with(command))
+}
+
+fn sandbox_mode_label(mode: SandboxMode) -> &'static str {
+    match mode {
+        SandboxMode::Disabled => "disabled",
+        SandboxMode::Subprocess => "subprocess",
+        SandboxMode::Bubblewrap => "bubblewrap",
+    }
+}
+
+fn sandbox_mode_value(mode: SandboxMode) -> &'static str {
+    sandbox_mode_label(mode)
+}
+
+fn parse_sandbox_mode_value(value: &str) -> Option<SandboxMode> {
+    match value.trim() {
+        "disabled" => Some(SandboxMode::Disabled),
+        "subprocess" => Some(SandboxMode::Subprocess),
+        "bubblewrap" => Some(SandboxMode::Bubblewrap),
+        _ => None,
+    }
+}
+
+fn replace_directory_contents(target: &Path, source: &Path) -> Result<()> {
+    if target.exists() {
+        std::fs::remove_dir_all(target)
+            .with_context(|| format!("failed to clear {}", target.display()))?;
+    }
+    copy_dir_recursive(source, target)
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
+    std::fs::create_dir_all(target)
+        .with_context(|| format!("failed to create {}", target.display()))?;
+    for entry in
+        std::fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", source_path.display()))?;
+        if file_type.is_dir() {
+            copy_dir_recursive(&source_path, &target_path)?;
+        } else if file_type.is_symlink() {
+            let link_target = std::fs::read_link(&source_path)
+                .with_context(|| format!("failed to read link {}", source_path.display()))?;
+            create_symlink(&link_target, &target_path)?;
+        } else {
+            std::fs::copy(&source_path, &target_path).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn create_symlink(source: &Path, target: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(source, target)
+            .with_context(|| format!("failed to create symlink {}", target.display()))
+    }
+    #[cfg(windows)]
+    {
+        let metadata = std::fs::metadata(source)
+            .with_context(|| format!("failed to stat symlink target {}", source.display()))?;
+        if metadata.is_dir() {
+            std::os::windows::fs::symlink_dir(source, target)
+                .with_context(|| format!("failed to create symlink {}", target.display()))
+        } else {
+            std::os::windows::fs::symlink_file(source, target)
+                .with_context(|| format!("failed to create symlink {}", target.display()))
+        }
+    }
 }
 
 fn workspace_visible_in_list(
@@ -4599,7 +5030,8 @@ mod tests {
         SinkTarget, TokenUsage, background_agent_timeout_seconds,
         background_recovery_timeout_seconds, background_timeout_with_active_children_text,
         build_user_turn_message, channel_restart_backoff_seconds, estimate_compaction_savings_usd,
-        estimate_cost_usd, extract_attachment_references, is_timeout_like, parse_oldspace_command,
+        estimate_cost_usd, extract_attachment_references, is_timeout_like, parse_load_command,
+        parse_model_command, parse_oldspace_command, parse_sandbox_command, parse_save_command,
         parse_set_api_timeout_command, parse_sink_target, should_attempt_idle_context_compaction,
         workspace_visible_in_list,
     };
@@ -4846,6 +5278,49 @@ mod tests {
             None
         );
         assert_eq!(parse_set_api_timeout_command(Some("hello")), None);
+    }
+
+    #[test]
+    fn parses_model_and_sandbox_commands_with_optional_arguments() {
+        assert_eq!(parse_model_command(Some("/model")), Some(None));
+        assert_eq!(
+            parse_model_command(Some("/model demo-model")),
+            Some(Some("demo-model".to_string()))
+        );
+        assert_eq!(
+            parse_model_command(Some("/model@party_claw_bot demo-model")),
+            Some(Some("demo-model".to_string()))
+        );
+
+        assert_eq!(parse_sandbox_command(Some("/sandbox")), Some(None));
+        assert_eq!(
+            parse_sandbox_command(Some("/sandbox subprocess")),
+            Some(Some("subprocess".to_string()))
+        );
+        assert_eq!(
+            parse_sandbox_command(Some("/sandbox@party_claw_bot bubblewrap")),
+            Some(Some("bubblewrap".to_string()))
+        );
+    }
+
+    #[test]
+    fn parses_save_and_load_commands_with_bot_suffix() {
+        assert_eq!(
+            parse_save_command(Some("/save demo-checkpoint")),
+            Some("demo-checkpoint".to_string())
+        );
+        assert_eq!(
+            parse_save_command(Some("/save@party_claw_bot demo-checkpoint")),
+            Some("demo-checkpoint".to_string())
+        );
+        assert_eq!(
+            parse_load_command(Some("/load restore-point")),
+            Some("restore-point".to_string())
+        );
+        assert_eq!(
+            parse_load_command(Some("/load@party_claw_bot restore-point")),
+            Some("restore-point".to_string())
+        );
     }
 
     #[test]

@@ -4,6 +4,7 @@ use crate::channel::{
 use crate::config::{BotCommandConfig, TelegramChannelConfig};
 use crate::domain::{
     AttachmentKind, ChannelAddress, OutgoingAttachment, OutgoingMessage, ProcessingState,
+    ShowOptions,
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -582,7 +583,7 @@ impl TelegramChannel {
         };
         self.call_multipart("sendPhoto", form).await?;
         for chunk in trailing_text_chunks {
-            self.send_text_chunks(chat_id, &chunk).await?;
+            self.send_text_chunks(chat_id, &chunk, None).await?;
         }
         Ok(())
     }
@@ -612,7 +613,7 @@ impl TelegramChannel {
         };
         self.call_multipart("sendDocument", form).await?;
         for chunk in trailing_text_chunks {
-            self.send_text_chunks(chat_id, &chunk).await?;
+            self.send_text_chunks(chat_id, &chunk, None).await?;
         }
         Ok(())
     }
@@ -684,18 +685,33 @@ impl TelegramChannel {
             .await
     }
 
-    async fn send_text_chunks(&self, chat_id: &str, text: &str) -> Result<()> {
-        for chunk in split_markdown_message(text, Self::MAX_MESSAGE_CHARS) {
+    async fn send_text_chunks(
+        &self,
+        chat_id: &str,
+        text: &str,
+        options: Option<&ShowOptions>,
+    ) -> Result<()> {
+        for (index, chunk) in split_markdown_message(text, Self::MAX_MESSAGE_CHARS)
+            .into_iter()
+            .enumerate()
+        {
             let translated = translate_markdown_to_telegram_html(&chunk);
-            self.call_api::<serde_json::Value>(
-                "sendMessage",
-                json!({
-                    "chat_id": chat_id,
-                    "text": translated.text,
-                    "parse_mode": "HTML",
-                }),
-            )
-            .await?;
+            let mut payload = json!({
+                "chat_id": chat_id,
+                "text": translated.text,
+                "parse_mode": "HTML",
+            });
+            if index == 0
+                && let Some(options) = options
+                && let Some(object) = payload.as_object_mut()
+            {
+                object.insert(
+                    "reply_markup".to_string(),
+                    build_reply_keyboard_markup(options),
+                );
+            }
+            self.call_api::<serde_json::Value>("sendMessage", payload)
+                .await?;
         }
         Ok(())
     }
@@ -709,6 +725,7 @@ impl TelegramChannel {
             text,
             images,
             attachments,
+            options,
         } = message;
         let mut trailing_text_chunks = Vec::new();
         if images.len() >= 2 {
@@ -746,12 +763,12 @@ impl TelegramChannel {
             if let Some(text) = text.as_deref()
                 && !has_images
             {
-                self.send_text_chunks(&address.conversation_id, text)
+                self.send_text_chunks(&address.conversation_id, text, options.as_ref())
                     .await?;
             }
         }
         for chunk in trailing_text_chunks {
-            self.send_text_chunks(&address.conversation_id, &chunk)
+            self.send_text_chunks(&address.conversation_id, &chunk, None)
                 .await?;
         }
         for attachment in attachments {
@@ -905,6 +922,7 @@ impl Channel for TelegramChannel {
             text,
             images,
             attachments,
+            options,
         } = message;
         info!(
             log_stream = "channel",
@@ -915,6 +933,7 @@ impl Channel for TelegramChannel {
             text_preview = text.as_deref().map(summarize_for_log),
             image_count = images.len() as u64,
             attachment_count = attachments.len() as u64,
+            has_options = options.is_some(),
             attachment_names = ?attachments
                 .iter()
                 .filter_map(|item| item.path.file_name().map(|name| name.to_string_lossy().to_string()))
@@ -948,6 +967,7 @@ impl Channel for TelegramChannel {
                     text,
                     images,
                     attachments,
+                    options,
                 },
             )
             .await
@@ -1023,6 +1043,20 @@ fn summarize_for_log(text: &str) -> String {
     } else {
         summary
     }
+}
+
+fn build_reply_keyboard_markup(options: &ShowOptions) -> serde_json::Value {
+    let keyboard = options
+        .options
+        .iter()
+        .map(|option| vec![json!({ "text": option.value })])
+        .collect::<Vec<_>>();
+    json!({
+        "keyboard": keyboard,
+        "resize_keyboard": true,
+        "one_time_keyboard": options.one_time,
+        "input_field_placeholder": options.prompt,
+    })
 }
 
 fn poll_backoff_seconds(consecutive_failures: u32, cap_seconds: u64) -> u64 {

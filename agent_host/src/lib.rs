@@ -6,6 +6,7 @@ pub mod channel;
 pub mod channels;
 pub mod child_rpc;
 pub mod config;
+pub mod conversation;
 pub mod cron;
 pub mod domain;
 pub mod env;

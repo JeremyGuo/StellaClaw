@@ -242,8 +242,24 @@ pub fn default_bot_commands() -> Vec<BotCommandConfig> {
             description: "Show current session usage and timeout settings".to_string(),
         },
         BotCommandConfig {
+            command: "model".to_string(),
+            description: "Show or set the conversation model".to_string(),
+        },
+        BotCommandConfig {
+            command: "sandbox".to_string(),
+            description: "Show or set the conversation sandbox mode".to_string(),
+        },
+        BotCommandConfig {
             command: "set_api_timeout".to_string(),
             description: "Set session API timeout in seconds".to_string(),
+        },
+        BotCommandConfig {
+            command: "save".to_string(),
+            description: "Save a named checkpoint for this conversation".to_string(),
+        },
+        BotCommandConfig {
+            command: "load".to_string(),
+            description: "Load a named checkpoint into this conversation".to_string(),
         },
     ]
 }

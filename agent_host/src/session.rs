@@ -40,6 +40,30 @@ pub enum SkillChangeNotice {
     },
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionCheckpointData {
+    #[serde(default)]
+    pub history: Vec<SessionMessage>,
+    #[serde(default)]
+    pub agent_messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub last_agent_returned_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_compacted_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub turn_count: u64,
+    #[serde(default)]
+    pub last_compacted_turn_count: u64,
+    #[serde(default)]
+    pub cumulative_usage: TokenUsage,
+    #[serde(default)]
+    pub cumulative_compaction: SessionCompactionStats,
+    #[serde(default)]
+    pub api_timeout_override_seconds: Option<f64>,
+    #[serde(default)]
+    pub skill_states: HashMap<String, SessionSkillState>,
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionSnapshot {
     pub id: Uuid,
@@ -393,6 +417,74 @@ impl SessionManager {
         session.close_after_summary = close_after_summary;
         session.persist()?;
         Ok(())
+    }
+
+    pub fn export_checkpoint(&self, address: &ChannelAddress) -> Result<SessionCheckpointData> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        Ok(SessionCheckpointData {
+            history: session.history.clone(),
+            agent_messages: session.agent_messages.clone(),
+            last_agent_returned_at: session.last_agent_returned_at,
+            last_compacted_at: session.last_compacted_at,
+            turn_count: session.turn_count,
+            last_compacted_turn_count: session.last_compacted_turn_count,
+            cumulative_usage: session.cumulative_usage.clone(),
+            cumulative_compaction: session.cumulative_compaction.clone(),
+            api_timeout_override_seconds: session.api_timeout_override_seconds,
+            skill_states: session.skill_states.clone(),
+        })
+    }
+
+    pub fn restore_foreground_from_checkpoint(
+        &mut self,
+        address: &ChannelAddress,
+        checkpoint: SessionCheckpointData,
+        workspace_id: String,
+        workspace_root: PathBuf,
+    ) -> Result<SessionSnapshot> {
+        self.destroy_foreground(address)?;
+        let session_id = Uuid::new_v4();
+        let agent_id = Uuid::new_v4();
+        let root_dir = self.sessions_root.join(session_id.to_string());
+        fs::create_dir_all(&root_dir)
+            .with_context(|| format!("failed to create session root {}", root_dir.display()))?;
+        let attachments_dir = workspace_root.join("upload");
+        fs::create_dir_all(&attachments_dir)
+            .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
+        let session = Session {
+            id: session_id,
+            agent_id,
+            address: address.clone(),
+            root_dir,
+            attachments_dir,
+            workspace_id,
+            workspace_root,
+            history: checkpoint.history,
+            agent_messages: checkpoint.agent_messages,
+            last_agent_returned_at: checkpoint.last_agent_returned_at,
+            last_compacted_at: checkpoint.last_compacted_at,
+            turn_count: checkpoint.turn_count,
+            last_compacted_turn_count: checkpoint.last_compacted_turn_count,
+            cumulative_usage: checkpoint.cumulative_usage,
+            cumulative_compaction: checkpoint.cumulative_compaction,
+            api_timeout_override_seconds: checkpoint.api_timeout_override_seconds,
+            skill_states: checkpoint.skill_states,
+            pending_workspace_summary: false,
+            close_after_summary: false,
+            closed_at: None,
+        };
+        session.persist()?;
+        let key = address.session_key();
+        self.foreground_sessions.insert(key.clone(), session);
+        Ok(self
+            .foreground_sessions
+            .get(&key)
+            .expect("foreground session inserted")
+            .snapshot())
     }
 
     pub fn update_agent_messages(
@@ -774,9 +866,9 @@ fn load_persisted_sessions(
 #[cfg(test)]
 mod tests {
     use super::{SessionManager, SessionSkillObservation, SkillChangeNotice};
-    use crate::domain::ChannelAddress;
+    use crate::domain::{ChannelAddress, StoredAttachment};
     use crate::workspace::WorkspaceManager;
-    use agent_frame::{SessionCompactionStats, TokenUsage};
+    use agent_frame::{ChatMessage, SessionCompactionStats, TokenUsage};
     use tempfile::TempDir;
 
     fn test_address() -> ChannelAddress {
@@ -941,6 +1033,48 @@ mod tests {
                 && content_description == "new desc"
                 && content == "new content"
         ));
+    }
+
+    #[test]
+    fn exports_and_restores_session_checkpoint() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager.clone()).unwrap();
+        let address = test_address();
+        sessions.ensure_foreground(&address).unwrap();
+
+        sessions
+            .append_user_message(
+                &address,
+                Some("hello".to_string()),
+                Vec::<StoredAttachment>::new(),
+            )
+            .unwrap();
+        sessions
+            .record_agent_turn(
+                &address,
+                vec![ChatMessage::text("assistant", "hi")],
+                &TokenUsage::default(),
+                &SessionCompactionStats::default(),
+            )
+            .unwrap();
+
+        let checkpoint = sessions.export_checkpoint(&address).unwrap();
+        let workspace = workspace_manager
+            .create_workspace(uuid::Uuid::new_v4(), uuid::Uuid::new_v4(), Some("restored"))
+            .unwrap();
+        let restored = sessions
+            .restore_foreground_from_checkpoint(
+                &address,
+                checkpoint,
+                workspace.id.clone(),
+                workspace.files_dir.clone(),
+            )
+            .unwrap();
+
+        assert_eq!(restored.workspace_id, workspace.id);
+        assert_eq!(restored.message_count, 1);
+        assert_eq!(restored.agent_message_count, 1);
     }
 }
 

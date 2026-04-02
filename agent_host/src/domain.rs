@@ -43,6 +43,24 @@ pub struct OutgoingAttachment {
     pub caption: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ShowOption {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ShowOptions {
+    pub prompt: String,
+    pub options: Vec<ShowOption>,
+    #[serde(default = "default_show_options_one_time")]
+    pub one_time: bool,
+}
+
+fn default_show_options_one_time() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct OutgoingMessage {
     #[serde(default)]
@@ -51,6 +69,8 @@ pub struct OutgoingMessage {
     pub images: Vec<OutgoingAttachment>,
     #[serde(default)]
     pub attachments: Vec<OutgoingAttachment>,
+    #[serde(default)]
+    pub options: Option<ShowOptions>,
 }
 
 impl OutgoingMessage {
@@ -59,6 +79,24 @@ impl OutgoingMessage {
             text: Some(text.into()),
             images: Vec::new(),
             attachments: Vec::new(),
+            options: None,
+        }
+    }
+
+    pub fn with_options(
+        text: impl Into<String>,
+        prompt: impl Into<String>,
+        options: Vec<ShowOption>,
+    ) -> Self {
+        Self {
+            text: Some(text.into()),
+            images: Vec::new(),
+            attachments: Vec::new(),
+            options: Some(ShowOptions {
+                prompt: prompt.into(),
+                options,
+                one_time: true,
+            }),
         }
     }
 }
