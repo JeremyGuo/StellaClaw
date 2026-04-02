@@ -201,6 +201,7 @@ pub fn run_turn_in_child_process(
     prompt: String,
     config: agent_frame::config::AgentConfig,
     skill_memory_source: PathBuf,
+    skills_source_root: PathBuf,
     extra_tools: Vec<Tool>,
     control: Option<SessionExecutionControl>,
 ) -> Result<SessionRunReport> {
@@ -215,6 +216,7 @@ pub fn run_turn_in_child_process(
             &config.runtime_state_root,
             &config.workspace_root.join(".skill_memory"),
             &skill_memory_source,
+            &skills_source_root,
             &config.skills_dirs,
         )?,
     };
@@ -393,6 +395,7 @@ fn build_bubblewrap_command(
     runtime_state_root: &Path,
     skill_memory_target: &Path,
     skill_memory_source: &Path,
+    skills_source_root: &Path,
     skills_dirs: &[std::path::PathBuf],
 ) -> Result<Command> {
     if !cfg!(target_os = "linux") {
@@ -420,11 +423,30 @@ fn build_bubblewrap_command(
     if Path::new("/etc").exists() {
         command.args(["--ro-bind", "/etc", "/etc"]);
     }
+    if Path::new("/run").exists() {
+        command.args(["--ro-bind", "/run", "/run"]);
+    }
+    let system_resolv = Path::new("/run/systemd/resolve/resolv.conf");
+    if system_resolv.exists() && Path::new("/etc/resolv.conf").exists() {
+        bind_path_to(
+            &mut command,
+            system_resolv,
+            Path::new("/etc/resolv.conf"),
+            true,
+        )?;
+    }
     command.args(["--dev", "/dev"]);
     command.args(["--proc", "/proc"]);
     command.args(["--tmpfs", "/tmp"]);
     command.args(["--tmpfs", "/var/tmp"]);
-    bind_path(&mut command, current_exe, true)?;
+    command.args(["--dir", "/__agent_host"]);
+    command.args(["--dir", "/__agent_host/bin"]);
+    bind_path_to(
+        &mut command,
+        current_exe,
+        Path::new("/__agent_host/bin/agent_host"),
+        true,
+    )?;
     bind_path(&mut command, workspace_root, false)?;
     bind_path(&mut command, runtime_state_root, false)?;
     if skill_memory_source.exists() {
@@ -436,10 +458,11 @@ fn build_bubblewrap_command(
         )?;
     }
     for skill_dir in skills_dirs {
-        if skill_dir.exists() {
-            bind_path(&mut command, skill_dir, false)?;
+        if skills_source_root.exists() {
+            bind_path_to(&mut command, skills_source_root, skill_dir, false)?;
         }
     }
+    command.arg("/__agent_host/bin/agent_host");
     Ok(command)
 }
 

@@ -501,7 +501,11 @@ impl ServerRuntime {
                 external_web_search: model.external_web_search.clone(),
             },
             image_tool_upstream,
-            skills_dirs: vec![self.agent_workspace.skills_dir.clone()],
+            skills_dirs: if matches!(self.sandbox.mode, crate::config::SandboxMode::Bubblewrap) {
+                vec![workspace_root.join(".skills")]
+            } else {
+                vec![self.agent_workspace.skills_dir.clone()]
+            },
             system_prompt: build_agent_system_prompt(
                 &self.agent_workspace,
                 session,
@@ -1119,6 +1123,7 @@ impl ServerRuntime {
                 prompt,
                 config,
                 self.agent_workspace.rundir.join("skill_memory"),
+                self.agent_workspace.skills_dir.clone(),
                 extra_tools,
                 execution_control,
             );

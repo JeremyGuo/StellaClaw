@@ -624,7 +624,7 @@ impl WorkspaceManager {
         {
             let entry = entry?;
             let source_path = entry.path();
-            if entry.file_name() == "skill_memory" {
+            if entry.file_name() == "skill_memory" || entry.file_name() == ".skill_memory" {
                 continue;
             }
             let target_path = record.files_dir.join(entry.file_name());
@@ -647,11 +647,16 @@ impl WorkspaceManager {
                 .with_context(|| format!("failed to remove legacy {}", legacy.display()))?;
         }
         let target = record.files_dir.join(".skill_memory");
-        if target.exists() {
+        if fs::symlink_metadata(&target).is_ok() {
             return Ok(());
         }
-        create_dir_symlink(&source, &target)
-            .with_context(|| format!("failed to create skill memory link {}", target.display()))
+        match create_dir_symlink(&source, &target) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error).with_context(|| {
+                format!("failed to create skill memory link {}", target.display())
+            }),
+        }
     }
 
     fn materialize_mount_path(
@@ -895,13 +900,20 @@ fn copy_path_recursive(source: &Path, target: &Path) -> Result<()> {
 }
 
 fn create_dir_symlink(source: &Path, target: &Path) -> std::io::Result<()> {
+    let link_source = source.canonicalize().or_else(|_| {
+        if source.is_absolute() {
+            Ok(source.to_path_buf())
+        } else {
+            std::env::current_dir().map(|cwd| cwd.join(source))
+        }
+    })?;
     #[cfg(unix)]
     {
-        std::os::unix::fs::symlink(source, target)
+        std::os::unix::fs::symlink(&link_source, target)
     }
     #[cfg(windows)]
     {
-        std::os::windows::fs::symlink_dir(source, target)
+        std::os::windows::fs::symlink_dir(&link_source, target)
     }
 }
 
