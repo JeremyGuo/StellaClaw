@@ -2692,6 +2692,21 @@ impl Server {
             return Ok(());
         }
 
+        if matches!(
+            parse_optional_command_argument(incoming.text.as_deref(), "/snap_save"),
+            Some(None)
+        ) {
+            self.send_channel_message(
+                &channel,
+                &incoming.address,
+                OutgoingMessage::text(
+                    "Usage: `/snap_save <name>`\nExample: `/snap_save demo`".to_string(),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+
         if let Some(checkpoint_name) = parse_snap_save_command(incoming.text.as_deref()) {
             let session = self.sessions.ensure_foreground(&incoming.address)?;
             let checkpoint = self.sessions.export_checkpoint(&incoming.address)?;
@@ -2718,7 +2733,12 @@ impl Server {
             return Ok(());
         }
 
-        if parse_snap_list_command(incoming.text.as_deref()) {
+        if parse_snap_list_command(incoming.text.as_deref())
+            || matches!(
+                parse_optional_command_argument(incoming.text.as_deref(), "/snap_load"),
+                Some(None)
+            )
+        {
             let conversation = self.conversations.ensure_conversation(&incoming.address)?;
             if conversation.checkpoints.is_empty() {
                 self.send_channel_message(
