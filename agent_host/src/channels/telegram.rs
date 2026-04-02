@@ -312,6 +312,22 @@ impl TelegramChannel {
         );
     }
 
+    async fn set_my_commands_for_scope(
+        &self,
+        scope: serde_json::Value,
+        commands: &[serde_json::Value],
+    ) -> Result<()> {
+        self.call_api::<bool>(
+            "setMyCommands",
+            json!({
+                "scope": scope,
+                "commands": commands,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn set_my_commands(&self) -> Result<()> {
         let commands = self
             .commands
@@ -323,13 +339,10 @@ impl TelegramChannel {
                 })
             })
             .collect::<Vec<_>>();
-        self.call_api::<bool>(
-            "setMyCommands",
-            json!({
-                "commands": commands,
-            }),
-        )
-        .await?;
+        self.set_my_commands_for_scope(json!({ "type": "all_private_chats" }), &commands)
+            .await?;
+        self.set_my_commands_for_scope(json!({ "type": "all_group_chats" }), &commands)
+            .await?;
         Ok(())
     }
 
