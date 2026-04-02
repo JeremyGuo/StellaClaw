@@ -29,6 +29,8 @@ pub struct TelegramChannel {
 
 impl TelegramChannel {
     const MAX_POLL_BACKOFF_SECONDS: u64 = 30;
+    const MAX_MESSAGE_CHARS: usize = 4096;
+    const MAX_CAPTION_CHARS: usize = 1024;
 
     pub fn from_config(config: TelegramChannelConfig) -> Result<Self> {
         let bot_token = match config.bot_token {
@@ -285,17 +287,24 @@ impl TelegramChannel {
         let bytes = fs::read(&attachment.path)
             .await
             .with_context(|| format!("failed to read image {}", attachment.path.display()))?;
+        let mut trailing_text_chunks = Vec::new();
         let form = Form::new()
             .text("chat_id", chat_id.to_string())
             .part("photo", Part::bytes(bytes).file_name(file_name));
         let form = if let Some(caption) = attachment.caption {
-            let translated = translate_markdown_to_telegram_html(&caption);
+            let mut iter = split_markdown_message(&caption, Self::MAX_CAPTION_CHARS).into_iter();
+            let caption = iter.next();
+            trailing_text_chunks = iter.collect();
+            let translated = translate_markdown_to_telegram_html(caption.as_deref().unwrap_or(""));
             form.text("caption", translated.text)
                 .text("parse_mode", "HTML".to_string())
         } else {
             form
         };
         self.call_multipart("sendPhoto", form).await?;
+        for chunk in trailing_text_chunks {
+            self.send_text_chunks(chat_id, &chunk).await?;
+        }
         Ok(())
     }
 
@@ -308,17 +317,24 @@ impl TelegramChannel {
         let bytes = fs::read(&attachment.path)
             .await
             .with_context(|| format!("failed to read attachment {}", attachment.path.display()))?;
+        let mut trailing_text_chunks = Vec::new();
         let form = Form::new()
             .text("chat_id", chat_id.to_string())
             .part("document", Part::bytes(bytes).file_name(file_name));
         let form = if let Some(caption) = attachment.caption {
-            let translated = translate_markdown_to_telegram_html(&caption);
+            let mut iter = split_markdown_message(&caption, Self::MAX_CAPTION_CHARS).into_iter();
+            let caption = iter.next();
+            trailing_text_chunks = iter.collect();
+            let translated = translate_markdown_to_telegram_html(caption.as_deref().unwrap_or(""));
             form.text("caption", translated.text)
                 .text("parse_mode", "HTML".to_string())
         } else {
             form
         };
         self.call_multipart("sendDocument", form).await?;
+        for chunk in trailing_text_chunks {
+            self.send_text_chunks(chat_id, &chunk).await?;
+        }
         Ok(())
     }
 
@@ -387,6 +403,22 @@ impl TelegramChannel {
     ) -> Result<()> {
         self.send_photo_group(&address.conversation_id, images, caption)
             .await
+    }
+
+    async fn send_text_chunks(&self, chat_id: &str, text: &str) -> Result<()> {
+        for chunk in split_markdown_message(text, Self::MAX_MESSAGE_CHARS) {
+            let translated = translate_markdown_to_telegram_html(&chunk);
+            self.call_api::<serde_json::Value>(
+                "sendMessage",
+                json!({
+                    "chat_id": chat_id,
+                    "text": translated.text,
+                    "parse_mode": "HTML",
+                }),
+            )
+            .await?;
+        }
+        Ok(())
     }
 }
 
@@ -487,31 +519,48 @@ impl Channel for TelegramChannel {
             attachment_count = attachments.len() as u64,
             "sending message to telegram user"
         );
+        let mut trailing_text_chunks = Vec::new();
         if images.len() >= 2 {
-            self.send_media_group_with_caption(address, images, text)
+            let (caption, trailing) = text
+                .as_deref()
+                .map(|value| {
+                    let chunks = split_markdown_message(value, Self::MAX_CAPTION_CHARS);
+                    let mut iter = chunks.into_iter();
+                    let caption = iter.next();
+                    let trailing = iter.collect::<Vec<_>>();
+                    (caption, trailing)
+                })
+                .unwrap_or((None, Vec::new()));
+            trailing_text_chunks = trailing;
+            self.send_media_group_with_caption(address, images, caption)
                 .await?;
         } else {
             let mut images = images;
             let has_images = !images.is_empty();
-            if let Some(image) = images.first_mut()
-                && image.caption.is_none()
+            if let Some(text) = text.as_deref()
+                && has_images
             {
-                image.caption = text.clone();
+                let chunks = split_markdown_message(text, Self::MAX_CAPTION_CHARS);
+                let mut iter = chunks.into_iter();
+                let caption = iter.next();
+                trailing_text_chunks = iter.collect();
+                if let Some(image) = images.first_mut()
+                    && image.caption.is_none()
+                {
+                    image.caption = caption;
+                }
             }
             self.send_media_group(address, images).await?;
-            if let Some(text) = text
+            if let Some(text) = text.as_deref()
                 && !has_images
             {
-                self.call_api::<serde_json::Value>(
-                    "sendMessage",
-                    json!({
-                        "chat_id": address.conversation_id,
-                        "text": translate_markdown_to_telegram_html(&text).text,
-                        "parse_mode": "HTML",
-                    }),
-                )
-                .await?;
+                self.send_text_chunks(&address.conversation_id, text)
+                    .await?;
             }
+        }
+        for chunk in trailing_text_chunks {
+            self.send_text_chunks(&address.conversation_id, &chunk)
+                .await?;
         }
         for attachment in attachments {
             self.send_document(&address.conversation_id, attachment)
@@ -794,9 +843,74 @@ fn escape_html_attribute(value: &str) -> String {
     escape_html_text(value).replace('"', "&quot;")
 }
 
+fn split_markdown_message(input: &str, max_chars: usize) -> Vec<String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let chars: Vec<char> = trimmed.chars().collect();
+    let mut cursor = 0usize;
+    let mut chunks = Vec::new();
+    while cursor < chars.len() {
+        let remaining = chars.len() - cursor;
+        let mut low = 1usize;
+        let mut high = remaining;
+        let mut best = 1usize;
+        while low <= high {
+            let mid = (low + high) / 2;
+            let candidate: String = chars[cursor..cursor + mid].iter().collect();
+            let translated_len = translate_markdown_to_telegram_html(&candidate)
+                .text
+                .chars()
+                .count();
+            if translated_len <= max_chars {
+                best = mid;
+                low = mid + 1;
+            } else {
+                high = mid.saturating_sub(1);
+            }
+        }
+
+        let mut end = cursor + best;
+        if end < chars.len()
+            && let Some(adjusted) = prefer_split_boundary(&chars[cursor..end], best / 2)
+        {
+            end = cursor + adjusted;
+        }
+
+        let chunk: String = chars[cursor..end].iter().collect();
+        let chunk = chunk.trim();
+        if !chunk.is_empty() {
+            chunks.push(chunk.to_string());
+        }
+        cursor = end;
+        while cursor < chars.len() && chars[cursor].is_whitespace() {
+            cursor += 1;
+        }
+    }
+    chunks
+}
+
+fn prefer_split_boundary(chars: &[char], minimum_index: usize) -> Option<usize> {
+    let text: String = chars.iter().collect();
+    for needle in ["\n\n", "\n", " "] {
+        if let Some(index) = text.rfind(needle) {
+            let split_index = index + needle.len();
+            if split_index >= minimum_index {
+                return Some(text[..split_index].chars().count());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{TelegramChannel, poll_backoff_seconds, translate_markdown_to_telegram_html};
+    use super::{
+        TelegramChannel, poll_backoff_seconds, split_markdown_message,
+        translate_markdown_to_telegram_html,
+    };
     use reqwest::Client;
 
     #[test]
@@ -846,6 +960,39 @@ mod tests {
         assert_eq!(poll_backoff_seconds(2, 30), 2);
         assert_eq!(poll_backoff_seconds(3, 30), 4);
         assert_eq!(poll_backoff_seconds(10, 30), 30);
+    }
+
+    #[test]
+    fn splits_long_markdown_messages_into_multiple_chunks() {
+        let input = format!(
+            "{}\n\n{}\n\n{}",
+            "a".repeat(2200),
+            "b".repeat(2200),
+            "c".repeat(2200)
+        );
+        let chunks = split_markdown_message(&input, 4096);
+        assert!(chunks.len() >= 2);
+        assert!(chunks.iter().all(|chunk| {
+            translate_markdown_to_telegram_html(chunk)
+                .text
+                .chars()
+                .count()
+                <= 4096
+        }));
+    }
+
+    #[test]
+    fn splits_caption_safely_under_caption_limit() {
+        let input = format!("**{}**", "x".repeat(1400));
+        let chunks = split_markdown_message(&input, 1024);
+        assert!(chunks.len() >= 2);
+        assert!(chunks.iter().all(|chunk| {
+            translate_markdown_to_telegram_html(chunk)
+                .text
+                .chars()
+                .count()
+                <= 1024
+        }));
     }
 
     #[test]
