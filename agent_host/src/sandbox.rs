@@ -426,15 +426,6 @@ fn build_bubblewrap_command(
     if Path::new("/run").exists() {
         command.args(["--ro-bind", "/run", "/run"]);
     }
-    let system_resolv = Path::new("/run/systemd/resolve/resolv.conf");
-    if system_resolv.exists() && Path::new("/etc/resolv.conf").exists() {
-        bind_path_to(
-            &mut command,
-            system_resolv,
-            Path::new("/etc/resolv.conf"),
-            true,
-        )?;
-    }
     command.args(["--dev", "/dev"]);
     command.args(["--proc", "/proc"]);
     command.args(["--tmpfs", "/tmp"]);
