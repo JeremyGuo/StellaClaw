@@ -26,6 +26,7 @@ pub struct TelegramChannel {
     poll_interval_ms: u64,
     commands: Vec<BotCommandConfig>,
     client: Client,
+    bot_username: Mutex<Option<String>>,
     pending_outbound: Mutex<VecDeque<PendingOutbound>>,
 }
 
@@ -60,6 +61,7 @@ impl TelegramChannel {
             poll_interval_ms: config.poll_interval_ms,
             commands: config.commands,
             client: Client::new(),
+            bot_username: Mutex::new(None),
             pending_outbound: Mutex::new(VecDeque::new()),
         })
     }
@@ -325,6 +327,31 @@ impl TelegramChannel {
         Ok(())
     }
 
+    async fn refresh_bot_identity(&self) {
+        match self.call_api::<TelegramUser>("getMe", json!({})).await {
+            Ok(user) => {
+                let username = user.username.clone();
+                *self.bot_username.lock().await = username.clone();
+                info!(
+                    log_stream = "channel",
+                    log_key = %self.id,
+                    kind = "telegram_bot_identity",
+                    bot_username = username.as_deref().unwrap_or(""),
+                    "telegram bot identity loaded"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    log_stream = "channel",
+                    log_key = %self.id,
+                    kind = "telegram_bot_identity_failed",
+                    error = %format!("{error:#}"),
+                    "failed to fetch telegram bot identity"
+                );
+            }
+        }
+    }
+
     fn build_address(&self, message: &TelegramMessage) -> ChannelAddress {
         let display_name = message.from.as_ref().map(|user| {
             let mut pieces = Vec::new();
@@ -431,6 +458,26 @@ impl TelegramChannel {
         }
 
         attachments
+    }
+
+    async fn should_accept_message(
+        &self,
+        message: &TelegramMessage,
+        text: Option<&str>,
+        _attachments_count: usize,
+    ) -> bool {
+        if message.chat.kind == "private" {
+            return true;
+        }
+        let Some(text) = text.map(str::trim).filter(|value| !value.is_empty()) else {
+            return false;
+        };
+        let bot_username = self.bot_username.lock().await.clone();
+        let Some(bot_username) = bot_username else {
+            return false;
+        };
+        let mention = format!("@{}", bot_username.to_ascii_lowercase());
+        text.to_ascii_lowercase().contains(&mention)
     }
 
     async fn send_photo(&self, chat_id: &str, attachment: OutgoingAttachment) -> Result<()> {
@@ -647,6 +694,7 @@ impl Channel for TelegramChannel {
 
     async fn run(self: Arc<Self>, sender: mpsc::Sender<IncomingMessage>) -> Result<()> {
         let mut offset = None::<i64>;
+        self.refresh_bot_identity().await;
         self.set_my_commands().await?;
         info!(
             log_stream = "channel",
@@ -711,6 +759,21 @@ impl Channel for TelegramChannel {
                         conversation_id = message.chat.id.to_string(),
                         remote_message_id = message.message_id.to_string(),
                         "ignoring telegram service/empty message without text or attachments"
+                    );
+                    continue;
+                }
+                if !self
+                    .should_accept_message(&message, text.as_deref(), attachments.len())
+                    .await
+                {
+                    info!(
+                        log_stream = "channel",
+                        log_key = %self.id,
+                        kind = "telegram_ignored_group_message",
+                        conversation_id = message.chat.id.to_string(),
+                        remote_message_id = message.message_id.to_string(),
+                        text_preview = text.as_deref().map(summarize_for_log),
+                        "ignoring group message without bot mention or command"
                     );
                     continue;
                 }
@@ -1162,8 +1225,8 @@ fn prefer_split_boundary(chars: &[char], minimum_index: usize) -> Option<usize> 
 #[cfg(test)]
 mod tests {
     use super::{
-        TelegramChannel, poll_backoff_seconds, split_markdown_message,
-        translate_markdown_to_telegram_html,
+        TelegramChannel, TelegramChat, TelegramMessage, poll_backoff_seconds,
+        split_markdown_message, translate_markdown_to_telegram_html,
     };
     use anyhow::anyhow;
     use reqwest::Client;
@@ -1262,6 +1325,7 @@ mod tests {
             poll_interval_ms: 250,
             commands: Vec::new(),
             client: Client::new(),
+            bot_username: Mutex::new(None),
             pending_outbound: Mutex::new(VecDeque::new()),
         };
 
@@ -1281,6 +1345,7 @@ mod tests {
             poll_interval_ms: 250,
             commands: Vec::new(),
             client: Client::new(),
+            bot_username: Mutex::new(None),
             pending_outbound: Mutex::new(VecDeque::new()),
         };
 
@@ -1298,11 +1363,114 @@ mod tests {
             poll_interval_ms: 250,
             commands: Vec::new(),
             client: Client::new(),
+            bot_username: Mutex::new(None),
             pending_outbound: Mutex::new(VecDeque::new()),
         };
 
         let error = anyhow!("telegram API sendMessage failed: Bad Request: chat not found");
         assert!(!channel.should_defer_outbound_message(&error));
+    }
+
+    #[tokio::test]
+    async fn accepts_private_messages_without_mention() {
+        let channel = TelegramChannel {
+            id: "telegram-main".to_string(),
+            bot_token: "secret-token".to_string(),
+            api_base_url: "https://api.telegram.org".to_string(),
+            poll_timeout_seconds: 30,
+            poll_interval_ms: 250,
+            commands: Vec::new(),
+            client: Client::new(),
+            bot_username: Mutex::new(Some("party_claw_bot".to_string())),
+            pending_outbound: Mutex::new(VecDeque::new()),
+        };
+        let message = TelegramMessage {
+            message_id: 1,
+            chat: TelegramChat {
+                id: 1,
+                kind: "private".to_string(),
+            },
+            from: None,
+            text: Some("介绍一下你自己".to_string()),
+            caption: None,
+            photo: None,
+            document: None,
+            video: None,
+            audio: None,
+        };
+        assert!(
+            channel
+                .should_accept_message(&message, message.text.as_deref(), 0)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn ignores_group_messages_without_mention_even_if_command() {
+        let channel = TelegramChannel {
+            id: "telegram-main".to_string(),
+            bot_token: "secret-token".to_string(),
+            api_base_url: "https://api.telegram.org".to_string(),
+            poll_timeout_seconds: 30,
+            poll_interval_ms: 250,
+            commands: Vec::new(),
+            client: Client::new(),
+            bot_username: Mutex::new(Some("party_claw_bot".to_string())),
+            pending_outbound: Mutex::new(VecDeque::new()),
+        };
+        let message = TelegramMessage {
+            message_id: 1,
+            chat: TelegramChat {
+                id: -1,
+                kind: "group".to_string(),
+            },
+            from: None,
+            text: Some("/status".to_string()),
+            caption: None,
+            photo: None,
+            document: None,
+            video: None,
+            audio: None,
+        };
+        assert!(
+            !channel
+                .should_accept_message(&message, message.text.as_deref(), 0)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn accepts_group_messages_with_mention() {
+        let channel = TelegramChannel {
+            id: "telegram-main".to_string(),
+            bot_token: "secret-token".to_string(),
+            api_base_url: "https://api.telegram.org".to_string(),
+            poll_timeout_seconds: 30,
+            poll_interval_ms: 250,
+            commands: Vec::new(),
+            client: Client::new(),
+            bot_username: Mutex::new(Some("party_claw_bot".to_string())),
+            pending_outbound: Mutex::new(VecDeque::new()),
+        };
+        let message = TelegramMessage {
+            message_id: 1,
+            chat: TelegramChat {
+                id: -1,
+                kind: "supergroup".to_string(),
+            },
+            from: None,
+            text: Some("@party_claw_bot 你好".to_string()),
+            caption: None,
+            photo: None,
+            document: None,
+            video: None,
+            audio: None,
+        };
+        assert!(
+            channel
+                .should_accept_message(&message, message.text.as_deref(), 0)
+                .await
+        );
     }
 }
 
@@ -1402,6 +1570,8 @@ struct TelegramMessage {
 #[derive(Deserialize)]
 struct TelegramChat {
     id: i64,
+    #[serde(rename = "type")]
+    kind: String,
 }
 
 #[derive(Deserialize)]
