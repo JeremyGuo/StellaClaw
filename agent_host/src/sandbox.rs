@@ -442,6 +442,8 @@ fn build_bubblewrap_command(
     )?;
     if let Some(home_dir) = discover_home_dir() {
         let home_skeleton = prepare_sandbox_home_skeleton(runtime_state_root, &home_dir)?;
+        ensure_home_skeleton_parent_for_target(&home_skeleton, &home_dir, workspace_root)?;
+        ensure_home_skeleton_parent_for_target(&home_skeleton, &home_dir, runtime_state_root)?;
         bind_path_to(&mut command, &home_skeleton, &home_dir, true)?;
     }
     bind_path(&mut command, workspace_root, false)?;
@@ -500,6 +502,26 @@ fn prepare_sandbox_home_skeleton(runtime_state_root: &Path, home_dir: &Path) -> 
         )
     })?;
     Ok(home_target)
+}
+
+fn ensure_home_skeleton_parent_for_target(
+    home_skeleton: &Path,
+    home_dir: &Path,
+    target: &Path,
+) -> Result<()> {
+    let Ok(relative_target) = target.strip_prefix(home_dir) else {
+        return Ok(());
+    };
+    let Some(parent) = relative_target.parent() else {
+        return Ok(());
+    };
+    fs::create_dir_all(home_skeleton.join(parent)).with_context(|| {
+        format!(
+            "failed to prepare sandbox home parent directories for {}",
+            target.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn bind_path(command: &mut Command, path: &Path, read_only: bool) -> Result<()> {
