@@ -180,6 +180,39 @@ fn generate_summary(
     Ok((summary_text, summary_message.usage))
 }
 
+fn find_originating_tool_use_index(
+    messages: &[ChatMessage],
+    search_before: usize,
+    tool_call_id: &str,
+) -> Option<usize> {
+    messages[..search_before].iter().rposition(|message| {
+        message.role == "assistant"
+            && message.tool_calls.as_ref().is_some_and(|tool_calls| {
+                tool_calls
+                    .iter()
+                    .any(|tool_call| tool_call.id == tool_call_id)
+            })
+    })
+}
+
+fn adjust_split_index_to_preserve_tool_context(
+    messages: &[ChatMessage],
+    mut split_index: usize,
+) -> usize {
+    while split_index < messages.len() && messages[split_index].role == "tool" {
+        let Some(tool_call_id) = messages[split_index].tool_call_id.as_deref() else {
+            break;
+        };
+        let Some(origin_index) =
+            find_originating_tool_use_index(messages, split_index, tool_call_id)
+        else {
+            break;
+        };
+        split_index = origin_index;
+    }
+    split_index
+}
+
 fn compact_history_once(
     config: &AgentConfig,
     messages: &[ChatMessage],
@@ -200,7 +233,10 @@ fn compact_history_once(
         return Ok((messages.to_vec(), TokenUsage::default()));
     }
 
-    let split_index = body.len() - retain_recent;
+    let split_index = adjust_split_index_to_preserve_tool_context(body, body.len() - retain_recent);
+    if split_index == 0 {
+        return Ok((messages.to_vec(), TokenUsage::default()));
+    }
     let messages_to_summarize = &body[..split_index];
     let recent_messages = &body[split_index..];
     let (summary_text, usage) = generate_summary(config, messages_to_summarize)?;
@@ -281,7 +317,11 @@ pub fn maybe_compact_messages_with_report(
 
 #[cfg(test)]
 mod tests {
-    use super::content_to_text;
+    use super::{
+        adjust_split_index_to_preserve_tool_context, content_to_text,
+        find_originating_tool_use_index,
+    };
+    use crate::message::{ChatMessage, ToolCall};
     use serde_json::json;
 
     #[test]
@@ -302,5 +342,57 @@ mod tests {
         let text = content_to_text(&content);
         assert!(text.contains("Please inspect this."));
         assert!(text.contains("[image] data:image/png;base64,abc123"));
+    }
+
+    #[test]
+    fn finds_originating_tool_use_for_tool_result() {
+        let messages = vec![
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    kind: "function".to_string(),
+                    function: crate::message::FunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: Some("{}".to_string()),
+                    },
+                }]),
+            },
+            ChatMessage::tool_output("call_1", "read_file", "{\"ok\":true}"),
+            ChatMessage::text("assistant", "done"),
+        ];
+
+        assert_eq!(
+            find_originating_tool_use_index(&messages, 1, "call_1"),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn split_index_moves_back_to_preserve_tool_transaction() {
+        let messages = vec![
+            ChatMessage::text("user", "start"),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    kind: "function".to_string(),
+                    function: crate::message::FunctionCall {
+                        name: "read_file".to_string(),
+                        arguments: Some("{}".to_string()),
+                    },
+                }]),
+            },
+            ChatMessage::tool_output("call_1", "read_file", "{\"ok\":true}"),
+            ChatMessage::text("assistant", "done"),
+        ];
+
+        assert_eq!(adjust_split_index_to_preserve_tool_context(&messages, 2), 1);
     }
 }
