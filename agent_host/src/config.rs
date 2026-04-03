@@ -83,6 +83,8 @@ pub struct MainAgentConfig {
     pub model: Option<String>,
     #[serde(default)]
     pub timeout_seconds: Option<f64>,
+    #[serde(default = "default_global_install_root")]
+    pub global_install_root: String,
     #[serde(default = "default_main_agent_language")]
     pub language: String,
     #[serde(default = "default_enabled_tools")]
@@ -169,6 +171,14 @@ fn default_context_window_tokens() -> usize {
 
 fn default_main_agent_language() -> String {
     "zh-CN".to_string()
+}
+
+fn default_global_install_root() -> String {
+    if cfg!(target_os = "windows") {
+        "C:/ClawPartyPrograms".to_string()
+    } else {
+        "/opt".to_string()
+    }
 }
 
 pub fn default_enabled_tools() -> Vec<String> {

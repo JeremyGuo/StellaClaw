@@ -49,6 +49,10 @@ pub fn build_agent_system_prompt(
         "Your primary writable workspace is the current workspace root for this session.".to_string(),
         skill_line.to_string(),
         "The path ./.skill_memory is shared persistent memory for skills. Do not proactively read from or write to ./.skill_memory unless a loaded skill explicitly instructs you to use it.".to_string(),
+        format!(
+            "Some system-wide software packages are installed under {}. If you need to install global software packages, install them under that directory unless the user explicitly asks for a different location.",
+            main_agent.global_install_root
+        ),
         "If you need to send files or images back to the user, append one or more tags in your final reply using this format: <attachment>relative/path/from/workspace_root</attachment>. Each path must be relative to the current workspace root.".to_string(),
         "Do not describe a file path to the user without using the attachment tag if you expect the file to be delivered.".to_string(),
         "You are talking to the user inside a chat application. You may reply naturally, including structured Markdown when it helps.".to_string(),
@@ -258,6 +262,7 @@ mod tests {
         models.insert("main".to_string(), model.clone());
         let main_agent = MainAgentConfig {
             model: Some("main".to_string()),
+            global_install_root: "/opt".to_string(),
             language: "zh-CN".to_string(),
             timeout_seconds: Some(60.0),
             enabled_tools: vec!["read_file".to_string()],
@@ -283,6 +288,7 @@ mod tests {
         );
 
         assert!(prompt.contains("append one or more tags in your final reply"));
+        assert!(prompt.contains("Some system-wide software packages are installed under /opt."));
         assert!(prompt.contains("Current workspace summary."));
         assert!(prompt.contains("workspace_id=workspace-1"));
         assert!(prompt.contains(
