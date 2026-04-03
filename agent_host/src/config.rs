@@ -270,6 +270,10 @@ pub fn default_bot_commands() -> Vec<BotCommandConfig> {
             command: "snaplist".to_string(),
             description: "List saved global snapshots".to_string(),
         },
+        BotCommandConfig {
+            command: "continue".to_string(),
+            description: "Continue the latest interrupted turn".to_string(),
+        },
     ]
 }
 

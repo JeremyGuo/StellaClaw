@@ -23,7 +23,10 @@ use crate::domain::{
 };
 use crate::prompt::{AgentPromptKind, build_agent_system_prompt, greeting_for_language};
 use crate::sandbox::run_turn_in_child_process;
-use crate::session::{SessionManager, SessionSkillObservation, SessionSnapshot, SkillChangeNotice};
+use crate::session::{
+    PendingContinueState, SessionManager, SessionSkillObservation, SessionSnapshot,
+    SkillChangeNotice,
+};
 use crate::sink::{SinkRouter, SinkTarget};
 use crate::snapshot::{SnapshotBundle, SnapshotManager};
 use crate::workspace::{WorkspaceManager, WorkspaceMountMaterialization};
@@ -39,7 +42,7 @@ use base64::Engine;
 use chrono::Utc;
 use humantime::parse_duration;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -104,6 +107,24 @@ enum TimedRunOutcome {
     Completed(SessionRunReport),
     TimedOut {
         checkpoint: Option<SessionRunReport>,
+        error: anyhow::Error,
+    },
+    Failed {
+        checkpoint: Option<SessionRunReport>,
+        error: anyhow::Error,
+    },
+}
+
+enum ForegroundTurnOutcome {
+    Replied {
+        messages: Vec<ChatMessage>,
+        outgoing: OutgoingMessage,
+        usage: TokenUsage,
+        compaction: SessionCompactionStats,
+        timed_out: bool,
+    },
+    Failed {
+        pending_continue: PendingContinueState,
         error: anyhow::Error,
     },
 }
@@ -179,6 +200,24 @@ impl ServerRuntime {
             .get(model_key)
             .with_context(|| format!("unknown model {}", model_key))?
             .timeout_seconds)
+    }
+
+    fn tell_user_now(&self, session: &SessionSnapshot, text: String) -> Result<Value> {
+        let channel = self
+            .channels
+            .get(&session.address.channel_id)
+            .with_context(|| format!("unknown channel {}", session.address.channel_id))?
+            .clone();
+        let address = session.address.clone();
+        let runtime_handle = tokio::runtime::Handle::try_current()
+            .context("user_tell is only available while the host runtime is active")?;
+        runtime_handle
+            .block_on(async move { channel.send(&address, OutgoingMessage::text(text)).await })
+            .context("failed to send immediate user_tell message")?;
+        Ok(json!({
+            "ok": true,
+            "sent": true
+        }))
     }
 
     fn register_managed_agent(
@@ -688,6 +727,27 @@ impl ServerRuntime {
             kind,
             AgentPromptKind::MainForeground | AgentPromptKind::MainBackground
         ) {
+            let runtime = self.clone();
+            let tell_session = session.clone();
+            tools.push(Tool::new(
+                "user_tell",
+                "Immediately send a short progress or coordination message to the current user conversation without waiting for the current turn to finish. Use this sparingly for genuinely useful mid-task updates.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"}
+                    },
+                    "required": ["text"],
+                    "additionalProperties": false
+                }),
+                move |arguments| {
+                    let object = arguments
+                        .as_object()
+                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                    runtime.tell_user_now(&tell_session, string_arg_required(object, "text")?)
+                },
+            ));
+
             let runtime = self.clone();
             let session = session.clone();
             tools.push(Tool::new_timed(
@@ -1254,7 +1314,15 @@ impl ServerRuntime {
                     for task in relay_tasks {
                         task.abort();
                     }
-                    let report = result?;
+                    let report = match result {
+                        Ok(report) => report,
+                        Err(error) => {
+                            return Ok(TimedRunOutcome::Failed {
+                                checkpoint: latest_checkpoint,
+                                error,
+                            });
+                        }
+                    };
                     if let Some(error) = soft_timeout_error {
                         return Ok(TimedRunOutcome::TimedOut {
                             checkpoint: Some(report),
@@ -1408,7 +1476,15 @@ impl ServerRuntime {
                     log_agent_frame_event(agent_id, &event_session, kind, &event_model_key, &event)
                 }
                 DriverEvent::Completed(result) => {
-                    let report = result?;
+                    let report = match result {
+                        Ok(report) => report,
+                        Err(error) => {
+                            return Ok(TimedRunOutcome::Failed {
+                                checkpoint: latest_checkpoint,
+                                error,
+                            });
+                        }
+                    };
                     if let Some(error) = soft_timeout_error {
                         return Ok(TimedRunOutcome::TimedOut {
                             checkpoint: Some(report),
@@ -1509,6 +1585,14 @@ impl ServerRuntime {
                 self.mark_managed_agent_timed_out(subagent_id, &usage, &error);
                 let report = checkpoint.ok_or(error)?;
                 (report, true)
+            }
+            Ok(TimedRunOutcome::Failed { checkpoint, error }) => {
+                let usage = checkpoint
+                    .as_ref()
+                    .map(|report| report.usage.clone())
+                    .unwrap_or_default();
+                self.mark_managed_agent_failed(subagent_id, &usage, &error);
+                return Err(error);
             }
             Err(error) => {
                 self.mark_managed_agent_failed(subagent_id, &TokenUsage::default(), &error);
@@ -1725,6 +1809,14 @@ impl ServerRuntime {
                 self.mark_managed_agent_timed_out(job.agent_id, &usage, &error);
                 self.handle_background_job_failure(&job, &error).await
             }
+            Ok(TimedRunOutcome::Failed { checkpoint, error }) => {
+                let usage = checkpoint
+                    .as_ref()
+                    .map(|report| report.usage.clone())
+                    .unwrap_or_default();
+                self.mark_managed_agent_failed(job.agent_id, &usage, &error);
+                self.handle_background_job_failure(&job, &error).await
+            }
             Err(error) => {
                 self.mark_managed_agent_failed(job.agent_id, &TokenUsage::default(), &error);
                 self.handle_background_job_failure(&job, &error).await
@@ -1868,6 +1960,31 @@ impl ServerRuntime {
                     failed_agent_id = %job.agent_id,
                     error = %format!("{recovery_error:#}"),
                     "background failure recovery agent timed out; user was notified"
+                );
+                Ok(())
+            }
+            Ok(TimedRunOutcome::Failed {
+                checkpoint,
+                error: recovery_error,
+            }) => {
+                let usage = checkpoint
+                    .as_ref()
+                    .map(|report| report.usage.clone())
+                    .unwrap_or_default();
+                self.mark_managed_agent_failed(recovery_agent_id, &usage, &recovery_error);
+                let text = user_facing_error_text(&self.main_agent.language, error);
+                let sink_router = self.sink_router.read().await;
+                sink_router
+                    .dispatch(&self.channels, &job.sink, OutgoingMessage::text(text))
+                    .await
+                    .context("failed to dispatch background failure notification")?;
+                warn!(
+                    log_stream = "agent",
+                    log_key = %recovery_agent_id,
+                    kind = "background_agent_recovery_failed",
+                    failed_agent_id = %job.agent_id,
+                    error = %format!("{recovery_error:#}"),
+                    "background failure recovery agent failed; user was notified"
                 );
                 Ok(())
             }
@@ -2208,8 +2325,25 @@ impl Server {
                 .idle_context_compaction_poll_interval_seconds,
         ));
         idle_compaction_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut pending_messages = VecDeque::new();
 
         loop {
+            while let Ok(message) = receiver.try_recv() {
+                pending_messages.push_back(message);
+            }
+            if let Some(message) = pending_messages.pop_front() {
+                let message =
+                    coalesce_buffered_conversation_messages(message, &mut pending_messages);
+                if let Err(error) = self.handle_incoming(message).await {
+                    error!(
+                        log_stream = "server",
+                        kind = "handle_incoming_failed",
+                        error = %format!("{error:#}"),
+                        "failed to handle incoming message"
+                    );
+                }
+                continue;
+            }
             select! {
                 _ = idle_compaction_ticker.tick() => {
                     if self.main_agent.enable_idle_context_compaction
@@ -2227,14 +2361,7 @@ impl Server {
                     let Some(message) = maybe_message else {
                         break;
                     };
-                    if let Err(error) = self.handle_incoming(message).await {
-                        error!(
-                            log_stream = "server",
-                            kind = "handle_incoming_failed",
-                            error = %format!("{error:#}"),
-                            "failed to handle incoming message"
-                        );
-                    }
+                    pending_messages.push_back(message);
                 }
             }
         }
@@ -2963,6 +3090,126 @@ impl Server {
             return Ok(());
         }
 
+        if parse_continue_command(incoming.text.as_deref()) {
+            let session = self.sessions.ensure_foreground(&incoming.address)?;
+            let Some(pending_continue) = self.sessions.pending_continue(&incoming.address)? else {
+                self.send_channel_message(
+                    &channel,
+                    &incoming.address,
+                    OutgoingMessage::text(
+                        "There is no interrupted turn to continue right now.".to_string(),
+                    ),
+                )
+                .await?;
+                return Ok(());
+            };
+            channel
+                .set_processing(&incoming.address, ProcessingState::Typing)
+                .await
+                .ok();
+            let typing_guard = spawn_processing_keepalive(
+                channel.clone(),
+                incoming.address.clone(),
+                ProcessingState::Typing,
+            );
+            let continue_message = ChatMessage::text(
+                "user",
+                "Continue from the preserved failure point. Do not restart completed work or repeat finished tool calls. Resume from the latest preserved state and finish the user's request.",
+            );
+            let outcome = self
+                .run_main_agent_turn(
+                    &session,
+                    &pending_continue.model_key,
+                    continue_message,
+                    pending_continue.original_user_text.clone(),
+                    pending_continue.original_attachments.clone(),
+                )
+                .await
+                .context("failed to continue interrupted foreground turn");
+            if let Some(stop_sender) = typing_guard {
+                let _ = stop_sender.send(());
+            }
+            if let Err(error) = &outcome {
+                channel
+                    .set_processing(&incoming.address, ProcessingState::Idle)
+                    .await
+                    .ok();
+                self.send_user_error_message(&channel, &incoming.address, error)
+                    .await;
+            }
+            match outcome? {
+                ForegroundTurnOutcome::Replied {
+                    messages,
+                    outgoing,
+                    usage,
+                    compaction,
+                    timed_out,
+                } => {
+                    let loaded_skills =
+                        extract_loaded_skill_names(&messages, session.agent_message_count);
+                    self.sessions
+                        .record_agent_turn(&incoming.address, messages, &usage, &compaction)
+                        .context("failed to persist continued agent_frame messages")?;
+                    self.sessions
+                        .mark_skills_loaded_current_turn(&incoming.address, &loaded_skills)?;
+                    self.sessions.append_user_message(
+                        &incoming.address,
+                        pending_continue.original_user_text.clone(),
+                        pending_continue.original_attachments.clone(),
+                    )?;
+                    self.sessions.append_assistant_message(
+                        &incoming.address,
+                        outgoing.text.clone(),
+                        Vec::new(),
+                    )?;
+                    let foreground =
+                        self.build_foreground_agent(&session, &pending_continue.model_key)?;
+                    self.log_turn_usage(&session, &usage, false);
+                    info!(
+                        log_stream = "agent",
+                        log_key = %foreground.id,
+                        kind = "foreground_agent_replied",
+                        session_id = %foreground.session_id,
+                        channel_id = %foreground.channel_id,
+                        system_prompt_len = foreground.system_prompt.len() as u64,
+                        timed_out,
+                        has_text = outgoing.text.as_deref().is_some_and(|text| !text.trim().is_empty()),
+                        attachment_count = outgoing.attachments.len() as u64 + outgoing.images.len() as u64,
+                        "foreground agent continued interrupted turn"
+                    );
+                    self.send_channel_message(&channel, &incoming.address, outgoing)
+                        .await?;
+                    channel
+                        .set_processing(&incoming.address, ProcessingState::Idle)
+                        .await
+                        .ok();
+                    return Ok(());
+                }
+                ForegroundTurnOutcome::Failed {
+                    pending_continue,
+                    error,
+                } => {
+                    self.sessions
+                        .set_pending_continue(&incoming.address, Some(pending_continue.clone()))?;
+                    channel
+                        .set_processing(&incoming.address, ProcessingState::Idle)
+                        .await
+                        .ok();
+                    self.send_channel_message(
+                        &channel,
+                        &incoming.address,
+                        OutgoingMessage::text(user_facing_continue_error_text(
+                            &self.main_agent.language,
+                            &error,
+                            &pending_continue.progress_summary,
+                        )),
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
+
         if self.selected_main_model_key(&incoming.address)?.is_none() {
             self.send_channel_message(
                 &channel,
@@ -3014,7 +3261,13 @@ impl Server {
         );
 
         let turn_result = self
-            .run_main_agent_turn(&session, &effective_model_key, user_message)
+            .run_main_agent_turn(
+                &session,
+                &effective_model_key,
+                user_message,
+                incoming.text.clone(),
+                stored_attachments.clone(),
+            )
             .await
             .context("foreground agent turn failed");
         if let Some(stop_sender) = typing_guard {
@@ -3028,7 +3281,38 @@ impl Server {
             self.send_user_error_message(&channel, &incoming.address, error)
                 .await;
         }
-        let (messages, outgoing, usage, compaction, timed_out) = turn_result?;
+        let outcome = turn_result?;
+        let (messages, outgoing, usage, compaction, timed_out) = match outcome {
+            ForegroundTurnOutcome::Replied {
+                messages,
+                outgoing,
+                usage,
+                compaction,
+                timed_out,
+            } => (messages, outgoing, usage, compaction, timed_out),
+            ForegroundTurnOutcome::Failed {
+                pending_continue,
+                error,
+            } => {
+                self.sessions
+                    .set_pending_continue(&incoming.address, Some(pending_continue.clone()))?;
+                channel
+                    .set_processing(&incoming.address, ProcessingState::Idle)
+                    .await
+                    .ok();
+                self.send_channel_message(
+                    &channel,
+                    &incoming.address,
+                    OutgoingMessage::text(user_facing_continue_error_text(
+                        &self.main_agent.language,
+                        &error,
+                        &pending_continue.progress_summary,
+                    )),
+                )
+                .await?;
+                return Ok(());
+            }
+        };
 
         let loaded_skills = extract_loaded_skill_names(&messages, session.agent_message_count);
         self.sessions
@@ -3257,10 +3541,20 @@ impl Server {
     ) -> Result<OutgoingMessage> {
         let greeting = ChatMessage::text("user", greeting_for_language(&self.main_agent.language));
         let effective_model_key = self.effective_main_model_key(&session.address)?;
-        let (messages, outgoing, usage, compaction, timed_out) = self
-            .run_main_agent_turn(session, &effective_model_key, greeting)
+        let outcome = self
+            .run_main_agent_turn(session, &effective_model_key, greeting, None, Vec::new())
             .await
             .context("failed to initialize foreground session")?;
+        let (messages, outgoing, usage, compaction, timed_out) = match outcome {
+            ForegroundTurnOutcome::Replied {
+                messages,
+                outgoing,
+                usage,
+                compaction,
+                timed_out,
+            } => (messages, outgoing, usage, compaction, timed_out),
+            ForegroundTurnOutcome::Failed { error, .. } => return Err(error),
+        };
         self.sessions
             .record_agent_turn(&session.address, messages, &usage, &compaction)?;
         self.log_turn_usage(session, &usage, true);
@@ -3399,6 +3693,14 @@ impl Server {
                 checkpoint: None,
                 error,
             } => return Err(error),
+            TimedRunOutcome::Failed {
+                checkpoint: Some(report),
+                ..
+            } => report,
+            TimedRunOutcome::Failed {
+                checkpoint: None,
+                error,
+            } => return Err(error),
         };
         let summary_text = extract_assistant_text(&report.messages);
         let (clean_summary, _) =
@@ -3456,13 +3758,9 @@ impl Server {
         session: &SessionSnapshot,
         model_key: &str,
         next_user_message: ChatMessage,
-    ) -> Result<(
-        Vec<ChatMessage>,
-        OutgoingMessage,
-        TokenUsage,
-        SessionCompactionStats,
-        bool,
-    )> {
+        original_user_text: Option<String>,
+        original_attachments: Vec<StoredAttachment>,
+    ) -> Result<ForegroundTurnOutcome> {
         let workspace_root = session.workspace_root.clone();
         let mut previous_messages = session.agent_messages.clone();
         previous_messages.push(next_user_message);
@@ -3477,7 +3775,7 @@ impl Server {
                 AgentPromptKind::MainForeground,
                 session.agent_id,
                 model_key.to_string(),
-                previous_messages,
+                previous_messages.clone(),
                 String::new(),
                 timeout_seconds,
                 Some(upstream_timeout_seconds),
@@ -3491,26 +3789,43 @@ impl Server {
                 let assistant_text = extract_assistant_text(&report.messages);
                 let outgoing =
                     build_outgoing_message_for_session(session, &assistant_text, &workspace_root)?;
-                Ok((
-                    report.messages,
+                Ok(ForegroundTurnOutcome::Replied {
+                    messages: report.messages,
                     outgoing,
-                    report.usage,
-                    report.compaction,
-                    false,
-                ))
+                    usage: report.usage,
+                    compaction: report.compaction,
+                    timed_out: false,
+                })
             }
             TimedRunOutcome::TimedOut { checkpoint, error } => {
                 let report = checkpoint.ok_or(error)?;
                 let assistant_text = extract_assistant_text(&report.messages);
                 let outgoing =
                     build_outgoing_message_for_session(session, &assistant_text, &workspace_root)?;
-                Ok((
-                    report.messages,
+                Ok(ForegroundTurnOutcome::Replied {
+                    messages: report.messages,
                     outgoing,
-                    report.usage,
-                    report.compaction,
-                    true,
-                ))
+                    usage: report.usage,
+                    compaction: report.compaction,
+                    timed_out: true,
+                })
+            }
+            TimedRunOutcome::Failed { checkpoint, error } => {
+                let resume_messages = checkpoint
+                    .map(|report| report.messages)
+                    .unwrap_or(previous_messages);
+                Ok(ForegroundTurnOutcome::Failed {
+                    pending_continue: PendingContinueState {
+                        model_key: model_key.to_string(),
+                        progress_summary: summarize_resume_progress(&resume_messages),
+                        error_summary: format!("{error:#}"),
+                        failed_at: Utc::now(),
+                        resume_messages,
+                        original_user_text,
+                        original_attachments,
+                    },
+                    error,
+                })
             }
         }
     }
@@ -3864,6 +4179,79 @@ fn compose_user_prompt(text: Option<&str>, attachments: &[StoredAttachment]) -> 
     } else {
         sections.join("\n\n")
     }
+}
+
+fn coalesce_buffered_conversation_messages(
+    initial: IncomingMessage,
+    pending_messages: &mut VecDeque<IncomingMessage>,
+) -> IncomingMessage {
+    if initial.control.is_some() {
+        return initial;
+    }
+
+    let mut grouped = vec![initial];
+    let mut remaining = VecDeque::new();
+    while let Some(candidate) = pending_messages.pop_front() {
+        if candidate.control.is_none() && candidate.address == grouped[0].address {
+            grouped.push(candidate);
+        } else {
+            remaining.push_back(candidate);
+        }
+    }
+    *pending_messages = remaining;
+    merge_buffered_messages(grouped)
+}
+
+fn merge_buffered_messages(mut grouped: Vec<IncomingMessage>) -> IncomingMessage {
+    if grouped.len() == 1 {
+        return grouped.remove(0);
+    }
+
+    let remote_message_id = grouped
+        .last()
+        .map(|message| message.remote_message_id.clone())
+        .expect("grouped messages should not be empty");
+    let address = grouped
+        .last()
+        .map(|message| message.address.clone())
+        .expect("grouped messages should not be empty");
+    let mut flattened = Vec::new();
+    let mut attachments = Vec::new();
+    for message in grouped.drain(..) {
+        flattened.push((message.text, message.attachments.len()));
+        attachments.extend(message.attachments);
+    }
+
+    IncomingMessage {
+        remote_message_id,
+        address,
+        text: Some(render_buffered_followup_messages(
+            &flattened
+                .iter()
+                .map(|(text, attachment_count)| (text.as_deref(), *attachment_count))
+                .collect::<Vec<_>>(),
+        )),
+        attachments,
+        control: None,
+    }
+}
+
+fn render_buffered_followup_messages(messages: &[(Option<&str>, usize)]) -> String {
+    let mut sections = vec![
+        "[Queued User Updates]".to_string(),
+        "While you were still working on the previous turn, the user sent multiple follow-up messages. Treat later items as newer steering updates when they conflict.".to_string(),
+    ];
+    for (index, (text, attachment_count)) in messages.iter().enumerate() {
+        let trimmed = text.map(str::trim).unwrap_or("");
+        let body = match (trimmed, *attachment_count) {
+            ("", 0) => "[empty message]".to_string(),
+            ("", count) => format!("[attachments only: {count}]"),
+            (value, 0) => value.to_string(),
+            (value, count) => format!("{value}\n[attachments: {count}]"),
+        };
+        sections.push(format!("Follow-up {}:\n{}", index + 1, body));
+    }
+    sections.join("\n\n")
 }
 
 fn build_user_turn_message(
@@ -4483,6 +4871,7 @@ fn create_detached_session_snapshot(
         cumulative_compaction: SessionCompactionStats::default(),
         api_timeout_override_seconds: None,
         skill_states: HashMap::new(),
+        pending_continue: None,
         pending_workspace_summary: false,
         close_after_summary: false,
     })
@@ -4579,6 +4968,99 @@ fn user_facing_error_text(language: &str, error: &anyhow::Error) -> String {
         "This turn timed out. Please try again, or send /new to start over.".to_string()
     } else {
         "This turn failed. Please try again, or send /new to start over.".to_string()
+    }
+}
+
+fn user_facing_continue_error_text(
+    language: &str,
+    error: &anyhow::Error,
+    progress_summary: &str,
+) -> String {
+    let language = language.to_ascii_lowercase();
+    let error_text = format!("{error:#}").to_ascii_lowercase();
+    let upstream_like = error_text.contains("upstream")
+        || error_text.contains("provider")
+        || error_text.contains("chat completion")
+        || is_timeout_like(error);
+    if language.starts_with("zh") {
+        if upstream_like {
+            format!(
+                "这一轮在调用上游模型时失败了，但系统已经保留到最近的稳定位置。\n\n当前进度：{}\n\n发送 /continue 可以从这里继续。",
+                progress_summary
+            )
+        } else {
+            format!(
+                "这一轮在完成前失败了，但系统已经保留到最近的稳定位置。\n\n当前进度：{}\n\n发送 /continue 可以尝试继续。",
+                progress_summary
+            )
+        }
+    } else if upstream_like {
+        format!(
+            "This turn failed while calling the upstream model, but the session has been preserved at the latest stable point.\n\nProgress so far: {}\n\nSend /continue to resume from there.",
+            progress_summary
+        )
+    } else {
+        format!(
+            "This turn failed before finishing, but the session has been preserved at the latest stable point.\n\nProgress so far: {}\n\nSend /continue to try resuming from there.",
+            progress_summary
+        )
+    }
+}
+
+fn summarize_resume_progress(messages: &[ChatMessage]) -> String {
+    let last_user_index = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .unwrap_or(0);
+    let trailing = &messages[last_user_index.saturating_add(1)..];
+    let tool_result_count = trailing
+        .iter()
+        .filter(|message| message.role == "tool")
+        .count();
+    let tool_names = trailing
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .filter_map(|message| message.tool_calls.as_ref())
+        .flat_map(|tool_calls| {
+            tool_calls
+                .iter()
+                .map(|tool_call| tool_call.function.name.clone())
+        })
+        .collect::<Vec<_>>();
+    if tool_result_count > 0 {
+        let recent_tools = tool_names.iter().rev().take(3).cloned().collect::<Vec<_>>();
+        if recent_tools.is_empty() {
+            format!(
+                "the previous turn already reached tool execution and preserved {tool_result_count} tool result(s)"
+            )
+        } else {
+            format!(
+                "the previous turn already reached tool execution and preserved {} tool result(s); recent tools: {}",
+                tool_result_count,
+                recent_tools
+                    .into_iter()
+                    .rev()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    } else {
+        let partial_text = trailing
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .filter_map(|message| message.content.as_ref())
+            .filter_map(Value::as_str)
+            .find(|text| !text.trim().is_empty())
+            .map(str::trim)
+            .map(|text| text.chars().take(120).collect::<String>());
+        match partial_text {
+            Some(text) => format!(
+                "the previous turn preserved partial assistant progress: {}",
+                text
+            ),
+            None => "the previous turn was preserved before the assistant could finish responding"
+                .to_string(),
+        }
     }
 }
 
@@ -4911,6 +5393,10 @@ fn parse_snap_load_command(text: Option<&str>) -> Option<String> {
 
 fn parse_snap_list_command(text: Option<&str>) -> bool {
     matches!(parse_optional_command_argument(text, "/snaplist"), Some(_))
+}
+
+fn parse_continue_command(text: Option<&str>) -> bool {
+    matches!(parse_optional_command_argument(text, "/continue"), Some(_))
 }
 
 fn parse_optional_command_argument(text: Option<&str>, command: &str) -> Option<Option<String>> {
@@ -5573,6 +6059,7 @@ mod tests {
             cumulative_compaction: agent_frame::SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             skill_states: HashMap::new(),
+            pending_continue: None,
             pending_workspace_summary: false,
             close_after_summary: false,
         };

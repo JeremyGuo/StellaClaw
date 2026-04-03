@@ -64,6 +64,22 @@ pub struct SessionCheckpointData {
     pub skill_states: HashMap<String, SessionSkillState>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PendingContinueState {
+    pub model_key: String,
+    #[serde(default)]
+    pub resume_messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub original_user_text: Option<String>,
+    #[serde(default)]
+    pub original_attachments: Vec<StoredAttachment>,
+    #[serde(default)]
+    pub error_summary: String,
+    #[serde(default)]
+    pub progress_summary: String,
+    pub failed_at: DateTime<Utc>,
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionSnapshot {
     pub id: Uuid,
@@ -84,6 +100,7 @@ pub struct SessionSnapshot {
     pub cumulative_compaction: SessionCompactionStats,
     pub api_timeout_override_seconds: Option<f64>,
     pub skill_states: HashMap<String, SessionSkillState>,
+    pub pending_continue: Option<PendingContinueState>,
     pub pending_workspace_summary: bool,
     pub close_after_summary: bool,
 }
@@ -107,6 +124,7 @@ struct Session {
     cumulative_compaction: SessionCompactionStats,
     api_timeout_override_seconds: Option<f64>,
     skill_states: HashMap<String, SessionSkillState>,
+    pending_continue: Option<PendingContinueState>,
     pending_workspace_summary: bool,
     close_after_summary: bool,
     closed_at: Option<DateTime<Utc>>,
@@ -137,6 +155,7 @@ impl Session {
             cumulative_compaction: self.cumulative_compaction.clone(),
             api_timeout_override_seconds: self.api_timeout_override_seconds,
             skill_states: self.skill_states.clone(),
+            pending_continue: self.pending_continue.clone(),
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
         }
@@ -171,6 +190,7 @@ impl Session {
             cumulative_compaction: self.cumulative_compaction.clone(),
             api_timeout_override_seconds: self.api_timeout_override_seconds,
             skill_states: self.skill_states.clone(),
+            pending_continue: self.pending_continue.clone(),
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
             closed_at: self.closed_at,
@@ -210,6 +230,7 @@ impl Session {
             cumulative_compaction: persisted.cumulative_compaction,
             api_timeout_override_seconds: persisted.api_timeout_override_seconds,
             skill_states: persisted.skill_states,
+            pending_continue: persisted.pending_continue,
             pending_workspace_summary: persisted.pending_workspace_summary,
             close_after_summary: persisted.close_after_summary,
             closed_at: persisted.closed_at,
@@ -244,6 +265,8 @@ struct PersistedSession {
     api_timeout_override_seconds: Option<f64>,
     #[serde(default)]
     skill_states: HashMap<String, SessionSkillState>,
+    #[serde(default)]
+    pending_continue: Option<PendingContinueState>,
     #[serde(default)]
     pending_workspace_summary: bool,
     #[serde(default)]
@@ -473,6 +496,7 @@ impl SessionManager {
             cumulative_compaction: checkpoint.cumulative_compaction,
             api_timeout_override_seconds: checkpoint.api_timeout_override_seconds,
             skill_states: checkpoint.skill_states,
+            pending_continue: None,
             pending_workspace_summary: false,
             close_after_summary: false,
             closed_at: None,
@@ -520,6 +544,33 @@ impl SessionManager {
             .get_mut(&key)
             .with_context(|| format!("no active session for {}", key))?;
         session.api_timeout_override_seconds = timeout_seconds;
+        session.persist()?;
+        Ok(())
+    }
+
+    pub fn pending_continue(
+        &self,
+        address: &ChannelAddress,
+    ) -> Result<Option<PendingContinueState>> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        Ok(session.pending_continue.clone())
+    }
+
+    pub fn set_pending_continue(
+        &mut self,
+        address: &ChannelAddress,
+        pending_continue: Option<PendingContinueState>,
+    ) -> Result<()> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        session.pending_continue = pending_continue;
         session.persist()?;
         Ok(())
     }
@@ -636,6 +687,7 @@ impl SessionManager {
             .cumulative_compaction
             .usage
             .add_assign(&compaction.usage);
+        session.pending_continue = None;
         info!(
             log_stream = "session",
             log_key = %session.id,
@@ -755,6 +807,7 @@ impl SessionManager {
             cumulative_compaction: SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             skill_states: HashMap::new(),
+            pending_continue: None,
             pending_workspace_summary: false,
             close_after_summary: false,
             closed_at: None,
@@ -801,6 +854,7 @@ impl SessionManager {
             cumulative_compaction: SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             skill_states: HashMap::new(),
+            pending_continue: None,
             pending_workspace_summary: false,
             close_after_summary: false,
             closed_at: None,

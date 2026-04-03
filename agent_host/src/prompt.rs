@@ -232,6 +232,7 @@ mod tests {
             cumulative_compaction: agent_frame::SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             skill_states: HashMap::new(),
+            pending_continue: None,
             pending_workspace_summary: false,
             close_after_summary: false,
         };
