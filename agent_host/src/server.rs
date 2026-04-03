@@ -2396,11 +2396,31 @@ impl Server {
         let pending_notify = Arc::new(Notify::new());
         let receiver_closed = Arc::new(AtomicBool::new(false));
         let active_controls = Arc::clone(&self.active_foreground_controls);
+        let pump_channels = Arc::clone(&self.channels);
+        let pump_models = self.models.clone();
+        let pump_workdir = self.workdir.clone();
         let pump_queue = Arc::clone(&pending_messages);
         let pump_notify = Arc::clone(&pending_notify);
         let pump_closed = Arc::clone(&receiver_closed);
         tokio::spawn(async move {
             while let Some(message) = receiver.recv().await {
+                if let Some(outgoing) =
+                    fast_path_model_selection_message(&pump_workdir, &pump_models, &message)
+                {
+                    if let Some(channel) = pump_channels.get(&message.address.channel_id) {
+                        if let Err(error) = channel.send(&message.address, outgoing).await {
+                            error!(
+                                log_stream = "channel",
+                                log_key = %message.address.channel_id,
+                                kind = "fast_path_send_failed",
+                                conversation_id = %message.address.conversation_id,
+                                error = %format!("{error:#}"),
+                                "failed to send fast-path model selection message"
+                            );
+                        }
+                    }
+                    continue;
+                }
                 request_yield_for_incoming(&active_controls, &message);
                 if let Ok(mut queue) = pump_queue.lock() {
                     queue.push_back(message);
@@ -4437,6 +4457,47 @@ fn request_yield_for_incoming(
     if let Some(control) = control {
         control.request_yield();
     }
+}
+
+fn fast_path_model_selection_message(
+    workdir: &Path,
+    models: &BTreeMap<String, ModelConfig>,
+    message: &IncomingMessage,
+) -> Option<OutgoingMessage> {
+    if message.control.is_some() {
+        return None;
+    }
+    let text = message.text.as_deref()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.starts_with("/model") || text.starts_with("/help") {
+        return None;
+    }
+
+    let settings = ConversationManager::new(workdir)
+        .ok()
+        .and_then(|manager| manager.get_snapshot(&message.address))
+        .map(|snapshot| snapshot.settings)
+        .unwrap_or_default();
+    if settings.main_model.is_some() {
+        return None;
+    }
+
+    let mut options = models
+        .keys()
+        .cloned()
+        .map(|model_key| ShowOption {
+            label: model_key.clone(),
+            value: format!("/model {}", model_key),
+        })
+        .collect::<Vec<_>>();
+    options.sort_by(|left, right| left.label.cmp(&right.label));
+    Some(OutgoingMessage::with_options(
+        "This conversation has no model yet. Choose one to start a new session.\nCurrent conversation model: `<not selected>`\nChoose a model below or send `/model <name>`.",
+        "Choose a model",
+        options,
+    ))
 }
 
 fn build_user_turn_message(
