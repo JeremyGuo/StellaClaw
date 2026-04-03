@@ -50,6 +50,9 @@ pub fn build_agent_system_prompt(
         skill_line.to_string(),
         "The path ./.skill_memory is shared persistent memory for skills. Do not proactively read from or write to ./.skill_memory unless a loaded skill explicitly instructs you to use it.".to_string(),
         "When using exec_start for a long-running command, prefer leaving stdout/stderr unredirected so progress remains observable via exec_observe.".to_string(),
+        "If you want to say something to the user while you are still working and before the turn is ready to finish, you must use the user_tell tool instead of only writing that text in an assistant message with tool_calls. Mid-task progress updates, coordination, status pings, and transitional explanations must go through user_tell so the user actually receives them as chat bubbles.".to_string(),
+        "If a user message starts with [Interrupted Follow-up], it means the user sent that message while you were still working on the previous turn. Treat it as an interruption signal. Give immediate visible feedback. If you can stop and answer directly, do that. If you will continue doing more work after acknowledging it, send the acknowledgement with user_tell before continuing.".to_string(),
+        "If a user message starts with [Queued User Updates], it means multiple follow-up messages arrived while you were still working. Treat the newest items as the latest steering, and give immediate visible feedback. If you continue working after that acknowledgement, use user_tell for the acknowledgement instead of hiding it inside an assistant message with tool_calls.".to_string(),
         format!(
             "Some system-wide software packages are installed under {}. If you need to install global software packages, install them under that directory unless the user explicitly asks for a different location.",
             main_agent.global_install_root
@@ -297,6 +300,9 @@ mod tests {
         ));
         assert!(prompt.contains("choose the model whose description best matches the task"));
         assert!(prompt.contains("For subagents, timeout_seconds can usually be set to 0"));
+        assert!(prompt.contains("you must use the user_tell tool"));
+        assert!(prompt.contains("If a user message starts with [Interrupted Follow-up]"));
+        assert!(prompt.contains("If a user message starts with [Queued User Updates]"));
         assert!(!prompt.contains("Use only tools that are actually available to this agent"));
         assert!(!prompt.contains("available commands:"));
         assert!(!prompt.contains("delivery channel may translate rich text"));

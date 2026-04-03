@@ -215,12 +215,12 @@ impl ServerRuntime {
             .get(&session.address.channel_id)
             .with_context(|| format!("unknown channel {}", session.address.channel_id))?
             .clone();
-        let address = session.address.clone();
-        let runtime_handle = tokio::runtime::Handle::try_current()
-            .context("user_tell is only available while the host runtime is active")?;
-        runtime_handle
-            .block_on(async move { channel.send(&address, OutgoingMessage::text(text)).await })
-            .context("failed to send immediate user_tell message")?;
+        send_outgoing_message_now(
+            channel,
+            session.address.clone(),
+            OutgoingMessage::text(text),
+        )
+        .context("failed to send immediate user_tell message")?;
         Ok(json!({
             "ok": true,
             "sent": true
@@ -740,7 +740,7 @@ impl ServerRuntime {
             let tell_session = session.clone();
             tools.push(Tool::new(
                 "user_tell",
-                "Immediately send a short progress or coordination message to the current user conversation without waiting for the current turn to finish. Use this sparingly for genuinely useful mid-task updates.",
+                "Immediately send a short progress or coordination message to the current user conversation without waiting for the current turn to finish. Use this for any mid-task user-facing update that should appear as its own chat bubble while work is still ongoing. If you want to answer the user, explain what you are doing, report progress, or give a transitional update before the turn is finished, use user_tell instead of only putting that text in an assistant message with tool_calls.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -2250,6 +2250,32 @@ impl ServerRuntime {
     }
 }
 
+fn send_outgoing_message_now(
+    channel: Arc<dyn Channel>,
+    address: ChannelAddress,
+    message: OutgoingMessage,
+) -> Result<()> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build temporary Tokio runtime for immediate channel send")
+            .and_then(|runtime| {
+                runtime
+                    .block_on(async move { channel.send(&address, message).await })
+                    .context("failed to send immediate channel message")
+            })
+            .map_err(|error| format!("{error:#}"));
+        let _ = sender.send(result);
+    });
+    match receiver.recv() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(anyhow!(error)),
+        Err(_) => Err(anyhow!("immediate channel send thread closed unexpectedly")),
+    }
+}
+
 pub struct Server {
     workdir: PathBuf,
     agent_workspace: AgentWorkspace,
@@ -2461,7 +2487,15 @@ impl Server {
                                 }
                                 continue;
                             }
-                            request_yield_for_incoming(&server.active_foreground_controls, &message);
+                            let interrupted_followup =
+                                request_yield_for_incoming(&server.active_foreground_controls, &message);
+                            let message = if interrupted_followup {
+                                let mut message = message;
+                                message.text = tag_interrupted_followup_text(message.text);
+                                message
+                            } else {
+                                message
+                            };
                             let session_key = message.address.session_key();
                             let mut pending_message = Some(message);
                             loop {
@@ -4758,9 +4792,9 @@ fn render_buffered_followup_messages(messages: &[(Option<&str>, usize)]) -> Stri
 fn request_yield_for_incoming(
     active_controls: &Arc<Mutex<HashMap<String, SessionExecutionControl>>>,
     message: &IncomingMessage,
-) {
+) -> bool {
     if message.control.is_some() {
-        return;
+        return false;
     }
     let session_key = message.address.session_key();
     let control = active_controls
@@ -4769,6 +4803,17 @@ fn request_yield_for_incoming(
         .and_then(|controls| controls.get(&session_key).cloned());
     if let Some(control) = control {
         control.request_yield();
+        true
+    } else {
+        false
+    }
+}
+
+fn tag_interrupted_followup_text(text: Option<String>) -> Option<String> {
+    let marker = "[Interrupted Follow-up]";
+    match text {
+        Some(text) if !text.trim().is_empty() => Some(format!("{marker}\n{text}")),
+        _ => Some(marker.to_string()),
     }
 }
 
@@ -6509,24 +6554,76 @@ mod tests {
         is_timeout_like, parse_model_command, parse_oldspace_command, parse_sandbox_command,
         parse_set_api_timeout_command, parse_sink_target, parse_snap_list_command,
         parse_snap_load_command, parse_snap_save_command, parse_think_command,
-        should_attempt_idle_context_compaction, workspace_visible_in_list,
+        send_outgoing_message_now, should_attempt_idle_context_compaction,
+        tag_interrupted_followup_text, workspace_visible_in_list,
     };
     use crate::backend::AgentBackendKind;
+    use crate::channel::{Channel, IncomingMessage};
     use crate::config::ModelConfig;
     use crate::domain::ChannelAddress;
-    use crate::domain::{AttachmentKind, StoredAttachment};
+    use crate::domain::{AttachmentKind, OutgoingMessage, ProcessingState, StoredAttachment};
     use crate::session::{PendingContinueState, SessionSnapshot};
     use agent_frame::ChatMessage;
     use agent_frame::SessionCompactionStats;
     use anyhow::anyhow;
+    use async_trait::async_trait;
     use chrono::{Duration as ChronoDuration, Utc};
     use serde_json::json;
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::TempDir;
+    use tokio::sync::mpsc;
     use uuid::Uuid;
+
+    #[derive(Default)]
+    struct RecordingChannel {
+        sent_messages: Mutex<Vec<(ChannelAddress, OutgoingMessage)>>,
+    }
+
+    #[async_trait]
+    impl Channel for RecordingChannel {
+        fn id(&self) -> &str {
+            "recording"
+        }
+
+        async fn run(
+            self: Arc<Self>,
+            _sender: mpsc::Sender<IncomingMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn send_media_group(
+            &self,
+            _address: &ChannelAddress,
+            _images: Vec<crate::domain::OutgoingAttachment>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn send(
+            &self,
+            address: &ChannelAddress,
+            message: OutgoingMessage,
+        ) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .unwrap()
+                .push((address.clone(), message));
+            Ok(())
+        }
+
+        async fn set_processing(
+            &self,
+            _address: &ChannelAddress,
+            _state: ProcessingState,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn extracts_multiple_attachments_and_strips_tags() {
@@ -6591,6 +6688,41 @@ mod tests {
         assert_eq!(items[1]["type"], "image_url");
         let url = items[1]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn immediate_channel_send_works_without_tokio_runtime() {
+        let channel = Arc::new(RecordingChannel::default());
+        let address = ChannelAddress {
+            channel_id: "telegram-main".to_string(),
+            conversation_id: "1717801091".to_string(),
+            user_id: Some("user-1".to_string()),
+            display_name: Some("Telegram User".to_string()),
+        };
+
+        send_outgoing_message_now(
+            channel.clone(),
+            address.clone(),
+            OutgoingMessage::text("still working"),
+        )
+        .unwrap();
+
+        let sent_messages = channel.sent_messages.lock().unwrap();
+        assert_eq!(sent_messages.len(), 1);
+        assert_eq!(sent_messages[0].0, address);
+        assert_eq!(sent_messages[0].1.text.as_deref(), Some("still working"));
+    }
+
+    #[test]
+    fn interrupted_followup_text_gets_marker_prefix() {
+        assert_eq!(
+            tag_interrupted_followup_text(Some("进度如何？".to_string())).as_deref(),
+            Some("[Interrupted Follow-up]\n进度如何？")
+        );
+        assert_eq!(
+            tag_interrupted_followup_text(None).as_deref(),
+            Some("[Interrupted Follow-up]")
+        );
     }
 
     #[test]
