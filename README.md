@@ -20,7 +20,7 @@
 <div align="center">
   <img src="docs/imgs/architecture.png" alt="System Architecture" width="780" />
   <br />
-  <em>Layered architecture: Channels → Session → Agent Topology → Cron / Sink</em>
+  <em>Layered architecture: Channels → Conversation → Session → Agent Topology → Cron / Sink</em>
 </div>
 
 ---
@@ -30,8 +30,8 @@
 ```
 ClawParty/
 ├── agent_frame/    # 🔧 Standalone agent runtime (tools, skills, compaction)
-├── agent_host/     # 🚀 Long-running service host (channels, sessions, cron, recovery)
-├── zgent/          # 🔌 Compatibility layer for zgent-core
+├── agent_host/     # 🚀 Long-running service host (channels, conversations, sessions, cron, recovery)
+├── zgent/          # 🔌 Compatibility layer for zgent-core (soft dependency)
 └── docs/           # 📄 Documentation & diagrams
 ```
 
@@ -45,13 +45,15 @@ A self-contained Rust library and CLI binary for running a single LLM agent sess
 
 | Feature | Details |
 |:--------|:--------|
-| 🛠️ **Built-in tools** | File I/O, patch apply, shell execution, web fetch, web search, image inspection |
-| 📚 **Skill system** | `SKILL.md`-based skill discovery with `load_skill` tool |
-| 🗜️ **Context compaction** | Automatic compression when context approaches model limits |
+| 🛠️ **Built-in tools** | File I/O, patch apply, shell execution (`exec_start` / `exec_observe` / `exec_wait` / `exec_kill`), web fetch, web search, image inspection |
+| 📚 **Skill system** | `SKILL.md`-based skill discovery with `skill_load` / `skill_create` / `skill_update` tools |
+| 🗜️ **Context compaction** | Automatic compression when context approaches model limits; safe handling of tool_use/tool_result boundaries |
 | 📊 **Token accounting** | Tracks `cache_read` / `cache_write` / `cache_hit` / `cache_miss` per request |
-| ⏱️ **Tool timeouts** | Every tool call has an explicit timeout budget |
+| ⏱️ **Tool timeouts** | Every tool call has an explicit timeout budget; tools categorized as `immediate` or `timed` |
+| ⚡ **Parallel tool calls** | Multiple independent tool calls in the same round execute concurrently |
 | 🛑 **Cancellation** | `SessionExecutionControl` with `AtomicBool` cancel flag — checked before every LLM call and tool execution |
 | 💾 **Checkpoint callback** | Optional callback fired after each tool round for mid-session state persistence |
+| 🤖 **Subagents** | `run_subagent` with model selection and `timeout_seconds=0` for unbounded wait |
 | 🎛️ **Modes** | CLI binary (`run_agent`) or embedded library |
 
 ### 🔨 Build & Test
@@ -76,16 +78,78 @@ The production layer that wraps `agent_frame` into a long-running, multi-channel
 
 | Feature | Description |
 |:--------|:------------|
+| 💬 **Conversation management** | Channel → Conversation → Session → Agent layered model; per-conversation model and sandbox settings |
 | 💾 **Session persistence** | State survives process restarts; attachment lifecycle managed automatically |
 | 📋 **Agent registry** | Background and subagent state persisted across restarts |
-| ⏰ **Cron tasks** | Scheduled work with optional checker commands, stored durably |
+| ⏰ **Cron tasks** | Scheduled work with optional checker commands, stored durably; inherits creator conversation's model |
 | 📡 **Background sinks** | Direct routing, broadcast topics, multi-target fan-out |
+| 🔄 **Model switching** | `/model` to switch mid-conversation with automatic context compression |
+| 📸 **Snapshots** | `/snapsave`, `/snapload`, `/snaplist` for global conversation state snapshots |
+| 🔒 **Sandbox execution** | Three modes: `disabled`, `subprocess`, `bubblewrap` — per-conversation configurable via `/sandbox` |
 | 📝 **Structured logging** | JSONL logs with per-agent / per-session / per-channel views |
+| 📊 **Status & billing** | `/status` shows token usage, cache hits, price estimation, compression savings |
 | 🔄 **Failure recovery** | Automatic handling of timeouts, upstream errors, and restart scenarios |
 
 ---
 
-## 🔄 Workspace Lifecycle
+## 💬 Conversation Lifecycle
+
+```
+Channel (e.g. Telegram)
+  └─ Conversation (persistent: model, sandbox mode, workspace)
+       └─ Session (one active agent turn)
+            └─ Agent Topology (main agent, subagents, background agents)
+```
+
+- `/new` starts a fresh conversation. If no model is selected, prompts the user first.
+- `/model` switches the main model with automatic context compression.
+- `/sandbox` toggles sandbox mode (`disabled` / `subprocess` / `bubblewrap`).
+- Cron tasks and background agents inherit the creating conversation's model.
+
+---
+
+## 🔒 Sandbox Execution
+
+Three isolation levels, configurable per conversation:
+
+| Mode | Isolation | Use Case |
+|:-----|:----------|:---------|
+| `disabled` | None — direct execution | Development, trusted environments |
+| `subprocess` | Separate process per agent turn | Basic isolation |
+| `bubblewrap` | `bwrap` namespaced container | Production — restricted filesystem, network-aware |
+
+### Bubblewrap Details
+
+- Only exposes: current workspace, runtime dir, `.skills/`, `.skill_memory/`
+- `.skill_memory` mounted as shared persistent directory across workspaces
+- `workspace_mount` becomes a read-only snapshot import
+- DNS, `/etc/resolv.conf` properly forwarded
+- Read-only mount cleanup on turn completion
+
+---
+
+## 📚 Skill System
+
+Skills are `SKILL.md`-based reusable workflows discovered at runtime.
+
+| Tool | Purpose |
+|:-----|:--------|
+| `skill_load` | Load a skill's instructions (renamed from `load_skill`, alias preserved) |
+| `skill_create` | Persist a new skill from `.skills/<name>/` |
+| `skill_update` | Update an existing skill |
+
+### Skill Lifecycle
+
+- Skills live in `.skills/<skill-name>/` with `SKILL.md` + optional `references/`, `scripts/`, `assets/`
+- Frontmatter (`name`, `description`) validated on create/update
+- Persistent skill-owned data goes to `.skill_memory/<skill-name>/...`
+- On each user message, the runtime checks for skill changes:
+  - Description changes → inject update notification
+  - Content changes on loaded skills → inject latest content
+
+---
+
+## 🔁 Workspace Lifecycle
 
 <div align="center">
   <img src="docs/imgs/workspace_lifecycle.png" alt="Workspace Lifecycle" width="780" />
@@ -123,7 +187,7 @@ Each named entry under `models` describes one LLM endpoint. `main_agent.model` s
 | `api_key` | string | null | Inline API key (prefer `api_key_env`) |
 | `api_key_env` | string | `"OPENAI_API_KEY"` | Env var from which to read the API key |
 | `chat_completions_path` | string | `"/chat/completions"` | Path appended to `api_endpoint` |
-| `timeout_seconds` | float | `120.0` | Per-request LLM timeout |
+| `timeout_seconds` | float | `120.0` | Per-request LLM timeout (adjustable at runtime via `/set_api_timeout`) |
 | `context_window_tokens` | int | `128000` | Context window size for compaction budget |
 | `cache_ttl` | string | null | Cache TTL hint (e.g. `"5m"`), enables cache control headers |
 | `reasoning` | object | null | Reasoning config (budget tokens, effort level) |
@@ -142,7 +206,7 @@ Each named entry under `models` describes one LLM endpoint. `main_agent.model` s
 |:------|:-----|:--------|:------------|
 | `model` | string | — | Must match a key in `models` |
 | `language` | string | `"zh-CN"` | Reply language injected into the system prompt |
-| `timeout_seconds` | float | null | Wall-clock timeout for a full agent turn (null = unlimited) |
+| `timeout_seconds` | float | null | Wall-clock timeout for a full agent turn (`0` = disabled, `null` = unlimited) |
 | `enabled_tools` | string[] | all built-ins | Tools made available to the agent |
 | `max_tool_roundtrips` | int | `12` | Max LLM → tool → LLM cycles per turn |
 | `enable_context_compression` | bool | `true` | Enable automatic mid-turn compaction |
@@ -153,6 +217,17 @@ Each named entry under `models` describes one LLM endpoint. `main_agent.model` s
 | `idle_context_compaction_poll_interval_seconds` | int | `15` | How often to check for idle compaction opportunity |
 
 </details>
+
+---
+
+## 📱 Telegram Integration
+
+| Feature | Details |
+|:--------|:--------|
+| **Long message splitting** | Auto-splits replies that exceed Telegram's length limit |
+| **Group chat** | Recognizes `@botname`-suffixed commands; two-person groups treated as direct chat |
+| **Retry & queuing** | Send-side retry with FIFO fallback on failure |
+| **Interactive commands** | `/model`, `/sandbox`, `/status`, `/new`, `/snapsave`, `/snapload`, `/snaplist`, `/set_api_timeout` |
 
 ---
 
@@ -231,7 +306,7 @@ TELEGRAM_BOT_TOKEN=...             # For Telegram channel (agent_host)
 
 The `backend` field in each model profile selects the agent execution backend. Default is `"agent_frame"`. Setting it to `"zgent"` routes through a compatibility layer.
 
-> ⚠️ `zgent` is useful for quick endpoint verification but is **not recommended for production**.
+> ⚠️ `zgent` is a **soft dependency** — the project compiles normally when the `zgent/` directory is absent; only the `zgent` backend becomes unavailable. It is useful for quick endpoint verification but is **not recommended for production**.
 
 <details>
 <summary><b>📊 Full Comparison Table</b></summary>
@@ -258,28 +333,14 @@ The `backend` field in each model profile selects the agent execution backend. D
 
 ---
 
-## 📐 Sandbox Design
-
-[`SANDBOX_DESIGN.md`](./SANDBOX_DESIGN.md) contains a detailed design for multi-agent workspace isolation.
-
-**Core idea**: per-agent scratch workspace + durable `projects/` store + enforced mount manager.
-
-Key mechanisms:
-- 🔒 Read/write leases with epoch validation (stale writers can't commit)
-- 📂 Overlay / copy-on-write writable mounts
-- 🗑️ Tombstone-based safe project deletion
-- 🔄 Startup recovery for stale leases and crashed agents
-
-> 📌 This design is **specified but not yet implemented**. It is only worth building with hard enforcement — soft prompt conventions are not enough.
-
----
-
 ## 🔁 CI / CD
 
 | Trigger | Action |
 |:--------|:-------|
 | Push / Pull Request | `cargo fmt --check` + `cargo test` for both crates |
 | Version tag `v*.*.*` | Release binaries: `agent_host`, `agent_frame/run_agent` |
+
+> Unified Cargo `target/` directory — avoids duplicate `agent_host/target` and `agent_frame/target` build bloat.
 
 ---
 
@@ -298,9 +359,10 @@ Key mechanisms:
 
 | Component | Version | State |
 |:----------|:--------|:------|
-| `agent_frame` | `0.1.0` | ✅ Stable |
-| `agent_host` | `0.1.0` | ✅ Active — cancellation hardening in progress |
-| Sandbox design | — | 📐 Designed, not yet implemented |
+| `agent_frame` | `0.2.0` | ✅ Stable — parallel tools, skill CRUD, exec refactor |
+| `agent_host` | `0.2.0` | ✅ Active — conversation model, sandbox, snapshots |
+| Sandbox | — | ✅ Implemented — `subprocess` and `bubblewrap` modes |
+| Deployment | — | ✅ systemd on NAT-pl1, bubblewrap verified |
 
 ---
 
