@@ -1,6 +1,6 @@
-use crate::config::{
-    AuthCredentialsStoreMode, CodexAuthConfig, UpstreamApiKind, UpstreamAuthKind, UpstreamConfig,
-};
+mod providers;
+
+use crate::config::{AuthCredentialsStoreMode, CodexAuthConfig, UpstreamAuthKind, UpstreamConfig};
 use crate::message::ChatMessage;
 use crate::tooling::Tool;
 use anyhow::{Context, Result, anyhow};
@@ -13,12 +13,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 #[derive(Deserialize)]
-struct ChatCompletionChoice {
+pub(super) struct ChatCompletionChoice {
     message: ChatMessage,
 }
 
 #[derive(Deserialize)]
-struct ChatCompletionResponse {
+pub(super) struct ChatCompletionResponse {
     choices: Vec<ChatCompletionChoice>,
 }
 
@@ -61,7 +61,7 @@ pub struct ChatCompletionOutcome {
     pub usage: TokenUsage,
 }
 
-fn upstream_error_from_value(value: &Value) -> Option<String> {
+pub(super) fn upstream_error_from_value(value: &Value) -> Option<String> {
     let error = value.get("error")?;
     match error {
         Value::Null => None,
@@ -87,7 +87,7 @@ fn upstream_error_from_value(value: &Value) -> Option<String> {
     }
 }
 
-fn build_chat_completions_url(config: &UpstreamConfig) -> String {
+pub(super) fn build_chat_completions_url(config: &UpstreamConfig) -> String {
     let base = config.base_url.trim_end_matches('/');
     let path = if config.chat_completions_path.starts_with('/') {
         config.chat_completions_path.clone()
@@ -101,7 +101,7 @@ fn auth_file_path(codex_home: &Path) -> PathBuf {
     codex_home.join("auth.json")
 }
 
-fn should_bypass_proxy(url: &str) -> bool {
+pub(super) fn should_bypass_proxy(url: &str) -> bool {
     let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
@@ -121,234 +121,10 @@ pub fn create_chat_completion(
     tools: &[Tool],
     extra_payload: Option<Map<String, Value>>,
 ) -> Result<ChatCompletionOutcome> {
-    match upstream.api_kind {
-        UpstreamApiKind::ChatCompletions => {
-            create_chat_completions_completion(upstream, messages, tools, extra_payload)
-        }
-        UpstreamApiKind::Responses => {
-            create_responses_completion(upstream, messages, tools, extra_payload)
-        }
-    }
+    providers::provider_for(upstream).create_completion(upstream, messages, tools, extra_payload)
 }
 
-fn create_chat_completions_completion(
-    upstream: &UpstreamConfig,
-    messages: &[ChatMessage],
-    tools: &[Tool],
-    extra_payload: Option<Map<String, Value>>,
-) -> Result<ChatCompletionOutcome> {
-    let chat_completions_url = build_chat_completions_url(upstream);
-    let mut client_builder = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs_f64(upstream.timeout_seconds));
-    if should_bypass_proxy(&chat_completions_url) {
-        client_builder = client_builder.no_proxy();
-    }
-    let client = client_builder
-        .build()
-        .context("failed to construct upstream client")?;
-
-    let mut payload = Map::new();
-    payload.insert("model".to_string(), Value::String(upstream.model.clone()));
-    payload.insert(
-        "messages".to_string(),
-        serde_json::to_value(messages).context("failed to serialize messages")?,
-    );
-    if let Some(cache_control) = &upstream.cache_control {
-        payload.insert(
-            "cache_control".to_string(),
-            serde_json::to_value(cache_control).context("failed to serialize cache_control")?,
-        );
-    }
-    if let Some(reasoning) = &upstream.reasoning {
-        payload.insert(
-            "reasoning".to_string(),
-            serde_json::to_value(reasoning).context("failed to serialize reasoning config")?,
-        );
-    }
-    if let Some(native_web_search) = &upstream.native_web_search
-        && native_web_search.enabled
-    {
-        for (key, value) in &native_web_search.payload {
-            payload.insert(key.clone(), value.clone());
-        }
-    }
-    if !tools.is_empty() {
-        payload.insert(
-            "tools".to_string(),
-            Value::Array(tools.iter().map(Tool::as_openai_tool).collect()),
-        );
-        payload.insert("tool_choice".to_string(), Value::String("auto".to_string()));
-    }
-    if let Some(extra_payload) = extra_payload {
-        for (key, value) in extra_payload {
-            payload.insert(key, value);
-        }
-    }
-
-    let mut request = client
-        .post(chat_completions_url)
-        .json(&Value::Object(payload));
-
-    request = apply_auth_headers(request, upstream, None)?;
-
-    for (key, value) in &upstream.headers {
-        if let Some(value) = value.as_str() {
-            request = request.header(key, value);
-        }
-    }
-
-    let response = request
-        .send()
-        .context("upstream chat completion request failed")?;
-    let status = response.status();
-    let body = response
-        .text()
-        .context("failed to read upstream response body")?;
-    if !status.is_success() {
-        return Err(anyhow!(
-            "upstream chat completion failed with {}: {}",
-            status,
-            body
-        ));
-    }
-
-    let value: Value =
-        serde_json::from_str(&body).context("failed to parse chat completion response")?;
-    if let Some(error_message) = upstream_error_from_value(&value) {
-        return Err(anyhow!(
-            "upstream chat completion returned an error payload: {}",
-            error_message
-        ));
-    }
-    let usage = parse_usage(&value);
-    let parsed: ChatCompletionResponse =
-        serde_json::from_value(value).context("failed to decode chat completion response")?;
-    let message = parsed
-        .choices
-        .into_iter()
-        .next()
-        .map(|choice| choice.message)
-        .ok_or_else(|| anyhow!("invalid chat completion response: missing choices[0].message"))?;
-    Ok(ChatCompletionOutcome { message, usage })
-}
-
-fn create_responses_completion(
-    upstream: &UpstreamConfig,
-    messages: &[ChatMessage],
-    tools: &[Tool],
-    extra_payload: Option<Map<String, Value>>,
-) -> Result<ChatCompletionOutcome> {
-    let responses_url = build_chat_completions_url(upstream);
-    let mut client_builder = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs_f64(upstream.timeout_seconds));
-    if should_bypass_proxy(&responses_url) {
-        client_builder = client_builder.no_proxy();
-    }
-    let client = client_builder
-        .build()
-        .context("failed to construct upstream client")?;
-
-    let (instructions, input) = build_responses_input(messages)?;
-    let mut payload = Map::new();
-    payload.insert("model".to_string(), Value::String(upstream.model.clone()));
-    payload.insert("input".to_string(), Value::Array(input));
-    payload.insert("store".to_string(), Value::Bool(false));
-    let uses_streaming = upstream.auth_kind == UpstreamAuthKind::CodexSubscription;
-    if uses_streaming {
-        payload.insert("stream".to_string(), Value::Bool(true));
-    }
-    if let Some(instructions) = instructions {
-        payload.insert("instructions".to_string(), Value::String(instructions));
-    }
-    if let Some(reasoning) = &upstream.reasoning {
-        payload.insert(
-            "reasoning".to_string(),
-            serde_json::to_value(reasoning).context("failed to serialize reasoning config")?,
-        );
-    }
-    if let Some(native_web_search) = &upstream.native_web_search
-        && native_web_search.enabled
-    {
-        for (key, value) in &native_web_search.payload {
-            payload.insert(key.clone(), value.clone());
-        }
-    }
-    if !tools.is_empty() {
-        payload.insert(
-            "tools".to_string(),
-            Value::Array(tools.iter().map(Tool::as_responses_tool).collect()),
-        );
-        payload.insert("parallel_tool_calls".to_string(), Value::Bool(true));
-    }
-    if let Some(extra_payload) = extra_payload {
-        for (key, value) in extra_payload {
-            payload.insert(key, value);
-        }
-    }
-    if upstream.auth_kind == UpstreamAuthKind::CodexSubscription {
-        // ChatGPT Codex responses reject some OpenAI-compatible optional knobs
-        // such as max_completion_tokens during compaction/image helper calls.
-        payload.remove("max_completion_tokens");
-    }
-
-    let auth = load_codex_auth(upstream)?;
-    let mut request = client.post(&responses_url).json(&Value::Object(payload.clone()));
-    request = apply_auth_headers(request, upstream, auth.as_ref())?;
-    if uses_streaming {
-        request = request.header(reqwest::header::ACCEPT, "text/event-stream");
-    }
-
-    for (key, value) in &upstream.headers {
-        if let Some(value) = value.as_str() {
-            request = request.header(key, value);
-        }
-    }
-
-    let mut response = request.send().context("upstream responses request failed")?;
-    if response.status() == reqwest::StatusCode::UNAUTHORIZED
-        && upstream.auth_kind == UpstreamAuthKind::CodexSubscription
-    {
-        if let Some(ref auth) = auth
-            && let Some(refreshed) = refresh_codex_auth(upstream, auth)?
-        {
-            let mut retry = client.post(&responses_url).json(&Value::Object(payload));
-            retry = apply_auth_headers(retry, upstream, Some(&refreshed))?;
-            for (key, value) in &upstream.headers {
-                if let Some(value) = value.as_str() {
-                    retry = retry.header(key, value);
-                }
-            }
-            response = retry
-                .send()
-                .context("upstream responses request failed after token refresh")?;
-        }
-    }
-
-    let status = response.status();
-    let body = response
-        .text()
-        .context("failed to read upstream responses body")?;
-    if !status.is_success() {
-        return Err(anyhow!("upstream responses failed with {}: {}", status, body));
-    }
-
-    let value: Value = if uses_streaming {
-        parse_streamed_responses_body(&body)?
-    } else {
-        serde_json::from_str(&body).context("failed to parse responses response")?
-    };
-    if let Some(error_message) = upstream_error_from_value(&value) {
-        return Err(anyhow!(
-            "upstream responses returned an error payload: {}",
-            error_message
-        ));
-    }
-    let usage = parse_usage(&value);
-    let message = responses_value_to_chat_message(&value)?;
-    Ok(ChatCompletionOutcome { message, usage })
-}
-
-fn parse_streamed_responses_body(body: &str) -> Result<Value> {
+pub(super) fn parse_streamed_responses_body(body: &str) -> Result<Value> {
     let mut current_event: Option<String> = None;
     let mut current_data = Vec::new();
     let mut completed_response: Option<Value> = None;
@@ -447,7 +223,9 @@ fn parse_streamed_responses_body(body: &str) -> Result<Value> {
         .context("failed to parse streamed responses fallback body as a response object")
 }
 
-fn build_responses_input(messages: &[ChatMessage]) -> Result<(Option<String>, Vec<Value>)> {
+pub(super) fn build_responses_input(
+    messages: &[ChatMessage],
+) -> Result<(Option<String>, Vec<Value>)> {
     let mut instructions = Vec::new();
     let mut input = Vec::new();
     for message in messages {
@@ -604,7 +382,7 @@ fn message_text_content(content: Option<&Value>) -> Option<String> {
     }
 }
 
-fn responses_value_to_chat_message(value: &Value) -> Result<ChatMessage> {
+pub(super) fn responses_value_to_chat_message(value: &Value) -> Result<ChatMessage> {
     let output = value
         .get("output")
         .and_then(Value::as_array)
@@ -660,7 +438,7 @@ fn responses_value_to_chat_message(value: &Value) -> Result<ChatMessage> {
     })
 }
 
-fn apply_auth_headers(
+pub(super) fn apply_auth_headers(
     mut request: reqwest::blocking::RequestBuilder,
     upstream: &UpstreamConfig,
     codex_auth: Option<&CodexAuthConfig>,
@@ -692,14 +470,17 @@ fn apply_auth_headers(
     Ok(request)
 }
 
-fn load_codex_auth(upstream: &UpstreamConfig) -> Result<Option<CodexAuthConfig>> {
+pub(super) fn load_codex_auth(upstream: &UpstreamConfig) -> Result<Option<CodexAuthConfig>> {
     if upstream.auth_kind != UpstreamAuthKind::CodexSubscription {
         return Ok(None);
     }
     if let Some(auth) = upstream.codex_auth.clone() {
         return Ok(Some(auth));
     }
-    if matches!(upstream.auth_credentials_store_mode, AuthCredentialsStoreMode::Keyring) {
+    if matches!(
+        upstream.auth_credentials_store_mode,
+        AuthCredentialsStoreMode::Keyring
+    ) {
         return Err(anyhow!(
             "codex subscription auth_credentials_store_mode=keyring is not supported here yet"
         ));
@@ -711,7 +492,7 @@ fn load_codex_auth(upstream: &UpstreamConfig) -> Result<Option<CodexAuthConfig>>
     Ok(Some(crate::config::load_codex_auth_tokens(codex_home)?))
 }
 
-fn refresh_codex_auth(
+pub(super) fn refresh_codex_auth(
     upstream: &UpstreamConfig,
     auth: &CodexAuthConfig,
 ) -> Result<Option<CodexAuthConfig>> {
@@ -748,7 +529,9 @@ fn refresh_codex_auth(
         access_token: parsed
             .access_token
             .ok_or_else(|| anyhow!("codex refresh response missing access_token"))?,
-        refresh_token: parsed.refresh_token.unwrap_or_else(|| auth.refresh_token.clone()),
+        refresh_token: parsed
+            .refresh_token
+            .unwrap_or_else(|| auth.refresh_token.clone()),
         account_id: auth
             .account_id
             .clone()
@@ -800,7 +583,7 @@ fn decode_jwt_payload(jwt: &str) -> Result<Value> {
     serde_json::from_slice(&payload_bytes).context("failed to parse JWT payload")
 }
 
-fn parse_usage(response: &Value) -> TokenUsage {
+pub(super) fn parse_usage(response: &Value) -> TokenUsage {
     let usage = response.get("usage").and_then(Value::as_object);
     let prompt_tokens = usage
         .and_then(|value| {
@@ -889,6 +672,9 @@ mod tests {
         UpstreamAuthKind, build_responses_input, parse_streamed_responses_body,
         responses_value_to_chat_message, upstream_error_from_value,
     };
+    use crate::config::{
+        AuthCredentialsStoreMode, ReasoningConfig, UpstreamApiKind, UpstreamConfig,
+    };
     use crate::message::{ChatMessage, FunctionCall, ToolCall};
     use serde_json::json;
 
@@ -927,6 +713,66 @@ mod tests {
         }
 
         assert!(payload.get("max_completion_tokens").is_none());
+    }
+
+    fn test_upstream_config() -> UpstreamConfig {
+        UpstreamConfig {
+            base_url: "https://example.com".to_string(),
+            model: "gpt-5.4".to_string(),
+            api_kind: UpstreamApiKind::Responses,
+            auth_kind: UpstreamAuthKind::ApiKey,
+            supports_vision_input: false,
+            api_key: None,
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            chat_completions_path: "/responses".to_string(),
+            codex_home: None,
+            codex_auth: None,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 200_000,
+            cache_control: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            native_web_search: None,
+            external_web_search: None,
+        }
+    }
+
+    #[test]
+    fn responses_reasoning_payload_omits_none_fields() {
+        let mut upstream = test_upstream_config();
+        upstream.reasoning = Some(ReasoningConfig {
+            effort: Some("medium".to_string()),
+            max_tokens: None,
+            exclude: None,
+            enabled: None,
+        });
+
+        let payload = super::providers::openrouter_responses::responses_reasoning_payload(
+            upstream.reasoning.as_ref(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(payload, json!({ "effort": "medium" }));
+    }
+
+    #[test]
+    fn codex_responses_reasoning_payload_only_keeps_effort() {
+        let mut upstream = test_upstream_config();
+        upstream.auth_kind = UpstreamAuthKind::CodexSubscription;
+        upstream.reasoning = Some(ReasoningConfig {
+            effort: Some("medium".to_string()),
+            max_tokens: Some(2048),
+            exclude: Some(true),
+            enabled: Some(true),
+        });
+
+        let payload = super::providers::codex_subscription::codex_reasoning_payload(
+            upstream.reasoning.as_ref(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(payload, json!({ "effort": "medium" }));
     }
 
     #[test]
