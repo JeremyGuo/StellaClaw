@@ -4,10 +4,40 @@ use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamApiKind {
+    #[default]
+    ChatCompletions,
+    Responses,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamAuthKind {
+    #[default]
+    ApiKey,
+    CodexSubscription,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthCredentialsStoreMode {
+    File,
+    Keyring,
+    #[default]
+    Auto,
+    Ephemeral,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UpstreamConfig {
     pub base_url: String,
     pub model: String,
+    #[serde(default)]
+    pub api_kind: UpstreamApiKind,
+    #[serde(default)]
+    pub auth_kind: UpstreamAuthKind,
     #[serde(default)]
     pub supports_vision_input: bool,
     #[serde(default)]
@@ -16,6 +46,12 @@ pub struct UpstreamConfig {
     pub api_key_env: String,
     #[serde(default = "default_chat_completions_path")]
     pub chat_completions_path: String,
+    #[serde(default)]
+    pub codex_home: Option<PathBuf>,
+    #[serde(default)]
+    pub codex_auth: Option<CodexAuthConfig>,
+    #[serde(default)]
+    pub auth_credentials_store_mode: AuthCredentialsStoreMode,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: f64,
     #[serde(default = "default_context_window_tokens")]
@@ -30,6 +66,15 @@ pub struct UpstreamConfig {
     pub native_web_search: Option<NativeWebSearchConfig>,
     #[serde(default)]
     pub external_web_search: Option<ExternalWebSearchConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CodexAuthConfig {
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: String,
+    #[serde(default)]
+    pub account_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -135,6 +180,10 @@ struct UpstreamConfigRaw {
     base_url: String,
     model: String,
     #[serde(default)]
+    api_kind: UpstreamApiKind,
+    #[serde(default)]
+    auth_kind: UpstreamAuthKind,
+    #[serde(default)]
     supports_vision_input: bool,
     #[serde(default)]
     api_key: Option<String>,
@@ -142,6 +191,12 @@ struct UpstreamConfigRaw {
     api_key_env: String,
     #[serde(default = "default_chat_completions_path")]
     chat_completions_path: String,
+    #[serde(default)]
+    codex_home: Option<String>,
+    #[serde(default)]
+    codex_auth: Option<CodexAuthConfig>,
+    #[serde(default)]
+    auth_credentials_store_mode: AuthCredentialsStoreMode,
     #[serde(default = "default_timeout_seconds")]
     timeout_seconds: f64,
     #[serde(default = "default_context_window_tokens")]
@@ -238,10 +293,15 @@ fn resolve_upstream(raw: UpstreamConfigRaw) -> UpstreamConfig {
     UpstreamConfig {
         base_url: raw.base_url,
         model: raw.model,
+        api_kind: raw.api_kind,
+        auth_kind: raw.auth_kind,
         supports_vision_input: raw.supports_vision_input,
         api_key: raw.api_key,
         api_key_env: raw.api_key_env,
         chat_completions_path: raw.chat_completions_path,
+        codex_home: raw.codex_home.map(PathBuf::from),
+        codex_auth: raw.codex_auth,
+        auth_credentials_store_mode: raw.auth_credentials_store_mode,
         timeout_seconds: raw.timeout_seconds,
         context_window_tokens: raw.context_window_tokens,
         cache_control: raw.cache_control,
@@ -250,6 +310,23 @@ fn resolve_upstream(raw: UpstreamConfigRaw) -> UpstreamConfig {
         native_web_search: raw.native_web_search,
         external_web_search: raw.external_web_search,
     }
+}
+
+#[derive(Deserialize)]
+struct CodexAuthFile {
+    #[serde(default)]
+    tokens: Option<CodexAuthConfig>,
+}
+
+pub fn load_codex_auth_tokens(codex_home: &Path) -> Result<CodexAuthConfig> {
+    let auth_path = codex_home.join("auth.json");
+    let raw = fs::read_to_string(&auth_path)
+        .with_context(|| format!("failed to read {}", auth_path.display()))?;
+    let auth_file: CodexAuthFile =
+        serde_json::from_str(&raw).context("failed to parse codex auth.json")?;
+    auth_file
+        .tokens
+        .ok_or_else(|| anyhow!("codex auth.json does not contain tokens"))
 }
 
 pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Result<AgentConfig> {

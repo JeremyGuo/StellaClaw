@@ -18,6 +18,7 @@ pub fn build_agent_system_prompt(
     model_name: &str,
     model: &ModelConfig,
     models: &BTreeMap<String, ModelConfig>,
+    chat_model_keys: &[String],
     main_agent: &MainAgentConfig,
     commands: &[BotCommandConfig],
 ) -> String {
@@ -74,8 +75,9 @@ pub fn build_agent_system_prompt(
         ),
     ];
 
-    let model_catalog = models
+    let model_catalog = chat_model_keys
         .iter()
+        .filter_map(|name| models.get_key_value(name))
         .map(|(name, config)| {
             let description = if config.description.trim().is_empty() {
                 "No description provided."
@@ -242,14 +244,18 @@ mod tests {
             close_after_summary: false,
         };
         let model = ModelConfig {
+            model_type: crate::config::ModelType::Openrouter,
             api_endpoint: "https://example.com/v1".to_string(),
             model: "example-model".to_string(),
             backend: AgentBackendKind::AgentFrame,
             supports_vision_input: false,
             image_tool_model: None,
+            web_search_model: None,
             api_key: None,
             api_key_env: "TEST_API_KEY".to_string(),
             chat_completions_path: "/chat/completions".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
             headers: serde_json::Map::new(),
             context_window_tokens: 100_000,
             description: "General-purpose test model".to_string(),
@@ -261,6 +267,9 @@ mod tests {
         };
         let mut models = BTreeMap::new();
         models.insert("main".to_string(), model.clone());
+        let mut vision_model = model.clone();
+        vision_model.description = "vision only".to_string();
+        models.insert("vision-only".to_string(), vision_model);
         let main_agent = MainAgentConfig {
             model: Some("main".to_string()),
             global_install_root: "/opt".to_string(),
@@ -284,6 +293,7 @@ mod tests {
             "main",
             &model,
             &models,
+            &["main".to_string()],
             &main_agent,
             &[],
         );
@@ -294,6 +304,8 @@ mod tests {
         assert!(prompt.contains("workspace_id=workspace-1"));
         assert!(prompt.contains("use the available workspace history tools"));
         assert!(prompt.contains("choose the model whose description best matches the task"));
+        assert!(prompt.contains("- main: General-purpose test model"));
+        assert!(!prompt.contains("vision-only"));
         assert!(prompt.contains("you must use the user_tell tool"));
         assert!(prompt.contains("If a user message starts with [Interrupted Follow-up]"));
         assert!(prompt.contains("If a user message starts with [Queued User Updates]"));

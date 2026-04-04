@@ -1,5 +1,5 @@
 use agent_host::Server;
-use agent_host::config::{load_server_config_file, resolve_model_api_keys};
+use agent_host::config::{load_server_config_file_and_upgrade, resolve_model_api_keys};
 use agent_host::env::load_dotenv_files;
 use agent_host::logging::init_logging;
 use agent_host::sandbox::run_child_stdio;
@@ -72,7 +72,16 @@ async fn run_server(args: Args) -> Result<()> {
             "loaded .env file"
         );
     }
-    let config = load_server_config_file(config_path)?;
+    let (config, upgraded_config) = load_server_config_file_and_upgrade(config_path)?;
+    if upgraded_config {
+        info!(
+            log_stream = "server",
+            kind = "config_upgraded",
+            config = %config_path.display(),
+            version = %config.version,
+            "upgraded config file to latest version"
+        );
+    }
     if std::env::var("DEBUG_API_KEY").ok().as_deref() == Some("1") {
         for item in resolve_model_api_keys(&config) {
             let value = item.api_key.unwrap_or_else(|| "<missing>".to_string());

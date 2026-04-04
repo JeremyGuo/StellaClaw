@@ -1,5 +1,8 @@
 use crate::backend::AgentBackendKind;
-use agent_frame::config::{ExternalWebSearchConfig, NativeWebSearchConfig, ReasoningConfig};
+use agent_frame::config::{
+    AuthCredentialsStoreMode, ExternalWebSearchConfig, NativeWebSearchConfig, ReasoningConfig,
+    UpstreamApiKind, UpstreamAuthKind,
+};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -7,10 +10,23 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
+mod v0_1;
+mod v0_2;
+mod v0_3;
+
+pub const LEGACY_CONFIG_VERSION: &str = "0.1";
+pub const LATEST_CONFIG_VERSION: &str = "0.3";
+pub const VERSION_0_2: &str = "0.2";
+
 fn zgent_checkout_available() -> bool {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../zgent/crates/zgent-core/Cargo.toml")
         .is_file()
+}
+
+trait ConfigLoader {
+    fn version(&self) -> &'static str;
+    fn load_and_upgrade(&self, value: Value) -> Result<ServerConfig>;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -45,6 +61,8 @@ pub struct TelegramChannelConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ModelConfig {
+    #[serde(rename = "type")]
+    pub model_type: ModelType,
     pub api_endpoint: String,
     pub model: String,
     #[serde(default)]
@@ -54,11 +72,18 @@ pub struct ModelConfig {
     #[serde(default)]
     pub image_tool_model: Option<String>,
     #[serde(default)]
+    #[serde(rename = "web_search", alias = "web_search_model")]
+    pub web_search_model: Option<String>,
+    #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default = "default_api_key_env")]
     pub api_key_env: String,
     #[serde(default = "default_chat_completions_path")]
     pub chat_completions_path: String,
+    #[serde(default)]
+    pub codex_home: Option<String>,
+    #[serde(default)]
+    pub auth_credentials_store_mode: AuthCredentialsStoreMode,
     #[serde(default = "default_model_timeout_seconds")]
     pub timeout_seconds: f64,
     #[serde(default = "default_context_window_tokens")]
@@ -74,7 +99,32 @@ pub struct ModelConfig {
     #[serde(default)]
     pub native_web_search: Option<NativeWebSearchConfig>,
     #[serde(default)]
+    #[serde(skip_serializing)]
     pub external_web_search: Option<ExternalWebSearchConfig>,
+}
+
+impl ModelConfig {
+    pub fn upstream_api_kind(&self) -> UpstreamApiKind {
+        match self.model_type {
+            ModelType::Openrouter => UpstreamApiKind::ChatCompletions,
+            ModelType::OpenrouterResp | ModelType::CodexSubscription => UpstreamApiKind::Responses,
+        }
+    }
+
+    pub fn upstream_auth_kind(&self) -> UpstreamAuthKind {
+        match self.model_type {
+            ModelType::CodexSubscription => UpstreamAuthKind::CodexSubscription,
+            ModelType::Openrouter | ModelType::OpenrouterResp => UpstreamAuthKind::ApiKey,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelType {
+    Openrouter,
+    OpenrouterResp,
+    CodexSubscription,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -131,7 +181,11 @@ pub enum ChannelConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ServerConfig {
+    pub version: String,
     pub models: BTreeMap<String, ModelConfig>,
+    pub model_catalog: ModelCatalogConfig,
+    #[serde(default)]
+    pub chat_model_keys: Vec<String>,
     pub main_agent: MainAgentConfig,
     #[serde(default)]
     pub sandbox: SandboxConfig,
@@ -140,6 +194,16 @@ pub struct ServerConfig {
     #[serde(default = "default_cron_poll_interval_seconds")]
     pub cron_poll_interval_seconds: u64,
     pub channels: Vec<ChannelConfig>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ModelCatalogConfig {
+    #[serde(default)]
+    pub chat: BTreeMap<String, ModelConfig>,
+    #[serde(default)]
+    pub vision: BTreeMap<String, ModelConfig>,
+    #[serde(default)]
+    pub web_search: BTreeMap<String, ExternalWebSearchConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,19 +217,27 @@ fn default_cli_prompt() -> String {
     "you> ".to_string()
 }
 
-fn default_api_key_env() -> String {
+pub(crate) fn default_api_key_env() -> String {
     "OPENAI_API_KEY".to_string()
 }
 
-fn default_chat_completions_path() -> String {
+pub(crate) fn default_chat_completions_path() -> String {
     "/chat/completions".to_string()
 }
 
-fn default_model_timeout_seconds() -> f64 {
+pub(crate) fn default_responses_path() -> String {
+    "/responses".to_string()
+}
+
+pub(crate) fn default_codex_subscription_endpoint() -> String {
+    "https://chatgpt.com/backend-api/codex".to_string()
+}
+
+pub(crate) fn default_model_timeout_seconds() -> f64 {
     120.0
 }
 
-fn default_context_window_tokens() -> usize {
+pub(crate) fn default_context_window_tokens() -> usize {
     128_000
 }
 
@@ -304,7 +376,7 @@ fn default_telegram_commands() -> Vec<BotCommandConfig> {
     default_bot_commands()
 }
 
-fn default_max_global_sub_agents() -> usize {
+pub(crate) fn default_max_global_sub_agents() -> usize {
     4
 }
 
@@ -312,7 +384,7 @@ fn default_bubblewrap_binary() -> String {
     "bwrap".to_string()
 }
 
-fn default_cron_poll_interval_seconds() -> u64 {
+pub(crate) fn default_cron_poll_interval_seconds() -> u64 {
     5
 }
 
@@ -320,8 +392,106 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
     let path = path.as_ref();
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read config file {}", path.display()))?;
-    let config: ServerConfig =
-        serde_json::from_str(&raw).context("failed to parse server config JSON")?;
+    let value: Value = serde_json::from_str(&raw).context("failed to parse server config JSON")?;
+    let version = match value.get("version") {
+        Some(Value::String(version)) => version.clone(),
+        _ => LEGACY_CONFIG_VERSION.to_string(),
+    };
+    let loaders: [&dyn ConfigLoader; 3] = [
+        &v0_1::LegacyConfigLoader,
+        &v0_2::VersionedConfigLoader,
+        &v0_3::LatestConfigLoader,
+    ];
+    let loader = loaders
+        .into_iter()
+        .find(|loader| loader.version() == version)
+        .ok_or_else(|| anyhow!("unsupported config version '{}'", version))?;
+    let config = loader.load_and_upgrade(value)?;
+    validate_server_config(&config)?;
+    Ok(config)
+}
+
+pub(crate) fn build_server_config(
+    version: String,
+    models: BTreeMap<String, ModelConfig>,
+    model_catalog: ModelCatalogConfig,
+    chat_model_keys: Vec<String>,
+    main_agent: MainAgentConfig,
+    sandbox: SandboxConfig,
+    max_global_sub_agents: usize,
+    cron_poll_interval_seconds: u64,
+    channels: Vec<ChannelConfig>,
+) -> ServerConfig {
+    ServerConfig {
+        version,
+        models,
+        model_catalog,
+        chat_model_keys,
+        main_agent,
+        sandbox,
+        max_global_sub_agents,
+        cron_poll_interval_seconds,
+        channels,
+    }
+}
+
+pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(ServerConfig, bool)> {
+    let path = path.as_ref();
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("failed to read config file {}", path.display()))?;
+    let value: Value = serde_json::from_str(&raw).context("failed to parse server config JSON")?;
+    let version = match value.get("version") {
+        Some(Value::String(version)) => version.clone(),
+        _ => LEGACY_CONFIG_VERSION.to_string(),
+    };
+    let config = {
+        let loaders: [&dyn ConfigLoader; 3] = [
+            &v0_1::LegacyConfigLoader,
+            &v0_2::VersionedConfigLoader,
+            &v0_3::LatestConfigLoader,
+        ];
+        let loader = loaders
+            .into_iter()
+            .find(|loader| loader.version() == version)
+            .ok_or_else(|| anyhow!("unsupported config version '{}'", version))?;
+        loader.load_and_upgrade(value)?
+    };
+    validate_server_config(&config)?;
+    let upgraded = version != LATEST_CONFIG_VERSION;
+    if upgraded {
+        write_server_config_file(path, &config)?;
+    }
+    Ok((config, upgraded))
+}
+
+pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -> Result<()> {
+    #[derive(Serialize)]
+    struct PersistedServerConfig<'a> {
+        version: &'a str,
+        models: &'a ModelCatalogConfig,
+        main_agent: &'a MainAgentConfig,
+        sandbox: &'a SandboxConfig,
+        max_global_sub_agents: usize,
+        cron_poll_interval_seconds: u64,
+        channels: &'a [ChannelConfig],
+    }
+
+    let persisted = PersistedServerConfig {
+        version: LATEST_CONFIG_VERSION,
+        models: &config.model_catalog,
+        main_agent: &config.main_agent,
+        sandbox: &config.sandbox,
+        max_global_sub_agents: config.max_global_sub_agents,
+        cron_poll_interval_seconds: config.cron_poll_interval_seconds,
+        channels: &config.channels,
+    };
+    let raw =
+        serde_json::to_string_pretty(&persisted).context("failed to serialize server config")?;
+    fs::write(path.as_ref(), raw)
+        .with_context(|| format!("failed to write config file {}", path.as_ref().display()))
+}
+
+fn validate_server_config(config: &ServerConfig) -> Result<()> {
     if config.channels.is_empty() {
         return Err(anyhow!("server config must include at least one channel"));
     }
@@ -354,13 +524,19 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
             "main_agent.idle_context_compaction_poll_interval_seconds must be at least 1"
         ));
     }
-    if let Some(model) = config.main_agent.model.as_deref()
-        && !config.models.contains_key(model)
-    {
-        return Err(anyhow!(
-            "main_agent.model '{}' does not exist in models",
-            model
-        ));
+    if let Some(model) = config.main_agent.model.as_deref() {
+        if !config.models.contains_key(model) {
+            return Err(anyhow!(
+                "main_agent.model '{}' does not exist in models",
+                model
+            ));
+        }
+        if !config.chat_model_keys.iter().any(|value| value == model) {
+            return Err(anyhow!(
+                "main_agent.model '{}' must reference a chat model",
+                model
+            ));
+        }
     }
     if config
         .main_agent
@@ -382,6 +558,12 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         if model.api_endpoint.trim().is_empty() || model.model.trim().is_empty() {
             return Err(anyhow!(
                 "model '{}' must include api_endpoint and model",
+                model_name
+            ));
+        }
+        if model.model_type == ModelType::CodexSubscription && model.codex_home.is_none() {
+            return Err(anyhow!(
+                "model '{}' uses codex-subscription and must include codex_home",
                 model_name
             ));
         }
@@ -410,12 +592,21 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
                 image_tool_model
             ));
         }
+        if let Some(web_search_model) = &model.web_search_model
+            && !config.model_catalog.web_search.contains_key(web_search_model)
+        {
+            return Err(anyhow!(
+                "model '{}' references unknown web_search_model '{}'",
+                model_name,
+                web_search_model
+            ));
+        }
     }
-    Ok(config)
+    Ok(())
 }
 
 pub fn resolve_model_api_keys(config: &ServerConfig) -> Vec<ResolvedModelApiKey> {
-    config
+    let mut resolved = config
         .models
         .iter()
         .map(|(model_name, model)| {
@@ -453,7 +644,45 @@ pub fn resolve_model_api_keys(config: &ServerConfig) -> Vec<ResolvedModelApiKey>
                 api_key: env_key,
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    resolved.extend(config.model_catalog.web_search.iter().map(|(name, search)| {
+        let inline_key = search
+            .api_key
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        if let Some(api_key) = inline_key {
+            return ResolvedModelApiKey {
+                model_name: format!("web_search:{name}"),
+                source: "config.api_key".to_string(),
+                api_key: Some(api_key),
+            };
+        }
+
+        let env_name = search.api_key_env.trim();
+        let env_key = if env_name.is_empty() {
+            None
+        } else {
+            std::env::var(env_name)
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+        };
+
+        ResolvedModelApiKey {
+            model_name: format!("web_search:{name}"),
+            source: if env_name.is_empty() {
+                "missing".to_string()
+            } else {
+                format!("env:{env_name}")
+            },
+            api_key: env_key,
+        }
+    }));
+
+    resolved
 }
 
 fn validate_bot_commands(commands: &[BotCommandConfig]) -> Result<()> {
@@ -492,7 +721,8 @@ fn validate_bot_commands(commands: &[BotCommandConfig]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelConfig, default_bot_commands, load_server_config_file, resolve_model_api_keys,
+        ChannelConfig, LATEST_CONFIG_VERSION, ModelType, default_bot_commands,
+        load_server_config_file, load_server_config_file_and_upgrade, resolve_model_api_keys,
         zgent_checkout_available,
     };
     use crate::backend::AgentBackendKind;
@@ -823,5 +1053,283 @@ mod tests {
             std::env::remove_var("AGENT_HOST_TEST_API_KEY");
             std::env::remove_var("AGENT_HOST_TEST_MISSING");
         }
+    }
+
+    #[test]
+    fn legacy_config_without_version_is_upgraded_to_latest() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "models": {
+                "main": {
+                  "api_endpoint": "https://openrouter.ai/api/v1",
+                  "model": "anthropic/claude-sonnet-4.6",
+                  "description": "demo"
+                }
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = load_server_config_file(&config_path).unwrap();
+        assert_eq!(config.version, LATEST_CONFIG_VERSION);
+        assert_eq!(config.chat_model_keys, vec!["main".to_string()]);
+        assert_eq!(config.models["main"].model_type, ModelType::Openrouter);
+    }
+
+    #[test]
+    fn versioned_model_catalog_loads_and_flattens_by_kind() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.2",
+              "models": {
+                "chat": {
+                  "main": {
+                    "type": "openrouter",
+                    "model": "anthropic/claude-sonnet-4.6",
+                    "description": "chat model"
+                  }
+                },
+                "vision": {
+                  "vision-model": {
+                    "type": "openrouter",
+                    "model": "openai/gpt-4.1-mini",
+                    "supports_vision_input": true,
+                    "description": "vision model"
+                  }
+                },
+                "web_search": {
+                  "search-model": {
+                    "type": "openrouter-resp",
+                    "model": "openai/gpt-4.1-mini",
+                    "description": "web search model"
+                  }
+                }
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = load_server_config_file(&config_path).unwrap();
+        assert_eq!(config.version, LATEST_CONFIG_VERSION);
+        assert_eq!(config.chat_model_keys, vec!["main".to_string()]);
+        assert_eq!(config.models["main"].model_type, ModelType::Openrouter);
+        assert_eq!(config.models["vision-model"].model_type, ModelType::Openrouter);
+        assert!(!config.models.contains_key("search-model"));
+        assert_eq!(
+            config.model_catalog.web_search["search-model"].model,
+            "openai/gpt-4.1-mini"
+        );
+        assert_eq!(
+            config.model_catalog.web_search["search-model"].chat_completions_path,
+            "/responses"
+        );
+    }
+
+    #[test]
+    fn openrouter_resp_defaults_to_responses_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.2",
+              "models": {
+                "chat": {
+                  "main": {
+                    "type": "openrouter-resp",
+                    "model": "openai/gpt-4.1-mini",
+                    "description": "demo"
+                  }
+                },
+                "vision": {},
+                "web_search": {}
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = load_server_config_file(&config_path).unwrap();
+        assert_eq!(config.models["main"].chat_completions_path, "/responses");
+    }
+
+    #[test]
+    fn codex_subscription_requires_codex_home_in_versioned_config() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.2",
+              "models": {
+                "chat": {
+                  "main": {
+                    "type": "codex-subscription",
+                    "model": "gpt-5",
+                    "description": "demo"
+                  }
+                },
+                "vision": {},
+                "web_search": {}
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let error = load_server_config_file(&config_path).unwrap_err();
+        assert!(error.to_string().contains("must include codex_home"));
+    }
+
+    #[test]
+    fn legacy_external_web_search_is_promoted_into_shared_web_search_catalog() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "models": {
+                "main": {
+                  "api_endpoint": "https://openrouter.ai/api/v1",
+                  "model": "anthropic/claude-sonnet-4.6",
+                  "description": "demo",
+                  "external_web_search": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": "perplexity/sonar-pro",
+                    "api_key_env": "OPENROUTER_API_KEY",
+                    "chat_completions_path": "/chat/completions",
+                    "timeout_seconds": 60
+                  }
+                }
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let (config, upgraded) = load_server_config_file_and_upgrade(&config_path).unwrap();
+        assert!(upgraded);
+        assert_eq!(
+            config.models["main"].web_search_model.as_deref(),
+            Some("main_web_search")
+        );
+        assert!(config.model_catalog.web_search.contains_key("main_web_search"));
+
+        let written = fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains("\"version\": \"0.3\""));
+        assert!(written.contains("\"web_search\": \"main_web_search\""));
+        assert!(written.contains("\"models\": {"));
+        assert!(written.contains("\"web_search\": {"));
+    }
+
+    #[test]
+    fn latest_config_loads_chat_web_search_alias() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.3",
+              "models": {
+                "chat": {
+                  "main": {
+                    "type": "openrouter",
+                    "model": "anthropic/claude-sonnet-4.6",
+                    "description": "demo",
+                    "web_search": "default_search"
+                  }
+                },
+                "vision": {},
+                "web_search": {
+                  "default_search": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": "perplexity/sonar-pro",
+                    "api_key_env": "OPENROUTER_API_KEY",
+                    "chat_completions_path": "/chat/completions",
+                    "timeout_seconds": 60,
+                    "headers": {}
+                  }
+                }
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = load_server_config_file(&config_path).unwrap();
+        assert_eq!(
+            config.models["main"].web_search_model.as_deref(),
+            Some("default_search")
+        );
+        assert!(config.models["main"].external_web_search.is_some());
+        assert!(config.model_catalog.web_search.contains_key("default_search"));
     }
 }

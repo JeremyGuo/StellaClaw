@@ -102,6 +102,23 @@ impl Tool {
         })
     }
 
+    pub fn as_responses_tool(&self) -> Value {
+        let execution_guidance = match self.execution_mode {
+            ToolExecutionMode::Immediate => {
+                "Execution mode: immediate. This tool returns promptly and does not use a top-level timeout parameter."
+            }
+            ToolExecutionMode::Interruptible => {
+                "Execution mode: interruptible. This tool may wait, but the runtime can interrupt it when a newer user message arrives or the turn hits its timeout observation boundary."
+            }
+        };
+        json!({
+            "type": "function",
+            "name": self.name,
+            "description": format!("{} {}", execution_guidance, self.description),
+            "parameters": self.parameters,
+        })
+    }
+
     pub fn invoke(&self, arguments: Value) -> Result<Value> {
         (self.handler)(arguments)
     }
@@ -2484,6 +2501,27 @@ mod tests {
 
         assert!(immediate_description.contains("Execution mode: immediate."));
         assert!(interruptible_description.contains("Execution mode: interruptible."));
+    }
+
+    #[test]
+    fn responses_tool_schema_is_flattened() {
+        let tool = Tool::new(
+            "demo",
+            "A demo tool.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" }
+                }
+            }),
+            |_| Ok(json!({"ok": true})),
+        );
+
+        let value = tool.as_responses_tool();
+        assert_eq!(value["type"], "function");
+        assert_eq!(value["name"], "demo");
+        assert_eq!(value["parameters"]["type"], "object");
+        assert!(value.get("function").is_none());
     }
 
     #[test]

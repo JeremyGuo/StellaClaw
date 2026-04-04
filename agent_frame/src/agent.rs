@@ -876,10 +876,15 @@ mod tests {
             upstream: UpstreamConfig {
                 base_url: "http://127.0.0.1:1".to_string(),
                 model: "fake-model".to_string(),
+                api_kind: crate::config::UpstreamApiKind::ChatCompletions,
+                auth_kind: crate::config::UpstreamAuthKind::ApiKey,
                 supports_vision_input: false,
                 api_key: None,
                 api_key_env: "OPENAI_API_KEY".to_string(),
                 chat_completions_path: "/chat/completions".to_string(),
+                codex_home: None,
+                codex_auth: None,
+                auth_credentials_store_mode: crate::config::AuthCredentialsStoreMode::Auto,
                 timeout_seconds: 30.0,
                 context_window_tokens: 1000,
                 cache_control: Some(CacheControlConfig {

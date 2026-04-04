@@ -31,7 +31,10 @@ use crate::sink::{SinkRouter, SinkTarget};
 use crate::snapshot::{SnapshotBundle, SnapshotManager};
 use crate::subagent::{HostedSubagent, HostedSubagentInner, SubagentState};
 use crate::workspace::{WorkspaceManager, WorkspaceMountMaterialization};
-use agent_frame::config::{AgentConfig as FrameAgentConfig, CacheControlConfig, UpstreamConfig};
+use agent_frame::config::{
+    AgentConfig as FrameAgentConfig, CacheControlConfig, CodexAuthConfig, UpstreamConfig,
+    load_codex_auth_tokens,
+};
 use agent_frame::skills::discover_skills;
 use agent_frame::tooling::{build_tool_registry, terminate_runtime_state_tasks};
 use agent_frame::{
@@ -81,6 +84,7 @@ struct ServerRuntime {
     channels: Arc<HashMap<String, Arc<dyn Channel>>>,
     command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     models: BTreeMap<String, ModelConfig>,
+    chat_model_keys: Vec<String>,
     main_agent: MainAgentConfig,
     sandbox: SandboxConfig,
     sink_router: Arc<RwLock<SinkRouter>>,
@@ -182,6 +186,17 @@ impl SummaryTracker {
 }
 
 impl ServerRuntime {
+    fn resolved_codex_auth(&self, model: &ModelConfig) -> Result<Option<CodexAuthConfig>> {
+        if model.upstream_auth_kind() != agent_frame::config::UpstreamAuthKind::CodexSubscription {
+            return Ok(None);
+        }
+        let codex_home = model
+            .codex_home
+            .as_deref()
+            .ok_or_else(|| anyhow!("codex subscription config must include codex_home"))?;
+        Ok(Some(load_codex_auth_tokens(Path::new(codex_home))?))
+    }
+
     fn effective_main_model_key(&self) -> Result<String> {
         self.selected_main_model_key.clone().ok_or_else(|| {
             anyhow!("this conversation does not have a main model yet; choose one with /model")
@@ -552,6 +567,7 @@ impl ServerRuntime {
                         "running": false,
                         "completed": false,
                         "reason": "charge_exhausted",
+                        "error": inner.persisted.last_error,
                         "text": inner.persisted.last_result_text,
                         "attachment_paths": inner.persisted.last_attachment_paths,
                     }));
@@ -1093,10 +1109,15 @@ impl ServerRuntime {
                 Some(UpstreamConfig {
                     base_url: image_model.api_endpoint.clone(),
                     model: image_model.model.clone(),
+                    api_kind: image_model.upstream_api_kind(),
+                    auth_kind: image_model.upstream_auth_kind(),
                     supports_vision_input: image_model.supports_vision_input,
                     api_key: image_model.api_key.clone(),
                     api_key_env: image_model.api_key_env.clone(),
                     chat_completions_path: image_model.chat_completions_path.clone(),
+                    codex_home: image_model.codex_home.clone().map(Into::into),
+                    codex_auth: self.resolved_codex_auth(image_model)?,
+                    auth_credentials_store_mode: image_model.auth_credentials_store_mode,
                     timeout_seconds: image_model.timeout_seconds,
                     context_window_tokens: image_model.context_window_tokens,
                     cache_control: image_model
@@ -1131,10 +1152,15 @@ impl ServerRuntime {
             upstream: UpstreamConfig {
                 base_url: model.api_endpoint.clone(),
                 model: model.model.clone(),
+                api_kind: model.upstream_api_kind(),
+                auth_kind: model.upstream_auth_kind(),
                 supports_vision_input: model.supports_vision_input,
                 api_key: model.api_key.clone(),
                 api_key_env: model.api_key_env.clone(),
                 chat_completions_path: model.chat_completions_path.clone(),
+                codex_home: model.codex_home.clone().map(Into::into),
+                codex_auth: self.resolved_codex_auth(model)?,
+                auth_credentials_store_mode: model.auth_credentials_store_mode,
                 timeout_seconds: upstream_timeout_seconds
                     .unwrap_or(model.timeout_seconds)
                     .min(model.timeout_seconds),
@@ -1162,6 +1188,7 @@ impl ServerRuntime {
                 model_key,
                 model,
                 &self.models,
+                &self.chat_model_keys,
                 &self.main_agent,
                 &commands,
             ),
@@ -3007,6 +3034,7 @@ pub struct Server {
     channels: Arc<HashMap<String, Arc<dyn Channel>>>,
     command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     models: BTreeMap<String, ModelConfig>,
+    chat_model_keys: Vec<String>,
     main_agent: MainAgentConfig,
     sandbox: SandboxConfig,
     conversations: Arc<Mutex<ConversationManager>>,
@@ -3027,6 +3055,39 @@ pub struct Server {
 }
 
 impl Server {
+    fn clear_missing_selected_main_model(
+        &self,
+        address: &ChannelAddress,
+    ) -> Result<Option<String>> {
+        let Some(model_key) = self.selected_main_model_key(address)? else {
+            return Ok(None);
+        };
+        if self.models.contains_key(&model_key) {
+            return Ok(None);
+        }
+        self.with_conversations(|conversations| {
+            conversations.set_main_model(address, None).map(|_| ())
+        })?;
+        Ok(Some(model_key))
+    }
+
+    async fn prompt_missing_conversation_model(
+        &self,
+        channel: &Arc<dyn Channel>,
+        address: &ChannelAddress,
+        missing_model_key: &str,
+    ) -> Result<()> {
+        self.send_channel_message(
+            channel,
+            address,
+            OutgoingMessage::text(format!(
+                "The previously selected model `{}` is no longer available in the current config. Please run `/model` to choose a new model.",
+                missing_model_key
+            )),
+        )
+        .await
+    }
+
     fn with_sessions<T>(&self, f: impl FnOnce(&mut SessionManager) -> Result<T>) -> Result<T> {
         let mut sessions = self
             .sessions
@@ -3108,6 +3169,7 @@ impl Server {
             channels: Arc::new(channels),
             command_catalog,
             models: config.models,
+            chat_model_keys: config.chat_model_keys,
             main_agent: config.main_agent,
             sandbox: config.sandbox,
             conversations: Arc::new(Mutex::new(ConversationManager::new(&workdir)?)),
@@ -3197,7 +3259,7 @@ impl Server {
                     match maybe_message {
                         Some(message) => {
                             if let Some(outgoing) =
-                                fast_path_model_selection_message(&server.workdir, &server.models, &message)
+                                fast_path_model_selection_message(&server.workdir, &server.models, &server.chat_model_keys, &message)
                             {
                                 if let Some(channel) = server.channels.get(&message.address.channel_id) {
                                     if let Err(error) = channel.send(&message.address, outgoing).await {
@@ -3425,6 +3487,7 @@ impl Server {
             channels: Arc::clone(&self.channels),
             command_catalog: self.command_catalog.clone(),
             models: self.models.clone(),
+            chat_model_keys: self.chat_model_keys.clone(),
             main_agent: self.main_agent.clone(),
             sandbox: self.sandbox.clone(),
             sink_router: Arc::clone(&self.sink_router),
@@ -3617,6 +3680,17 @@ impl Server {
                 conversation_id = %incoming.address.conversation_id,
                 "foreground session reset"
             );
+            if let Some(missing_model_key) =
+                self.clear_missing_selected_main_model(&incoming.address)?
+            {
+                self.prompt_missing_conversation_model(
+                    &channel,
+                    &incoming.address,
+                    &missing_model_key,
+                )
+                .await?;
+                return Ok(());
+            }
             if self.selected_main_model_key(&incoming.address)?.is_some() {
                 let welcome = match self.initialize_foreground_session(&session, true).await {
                     Ok(welcome) => welcome,
@@ -3676,6 +3750,17 @@ impl Server {
                     return Err(error);
                 }
             };
+            if let Some(missing_model_key) =
+                self.clear_missing_selected_main_model(&incoming.address)?
+            {
+                self.prompt_missing_conversation_model(
+                    &channel,
+                    &incoming.address,
+                    &missing_model_key,
+                )
+                .await?;
+                return Ok(());
+            }
             if self.selected_main_model_key(&incoming.address)?.is_some() {
                 let welcome = match self.initialize_foreground_session(&session, true).await {
                     Ok(welcome) => welcome,
@@ -3719,6 +3804,19 @@ impl Server {
                 &channel,
                 &incoming.address,
                 OutgoingMessage::text(help_text),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        if parse_model_command(incoming.text.as_deref()).is_none()
+            && let Some(missing_model_key) =
+                self.clear_missing_selected_main_model(&incoming.address)?
+        {
+            self.prompt_missing_conversation_model(
+                &channel,
+                &incoming.address,
+                &missing_model_key,
             )
             .await?;
             return Ok(());
@@ -3823,6 +3921,9 @@ impl Server {
         }
 
         if let Some(argument) = parse_model_command(incoming.text.as_deref()) {
+            if argument.is_none() {
+                let _ = self.clear_missing_selected_main_model(&incoming.address)?;
+            }
             if let Some(model_key) = argument {
                 if !self.models.contains_key(&model_key) {
                     let error = anyhow!("unknown model {}", model_key);
@@ -5118,8 +5219,9 @@ impl Server {
     ) -> Result<OutgoingMessage> {
         let current = self.selected_main_model_key(address)?;
         let mut options = self
-            .models
-            .keys()
+            .chat_model_keys
+            .iter()
+            .filter(|model_key| self.models.contains_key(model_key.as_str()))
             .cloned()
             .map(|model_key| ShowOption {
                 label: model_key.clone(),
@@ -5253,6 +5355,7 @@ impl Server {
                 model_key,
                 model,
                 &self.models,
+                &self.chat_model_keys,
                 &self.main_agent,
                 &commands,
             ),
@@ -5559,6 +5662,7 @@ fn tag_interrupted_followup_text(text: Option<String>) -> Option<String> {
 fn fast_path_model_selection_message(
     workdir: &Path,
     models: &BTreeMap<String, ModelConfig>,
+    chat_model_keys: &[String],
     message: &IncomingMessage,
 ) -> Option<OutgoingMessage> {
     if message.control.is_some() {
@@ -5581,8 +5685,9 @@ fn fast_path_model_selection_message(
         return None;
     }
 
-    let mut options = models
-        .keys()
+    let mut options = chat_model_keys
+        .iter()
+        .filter(|model_key| models.contains_key(model_key.as_str()))
         .cloned()
         .map(|model_key| ShowOption {
             label: model_key.clone(),
@@ -7408,14 +7513,18 @@ mod tests {
             size_bytes: 4,
         };
         let model = ModelConfig {
+            model_type: crate::config::ModelType::Openrouter,
             api_endpoint: "https://example.com/v1".to_string(),
             model: "demo-vision".to_string(),
             backend: AgentBackendKind::AgentFrame,
             supports_vision_input: true,
             image_tool_model: None,
+            web_search_model: None,
             api_key: None,
             api_key_env: "TEST_API_KEY".to_string(),
             chat_completions_path: "/chat/completions".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
             timeout_seconds: 30.0,
             context_window_tokens: 128_000,
             cache_ttl: None,
@@ -7745,14 +7854,18 @@ mod tests {
     #[test]
     fn estimates_openrouter_opus_cost_with_cache_formula() {
         let model = ModelConfig {
+            model_type: crate::config::ModelType::Openrouter,
             api_endpoint: "https://openrouter.ai/api/v1".to_string(),
             model: "anthropic/claude-opus-4.6".to_string(),
             backend: AgentBackendKind::AgentFrame,
             supports_vision_input: true,
             image_tool_model: None,
+            web_search_model: None,
             api_key: None,
             api_key_env: "OPENROUTER_API_KEY".to_string(),
             chat_completions_path: "/chat/completions".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
             timeout_seconds: 300.0,
             context_window_tokens: 262_144,
             cache_ttl: Some("5m".to_string()),
@@ -7781,14 +7894,18 @@ mod tests {
     #[test]
     fn estimates_compaction_savings_from_token_delta_and_compaction_cost() {
         let model = ModelConfig {
+            model_type: crate::config::ModelType::Openrouter,
             api_endpoint: "https://openrouter.ai/api/v1".to_string(),
             model: "anthropic/claude-sonnet-4.6".to_string(),
             backend: AgentBackendKind::AgentFrame,
             supports_vision_input: true,
             image_tool_model: None,
+            web_search_model: None,
             api_key: None,
             api_key_env: "OPENROUTER_API_KEY".to_string(),
             chat_completions_path: "/chat/completions".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
             timeout_seconds: 300.0,
             context_window_tokens: 262_144,
             cache_ttl: Some("5m".to_string()),
