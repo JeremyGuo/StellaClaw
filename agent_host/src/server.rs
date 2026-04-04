@@ -7,6 +7,10 @@ use crate::backend::{
 };
 use crate::bootstrap::AgentWorkspace;
 use crate::channel::{Channel, IncomingMessage};
+use crate::channel_auth::{
+    AdminAuthorizeOutcome, ChannelAuthorizationManager, ConversationApprovalSnapshot,
+    ConversationApprovalState,
+};
 use crate::channels::command_line::CommandLineChannel;
 use crate::channels::telegram::TelegramChannel;
 use crate::config::{
@@ -46,7 +50,7 @@ use base64::Engine;
 use chrono::Utc;
 use humantime::parse_duration;
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -3030,6 +3034,7 @@ pub struct Server {
     agent_workspace: AgentWorkspace,
     workspace_manager: WorkspaceManager,
     channels: Arc<HashMap<String, Arc<dyn Channel>>>,
+    telegram_channel_ids: Arc<HashSet<String>>,
     command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     models: BTreeMap<String, ModelConfig>,
     chat_model_keys: Vec<String>,
@@ -3050,9 +3055,257 @@ pub struct Server {
     summary_tracker: Arc<SummaryTracker>,
     active_foreground_controls: Arc<Mutex<HashMap<String, SessionExecutionControl>>>,
     subagents: Arc<Mutex<HashMap<uuid::Uuid, Arc<HostedSubagent>>>>,
+    channel_auth: Arc<Mutex<ChannelAuthorizationManager>>,
 }
 
 impl Server {
+    fn requires_channel_authorization(&self, address: &ChannelAddress) -> bool {
+        self.telegram_channel_ids.contains(&address.channel_id)
+    }
+
+    fn is_private_conversation(address: &ChannelAddress) -> bool {
+        if let Ok(conversation_id) = address.conversation_id.parse::<i64>() {
+            conversation_id > 0
+        } else {
+            address
+                .user_id
+                .as_deref()
+                .is_some_and(|user_id| user_id == address.conversation_id)
+        }
+    }
+
+    fn render_chat_approval_state(state: ConversationApprovalState) -> &'static str {
+        match state {
+            ConversationApprovalState::Pending => "waiting_application",
+            ConversationApprovalState::Approved => "approved",
+            ConversationApprovalState::Rejected => "rejected",
+        }
+    }
+
+    async fn handle_admin_authorize_command(
+        &self,
+        channel: &Arc<dyn Channel>,
+        address: &ChannelAddress,
+    ) -> Result<()> {
+        if !Self::is_private_conversation(address) {
+            self.send_channel_message(
+                channel,
+                address,
+                OutgoingMessage::text(
+                    "Please open a private chat with the bot and send `/admin_authorize` there."
+                        .to_string(),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        let outcome = self.with_channel_auth(|auth| auth.authorize_admin(address))?;
+        let text = match outcome {
+            AdminAuthorizeOutcome::Authorized(snapshot) => format!(
+                "You are now the administrator for channel `{}` as user `{}`. This private chat is approved automatically. Use `/admin_chat_list` here to review chat requests.",
+                address.channel_id, snapshot.user_id
+            ),
+            AdminAuthorizeOutcome::AlreadyAuthorized(snapshot) => format!(
+                "You are already the administrator for channel `{}` as user `{}`. This private chat remains approved.",
+                address.channel_id, snapshot.user_id
+            ),
+            AdminAuthorizeOutcome::OwnedByAnotherAdmin(snapshot) => format!(
+                "This channel already has an administrator registered as user `{}`{}.",
+                snapshot.user_id,
+                snapshot
+                    .display_name
+                    .as_deref()
+                    .map(|name| format!(" ({name})"))
+                    .unwrap_or_default()
+            ),
+        };
+        self.send_channel_message(channel, address, OutgoingMessage::text(text))
+            .await
+    }
+
+    async fn handle_admin_chat_list_command(
+        &self,
+        channel: &Arc<dyn Channel>,
+        address: &ChannelAddress,
+    ) -> Result<()> {
+        if !Self::is_private_conversation(address)
+            || !self.with_channel_auth(|auth| Ok(auth.is_channel_admin(address)))?
+        {
+            self.send_channel_message(
+                channel,
+                address,
+                OutgoingMessage::text(
+                    "Only this channel's administrator can use `/admin_chat_list` from a private chat."
+                        .to_string(),
+                ),
+            )
+            .await?;
+            return Ok(());
+        }
+        let items =
+            self.with_channel_auth(|auth| Ok(auth.list_conversations(&address.channel_id)))?;
+        if items.is_empty() {
+            self.send_channel_message(
+                channel,
+                address,
+                OutgoingMessage::text("No chats have requested access yet.".to_string()),
+            )
+            .await?;
+            return Ok(());
+        }
+        let mut lines = vec!["Chat approvals:".to_string()];
+        for item in items {
+            let user = item
+                .user_id
+                .as_deref()
+                .map(|value| format!(" user={value}"))
+                .unwrap_or_default();
+            let name = item
+                .display_name
+                .as_deref()
+                .map(|value| format!(" name={value}"))
+                .unwrap_or_default();
+            lines.push(format!(
+                "- {} [{}]{}{}",
+                item.conversation_id,
+                Self::render_chat_approval_state(item.state),
+                user,
+                name
+            ));
+        }
+        self.send_channel_message(channel, address, OutgoingMessage::text(lines.join("\n")))
+            .await
+    }
+
+    async fn handle_admin_chat_state_command(
+        &self,
+        channel: &Arc<dyn Channel>,
+        address: &ChannelAddress,
+        conversation_id: &str,
+        approve: bool,
+    ) -> Result<()> {
+        if !Self::is_private_conversation(address)
+            || !self.with_channel_auth(|auth| Ok(auth.is_channel_admin(address)))?
+        {
+            let command_name = if approve {
+                "/admin_chat_approve"
+            } else {
+                "/admin_chat_reject"
+            };
+            self.send_channel_message(
+                channel,
+                address,
+                OutgoingMessage::text(format!(
+                    "Only this channel's administrator can use `{command_name}` from a private chat."
+                )),
+            )
+            .await?;
+            return Ok(());
+        }
+        let snapshot: ConversationApprovalSnapshot = self.with_channel_auth(|auth| {
+            if approve {
+                auth.approve_conversation(&address.channel_id, conversation_id)
+            } else {
+                auth.reject_conversation(&address.channel_id, conversation_id)
+            }
+        })?;
+        let action = if approve { "approved" } else { "rejected" };
+        self.send_channel_message(
+            channel,
+            address,
+            OutgoingMessage::text(format!(
+                "Conversation `{}` is now `{}`.",
+                snapshot.conversation_id, action
+            )),
+        )
+        .await
+    }
+
+    async fn enforce_channel_authorization(
+        &self,
+        channel: &Arc<dyn Channel>,
+        incoming: &IncomingMessage,
+    ) -> Result<bool> {
+        if !self.requires_channel_authorization(&incoming.address) {
+            return Ok(false);
+        }
+
+        let text = incoming.text.as_deref();
+        if parse_admin_authorize_command(text) {
+            self.handle_admin_authorize_command(channel, &incoming.address)
+                .await?;
+            return Ok(true);
+        }
+
+        let admin = self
+            .with_channel_auth(|auth| Ok(auth.admin_for_channel(&incoming.address.channel_id)))?;
+        let Some(_admin) = admin else {
+            self.send_channel_message(
+                channel,
+                &incoming.address,
+                OutgoingMessage::text(
+                    "This channel has no administrator yet. Please open a private chat with the bot and send `/admin_authorize` (or `/authorize`) there."
+                        .to_string(),
+                ),
+            )
+            .await?;
+            return Ok(true);
+        };
+
+        let is_admin_private = Self::is_private_conversation(&incoming.address)
+            && self.with_channel_auth(|auth| Ok(auth.is_channel_admin(&incoming.address)))?;
+
+        if is_admin_private && parse_admin_chat_list_command(text) {
+            self.handle_admin_chat_list_command(channel, &incoming.address)
+                .await?;
+            return Ok(true);
+        }
+        if is_admin_private && let Some(conversation_id) = parse_admin_chat_approve_command(text) {
+            self.handle_admin_chat_state_command(
+                channel,
+                &incoming.address,
+                &conversation_id,
+                true,
+            )
+            .await?;
+            return Ok(true);
+        }
+        if is_admin_private && let Some(conversation_id) = parse_admin_chat_reject_command(text) {
+            self.handle_admin_chat_state_command(
+                channel,
+                &incoming.address,
+                &conversation_id,
+                false,
+            )
+            .await?;
+            return Ok(true);
+        }
+
+        let state = self.with_channel_auth(|auth| {
+            let current = auth.current_conversation_state(&incoming.address);
+            if current.is_none() {
+                return auth.ensure_pending_conversation(&incoming.address);
+            }
+            Ok(current.expect("checked is_some above"))
+        })?;
+        match state {
+            ConversationApprovalState::Approved => Ok(false),
+            ConversationApprovalState::Pending => {
+                self.send_channel_message(
+                    channel,
+                    &incoming.address,
+                    OutgoingMessage::text(
+                        "This conversation is waiting for administrator approval. Please ask the channel admin to review it with `/admin_chat_list` in their private chat."
+                            .to_string(),
+                    ),
+                )
+                .await?;
+                Ok(true)
+            }
+            ConversationApprovalState::Rejected => Ok(true),
+        }
+    }
+
     fn clear_missing_selected_main_model(
         &self,
         address: &ChannelAddress,
@@ -3113,6 +3366,17 @@ impl Server {
         f(&mut snapshots)
     }
 
+    fn with_channel_auth<T>(
+        &self,
+        f: impl FnOnce(&mut ChannelAuthorizationManager) -> Result<T>,
+    ) -> Result<T> {
+        let mut auth = self
+            .channel_auth
+            .lock()
+            .map_err(|_| anyhow!("channel authorization manager lock poisoned"))?;
+        f(&mut auth)
+    }
+
     pub fn from_config(config: ServerConfig, workdir: impl AsRef<Path>) -> Result<Self> {
         let workdir = workdir.as_ref().to_path_buf();
         std::fs::create_dir_all(&workdir)
@@ -3121,6 +3385,7 @@ impl Server {
         let workspace_manager = WorkspaceManager::load_or_create(&workdir)?;
 
         let mut channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+        let mut telegram_channel_ids: HashSet<String> = HashSet::new();
         let mut command_catalog: HashMap<String, Vec<BotCommandConfig>> = HashMap::new();
         for channel_config in config.channels {
             match channel_config {
@@ -3131,6 +3396,7 @@ impl Server {
                 }
                 ChannelConfig::Telegram(telegram) => {
                     let id = telegram.id.clone();
+                    telegram_channel_ids.insert(id.clone());
                     command_catalog.insert(id.clone(), telegram.commands.clone());
                     channels.insert(id, Arc::new(TelegramChannel::from_config(telegram)?));
                 }
@@ -3165,6 +3431,7 @@ impl Server {
             agent_workspace,
             workspace_manager,
             channels: Arc::new(channels),
+            telegram_channel_ids: Arc::new(telegram_channel_ids),
             command_catalog,
             models: config.models,
             chat_model_keys: config.chat_model_keys,
@@ -3184,6 +3451,7 @@ impl Server {
             summary_tracker: Arc::new(SummaryTracker::new()),
             active_foreground_controls: Arc::new(Mutex::new(HashMap::new())),
             subagents: Arc::new(Mutex::new(HashMap::new())),
+            channel_auth: Arc::new(Mutex::new(ChannelAuthorizationManager::new(&workdir)?)),
         })
     }
 
@@ -3582,28 +3850,6 @@ impl Server {
     }
 
     async fn handle_incoming(&self, incoming: IncomingMessage) -> Result<()> {
-        self.with_conversations(|conversations| {
-            conversations.ensure_conversation(&incoming.address)
-        })?;
-        if let Err(error) = self.archive_stale_workspaces_if_needed() {
-            warn!(
-                log_stream = "server",
-                kind = "workspace_archive_pass_failed",
-                error = %format!("{error:#}"),
-                "failed to archive stale workspaces before handling message"
-            );
-        }
-        info!(
-            log_stream = "channel",
-            log_key = %incoming.address.channel_id,
-            kind = "incoming_message",
-            conversation_id = %incoming.address.conversation_id,
-            remote_message_id = %incoming.remote_message_id,
-            has_text = incoming.text.is_some(),
-            attachments_count = incoming.attachments.len() as u64,
-            "received normalized incoming message"
-        );
-
         let channel = self
             .channels
             .get(&incoming.address.channel_id)
@@ -3636,6 +3882,36 @@ impl Server {
                     return Ok(());
                 }
             }
+        }
+
+        info!(
+            log_stream = "channel",
+            log_key = %incoming.address.channel_id,
+            kind = "incoming_message",
+            conversation_id = %incoming.address.conversation_id,
+            remote_message_id = %incoming.remote_message_id,
+            has_text = incoming.text.is_some(),
+            attachments_count = incoming.attachments.len() as u64,
+            "received normalized incoming message"
+        );
+
+        if self
+            .enforce_channel_authorization(&channel, &incoming)
+            .await?
+        {
+            return Ok(());
+        }
+
+        self.with_conversations(|conversations| {
+            conversations.ensure_conversation(&incoming.address)
+        })?;
+        if let Err(error) = self.archive_stale_workspaces_if_needed() {
+            warn!(
+                log_stream = "server",
+                kind = "workspace_archive_pass_failed",
+                error = %format!("{error:#}"),
+                "failed to archive stale workspaces before handling message"
+            );
         }
 
         if incoming
@@ -3811,12 +4087,8 @@ impl Server {
             && let Some(missing_model_key) =
                 self.clear_missing_selected_main_model(&incoming.address)?
         {
-            self.prompt_missing_conversation_model(
-                &channel,
-                &incoming.address,
-                &missing_model_key,
-            )
-            .await?;
+            self.prompt_missing_conversation_model(&channel, &incoming.address, &missing_model_key)
+                .await?;
             return Ok(());
         }
 
@@ -6896,6 +7168,27 @@ fn parse_snap_list_command(text: Option<&str>) -> bool {
 
 fn parse_continue_command(text: Option<&str>) -> bool {
     matches!(parse_optional_command_argument(text, "/continue"), Some(_))
+}
+
+fn parse_admin_authorize_command(text: Option<&str>) -> bool {
+    text.map(str::trim).is_some_and(|value| {
+        command_matches(value, "/admin_authorize") || command_matches(value, "/authorize")
+    })
+}
+
+fn parse_admin_chat_list_command(text: Option<&str>) -> bool {
+    matches!(
+        parse_optional_command_argument(text, "/admin_chat_list"),
+        Some(_)
+    )
+}
+
+fn parse_admin_chat_approve_command(text: Option<&str>) -> Option<String> {
+    parse_required_command_argument(text, "/admin_chat_approve")
+}
+
+fn parse_admin_chat_reject_command(text: Option<&str>) -> Option<String> {
+    parse_required_command_argument(text, "/admin_chat_reject")
 }
 
 fn parse_optional_command_argument(text: Option<&str>, command: &str) -> Option<Option<String>> {

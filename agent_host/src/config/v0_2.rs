@@ -104,7 +104,9 @@ impl ConfigLoader for VersionedConfigLoader {
             .models
             .web_search
             .into_iter()
-            .map(|(name, raw_model)| upgrade_external_web_search_model(raw_model).map(|cfg| (name, cfg)))
+            .map(|(name, raw_model)| {
+                upgrade_external_web_search_model(raw_model).map(|cfg| (name, cfg))
+            })
             .collect::<Result<BTreeMap<_, _>>>()?;
 
         let mut dedup_index = web_search_catalog
@@ -151,7 +153,10 @@ impl ConfigLoader for VersionedConfigLoader {
         let mut models = chat;
         for (name, model) in vision {
             if models.insert(name.clone(), model).is_some() {
-                return Err(anyhow!("duplicate model name '{}' across model catalogs", name));
+                return Err(anyhow!(
+                    "duplicate model name '{}' across model catalogs",
+                    name
+                ));
             }
         }
 
@@ -181,7 +186,9 @@ fn upgrade_chat_or_vision_model(
 
     if let Some(inline_external) = inline_external {
         let alias = register_web_search_config(
-            preferred_alias.clone().unwrap_or_else(|| format!("{model_name}_web_search")),
+            preferred_alias
+                .clone()
+                .unwrap_or_else(|| format!("{model_name}_web_search")),
             inline_external,
             web_search_catalog,
             dedup_index,
@@ -233,7 +240,9 @@ fn upgrade_base_model(raw: VersionedModelConfigRaw) -> ModelConfig {
     }
 }
 
-fn upgrade_external_web_search_model(raw: VersionedModelConfigRaw) -> Result<ExternalWebSearchConfig> {
+fn upgrade_external_web_search_model(
+    raw: VersionedModelConfigRaw,
+) -> Result<ExternalWebSearchConfig> {
     Ok(ExternalWebSearchConfig {
         base_url: raw
             .api_endpoint

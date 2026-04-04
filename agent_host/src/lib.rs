@@ -3,6 +3,7 @@ pub mod agents;
 pub mod backend;
 pub mod bootstrap;
 pub mod channel;
+pub mod channel_auth;
 pub mod channels;
 pub mod child_rpc;
 pub mod config;

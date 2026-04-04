@@ -720,7 +720,8 @@ mod tests {
                     chat_completions_path: "/chat/completions".to_string(),
                     codex_home: None,
                     codex_auth: None,
-                    auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
+                    auth_credentials_store_mode:
+                        agent_frame::config::AuthCredentialsStoreMode::Auto,
                     timeout_seconds: 10.0,
                     context_window_tokens: 128_000,
                     cache_control: None,

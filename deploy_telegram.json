@@ -2,66 +2,31 @@
   "version": "0.3",
   "models": {
     "chat": {
-      "claude": {
-        "type": "openrouter",
-        "api_endpoint": "https://openrouter.ai/api/v1",
-        "model": "anthropic/claude-opus-4.6",
-        "backend": "agent_frame",
-        "supports_vision_input": true,
-        "image_tool_model": "self",
-        "web_search": "main_web_search",
-        "api_key": null,
-        "api_key_env": "OPENROUTER_API_KEY",
-        "chat_completions_path": "/chat/completions",
-        "codex_home": null,
-        "auth_credentials_store_mode": "auto",
-        "timeout_seconds": 300.0,
-        "context_window_tokens": 262144,
-        "cache_ttl": "5m",
-        "reasoning": null,
-        "headers": {},
-        "description": "A model better at generating visual content.",
-        "native_web_search": {
-          "enabled": false,
-          "payload": {
-            "web_search_options": {
-              "search_context_size": "medium"
-            }
-          }
-        }
-      },
-      "qwen35-27B": {
-        "type": "openrouter",
-        "api_endpoint": "https://openrouter.ai/api/v1",
-        "model": "qwen/qwen3.5-27b",
+      "gpt54": {
+        "type": "codex-subscription",
+        "api_endpoint": "https://chatgpt.com/backend-api/codex",
+        "model": "gpt-5.4",
         "backend": "agent_frame",
         "supports_vision_input": true,
         "image_tool_model": null,
-        "web_search": "main_web_search",
+        "web_search": null,
         "api_key": null,
-        "api_key_env": "OPENROUTER_API_KEY",
-        "chat_completions_path": "/chat/completions",
-        "codex_home": null,
+        "api_key_env": "OPENAI_API_KEY",
+        "chat_completions_path": "/responses",
+        "codex_home": "/home/jeremyguo/.codex",
         "auth_credentials_store_mode": "auto",
-        "timeout_seconds": 120.0,
+        "timeout_seconds": 300.0,
         "context_window_tokens": 262144,
-        "cache_ttl": "5m",
+        "cache_ttl": null,
         "reasoning": null,
         "headers": {},
-        "description": "A cheap model for background long context processing and web search, executing invsible tasks, etc.",
-        "native_web_search": {
-          "enabled": false,
-          "payload": {
-            "web_search_options": {
-              "search_context_size": "medium"
-            }
-          }
-        }
+        "description": "A general model for processing, which should be used at most works.",
+        "native_web_search": null
       }
     },
     "vision": {},
     "web_search": {
-      "main_web_search": {
+      "claude_web_search": {
         "base_url": "https://openrouter.ai/api/v1",
         "model": "perplexity/sonar-pro",
         "api_key": null,
@@ -76,7 +41,7 @@
     }
   },
   "main_agent": {
-    "model": "claude",
+    "model": "gpt54",
     "timeout_seconds": 0.0,
     "global_install_root": "/opt",
     "language": "zh-CN",
@@ -108,7 +73,7 @@
     "idle_context_compaction_poll_interval_seconds": 15
   },
   "sandbox": {
-    "mode": "subprocess",
+    "mode": "bubblewrap",
     "bubblewrap_binary": "bwrap"
   },
   "max_global_sub_agents": 4,

@@ -373,7 +373,30 @@ pub fn default_bot_commands() -> Vec<BotCommandConfig> {
 }
 
 fn default_telegram_commands() -> Vec<BotCommandConfig> {
-    default_bot_commands()
+    let mut commands = default_bot_commands();
+    commands.splice(
+        0..0,
+        [
+            BotCommandConfig {
+                command: "admin_authorize".to_string(),
+                description: "Authorize yourself as this channel's admin from a private chat"
+                    .to_string(),
+            },
+            BotCommandConfig {
+                command: "admin_chat_list".to_string(),
+                description: "List approval state for this channel's chats".to_string(),
+            },
+            BotCommandConfig {
+                command: "admin_chat_approve".to_string(),
+                description: "Approve a chat id for this channel".to_string(),
+            },
+            BotCommandConfig {
+                command: "admin_chat_reject".to_string(),
+                description: "Reject a chat id for this channel".to_string(),
+            },
+        ],
+    );
+    commands
 }
 
 pub(crate) fn default_max_global_sub_agents() -> usize {
@@ -593,7 +616,10 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
             ));
         }
         if let Some(web_search_model) = &model.web_search_model
-            && !config.model_catalog.web_search.contains_key(web_search_model)
+            && !config
+                .model_catalog
+                .web_search
+                .contains_key(web_search_model)
         {
             return Err(anyhow!(
                 "model '{}' references unknown web_search_model '{}'",
@@ -646,41 +672,47 @@ pub fn resolve_model_api_keys(config: &ServerConfig) -> Vec<ResolvedModelApiKey>
         })
         .collect::<Vec<_>>();
 
-    resolved.extend(config.model_catalog.web_search.iter().map(|(name, search)| {
-        let inline_key = search
-            .api_key
-            .as_ref()
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned);
-        if let Some(api_key) = inline_key {
-            return ResolvedModelApiKey {
-                model_name: format!("web_search:{name}"),
-                source: "config.api_key".to_string(),
-                api_key: Some(api_key),
-            };
-        }
+    resolved.extend(
+        config
+            .model_catalog
+            .web_search
+            .iter()
+            .map(|(name, search)| {
+                let inline_key = search
+                    .api_key
+                    .as_ref()
+                    .map(|value| value.trim())
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned);
+                if let Some(api_key) = inline_key {
+                    return ResolvedModelApiKey {
+                        model_name: format!("web_search:{name}"),
+                        source: "config.api_key".to_string(),
+                        api_key: Some(api_key),
+                    };
+                }
 
-        let env_name = search.api_key_env.trim();
-        let env_key = if env_name.is_empty() {
-            None
-        } else {
-            std::env::var(env_name)
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-        };
+                let env_name = search.api_key_env.trim();
+                let env_key = if env_name.is_empty() {
+                    None
+                } else {
+                    std::env::var(env_name)
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                };
 
-        ResolvedModelApiKey {
-            model_name: format!("web_search:{name}"),
-            source: if env_name.is_empty() {
-                "missing".to_string()
-            } else {
-                format!("env:{env_name}")
-            },
-            api_key: env_key,
-        }
-    }));
+                ResolvedModelApiKey {
+                    model_name: format!("web_search:{name}"),
+                    source: if env_name.is_empty() {
+                        "missing".to_string()
+                    } else {
+                        format!("env:{env_name}")
+                    },
+                    api_key: env_key,
+                }
+            }),
+    );
 
     resolved
 }
@@ -721,7 +753,7 @@ fn validate_bot_commands(commands: &[BotCommandConfig]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelConfig, LATEST_CONFIG_VERSION, ModelType, default_bot_commands,
+        ChannelConfig, LATEST_CONFIG_VERSION, ModelType, default_telegram_commands,
         load_server_config_file, load_server_config_file_and_upgrade, resolve_model_api_keys,
         zgent_checkout_available,
     };
@@ -762,7 +794,7 @@ mod tests {
         let config = load_server_config_file(&config_path).unwrap();
         match &config.channels[0] {
             ChannelConfig::Telegram(telegram) => {
-                assert_eq!(telegram.commands, default_bot_commands());
+                assert_eq!(telegram.commands, default_telegram_commands());
             }
             _ => panic!("expected telegram channel"),
         }
@@ -1141,7 +1173,10 @@ mod tests {
         assert_eq!(config.version, LATEST_CONFIG_VERSION);
         assert_eq!(config.chat_model_keys, vec!["main".to_string()]);
         assert_eq!(config.models["main"].model_type, ModelType::Openrouter);
-        assert_eq!(config.models["vision-model"].model_type, ModelType::Openrouter);
+        assert_eq!(
+            config.models["vision-model"].model_type,
+            ModelType::Openrouter
+        );
         assert!(!config.models.contains_key("search-model"));
         assert_eq!(
             config.model_catalog.web_search["search-model"].model,
@@ -1271,7 +1306,12 @@ mod tests {
             config.models["main"].web_search_model.as_deref(),
             Some("main_web_search")
         );
-        assert!(config.model_catalog.web_search.contains_key("main_web_search"));
+        assert!(
+            config
+                .model_catalog
+                .web_search
+                .contains_key("main_web_search")
+        );
 
         let written = fs::read_to_string(&config_path).unwrap();
         assert!(written.contains("\"version\": \"0.3\""));
@@ -1330,6 +1370,11 @@ mod tests {
             Some("default_search")
         );
         assert!(config.models["main"].external_web_search.is_some());
-        assert!(config.model_catalog.web_search.contains_key("default_search"));
+        assert!(
+            config
+                .model_catalog
+                .web_search
+                .contains_key("default_search")
+        );
     }
 }
