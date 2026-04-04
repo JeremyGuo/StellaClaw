@@ -234,12 +234,10 @@ impl ServerRuntime {
             .get(&session.address.channel_id)
             .with_context(|| format!("unknown channel {}", session.address.channel_id))?
             .clone();
-        send_outgoing_message_now(
-            channel,
-            session.address.clone(),
-            OutgoingMessage::text(text),
-        )
-        .context("failed to send immediate user_tell message")?;
+        let outgoing = build_outgoing_message_for_session(session, &text, &session.workspace_root)
+            .context("failed to build immediate user_tell message")?;
+        send_outgoing_message_now(channel, session.address.clone(), outgoing)
+            .context("failed to send immediate user_tell message")?;
         Ok(json!({
             "ok": true,
             "sent": true
@@ -1357,7 +1355,7 @@ impl ServerRuntime {
             let tell_session = session.clone();
             tools.push(Tool::new(
                 "user_tell",
-                "Immediately send a short progress or coordination message to the current user conversation without waiting for the current turn to finish. Use this for any mid-task user-facing update that should appear as its own chat bubble while work is still ongoing. If you want to answer the user, explain what you are doing, report progress, or give a transitional update before the turn is finished, use user_tell instead of only putting that text in an assistant message with tool_calls.",
+                "Immediately send a short progress or coordination message to the current user conversation without waiting for the current turn to finish. Use this for any mid-task user-facing update that should appear as its own chat bubble while work is still ongoing. If you want to answer the user, explain what you are doing, report progress, or give a transitional update before the turn is finished, use user_tell instead of only putting that text in an assistant message with tool_calls. To include files or images, append one or more <attachment>relative/path/from/workspace_root</attachment> tags inside text.",
                 json!({
                     "type": "object",
                     "properties": {

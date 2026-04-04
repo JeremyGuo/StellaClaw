@@ -708,8 +708,17 @@ impl TelegramChannel {
         images: Vec<OutgoingAttachment>,
         caption: Option<String>,
     ) -> Result<()> {
-        self.send_photo_group(&address.conversation_id, images, caption)
-            .await
+        let total_chunks = images.len().div_ceil(5);
+        for (index, chunk) in images.chunks(5).enumerate() {
+            let shared_caption = if index + 1 == total_chunks {
+                caption.clone()
+            } else {
+                None
+            };
+            self.send_photo_group(&address.conversation_id, chunk.to_vec(), shared_caption)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn send_text_chunks(
