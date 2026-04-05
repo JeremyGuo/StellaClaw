@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use reqwest::Client;
 use reqwest::multipart::{Form, Part};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -599,18 +599,30 @@ impl TelegramChannel {
             .text("chat_id", chat_id.to_string())
             .part("photo", Part::bytes(bytes).file_name(file_name));
         let form = if let Some(caption) = attachment.caption {
-            let mut iter = split_markdown_message(&caption, Self::MAX_CAPTION_CHARS).into_iter();
+            let mut iter =
+                render_markdown_chunks_to_telegram_entities(&caption, Self::MAX_CAPTION_CHARS)
+                    .into_iter();
             let caption = iter.next();
             trailing_text_chunks = iter.collect();
-            let translated = translate_markdown_to_telegram_html(caption.as_deref().unwrap_or(""));
-            form.text("caption", translated.text)
-                .text("parse_mode", "HTML".to_string())
+            let rendered = caption.unwrap_or_else(|| TelegramRenderedText {
+                text: String::new(),
+                entities: Vec::new(),
+            });
+            let mut form = form.text("caption", rendered.text);
+            if !rendered.entities.is_empty() {
+                form = form.text(
+                    "caption_entities",
+                    serde_json::to_string(&rendered.entities)
+                        .context("failed to serialize telegram caption entities")?,
+                );
+            }
+            form
         } else {
             form
         };
         self.call_multipart("sendPhoto", form).await?;
         for chunk in trailing_text_chunks {
-            self.send_text_chunks(chat_id, &chunk, None).await?;
+            self.send_rendered_text_chunk(chat_id, chunk, None).await?;
         }
         Ok(())
     }
@@ -629,18 +641,30 @@ impl TelegramChannel {
             .text("chat_id", chat_id.to_string())
             .part("document", Part::bytes(bytes).file_name(file_name));
         let form = if let Some(caption) = attachment.caption {
-            let mut iter = split_markdown_message(&caption, Self::MAX_CAPTION_CHARS).into_iter();
+            let mut iter =
+                render_markdown_chunks_to_telegram_entities(&caption, Self::MAX_CAPTION_CHARS)
+                    .into_iter();
             let caption = iter.next();
             trailing_text_chunks = iter.collect();
-            let translated = translate_markdown_to_telegram_html(caption.as_deref().unwrap_or(""));
-            form.text("caption", translated.text)
-                .text("parse_mode", "HTML".to_string())
+            let rendered = caption.unwrap_or_else(|| TelegramRenderedText {
+                text: String::new(),
+                entities: Vec::new(),
+            });
+            let mut form = form.text("caption", rendered.text);
+            if !rendered.entities.is_empty() {
+                form = form.text(
+                    "caption_entities",
+                    serde_json::to_string(&rendered.entities)
+                        .context("failed to serialize telegram caption entities")?,
+                );
+            }
+            form
         } else {
             form
         };
         self.call_multipart("sendDocument", form).await?;
         for chunk in trailing_text_chunks {
-            self.send_text_chunks(chat_id, &chunk, None).await?;
+            self.send_rendered_text_chunk(chat_id, chunk, None).await?;
         }
         Ok(())
     }
@@ -663,6 +687,7 @@ impl TelegramChannel {
 
         let mut form = Form::new().text("chat_id", chat_id.to_string());
         let mut media = Vec::new();
+        let mut trailing_text_chunks = Vec::new();
         for (index, image) in images.into_iter().enumerate() {
             let file_name = image
                 .path
@@ -687,9 +712,22 @@ impl TelegramChannel {
             if let Some(caption) = caption
                 && let Some(object) = item.as_object_mut()
             {
-                let translated = translate_markdown_to_telegram_html(&caption);
-                object.insert("caption".to_string(), json!(translated.text));
-                object.insert("parse_mode".to_string(), json!("HTML"));
+                let mut chunks =
+                    render_markdown_chunks_to_telegram_entities(&caption, Self::MAX_CAPTION_CHARS)
+                        .into_iter();
+                if let Some(rendered_caption) = chunks.next() {
+                    object.insert("caption".to_string(), json!(rendered_caption.text));
+                    if !rendered_caption.entities.is_empty() {
+                        object.insert(
+                            "caption_entities".to_string(),
+                            serde_json::to_value(rendered_caption.entities)
+                                .context("failed to encode telegram caption entities")?,
+                        );
+                    }
+                }
+                if index == 0 {
+                    trailing_text_chunks.extend(chunks);
+                }
             }
             media.push(item);
             form = form.part(field_name, Part::bytes(bytes).file_name(file_name));
@@ -699,6 +737,9 @@ impl TelegramChannel {
             serde_json::to_string(&media).context("failed to serialize telegram media group")?,
         );
         self.call_multipart("sendMediaGroup", form).await?;
+        for chunk in trailing_text_chunks {
+            self.send_rendered_text_chunk(chat_id, chunk, None).await?;
+        }
         Ok(())
     }
 
@@ -727,31 +768,88 @@ impl TelegramChannel {
         text: &str,
         options: Option<&ShowOptions>,
     ) -> Result<()> {
-        for (index, chunk) in split_markdown_message(text, Self::MAX_MESSAGE_CHARS)
-            .into_iter()
-            .enumerate()
-        {
-            let translated = translate_markdown_to_telegram_html(&chunk);
-            let mut payload = json!({
-                "chat_id": chat_id,
-                "text": translated.text,
-                "parse_mode": "HTML",
-            });
-            if index == 0
-                && let Some(options) = options
-                && let Some(object) = payload.as_object_mut()
-            {
-                object.insert(
-                    "reply_markup".to_string(),
-                    build_reply_keyboard_markup(options),
-                );
-            }
-            self.call_api::<serde_json::Value>("sendMessage", payload)
-                .await?;
-        }
+        let chunks = render_markdown_chunks_to_telegram_entities(text, Self::MAX_MESSAGE_CHARS);
+        let mut message_ids = Vec::new();
+        self.upsert_rendered_text_chain(chat_id, chunks, &mut message_ids, options)
+            .await?;
         Ok(())
     }
 
+    async fn send_rendered_text_chunk(
+        &self,
+        chat_id: &str,
+        rendered: TelegramRenderedText,
+        options: Option<&ShowOptions>,
+    ) -> Result<i64> {
+        let payload = build_send_text_payload(chat_id, rendered, options)?;
+        let message = self
+            .call_api::<TelegramMessage>("sendMessage", payload)
+            .await?;
+        Ok(message.message_id)
+    }
+
+    async fn edit_rendered_text_chunk(
+        &self,
+        chat_id: &str,
+        message_id: i64,
+        rendered: TelegramRenderedText,
+        options: Option<&ShowOptions>,
+    ) -> Result<()> {
+        let payload = build_edit_text_payload(chat_id, message_id, rendered, options)?;
+        self.call_api::<serde_json::Value>("editMessageText", payload)
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_message(&self, chat_id: &str, message_id: i64) -> Result<()> {
+        self.call_api::<serde_json::Value>(
+            "deleteMessage",
+            json!({
+                "chat_id": chat_id,
+                "message_id": message_id,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn upsert_rendered_text_chain(
+        &self,
+        chat_id: &str,
+        chunks: Vec<TelegramRenderedText>,
+        message_ids: &mut Vec<i64>,
+        options: Option<&ShowOptions>,
+    ) -> Result<()> {
+        for (index, rendered) in chunks.iter().take(message_ids.len()).cloned().enumerate() {
+            self.edit_rendered_text_chunk(
+                chat_id,
+                message_ids[index],
+                rendered,
+                (index == 0).then_some(options).flatten(),
+            )
+            .await?;
+        }
+
+        for (index, rendered) in chunks.iter().skip(message_ids.len()).cloned().enumerate() {
+            let absolute_index = message_ids.len() + index;
+            let message_id = self
+                .send_rendered_text_chunk(
+                    chat_id,
+                    rendered,
+                    (absolute_index == 0).then_some(options).flatten(),
+                )
+                .await?;
+            message_ids.push(message_id);
+        }
+
+        while message_ids.len() > chunks.len() {
+            if let Some(message_id) = message_ids.pop() {
+                self.delete_message(chat_id, message_id).await?;
+            }
+        }
+
+        Ok(())
+    }
     async fn deliver_outgoing_message(
         &self,
         address: &ChannelAddress,
@@ -763,20 +861,8 @@ impl TelegramChannel {
             attachments,
             options,
         } = message;
-        let mut trailing_text_chunks = Vec::new();
         if images.len() >= 2 {
-            let (caption, trailing) = text
-                .as_deref()
-                .map(|value| {
-                    let chunks = split_markdown_message(value, Self::MAX_CAPTION_CHARS);
-                    let mut iter = chunks.into_iter();
-                    let caption = iter.next();
-                    let trailing = iter.collect::<Vec<_>>();
-                    (caption, trailing)
-                })
-                .unwrap_or((None, Vec::new()));
-            trailing_text_chunks = trailing;
-            self.send_media_group_with_caption(address, images, caption)
+            self.send_media_group_with_caption(address, images, text)
                 .await?;
         } else {
             let mut images = images;
@@ -784,14 +870,10 @@ impl TelegramChannel {
             if let Some(text) = text.as_deref()
                 && has_images
             {
-                let chunks = split_markdown_message(text, Self::MAX_CAPTION_CHARS);
-                let mut iter = chunks.into_iter();
-                let caption = iter.next();
-                trailing_text_chunks = iter.collect();
                 if let Some(image) = images.first_mut()
                     && image.caption.is_none()
                 {
-                    image.caption = caption;
+                    image.caption = Some(text.to_string());
                 }
             }
             self.send_photo_group(&address.conversation_id, images, None)
@@ -802,10 +884,6 @@ impl TelegramChannel {
                 self.send_text_chunks(&address.conversation_id, text, options.as_ref())
                     .await?;
             }
-        }
-        for chunk in trailing_text_chunks {
-            self.send_text_chunks(&address.conversation_id, &chunk, None)
-                .await?;
         }
         for attachment in attachments {
             self.send_document(&address.conversation_id, attachment)
@@ -1116,6 +1194,66 @@ fn build_reply_keyboard_markup(options: &ShowOptions) -> serde_json::Value {
     })
 }
 
+fn build_send_text_payload(
+    chat_id: &str,
+    rendered: TelegramRenderedText,
+    options: Option<&ShowOptions>,
+) -> Result<serde_json::Value> {
+    let mut payload = json!({
+        "chat_id": chat_id,
+        "text": rendered.text,
+    });
+    if !rendered.entities.is_empty()
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert(
+            "entities".to_string(),
+            serde_json::to_value(rendered.entities)
+                .context("failed to encode telegram entities")?,
+        );
+    }
+    if let Some(options) = options
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert(
+            "reply_markup".to_string(),
+            build_reply_keyboard_markup(options),
+        );
+    }
+    Ok(payload)
+}
+
+fn build_edit_text_payload(
+    chat_id: &str,
+    message_id: i64,
+    rendered: TelegramRenderedText,
+    options: Option<&ShowOptions>,
+) -> Result<serde_json::Value> {
+    let mut payload = json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": rendered.text,
+    });
+    if !rendered.entities.is_empty()
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert(
+            "entities".to_string(),
+            serde_json::to_value(rendered.entities)
+                .context("failed to encode telegram entities")?,
+        );
+    }
+    if let Some(options) = options
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert(
+            "reply_markup".to_string(),
+            build_reply_keyboard_markup(options),
+        );
+    }
+    Ok(payload)
+}
+
 fn poll_backoff_seconds(consecutive_failures: u32, cap_seconds: u64) -> u64 {
     let exponent = consecutive_failures.saturating_sub(1).min(5);
     2_u64.saturating_pow(exponent).min(cap_seconds).max(1)
@@ -1126,103 +1264,239 @@ struct TelegramFormattedText {
     text: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TelegramRenderedText {
+    text: String,
+    entities: Vec<TelegramMessageEntity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct TelegramMessageEntity {
+    #[serde(rename = "type")]
+    kind: String,
+    offset: usize,
+    length: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct TableState {
+struct RichDocument {
+    blocks: Vec<RichBlock>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RichBlock {
+    Paragraph(Vec<RichInline>),
+    Heading(Vec<RichInline>),
+    BlockQuote(Vec<RichBlock>),
+    List {
+        start: Option<u64>,
+        items: Vec<Vec<RichBlock>>,
+    },
+    CodeBlock {
+        language: Option<String>,
+        code: String,
+    },
+    Table(RichTable),
+    ThematicBreak,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RichTable {
+    rows: Vec<Vec<String>>,
+    header_rows: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RichInline {
+    Text(String),
+    Emphasis(Vec<RichInline>),
+    Strong(Vec<RichInline>),
+    Strikethrough(Vec<RichInline>),
+    Link {
+        url: String,
+        content: Vec<RichInline>,
+    },
+    Code(String),
+    LineBreak,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingBlockKind {
+    Paragraph,
+    Heading,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InlineStyle {
+    Emphasis,
+    Strong,
+    Strikethrough,
+    Link,
+}
+
+#[derive(Clone, Debug)]
+enum InlineWrapper {
+    Emphasis,
+    Strong,
+    Strikethrough,
+    Link(String),
+}
+
+#[derive(Clone, Debug)]
+struct PendingInlineBlock {
+    kind: PendingBlockKind,
+    inlines: Vec<RichInline>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingInlineContainer {
+    style: InlineStyle,
+    url: Option<String>,
+    inlines: Vec<RichInline>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PendingTable {
     rows: Vec<Vec<String>>,
     current_row: Vec<String>,
     current_cell: String,
     header_rows: usize,
-    in_header: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TextContainer {
-    Paragraph,
-    Heading,
-    BlockQuote,
+#[derive(Clone, Debug)]
+enum BlockContainer {
+    Root(Vec<RichBlock>),
+    BlockQuote(Vec<RichBlock>),
+    List {
+        start: Option<u64>,
+        items: Vec<Vec<RichBlock>>,
+    },
+    ListItem(Vec<RichBlock>),
 }
 
-fn translate_markdown_to_telegram_html(input: &str) -> TelegramFormattedText {
+fn parse_markdown_to_rich_document(input: &str) -> RichDocument {
     let parser = Parser::new_ext(input, Options::all());
-    let mut output = String::new();
-    let mut list_stack: Vec<Option<u64>> = Vec::new();
-    let mut blockquote_depth = 0usize;
-    let mut pending_list_item = false;
-    let mut text_stack: Vec<TextContainer> = Vec::new();
+    let mut block_stack = vec![BlockContainer::Root(Vec::new())];
+    let mut pending_inline_block: Option<PendingInlineBlock> = None;
+    let mut inline_stack: Vec<PendingInlineContainer> = Vec::new();
     let mut code_block_language: Option<String> = None;
     let mut code_block_buffer: Option<String> = None;
-    let mut need_paragraph_break = false;
-    let mut table_state: Option<TableState> = None;
+    let mut pending_table: Option<PendingTable> = None;
 
     for event in parser {
         match event {
             Event::Start(tag) => match tag {
                 Tag::Table(_) => {
-                    ensure_block_break(&mut output, &mut need_paragraph_break);
-                    table_state = Some(TableState::default());
+                    flush_inline_block(
+                        &mut pending_inline_block,
+                        &mut inline_stack,
+                        &mut block_stack,
+                    );
+                    pending_table = Some(PendingTable::default());
                 }
-                Tag::TableHead => {
-                    if let Some(table) = table_state.as_mut() {
-                        table.in_header = true;
-                    }
-                }
+                Tag::TableHead => {}
                 Tag::TableRow => {
-                    if let Some(table) = table_state.as_mut() {
+                    if let Some(table) = pending_table.as_mut() {
                         table.current_row.clear();
                     }
                 }
                 Tag::TableCell => {
-                    if let Some(table) = table_state.as_mut() {
+                    if let Some(table) = pending_table.as_mut() {
                         table.current_cell.clear();
                     }
                 }
                 Tag::Paragraph => {
-                    ensure_block_break(&mut output, &mut need_paragraph_break);
-                    text_stack.push(TextContainer::Paragraph);
+                    flush_inline_block(
+                        &mut pending_inline_block,
+                        &mut inline_stack,
+                        &mut block_stack,
+                    );
+                    pending_inline_block = Some(PendingInlineBlock {
+                        kind: PendingBlockKind::Paragraph,
+                        inlines: Vec::new(),
+                    });
                 }
-                Tag::Heading { level, .. } => {
-                    ensure_block_break(&mut output, &mut need_paragraph_break);
-                    let _ = level;
-                    output.push_str("<b>");
-                    text_stack.push(TextContainer::Heading);
+                Tag::Heading { .. } => {
+                    flush_inline_block(
+                        &mut pending_inline_block,
+                        &mut inline_stack,
+                        &mut block_stack,
+                    );
+                    pending_inline_block = Some(PendingInlineBlock {
+                        kind: PendingBlockKind::Heading,
+                        inlines: Vec::new(),
+                    });
                 }
                 Tag::BlockQuote(_) => {
-                    ensure_block_break(&mut output, &mut need_paragraph_break);
-                    blockquote_depth += 1;
-                    text_stack.push(TextContainer::BlockQuote);
+                    flush_inline_block(
+                        &mut pending_inline_block,
+                        &mut inline_stack,
+                        &mut block_stack,
+                    );
+                    block_stack.push(BlockContainer::BlockQuote(Vec::new()));
                 }
                 Tag::List(start) => {
-                    ensure_block_break(&mut output, &mut need_paragraph_break);
-                    list_stack.push(start);
+                    flush_inline_block(
+                        &mut pending_inline_block,
+                        &mut inline_stack,
+                        &mut block_stack,
+                    );
+                    block_stack.push(BlockContainer::List {
+                        start,
+                        items: Vec::new(),
+                    });
                 }
                 Tag::Item => {
-                    if !output.is_empty() && !output.ends_with('\n') {
-                        output.push('\n');
-                    }
-                    let prefix = if let Some(Some(next_number)) = list_stack.last_mut() {
-                        let prefix = format!("{}. ", *next_number);
-                        *next_number += 1;
-                        prefix
-                    } else {
-                        "• ".to_string()
-                    };
-                    if blockquote_depth > 0 {
-                        output.push_str(&"&gt; ".repeat(blockquote_depth));
-                    }
-                    output.push_str(&prefix);
-                    pending_list_item = false;
+                    flush_inline_block(
+                        &mut pending_inline_block,
+                        &mut inline_stack,
+                        &mut block_stack,
+                    );
+                    block_stack.push(BlockContainer::ListItem(Vec::new()));
                 }
-                Tag::Emphasis => output.push_str("<i>"),
-                Tag::Strong => output.push_str("<b>"),
-                Tag::Strikethrough => output.push_str("<s>"),
+                Tag::Emphasis => {
+                    ensure_inline_block(&mut pending_inline_block);
+                    inline_stack.push(PendingInlineContainer {
+                        style: InlineStyle::Emphasis,
+                        url: None,
+                        inlines: Vec::new(),
+                    });
+                }
+                Tag::Strong => {
+                    ensure_inline_block(&mut pending_inline_block);
+                    inline_stack.push(PendingInlineContainer {
+                        style: InlineStyle::Strong,
+                        url: None,
+                        inlines: Vec::new(),
+                    });
+                }
+                Tag::Strikethrough => {
+                    ensure_inline_block(&mut pending_inline_block);
+                    inline_stack.push(PendingInlineContainer {
+                        style: InlineStyle::Strikethrough,
+                        url: None,
+                        inlines: Vec::new(),
+                    });
+                }
                 Tag::Link { dest_url, .. } => {
-                    output.push_str("<a href=\"");
-                    output.push_str(&escape_html_attribute(&dest_url));
-                    output.push_str("\">");
+                    ensure_inline_block(&mut pending_inline_block);
+                    inline_stack.push(PendingInlineContainer {
+                        style: InlineStyle::Link,
+                        url: Some(dest_url.to_string()),
+                        inlines: Vec::new(),
+                    });
                 }
                 Tag::CodeBlock(kind) => {
-                    ensure_block_break(&mut output, &mut need_paragraph_break);
-                    let language = match kind {
+                    flush_inline_block(
+                        &mut pending_inline_block,
+                        &mut inline_stack,
+                        &mut block_stack,
+                    );
+                    code_block_language = match kind {
                         CodeBlockKind::Indented => None,
                         CodeBlockKind::Fenced(language) => {
                             let trimmed = language.trim();
@@ -1233,161 +1507,784 @@ fn translate_markdown_to_telegram_html(input: &str) -> TelegramFormattedText {
                             }
                         }
                     };
-                    code_block_language = language;
                     code_block_buffer = Some(String::new());
                 }
                 _ => {}
             },
             Event::End(tag) => match tag {
                 TagEnd::Table => {
-                    if let Some(table) = table_state.take() {
-                        output.push_str(&render_table_for_telegram(&table));
-                        need_paragraph_break = true;
+                    if let Some(table) = pending_table.take() {
+                        push_block(
+                            &mut block_stack,
+                            RichBlock::Table(RichTable {
+                                rows: table.rows,
+                                header_rows: table.header_rows,
+                            }),
+                        );
                     }
                 }
                 TagEnd::TableHead => {
-                    if let Some(table) = table_state.as_mut() {
+                    if let Some(table) = pending_table.as_mut() {
                         if !table.current_row.is_empty() {
                             table.rows.push(std::mem::take(&mut table.current_row));
                         }
                         table.header_rows = table.rows.len();
-                        table.in_header = false;
                     }
                 }
                 TagEnd::TableRow => {
-                    if let Some(table) = table_state.as_mut()
+                    if let Some(table) = pending_table.as_mut()
                         && !table.current_row.is_empty()
                     {
                         table.rows.push(std::mem::take(&mut table.current_row));
                     }
                 }
                 TagEnd::TableCell => {
-                    if let Some(table) = table_state.as_mut() {
+                    if let Some(table) = pending_table.as_mut() {
                         table
                             .current_row
                             .push(normalize_table_cell(&table.current_cell));
                         table.current_cell.clear();
                     }
                 }
-                TagEnd::Paragraph => {
-                    let _ = text_stack.pop();
-                    need_paragraph_break = true;
-                }
-                TagEnd::Heading(_) => {
-                    output.push_str("</b>");
-                    let _ = text_stack.pop();
-                    need_paragraph_break = true;
+                TagEnd::Paragraph | TagEnd::Heading(_) => {
+                    flush_inline_block(
+                        &mut pending_inline_block,
+                        &mut inline_stack,
+                        &mut block_stack,
+                    );
                 }
                 TagEnd::BlockQuote(_) => {
-                    blockquote_depth = blockquote_depth.saturating_sub(1);
-                    let _ = text_stack.pop();
-                    need_paragraph_break = true;
+                    flush_inline_block(
+                        &mut pending_inline_block,
+                        &mut inline_stack,
+                        &mut block_stack,
+                    );
+                    if let Some(BlockContainer::BlockQuote(blocks)) = block_stack.pop() {
+                        push_block(&mut block_stack, RichBlock::BlockQuote(blocks));
+                    }
                 }
                 TagEnd::List(_) => {
-                    let _ = list_stack.pop();
-                    need_paragraph_break = true;
+                    flush_inline_block(
+                        &mut pending_inline_block,
+                        &mut inline_stack,
+                        &mut block_stack,
+                    );
+                    if let Some(BlockContainer::List { start, items }) = block_stack.pop() {
+                        push_block(&mut block_stack, RichBlock::List { start, items });
+                    }
                 }
-                TagEnd::Item => pending_list_item = false,
-                TagEnd::Emphasis => output.push_str("</i>"),
-                TagEnd::Strong => output.push_str("</b>"),
-                TagEnd::Strikethrough => output.push_str("</s>"),
-                TagEnd::Link => output.push_str("</a>"),
+                TagEnd::Item => {
+                    flush_inline_block(
+                        &mut pending_inline_block,
+                        &mut inline_stack,
+                        &mut block_stack,
+                    );
+                    if let Some(BlockContainer::ListItem(blocks)) = block_stack.pop()
+                        && let Some(BlockContainer::List { items, .. }) = block_stack.last_mut()
+                    {
+                        items.push(blocks);
+                    }
+                }
+                TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
+                    if let Some(container) = inline_stack.pop() {
+                        let inline = match container.style {
+                            InlineStyle::Emphasis => RichInline::Emphasis(container.inlines),
+                            InlineStyle::Strong => RichInline::Strong(container.inlines),
+                            InlineStyle::Strikethrough => {
+                                RichInline::Strikethrough(container.inlines)
+                            }
+                            InlineStyle::Link => RichInline::Link {
+                                url: container.url.unwrap_or_default(),
+                                content: container.inlines,
+                            },
+                        };
+                        push_inline(&mut pending_inline_block, &mut inline_stack, inline);
+                    }
+                }
                 TagEnd::CodeBlock => {
                     let code = code_block_buffer.take().unwrap_or_default();
-                    if let Some(language) = code_block_language.take() {
-                        output.push_str("<pre><code class=\"language-");
-                        output.push_str(&escape_html_attribute(&language));
-                        output.push_str("\">");
-                        output.push_str(&escape_html_text(&code));
-                        output.push_str("</code></pre>");
-                    } else {
-                        output.push_str("<pre>");
-                        output.push_str(&escape_html_text(&code));
-                        output.push_str("</pre>");
-                    }
-                    need_paragraph_break = true;
+                    let language = code_block_language.take();
+                    push_block(&mut block_stack, RichBlock::CodeBlock { language, code });
                 }
                 _ => {}
             },
             Event::Text(text) => {
-                if let Some(table) = table_state.as_mut() {
+                if let Some(table) = pending_table.as_mut() {
                     table.current_cell.push_str(&text);
                 } else if let Some(buffer) = code_block_buffer.as_mut() {
                     buffer.push_str(&text);
                 } else {
-                    if blockquote_depth > 0 && starts_new_block_line(&output) && !pending_list_item
-                    {
-                        output.push_str(&"&gt; ".repeat(blockquote_depth));
-                    }
-                    output.push_str(&escape_html_text(&text));
+                    push_inline(
+                        &mut pending_inline_block,
+                        &mut inline_stack,
+                        RichInline::Text(text.to_string()),
+                    );
                 }
             }
             Event::Code(code) => {
-                if let Some(table) = table_state.as_mut() {
+                if let Some(table) = pending_table.as_mut() {
                     table.current_cell.push_str(&code);
                 } else {
-                    output.push_str("<code>");
-                    output.push_str(&escape_html_text(&code));
-                    output.push_str("</code>");
+                    push_inline(
+                        &mut pending_inline_block,
+                        &mut inline_stack,
+                        RichInline::Code(code.to_string()),
+                    );
                 }
             }
-            Event::SoftBreak => {
-                if let Some(table) = table_state.as_mut() {
+            Event::SoftBreak | Event::HardBreak => {
+                if let Some(table) = pending_table.as_mut() {
                     if !table.current_cell.ends_with(' ') {
                         table.current_cell.push(' ');
                     }
-                } else if code_block_buffer.is_some() {
-                    if let Some(buffer) = code_block_buffer.as_mut() {
-                        buffer.push('\n');
-                    }
+                } else if let Some(buffer) = code_block_buffer.as_mut() {
+                    buffer.push('\n');
                 } else {
-                    output.push('\n');
-                    pending_list_item = false;
-                }
-            }
-            Event::HardBreak => {
-                if let Some(table) = table_state.as_mut() {
-                    if !table.current_cell.ends_with(' ') {
-                        table.current_cell.push(' ');
-                    }
-                } else {
-                    output.push('\n');
-                    pending_list_item = false;
+                    push_inline(
+                        &mut pending_inline_block,
+                        &mut inline_stack,
+                        RichInline::LineBreak,
+                    );
                 }
             }
             Event::Rule => {
-                ensure_block_break(&mut output, &mut need_paragraph_break);
-                output.push_str("──────────");
-                need_paragraph_break = true;
+                flush_inline_block(
+                    &mut pending_inline_block,
+                    &mut inline_stack,
+                    &mut block_stack,
+                );
+                push_block(&mut block_stack, RichBlock::ThematicBreak);
             }
             Event::Html(html) | Event::InlineHtml(html) => {
-                output.push_str(&escape_html_text(&html));
+                push_inline(
+                    &mut pending_inline_block,
+                    &mut inline_stack,
+                    RichInline::Text(html.to_string()),
+                );
             }
             Event::InlineMath(math) => {
-                output.push_str("<code>");
-                output.push_str(&escape_html_text(&math));
-                output.push_str("</code>");
+                push_inline(
+                    &mut pending_inline_block,
+                    &mut inline_stack,
+                    RichInline::Code(math.to_string()),
+                );
             }
             Event::DisplayMath(math) => {
-                ensure_block_break(&mut output, &mut need_paragraph_break);
-                output.push_str("<pre>");
-                output.push_str(&escape_html_text(&math));
-                output.push_str("</pre>");
-                need_paragraph_break = true;
+                flush_inline_block(
+                    &mut pending_inline_block,
+                    &mut inline_stack,
+                    &mut block_stack,
+                );
+                push_block(
+                    &mut block_stack,
+                    RichBlock::CodeBlock {
+                        language: None,
+                        code: math.to_string(),
+                    },
+                );
             }
             Event::FootnoteReference(text) => {
-                output.push('[');
-                output.push_str(&escape_html_text(&text));
-                output.push(']');
+                push_inline(
+                    &mut pending_inline_block,
+                    &mut inline_stack,
+                    RichInline::Text(format!("[{}]", text)),
+                );
             }
             Event::TaskListMarker(checked) => {
-                output.push_str(if checked { "☑ " } else { "☐ " });
+                push_inline(
+                    &mut pending_inline_block,
+                    &mut inline_stack,
+                    RichInline::Text(if checked {
+                        "☑ ".to_string()
+                    } else {
+                        "☐ ".to_string()
+                    }),
+                );
             }
         }
     }
 
+    flush_inline_block(
+        &mut pending_inline_block,
+        &mut inline_stack,
+        &mut block_stack,
+    );
+
+    let blocks = match block_stack.pop() {
+        Some(BlockContainer::Root(blocks)) => blocks,
+        _ => Vec::new(),
+    };
+    RichDocument { blocks }
+}
+
+fn translate_markdown_to_telegram_html(input: &str) -> TelegramFormattedText {
+    render_rich_document_to_telegram_html(&parse_markdown_to_rich_document(input))
+}
+
+fn ensure_inline_block(pending_inline_block: &mut Option<PendingInlineBlock>) {
+    if pending_inline_block.is_none() {
+        *pending_inline_block = Some(PendingInlineBlock {
+            kind: PendingBlockKind::Paragraph,
+            inlines: Vec::new(),
+        });
+    }
+}
+
+fn push_inline(
+    pending_inline_block: &mut Option<PendingInlineBlock>,
+    inline_stack: &mut Vec<PendingInlineContainer>,
+    inline: RichInline,
+) {
+    ensure_inline_block(pending_inline_block);
+    if let Some(container) = inline_stack.last_mut() {
+        container.inlines.push(inline);
+    } else if let Some(block) = pending_inline_block.as_mut() {
+        block.inlines.push(inline);
+    }
+}
+
+fn push_block(block_stack: &mut [BlockContainer], block: RichBlock) {
+    if let Some(container) = block_stack.last_mut() {
+        match container {
+            BlockContainer::Root(blocks)
+            | BlockContainer::BlockQuote(blocks)
+            | BlockContainer::ListItem(blocks) => blocks.push(block),
+            BlockContainer::List { .. } => {}
+        }
+    }
+}
+
+fn flush_inline_block(
+    pending_inline_block: &mut Option<PendingInlineBlock>,
+    inline_stack: &mut Vec<PendingInlineContainer>,
+    block_stack: &mut [BlockContainer],
+) {
+    while let Some(container) = inline_stack.pop() {
+        let inline = match container.style {
+            InlineStyle::Emphasis => RichInline::Emphasis(container.inlines),
+            InlineStyle::Strong => RichInline::Strong(container.inlines),
+            InlineStyle::Strikethrough => RichInline::Strikethrough(container.inlines),
+            InlineStyle::Link => RichInline::Link {
+                url: container.url.unwrap_or_default(),
+                content: container.inlines,
+            },
+        };
+        push_inline(pending_inline_block, inline_stack, inline);
+    }
+
+    let Some(block) = pending_inline_block.take() else {
+        return;
+    };
+    if block.inlines.is_empty() {
+        return;
+    }
+    let rich_block = match block.kind {
+        PendingBlockKind::Paragraph => RichBlock::Paragraph(block.inlines),
+        PendingBlockKind::Heading => RichBlock::Heading(block.inlines),
+    };
+    push_block(block_stack, rich_block);
+}
+
+fn render_rich_document_to_telegram_html(document: &RichDocument) -> TelegramFormattedText {
+    let mut output = String::new();
+    let mut need_paragraph_break = false;
+    render_blocks_for_telegram(&document.blocks, &mut output, &mut need_paragraph_break, 0);
     TelegramFormattedText {
         text: output.trim().to_string(),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EntityCursor {
+    byte: usize,
+    utf16: usize,
+}
+
+#[derive(Default)]
+struct TelegramEntityBuilder {
+    text: String,
+    entities: Vec<TelegramMessageEntity>,
+}
+
+impl TelegramEntityBuilder {
+    fn cursor(&self) -> EntityCursor {
+        EntityCursor {
+            byte: self.text.len(),
+            utf16: utf16_len(&self.text),
+        }
+    }
+
+    fn push_text(&mut self, value: &str) {
+        self.text.push_str(value);
+    }
+
+    fn push_entity_trimmed(
+        &mut self,
+        start: EntityCursor,
+        kind: &str,
+        url: Option<String>,
+        language: Option<String>,
+    ) {
+        let end = self.cursor();
+        let slice = &self.text[start.byte..end.byte];
+        let leading_utf16 =
+            utf16_len(slice.trim_start_matches(char::is_whitespace)).abs_diff(utf16_len(slice));
+        let trailing_utf16 =
+            utf16_len(slice.trim_end_matches(char::is_whitespace)).abs_diff(utf16_len(slice));
+        let full_length = end.utf16.saturating_sub(start.utf16);
+        let length = full_length
+            .saturating_sub(leading_utf16)
+            .saturating_sub(trailing_utf16);
+        if length == 0 {
+            return;
+        }
+        self.entities.push(TelegramMessageEntity {
+            kind: kind.to_string(),
+            offset: start.utf16 + leading_utf16,
+            length,
+            url,
+            language,
+        });
+    }
+
+    fn has_entity_of_kinds_in_range(
+        &self,
+        start_utf16: usize,
+        end_utf16: usize,
+        kinds: &[&str],
+    ) -> bool {
+        self.entities.iter().any(|entity| {
+            entity.offset >= start_utf16
+                && entity.offset + entity.length <= end_utf16
+                && kinds.contains(&entity.kind.as_str())
+        })
+    }
+
+    fn has_any_entity_in_range(&self, start_utf16: usize, end_utf16: usize) -> bool {
+        self.entities.iter().any(|entity| {
+            entity.offset >= start_utf16 && entity.offset + entity.length <= end_utf16
+        })
+    }
+}
+
+fn render_rich_document_to_telegram_entities(document: &RichDocument) -> TelegramRenderedText {
+    let mut builder = TelegramEntityBuilder::default();
+    let mut need_paragraph_break = false;
+    render_blocks_to_telegram_entities(
+        &document.blocks,
+        &mut builder,
+        &mut need_paragraph_break,
+        0,
+    );
+    builder.entities.sort_by(|left, right| {
+        left.offset
+            .cmp(&right.offset)
+            .then(right.length.cmp(&left.length))
+    });
+    TelegramRenderedText {
+        text: builder.text,
+        entities: builder.entities,
+    }
+}
+
+fn render_blocks_to_telegram_entities(
+    blocks: &[RichBlock],
+    builder: &mut TelegramEntityBuilder,
+    need_paragraph_break: &mut bool,
+    quote_depth: usize,
+) {
+    for block in blocks {
+        match block {
+            RichBlock::Paragraph(inlines) => {
+                ensure_block_break_text(&mut builder.text, need_paragraph_break);
+                maybe_render_nested_quote_prefix(builder, quote_depth);
+                render_inlines_to_telegram_entities(inlines, builder, quote_depth);
+                *need_paragraph_break = true;
+            }
+            RichBlock::Heading(inlines) => {
+                ensure_block_break_text(&mut builder.text, need_paragraph_break);
+                maybe_render_nested_quote_prefix(builder, quote_depth);
+                let start = builder.cursor();
+                render_inlines_to_telegram_entities(inlines, builder, quote_depth);
+                maybe_push_wrapping_entity(builder, start, "bold", None, None);
+                *need_paragraph_break = true;
+            }
+            RichBlock::BlockQuote(inner) => {
+                ensure_block_break_text(&mut builder.text, need_paragraph_break);
+                let start = builder.cursor();
+                render_blocks_to_telegram_entities(
+                    inner,
+                    builder,
+                    need_paragraph_break,
+                    quote_depth + 1,
+                );
+                if quote_depth == 0 {
+                    builder.push_entity_trimmed(
+                        start,
+                        classify_blockquote_entity(&builder.text[start.byte..builder.text.len()]),
+                        None,
+                        None,
+                    );
+                }
+            }
+            RichBlock::List { start, items } => {
+                ensure_block_break_text(&mut builder.text, need_paragraph_break);
+                maybe_render_nested_quote_prefix(builder, quote_depth);
+                render_list_to_telegram_entities(*start, items, builder, quote_depth);
+                *need_paragraph_break = true;
+            }
+            RichBlock::CodeBlock { language, code } => {
+                ensure_block_break_text(&mut builder.text, need_paragraph_break);
+                maybe_render_nested_quote_prefix(builder, quote_depth);
+                let start = builder.cursor();
+                builder.push_text(code);
+                builder.push_entity_trimmed(start, "pre", None, language.clone());
+                *need_paragraph_break = true;
+            }
+            RichBlock::Table(table) => {
+                ensure_block_break_text(&mut builder.text, need_paragraph_break);
+                maybe_render_nested_quote_prefix(builder, quote_depth);
+                let start = builder.cursor();
+                builder.push_text(&render_table_text(table));
+                builder.push_entity_trimmed(start, "pre", None, None);
+                *need_paragraph_break = true;
+            }
+            RichBlock::ThematicBreak => {
+                ensure_block_break_text(&mut builder.text, need_paragraph_break);
+                maybe_render_nested_quote_prefix(builder, quote_depth);
+                builder.push_text("──────────");
+                *need_paragraph_break = true;
+            }
+        }
+    }
+}
+
+fn render_list_to_telegram_entities(
+    start: Option<u64>,
+    items: &[Vec<RichBlock>],
+    builder: &mut TelegramEntityBuilder,
+    quote_depth: usize,
+) {
+    let mut next_number = start.unwrap_or(1);
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 && !builder.text.ends_with('\n') {
+            builder.push_text("\n");
+        }
+        maybe_render_nested_quote_prefix(builder, quote_depth);
+        if start.is_some() {
+            builder.push_text(&format!("{}. ", next_number));
+            next_number += 1;
+        } else {
+            builder.push_text("• ");
+        }
+        if let Some((first, rest)) = item.split_first() {
+            render_first_list_block_to_telegram_entities(first, builder, quote_depth);
+            if !rest.is_empty() {
+                let mut nested_break = true;
+                render_blocks_to_telegram_entities(rest, builder, &mut nested_break, quote_depth);
+            }
+        }
+    }
+}
+
+fn render_first_list_block_to_telegram_entities(
+    block: &RichBlock,
+    builder: &mut TelegramEntityBuilder,
+    quote_depth: usize,
+) {
+    match block {
+        RichBlock::Paragraph(inlines) => {
+            render_inlines_to_telegram_entities(inlines, builder, quote_depth)
+        }
+        RichBlock::Heading(inlines) => {
+            let start = builder.cursor();
+            render_inlines_to_telegram_entities(inlines, builder, quote_depth);
+            maybe_push_wrapping_entity(builder, start, "bold", None, None);
+        }
+        RichBlock::CodeBlock { language, code } => {
+            builder.push_text("\n");
+            maybe_render_nested_quote_prefix(builder, quote_depth);
+            let start = builder.cursor();
+            builder.push_text(code);
+            builder.push_entity_trimmed(start, "pre", None, language.clone());
+        }
+        RichBlock::Table(table) => {
+            builder.push_text("\n");
+            maybe_render_nested_quote_prefix(builder, quote_depth);
+            let start = builder.cursor();
+            builder.push_text(&render_table_text(table));
+            builder.push_entity_trimmed(start, "pre", None, None);
+        }
+        RichBlock::ThematicBreak => builder.push_text("──────────"),
+        RichBlock::BlockQuote(inner) => {
+            let mut nested_break = false;
+            render_blocks_to_telegram_entities(inner, builder, &mut nested_break, quote_depth + 1);
+        }
+        RichBlock::List { start, items } => {
+            builder.push_text("\n");
+            render_list_to_telegram_entities(*start, items, builder, quote_depth);
+        }
+    }
+}
+
+fn render_inlines_to_telegram_entities(
+    inlines: &[RichInline],
+    builder: &mut TelegramEntityBuilder,
+    quote_depth: usize,
+) {
+    for inline in inlines {
+        match inline {
+            RichInline::Text(text) => render_text_to_telegram_entities(text, builder, quote_depth),
+            RichInline::Emphasis(children) => {
+                let start = builder.cursor();
+                render_inlines_to_telegram_entities(children, builder, quote_depth);
+                maybe_push_wrapping_entity(builder, start, "italic", None, None);
+            }
+            RichInline::Strong(children) => {
+                let start = builder.cursor();
+                render_inlines_to_telegram_entities(children, builder, quote_depth);
+                maybe_push_wrapping_entity(builder, start, "bold", None, None);
+            }
+            RichInline::Strikethrough(children) => {
+                let start = builder.cursor();
+                render_inlines_to_telegram_entities(children, builder, quote_depth);
+                maybe_push_wrapping_entity(builder, start, "strikethrough", None, None);
+            }
+            RichInline::Link { url, content } => {
+                let start = builder.cursor();
+                render_inlines_to_telegram_entities(content, builder, quote_depth);
+                let end = builder.cursor();
+                if !builder.has_any_entity_in_range(start.utf16, end.utf16) {
+                    builder.push_entity_trimmed(start, "text_link", Some(url.clone()), None);
+                }
+            }
+            RichInline::Code(code) => {
+                let start = builder.cursor();
+                builder.push_text(code);
+                builder.push_entity_trimmed(start, "code", None, None);
+            }
+            RichInline::LineBreak => builder.push_text("\n"),
+        }
+    }
+}
+
+fn render_text_to_telegram_entities(
+    text: &str,
+    builder: &mut TelegramEntityBuilder,
+    quote_depth: usize,
+) {
+    for segment in text.split_inclusive('\n') {
+        maybe_render_nested_quote_prefix(builder, quote_depth);
+        builder.push_text(segment);
+    }
+}
+
+fn maybe_render_nested_quote_prefix(builder: &mut TelegramEntityBuilder, quote_depth: usize) {
+    if quote_depth > 1 && (builder.text.is_empty() || builder.text.ends_with('\n')) {
+        builder.push_text(&"> ".repeat(quote_depth - 1));
+    }
+}
+
+fn classify_blockquote_entity(text: &str) -> &'static str {
+    let line_count = text.lines().count();
+    let char_count = text.chars().count();
+    if line_count >= 6 || char_count >= 360 {
+        "expandable_blockquote"
+    } else {
+        "blockquote"
+    }
+}
+
+fn maybe_push_wrapping_entity(
+    builder: &mut TelegramEntityBuilder,
+    start: EntityCursor,
+    kind: &str,
+    url: Option<String>,
+    language: Option<String>,
+) {
+    let end = builder.cursor();
+    if matches!(kind, "bold" | "italic" | "strikethrough")
+        && builder.has_entity_of_kinds_in_range(start.utf16, end.utf16, &["code", "pre"])
+    {
+        return;
+    }
+    builder.push_entity_trimmed(start, kind, url, language);
+}
+
+fn render_blocks_for_telegram(
+    blocks: &[RichBlock],
+    output: &mut String,
+    need_paragraph_break: &mut bool,
+    quote_depth: usize,
+) {
+    for block in blocks {
+        match block {
+            RichBlock::Paragraph(inlines) => {
+                ensure_block_break(output, need_paragraph_break);
+                render_inlines_for_telegram(inlines, output, quote_depth);
+                *need_paragraph_break = true;
+            }
+            RichBlock::Heading(inlines) => {
+                ensure_block_break(output, need_paragraph_break);
+                render_quote_prefix_if_needed(output, quote_depth);
+                output.push_str("<b>");
+                render_inlines_for_telegram(inlines, output, quote_depth);
+                output.push_str("</b>");
+                *need_paragraph_break = true;
+            }
+            RichBlock::BlockQuote(inner) => {
+                render_blocks_for_telegram(inner, output, need_paragraph_break, quote_depth + 1);
+            }
+            RichBlock::List { start, items } => {
+                ensure_block_break(output, need_paragraph_break);
+                render_list_for_telegram(items, *start, output, quote_depth);
+                *need_paragraph_break = true;
+            }
+            RichBlock::CodeBlock { language, code } => {
+                ensure_block_break(output, need_paragraph_break);
+                render_code_block_for_telegram(language.as_deref(), code, output);
+                *need_paragraph_break = true;
+            }
+            RichBlock::Table(table) => {
+                ensure_block_break(output, need_paragraph_break);
+                output.push_str(&render_table_for_telegram(table));
+                *need_paragraph_break = true;
+            }
+            RichBlock::ThematicBreak => {
+                ensure_block_break(output, need_paragraph_break);
+                output.push_str("──────────");
+                *need_paragraph_break = true;
+            }
+        }
+    }
+}
+
+fn render_list_for_telegram(
+    items: &[Vec<RichBlock>],
+    start: Option<u64>,
+    output: &mut String,
+    quote_depth: usize,
+) {
+    let mut next_number = start.unwrap_or(1);
+    for (index, item) in items.iter().enumerate() {
+        if index > 0 && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        render_quote_prefix_if_needed(output, quote_depth);
+        if start.is_some() {
+            output.push_str(&format!("{}. ", next_number));
+            next_number += 1;
+        } else {
+            output.push_str("• ");
+        }
+
+        if let Some((first, rest)) = item.split_first() {
+            render_first_list_block_for_telegram(first, output, quote_depth);
+            if !rest.is_empty() {
+                let mut nested_break = true;
+                render_blocks_for_telegram(rest, output, &mut nested_break, quote_depth);
+            }
+        }
+    }
+}
+
+fn render_first_list_block_for_telegram(
+    block: &RichBlock,
+    output: &mut String,
+    quote_depth: usize,
+) {
+    match block {
+        RichBlock::Paragraph(inlines) => render_inlines_for_telegram(inlines, output, quote_depth),
+        RichBlock::Heading(inlines) => {
+            output.push_str("<b>");
+            render_inlines_for_telegram(inlines, output, quote_depth);
+            output.push_str("</b>");
+        }
+        RichBlock::CodeBlock { language, code } => {
+            output.push('\n');
+            render_code_block_for_telegram(language.as_deref(), code, output);
+        }
+        RichBlock::Table(table) => {
+            output.push('\n');
+            output.push_str(&render_table_for_telegram(table));
+        }
+        RichBlock::ThematicBreak => output.push_str("──────────"),
+        RichBlock::BlockQuote(inner) => {
+            let mut nested_break = false;
+            render_blocks_for_telegram(inner, output, &mut nested_break, quote_depth + 1);
+        }
+        RichBlock::List { start, items } => {
+            output.push('\n');
+            render_list_for_telegram(items, *start, output, quote_depth);
+        }
+    }
+}
+
+fn render_inlines_for_telegram(inlines: &[RichInline], output: &mut String, quote_depth: usize) {
+    for inline in inlines {
+        match inline {
+            RichInline::Text(text) => render_text_for_telegram(text, output, quote_depth),
+            RichInline::Emphasis(children) => {
+                render_quote_prefix_if_needed(output, quote_depth);
+                output.push_str("<i>");
+                render_inlines_for_telegram(children, output, quote_depth);
+                output.push_str("</i>");
+            }
+            RichInline::Strong(children) => {
+                render_quote_prefix_if_needed(output, quote_depth);
+                output.push_str("<b>");
+                render_inlines_for_telegram(children, output, quote_depth);
+                output.push_str("</b>");
+            }
+            RichInline::Strikethrough(children) => {
+                render_quote_prefix_if_needed(output, quote_depth);
+                output.push_str("<s>");
+                render_inlines_for_telegram(children, output, quote_depth);
+                output.push_str("</s>");
+            }
+            RichInline::Link { url, content } => {
+                render_quote_prefix_if_needed(output, quote_depth);
+                output.push_str("<a href=\"");
+                output.push_str(&escape_html_attribute(url));
+                output.push_str("\">");
+                render_inlines_for_telegram(content, output, quote_depth);
+                output.push_str("</a>");
+            }
+            RichInline::Code(code) => {
+                render_quote_prefix_if_needed(output, quote_depth);
+                output.push_str("<code>");
+                output.push_str(&escape_html_text(code));
+                output.push_str("</code>");
+            }
+            RichInline::LineBreak => output.push('\n'),
+        }
+    }
+}
+
+fn render_text_for_telegram(text: &str, output: &mut String, quote_depth: usize) {
+    for segment in text.split_inclusive('\n') {
+        render_quote_prefix_if_needed(output, quote_depth);
+        output.push_str(&escape_html_text(segment));
+    }
+}
+
+fn render_quote_prefix_if_needed(output: &mut String, quote_depth: usize) {
+    if quote_depth > 0 && starts_new_block_line(output) {
+        output.push_str(&"&gt; ".repeat(quote_depth));
+    }
+}
+
+fn render_code_block_for_telegram(language: Option<&str>, code: &str, output: &mut String) {
+    if let Some(language) = language {
+        output.push_str("<pre><code class=\"language-");
+        output.push_str(&escape_html_attribute(language));
+        output.push_str("\">");
+        output.push_str(&escape_html_text(code));
+        output.push_str("</code></pre>");
+    } else {
+        output.push_str("<pre>");
+        output.push_str(&escape_html_text(code));
+        output.push_str("</pre>");
     }
 }
 
@@ -1427,7 +2324,16 @@ fn pad_table_cell(value: &str, width: usize) -> String {
     }
 }
 
-fn render_table_for_telegram(table: &TableState) -> String {
+fn render_table_for_telegram(table: &RichTable) -> String {
+    let text = render_table_text(table);
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("<pre>{}</pre>", escape_html_text(&text))
+    }
+}
+
+fn render_table_text(table: &RichTable) -> String {
     if table.rows.is_empty() {
         return String::new();
     }
@@ -1469,7 +2375,7 @@ fn render_table_for_telegram(table: &TableState) -> String {
         }
     }
 
-    format!("<pre>{}</pre>", escape_html_text(&lines.join("\n")))
+    lines.join("\n")
 }
 
 fn escape_html_text(value: &str) -> String {
@@ -1483,7 +2389,558 @@ fn escape_html_attribute(value: &str) -> String {
     escape_html_text(value).replace('"', "&quot;")
 }
 
-fn split_markdown_message(input: &str, max_chars: usize) -> Vec<String> {
+fn ensure_block_break_text(output: &mut String, need_paragraph_break: &mut bool) {
+    ensure_block_break(output, need_paragraph_break)
+}
+
+fn utf16_len(value: &str) -> usize {
+    value.encode_utf16().count()
+}
+
+fn split_markdown_for_telegram_documents(input: &str, max_chars: usize) -> Vec<RichDocument> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+
+    let document = parse_markdown_to_rich_document(trimmed);
+    if rendered_length_for_document(&document) <= max_chars {
+        return vec![document];
+    }
+
+    match split_blocks_to_fit(&document.blocks, max_chars) {
+        Some(chunks) => chunks
+            .into_iter()
+            .map(|blocks| RichDocument { blocks })
+            .collect(),
+        None => split_markdown_message_legacy(trimmed, max_chars)
+            .into_iter()
+            .map(|chunk| parse_markdown_to_rich_document(&chunk))
+            .collect(),
+    }
+}
+
+fn render_markdown_chunks_to_telegram_entities(
+    input: &str,
+    max_chars: usize,
+) -> Vec<TelegramRenderedText> {
+    split_markdown_for_telegram_documents(input, max_chars)
+        .into_iter()
+        .map(|document| render_rich_document_to_telegram_entities(&document))
+        .collect()
+}
+
+fn rendered_length_for_document(document: &RichDocument) -> usize {
+    render_rich_document_to_telegram_entities(document)
+        .text
+        .chars()
+        .count()
+}
+
+fn rendered_length_for_blocks(blocks: &[RichBlock]) -> usize {
+    rendered_length_for_document(&RichDocument {
+        blocks: blocks.to_vec(),
+    })
+}
+
+fn rendered_length_for_block(block: &RichBlock) -> usize {
+    rendered_length_for_document(&RichDocument {
+        blocks: vec![block.clone()],
+    })
+}
+
+fn split_blocks_to_fit(blocks: &[RichBlock], max_chars: usize) -> Option<Vec<Vec<RichBlock>>> {
+    let mut chunks = Vec::new();
+    let mut current_blocks = Vec::new();
+
+    for block in blocks {
+        let split_parts = split_block_to_fit(block, max_chars)?;
+        for part in split_parts {
+            let mut candidate_blocks = current_blocks.clone();
+            candidate_blocks.extend(part.clone());
+            if rendered_length_for_blocks(&candidate_blocks) <= max_chars {
+                current_blocks = candidate_blocks;
+                continue;
+            }
+            if !current_blocks.is_empty() {
+                chunks.push(std::mem::take(&mut current_blocks));
+            }
+            if rendered_length_for_blocks(&part) > max_chars {
+                return None;
+            }
+            current_blocks = part;
+        }
+    }
+
+    if !current_blocks.is_empty() {
+        chunks.push(current_blocks);
+    }
+    Some(chunks)
+}
+
+fn split_block_to_fit(block: &RichBlock, max_chars: usize) -> Option<Vec<Vec<RichBlock>>> {
+    if rendered_length_for_block(block) <= max_chars {
+        return Some(vec![vec![block.clone()]]);
+    }
+
+    match block {
+        RichBlock::Paragraph(inlines) => {
+            split_inline_block_to_fit(PendingBlockKind::Paragraph, inlines, max_chars)
+        }
+        RichBlock::Heading(inlines) => {
+            split_inline_block_to_fit(PendingBlockKind::Heading, inlines, max_chars)
+        }
+        RichBlock::BlockQuote(blocks) => {
+            let chunks = split_blocks_to_fit(blocks, max_chars)?;
+            Some(
+                chunks
+                    .into_iter()
+                    .map(|chunk| vec![RichBlock::BlockQuote(chunk)])
+                    .collect(),
+            )
+        }
+        RichBlock::List { start, items } => split_list_block_to_fit(*start, items, max_chars),
+        RichBlock::CodeBlock { language, code } => {
+            split_code_block_to_fit(language.clone(), code, max_chars)
+        }
+        RichBlock::Table(_) => None,
+        RichBlock::ThematicBreak => Some(vec![vec![RichBlock::ThematicBreak]]),
+    }
+}
+
+fn split_inline_block_to_fit(
+    kind: PendingBlockKind,
+    inlines: &[RichInline],
+    max_chars: usize,
+) -> Option<Vec<Vec<RichBlock>>> {
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+
+    for inline in inlines {
+        let split_parts = split_inline_to_fit(kind, inline, max_chars)?;
+        for part in split_parts {
+            let mut candidate = current.clone();
+            candidate.push(part.clone());
+            if rendered_length_for_inline_block(kind, &candidate) <= max_chars {
+                current = candidate;
+                continue;
+            }
+            if !current.is_empty() {
+                chunks.push(vec![inline_block_from_parts(
+                    kind,
+                    std::mem::take(&mut current),
+                )]);
+            }
+            if rendered_length_for_inline_block(kind, std::slice::from_ref(&part)) > max_chars {
+                return None;
+            }
+            current.push(part);
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(vec![inline_block_from_parts(kind, current)]);
+    }
+    Some(chunks)
+}
+
+fn split_inline_to_fit(
+    block_kind: PendingBlockKind,
+    inline: &RichInline,
+    max_chars: usize,
+) -> Option<Vec<RichInline>> {
+    if rendered_length_for_inline_block(block_kind, std::slice::from_ref(inline)) <= max_chars {
+        return Some(vec![inline.clone()]);
+    }
+
+    match inline {
+        RichInline::Text(text) => split_text_inline_to_fit(block_kind, text, max_chars),
+        RichInline::Code(code) => {
+            split_leaf_inline_text_to_fit(block_kind, code, max_chars, RichInline::Code)
+        }
+        RichInline::LineBreak => Some(vec![RichInline::LineBreak]),
+        RichInline::Emphasis(children) => {
+            split_wrapped_inline_to_fit(block_kind, children, max_chars, &InlineWrapper::Emphasis)
+        }
+        RichInline::Strong(children) => {
+            split_wrapped_inline_to_fit(block_kind, children, max_chars, &InlineWrapper::Strong)
+        }
+        RichInline::Strikethrough(children) => split_wrapped_inline_to_fit(
+            block_kind,
+            children,
+            max_chars,
+            &InlineWrapper::Strikethrough,
+        ),
+        RichInline::Link { url, content } => split_wrapped_inline_to_fit(
+            block_kind,
+            content,
+            max_chars,
+            &InlineWrapper::Link(url.clone()),
+        ),
+    }
+}
+
+fn split_text_inline_to_fit(
+    block_kind: PendingBlockKind,
+    text: &str,
+    max_chars: usize,
+) -> Option<Vec<RichInline>> {
+    split_leaf_inline_text_to_fit(block_kind, text, max_chars, |value| RichInline::Text(value))
+}
+
+fn split_leaf_inline_text_to_fit<F>(
+    block_kind: PendingBlockKind,
+    text: &str,
+    max_chars: usize,
+    make_inline: F,
+) -> Option<Vec<RichInline>>
+where
+    F: Fn(String) -> RichInline,
+{
+    split_text_to_fit(
+        text,
+        |candidate| {
+            rendered_length_for_inline_block(block_kind, &[make_inline(candidate.to_string())])
+        },
+        max_chars,
+    )
+    .map(|parts| {
+        parts
+            .into_iter()
+            .map(|part| make_inline(part))
+            .collect::<Vec<_>>()
+    })
+    .filter(|parts| {
+        !parts.is_empty()
+            && parts.iter().all(|inline| {
+                rendered_length_for_inline_block(block_kind, std::slice::from_ref(inline))
+                    <= max_chars
+            })
+    })
+}
+
+fn split_wrapped_inline_to_fit(
+    block_kind: PendingBlockKind,
+    children: &[RichInline],
+    max_chars: usize,
+    wrapper: &InlineWrapper,
+) -> Option<Vec<RichInline>> {
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+
+    for child in children {
+        let split_parts = split_child_for_wrapped_chunk(block_kind, child, max_chars, wrapper)?;
+        for part in split_parts {
+            let mut candidate = current.clone();
+            candidate.push(part.clone());
+            if rendered_length_for_inline_block(
+                block_kind,
+                &[apply_inline_wrapper(wrapper, candidate.clone())],
+            ) <= max_chars
+            {
+                current = candidate;
+                continue;
+            }
+            if !current.is_empty() {
+                chunks.push(apply_inline_wrapper(wrapper, std::mem::take(&mut current)));
+            }
+            if rendered_length_for_inline_block(
+                block_kind,
+                &[apply_inline_wrapper(wrapper, vec![part.clone()])],
+            ) > max_chars
+            {
+                return None;
+            }
+            current.push(part);
+        }
+    }
+
+    if !current.is_empty() {
+        chunks.push(apply_inline_wrapper(wrapper, current));
+    }
+
+    Some(chunks)
+}
+
+fn split_child_for_wrapped_chunk(
+    block_kind: PendingBlockKind,
+    child: &RichInline,
+    max_chars: usize,
+    wrapper: &InlineWrapper,
+) -> Option<Vec<RichInline>> {
+    if rendered_length_for_inline_block(
+        block_kind,
+        &[apply_inline_wrapper(wrapper, vec![child.clone()])],
+    ) <= max_chars
+    {
+        return Some(vec![child.clone()]);
+    }
+
+    match child {
+        RichInline::Text(text) => split_text_to_fit(
+            text,
+            |candidate| {
+                rendered_length_for_inline_block(
+                    block_kind,
+                    &[apply_inline_wrapper(
+                        wrapper,
+                        vec![RichInline::Text(candidate.to_string())],
+                    )],
+                )
+            },
+            max_chars,
+        )
+        .map(|parts| parts.into_iter().map(RichInline::Text).collect()),
+        RichInline::Code(code) => split_text_to_fit(
+            code,
+            |candidate| {
+                rendered_length_for_inline_block(
+                    block_kind,
+                    &[apply_inline_wrapper(
+                        wrapper,
+                        vec![RichInline::Code(candidate.to_string())],
+                    )],
+                )
+            },
+            max_chars,
+        )
+        .map(|parts| parts.into_iter().map(RichInline::Code).collect()),
+        RichInline::LineBreak => Some(vec![RichInline::LineBreak]),
+        RichInline::Emphasis(children) => {
+            split_wrapped_inline_to_fit(block_kind, children, max_chars, &InlineWrapper::Emphasis)
+        }
+        RichInline::Strong(children) => {
+            split_wrapped_inline_to_fit(block_kind, children, max_chars, &InlineWrapper::Strong)
+        }
+        RichInline::Strikethrough(children) => split_wrapped_inline_to_fit(
+            block_kind,
+            children,
+            max_chars,
+            &InlineWrapper::Strikethrough,
+        ),
+        RichInline::Link { url, content } => split_wrapped_inline_to_fit(
+            block_kind,
+            content,
+            max_chars,
+            &InlineWrapper::Link(url.clone()),
+        ),
+    }
+}
+
+fn apply_inline_wrapper(wrapper: &InlineWrapper, children: Vec<RichInline>) -> RichInline {
+    match wrapper {
+        InlineWrapper::Emphasis => RichInline::Emphasis(children),
+        InlineWrapper::Strong => RichInline::Strong(children),
+        InlineWrapper::Strikethrough => RichInline::Strikethrough(children),
+        InlineWrapper::Link(url) => RichInline::Link {
+            url: url.clone(),
+            content: children,
+        },
+    }
+}
+
+fn split_list_block_to_fit(
+    start: Option<u64>,
+    items: &[Vec<RichBlock>],
+    max_chars: usize,
+) -> Option<Vec<Vec<RichBlock>>> {
+    let mut normalized_items = Vec::new();
+    for item in items {
+        if rendered_length_for_single_item_list(start, item) <= max_chars {
+            normalized_items.push(item.clone());
+            continue;
+        }
+        let item_chunks = split_blocks_to_fit(item, max_chars)?;
+        for chunk in item_chunks {
+            if rendered_length_for_single_item_list(start, &chunk) > max_chars {
+                return None;
+            }
+            normalized_items.push(chunk);
+        }
+    }
+
+    let mut chunks = Vec::new();
+    let mut current_items = Vec::new();
+    let mut current_start = start;
+    let mut next_number = start.unwrap_or(1);
+
+    for item in normalized_items {
+        let candidate_items = {
+            let mut items = current_items.clone();
+            items.push(item.clone());
+            items
+        };
+        let candidate_block = RichBlock::List {
+            start: current_start,
+            items: candidate_items.clone(),
+        };
+        if rendered_length_for_block(&candidate_block) <= max_chars {
+            current_items = candidate_items;
+        } else {
+            if !current_items.is_empty() {
+                chunks.push(vec![RichBlock::List {
+                    start: current_start,
+                    items: std::mem::take(&mut current_items),
+                }]);
+                current_start = start.map(|_| next_number);
+            }
+            current_items.push(item.clone());
+            let single_block = RichBlock::List {
+                start: current_start,
+                items: current_items.clone(),
+            };
+            if rendered_length_for_block(&single_block) > max_chars {
+                return None;
+            }
+        }
+        if start.is_some() {
+            next_number += 1;
+        }
+    }
+
+    if !current_items.is_empty() {
+        chunks.push(vec![RichBlock::List {
+            start: current_start,
+            items: current_items,
+        }]);
+    }
+
+    Some(chunks)
+}
+
+fn split_code_block_to_fit(
+    language: Option<String>,
+    code: &str,
+    max_chars: usize,
+) -> Option<Vec<Vec<RichBlock>>> {
+    let parts = split_text_to_fit(
+        code,
+        |candidate| {
+            rendered_length_for_block(&RichBlock::CodeBlock {
+                language: language.clone(),
+                code: candidate.to_string(),
+            })
+        },
+        max_chars,
+    )?;
+
+    let chunks = parts
+        .into_iter()
+        .map(|part| {
+            vec![RichBlock::CodeBlock {
+                language: language.clone(),
+                code: part,
+            }]
+        })
+        .collect::<Vec<_>>();
+
+    if chunks
+        .iter()
+        .all(|chunk| rendered_length_for_blocks(chunk) <= max_chars)
+    {
+        Some(chunks)
+    } else {
+        None
+    }
+}
+
+fn split_text_to_fit<F>(text: &str, measure: F, max_chars: usize) -> Option<Vec<String>>
+where
+    F: Fn(&str) -> usize,
+{
+    if text.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut cursor = 0usize;
+    let mut chunks = Vec::new();
+
+    while cursor < chars.len() {
+        let remaining = chars.len() - cursor;
+        let mut low = 1usize;
+        let mut high = remaining;
+        let mut best = 0usize;
+        while low <= high {
+            let mid = (low + high) / 2;
+            let candidate: String = chars[cursor..cursor + mid].iter().collect();
+            if measure(&candidate) <= max_chars {
+                best = mid;
+                low = mid + 1;
+            } else {
+                high = mid.saturating_sub(1);
+            }
+        }
+        if best == 0 {
+            return None;
+        }
+
+        let mut end = cursor + best;
+        if end < chars.len()
+            && let Some(adjusted) = prefer_split_boundary_with_measure(
+                &chars[cursor..end],
+                best / 2,
+                &measure,
+                max_chars,
+            )
+        {
+            end = cursor + adjusted;
+        }
+
+        let chunk: String = chars[cursor..end].iter().collect();
+        if chunk.is_empty() {
+            return None;
+        }
+        chunks.push(chunk);
+        cursor = end;
+    }
+
+    Some(chunks)
+}
+
+fn prefer_split_boundary_with_measure<F>(
+    chars: &[char],
+    minimum_index: usize,
+    measure: &F,
+    max_chars: usize,
+) -> Option<usize>
+where
+    F: Fn(&str) -> usize,
+{
+    let text: String = chars.iter().collect();
+    for needle in ["\n\n", "\n", " "] {
+        if let Some(index) = text.rfind(needle) {
+            let split_index = index + needle.len();
+            if split_index >= minimum_index {
+                let candidate = &text[..split_index];
+                if measure(candidate) <= max_chars {
+                    return Some(candidate.chars().count());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn inline_block_from_parts(kind: PendingBlockKind, inlines: Vec<RichInline>) -> RichBlock {
+    match kind {
+        PendingBlockKind::Paragraph => RichBlock::Paragraph(inlines),
+        PendingBlockKind::Heading => RichBlock::Heading(inlines),
+    }
+}
+
+fn rendered_length_for_inline_block(kind: PendingBlockKind, inlines: &[RichInline]) -> usize {
+    rendered_length_for_block(&inline_block_from_parts(kind, inlines.to_vec()))
+}
+
+fn rendered_length_for_single_item_list(start: Option<u64>, item: &[RichBlock]) -> usize {
+    rendered_length_for_block(&RichBlock::List {
+        start,
+        items: vec![item.to_vec()],
+    })
+}
+
+fn split_markdown_message_legacy(input: &str, max_chars: usize) -> Vec<String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Vec::new();
@@ -1548,9 +3005,13 @@ fn prefer_split_boundary(chars: &[char], minimum_index: usize) -> Option<usize> 
 #[cfg(test)]
 mod tests {
     use super::{
-        TelegramChannel, TelegramChat, TelegramMessage, poll_backoff_seconds,
-        split_markdown_message, translate_markdown_to_telegram_html,
+        RichBlock, RichInline, TelegramChannel, TelegramChat, TelegramMessage,
+        TelegramMessageEntity, TelegramRenderedText, build_edit_text_payload,
+        build_send_text_payload, parse_markdown_to_rich_document, poll_backoff_seconds,
+        render_markdown_chunks_to_telegram_entities, render_rich_document_to_telegram_entities,
+        translate_markdown_to_telegram_html,
     };
+    use crate::domain::ShowOptions;
     use anyhow::anyhow;
     use reqwest::Client;
     use std::collections::{HashMap, VecDeque};
@@ -1573,6 +3034,176 @@ mod tests {
         );
         assert!(translated.text.contains("• one"));
         assert!(translated.text.contains("• two"));
+    }
+
+    #[test]
+    fn renders_basic_entities_for_telegram() {
+        let document = parse_markdown_to_rich_document(
+            "# Title\n\n**bold** and *italic* with [link](https://example.com).\n\n```rust\nlet x = 1;\n```",
+        );
+        let rendered = render_rich_document_to_telegram_entities(&document);
+
+        assert!(rendered.text.contains("Title"));
+        assert!(rendered.text.contains("bold"));
+        assert!(rendered.text.contains("italic"));
+        assert!(rendered.text.contains("let x = 1;"));
+        assert!(rendered.entities.iter().any(|entity| entity.kind == "bold"));
+        assert!(
+            rendered
+                .entities
+                .iter()
+                .any(|entity| entity.kind == "italic")
+        );
+        assert!(
+            rendered
+                .entities
+                .iter()
+                .any(|entity| entity.kind == "text_link")
+        );
+        assert!(
+            rendered
+                .entities
+                .iter()
+                .any(|entity| entity.kind == "pre" && entity.language.as_deref() == Some("rust"))
+        );
+    }
+
+    #[test]
+    fn renders_blockquote_entities_for_telegram() {
+        let document = parse_markdown_to_rich_document("> quoted line\n>\n> second line");
+        let rendered = render_rich_document_to_telegram_entities(&document);
+
+        assert!(rendered.text.contains("quoted line"));
+        assert!(rendered.text.contains("second line"));
+        assert!(
+            rendered
+                .entities
+                .iter()
+                .any(|entity| entity.kind == "blockquote")
+        );
+    }
+
+    #[test]
+    fn build_send_text_payload_includes_entities_and_reply_markup() {
+        let payload = build_send_text_payload(
+            "123",
+            TelegramRenderedText {
+                text: "hello".to_string(),
+                entities: vec![TelegramMessageEntity {
+                    kind: "bold".to_string(),
+                    offset: 0,
+                    length: 5,
+                    url: None,
+                    language: None,
+                }],
+            },
+            Some(&ShowOptions {
+                prompt: "Choose".to_string(),
+                options: vec![crate::domain::ShowOption {
+                    label: "One".to_string(),
+                    value: "One".to_string(),
+                }],
+                one_time: true,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(payload["chat_id"], "123");
+        assert_eq!(payload["text"], "hello");
+        assert_eq!(payload["entities"][0]["type"], "bold");
+        assert!(payload.get("reply_markup").is_some());
+    }
+
+    #[test]
+    fn build_edit_text_payload_includes_message_id_and_entities() {
+        let payload = build_edit_text_payload(
+            "123",
+            42,
+            TelegramRenderedText {
+                text: "hello".to_string(),
+                entities: vec![TelegramMessageEntity {
+                    kind: "italic".to_string(),
+                    offset: 0,
+                    length: 5,
+                    url: None,
+                    language: None,
+                }],
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(payload["chat_id"], "123");
+        assert_eq!(payload["message_id"], 42);
+        assert_eq!(payload["entities"][0]["type"], "italic");
+    }
+
+    #[test]
+    fn renders_long_blockquotes_as_expandable_entities() {
+        let document = parse_markdown_to_rich_document(
+            &(0..8)
+                .map(|index| format!("> quoted line {}", index))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let rendered = render_rich_document_to_telegram_entities(&document);
+
+        assert!(
+            rendered
+                .entities
+                .iter()
+                .any(|entity| entity.kind == "expandable_blockquote")
+        );
+    }
+
+    #[test]
+    fn preserves_nested_blockquote_depth_markers() {
+        let document =
+            parse_markdown_to_rich_document("> outer line\n> > inner line\n> > second inner line");
+        let rendered = render_rich_document_to_telegram_entities(&document);
+
+        assert!(rendered.text.contains("outer line"));
+        assert!(rendered.text.contains("> inner line"));
+        assert!(rendered.text.contains("> second inner line"));
+        assert!(
+            rendered
+                .entities
+                .iter()
+                .any(|entity| entity.kind == "blockquote")
+        );
+    }
+
+    #[test]
+    fn parses_markdown_into_rich_blocks_before_rendering() {
+        let document =
+            parse_markdown_to_rich_document("# Title\n\n**bold** and `code`\n\n- one\n- two");
+
+        assert!(matches!(
+            document.blocks.first(),
+            Some(RichBlock::Heading(_))
+        ));
+        assert!(matches!(
+            document.blocks.get(1),
+            Some(RichBlock::Paragraph(_))
+        ));
+        assert!(matches!(
+            document.blocks.get(2),
+            Some(RichBlock::List { items, .. }) if items.len() == 2
+        ));
+
+        let Some(RichBlock::Paragraph(inlines)) = document.blocks.get(1) else {
+            panic!("expected paragraph block");
+        };
+        assert!(
+            inlines
+                .iter()
+                .any(|inline| matches!(inline, RichInline::Strong(_)))
+        );
+        assert!(
+            inlines
+                .iter()
+                .any(|inline| matches!(inline, RichInline::Code(code) if code == "code"))
+        );
     }
 
     #[test]
@@ -1630,29 +3261,94 @@ mod tests {
             "b".repeat(2200),
             "c".repeat(2200)
         );
-        let chunks = split_markdown_message(&input, 4096);
+        let chunks = render_markdown_chunks_to_telegram_entities(&input, 4096);
         assert!(chunks.len() >= 2);
-        assert!(chunks.iter().all(|chunk| {
-            translate_markdown_to_telegram_html(chunk)
-                .text
-                .chars()
-                .count()
-                <= 4096
-        }));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| { chunk.text.chars().count() <= 4096 })
+        );
     }
 
     #[test]
     fn splits_caption_safely_under_caption_limit() {
         let input = format!("**{}**", "x".repeat(1400));
-        let chunks = split_markdown_message(&input, 1024);
+        let chunks = render_markdown_chunks_to_telegram_entities(&input, 1024);
         assert!(chunks.len() >= 2);
-        assert!(chunks.iter().all(|chunk| {
-            translate_markdown_to_telegram_html(chunk)
-                .text
-                .chars()
-                .count()
-                <= 1024
-        }));
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| { chunk.text.chars().count() <= 1024 })
+        );
+    }
+
+    #[test]
+    fn splits_prefer_rich_block_boundaries_before_falling_back() {
+        let input = format!(
+            "{}\n\n{}\n\n{}",
+            "a".repeat(1000),
+            "b".repeat(1000),
+            "c".repeat(1000)
+        );
+        let chunks = render_markdown_chunks_to_telegram_entities(&input, 2200);
+
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks[0].text.contains(&"a".repeat(1000)));
+        assert!(chunks[0].text.contains(&"b".repeat(1000)));
+        assert!(!chunks[0].text.contains(&"c".repeat(1000)));
+    }
+
+    #[test]
+    fn splits_single_large_paragraph_without_legacy_markdown_boundaries() {
+        let input = format!("**{}**", vec!["word"; 900].join(" "));
+        let chunks = render_markdown_chunks_to_telegram_entities(&input, 1024);
+
+        assert!(chunks.len() >= 2);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.text.chars().count() <= 1024)
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.entities.iter().any(|entity| entity.kind == "bold"))
+        );
+    }
+
+    #[test]
+    fn splits_large_code_block_into_multiple_pre_blocks() {
+        let input = format!("```rust\n{}\n```", "let x = 42;\n".repeat(300));
+        let chunks = render_markdown_chunks_to_telegram_entities(&input, 1024);
+
+        assert!(chunks.len() >= 2);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.text.chars().count() <= 1024)
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.entities.iter().any(|entity| entity.kind == "pre"))
+        );
+    }
+
+    #[test]
+    fn splits_long_list_across_multiple_messages() {
+        let input = (1..=40)
+            .map(|index| format!("- item {} {}", index, "x".repeat(60)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let chunks = render_markdown_chunks_to_telegram_entities(&input, 1024);
+
+        assert!(chunks.len() >= 2);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.text.chars().count() <= 1024)
+        );
+        assert!(chunks.iter().all(|chunk| chunk.text.contains("• ")));
     }
 
     #[test]
