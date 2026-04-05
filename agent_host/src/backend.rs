@@ -207,11 +207,16 @@ pub fn compact_session_messages_with_report(
             }
             Ok(ContextCompactionReport {
                 messages: previous_messages,
+                compacted_messages: Vec::new(),
                 usage: TokenUsage::default(),
                 compacted: false,
-                token_limit: config.auto_compact_token_limit.unwrap_or_default(),
+                token_limit: config
+                    .context_compaction
+                    .token_limit_override
+                    .unwrap_or_default(),
                 estimated_tokens_before: 0,
                 estimated_tokens_after: 0,
+                structured_output: None,
             })
         }
     }
@@ -737,9 +742,13 @@ mod tests {
                 runtime_state_root: workspace_root.clone(),
                 workspace_root,
                 enable_context_compression: false,
-                effective_context_window_percent: 0.9,
-                auto_compact_token_limit: None,
-                retain_recent_messages: 8,
+                context_compaction: agent_frame::config::ContextCompactionConfig {
+                    trigger_ratio: 0.9,
+                    token_limit_override: None,
+                    recent_fidelity_target_ratio: 0.18,
+                },
+                timeout_observation_compaction:
+                    agent_frame::config::TimeoutObservationCompactionConfig { enabled: true },
             }
         }
 

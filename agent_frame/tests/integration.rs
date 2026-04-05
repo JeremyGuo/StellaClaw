@@ -883,7 +883,9 @@ fn run_session_auto_compacts_before_next_turn() -> Result<()> {
                 "context_window_tokens": 3000
             },
             "system_prompt": "Test system prompt.",
-            "retain_recent_messages": 2
+            "context_compaction": {
+                "trigger_ratio": 0.9
+            }
         }),
         ".",
     )?;
@@ -1055,7 +1057,9 @@ fn compact_session_messages_with_report_compacts_and_reports_usage() -> Result<(
                 "context_window_tokens": 2500
             },
             "system_prompt": "Test system prompt.",
-            "retain_recent_messages": 2
+            "context_compaction": {
+                "trigger_ratio": 0.9
+            }
         }),
         ".",
     )?;

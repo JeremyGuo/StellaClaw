@@ -13,10 +13,12 @@ use std::path::Path;
 mod v0_1;
 mod v0_2;
 mod v0_3;
+mod v0_4;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.3";
+pub const LATEST_CONFIG_VERSION: &str = "0.4";
 pub const VERSION_0_2: &str = "0.2";
+pub const VERSION_0_3: &str = "0.3";
 
 fn zgent_checkout_available() -> bool {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -127,7 +129,33 @@ pub enum ModelType {
     CodexSubscription,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ContextCompactionConfig {
+    #[serde(default = "default_compact_trigger_ratio")]
+    pub trigger_ratio: f64,
+    #[serde(default)]
+    pub token_limit_override: Option<usize>,
+    #[serde(default = "default_recent_fidelity_target_ratio")]
+    pub recent_fidelity_target_ratio: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct IdleCompactionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_idle_context_compaction_poll_interval_seconds")]
+    pub poll_interval_seconds: u64,
+    #[serde(default = "default_idle_compact_min_ratio")]
+    pub min_ratio: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TimeoutObservationCompactionConfig {
+    #[serde(default = "default_enable_timeout_observation_compaction")]
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct MainAgentConfig {
     #[serde(default)]
     pub model: Option<String>,
@@ -143,16 +171,90 @@ pub struct MainAgentConfig {
     pub max_tool_roundtrips: usize,
     #[serde(default = "default_enable_context_compression")]
     pub enable_context_compression: bool,
+    #[serde(default)]
+    pub context_compaction: ContextCompactionConfig,
+    #[serde(default)]
+    pub idle_compaction: IdleCompactionConfig,
+    #[serde(default)]
+    pub timeout_observation_compaction: TimeoutObservationCompactionConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct MainAgentConfigRaw {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    timeout_seconds: Option<f64>,
+    #[serde(default = "default_global_install_root")]
+    global_install_root: String,
+    #[serde(default = "default_main_agent_language")]
+    language: String,
+    #[serde(default = "default_enabled_tools")]
+    enabled_tools: Vec<String>,
+    #[serde(default = "default_max_tool_roundtrips")]
+    max_tool_roundtrips: usize,
+    #[serde(default = "default_enable_context_compression")]
+    enable_context_compression: bool,
+    #[serde(default)]
+    context_compaction: Option<ContextCompactionConfig>,
+    #[serde(default)]
+    idle_compaction: Option<IdleCompactionConfig>,
+    #[serde(default)]
+    timeout_observation_compaction: Option<TimeoutObservationCompactionConfig>,
+    #[serde(default = "default_compact_trigger_ratio")]
+    compact_trigger_ratio: f64,
     #[serde(default = "default_effective_context_window_percent")]
-    pub effective_context_window_percent: f64,
+    effective_context_window_percent: f64,
+    #[serde(default = "default_idle_compact_min_ratio")]
+    idle_compact_min_ratio: f64,
+    #[serde(default = "default_recent_fidelity_target_ratio")]
+    recent_fidelity_target_ratio: f64,
     #[serde(default)]
-    pub auto_compact_token_limit: Option<usize>,
-    #[serde(default = "default_retain_recent_messages")]
-    pub retain_recent_messages: usize,
+    auto_compact_token_limit: Option<usize>,
     #[serde(default)]
-    pub enable_idle_context_compaction: bool,
+    enable_idle_context_compaction: bool,
     #[serde(default = "default_idle_context_compaction_poll_interval_seconds")]
-    pub idle_context_compaction_poll_interval_seconds: u64,
+    idle_context_compaction_poll_interval_seconds: u64,
+}
+
+impl<'de> Deserialize<'de> for MainAgentConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = MainAgentConfigRaw::deserialize(deserializer)?;
+        let legacy_trigger_ratio = if (raw.effective_context_window_percent
+            - default_effective_context_window_percent())
+        .abs()
+            > f64::EPSILON
+        {
+            raw.effective_context_window_percent
+        } else {
+            raw.compact_trigger_ratio
+        };
+        Ok(Self {
+            model: raw.model,
+            timeout_seconds: raw.timeout_seconds,
+            global_install_root: raw.global_install_root,
+            language: raw.language,
+            enabled_tools: raw.enabled_tools,
+            max_tool_roundtrips: raw.max_tool_roundtrips,
+            enable_context_compression: raw.enable_context_compression,
+            context_compaction: raw.context_compaction.unwrap_or(ContextCompactionConfig {
+                trigger_ratio: legacy_trigger_ratio,
+                token_limit_override: raw.auto_compact_token_limit,
+                recent_fidelity_target_ratio: raw.recent_fidelity_target_ratio,
+            }),
+            idle_compaction: raw.idle_compaction.unwrap_or(IdleCompactionConfig {
+                enabled: raw.enable_idle_context_compaction,
+                poll_interval_seconds: raw.idle_context_compaction_poll_interval_seconds,
+                min_ratio: raw.idle_compact_min_ratio,
+            }),
+            timeout_observation_compaction: raw
+                .timeout_observation_compaction
+                .unwrap_or_default(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -283,16 +385,28 @@ fn default_enable_context_compression() -> bool {
     true
 }
 
+fn default_compact_trigger_ratio() -> f64 {
+    0.9
+}
+
 fn default_effective_context_window_percent() -> f64 {
     0.9
 }
 
-fn default_retain_recent_messages() -> usize {
-    8
+fn default_idle_compact_min_ratio() -> f64 {
+    0.5
+}
+
+fn default_recent_fidelity_target_ratio() -> f64 {
+    0.18
 }
 
 fn default_idle_context_compaction_poll_interval_seconds() -> u64 {
     15
+}
+
+fn default_enable_timeout_observation_compaction() -> bool {
+    true
 }
 
 fn default_telegram_bot_token_env() -> String {
@@ -313,10 +427,6 @@ fn default_poll_interval_ms() -> u64 {
 
 pub fn default_bot_commands() -> Vec<BotCommandConfig> {
     vec![
-        BotCommandConfig {
-            command: "new".to_string(),
-            description: "Start a new session".to_string(),
-        },
         BotCommandConfig {
             command: "oldspace".to_string(),
             description: "Reactivate an older workspace by id".to_string(),
@@ -420,10 +530,11 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let loaders: [&dyn ConfigLoader; 3] = [
+    let loaders: [&dyn ConfigLoader; 4] = [
         &v0_1::LegacyConfigLoader,
         &v0_2::VersionedConfigLoader,
-        &v0_3::LatestConfigLoader,
+        &v0_3::VersionedConfigLoader,
+        &v0_4::LatestConfigLoader,
     ];
     let loader = loaders
         .into_iter()
@@ -468,10 +579,11 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
     let config = {
-        let loaders: [&dyn ConfigLoader; 3] = [
+        let loaders: [&dyn ConfigLoader; 4] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
-            &v0_3::LatestConfigLoader,
+            &v0_3::VersionedConfigLoader,
+            &v0_4::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()
@@ -537,14 +649,11 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
             return Err(anyhow!("sandbox.bubblewrap_binary must not be empty"));
         }
     }
-    if config.main_agent.enable_idle_context_compaction
-        && config
-            .main_agent
-            .idle_context_compaction_poll_interval_seconds
-            == 0
+    if config.main_agent.idle_compaction.enabled
+        && config.main_agent.idle_compaction.poll_interval_seconds == 0
     {
         return Err(anyhow!(
-            "main_agent.idle_context_compaction_poll_interval_seconds must be at least 1"
+            "main_agent.idle_compaction.poll_interval_seconds must be at least 1"
         ));
     }
     if let Some(model) = config.main_agent.model.as_deref() {
@@ -836,7 +945,7 @@ mod tests {
         assert!(
             error
                 .to_string()
-                .contains("idle_context_compaction_poll_interval_seconds")
+                .contains("idle_compaction.poll_interval_seconds")
         );
     }
 
@@ -1314,10 +1423,11 @@ mod tests {
         );
 
         let written = fs::read_to_string(&config_path).unwrap();
-        assert!(written.contains("\"version\": \"0.3\""));
+        assert!(written.contains("\"version\": \"0.4\""));
         assert!(written.contains("\"web_search\": \"main_web_search\""));
         assert!(written.contains("\"models\": {"));
         assert!(written.contains("\"web_search\": {"));
+        assert!(written.contains("\"context_compaction\": {"));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::compaction::{
-    COMPACTION_MARKER, ContextCompactionReport, maybe_compact_messages_with_report,
+    COMPACTION_MARKER, ContextCompactionReport, StructuredCompactionOutput,
+    maybe_compact_messages_with_report,
 };
 use crate::config::AgentConfig;
 use crate::llm::{TokenUsage, create_chat_completion};
@@ -8,7 +9,7 @@ use crate::skills::{SkillMetadata, build_skills_meta_prompt, discover_skills};
 use crate::tooling::{
     InterruptSignal, Tool, build_tool_registry, build_tool_registry_with_cancel, execute_tool,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use humantime::parse_duration;
 use serde::{Deserialize, Serialize};
@@ -160,6 +161,8 @@ pub enum SessionEvent {
         estimated_tokens_before: usize,
         estimated_tokens_after: usize,
         token_limit: usize,
+        structured_output: Option<StructuredCompactionOutput>,
+        compacted_messages: Vec<ChatMessage>,
     },
     RoundStarted {
         round_index: usize,
@@ -195,6 +198,8 @@ pub enum SessionEvent {
         estimated_tokens_before: usize,
         estimated_tokens_after: usize,
         token_limit: usize,
+        structured_output: Option<StructuredCompactionOutput>,
+        compacted_messages: Vec<ChatMessage>,
     },
     ToolCallStarted {
         round_index: usize,
@@ -491,17 +496,24 @@ pub fn run_session_with_report_controlled(
         });
     }
 
-    let initial_compaction =
-        maybe_compact_messages_with_report(&config, &messages, &tool_definitions, &prompt)?;
+    let initial_compaction = maybe_compact_messages_with_report(
+        &config,
+        &messages,
+        &tool_definitions,
+        &prompt,
+    )
+    .context("threshold context compaction failed during initial phase")?;
     if let Some(control) = &control {
-        control.emit_event(SessionEvent::CompactionCompleted {
-            phase: "initial".to_string(),
-            compacted: initial_compaction.compacted,
-            estimated_tokens_before: initial_compaction.estimated_tokens_before,
-            estimated_tokens_after: initial_compaction.estimated_tokens_after,
-            token_limit: initial_compaction.token_limit,
-        });
-    }
+            control.emit_event(SessionEvent::CompactionCompleted {
+                phase: "initial".to_string(),
+                compacted: initial_compaction.compacted,
+                estimated_tokens_before: initial_compaction.estimated_tokens_before,
+                estimated_tokens_after: initial_compaction.estimated_tokens_after,
+                token_limit: initial_compaction.token_limit,
+                structured_output: initial_compaction.structured_output.clone(),
+                compacted_messages: initial_compaction.compacted_messages.clone(),
+            });
+        }
     usage.add_assign(&initial_compaction.usage);
     compaction_stats.record_report(&initial_compaction);
     messages = initial_compaction.messages;
@@ -542,7 +554,8 @@ pub fn run_session_with_report_controlled(
                 });
             }
             let round_compaction =
-                maybe_compact_messages_with_report(&config, &messages, &tool_definitions, "")?;
+                maybe_compact_messages_with_report(&config, &messages, &tool_definitions, "")
+                    .context("threshold context compaction failed during round phase")?;
             if let Some(control) = &control {
                 control.emit_event(SessionEvent::CompactionCompleted {
                     phase: "round".to_string(),
@@ -550,6 +563,8 @@ pub fn run_session_with_report_controlled(
                     estimated_tokens_before: round_compaction.estimated_tokens_before,
                     estimated_tokens_after: round_compaction.estimated_tokens_after,
                     token_limit: round_compaction.token_limit,
+                    structured_output: round_compaction.structured_output.clone(),
+                    compacted_messages: round_compaction.compacted_messages.clone(),
                 });
             }
             usage.add_assign(&round_compaction.usage);
@@ -649,9 +664,10 @@ pub fn run_session_with_report_controlled(
         }
         finish_pending_tool_wait_compaction(pending_compaction)?;
 
-        let timeout_observation_requested = control
-            .as_ref()
-            .is_some_and(SessionExecutionControl::take_timeout_observation_requested);
+        let timeout_observation_requested = config.timeout_observation_compaction.enabled
+            && control
+                .as_ref()
+                .is_some_and(SessionExecutionControl::take_timeout_observation_requested);
         for completed_tool in completed {
             let result = if timeout_observation_requested {
                 synthesize_tool_timeout_observation(
@@ -685,7 +701,8 @@ pub fn run_session_with_report_controlled(
                 });
             }
             let post_tool_compaction =
-                maybe_compact_messages_with_report(&config, &messages, &tool_definitions, "")?;
+                maybe_compact_messages_with_report(&config, &messages, &tool_definitions, "")
+                    .context("tool-wait context compaction failed")?;
             if let Some(control) = &control {
                 control.emit_event(SessionEvent::ToolWaitCompactionCompleted {
                     tool_name: "tool_batch".to_string(),
@@ -693,6 +710,8 @@ pub fn run_session_with_report_controlled(
                     estimated_tokens_before: post_tool_compaction.estimated_tokens_before,
                     estimated_tokens_after: post_tool_compaction.estimated_tokens_after,
                     token_limit: post_tool_compaction.token_limit,
+                    structured_output: post_tool_compaction.structured_output.clone(),
+                    compacted_messages: post_tool_compaction.compacted_messages.clone(),
                 });
             }
             usage.add_assign(&post_tool_compaction.usage);
@@ -732,7 +751,7 @@ fn start_pending_tool_wait_compaction(
     tool_name: &str,
     last_model_response_at: Option<Instant>,
 ) -> Result<Option<PendingToolWaitCompaction>> {
-    if !config.enable_context_compression {
+    if !config.enable_context_compression || !config.timeout_observation_compaction.enabled {
         return Ok(None);
     }
     if control.is_none() || stable_prefix.is_empty() {
@@ -903,9 +922,13 @@ mod tests {
             workspace_root: PathBuf::from("."),
             runtime_state_root: std::env::temp_dir().join("agent_frame_tests"),
             enable_context_compression: true,
-            effective_context_window_percent: 0.9,
-            auto_compact_token_limit: Some(40),
-            retain_recent_messages: 1,
+            context_compaction: crate::config::ContextCompactionConfig {
+                trigger_ratio: 0.9,
+                token_limit_override: Some(40),
+                recent_fidelity_target_ratio: 0.18,
+            },
+            timeout_observation_compaction:
+                crate::config::TimeoutObservationCompactionConfig { enabled: true },
         };
         let stable_prefix = vec![
             ChatMessage::text("system", "[AgentFrame Runtime]\n\nTest system prompt."),

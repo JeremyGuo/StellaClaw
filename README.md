@@ -15,6 +15,13 @@
 
 ---
 
+## 📚 Docs
+
+- [部署说明](docs/DEPLOY.md)
+- [版本与发布说明](VERSION)
+
+---
+
 ## 🏗️ Architecture
 
 <div align="center">

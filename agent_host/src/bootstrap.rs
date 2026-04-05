@@ -177,7 +177,7 @@ impl AgentWorkspace {
             .with_context(|| format!("failed to read {}", user_md_path.display()))?;
         let raw_identity_markdown = fs::read_to_string(&identity_md_path)
             .with_context(|| format!("failed to read {}", identity_md_path.display()))?;
-        let identity_prompt = render_identity_prompt(&raw_identity_markdown);
+        let identity_prompt = render_identity_prompt_for_runtime(&raw_identity_markdown);
         let agents_markdown = fs::read_to_string(&agents_md_path)
             .with_context(|| format!("failed to read {}", agents_md_path.display()))?;
 
@@ -215,7 +215,7 @@ fn ensure_seed_file(path: &Path, template: &str) -> Result<()> {
     Ok(())
 }
 
-fn render_identity_prompt(markdown: &str) -> String {
+pub fn render_identity_prompt_for_runtime(markdown: &str) -> String {
     markdown
         .lines()
         .filter_map(|line| {

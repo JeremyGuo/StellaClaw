@@ -26,6 +26,12 @@
   "max_tool_roundtrips": 12,
   "workspace_root": ".",
   "enable_context_compression": true,
-  "effective_context_window_percent": 0.9,
-  "retain_recent_messages": 8
+  "context_compaction": {
+    "trigger_ratio": 0.9,
+    "token_limit_override": null,
+    "recent_fidelity_target_ratio": 0.18
+  },
+  "timeout_observation_compaction": {
+    "enabled": true
+  }
 }

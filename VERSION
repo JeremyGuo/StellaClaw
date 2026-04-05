@@ -1,0 +1,29 @@
+---
+version: 0.4.0-beta1
+---
+
+# 0.4.0-beta1
+
+- 提供完整的 Rust 多代理运行时与长驻服务架构，分为 `agent_frame` 与 `agent_host` 两层。
+- 支持长期运行的 conversation/session 模型，具备持久化、恢复、`/continue`、中断 follow-up 合流与多会话并发处理。
+- 内置丰富工具链：
+  `read_file`、`write_file`、`edit`、`apply_patch`、`exec_*`、`file_download_*`、`web_fetch`、`web_search`、`image_*`、subagent 等。
+- 支持可中断工具与长任务状态保持，`exec`、下载、subagent 等运行态可跨压缩与跨 turn 延续。
+- 支持技能系统：`SKILL.md` 驱动的 skills、共享 `.skill_memory`、skill create/update/load 与运行时变更感知。
+- 支持 conversation 级记忆系统：
+  `memory_summary`、`MEMORY`、`rollout_summary`、`rollout_transcript` 四层检索路径。
+- 支持结构化上下文压缩：
+  threshold compaction、idle compaction、timeout-observation compaction，以及高保真 recent context 保留。
+- 支持共享状态更新注入：
+  `USER.md`、`IDENTITY.md`、skills 更新通过 synthetic system message 提示并参与最新 system prompt 重组。
+- 支持 Telegram 等 channel 集成，包含命令体系、长消息拆分、状态提示、恢复提示与会话级设置。
+- 支持多模型配置、模型切换、reasoning effort、sandbox mode 切换与 bubblewrap 隔离。
+- 支持 snapshots：
+  `/snapsave`、`/snapload`、`/snaplist` 可完整保存与恢复 workspace、session、conversation memory。
+- 提供结构化日志、状态查询、成本/usage 统计，以及用于生产部署的 systemd 运行方式。
+
+# Versioning
+
+- 版本号使用 SemVer，并允许 `-beta1`、`-rc1` 这类预发布后缀。
+- 开发中的不稳定测试发布统一使用 `0.x.y-betaN`。
+- 正式稳定发布使用 `MAJOR.MINOR.PATCH`。

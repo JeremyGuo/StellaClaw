@@ -123,6 +123,22 @@ pub struct ExternalWebSearchConfig {
     pub headers: serde_json::Map<String, Value>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ContextCompactionConfig {
+    #[serde(default = "default_compact_trigger_ratio")]
+    pub trigger_ratio: f64,
+    #[serde(default)]
+    pub token_limit_override: Option<usize>,
+    #[serde(default = "default_recent_fidelity_target_ratio")]
+    pub recent_fidelity_target_ratio: f64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TimeoutObservationCompactionConfig {
+    #[serde(default = "default_enable_timeout_observation_compaction")]
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentConfig {
     #[serde(default)]
@@ -140,12 +156,10 @@ pub struct AgentConfig {
     pub runtime_state_root: PathBuf,
     #[serde(default = "default_enable_context_compression")]
     pub enable_context_compression: bool,
-    #[serde(default = "default_effective_context_window_percent")]
-    pub effective_context_window_percent: f64,
     #[serde(default)]
-    pub auto_compact_token_limit: Option<usize>,
-    #[serde(default = "default_retain_recent_messages")]
-    pub retain_recent_messages: usize,
+    pub context_compaction: ContextCompactionConfig,
+    #[serde(default)]
+    pub timeout_observation_compaction: TimeoutObservationCompactionConfig,
 }
 
 #[derive(Deserialize)]
@@ -167,12 +181,18 @@ struct AgentConfigRaw {
     runtime_state_root: Option<String>,
     #[serde(default = "default_enable_context_compression")]
     enable_context_compression: bool,
+    #[serde(default)]
+    context_compaction: Option<ContextCompactionConfig>,
+    #[serde(default)]
+    timeout_observation_compaction: Option<TimeoutObservationCompactionConfig>,
+    #[serde(default = "default_compact_trigger_ratio")]
+    compact_trigger_ratio: f64,
     #[serde(default = "default_effective_context_window_percent")]
     effective_context_window_percent: f64,
+    #[serde(default = "default_recent_fidelity_target_ratio")]
+    recent_fidelity_target_ratio: f64,
     #[serde(default)]
     auto_compact_token_limit: Option<usize>,
-    #[serde(default = "default_retain_recent_messages")]
-    retain_recent_messages: usize,
 }
 
 #[derive(Deserialize)]
@@ -255,12 +275,20 @@ fn default_enable_context_compression() -> bool {
     true
 }
 
+fn default_compact_trigger_ratio() -> f64 {
+    0.9
+}
+
 fn default_effective_context_window_percent() -> f64 {
     0.9
 }
 
-fn default_retain_recent_messages() -> usize {
-    8
+fn default_recent_fidelity_target_ratio() -> f64 {
+    0.18
+}
+
+fn default_enable_timeout_observation_compaction() -> bool {
+    true
 }
 
 fn resolve_path(path: &str, base_dir: &Path) -> PathBuf {
@@ -378,9 +406,22 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
         workspace_root,
         runtime_state_root,
         enable_context_compression: raw.enable_context_compression,
-        effective_context_window_percent: raw.effective_context_window_percent,
-        auto_compact_token_limit: raw.auto_compact_token_limit,
-        retain_recent_messages: raw.retain_recent_messages,
+        context_compaction: raw.context_compaction.unwrap_or(ContextCompactionConfig {
+            trigger_ratio: if (raw.effective_context_window_percent
+                - default_effective_context_window_percent())
+            .abs()
+                > f64::EPSILON
+            {
+                raw.effective_context_window_percent
+            } else {
+                raw.compact_trigger_ratio
+            },
+            token_limit_override: raw.auto_compact_token_limit,
+            recent_fidelity_target_ratio: raw.recent_fidelity_target_ratio,
+        }),
+        timeout_observation_compaction: raw
+            .timeout_observation_compaction
+            .unwrap_or_default(),
     })
 }
 

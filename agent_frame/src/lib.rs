@@ -16,7 +16,10 @@ pub use agent::{
     extract_assistant_text, run_session, run_session_with_report,
     run_session_with_report_controlled,
 };
-pub use compaction::{ContextCompactionReport, estimate_session_tokens};
+pub use compaction::{
+    ContextCompactionReport, StructuredCompactionMemoryHint, StructuredCompactionOutput,
+    StructuredCompactionRefs, estimate_session_tokens,
+};
 pub use config::{
     AgentConfig, ExternalWebSearchConfig, NativeWebSearchConfig, UpstreamConfig, load_config_file,
     load_config_value,

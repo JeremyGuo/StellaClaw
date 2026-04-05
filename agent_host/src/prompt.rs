@@ -2,6 +2,7 @@ use crate::bootstrap::AgentWorkspace;
 use crate::config::{BotCommandConfig, MainAgentConfig, ModelConfig};
 use crate::session::SessionSnapshot;
 use std::collections::BTreeMap;
+use std::fs;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentPromptKind {
@@ -22,6 +23,18 @@ pub fn build_agent_system_prompt(
     main_agent: &MainAgentConfig,
     commands: &[BotCommandConfig],
 ) -> String {
+    let current_identity_prompt = fs::read_to_string(&workspace.identity_md_path)
+        .ok()
+        .map(|markdown| crate::bootstrap::render_identity_prompt_for_runtime(&markdown))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| workspace.identity_prompt.clone());
+    let current_user_profile_markdown = fs::read_to_string(&workspace.user_md_path)
+        .ok()
+        .unwrap_or_else(|| workspace.user_profile_markdown.clone());
+    let current_agents_markdown = fs::read_to_string(&workspace.agents_md_path)
+        .ok()
+        .unwrap_or_else(|| workspace.agents_markdown.clone());
+
     let header = match kind {
         AgentPromptKind::MainForeground => "[AgentHost Main Foreground Agent]",
         AgentPromptKind::MainBackground => "[AgentHost Main Background Agent]",
@@ -116,13 +129,13 @@ pub fn build_agent_system_prompt(
         }
     }
 
-    let identity = workspace.identity_prompt.trim();
+    let identity = current_identity_prompt.trim();
     if !identity.is_empty() {
         parts.push("Identity:".to_string());
         parts.push(identity.to_string());
     }
 
-    if let Some(user_meta) = extract_frontmatter(&workspace.user_profile_markdown) {
+    if let Some(user_meta) = extract_frontmatter(&current_user_profile_markdown) {
         parts.push("User meta:".to_string());
         parts.push(user_meta.trim().to_string());
     }
@@ -133,9 +146,9 @@ pub fn build_agent_system_prompt(
         parts.push(workspace_summary.to_string());
     }
 
-    if !workspace.agents_markdown.trim().is_empty() {
+    if !current_agents_markdown.trim().is_empty() {
         parts.push("Runtime notes:".to_string());
-        parts.push(workspace.agents_markdown.trim().to_string());
+        parts.push(current_agents_markdown.trim().to_string());
     }
 
     let _ = commands;
@@ -191,11 +204,16 @@ mod tests {
     use super::{AgentPromptKind, build_agent_system_prompt};
     use crate::backend::AgentBackendKind;
     use crate::bootstrap::AgentWorkspace;
-    use crate::config::{MainAgentConfig, ModelConfig};
+    use crate::config::{
+        ContextCompactionConfig, IdleCompactionConfig, MainAgentConfig, ModelConfig,
+        TimeoutObservationCompactionConfig,
+    };
     use crate::domain::ChannelAddress;
     use crate::session::SessionSnapshot;
     use std::collections::{BTreeMap, HashMap};
+    use std::fs;
     use std::path::PathBuf;
+    use tempfile::TempDir;
     use uuid::Uuid;
 
     #[test]
@@ -239,6 +257,9 @@ mod tests {
             cumulative_compaction: agent_frame::SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             skill_states: HashMap::new(),
+            seen_user_profile_version: None,
+            seen_identity_profile_version: None,
+            idle_compaction_retry: None,
             pending_continue: None,
             pending_workspace_summary: false,
             close_after_summary: false,
@@ -278,11 +299,19 @@ mod tests {
             enabled_tools: vec!["read_file".to_string()],
             max_tool_roundtrips: 8,
             enable_context_compression: true,
-            effective_context_window_percent: 0.9,
-            auto_compact_token_limit: None,
-            retain_recent_messages: 12,
-            enable_idle_context_compaction: false,
-            idle_context_compaction_poll_interval_seconds: 15,
+            context_compaction: ContextCompactionConfig {
+                trigger_ratio: 0.9,
+                token_limit_override: None,
+                recent_fidelity_target_ratio: 0.18,
+            },
+            idle_compaction: IdleCompactionConfig {
+                enabled: false,
+                poll_interval_seconds: 15,
+                min_ratio: 0.5,
+            },
+            timeout_observation_compaction: TimeoutObservationCompactionConfig {
+                enabled: true,
+            },
         };
 
         let prompt = build_agent_system_prompt(
@@ -314,5 +343,132 @@ mod tests {
         assert!(!prompt.contains("Use only tools that are actually available to this agent"));
         assert!(!prompt.contains("available commands:"));
         assert!(!prompt.contains("delivery channel may translate rich text"));
+    }
+
+    #[test]
+    fn prompt_rereads_user_and_identity_files_from_disk() {
+        let temp_dir = TempDir::new().unwrap();
+        let agent_dir = temp_dir.path().join("agent");
+        let rundir = temp_dir.path().join("rundir");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::create_dir_all(&rundir).unwrap();
+        let user_md_path = agent_dir.join("USER.md");
+        let identity_md_path = agent_dir.join("IDENTITY.md");
+        let agents_md_path = rundir.join("AGENTS.md");
+        fs::write(&user_md_path, "---\nname: Fresh User\n---\n").unwrap();
+        fs::write(&identity_md_path, "You are Fresh Identity.\n").unwrap();
+        fs::write(&agents_md_path, "runtime notes").unwrap();
+
+        let workspace = AgentWorkspace {
+            root_dir: temp_dir.path().to_path_buf(),
+            rundir: rundir.clone(),
+            agent_dir: agent_dir.clone(),
+            skills_dir: rundir.join(".skills"),
+            skill_creator_dir: rundir.join(".skills/skill-creator"),
+            tmp_dir: rundir.join("tmp"),
+            identity_md_path: identity_md_path.clone(),
+            user_md_path: user_md_path.clone(),
+            agents_md_path: agents_md_path.clone(),
+            identity_prompt: "Stale Identity".to_string(),
+            user_profile_markdown: "---\nname: Stale User\n---".to_string(),
+            raw_identity_markdown: "Stale Identity".to_string(),
+            agents_markdown: "stale runtime notes".to_string(),
+        };
+        let session = SessionSnapshot {
+            id: Uuid::nil(),
+            agent_id: Uuid::nil(),
+            address: ChannelAddress {
+                channel_id: "telegram-main".to_string(),
+                conversation_id: "123".to_string(),
+                user_id: None,
+                display_name: None,
+            },
+            root_dir: temp_dir.path().join("sessions/test"),
+            attachments_dir: temp_dir.path().join("workspace/upload"),
+            workspace_id: "workspace-1".to_string(),
+            workspace_root: temp_dir.path().join("workspace"),
+            message_count: 0,
+            agent_message_count: 0,
+            agent_messages: Vec::new(),
+            last_agent_returned_at: None,
+            last_compacted_at: None,
+            turn_count: 0,
+            last_compacted_turn_count: 0,
+            cumulative_usage: agent_frame::TokenUsage::default(),
+            cumulative_compaction: agent_frame::SessionCompactionStats::default(),
+            api_timeout_override_seconds: None,
+            skill_states: HashMap::new(),
+            seen_user_profile_version: None,
+            seen_identity_profile_version: None,
+            idle_compaction_retry: None,
+            pending_continue: None,
+            pending_workspace_summary: false,
+            close_after_summary: false,
+        };
+        let model = ModelConfig {
+            model_type: crate::config::ModelType::Openrouter,
+            api_endpoint: "https://example.com/v1".to_string(),
+            model: "example-model".to_string(),
+            backend: AgentBackendKind::AgentFrame,
+            supports_vision_input: false,
+            image_tool_model: None,
+            web_search_model: None,
+            api_key: None,
+            api_key_env: "TEST_API_KEY".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
+            headers: serde_json::Map::new(),
+            context_window_tokens: 100_000,
+            description: "General-purpose test model".to_string(),
+            timeout_seconds: 30.0,
+            cache_ttl: None,
+            reasoning: None,
+            native_web_search: None,
+            external_web_search: None,
+        };
+        let mut models = BTreeMap::new();
+        models.insert("main".to_string(), model.clone());
+        let main_agent = MainAgentConfig {
+            model: Some("main".to_string()),
+            global_install_root: "/opt".to_string(),
+            language: "zh-CN".to_string(),
+            timeout_seconds: Some(60.0),
+            enabled_tools: vec!["read_file".to_string()],
+            max_tool_roundtrips: 8,
+            enable_context_compression: true,
+            context_compaction: ContextCompactionConfig {
+                trigger_ratio: 0.9,
+                token_limit_override: None,
+                recent_fidelity_target_ratio: 0.18,
+            },
+            idle_compaction: IdleCompactionConfig {
+                enabled: false,
+                poll_interval_seconds: 15,
+                min_ratio: 0.5,
+            },
+            timeout_observation_compaction: TimeoutObservationCompactionConfig {
+                enabled: true,
+            },
+        };
+
+        let prompt = build_agent_system_prompt(
+            &workspace,
+            &session,
+            "",
+            AgentPromptKind::MainForeground,
+            "main",
+            &model,
+            &models,
+            &["main".to_string()],
+            &main_agent,
+            &[],
+        );
+
+        assert!(prompt.contains("Fresh Identity"));
+        assert!(prompt.contains("name: Fresh User"));
+        assert!(prompt.contains("runtime notes"));
+        assert!(!prompt.contains("Stale Identity"));
+        assert!(!prompt.contains("name: Stale User"));
     }
 }

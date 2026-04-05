@@ -1,5 +1,5 @@
 {
-  "version": "0.3",
+  "version": "0.4",
   "models": {
     "chat": {
       "gpt54": {
@@ -66,11 +66,19 @@
     ],
     "max_tool_roundtrips": 120,
     "enable_context_compression": true,
-    "effective_context_window_percent": 0.9,
-    "auto_compact_token_limit": null,
-    "retain_recent_messages": 8,
-    "enable_idle_context_compaction": false,
-    "idle_context_compaction_poll_interval_seconds": 15
+    "context_compaction": {
+      "trigger_ratio": 0.9,
+      "token_limit_override": null,
+      "recent_fidelity_target_ratio": 0.18
+    },
+    "idle_compaction": {
+      "enabled": false,
+      "poll_interval_seconds": 15,
+      "min_ratio": 0.5
+    },
+    "timeout_observation_compaction": {
+      "enabled": true
+    }
   },
   "sandbox": {
     "mode": "bubblewrap",

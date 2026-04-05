@@ -40,6 +40,12 @@ pub enum SkillChangeNotice {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SharedProfileChangeNotice {
+    UserUpdated,
+    IdentityUpdated,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SessionCheckpointData {
     #[serde(default)]
@@ -62,6 +68,10 @@ pub struct SessionCheckpointData {
     pub api_timeout_override_seconds: Option<f64>,
     #[serde(default)]
     pub skill_states: HashMap<String, SessionSkillState>,
+    #[serde(default)]
+    pub seen_user_profile_version: Option<String>,
+    #[serde(default)]
+    pub seen_identity_profile_version: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -78,6 +88,14 @@ pub struct PendingContinueState {
     #[serde(default)]
     pub progress_summary: String,
     pub failed_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct IdleCompactionRetryState {
+    #[serde(default)]
+    pub error_summary: String,
+    #[serde(default)]
+    pub failed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +118,9 @@ pub struct SessionSnapshot {
     pub cumulative_compaction: SessionCompactionStats,
     pub api_timeout_override_seconds: Option<f64>,
     pub skill_states: HashMap<String, SessionSkillState>,
+    pub seen_user_profile_version: Option<String>,
+    pub seen_identity_profile_version: Option<String>,
+    pub idle_compaction_retry: Option<IdleCompactionRetryState>,
     pub pending_continue: Option<PendingContinueState>,
     pub pending_workspace_summary: bool,
     pub close_after_summary: bool,
@@ -124,6 +145,9 @@ struct Session {
     cumulative_compaction: SessionCompactionStats,
     api_timeout_override_seconds: Option<f64>,
     skill_states: HashMap<String, SessionSkillState>,
+    seen_user_profile_version: Option<String>,
+    seen_identity_profile_version: Option<String>,
+    idle_compaction_retry: Option<IdleCompactionRetryState>,
     pending_continue: Option<PendingContinueState>,
     pending_workspace_summary: bool,
     close_after_summary: bool,
@@ -155,6 +179,9 @@ impl Session {
             cumulative_compaction: self.cumulative_compaction.clone(),
             api_timeout_override_seconds: self.api_timeout_override_seconds,
             skill_states: self.skill_states.clone(),
+            seen_user_profile_version: self.seen_user_profile_version.clone(),
+            seen_identity_profile_version: self.seen_identity_profile_version.clone(),
+            idle_compaction_retry: self.idle_compaction_retry.clone(),
             pending_continue: self.pending_continue.clone(),
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
@@ -190,6 +217,9 @@ impl Session {
             cumulative_compaction: self.cumulative_compaction.clone(),
             api_timeout_override_seconds: self.api_timeout_override_seconds,
             skill_states: self.skill_states.clone(),
+            seen_user_profile_version: self.seen_user_profile_version.clone(),
+            seen_identity_profile_version: self.seen_identity_profile_version.clone(),
+            idle_compaction_retry: self.idle_compaction_retry.clone(),
             pending_continue: self.pending_continue.clone(),
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
@@ -212,6 +242,11 @@ impl Session {
         let attachments_dir = workspace_root.join("upload");
         fs::create_dir_all(&attachments_dir)
             .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
+        let agent_messages = sanitize_persisted_agent_messages(persisted.agent_messages);
+        let pending_continue = persisted.pending_continue.map(|mut pending| {
+            pending.resume_messages = sanitize_persisted_agent_messages(pending.resume_messages);
+            pending
+        });
         Ok(Self {
             id: persisted.id,
             agent_id: persisted.agent_id,
@@ -221,7 +256,7 @@ impl Session {
             workspace_id,
             workspace_root,
             history: persisted.history,
-            agent_messages: persisted.agent_messages,
+            agent_messages,
             last_agent_returned_at: persisted.last_agent_returned_at,
             last_compacted_at: persisted.last_compacted_at,
             turn_count: persisted.turn_count,
@@ -230,12 +265,37 @@ impl Session {
             cumulative_compaction: persisted.cumulative_compaction,
             api_timeout_override_seconds: persisted.api_timeout_override_seconds,
             skill_states: persisted.skill_states,
-            pending_continue: persisted.pending_continue,
+            seen_user_profile_version: persisted.seen_user_profile_version,
+            seen_identity_profile_version: persisted.seen_identity_profile_version,
+            idle_compaction_retry: persisted.idle_compaction_retry,
+            pending_continue,
             pending_workspace_summary: persisted.pending_workspace_summary,
             close_after_summary: persisted.close_after_summary,
             closed_at: persisted.closed_at,
         })
     }
+}
+
+fn sanitize_persisted_agent_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut sanitized = Vec::new();
+    let mut seen_leading_system = false;
+    let mut leading = true;
+    for message in messages {
+        let is_system = message.role == "system";
+        if leading {
+            if is_system {
+                if seen_leading_system {
+                    continue;
+                }
+                seen_leading_system = true;
+                sanitized.push(message);
+                continue;
+            }
+            leading = false;
+        }
+        sanitized.push(message);
+    }
+    sanitized
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -265,6 +325,12 @@ struct PersistedSession {
     api_timeout_override_seconds: Option<f64>,
     #[serde(default)]
     skill_states: HashMap<String, SessionSkillState>,
+    #[serde(default)]
+    seen_user_profile_version: Option<String>,
+    #[serde(default)]
+    seen_identity_profile_version: Option<String>,
+    #[serde(default)]
+    idle_compaction_retry: Option<IdleCompactionRetryState>,
     #[serde(default)]
     pending_continue: Option<PendingContinueState>,
     #[serde(default)]
@@ -314,11 +380,6 @@ impl SessionManager {
             .get(&key)
             .expect("foreground session inserted")
             .snapshot())
-    }
-
-    pub fn reset_foreground(&mut self, address: &ChannelAddress) -> Result<SessionSnapshot> {
-        self.destroy_foreground(address)?;
-        self.ensure_foreground(address)
     }
 
     pub fn reset_foreground_to_workspace(
@@ -459,6 +520,8 @@ impl SessionManager {
             cumulative_compaction: session.cumulative_compaction.clone(),
             api_timeout_override_seconds: session.api_timeout_override_seconds,
             skill_states: session.skill_states.clone(),
+            seen_user_profile_version: session.seen_user_profile_version.clone(),
+            seen_identity_profile_version: session.seen_identity_profile_version.clone(),
         })
     }
 
@@ -496,6 +559,9 @@ impl SessionManager {
             cumulative_compaction: checkpoint.cumulative_compaction,
             api_timeout_override_seconds: checkpoint.api_timeout_override_seconds,
             skill_states: checkpoint.skill_states,
+            seen_user_profile_version: checkpoint.seen_user_profile_version,
+            seen_identity_profile_version: checkpoint.seen_identity_profile_version,
+            idle_compaction_retry: None,
             pending_continue: None,
             pending_workspace_summary: false,
             close_after_summary: false,
@@ -627,6 +693,45 @@ impl SessionManager {
         Ok(notices)
     }
 
+    pub fn observe_shared_profile_changes(
+        &mut self,
+        address: &ChannelAddress,
+        user_profile_version: String,
+        identity_profile_version: String,
+    ) -> Result<Vec<SharedProfileChangeNotice>> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        let mut notices = Vec::new();
+
+        match session.seen_user_profile_version.as_deref() {
+            None => {
+                session.seen_user_profile_version = Some(user_profile_version);
+            }
+            Some(previous) if previous != user_profile_version => {
+                session.seen_user_profile_version = Some(user_profile_version);
+                notices.push(SharedProfileChangeNotice::UserUpdated);
+            }
+            Some(_) => {}
+        }
+
+        match session.seen_identity_profile_version.as_deref() {
+            None => {
+                session.seen_identity_profile_version = Some(identity_profile_version);
+            }
+            Some(previous) if previous != identity_profile_version => {
+                session.seen_identity_profile_version = Some(identity_profile_version);
+                notices.push(SharedProfileChangeNotice::IdentityUpdated);
+            }
+            Some(_) => {}
+        }
+
+        session.persist()?;
+        Ok(notices)
+    }
+
     pub fn mark_skills_loaded_current_turn(
         &mut self,
         address: &ChannelAddress,
@@ -688,6 +793,7 @@ impl SessionManager {
             .usage
             .add_assign(&compaction.usage);
         session.pending_continue = None;
+        session.idle_compaction_retry = None;
         info!(
             log_stream = "session",
             log_key = %session.id,
@@ -736,6 +842,7 @@ impl SessionManager {
             .cumulative_compaction
             .usage
             .add_assign(&compaction.usage);
+        session.idle_compaction_retry = None;
         info!(
             log_stream = "session",
             log_key = %session.id,
@@ -759,7 +866,10 @@ impl SessionManager {
             .foreground_sessions
             .get_mut(&key)
             .with_context(|| format!("no active session for {}", key))?;
-        session.agent_messages = messages;
+        session.agent_messages = messages.clone();
+        if let Some(pending_continue) = &mut session.pending_continue {
+            pending_continue.resume_messages = messages;
+        }
         session.last_compacted_at = Some(Utc::now());
         session.last_compacted_turn_count = session.turn_count;
         session.cumulative_compaction.run_count = session
@@ -782,6 +892,7 @@ impl SessionManager {
             .cumulative_compaction
             .usage
             .add_assign(&compaction.usage);
+        session.idle_compaction_retry = None;
         info!(
             log_stream = "session",
             log_key = %session.id,
@@ -790,6 +901,35 @@ impl SessionManager {
             turn_count = session.turn_count,
             "persisted idle context compaction"
         );
+        session.persist()?;
+        Ok(())
+    }
+
+    pub fn mark_idle_compaction_retry_needed(
+        &mut self,
+        address: &ChannelAddress,
+        error_summary: String,
+    ) -> Result<()> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        session.idle_compaction_retry = Some(IdleCompactionRetryState {
+            error_summary,
+            failed_at: Some(Utc::now()),
+        });
+        session.persist()?;
+        Ok(())
+    }
+
+    pub fn clear_idle_compaction_retry(&mut self, address: &ChannelAddress) -> Result<()> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        session.idle_compaction_retry = None;
         session.persist()?;
         Ok(())
     }
@@ -855,6 +995,9 @@ impl SessionManager {
             cumulative_compaction: SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             skill_states: HashMap::new(),
+            seen_user_profile_version: None,
+            seen_identity_profile_version: None,
+            idle_compaction_retry: None,
             pending_continue: None,
             pending_workspace_summary: false,
             close_after_summary: false,
@@ -902,6 +1045,9 @@ impl SessionManager {
             cumulative_compaction: SessionCompactionStats::default(),
             api_timeout_override_seconds: None,
             skill_states: HashMap::new(),
+            seen_user_profile_version: None,
+            seen_identity_profile_version: None,
+            idle_compaction_retry: None,
             pending_continue: None,
             pending_workspace_summary: false,
             close_after_summary: false,
@@ -967,7 +1113,10 @@ fn load_persisted_sessions(
 
 #[cfg(test)]
 mod tests {
-    use super::{SessionManager, SessionSkillObservation, SkillChangeNotice};
+    use super::{
+        SessionManager, SessionSkillObservation, SharedProfileChangeNotice, SkillChangeNotice,
+        sanitize_persisted_agent_messages,
+    };
     use crate::domain::{ChannelAddress, StoredAttachment};
     use crate::workspace::WorkspaceManager;
     use agent_frame::{ChatMessage, SessionCompactionStats, TokenUsage};
@@ -980,6 +1129,28 @@ mod tests {
             user_id: Some("user-1".to_string()),
             display_name: Some("Test User".to_string()),
         }
+    }
+
+    #[test]
+    fn sanitize_persisted_agent_messages_keeps_only_first_leading_system() {
+        let messages = vec![
+            ChatMessage::text("system", "system a"),
+            ChatMessage::text("system", "system b"),
+            ChatMessage::text("assistant", "summary"),
+            ChatMessage::text("system", "runtime state"),
+        ];
+
+        let sanitized = sanitize_persisted_agent_messages(messages);
+
+        assert_eq!(sanitized.len(), 3);
+        assert_eq!(sanitized[0].role, "system");
+        assert_eq!(sanitized[0].content.as_ref().and_then(|v| v.as_str()), Some("system a"));
+        assert_eq!(sanitized[1].role, "assistant");
+        assert_eq!(sanitized[2].role, "system");
+        assert_eq!(
+            sanitized[2].content.as_ref().and_then(|v| v.as_str()),
+            Some("runtime state")
+        );
     }
 
     #[test]
@@ -1135,6 +1306,55 @@ mod tests {
                 && content_description == "new desc"
                 && content == "new content"
         ));
+    }
+
+    #[test]
+    fn shared_profile_changes_are_silent_on_first_observation_then_emit_updates() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        sessions.ensure_foreground(&address).unwrap();
+
+        let first = sessions
+            .observe_shared_profile_changes(&address, "user-v1".to_string(), "identity-v1".to_string())
+            .unwrap();
+        assert!(first.is_empty());
+
+        let second = sessions
+            .observe_shared_profile_changes(&address, "user-v2".to_string(), "identity-v1".to_string())
+            .unwrap();
+        assert_eq!(second, vec![SharedProfileChangeNotice::UserUpdated]);
+
+        let third = sessions
+            .observe_shared_profile_changes(&address, "user-v2".to_string(), "identity-v2".to_string())
+            .unwrap();
+        assert_eq!(third, vec![SharedProfileChangeNotice::IdentityUpdated]);
+    }
+
+    #[test]
+    fn idle_compaction_retry_state_can_be_set_and_cleared() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        sessions.ensure_foreground(&address).unwrap();
+
+        sessions
+            .mark_idle_compaction_retry_needed(&address, "idle compaction failed".to_string())
+            .unwrap();
+        let snapshot = sessions.get_snapshot(&address).unwrap();
+        assert_eq!(
+            snapshot
+                .idle_compaction_retry
+                .as_ref()
+                .map(|state| state.error_summary.as_str()),
+            Some("idle compaction failed")
+        );
+
+        sessions.clear_idle_compaction_retry(&address).unwrap();
+        let snapshot = sessions.get_snapshot(&address).unwrap();
+        assert!(snapshot.idle_compaction_retry.is_none());
     }
 
     #[test]

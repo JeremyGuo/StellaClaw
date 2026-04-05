@@ -1,10 +1,9 @@
 use super::{
-    ChannelConfig, ConfigLoader, MainAgentConfig, ModelCatalogConfig,
+    ChannelConfig, ConfigLoader, LATEST_CONFIG_VERSION, MainAgentConfig, ModelCatalogConfig,
     ModelConfig, ModelType, SandboxConfig, ServerConfig, build_server_config, default_api_key_env,
     default_chat_completions_path, default_codex_subscription_endpoint,
     default_context_window_tokens, default_cron_poll_interval_seconds,
     default_max_global_sub_agents, default_model_timeout_seconds, default_responses_path,
-    VERSION_0_3,
 };
 use crate::backend::AgentBackendKind;
 use agent_frame::config::{
@@ -15,7 +14,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-pub(super) struct VersionedConfigLoader;
+pub(super) struct LatestConfigLoader;
 
 #[derive(Clone, Debug, Deserialize)]
 struct VersionedServerConfigRaw {
@@ -82,18 +81,18 @@ struct VersionedModelConfigRaw {
     pub native_web_search: Option<NativeWebSearchConfig>,
 }
 
-impl ConfigLoader for VersionedConfigLoader {
+impl ConfigLoader for LatestConfigLoader {
     fn version(&self) -> &'static str {
-        VERSION_0_3
+        LATEST_CONFIG_VERSION
     }
 
     fn load_and_upgrade(&self, value: Value) -> Result<ServerConfig> {
         let raw: VersionedServerConfigRaw =
             serde_json::from_value(value).context("failed to parse latest server config")?;
-        if raw.version != VERSION_0_3 {
+        if raw.version != LATEST_CONFIG_VERSION {
             return Err(anyhow!(
                 "latest config loader expected version '{}' but received '{}'",
-                VERSION_0_3,
+                LATEST_CONFIG_VERSION,
                 raw.version
             ));
         }
@@ -137,7 +136,7 @@ impl ConfigLoader for VersionedConfigLoader {
         }
 
         Ok(build_server_config(
-            VERSION_0_3.to_string(),
+            LATEST_CONFIG_VERSION.to_string(),
             models,
             model_catalog,
             chat_model_keys,
