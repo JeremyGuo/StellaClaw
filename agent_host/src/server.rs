@@ -34,6 +34,7 @@ use crate::session::{
 use crate::sink::{SinkRouter, SinkTarget};
 use crate::snapshot::{SnapshotBundle, SnapshotManager};
 use crate::subagent::{HostedSubagent, HostedSubagentInner, SubagentState};
+use crate::upgrade::upgrade_workdir;
 use crate::workspace::{WorkspaceManager, WorkspaceMountMaterialization};
 use agent_frame::config::{
     AgentConfig as FrameAgentConfig, CacheControlConfig, CodexAuthConfig, UpstreamConfig,
@@ -66,6 +67,16 @@ use tokio::time::{Duration, MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+mod commands;
+mod messaging;
+mod persistence;
+mod runtime_helpers;
+
+use self::commands::*;
+use self::messaging::*;
+use self::persistence::*;
+use self::runtime_helpers::*;
+
 const ATTACHMENT_OPEN_TAG: &str = "<attachment>";
 const ATTACHMENT_CLOSE_TAG: &str = "</attachment>";
 const INTERRUPTED_FOLLOWUP_MARKER: &str = "[Interrupted Follow-up]";
@@ -92,6 +103,7 @@ enum ForegroundRuntimePhase {
 #[derive(Clone)]
 struct ServerRuntime {
     agent_workspace: AgentWorkspace,
+    sessions: Arc<Mutex<SessionManager>>,
     workspace_manager: WorkspaceManager,
     active_workspace_ids: Vec<String>,
     selected_main_model_key: Option<String>,
@@ -150,7 +162,6 @@ enum ForegroundTurnOutcome {
         outgoing: OutgoingMessage,
         usage: TokenUsage,
         compaction: SessionCompactionStats,
-        timed_out: bool,
     },
     Yielded {
         messages: Vec<ChatMessage>,
@@ -162,49 +173,6 @@ enum ForegroundTurnOutcome {
         compaction: SessionCompactionStats,
         error: anyhow::Error,
     },
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct PersistedMemoryGroup {
-    group: String,
-    #[serde(default)]
-    conclusions: Vec<String>,
-    #[serde(default)]
-    keywords: Vec<String>,
-    #[serde(default)]
-    rollouts: Vec<String>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct PersistedMemoryIndex {
-    #[serde(default)]
-    groups: Vec<PersistedMemoryGroup>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-struct PersistedMemorySummary {
-    #[serde(default)]
-    recent_groups: Vec<String>,
-    #[serde(default)]
-    recent_rollouts: Vec<String>,
-    #[serde(default)]
-    updated_at: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PersistedRolloutSummary {
-    rollout_id: String,
-    conversation_id: String,
-    created_at: String,
-    source_message_count: usize,
-    summary: String,
-    #[serde(default)]
-    old_summary: String,
-    #[serde(default)]
-    keywords: Vec<String>,
-    important_refs: agent_frame::StructuredCompactionRefs,
-    #[serde(default)]
-    next_step: String,
 }
 
 impl Drop for SubAgentSlot {
@@ -271,18 +239,6 @@ impl ServerRuntime {
             .with_context(|| format!("unknown model {}", model_key))
     }
 
-    fn main_agent_timeout_seconds(&self, model_key: &str) -> Result<Option<f64>> {
-        if let Some(timeout_seconds) = self.main_agent.timeout_seconds {
-            return Ok((timeout_seconds > 0.0).then_some(timeout_seconds));
-        }
-        Ok(Some(background_agent_timeout_seconds(
-            self.models
-                .get(model_key)
-                .with_context(|| format!("unknown model {}", model_key))?
-                .timeout_seconds,
-        )))
-    }
-
     fn model_upstream_timeout_seconds(&self, model_key: &str) -> Result<f64> {
         Ok(self
             .models
@@ -335,7 +291,19 @@ impl ServerRuntime {
     }
 
     fn default_subagent_charge_seconds(&self, model_key: &str) -> Result<f64> {
-        Ok(self.main_agent_timeout_seconds(model_key)?.unwrap_or(300.0))
+        if let Some(timeout_seconds) = self.main_agent.timeout_seconds {
+            return Ok(if timeout_seconds > 0.0 {
+                timeout_seconds
+            } else {
+                300.0
+            });
+        }
+        Ok(background_agent_timeout_seconds(
+            self.models
+                .get(model_key)
+                .with_context(|| format!("unknown model {}", model_key))?
+                .timeout_seconds,
+        ))
     }
 
     fn subagent_prompt(description: &str, workbook_relative_path: &str) -> String {
@@ -366,6 +334,14 @@ impl ServerRuntime {
         f(&mut conversations)
     }
 
+    fn with_sessions<T>(&self, f: impl FnOnce(&mut SessionManager) -> Result<T>) -> Result<T> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow!("session manager lock poisoned"))?;
+        f(&mut sessions)
+    }
+
     fn get_subagent_handle(&self, subagent_id: uuid::Uuid) -> Result<Arc<HostedSubagent>> {
         self.with_subagents(|subagents| {
             subagents
@@ -373,6 +349,30 @@ impl ServerRuntime {
                 .cloned()
                 .ok_or_else(|| anyhow!("unknown subagent {}", subagent_id))
         })
+    }
+
+    fn create_background_session_for_conversation(
+        &self,
+        address: &ChannelAddress,
+        agent_id: uuid::Uuid,
+    ) -> Result<SessionSnapshot> {
+        let preferred_workspace_id = self.with_conversations(|conversations| {
+            Ok(conversations
+                .ensure_conversation(address)?
+                .settings
+                .workspace_id)
+        })?;
+        let session = self.with_sessions(|sessions| match preferred_workspace_id.as_deref() {
+            Some(workspace_id) => {
+                sessions.create_background_in_workspace(address, agent_id, workspace_id)
+            }
+            None => sessions.create_background(address, agent_id),
+        })?;
+        self.with_conversations(|conversations| {
+            conversations.set_workspace_id(address, Some(session.workspace_id.clone()))?;
+            Ok(())
+        })?;
+        Ok(session)
     }
 
     fn subagent_state_view(subagent: &HostedSubagent, inner: &HostedSubagentInner) -> Value {
@@ -2182,22 +2182,17 @@ impl ServerRuntime {
         model_key: String,
         previous_messages: Vec<ChatMessage>,
         prompt: String,
-        timeout_seconds: Option<f64>,
         upstream_timeout_seconds: Option<f64>,
         control_observer: Option<Arc<dyn Fn(SessionExecutionControl) + Send + Sync>>,
-        timeout_label: &str,
         join_label: &str,
     ) -> Result<TimedRunOutcome> {
         enum DriverEvent {
             Checkpoint(SessionRunReport),
             Runtime(SessionEvent),
             Completed(Result<SessionRunReport>),
-            SoftDeadline,
-            HardDeadline,
         }
 
         let runtime = self.clone();
-        let timeout_label = timeout_label.to_string();
         let join_label = join_label.to_string();
         let event_session = session.clone();
         let event_model_key = model_key.clone();
@@ -2221,7 +2216,6 @@ impl ServerRuntime {
             }
             observer(execution_control.clone());
         }
-        let cancellation_handle = execution_control.clone();
         let worker_session = session;
         let worker_model_key = model_key;
         let join_handle = tokio::task::spawn_blocking(move || {
@@ -2264,29 +2258,8 @@ impl ServerRuntime {
                 let _ = driver_sender.send(DriverEvent::Completed(result));
             }));
         }
-        let soft_deadline = timeout_seconds
-            .map(|seconds| tokio::time::Instant::now() + Duration::from_secs_f64(seconds));
-        let hard_deadline = timeout_seconds.map(|seconds| {
-            tokio::time::Instant::now()
-                + Duration::from_secs_f64(seconds + tool_phase_timeout_grace_seconds())
-        });
-        if let Some(deadline) = soft_deadline {
-            let driver_sender = driver_sender.clone();
-            relay_tasks.push(tokio::spawn(async move {
-                tokio::time::sleep_until(deadline).await;
-                let _ = driver_sender.send(DriverEvent::SoftDeadline);
-            }));
-        }
-        if let Some(deadline) = hard_deadline {
-            let driver_sender = driver_sender.clone();
-            relay_tasks.push(tokio::spawn(async move {
-                tokio::time::sleep_until(deadline).await;
-                let _ = driver_sender.send(DriverEvent::HardDeadline);
-            }));
-        }
         drop(driver_sender);
         let mut latest_checkpoint = None;
-        let mut soft_timeout_error = None;
         while let Some(driver_event) = driver_receiver.recv().await {
             match driver_event {
                 DriverEvent::Checkpoint(checkpoint) => latest_checkpoint = Some(checkpoint),
@@ -2338,39 +2311,7 @@ impl ServerRuntime {
                     if report.yielded {
                         return Ok(TimedRunOutcome::Yielded(report));
                     }
-                    if let Some(error) = soft_timeout_error {
-                        return Ok(TimedRunOutcome::TimedOut {
-                            checkpoint: Some(report),
-                            error,
-                        });
-                    }
                     return Ok(TimedRunOutcome::Completed(report));
-                }
-                DriverEvent::SoftDeadline => {
-                    if soft_timeout_error.is_none() {
-                        let timeout_seconds = timeout_seconds.expect("soft deadline exists");
-                        soft_timeout_error = Some(anyhow!(
-                            "{} timed out after {:.1} seconds",
-                            timeout_label,
-                            timeout_seconds
-                        ));
-                        cancellation_handle.request_timeout_observation();
-                    }
-                }
-                DriverEvent::HardDeadline => {
-                    let timeout_seconds = timeout_seconds.expect("hard deadline exists");
-                    cancellation_handle.request_cancel();
-                    for task in relay_tasks {
-                        task.abort();
-                    }
-                    return Ok(TimedRunOutcome::TimedOut {
-                        checkpoint: latest_checkpoint,
-                        error: anyhow!(
-                            "{} hard timed out after {:.1} seconds",
-                            timeout_label,
-                            timeout_seconds + tool_phase_timeout_grace_seconds()
-                        ),
-                    });
                 }
             }
         }
@@ -2830,12 +2771,14 @@ impl ServerRuntime {
             None => self.effective_main_model_key()?,
         };
         self.model_config(&model_key)?;
+        let background_session =
+            self.create_background_session_for_conversation(&session.address, background_agent_id)?;
         self.register_managed_agent(
             background_agent_id,
             ManagedAgentKind::Background,
             model_key.clone(),
             Some(parent_agent_id),
-            &session,
+            &background_session,
             ManagedAgentState::Enqueued,
         );
         self.background_job_sender
@@ -2843,7 +2786,7 @@ impl ServerRuntime {
                 agent_id: background_agent_id,
                 parent_agent_id: Some(parent_agent_id),
                 cron_task_id: None,
-                session: session.clone(),
+                session: background_session.clone(),
                 model_key: model_key.clone(),
                 prompt,
                 sink: sink.clone(),
@@ -2854,8 +2797,8 @@ impl ServerRuntime {
             log_key = %background_agent_id,
             kind = "background_agent_enqueued",
             parent_agent_id = %parent_agent_id,
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
+            session_id = %background_session.id,
+            channel_id = %background_session.address.channel_id,
             model = %model_key,
             "background agent enqueued"
         );
@@ -2867,7 +2810,50 @@ impl ServerRuntime {
         }))
     }
 
+    fn background_session_snapshot(&self, session_id: uuid::Uuid) -> Result<SessionSnapshot> {
+        self.with_sessions(|sessions| sessions.background_snapshot(session_id))
+    }
+
+    async fn run_background_agent_turn(
+        &self,
+        session: &SessionSnapshot,
+        agent_id: uuid::Uuid,
+        model_key: &str,
+        prompt: String,
+        join_label: &str,
+    ) -> Result<TimedRunOutcome> {
+        let upstream_timeout_seconds = self.model_upstream_timeout_seconds(model_key)?;
+        self.run_agent_turn_with_timeout(
+            session.clone(),
+            AgentPromptKind::MainBackground,
+            agent_id,
+            model_key.to_string(),
+            session.agent_messages.clone(),
+            prompt,
+            Some(upstream_timeout_seconds),
+            None,
+            join_label,
+        )
+        .await
+    }
+
+    fn persist_background_checkpoint(
+        &self,
+        session_id: uuid::Uuid,
+        checkpoint: &SessionRunReport,
+    ) -> Result<()> {
+        self.with_sessions(|sessions| {
+            sessions.update_background_checkpoint(
+                session_id,
+                checkpoint.messages.clone(),
+                &checkpoint.usage,
+                &checkpoint.compaction,
+            )
+        })
+    }
+
     async fn run_background_job(&self, job: BackgroundJobRequest) -> Result<()> {
+        let session = self.background_session_snapshot(job.session.id)?;
         self.mark_managed_agent_running(job.agent_id);
         info!(
             log_stream = "agent",
@@ -2875,40 +2861,54 @@ impl ServerRuntime {
             kind = "background_agent_started",
             parent_agent_id = job.parent_agent_id.map(|value| value.to_string()),
             cron_task_id = job.cron_task_id.map(|value| value.to_string()),
-            session_id = %job.session.id,
-            channel_id = %job.session.address.channel_id,
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
             model = %job.model_key,
             "background agent started"
         );
-        let timeout_seconds = self.main_agent_timeout_seconds(&job.model_key)?;
-        let upstream_timeout_seconds = self.model_upstream_timeout_seconds(&job.model_key)?;
         let run_result = self
-            .run_agent_turn_with_timeout(
-                job.session.clone(),
-                AgentPromptKind::MainBackground,
+            .run_background_agent_turn(
+                &session,
                 job.agent_id,
-                job.model_key.clone(),
-                Vec::new(),
+                &job.model_key,
                 job.prompt.clone(),
-                timeout_seconds,
-                Some(upstream_timeout_seconds),
-                None,
-                "background agent",
                 "background agent task join failed",
             )
             .await;
 
         let outcome = match run_result {
             Ok(TimedRunOutcome::Completed(report)) => {
+                self.with_sessions(|sessions| {
+                    sessions.record_background_turn(
+                        session.id,
+                        report.messages.clone(),
+                        &report.usage,
+                        &report.compaction,
+                    )
+                })?;
+                self.with_sessions(|sessions| {
+                    sessions.append_background_user_message(
+                        session.id,
+                        Some(job.prompt.clone()),
+                        Vec::new(),
+                    )
+                })?;
                 let assistant_text = extract_assistant_text(&report.messages);
                 let outgoing = build_outgoing_message_for_session(
-                    &job.session,
+                    &session,
                     &assistant_text,
-                    &job.session.workspace_root,
+                    &session.workspace_root,
                 )?;
+                self.with_sessions(|sessions| {
+                    sessions.append_background_assistant_message(
+                        session.id,
+                        outgoing.text.clone(),
+                        Vec::new(),
+                    )
+                })?;
                 log_turn_usage(
                     job.agent_id,
-                    &job.session,
+                    &session,
                     &report.usage,
                     false,
                     "main_background",
@@ -2920,8 +2920,8 @@ impl ServerRuntime {
                     kind = "background_agent_replied",
                     parent_agent_id = job.parent_agent_id.map(|value| value.to_string()),
                     cron_task_id = job.cron_task_id.map(|value| value.to_string()),
-                    session_id = %job.session.id,
-                    channel_id = %job.session.address.channel_id,
+                    session_id = %session.id,
+                    channel_id = %session.address.channel_id,
                     has_text = outgoing.text.as_deref().is_some_and(|text| !text.trim().is_empty()),
                     attachment_count = outgoing.attachments.len() as u64 + outgoing.images.len() as u64,
                     "background agent produced reply"
@@ -2934,25 +2934,47 @@ impl ServerRuntime {
                 {
                     self.mark_managed_agent_failed(job.agent_id, &report.usage, &error);
                     let recovery = self
-                        .handle_background_job_failure(&job, &error)
+                        .handle_background_job_failure(&job, &session, &error)
                         .await
                         .with_context(|| format!("{error:#}"));
-                    cleanup_detached_session_root(self, &job).ok();
+                    let _ = self.with_sessions(|sessions| sessions.close_background(session.id));
                     return recovery;
                 }
                 self.mark_managed_agent_completed(job.agent_id, &report.usage);
                 Ok(())
             }
             Ok(TimedRunOutcome::Yielded(report)) => {
+                self.with_sessions(|sessions| {
+                    sessions.record_background_yielded_turn(
+                        session.id,
+                        report.messages.clone(),
+                        &report.usage,
+                        &report.compaction,
+                    )
+                })?;
+                self.with_sessions(|sessions| {
+                    sessions.append_background_user_message(
+                        session.id,
+                        Some(job.prompt.clone()),
+                        Vec::new(),
+                    )
+                })?;
                 let assistant_text = extract_assistant_text(&report.messages);
                 let outgoing = build_outgoing_message_for_session(
-                    &job.session,
+                    &session,
                     &assistant_text,
-                    &job.session.workspace_root,
+                    &session.workspace_root,
                 )?;
+                self.with_sessions(|sessions| {
+                    sessions.append_background_assistant_message(
+                        session.id,
+                        outgoing.text.clone(),
+                        Vec::new(),
+                    )
+                })?;
                 log_turn_usage(
                     job.agent_id,
-                    &job.session,
+                    &session,
                     &report.usage,
                     false,
                     "main_background",
@@ -2967,35 +2989,46 @@ impl ServerRuntime {
                 Ok(())
             }
             Ok(TimedRunOutcome::TimedOut { checkpoint, error }) => {
+                if let Some(checkpoint) = &checkpoint {
+                    self.persist_background_checkpoint(session.id, checkpoint)?;
+                }
                 let usage = checkpoint
                     .as_ref()
                     .map(|report| report.usage.clone())
                     .unwrap_or_default();
                 self.mark_managed_agent_timed_out(job.agent_id, &usage, &error);
-                self.handle_background_job_failure(&job, &error).await
+                self.handle_background_job_failure(&job, &session, &error)
+                    .await
             }
             Ok(TimedRunOutcome::Failed { checkpoint, error }) => {
+                if let Some(checkpoint) = &checkpoint {
+                    self.persist_background_checkpoint(session.id, checkpoint)?;
+                }
                 let usage = checkpoint
                     .as_ref()
                     .map(|report| report.usage.clone())
                     .unwrap_or_default();
                 self.mark_managed_agent_failed(job.agent_id, &usage, &error);
-                self.handle_background_job_failure(&job, &error).await
+                self.handle_background_job_failure(&job, &session, &error)
+                    .await
             }
             Err(error) => {
                 self.mark_managed_agent_failed(job.agent_id, &TokenUsage::default(), &error);
-                self.handle_background_job_failure(&job, &error).await
+                self.handle_background_job_failure(&job, &session, &error)
+                    .await
             }
         };
-        cleanup_detached_session_root(self, &job).ok();
+        let _ = self.with_sessions(|sessions| sessions.close_background(session.id));
         outcome
     }
 
     async fn handle_background_job_failure(
         &self,
         job: &BackgroundJobRequest,
+        session: &SessionSnapshot,
         error: &anyhow::Error,
     ) -> Result<()> {
+        let session = self.background_session_snapshot(session.id)?;
         if error
             .to_string()
             .contains("failed to dispatch background agent reply")
@@ -3013,8 +3046,8 @@ impl ServerRuntime {
                 log_stream = "agent",
                 log_key = %job.agent_id,
                 kind = "background_agent_recovery_skipped_active_children",
-                session_id = %job.session.id,
-                channel_id = %job.session.address.channel_id,
+                session_id = %session.id,
+                channel_id = %session.address.channel_id,
                 "background agent timed out while child agents were still active; skipping automatic recovery"
             );
             self.wait_for_child_agents_to_finish(job.agent_id).await;
@@ -3033,7 +3066,7 @@ impl ServerRuntime {
             ManagedAgentKind::Background,
             job.model_key.clone(),
             Some(job.agent_id),
-            &job.session,
+            &session,
             ManagedAgentState::Running,
         );
         info!(
@@ -3042,53 +3075,57 @@ impl ServerRuntime {
             kind = "background_agent_recovery_started",
             failed_agent_id = %job.agent_id,
             parent_agent_id = job.parent_agent_id.map(|value| value.to_string()),
-            session_id = %job.session.id,
-            channel_id = %job.session.address.channel_id,
+            session_id = %session.id,
+            channel_id = %session.address.channel_id,
             model = %job.model_key,
             "background failure recovery agent started"
         );
 
-        let recovery_timeout = background_recovery_timeout_seconds(
-            self.main_agent_timeout_seconds(&job.model_key)?
-                .unwrap_or_else(|| {
-                    background_agent_timeout_seconds(
-                        self.models
-                            .get(&job.model_key)
-                            .map(|model| model.timeout_seconds)
-                            .unwrap_or(120.0),
-                    )
-                }),
-            error,
-        );
-        let upstream_timeout_seconds = self.model_upstream_timeout_seconds(&job.model_key)?;
         let recovery_prompt = format!(
             "A previous main background agent failed before completing its work.\n\nOriginal task:\n{}\n\nFailure:\n{}\n\nYour job now:\n1. Diagnose the failure.\n2. If it is recoverable without user intervention, continue or retry the original task yourself now and produce the final user-facing result. Do not mention the failure unless it is relevant.\n3. If it is not recoverable, produce a concise user-facing explanation of the problem and what the user should do next.\n4. Do not say that you will continue later. Either complete the work now or explain the blocker clearly.",
             job.prompt, error
         );
+        let recovery_prompt_for_history = recovery_prompt.clone();
         let run_result = self
-            .run_agent_turn_with_timeout(
-                job.session.clone(),
-                AgentPromptKind::MainBackground,
+            .run_background_agent_turn(
+                &session,
                 recovery_agent_id,
-                job.model_key.clone(),
-                Vec::new(),
+                &job.model_key,
                 recovery_prompt,
-                Some(recovery_timeout),
-                Some(upstream_timeout_seconds),
-                None,
-                "background failure recovery",
                 "background failure recovery task join failed",
             )
             .await;
 
         match run_result {
             Ok(TimedRunOutcome::Completed(report)) => {
+                self.with_sessions(|sessions| {
+                    sessions.record_background_turn(
+                        session.id,
+                        report.messages.clone(),
+                        &report.usage,
+                        &report.compaction,
+                    )
+                })?;
+                self.with_sessions(|sessions| {
+                    sessions.append_background_user_message(
+                        session.id,
+                        Some(recovery_prompt_for_history.clone()),
+                        Vec::new(),
+                    )
+                })?;
                 let assistant_text = extract_assistant_text(&report.messages);
                 let outgoing = build_outgoing_message_for_session(
-                    &job.session,
+                    &session,
                     &assistant_text,
-                    &job.session.workspace_root,
+                    &session.workspace_root,
                 )?;
+                self.with_sessions(|sessions| {
+                    sessions.append_background_assistant_message(
+                        session.id,
+                        outgoing.text.clone(),
+                        Vec::new(),
+                    )
+                })?;
                 let sink_router = self.sink_router.read().await;
                 sink_router
                     .dispatch(&self.channels, &job.sink, outgoing)
@@ -3105,12 +3142,34 @@ impl ServerRuntime {
                 Ok(())
             }
             Ok(TimedRunOutcome::Yielded(report)) => {
+                self.with_sessions(|sessions| {
+                    sessions.record_background_yielded_turn(
+                        session.id,
+                        report.messages.clone(),
+                        &report.usage,
+                        &report.compaction,
+                    )
+                })?;
+                self.with_sessions(|sessions| {
+                    sessions.append_background_user_message(
+                        session.id,
+                        Some(recovery_prompt_for_history.clone()),
+                        Vec::new(),
+                    )
+                })?;
                 let assistant_text = extract_assistant_text(&report.messages);
                 let outgoing = build_outgoing_message_for_session(
-                    &job.session,
+                    &session,
                     &assistant_text,
-                    &job.session.workspace_root,
+                    &session.workspace_root,
                 )?;
+                self.with_sessions(|sessions| {
+                    sessions.append_background_assistant_message(
+                        session.id,
+                        outgoing.text.clone(),
+                        Vec::new(),
+                    )
+                })?;
                 let sink_router = self.sink_router.read().await;
                 sink_router
                     .dispatch(&self.channels, &job.sink, outgoing)
@@ -3123,6 +3182,9 @@ impl ServerRuntime {
                 checkpoint,
                 error: recovery_error,
             }) => {
+                if let Some(checkpoint) = &checkpoint {
+                    self.persist_background_checkpoint(session.id, checkpoint)?;
+                }
                 let usage = checkpoint
                     .as_ref()
                     .map(|report| report.usage.clone())
@@ -3148,6 +3210,9 @@ impl ServerRuntime {
                 checkpoint,
                 error: recovery_error,
             }) => {
+                if let Some(checkpoint) = &checkpoint {
+                    self.persist_background_checkpoint(session.id, checkpoint)?;
+                }
                 let usage = checkpoint
                     .as_ref()
                     .map(|report| report.usage.clone())
@@ -3317,12 +3382,8 @@ impl ServerRuntime {
 
         self.model_config(&task.model_key)?;
         let background_agent_id = uuid::Uuid::new_v4();
-        let session = create_detached_session_snapshot(
-            &self.workspace_manager,
-            &self.agent_workspace.root_dir,
-            task.address.clone(),
-            background_agent_id,
-        )?;
+        let session =
+            self.create_background_session_for_conversation(&task.address, background_agent_id)?;
         self.register_managed_agent(
             background_agent_id,
             ManagedAgentKind::Background,
@@ -3360,32 +3421,6 @@ impl ServerRuntime {
             "cron task enqueued background agent"
         );
         Ok(())
-    }
-}
-
-fn send_outgoing_message_now(
-    channel: Arc<dyn Channel>,
-    address: ChannelAddress,
-    message: OutgoingMessage,
-) -> Result<()> {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to build temporary Tokio runtime for immediate channel send")
-            .and_then(|runtime| {
-                runtime
-                    .block_on(async move { channel.send(&address, message).await })
-                    .context("failed to send immediate channel message")
-            })
-            .map_err(|error| format!("{error:#}"));
-        let _ = sender.send(result);
-    });
-    match receiver.recv() {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => Err(anyhow!(error)),
-        Err(_) => Err(anyhow!("immediate channel send thread closed unexpectedly")),
     }
 }
 
@@ -3742,6 +3777,7 @@ impl Server {
         let workdir = workdir.as_ref().to_path_buf();
         std::fs::create_dir_all(&workdir)
             .with_context(|| format!("failed to create workdir {}", workdir.display()))?;
+        upgrade_workdir(&workdir)?;
         let agent_workspace = AgentWorkspace::initialize(&workdir)?;
         let workspace_manager = WorkspaceManager::load_or_create(&workdir)?;
 
@@ -4183,6 +4219,7 @@ impl Server {
     fn tool_runtime(&self) -> ServerRuntime {
         ServerRuntime {
             agent_workspace: self.agent_workspace.clone(),
+            sessions: Arc::clone(&self.sessions),
             workspace_manager: self.workspace_manager.clone(),
             active_workspace_ids: self
                 .with_sessions(|sessions| Ok(sessions.list_foreground_snapshots()))
@@ -4234,6 +4271,24 @@ impl Server {
         runtime.selected_context_compaction_enabled = settings.context_compaction_enabled;
         runtime.selected_chat_version_id = Some(settings.chat_version_id);
         Ok(runtime)
+    }
+
+    fn ensure_foreground_session(&self, address: &ChannelAddress) -> Result<SessionSnapshot> {
+        let preferred_workspace_id = self.with_conversations(|conversations| {
+            Ok(conversations
+                .ensure_conversation(address)?
+                .settings
+                .workspace_id)
+        })?;
+        let session = self.with_sessions(|sessions| match preferred_workspace_id.as_deref() {
+            Some(workspace_id) => sessions.ensure_foreground_in_workspace(address, workspace_id),
+            None => sessions.ensure_foreground(address),
+        })?;
+        self.with_conversations(|conversations| {
+            conversations.set_workspace_id(address, Some(session.workspace_id.clone()))?;
+            Ok(())
+        })?;
+        Ok(session)
     }
 
     fn unregister_active_foreground_control(&self, address: &ChannelAddress) -> Result<()> {
@@ -4508,8 +4563,7 @@ impl Server {
                 .await?;
                 return Ok(());
             };
-            let session =
-                self.with_sessions(|sessions| sessions.ensure_foreground(&incoming.address))?;
+            let session = self.ensure_foreground_session(&incoming.address)?;
             let status_text = self.status_text_for_session(&session, &effective_model_key)?;
             self.send_channel_message(
                 &channel,
@@ -4538,8 +4592,7 @@ impl Server {
                 .await?;
                 return Ok(());
             };
-            let session =
-                self.with_sessions(|sessions| sessions.ensure_foreground(&incoming.address))?;
+            let session = self.ensure_foreground_session(&incoming.address)?;
             self.send_channel_message(
                 &channel,
                 &incoming.address,
@@ -4619,8 +4672,7 @@ impl Server {
                     return Ok(());
                 }
                 let compacted = if let Some(previous_model_key) = current_model_key {
-                    let session = self
-                        .with_sessions(|sessions| sessions.ensure_foreground(&incoming.address))?;
+                    let session = self.ensure_foreground_session(&incoming.address)?;
                     self.compact_session_now(&session, &previous_model_key, false)
                         .await
                         .unwrap_or(false)
@@ -4808,8 +4860,7 @@ impl Server {
         }
 
         if let Some(checkpoint_name) = parse_snap_save_command(incoming.text.as_deref()) {
-            let session =
-                self.with_sessions(|sessions| sessions.ensure_foreground(&incoming.address))?;
+            let session = self.ensure_foreground_session(&incoming.address)?;
             let checkpoint =
                 self.with_sessions(|sessions| sessions.export_checkpoint(&incoming.address))?;
             let bundle = SnapshotBundle {
@@ -4970,8 +5021,7 @@ impl Server {
         }
 
         if let Some(argument) = parse_set_api_timeout_command(incoming.text.as_deref()) {
-            let session =
-                self.with_sessions(|sessions| sessions.ensure_foreground(&incoming.address))?;
+            let session = self.ensure_foreground_session(&incoming.address)?;
             let effective_model_key = self.effective_main_model_key(&incoming.address)?;
             let model_timeout_seconds =
                 self.model_upstream_timeout_seconds(&effective_model_key)?;
@@ -4997,8 +5047,7 @@ impl Server {
         }
 
         if parse_continue_command(incoming.text.as_deref()) {
-            let session =
-                self.with_sessions(|sessions| sessions.ensure_foreground(&incoming.address))?;
+            let session = self.ensure_foreground_session(&incoming.address)?;
             let Some(pending_continue) =
                 self.with_sessions(|sessions| sessions.pending_continue(&incoming.address))?
             else {
@@ -5051,7 +5100,6 @@ impl Server {
                     outgoing,
                     usage,
                     compaction,
-                    timed_out,
                 } => {
                     let messages = normalize_messages_for_persistence(
                         messages,
@@ -5092,7 +5140,6 @@ impl Server {
                         session_id = %foreground.session_id,
                         channel_id = %foreground.channel_id,
                         system_prompt_len = foreground.system_prompt.len() as u64,
-                        timed_out,
                         has_text = outgoing.text.as_deref().is_some_and(|text| !text.trim().is_empty()),
                         attachment_count = outgoing.attachments.len() as u64 + outgoing.images.len() as u64,
                         "foreground agent continued interrupted turn"
@@ -5183,8 +5230,7 @@ impl Server {
             return Ok(());
         }
 
-        let session =
-            self.with_sessions(|sessions| sessions.ensure_foreground(&incoming.address))?;
+        let session = self.ensure_foreground_session(&incoming.address)?;
         if session.agent_message_count == 0 {
             if let Err(error) = self.initialize_foreground_session(&session, false).await {
                 self.send_user_error_message(&channel, &incoming.address, &error)
@@ -5298,14 +5344,13 @@ impl Server {
                 .await;
         }
         let outcome = turn_result?;
-        let (messages, outgoing, usage, compaction, timed_out) = match outcome {
+        let (messages, outgoing, usage, compaction) = match outcome {
             ForegroundTurnOutcome::Replied {
                 messages,
                 outgoing,
                 usage,
                 compaction,
-                timed_out,
-            } => (messages, outgoing, usage, compaction, timed_out),
+            } => (messages, outgoing, usage, compaction),
             ForegroundTurnOutcome::Yielded {
                 messages,
                 usage,
@@ -5405,7 +5450,6 @@ impl Server {
             session_id = %foreground.session_id,
             channel_id = %foreground.channel_id,
             system_prompt_len = foreground.system_prompt.len() as u64,
-            timed_out,
             has_text = outgoing.text.as_deref().is_some_and(|text| !text.trim().is_empty()),
             attachment_count = outgoing.attachments.len() as u64 + outgoing.images.len() as u64,
             "foreground agent produced reply"
@@ -5554,6 +5598,10 @@ impl Server {
         let session = self.with_sessions(|sessions| {
             sessions.reset_foreground_to_workspace(address, workspace_id)
         })?;
+        self.with_conversations(|conversations| {
+            conversations.set_workspace_id(address, Some(session.workspace_id.clone()))?;
+            Ok(())
+        })?;
         info!(
             log_stream = "session",
             log_key = %session.id,
@@ -5653,14 +5701,13 @@ impl Server {
             .run_main_agent_turn(session, &effective_model_key, greeting, None, Vec::new())
             .await
             .context("failed to initialize foreground session")?;
-        let (messages, outgoing, usage, compaction, timed_out) = match outcome {
+        let (messages, outgoing, usage, compaction) = match outcome {
             ForegroundTurnOutcome::Replied {
                 messages,
                 outgoing,
                 usage,
                 compaction,
-                timed_out,
-            } => (messages, outgoing, usage, compaction, timed_out),
+            } => (messages, outgoing, usage, compaction),
             ForegroundTurnOutcome::Yielded {
                 messages,
                 usage,
@@ -5683,16 +5730,6 @@ impl Server {
         })?;
         self.rotate_chat_version_if_compacted(&session.address, &compaction)?;
         self.log_turn_usage(session, &usage, true);
-        if timed_out {
-            warn!(
-                log_stream = "agent",
-                log_key = %session.agent_id,
-                kind = "foreground_initialization_timed_out",
-                session_id = %session.id,
-                channel_id = %session.address.channel_id,
-                "foreground initialization returned the latest stable checkpoint after timeout"
-            );
-        }
         if show_reply {
             self.with_sessions(|sessions| {
                 sessions.append_assistant_message(
@@ -5792,7 +5829,6 @@ impl Server {
                 &tree
             }
         );
-        let timeout_seconds = self.main_agent_timeout_seconds(&effective_model_key)?;
         let upstream_timeout_seconds = self.model_upstream_timeout_seconds(&effective_model_key)?;
         let runtime = self.tool_runtime_for_address(&session.address)?;
         let outcome = runtime
@@ -5803,10 +5839,8 @@ impl Server {
                 effective_model_key.clone(),
                 previous_messages,
                 prompt,
-                timeout_seconds,
                 Some(upstream_timeout_seconds),
                 None,
-                "workspace summary",
                 "workspace summary task join failed",
             )
             .await?;
@@ -5914,7 +5948,6 @@ impl Server {
         original_attachments: Vec<StoredAttachment>,
     ) -> Result<ForegroundTurnOutcome> {
         let workspace_root = session.workspace_root.clone();
-        let timeout_seconds = self.main_agent_timeout_seconds(model_key)?;
         let upstream_timeout_seconds = session
             .api_timeout_override_seconds
             .unwrap_or(self.model_upstream_timeout_seconds(model_key)?);
@@ -5935,10 +5968,8 @@ impl Server {
                 model_key.to_string(),
                 previous_messages.clone(),
                 String::new(),
-                timeout_seconds,
                 Some(upstream_timeout_seconds),
                 Some(control_observer),
-                "foreground agent turn",
                 "agent_frame task join failed",
             )
             .await;
@@ -5955,7 +5986,6 @@ impl Server {
                     outgoing,
                     usage: report.usage,
                     compaction: report.compaction,
-                    timed_out: false,
                 })
             }
             TimedRunOutcome::Yielded(report) => Ok(ForegroundTurnOutcome::Yielded {
@@ -5973,7 +6003,6 @@ impl Server {
                     outgoing,
                     usage: report.usage,
                     compaction: report.compaction,
-                    timed_out: true,
                 })
             }
             TimedRunOutcome::Failed { checkpoint, error } => {
@@ -6147,18 +6176,6 @@ impl Server {
         self.models
             .get(model_key)
             .with_context(|| format!("unknown model {}", model_key))
-    }
-
-    fn main_agent_timeout_seconds(&self, model_key: &str) -> Result<Option<f64>> {
-        if let Some(timeout_seconds) = self.main_agent.timeout_seconds {
-            return Ok((timeout_seconds > 0.0).then_some(timeout_seconds));
-        }
-        Ok(Some(background_agent_timeout_seconds(
-            self.models
-                .get(model_key)
-                .with_context(|| format!("unknown model {}", model_key))?
-                .timeout_seconds,
-        )))
     }
 
     fn model_upstream_timeout_seconds(&self, model_key: &str) -> Result<f64> {
@@ -6422,2635 +6439,23 @@ fn spawn_channel_supervisor(channel: Arc<dyn Channel>, sender: mpsc::Sender<Inco
     });
 }
 
-fn compose_user_prompt(text: Option<&str>, attachments: &[StoredAttachment]) -> String {
-    let mut sections = Vec::new();
-    if let Some(text) = text.map(str::trim).filter(|value| !value.is_empty()) {
-        sections.push(text.to_string());
-    }
-    if !attachments.is_empty() {
-        let mut attachment_lines = vec!["Attachments available for this turn:".to_string()];
-        for attachment in attachments {
-            attachment_lines.push(format!(
-                "- kind={:?}, path={}, original_name={}, media_type={}",
-                attachment.kind,
-                attachment.path.display(),
-                attachment.original_name.as_deref().unwrap_or("unknown"),
-                attachment.media_type.as_deref().unwrap_or("unknown")
-            ));
-        }
-        attachment_lines.push(
-            "Use tools if you need to inspect any text attachment or related files.".to_string(),
-        );
-        sections.push(attachment_lines.join("\n"));
-    }
-    if sections.is_empty() {
-        "(No text content; inspect attachments if needed.)".to_string()
-    } else {
-        sections.join("\n\n")
-    }
-}
-
-fn coalesce_buffered_conversation_messages(
-    initial: IncomingMessage,
-    pending_messages: &mut VecDeque<IncomingMessage>,
-) -> IncomingMessage {
-    if initial.control.is_some() {
-        return initial;
-    }
-
-    let mut grouped = vec![initial];
-    let mut remaining = VecDeque::new();
-    while let Some(candidate) = pending_messages.pop_front() {
-        if candidate.control.is_none() && candidate.address == grouped[0].address {
-            grouped.push(candidate);
-        } else {
-            remaining.push_back(candidate);
-        }
-    }
-    *pending_messages = remaining;
-    merge_buffered_messages(grouped)
-}
-
-fn merge_buffered_messages(mut grouped: Vec<IncomingMessage>) -> IncomingMessage {
-    if grouped.len() == 1 {
-        return grouped.remove(0);
-    }
-
-    let remote_message_id = grouped
-        .last()
-        .map(|message| message.remote_message_id.clone())
-        .expect("grouped messages should not be empty");
-    let address = grouped
-        .last()
-        .map(|message| message.address.clone())
-        .expect("grouped messages should not be empty");
-    let mut flattened = Vec::new();
-    let mut attachments = Vec::new();
-    for message in grouped.drain(..) {
-        flattened.push((message.text, message.attachments.len()));
-        attachments.extend(message.attachments);
-    }
-
-    IncomingMessage {
-        remote_message_id,
-        address,
-        text: Some(render_buffered_followup_messages(
-            &flattened
-                .iter()
-                .map(|(text, attachment_count)| (text.as_deref(), *attachment_count))
-                .collect::<Vec<_>>(),
-        )),
-        attachments,
-        control: None,
-    }
-}
-
-fn render_buffered_followup_messages(messages: &[(Option<&str>, usize)]) -> String {
-    let mut sections = vec![
-        QUEUED_USER_UPDATES_MARKER.to_string(),
-        "While you were still working on the previous turn, the user sent multiple follow-up messages. Treat later items as newer steering updates when they conflict.".to_string(),
-    ];
-    for (index, (text, attachment_count)) in messages.iter().enumerate() {
-        let trimmed = text.map(str::trim).unwrap_or("");
-        let body = match (trimmed, *attachment_count) {
-            ("", 0) => "[empty message]".to_string(),
-            ("", count) => format!("[attachments only: {count}]"),
-            (value, 0) => value.to_string(),
-            (value, count) => format!("{value}\n[attachments: {count}]"),
-        };
-        sections.push(format!("Follow-up {}:\n{}", index + 1, body));
-    }
-    sections.join("\n\n")
-}
-
-fn should_emit_profile_change_prompt(text: Option<&str>) -> bool {
-    let trimmed = text.map(str::trim_start).unwrap_or("");
-    !trimmed.starts_with(INTERRUPTED_FOLLOWUP_MARKER)
-        && !trimmed.starts_with(QUEUED_USER_UPDATES_MARKER)
-}
-
-struct IncomingYieldDisposition {
-    interrupted: bool,
-    compaction_in_progress: bool,
-}
-
-fn request_yield_for_incoming(
-    active_controls: &Arc<Mutex<HashMap<String, SessionExecutionControl>>>,
-    active_phases: &Arc<Mutex<HashMap<String, ForegroundRuntimePhase>>>,
-    message: &IncomingMessage,
-) -> IncomingYieldDisposition {
-    if message.control.is_some() {
-        return IncomingYieldDisposition {
-            interrupted: false,
-            compaction_in_progress: false,
-        };
-    }
-    let session_key = message.address.session_key();
-    let control = active_controls
-        .lock()
-        .ok()
-        .and_then(|controls| controls.get(&session_key).cloned());
-    let compaction_in_progress = active_phases
-        .lock()
-        .ok()
-        .and_then(|phases| phases.get(&session_key).copied())
-        .is_some_and(|phase| phase == ForegroundRuntimePhase::Compacting);
-    if let Some(control) = control {
-        control.request_yield();
-        IncomingYieldDisposition {
-            interrupted: true,
-            compaction_in_progress,
-        }
-    } else {
-        IncomingYieldDisposition {
-            interrupted: false,
-            compaction_in_progress: false,
-        }
-    }
-}
-
-fn update_active_foreground_phase(
-    active_phases: &Arc<Mutex<HashMap<String, ForegroundRuntimePhase>>>,
-    session_key: &str,
-    event: &SessionEvent,
-) {
-    let phase = match event {
-        SessionEvent::CompactionStarted { .. } | SessionEvent::ToolWaitCompactionStarted { .. } => {
-            Some(ForegroundRuntimePhase::Compacting)
-        }
-        SessionEvent::CompactionCompleted { .. }
-        | SessionEvent::ToolWaitCompactionCompleted { .. }
-        | SessionEvent::SessionStarted { .. }
-        | SessionEvent::RoundStarted { .. }
-        | SessionEvent::ModelCallStarted { .. }
-        | SessionEvent::ModelCallCompleted { .. }
-        | SessionEvent::CheckpointEmitted { .. }
-        | SessionEvent::ToolWaitCompactionScheduled { .. }
-        | SessionEvent::ToolCallStarted { .. }
-        | SessionEvent::ToolCallCompleted { .. }
-        | SessionEvent::SessionYielded { .. }
-        | SessionEvent::PrefixRewriteApplied { .. }
-        | SessionEvent::SessionCompleted { .. } => Some(ForegroundRuntimePhase::Running),
-    };
-    if let Some(phase) = phase
-        && let Ok(mut phases) = active_phases.lock()
-    {
-        phases.insert(session_key.to_string(), phase);
-    }
-}
-
-fn tag_interrupted_followup_text(text: Option<String>) -> Option<String> {
-    match text {
-        Some(text) if !text.trim().is_empty() => {
-            Some(format!("{INTERRUPTED_FOLLOWUP_MARKER}\n{text}"))
-        }
-        _ => Some(INTERRUPTED_FOLLOWUP_MARKER.to_string()),
-    }
-}
-
-fn fast_path_model_selection_message(
-    workdir: &Path,
-    models: &BTreeMap<String, ModelConfig>,
-    chat_model_keys: &[String],
-    message: &IncomingMessage,
-) -> Option<OutgoingMessage> {
-    if message.control.is_some() {
-        return None;
-    }
-    let text = message.text.as_deref()?.trim();
-    if text.is_empty() {
-        return None;
-    }
-    if text.starts_with('/') {
-        return None;
-    }
-
-    let settings = ConversationManager::new(workdir)
-        .ok()
-        .and_then(|manager| manager.get_snapshot(&message.address))
-        .map(|snapshot| snapshot.settings)
-        .unwrap_or_default();
-    if settings.main_model.is_some() {
-        return None;
-    }
-
-    let mut options = chat_model_keys
-        .iter()
-        .filter(|model_key| models.contains_key(model_key.as_str()))
-        .cloned()
-        .map(|model_key| ShowOption {
-            label: model_key.clone(),
-            value: format!("/model {}", model_key),
-        })
-        .collect::<Vec<_>>();
-    options.sort_by(|left, right| left.label.cmp(&right.label));
-    Some(OutgoingMessage::with_options(
-        "This conversation has no model yet. Choose one to start a new session.\nCurrent conversation model: `<not selected>`\nChoose a model below or send `/model <name>`.",
-        "Choose a model",
-        options,
-    ))
-}
-
-fn build_user_turn_message(
-    text: Option<&str>,
-    attachments: &[StoredAttachment],
-    model: &ModelConfig,
-    backend_supports_native_multimodal: bool,
-) -> Result<ChatMessage> {
-    let image_attachments = attachments
-        .iter()
-        .filter(|attachment| attachment.kind == AttachmentKind::Image)
-        .collect::<Vec<_>>();
-    if !backend_supports_native_multimodal
-        || !model.supports_vision_input
-        || image_attachments.is_empty()
-    {
-        return Ok(ChatMessage::text(
-            "user",
-            compose_user_prompt(text, attachments),
-        ));
-    }
-
-    let mut text_sections = Vec::new();
-    if let Some(text) = text.map(str::trim).filter(|value| !value.is_empty()) {
-        text_sections.push(text.to_string());
-    }
-
-    let file_attachments = attachments
-        .iter()
-        .filter(|attachment| attachment.kind != AttachmentKind::Image)
-        .collect::<Vec<_>>();
-    if !file_attachments.is_empty() {
-        let mut attachment_lines =
-            vec!["Non-image attachments available for this turn:".to_string()];
-        for attachment in file_attachments {
-            attachment_lines.push(format!(
-                "- kind={:?}, path={}, original_name={}, media_type={}",
-                attachment.kind,
-                attachment.path.display(),
-                attachment.original_name.as_deref().unwrap_or("unknown"),
-                attachment.media_type.as_deref().unwrap_or("unknown")
-            ));
-        }
-        attachment_lines.push(
-            "Use tools if you need to inspect any non-image attachment or related files."
-                .to_string(),
-        );
-        text_sections.push(attachment_lines.join("\n"));
-    }
-
-    if text_sections.is_empty() {
-        text_sections.push(format!(
-            "The user attached {} image(s). Inspect the images directly.",
-            image_attachments.len()
-        ));
-    } else {
-        text_sections.push(format!(
-            "The user attached {} image(s), and those images are already directly visible in this request. Inspect them directly here instead of calling the image tool again for the same current-turn attachments.",
-            image_attachments.len()
-        ));
-    }
-
-    let mut content = vec![json!({
-        "type": "text",
-        "text": text_sections.join("\n\n")
-    })];
-    for image in image_attachments {
-        content.push(json!({
-            "type": "image_url",
-            "image_url": {
-                "url": build_image_data_url(image)?,
-            }
-        }));
-    }
-
-    Ok(ChatMessage {
-        role: "user".to_string(),
-        content: Some(Value::Array(content)),
-        name: None,
-        tool_call_id: None,
-        tool_calls: None,
-    })
-}
-
-fn build_synthetic_system_messages(
-    skill_updates_prefix: Option<&str>,
-    profile_change_notices: &[SharedProfileChangeNotice],
-) -> Vec<ChatMessage> {
-    let mut messages = Vec::new();
-    for notice in profile_change_notices {
-        let text = match notice {
-            SharedProfileChangeNotice::UserUpdated => {
-                "[System Message: USER.md changed. It stores user info. If you need refreshed user info in this run, use read_file on ./USER.md.]"
-            }
-            SharedProfileChangeNotice::IdentityUpdated => {
-                "[System Message: IDENTITY.md changed. It defines your persona. Use read_file on ./IDENTITY.md now so your current behavior follows the updated persona.]"
-            }
-        };
-        messages.push(ChatMessage::text("system", text));
-    }
-    if let Some(skill_updates_prefix) = skill_updates_prefix
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        messages.push(ChatMessage::text("system", skill_updates_prefix));
-    }
-    messages
-}
-
-fn build_previous_messages_for_turn(
-    session_agent_messages: &[ChatMessage],
-    pending_continue: Option<&PendingContinueState>,
-    injected_messages: &[ChatMessage],
-    next_user_message: Option<ChatMessage>,
-) -> Vec<ChatMessage> {
-    let mut previous_messages = pending_continue
-        .map(|pending| pending.resume_messages.clone())
-        .unwrap_or_else(|| session_agent_messages.to_vec());
-    previous_messages.extend(injected_messages.iter().cloned());
-    if let Some(next_user_message) = next_user_message {
-        previous_messages.push(next_user_message);
-    }
-    previous_messages
-}
-
-fn system_message_text(message: &ChatMessage) -> Option<&str> {
-    if message.role != "system" {
-        return None;
-    }
-    message.content.as_ref().and_then(Value::as_str)
-}
-
-fn normalize_messages_for_persistence(
-    messages: Vec<ChatMessage>,
-    canonical_system_prompt: &str,
-    ephemeral_system_messages: &[ChatMessage],
-) -> Vec<ChatMessage> {
-    let ephemeral_texts = ephemeral_system_messages
-        .iter()
-        .filter_map(system_message_text)
-        .collect::<HashSet<_>>();
-
-    let mut normalized = Vec::new();
-    let mut index = 0usize;
-    while index < messages.len() && system_message_text(&messages[index]).is_some() {
-        index += 1;
-    }
-    if index > 0 {
-        normalized.push(ChatMessage::text("system", canonical_system_prompt));
-    }
-    for message in messages.into_iter().skip(index) {
-        if let Some(text) = system_message_text(&message) {
-            if ephemeral_texts.contains(text) {
-                continue;
-            }
-        }
-        normalized.push(message);
-    }
-    normalized
-}
-
-fn render_skill_change_notices(notices: &[SkillChangeNotice]) -> String {
-    if notices.is_empty() {
-        return String::new();
-    }
-    let mut sections = vec![
-        "[Runtime Skill Updates]".to_string(),
-        "The global skill registry changed since earlier in this session. Apply these updates before handling the user's new request.".to_string(),
-    ];
-    for notice in notices {
-        match notice {
-            SkillChangeNotice::DescriptionChanged { name, description } => {
-                sections.push(format!(
-                    "Skill \"{name}\" has an updated description:\n{description}"
-                ));
-            }
-            SkillChangeNotice::ContentChanged {
-                name,
-                description,
-                content,
-            } => {
-                sections.push(format!(
-                    "Skill \"{name}\" changed after it was loaded earlier in this session and before that load was compacted away. Use the refreshed skill immediately.\nUpdated description: {description}\nRefreshed SKILL.md content:\n{content}"
-                ));
-            }
-        }
-    }
-    sections.join("\n\n")
-}
-
-fn extract_loaded_skill_names(
-    messages: &[ChatMessage],
-    previous_message_count: usize,
-) -> Vec<String> {
-    let mut skill_names = Vec::new();
-    for message in messages.iter().skip(previous_message_count) {
-        if message.role != "tool" {
-            continue;
-        }
-        let Some(tool_name) = message.name.as_deref() else {
-            continue;
-        };
-        if tool_name != "skill_load" {
-            continue;
-        }
-        let Some(content) = message.content.as_ref().and_then(|value| value.as_str()) else {
-            continue;
-        };
-        let Ok(parsed) = serde_json::from_str::<Value>(content) else {
-            continue;
-        };
-        let Some(skill_name) = parsed.get("name").and_then(|value| value.as_str()) else {
-            continue;
-        };
-        if !skill_names.iter().any(|existing| existing == skill_name) {
-            skill_names.push(skill_name.to_string());
-        }
-    }
-    skill_names
-}
-
-fn build_image_data_url(attachment: &StoredAttachment) -> Result<String> {
-    let bytes = std::fs::read(&attachment.path).with_context(|| {
-        format!(
-            "failed to read image attachment {}",
-            attachment.path.display()
-        )
-    })?;
-    let mime_type = attachment
-        .media_type
-        .as_deref()
-        .filter(|value| value.starts_with("image/"))
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| infer_image_media_type(&attachment.path));
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    Ok(format!("data:{};base64,{}", mime_type, encoded))
-}
-
-fn infer_image_media_type(path: &Path) -> String {
-    match path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        _ => "image/png",
-    }
-    .to_string()
-}
-
-fn spawn_processing_keepalive(
-    channel: Arc<dyn Channel>,
-    address: ChannelAddress,
-    state: ProcessingState,
-) -> Option<oneshot::Sender<()>> {
-    let keepalive_interval = channel.processing_keepalive_interval(state)?;
-    let (stop_sender, mut stop_receiver) = oneshot::channel();
-    tokio::spawn(async move {
-        let mut ticker = interval(keepalive_interval);
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                        _ = &mut stop_receiver => break,
-                        _ = ticker.tick() => {
-                            if let Err(error) = channel.set_processing(&address, state).await {
-                                warn!(
-                                    log_stream = "channel",
-                                    log_key = %channel.id(),
-                                    kind = "processing_keepalive_failed",
-                                    conversation_id = %address.conversation_id,
-                                    error = %format!("{error:#}"),
-                                    "processing keepalive failed"
-                                );
-                                break;
-                    }
-                }
-            }
-        }
-    });
-    Some(stop_sender)
-}
-
-fn extract_attachment_references(
-    assistant_text: &str,
-    workspace_root: &Path,
-) -> Result<(String, Vec<OutgoingAttachment>)> {
-    let mut clean = String::new();
-    let mut remainder = assistant_text;
-    let mut found_paths = Vec::new();
-
-    loop {
-        let Some(open_index) = remainder.find(ATTACHMENT_OPEN_TAG) else {
-            clean.push_str(remainder);
-            break;
-        };
-        clean.push_str(&remainder[..open_index]);
-        let after_open = &remainder[open_index + ATTACHMENT_OPEN_TAG.len()..];
-        let Some(close_index) = after_open.find(ATTACHMENT_CLOSE_TAG) else {
-            clean.push_str(&remainder[open_index..]);
-            break;
-        };
-        let path_text = after_open[..close_index].trim();
-        if !path_text.is_empty() {
-            found_paths.push(path_text.to_string());
-        }
-        remainder = &after_open[close_index + ATTACHMENT_CLOSE_TAG.len()..];
-    }
-
-    let attachments = found_paths
-        .into_iter()
-        .map(|path_text| resolve_outgoing_attachment(workspace_root, &path_text))
-        .collect::<Result<Vec<_>>>()?;
-
-    Ok((clean.trim().to_string(), attachments))
-}
-
-fn resolve_outgoing_attachment(
-    workspace_root: &Path,
-    relative_path: &str,
-) -> Result<OutgoingAttachment> {
-    let candidate = PathBuf::from(relative_path);
-    if candidate.is_absolute() {
-        return Err(anyhow::anyhow!(
-            "attachment path must be relative to workspace root, got absolute path {}",
-            candidate.display()
-        ));
-    }
-
-    let joined = workspace_root.join(&candidate);
-    let canonical_root = std::fs::canonicalize(workspace_root)
-        .with_context(|| format!("failed to canonicalize {}", workspace_root.display()))?;
-    let canonical_file = std::fs::canonicalize(&joined)
-        .with_context(|| format!("attachment path does not exist: {}", joined.display()))?;
-    if !canonical_file.starts_with(&canonical_root) {
-        return Err(anyhow::anyhow!(
-            "attachment path escapes workspace root: {}",
-            canonical_file.display()
-        ));
-    }
-
-    let extension = canonical_file
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let kind = match extension.as_str() {
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" => AttachmentKind::Image,
-        _ => AttachmentKind::File,
-    };
-
-    Ok(OutgoingAttachment {
-        kind,
-        path: canonical_file,
-        caption: None,
-    })
-}
-
-fn build_outgoing_message_for_session(
-    session: &SessionSnapshot,
-    assistant_text: &str,
-    workspace_root: &Path,
-) -> Result<OutgoingMessage> {
-    let (clean_text, attachments) = extract_attachment_references(assistant_text, workspace_root)?;
-    let mut outgoing = OutgoingMessage {
-        text: if clean_text.trim().is_empty() {
-            None
-        } else {
-            Some(clean_text)
-        },
-        images: Vec::new(),
-        attachments: Vec::new(),
-        options: None,
-    };
-    for attachment in attachments {
-        let attachment = persist_outgoing_attachment(session, attachment)?;
-        match attachment.kind {
-            AttachmentKind::Image => outgoing.images.push(attachment),
-            AttachmentKind::File => outgoing.attachments.push(attachment),
-        }
-    }
-    Ok(outgoing)
-}
-
-fn persist_outgoing_attachment(
-    session: &SessionSnapshot,
-    attachment: OutgoingAttachment,
-) -> Result<OutgoingAttachment> {
-    let outgoing_dir = session.root_dir.join("outgoing");
-    std::fs::create_dir_all(&outgoing_dir)
-        .with_context(|| format!("failed to create {}", outgoing_dir.display()))?;
-    let file_name = attachment
-        .path
-        .file_name()
-        .map(|value| value.to_os_string())
-        .unwrap_or_else(|| format!("attachment-{}", uuid::Uuid::new_v4()).into());
-    let persisted_path = outgoing_dir.join(file_name);
-    std::fs::copy(&attachment.path, &persisted_path).with_context(|| {
-        format!(
-            "failed to copy outgoing attachment {} to {}",
-            attachment.path.display(),
-            persisted_path.display()
-        )
-    })?;
-    Ok(OutgoingAttachment {
-        kind: attachment.kind,
-        path: persisted_path,
-        caption: attachment.caption,
-    })
-}
-
-fn relative_attachment_path(workspace_root: &Path, path: &Path) -> Result<String> {
-    let relative = path.strip_prefix(workspace_root).with_context(|| {
-        format!(
-            "path {} is not under {}",
-            path.display(),
-            workspace_root.display()
-        )
-    })?;
-    Ok(relative.to_string_lossy().to_string())
-}
-
-fn parse_sink_target(value: &Value, default_target: Option<SinkTarget>) -> Result<SinkTarget> {
-    let object = value
-        .as_object()
-        .ok_or_else(|| anyhow!("sink must be an object"))?;
-    let kind = object
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or("direct");
-    match kind {
-        "current_session" => default_target
-            .ok_or_else(|| anyhow!("current_session sink requires a default session target")),
-        "direct" => Ok(SinkTarget::Direct(ChannelAddress {
-            channel_id: object
-                .get("channel_id")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .or_else(|| match &default_target {
-                    Some(SinkTarget::Direct(address)) => Some(address.channel_id.clone()),
-                    _ => None,
-                })
-                .ok_or_else(|| anyhow!("direct sink requires channel_id"))?,
-            conversation_id: object
-                .get("conversation_id")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .or_else(|| match &default_target {
-                    Some(SinkTarget::Direct(address)) => Some(address.conversation_id.clone()),
-                    _ => None,
-                })
-                .ok_or_else(|| anyhow!("direct sink requires conversation_id"))?,
-            user_id: object
-                .get("user_id")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .or_else(|| match &default_target {
-                    Some(SinkTarget::Direct(address)) => address.user_id.clone(),
-                    _ => None,
-                }),
-            display_name: object
-                .get("display_name")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .or_else(|| match &default_target {
-                    Some(SinkTarget::Direct(address)) => address.display_name.clone(),
-                    _ => None,
-                }),
-        })),
-        "broadcast" => Ok(SinkTarget::Broadcast(
-            object
-                .get("topic")
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| anyhow!("broadcast sink requires topic"))?,
-        )),
-        "multi" => {
-            let targets = object
-                .get("targets")
-                .and_then(Value::as_array)
-                .ok_or_else(|| anyhow!("multi sink requires targets"))?;
-            let parsed = targets
-                .iter()
-                .map(|target| parse_sink_target(target, default_target.clone()))
-                .collect::<Result<Vec<_>>>()?;
-            Ok(SinkTarget::Multi(parsed))
-        }
-        other => Err(anyhow!("unsupported sink kind {}", other)),
-    }
-}
-
-fn sink_target_to_value(target: &SinkTarget) -> Value {
-    match target {
-        SinkTarget::Direct(address) => json!({
-            "kind": "direct",
-            "channel_id": address.channel_id,
-            "conversation_id": address.conversation_id,
-            "user_id": address.user_id,
-            "display_name": address.display_name
-        }),
-        SinkTarget::Broadcast(topic) => json!({
-            "kind": "broadcast",
-            "topic": topic
-        }),
-        SinkTarget::Multi(targets) => json!({
-            "kind": "multi",
-            "targets": targets.iter().map(sink_target_to_value).collect::<Vec<_>>()
-        }),
-    }
-}
-
-fn parse_uuid_arg(arguments: &serde_json::Map<String, Value>, key: &str) -> Result<uuid::Uuid> {
-    let value = arguments
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("{} must be a string UUID", key))?;
-    uuid::Uuid::parse_str(value).with_context(|| format!("{} must be a valid UUID", key))
-}
-
-fn string_arg_required(arguments: &serde_json::Map<String, Value>, key: &str) -> Result<String> {
-    arguments
-        .get(key)
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| anyhow!("{} must be a non-empty string", key))
-}
-
-fn optional_string_arg(
-    arguments: &serde_json::Map<String, Value>,
-    key: &str,
-) -> Result<Option<String>> {
-    match arguments.get(key) {
-        Some(value) => value
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .map(Some)
-            .ok_or_else(|| anyhow!("{} must be a non-empty string", key)),
-        None => Ok(None),
-    }
-}
-
-fn parse_checker_from_tool_args(
-    arguments: &serde_json::Map<String, Value>,
-) -> Result<Option<CronCheckerConfig>> {
-    let Some(command) = arguments.get("checker_command").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let command = command.trim();
-    if command.is_empty() {
-        return Err(anyhow!("checker_command must not be empty"));
-    }
-    let timeout_seconds = arguments
-        .get("checker_timeout_seconds")
-        .and_then(Value::as_f64)
-        .unwrap_or(30.0);
-    let cwd = arguments
-        .get("checker_cwd")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    Ok(Some(CronCheckerConfig {
-        command: command.to_string(),
-        timeout_seconds,
-        cwd,
-    }))
-}
-
-fn normalize_sink_target(target: SinkTarget, session: &SessionSnapshot) -> SinkTarget {
-    match target {
-        SinkTarget::Direct(address) => {
-            if address.channel_id == session.address.channel_id
-                && address.conversation_id == session.id.to_string()
-            {
-                warn!(
-                    log_stream = "agent",
-                    log_key = %session.agent_id,
-                    kind = "background_sink_normalized",
-                    session_id = %session.id,
-                    channel_id = %session.address.channel_id,
-                    incorrect_conversation_id = %address.conversation_id,
-                    corrected_conversation_id = %session.address.conversation_id,
-                    "background agent sink used session_id as conversation_id; correcting to the current channel conversation"
-                );
-                SinkTarget::Direct(session.address.clone())
-            } else {
-                SinkTarget::Direct(address)
-            }
-        }
-        SinkTarget::Broadcast(topic) => SinkTarget::Broadcast(topic),
-        SinkTarget::Multi(targets) => SinkTarget::Multi(
-            targets
-                .into_iter()
-                .map(|target| normalize_sink_target(target, session))
-                .collect(),
-        ),
-    }
-}
-
-fn evaluate_cron_checker(checker: &CronCheckerConfig, workspace_root: &Path) -> Result<bool> {
-    let cwd = checker
-        .cwd
-        .as_deref()
-        .map(PathBuf::from)
-        .map(|path| {
-            if path.is_absolute() {
-                path
-            } else {
-                workspace_root.join(path)
-            }
-        })
-        .unwrap_or_else(|| workspace_root.to_path_buf());
-    let command = checker.command.clone();
-    let timeout_seconds = checker.timeout_seconds;
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let result = Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .current_dir(&cwd)
-            .output()
-            .with_context(|| format!("failed to execute checker in {}", cwd.display()))
-            .map(|output| output.status.success());
-        let _ = sender.send(result);
-    });
-    receiver
-        .recv_timeout(Duration::from_secs_f64(timeout_seconds))
-        .map_err(|_| anyhow!("checker timed out after {} seconds", timeout_seconds))?
-}
-
-fn create_detached_session_snapshot(
-    workspace_manager: &WorkspaceManager,
-    workdir: &Path,
-    address: ChannelAddress,
-    agent_id: uuid::Uuid,
-) -> Result<SessionSnapshot> {
-    let session_id = uuid::Uuid::new_v4();
-    let workspace_id = format!("detached-{}", session_id);
-    let root_dir = workdir.join("sessions").join(session_id.to_string());
-    std::fs::create_dir_all(&root_dir)
-        .with_context(|| format!("failed to create {}", root_dir.display()))?;
-    let workspace = workspace_manager.create_transient_workspace(
-        workspace_id.clone(),
-        Some("Detached Background Workspace"),
-        agent_id,
-        session_id,
-    )?;
-    let workspace_root = workspace.files_dir.clone();
-    let attachments_dir = workspace_root.join("upload");
-    Ok(SessionSnapshot {
-        id: session_id,
-        agent_id,
-        address,
-        root_dir,
-        attachments_dir,
-        workspace_id,
-        workspace_root,
-        message_count: 0,
-        agent_message_count: 0,
-        agent_messages: Vec::new(),
-        last_agent_returned_at: None,
-        last_compacted_at: None,
-        turn_count: 0,
-        last_compacted_turn_count: 0,
-        cumulative_usage: TokenUsage::default(),
-        cumulative_compaction: SessionCompactionStats::default(),
-        api_timeout_override_seconds: None,
-        skill_states: HashMap::new(),
-        seen_user_profile_version: None,
-        seen_identity_profile_version: None,
-        idle_compaction_retry: None,
-        pending_continue: None,
-        pending_workspace_summary: false,
-        close_after_summary: false,
-    })
-}
-
-fn f64_arg_required(arguments: &serde_json::Map<String, Value>, key: &str) -> Result<f64> {
-    arguments
-        .get(key)
-        .and_then(Value::as_f64)
-        .ok_or_else(|| anyhow!("{} must be a number", key))
-}
-
-fn cleanup_detached_session_root(
-    runtime: &ServerRuntime,
-    job: &BackgroundJobRequest,
-) -> Result<()> {
-    if job.cron_task_id.is_some() && job.session.root_dir.exists() {
-        std::fs::remove_dir_all(&job.session.root_dir).with_context(|| {
-            format!(
-                "failed to remove detached cron session directory {}",
-                job.session.root_dir.display()
-            )
-        })?;
-    }
-    if job.cron_task_id.is_some() {
-        runtime
-            .workspace_manager
-            .delete_workspace(&job.session.workspace_id)?;
-    }
-    Ok(())
-}
-
-fn background_agent_timeout_seconds(model_timeout_seconds: f64) -> f64 {
-    model_timeout_seconds + 15.0
-}
-
-fn background_recovery_timeout_seconds(model_timeout_seconds: f64, error: &anyhow::Error) -> f64 {
-    if error.to_string().contains("timed out") {
-        model_timeout_seconds.mul_add(2.0, 15.0)
-    } else {
-        model_timeout_seconds + 30.0
-    }
-}
-
-fn is_timeout_like(error: &anyhow::Error) -> bool {
-    error.to_string().contains("timed out")
-}
-
-fn should_attempt_idle_context_compaction(
-    session: &SessionSnapshot,
-    now: chrono::DateTime<Utc>,
-    idle_threshold: Duration,
-    estimated_tokens: usize,
-    min_tokens: usize,
-) -> bool {
-    let Some(last_returned_at) = session.last_agent_returned_at else {
-        return false;
-    };
-    if session.turn_count <= session.last_compacted_turn_count {
-        return false;
-    }
-    if estimated_tokens < min_tokens {
-        return false;
-    }
-    let Ok(idle_elapsed) = now.signed_duration_since(last_returned_at).to_std() else {
-        return false;
-    };
-    idle_elapsed > idle_threshold
-}
-
-fn background_timeout_with_active_children_text(language: &str) -> String {
-    let language = language.to_ascii_lowercase();
-    if language.starts_with("zh") {
-        "后台任务超时了，而且它启动的子任务可能还在收尾，所以系统没有自动重试以避免冲突。请稍后查看结果，或重新发起一个新任务。".to_string()
-    } else {
-        "The background task timed out, and child agents may still be finishing work, so the system skipped automatic recovery to avoid conflicts. Please check back later or start a new task.".to_string()
-    }
-}
-
-fn user_facing_error_text(language: &str, error: &anyhow::Error) -> String {
-    let language = language.to_ascii_lowercase();
-    let error_text = format!("{error:#}").to_ascii_lowercase();
-    let timeout_like = is_timeout_like(error);
-    let upstream_timeout = timeout_like
-        && (error_text.contains("upstream")
-            || error_text.contains("response body")
-            || error_text.contains("chat completion")
-            || error_text.contains("operation timed out"));
-    let upstream_error = error_text.contains("upstream");
-    if language.starts_with("zh") {
-        if upstream_timeout {
-            "这一轮请求上游模型超时了。通常是模型响应过慢或网络波动导致的。请稍后重试；如果系统提示存在恢复点，可以发送 /continue 从最近稳定状态继续。".to_string()
-        } else if upstream_error {
-            "这一轮请求上游模型时失败了。请稍后重试；如果系统提示存在恢复点，可以发送 /continue 从最近稳定状态继续。"
-                .to_string()
-        } else if timeout_like {
-            "这一轮处理超时了。请稍后重试；如果系统提示存在恢复点，可以发送 /continue 从最近稳定状态继续。".to_string()
-        } else {
-            "这一轮处理失败了。请稍后重试；如果系统提示存在恢复点，可以发送 /continue 从最近稳定状态继续。".to_string()
-        }
-    } else if upstream_timeout {
-        "This turn failed because the upstream model request timed out. Please try again; if the system indicates a recovery point is available, send /continue to resume from the last stable state.".to_string()
-    } else if upstream_error {
-        "This turn failed while calling the upstream model. Please try again; if the system indicates a recovery point is available, send /continue to resume from the last stable state.".to_string()
-    } else if timeout_like {
-        "This turn timed out. Please try again; if the system indicates a recovery point is available, send /continue to resume from the last stable state.".to_string()
-    } else {
-        "This turn failed. Please try again; if the system indicates a recovery point is available, send /continue to resume from the last stable state.".to_string()
-    }
-}
-
-fn user_facing_continue_error_text(
-    language: &str,
-    error: &anyhow::Error,
-    progress_summary: &str,
-) -> String {
-    let language = language.to_ascii_lowercase();
-    let error_text = format!("{error:#}").to_ascii_lowercase();
-    if error_text.contains("tool-wait context compaction failed")
-        || error_text.contains("threshold context compaction failed")
-    {
-        if language.starts_with("zh") {
-            return format!(
-                "自动上下文压缩失败了，但系统已经保留到最近的稳定位置。\n\n当前进度：{}\n\n发送 /continue 可以从这里继续。",
-                progress_summary
-            );
-        }
-        return format!(
-            "Automatic context compaction failed, but the session has been preserved at the latest stable point.\n\nProgress so far: {}\n\nSend /continue to resume from there.",
-            progress_summary
-        );
-    }
-    let upstream_like = error_text.contains("upstream")
-        || error_text.contains("provider")
-        || error_text.contains("chat completion")
-        || is_timeout_like(error);
-    if language.starts_with("zh") {
-        if upstream_like {
-            format!(
-                "这一轮在调用上游模型时失败了，但系统已经保留到最近的稳定位置。\n\n当前进度：{}\n\n发送 /continue 可以从这里继续。",
-                progress_summary
-            )
-        } else {
-            format!(
-                "这一轮在完成前失败了，但系统已经保留到最近的稳定位置。\n\n当前进度：{}\n\n发送 /continue 可以尝试继续。",
-                progress_summary
-            )
-        }
-    } else if upstream_like {
-        format!(
-            "This turn failed while calling the upstream model, but the session has been preserved at the latest stable point.\n\nProgress so far: {}\n\nSend /continue to resume from there.",
-            progress_summary
-        )
-    } else {
-        format!(
-            "This turn failed before finishing, but the session has been preserved at the latest stable point.\n\nProgress so far: {}\n\nSend /continue to try resuming from there.",
-            progress_summary
-        )
-    }
-}
-
-fn summarize_resume_progress(messages: &[ChatMessage]) -> String {
-    let last_user_index = messages
-        .iter()
-        .rposition(|message| message.role == "user")
-        .unwrap_or(0);
-    let trailing = &messages[last_user_index.saturating_add(1)..];
-    let tool_result_count = trailing
-        .iter()
-        .filter(|message| message.role == "tool")
-        .count();
-    let tool_names = trailing
-        .iter()
-        .filter(|message| message.role == "assistant")
-        .filter_map(|message| message.tool_calls.as_ref())
-        .flat_map(|tool_calls| {
-            tool_calls
-                .iter()
-                .map(|tool_call| tool_call.function.name.clone())
-        })
-        .collect::<Vec<_>>();
-    if tool_result_count > 0 {
-        let recent_tools = tool_names.iter().rev().take(3).cloned().collect::<Vec<_>>();
-        if recent_tools.is_empty() {
-            format!(
-                "the previous turn already reached tool execution and preserved {tool_result_count} tool result(s)"
-            )
-        } else {
-            format!(
-                "the previous turn already reached tool execution and preserved {} tool result(s); recent tools: {}",
-                tool_result_count,
-                recent_tools
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
-        }
-    } else {
-        let partial_text = trailing
-            .iter()
-            .filter(|message| message.role == "assistant")
-            .filter_map(|message| message.content.as_ref())
-            .filter_map(Value::as_str)
-            .find(|text| !text.trim().is_empty())
-            .map(str::trim)
-            .map(|text| text.chars().take(120).collect::<String>());
-        match partial_text {
-            Some(text) => format!(
-                "the previous turn preserved partial assistant progress: {}",
-                text
-            ),
-            None => "the previous turn was preserved before the assistant could finish responding"
-                .to_string(),
-        }
-    }
-}
-
-fn format_session_status(
-    language: &str,
-    model_key: &str,
-    model: &ModelConfig,
-    session: &SessionSnapshot,
-    effective_api_timeout_seconds: f64,
-    timeout_source: &str,
-    current_context_estimate: usize,
-    current_context_limit: usize,
-    current_reasoning_effort: Option<&str>,
-    context_compaction_enabled: bool,
-) -> String {
-    let usage = &session.cumulative_usage;
-    let compaction = &session.cumulative_compaction;
-    let cache_hit_rate = if usage.prompt_tokens == 0 {
-        0.0
-    } else {
-        (usage.cache_hit_tokens as f64 / usage.prompt_tokens as f64) * 100.0
-    };
-    let pricing = estimate_cost_usd(model, usage);
-    let compaction_pricing = estimate_compaction_savings_usd(model, compaction);
-    let context_percent = if current_context_limit == 0 {
-        0.0
-    } else {
-        (current_context_estimate as f64 / current_context_limit as f64) * 100.0
-    };
-    let language = language.to_ascii_lowercase();
-    if language.starts_with("zh") {
-        let mut lines = vec![
-            format!("Session: {}", session.id),
-            format!("Workspace: {}", session.workspace_id),
-            format!("Model: {} ({})", model_key, model.model),
-            format!(
-                "API timeout: {:.1}s ({})",
-                effective_api_timeout_seconds, timeout_source
-            ),
-            format!(
-                "Reasoning effort: {}",
-                current_reasoning_effort.unwrap_or("default")
-            ),
-            format!(
-                "Automatic context compaction: {}",
-                if context_compaction_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            ),
-            format!(
-                "Idle compaction retry: {}",
-                format_idle_compaction_retry_status("zh", session)
-            ),
-            format!("Turns: {}", session.turn_count),
-            format!(
-                "Current context estimate: {} / {} tokens ({:.1}%, local estimate)",
-                current_context_estimate, current_context_limit, context_percent
-            ),
-            String::new(),
-            "Token 用量：".to_string(),
-            format!("- llm_calls: {}", usage.llm_calls),
-            format!("- prompt_tokens: {}", usage.prompt_tokens),
-            format!("- completion_tokens: {}", usage.completion_tokens),
-            format!("- total_tokens: {}", usage.total_tokens),
-            format!("- cache_hit_tokens: {}", usage.cache_hit_tokens),
-            format!("- cache_miss_tokens: {}", usage.cache_miss_tokens),
-            format!("- cache_read_tokens: {}", usage.cache_read_tokens),
-            format!("- cache_write_tokens: {}", usage.cache_write_tokens),
-            format!("- cache_hit_rate: {:.2}%", cache_hit_rate),
-        ];
-        if let Some((formula, total_usd)) = pricing {
-            lines.push(String::new());
-            lines.push("价格估算：".to_string());
-            lines.push(format!("- formula: {}", formula));
-            lines.push(format!("- estimated_total_usd: ${:.6}", total_usd));
-        } else {
-            lines.push(String::new());
-            lines.push("价格估算：当前模型没有内置价格表，无法直接估算。".to_string());
-        }
-        lines.push(String::new());
-        lines.push("累计上下文压缩统计：".to_string());
-        lines.push(format!("- compaction_runs: {}", compaction.run_count));
-        lines.push(format!(
-            "- compacted_runs: {}",
-            compaction.compacted_run_count
-        ));
-        lines.push(format!(
-            "- estimated_tokens_before: {}",
-            compaction.estimated_tokens_before
-        ));
-        lines.push(format!(
-            "- estimated_tokens_after: {}",
-            compaction.estimated_tokens_after
-        ));
-        lines.push(format!(
-            "- estimated_tokens_saved: {}",
-            compaction
-                .estimated_tokens_before
-                .saturating_sub(compaction.estimated_tokens_after)
-        ));
-        if let Some((formula, gross_usd, compaction_cost_usd, net_usd)) = compaction_pricing {
-            lines.push(format!("- formula: {}", formula));
-            lines.push(format!(
-                "- estimated_cold_start_gross_usd: ${:.6}",
-                gross_usd
-            ));
-            lines.push(format!(
-                "- estimated_compaction_cost_usd: ${:.6}",
-                compaction_cost_usd
-            ));
-            lines.push(format!("- estimated_net_usd: ${:.6}", net_usd));
-        } else {
-            lines.push(
-                "- estimated_net_usd: unavailable for the current model pricing table.".to_string(),
-            );
-        }
-        lines.join("\n")
-    } else {
-        let mut lines = vec![
-            format!("Session: {}", session.id),
-            format!("Workspace: {}", session.workspace_id),
-            format!("Model: {} ({})", model_key, model.model),
-            format!(
-                "API timeout: {:.1}s ({})",
-                effective_api_timeout_seconds, timeout_source
-            ),
-            format!(
-                "Reasoning effort: {}",
-                current_reasoning_effort.unwrap_or("default")
-            ),
-            format!(
-                "Automatic context compaction: {}",
-                if context_compaction_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            ),
-            format!(
-                "Idle compaction retry: {}",
-                format_idle_compaction_retry_status("en", session)
-            ),
-            format!("Turns: {}", session.turn_count),
-            format!(
-                "Current context estimate: {} / {} tokens ({:.1}%, local estimate)",
-                current_context_estimate, current_context_limit, context_percent
-            ),
-            String::new(),
-            "Token usage:".to_string(),
-            format!("- llm_calls: {}", usage.llm_calls),
-            format!("- prompt_tokens: {}", usage.prompt_tokens),
-            format!("- completion_tokens: {}", usage.completion_tokens),
-            format!("- total_tokens: {}", usage.total_tokens),
-            format!("- cache_hit_tokens: {}", usage.cache_hit_tokens),
-            format!("- cache_miss_tokens: {}", usage.cache_miss_tokens),
-            format!("- cache_read_tokens: {}", usage.cache_read_tokens),
-            format!("- cache_write_tokens: {}", usage.cache_write_tokens),
-            format!("- cache_hit_rate: {:.2}%", cache_hit_rate),
-        ];
-        if let Some((formula, total_usd)) = pricing {
-            lines.push(String::new());
-            lines.push("Estimated cost:".to_string());
-            lines.push(format!("- formula: {}", formula));
-            lines.push(format!("- estimated_total_usd: ${:.6}", total_usd));
-        } else {
-            lines.push(String::new());
-            lines.push(
-                "Estimated cost: unavailable for the current model pricing table.".to_string(),
-            );
-        }
-        lines.push(String::new());
-        lines.push("Cumulative context compaction stats:".to_string());
-        lines.push(format!("- compaction_runs: {}", compaction.run_count));
-        lines.push(format!(
-            "- compacted_runs: {}",
-            compaction.compacted_run_count
-        ));
-        lines.push(format!(
-            "- estimated_tokens_before: {}",
-            compaction.estimated_tokens_before
-        ));
-        lines.push(format!(
-            "- estimated_tokens_after: {}",
-            compaction.estimated_tokens_after
-        ));
-        lines.push(format!(
-            "- estimated_tokens_saved: {}",
-            compaction
-                .estimated_tokens_before
-                .saturating_sub(compaction.estimated_tokens_after)
-        ));
-        if let Some((formula, gross_usd, compaction_cost_usd, net_usd)) = compaction_pricing {
-            lines.push(format!("- formula: {}", formula));
-            lines.push(format!(
-                "- estimated_cold_start_gross_usd: ${:.6}",
-                gross_usd
-            ));
-            lines.push(format!(
-                "- estimated_compaction_cost_usd: ${:.6}",
-                compaction_cost_usd
-            ));
-            lines.push(format!("- estimated_net_usd: ${:.6}", net_usd));
-        } else {
-            lines.push(
-                "- estimated_net_usd: unavailable for the current model pricing table.".to_string(),
-            );
-        }
-        lines.join("\n")
-    }
-}
-
-fn format_idle_compaction_retry_status(language: &str, session: &SessionSnapshot) -> String {
-    let Some(retry) = session.idle_compaction_retry.as_ref() else {
-        return if language.starts_with("zh") {
-            "无".to_string()
-        } else {
-            "none".to_string()
-        };
-    };
-
-    let age = retry
-        .failed_at
-        .map(|failed_at| {
-            let seconds = (Utc::now() - failed_at).num_seconds().max(0);
-            if language.starts_with("zh") {
-                format!("{seconds}s前")
-            } else {
-                format!("{seconds}s ago")
-            }
-        })
-        .unwrap_or_else(|| {
-            if language.starts_with("zh") {
-                "时间未知".to_string()
-            } else {
-                "time unknown".to_string()
-            }
-        });
-    let summary = summarize_idle_compaction_retry_error(&retry.error_summary);
-    if language.starts_with("zh") {
-        format!("待重试 ({age}): {summary}")
-    } else {
-        format!("pending ({age}): {summary}")
-    }
-}
-
-fn summarize_idle_compaction_retry_error(error_summary: &str) -> String {
-    const MAX_CHARS: usize = 120;
-
-    let normalized = error_summary
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    if normalized.chars().count() <= MAX_CHARS {
-        return normalized;
-    }
-
-    normalized.chars().take(MAX_CHARS).collect::<String>() + "..."
-}
-
-struct ModelPricing {
-    input_per_million: f64,
-    output_per_million: f64,
-}
-
-fn model_pricing(model: &ModelConfig) -> Option<ModelPricing> {
-    match (
-        model.api_endpoint.contains("openrouter.ai"),
-        model.model.as_str(),
-    ) {
-        (true, "anthropic/claude-opus-4.6") => Some(ModelPricing {
-            input_per_million: 15.0,
-            output_per_million: 75.0,
-        }),
-        (true, "anthropic/claude-sonnet-4.6") => Some(ModelPricing {
-            input_per_million: 3.0,
-            output_per_million: 15.0,
-        }),
-        (true, "qwen/qwen3.5-27b") => Some(ModelPricing {
-            input_per_million: 0.195,
-            output_per_million: 1.56,
-        }),
-        _ => None,
-    }
-}
-
-fn estimate_cost_usd(model: &ModelConfig, usage: &TokenUsage) -> Option<(String, f64)> {
-    let pricing = model_pricing(model)?;
-    let input_per_million = pricing.input_per_million;
-    let output_per_million = pricing.output_per_million;
-    let cache_read_per_million = input_per_million * 0.1;
-    let cache_write_per_million = input_per_million * 1.25;
-    let uncached_input_tokens = usage
-        .cache_miss_tokens
-        .saturating_sub(usage.cache_write_tokens);
-    let total_usd = (usage.cache_read_tokens as f64 / 1_000_000.0) * cache_read_per_million
-        + (usage.cache_write_tokens as f64 / 1_000_000.0) * cache_write_per_million
-        + (uncached_input_tokens as f64 / 1_000_000.0) * input_per_million
-        + (usage.completion_tokens as f64 / 1_000_000.0) * output_per_million;
-    let formula = format!(
-        "cache_read_tokens * ${cache_read_per_million:.6}/1M + cache_write_tokens * ${cache_write_per_million:.6}/1M + (cache_miss_tokens - cache_write_tokens) * ${input_per_million:.6}/1M + completion_tokens * ${output_per_million:.6}/1M"
-    );
-    Some((formula, total_usd))
-}
-
-fn estimate_compaction_savings_usd(
-    model: &ModelConfig,
-    compaction: &SessionCompactionStats,
-) -> Option<(String, f64, f64, f64)> {
-    let pricing = model_pricing(model)?;
-    let saved_tokens = compaction
-        .estimated_tokens_before
-        .saturating_sub(compaction.estimated_tokens_after);
-    let cold_start_gross_usd = (saved_tokens as f64 / 1_000_000.0) * pricing.input_per_million;
-    let (_, compaction_cost_usd) = estimate_cost_usd(model, &compaction.usage)?;
-    let net_usd = cold_start_gross_usd - compaction_cost_usd;
-    let formula = format!(
-        "(estimated_tokens_before - estimated_tokens_after) * ${:.6}/1M - compaction_run_cost",
-        pricing.input_per_million
-    );
-    Some((formula, cold_start_gross_usd, compaction_cost_usd, net_usd))
-}
-
-fn compaction_stats_from_report(
-    report: &agent_frame::ContextCompactionReport,
-) -> SessionCompactionStats {
-    let mut stats = SessionCompactionStats::default();
-    stats.run_count = 1;
-    stats.compacted_run_count = u64::from(report.compacted);
-    stats.estimated_tokens_before = report.estimated_tokens_before as u64;
-    stats.estimated_tokens_after = report.estimated_tokens_after as u64;
-    stats.usage = report.usage.clone();
-    stats
-}
-
-fn default_prompt_cache_retention(cache_ttl: Option<&str>, model: &ModelConfig) -> Option<String> {
-    cache_ttl.map(str::to_string).or_else(|| {
-        (model.upstream_auth_kind() == agent_frame::config::UpstreamAuthKind::CodexSubscription)
-            .then(|| "24h".to_string())
-    })
-}
-
-fn format_api_timeout_update(
-    session: &SessionSnapshot,
-    model_timeout_seconds: f64,
-    argument: &str,
-) -> Result<(Option<f64>, String)> {
-    let normalized = argument.trim().to_ascii_lowercase();
-    if normalized == "default" || normalized == "reset" || normalized == "0" {
-        return Ok((
-            None,
-            format!(
-                "API timeout reset for session {}. Effective timeout is now {:.1}s (model default).",
-                session.id, model_timeout_seconds
-            ),
-        ));
-    }
-    let timeout_seconds: f64 = argument
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid timeout value '{}'", argument.trim()))?;
-    if timeout_seconds <= 0.0 {
-        return Err(anyhow!(
-            "API timeout must be greater than 0 seconds, or use 0/default/reset to restore the model default"
-        ));
-    }
-    Ok((
-        Some(timeout_seconds),
-        format!(
-            "API timeout updated for session {}. Effective timeout is now {:.1}s (session override).",
-            session.id, timeout_seconds
-        ),
-    ))
-}
-
-fn parse_oldspace_command(text: Option<&str>) -> Option<String> {
-    let text = normalized_command_text(text?)?;
-    let suffix = text.strip_prefix("/oldspace")?.trim();
-    if suffix.is_empty() {
-        None
-    } else {
-        Some(suffix.to_string())
-    }
-}
-
-fn parse_set_api_timeout_command(text: Option<&str>) -> Option<String> {
-    let text = normalized_command_text(text?)?;
-    let suffix = text.strip_prefix("/set_api_timeout")?.trim();
-    if suffix.is_empty() {
-        None
-    } else {
-        Some(suffix.to_string())
-    }
-}
-
-fn parse_model_command(text: Option<&str>) -> Option<Option<String>> {
-    parse_optional_command_argument(text, "/model")
-}
-
-fn parse_compact_mode_command(text: Option<&str>) -> Option<Option<String>> {
-    parse_optional_command_argument(text, "/compact_mode")
-}
-
-fn parse_sandbox_command(text: Option<&str>) -> Option<Option<String>> {
-    parse_optional_command_argument(text, "/sandbox")
-}
-
-fn parse_think_command(text: Option<&str>) -> Option<Option<String>> {
-    parse_optional_command_argument(text, "/think")
-}
-
-fn parse_snap_save_command(text: Option<&str>) -> Option<String> {
-    parse_required_command_argument(text, "/snapsave")
-}
-
-fn parse_snap_load_command(text: Option<&str>) -> Option<String> {
-    parse_required_command_argument(text, "/snapload")
-}
-
-fn parse_snap_list_command(text: Option<&str>) -> bool {
-    matches!(parse_optional_command_argument(text, "/snaplist"), Some(_))
-}
-
-fn parse_continue_command(text: Option<&str>) -> bool {
-    matches!(parse_optional_command_argument(text, "/continue"), Some(_))
-}
-
-fn parse_admin_authorize_command(text: Option<&str>) -> bool {
-    text.map(str::trim).is_some_and(|value| {
-        command_matches(value, "/admin_authorize") || command_matches(value, "/authorize")
-    })
-}
-
-fn parse_admin_chat_list_command(text: Option<&str>) -> bool {
-    matches!(
-        parse_optional_command_argument(text, "/admin_chat_list"),
-        Some(_)
-    )
-}
-
-fn parse_admin_chat_approve_command(text: Option<&str>) -> Option<String> {
-    parse_required_command_argument(text, "/admin_chat_approve")
-}
-
-fn parse_admin_chat_reject_command(text: Option<&str>) -> Option<String> {
-    parse_required_command_argument(text, "/admin_chat_reject")
-}
-
-fn parse_optional_command_argument(text: Option<&str>, command: &str) -> Option<Option<String>> {
-    let text = normalized_command_text(text?)?;
-    if text == command {
-        return Some(None);
-    }
-    let suffix = text.strip_prefix(command)?.trim();
-    if suffix.is_empty() {
-        Some(None)
-    } else {
-        Some(Some(suffix.to_string()))
-    }
-}
-
-fn parse_required_command_argument(text: Option<&str>, command: &str) -> Option<String> {
-    let text = normalized_command_text(text?)?;
-    let suffix = text.strip_prefix(command)?.trim();
-    if suffix.is_empty() {
-        None
-    } else {
-        Some(suffix.to_string())
-    }
-}
-
-fn normalized_command_text(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut parts = trimmed.splitn(2, char::is_whitespace);
-    let first = parts.next()?;
-    let normalized_first = first_token_without_mention(first);
-    let rest = parts.next().map(str::trim_start).unwrap_or("");
-    if rest.is_empty() {
-        Some(normalized_first.to_string())
-    } else {
-        Some(format!("{normalized_first} {rest}"))
-    }
-}
-
-fn first_token_without_mention(token: &str) -> &str {
-    token.split_once('@').map_or(token, |(base, _)| base)
-}
-
-fn command_matches(text: &str, command: &str) -> bool {
-    normalized_command_text(text).as_deref() == Some(command)
-}
-
-fn command_starts_with(text: &str, command: &str) -> bool {
-    normalized_command_text(text)
-        .as_deref()
-        .is_some_and(|normalized| normalized.starts_with(command))
-}
-
-fn sandbox_mode_label(mode: SandboxMode) -> &'static str {
-    match mode {
-        SandboxMode::Disabled => "disabled",
-        SandboxMode::Subprocess => "subprocess",
-        SandboxMode::Bubblewrap => "bubblewrap",
-    }
-}
-
-fn sandbox_mode_value(mode: SandboxMode) -> &'static str {
-    sandbox_mode_label(mode)
-}
-
-fn parse_sandbox_mode_value(value: &str) -> Option<SandboxMode> {
-    match value.trim() {
-        "disabled" => Some(SandboxMode::Disabled),
-        "subprocess" => Some(SandboxMode::Subprocess),
-        "bubblewrap" => Some(SandboxMode::Bubblewrap),
-        _ => None,
-    }
-}
-
-fn parse_reasoning_effort_value(value: &str) -> Option<&'static str> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "low" => Some("low"),
-        "medium" => Some("medium"),
-        "high" => Some("high"),
-        _ => None,
-    }
-}
-
-fn effective_reasoning_config(
-    model: &ModelConfig,
-    conversation_effort: Option<&str>,
-) -> Option<agent_frame::config::ReasoningConfig> {
-    let mut reasoning = model.reasoning.clone().unwrap_or_default();
-    if let Some(effort) = conversation_effort {
-        reasoning.effort = Some(effort.to_string());
-    }
-    if reasoning.effort.is_none()
-        && reasoning.max_tokens.is_none()
-        && reasoning.exclude.is_none()
-        && reasoning.enabled.is_none()
-    {
-        None
-    } else {
-        Some(reasoning)
-    }
-}
-
-fn estimate_current_context_tokens_for_session(
-    runtime: &ServerRuntime,
-    session: &SessionSnapshot,
-    model_key: &str,
-) -> Result<usize> {
-    let frame_config = runtime.build_agent_frame_config(
-        session,
-        &session.workspace_root,
-        AgentPromptKind::MainForeground,
-        model_key,
-        None,
-    )?;
-    let skills = discover_skills(&frame_config.skills_dirs)?;
-    let extra_tools = runtime.build_extra_tools(
-        session,
-        AgentPromptKind::MainForeground,
-        session.agent_id,
-        None,
-    );
-    let registry = build_tool_registry(
-        &frame_config.enabled_tools,
-        &frame_config.workspace_root,
-        &frame_config.runtime_state_root,
-        &frame_config.upstream,
-        frame_config.image_tool_upstream.as_ref(),
-        &frame_config.skills_dirs,
-        &skills,
-        &extra_tools,
-    )?;
-    let tools = registry.into_values().collect::<Vec<_>>();
-    Ok(estimate_session_tokens(&session.agent_messages, &tools, ""))
-}
-
-fn conversation_memory_root(session: &SessionSnapshot) -> PathBuf {
-    session.root_dir.join("conversation_memory")
-}
-
-fn ensure_parent_dir(path: &Path) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("path {} has no parent", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))
-}
-
-fn write_json_pretty<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    ensure_parent_dir(path)?;
-    let raw = serde_json::to_string_pretty(value)
-        .with_context(|| format!("failed to serialize {}", path.display()))?;
-    fs::write(path, raw).with_context(|| format!("failed to write {}", path.display()))
-}
-
-fn read_json_or_default<T>(path: &Path) -> Result<T>
-where
-    T: for<'de> Deserialize<'de> + Default,
-{
-    if !path.is_file() {
-        return Ok(T::default());
-    }
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
-}
-
-fn merge_unique_strings(existing: &mut Vec<String>, incoming: impl IntoIterator<Item = String>) {
-    for value in incoming {
-        let trimmed = value.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if !existing.iter().any(|current| current == trimmed) {
-            existing.push(trimmed.to_string());
-        }
-    }
-}
-
-fn classify_chat_message_kind(message: &ChatMessage) -> &'static str {
-    if message.role == "tool" {
-        "tool_result"
-    } else if message.role == "assistant"
-        && message
-            .tool_calls
-            .as_ref()
-            .is_some_and(|calls| !calls.is_empty())
-    {
-        "tool_call"
-    } else if message.role == "user" {
-        "user_message"
-    } else if message.role == "system" {
-        "system_message"
-    } else {
-        "assistant_message"
-    }
-}
-
-fn next_rollout_id() -> String {
-    let suffix = Uuid::new_v4().simple().to_string();
-    format!(
-        "{}-{}",
-        Utc::now().format("%Y-%m-%dT%H-%M-%S"),
-        &suffix[..8]
-    )
-}
-
-fn persist_compaction_artifacts(
-    session: &SessionSnapshot,
-    report: &ContextCompactionReport,
-) -> Result<Option<String>> {
-    let Some(structured) = report.structured_output.as_ref() else {
-        return Ok(None);
-    };
-    if report.compacted_messages.is_empty() {
-        return Ok(None);
-    }
-
-    let memory_root = conversation_memory_root(session);
-    let rollout_id = next_rollout_id();
-    let rollout_dir = memory_root.join("rollouts").join(&rollout_id);
-    fs::create_dir_all(&rollout_dir)
-        .with_context(|| format!("failed to create {}", rollout_dir.display()))?;
-
-    let created_at = Utc::now().to_rfc3339();
-    let rollout_summary = PersistedRolloutSummary {
-        rollout_id: rollout_id.clone(),
-        conversation_id: session.address.conversation_id.clone(),
-        created_at: created_at.clone(),
-        source_message_count: report.compacted_messages.len(),
-        summary: structured.new_summary.clone(),
-        old_summary: structured.old_summary.clone(),
-        keywords: structured.keywords.clone(),
-        important_refs: structured.important_refs.clone(),
-        next_step: structured.next_step.clone(),
-    };
-    write_json_pretty(&rollout_dir.join("rollout_summary.json"), &rollout_summary)?;
-
-    let transcript_path = rollout_dir.join("rollout_transcript.jsonl");
-    let mut transcript_lines = Vec::with_capacity(report.compacted_messages.len());
-    for (index, message) in report.compacted_messages.iter().enumerate() {
-        transcript_lines.push(serde_json::to_string(&json!({
-            "event_id": index,
-            "timestamp": created_at,
-            "kind": classify_chat_message_kind(message),
-            "role": message.role,
-            "name": message.name,
-            "tool_call_id": message.tool_call_id,
-            "tool_calls": message.tool_calls,
-            "content": message.content,
-        }))?);
-    }
-    fs::write(&transcript_path, transcript_lines.join("\n"))
-        .with_context(|| format!("failed to write {}", transcript_path.display()))?;
-
-    let memory_path = memory_root.join("MEMORY.json");
-    let mut memory_index: PersistedMemoryIndex = read_json_or_default(&memory_path)?;
-    let rollout_summary_path = format!("rollouts/{}/rollout_summary.json", rollout_id);
-    for hint in &structured.memory_hints {
-        if hint.group.trim().is_empty() {
-            continue;
-        }
-        let group = if let Some(existing) = memory_index
-            .groups
-            .iter_mut()
-            .find(|group| group.group == hint.group)
-        {
-            existing
-        } else {
-            memory_index.groups.push(PersistedMemoryGroup {
-                group: hint.group.clone(),
-                ..PersistedMemoryGroup::default()
-            });
-            memory_index
-                .groups
-                .last_mut()
-                .expect("group inserted for memory index")
-        };
-        merge_unique_strings(&mut group.conclusions, hint.conclusions.clone());
-        merge_unique_strings(&mut group.keywords, structured.keywords.clone());
-        merge_unique_strings(&mut group.rollouts, [rollout_summary_path.clone()]);
-    }
-    write_json_pretty(&memory_path, &memory_index)?;
-
-    let memory_summary_path = memory_root.join("memory_summary.json");
-    let mut memory_summary: PersistedMemorySummary = read_json_or_default(&memory_summary_path)?;
-    memory_summary.updated_at = created_at;
-    merge_unique_strings(
-        &mut memory_summary.recent_groups,
-        structured
-            .memory_hints
-            .iter()
-            .map(|hint| hint.group.clone()),
-    );
-    merge_unique_strings(
-        &mut memory_summary.recent_rollouts,
-        [rollout_summary_path.clone()],
-    );
-    if memory_summary.recent_groups.len() > 12 {
-        let drain_count = memory_summary.recent_groups.len() - 12;
-        memory_summary.recent_groups.drain(0..drain_count);
-    }
-    if memory_summary.recent_rollouts.len() > 12 {
-        let drain_count = memory_summary.recent_rollouts.len() - 12;
-        memory_summary.recent_rollouts.drain(0..drain_count);
-    }
-    write_json_pretty(&memory_summary_path, &memory_summary)?;
-
-    Ok(Some(rollout_id))
-}
-
-fn persist_compaction_artifacts_from_event(
-    session: &SessionSnapshot,
-    structured_output: &StructuredCompactionOutput,
-    compacted_messages: &[ChatMessage],
-) -> Result<Option<String>> {
-    let report = ContextCompactionReport {
-        messages: Vec::new(),
-        compacted_messages: compacted_messages.to_vec(),
-        usage: TokenUsage::default(),
-        compacted: true,
-        estimated_tokens_before: 0,
-        estimated_tokens_after: 0,
-        token_limit: 0,
-        structured_output: Some(structured_output.clone()),
-    };
-    persist_compaction_artifacts(session, &report)
-}
-
-fn lower_contains(haystack: &str, needle: &str) -> bool {
-    haystack.to_lowercase().contains(&needle.to_lowercase())
-}
-
-fn stable_content_version(content: &str) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    content.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct SharedProfileUploadReport {
-    user_changed: bool,
-    identity_changed: bool,
-}
-
-impl SharedProfileUploadReport {
-    fn changed_any(self) -> bool {
-        self.user_changed || self.identity_changed
-    }
-}
-
-fn sync_workspace_shared_profile_files(
-    agent_workspace: &AgentWorkspace,
-    workspace_root: &Path,
-) -> Result<Vec<SharedProfileChangeNotice>> {
-    let mut notices = Vec::new();
-    if sync_shared_profile_file(
-        &agent_workspace.user_md_path,
-        &workspace_root.join("USER.md"),
-    )? {
-        notices.push(SharedProfileChangeNotice::UserUpdated);
-    }
-    if sync_shared_profile_file(
-        &agent_workspace.identity_md_path,
-        &workspace_root.join("IDENTITY.md"),
-    )? {
-        notices.push(SharedProfileChangeNotice::IdentityUpdated);
-    }
-    Ok(notices)
-}
-
-fn upload_workspace_shared_profile_files(
-    agent_workspace: &AgentWorkspace,
-    workspace_root: &Path,
-) -> Result<SharedProfileUploadReport> {
-    Ok(SharedProfileUploadReport {
-        user_changed: sync_shared_profile_file(
-            &workspace_root.join("USER.md"),
-            &agent_workspace.user_md_path,
-        )?,
-        identity_changed: sync_shared_profile_file(
-            &workspace_root.join("IDENTITY.md"),
-            &agent_workspace.identity_md_path,
-        )?,
-    })
-}
-
-fn sync_shared_profile_file(source_path: &Path, target_path: &Path) -> Result<bool> {
-    let source_bytes = fs::read(source_path)
-        .with_context(|| format!("failed to read {}", source_path.display()))?;
-    let changed = match fs::read(target_path) {
-        Ok(existing) => existing != source_bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", target_path.display()));
-        }
-    };
-    if !changed {
-        return Ok(false);
-    }
-    if let Some(parent) = target_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-    fs::write(target_path, &source_bytes)
-        .with_context(|| format!("failed to write {}", target_path.display()))?;
-    Ok(true)
-}
-
-fn memory_search_files(session: &SessionSnapshot, query: &str, limit: usize) -> Result<Value> {
-    let query = query.trim();
-    if query.is_empty() {
-        return Err(anyhow!("query must be a non-empty string"));
-    }
-    let memory_root = conversation_memory_root(session);
-    let memory_summary: PersistedMemorySummary =
-        read_json_or_default(&memory_root.join("memory_summary.json"))?;
-    let memory_index: PersistedMemoryIndex =
-        read_json_or_default(&memory_root.join("MEMORY.json"))?;
-
-    let mut matches = Vec::new();
-    let summary_blob = serde_json::to_string(&memory_summary).unwrap_or_default();
-    if lower_contains(&summary_blob, query) {
-        matches.push(json!({
-            "layer": "memory_summary",
-            "preview": summary_blob.chars().take(200).collect::<String>(),
-            "recent_groups": memory_summary.recent_groups,
-            "recent_rollouts": memory_summary.recent_rollouts,
-        }));
-    }
-    for group in memory_index.groups {
-        let group_blob = serde_json::to_string(&group).unwrap_or_default();
-        if !lower_contains(&group_blob, query) {
-            continue;
-        }
-        matches.push(json!({
-            "layer": "memory",
-            "group": group.group,
-            "preview": group_blob.chars().take(200).collect::<String>(),
-            "keywords": group.keywords,
-            "rollouts": group.rollouts,
-        }));
-        if matches.len() >= limit {
-            break;
-        }
-    }
-
-    Ok(json!({
-        "query": query,
-        "matches": matches.into_iter().take(limit).collect::<Vec<_>>(),
-    }))
-}
-
-fn rollout_search_files(
-    session: &SessionSnapshot,
-    query: &str,
-    rollout_id: Option<&str>,
-    kinds: &[String],
-    limit: usize,
-) -> Result<Value> {
-    let query = query.trim();
-    if query.is_empty() {
-        return Err(anyhow!("query must be a non-empty string"));
-    }
-    let allowed_kinds = kinds
-        .iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .collect::<Vec<_>>();
-    let memory_root = conversation_memory_root(session);
-    let rollouts_root = memory_root.join("rollouts");
-    if !rollouts_root.is_dir() {
-        return Ok(json!({ "query": query, "matches": [] }));
-    }
-
-    let mut rollout_ids = if let Some(rollout_id) = rollout_id {
-        vec![rollout_id.to_string()]
-    } else {
-        fs::read_dir(&rollouts_root)
-            .with_context(|| format!("failed to read {}", rollouts_root.display()))?
-            .filter_map(|entry| entry.ok())
-            .filter_map(|entry| {
-                entry
-                    .file_type()
-                    .ok()
-                    .filter(|file_type| file_type.is_dir())
-                    .map(|_| entry.file_name().to_string_lossy().to_string())
-            })
-            .collect::<Vec<_>>()
-    };
-    rollout_ids.sort();
-    rollout_ids.reverse();
-
-    let mut matches = Vec::new();
-    for current_rollout_id in rollout_ids {
-        let transcript_path = rollouts_root
-            .join(&current_rollout_id)
-            .join("rollout_transcript.jsonl");
-        let events = parse_transcript_events(&transcript_path)?;
-        for event in events {
-            let kind = transcript_event_kind(&event);
-            if !allowed_kinds.is_empty()
-                && !allowed_kinds.iter().any(|candidate| candidate == &kind)
-            {
-                continue;
-            }
-            let event_blob = serde_json::to_string(&event).unwrap_or_default();
-            if !lower_contains(&event_blob, query) {
-                continue;
-            }
-            matches.push(json!({
-                "rollout_id": current_rollout_id,
-                "event_id": event.get("event_id").and_then(Value::as_u64).unwrap_or(0),
-                "timestamp": event.get("timestamp").and_then(Value::as_str).unwrap_or(""),
-                "kind": kind,
-                "preview": transcript_event_preview(&event),
-            }));
-            if matches.len() >= limit {
-                return Ok(json!({
-                    "query": query,
-                    "matches": matches,
-                    "truncated": true,
-                }));
-            }
-        }
-    }
-
-    Ok(json!({
-        "query": query,
-        "matches": matches,
-        "truncated": false,
-    }))
-}
-
-fn rollout_read_file(
-    session: &SessionSnapshot,
-    rollout_id: &str,
-    anchor_event_id: usize,
-    mode: Option<&str>,
-    before: usize,
-    after: usize,
-) -> Result<Value> {
-    let transcript_path = conversation_memory_root(session)
-        .join("rollouts")
-        .join(rollout_id)
-        .join("rollout_transcript.jsonl");
-    let events = parse_transcript_events(&transcript_path)?;
-    let anchor_index = events
-        .iter()
-        .position(|event| {
-            event.get("event_id").and_then(Value::as_u64) == Some(anchor_event_id as u64)
-        })
-        .ok_or_else(|| {
-            anyhow!(
-                "anchor_event_id {} not found in rollout {}",
-                anchor_event_id,
-                rollout_id
-            )
-        })?;
-
-    let mode = mode.unwrap_or("turn_segment").to_string();
-    let (start, end) = if mode == "window" {
-        (
-            anchor_index.saturating_sub(before),
-            (anchor_index + after + 1).min(events.len()),
-        )
-    } else {
-        let mut start = anchor_index;
-        while start > 0 {
-            let previous_kind = transcript_event_kind(&events[start - 1]);
-            if previous_kind == "user_message" {
-                start -= 1;
-                break;
-            }
-            start -= 1;
-        }
-        let mut end = anchor_index + 1;
-        while end < events.len() {
-            if end > anchor_index && transcript_event_kind(&events[end]) == "user_message" {
-                break;
-            }
-            end += 1;
-        }
-        (start, end)
-    };
-
-    Ok(json!({
-        "rollout_id": rollout_id,
-        "anchor_event_id": anchor_event_id,
-        "mode": mode,
-        "events": events[start..end].to_vec(),
-        "has_more_before": start > 0,
-        "has_more_after": end < events.len(),
-    }))
-}
-
-fn parse_transcript_events(transcript_path: &Path) -> Result<Vec<Value>> {
-    if !transcript_path.is_file() {
-        return Ok(Vec::new());
-    }
-    let raw = fs::read_to_string(transcript_path)
-        .with_context(|| format!("failed to read {}", transcript_path.display()))?;
-    raw.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str::<Value>(line).with_context(|| {
-                format!(
-                    "failed to parse transcript line in {}",
-                    transcript_path.display()
-                )
-            })
-        })
-        .collect()
-}
-
-fn transcript_event_kind(event: &Value) -> String {
-    event
-        .get("kind")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            let role = event.get("role").and_then(Value::as_str)?;
-            Some(match role {
-                "tool" => "tool_result".to_string(),
-                "user" => "user_message".to_string(),
-                "system" => "system_message".to_string(),
-                _ => "assistant_message".to_string(),
-            })
-        })
-        .unwrap_or_else(|| "assistant_message".to_string())
-}
-
-fn transcript_event_preview(event: &Value) -> String {
-    if let Some(content) = event.get("content") {
-        if let Some(text) = content.as_str() {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                return trimmed.chars().take(180).collect();
-            }
-        }
-        if !content.is_null() {
-            return serde_json::to_string(content)
-                .unwrap_or_default()
-                .chars()
-                .take(180)
-                .collect();
-        }
-    }
-    format!("[{}]", transcript_event_kind(event))
-}
-
-fn replace_directory_contents(target: &Path, source: &Path) -> Result<()> {
-    if target.exists() {
-        std::fs::remove_dir_all(target)
-            .with_context(|| format!("failed to clear {}", target.display()))?;
-    }
-    copy_dir_recursive(source, target)
-}
-
-fn copy_dir_recursive(source: &Path, target: &Path) -> Result<()> {
-    std::fs::create_dir_all(target)
-        .with_context(|| format!("failed to create {}", target.display()))?;
-    for entry in
-        std::fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
-    {
-        let entry = entry?;
-        let source_path = entry.path();
-        let target_path = target.join(entry.file_name());
-        let file_type = entry
-            .file_type()
-            .with_context(|| format!("failed to inspect {}", source_path.display()))?;
-        if file_type.is_dir() {
-            copy_dir_recursive(&source_path, &target_path)?;
-        } else if file_type.is_symlink() {
-            let link_target = std::fs::read_link(&source_path)
-                .with_context(|| format!("failed to read link {}", source_path.display()))?;
-            create_symlink(&link_target, &target_path)?;
-        } else {
-            std::fs::copy(&source_path, &target_path).with_context(|| {
-                format!(
-                    "failed to copy {} to {}",
-                    source_path.display(),
-                    target_path.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
-}
-
-fn create_symlink(source: &Path, target: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(source, target)
-            .with_context(|| format!("failed to create symlink {}", target.display()))
-    }
-    #[cfg(windows)]
-    {
-        let metadata = std::fs::metadata(source)
-            .with_context(|| format!("failed to stat symlink target {}", source.display()))?;
-        if metadata.is_dir() {
-            std::os::windows::fs::symlink_dir(source, target)
-                .with_context(|| format!("failed to create symlink {}", target.display()))
-        } else {
-            std::os::windows::fs::symlink_file(source, target)
-                .with_context(|| format!("failed to create symlink {}", target.display()))
-        }
-    }
-}
-
-fn workspace_visible_in_list(
-    workspace_id: &str,
-    active_workspace_ids: &[String],
-    is_archived: bool,
-) -> bool {
-    is_archived || !active_workspace_ids.iter().any(|id| id == workspace_id)
-}
-
-fn tool_phase_timeout_grace_seconds() -> f64 {
-    15.0
-}
-
-fn log_turn_usage(
-    agent_id: uuid::Uuid,
-    session: &SessionSnapshot,
-    usage: &TokenUsage,
-    initialization: bool,
-    agent_kind: &str,
-    parent_agent_id: Option<uuid::Uuid>,
-) {
-    info!(
-        log_stream = "agent",
-        log_key = %agent_id,
-        kind = "turn_token_usage",
-        session_id = %session.id,
-        channel_id = %session.address.channel_id,
-        agent_kind,
-        initialization,
-        parent_agent_id = parent_agent_id.map(|value| value.to_string()),
-        llm_calls = usage.llm_calls,
-        prompt_tokens = usage.prompt_tokens,
-        completion_tokens = usage.completion_tokens,
-        total_tokens = usage.total_tokens,
-        cache_hit_tokens = usage.cache_hit_tokens,
-        cache_miss_tokens = usage.cache_miss_tokens,
-        cache_read_tokens = usage.cache_read_tokens,
-        cache_write_tokens = usage.cache_write_tokens,
-        "recorded turn token usage"
-    );
-}
-
-fn log_agent_frame_event(
-    agent_id: uuid::Uuid,
-    session: &SessionSnapshot,
-    kind: AgentPromptKind,
-    model_key: &str,
-    event: &SessionEvent,
-) {
-    let agent_kind = match kind {
-        AgentPromptKind::MainForeground => "main_foreground",
-        AgentPromptKind::MainBackground => "main_background",
-        AgentPromptKind::SubAgent => "subagent",
-    };
-    match event {
-        SessionEvent::SessionStarted {
-            previous_message_count,
-            prompt_len,
-            tool_definition_count,
-            skill_count,
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_session_started",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model = model_key,
-            previous_message_count = *previous_message_count as u64,
-            prompt_len = *prompt_len as u64,
-            tool_definition_count = *tool_definition_count as u64,
-            skill_count = *skill_count as u64,
-            "agent_frame session started"
-        ),
-        SessionEvent::CompactionStarted {
-            phase,
-            message_count,
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_compaction_started",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model = model_key,
-            phase,
-            message_count = *message_count as u64,
-            "agent_frame compaction started"
-        ),
-        SessionEvent::CompactionCompleted {
-            phase,
-            compacted,
-            estimated_tokens_before,
-            estimated_tokens_after,
-            token_limit,
-            structured_output,
-            compacted_messages,
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_compaction_completed",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model = model_key,
-            phase,
-            compacted = *compacted,
-            estimated_tokens_before = *estimated_tokens_before as u64,
-            estimated_tokens_after = *estimated_tokens_after as u64,
-            token_limit = *token_limit as u64,
-            structured_keywords = structured_output
-                .as_ref()
-                .map(|output| output.keywords.len() as u64)
-                .unwrap_or(0),
-            compacted_message_count = compacted_messages.len() as u64,
-            "agent_frame compaction completed"
-        ),
-        SessionEvent::RoundStarted {
-            round_index,
-            message_count,
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_round_started",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model = model_key,
-            round_index = *round_index as u64,
-            message_count = *message_count as u64,
-            "agent_frame round started"
-        ),
-        SessionEvent::ModelCallStarted {
-            round_index,
-            message_count,
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_model_call_started",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model = model_key,
-            round_index = *round_index as u64,
-            message_count = *message_count as u64,
-            "agent_frame model call started"
-        ),
-        SessionEvent::ModelCallCompleted {
-            round_index,
-            tool_call_count,
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_model_call_completed",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model = model_key,
-            round_index = *round_index as u64,
-            tool_call_count = *tool_call_count as u64,
-            prompt_tokens = *prompt_tokens,
-            completion_tokens = *completion_tokens,
-            total_tokens = *total_tokens,
-            "agent_frame model call completed"
-        ),
-        SessionEvent::CheckpointEmitted {
-            message_count,
-            total_tokens,
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_checkpoint_emitted",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model = model_key,
-            message_count = *message_count as u64,
-            total_tokens = *total_tokens,
-            "agent_frame checkpoint emitted"
-        ),
-        SessionEvent::ToolWaitCompactionScheduled {
-            tool_name,
-            stable_prefix_message_count,
-            delay_ms,
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_tool_wait_compaction_scheduled",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model = model_key,
-            tool_name,
-            stable_prefix_message_count = *stable_prefix_message_count as u64,
-            delay_ms = *delay_ms,
-            "agent_frame tool-wait compaction scheduled"
-        ),
-        SessionEvent::ToolWaitCompactionStarted {
-            tool_name,
-            stable_prefix_message_count,
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_tool_wait_compaction_started",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model = model_key,
-            tool_name,
-            stable_prefix_message_count = *stable_prefix_message_count as u64,
-            "agent_frame tool-wait compaction started"
-        ),
-        SessionEvent::ToolWaitCompactionCompleted {
-            tool_name,
-            compacted,
-            estimated_tokens_before,
-            estimated_tokens_after,
-            token_limit,
-            structured_output,
-            compacted_messages,
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_tool_wait_compaction_completed",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model = model_key,
-            tool_name,
-            compacted = *compacted,
-            estimated_tokens_before = *estimated_tokens_before as u64,
-            estimated_tokens_after = *estimated_tokens_after as u64,
-            token_limit = *token_limit as u64,
-            structured_keywords = structured_output
-                .as_ref()
-                .map(|output| output.keywords.len() as u64)
-                .unwrap_or(0),
-            compacted_message_count = compacted_messages.len() as u64,
-            "agent_frame tool-wait compaction completed"
-        ),
-        SessionEvent::ToolCallStarted {
-            round_index,
-            tool_name,
-            tool_call_id,
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_tool_call_started",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model = model_key,
-            round_index = *round_index as u64,
-            tool_name,
-            tool_call_id,
-            "agent_frame tool call started"
-        ),
-        SessionEvent::ToolCallCompleted {
-            round_index,
-            tool_name,
-            tool_call_id,
-            output_len,
-            errored,
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_tool_call_completed",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model = model_key,
-            round_index = *round_index as u64,
-            tool_name,
-            tool_call_id,
-            output_len = *output_len as u64,
-            errored = *errored,
-            "agent_frame tool call completed"
-        ),
-        SessionEvent::SessionYielded {
-            phase,
-            message_count,
-            total_tokens,
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_session_yielded",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model = model_key,
-            phase,
-            message_count = *message_count as u64,
-            total_tokens = *total_tokens,
-            "agent_frame session yielded at a safe boundary"
-        ),
-        SessionEvent::PrefixRewriteApplied {
-            previous_prefix_message_count,
-            replacement_prefix_message_count,
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_prefix_rewrite_applied",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model = model_key,
-            previous_prefix_message_count = *previous_prefix_message_count as u64,
-            replacement_prefix_message_count = *replacement_prefix_message_count as u64,
-            "agent_frame prefix rewrite applied"
-        ),
-        SessionEvent::SessionCompleted {
-            message_count,
-            total_tokens,
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_session_completed",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model = model_key,
-            message_count = *message_count as u64,
-            total_tokens = *total_tokens,
-            "agent_frame session completed"
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        ForegroundRuntimePhase, SinkTarget, TokenUsage, background_agent_timeout_seconds,
-        background_recovery_timeout_seconds, background_timeout_with_active_children_text,
-        build_previous_messages_for_turn, build_synthetic_system_messages, build_user_turn_message,
-        channel_restart_backoff_seconds, conversation_memory_root, estimate_compaction_savings_usd,
-        estimate_cost_usd, extract_attachment_references, format_session_status, is_timeout_like,
-        memory_search_files, normalize_messages_for_persistence, parse_model_command,
-        parse_oldspace_command, parse_sandbox_command, parse_set_api_timeout_command,
-        parse_sink_target, parse_snap_list_command, parse_snap_load_command,
-        parse_snap_save_command, parse_think_command, persist_compaction_artifacts,
-        request_yield_for_incoming, rollout_read_file, rollout_search_files,
-        send_outgoing_message_now, should_attempt_idle_context_compaction,
-        should_emit_profile_change_prompt, sync_workspace_shared_profile_files,
-        tag_interrupted_followup_text, update_active_foreground_phase,
-        upload_workspace_shared_profile_files, user_facing_continue_error_text,
-        workspace_visible_in_list,
+        ForegroundRuntimePhase, SinkTarget, TokenUsage,
+        background_timeout_with_active_children_text, build_previous_messages_for_turn,
+        build_synthetic_system_messages, build_user_turn_message, channel_restart_backoff_seconds,
+        conversation_memory_root, estimate_compaction_savings_usd, estimate_cost_usd,
+        extract_attachment_references, format_session_status, is_timeout_like, memory_search_files,
+        normalize_messages_for_persistence, parse_model_command, parse_oldspace_command,
+        parse_sandbox_command, parse_set_api_timeout_command, parse_sink_target,
+        parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
+        parse_think_command, persist_compaction_artifacts, request_yield_for_incoming,
+        rollout_read_file, rollout_search_files, send_outgoing_message_now,
+        should_attempt_idle_context_compaction, should_emit_profile_change_prompt,
+        sync_workspace_shared_profile_files, tag_interrupted_followup_text,
+        update_active_foreground_phase, upload_workspace_shared_profile_files,
+        user_facing_continue_error_text, workspace_visible_in_list,
     };
     use crate::backend::AgentBackendKind;
     use crate::bootstrap::AgentWorkspace;
@@ -9683,22 +7088,6 @@ mod tests {
             SinkTarget::Multi(targets) => assert_eq!(targets.len(), 2),
             other => panic!("expected multi sink, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn background_timeout_helpers_scale_as_expected() {
-        let timeout_error = anyhow!("background agent timed out after 135.0 seconds");
-        let generic_error = anyhow!("background agent failed for another reason");
-
-        assert_eq!(background_agent_timeout_seconds(120.0), 135.0);
-        assert_eq!(
-            background_recovery_timeout_seconds(120.0, &timeout_error),
-            255.0
-        );
-        assert_eq!(
-            background_recovery_timeout_seconds(120.0, &generic_error),
-            150.0
-        );
     }
 
     #[test]

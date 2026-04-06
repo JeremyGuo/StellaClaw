@@ -14,11 +14,13 @@ mod v0_1;
 mod v0_2;
 mod v0_3;
 mod v0_4;
+mod v0_5;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.4";
+pub const LATEST_CONFIG_VERSION: &str = "0.5";
 pub const VERSION_0_2: &str = "0.2";
 pub const VERSION_0_3: &str = "0.3";
+pub const VERSION_0_4: &str = "0.4";
 
 fn zgent_checkout_available() -> bool {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -528,11 +530,12 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let loaders: [&dyn ConfigLoader; 4] = [
+    let loaders: [&dyn ConfigLoader; 5] = [
         &v0_1::LegacyConfigLoader,
         &v0_2::VersionedConfigLoader,
         &v0_3::VersionedConfigLoader,
         &v0_4::LatestConfigLoader,
+        &v0_5::LatestConfigLoader,
     ];
     let loader = loaders
         .into_iter()
@@ -577,11 +580,12 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
     let config = {
-        let loaders: [&dyn ConfigLoader; 4] = [
+        let loaders: [&dyn ConfigLoader; 5] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
             &v0_3::VersionedConfigLoader,
             &v0_4::LatestConfigLoader,
+            &v0_5::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()
@@ -599,10 +603,23 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
 
 pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -> Result<()> {
     #[derive(Serialize)]
+    struct PersistedMainAgentConfig<'a> {
+        model: &'a Option<String>,
+        global_install_root: &'a str,
+        language: &'a str,
+        enabled_tools: &'a [String],
+        max_tool_roundtrips: usize,
+        enable_context_compression: bool,
+        context_compaction: &'a ContextCompactionConfig,
+        idle_compaction: &'a IdleCompactionConfig,
+        timeout_observation_compaction: &'a TimeoutObservationCompactionConfig,
+    }
+
+    #[derive(Serialize)]
     struct PersistedServerConfig<'a> {
         version: &'a str,
         models: &'a ModelCatalogConfig,
-        main_agent: &'a MainAgentConfig,
+        main_agent: PersistedMainAgentConfig<'a>,
         sandbox: &'a SandboxConfig,
         max_global_sub_agents: usize,
         cron_poll_interval_seconds: u64,
@@ -612,7 +629,17 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
     let persisted = PersistedServerConfig {
         version: LATEST_CONFIG_VERSION,
         models: &config.model_catalog,
-        main_agent: &config.main_agent,
+        main_agent: PersistedMainAgentConfig {
+            model: &config.main_agent.model,
+            global_install_root: &config.main_agent.global_install_root,
+            language: &config.main_agent.language,
+            enabled_tools: &config.main_agent.enabled_tools,
+            max_tool_roundtrips: config.main_agent.max_tool_roundtrips,
+            enable_context_compression: config.main_agent.enable_context_compression,
+            context_compaction: &config.main_agent.context_compaction,
+            idle_compaction: &config.main_agent.idle_compaction,
+            timeout_observation_compaction: &config.main_agent.timeout_observation_compaction,
+        },
         sandbox: &config.sandbox,
         max_global_sub_agents: config.max_global_sub_agents,
         cron_poll_interval_seconds: config.cron_poll_interval_seconds,
@@ -1421,11 +1448,19 @@ mod tests {
         );
 
         let written = fs::read_to_string(&config_path).unwrap();
-        assert!(written.contains("\"version\": \"0.4\""));
+        let written_json: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert!(written.contains("\"version\": \"0.5\""));
         assert!(written.contains("\"web_search\": \"main_web_search\""));
         assert!(written.contains("\"models\": {"));
         assert!(written.contains("\"web_search\": {"));
         assert!(written.contains("\"context_compaction\": {"));
+        assert!(
+            written_json["main_agent"]
+                .as_object()
+                .unwrap()
+                .get("timeout_seconds")
+                .is_none()
+        );
     }
 
     #[test]

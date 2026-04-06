@@ -7,7 +7,7 @@ if [[ $# -ne 1 ]]; then
 fi
 
 CONFIG_FILE="$1"
-LATEST_VERSION="0.3"
+LATEST_VERSION="0.5"
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   echo "Config file not found: $CONFIG_FILE" >&2

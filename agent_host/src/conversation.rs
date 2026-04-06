@@ -21,6 +21,8 @@ pub struct ConversationSettings {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub context_compaction_enabled: Option<bool>,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
     #[serde(default = "default_chat_version_id")]
     pub chat_version_id: Uuid,
 }
@@ -32,6 +34,7 @@ impl Default for ConversationSettings {
             sandbox_mode: None,
             reasoning_effort: None,
             context_compaction_enabled: None,
+            workspace_id: None,
             chat_version_id: default_chat_version_id(),
         }
     }
@@ -212,6 +215,24 @@ impl ConversationManager {
         Ok(state.snapshot())
     }
 
+    pub fn set_workspace_id(
+        &mut self,
+        address: &ChannelAddress,
+        workspace_id: Option<String>,
+    ) -> Result<ConversationSnapshot> {
+        let key = address.session_key();
+        if !self.conversations.contains_key(&key) {
+            self.ensure_conversation(address)?;
+        }
+        let state = self
+            .conversations
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("missing conversation {}", key))?;
+        state.settings.workspace_id = workspace_id;
+        state.persist()?;
+        Ok(state.snapshot())
+    }
+
     pub fn rotate_chat_version_id(
         &mut self,
         address: &ChannelAddress,
@@ -295,6 +316,9 @@ mod tests {
         manager
             .set_context_compaction_enabled(&address, Some(false))
             .unwrap();
+        manager
+            .set_workspace_id(&address, Some("workspace-1".to_string()))
+            .unwrap();
 
         let reloaded = ConversationManager::new(temp_dir.path()).unwrap();
         let snapshot = reloaded.get_snapshot(&address).unwrap();
@@ -305,6 +329,10 @@ mod tests {
         );
         assert_eq!(snapshot.settings.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(snapshot.settings.context_compaction_enabled, Some(false));
+        assert_eq!(
+            snapshot.settings.workspace_id.as_deref(),
+            Some("workspace-1")
+        );
         assert_ne!(snapshot.settings.chat_version_id, Uuid::nil());
     }
 

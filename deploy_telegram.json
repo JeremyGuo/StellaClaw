@@ -1,5 +1,5 @@
 {
-  "version": "0.4",
+  "version": "0.5",
   "models": {
     "chat": {
       "gpt54": {
@@ -42,7 +42,6 @@
   },
   "main_agent": {
     "model": "gpt54",
-    "timeout_seconds": 0.0,
     "global_install_root": "/opt",
     "language": "zh-CN",
     "enabled_tools": [

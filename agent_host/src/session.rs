@@ -130,8 +130,17 @@ pub struct SessionSnapshot {
     pub close_after_summary: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum SessionKind {
+    #[default]
+    Foreground,
+    Background,
+}
+
 #[derive(Debug)]
 struct Session {
+    kind: SessionKind,
     id: Uuid,
     agent_id: Uuid,
     address: ChannelAddress,
@@ -209,6 +218,7 @@ impl Session {
 
     fn persist(&self) -> Result<()> {
         let state = PersistedSession {
+            kind: self.kind,
             id: self.id,
             agent_id: self.agent_id,
             address: self.address.clone(),
@@ -256,6 +266,7 @@ impl Session {
             pending
         });
         Ok(Self {
+            kind: persisted.kind,
             id: persisted.id,
             agent_id: persisted.agent_id,
             address: persisted.address,
@@ -308,8 +319,58 @@ fn sanitize_persisted_agent_messages(messages: Vec<ChatMessage>) -> Vec<ChatMess
     sanitized
 }
 
+fn record_turn(
+    session: &mut Session,
+    messages: Vec<ChatMessage>,
+    usage: &TokenUsage,
+    compaction: &SessionCompactionStats,
+    clear_pending_continue: bool,
+    log_kind: &str,
+) -> Result<()> {
+    session.agent_messages = messages;
+    session.last_agent_returned_at = Some(Utc::now());
+    session.turn_count = session.turn_count.saturating_add(1);
+    session.cumulative_usage.add_assign(usage);
+    session.cumulative_compaction.run_count = session
+        .cumulative_compaction
+        .run_count
+        .saturating_add(compaction.run_count);
+    session.cumulative_compaction.compacted_run_count = session
+        .cumulative_compaction
+        .compacted_run_count
+        .saturating_add(compaction.compacted_run_count);
+    session.cumulative_compaction.estimated_tokens_before = session
+        .cumulative_compaction
+        .estimated_tokens_before
+        .saturating_add(compaction.estimated_tokens_before);
+    session.cumulative_compaction.estimated_tokens_after = session
+        .cumulative_compaction
+        .estimated_tokens_after
+        .saturating_add(compaction.estimated_tokens_after);
+    session
+        .cumulative_compaction
+        .usage
+        .add_assign(&compaction.usage);
+    if clear_pending_continue {
+        session.pending_continue = None;
+    }
+    session.idle_compaction_retry = None;
+    info!(
+        log_stream = "session",
+        log_key = %session.id,
+        kind = log_kind,
+        agent_message_count = session.agent_messages.len() as u64,
+        turn_count = session.turn_count,
+        "recorded agent turn"
+    );
+    session.persist()?;
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedSession {
+    #[serde(default)]
+    kind: SessionKind,
     id: Uuid,
     agent_id: Uuid,
     address: ChannelAddress,
@@ -359,6 +420,7 @@ pub struct SessionManager {
     sessions_root: PathBuf,
     workspace_manager: WorkspaceManager,
     foreground_sessions: HashMap<String, Session>,
+    background_sessions: HashMap<Uuid, Session>,
 }
 
 impl SessionManager {
@@ -371,6 +433,7 @@ impl SessionManager {
             sessions_root,
             workspace_manager,
             foreground_sessions,
+            background_sessions: HashMap::new(),
         })
     }
 
@@ -489,7 +552,52 @@ impl SessionManager {
     pub fn has_active_workspace(&self, workspace_id: &str) -> bool {
         self.foreground_sessions
             .values()
+            .chain(self.background_sessions.values())
             .any(|session| session.workspace_id == workspace_id)
+    }
+
+    pub fn create_background(
+        &mut self,
+        address: &ChannelAddress,
+        agent_id: Uuid,
+    ) -> Result<SessionSnapshot> {
+        let session =
+            self.create_session_with_kind(address, agent_id, None, SessionKind::Background)?;
+        let snapshot = session.snapshot();
+        self.background_sessions.insert(session.id, session);
+        Ok(snapshot)
+    }
+
+    pub fn create_background_in_workspace(
+        &mut self,
+        address: &ChannelAddress,
+        agent_id: Uuid,
+        workspace_id: &str,
+    ) -> Result<SessionSnapshot> {
+        let session = self.create_session_with_kind(
+            address,
+            agent_id,
+            Some(workspace_id),
+            SessionKind::Background,
+        )?;
+        let snapshot = session.snapshot();
+        self.background_sessions.insert(session.id, session);
+        Ok(snapshot)
+    }
+
+    pub fn background_snapshot(&self, session_id: Uuid) -> Result<SessionSnapshot> {
+        self.background_sessions
+            .get(&session_id)
+            .map(Session::snapshot)
+            .with_context(|| format!("no active background session for {}", session_id))
+    }
+
+    pub fn close_background(&mut self, session_id: Uuid) -> Result<()> {
+        if let Some(mut session) = self.background_sessions.remove(&session_id) {
+            session.closed_at = Some(Utc::now());
+            session.persist()?;
+        }
+        Ok(())
     }
 
     pub fn pending_workspace_summary_snapshots(&self) -> Vec<SessionSnapshot> {
@@ -558,6 +666,7 @@ impl SessionManager {
         fs::create_dir_all(&attachments_dir)
             .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
         let session = Session {
+            kind: SessionKind::Foreground,
             id: session_id,
             agent_id,
             address: address.clone(),
@@ -837,42 +946,14 @@ impl SessionManager {
             .foreground_sessions
             .get_mut(&key)
             .with_context(|| format!("no active session for {}", key))?;
-        session.agent_messages = messages;
-        session.last_agent_returned_at = Some(Utc::now());
-        session.turn_count = session.turn_count.saturating_add(1);
-        session.cumulative_usage.add_assign(usage);
-        session.cumulative_compaction.run_count = session
-            .cumulative_compaction
-            .run_count
-            .saturating_add(compaction.run_count);
-        session.cumulative_compaction.compacted_run_count = session
-            .cumulative_compaction
-            .compacted_run_count
-            .saturating_add(compaction.compacted_run_count);
-        session.cumulative_compaction.estimated_tokens_before = session
-            .cumulative_compaction
-            .estimated_tokens_before
-            .saturating_add(compaction.estimated_tokens_before);
-        session.cumulative_compaction.estimated_tokens_after = session
-            .cumulative_compaction
-            .estimated_tokens_after
-            .saturating_add(compaction.estimated_tokens_after);
-        session
-            .cumulative_compaction
-            .usage
-            .add_assign(&compaction.usage);
-        session.pending_continue = None;
-        session.idle_compaction_retry = None;
-        info!(
-            log_stream = "session",
-            log_key = %session.id,
-            kind = "agent_turn_recorded",
-            agent_message_count = session.agent_messages.len() as u64,
-            turn_count = session.turn_count,
-            "recorded successful agent turn"
-        );
-        session.persist()?;
-        Ok(())
+        record_turn(
+            session,
+            messages,
+            usage,
+            compaction,
+            true,
+            "agent_turn_recorded",
+        )
     }
 
     pub fn record_yielded_turn(
@@ -887,9 +968,64 @@ impl SessionManager {
             .foreground_sessions
             .get_mut(&key)
             .with_context(|| format!("no active session for {}", key))?;
+        record_turn(
+            session,
+            messages,
+            usage,
+            compaction,
+            false,
+            "agent_turn_yielded",
+        )
+    }
+
+    pub fn record_background_turn(
+        &mut self,
+        session_id: Uuid,
+        messages: Vec<ChatMessage>,
+        usage: &TokenUsage,
+        compaction: &SessionCompactionStats,
+    ) -> Result<()> {
+        let session = self.background_session_mut(session_id)?;
+        record_turn(
+            session,
+            messages,
+            usage,
+            compaction,
+            true,
+            "agent_turn_recorded",
+        )?;
+        Ok(())
+    }
+
+    pub fn record_background_yielded_turn(
+        &mut self,
+        session_id: Uuid,
+        messages: Vec<ChatMessage>,
+        usage: &TokenUsage,
+        compaction: &SessionCompactionStats,
+    ) -> Result<()> {
+        let session = self.background_session_mut(session_id)?;
+        record_turn(
+            session,
+            messages,
+            usage,
+            compaction,
+            false,
+            "agent_turn_yielded",
+        )?;
+        Ok(())
+    }
+
+    pub fn update_background_checkpoint(
+        &mut self,
+        session_id: Uuid,
+        messages: Vec<ChatMessage>,
+        usage: &TokenUsage,
+        compaction: &SessionCompactionStats,
+    ) -> Result<()> {
+        let session = self.background_session_mut(session_id)?;
         session.agent_messages = messages;
         session.last_agent_returned_at = Some(Utc::now());
-        session.turn_count = session.turn_count.saturating_add(1);
         session.cumulative_usage.add_assign(usage);
         session.cumulative_compaction.run_count = session
             .cumulative_compaction
@@ -911,15 +1047,6 @@ impl SessionManager {
             .cumulative_compaction
             .usage
             .add_assign(&compaction.usage);
-        session.idle_compaction_retry = None;
-        info!(
-            log_stream = "session",
-            log_key = %session.id,
-            kind = "agent_turn_yielded",
-            agent_message_count = session.agent_messages.len() as u64,
-            turn_count = session.turn_count,
-            "recorded yielded agent turn"
-        );
         session.persist()?;
         Ok(())
     }
@@ -1003,6 +1130,24 @@ impl SessionManager {
         Ok(())
     }
 
+    pub fn append_background_user_message(
+        &mut self,
+        session_id: Uuid,
+        text: Option<String>,
+        attachments: Vec<StoredAttachment>,
+    ) -> Result<()> {
+        self.append_background_message(session_id, MessageRole::User, text, attachments)
+    }
+
+    pub fn append_background_assistant_message(
+        &mut self,
+        session_id: Uuid,
+        text: Option<String>,
+        attachments: Vec<StoredAttachment>,
+    ) -> Result<()> {
+        self.append_background_message(session_id, MessageRole::Assistant, text, attachments)
+    }
+
     fn append_message(
         &mut self,
         address: &ChannelAddress,
@@ -1030,12 +1175,62 @@ impl SessionManager {
         Ok(())
     }
 
+    fn append_background_message(
+        &mut self,
+        session_id: Uuid,
+        role: MessageRole,
+        text: Option<String>,
+        attachments: Vec<StoredAttachment>,
+    ) -> Result<()> {
+        let session = self.background_session_mut(session_id)?;
+        let attachment_count = attachments.len();
+        session.push_message(role.clone(), text, attachments);
+        info!(
+            log_stream = "session",
+            log_key = %session.id,
+            kind = "message_appended",
+            role = ?role,
+            message_count = session.history.len() as u64,
+            attachment_count = attachment_count as u64,
+            "appended message to session history"
+        );
+        session.persist()?;
+        Ok(())
+    }
+
     fn create_session(&self, address: &ChannelAddress) -> Result<Session> {
+        self.create_session_with_kind(address, Uuid::new_v4(), None, SessionKind::Foreground)
+    }
+
+    fn create_session_with_workspace(
+        &self,
+        address: &ChannelAddress,
+        workspace_id: &str,
+    ) -> Result<Session> {
+        self.create_session_with_kind(
+            address,
+            Uuid::new_v4(),
+            Some(workspace_id),
+            SessionKind::Foreground,
+        )
+    }
+
+    fn create_session_with_kind(
+        &self,
+        address: &ChannelAddress,
+        agent_id: Uuid,
+        workspace_id: Option<&str>,
+        kind: SessionKind,
+    ) -> Result<Session> {
         let session_id = Uuid::new_v4();
-        let agent_id = Uuid::new_v4();
-        let workspace = self
-            .workspace_manager
-            .create_workspace(agent_id, session_id, None)?;
+        let workspace = match workspace_id {
+            Some(workspace_id) => self
+                .workspace_manager
+                .ensure_workspace_exists(workspace_id)?,
+            None => self
+                .workspace_manager
+                .create_workspace(agent_id, session_id, None)?,
+        };
         let root_dir = self.sessions_root.join(session_id.to_string());
         fs::create_dir_all(&root_dir)
             .with_context(|| format!("failed to create session root {}", root_dir.display()))?;
@@ -1047,6 +1242,7 @@ impl SessionManager {
             )
         })?;
         let session = Session {
+            kind,
             id: session_id,
             agent_id,
             address: address.clone(),
@@ -1078,56 +1274,10 @@ impl SessionManager {
         Ok(session)
     }
 
-    fn create_session_with_workspace(
-        &self,
-        address: &ChannelAddress,
-        workspace_id: &str,
-    ) -> Result<Session> {
-        let session_id = Uuid::new_v4();
-        let agent_id = Uuid::new_v4();
-        let workspace = self
-            .workspace_manager
-            .ensure_workspace_exists(workspace_id)?;
-        let root_dir = self.sessions_root.join(session_id.to_string());
-        fs::create_dir_all(&root_dir)
-            .with_context(|| format!("failed to create session root {}", root_dir.display()))?;
-        let attachments_dir = workspace.files_dir.join("upload");
-        fs::create_dir_all(&attachments_dir).with_context(|| {
-            format!(
-                "failed to create workspace upload directory {}",
-                attachments_dir.display()
-            )
-        })?;
-        let session = Session {
-            id: session_id,
-            agent_id,
-            address: address.clone(),
-            root_dir,
-            attachments_dir,
-            workspace_id: workspace.id,
-            workspace_root: workspace.files_dir,
-            history: Vec::new(),
-            agent_messages: Vec::new(),
-            last_agent_returned_at: None,
-            last_compacted_at: None,
-            turn_count: 0,
-            last_compacted_turn_count: 0,
-            cumulative_usage: TokenUsage::default(),
-            cumulative_compaction: SessionCompactionStats::default(),
-            api_timeout_override_seconds: None,
-            skill_states: HashMap::new(),
-            seen_user_profile_version: None,
-            seen_identity_profile_version: None,
-            pending_user_profile_notice: false,
-            pending_identity_profile_notice: false,
-            idle_compaction_retry: None,
-            pending_continue: None,
-            pending_workspace_summary: false,
-            close_after_summary: false,
-            closed_at: None,
-        };
-        session.persist()?;
-        Ok(session)
+    fn background_session_mut(&mut self, session_id: Uuid) -> Result<&mut Session> {
+        self.background_sessions
+            .get_mut(&session_id)
+            .with_context(|| format!("no active background session for {}", session_id))
     }
 }
 
@@ -1150,6 +1300,15 @@ fn load_persisted_sessions(
         }
         match load_single_session(&path, &state_path, workspace_manager) {
             Ok(Some(session)) => {
+                if session.kind != SessionKind::Foreground {
+                    info!(
+                        log_stream = "session",
+                        kind = "session_restore_skipped",
+                        root_dir = %path.display(),
+                        "skipping persisted background session on startup"
+                    );
+                    continue;
+                }
                 let key = session.address.session_key();
                 info!(
                     log_stream = "session",
@@ -1194,6 +1353,7 @@ mod tests {
     use crate::workspace::WorkspaceManager;
     use agent_frame::{ChatMessage, SessionCompactionStats, TokenUsage};
     use tempfile::TempDir;
+    use uuid::Uuid;
 
     fn test_address() -> ChannelAddress {
         ChannelAddress {
@@ -1511,6 +1671,41 @@ mod tests {
         assert_eq!(restored.workspace_id, workspace.id);
         assert_eq!(restored.message_count, 1);
         assert_eq!(restored.agent_message_count, 1);
+    }
+
+    #[test]
+    fn background_sessions_can_share_workspace_without_sharing_memory() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let foreground = sessions.ensure_foreground(&address).unwrap();
+        let background = sessions
+            .create_background_in_workspace(&address, Uuid::new_v4(), &foreground.workspace_id)
+            .unwrap();
+
+        assert_ne!(foreground.id, background.id);
+        assert_eq!(foreground.workspace_id, background.workspace_id);
+
+        sessions
+            .record_background_turn(
+                background.id,
+                vec![ChatMessage::text("assistant", "background memory")],
+                &TokenUsage::default(),
+                &SessionCompactionStats::default(),
+            )
+            .unwrap();
+
+        let foreground_after = sessions.get_snapshot(&address).unwrap();
+        let background_after = sessions.background_snapshot(background.id).unwrap();
+        assert!(foreground_after.agent_messages.is_empty());
+        assert_eq!(
+            background_after.agent_messages[0]
+                .content
+                .as_ref()
+                .and_then(|value| value.as_str()),
+            Some("background memory")
+        );
     }
 }
 
