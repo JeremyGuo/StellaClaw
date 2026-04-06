@@ -6,6 +6,8 @@ version: 0.5.0-beta1
 
 - 修复 GitHub Release workflow 的 Zig 安装链路：
   将 `mlugg/setup-zig` 从过时的 `v1` 升级到 `v2.2.1`，解决 Zig 0.15.x 官方下载路径与 tarball 命名变化导致的 `404`，恢复自动打包发布。
+- 修复 GitHub Release workflow 的交叉编译目标安装：
+  Release 构建矩阵现在会随 `matrix.target` 一起安装对应 Rust target，避免 `cargo zigbuild` 在 musl 目标下因缺少标准库而报 `can't find crate for core`。
 - 重构 `agent_host` 服务端主流程：
   将超长的 `server.rs` 拆分为运行时辅助、消息处理、命令处理和持久化子模块，并补充了 Mermaid 工作流图与伪代码文档。
 - 调整 Background Agent 架构：
