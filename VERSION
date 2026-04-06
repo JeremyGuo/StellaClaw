@@ -4,6 +4,8 @@ version: 0.5.0-beta1
 
 # 0.5.0-beta1
 
+- 修复 GitHub Release workflow 的 Zig 安装链路：
+  将 `mlugg/setup-zig` 从过时的 `v1` 升级到 `v2.2.1`，解决 Zig 0.15.x 官方下载路径与 tarball 命名变化导致的 `404`，恢复自动打包发布。
 - 重构 `agent_host` 服务端主流程：
   将超长的 `server.rs` 拆分为运行时辅助、消息处理、命令处理和持久化子模块，并补充了 Mermaid 工作流图与伪代码文档。
 - 调整 Background Agent 架构：
