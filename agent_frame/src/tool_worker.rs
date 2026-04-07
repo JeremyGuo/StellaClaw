@@ -123,7 +123,8 @@ fn run_job(job: ToolWorkerJob) -> Result<()> {
             output_path,
             images,
         } => {
-            let result = run_image_generate_job(&prompt, upstream, Path::new(&output_path), &images)?;
+            let result =
+                run_image_generate_job(&prompt, upstream, Path::new(&output_path), &images)?;
             write_json_stdout(&result)
         }
         ToolWorkerJob::FileDownload {
@@ -556,19 +557,13 @@ fn run_image_generate_job(
         }
     }
 
-    let response = request
-        .send()
-        .context("image generation request failed")?;
+    let response = request.send().context("image generation request failed")?;
     let status = response.status();
     let body = response
         .text()
         .context("failed to read image generation response body")?;
     if !status.is_success() {
-        return Err(anyhow!(
-            "image generation failed with {}: {}",
-            status,
-            body
-        ));
+        return Err(anyhow!("image generation failed with {}: {}", status, body));
     }
     let value: Value =
         serde_json::from_str(&body).context("failed to parse image generation response")?;

@@ -263,7 +263,10 @@ fn estimate_message_tokens(message: &ChatMessage) -> usize {
         inline_file_estimate_adjustment(&message.content),
         inline_audio_estimate_adjustment(&message.content),
     ];
-    let payload_bytes = adjustments.iter().map(|(payload, _)| *payload).sum::<usize>();
+    let payload_bytes = adjustments
+        .iter()
+        .map(|(payload, _)| *payload)
+        .sum::<usize>();
     let replacement_bytes = adjustments
         .iter()
         .map(|(_, replacement)| *replacement)

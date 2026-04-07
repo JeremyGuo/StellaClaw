@@ -1,6 +1,26 @@
 ---
-version: 0.8.0-beta1
+version: 0.8.2
 ---
+
+# 0.8.2
+
+- 升级 `workdir` 结构版本到 `0.7`：
+  `zgent_native` 持久化状态新增真实的 `context_window_current/context_window_size` 字段，用来记录 native `zgent` session 返回的上下文窗口占用信息。
+- 接入 Native ZGent 的真实上下文窗口回灌：
+  前台 native `zgent` turn 结束后，AgentHost 会从远端 `session/get` 拉回当前窗口用量并持久化到本地 session。
+- 调整上下文阈值判断优先级：
+  `/status`、idle compaction 和手动 compaction 现在会优先使用 native `zgent` 提供的真实 context window 占用；缺失时才回退到本地估算。
+- 明确本次只影响 `workdir`，不影响 `config`：
+  新增 `0.6 -> 0.7` workdir upgrade step，现有配置格式保持不变。
+
+# 0.8.1-beta1
+
+- 升级 `workdir` 结构版本到 `0.6`：
+  前台 session 持久化新增 `zgent_native` 状态，用来记录 Native ZGent Kernel 绑定的远端 session 元数据，便于会话级复用与重连。
+- 收敛 `zgent` 运行路径为 native-only：
+  `agent_host` 不再走 zgent compat chat-completions 路径，前台会话直接复用 native kernel session，并把插话转发给 native `zgent-server` 处理。
+- 明确本次只影响 `workdir`，不影响 `config`：
+  新增 `0.5 -> 0.6` workdir upgrade step，现有配置格式保持不变。
 
 # 0.8.0-beta1
 

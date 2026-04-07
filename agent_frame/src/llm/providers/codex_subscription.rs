@@ -57,13 +57,8 @@ impl UpstreamProvider for CodexSubscriptionProvider {
             ));
         }
 
-        let payload = build_responses_request_payload(
-            upstream,
-            messages,
-            tools,
-            extra_payload,
-            true,
-        )?;
+        let payload =
+            build_responses_request_payload(upstream, messages, tools, extra_payload, true)?;
 
         let response = match session {
             Some(ChatCompletionSession::CodexSubscription(session)) => {

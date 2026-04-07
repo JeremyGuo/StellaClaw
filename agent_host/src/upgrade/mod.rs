@@ -3,9 +3,11 @@ use std::fs;
 use std::path::Path;
 
 mod v0_5;
+mod v0_6;
+mod v0_7;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.5";
+pub const LATEST_WORKDIR_VERSION: &str = "0.7";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -21,7 +23,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 1] = [&v0_5::Upgrade];
+    let upgraders: [&dyn WorkdirUpgrader; 3] = [&v0_5::Upgrade, &v0_6::Upgrade, &v0_7::Upgrade];
 
     while current != LATEST_WORKDIR_VERSION {
         let upgrader = upgraders
@@ -50,6 +52,8 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         .with_context(|| format!("failed to read {}", version_path.display()))?;
     match raw.trim() {
         LEGACY_WORKDIR_VERSION => Ok(LEGACY_WORKDIR_VERSION),
+        "0.5" => Ok("0.5"),
+        "0.6" => Ok("0.6"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }

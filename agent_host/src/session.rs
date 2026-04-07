@@ -104,6 +104,18 @@ pub struct IdleCompactionRetryState {
     pub failed_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ZgentNativeSessionState {
+    #[serde(default)]
+    pub remote_session_id: Option<String>,
+    #[serde(default)]
+    pub model_key: Option<String>,
+    #[serde(default)]
+    pub context_window_current: Option<u32>,
+    #[serde(default)]
+    pub context_window_size: Option<u32>,
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionSnapshot {
     pub id: Uuid,
@@ -127,6 +139,7 @@ pub struct SessionSnapshot {
     pub seen_user_profile_version: Option<String>,
     pub seen_identity_profile_version: Option<String>,
     pub idle_compaction_retry: Option<IdleCompactionRetryState>,
+    pub zgent_native: Option<ZgentNativeSessionState>,
     pub pending_continue: Option<PendingContinueState>,
     pub response_checkpoint: Option<ResponseCheckpoint>,
     pub pending_workspace_summary: bool,
@@ -166,6 +179,7 @@ struct Session {
     pending_user_profile_notice: bool,
     pending_identity_profile_notice: bool,
     idle_compaction_retry: Option<IdleCompactionRetryState>,
+    zgent_native: Option<ZgentNativeSessionState>,
     pending_continue: Option<PendingContinueState>,
     response_checkpoint: Option<ResponseCheckpoint>,
     pending_workspace_summary: bool,
@@ -201,6 +215,7 @@ impl Session {
             seen_user_profile_version: self.seen_user_profile_version.clone(),
             seen_identity_profile_version: self.seen_identity_profile_version.clone(),
             idle_compaction_retry: self.idle_compaction_retry.clone(),
+            zgent_native: self.zgent_native.clone(),
             pending_continue: self.pending_continue.clone(),
             response_checkpoint: self.response_checkpoint.clone(),
             pending_workspace_summary: self.pending_workspace_summary,
@@ -243,6 +258,7 @@ impl Session {
             pending_user_profile_notice: self.pending_user_profile_notice,
             pending_identity_profile_notice: self.pending_identity_profile_notice,
             idle_compaction_retry: self.idle_compaction_retry.clone(),
+            zgent_native: self.zgent_native.clone(),
             pending_continue: self.pending_continue.clone(),
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
@@ -294,6 +310,7 @@ impl Session {
             pending_user_profile_notice: persisted.pending_user_profile_notice,
             pending_identity_profile_notice: persisted.pending_identity_profile_notice,
             idle_compaction_retry: persisted.idle_compaction_retry,
+            zgent_native: persisted.zgent_native,
             pending_continue,
             response_checkpoint: None,
             pending_workspace_summary: persisted.pending_workspace_summary,
@@ -414,6 +431,8 @@ struct PersistedSession {
     pending_identity_profile_notice: bool,
     #[serde(default)]
     idle_compaction_retry: Option<IdleCompactionRetryState>,
+    #[serde(default)]
+    zgent_native: Option<ZgentNativeSessionState>,
     #[serde(default)]
     pending_continue: Option<PendingContinueState>,
     #[serde(default)]
@@ -697,6 +716,7 @@ impl SessionManager {
             pending_user_profile_notice: checkpoint.pending_user_profile_notice,
             pending_identity_profile_notice: checkpoint.pending_identity_profile_notice,
             idle_compaction_retry: None,
+            zgent_native: None,
             pending_continue: None,
             response_checkpoint: None,
             pending_workspace_summary: false,
@@ -761,6 +781,33 @@ impl SessionManager {
             .get(&key)
             .with_context(|| format!("no active session for {}", key))?;
         Ok(session.pending_continue.clone())
+    }
+
+    pub fn zgent_native_state(
+        &self,
+        address: &ChannelAddress,
+    ) -> Result<Option<ZgentNativeSessionState>> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        Ok(session.zgent_native.clone())
+    }
+
+    pub fn set_zgent_native_state(
+        &mut self,
+        address: &ChannelAddress,
+        zgent_native: Option<ZgentNativeSessionState>,
+    ) -> Result<()> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        session.zgent_native = zgent_native;
+        session.persist()?;
+        Ok(())
     }
 
     pub fn set_pending_continue(
@@ -1287,6 +1334,7 @@ impl SessionManager {
             pending_user_profile_notice: false,
             pending_identity_profile_notice: false,
             idle_compaction_retry: None,
+            zgent_native: None,
             pending_continue: None,
             response_checkpoint: None,
             pending_workspace_summary: false,

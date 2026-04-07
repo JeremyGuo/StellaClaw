@@ -21,5 +21,6 @@ pub mod snapshot;
 pub mod subagent;
 pub mod upgrade;
 pub mod workspace;
+pub mod zgent;
 
 pub use server::Server;

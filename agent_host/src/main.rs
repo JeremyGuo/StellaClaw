@@ -3,6 +3,7 @@ use agent_host::config::{load_server_config_file_and_upgrade, resolve_model_api_
 use agent_host::env::load_dotenv_files;
 use agent_host::logging::init_logging;
 use agent_host::sandbox::run_child_stdio;
+use agent_host::zgent::app_bridge::run_zgent_app_bridge_stdio;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -28,6 +29,15 @@ enum AgentHostCommand {
         #[arg(long)]
         job_file: PathBuf,
     },
+    #[command(name = "run-zgent-app-bridge", hide = true)]
+    RunZgentAppBridge {
+        #[arg(long)]
+        tools_file: PathBuf,
+        #[arg(long)]
+        bridge_address: String,
+        #[arg(long)]
+        bridge_token: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -36,6 +46,13 @@ fn main() -> Result<()> {
         Some(AgentHostCommand::RunChild) => return run_child_stdio(),
         Some(AgentHostCommand::RunToolWorker { job_file }) => {
             return agent_frame::tool_worker::run_job_file(&job_file);
+        }
+        Some(AgentHostCommand::RunZgentAppBridge {
+            tools_file,
+            bridge_address,
+            bridge_token,
+        }) => {
+            return run_zgent_app_bridge_stdio(&tools_file, &bridge_address, &bridge_token);
         }
         None => {}
     }

@@ -1,4 +1,7 @@
-use crate::backend::{AgentBackendKind, run_session_with_report_controlled as run_backend_session};
+use crate::backend::{
+    AgentBackendKind, BackendExecutionOptions,
+    run_session_with_report_controlled_with_options as run_backend_session,
+};
 use crate::child_rpc::{
     ChildInitPayload, ChildToParentMessage, ParentToChildMessage, RemoteToolDefinition,
 };
@@ -180,6 +183,7 @@ pub fn run_child_stdio() -> Result<()> {
         init.config,
         extra_tools,
         Some(control),
+        init.execution_options,
     );
 
     {
@@ -204,6 +208,7 @@ pub fn run_turn_in_child_process(
     previous_messages: Vec<agent_frame::ChatMessage>,
     prompt: String,
     config: agent_frame::config::AgentConfig,
+    execution_options: BackendExecutionOptions,
     skill_memory_source: PathBuf,
     skills_source_root: PathBuf,
     extra_tools: Vec<Tool>,
@@ -257,6 +262,7 @@ pub fn run_turn_in_child_process(
                     parameters: tool.parameters.clone(),
                 })
                 .collect(),
+            execution_options,
         });
         let mut writer_guard = writer.lock().map_err(|_| anyhow!("child stdin poisoned"))?;
         if let Err(error) = write_json_line(&mut *writer_guard, &init) {
@@ -498,7 +504,7 @@ fn build_bubblewrap_command(
     Ok(command)
 }
 
-fn resolve_spawnable_current_exe() -> Result<PathBuf> {
+pub(crate) fn resolve_spawnable_current_exe() -> Result<PathBuf> {
     let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
     if current_exe.exists() {
         return Ok(current_exe);

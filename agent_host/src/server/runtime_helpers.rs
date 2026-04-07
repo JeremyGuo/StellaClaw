@@ -439,6 +439,16 @@ pub(super) fn format_session_status(
     } else {
         (current_context_estimate as f64 / current_context_limit as f64) * 100.0
     };
+    let context_source_label = if session
+        .zgent_native
+        .as_ref()
+        .and_then(|state| state.context_window_current)
+        .is_some()
+    {
+        "native actual"
+    } else {
+        "local estimate"
+    };
     let language = language.to_ascii_lowercase();
     if language.starts_with("zh") {
         let mut lines = vec![
@@ -467,8 +477,11 @@ pub(super) fn format_session_status(
             ),
             format!("Turns: {}", session.turn_count),
             format!(
-                "Current context estimate: {} / {} tokens ({:.1}%, local estimate)",
-                current_context_estimate, current_context_limit, context_percent
+                "Current context estimate: {} / {} tokens ({:.1}%, {})",
+                current_context_estimate,
+                current_context_limit,
+                context_percent,
+                context_source_label
             ),
             String::new(),
             "Token 用量：".to_string(),
@@ -556,8 +569,11 @@ pub(super) fn format_session_status(
             ),
             format!("Turns: {}", session.turn_count),
             format!(
-                "Current context estimate: {} / {} tokens ({:.1}%, local estimate)",
-                current_context_estimate, current_context_limit, context_percent
+                "Current context estimate: {} / {} tokens ({:.1}%, {})",
+                current_context_estimate,
+                current_context_limit,
+                context_percent,
+                context_source_label
             ),
             String::new(),
             "Token usage:".to_string(),
@@ -780,6 +796,13 @@ pub(super) fn estimate_current_context_tokens_for_session(
     session: &SessionSnapshot,
     model_key: &str,
 ) -> Result<usize> {
+    if let Some(actual) = session
+        .zgent_native
+        .as_ref()
+        .and_then(|state| state.context_window_current)
+    {
+        return Ok(actual as usize);
+    }
     let frame_config = runtime.build_agent_frame_config(
         session,
         &session.workspace_root,
@@ -809,6 +832,18 @@ pub(super) fn estimate_current_context_tokens_for_session(
     )?;
     let tools = registry.into_values().collect::<Vec<_>>();
     Ok(estimate_session_tokens(&session.agent_messages, &tools, ""))
+}
+
+pub(super) fn effective_context_window_limit_for_session(
+    session: &SessionSnapshot,
+    model: &ModelConfig,
+) -> usize {
+    session
+        .zgent_native
+        .as_ref()
+        .and_then(|state| state.context_window_size)
+        .map(|value| value as usize)
+        .unwrap_or(model.context_window_tokens)
 }
 
 pub(super) fn replace_directory_contents(target: &Path, source: &Path) -> Result<()> {

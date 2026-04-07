@@ -54,6 +54,20 @@
       "timeout_seconds": 120.0,
       "context_window_tokens": 262144,
       "description": "OpenRouter Responses image model for multimodal generation with text and reference image input."
+    },
+    "opus-4.6": {
+      "type": "openrouter",
+      "api_endpoint": "https://openrouter.ai/api/v1",
+      "model": "anthropic/claude-opus-4.6",
+      "backend": "zgent",
+      "capabilities": [
+        "chat",
+        "image_in"
+      ],
+      "api_key_env": "OPENROUTER_API_KEY",
+      "timeout_seconds": 300.0,
+      "context_window_tokens": 262144,
+      "description": "Claude Opus 4.6 via OpenRouter using the native ZGent backend."
     }
   },
   "tooling": {

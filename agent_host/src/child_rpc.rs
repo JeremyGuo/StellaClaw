@@ -1,4 +1,4 @@
-use crate::backend::AgentBackendKind;
+use crate::backend::{AgentBackendKind, BackendExecutionOptions};
 use agent_frame::config::AgentConfig as FrameAgentConfig;
 use agent_frame::{ChatMessage, SessionEvent, SessionRunReport};
 use serde::{Deserialize, Serialize};
@@ -18,6 +18,8 @@ pub struct ChildInitPayload {
     pub prompt: String,
     pub config: FrameAgentConfig,
     pub extra_tools: Vec<RemoteToolDefinition>,
+    #[serde(default)]
+    pub execution_options: BackendExecutionOptions,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

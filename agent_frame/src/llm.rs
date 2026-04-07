@@ -398,18 +398,33 @@ fn user_content_to_responses_items(content: Option<&Value>) -> Result<Vec<Value>
                             let file_url = file_value.get("file_url").and_then(Value::as_str);
                             let filename = file_value.get("filename").and_then(Value::as_str);
                             let mut payload = Map::new();
-                            payload.insert("type".to_string(), Value::String("input_file".to_string()));
+                            payload.insert(
+                                "type".to_string(),
+                                Value::String("input_file".to_string()),
+                            );
                             if let Some(file_id) = file_id {
-                                payload.insert("file_id".to_string(), Value::String(file_id.to_string()));
+                                payload.insert(
+                                    "file_id".to_string(),
+                                    Value::String(file_id.to_string()),
+                                );
                             }
                             if let Some(file_data) = file_data {
-                                payload.insert("file_data".to_string(), Value::String(file_data.to_string()));
+                                payload.insert(
+                                    "file_data".to_string(),
+                                    Value::String(file_data.to_string()),
+                                );
                             }
                             if let Some(file_url) = file_url {
-                                payload.insert("file_url".to_string(), Value::String(file_url.to_string()));
+                                payload.insert(
+                                    "file_url".to_string(),
+                                    Value::String(file_url.to_string()),
+                                );
                             }
                             if let Some(filename) = filename {
-                                payload.insert("filename".to_string(), Value::String(filename.to_string()));
+                                payload.insert(
+                                    "filename".to_string(),
+                                    Value::String(filename.to_string()),
+                                );
                             }
                             if payload.len() > 1 {
                                 converted.push(Value::Object(payload));

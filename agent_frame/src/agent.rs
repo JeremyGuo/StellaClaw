@@ -1306,10 +1306,12 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["type"], "file");
         assert_eq!(items[0]["file"]["filename"], "sample.pdf");
-        assert!(items[0]["file"]["file_data"]
-            .as_str()
-            .unwrap_or_default()
-            .starts_with("JVBER"));
+        assert!(
+            items[0]["file"]["file_data"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("JVBER")
+        );
     }
 
     #[test]
@@ -1336,10 +1338,12 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["type"], "input_audio");
         assert_eq!(items[0]["input_audio"]["format"], "wav");
-        assert!(!items[0]["input_audio"]["data"]
-            .as_str()
-            .unwrap_or_default()
-            .is_empty());
+        assert!(
+            !items[0]["input_audio"]["data"]
+                .as_str()
+                .unwrap_or_default()
+                .is_empty()
+        );
     }
 }
 

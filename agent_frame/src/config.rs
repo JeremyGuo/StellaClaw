@@ -434,7 +434,10 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
     }
     for (label, upstream) in [
         ("config.pdf_tool_upstream", raw.pdf_tool_upstream.as_ref()),
-        ("config.audio_tool_upstream", raw.audio_tool_upstream.as_ref()),
+        (
+            "config.audio_tool_upstream",
+            raw.audio_tool_upstream.as_ref(),
+        ),
         (
             "config.image_generation_tool_upstream",
             raw.image_generation_tool_upstream.as_ref(),
@@ -443,7 +446,9 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
         if let Some(upstream) = upstream
             && (upstream.base_url.trim().is_empty() || upstream.model.trim().is_empty())
         {
-            return Err(anyhow!("{label} must include base_url and model when provided"));
+            return Err(anyhow!(
+                "{label} must include base_url and model when provided"
+            ));
         }
     }
 

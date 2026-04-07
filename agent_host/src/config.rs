@@ -1,4 +1,5 @@
 use crate::backend::AgentBackendKind;
+use crate::zgent::zgent_runtime_available;
 use agent_frame::config::{
     AuthCredentialsStoreMode, ExternalWebSearchConfig, NativeWebSearchConfig, ReasoningConfig,
     UpstreamApiKind, UpstreamAuthKind,
@@ -27,12 +28,6 @@ pub const VERSION_0_4: &str = "0.4";
 pub const VERSION_0_5: &str = "0.5";
 pub const VERSION_0_6: &str = "0.6";
 pub const VERSION_0_7: &str = "0.7";
-
-fn zgent_checkout_available() -> bool {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../zgent/crates/zgent-core/Cargo.toml")
-        .is_file()
-}
 
 trait ConfigLoader {
     fn version(&self) -> &'static str;
@@ -973,9 +968,9 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
             ));
         }
         if model.backend == AgentBackendKind::Zgent {
-            if !zgent_checkout_available() {
+            if !zgent_runtime_available() {
                 return Err(anyhow!(
-                    "model '{}' uses zgent backend but the local zgent checkout is unavailable",
+                    "model '{}' uses zgent backend but the local ./zgent runtime directory is unavailable",
                     model_name
                 ));
             }
@@ -1243,9 +1238,9 @@ mod tests {
     use super::{
         ChannelConfig, LATEST_CONFIG_VERSION, ModelType, default_telegram_commands,
         load_server_config_file, load_server_config_file_and_upgrade, resolve_model_api_keys,
-        zgent_checkout_available,
     };
     use crate::backend::AgentBackendKind;
+    use crate::zgent::zgent_runtime_available;
     use std::fs;
     use tempfile::TempDir;
 
@@ -1495,13 +1490,13 @@ mod tests {
         .unwrap();
 
         let error = load_server_config_file(&config_path).unwrap_err();
-        if zgent_checkout_available() {
+        if zgent_runtime_available() {
             assert!(error.to_string().contains("chat_completions_path"));
         } else {
             assert!(
                 error
                     .to_string()
-                    .contains("local zgent checkout is unavailable")
+                    .contains("local ./zgent runtime directory is unavailable")
             );
         }
     }
@@ -2033,7 +2028,11 @@ mod tests {
         )
         .unwrap();
 
-        let error = load_server_config_file(&config_path).unwrap_err().to_string();
-        assert!(error.contains("main_agent.model 'helper' must reference an enabled agent chat model"));
+        let error = load_server_config_file(&config_path)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("main_agent.model 'helper' must reference an enabled agent chat model")
+        );
     }
 }

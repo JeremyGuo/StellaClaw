@@ -1,9 +1,9 @@
 use crate::agent_status::{AgentRegistry, ManagedAgentKind, ManagedAgentRecord, ManagedAgentState};
 use crate::agents::{ForegroundAgent, SubAgentSpec};
 use crate::backend::{
-    backend_supports_native_multimodal_input,
+    AgentBackendKind, BackendExecutionOptions, backend_supports_native_multimodal_input,
     compact_session_messages_with_report as run_backend_compaction,
-    run_session_with_report_controlled as run_backend_session,
+    run_session_with_report_controlled_with_options as run_backend_session,
 };
 use crate::bootstrap::AgentWorkspace;
 use crate::channel::{Channel, IncomingMessage};
@@ -29,13 +29,17 @@ use crate::prompt::{AgentPromptKind, build_agent_system_prompt, greeting_for_lan
 use crate::sandbox::run_turn_in_child_process;
 use crate::session::{
     PendingContinueState, SessionManager, SessionSkillObservation, SessionSnapshot,
-    SharedProfileChangeNotice, SkillChangeNotice,
+    SharedProfileChangeNotice, SkillChangeNotice, ZgentNativeSessionState,
 };
 use crate::sink::{SinkRouter, SinkTarget};
 use crate::snapshot::{SnapshotBundle, SnapshotManager};
 use crate::subagent::{HostedSubagent, HostedSubagentInner, SubagentState};
 use crate::upgrade::upgrade_workdir;
 use crate::workspace::{WorkspaceManager, WorkspaceMountMaterialization};
+use crate::zgent::kernel::{
+    PersistentZgentKernelSession, ZgentKernelRuntimeSpec, zgent_native_kernel_runtime_available,
+};
+use crate::zgent::subagent::ZgentSubagentModel;
 use agent_frame::config::{
     AgentConfig as FrameAgentConfig, CacheControlConfig, CodexAuthConfig, ExternalWebSearchConfig,
     NativeWebSearchConfig, ReasoningConfig, UpstreamApiKind, UpstreamConfig,
@@ -59,7 +63,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use tokio::select;
@@ -99,6 +103,13 @@ struct BackgroundJobRequest {
 enum ForegroundRuntimePhase {
     Running,
     Compacting,
+}
+
+#[derive(Clone)]
+struct ActiveNativeZgentSession {
+    kernel: Arc<PersistentZgentKernelSession>,
+    model_key: String,
+    busy: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1201,6 +1212,7 @@ impl ServerRuntime {
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
             idle_compaction_retry: None,
+            zgent_native: None,
             pending_continue: None,
             response_checkpoint: None,
             pending_workspace_summary: false,
@@ -2434,6 +2446,24 @@ impl ServerRuntime {
         tools
     }
 
+    fn build_backend_execution_options(&self) -> BackendExecutionOptions {
+        BackendExecutionOptions {
+            zgent_allowed_subagent_models: self
+                .models
+                .iter()
+                .filter(|(_, model)| model.can_be_agent_model())
+                .map(|(alias, model)| ZgentSubagentModel {
+                    alias: alias.clone(),
+                    description: if model.description.trim().is_empty() {
+                        model.model.clone()
+                    } else {
+                        model.description.clone()
+                    },
+                })
+                .collect(),
+        }
+    }
+
     fn try_acquire_subagent_slot(&self) -> Result<SubAgentSlot> {
         loop {
             let current = self.subagent_count.load(Ordering::SeqCst);
@@ -2503,6 +2533,7 @@ impl ServerRuntime {
         let backend = self.model_config(&model_key)?.backend;
         let extra_tools =
             self.build_extra_tools(&session, kind, agent_id, execution_control.clone());
+        let backend_execution_options = self.build_backend_execution_options();
         if matches!(self.sandbox.mode, crate::config::SandboxMode::Disabled) {
             run_backend_session(
                 backend,
@@ -2511,6 +2542,7 @@ impl ServerRuntime {
                 config,
                 extra_tools,
                 execution_control,
+                backend_execution_options,
             )
         } else {
             let result = run_turn_in_child_process(
@@ -2519,6 +2551,7 @@ impl ServerRuntime {
                 previous_messages,
                 prompt,
                 config,
+                backend_execution_options,
                 self.agent_workspace.rundir.join("skill_memory"),
                 self.agent_workspace.skills_dir.clone(),
                 extra_tools,
@@ -2972,6 +3005,7 @@ impl ServerRuntime {
                 seen_user_profile_version: None,
                 seen_identity_profile_version: None,
                 idle_compaction_retry: None,
+                zgent_native: None,
                 pending_continue: None,
                 response_checkpoint: None,
                 pending_workspace_summary: false,
@@ -3816,6 +3850,7 @@ pub struct Server {
     summary_tracker: Arc<SummaryTracker>,
     active_foreground_controls: Arc<Mutex<HashMap<String, SessionExecutionControl>>>,
     active_foreground_phases: Arc<Mutex<HashMap<String, ForegroundRuntimePhase>>>,
+    active_native_zgent_sessions: Arc<Mutex<HashMap<String, Arc<ActiveNativeZgentSession>>>>,
     subagents: Arc<Mutex<HashMap<uuid::Uuid, Arc<HostedSubagent>>>>,
     channel_auth: Arc<Mutex<ChannelAuthorizationManager>>,
 }
@@ -4084,6 +4119,142 @@ impl Server {
         Ok(Some(model_key))
     }
 
+    fn foreground_uses_native_zgent(
+        &self,
+        _address: &ChannelAddress,
+        model_key: &str,
+    ) -> Result<bool> {
+        let model = self.model_config_or_main(model_key)?;
+        if model.backend != AgentBackendKind::Zgent {
+            return Ok(false);
+        }
+        if !zgent_native_kernel_runtime_available() {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn ensure_native_zgent_session(
+        &self,
+        session: &SessionSnapshot,
+        model_key: &str,
+    ) -> Result<Arc<ActiveNativeZgentSession>> {
+        let session_key = session.address.session_key();
+        if let Some(existing) = self
+            .active_native_zgent_sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(&session_key).cloned())
+            .filter(|active| active.model_key == model_key)
+        {
+            return Ok(existing);
+        }
+
+        let runtime = self.tool_runtime_for_address(&session.address)?;
+        let config = runtime.build_agent_frame_config(
+            session,
+            &session.workspace_root,
+            AgentPromptKind::MainForeground,
+            model_key,
+            None,
+        )?;
+        let extra_tools = runtime.build_extra_tools(
+            session,
+            AgentPromptKind::MainForeground,
+            session.agent_id,
+            None,
+        );
+        let options = runtime.build_backend_execution_options();
+        let existing_remote_session_id = self
+            .with_sessions(|sessions| sessions.zgent_native_state(&session.address))?
+            .filter(|state| state.model_key.as_deref() == Some(model_key))
+            .and_then(|state| state.remote_session_id);
+        let kernel = PersistentZgentKernelSession::spawn_or_attach(
+            &ZgentKernelRuntimeSpec::from_frame_config(&config),
+            &extra_tools,
+            &options,
+            existing_remote_session_id.as_deref(),
+        )?;
+        let session_summary = kernel.fetch_session_summary().ok();
+        crate::zgent::kernel::require_workspace_binding(
+            kernel.remote_workspace_path(),
+            &config.workspace_root,
+        )?;
+        let active = Arc::new(ActiveNativeZgentSession {
+            kernel: Arc::new(kernel),
+            model_key: model_key.to_string(),
+            busy: Arc::new(AtomicBool::new(false)),
+        });
+        self.with_sessions(|sessions| {
+            sessions.set_zgent_native_state(
+                &session.address,
+                Some(ZgentNativeSessionState {
+                    remote_session_id: Some(active.kernel.remote_session_id().to_string()),
+                    model_key: Some(model_key.to_string()),
+                    context_window_current: session_summary
+                        .as_ref()
+                        .and_then(|summary| summary.context_window_current),
+                    context_window_size: session_summary
+                        .as_ref()
+                        .and_then(|summary| summary.context_window_size),
+                }),
+            )
+        })?;
+        let mut sessions = self
+            .active_native_zgent_sessions
+            .lock()
+            .map_err(|_| anyhow!("active native zgent sessions lock poisoned"))?;
+        sessions.insert(session_key, Arc::clone(&active));
+        Ok(active)
+    }
+
+    async fn try_forward_to_active_native_zgent_turn(
+        &self,
+        message: IncomingMessage,
+    ) -> Result<Option<IncomingMessage>> {
+        if message.control.is_some() {
+            return Ok(Some(message));
+        }
+        let Some(model_key) = self.selected_main_model_key(&message.address)? else {
+            return Ok(Some(message));
+        };
+        if !self.foreground_uses_native_zgent(&message.address, &model_key)? {
+            return Ok(Some(message));
+        }
+        let session_key = message.address.session_key();
+        let Some(active) = self
+            .active_native_zgent_sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(&session_key).cloned())
+            .filter(|active| active.model_key == model_key)
+        else {
+            return Ok(Some(message));
+        };
+        if !active.busy.load(Ordering::SeqCst) {
+            return Ok(Some(message));
+        }
+
+        let Some(session) =
+            self.with_sessions(|sessions| Ok(sessions.get_snapshot(&message.address)))?
+        else {
+            return Ok(Some(message));
+        };
+        let stored_attachments = self
+            .materialize_attachments(&session.attachments_dir, message.attachments)
+            .await?;
+        let steer_prompt = tag_interrupted_followup_text(Some(compose_user_prompt(
+            message.text.as_deref(),
+            &stored_attachments,
+        )))
+        .unwrap_or_else(|| INTERRUPTED_FOLLOWUP_MARKER.to_string());
+        let kernel = Arc::clone(&active.kernel);
+        tokio::task::spawn_blocking(move || kernel.send_steer(&steer_prompt))
+            .await
+            .context("native zgent steer task join failed")??;
+        Ok(None)
+    }
+
     async fn prompt_missing_conversation_model(
         &self,
         channel: &Arc<dyn Channel>,
@@ -4232,6 +4403,7 @@ impl Server {
             summary_tracker: Arc::new(SummaryTracker::new()),
             active_foreground_controls: Arc::new(Mutex::new(HashMap::new())),
             active_foreground_phases: Arc::new(Mutex::new(HashMap::new())),
+            active_native_zgent_sessions: Arc::new(Mutex::new(HashMap::new())),
             subagents: Arc::new(Mutex::new(HashMap::new())),
             channel_auth: Arc::new(Mutex::new(ChannelAuthorizationManager::new(&workdir)?)),
         })
@@ -4321,6 +4493,12 @@ impl Server {
                                 }
                                 continue;
                             }
+                            let Some(message) = server
+                                .try_forward_to_active_native_zgent_turn(message)
+                                .await?
+                            else {
+                                continue;
+                            };
                             let interrupted_followup = request_yield_for_incoming(
                                 &server.active_foreground_controls,
                                 &server.active_foreground_phases,
@@ -4515,8 +4693,9 @@ impl Server {
             session.agent_id,
             None,
         );
-        let estimated_tokens = estimate_session_tokens(&source_messages, &extra_tools, "");
-        let idle_min_tokens = (model.context_window_tokens as f64
+        let estimated_tokens =
+            estimate_current_context_tokens_for_session(&runtime, session, &model_key)?;
+        let idle_min_tokens = (effective_context_window_limit_for_session(session, &model) as f64
             * self.main_agent.idle_compaction.min_ratio)
             .floor() as usize;
         if estimated_tokens < idle_min_tokens {
@@ -4692,6 +4871,9 @@ impl Server {
 
     fn destroy_foreground_session(&self, address: &ChannelAddress) -> Result<()> {
         let snapshot = self.with_sessions(|sessions| Ok(sessions.get_snapshot(address)))?;
+        if let Ok(mut sessions) = self.active_native_zgent_sessions.lock() {
+            sessions.remove(&address.session_key());
+        }
         if let Some(control) = self
             .active_foreground_controls
             .lock()
@@ -5951,7 +6133,7 @@ impl Server {
             .context_compaction
             .token_limit_override
             .unwrap_or_else(|| {
-                (model.context_window_tokens as f64
+                (effective_context_window_limit_for_session(session, model) as f64
                     * self.main_agent.context_compaction.trigger_ratio)
                     .floor() as usize
             });
@@ -6052,11 +6234,12 @@ impl Server {
         );
         let model = self.model_config_or_main(model_key)?;
         if force {
-            let manual_compact_min_tokens = (model.context_window_tokens as f64
-                * self.main_agent.idle_compaction.min_ratio)
-                .floor() as usize;
+            let manual_compact_min_tokens =
+                (effective_context_window_limit_for_session(session, model) as f64
+                    * self.main_agent.idle_compaction.min_ratio)
+                    .floor() as usize;
             let estimated_tokens =
-                estimate_session_tokens(&session.agent_messages, &extra_tools, "");
+                estimate_current_context_tokens_for_session(&runtime, session, model_key)?;
             if estimated_tokens < manual_compact_min_tokens {
                 return Ok(false);
             }
@@ -6372,6 +6555,47 @@ impl Server {
         original_user_text: Option<String>,
         original_attachments: Vec<StoredAttachment>,
     ) -> Result<ForegroundTurnOutcome> {
+        if self.foreground_uses_native_zgent(&session.address, model_key)? {
+            let active = self.ensure_native_zgent_session(session, model_key)?;
+            active.busy.store(true, Ordering::SeqCst);
+            let kernel = Arc::clone(&active.kernel);
+            let previous_messages_clone = previous_messages.clone();
+            let run_result = tokio::task::spawn_blocking(move || {
+                kernel.run_immediate_turn(&previous_messages_clone, "")
+            })
+            .await
+            .context("native zgent foreground task join failed");
+            active.busy.store(false, Ordering::SeqCst);
+            let messages = run_result??;
+            let session_summary = active.kernel.fetch_session_summary().ok();
+            self.with_sessions(|sessions| {
+                sessions.set_zgent_native_state(
+                    &session.address,
+                    Some(ZgentNativeSessionState {
+                        remote_session_id: Some(active.kernel.remote_session_id().to_string()),
+                        model_key: Some(model_key.to_string()),
+                        context_window_current: session_summary
+                            .as_ref()
+                            .and_then(|summary| summary.context_window_current),
+                        context_window_size: session_summary
+                            .as_ref()
+                            .and_then(|summary| summary.context_window_size),
+                    }),
+                )
+            })?;
+            let workspace_root = session.workspace_root.clone();
+            let assistant_text = extract_assistant_text(&messages);
+            let outgoing =
+                build_outgoing_message_for_session(session, &assistant_text, &workspace_root)?;
+            return Ok(ForegroundTurnOutcome::Replied {
+                messages,
+                outgoing,
+                usage: TokenUsage::default(),
+                compaction: SessionCompactionStats::default(),
+                response_checkpoint: None,
+            });
+        }
+
         let workspace_root = session.workspace_root.clone();
         let upstream_timeout_seconds = session
             .api_timeout_override_seconds
@@ -6955,6 +7179,7 @@ mod tests {
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
             idle_compaction_retry: None,
+            zgent_native: None,
             pending_continue: None,
             response_checkpoint: None,
             pending_workspace_summary: false,
@@ -7562,6 +7787,7 @@ mod tests {
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
             idle_compaction_retry: None,
+            zgent_native: None,
             pending_continue: None,
             response_checkpoint: None,
             pending_workspace_summary: false,
