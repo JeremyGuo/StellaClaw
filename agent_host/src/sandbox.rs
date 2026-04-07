@@ -209,7 +209,13 @@ pub fn run_turn_in_child_process(
     extra_tools: Vec<Tool>,
     control: Option<SessionExecutionControl>,
 ) -> Result<SessionRunReport> {
-    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
+    fs::create_dir_all(&config.runtime_state_root).with_context(|| {
+        format!(
+            "failed to prepare runtime state root {}",
+            config.runtime_state_root.display()
+        )
+    })?;
+    let current_exe = resolve_spawnable_current_exe()?;
     let mut command = match sandbox.mode {
         SandboxMode::Disabled => Command::new(&current_exe),
         SandboxMode::Subprocess => Command::new(&current_exe),
@@ -253,7 +259,28 @@ pub fn run_turn_in_child_process(
                 .collect(),
         });
         let mut writer_guard = writer.lock().map_err(|_| anyhow!("child stdin poisoned"))?;
-        write_json_line(&mut *writer_guard, &init)?;
+        if let Err(error) = write_json_line(&mut *writer_guard, &init) {
+            let mut stderr_reader = BufReader::new(
+                child_stderr
+                    .take()
+                    .ok_or_else(|| anyhow!("child stderr already consumed"))?,
+            );
+            let mut stderr_output = String::new();
+            let _ = std::io::Read::read_to_string(&mut stderr_reader, &mut stderr_output);
+            let status = child.wait().ok();
+            let stderr_output = stderr_output.trim();
+            return Err(anyhow!(
+                "failed to send init RPC message to child: {error:#}; exit_status={}; stderr={}",
+                status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string()),
+                if stderr_output.is_empty() {
+                    "<empty>"
+                } else {
+                    stderr_output
+                }
+            ));
+        }
     }
 
     if let Some(control) = &control {
@@ -469,6 +496,26 @@ fn build_bubblewrap_command(
     }
     command.arg("/__agent_host/bin/agent_host");
     Ok(command)
+}
+
+fn resolve_spawnable_current_exe() -> Result<PathBuf> {
+    let current_exe = std::env::current_exe().context("failed to resolve current executable")?;
+    if current_exe.exists() {
+        return Ok(current_exe);
+    }
+
+    let current_exe_text = current_exe.to_string_lossy();
+    if let Some(stripped) = current_exe_text.strip_suffix(" (deleted)") {
+        let candidate = PathBuf::from(stripped);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!(
+        "resolved current executable does not exist: {}",
+        current_exe.display()
+    ))
 }
 
 fn discover_home_dir() -> Option<PathBuf> {

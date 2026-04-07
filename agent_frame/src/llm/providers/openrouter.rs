@@ -1,8 +1,8 @@
 use super::UpstreamProvider;
 use crate::config::UpstreamConfig;
 use crate::llm::{
-    ChatCompletionOutcome, ChatCompletionResponse, build_chat_completions_url, parse_usage,
-    should_bypass_proxy, upstream_error_from_value,
+    ChatCompletionOutcome, ChatCompletionResponse, ChatCompletionSession,
+    build_chat_completions_url, parse_usage, should_bypass_proxy, upstream_error_from_value,
 };
 use crate::message::ChatMessage;
 use crate::tooling::Tool;
@@ -19,6 +19,7 @@ impl UpstreamProvider for OpenRouterProvider {
         messages: &[ChatMessage],
         tools: &[Tool],
         extra_payload: Option<Map<String, Value>>,
+        _session: Option<&mut ChatCompletionSession>,
     ) -> Result<ChatCompletionOutcome> {
         let chat_completions_url = build_chat_completions_url(upstream);
         let mut client_builder = reqwest::blocking::Client::builder()
@@ -47,13 +48,6 @@ impl UpstreamProvider for OpenRouterProvider {
                 "reasoning".to_string(),
                 serde_json::to_value(reasoning).context("failed to serialize reasoning config")?,
             );
-        }
-        if let Some(native_web_search) = &upstream.native_web_search
-            && native_web_search.enabled
-        {
-            for (key, value) in &native_web_search.payload {
-                payload.insert(key.clone(), value.clone());
-            }
         }
         if !tools.is_empty() {
             payload.insert(
@@ -120,6 +114,10 @@ impl UpstreamProvider for OpenRouterProvider {
             .ok_or_else(|| {
                 anyhow!("invalid chat completion response: missing choices[0].message")
             })?;
-        Ok(ChatCompletionOutcome { message, usage })
+        Ok(ChatCompletionOutcome {
+            message,
+            usage,
+            response_id: None,
+        })
     }
 }

@@ -1,3 +1,4 @@
+use crate::agent::ResponseCheckpoint;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -41,6 +42,10 @@ pub struct UpstreamConfig {
     #[serde(default)]
     pub supports_vision_input: bool,
     #[serde(default)]
+    pub supports_pdf_input: bool,
+    #[serde(default)]
+    pub supports_audio_input: bool,
+    #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default = "default_api_key_env")]
     pub api_key_env: String,
@@ -70,6 +75,14 @@ pub struct UpstreamConfig {
     pub native_web_search: Option<NativeWebSearchConfig>,
     #[serde(default)]
     pub external_web_search: Option<ExternalWebSearchConfig>,
+    #[serde(default)]
+    pub native_image_input: bool,
+    #[serde(default)]
+    pub native_pdf_input: bool,
+    #[serde(default)]
+    pub native_audio_input: bool,
+    #[serde(default)]
+    pub native_image_generation: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -116,6 +129,8 @@ pub struct ExternalWebSearchConfig {
     #[serde(default = "default_external_web_search_model")]
     pub model: String,
     #[serde(default)]
+    pub supports_vision_input: bool,
+    #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default = "default_external_web_search_api_key_env")]
     pub api_key_env: String,
@@ -149,7 +164,15 @@ pub struct AgentConfig {
     pub enabled_tools: Vec<String>,
     pub upstream: UpstreamConfig,
     #[serde(default)]
+    pub response_checkpoint: Option<ResponseCheckpoint>,
+    #[serde(default)]
     pub image_tool_upstream: Option<UpstreamConfig>,
+    #[serde(default)]
+    pub pdf_tool_upstream: Option<UpstreamConfig>,
+    #[serde(default)]
+    pub audio_tool_upstream: Option<UpstreamConfig>,
+    #[serde(default)]
+    pub image_generation_tool_upstream: Option<UpstreamConfig>,
     #[serde(default)]
     pub skills_dirs: Vec<PathBuf>,
     #[serde(default)]
@@ -172,7 +195,15 @@ struct AgentConfigRaw {
     enabled_tools: Vec<String>,
     upstream: UpstreamConfigRaw,
     #[serde(default)]
+    response_checkpoint: Option<ResponseCheckpoint>,
+    #[serde(default)]
     image_tool_upstream: Option<UpstreamConfigRaw>,
+    #[serde(default)]
+    pdf_tool_upstream: Option<UpstreamConfigRaw>,
+    #[serde(default)]
+    audio_tool_upstream: Option<UpstreamConfigRaw>,
+    #[serde(default)]
+    image_generation_tool_upstream: Option<UpstreamConfigRaw>,
     #[serde(default)]
     skills_dirs: Vec<String>,
     #[serde(default)]
@@ -210,6 +241,10 @@ struct UpstreamConfigRaw {
     #[serde(default)]
     supports_vision_input: bool,
     #[serde(default)]
+    supports_pdf_input: bool,
+    #[serde(default)]
+    supports_audio_input: bool,
+    #[serde(default)]
     api_key: Option<String>,
     #[serde(default = "default_api_key_env")]
     api_key_env: String,
@@ -241,6 +276,14 @@ struct UpstreamConfigRaw {
     native_web_search: Option<NativeWebSearchConfig>,
     #[serde(default)]
     external_web_search: Option<ExternalWebSearchConfig>,
+    #[serde(default)]
+    native_image_input: bool,
+    #[serde(default)]
+    native_pdf_input: bool,
+    #[serde(default)]
+    native_audio_input: bool,
+    #[serde(default)]
+    native_image_generation: bool,
 }
 
 fn default_api_key_env() -> String {
@@ -332,6 +375,8 @@ fn resolve_upstream(raw: UpstreamConfigRaw) -> UpstreamConfig {
         api_kind: raw.api_kind,
         auth_kind: raw.auth_kind,
         supports_vision_input: raw.supports_vision_input,
+        supports_pdf_input: raw.supports_pdf_input,
+        supports_audio_input: raw.supports_audio_input,
         api_key: raw.api_key,
         api_key_env: raw.api_key_env,
         chat_completions_path: raw.chat_completions_path,
@@ -347,6 +392,10 @@ fn resolve_upstream(raw: UpstreamConfigRaw) -> UpstreamConfig {
         headers: raw.headers,
         native_web_search: raw.native_web_search,
         external_web_search: raw.external_web_search,
+        native_image_input: raw.native_image_input,
+        native_pdf_input: raw.native_pdf_input,
+        native_audio_input: raw.native_audio_input,
+        native_image_generation: raw.native_image_generation,
     }
 }
 
@@ -383,6 +432,20 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
             "config.image_tool_upstream must include base_url and model when provided"
         ));
     }
+    for (label, upstream) in [
+        ("config.pdf_tool_upstream", raw.pdf_tool_upstream.as_ref()),
+        ("config.audio_tool_upstream", raw.audio_tool_upstream.as_ref()),
+        (
+            "config.image_generation_tool_upstream",
+            raw.image_generation_tool_upstream.as_ref(),
+        ),
+    ] {
+        if let Some(upstream) = upstream
+            && (upstream.base_url.trim().is_empty() || upstream.model.trim().is_empty())
+        {
+            return Err(anyhow!("{label} must include base_url and model when provided"));
+        }
+    }
 
     let workspace_root_explicit = raw.workspace_root.is_some();
     let workspace_root = raw
@@ -405,7 +468,11 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
     Ok(AgentConfig {
         enabled_tools: raw.enabled_tools,
         upstream: resolve_upstream(raw.upstream),
+        response_checkpoint: raw.response_checkpoint,
         image_tool_upstream: raw.image_tool_upstream.map(resolve_upstream),
+        pdf_tool_upstream: raw.pdf_tool_upstream.map(resolve_upstream),
+        audio_tool_upstream: raw.audio_tool_upstream.map(resolve_upstream),
+        image_generation_tool_upstream: raw.image_generation_tool_upstream.map(resolve_upstream),
         skills_dirs: raw
             .skills_dirs
             .iter()

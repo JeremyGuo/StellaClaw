@@ -139,6 +139,7 @@ impl ConfigLoader for LatestConfigLoader {
             LATEST_CONFIG_VERSION.to_string(),
             models,
             model_catalog,
+            super::ToolingConfig::default(),
             chat_model_keys,
             raw.main_agent,
             raw.sandbox,
@@ -190,6 +191,8 @@ fn upgrade_versioned_model(
         reasoning: raw.reasoning,
         headers: raw.headers,
         description: raw.description,
+        agent_model_enabled: true,
+        capabilities: Vec::new(),
         native_web_search: raw.native_web_search,
         external_web_search,
     })

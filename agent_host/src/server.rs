@@ -14,8 +14,8 @@ use crate::channel_auth::{
 use crate::channels::command_line::CommandLineChannel;
 use crate::channels::telegram::TelegramChannel;
 use crate::config::{
-    BotCommandConfig, ChannelConfig, MainAgentConfig, ModelConfig, SandboxConfig, SandboxMode,
-    ServerConfig, default_bot_commands,
+    BotCommandConfig, ChannelConfig, MainAgentConfig, ModelCapability, ModelConfig, SandboxConfig,
+    SandboxMode, ServerConfig, ToolingConfig, ToolingTarget, default_bot_commands,
 };
 use crate::conversation::{ConversationManager, ConversationSettings};
 use crate::cron::{
@@ -37,13 +37,14 @@ use crate::subagent::{HostedSubagent, HostedSubagentInner, SubagentState};
 use crate::upgrade::upgrade_workdir;
 use crate::workspace::{WorkspaceManager, WorkspaceMountMaterialization};
 use agent_frame::config::{
-    AgentConfig as FrameAgentConfig, CacheControlConfig, CodexAuthConfig, UpstreamConfig,
+    AgentConfig as FrameAgentConfig, CacheControlConfig, CodexAuthConfig, ExternalWebSearchConfig,
+    NativeWebSearchConfig, ReasoningConfig, UpstreamApiKind, UpstreamConfig,
     load_codex_auth_tokens,
 };
 use agent_frame::skills::discover_skills;
 use agent_frame::tooling::{build_tool_registry, terminate_runtime_state_tasks};
 use agent_frame::{
-    ChatMessage, ContextCompactionReport, SessionCompactionStats, SessionEvent,
+    ChatMessage, ContextCompactionReport, ResponseCheckpoint, SessionCompactionStats, SessionEvent,
     SessionExecutionControl, SessionRunReport, StructuredCompactionOutput, TokenUsage, Tool,
     estimate_session_tokens, extract_assistant_text,
 };
@@ -100,6 +101,47 @@ enum ForegroundRuntimePhase {
     Compacting,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ToolingFamily {
+    WebSearch,
+    Image,
+    ImageGen,
+    Pdf,
+    AudioInput,
+}
+
+impl ToolingFamily {
+    fn field_name(self) -> &'static str {
+        match self {
+            Self::WebSearch => "tooling.web_search",
+            Self::Image => "tooling.image",
+            Self::ImageGen => "tooling.image_gen",
+            Self::Pdf => "tooling.pdf",
+            Self::AudioInput => "tooling.audio_input",
+        }
+    }
+
+    fn target<'a>(self, tooling: &'a ToolingConfig) -> Option<&'a ToolingTarget> {
+        match self {
+            Self::WebSearch => tooling.web_search.as_ref(),
+            Self::Image => tooling.image.as_ref(),
+            Self::ImageGen => tooling.image_gen.as_ref(),
+            Self::Pdf => tooling.pdf.as_ref(),
+            Self::AudioInput => tooling.audio_input.as_ref(),
+        }
+    }
+
+    fn required_capability(self) -> ModelCapability {
+        match self {
+            Self::WebSearch => ModelCapability::WebSearch,
+            Self::Image => ModelCapability::ImageIn,
+            Self::ImageGen => ModelCapability::ImageOut,
+            Self::Pdf => ModelCapability::Pdf,
+            Self::AudioInput => ModelCapability::AudioIn,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct ServerRuntime {
     agent_workspace: AgentWorkspace,
@@ -113,6 +155,7 @@ struct ServerRuntime {
     channels: Arc<HashMap<String, Arc<dyn Channel>>>,
     command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     models: BTreeMap<String, ModelConfig>,
+    tooling: ToolingConfig,
     chat_model_keys: Vec<String>,
     main_agent: MainAgentConfig,
     sandbox: SandboxConfig,
@@ -162,11 +205,13 @@ enum ForegroundTurnOutcome {
         outgoing: OutgoingMessage,
         usage: TokenUsage,
         compaction: SessionCompactionStats,
+        response_checkpoint: Option<ResponseCheckpoint>,
     },
     Yielded {
         messages: Vec<ChatMessage>,
         usage: TokenUsage,
         compaction: SessionCompactionStats,
+        response_checkpoint: Option<ResponseCheckpoint>,
     },
     Failed {
         pending_continue: PendingContinueState,
@@ -245,6 +290,342 @@ impl ServerRuntime {
             .get(model_key)
             .with_context(|| format!("unknown model {}", model_key))?
             .timeout_seconds)
+    }
+
+    fn tooling_target(&self, family: ToolingFamily) -> Option<&ToolingTarget> {
+        family.target(&self.tooling)
+    }
+
+    fn build_upstream_config(
+        &self,
+        model: &ModelConfig,
+        timeout_seconds: f64,
+        prompt_cache_key: Option<String>,
+        prompt_cache_retention: Option<String>,
+        reasoning: Option<ReasoningConfig>,
+        native_web_search: Option<NativeWebSearchConfig>,
+        external_web_search: Option<ExternalWebSearchConfig>,
+        native_image_input: bool,
+        native_pdf_input: bool,
+        native_audio_input: bool,
+        native_image_generation: bool,
+    ) -> Result<UpstreamConfig> {
+        Ok(UpstreamConfig {
+            base_url: model.api_endpoint.clone(),
+            model: model.model.clone(),
+            api_kind: model.upstream_api_kind(),
+            auth_kind: model.upstream_auth_kind(),
+            supports_vision_input: model.supports_image_input(),
+            supports_pdf_input: model.has_capability(ModelCapability::Pdf),
+            supports_audio_input: model.has_capability(ModelCapability::AudioIn),
+            api_key: model.api_key.clone(),
+            api_key_env: model.api_key_env.clone(),
+            chat_completions_path: model.chat_completions_path.clone(),
+            codex_home: model.codex_home.clone().map(Into::into),
+            codex_auth: self.resolved_codex_auth(model)?,
+            auth_credentials_store_mode: model.auth_credentials_store_mode,
+            timeout_seconds,
+            context_window_tokens: model.context_window_tokens,
+            cache_control: model.cache_ttl.as_ref().map(|ttl| CacheControlConfig {
+                cache_type: "ephemeral".to_string(),
+                ttl: Some(ttl.clone()),
+            }),
+            prompt_cache_retention,
+            prompt_cache_key,
+            reasoning,
+            headers: model.headers.clone(),
+            native_web_search,
+            external_web_search,
+            native_image_input,
+            native_pdf_input,
+            native_audio_input,
+            native_image_generation,
+        })
+    }
+
+    fn synthesize_external_web_search_config(
+        &self,
+        model_key: &str,
+        model: &ModelConfig,
+    ) -> Option<ExternalWebSearchConfig> {
+        if model.upstream_api_kind() != UpstreamApiKind::ChatCompletions {
+            warn!(
+                log_stream = "server",
+                kind = "tooling_web_search_unsupported_upstream",
+                model_key,
+                model_type = ?model.model_type,
+                chat_completions_path = %model.chat_completions_path,
+                "tooling.web_search fallback currently requires a chat-completions-compatible upstream"
+            );
+            return None;
+        }
+        Some(ExternalWebSearchConfig {
+            base_url: model.api_endpoint.clone(),
+            model: model.model.clone(),
+            supports_vision_input: model.supports_image_input(),
+            api_key: model.api_key.clone(),
+            api_key_env: model.api_key_env.clone(),
+            chat_completions_path: model.chat_completions_path.clone(),
+            timeout_seconds: model.timeout_seconds,
+            headers: model.headers.clone(),
+        })
+    }
+
+    fn resolve_image_tool_upstream(
+        &self,
+        active_model_key: &str,
+        model: &ModelConfig,
+    ) -> Result<(bool, Option<UpstreamConfig>)> {
+        let configured_target = self.tooling_target(ToolingFamily::Image);
+        let image_model_key = match configured_target {
+            Some(target) if target.prefer_self && model.supports_image_input() => {
+                return Ok((true, None));
+            }
+            Some(target) => Some(target.alias.as_str()),
+            None => match model.image_tool_model.as_deref() {
+                None => return Ok((false, None)),
+                Some("self") if model.supports_image_input() => return Ok((true, None)),
+                Some("self") => return Ok((false, None)),
+                Some(other_model_key) => Some(other_model_key),
+            },
+        };
+        let Some(image_model_key) = image_model_key else {
+            return Ok((false, None));
+        };
+        let Some(image_model) = self.models.get(image_model_key) else {
+            warn!(
+                log_stream = "server",
+                kind = "tooling_image_model_missing",
+                active_model_key,
+                image_model_key,
+                "configured image tooling model is missing; falling back to current upstream"
+            );
+            return Ok((false, None));
+        };
+        if !image_model.supports_image_input() {
+            warn!(
+                log_stream = "server",
+                kind = "tooling_image_model_without_capability",
+                active_model_key,
+                image_model_key,
+                "configured image tooling model does not advertise image input support"
+            );
+        }
+        self.build_upstream_config(
+            image_model,
+            image_model.timeout_seconds,
+            None,
+            default_prompt_cache_retention(image_model.cache_ttl.as_deref(), image_model),
+            image_model.reasoning.clone(),
+            image_model.native_web_search.clone(),
+            image_model.external_web_search.clone(),
+            false,
+            false,
+            false,
+            false,
+        )
+        .map(|upstream| (false, Some(upstream)))
+    }
+
+    fn resolve_named_tool_upstream(
+        &self,
+        family: ToolingFamily,
+        active_model_key: &str,
+    ) -> Result<Option<UpstreamConfig>> {
+        let Some(target) = self.tooling_target(family) else {
+            return Ok(None);
+        };
+        let Some(tool_model) = self.models.get(&target.alias) else {
+            warn!(
+                log_stream = "server",
+                kind = "tooling_model_missing",
+                family = family.field_name(),
+                active_model_key,
+                target = %target.alias,
+                "configured tooling model is missing"
+            );
+            return Ok(None);
+        };
+        let required = family.required_capability();
+        let supports_required = match family {
+            ToolingFamily::Image => tool_model.supports_image_input(),
+            capability => tool_model.has_capability(capability.required_capability()),
+        };
+        if !supports_required {
+            warn!(
+                log_stream = "server",
+                kind = "tooling_model_missing_capability",
+                family = family.field_name(),
+                active_model_key,
+                target = %target.alias,
+                required_capability = ?required,
+                "configured tooling model does not advertise the required capability"
+            );
+        }
+        self.build_upstream_config(
+            tool_model,
+            tool_model.timeout_seconds,
+            None,
+            default_prompt_cache_retention(tool_model.cache_ttl.as_deref(), tool_model),
+            tool_model.reasoning.clone(),
+            tool_model.native_web_search.clone(),
+            tool_model.external_web_search.clone(),
+            false,
+            false,
+            false,
+            false,
+        )
+        .map(Some)
+    }
+
+    fn resolve_native_or_tool_upstream(
+        &self,
+        family: ToolingFamily,
+        active_model_key: &str,
+        model: &ModelConfig,
+    ) -> (bool, Option<UpstreamConfig>) {
+        let Some(target) = self.tooling_target(family) else {
+            return (false, None);
+        };
+        let self_supported = match family {
+            ToolingFamily::Image => model.supports_image_input(),
+            ToolingFamily::Pdf => model.has_capability(ModelCapability::Pdf),
+            ToolingFamily::AudioInput => model.has_capability(ModelCapability::AudioIn),
+            _ => false,
+        };
+        if target.prefer_self && self_supported {
+            return (true, None);
+        }
+        match self.resolve_named_tool_upstream(family, active_model_key) {
+            Ok(upstream) => (false, upstream),
+            Err(error) => {
+                warn!(
+                    log_stream = "server",
+                    kind = "tooling_model_resolve_failed",
+                    family = family.field_name(),
+                    active_model_key,
+                    target = %target.alias,
+                    error = %error,
+                    "failed to resolve external tooling model"
+                );
+                (false, None)
+            }
+        }
+    }
+
+    fn resolve_native_image_generation(
+        &self,
+        active_model_key: &str,
+        model: &ModelConfig,
+    ) -> (bool, Option<UpstreamConfig>) {
+        let Some(target) = self.tooling_target(ToolingFamily::ImageGen) else {
+            return (false, None);
+        };
+        if model.has_capability(ModelCapability::ImageOut) {
+            if model.upstream_api_kind() == UpstreamApiKind::Responses {
+                return (true, None);
+            }
+            warn!(
+                log_stream = "server",
+                kind = "tooling_image_generation_self_requires_responses",
+                active_model_key,
+                model_type = ?model.model_type,
+                chat_completions_path = %model.chat_completions_path,
+                "native provider image generation is only enabled for responses-based upstreams; falling back to the configured alias"
+            );
+        }
+        match self.resolve_named_tool_upstream(ToolingFamily::ImageGen, active_model_key) {
+            Ok(upstream) => (false, upstream),
+            Err(error) => {
+                warn!(
+                    log_stream = "server",
+                    kind = "tooling_image_generation_resolve_failed",
+                    active_model_key,
+                    target = %target.alias,
+                    error = %error,
+                    "failed to resolve external image generation tooling model"
+                );
+                (false, None)
+            }
+        }
+    }
+
+    fn resolve_web_search_configs(
+        &self,
+        active_model_key: &str,
+        model: &ModelConfig,
+    ) -> (
+        Option<NativeWebSearchConfig>,
+        Option<ExternalWebSearchConfig>,
+    ) {
+        if let Some(target) = self.tooling_target(ToolingFamily::WebSearch) {
+            if target.prefer_self && model.has_capability(ModelCapability::WebSearch) {
+                if model.upstream_api_kind() == UpstreamApiKind::Responses {
+                    if let Some(native) = model
+                        .native_web_search
+                        .clone()
+                        .filter(|settings| settings.enabled)
+                    {
+                        return (Some(native), None);
+                    }
+                    warn!(
+                        log_stream = "server",
+                        kind = "tooling_web_search_self_without_native_payload",
+                        active_model_key,
+                        "tooling.web_search requested :self but the active model has no native_web_search payload; falling back to the configured alias"
+                    );
+                } else {
+                    warn!(
+                        log_stream = "server",
+                        kind = "tooling_web_search_self_requires_responses",
+                        active_model_key,
+                        model_type = ?model.model_type,
+                        chat_completions_path = %model.chat_completions_path,
+                        "tooling.web_search requested :self but native provider web search is only enabled for responses-based upstreams; falling back to the configured alias"
+                    );
+                }
+            }
+            let Some(search_model) = self.models.get(&target.alias) else {
+                warn!(
+                    log_stream = "server",
+                    kind = "tooling_web_search_model_missing",
+                    active_model_key,
+                    target = %target.alias,
+                    "configured web search tooling model is missing"
+                );
+                return (None, None);
+            };
+            let external = search_model.external_web_search.clone().or_else(|| {
+                self.synthesize_external_web_search_config(&target.alias, search_model)
+            });
+            if external.is_none() {
+                warn!(
+                    log_stream = "server",
+                    kind = "tooling_web_search_model_unavailable",
+                    active_model_key,
+                    target = %target.alias,
+                    "configured web search tooling model could not be translated into an external web search upstream"
+                );
+            }
+            return (None, external);
+        }
+
+        let native = if model.upstream_api_kind() == UpstreamApiKind::Responses {
+            model
+                .native_web_search
+                .clone()
+                .filter(|settings| settings.enabled)
+        } else {
+            None
+        };
+        let external = model.external_web_search.clone().or_else(|| {
+            model.web_search_model.as_ref().and_then(|alias| {
+                self.models.get(alias).and_then(|search_model| {
+                    self.synthesize_external_web_search_config(alias, search_model)
+                })
+            })
+        });
+        (native, external)
     }
 
     fn tell_user_now(&self, session: &SessionSnapshot, text: String) -> Result<Value> {
@@ -821,6 +1202,7 @@ impl ServerRuntime {
             seen_identity_profile_version: None,
             idle_compaction_retry: None,
             pending_continue: None,
+            response_checkpoint: None,
             pending_workspace_summary: false,
             close_after_summary: false,
         }
@@ -1246,43 +1628,12 @@ impl ServerRuntime {
         let prompt_cache_key = self.selected_chat_version_id.as_ref().map(Uuid::to_string);
         let prompt_cache_retention =
             default_prompt_cache_retention(model.cache_ttl.as_deref(), model);
-        let image_tool_upstream = match model.image_tool_model.as_deref() {
-            None | Some("self") => None,
-            Some(other_model_key) => {
-                let image_model = self.model_config(other_model_key)?;
-                Some(UpstreamConfig {
-                    base_url: image_model.api_endpoint.clone(),
-                    model: image_model.model.clone(),
-                    api_kind: image_model.upstream_api_kind(),
-                    auth_kind: image_model.upstream_auth_kind(),
-                    supports_vision_input: image_model.supports_vision_input,
-                    api_key: image_model.api_key.clone(),
-                    api_key_env: image_model.api_key_env.clone(),
-                    chat_completions_path: image_model.chat_completions_path.clone(),
-                    codex_home: image_model.codex_home.clone().map(Into::into),
-                    codex_auth: self.resolved_codex_auth(image_model)?,
-                    auth_credentials_store_mode: image_model.auth_credentials_store_mode,
-                    timeout_seconds: image_model.timeout_seconds,
-                    context_window_tokens: image_model.context_window_tokens,
-                    cache_control: image_model
-                        .cache_ttl
-                        .as_ref()
-                        .map(|ttl| CacheControlConfig {
-                            cache_type: "ephemeral".to_string(),
-                            ttl: Some(ttl.clone()),
-                        }),
-                    prompt_cache_retention: default_prompt_cache_retention(
-                        image_model.cache_ttl.as_deref(),
-                        image_model,
-                    ),
-                    prompt_cache_key: None,
-                    reasoning: image_model.reasoning.clone(),
-                    headers: image_model.headers.clone(),
-                    native_web_search: image_model.native_web_search.clone(),
-                    external_web_search: image_model.external_web_search.clone(),
-                })
-            }
-        };
+        let (native_image_input, image_tool_upstream) =
+            self.resolve_image_tool_upstream(model_key, model)?;
+        let (native_pdf_input, pdf_tool_upstream) =
+            self.resolve_native_or_tool_upstream(ToolingFamily::Pdf, model_key, model);
+        let (native_audio_input, audio_tool_upstream) =
+            self.resolve_native_or_tool_upstream(ToolingFamily::AudioInput, model_key, model);
         let commands = self
             .command_catalog
             .get(&session.address.channel_id)
@@ -1295,37 +1646,33 @@ impl ServerRuntime {
             .unwrap_or_default();
         let reasoning =
             effective_reasoning_config(model, self.selected_reasoning_effort.as_deref());
+        let (native_web_search, external_web_search) =
+            self.resolve_web_search_configs(model_key, model);
+        let (native_image_generation, image_generation_tool_upstream) =
+            self.resolve_native_image_generation(model_key, model);
 
         Ok(FrameAgentConfig {
             enabled_tools: self.main_agent.enabled_tools.clone(),
-            upstream: UpstreamConfig {
-                base_url: model.api_endpoint.clone(),
-                model: model.model.clone(),
-                api_kind: model.upstream_api_kind(),
-                auth_kind: model.upstream_auth_kind(),
-                supports_vision_input: model.supports_vision_input,
-                api_key: model.api_key.clone(),
-                api_key_env: model.api_key_env.clone(),
-                chat_completions_path: model.chat_completions_path.clone(),
-                codex_home: model.codex_home.clone().map(Into::into),
-                codex_auth: self.resolved_codex_auth(model)?,
-                auth_credentials_store_mode: model.auth_credentials_store_mode,
-                timeout_seconds: upstream_timeout_seconds
+            upstream: self.build_upstream_config(
+                model,
+                upstream_timeout_seconds
                     .unwrap_or(model.timeout_seconds)
                     .min(model.timeout_seconds),
-                context_window_tokens: model.context_window_tokens,
-                cache_control: model.cache_ttl.as_ref().map(|ttl| CacheControlConfig {
-                    cache_type: "ephemeral".to_string(),
-                    ttl: Some(ttl.clone()),
-                }),
-                prompt_cache_retention,
                 prompt_cache_key,
+                prompt_cache_retention,
                 reasoning,
-                headers: model.headers.clone(),
-                native_web_search: model.native_web_search.clone(),
-                external_web_search: model.external_web_search.clone(),
-            },
+                native_web_search,
+                external_web_search,
+                native_image_input,
+                native_pdf_input,
+                native_audio_input,
+                native_image_generation,
+            )?,
+            response_checkpoint: None,
             image_tool_upstream,
+            pdf_tool_upstream,
+            audio_tool_upstream,
+            image_generation_tool_upstream,
             skills_dirs: if matches!(self.sandbox.mode, crate::config::SandboxMode::Bubblewrap) {
                 vec![workspace_root.join(".skills")]
             } else {
@@ -2135,6 +2482,18 @@ impl ServerRuntime {
             &model_key,
             upstream_timeout_seconds,
         )?;
+        let mut config = config;
+        config.response_checkpoint = session
+            .pending_continue
+            .as_ref()
+            .and_then(|pending| pending.response_checkpoint.clone())
+            .filter(|checkpoint| checkpoint.matches_messages(&previous_messages))
+            .or_else(|| {
+                session
+                    .response_checkpoint
+                    .clone()
+                    .filter(|checkpoint| checkpoint.matches_messages(&previous_messages))
+            });
         std::fs::create_dir_all(&config.runtime_state_root).with_context(|| {
             format!(
                 "failed to create runtime state root {}",
@@ -2614,6 +2973,7 @@ impl ServerRuntime {
                 seen_identity_profile_version: None,
                 idle_compaction_retry: None,
                 pending_continue: None,
+                response_checkpoint: None,
                 pending_workspace_summary: false,
                 close_after_summary: false,
             };
@@ -2848,6 +3208,7 @@ impl ServerRuntime {
                 checkpoint.messages.clone(),
                 &checkpoint.usage,
                 &checkpoint.compaction,
+                checkpoint.response_checkpoint.clone(),
             )
         })
     }
@@ -2884,6 +3245,7 @@ impl ServerRuntime {
                         report.messages.clone(),
                         &report.usage,
                         &report.compaction,
+                        report.response_checkpoint.clone(),
                     )
                 })?;
                 self.with_sessions(|sessions| {
@@ -2950,6 +3312,7 @@ impl ServerRuntime {
                         report.messages.clone(),
                         &report.usage,
                         &report.compaction,
+                        report.response_checkpoint.clone(),
                     )
                 })?;
                 self.with_sessions(|sessions| {
@@ -3104,6 +3467,7 @@ impl ServerRuntime {
                         report.messages.clone(),
                         &report.usage,
                         &report.compaction,
+                        report.response_checkpoint.clone(),
                     )
                 })?;
                 self.with_sessions(|sessions| {
@@ -3148,6 +3512,7 @@ impl ServerRuntime {
                         report.messages.clone(),
                         &report.usage,
                         &report.compaction,
+                        report.response_checkpoint.clone(),
                     )
                 })?;
                 self.with_sessions(|sessions| {
@@ -3432,6 +3797,7 @@ pub struct Server {
     telegram_channel_ids: Arc<HashSet<String>>,
     command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     models: BTreeMap<String, ModelConfig>,
+    tooling: ToolingConfig,
     chat_model_keys: Vec<String>,
     main_agent: MainAgentConfig,
     sandbox: SandboxConfig,
@@ -3780,6 +4146,7 @@ impl Server {
         upgrade_workdir(&workdir)?;
         let agent_workspace = AgentWorkspace::initialize(&workdir)?;
         let workspace_manager = WorkspaceManager::load_or_create(&workdir)?;
+        let tooling = config.tooling.clone();
 
         let mut channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
         let mut telegram_channel_ids: HashSet<String> = HashSet::new();
@@ -3814,6 +4181,22 @@ impl Server {
             "server initialized"
         );
 
+        for family in [
+            ToolingFamily::ImageGen,
+            ToolingFamily::Pdf,
+            ToolingFamily::AudioInput,
+        ] {
+            if let Some(target) = family.target(&tooling) {
+                warn!(
+                    log_stream = "server",
+                    kind = "tooling_config_unimplemented",
+                    field = family.field_name(),
+                    target = %target.as_config_string(),
+                    "configured tooling target is not wired yet and will only log warnings for now"
+                );
+            }
+        }
+
         let (background_job_sender, background_job_receiver) = mpsc::channel(64);
         let cron_manager = Arc::new(Mutex::new(CronManager::load_or_create(&workdir)?));
         let agent_registry = Arc::new(Mutex::new(AgentRegistry::load_or_create(&workdir)?));
@@ -3831,6 +4214,7 @@ impl Server {
             telegram_channel_ids: Arc::new(telegram_channel_ids),
             command_catalog,
             models: config.models,
+            tooling,
             chat_model_keys: config.chat_model_keys,
             main_agent: config.main_agent,
             sandbox: config.sandbox,
@@ -4234,6 +4618,7 @@ impl Server {
             channels: Arc::clone(&self.channels),
             command_catalog: self.command_catalog.clone(),
             models: self.models.clone(),
+            tooling: self.tooling.clone(),
             chat_model_keys: self.chat_model_keys.clone(),
             main_agent: self.main_agent.clone(),
             sandbox: self.sandbox.clone(),
@@ -5100,6 +5485,7 @@ impl Server {
                     outgoing,
                     usage,
                     compaction,
+                    response_checkpoint,
                 } => {
                     let messages = normalize_messages_for_persistence(
                         messages,
@@ -5109,7 +5495,13 @@ impl Server {
                     let loaded_skills =
                         extract_loaded_skill_names(&messages, session.agent_message_count);
                     self.with_sessions(|sessions| {
-                        sessions.record_agent_turn(&incoming.address, messages, &usage, &compaction)
+                        sessions.record_agent_turn(
+                            &incoming.address,
+                            messages,
+                            &usage,
+                            &compaction,
+                            response_checkpoint,
+                        )
                     })
                     .context("failed to persist continued agent_frame messages")?;
                     self.rotate_chat_version_if_compacted(&incoming.address, &compaction)?;
@@ -5156,6 +5548,7 @@ impl Server {
                     messages,
                     usage,
                     compaction,
+                    response_checkpoint,
                 } => {
                     let messages = normalize_messages_for_persistence(
                         messages,
@@ -5170,6 +5563,7 @@ impl Server {
                             messages,
                             &usage,
                             &compaction,
+                            response_checkpoint,
                         )
                     })
                     .context("failed to persist yielded continued agent_frame messages")?;
@@ -5344,17 +5738,19 @@ impl Server {
                 .await;
         }
         let outcome = turn_result?;
-        let (messages, outgoing, usage, compaction) = match outcome {
+        let (messages, outgoing, usage, compaction, response_checkpoint) = match outcome {
             ForegroundTurnOutcome::Replied {
                 messages,
                 outgoing,
                 usage,
                 compaction,
-            } => (messages, outgoing, usage, compaction),
+                response_checkpoint,
+            } => (messages, outgoing, usage, compaction, response_checkpoint),
             ForegroundTurnOutcome::Yielded {
                 messages,
                 usage,
                 compaction,
+                response_checkpoint,
             } => {
                 let messages = normalize_messages_for_persistence(
                     messages,
@@ -5364,7 +5760,13 @@ impl Server {
                 let loaded_skills =
                     extract_loaded_skill_names(&messages, session.agent_message_count);
                 self.with_sessions(|sessions| {
-                    sessions.record_yielded_turn(&incoming.address, messages, &usage, &compaction)
+                    sessions.record_yielded_turn(
+                        &incoming.address,
+                        messages,
+                        &usage,
+                        &compaction,
+                        response_checkpoint,
+                    )
                 })
                 .context("failed to persist yielded agent_frame messages")?;
                 self.rotate_chat_version_if_compacted(&incoming.address, &compaction)?;
@@ -5423,7 +5825,13 @@ impl Server {
         );
         let loaded_skills = extract_loaded_skill_names(&messages, session.agent_message_count);
         self.with_sessions(|sessions| {
-            sessions.record_agent_turn(&incoming.address, messages, &usage, &compaction)
+            sessions.record_agent_turn(
+                &incoming.address,
+                messages,
+                &usage,
+                &compaction,
+                response_checkpoint,
+            )
         })
         .context("failed to persist agent_frame messages")?;
         self.rotate_chat_version_if_compacted(&incoming.address, &compaction)?;
@@ -5450,7 +5858,10 @@ impl Server {
             session_id = %foreground.session_id,
             channel_id = %foreground.channel_id,
             system_prompt_len = foreground.system_prompt.len() as u64,
-            has_text = outgoing.text.as_deref().is_some_and(|text| !text.trim().is_empty()),
+            has_text = outgoing
+                .text
+                .as_deref()
+                .is_some_and(|text: &str| !text.trim().is_empty()),
             attachment_count = outgoing.attachments.len() as u64 + outgoing.images.len() as u64,
             "foreground agent produced reply"
         );
@@ -5701,22 +6112,30 @@ impl Server {
             .run_main_agent_turn(session, &effective_model_key, greeting, None, Vec::new())
             .await
             .context("failed to initialize foreground session")?;
-        let (messages, outgoing, usage, compaction) = match outcome {
+        let (messages, outgoing, usage, compaction, response_checkpoint) = match outcome {
             ForegroundTurnOutcome::Replied {
                 messages,
                 outgoing,
                 usage,
                 compaction,
-            } => (messages, outgoing, usage, compaction),
+                response_checkpoint,
+            } => (messages, outgoing, usage, compaction, response_checkpoint),
             ForegroundTurnOutcome::Yielded {
                 messages,
                 usage,
                 compaction,
+                response_checkpoint,
             } => {
                 let messages =
                     normalize_messages_for_persistence(messages, &persistence_system_prompt, &[]);
                 self.with_sessions(|sessions| {
-                    sessions.record_yielded_turn(&session.address, messages, &usage, &compaction)
+                    sessions.record_yielded_turn(
+                        &session.address,
+                        messages,
+                        &usage,
+                        &compaction,
+                        response_checkpoint,
+                    )
                 })?;
                 self.rotate_chat_version_if_compacted(&session.address, &compaction)?;
                 return Ok(OutgoingMessage::default());
@@ -5726,7 +6145,13 @@ impl Server {
         let messages =
             normalize_messages_for_persistence(messages, &persistence_system_prompt, &[]);
         self.with_sessions(|sessions| {
-            sessions.record_agent_turn(&session.address, messages, &usage, &compaction)
+            sessions.record_agent_turn(
+                &session.address,
+                messages,
+                &usage,
+                &compaction,
+                response_checkpoint,
+            )
         })?;
         self.rotate_chat_version_if_compacted(&session.address, &compaction)?;
         self.log_turn_usage(session, &usage, true);
@@ -5986,12 +6411,14 @@ impl Server {
                     outgoing,
                     usage: report.usage,
                     compaction: report.compaction,
+                    response_checkpoint: report.response_checkpoint,
                 })
             }
             TimedRunOutcome::Yielded(report) => Ok(ForegroundTurnOutcome::Yielded {
                 messages: report.messages,
                 usage: report.usage,
                 compaction: report.compaction,
+                response_checkpoint: report.response_checkpoint,
             }),
             TimedRunOutcome::TimedOut { checkpoint, error } => {
                 let report = checkpoint.ok_or(error)?;
@@ -6003,13 +6430,24 @@ impl Server {
                     outgoing,
                     usage: report.usage,
                     compaction: report.compaction,
+                    response_checkpoint: report.response_checkpoint,
                 })
             }
             TimedRunOutcome::Failed { checkpoint, error } => {
-                let (resume_messages, compaction) = checkpoint
-                    .map(|report| (report.messages, report.compaction))
+                let (resume_messages, compaction, response_checkpoint) = checkpoint
+                    .map(|report| {
+                        (
+                            report.messages,
+                            report.compaction,
+                            report.response_checkpoint,
+                        )
+                    })
                     .unwrap_or_else(|| {
-                        (previous_messages.clone(), SessionCompactionStats::default())
+                        (
+                            previous_messages.clone(),
+                            SessionCompactionStats::default(),
+                            session.response_checkpoint.clone(),
+                        )
                     });
                 Ok(ForegroundTurnOutcome::Failed {
                     pending_continue: PendingContinueState {
@@ -6020,6 +6458,7 @@ impl Server {
                         resume_messages,
                         original_user_text,
                         original_attachments,
+                        response_checkpoint,
                     },
                     compaction,
                     error,
@@ -6460,7 +6899,7 @@ mod tests {
     use crate::backend::AgentBackendKind;
     use crate::bootstrap::AgentWorkspace;
     use crate::channel::{Channel, IncomingMessage};
-    use crate::config::ModelConfig;
+    use crate::config::{ModelCapability, ModelConfig};
     use crate::domain::ChannelAddress;
     use crate::domain::{AttachmentKind, OutgoingMessage, ProcessingState, StoredAttachment};
     use crate::session::{PendingContinueState, SessionSnapshot};
@@ -6517,6 +6956,7 @@ mod tests {
             seen_identity_profile_version: None,
             idle_compaction_retry: None,
             pending_continue: None,
+            response_checkpoint: None,
             pending_workspace_summary: false,
             close_after_summary: false,
         }
@@ -6661,7 +7101,7 @@ mod tests {
             api_endpoint: "https://example.com/v1".to_string(),
             model: "demo-vision".to_string(),
             backend: AgentBackendKind::AgentFrame,
-            supports_vision_input: true,
+            supports_vision_input: false,
             image_tool_model: None,
             web_search_model: None,
             api_key: None,
@@ -6675,8 +7115,10 @@ mod tests {
             reasoning: None,
             headers: serde_json::Map::new(),
             description: "vision".to_string(),
+            agent_model_enabled: true,
             native_web_search: None,
             external_web_search: None,
+            capabilities: vec![ModelCapability::ImageIn],
         };
 
         let message =
@@ -7121,6 +7563,7 @@ mod tests {
             seen_identity_profile_version: None,
             idle_compaction_retry: None,
             pending_continue: None,
+            response_checkpoint: None,
             pending_workspace_summary: false,
             close_after_summary: false,
         };
@@ -7235,8 +7678,10 @@ mod tests {
             reasoning: None,
             headers: serde_json::Map::new(),
             description: "test model".to_string(),
+            agent_model_enabled: true,
             native_web_search: None,
             external_web_search: None,
+            capabilities: Vec::new(),
         };
 
         let text = format_session_status(
@@ -7360,6 +7805,7 @@ mod tests {
             original_attachments: Vec::new(),
             error_summary: "error".to_string(),
             progress_summary: "progress".to_string(),
+            response_checkpoint: None,
             failed_at: Utc::now(),
         };
 
@@ -7411,8 +7857,10 @@ mod tests {
             reasoning: None,
             headers: serde_json::Map::new(),
             description: "demo".to_string(),
+            agent_model_enabled: true,
             native_web_search: None,
             external_web_search: None,
+            capabilities: Vec::new(),
         };
         let usage = TokenUsage {
             llm_calls: 1,
@@ -7451,8 +7899,10 @@ mod tests {
             reasoning: None,
             headers: serde_json::Map::new(),
             description: "demo".to_string(),
+            agent_model_enabled: true,
             native_web_search: None,
             external_web_search: None,
+            capabilities: Vec::new(),
         };
         let compaction = SessionCompactionStats {
             run_count: 2,

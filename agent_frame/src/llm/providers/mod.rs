@@ -2,7 +2,7 @@ pub(super) mod codex_subscription;
 pub(super) mod openrouter;
 pub(super) mod openrouter_responses;
 
-use super::ChatCompletionOutcome;
+use super::{ChatCompletionOutcome, ChatCompletionSession};
 use crate::config::{UpstreamApiKind, UpstreamAuthKind, UpstreamConfig};
 use crate::message::ChatMessage;
 use crate::tooling::Tool;
@@ -10,12 +10,17 @@ use anyhow::Result;
 use serde_json::{Map, Value};
 
 pub(super) trait UpstreamProvider {
+    fn start_session(&self, _upstream: &UpstreamConfig) -> Result<Option<ChatCompletionSession>> {
+        Ok(None)
+    }
+
     fn create_completion(
         &self,
         upstream: &UpstreamConfig,
         messages: &[ChatMessage],
         tools: &[Tool],
         extra_payload: Option<Map<String, Value>>,
+        session: Option<&mut ChatCompletionSession>,
     ) -> Result<ChatCompletionOutcome>;
 }
 

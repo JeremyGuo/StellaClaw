@@ -262,6 +262,7 @@ mod tests {
             seen_identity_profile_version: None,
             idle_compaction_retry: None,
             pending_continue: None,
+            response_checkpoint: None,
             pending_workspace_summary: false,
             close_after_summary: false,
         };
@@ -281,11 +282,13 @@ mod tests {
             headers: serde_json::Map::new(),
             context_window_tokens: 100_000,
             description: "General-purpose test model".to_string(),
+            agent_model_enabled: true,
             timeout_seconds: 30.0,
             cache_ttl: None,
             reasoning: None,
             native_web_search: None,
             external_web_search: None,
+            capabilities: Vec::new(),
         };
         let mut models = BTreeMap::new();
         models.insert("main".to_string(), model.clone());
@@ -403,6 +406,7 @@ mod tests {
             seen_identity_profile_version: None,
             idle_compaction_retry: None,
             pending_continue: None,
+            response_checkpoint: None,
             pending_workspace_summary: false,
             close_after_summary: false,
         };
@@ -422,11 +426,13 @@ mod tests {
             headers: serde_json::Map::new(),
             context_window_tokens: 100_000,
             description: "General-purpose test model".to_string(),
+            agent_model_enabled: true,
             timeout_seconds: 30.0,
             cache_ttl: None,
             reasoning: None,
             native_web_search: None,
             external_web_search: None,
+            capabilities: Vec::new(),
         };
         let mut models = BTreeMap::new();
         models.insert("main".to_string(), model.clone());

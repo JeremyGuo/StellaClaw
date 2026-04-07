@@ -15,12 +15,18 @@ mod v0_2;
 mod v0_3;
 mod v0_4;
 mod v0_5;
+mod v0_6;
+mod v0_7;
+mod v0_8;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.5";
+pub const LATEST_CONFIG_VERSION: &str = "0.8";
 pub const VERSION_0_2: &str = "0.2";
 pub const VERSION_0_3: &str = "0.3";
 pub const VERSION_0_4: &str = "0.4";
+pub const VERSION_0_5: &str = "0.5";
+pub const VERSION_0_6: &str = "0.6";
+pub const VERSION_0_7: &str = "0.7";
 
 fn zgent_checkout_available() -> bool {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -100,6 +106,10 @@ pub struct ModelConfig {
     pub headers: Map<String, Value>,
     #[serde(default)]
     pub description: String,
+    #[serde(default = "default_agent_model_enabled")]
+    pub agent_model_enabled: bool,
+    #[serde(default)]
+    pub capabilities: Vec<ModelCapability>,
     #[serde(default)]
     pub native_web_search: Option<NativeWebSearchConfig>,
     #[serde(default)]
@@ -121,6 +131,18 @@ impl ModelConfig {
             ModelType::Openrouter | ModelType::OpenrouterResp => UpstreamAuthKind::ApiKey,
         }
     }
+
+    pub fn has_capability(&self, capability: ModelCapability) -> bool {
+        self.capabilities.contains(&capability)
+    }
+
+    pub fn supports_image_input(&self) -> bool {
+        self.supports_vision_input || self.has_capability(ModelCapability::ImageIn)
+    }
+
+    pub fn can_be_agent_model(&self) -> bool {
+        self.agent_model_enabled && self.has_capability(ModelCapability::Chat)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -129,6 +151,103 @@ pub enum ModelType {
     Openrouter,
     OpenrouterResp,
     CodexSubscription,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelCapability {
+    Chat,
+    WebSearch,
+    ImageIn,
+    ImageOut,
+    Pdf,
+    AudioIn,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolingTarget {
+    pub alias: String,
+    pub prefer_self: bool,
+}
+
+impl ToolingTarget {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Err(anyhow!("tooling target must not be empty"));
+        }
+        let mut alias = raw;
+        let mut prefer_self = false;
+        if let Some((before, after)) = raw.split_once(':') {
+            alias = before.trim();
+            let suffix = after.trim();
+            if suffix != "self" {
+                return Err(anyhow!(
+                    "unsupported tooling target suffix '{}'; expected ':self'",
+                    suffix
+                ));
+            }
+            prefer_self = true;
+        }
+        if alias.is_empty() {
+            return Err(anyhow!("tooling target alias must not be empty"));
+        }
+        Ok(Self {
+            alias: alias.to_string(),
+            prefer_self,
+        })
+    }
+
+    pub fn as_config_string(&self) -> String {
+        if self.prefer_self {
+            format!("{}:self", self.alias)
+        } else {
+            self.alias.clone()
+        }
+    }
+}
+
+impl Serialize for ToolingTarget {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.as_config_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for ToolingTarget {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolingConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search: Option<ToolingTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ToolingTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_gen: Option<ToolingTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf: Option<ToolingTarget>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_input: Option<ToolingTarget>,
+}
+
+impl ToolingConfig {
+    pub fn is_empty(&self) -> bool {
+        self.web_search.is_none()
+            && self.image.is_none()
+            && self.image_gen.is_none()
+            && self.pdf.is_none()
+            && self.audio_input.is_none()
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -287,6 +406,8 @@ pub struct ServerConfig {
     pub models: BTreeMap<String, ModelConfig>,
     pub model_catalog: ModelCatalogConfig,
     #[serde(default)]
+    pub tooling: ToolingConfig,
+    #[serde(default)]
     pub chat_model_keys: Vec<String>,
     pub main_agent: MainAgentConfig,
     #[serde(default)]
@@ -313,6 +434,14 @@ pub struct ResolvedModelApiKey {
     pub model_name: String,
     pub source: String,
     pub api_key: Option<String>,
+}
+
+fn slice_is_empty<T>(value: &[T]) -> bool {
+    value.is_empty()
+}
+
+fn str_is_empty(value: &str) -> bool {
+    value.is_empty()
 }
 
 fn default_cli_prompt() -> String {
@@ -521,6 +650,10 @@ pub(crate) fn default_cron_poll_interval_seconds() -> u64 {
     5
 }
 
+fn default_agent_model_enabled() -> bool {
+    true
+}
+
 pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
     let path = path.as_ref();
     let raw = fs::read_to_string(path)
@@ -530,12 +663,15 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let loaders: [&dyn ConfigLoader; 5] = [
+    let loaders: [&dyn ConfigLoader; 8] = [
         &v0_1::LegacyConfigLoader,
         &v0_2::VersionedConfigLoader,
         &v0_3::VersionedConfigLoader,
         &v0_4::LatestConfigLoader,
         &v0_5::LatestConfigLoader,
+        &v0_6::LatestConfigLoader,
+        &v0_7::LatestConfigLoader,
+        &v0_8::LatestConfigLoader,
     ];
     let loader = loaders
         .into_iter()
@@ -548,19 +684,50 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
 
 pub(crate) fn build_server_config(
     version: String,
-    models: BTreeMap<String, ModelConfig>,
-    model_catalog: ModelCatalogConfig,
-    chat_model_keys: Vec<String>,
+    mut models: BTreeMap<String, ModelConfig>,
+    mut model_catalog: ModelCatalogConfig,
+    tooling: ToolingConfig,
+    mut chat_model_keys: Vec<String>,
     main_agent: MainAgentConfig,
     sandbox: SandboxConfig,
     max_global_sub_agents: usize,
     cron_poll_interval_seconds: u64,
     channels: Vec<ChannelConfig>,
 ) -> ServerConfig {
+    for (name, model) in &mut models {
+        normalize_model_capabilities(
+            model,
+            name,
+            &chat_model_keys,
+            &model_catalog.vision,
+            &model_catalog.chat,
+        );
+    }
+    if chat_model_keys.is_empty() {
+        chat_model_keys = models
+            .iter()
+            .filter_map(|(name, model)| model.can_be_agent_model().then_some(name.clone()))
+            .collect();
+    }
+    if model_catalog.chat.is_empty() {
+        model_catalog.chat = models
+            .iter()
+            .filter(|(_, model)| model.can_be_agent_model())
+            .map(|(name, model)| (name.clone(), model.clone()))
+            .collect();
+    }
+    if model_catalog.vision.is_empty() {
+        model_catalog.vision = models
+            .iter()
+            .filter(|(_, model)| model.supports_image_input())
+            .map(|(name, model)| (name.clone(), model.clone()))
+            .collect();
+    }
     ServerConfig {
         version,
         models,
         model_catalog,
+        tooling,
         chat_model_keys,
         main_agent,
         sandbox,
@@ -580,12 +747,15 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
     let config = {
-        let loaders: [&dyn ConfigLoader; 5] = [
+        let loaders: [&dyn ConfigLoader; 8] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
             &v0_3::VersionedConfigLoader,
             &v0_4::LatestConfigLoader,
             &v0_5::LatestConfigLoader,
+            &v0_6::LatestConfigLoader,
+            &v0_7::LatestConfigLoader,
+            &v0_8::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()
@@ -607,7 +777,6 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
         model: &'a Option<String>,
         global_install_root: &'a str,
         language: &'a str,
-        enabled_tools: &'a [String],
         max_tool_roundtrips: usize,
         enable_context_compression: bool,
         context_compaction: &'a ContextCompactionConfig,
@@ -616,9 +785,49 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
     }
 
     #[derive(Serialize)]
+    struct PersistedModelConfig<'a> {
+        #[serde(rename = "type")]
+        model_type: ModelType,
+        api_endpoint: &'a str,
+        model: &'a str,
+        backend: AgentBackendKind,
+        #[serde(skip_serializing_if = "slice_is_empty")]
+        capabilities: &'a [ModelCapability],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        api_key: &'a Option<String>,
+        api_key_env: &'a str,
+        chat_completions_path: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        codex_home: &'a Option<String>,
+        auth_credentials_store_mode: AuthCredentialsStoreMode,
+        timeout_seconds: f64,
+        context_window_tokens: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_ttl: &'a Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning: &'a Option<ReasoningConfig>,
+        #[serde(skip_serializing_if = "Map::is_empty")]
+        headers: &'a Map<String, Value>,
+        #[serde(skip_serializing_if = "str_is_empty")]
+        description: &'a str,
+        #[serde(skip_serializing_if = "is_true")]
+        agent_model_enabled: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        native_web_search: &'a Option<NativeWebSearchConfig>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        supports_vision_input: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        image_tool_model: &'a Option<String>,
+        #[serde(rename = "web_search", skip_serializing_if = "Option::is_none")]
+        web_search_model: &'a Option<String>,
+    }
+
+    #[derive(Serialize)]
     struct PersistedServerConfig<'a> {
         version: &'a str,
-        models: &'a ModelCatalogConfig,
+        models: BTreeMap<String, PersistedModelConfig<'a>>,
+        #[serde(skip_serializing_if = "ToolingConfig::is_empty")]
+        tooling: &'a ToolingConfig,
         main_agent: PersistedMainAgentConfig<'a>,
         sandbox: &'a SandboxConfig,
         max_global_sub_agents: usize,
@@ -626,14 +835,49 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
         channels: &'a [ChannelConfig],
     }
 
+    let persisted_models = config
+        .models
+        .iter()
+        .map(|(name, model)| {
+            (
+                name.clone(),
+                PersistedModelConfig {
+                    model_type: model.model_type,
+                    api_endpoint: &model.api_endpoint,
+                    model: &model.model,
+                    backend: model.backend,
+                    capabilities: &model.capabilities,
+                    api_key: &model.api_key,
+                    api_key_env: &model.api_key_env,
+                    chat_completions_path: &model.chat_completions_path,
+                    codex_home: &model.codex_home,
+                    auth_credentials_store_mode: model.auth_credentials_store_mode,
+                    timeout_seconds: model.timeout_seconds,
+                    context_window_tokens: model.context_window_tokens,
+                    cache_ttl: &model.cache_ttl,
+                    reasoning: &model.reasoning,
+                    headers: &model.headers,
+                    description: &model.description,
+                    agent_model_enabled: model.agent_model_enabled,
+                    native_web_search: &model.native_web_search,
+                    supports_vision_input: model
+                        .supports_vision_input
+                        .then_some(model.supports_vision_input),
+                    image_tool_model: &model.image_tool_model,
+                    web_search_model: &model.web_search_model,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+
     let persisted = PersistedServerConfig {
         version: LATEST_CONFIG_VERSION,
-        models: &config.model_catalog,
+        models: persisted_models,
+        tooling: &config.tooling,
         main_agent: PersistedMainAgentConfig {
             model: &config.main_agent.model,
             global_install_root: &config.main_agent.global_install_root,
             language: &config.main_agent.language,
-            enabled_tools: &config.main_agent.enabled_tools,
             max_tool_roundtrips: config.main_agent.max_tool_roundtrips,
             enable_context_compression: config.main_agent.enable_context_compression,
             context_compaction: &config.main_agent.context_compaction,
@@ -688,9 +932,13 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
                 model
             ));
         }
-        if !config.chat_model_keys.iter().any(|value| value == model) {
+        if !config
+            .models
+            .get(model)
+            .is_some_and(ModelConfig::can_be_agent_model)
+        {
             return Err(anyhow!(
-                "main_agent.model '{}' must reference a chat model",
+                "main_agent.model '{}' must reference an enabled agent chat model",
                 model
             ));
         }
@@ -750,6 +998,7 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
             ));
         }
         if let Some(web_search_model) = &model.web_search_model
+            && !config.models.contains_key(web_search_model)
             && !config
                 .model_catalog
                 .web_search
@@ -762,7 +1011,112 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
             ));
         }
     }
+    validate_tooling_target(
+        config,
+        "tooling.web_search",
+        config.tooling.web_search.as_ref(),
+        ModelCapability::WebSearch,
+    )?;
+    validate_tooling_target(
+        config,
+        "tooling.image",
+        config.tooling.image.as_ref(),
+        ModelCapability::ImageIn,
+    )?;
+    validate_tooling_target(
+        config,
+        "tooling.image_gen",
+        config.tooling.image_gen.as_ref(),
+        ModelCapability::ImageOut,
+    )?;
+    validate_tooling_target(
+        config,
+        "tooling.pdf",
+        config.tooling.pdf.as_ref(),
+        ModelCapability::Pdf,
+    )?;
+    validate_tooling_target(
+        config,
+        "tooling.audio_input",
+        config.tooling.audio_input.as_ref(),
+        ModelCapability::AudioIn,
+    )?;
     Ok(())
+}
+
+fn validate_tooling_target(
+    config: &ServerConfig,
+    field_name: &str,
+    target: Option<&ToolingTarget>,
+    required_capability: ModelCapability,
+) -> Result<()> {
+    let Some(target) = target else {
+        return Ok(());
+    };
+    let Some(model) = config.models.get(&target.alias) else {
+        return Err(anyhow!(
+            "{} references unknown model alias '{}'",
+            field_name,
+            target.alias
+        ));
+    };
+    let supports_required_capability = match required_capability {
+        ModelCapability::ImageIn => model.supports_image_input(),
+        capability => model.has_capability(capability),
+    };
+    if !supports_required_capability {
+        return Err(anyhow!(
+            "{} references model '{}' which does not declare capability '{}'",
+            field_name,
+            target.alias,
+            serde_json::to_string(&required_capability)
+                .unwrap_or_else(|_| "\"unknown\"".to_string())
+                .trim_matches('"')
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_model_capabilities(
+    model: &mut ModelConfig,
+    model_name: &str,
+    chat_model_keys: &[String],
+    vision_catalog: &BTreeMap<String, ModelConfig>,
+    chat_catalog: &BTreeMap<String, ModelConfig>,
+) {
+    if model.capabilities.contains(&ModelCapability::ImageIn) {
+        model.supports_vision_input = true;
+    }
+    if model.supports_vision_input && !model.capabilities.contains(&ModelCapability::ImageIn) {
+        model.capabilities.push(ModelCapability::ImageIn);
+    }
+    if model.agent_model_enabled
+        && (chat_model_keys.iter().any(|value| value == model_name)
+            || chat_catalog.contains_key(model_name))
+        && !model.capabilities.contains(&ModelCapability::Chat)
+    {
+        model.capabilities.push(ModelCapability::Chat);
+    }
+    if vision_catalog.contains_key(model_name)
+        && !model.capabilities.contains(&ModelCapability::ImageIn)
+    {
+        model.capabilities.push(ModelCapability::ImageIn);
+        model.supports_vision_input = true;
+    }
+    if model
+        .native_web_search
+        .as_ref()
+        .is_some_and(|cfg| cfg.enabled)
+        && !model.capabilities.contains(&ModelCapability::WebSearch)
+    {
+        model.capabilities.push(ModelCapability::WebSearch);
+    }
+    model.capabilities.sort();
+    model.capabilities.dedup();
+}
+
+fn is_true(value: &bool) -> bool {
+    *value
 }
 
 pub fn resolve_model_api_keys(config: &ServerConfig) -> Vec<ResolvedModelApiKey> {
@@ -1449,10 +1803,11 @@ mod tests {
 
         let written = fs::read_to_string(&config_path).unwrap();
         let written_json: serde_json::Value = serde_json::from_str(&written).unwrap();
-        assert!(written.contains("\"version\": \"0.5\""));
+        assert!(written.contains("\"version\": \"0.8\""));
         assert!(written.contains("\"web_search\": \"main_web_search\""));
         assert!(written.contains("\"models\": {"));
-        assert!(written.contains("\"web_search\": {"));
+        assert!(!written.contains("\"tooling\": {"));
+        assert!(!written.contains("\"enabled_tools\""));
         assert!(written.contains("\"context_compaction\": {"));
         assert!(
             written_json["main_agent"]
@@ -1519,5 +1874,166 @@ mod tests {
                 .web_search
                 .contains_key("default_search")
         );
+    }
+
+    #[test]
+    fn latest_config_supports_alias_keyed_models_and_tooling_targets() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.8",
+              "models": {
+                "gpt54": {
+                  "type": "codex-subscription",
+                  "api_endpoint": "https://chatgpt.com/backend-api/codex",
+                  "model": "gpt-5.4",
+                  "codex_home": "~/.codex",
+                  "description": "demo",
+                  "capabilities": ["chat", "web_search", "image_in"]
+                },
+                "sonar": {
+                  "type": "openrouter",
+                  "api_endpoint": "https://openrouter.ai/api/v1",
+                  "model": "perplexity/sonar-pro",
+                  "description": "search",
+                  "capabilities": ["chat", "web_search"],
+                  "agent_model_enabled": false
+                }
+              },
+              "tooling": {
+                "web_search": "sonar:self",
+                "image": "gpt54:self"
+              },
+              "main_agent": {
+                "model": "gpt54"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = load_server_config_file(&config_path).unwrap();
+        assert_eq!(config.chat_model_keys, vec!["gpt54".to_string()]);
+        assert!(config.models["gpt54"].has_capability(super::ModelCapability::WebSearch));
+        assert!(config.models["gpt54"].supports_image_input());
+        assert!(!config.models["sonar"].agent_model_enabled);
+        assert_eq!(
+            config
+                .tooling
+                .web_search
+                .as_ref()
+                .map(|value| value.as_config_string()),
+            Some("sonar:self".to_string())
+        );
+        assert_eq!(
+            config
+                .tooling
+                .image
+                .as_ref()
+                .map(|value| value.as_config_string()),
+            Some("gpt54:self".to_string())
+        );
+    }
+
+    #[test]
+    fn tooling_targets_require_models_with_matching_capabilities() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.8",
+              "models": {
+                "main": {
+                  "type": "openrouter",
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-model",
+                  "description": "demo",
+                  "capabilities": ["chat"]
+                },
+                "helper": {
+                  "type": "openrouter",
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "helper-model",
+                  "description": "helper"
+                }
+              },
+              "tooling": {
+                "web_search": "helper"
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let error = load_server_config_file(&config_path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("tooling.web_search references model 'helper' which does not declare capability 'web_search'")
+        );
+    }
+
+    #[test]
+    fn disabled_agent_models_are_excluded_from_chat_model_keys_and_main_model_selection() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.8",
+              "models": {
+                "main": {
+                  "type": "openrouter",
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-main",
+                  "description": "demo",
+                  "capabilities": ["chat"]
+                },
+                "helper": {
+                  "type": "openrouter-resp",
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-helper",
+                  "description": "helper",
+                  "capabilities": ["chat", "image_out"],
+                  "agent_model_enabled": false
+                }
+              },
+              "main_agent": {
+                "model": "helper"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let error = load_server_config_file(&config_path).unwrap_err().to_string();
+        assert!(error.contains("main_agent.model 'helper' must reference an enabled agent chat model"));
     }
 }

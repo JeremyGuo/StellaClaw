@@ -20,6 +20,8 @@ humantime = "2.3"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+tungstenite = { version = "0.24", default-features = false, features = ["handshake", "http", "rustls-tls-webpki-roots"] }
+url = "2.5"
 uuid = { version = "1.18", features = ["v4"] }
 
 [dev-dependencies]

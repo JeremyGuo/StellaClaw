@@ -107,6 +107,8 @@ impl ConfigLoader for LegacyConfigLoader {
                     reasoning: model.reasoning,
                     headers: model.headers,
                     description: model.description,
+                    agent_model_enabled: true,
+                    capabilities: Vec::new(),
                     native_web_search: model.native_web_search,
                     external_web_search: search_alias
                         .as_ref()
@@ -125,6 +127,7 @@ impl ConfigLoader for LegacyConfigLoader {
             LATEST_CONFIG_VERSION.to_string(),
             models,
             model_catalog,
+            super::ToolingConfig::default(),
             chat_model_keys,
             raw.main_agent,
             raw.sandbox,

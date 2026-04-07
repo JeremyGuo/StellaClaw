@@ -1,9 +1,9 @@
 use crate::compaction::{
     COMPACTION_MARKER, ContextCompactionReport, StructuredCompactionOutput,
-    maybe_compact_messages_with_report,
+    maybe_compact_messages_with_report, maybe_compact_messages_with_report_with_session,
 };
 use crate::config::AgentConfig;
-use crate::llm::{TokenUsage, create_chat_completion};
+use crate::llm::{TokenUsage, create_chat_completion, start_chat_completion_session};
 use crate::message::ChatMessage;
 use crate::skills::{SkillMetadata, build_skills_meta_prompt, discover_skills};
 use crate::tooling::{
@@ -14,6 +14,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use humantime::parse_duration;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,6 +38,12 @@ fn compose_system_prompt(config: &AgentConfig, skills: &[SkillMetadata]) -> Stri
     {
         parts.push(
             "Native provider web search is enabled for this session. Prefer that built-in capability instead of expecting a separate external web_search tool."
+                .to_string(),
+        );
+    }
+    if config.upstream.native_image_generation {
+        parts.push(
+            "Native provider image generation is enabled for this session. When the user asks to create or edit images, use that built-in capability instead of expecting a separate local image generation tool."
                 .to_string(),
         );
     }
@@ -109,6 +116,157 @@ pub fn run_session(
     Ok(run_session_with_report(previous_messages, prompt, config, extra_tools)?.messages)
 }
 
+fn prepare_responses_continuation_messages(
+    messages: &[ChatMessage],
+    checkpoint: &ResponseCheckpoint,
+) -> Option<Vec<ChatMessage>> {
+    if !checkpoint.matches_messages(messages) || messages.len() <= checkpoint.message_count {
+        return None;
+    }
+
+    let mut request_messages = messages
+        .iter()
+        .filter(|message| message.role == "system")
+        .cloned()
+        .collect::<Vec<_>>();
+    request_messages.extend(
+        messages[checkpoint.message_count..]
+            .iter()
+            .filter(|message| message.role != "system")
+            .cloned(),
+    );
+
+    (!request_messages.is_empty()).then_some(request_messages)
+}
+
+fn codex_previous_response_payload(
+    checkpoint: &ResponseCheckpoint,
+) -> serde_json::Map<String, Value> {
+    serde_json::Map::from_iter([(
+        "previous_response_id".to_string(),
+        Value::String(checkpoint.response_id.clone()),
+    )])
+}
+
+fn is_previous_response_id_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("previous_response_id")
+        || message.contains("previous response")
+        || (message.contains("response") && message.contains("not found"))
+        || (message.contains("response") && message.contains("invalid"))
+}
+
+fn image_path_to_data_url(path: &Path) -> Result<String> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let media_type = match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("bmp") => "image/bmp",
+        Some("svg") => "image/svg+xml",
+        _ => "application/octet-stream",
+    };
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:{};base64,{}", media_type, encoded))
+}
+
+fn file_path_to_base64(path: &Path) -> Result<String> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    use base64::Engine as _;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+fn infer_audio_format(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("wav") => Some("wav"),
+        Some("mp3") | Some("mpeg") | Some("mpga") => Some("mp3"),
+        Some("ogg") | Some("opus") => Some("ogg"),
+        Some("webm") => Some("webm"),
+        Some("m4a") | Some("mp4") | Some("aac") => Some("m4a"),
+        Some("flac") => Some("flac"),
+        _ => None,
+    }
+}
+
+fn synthetic_user_message_from_tool_result(result: &str) -> Option<ChatMessage> {
+    let value: Value = serde_json::from_str(result).ok()?;
+    let object = value.as_object()?;
+    if object.get("kind").and_then(Value::as_str) != Some("synthetic_user_multimodal") {
+        return None;
+    }
+    let mut content = Vec::new();
+    for item in object.get("media")?.as_array()? {
+        let kind = item.get("type").and_then(Value::as_str)?;
+        match kind {
+            "input_image" => {
+                let path = item.get("path").and_then(Value::as_str)?;
+                let image_url = image_path_to_data_url(Path::new(path)).ok()?;
+                content.push(json!({
+                    "type": "input_image",
+                    "image_url": image_url,
+                }));
+            }
+            "input_file" => {
+                let path = item.get("path").and_then(Value::as_str)?;
+                let filename = item
+                    .get("filename")
+                    .and_then(Value::as_str)
+                    .or_else(|| Path::new(path).file_name().and_then(|value| value.to_str()))
+                    .unwrap_or("document.pdf");
+                let file_data = file_path_to_base64(Path::new(path)).ok()?;
+                content.push(json!({
+                    "type": "file",
+                    "file": {
+                        "file_data": file_data,
+                        "filename": filename,
+                    }
+                }));
+            }
+            "input_audio" => {
+                let path = item.get("path").and_then(Value::as_str)?;
+                let format = item
+                    .get("format")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .or_else(|| infer_audio_format(Path::new(path)).map(ToOwned::to_owned))?;
+                let data = file_path_to_base64(Path::new(path)).ok()?;
+                content.push(json!({
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": data,
+                        "format": format,
+                    }
+                }));
+            }
+            _ => {}
+        }
+    }
+    if content.is_empty() {
+        return None;
+    }
+    Some(ChatMessage {
+        role: "user".to_string(),
+        content: Some(Value::Array(content)),
+        name: None,
+        tool_call_id: None,
+        tool_calls: None,
+    })
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SessionRunReport {
     pub messages: Vec<ChatMessage>,
@@ -116,6 +274,40 @@ pub struct SessionRunReport {
     pub compaction: SessionCompactionStats,
     #[serde(default)]
     pub yielded: bool,
+    #[serde(default)]
+    pub response_checkpoint: Option<ResponseCheckpoint>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResponseCheckpoint {
+    pub response_id: String,
+    pub message_count: usize,
+    pub message_hash: u64,
+}
+
+impl ResponseCheckpoint {
+    pub fn for_messages(response_id: impl Into<String>, messages: &[ChatMessage]) -> Self {
+        Self {
+            response_id: response_id.into(),
+            message_count: messages.len(),
+            message_hash: message_hash(messages),
+        }
+    }
+
+    pub fn matches_messages(&self, messages: &[ChatMessage]) -> bool {
+        messages.len() >= self.message_count
+            && self.message_hash == message_hash(&messages[..self.message_count])
+    }
+}
+
+fn message_hash(messages: &[ChatMessage]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let raw = serde_json::to_vec(messages).unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    raw.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -401,13 +593,19 @@ impl SessionExecutionControl {
         Ok(())
     }
 
-    fn emit_checkpoint(&self, messages: &[ChatMessage], usage: &TokenUsage) {
+    fn emit_checkpoint(
+        &self,
+        messages: &[ChatMessage],
+        usage: &TokenUsage,
+        response_checkpoint: Option<ResponseCheckpoint>,
+    ) {
         if let Some(callback) = &self.checkpoint_callback {
             callback(SessionRunReport {
                 messages: messages.to_vec(),
                 usage: usage.clone(),
                 compaction: SessionCompactionStats::default(),
                 yielded: false,
+                response_checkpoint,
             });
         }
         self.emit_event(SessionEvent::CheckpointEmitted {
@@ -464,6 +662,8 @@ pub fn run_session_with_report_controlled(
     let mut messages = ensure_system_message(&previous_messages, &system_prompt);
     let mut usage = TokenUsage::default();
     let mut compaction_stats = SessionCompactionStats::default();
+    let mut last_response_checkpoint = config.response_checkpoint.clone();
+    let mut llm_session = start_chat_completion_session(&config.upstream)?;
 
     if let Some(control) = &control {
         control.ensure_not_cancelled()?;
@@ -475,6 +675,9 @@ pub fn run_session_with_report_controlled(
         &config.runtime_state_root,
         &config.upstream,
         config.image_tool_upstream.as_ref(),
+        config.pdf_tool_upstream.as_ref(),
+        config.audio_tool_upstream.as_ref(),
+        config.image_generation_tool_upstream.as_ref(),
         &config.skills_dirs,
         &discovered_skills,
         &extra_tools,
@@ -496,9 +699,14 @@ pub fn run_session_with_report_controlled(
         });
     }
 
-    let initial_compaction =
-        maybe_compact_messages_with_report(&config, &messages, &tool_definitions, &prompt)
-            .context("threshold context compaction failed during initial phase")?;
+    let initial_compaction = maybe_compact_messages_with_report_with_session(
+        &config,
+        &messages,
+        &tool_definitions,
+        &prompt,
+        llm_session.as_mut(),
+    )
+    .context("threshold context compaction failed during initial phase")?;
     if let Some(control) = &control {
         control.emit_event(SessionEvent::CompactionCompleted {
             phase: "initial".to_string(),
@@ -525,6 +733,9 @@ pub fn run_session_with_report_controlled(
             control.ensure_not_cancelled()?;
             apply_pending_prefix_rewrite(control, &mut messages, &mut usage, &mut compaction_stats);
             if control.take_yield_requested() {
+                let response_checkpoint = last_response_checkpoint
+                    .clone()
+                    .filter(|checkpoint| checkpoint.matches_messages(&messages));
                 control.emit_event(SessionEvent::SessionYielded {
                     phase: "round_start".to_string(),
                     message_count: messages.len(),
@@ -535,6 +746,7 @@ pub fn run_session_with_report_controlled(
                     usage,
                     compaction: compaction_stats,
                     yielded: true,
+                    response_checkpoint,
                 });
             }
             control.emit_event(SessionEvent::RoundStarted {
@@ -549,9 +761,14 @@ pub fn run_session_with_report_controlled(
                     message_count: messages.len(),
                 });
             }
-            let round_compaction =
-                maybe_compact_messages_with_report(&config, &messages, &tool_definitions, "")
-                    .context("threshold context compaction failed during round phase")?;
+            let round_compaction = maybe_compact_messages_with_report_with_session(
+                &config,
+                &messages,
+                &tool_definitions,
+                "",
+                llm_session.as_mut(),
+            )
+            .context("threshold context compaction failed during round phase")?;
             if let Some(control) = &control {
                 control.emit_event(SessionEvent::CompactionCompleted {
                     phase: "round".to_string(),
@@ -574,7 +791,35 @@ pub fn run_session_with_report_controlled(
                 message_count: messages.len(),
             });
         }
-        let outcome = create_chat_completion(&config.upstream, &messages, &tool_definitions, None)?;
+        let continuation_messages = last_response_checkpoint
+            .as_ref()
+            .and_then(|checkpoint| prepare_responses_continuation_messages(&messages, checkpoint));
+        let continuation_payload = last_response_checkpoint.as_ref().and_then(|checkpoint| {
+            continuation_messages
+                .as_ref()
+                .map(|_| codex_previous_response_payload(checkpoint))
+        });
+        let outcome = match create_chat_completion(
+            &config.upstream,
+            continuation_messages.as_deref().unwrap_or(&messages),
+            &tool_definitions,
+            continuation_payload.clone(),
+            llm_session.as_mut(),
+        ) {
+            Ok(outcome) => outcome,
+            Err(error)
+                if continuation_payload.is_some() && is_previous_response_id_error(&error) =>
+            {
+                create_chat_completion(
+                    &config.upstream,
+                    &messages,
+                    &tool_definitions,
+                    None,
+                    llm_session.as_mut(),
+                )?
+            }
+            Err(error) => return Err(error),
+        };
         usage.add_assign(&outcome.usage);
         let last_model_response_at = Instant::now();
         let tool_calls = outcome.message.tool_calls.clone().unwrap_or_default();
@@ -588,13 +833,19 @@ pub fn run_session_with_report_controlled(
             });
         }
         messages.push(outcome.message);
+        last_response_checkpoint = outcome
+            .response_id
+            .map(|response_id| ResponseCheckpoint::for_messages(response_id, &messages));
         if let Some(control) = &control
             && tool_calls.is_empty()
             && !extract_assistant_text(&messages).trim().is_empty()
         {
-            control.emit_checkpoint(&messages, &usage);
+            control.emit_checkpoint(&messages, &usage, last_response_checkpoint.clone());
         }
         if tool_calls.is_empty() {
+            let response_checkpoint = last_response_checkpoint
+                .clone()
+                .filter(|checkpoint| checkpoint.matches_messages(&messages));
             if let Some(control) = &control {
                 control.emit_event(SessionEvent::SessionCompleted {
                     message_count: messages.len(),
@@ -606,6 +857,7 @@ pub fn run_session_with_report_controlled(
                 usage,
                 compaction: compaction_stats,
                 yielded: false,
+                response_checkpoint,
             });
         }
 
@@ -664,6 +916,7 @@ pub fn run_session_with_report_controlled(
             && control
                 .as_ref()
                 .is_some_and(SessionExecutionControl::take_timeout_observation_requested);
+        let mut synthetic_user_content = Vec::new();
         for completed_tool in completed {
             let result = if timeout_observation_requested {
                 synthesize_tool_timeout_observation(
@@ -679,6 +932,11 @@ pub fn run_session_with_report_controlled(
                 completed_tool.tool_name.clone(),
                 result.clone(),
             ));
+            if let Some(synthetic_user_message) = synthetic_user_message_from_tool_result(&result)
+                && let Some(Value::Array(items)) = synthetic_user_message.content
+            {
+                synthetic_user_content.extend(items);
+            }
             if let Some(control) = &control {
                 control.emit_event(SessionEvent::ToolCallCompleted {
                     round_index,
@@ -689,6 +947,15 @@ pub fn run_session_with_report_controlled(
                 });
             }
         }
+        if !synthetic_user_content.is_empty() {
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::Array(synthetic_user_content)),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            });
+        }
         if timeout_observation_requested {
             if let Some(control) = &control {
                 control.emit_event(SessionEvent::ToolWaitCompactionStarted {
@@ -696,9 +963,14 @@ pub fn run_session_with_report_controlled(
                     stable_prefix_message_count: messages.len(),
                 });
             }
-            let post_tool_compaction =
-                maybe_compact_messages_with_report(&config, &messages, &tool_definitions, "")
-                    .context("tool-wait context compaction failed")?;
+            let post_tool_compaction = maybe_compact_messages_with_report_with_session(
+                &config,
+                &messages,
+                &tool_definitions,
+                "",
+                llm_session.as_mut(),
+            )
+            .context("tool-wait context compaction failed")?;
             if let Some(control) = &control {
                 control.emit_event(SessionEvent::ToolWaitCompactionCompleted {
                     tool_name: "tool_batch".to_string(),
@@ -720,6 +992,9 @@ pub fn run_session_with_report_controlled(
         if let Some(control) = &control
             && control.take_yield_requested()
         {
+            let response_checkpoint = last_response_checkpoint
+                .clone()
+                .filter(|checkpoint| checkpoint.matches_messages(&messages));
             control.emit_event(SessionEvent::SessionYielded {
                 phase: "after_tool_batch".to_string(),
                 message_count: messages.len(),
@@ -730,6 +1005,7 @@ pub fn run_session_with_report_controlled(
                 usage,
                 compaction: compaction_stats,
                 yielded: true,
+                response_checkpoint,
             });
         }
     }
@@ -876,13 +1152,15 @@ fn synthesize_tool_timeout_observation(
 mod tests {
     use super::{
         ExecutionSignal, SessionExecutionControl, finish_pending_tool_wait_compaction,
-        start_pending_tool_wait_compaction,
+        start_pending_tool_wait_compaction, synthetic_user_message_from_tool_result,
     };
     use crate::config::{AgentConfig, CacheControlConfig, UpstreamConfig};
     use crate::message::ChatMessage;
+    use serde_json::Value;
     use std::path::PathBuf;
     use std::thread;
     use std::time::{Duration, Instant};
+    use tempfile::TempDir;
 
     #[test]
     fn pending_tool_wait_compaction_requests_timeout_observation_after_deadline() {
@@ -894,6 +1172,8 @@ mod tests {
                 api_kind: crate::config::UpstreamApiKind::ChatCompletions,
                 auth_kind: crate::config::UpstreamAuthKind::ApiKey,
                 supports_vision_input: false,
+                supports_pdf_input: false,
+                supports_audio_input: false,
                 api_key: None,
                 api_key_env: "OPENAI_API_KEY".to_string(),
                 chat_completions_path: "/chat/completions".to_string(),
@@ -912,8 +1192,16 @@ mod tests {
                 headers: serde_json::Map::new(),
                 native_web_search: None,
                 external_web_search: None,
+                native_image_input: false,
+                native_pdf_input: false,
+                native_audio_input: false,
+                native_image_generation: false,
             },
+            response_checkpoint: None,
             image_tool_upstream: None,
+            pdf_tool_upstream: None,
+            audio_tool_upstream: None,
+            image_generation_tool_upstream: None,
             skills_dirs: Vec::new(),
             system_prompt: "Test system prompt.".to_string(),
             max_tool_roundtrips: 4,
@@ -961,6 +1249,98 @@ mod tests {
             Ok(ExecutionSignal::TimeoutObservation)
         ));
     }
+
+    #[test]
+    fn synthetic_multimodal_tool_result_becomes_user_image_message() {
+        let temp_dir = TempDir::new().unwrap();
+        let image_path = temp_dir.path().join("sample.png");
+        std::fs::write(&image_path, b"png-bytes").unwrap();
+
+        let message = synthetic_user_message_from_tool_result(
+            &serde_json::json!({
+                "kind": "synthetic_user_multimodal",
+                "media": [{
+                    "type": "input_image",
+                    "path": image_path.display().to_string(),
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(message.role, "user");
+        let content = message.content.unwrap();
+        let items = content.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "input_image");
+        assert!(
+            items[0]["image_url"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("data:image/png;base64,")
+        );
+        assert!(matches!(content, Value::Array(_)));
+    }
+
+    #[test]
+    fn synthetic_multimodal_tool_result_becomes_user_file_message() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("sample.pdf");
+        std::fs::write(&file_path, b"%PDF-demo").unwrap();
+
+        let message = synthetic_user_message_from_tool_result(
+            &serde_json::json!({
+                "kind": "synthetic_user_multimodal",
+                "media": [{
+                    "type": "input_file",
+                    "path": file_path.display().to_string(),
+                    "filename": "sample.pdf",
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let content = message.content.unwrap();
+        let items = content.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "file");
+        assert_eq!(items[0]["file"]["filename"], "sample.pdf");
+        assert!(items[0]["file"]["file_data"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("JVBER"));
+    }
+
+    #[test]
+    fn synthetic_multimodal_tool_result_becomes_user_audio_message() {
+        let temp_dir = TempDir::new().unwrap();
+        let audio_path = temp_dir.path().join("sample.wav");
+        std::fs::write(&audio_path, b"RIFFdemoWAVE").unwrap();
+
+        let message = synthetic_user_message_from_tool_result(
+            &serde_json::json!({
+                "kind": "synthetic_user_multimodal",
+                "media": [{
+                    "type": "input_audio",
+                    "path": audio_path.display().to_string(),
+                    "format": "wav",
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let content = message.content.unwrap();
+        let items = content.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["type"], "input_audio");
+        assert_eq!(items[0]["input_audio"]["format"], "wav");
+        assert!(!items[0]["input_audio"]["data"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty());
+    }
 }
 
 pub fn compact_session_messages(
@@ -985,6 +1365,9 @@ pub fn compact_session_messages_with_report(
         &config.runtime_state_root,
         &config.upstream,
         config.image_tool_upstream.as_ref(),
+        config.pdf_tool_upstream.as_ref(),
+        config.audio_tool_upstream.as_ref(),
+        config.image_generation_tool_upstream.as_ref(),
         &config.skills_dirs,
         &discovered_skills,
         &extra_tools,

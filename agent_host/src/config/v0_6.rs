@@ -1,25 +1,26 @@
 use super::{
-    ChannelConfig, ConfigLoader, MainAgentConfig, ModelCatalogConfig, ModelConfig, ModelType,
-    SandboxConfig, ServerConfig, VERSION_0_3, build_server_config, default_api_key_env,
-    default_chat_completions_path, default_codex_subscription_endpoint,
-    default_context_window_tokens, default_cron_poll_interval_seconds,
-    default_max_global_sub_agents, default_model_timeout_seconds, default_responses_path,
+    ChannelConfig, ConfigLoader, LATEST_CONFIG_VERSION, MainAgentConfig, ModelCapability,
+    ModelCatalogConfig, ModelConfig, ModelType, SandboxConfig, ServerConfig, ToolingConfig,
+    VERSION_0_6, build_server_config, default_api_key_env, default_chat_completions_path,
+    default_codex_subscription_endpoint, default_context_window_tokens,
+    default_cron_poll_interval_seconds, default_max_global_sub_agents,
+    default_model_timeout_seconds, default_responses_path,
 };
 use crate::backend::AgentBackendKind;
-use agent_frame::config::{
-    AuthCredentialsStoreMode, ExternalWebSearchConfig, NativeWebSearchConfig, ReasoningConfig,
-};
+use agent_frame::config::{AuthCredentialsStoreMode, NativeWebSearchConfig, ReasoningConfig};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-pub(super) struct VersionedConfigLoader;
+pub(super) struct LatestConfigLoader;
 
 #[derive(Clone, Debug, Deserialize)]
 struct VersionedServerConfigRaw {
     pub version: String,
-    pub models: VersionedModelCatalogRaw,
+    pub models: BTreeMap<String, VersionedModelConfigRaw>,
+    #[serde(default)]
+    pub tooling: ToolingConfig,
     pub main_agent: MainAgentConfig,
     #[serde(default)]
     pub sandbox: SandboxConfig,
@@ -28,16 +29,6 @@ struct VersionedServerConfigRaw {
     #[serde(default = "default_cron_poll_interval_seconds")]
     pub cron_poll_interval_seconds: u64,
     pub channels: Vec<ChannelConfig>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-struct VersionedModelCatalogRaw {
-    #[serde(default)]
-    pub chat: BTreeMap<String, VersionedModelConfigRaw>,
-    #[serde(default)]
-    pub vision: BTreeMap<String, VersionedModelConfigRaw>,
-    #[serde(default)]
-    pub web_search: BTreeMap<String, ExternalWebSearchConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -49,6 +40,8 @@ struct VersionedModelConfigRaw {
     pub api_endpoint: Option<String>,
     #[serde(default)]
     pub backend: AgentBackendKind,
+    #[serde(default)]
+    pub capabilities: Vec<ModelCapability>,
     #[serde(default)]
     pub supports_vision_input: bool,
     #[serde(default)]
@@ -81,66 +74,34 @@ struct VersionedModelConfigRaw {
     pub native_web_search: Option<NativeWebSearchConfig>,
 }
 
-impl ConfigLoader for VersionedConfigLoader {
+impl ConfigLoader for LatestConfigLoader {
     fn version(&self) -> &'static str {
-        VERSION_0_3
+        VERSION_0_6
     }
 
     fn load_and_upgrade(&self, value: Value) -> Result<ServerConfig> {
         let raw: VersionedServerConfigRaw =
             serde_json::from_value(value).context("failed to parse latest server config")?;
-        if raw.version != VERSION_0_3 {
+        if raw.version != VERSION_0_6 {
             return Err(anyhow!(
                 "latest config loader expected version '{}' but received '{}'",
-                VERSION_0_3,
+                VERSION_0_6,
                 raw.version
             ));
         }
 
-        let chat_model_keys = raw.models.chat.keys().cloned().collect::<Vec<_>>();
-        let web_search_catalog = raw.models.web_search;
-
-        let chat = raw
+        let models = raw
             .models
-            .chat
             .into_iter()
-            .map(|(name, raw_model)| {
-                let model = upgrade_versioned_model(raw_model, &web_search_catalog)?;
-                Ok((name, model))
-            })
+            .map(|(name, raw_model)| Ok((name, upgrade_versioned_model(raw_model))))
             .collect::<Result<BTreeMap<_, _>>>()?;
-        let vision = raw
-            .models
-            .vision
-            .into_iter()
-            .map(|(name, raw_model)| {
-                let model = upgrade_versioned_model(raw_model, &web_search_catalog)?;
-                Ok((name, model))
-            })
-            .collect::<Result<BTreeMap<_, _>>>()?;
-
-        let model_catalog = ModelCatalogConfig {
-            chat: chat.clone(),
-            vision: vision.clone(),
-            web_search: web_search_catalog,
-        };
-
-        let mut models = chat;
-        for (name, model) in vision {
-            if models.insert(name.clone(), model).is_some() {
-                return Err(anyhow!(
-                    "duplicate model name '{}' across model catalogs",
-                    name
-                ));
-            }
-        }
 
         Ok(build_server_config(
-            VERSION_0_3.to_string(),
+            LATEST_CONFIG_VERSION.to_string(),
             models,
-            model_catalog,
-            super::ToolingConfig::default(),
-            chat_model_keys,
+            ModelCatalogConfig::default(),
+            raw.tooling,
+            Vec::new(),
             raw.main_agent,
             raw.sandbox,
             raw.max_global_sub_agents,
@@ -150,10 +111,7 @@ impl ConfigLoader for VersionedConfigLoader {
     }
 }
 
-fn upgrade_versioned_model(
-    raw: VersionedModelConfigRaw,
-    web_search_catalog: &BTreeMap<String, ExternalWebSearchConfig>,
-) -> Result<ModelConfig> {
+fn upgrade_versioned_model(raw: VersionedModelConfigRaw) -> ModelConfig {
     let api_endpoint = raw.api_endpoint.unwrap_or_else(|| match raw.model_type {
         ModelType::Openrouter | ModelType::OpenrouterResp => {
             "https://openrouter.ai/api/v1".to_string()
@@ -166,13 +124,8 @@ fn upgrade_versioned_model(
             ModelType::Openrouter => default_chat_completions_path(),
             ModelType::OpenrouterResp | ModelType::CodexSubscription => default_responses_path(),
         });
-    let external_web_search = raw
-        .web_search
-        .as_ref()
-        .and_then(|alias| web_search_catalog.get(alias))
-        .cloned();
 
-    Ok(ModelConfig {
+    ModelConfig {
         model_type: raw.model_type,
         api_endpoint,
         model: raw.model,
@@ -192,8 +145,8 @@ fn upgrade_versioned_model(
         headers: raw.headers,
         description: raw.description,
         agent_model_enabled: true,
-        capabilities: Vec::new(),
+        capabilities: raw.capabilities,
         native_web_search: raw.native_web_search,
-        external_web_search,
-    })
+        external_web_search: None,
+    }
 }

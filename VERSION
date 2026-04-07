@@ -1,6 +1,39 @@
 ---
-version: 0.5.0-beta1
+version: 0.8.0-beta1
 ---
+
+# 0.8.0-beta1
+
+- 升级 `config` 保存格式到 `0.8`：
+  `models.<alias>` 新增 `agent_model_enabled` 开关，用来控制某个模型能否被当作前台/后台 agent model 选择；默认值为 `true`，老版本 config loader 会自动补成 `true` 保持兼容。
+- 调整 agent model 可见性与校验：
+  `/model` 可选列表、prompt 里的 `Available models`、以及 `main_agent.model` 校验现在都会忽略 `agent_model_enabled=false` 的 helper 模型；这类模型仍可保留 `chat` 能力供工具链内部调用。
+- 更新默认部署配置：
+  `sonar_pro` 和 `gemini3.1-flash-image` 现在被显式标记为 helper-only，不再出现在用户可选 agent model 列表中。
+- 明确本次只影响 `config`，不影响 `workdir`：
+  没有新增 `workdir` 结构版本，也不需要新的 workdir upgrade step。
+
+# 0.7.0-beta1
+
+- 升级 `config` 保存格式到 `0.7`：
+  `main_agent.enabled_tools` 不再写入最新配置文件，工具改为默认可用并在运行时按 agent kind、模型能力和 tooling 配置自适应选择；老版本 config loader 继续兼容读取带 `enabled_tools` 的配置。
+- 调整默认工具注册策略：
+  `agent_frame` 不再依赖白名单构建 built-in tool registry，而是默认开放基础文件、exec、下载、web_fetch 等工具；`web_search` 会继续根据 native search / external tooling 自适应。
+- 收敛图像工具语义：
+  对支持 `image_in` 的模型默认暴露 `image_load`，工具会在 `function_call_output` 后自动拼接 synthetic 多模态 `user` 消息，把图片直接带回同一模型；如果 `tooling.image` 明确指定了外部图像模型且未使用 `:self`，则仍暴露旧的 `image_start/image_wait/image_cancel` 异步链路。
+- 明确本次只影响 `config`，不影响 `workdir`：
+  没有新增 `workdir` 结构版本，也不需要新的 workdir upgrade step。
+
+# 0.6.0-beta1
+
+- 升级 `config` 保存格式到 `0.6`：
+  `models` 现在按 alias 扁平定义，并新增 `capabilities` 字段与根级 `tooling` 配置；老版本 config loader 继续保留兼容升级路径。
+- 将 capability / tooling 接入运行时路由：
+  `tooling.web_search` 与 `tooling.image` 已经真正影响 `agent_host` 的上游能力解析；直接多模态输入也开始读取 `image_in` capability，而不再只依赖旧的 `supports_vision_input`。
+- 接入 Codex 订阅 websocket 连续对话：
+  `agent_frame` 现在会在运行中使用 websocket 和 `previous_response_id` 做短期续接优化；这些状态不再持久化到 workdir，重启后的恢复仍然依赖本地 messages / rollout 重建，因此本次变更不影响 `workdir` 结构版本。
+- 补充 `v0.6` 配置回归测试：
+  覆盖 alias-keyed models、tooling target 解析，以及 tooling alias capability 校验。
 
 # 0.5.0-beta1
 

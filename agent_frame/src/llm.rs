@@ -1,6 +1,8 @@
 mod providers;
 
-use crate::config::{AuthCredentialsStoreMode, CodexAuthConfig, UpstreamAuthKind, UpstreamConfig};
+use crate::config::{
+    AuthCredentialsStoreMode, CodexAuthConfig, UpstreamApiKind, UpstreamAuthKind, UpstreamConfig,
+};
 use crate::message::ChatMessage;
 use crate::tooling::Tool;
 use anyhow::{Context, Result, anyhow};
@@ -59,6 +61,11 @@ impl TokenUsage {
 pub struct ChatCompletionOutcome {
     pub message: ChatMessage,
     pub usage: TokenUsage,
+    pub response_id: Option<String>,
+}
+
+pub(crate) enum ChatCompletionSession {
+    CodexSubscription(providers::codex_subscription::CodexSubscriptionSession),
 }
 
 pub(super) fn upstream_error_from_value(value: &Value) -> Option<String> {
@@ -115,15 +122,54 @@ pub(super) fn should_bypass_proxy(url: &str) -> bool {
     }
 }
 
-pub fn create_chat_completion(
+pub(crate) fn create_chat_completion(
     upstream: &UpstreamConfig,
     messages: &[ChatMessage],
     tools: &[Tool],
     extra_payload: Option<Map<String, Value>>,
+    session: Option<&mut ChatCompletionSession>,
 ) -> Result<ChatCompletionOutcome> {
-    providers::provider_for(upstream).create_completion(upstream, messages, tools, extra_payload)
+    providers::provider_for(upstream).create_completion(
+        upstream,
+        messages,
+        tools,
+        extra_payload,
+        session,
+    )
 }
 
+pub(crate) fn start_chat_completion_session(
+    upstream: &UpstreamConfig,
+) -> Result<Option<ChatCompletionSession>> {
+    providers::provider_for(upstream).start_session(upstream)
+}
+
+pub(super) fn build_responses_tools_payload(
+    upstream: &UpstreamConfig,
+    tools: &[Tool],
+) -> Vec<Value> {
+    let mut payload_tools = Vec::new();
+
+    if upstream.api_kind == UpstreamApiKind::Responses
+        && let Some(native_web_search) = &upstream.native_web_search
+        && native_web_search.enabled
+    {
+        let mut native_tool = native_web_search.payload.clone();
+        native_tool.insert("type".to_string(), Value::String("web_search".to_string()));
+        payload_tools.push(Value::Object(native_tool));
+    }
+
+    if upstream.api_kind == UpstreamApiKind::Responses && upstream.native_image_generation {
+        payload_tools.push(json!({
+            "type": "image_generation"
+        }));
+    }
+
+    payload_tools.extend(tools.iter().map(Tool::as_responses_tool));
+    payload_tools
+}
+
+#[cfg(test)]
 pub(super) fn parse_streamed_responses_body(body: &str) -> Result<Value> {
     let mut current_event: Option<String> = None;
     let mut current_data = Vec::new();
@@ -340,6 +386,51 @@ fn user_content_to_responses_items(content: Option<&Value>) -> Result<Vec<Value>
                             }));
                         }
                     }
+                    "file" | "input_file" => {
+                        let file_value = if kind == "file" {
+                            item.get("file")
+                        } else {
+                            Some(item)
+                        };
+                        if let Some(file_value) = file_value {
+                            let file_id = file_value.get("file_id").and_then(Value::as_str);
+                            let file_data = file_value.get("file_data").and_then(Value::as_str);
+                            let file_url = file_value.get("file_url").and_then(Value::as_str);
+                            let filename = file_value.get("filename").and_then(Value::as_str);
+                            let mut payload = Map::new();
+                            payload.insert("type".to_string(), Value::String("input_file".to_string()));
+                            if let Some(file_id) = file_id {
+                                payload.insert("file_id".to_string(), Value::String(file_id.to_string()));
+                            }
+                            if let Some(file_data) = file_data {
+                                payload.insert("file_data".to_string(), Value::String(file_data.to_string()));
+                            }
+                            if let Some(file_url) = file_url {
+                                payload.insert("file_url".to_string(), Value::String(file_url.to_string()));
+                            }
+                            if let Some(filename) = filename {
+                                payload.insert("filename".to_string(), Value::String(filename.to_string()));
+                            }
+                            if payload.len() > 1 {
+                                converted.push(Value::Object(payload));
+                            }
+                        }
+                    }
+                    "input_audio" => {
+                        if let Some(audio) = item.get("input_audio").and_then(Value::as_object) {
+                            let data = audio.get("data").and_then(Value::as_str);
+                            let format = audio.get("format").and_then(Value::as_str);
+                            if let (Some(data), Some(format)) = (data, format) {
+                                converted.push(json!({
+                                    "type": "input_audio",
+                                    "input_audio": {
+                                        "data": data,
+                                        "format": format,
+                                    }
+                                }));
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -438,36 +529,18 @@ pub(super) fn responses_value_to_chat_message(value: &Value) -> Result<ChatMessa
     })
 }
 
-pub(super) fn apply_auth_headers(
-    mut request: reqwest::blocking::RequestBuilder,
-    upstream: &UpstreamConfig,
-    codex_auth: Option<&CodexAuthConfig>,
-) -> Result<reqwest::blocking::RequestBuilder> {
-    match upstream.auth_kind {
-        UpstreamAuthKind::ApiKey => {
-            if let Some(api_key) = upstream
-                .api_key
-                .clone()
-                .or_else(|| std::env::var(&upstream.api_key_env).ok())
-            {
-                request = request.bearer_auth(api_key);
-            }
-        }
-        UpstreamAuthKind::CodexSubscription => {
-            let auth = codex_auth.ok_or_else(|| anyhow!("codex auth is unavailable"))?;
-            let account_id = auth
-                .account_id
-                .clone()
-                .or_else(|| account_id_from_access_token(&auth.access_token))
-                .ok_or_else(|| {
-                    anyhow!("codex auth token is missing chatgpt account id; please log in again")
-                })?;
-            request = request
-                .bearer_auth(&auth.access_token)
-                .header("chatgpt-account-id", account_id);
-        }
-    }
-    Ok(request)
+pub(super) fn response_id_from_value(value: &Value) -> Option<String> {
+    value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("response")
+                .and_then(|response| response.get("id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
 }
 
 pub(super) fn load_codex_auth(upstream: &UpstreamConfig) -> Result<Option<CodexAuthConfig>> {
@@ -557,7 +630,7 @@ pub(super) fn refresh_codex_auth(
     Ok(Some(refreshed))
 }
 
-fn account_id_from_access_token(access_token: &str) -> Option<String> {
+pub(super) fn account_id_from_access_token(access_token: &str) -> Option<String> {
     let payload = decode_jwt_payload(access_token).ok()?;
     payload
         .get("https://api.openai.com/auth")
@@ -671,13 +744,16 @@ fn nested_u64(object: &Map<String, Value>, path: &[&str]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        UpstreamAuthKind, build_responses_input, parse_streamed_responses_body, parse_usage,
-        responses_value_to_chat_message, upstream_error_from_value,
+        UpstreamAuthKind, build_responses_input, build_responses_tools_payload,
+        parse_streamed_responses_body, parse_usage, responses_value_to_chat_message,
+        upstream_error_from_value,
     };
     use crate::config::{
-        AuthCredentialsStoreMode, ReasoningConfig, UpstreamApiKind, UpstreamConfig,
+        AuthCredentialsStoreMode, NativeWebSearchConfig, ReasoningConfig, UpstreamApiKind,
+        UpstreamConfig,
     };
     use crate::message::{ChatMessage, FunctionCall, ToolCall};
+    use crate::tooling::Tool;
     use serde_json::json;
 
     #[test]
@@ -724,6 +800,8 @@ mod tests {
             api_kind: UpstreamApiKind::Responses,
             auth_kind: UpstreamAuthKind::ApiKey,
             supports_vision_input: false,
+            supports_pdf_input: false,
+            supports_audio_input: false,
             api_key: None,
             api_key_env: "OPENAI_API_KEY".to_string(),
             chat_completions_path: "/responses".to_string(),
@@ -739,6 +817,10 @@ mod tests {
             headers: serde_json::Map::new(),
             native_web_search: None,
             external_web_search: None,
+            native_image_input: false,
+            native_pdf_input: false,
+            native_audio_input: false,
+            native_image_generation: false,
         }
     }
 
@@ -910,5 +992,56 @@ mod tests {
 
         let error = parse_streamed_responses_body(body).unwrap_err().to_string();
         assert!(error.contains("boom"));
+    }
+
+    #[test]
+    fn responses_tools_payload_includes_native_web_search_tool() {
+        let mut upstream = test_upstream_config();
+        upstream.native_web_search = Some(NativeWebSearchConfig {
+            enabled: true,
+            payload: serde_json::Map::from_iter([(
+                "user_location".to_string(),
+                json!({
+                    "type": "approximate",
+                    "approximate": { "country": "US" }
+                }),
+            )]),
+        });
+        let local_tool = Tool::new("demo", "demo tool", json!({"type":"object"}), |_| {
+            Ok(json!({"ok": true}))
+        });
+
+        let tools = build_responses_tools_payload(&upstream, &[local_tool]);
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "web_search");
+        assert_eq!(tools[0]["user_location"]["approximate"]["country"], "US");
+        assert_eq!(tools[1]["type"], "function");
+        assert_eq!(tools[1]["name"], "demo");
+    }
+
+    #[test]
+    fn responses_tools_payload_skips_native_web_search_for_chat_completions() {
+        let mut upstream = test_upstream_config();
+        upstream.api_kind = UpstreamApiKind::ChatCompletions;
+        upstream.native_web_search = Some(NativeWebSearchConfig {
+            enabled: true,
+            payload: serde_json::Map::new(),
+        });
+
+        let tools = build_responses_tools_payload(&upstream, &[]);
+
+        assert!(tools.is_empty());
+    }
+
+    #[test]
+    fn responses_tools_payload_includes_native_image_generation_tool() {
+        let mut upstream = test_upstream_config();
+        upstream.native_image_generation = true;
+
+        let tools = build_responses_tools_payload(&upstream, &[]);
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "image_generation");
     }
 }

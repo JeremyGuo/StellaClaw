@@ -1,7 +1,7 @@
 use crate::config::{ExternalWebSearchConfig, UpstreamConfig};
 use crate::llm::create_chat_completion;
 use crate::message::ChatMessage;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -22,6 +22,7 @@ pub enum ToolWorkerJob {
         search_config: ExternalWebSearchConfig,
         query: String,
         max_results: usize,
+        images: Vec<String>,
     },
     Image {
         image_id: String,
@@ -29,6 +30,24 @@ pub enum ToolWorkerJob {
         question: String,
         upstream: UpstreamConfig,
         status_path: String,
+    },
+    Pdf {
+        path: String,
+        question: String,
+        upstream: UpstreamConfig,
+        images: Vec<String>,
+    },
+    Audio {
+        path: String,
+        question: String,
+        upstream: UpstreamConfig,
+        images: Vec<String>,
+    },
+    ImageGenerate {
+        prompt: String,
+        upstream: UpstreamConfig,
+        output_path: String,
+        images: Vec<String>,
     },
     FileDownload {
         download_id: String,
@@ -62,8 +81,9 @@ fn run_job(job: ToolWorkerJob) -> Result<()> {
             search_config,
             query,
             max_results,
+            images,
         } => {
-            let result = run_web_search(search_config, &query, max_results)?;
+            let result = run_web_search(search_config, &query, max_results, &images)?;
             write_json_stdout(&result)
         }
         ToolWorkerJob::Image {
@@ -79,6 +99,33 @@ fn run_job(job: ToolWorkerJob) -> Result<()> {
             upstream,
             Path::new(&status_path),
         ),
+        ToolWorkerJob::Pdf {
+            path,
+            question,
+            upstream,
+            images,
+        } => {
+            let result = run_pdf_job(&path, &question, upstream, &images)?;
+            write_json_stdout(&result)
+        }
+        ToolWorkerJob::Audio {
+            path,
+            question,
+            upstream,
+            images,
+        } => {
+            let result = run_audio_job(&path, &question, upstream, &images)?;
+            write_json_stdout(&result)
+        }
+        ToolWorkerJob::ImageGenerate {
+            prompt,
+            upstream,
+            output_path,
+            images,
+        } => {
+            let result = run_image_generate_job(&prompt, upstream, Path::new(&output_path), &images)?;
+            write_json_stdout(&result)
+        }
         ToolWorkerJob::FileDownload {
             download_id,
             url,
@@ -183,6 +230,7 @@ fn run_web_search(
     search_config: ExternalWebSearchConfig,
     query: &str,
     max_results: usize,
+    images: &[String],
 ) -> Result<Value> {
     let request_url = {
         let base = search_config.base_url.trim_end_matches('/');
@@ -199,6 +247,11 @@ fn run_web_search(
         "model".to_string(),
         Value::String(search_config.model.clone()),
     );
+    let mut user_content = vec![json!({
+        "type": "text",
+        "text": query
+    })];
+    append_reference_images(&mut user_content, images)?;
     payload.insert(
         "messages".to_string(),
         json!([
@@ -208,7 +261,7 @@ fn run_web_search(
             },
             {
                 "role": "user",
-                "content": query
+                "content": user_content
             }
         ]),
     );
@@ -315,6 +368,7 @@ fn run_image_job(
             "max_completion_tokens".to_string(),
             Value::from(800_u64),
         )])),
+        None,
     )?;
     write_json_file(
         status_path,
@@ -329,6 +383,228 @@ fn run_image_job(
             "answer": chat_message_text(&outcome.message),
         }),
     )
+}
+
+fn run_pdf_job(
+    path: &str,
+    question: &str,
+    upstream: UpstreamConfig,
+    images: &[String],
+) -> Result<Value> {
+    let base64_data = file_to_base64(Path::new(path))?;
+    let filename = Path::new(path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("document.pdf")
+        .to_string();
+    let mut user_content = vec![
+        json!({
+            "type": "text",
+            "text": question
+        }),
+        json!({
+            "type": "file",
+            "file": {
+                "file_data": base64_data,
+                "filename": filename,
+            }
+        }),
+    ];
+    append_reference_images(&mut user_content, images)?;
+    let outcome = create_chat_completion(
+        &upstream,
+        &[
+            ChatMessage::text(
+                "system",
+                "You inspect a local PDF document for an agent runtime. Answer the user's question directly and concisely. Quote exact text when relevant and note uncertainty if the PDF content is ambiguous.",
+            ),
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::Array(user_content)),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ],
+        &[],
+        Some(Map::from_iter([(
+            "max_completion_tokens".to_string(),
+            Value::from(1_200_u64),
+        )])),
+        None,
+    )?;
+    Ok(json!({
+        "path": path,
+        "question": question,
+        "answer": chat_message_text(&outcome.message),
+    }))
+}
+
+fn run_audio_job(
+    path: &str,
+    question: &str,
+    upstream: UpstreamConfig,
+    images: &[String],
+) -> Result<Value> {
+    let format = infer_audio_format(Path::new(path))
+        .ok_or_else(|| anyhow!("unsupported audio format for audio tool: {}", path))?;
+    let base64_data = file_to_base64(Path::new(path))?;
+    let mut user_content = vec![
+        json!({
+            "type": "text",
+            "text": question
+        }),
+        json!({
+            "type": "input_audio",
+            "input_audio": {
+                "data": base64_data,
+                "format": format,
+            }
+        }),
+    ];
+    append_reference_images(&mut user_content, images)?;
+    let outcome = create_chat_completion(
+        &upstream,
+        &[
+            ChatMessage::text(
+                "system",
+                "You inspect a local audio clip for an agent runtime. First understand or transcribe the audio, then answer the user's question directly and concisely.",
+            ),
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(Value::Array(user_content)),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ],
+        &[],
+        Some(Map::from_iter([(
+            "max_completion_tokens".to_string(),
+            Value::from(1_200_u64),
+        )])),
+        None,
+    )?;
+    Ok(json!({
+        "path": path,
+        "question": question,
+        "answer": chat_message_text(&outcome.message),
+    }))
+}
+
+fn run_image_generate_job(
+    prompt: &str,
+    upstream: UpstreamConfig,
+    output_path: &Path,
+    images: &[String],
+) -> Result<Value> {
+    if upstream.api_kind != crate::config::UpstreamApiKind::Responses {
+        return Err(anyhow!(
+            "image_generate requires a responses-compatible upstream"
+        ));
+    }
+    let request_url = {
+        let base = upstream.base_url.trim_end_matches('/');
+        let path = if upstream.chat_completions_path.starts_with('/') {
+            upstream.chat_completions_path.clone()
+        } else {
+            format!("/{}", upstream.chat_completions_path)
+        };
+        format!("{}{}", base, path)
+    };
+    let client = build_http_client(&request_url, Some(upstream.timeout_seconds))?;
+    let mut payload = Map::new();
+    payload.insert("model".to_string(), Value::String(upstream.model.clone()));
+    let input = if images.is_empty() {
+        Value::String(prompt.to_string())
+    } else {
+        let mut content = vec![json!({
+            "type": "input_text",
+            "text": prompt,
+        })];
+        append_reference_input_images(&mut content, images)?;
+        json!([{
+            "type": "message",
+            "role": "user",
+            "content": content,
+        }])
+    };
+    payload.insert("input".to_string(), input);
+    payload.insert(
+        "tools".to_string(),
+        Value::Array(vec![json!({
+            "type": "image_generation"
+        })]),
+    );
+    payload.insert("store".to_string(), Value::Bool(false));
+
+    let mut request = client.post(&request_url).json(&Value::Object(payload));
+    if let Some(api_key) = upstream
+        .api_key
+        .clone()
+        .or_else(|| std::env::var(&upstream.api_key_env).ok())
+    {
+        request = request.bearer_auth(api_key);
+    } else if upstream.auth_kind == crate::config::UpstreamAuthKind::CodexSubscription {
+        return Err(anyhow!(
+            "image_generate does not currently support codex-subscription auth in worker mode"
+        ));
+    }
+    for (key, value) in &upstream.headers {
+        if let Some(value) = value.as_str() {
+            request = request.header(key, value);
+        }
+    }
+
+    let response = request
+        .send()
+        .context("image generation request failed")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .context("failed to read image generation response body")?;
+    if !status.is_success() {
+        return Err(anyhow!(
+            "image generation failed with {}: {}",
+            status,
+            body
+        ));
+    }
+    let value: Value =
+        serde_json::from_str(&body).context("failed to parse image generation response")?;
+    if let Some(error_message) = crate::llm::upstream_error_from_value(&value) {
+        return Err(anyhow!(
+            "image generation returned an error payload: {}",
+            error_message
+        ));
+    }
+    let image_base64 = value
+        .get("output")
+        .and_then(Value::as_array)
+        .and_then(|output| {
+            output.iter().find_map(|item| {
+                (item.get("type").and_then(Value::as_str) == Some("image_generation_call"))
+                    .then(|| item.get("result").and_then(Value::as_str))
+                    .flatten()
+            })
+        })
+        .ok_or_else(|| anyhow!("image generation response did not contain image data"))?;
+    let image_bytes = decode_generated_image_result(image_base64)?;
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(output_path, image_bytes)
+        .with_context(|| format!("failed to write {}", output_path.display()))?;
+    Ok(json!({
+        "prompt": prompt,
+        "path": output_path.display().to_string(),
+        "kind": "synthetic_user_multimodal",
+        "media": [{
+            "type": "input_image",
+            "path": output_path.display().to_string(),
+        }],
+    }))
 }
 
 fn run_file_download_job(
@@ -456,6 +732,31 @@ fn strip_html_tags(body: &str) -> String {
     output.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn decode_generated_image_result(result: &str) -> Result<Vec<u8>> {
+    let payload = if let Some(payload) = parse_base64_data_url(result) {
+        payload
+    } else {
+        result
+    };
+
+    base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .context("failed to decode generated image base64")
+}
+
+fn parse_base64_data_url(value: &str) -> Option<&str> {
+    let (metadata, payload) = value.split_once(',')?;
+    if !metadata.starts_with("data:") {
+        return None;
+    }
+    let mut metadata_parts = metadata["data:".len()..].split(';');
+    metadata_parts.next()?;
+    if !metadata_parts.any(|part| part.eq_ignore_ascii_case("base64")) {
+        return None;
+    }
+    Some(payload)
+}
+
 fn infer_image_media_type(path: &Path) -> String {
     match path
         .extension()
@@ -482,6 +783,51 @@ fn image_to_data_url(path: &Path) -> Result<String> {
         infer_image_media_type(path),
         encoded
     ))
+}
+
+fn file_to_base64(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+fn append_reference_images(content: &mut Vec<Value>, image_paths: &[String]) -> Result<()> {
+    for path in image_paths {
+        content.push(json!({
+            "type": "image_url",
+            "image_url": {
+                "url": image_to_data_url(Path::new(path))?
+            }
+        }));
+    }
+    Ok(())
+}
+
+fn append_reference_input_images(content: &mut Vec<Value>, image_paths: &[String]) -> Result<()> {
+    for path in image_paths {
+        content.push(json!({
+            "type": "input_image",
+            "image_url": image_to_data_url(Path::new(path))?
+        }));
+    }
+    Ok(())
+}
+
+fn infer_audio_format(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "wav" => Some("wav"),
+        "mp3" | "mpeg" | "mpga" => Some("mp3"),
+        "ogg" | "opus" => Some("ogg"),
+        "webm" => Some("webm"),
+        "m4a" | "mp4" | "aac" => Some("m4a"),
+        "flac" => Some("flac"),
+        _ => None,
+    }
 }
 
 fn chat_message_content_to_text(message: &Value) -> String {
@@ -525,5 +871,29 @@ fn chat_message_text(message: &ChatMessage) -> String {
             .join("\n"),
         Some(other) => other.to_string(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_generated_image_result, parse_base64_data_url};
+    use base64::Engine as _;
+
+    #[test]
+    fn generated_image_result_accepts_raw_base64() {
+        let expected = b"test-image-bytes";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(expected);
+        let decoded = decode_generated_image_result(&encoded).unwrap();
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn generated_image_result_accepts_base64_data_url() {
+        let expected = b"test-image-bytes";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(expected);
+        let data_url = format!("data:image/png;base64,{encoded}");
+        assert_eq!(parse_base64_data_url(&data_url), Some(encoded.as_str()));
+        let decoded = decode_generated_image_result(&data_url).unwrap();
+        assert_eq!(decoded, expected);
     }
 }

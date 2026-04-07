@@ -164,6 +164,7 @@ impl ConfigLoader for VersionedConfigLoader {
             super::LATEST_CONFIG_VERSION.to_string(),
             models,
             model_catalog,
+            super::ToolingConfig::default(),
             chat_model_keys,
             raw.main_agent,
             raw.sandbox,
@@ -235,6 +236,8 @@ fn upgrade_base_model(raw: VersionedModelConfigRaw) -> ModelConfig {
         reasoning: raw.reasoning,
         headers: raw.headers,
         description: raw.description,
+        agent_model_enabled: true,
+        capabilities: Vec::new(),
         native_web_search: raw.native_web_search,
         external_web_search: None,
     }
@@ -248,6 +251,7 @@ fn upgrade_external_web_search_model(
             .api_endpoint
             .unwrap_or_else(|| "https://openrouter.ai/api/v1".to_string()),
         model: raw.model,
+        supports_vision_input: false,
         api_key: raw.api_key,
         api_key_env: raw.api_key_env,
         chat_completions_path: raw

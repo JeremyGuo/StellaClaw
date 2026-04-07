@@ -1,7 +1,7 @@
 use super::{
     ChannelConfig, ConfigLoader, LATEST_CONFIG_VERSION, MainAgentConfig, ModelCatalogConfig,
-    ModelConfig, ModelType, SandboxConfig, ServerConfig, build_server_config, default_api_key_env,
-    default_chat_completions_path, default_codex_subscription_endpoint,
+    ModelConfig, ModelType, SandboxConfig, ServerConfig, VERSION_0_5, build_server_config,
+    default_api_key_env, default_chat_completions_path, default_codex_subscription_endpoint,
     default_context_window_tokens, default_cron_poll_interval_seconds,
     default_max_global_sub_agents, default_model_timeout_seconds, default_responses_path,
 };
@@ -83,16 +83,16 @@ struct VersionedModelConfigRaw {
 
 impl ConfigLoader for LatestConfigLoader {
     fn version(&self) -> &'static str {
-        LATEST_CONFIG_VERSION
+        VERSION_0_5
     }
 
     fn load_and_upgrade(&self, value: Value) -> Result<ServerConfig> {
         let raw: VersionedServerConfigRaw =
             serde_json::from_value(value).context("failed to parse latest server config")?;
-        if raw.version != LATEST_CONFIG_VERSION {
+        if raw.version != VERSION_0_5 {
             return Err(anyhow!(
                 "latest config loader expected version '{}' but received '{}'",
-                LATEST_CONFIG_VERSION,
+                VERSION_0_5,
                 raw.version
             ));
         }
@@ -139,6 +139,7 @@ impl ConfigLoader for LatestConfigLoader {
             LATEST_CONFIG_VERSION.to_string(),
             models,
             model_catalog,
+            super::ToolingConfig::default(),
             chat_model_keys,
             raw.main_agent,
             raw.sandbox,
@@ -190,6 +191,8 @@ fn upgrade_versioned_model(
         reasoning: raw.reasoning,
         headers: raw.headers,
         description: raw.description,
+        agent_model_enabled: true,
+        capabilities: Vec::new(),
         native_web_search: raw.native_web_search,
         external_web_search,
     })

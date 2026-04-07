@@ -1,6 +1,6 @@
 use crate::domain::{ChannelAddress, MessageRole, SessionMessage, StoredAttachment};
 use crate::workspace::WorkspaceManager;
-use agent_frame::{ChatMessage, SessionCompactionStats, TokenUsage};
+use agent_frame::{ChatMessage, ResponseCheckpoint, SessionCompactionStats, TokenUsage};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -91,6 +91,8 @@ pub struct PendingContinueState {
     pub error_summary: String,
     #[serde(default)]
     pub progress_summary: String,
+    #[serde(skip, default)]
+    pub response_checkpoint: Option<ResponseCheckpoint>,
     pub failed_at: DateTime<Utc>,
 }
 
@@ -126,6 +128,7 @@ pub struct SessionSnapshot {
     pub seen_identity_profile_version: Option<String>,
     pub idle_compaction_retry: Option<IdleCompactionRetryState>,
     pub pending_continue: Option<PendingContinueState>,
+    pub response_checkpoint: Option<ResponseCheckpoint>,
     pub pending_workspace_summary: bool,
     pub close_after_summary: bool,
 }
@@ -164,6 +167,7 @@ struct Session {
     pending_identity_profile_notice: bool,
     idle_compaction_retry: Option<IdleCompactionRetryState>,
     pending_continue: Option<PendingContinueState>,
+    response_checkpoint: Option<ResponseCheckpoint>,
     pending_workspace_summary: bool,
     close_after_summary: bool,
     closed_at: Option<DateTime<Utc>>,
@@ -198,6 +202,7 @@ impl Session {
             seen_identity_profile_version: self.seen_identity_profile_version.clone(),
             idle_compaction_retry: self.idle_compaction_retry.clone(),
             pending_continue: self.pending_continue.clone(),
+            response_checkpoint: self.response_checkpoint.clone(),
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
         }
@@ -290,6 +295,7 @@ impl Session {
             pending_identity_profile_notice: persisted.pending_identity_profile_notice,
             idle_compaction_retry: persisted.idle_compaction_retry,
             pending_continue,
+            response_checkpoint: None,
             pending_workspace_summary: persisted.pending_workspace_summary,
             close_after_summary: persisted.close_after_summary,
             closed_at: persisted.closed_at,
@@ -324,6 +330,7 @@ fn record_turn(
     messages: Vec<ChatMessage>,
     usage: &TokenUsage,
     compaction: &SessionCompactionStats,
+    response_checkpoint: Option<ResponseCheckpoint>,
     clear_pending_continue: bool,
     log_kind: &str,
 ) -> Result<()> {
@@ -354,6 +361,7 @@ fn record_turn(
     if clear_pending_continue {
         session.pending_continue = None;
     }
+    session.response_checkpoint = response_checkpoint;
     session.idle_compaction_retry = None;
     info!(
         log_stream = "session",
@@ -690,6 +698,7 @@ impl SessionManager {
             pending_identity_profile_notice: checkpoint.pending_identity_profile_notice,
             idle_compaction_retry: None,
             pending_continue: None,
+            response_checkpoint: None,
             pending_workspace_summary: false,
             close_after_summary: false,
             closed_at: None,
@@ -715,6 +724,7 @@ impl SessionManager {
             .get_mut(&key)
             .with_context(|| format!("no active session for {}", key))?;
         session.agent_messages = messages;
+        session.response_checkpoint = None;
         info!(
             log_stream = "session",
             log_key = %session.id,
@@ -940,6 +950,7 @@ impl SessionManager {
         messages: Vec<ChatMessage>,
         usage: &TokenUsage,
         compaction: &SessionCompactionStats,
+        response_checkpoint: Option<ResponseCheckpoint>,
     ) -> Result<()> {
         let key = address.session_key();
         let session = self
@@ -951,6 +962,7 @@ impl SessionManager {
             messages,
             usage,
             compaction,
+            response_checkpoint,
             true,
             "agent_turn_recorded",
         )
@@ -962,6 +974,7 @@ impl SessionManager {
         messages: Vec<ChatMessage>,
         usage: &TokenUsage,
         compaction: &SessionCompactionStats,
+        response_checkpoint: Option<ResponseCheckpoint>,
     ) -> Result<()> {
         let key = address.session_key();
         let session = self
@@ -973,6 +986,7 @@ impl SessionManager {
             messages,
             usage,
             compaction,
+            response_checkpoint,
             false,
             "agent_turn_yielded",
         )
@@ -984,6 +998,7 @@ impl SessionManager {
         messages: Vec<ChatMessage>,
         usage: &TokenUsage,
         compaction: &SessionCompactionStats,
+        response_checkpoint: Option<ResponseCheckpoint>,
     ) -> Result<()> {
         let session = self.background_session_mut(session_id)?;
         record_turn(
@@ -991,6 +1006,7 @@ impl SessionManager {
             messages,
             usage,
             compaction,
+            response_checkpoint,
             true,
             "agent_turn_recorded",
         )?;
@@ -1003,6 +1019,7 @@ impl SessionManager {
         messages: Vec<ChatMessage>,
         usage: &TokenUsage,
         compaction: &SessionCompactionStats,
+        response_checkpoint: Option<ResponseCheckpoint>,
     ) -> Result<()> {
         let session = self.background_session_mut(session_id)?;
         record_turn(
@@ -1010,6 +1027,7 @@ impl SessionManager {
             messages,
             usage,
             compaction,
+            response_checkpoint,
             false,
             "agent_turn_yielded",
         )?;
@@ -1022,10 +1040,12 @@ impl SessionManager {
         messages: Vec<ChatMessage>,
         usage: &TokenUsage,
         compaction: &SessionCompactionStats,
+        response_checkpoint: Option<ResponseCheckpoint>,
     ) -> Result<()> {
         let session = self.background_session_mut(session_id)?;
         session.agent_messages = messages;
         session.last_agent_returned_at = Some(Utc::now());
+        session.response_checkpoint = response_checkpoint;
         session.cumulative_usage.add_assign(usage);
         session.cumulative_compaction.run_count = session
             .cumulative_compaction
@@ -1063,8 +1083,10 @@ impl SessionManager {
             .get_mut(&key)
             .with_context(|| format!("no active session for {}", key))?;
         session.agent_messages = messages.clone();
+        session.response_checkpoint = None;
         if let Some(pending_continue) = &mut session.pending_continue {
             pending_continue.resume_messages = messages;
+            pending_continue.response_checkpoint = None;
         }
         session.last_compacted_at = Some(Utc::now());
         session.last_compacted_turn_count = session.turn_count;
@@ -1266,6 +1288,7 @@ impl SessionManager {
             pending_identity_profile_notice: false,
             idle_compaction_retry: None,
             pending_continue: None,
+            response_checkpoint: None,
             pending_workspace_summary: false,
             close_after_summary: false,
             closed_at: None,
@@ -1414,6 +1437,7 @@ mod tests {
                 session.agent_messages.clone(),
                 &TokenUsage::default(),
                 &SessionCompactionStats::default(),
+                None,
             )
             .unwrap();
         sessions
@@ -1510,6 +1534,7 @@ mod tests {
                 session.agent_messages.clone(),
                 &TokenUsage::default(),
                 &SessionCompactionStats::default(),
+                None,
             )
             .unwrap();
         sessions
@@ -1652,6 +1677,7 @@ mod tests {
                 vec![ChatMessage::text("assistant", "hi")],
                 &TokenUsage::default(),
                 &SessionCompactionStats::default(),
+                None,
             )
             .unwrap();
 
@@ -1693,6 +1719,7 @@ mod tests {
                 vec![ChatMessage::text("assistant", "background memory")],
                 &TokenUsage::default(),
                 &SessionCompactionStats::default(),
+                None,
             )
             .unwrap();
 

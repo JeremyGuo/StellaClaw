@@ -148,6 +148,7 @@ fn session_manager_restores_persisted_foreground_session_after_restart() {
                         cache_write_tokens: 0,
                     },
                 },
+                None,
             )
             .unwrap();
         manager.get_snapshot(&address).unwrap()
@@ -198,6 +199,7 @@ fn session_manager_persists_idle_compaction_metadata_after_restart() {
                 vec![ChatMessage::text("assistant", "before compact")],
                 &agent_frame::TokenUsage::default(),
                 &SessionCompactionStats::default(),
+                None,
             )
             .unwrap();
         manager

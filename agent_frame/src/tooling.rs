@@ -178,6 +178,24 @@ fn string_arg_with_default(
     }
 }
 
+fn string_array_arg(arguments: &Map<String, Value>, key: &str) -> Result<Vec<String>> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow!("argument {} must be an array of strings", key))?;
+    let mut values = Vec::with_capacity(items.len());
+    for item in items {
+        values.push(
+            item.as_str()
+                .ok_or_else(|| anyhow!("argument {} must be an array of strings", key))?
+                .to_string(),
+        );
+    }
+    Ok(values)
+}
+
 fn validate_skill_name_component(skill_name: &str) -> Result<String> {
     let trimmed = skill_name.trim();
     if trimmed.is_empty() {
@@ -1688,6 +1706,283 @@ fn image_start_tool(
     )
 }
 
+fn image_load_tool(
+    workspace_root: PathBuf,
+    upstream: UpstreamConfig,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
+    Tool::new(
+        "image_load",
+        "Load a local image file into the next model request for direct multimodal inspection by the current model. Returns immediately.",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"}
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            if !upstream.native_image_input {
+                return Err(anyhow!(
+                    "image_load requires a model with native image input support"
+                ));
+            }
+            let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
+            Ok(json!({
+                "loaded": true,
+                "kind": "synthetic_user_multimodal",
+                "media": [{
+                    "type": "input_image",
+                    "path": path.display().to_string(),
+                }],
+                "path": path.display().to_string(),
+            }))
+        },
+    )
+}
+
+fn pdf_load_tool(
+    workspace_root: PathBuf,
+    upstream: UpstreamConfig,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
+    Tool::new(
+        "pdf_load",
+        "Load a local PDF file into the next model request for direct inspection by the current model. Returns immediately.",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"}
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            if !upstream.native_pdf_input {
+                return Err(anyhow!(
+                    "pdf_load requires a model with native PDF input support"
+                ));
+            }
+            let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
+            Ok(json!({
+                "loaded": true,
+                "kind": "synthetic_user_multimodal",
+                "media": [{
+                    "type": "input_file",
+                    "path": path.display().to_string(),
+                    "filename": path.file_name().and_then(|value| value.to_str()).unwrap_or("document.pdf"),
+                }],
+                "path": path.display().to_string(),
+            }))
+        },
+    )
+}
+
+fn audio_load_tool(
+    workspace_root: PathBuf,
+    upstream: UpstreamConfig,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
+    Tool::new(
+        "audio_load",
+        "Load a local audio file into the next model request for direct inspection by the current model. Returns immediately.",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"}
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            if !upstream.native_audio_input {
+                return Err(anyhow!(
+                    "audio_load requires a model with native audio input support"
+                ));
+            }
+            let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
+            let format = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            Ok(json!({
+                "loaded": true,
+                "kind": "synthetic_user_multimodal",
+                "media": [{
+                    "type": "input_audio",
+                    "path": path.display().to_string(),
+                    "format": format,
+                }],
+                "path": path.display().to_string(),
+            }))
+        },
+    )
+}
+
+fn maybe_add_images_schema(properties: &mut Map<String, Value>, upstream_supports_vision: bool) {
+    if upstream_supports_vision {
+        properties.insert(
+            "images".to_string(),
+            json!({
+                "type": "array",
+                "items": { "type": "string" }
+            }),
+        );
+    }
+}
+
+fn pdf_query_tool(
+    workspace_root: PathBuf,
+    runtime_state_root: PathBuf,
+    upstream: UpstreamConfig,
+    cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
+    let mut properties = Map::new();
+    properties.insert("path".to_string(), json!({"type": "string"}));
+    properties.insert("question".to_string(), json!({"type": "string"}));
+    maybe_add_images_schema(&mut properties, upstream.supports_vision_input);
+    Tool::new_interruptible(
+        "pdf_query",
+        "Ask a question about a local PDF using a helper model. This can be interrupted and will cancel immediately.",
+        Value::Object(Map::from_iter([
+            ("type".to_string(), Value::String("object".to_string())),
+            ("properties".to_string(), Value::Object(properties)),
+            ("required".to_string(), json!(["path", "question"])),
+            ("additionalProperties".to_string(), Value::Bool(false)),
+        ])),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
+            let question = string_arg(arguments, "question")?;
+            let images = string_array_arg(arguments, "images")?
+                .into_iter()
+                .map(|path| resolve_path(&path, &workspace_root).display().to_string())
+                .collect::<Vec<_>>();
+            let result = run_interruptible_worker_job(
+                &runtime_state_root,
+                &ToolWorkerJob::Pdf {
+                    path: path.display().to_string(),
+                    question,
+                    upstream: upstream.clone(),
+                    images,
+                },
+                upstream.timeout_seconds,
+                cancel_flag.as_ref(),
+            )?;
+            Ok(result)
+        },
+    )
+}
+
+fn audio_transcribe_tool(
+    workspace_root: PathBuf,
+    runtime_state_root: PathBuf,
+    upstream: UpstreamConfig,
+    cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
+    let mut properties = Map::new();
+    properties.insert("path".to_string(), json!({"type": "string"}));
+    properties.insert("question".to_string(), json!({"type": "string"}));
+    maybe_add_images_schema(&mut properties, upstream.supports_vision_input);
+    Tool::new_interruptible(
+        "audio_transcribe",
+        "Transcribe or inspect a local audio file using a helper model. This can be interrupted and will cancel immediately.",
+        Value::Object(Map::from_iter([
+            ("type".to_string(), Value::String("object".to_string())),
+            ("properties".to_string(), Value::Object(properties)),
+            ("required".to_string(), json!(["path"])),
+            ("additionalProperties".to_string(), Value::Bool(false)),
+        ])),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
+            let question = string_arg_with_default(
+                arguments,
+                "question",
+                "Transcribe the audio accurately and summarize anything important.",
+            )?;
+            let images = string_array_arg(arguments, "images")?
+                .into_iter()
+                .map(|path| resolve_path(&path, &workspace_root).display().to_string())
+                .collect::<Vec<_>>();
+            let result = run_interruptible_worker_job(
+                &runtime_state_root,
+                &ToolWorkerJob::Audio {
+                    path: path.display().to_string(),
+                    question,
+                    upstream: upstream.clone(),
+                    images,
+                },
+                upstream.timeout_seconds,
+                cancel_flag.as_ref(),
+            )?;
+            Ok(result)
+        },
+    )
+}
+
+fn image_generate_tool(
+    workspace_root: PathBuf,
+    runtime_state_root: PathBuf,
+    upstream: UpstreamConfig,
+    cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
+    let mut properties = Map::new();
+    properties.insert("prompt".to_string(), json!({"type": "string"}));
+    maybe_add_images_schema(&mut properties, upstream.supports_vision_input);
+    Tool::new_interruptible(
+        "image_generate",
+        "Generate a new image with a helper model. Returns a generated file path and attaches the image back into context. This can be interrupted and will cancel immediately.",
+        Value::Object(Map::from_iter([
+            ("type".to_string(), Value::String("object".to_string())),
+            ("properties".to_string(), Value::Object(properties)),
+            ("required".to_string(), json!(["prompt"])),
+            ("additionalProperties".to_string(), Value::Bool(false)),
+        ])),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let prompt = string_arg(arguments, "prompt")?;
+            let images = string_array_arg(arguments, "images")?
+                .into_iter()
+                .map(|path| resolve_path(&path, &workspace_root).display().to_string())
+                .collect::<Vec<_>>();
+            let output_dir = workspace_root.join("generated");
+            fs::create_dir_all(&output_dir)
+                .with_context(|| format!("failed to create {}", output_dir.display()))?;
+            let output_path = output_dir.join(format!("generated-{}.png", Uuid::new_v4()));
+            let result = run_interruptible_worker_job(
+                &runtime_state_root,
+                &ToolWorkerJob::ImageGenerate {
+                    prompt,
+                    upstream: upstream.clone(),
+                    output_path: output_path.display().to_string(),
+                    images,
+                },
+                upstream.timeout_seconds,
+                cancel_flag.as_ref(),
+            )?;
+            Ok(result)
+        },
+    )
+}
+
 fn image_wait_tool(runtime_state_root: PathBuf, cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new_interruptible(
         "image_wait",
@@ -2051,36 +2346,26 @@ fn file_download_cancel_tool(
     )
 }
 
-fn default_external_web_search_config() -> ExternalWebSearchConfig {
-    ExternalWebSearchConfig {
-        base_url: "https://openrouter.ai/api/v1".to_string(),
-        model: "perplexity/sonar".to_string(),
-        api_key: None,
-        api_key_env: "OPENROUTER_API_KEY".to_string(),
-        chat_completions_path: "/chat/completions".to_string(),
-        timeout_seconds: 60.0,
-        headers: Map::new(),
-    }
-}
-
 fn web_search_tool(
     runtime_state_root: PathBuf,
+    workspace_root: PathBuf,
     search_config: ExternalWebSearchConfig,
     cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
+    let mut properties = Map::new();
+    properties.insert("query".to_string(), json!({"type": "string"}));
+    properties.insert("timeout_seconds".to_string(), json!({"type": "number"}));
+    properties.insert("max_results".to_string(), json!({"type": "integer"}));
+    maybe_add_images_schema(&mut properties, search_config.supports_vision_input);
     Tool::new_interruptible(
         "web_search",
         "Search the web using the configured search provider and return an answer plus citations. If interrupted by a newer user message or timeout observation, this tool cancels the in-flight search result and returns immediately.",
-        json!({
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "timeout_seconds": {"type": "number"},
-                "max_results": {"type": "integer"}
-            },
-            "required": ["query", "timeout_seconds"],
-            "additionalProperties": false
-        }),
+        Value::Object(Map::from_iter([
+            ("type".to_string(), Value::String("object".to_string())),
+            ("properties".to_string(), Value::Object(properties)),
+            ("required".to_string(), json!(["query", "timeout_seconds"])),
+            ("additionalProperties".to_string(), Value::Bool(false)),
+        ])),
         move |arguments| {
             let arguments = arguments
                 .as_object()
@@ -2088,6 +2373,10 @@ fn web_search_tool(
             let query = string_arg(arguments, "query")?;
             let timeout_seconds = f64_arg(arguments, "timeout_seconds")?;
             let max_results = usize_arg_with_default(arguments, "max_results", 8)?;
+            let images = string_array_arg(arguments, "images")?
+                .into_iter()
+                .map(|path| resolve_path(&path, &workspace_root).display().to_string())
+                .collect::<Vec<_>>();
             let mut runtime_search_config = search_config.clone();
             runtime_search_config.timeout_seconds = timeout_seconds;
             let search_result = run_interruptible_worker_job(
@@ -2096,6 +2385,7 @@ fn web_search_tool(
                     search_config: runtime_search_config,
                     query: query.clone(),
                     max_results,
+                    images,
                 },
                 timeout_seconds,
                 cancel_flag.as_ref(),
@@ -2201,6 +2491,9 @@ pub fn build_tool_registry(
     runtime_state_root: &Path,
     upstream: &UpstreamConfig,
     image_tool_upstream: Option<&UpstreamConfig>,
+    pdf_tool_upstream: Option<&UpstreamConfig>,
+    audio_tool_upstream: Option<&UpstreamConfig>,
+    image_generation_tool_upstream: Option<&UpstreamConfig>,
     skill_roots: &[PathBuf],
     skills: &[SkillMetadata],
     extra_tools: &[Tool],
@@ -2211,6 +2504,9 @@ pub fn build_tool_registry(
         runtime_state_root,
         upstream,
         image_tool_upstream,
+        pdf_tool_upstream,
+        audio_tool_upstream,
+        image_generation_tool_upstream,
         skill_roots,
         skills,
         extra_tools,
@@ -2219,17 +2515,20 @@ pub fn build_tool_registry(
 }
 
 pub fn build_tool_registry_with_cancel(
-    enabled_tools: &[String],
+    _enabled_tools: &[String],
     workspace_root: &Path,
     runtime_state_root: &Path,
     upstream: &UpstreamConfig,
     image_tool_upstream: Option<&UpstreamConfig>,
+    pdf_tool_upstream: Option<&UpstreamConfig>,
+    audio_tool_upstream: Option<&UpstreamConfig>,
+    image_generation_tool_upstream: Option<&UpstreamConfig>,
     skill_roots: &[PathBuf],
     skills: &[SkillMetadata],
     extra_tools: &[Tool],
     cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Result<BTreeMap<String, Tool>> {
-    let mut builtins = BTreeMap::from([
+    let mut registry = BTreeMap::from([
         (
             "read_file".to_string(),
             read_file_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
@@ -2267,24 +2566,6 @@ pub fn build_tool_registry_with_cancel(
             apply_patch_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
         ),
         (
-            "image_start".to_string(),
-            image_start_tool(
-                workspace_root.to_path_buf(),
-                runtime_state_root.to_path_buf(),
-                upstream.clone(),
-                image_tool_upstream.cloned(),
-                cancel_flag.clone(),
-            ),
-        ),
-        (
-            "image_wait".to_string(),
-            image_wait_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
-        ),
-        (
-            "image_cancel".to_string(),
-            image_cancel_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
-        ),
-        (
             "file_download_start".to_string(),
             file_download_start_tool(
                 workspace_root.to_path_buf(),
@@ -2309,35 +2590,102 @@ pub fn build_tool_registry_with_cancel(
             web_fetch_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
         ),
     ]);
+    if image_tool_upstream.is_some() {
+        registry.insert(
+            "image_start".to_string(),
+            image_start_tool(
+                workspace_root.to_path_buf(),
+                runtime_state_root.to_path_buf(),
+                upstream.clone(),
+                image_tool_upstream.cloned(),
+                cancel_flag.clone(),
+            ),
+        );
+        registry.insert(
+            "image_wait".to_string(),
+            image_wait_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
+        );
+        registry.insert(
+            "image_cancel".to_string(),
+            image_cancel_tool(runtime_state_root.to_path_buf(), cancel_flag.clone()),
+        );
+    } else if upstream.native_image_input {
+        registry.insert(
+            "image_load".to_string(),
+            image_load_tool(
+                workspace_root.to_path_buf(),
+                upstream.clone(),
+                cancel_flag.clone(),
+            ),
+        );
+    }
+    if let Some(pdf_tool_upstream) = pdf_tool_upstream {
+        registry.insert(
+            "pdf_query".to_string(),
+            pdf_query_tool(
+                workspace_root.to_path_buf(),
+                runtime_state_root.to_path_buf(),
+                pdf_tool_upstream.clone(),
+                cancel_flag.clone(),
+            ),
+        );
+    } else if upstream.native_pdf_input {
+        registry.insert(
+            "pdf_load".to_string(),
+            pdf_load_tool(
+                workspace_root.to_path_buf(),
+                upstream.clone(),
+                cancel_flag.clone(),
+            ),
+        );
+    }
+    if let Some(audio_tool_upstream) = audio_tool_upstream {
+        registry.insert(
+            "audio_transcribe".to_string(),
+            audio_transcribe_tool(
+                workspace_root.to_path_buf(),
+                runtime_state_root.to_path_buf(),
+                audio_tool_upstream.clone(),
+                cancel_flag.clone(),
+            ),
+        );
+    } else if upstream.native_audio_input {
+        registry.insert(
+            "audio_load".to_string(),
+            audio_load_tool(
+                workspace_root.to_path_buf(),
+                upstream.clone(),
+                cancel_flag.clone(),
+            ),
+        );
+    }
+    if let Some(image_generation_tool_upstream) = image_generation_tool_upstream {
+        registry.insert(
+            "image_generate".to_string(),
+            image_generate_tool(
+                workspace_root.to_path_buf(),
+                runtime_state_root.to_path_buf(),
+                image_generation_tool_upstream.clone(),
+                cancel_flag.clone(),
+            ),
+        );
+    }
     let native_web_search_enabled = upstream
         .native_web_search
         .as_ref()
         .is_some_and(|settings| settings.enabled);
     if !native_web_search_enabled {
-        let web_search_config = upstream
-            .external_web_search
-            .clone()
-            .unwrap_or_else(default_external_web_search_config);
-        builtins.insert(
-            "web_search".to_string(),
-            web_search_tool(
-                runtime_state_root.to_path_buf(),
-                web_search_config,
-                cancel_flag.clone(),
-            ),
-        );
-    }
-
-    let mut registry = BTreeMap::new();
-    for tool_name in enabled_tools {
-        if native_web_search_enabled && tool_name == "web_search" {
-            continue;
+        if let Some(web_search_config) = upstream.external_web_search.clone() {
+            registry.insert(
+                "web_search".to_string(),
+                web_search_tool(
+                    runtime_state_root.to_path_buf(),
+                    workspace_root.to_path_buf(),
+                    web_search_config,
+                    cancel_flag.clone(),
+                ),
+            );
         }
-        let tool = builtins
-            .get(tool_name)
-            .cloned()
-            .ok_or_else(|| anyhow!("unknown built-in tool: {}", tool_name))?;
-        registry.insert(tool.name.clone(), tool);
     }
 
     if !skills.is_empty() {
@@ -2459,11 +2807,15 @@ pub mod macro_support {
 mod tests {
     use super::{
         BackgroundTaskMetadata, ProcessMetadata, Tool, active_runtime_state_summary,
-        process_is_running, process_meta_path, record_exit_code, terminate_runtime_state_tasks,
-        write_background_task_metadata,
+        build_tool_registry_with_cancel, process_is_running, process_meta_path, record_exit_code,
+        terminate_runtime_state_tasks, write_background_task_metadata,
+    };
+    use crate::config::{
+        AuthCredentialsStoreMode, UpstreamApiKind, UpstreamAuthKind, UpstreamConfig,
     };
     use serde_json::json;
     use std::fs;
+    use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::thread;
     use std::time::Duration;
@@ -2522,6 +2874,299 @@ mod tests {
         assert_eq!(value["name"], "demo");
         assert_eq!(value["parameters"]["type"], "object");
         assert!(value.get("function").is_none());
+    }
+
+    #[test]
+    fn image_load_returns_small_multimodal_marker_payload() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let image_path = workspace_root.join("demo.png");
+        fs::write(&image_path, b"png-bytes").unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = UpstreamConfig {
+            base_url: "https://example.com".to_string(),
+            model: "demo".to_string(),
+            api_kind: UpstreamApiKind::Responses,
+            auth_kind: UpstreamAuthKind::CodexSubscription,
+            supports_vision_input: true,
+            supports_pdf_input: false,
+            supports_audio_input: false,
+            api_key: None,
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            chat_completions_path: "/responses".to_string(),
+            codex_home: None,
+            codex_auth: None,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 200_000,
+            cache_control: None,
+            prompt_cache_retention: None,
+            prompt_cache_key: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            native_web_search: None,
+            external_web_search: None,
+            native_image_input: true,
+            native_pdf_input: false,
+            native_audio_input: false,
+            native_image_generation: false,
+        };
+        let registry = build_tool_registry_with_cancel(
+            &["image_load".to_string()],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let result = registry["image_load"]
+            .invoke(json!({
+                "path": "demo.png"
+            }))
+            .unwrap();
+
+        assert_eq!(result["kind"], "synthetic_user_multimodal");
+        assert_eq!(result["media"][0]["type"], "input_image");
+        assert_eq!(result["media"][0]["path"], image_path.display().to_string());
+        assert!(result["media"][0].get("image_url").is_none());
+    }
+
+    #[test]
+    fn vision_upstream_registers_image_load_instead_of_async_image_tools() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = UpstreamConfig {
+            base_url: "https://example.com".to_string(),
+            model: "demo".to_string(),
+            api_kind: UpstreamApiKind::Responses,
+            auth_kind: UpstreamAuthKind::CodexSubscription,
+            supports_vision_input: true,
+            supports_pdf_input: false,
+            supports_audio_input: false,
+            api_key: None,
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            chat_completions_path: "/responses".to_string(),
+            codex_home: None,
+            codex_auth: None,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 200_000,
+            cache_control: None,
+            prompt_cache_retention: None,
+            prompt_cache_key: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            native_web_search: None,
+            external_web_search: None,
+            native_image_input: true,
+            native_pdf_input: false,
+            native_audio_input: false,
+            native_image_generation: false,
+        };
+        let registry = build_tool_registry_with_cancel(
+            &[],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert!(registry.contains_key("image_load"));
+        assert!(!registry.contains_key("image_start"));
+        assert!(!registry.contains_key("image_wait"));
+        assert!(!registry.contains_key("image_cancel"));
+    }
+
+    #[test]
+    fn external_image_tool_target_registers_async_image_tools() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = UpstreamConfig {
+            base_url: "https://example.com".to_string(),
+            model: "demo".to_string(),
+            api_kind: UpstreamApiKind::Responses,
+            auth_kind: UpstreamAuthKind::CodexSubscription,
+            supports_vision_input: true,
+            supports_pdf_input: false,
+            supports_audio_input: false,
+            api_key: None,
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            chat_completions_path: "/responses".to_string(),
+            codex_home: None,
+            codex_auth: None,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 200_000,
+            cache_control: None,
+            prompt_cache_retention: None,
+            prompt_cache_key: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            native_web_search: None,
+            external_web_search: None,
+            native_image_input: false,
+            native_pdf_input: false,
+            native_audio_input: false,
+            native_image_generation: false,
+        };
+        let image_helper = UpstreamConfig {
+            supports_vision_input: true,
+            ..upstream.clone()
+        };
+        let registry = build_tool_registry_with_cancel(
+            &[],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            Some(&image_helper),
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert!(!registry.contains_key("image_load"));
+        assert!(registry.contains_key("image_start"));
+        assert!(registry.contains_key("image_wait"));
+        assert!(registry.contains_key("image_cancel"));
+    }
+
+    #[test]
+    fn native_pdf_input_registers_pdf_load_without_external_helper() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = UpstreamConfig {
+            base_url: "https://example.com".to_string(),
+            model: "demo".to_string(),
+            api_kind: UpstreamApiKind::Responses,
+            auth_kind: UpstreamAuthKind::ApiKey,
+            supports_vision_input: false,
+            supports_pdf_input: true,
+            supports_audio_input: false,
+            api_key: None,
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            chat_completions_path: "/responses".to_string(),
+            codex_home: None,
+            codex_auth: None,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 200_000,
+            cache_control: None,
+            prompt_cache_retention: None,
+            prompt_cache_key: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            native_web_search: None,
+            external_web_search: None,
+            native_image_input: false,
+            native_pdf_input: true,
+            native_audio_input: false,
+            native_image_generation: false,
+        };
+        let registry = build_tool_registry_with_cancel(
+            &[],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert!(registry.contains_key("pdf_load"));
+        assert!(!registry.contains_key("pdf_query"));
+    }
+
+    #[test]
+    fn native_audio_input_registers_audio_load_without_external_helper() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = UpstreamConfig {
+            base_url: "https://example.com".to_string(),
+            model: "demo".to_string(),
+            api_kind: UpstreamApiKind::Responses,
+            auth_kind: UpstreamAuthKind::ApiKey,
+            supports_vision_input: false,
+            supports_pdf_input: false,
+            supports_audio_input: true,
+            api_key: None,
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            chat_completions_path: "/responses".to_string(),
+            codex_home: None,
+            codex_auth: None,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 200_000,
+            cache_control: None,
+            prompt_cache_retention: None,
+            prompt_cache_key: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            native_web_search: None,
+            external_web_search: None,
+            native_image_input: false,
+            native_pdf_input: false,
+            native_audio_input: true,
+            native_image_generation: false,
+        };
+        let registry = build_tool_registry_with_cancel(
+            &[],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert!(registry.contains_key("audio_load"));
+        assert!(!registry.contains_key("audio_transcribe"));
     }
 
     #[test]

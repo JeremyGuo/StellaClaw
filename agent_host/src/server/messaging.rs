@@ -266,7 +266,7 @@ pub(super) fn build_user_turn_message(
         .filter(|attachment| attachment.kind == AttachmentKind::Image)
         .collect::<Vec<_>>();
     if !backend_supports_native_multimodal
-        || !model.supports_vision_input
+        || !model.supports_image_input()
         || image_attachments.is_empty()
     {
         return Ok(ChatMessage::text(

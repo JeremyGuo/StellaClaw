@@ -1,6 +1,5 @@
 use crate::config::AgentConfig;
-use crate::llm::TokenUsage;
-use crate::llm::create_chat_completion;
+use crate::llm::{ChatCompletionSession, TokenUsage, create_chat_completion};
 use crate::message::ChatMessage;
 use crate::tooling::Tool;
 use crate::tooling::active_runtime_state_summary;
@@ -83,6 +82,27 @@ fn content_to_text(content: &Option<Value>) -> String {
                             _ => None,
                         })
                         .map(|value| format!("[image] {}", value)),
+                    "file" | "input_file" => {
+                        let file_value = if item_type == "file" {
+                            object.get("file")?
+                        } else {
+                            item
+                        };
+                        let filename = file_value
+                            .get("filename")
+                            .and_then(Value::as_str)
+                            .unwrap_or("document");
+                        Some(format!("[file] {}", filename))
+                    }
+                    "input_audio" => {
+                        let format = object
+                            .get("input_audio")
+                            .and_then(Value::as_object)
+                            .and_then(|audio| audio.get("format"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("audio");
+                        Some(format!("[audio] {}", format))
+                    }
                     _ => None,
                 }
             })
@@ -102,16 +122,177 @@ fn estimate_text_tokens(text: &str) -> usize {
     char_estimate.max(byte_estimate).max(1)
 }
 
+// Mirrors Codex's approach: do not estimate inline base64 image payloads as
+// raw text. Replace them with a fixed per-image byte estimate before turning
+// bytes into tokens. 7,373 bytes is approximately 1,844 tokens at 4 bytes/token.
+const RESIZED_IMAGE_BYTES_ESTIMATE: usize = 7_373;
+const INLINE_FILE_BYTES_ESTIMATE: usize = 12_000;
+const INLINE_AUDIO_BYTES_ESTIMATE: usize = 16_000;
+
+fn parse_base64_image_data_url(url: &str) -> Option<&str> {
+    if !url
+        .get(.."data:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    {
+        return None;
+    }
+    let comma_index = url.find(',')?;
+    let metadata = &url[..comma_index];
+    let payload = &url[comma_index + 1..];
+    let metadata_without_scheme = &metadata["data:".len()..];
+    let mut metadata_parts = metadata_without_scheme.split(';');
+    let mime_type = metadata_parts.next().unwrap_or_default();
+    let has_base64_marker = metadata_parts.any(|part| part.eq_ignore_ascii_case("base64"));
+    if !mime_type
+        .get(.."image/".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+    {
+        return None;
+    }
+    if !has_base64_marker {
+        return None;
+    }
+    Some(payload)
+}
+
+fn image_data_url_estimate_adjustment(content: &Option<Value>) -> (usize, usize) {
+    let Some(Value::Array(items)) = content else {
+        return (0, 0);
+    };
+
+    let mut payload_bytes = 0usize;
+    let mut replacement_bytes = 0usize;
+
+    for item in items {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let Some(kind) = object.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        if kind != "input_image" && kind != "image_url" {
+            continue;
+        }
+        let image_url = object.get("image_url").and_then(|value| match value {
+            Value::String(url) => Some(url.as_str()),
+            Value::Object(map) => map.get("url").and_then(Value::as_str),
+            _ => None,
+        });
+        let Some(image_url) = image_url else {
+            continue;
+        };
+        let Some(payload) = parse_base64_image_data_url(image_url) else {
+            continue;
+        };
+        payload_bytes = payload_bytes.saturating_add(payload.len());
+        replacement_bytes = replacement_bytes.saturating_add(RESIZED_IMAGE_BYTES_ESTIMATE);
+    }
+
+    (payload_bytes, replacement_bytes)
+}
+
+fn inline_file_estimate_adjustment(content: &Option<Value>) -> (usize, usize) {
+    let Some(Value::Array(items)) = content else {
+        return (0, 0);
+    };
+
+    let mut payload_bytes = 0usize;
+    let mut replacement_bytes = 0usize;
+
+    for item in items {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        let Some(kind) = object.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        let file_value = match kind {
+            "file" => object.get("file"),
+            "input_file" => Some(item),
+            _ => None,
+        };
+        let Some(file_value) = file_value else {
+            continue;
+        };
+        let Some(file_data) = file_value.get("file_data").and_then(Value::as_str) else {
+            continue;
+        };
+        payload_bytes = payload_bytes.saturating_add(file_data.len());
+        replacement_bytes = replacement_bytes.saturating_add(INLINE_FILE_BYTES_ESTIMATE);
+    }
+
+    (payload_bytes, replacement_bytes)
+}
+
+fn inline_audio_estimate_adjustment(content: &Option<Value>) -> (usize, usize) {
+    let Some(Value::Array(items)) = content else {
+        return (0, 0);
+    };
+
+    let mut payload_bytes = 0usize;
+    let mut replacement_bytes = 0usize;
+
+    for item in items {
+        let Some(object) = item.as_object() else {
+            continue;
+        };
+        if object.get("type").and_then(Value::as_str) != Some("input_audio") {
+            continue;
+        }
+        let Some(data) = object
+            .get("input_audio")
+            .and_then(Value::as_object)
+            .and_then(|audio| audio.get("data"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        payload_bytes = payload_bytes.saturating_add(data.len());
+        replacement_bytes = replacement_bytes.saturating_add(INLINE_AUDIO_BYTES_ESTIMATE);
+    }
+
+    (payload_bytes, replacement_bytes)
+}
+
+fn estimate_message_tokens(message: &ChatMessage) -> usize {
+    let serialized = serde_json::to_string(message).unwrap_or_default();
+    let serialized_bytes = serialized.len();
+    let serialized_chars = serialized.chars().count();
+    let adjustments = [
+        image_data_url_estimate_adjustment(&message.content),
+        inline_file_estimate_adjustment(&message.content),
+        inline_audio_estimate_adjustment(&message.content),
+    ];
+    let payload_bytes = adjustments.iter().map(|(payload, _)| *payload).sum::<usize>();
+    let replacement_bytes = adjustments
+        .iter()
+        .map(|(_, replacement)| *replacement)
+        .sum::<usize>();
+    let adjusted_bytes = if payload_bytes == 0 || replacement_bytes == 0 {
+        serialized_bytes
+    } else {
+        serialized_bytes
+            .saturating_sub(payload_bytes)
+            .saturating_add(replacement_bytes)
+    };
+    let adjusted_chars = if payload_bytes == 0 || replacement_bytes == 0 {
+        serialized_chars
+    } else {
+        serialized_chars
+            .saturating_sub(payload_bytes)
+            .saturating_add(replacement_bytes)
+    };
+    let char_estimate = (adjusted_chars as f64 * 0.75).ceil() as usize;
+    let byte_estimate = adjusted_bytes.div_ceil(4);
+    char_estimate.max(byte_estimate).max(1) + 6
+}
+
 pub fn estimate_session_tokens(
     messages: &[ChatMessage],
     tools: &[Tool],
     pending_user_prompt: &str,
 ) -> usize {
-    let message_tokens = messages
-        .iter()
-        .map(|message| serde_json::to_string(message).unwrap_or_default())
-        .map(|serialized| estimate_text_tokens(&serialized) + 6)
-        .sum::<usize>();
+    let message_tokens = messages.iter().map(estimate_message_tokens).sum::<usize>();
     let tool_tokens = if tools.is_empty() {
         0
     } else {
@@ -236,6 +417,7 @@ fn generate_summary(
     config: &AgentConfig,
     messages: &[ChatMessage],
     preserved_recent_count: usize,
+    session: Option<&mut ChatCompletionSession>,
 ) -> Result<(StructuredCompactionOutput, TokenUsage)> {
     let mut extra_payload = Map::new();
     extra_payload.insert("max_completion_tokens".to_string(), Value::from(1_200_u64));
@@ -244,6 +426,7 @@ fn generate_summary(
         &build_summary_request(messages, preserved_recent_count),
         &[],
         Some(extra_payload),
+        session,
     )?;
     let summary_text = content_to_text(&summary_message.message.content);
     if summary_text.trim().is_empty() {
@@ -288,11 +471,6 @@ fn adjust_split_index_to_preserve_tool_context(
     split_index
 }
 
-fn estimate_message_tokens(message: &ChatMessage) -> usize {
-    let serialized = serde_json::to_string(message).unwrap_or_default();
-    estimate_text_tokens(&serialized) + 6
-}
-
 fn recent_tail_start_by_token_budget(messages: &[ChatMessage], token_budget: usize) -> usize {
     if messages.is_empty() {
         return 0;
@@ -328,6 +506,7 @@ fn compact_history_once(
     config: &AgentConfig,
     messages: &[ChatMessage],
     retain_recent_token_budget: usize,
+    session: Option<&mut ChatCompletionSession>,
 ) -> Result<(
     Vec<ChatMessage>,
     TokenUsage,
@@ -355,7 +534,8 @@ fn compact_history_once(
     }
     let messages_to_summarize = &body[..split_index];
     let recent_messages = &body[split_index..];
-    let (structured_output, usage) = generate_summary(config, messages, recent_messages.len())?;
+    let (structured_output, usage) =
+        generate_summary(config, messages, recent_messages.len(), session)?;
     let runtime_state = active_runtime_state_summary(&config.runtime_state_root)?;
     let summary_message =
         ChatMessage::text("assistant", render_structured_summary(&structured_output));
@@ -388,6 +568,22 @@ pub fn maybe_compact_messages_with_report(
     tools: &[Tool],
     pending_user_prompt: &str,
 ) -> Result<ContextCompactionReport> {
+    maybe_compact_messages_with_report_with_session(
+        config,
+        messages,
+        tools,
+        pending_user_prompt,
+        None,
+    )
+}
+
+pub(crate) fn maybe_compact_messages_with_report_with_session(
+    config: &AgentConfig,
+    messages: &[ChatMessage],
+    tools: &[Tool],
+    pending_user_prompt: &str,
+    mut session: Option<&mut ChatCompletionSession>,
+) -> Result<ContextCompactionReport> {
     let estimated_tokens_before = estimate_session_tokens(messages, tools, pending_user_prompt);
     if !config.enable_context_compression {
         return Ok(ContextCompactionReport {
@@ -418,7 +614,12 @@ pub fn maybe_compact_messages_with_report(
     let mut compacted_messages = Vec::new();
     for _ in 0..3 {
         let (next, step_usage, step_structured_output, step_compacted_messages) =
-            compact_history_once(config, &compacted, retain_recent_token_budget)?;
+            compact_history_once(
+                config,
+                &compacted,
+                retain_recent_token_budget,
+                session.as_deref_mut(),
+            )?;
         if next == compacted {
             break;
         }
@@ -450,7 +651,7 @@ pub fn maybe_compact_messages_with_report(
 mod tests {
     use super::{
         COMPACTION_MARKER, adjust_split_index_to_preserve_tool_context, content_to_text,
-        estimate_message_tokens, extract_previous_compaction_summary,
+        estimate_message_tokens, estimate_text_tokens, extract_previous_compaction_summary,
         find_originating_tool_use_index, parse_structured_summary,
         recent_tail_start_by_token_budget, split_compaction_inputs,
     };
@@ -475,6 +676,96 @@ mod tests {
         let text = content_to_text(&content);
         assert!(text.contains("Please inspect this."));
         assert!(text.contains("[image] data:image/png;base64,abc123"));
+    }
+
+    #[test]
+    fn estimate_message_tokens_discounts_inline_image_data_urls() {
+        let base64_payload = "A".repeat(20_000);
+        let message = ChatMessage {
+            role: "user".to_string(),
+            content: Some(json!([
+                {
+                    "type": "text",
+                    "text": "Please inspect this image."
+                },
+                {
+                    "type": "input_image",
+                    "image_url": format!("data:image/png;base64,{base64_payload}")
+                }
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        };
+
+        let discounted = estimate_message_tokens(&message);
+        let naive = estimate_text_tokens(&serde_json::to_string(&message).unwrap()) + 6;
+
+        assert!(naive > 10_000);
+        assert!(discounted < naive / 2);
+        assert!(discounted < 8_000);
+    }
+
+    #[test]
+    fn estimate_message_tokens_discounts_inline_file_payloads() {
+        let base64_payload = "A".repeat(32_000);
+        let message = ChatMessage {
+            role: "user".to_string(),
+            content: Some(json!([
+                {
+                    "type": "text",
+                    "text": "Inspect this PDF."
+                },
+                {
+                    "type": "file",
+                    "file": {
+                        "file_data": base64_payload,
+                        "filename": "report.pdf"
+                    }
+                }
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        };
+
+        let discounted = estimate_message_tokens(&message);
+        let naive = estimate_text_tokens(&serde_json::to_string(&message).unwrap()) + 6;
+
+        assert!(naive > 10_000);
+        assert!(discounted < naive);
+        assert!(discounted < naive.saturating_sub(2_000));
+    }
+
+    #[test]
+    fn estimate_message_tokens_discounts_inline_audio_payloads() {
+        let base64_payload = "A".repeat(32_000);
+        let message = ChatMessage {
+            role: "user".to_string(),
+            content: Some(json!([
+                {
+                    "type": "text",
+                    "text": "Inspect this audio."
+                },
+                {
+                    "type": "input_audio",
+                    "input_audio": {
+                        "data": base64_payload,
+                        "format": "wav"
+                    }
+                }
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        };
+
+        let discounted = estimate_message_tokens(&message);
+        let naive = estimate_text_tokens(&serde_json::to_string(&message).unwrap()) + 6;
+
+        assert!(naive > 10_000);
+        assert!(discounted < naive);
+        assert!(discounted < naive.saturating_sub(2_000));
     }
 
     #[test]

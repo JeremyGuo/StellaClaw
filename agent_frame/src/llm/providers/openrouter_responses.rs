@@ -1,7 +1,8 @@
 use super::UpstreamProvider;
 use crate::config::{ReasoningConfig, UpstreamConfig};
 use crate::llm::{
-    ChatCompletionOutcome, build_chat_completions_url, build_responses_input, parse_usage,
+    ChatCompletionOutcome, ChatCompletionSession, build_chat_completions_url,
+    build_responses_input, build_responses_tools_payload, parse_usage, response_id_from_value,
     responses_value_to_chat_message, should_bypass_proxy, upstream_error_from_value,
 };
 use crate::message::ChatMessage;
@@ -19,6 +20,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
         messages: &[ChatMessage],
         tools: &[Tool],
         extra_payload: Option<Map<String, Value>>,
+        _session: Option<&mut ChatCompletionSession>,
     ) -> Result<ChatCompletionOutcome> {
         let responses_url = build_chat_completions_url(upstream);
         let mut client_builder = reqwest::blocking::Client::builder()
@@ -41,18 +43,9 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
         if let Some(reasoning) = responses_reasoning_payload(upstream.reasoning.as_ref())? {
             payload.insert("reasoning".to_string(), reasoning);
         }
-        if let Some(native_web_search) = &upstream.native_web_search
-            && native_web_search.enabled
-        {
-            for (key, value) in &native_web_search.payload {
-                payload.insert(key.clone(), value.clone());
-            }
-        }
-        if !tools.is_empty() {
-            payload.insert(
-                "tools".to_string(),
-                Value::Array(tools.iter().map(Tool::as_responses_tool).collect()),
-            );
+        let response_tools = build_responses_tools_payload(upstream, tools);
+        if !response_tools.is_empty() {
+            payload.insert("tools".to_string(), Value::Array(response_tools));
             payload.insert("parallel_tool_calls".to_string(), Value::Bool(true));
         }
         if let Some(extra_payload) = extra_payload {
@@ -100,7 +93,11 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
         }
         let usage = parse_usage(&value);
         let message = responses_value_to_chat_message(&value)?;
-        Ok(ChatCompletionOutcome { message, usage })
+        Ok(ChatCompletionOutcome {
+            message,
+            usage,
+            response_id: response_id_from_value(&value),
+        })
     }
 }
 
