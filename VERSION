@@ -1,8 +1,8 @@
 ---
-version: 0.8.2
+version: 0.8.3
 ---
 
-# 0.8.2
+# 0.8.3
 
 - 升级 `workdir` 结构版本到 `0.7`：
   `zgent_native` 持久化状态新增真实的 `context_window_current/context_window_size` 字段，用来记录 native `zgent` session 返回的上下文窗口占用信息。
