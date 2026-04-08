@@ -418,7 +418,7 @@ impl<'de> Deserialize<'de> for MainAgentConfig {
             timeout_seconds: raw.timeout_seconds,
             global_install_root: raw.global_install_root,
             language: raw.language,
-            enabled_tools: raw.enabled_tools,
+            enabled_tools: normalize_enabled_tools(raw.enabled_tools),
             max_tool_roundtrips: raw.max_tool_roundtrips,
             enable_context_compression: raw.enable_context_compression,
             context_compaction: raw.context_compaction.unwrap_or(ContextCompactionConfig {
@@ -546,10 +546,32 @@ fn default_global_install_root() -> String {
     }
 }
 
+fn canonical_enabled_tool_name(tool_name: &str) -> &str {
+    match tool_name {
+        "read_file" => "file_read",
+        "write_file" => "file_write",
+        _ => tool_name,
+    }
+}
+
+fn normalize_enabled_tools(enabled_tools: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for tool_name in enabled_tools {
+        let canonical = canonical_enabled_tool_name(&tool_name).to_string();
+        if !normalized.iter().any(|existing| existing == &canonical) {
+            normalized.push(canonical);
+        }
+    }
+    normalized
+}
+
 pub fn default_enabled_tools() -> Vec<String> {
     vec![
-        "read_file".to_string(),
-        "write_file".to_string(),
+        "file_read".to_string(),
+        "file_write".to_string(),
+        "glob".to_string(),
+        "grep".to_string(),
+        "ls".to_string(),
         "edit".to_string(),
         "apply_patch".to_string(),
         "exec_start".to_string(),
@@ -1310,8 +1332,9 @@ pub fn resolve_model_api_keys(config: &ServerConfig) -> Vec<ResolvedModelApiKey>
 #[cfg(test)]
 mod tests {
     use super::{
-        ChannelConfig, LATEST_CONFIG_VERSION, ModelType, default_telegram_commands,
-        load_server_config_file, load_server_config_file_and_upgrade, resolve_model_api_keys,
+        ChannelConfig, LATEST_CONFIG_VERSION, MainAgentConfig, ModelType,
+        default_telegram_commands, load_server_config_file, load_server_config_file_and_upgrade,
+        resolve_model_api_keys,
     };
     use crate::backend::AgentBackendKind;
     use crate::zgent::zgent_runtime_available;
@@ -2117,5 +2140,15 @@ mod tests {
         let config = load_server_config_file(&config_path).unwrap();
         assert_eq!(config.main_agent.model.as_deref(), Some("helper"));
         assert!(!config.models["helper"].agent_model_enabled);
+    }
+
+    #[test]
+    fn main_agent_config_normalizes_legacy_file_tool_names() {
+        let config: MainAgentConfig = serde_json::from_value(serde_json::json!({
+            "enabled_tools": ["read_file", "write_file", "file_read"]
+        }))
+        .unwrap();
+
+        assert_eq!(config.enabled_tools, vec!["file_read", "file_write"]);
     }
 }

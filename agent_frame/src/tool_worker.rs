@@ -3,12 +3,15 @@ use crate::llm::create_chat_completion;
 use crate::message::ChatMessage;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use nix::pty::{Winsize, openpty};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::fs;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::net::IpAddr;
+use std::os::fd::AsRawFd;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{ChildStdin, Command, Stdio};
 use std::thread;
@@ -63,6 +66,8 @@ pub enum ToolWorkerJob {
     },
     Exec {
         exec_id: String,
+        #[serde(default)]
+        tty: bool,
         command: String,
         cwd: String,
         status_path: String,
@@ -157,6 +162,7 @@ fn run_job(job: ToolWorkerJob) -> Result<()> {
         ),
         ToolWorkerJob::Exec {
             exec_id,
+            tty,
             command,
             cwd,
             status_path,
@@ -165,6 +171,7 @@ fn run_job(job: ToolWorkerJob) -> Result<()> {
             requests_dir,
         } => run_exec_job(
             &exec_id,
+            tty,
             &command,
             Path::new(&cwd),
             Path::new(&status_path),
@@ -200,6 +207,7 @@ fn write_json_file(path: &Path, value: &Value) -> Result<()> {
 
 fn exec_status_json(
     exec_id: &str,
+    tty: bool,
     command: &str,
     cwd: &Path,
     pid: Option<u32>,
@@ -212,6 +220,7 @@ fn exec_status_json(
 ) -> Value {
     json!({
         "exec_id": exec_id,
+        "tty": tty,
         "pid": pid,
         "command": command,
         "cwd": cwd.display().to_string(),
@@ -227,6 +236,7 @@ fn exec_status_json(
 fn write_exec_status(
     status_path: &Path,
     exec_id: &str,
+    tty: bool,
     command: &str,
     cwd: &Path,
     pid: Option<u32>,
@@ -241,6 +251,7 @@ fn write_exec_status(
         status_path,
         &exec_status_json(
             exec_id,
+            tty,
             command,
             cwd,
             pid,
@@ -254,6 +265,27 @@ fn write_exec_status(
     )
 }
 
+enum ExecInputWriter {
+    Pipe(ChildStdin),
+    Pty(File),
+}
+
+impl ExecInputWriter {
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            ExecInputWriter::Pipe(stdin) => stdin.write_all(buf),
+            ExecInputWriter::Pty(writer) => writer.write_all(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            ExecInputWriter::Pipe(stdin) => stdin.flush(),
+            ExecInputWriter::Pty(writer) => writer.flush(),
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct ExecInputRequest {
     input: String,
@@ -261,7 +293,7 @@ struct ExecInputRequest {
 
 fn process_exec_requests(
     requests_dir: &Path,
-    stdin: &mut Option<ChildStdin>,
+    stdin: &mut Option<ExecInputWriter>,
     exec_id: &str,
 ) -> Result<bool> {
     let mut request_paths = fs::read_dir(requests_dir)
@@ -874,8 +906,50 @@ fn run_file_download_job(
     )
 }
 
+fn spawn_pty_output_reader(
+    reader: File,
+    stdout_path: &Path,
+) -> Result<thread::JoinHandle<Result<()>>> {
+    let output_path = stdout_path.to_path_buf();
+    Ok(thread::spawn(move || -> Result<()> {
+        let mut reader = reader;
+        let mut output = fs::OpenOptions::new()
+            .append(true)
+            .open(&output_path)
+            .with_context(|| format!("failed to open {} for PTY output", output_path.display()))?;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => return Ok(()),
+                Ok(read_len) => {
+                    output
+                        .write_all(&buffer[..read_len])
+                        .with_context(|| format!("failed to write {}", output_path.display()))?;
+                    output
+                        .flush()
+                        .with_context(|| format!("failed to flush {}", output_path.display()))?;
+                }
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => return Ok(()),
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to read PTY output for {}", output_path.display())
+                    });
+                }
+            }
+        }
+    }))
+}
+
+fn join_pty_output_reader(handle: thread::JoinHandle<Result<()>>) -> Result<()> {
+    handle
+        .join()
+        .map_err(|_| anyhow!("PTY output reader thread panicked"))?
+}
+
 fn run_exec_job(
     exec_id: &str,
+    tty: bool,
     command: &str,
     cwd: &Path,
     status_path: &Path,
@@ -900,24 +974,86 @@ fn run_exec_job(
         let stderr_file = File::create(stderr_path)
             .with_context(|| format!("failed to create {}", stderr_path.display()))?;
 
-        let mut child = Command::new("sh")
-            .arg("-c")
-            .arg("eval \"$AGENT_FRAME_EXEC_COMMAND\"")
-            .current_dir(cwd)
-            .env("AGENT_FRAME_EXEC_COMMAND", command)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::from(stdout_file))
-            .stderr(Stdio::from(stderr_file))
-            .spawn()
-            .with_context(|| format!("failed to spawn shell in {}", cwd.display()))?;
+        let mut child;
+        let mut stdin: Option<ExecInputWriter>;
+        let reader_handle = if tty {
+            let pty = openpty(
+                Some(&Winsize {
+                    ws_row: 24,
+                    ws_col: 80,
+                    ws_xpixel: 0,
+                    ws_ypixel: 0,
+                }),
+                None,
+            )
+            .context("failed to allocate pty for exec process")?;
+            let master_fd = pty.master.as_raw_fd();
+            let slave_fd = pty.slave.as_raw_fd();
+
+            let mut command_builder = Command::new("sh");
+            command_builder
+                .arg("-c")
+                .arg("eval \"$AGENT_FRAME_EXEC_COMMAND\"")
+                .current_dir(cwd)
+                .env("AGENT_FRAME_EXEC_COMMAND", command)
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            // PTY-backed commands need a controlling terminal and their own process group.
+            unsafe {
+                command_builder.pre_exec(move || {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::ioctl(slave_fd, libc::TIOCSCTTY, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::dup2(slave_fd, libc::STDIN_FILENO) == -1
+                        || libc::dup2(slave_fd, libc::STDOUT_FILENO) == -1
+                        || libc::dup2(slave_fd, libc::STDERR_FILENO) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    libc::close(master_fd);
+                    if slave_fd > libc::STDERR_FILENO {
+                        libc::close(slave_fd);
+                    }
+                    Ok(())
+                });
+            }
+            child = command_builder
+                .spawn()
+                .with_context(|| format!("failed to spawn PTY shell in {}", cwd.display()))?;
+            drop(pty.slave);
+            let reader_master = File::from(pty.master);
+            let writer_master = reader_master
+                .try_clone()
+                .context("failed to clone PTY master for stdin writes")?;
+            stdin = Some(ExecInputWriter::Pty(writer_master));
+            drop(stderr_file);
+            Some(spawn_pty_output_reader(reader_master, stdout_path)?)
+        } else {
+            child = Command::new("sh")
+                .arg("-c")
+                .arg("eval \"$AGENT_FRAME_EXEC_COMMAND\"")
+                .current_dir(cwd)
+                .env("AGENT_FRAME_EXEC_COMMAND", command)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::from(stdout_file))
+                .stderr(Stdio::from(stderr_file))
+                .spawn()
+                .with_context(|| format!("failed to spawn shell in {}", cwd.display()))?;
+            stdin = child.stdin.take().map(ExecInputWriter::Pipe);
+            None
+        };
         let pid = child.id();
-        let mut stdin = child.stdin.take();
         let mut stdin_closed = stdin.is_none();
         let mut last_stdin_closed = stdin_closed;
 
         write_exec_status(
             status_path,
             exec_id,
+            tty,
             command,
             cwd,
             Some(pid),
@@ -935,6 +1071,7 @@ fn run_exec_job(
                 write_exec_status(
                     status_path,
                     exec_id,
+                    tty,
                     command,
                     cwd,
                     Some(pid),
@@ -951,9 +1088,13 @@ fn run_exec_job(
                 .try_wait()
                 .context("failed to poll exec child process")?
             {
+                if let Some(handle) = reader_handle {
+                    join_pty_output_reader(handle)?;
+                }
                 write_exec_status(
                     status_path,
                     exec_id,
+                    tty,
                     command,
                     cwd,
                     Some(pid),
@@ -974,6 +1115,7 @@ fn run_exec_job(
         write_exec_status(
             status_path,
             exec_id,
+            tty,
             command,
             cwd,
             None,

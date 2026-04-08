@@ -102,14 +102,14 @@ jobs:
       - name: Build release binaries
         run: |
           cargo zigbuild --manifest-path agent_frame/Cargo.toml --release --bin run_agent --target ${{ matrix.target }}
-          cargo zigbuild --manifest-path agent_host/Cargo.toml --release --target ${{ matrix.target }}
+          cargo zigbuild --manifest-path agent_host/Cargo.toml --release --bin partyclaw --target ${{ matrix.target }}
 
       - name: Package artifacts
         shell: bash
         run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/run_agent" dist/
-          cp "target/${{ matrix.target }}/release/agent_host" dist/
+          cp "target/${{ matrix.target }}/release/partyclaw" dist/
           cp README.md dist/
           cp VERSION dist/
           cp docs/DEPLOY.md dist/

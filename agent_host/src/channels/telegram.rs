@@ -2463,6 +2463,10 @@ fn utf16_len(value: &str) -> usize {
     value.encode_utf16().count()
 }
 
+fn telegram_text_len(value: &str) -> usize {
+    utf16_len(value)
+}
+
 fn split_markdown_for_telegram_documents(input: &str, max_chars: usize) -> Vec<RichDocument> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -2497,10 +2501,7 @@ fn render_markdown_chunks_to_telegram_entities(
 }
 
 fn rendered_length_for_document(document: &RichDocument) -> usize {
-    render_rich_document_to_telegram_entities(document)
-        .text
-        .chars()
-        .count()
+    telegram_text_len(&render_rich_document_to_telegram_entities(document).text)
 }
 
 fn rendered_length_for_blocks(blocks: &[RichBlock]) -> usize {
@@ -3023,10 +3024,8 @@ fn split_markdown_message_legacy(input: &str, max_chars: usize) -> Vec<String> {
         while low <= high {
             let mid = (low + high) / 2;
             let candidate: String = chars[cursor..cursor + mid].iter().collect();
-            let translated_len = translate_markdown_to_telegram_html(&candidate)
-                .text
-                .chars()
-                .count();
+            let translated_len =
+                telegram_text_len(&translate_markdown_to_telegram_html(&candidate).text);
             if translated_len <= max_chars {
                 best = mid;
                 low = mid + 1;
@@ -3075,7 +3074,7 @@ mod tests {
         TelegramMessageEntity, TelegramRenderedText, build_edit_text_payload,
         build_send_text_payload, parse_markdown_to_rich_document, poll_backoff_seconds,
         render_markdown_chunks_to_telegram_entities, render_rich_document_to_telegram_entities,
-        translate_markdown_to_telegram_html,
+        telegram_text_len, translate_markdown_to_telegram_html,
     };
     use crate::domain::ShowOptions;
     use anyhow::anyhow;
@@ -3384,7 +3383,7 @@ mod tests {
         assert!(
             chunks
                 .iter()
-                .all(|chunk| { chunk.text.chars().count() <= 4096 })
+                .all(|chunk| { telegram_text_len(&chunk.text) <= 4096 })
         );
     }
 
@@ -3396,7 +3395,7 @@ mod tests {
         assert!(
             chunks
                 .iter()
-                .all(|chunk| { chunk.text.chars().count() <= 1024 })
+                .all(|chunk| { telegram_text_len(&chunk.text) <= 1024 })
         );
     }
 
@@ -3425,7 +3424,7 @@ mod tests {
         assert!(
             chunks
                 .iter()
-                .all(|chunk| chunk.text.chars().count() <= 1024)
+                .all(|chunk| telegram_text_len(&chunk.text) <= 1024)
         );
         assert!(
             chunks
@@ -3443,7 +3442,25 @@ mod tests {
         assert!(
             chunks
                 .iter()
-                .all(|chunk| chunk.text.chars().count() <= 1024)
+                .all(|chunk| telegram_text_len(&chunk.text) <= 1024)
+        );
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| chunk.entities.iter().any(|entity| entity.kind == "pre"))
+        );
+    }
+
+    #[test]
+    fn splits_large_code_block_with_astral_chars_under_utf16_limit() {
+        let input = format!("```txt\n{}\n```", "😀".repeat(900));
+        let chunks = render_markdown_chunks_to_telegram_entities(&input, 1024);
+
+        assert!(chunks.len() >= 2);
+        assert!(
+            chunks
+                .iter()
+                .all(|chunk| telegram_text_len(&chunk.text) <= 1024)
         );
         assert!(
             chunks
@@ -3464,7 +3481,7 @@ mod tests {
         assert!(
             chunks
                 .iter()
-                .all(|chunk| chunk.text.chars().count() <= 1024)
+                .all(|chunk| telegram_text_len(&chunk.text) <= 1024)
         );
         assert!(chunks.iter().all(|chunk| chunk.text.contains("• ")));
     }

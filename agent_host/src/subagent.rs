@@ -22,10 +22,7 @@ pub enum SubagentState {
 
 impl SubagentState {
     pub fn is_alive(self) -> bool {
-        matches!(
-            self,
-            SubagentState::Running | SubagentState::WaitingForCharge | SubagentState::Ready
-        )
+        matches!(self, SubagentState::Running | SubagentState::Ready)
     }
 }
 
@@ -175,36 +172,6 @@ impl HostedSubagent {
         Ok(hosted)
     }
 
-    pub fn load(runtime_state_root: &Path, id: Uuid) -> Result<PersistedSubagentState> {
-        let path = subagent_state_dir(runtime_state_root)?.join(format!("{id}.json"));
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        serde_json::from_str(&raw).context("failed to parse subagent state")
-    }
-
-    pub fn list(runtime_state_root: &Path) -> Result<Vec<PersistedSubagentState>> {
-        let dir = subagent_state_dir(runtime_state_root)?;
-        if !dir.exists() {
-            return Ok(Vec::new());
-        }
-        let mut states = Vec::new();
-        for entry in
-            fs::read_dir(&dir).with_context(|| format!("failed to read {}", dir.display()))?
-        {
-            let path = entry?.path();
-            if path.extension().and_then(|value| value.to_str()) != Some("json") {
-                continue;
-            }
-            let raw = fs::read_to_string(&path)
-                .with_context(|| format!("failed to read {}", path.display()))?;
-            let state: PersistedSubagentState =
-                serde_json::from_str(&raw).context("failed to parse subagent state")?;
-            states.push(state);
-        }
-        states.sort_by_key(|state| state.created_at);
-        Ok(states)
-    }
-
     pub fn persist(&self) -> Result<()> {
         let inner = self
             .inner
@@ -222,6 +189,15 @@ impl HostedSubagent {
             .context("failed to serialize subagent state")?;
         fs::write(&self.state_path, raw)
             .with_context(|| format!("failed to write {}", self.state_path.display()))
+    }
+
+    pub fn remove_state_file(&self) -> Result<()> {
+        match fs::remove_file(&self.state_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to remove {}", self.state_path.display())),
+        }
     }
 }
 

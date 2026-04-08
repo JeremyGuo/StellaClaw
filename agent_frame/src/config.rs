@@ -399,6 +399,25 @@ fn resolve_upstream(raw: UpstreamConfigRaw) -> UpstreamConfig {
     }
 }
 
+fn canonical_enabled_tool_name(tool_name: &str) -> &str {
+    match tool_name {
+        "read_file" => "file_read",
+        "write_file" => "file_write",
+        _ => tool_name,
+    }
+}
+
+fn normalize_enabled_tools(enabled_tools: Vec<String>) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for tool_name in enabled_tools {
+        let canonical = canonical_enabled_tool_name(&tool_name).to_string();
+        if !normalized.iter().any(|existing| existing == &canonical) {
+            normalized.push(canonical);
+        }
+    }
+    normalized
+}
+
 #[derive(Deserialize)]
 struct CodexAuthFile {
     #[serde(default)]
@@ -471,7 +490,7 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
         });
 
     Ok(AgentConfig {
-        enabled_tools: raw.enabled_tools,
+        enabled_tools: normalize_enabled_tools(raw.enabled_tools),
         upstream: resolve_upstream(raw.upstream),
         response_checkpoint: raw.response_checkpoint,
         image_tool_upstream: raw.image_tool_upstream.map(resolve_upstream),
@@ -513,4 +532,29 @@ pub fn load_config_file(path: impl AsRef<Path>) -> Result<AgentConfig> {
         serde_json::from_str(&config_text).context("failed to parse config file as JSON")?;
     let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
     load_config_value(value, base_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_config_value;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    #[test]
+    fn load_config_value_normalizes_legacy_file_tool_names() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = load_config_value(
+            json!({
+                "enabled_tools": ["read_file", "write_file", "file_read"],
+                "upstream": {
+                    "base_url": "https://example.com/v1",
+                    "model": "demo"
+                }
+            }),
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(config.enabled_tools, vec!["file_read", "file_write"]);
+    }
 }

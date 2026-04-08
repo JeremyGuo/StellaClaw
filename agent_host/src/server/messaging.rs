@@ -389,10 +389,10 @@ pub(super) fn build_synthetic_system_messages(
     for notice in profile_change_notices {
         let text = match notice {
             SharedProfileChangeNotice::UserUpdated => {
-                "[System Message: USER.md changed. It stores user info. If you need refreshed user info in this run, use read_file on ./USER.md.]"
+                "[System Message: USER.md changed. It stores user info. If you need refreshed user info in this run, use file_read on ./USER.md.]"
             }
             SharedProfileChangeNotice::IdentityUpdated => {
-                "[System Message: IDENTITY.md changed. It defines your persona. Use read_file on ./IDENTITY.md now so your current behavior follows the updated persona.]"
+                "[System Message: IDENTITY.md changed. It defines your persona. Use file_read on ./IDENTITY.md now so your current behavior follows the updated persona.]"
             }
         };
         messages.push(ChatMessage::text("system", text));

@@ -52,7 +52,7 @@ A self-contained Rust library and CLI binary for running a single LLM agent sess
 
 | Feature | Details |
 |:--------|:--------|
-| 🛠️ **Built-in tools** | File I/O (`read_file` / `write_file` / `edit` / `apply_patch`), shell execution (`exec_start` / `exec_observe` / `exec_wait` / `exec_kill`), interruptible `web_fetch` / `web_search`, image workers (`image_start` / `image_wait` / `image_cancel`), and file download workers (`file_download_start` / `file_download_progress` / `file_download_wait` / `file_download_cancel`) |
+| 🛠️ **Built-in tools** | File I/O (`file_read` / `file_write` / `edit` / `apply_patch`), repo exploration (`glob` / `grep` / `ls`), shell execution (`exec_start` / `exec_observe` / `exec_wait` / `exec_kill`), interruptible `web_fetch` / `web_search`, image workers (`image_start` / `image_wait` / `image_cancel`), and file download workers (`file_download_start` / `file_download_progress` / `file_download_wait` / `file_download_cancel`) |
 | 📚 **Skill system** | `SKILL.md`-based skill discovery with `skill_load` / `skill_create` / `skill_update` tools |
 | 🗜️ **Context compaction** | Automatic compression when context approaches model limits; tool-wait compaction only runs after all outstanding tool results are appended, with running `exec` / `file_download` state preserved in summaries |
 | 📊 **Token accounting** | Tracks `cache_read` / `cache_write` / `cache_hit` / `cache_miss` per request |
@@ -60,7 +60,7 @@ A self-contained Rust library and CLI binary for running a single LLM agent sess
 | ⚡ **Parallel tool calls** | Multiple independent tool calls in the same round execute concurrently |
 | 🛑 **Cancellation** | New user input requests a `yield` and interrupts interruptible tools; immediate tools finish quickly and return the turn to a safe boundary |
 | 💾 **Checkpoint callback** | Optional callback fired after each tool round for mid-session state persistence |
-| 🤖 **Subagents** | Session-bound subagents with `subagent_create` / `subagent_wait` / `subagent_charge` / `subagent_tell` / `subagent_progress` / `subagent_destroy` and workbook tracking under `.subagent/` |
+| 🧩 **Host extensions** | `agent_host` can inject higher-level runtime tools such as `user_tell`, `subagent_start` / `subagent_join` / `subagent_kill`, and cron task management into the same tool loop |
 | 🎛️ **Modes** | CLI binary (`run_agent`) or embedded library |
 
 ### 🔨 Build & Test
@@ -78,6 +78,7 @@ See [`agent_frame/example_config.json`](agent_frame/example_config.json) and [`a
 ### 🧭 Tool Behavior Notes
 
 - `exec_start`, `image_start`, and `file_download_start` start long-lived work and return immediately with an id.
+- `exec_start` accepts `tty=true` when a command needs terminal semantics; the runtime allocates a PTY for that process while keeping the same `exec_observe` / `exec_wait` / `exec_kill` flow.
 - `exec_wait`, `image_wait`, `file_download_wait`, `web_fetch`, and `web_search` are interruptible.
 - `image_wait` and `file_download_wait` return immediately when interrupted and leave the background task running.
 - `web_search` and `web_fetch` are cancelled when interrupted.
@@ -186,8 +187,12 @@ Skills are `SKILL.md`-based reusable workflows discovered at runtime.
 
 ```jsonc
 {
+  "version": "0.9",
   "models":     { /* named model profiles */ },
+  "agent":      { /* backend -> available model aliases */ },
+  "tooling":    { /* helper model routing */ },
   "main_agent": { /* agent behavior settings */ },
+  "sandbox":    { /* sandbox defaults */ },
   "channels":   [ /* one or more channel configs */ ]
 }
 ```
@@ -196,26 +201,46 @@ Skills are `SKILL.md`-based reusable workflows discovered at runtime.
 <summary><b>📋 Model Profile (<code>models.&lt;name&gt;</code>)</b></summary>
 <br />
 
-Each named entry under `models` describes one LLM endpoint. `main_agent.model` selects which one the foreground agent uses.
+Each named entry under `models` describes one model alias and its upstream settings. Foreground agent selection is now split in two parts:
+
+- `agent.agent_frame.available_models` / `agent.zgent.available_models` decide which model aliases each backend may use
+- Conversations choose backend + model via `/agent`; `main_agent.model` is only the default/fallback selection when present
 
 | Field | Type | Default | Description |
 |:------|:-----|:--------|:------------|
+| `type` | `"openrouter"` \| `"openrouter-resp"` \| `"codex-subscription"` | — | Upstream adapter kind |
 | `api_endpoint` | string | — | Base URL of the OpenAI-compatible API |
 | `model` | string | — | Model identifier passed to the API |
-| `backend` | `"agent_frame"` \| `"zgent"` | `"agent_frame"` | Agent execution backend |
+| `capabilities` | string[] | `[]` | Declared abilities such as `chat`, `web_search`, `image_in`, `image_out`, `pdf`, `audio_in` |
+| `agent_model_enabled` | bool | `true` | Whether this alias can appear in agent model pickers |
 | `supports_vision_input` | bool | `false` | Whether to pass images to the model |
-| `image_tool_model` | string \| `"self"` | null | A separate model name for the `image` tool; `"self"` = this model |
 | `api_key` | string | null | Inline API key (prefer `api_key_env`) |
 | `api_key_env` | string | `"OPENAI_API_KEY"` | Env var from which to read the API key |
 | `chat_completions_path` | string | `"/chat/completions"` | Path appended to `api_endpoint` |
+| `codex_home` | string | null | Required for `codex-subscription` models |
 | `timeout_seconds` | float | `120.0` | Per-request LLM timeout (adjustable at runtime via `/set_api_timeout`) |
 | `context_window_tokens` | int | `128000` | Context window size for compaction budget |
 | `cache_ttl` | string | null | Cache TTL hint (e.g. `"5m"`), enables cache control headers |
 | `reasoning` | object | null | Reasoning config (budget tokens, effort level) |
 | `headers` | object | `{}` | Extra HTTP headers sent with every request |
 | `native_web_search` | object | null | Provider-native search (mutually exclusive with `external_web_search`) |
-| `external_web_search` | object | null | External search via a separate model/endpoint |
 | `description` | string | `""` | Human-readable label; shown to agents in model catalog |
+
+</details>
+
+<details>
+<summary><b>🤖 Agent Routing (<code>agent</code> / <code>tooling</code>)</b></summary>
+<br />
+
+| Field | Type | Description |
+|:------|:-----|:------------|
+| `agent.agent_frame.available_models` | string[] | Model aliases selectable by the `agent_frame` backend |
+| `agent.zgent.available_models` | string[] | Model aliases selectable by the `zgent` backend |
+| `tooling.web_search` | string | Helper model alias for external search |
+| `tooling.image` | string | Image input helper alias, optionally with `:self` |
+| `tooling.image_gen` | string | Image generation helper alias |
+| `tooling.pdf` | string | PDF helper alias |
+| `tooling.audio_input` | string | Audio input helper alias |
 
 </details>
 
@@ -225,17 +250,20 @@ Each named entry under `models` describes one LLM endpoint. `main_agent.model` s
 
 | Field | Type | Default | Description |
 |:------|:-----|:--------|:------------|
-| `model` | string | — | Must match a key in `models` |
+| `model` | string | null | Optional default model alias used before a conversation picks its own backend/model |
 | `language` | string | `"zh-CN"` | Reply language injected into the system prompt |
 | `timeout_seconds` | float | null | Wall-clock timeout for a full agent turn (`0` = disabled, `null` = unlimited) |
-| `enabled_tools` | string[] | all built-ins | Tools made available to the agent |
+| `global_install_root` | string | `"/opt"` | Shared install root exposed to runtime helpers |
+| `enabled_tools` | string[] | all built-ins | Legacy/advanced override for built-in tool availability |
 | `max_tool_roundtrips` | int | `12` | Max LLM → tool → LLM cycles per turn |
 | `enable_context_compression` | bool | `true` | Enable automatic turn compaction |
-| `effective_context_window_percent` | float | `0.9` | Fraction of `context_window_tokens` before compaction triggers |
-| `auto_compact_token_limit` | int | null | Hard token budget that triggers compaction |
-| `retain_recent_messages` | int | `8` | Minimum recent messages preserved during compaction |
-| `enable_idle_context_compaction` | bool | `false` | Run compaction between turns when a conversation is idle |
-| `idle_context_compaction_poll_interval_seconds` | int | `15` | How often to check for idle compaction opportunity |
+| `context_compaction.trigger_ratio` | float | `0.9` | Fraction of context budget that triggers compaction |
+| `context_compaction.token_limit_override` | int | null | Hard token budget override for compaction |
+| `context_compaction.recent_fidelity_target_ratio` | float | `0.18` | Share of token budget reserved for recent high-fidelity history |
+| `idle_compaction.enabled` | bool | `false` | Run compaction between turns when a conversation is idle |
+| `idle_compaction.poll_interval_seconds` | int | `15` | How often to check for idle compaction opportunity |
+| `idle_compaction.min_ratio` | float | `0.5` | Minimum context pressure before idle compaction runs |
+| `timeout_observation_compaction.enabled` | bool | `true` | Compact when the model times out and needs a shorter retry context |
 
 </details>
 
@@ -271,11 +299,13 @@ TELEGRAM_BOT_TOKEN=...             # For Telegram channel (agent_host)
 
 ```json
 {
+  "version": "0.9",
   "models": {
     "main": {
-      "backend": "agent_frame",
+      "type": "openrouter",
       "api_endpoint": "https://openrouter.ai/api/v1",
       "model": "openai/gpt-4o-mini",
+      "capabilities": ["chat", "image_in"],
       "supports_vision_input": true,
       "api_key_env": "OPENROUTER_API_KEY",
       "cache_ttl": "5m",
@@ -283,7 +313,10 @@ TELEGRAM_BOT_TOKEN=...             # For Telegram channel (agent_host)
       "description": "Fast general-purpose chat model."
     }
   },
-  "main_agent": { "model": "main", "language": "zh-CN" },
+  "agent": {
+    "agent_frame": { "available_models": ["main"] }
+  },
+  "main_agent": { "language": "zh-CN" },
   "channels": [{ "kind": "command_line", "id": "local-cli", "prompt": "you> " }]
 }
 ```
@@ -296,17 +329,22 @@ TELEGRAM_BOT_TOKEN=...             # For Telegram channel (agent_host)
 
 ```json
 {
+  "version": "0.9",
+  "agent": {
+    "agent_frame": { "available_models": ["main"] }
+  },
   "models": {
     "main": {
-      "backend": "agent_frame",
+      "type": "openrouter",
       "api_endpoint": "https://openrouter.ai/api/v1",
       "model": "openai/gpt-4o-mini",
+      "capabilities": ["chat", "image_in"],
       "supports_vision_input": true,
       "api_key_env": "OPENROUTER_API_KEY",
       "description": "Fast general-purpose chat model."
     }
   },
-  "main_agent": { "model": "main", "language": "zh-CN" },
+  "main_agent": { "language": "zh-CN" },
   "channels": [{
     "kind": "telegram",
     "id": "telegram-main",
@@ -333,7 +371,7 @@ cargo run --release --manifest-path agent_host/Cargo.toml --bin partyclaw -- \
 
 ## 🔌 Agent Backend: `agent_frame` vs `zgent`
 
-The `backend` field in each model profile selects the agent execution backend. Default is `"agent_frame"`. Setting it to `"zgent"` routes through a compatibility layer.
+Backends are now selected per conversation, not per model definition. Models live under `models.<alias>`, each backend exposes its own allowlist under `agent.agent_frame.available_models` or `agent.zgent.available_models`, and `/agent` lets the user choose the backend + model pair at runtime.
 
 > ⚠️ `zgent` is a **soft dependency** — the project compiles normally when the `zgent/` directory is absent; only the `zgent` backend becomes unavailable. It is useful for quick endpoint verification but is **not recommended for production**.
 
@@ -356,7 +394,7 @@ The `backend` field in each model profile selects the agent execution backend. D
 | **Skills** | ✅ | ✅ | Identical |
 | **Tokio runtime** | Sync on caller | ⚠️ New runtime per call | Extra overhead |
 
-> **Constraint**: when `backend` is `"zgent"`, `chat_completions_path` must remain the default (`"/chat/completions"`).
+> **Constraint**: if a conversation uses the `zgent` backend, the selected model alias must still point at a `chat_completions`-style upstream (`chat_completions_path` should stay at the default `"/chat/completions"`).
 
 </details>
 
@@ -367,7 +405,7 @@ The `backend` field in each model profile selects the agent execution backend. D
 | Trigger | Action |
 |:--------|:-------|
 | Push / Pull Request | `cargo fmt --check` + `cargo test` for both crates |
-| Version tag `v*.*.*` | Release binaries: `partyclaw`, `agent_frame/run_agent` |
+| Push to `main` with `VERSION` changed | After CI succeeds, the release workflow tags `vX.Y.Z` automatically and publishes binaries for `partyclaw` and `agent_frame/run_agent` |
 
 > Unified Cargo `target/` directory — avoids duplicate `agent_host/target` and `agent_frame/target` build bloat.
 
@@ -388,8 +426,8 @@ The `backend` field in each model profile selects the agent execution backend. D
 
 | Component | Version | State |
 |:----------|:--------|:------|
-| `agent_frame` | `0.2.0` | ✅ Stable — parallel tools, skill CRUD, exec refactor |
-| `agent_host` | `0.2.0` | ✅ Active — conversation model, sandbox, snapshots |
+| `agent_frame` | `0.9.2` | ✅ Active — PTY-backed `exec_start`, repo exploration tools, context compaction |
+| `agent_host` | `0.9.2` | ✅ Active — backend/model routing, Telegram service host, snapshots, cron |
 | Sandbox | — | ✅ Implemented — `subprocess` and `bubblewrap` modes |
 | Deployment | — | ✅ systemd on NAT-pl1, bubblewrap verified |
 

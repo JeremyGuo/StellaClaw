@@ -783,12 +783,12 @@ mod tests {
                     id: "call_1".to_string(),
                     kind: "function".to_string(),
                     function: crate::message::FunctionCall {
-                        name: "read_file".to_string(),
+                        name: "file_read".to_string(),
                         arguments: Some("{}".to_string()),
                     },
                 }]),
             },
-            ChatMessage::tool_output("call_1", "read_file", "{\"ok\":true}"),
+            ChatMessage::tool_output("call_1", "file_read", "{\"ok\":true}"),
             ChatMessage::text("assistant", "done"),
         ];
 
@@ -811,12 +811,12 @@ mod tests {
                     id: "call_1".to_string(),
                     kind: "function".to_string(),
                     function: crate::message::FunctionCall {
-                        name: "read_file".to_string(),
+                        name: "file_read".to_string(),
                         arguments: Some("{}".to_string()),
                     },
                 }]),
             },
-            ChatMessage::tool_output("call_1", "read_file", "{\"ok\":true}"),
+            ChatMessage::tool_output("call_1", "file_read", "{\"ok\":true}"),
             ChatMessage::text("assistant", "done"),
         ];
 

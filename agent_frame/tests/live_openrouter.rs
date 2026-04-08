@@ -75,7 +75,7 @@ fn live_openrouter_kimi_roundtrip_and_tool_call() -> Result<()> {
         format!("{file_content}\n"),
     )?;
 
-    let tool_config = live_config(&temp_dir.path().display().to_string(), vec!["read_file"])?;
+    let tool_config = live_config(&temp_dir.path().display().to_string(), vec!["file_read"])?;
     let tool_messages = run_session(
         Vec::new(),
         "Read hello.txt and reply with only its content.",
@@ -85,7 +85,7 @@ fn live_openrouter_kimi_roundtrip_and_tool_call() -> Result<()> {
 
     assert!(
         tool_messages.iter().any(|message| {
-            message.role == "tool" && message.name.as_deref() == Some("read_file")
+            message.role == "tool" && message.name.as_deref() == Some("file_read")
         })
     );
     assert!(extract_assistant_text(&tool_messages).contains(file_content));

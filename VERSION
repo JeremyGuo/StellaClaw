@@ -1,6 +1,27 @@
 ---
-version: 0.9.0
+version: 0.9.2
 ---
+
+# 0.9.2
+
+- 升级 `workdir` 结构版本到 `0.10`：
+  `agent/runtime/*/agent_frame/processes/*.json` 的 exec 运行态元数据新增 `tty` 标记，用来区分普通 pipe 模式与 PTY 模式；升级时会清理旧版 exec 运行态与对应的 exec tool worker 文件，避免旧 metadata 与新 PTY 运行时混用。
+- 为 `exec_start` 增加 `tty` 参数：
+  当 `tty=true` 时，后台 exec worker 会为子进程分配 PTY，让安装器、REPL 等需要终端语义的命令能以终端模式运行，同时继续沿用 `exec_observe` / `exec_wait` / `exec_kill` 的同一套生命周期。
+- 打通 PTY 模式下的输入与终止语义：
+  `exec_wait(input=...)` 现在可以继续给 PTY 进程写入输入；当 PTY exec 被 kill 或 session destroy 时，运行时会按进程组终止前台命令，减少 shell 退出后子进程残留的风险。
+- 明确本次只影响 `workdir`，不影响 `config`：
+  新增 `0.9 -> 0.10` workdir upgrade step；按版本策略将仓库版本提升到 `0.9.2`。
+- 收敛仓库探索工具命名与分工：
+  `read_file` / `write_file` 统一重命名为 `file_read` / `file_write`，并新增 `glob`、`grep`、`ls`，主 prompt 也改为优先使用这些专用探索工具而不是默认走 shell 搜索。
+- 增强只读探索体验：
+  `file_read` 现支持 Claude 风格的 `file_path` / `offset` / `limit` 参数，并补充了截断与大文件保护；`glob` / `grep` / `ls` 也加入结果上限与更适合大仓库浏览的返回结构。
+- 简化 subagent 生命周期：
+  主 agent 现在只暴露 `subagent_start`、`subagent_join`、`subagent_kill`；旧的 `subagent_progress`、`subagent_charge`、`subagent_tell`、`subagent_list` 已移除，subagent 改为单次小任务 worker，完成或失败后由 `join` 立即回收。
+- 调整 subagent 委派策略：
+  主 / 子 agent prompt 现在更明确地鼓励把小搜索、小 side task 和并行任务尽早卸载给 subagent，以降低 main agent 的上下文开销；`subagent_join` 同时支持超时等待而不强制杀掉任务。
+- 明确本次不影响 `config` 与 `workdir` schema：
+  没有新增 config loader，也没有新增 workdir upgrade step；这是一次运行时工具与 prompt 行为更新。
 
 # 0.9.0
 

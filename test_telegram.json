@@ -81,8 +81,11 @@
     "global_install_root": "/opt",
     "language": "zh-CN",
     "enabled_tools": [
-      "read_file",
-      "write_file",
+      "file_read",
+      "file_write",
+      "glob",
+      "grep",
+      "ls",
       "edit",
       "apply_patch",
       "exec_start",

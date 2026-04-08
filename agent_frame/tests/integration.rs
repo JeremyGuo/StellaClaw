@@ -302,8 +302,8 @@ fn builtin_tools_work() -> Result<()> {
     });
     let registry = build_tool_registry(
         &[
-            "read_file".to_string(),
-            "write_file".to_string(),
+            "file_read".to_string(),
+            "file_write".to_string(),
             "edit".to_string(),
             "apply_patch".to_string(),
             "exec_start".to_string(),
@@ -314,6 +314,9 @@ fn builtin_tools_work() -> Result<()> {
             "file_download_progress".to_string(),
             "file_download_wait".to_string(),
             "file_download_cancel".to_string(),
+            "glob".to_string(),
+            "grep".to_string(),
+            "ls".to_string(),
             "web_fetch".to_string(),
             "web_search".to_string(),
         ],
@@ -331,15 +334,15 @@ fn builtin_tools_work() -> Result<()> {
 
     let write_result = execute_tool_call(
         &registry,
-        "write_file",
-        Some(r#"{"path":"note.txt","content":"alpha\nbeta\n"}"#),
+        "file_write",
+        Some(r#"{"file_path":"note.txt","content":"alpha\nbeta\n"}"#),
     );
     assert!(write_result.contains("note.txt"));
 
     let read_result = execute_tool_call(
         &registry,
-        "read_file",
-        Some(r#"{"path":"note.txt","offset_lines":0,"limit_lines":10}"#),
+        "file_read",
+        Some(r#"{"file_path":"note.txt","offset":1,"limit":10}"#),
     );
     assert!(read_result.contains("1: alpha"));
     assert!(read_result.contains("2: beta"));
@@ -353,8 +356,8 @@ fn builtin_tools_work() -> Result<()> {
 
     let read_after_edit = execute_tool_call(
         &registry,
-        "read_file",
-        Some(r#"{"path":"note.txt","offset_lines":0,"limit_lines":10}"#),
+        "file_read",
+        Some(r#"{"file_path":"note.txt","offset":1,"limit":10}"#),
     );
     assert!(read_after_edit.contains("1: gamma"));
 
@@ -1834,7 +1837,7 @@ fn controlled_run_starts_tools_and_yields_after_tool_batch() -> Result<()> {
     let temp_dir = TempDir::new()?;
     fs::write(
         temp_dir.path().join("README.md"),
-        "# Test Workspace\nThis file is here for read_file.\n",
+        "# Test Workspace\nThis file is here for file_read.\n",
     )?;
     let server = TestServer::start();
     server.push_response(json!({
@@ -1846,8 +1849,8 @@ fn controlled_run_starts_tools_and_yields_after_tool_batch() -> Result<()> {
                     "id": "call-1",
                     "type": "function",
                     "function": {
-                        "name": "read_file",
-                        "arguments": "{\"path\":\"README.md\"}"
+                        "name": "file_read",
+                        "arguments": "{\"file_path\":\"README.md\"}"
                     }
                 }]
             }
@@ -1874,7 +1877,7 @@ fn controlled_run_starts_tools_and_yields_after_tool_batch() -> Result<()> {
 
     let config = load_config_value(
         json!({
-            "enabled_tools": ["read_file"],
+            "enabled_tools": ["file_read"],
             "enable_context_compression": false,
             "upstream": {"base_url": server.address, "model": "fake-model"},
             "system_prompt": "Test system prompt.",
@@ -1921,7 +1924,7 @@ fn controlled_run_starts_tools_and_yields_after_tool_batch() -> Result<()> {
             .unwrap(),
     )?;
     assert!(
-        tool_json["path"]
+        tool_json["file_path"]
             .as_str()
             .is_some_and(|path| path.ends_with("README.md"))
     );
@@ -1931,7 +1934,7 @@ fn controlled_run_starts_tools_and_yields_after_tool_batch() -> Result<()> {
             .lock()
             .unwrap()
             .iter()
-            .any(|event| matches!(event, SessionEvent::ToolCallStarted { tool_name, .. } if tool_name == "read_file"))
+            .any(|event| matches!(event, SessionEvent::ToolCallStarted { tool_name, .. } if tool_name == "file_read"))
     );
     assert!(
         events

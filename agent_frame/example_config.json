@@ -1,7 +1,10 @@
 {
   "enabled_tools": [
-    "read_file",
-    "write_file",
+    "file_read",
+    "file_write",
+    "glob",
+    "grep",
+    "ls",
     "run_shell",
     "http_request"
   ],

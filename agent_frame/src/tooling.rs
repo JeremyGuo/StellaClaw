@@ -5,6 +5,8 @@ use crate::skills::{
 use crate::tool_worker::ToolWorkerJob;
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{self, Receiver};
+use globset::{Glob, GlobMatcher};
+use regex::Regex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -18,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+use walkdir::WalkDir;
 
 type ToolHandler = dyn Fn(Value) -> Result<Value> + Send + Sync + 'static;
 
@@ -327,6 +330,119 @@ fn resolve_path(path: &str, workspace_root: &Path) -> PathBuf {
     }
 }
 
+fn canonical_tool_name(tool_name: &str) -> &str {
+    match tool_name {
+        "read_file" => "file_read",
+        "write_file" => "file_write",
+        _ => tool_name,
+    }
+}
+
+fn string_arg_with_alias(arguments: &Map<String, Value>, key: &str, alias: &str) -> Result<String> {
+    arguments
+        .get(key)
+        .or_else(|| arguments.get(alias))
+        .ok_or_else(|| anyhow!("missing required argument: {}", key))?
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| anyhow!("argument {} must be a string", key))
+}
+
+fn usize_arg_with_alias(
+    arguments: &Map<String, Value>,
+    key: &str,
+    alias: &str,
+) -> Result<Option<usize>> {
+    match arguments.get(key).or_else(|| arguments.get(alias)) {
+        Some(value) => value
+            .as_u64()
+            .map(|value| Some(value as usize))
+            .ok_or_else(|| anyhow!("argument {} must be an integer", key)),
+        None => Ok(None),
+    }
+}
+
+const FILE_READ_DEFAULT_LIMIT: usize = 2_000;
+const FILE_READ_MAX_LINE_LENGTH: usize = 2_000;
+const FILE_READ_MAX_OUTPUT_BYTES: usize = 256 * 1024;
+const SEARCH_MAX_RESULTS: usize = 100;
+const LS_MAX_ENTRIES: usize = 1_000;
+
+#[derive(Clone)]
+struct SearchMatch {
+    path: String,
+    mtime_ms: u128,
+}
+
+fn truncate_line_for_file_read(line: &str) -> (String, bool) {
+    let count = line.chars().count();
+    if count <= FILE_READ_MAX_LINE_LENGTH {
+        return (line.to_string(), false);
+    }
+    let truncated = line
+        .chars()
+        .take(FILE_READ_MAX_LINE_LENGTH)
+        .collect::<String>();
+    (format!("{}...", truncated), true)
+}
+
+fn sort_search_matches(matches: &mut [SearchMatch]) {
+    matches.sort_by(|left, right| {
+        right
+            .mtime_ms
+            .cmp(&left.mtime_ms)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+}
+
+fn file_mtime_ms(path: &Path) -> u128 {
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn relative_display_path(path: &Path, base: &Path) -> String {
+    path.strip_prefix(base)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn build_optional_glob_matcher(pattern: Option<&str>) -> Result<Option<GlobMatcher>> {
+    match pattern {
+        Some(pattern) if !pattern.trim().is_empty() => Ok(Some(
+            Glob::new(pattern)
+                .with_context(|| format!("invalid glob pattern: {}", pattern))?
+                .compile_matcher(),
+        )),
+        _ => Ok(None),
+    }
+}
+
+fn collect_walk_paths(base_path: &Path, include_directories: bool) -> Vec<PathBuf> {
+    WalkDir::new(base_path)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.into_path();
+            if path == base_path {
+                return None;
+            }
+            if path.is_dir() {
+                include_directories.then_some(path)
+            } else if path.is_file() {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 #[derive(Default)]
 pub struct InterruptSignal {
     flag: AtomicBool,
@@ -363,76 +479,122 @@ impl InterruptSignal {
     }
 }
 
-fn read_file_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+fn file_read_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
-        "read_file",
-        "Read a UTF-8 text file.",
+        "file_read",
+        "Read a UTF-8 text file from the local filesystem. Supports file_path plus optional offset and limit for large files.",
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "offset_lines": {"type": "integer"},
-                "limit_lines": {"type": "integer"},
-                "encoding": {"type": "string"}
+                "file_path": {"type": "string"},
+                "offset": {"type": "integer"},
+                "limit": {"type": "integer"}
             },
-            "required": ["path"],
+            "required": ["file_path"],
             "additionalProperties": false
         }),
         move |arguments| {
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
-            let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
-            let offset_lines = usize_arg_with_default(arguments, "offset_lines", 0)?;
-            let limit_lines = usize_arg_with_default(arguments, "limit_lines", 200)?;
-            let encoding = string_arg_with_default(arguments, "encoding", "utf-8")?;
+            let file_path = string_arg_with_alias(arguments, "file_path", "path")?;
+            let path = resolve_path(&file_path, &workspace_root);
+            if path.is_dir() {
+                return Err(anyhow!("{} is a directory, not a file", path.display()));
+            }
 
+            let encoding = string_arg_with_default(arguments, "encoding", "utf-8")?;
             if encoding.to_lowercase() != "utf-8" {
                 return Err(anyhow!("only utf-8 encoding is supported"));
             }
+
+            let offset = match usize_arg_with_alias(arguments, "offset", "offset_lines")? {
+                Some(value)
+                    if arguments.contains_key("offset_lines")
+                        && !arguments.contains_key("offset") =>
+                {
+                    value.saturating_add(1)
+                }
+                Some(value) => value,
+                None => 1,
+            };
+            let limit = match usize_arg_with_alias(arguments, "limit", "limit_lines")? {
+                Some(value) => value,
+                None => FILE_READ_DEFAULT_LIMIT,
+            };
+            let start_line = if offset == 0 { 0 } else { offset.max(1) };
+            let line_offset = if start_line == 0 { 0 } else { start_line - 1 };
+
             let text = fs::read_to_string(&path)
                 .with_context(|| format!("failed to read {}", path.display()))?;
             let lines: Vec<&str> = text.lines().collect();
-            let selected = lines
-                .iter()
-                .skip(offset_lines)
-                .take(limit_lines)
-                .enumerate()
-                .map(|(index, line)| format!("{}: {}", offset_lines + index + 1, line))
-                .collect::<Vec<_>>()
-                .join("\n");
+
+            let mut content = String::new();
+            let mut selected_line_count = 0usize;
+            let mut truncated_long_lines = false;
+            let mut truncated_by_bytes = false;
+
+            for (index, line) in lines.iter().enumerate().skip(line_offset).take(limit) {
+                let (display_line, was_truncated) = truncate_line_for_file_read(line);
+                truncated_long_lines |= was_truncated;
+                let next = format!("{}: {}", index + 1, display_line);
+                let separator = if content.is_empty() { 0 } else { 1 };
+                if content.len() + separator + next.len() > FILE_READ_MAX_OUTPUT_BYTES {
+                    truncated_by_bytes = true;
+                    break;
+                }
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&next);
+                selected_line_count += 1;
+            }
+
+            let end_line = if selected_line_count == 0 {
+                start_line.saturating_sub(1)
+            } else if start_line == 0 {
+                selected_line_count - 1
+            } else {
+                start_line + selected_line_count - 1
+            };
+            let truncated_by_lines = line_offset.saturating_add(selected_line_count) < lines.len();
+
             Ok(json!({
-                "path": path.display().to_string(),
-                "start_line": offset_lines + 1,
-                "end_line": offset_lines + lines.iter().skip(offset_lines).take(limit_lines).count(),
+                "file_path": path.display().to_string(),
+                "start_line": start_line,
+                "end_line": end_line,
                 "total_lines": lines.len(),
-                "truncated": offset_lines + limit_lines < lines.len(),
-                "content": selected
+                "truncated": truncated_by_lines || truncated_by_bytes || truncated_long_lines,
+                "truncated_by_lines": truncated_by_lines,
+                "truncated_by_bytes": truncated_by_bytes,
+                "truncated_long_lines": truncated_long_lines,
+                "content": content
             }))
         },
     )
 }
 
-fn write_file_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+fn file_write_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
-        "write_file",
+        "file_write",
         "Write a UTF-8 text file.",
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
+                "file_path": {"type": "string"},
                 "content": {"type": "string"},
                 "mode": {"type": "string", "enum": ["overwrite", "append"]},
                 "encoding": {"type": "string"}
             },
-            "required": ["path", "content"],
+            "required": ["file_path", "content"],
             "additionalProperties": false
         }),
         move |arguments| {
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
-            let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
+            let file_path = string_arg_with_alias(arguments, "file_path", "path")?;
+            let path = resolve_path(&file_path, &workspace_root);
             let content = string_arg(arguments, "content")?;
             let mode = string_arg_with_default(arguments, "mode", "overwrite")?;
             let encoding = string_arg_with_default(arguments, "encoding", "utf-8")?;
@@ -458,9 +620,188 @@ fn write_file_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSi
             file.write_all(content.as_bytes())
                 .with_context(|| format!("failed to write {}", path.display()))?;
             Ok(json!({
-                "path": path.display().to_string(),
+                "file_path": path.display().to_string(),
                 "mode": mode,
                 "bytes_written": content.len()
+            }))
+        },
+    )
+}
+
+fn glob_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+    Tool::new(
+        "glob",
+        "Fast file pattern matching tool. Supports glob patterns like **/*.rs and src/**/*.ts.",
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "path": {"type": "string"}
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        }),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let pattern = string_arg(arguments, "pattern")?;
+            let base_path = resolve_path(
+                &string_arg_with_default(arguments, "path", ".")?,
+                &workspace_root,
+            );
+            if !base_path.exists() {
+                return Err(anyhow!("{} does not exist", base_path.display()));
+            }
+            let matcher = Glob::new(&pattern)
+                .with_context(|| format!("invalid glob pattern: {}", pattern))?
+                .compile_matcher();
+            let mut matches = collect_walk_paths(&base_path, false)
+                .into_iter()
+                .filter_map(|path| {
+                    let relative = relative_display_path(&path, &base_path);
+                    matcher.is_match(&relative).then(|| SearchMatch {
+                        path: path.display().to_string(),
+                        mtime_ms: file_mtime_ms(&path),
+                    })
+                })
+                .collect::<Vec<_>>();
+            sort_search_matches(&mut matches);
+            let total_matches = matches.len();
+            let truncated = total_matches > SEARCH_MAX_RESULTS;
+            let filenames = matches
+                .into_iter()
+                .take(SEARCH_MAX_RESULTS)
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "pattern": pattern,
+                "path": base_path.display().to_string(),
+                "num_files": total_matches,
+                "truncated": truncated,
+                "filenames": filenames
+            }))
+        },
+    )
+}
+
+fn grep_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+    Tool::new(
+        "grep",
+        "Fast content search tool. Searches file contents with a regex pattern and returns matching file paths.",
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string"},
+                "path": {"type": "string"},
+                "include": {"type": "string"}
+            },
+            "required": ["pattern"],
+            "additionalProperties": false
+        }),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let pattern = string_arg(arguments, "pattern")?;
+            let base_path = resolve_path(
+                &string_arg_with_default(arguments, "path", ".")?,
+                &workspace_root,
+            );
+            if !base_path.exists() {
+                return Err(anyhow!("{} does not exist", base_path.display()));
+            }
+            let regex = Regex::new(&pattern)
+                .with_context(|| format!("invalid regex pattern: {}", pattern))?;
+            let include =
+                build_optional_glob_matcher(arguments.get("include").and_then(Value::as_str))?;
+
+            let mut matches = Vec::new();
+            for path in collect_walk_paths(&base_path, false) {
+                let relative = relative_display_path(&path, &base_path);
+                if let Some(include) = &include
+                    && !include.is_match(&relative)
+                {
+                    continue;
+                }
+                let Ok(text) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                if regex.is_match(&text) {
+                    matches.push(SearchMatch {
+                        path: path.display().to_string(),
+                        mtime_ms: file_mtime_ms(&path),
+                    });
+                }
+            }
+            sort_search_matches(&mut matches);
+            let total_matches = matches.len();
+            let truncated = total_matches > SEARCH_MAX_RESULTS;
+            let filenames = matches
+                .into_iter()
+                .take(SEARCH_MAX_RESULTS)
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>();
+            Ok(json!({
+                "pattern": pattern,
+                "path": base_path.display().to_string(),
+                "include": arguments.get("include").and_then(Value::as_str),
+                "num_files": total_matches,
+                "truncated": truncated,
+                "filenames": filenames
+            }))
+        },
+    )
+}
+
+fn ls_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+    Tool::new(
+        "ls",
+        "List files and directories under a path. Returns a truncated tree-friendly entry list for large directories.",
+        json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"}
+            },
+            "required": ["path"],
+            "additionalProperties": false
+        }),
+        move |arguments| {
+            let arguments = arguments
+                .as_object()
+                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let base_path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
+            if !base_path.exists() {
+                return Err(anyhow!("{} does not exist", base_path.display()));
+            }
+            if !base_path.is_dir() {
+                return Err(anyhow!("{} is not a directory", base_path.display()));
+            }
+
+            let mut entries = collect_walk_paths(&base_path, true)
+                .into_iter()
+                .map(|path| {
+                    let entry_type = if path.is_dir() { "directory" } else { "file" };
+                    json!({
+                        "path": relative_display_path(&path, &base_path),
+                        "type": entry_type
+                    })
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| {
+                left["path"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .cmp(right["path"].as_str().unwrap_or_default())
+            });
+            let total_entries = entries.len();
+            let truncated = total_entries > LS_MAX_ENTRIES;
+            entries.truncate(LS_MAX_ENTRIES);
+            Ok(json!({
+                "path": base_path.display().to_string(),
+                "num_entries": total_entries,
+                "truncated": truncated,
+                "entries": entries
             }))
         },
     )
@@ -559,6 +900,8 @@ fn ensure_process_state_dir(runtime_state_root: &Path) -> Result<PathBuf> {
 struct ProcessMetadata {
     exec_id: String,
     worker_pid: u32,
+    #[serde(default)]
+    tty: bool,
     command: String,
     cwd: String,
     stdout_path: String,
@@ -612,6 +955,7 @@ fn legacy_process_metadata_to_current(
     ProcessMetadata {
         exec_id: metadata.exec_id.clone(),
         worker_pid: metadata.pid,
+        tty: false,
         command: metadata.command,
         cwd: metadata.cwd,
         stdout_path: metadata.stdout_path,
@@ -681,6 +1025,13 @@ fn terminate_process_pid(pid: u32) {
         .status();
 }
 
+fn terminate_process_group(pid: u32) {
+    let _ = Command::new("kill")
+        .arg("-KILL")
+        .arg(format!("-{}", pid))
+        .status();
+}
+
 fn record_exit_code(path: &Path, code: i32) -> Result<()> {
     fs::write(path, code.to_string())
         .with_context(|| format!("failed to write exit code to {}", path.display()))
@@ -742,7 +1093,11 @@ fn kill_exec_processes(metadata: &ProcessMetadata, snapshot: Option<&Value>) {
     if let Some(exec_pid) = snapshot.and_then(exec_pid_from_snapshot)
         && exec_pid != metadata.worker_pid
     {
-        terminate_process_pid(exec_pid);
+        if metadata.tty {
+            terminate_process_group(exec_pid);
+        } else {
+            terminate_process_pid(exec_pid);
+        }
     }
     terminate_process_pid(metadata.worker_pid);
 }
@@ -772,6 +1127,7 @@ fn write_exec_snapshot(
             "exec_id".to_string(),
             Value::String(metadata.exec_id.clone()),
         ),
+        ("tty".to_string(), Value::Bool(metadata.tty)),
         ("pid".to_string(), pid),
         (
             "command".to_string(),
@@ -800,6 +1156,7 @@ fn spawn_managed_process(
     state_dir: &Path,
     command: &str,
     cwd: &Path,
+    tty: bool,
 ) -> Result<ProcessMetadata> {
     let exec_id = Uuid::new_v4().to_string();
     let stdout_path = state_dir.join(format!("{}.stdout", exec_id));
@@ -812,6 +1169,7 @@ fn spawn_managed_process(
         &status_path,
         serde_json::to_vec_pretty(&json!({
             "exec_id": exec_id,
+            "tty": tty,
             "pid": Value::Null,
             "command": command,
             "cwd": cwd.display().to_string(),
@@ -831,6 +1189,7 @@ fn spawn_managed_process(
         &exec_id,
         &ToolWorkerJob::Exec {
             exec_id: exec_id.clone(),
+            tty,
             command: command.to_string(),
             cwd: cwd.display().to_string(),
             status_path: status_path.display().to_string(),
@@ -842,6 +1201,7 @@ fn spawn_managed_process(
     let metadata = ProcessMetadata {
         exec_id: exec_id.clone(),
         worker_pid: worker.pid,
+        tty,
         command: command.to_string(),
         cwd: cwd.display().to_string(),
         stdout_path: stdout_path.display().to_string(),
@@ -887,6 +1247,7 @@ fn read_process_snapshot(
         let pid = snapshot.get("pid").cloned().unwrap_or(Value::Null);
         snapshot = json!({
             "exec_id": metadata.exec_id,
+            "tty": metadata.tty,
             "pid": pid,
             "command": metadata.command,
             "cwd": metadata.cwd,
@@ -902,6 +1263,9 @@ fn read_process_snapshot(
         .as_object()
         .cloned()
         .ok_or_else(|| anyhow!("exec snapshot must be a JSON object"))?;
+    object
+        .entry("tty".to_string())
+        .or_insert_with(|| Value::Bool(metadata.tty));
     object.insert(
         "stdout".to_string(),
         Value::String(read_file_lines_window(
@@ -965,8 +1329,8 @@ fn list_active_exec_summaries(runtime_state_root: &Path) -> Result<Vec<String>> 
             .and_then(Value::as_u64)
             .unwrap_or(metadata.worker_pid as u64);
         entries.push(format!(
-            "- exec_id=`{}` pid={} cwd=`{}` command=`{}`",
-            metadata.exec_id, pid, metadata.cwd, metadata.command
+            "- exec_id=`{}` pid={} tty={} cwd=`{}` command=`{}`",
+            metadata.exec_id, pid, metadata.tty, metadata.cwd, metadata.command
         ));
     }
     entries.sort();
@@ -1088,6 +1452,7 @@ fn wait_for_managed_process(
                 "pid": snapshot["pid"].clone(),
                 "command": snapshot["command"].clone(),
                 "cwd": snapshot["cwd"].clone(),
+                "tty": snapshot["tty"].clone(),
                 "running": true,
                 "completed": false,
                 "returncode": Value::Null,
@@ -1120,12 +1485,13 @@ fn exec_start_tool(
 ) -> Tool {
     Tool::new(
         "exec_start",
-        "Start a shell command or executable and return immediately with an exec_id plus the latest observable stdout/stderr window. Prefer commands that write progress directly to stdout/stderr instead of redirecting output to files so exec_observe can inspect progress.",
+        "Start a shell command or executable and return immediately with an exec_id plus the latest observable stdout/stderr window. Set tty=true when the command needs terminal semantics or interactive prompts. Prefer commands that write progress directly to stdout/stderr instead of redirecting output to files so exec_observe can inspect progress.",
         json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
                 "cwd": {"type": "string"},
+                "tty": {"type": "boolean"},
                 "include_stdout": {"type": "boolean"},
                 "start": {"type": "integer"},
                 "limit": {"type": "integer"}
@@ -1142,6 +1508,10 @@ fn exec_start_tool(
                 .get("include_stdout")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
+            let tty = arguments
+                .get("tty")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let start = usize_arg_with_default(arguments, "start", 0)?;
             let limit = usize_arg_with_default(arguments, "limit", 20)?;
             let cwd = arguments
@@ -1150,7 +1520,8 @@ fn exec_start_tool(
                 .map(|value| resolve_path(value, &workspace_root))
                 .unwrap_or_else(|| workspace_root.clone());
             let state_dir = ensure_process_state_dir(&runtime_state_root)?;
-            let metadata = spawn_managed_process(&runtime_state_root, &state_dir, &command, &cwd)?;
+            let metadata =
+                spawn_managed_process(&runtime_state_root, &state_dir, &command, &cwd, tty)?;
             let mut result = read_process_snapshot(&state_dir, &metadata.exec_id, start, limit)?;
             if !include_stdout && let Some(object) = result.as_object_mut() {
                 object.remove("stdout");
@@ -2829,12 +3200,24 @@ pub fn build_tool_registry_with_cancel(
 ) -> Result<BTreeMap<String, Tool>> {
     let mut registry = BTreeMap::from([
         (
-            "read_file".to_string(),
-            read_file_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            "file_read".to_string(),
+            file_read_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
         ),
         (
-            "write_file".to_string(),
-            write_file_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            "file_write".to_string(),
+            file_write_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+        ),
+        (
+            "glob".to_string(),
+            glob_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+        ),
+        (
+            "grep".to_string(),
+            grep_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+        ),
+        (
+            "ls".to_string(),
+            ls_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
         ),
         (
             "edit".to_string(),
@@ -3013,7 +3396,8 @@ pub fn execute_tool_call(
     tool_name: &str,
     raw_arguments: Option<&str>,
 ) -> String {
-    let Some(tool) = registry.get(tool_name) else {
+    let normalized_name = canonical_tool_name(tool_name);
+    let Some(tool) = registry.get(normalized_name) else {
         return normalize_tool_result(json!({"error": format!("unknown tool: {}", tool_name)}));
     };
 
@@ -3106,7 +3490,7 @@ pub mod macro_support {
 mod tests {
     use super::{
         BackgroundTaskMetadata, ProcessMetadata, Tool, active_runtime_state_summary,
-        build_tool_registry_with_cancel, process_is_running, process_meta_path,
+        build_tool_registry_with_cancel, execute_tool_call, process_is_running, process_meta_path,
         terminate_runtime_state_tasks, write_background_task_metadata,
     };
     use crate::config::{
@@ -3173,6 +3557,160 @@ mod tests {
         assert_eq!(value["name"], "demo");
         assert_eq!(value["parameters"]["type"], "object");
         assert!(value.get("function").is_none());
+    }
+
+    #[test]
+    fn execute_tool_call_accepts_legacy_file_tool_names() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = UpstreamConfig {
+            base_url: "https://example.com".to_string(),
+            model: "demo".to_string(),
+            api_kind: UpstreamApiKind::Responses,
+            auth_kind: UpstreamAuthKind::ApiKey,
+            supports_vision_input: false,
+            supports_pdf_input: false,
+            supports_audio_input: false,
+            api_key: None,
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            chat_completions_path: "/responses".to_string(),
+            codex_home: None,
+            codex_auth: None,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 200_000,
+            cache_control: None,
+            prompt_cache_retention: None,
+            prompt_cache_key: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            native_web_search: None,
+            external_web_search: None,
+            native_image_input: false,
+            native_pdf_input: false,
+            native_audio_input: false,
+            native_image_generation: false,
+        };
+        let registry = build_tool_registry_with_cancel(
+            &[],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let write_result = execute_tool_call(
+            &registry,
+            "write_file",
+            Some(r#"{"path":"legacy.txt","content":"hello"}"#),
+        );
+        assert!(write_result.contains("legacy.txt"));
+
+        let read_result = execute_tool_call(
+            &registry,
+            "read_file",
+            Some(r#"{"path":"legacy.txt","offset_lines":0,"limit_lines":10}"#),
+        );
+        assert!(read_result.contains("1: hello"));
+    }
+
+    #[test]
+    fn glob_grep_and_ls_tools_explore_workspace() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        let src_dir = workspace_root.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(
+            src_dir.join("main.rs"),
+            "fn main() { println!(\"hello\"); }\n",
+        )
+        .unwrap();
+        fs::write(src_dir.join("lib.rs"), "pub fn helper() {}\n").unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = UpstreamConfig {
+            base_url: "https://example.com".to_string(),
+            model: "demo".to_string(),
+            api_kind: UpstreamApiKind::Responses,
+            auth_kind: UpstreamAuthKind::ApiKey,
+            supports_vision_input: false,
+            supports_pdf_input: false,
+            supports_audio_input: false,
+            api_key: None,
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            chat_completions_path: "/responses".to_string(),
+            codex_home: None,
+            codex_auth: None,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 200_000,
+            cache_control: None,
+            prompt_cache_retention: None,
+            prompt_cache_key: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            native_web_search: None,
+            external_web_search: None,
+            native_image_input: false,
+            native_pdf_input: false,
+            native_audio_input: false,
+            native_image_generation: false,
+        };
+        let registry = build_tool_registry_with_cancel(
+            &[],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let glob_result = registry["glob"]
+            .invoke(json!({"pattern":"src/**/*.rs"}))
+            .unwrap();
+        assert_eq!(glob_result["num_files"].as_u64(), Some(2));
+
+        let grep_result = registry["grep"]
+            .invoke(json!({"pattern":"println!", "path":"src"}))
+            .unwrap();
+        assert_eq!(grep_result["num_files"].as_u64(), Some(1));
+        assert!(
+            grep_result["filenames"][0]
+                .as_str()
+                .is_some_and(|path| path.ends_with("main.rs"))
+        );
+
+        let ls_result = registry["ls"].invoke(json!({"path":"src"})).unwrap();
+        assert!(
+            ls_result["num_entries"]
+                .as_u64()
+                .is_some_and(|count| count >= 2)
+        );
+        assert!(
+            ls_result["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entry| entry["path"].as_str() == Some("main.rs"))
+        );
     }
 
     #[test]
@@ -3502,6 +4040,7 @@ mod tests {
         let exec_metadata = ProcessMetadata {
             exec_id: "exec-1".to_string(),
             worker_pid: std::process::id(),
+            tty: false,
             command: "sleep 10".to_string(),
             cwd: "/tmp/demo".to_string(),
             stdout_path: processes_dir.join("exec-1.stdout").display().to_string(),
@@ -3540,6 +4079,7 @@ mod tests {
         let finished_metadata = ProcessMetadata {
             exec_id: "exec-finished".to_string(),
             worker_pid: std::process::id(),
+            tty: false,
             command: "echo done".to_string(),
             cwd: "/tmp/finished".to_string(),
             stdout_path: processes_dir
@@ -3671,6 +4211,7 @@ mod tests {
         let current_metadata = ProcessMetadata {
             exec_id: current_exec_id.to_string(),
             worker_pid: std::process::id(),
+            tty: false,
             command: "sleep 10".to_string(),
             cwd: "/tmp/current".to_string(),
             stdout_path: processes_dir
@@ -3746,6 +4287,7 @@ mod tests {
         let exec_metadata = ProcessMetadata {
             exec_id: "exec-cleanup".to_string(),
             worker_pid: exec_child.id(),
+            tty: false,
             command: "sleep 30".to_string(),
             cwd: "/tmp".to_string(),
             stdout_path: processes_dir

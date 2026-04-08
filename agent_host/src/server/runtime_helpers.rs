@@ -225,16 +225,6 @@ pub(super) fn evaluate_cron_checker(
         .map_err(|_| anyhow!("checker timed out after {} seconds", timeout_seconds))?
 }
 
-pub(super) fn f64_arg_required(
-    arguments: &serde_json::Map<String, Value>,
-    key: &str,
-) -> Result<f64> {
-    arguments
-        .get(key)
-        .and_then(Value::as_f64)
-        .ok_or_else(|| anyhow!("{} must be a number", key))
-}
-
 pub(super) fn background_agent_timeout_seconds(model_timeout_seconds: f64) -> f64 {
     model_timeout_seconds + 15.0
 }

@@ -920,8 +920,8 @@ mod tests {
                     id: "call_1".to_string(),
                     kind: "function".to_string(),
                     function: FunctionCall {
-                        name: "read_file".to_string(),
-                        arguments: Some("{\"path\":\"README.md\"}".to_string()),
+                        name: "file_read".to_string(),
+                        arguments: Some("{\"file_path\":\"README.md\"}".to_string()),
                     },
                 }]),
             },
@@ -943,7 +943,7 @@ mod tests {
         assert_eq!(input[1]["type"], "message");
         assert_eq!(input[1]["role"], "assistant");
         assert_eq!(input[2]["type"], "function_call");
-        assert_eq!(input[2]["name"], "read_file");
+        assert_eq!(input[2]["name"], "file_read");
         assert_eq!(input[3]["type"], "function_call_output");
         assert_eq!(input[3]["call_id"], "call_1");
     }

@@ -2,6 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use std::fs;
 use std::path::Path;
 
+mod v0_10;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -9,7 +10,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.9";
+pub const LATEST_WORKDIR_VERSION: &str = "0.10";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -25,12 +26,13 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 5] = [
+    let upgraders: [&dyn WorkdirUpgrader; 6] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
         &v0_8::Upgrade,
         &v0_9::Upgrade,
+        &v0_10::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -64,6 +66,7 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.6" => Ok("0.6"),
         "0.7" => Ok("0.7"),
         "0.8" => Ok("0.8"),
+        "0.9" => Ok("0.9"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -329,5 +332,43 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(subagent_dir.join("subagent.json")).unwrap())
                 .unwrap();
         assert_eq!(subagent["agent_backend"].as_str(), Some("agent_frame"));
+    }
+
+    #[test]
+    fn v0_9_workdir_upgrade_clears_exec_runtime_state_for_tty_metadata_refresh() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.9\n").unwrap();
+
+        let processes_dir = temp_dir
+            .path()
+            .join("agent")
+            .join("runtime")
+            .join("workspace-1")
+            .join("agent_frame")
+            .join("processes");
+        let tool_workers_dir = temp_dir
+            .path()
+            .join("agent")
+            .join("runtime")
+            .join("workspace-1")
+            .join("agent_frame")
+            .join("tool_workers");
+        fs::create_dir_all(&processes_dir).unwrap();
+        fs::create_dir_all(&tool_workers_dir).unwrap();
+        fs::write(processes_dir.join("exec-1.json"), "{}").unwrap();
+        fs::write(tool_workers_dir.join("exec-1.job.json"), "{}").unwrap();
+        fs::write(tool_workers_dir.join("image-1.job.json"), "{}").unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+        assert!(upgraded);
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("VERSION"))
+                .unwrap()
+                .trim(),
+            LATEST_WORKDIR_VERSION
+        );
+        assert!(!processes_dir.exists());
+        assert!(!tool_workers_dir.join("exec-1.job.json").exists());
+        assert!(tool_workers_dir.join("image-1.job.json").exists());
     }
 }

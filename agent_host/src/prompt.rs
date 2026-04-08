@@ -66,7 +66,8 @@ pub fn build_agent_system_prompt(
         "If you want to say something to the user while you are still working and before the turn is ready to finish, you must use the user_tell tool instead of only writing that text in an assistant message with tool_calls. Mid-task progress updates, coordination, status pings, and transitional explanations must go through user_tell so the user actually receives them as chat bubbles.".to_string(),
         "If a user message starts with [Interrupted Follow-up], it means the user sent that message while you were still working on the previous turn. Treat it as an interruption signal. Give immediate visible feedback. If you can stop and answer directly, do that. If you will continue doing more work after acknowledging it, send the acknowledgement with user_tell before continuing.".to_string(),
         "If a user message starts with [Queued User Updates], it means multiple follow-up messages arrived while you were still working. Treat the newest items as the latest steering, and give immediate visible feedback. If you continue working after that acknowledgement, use user_tell for the acknowledgement instead of hiding it inside an assistant message with tool_calls.".to_string(),
-        "USER.md and IDENTITY.md are copied into the workspace root. The current foreground run keeps a fixed system prompt, so shared-profile updates do not rewrite that prompt mid-run. If a system message says one of those files changed, use read_file to inspect that workspace file: always reread IDENTITY.md immediately so your current behavior follows the updated persona, and read USER.md when you need refreshed user info. If you edit either file, call shared_profile_upload right away, then use read_file on ./IDENTITY.md after changing it.".to_string(),
+        "USER.md and IDENTITY.md are copied into the workspace root. The current foreground run keeps a fixed system prompt, so shared-profile updates do not rewrite that prompt mid-run. If a system message says one of those files changed, use file_read to inspect that workspace file: always reread IDENTITY.md immediately so your current behavior follows the updated persona, and read USER.md when you need refreshed user info. If you edit either file, call shared_profile_upload right away, then use file_read on ./IDENTITY.md after changing it.".to_string(),
+        "For repository exploration, prefer the dedicated tools over shell commands: use glob to find files by path pattern, grep to find files by content pattern, ls to inspect directories, and file_read to read file contents. Only fall back to shell search commands when those tools are insufficient.".to_string(),
         format!(
             "Some system-wide software packages are installed under {}. If you need to install global software packages, install them under that directory unless the user explicitly asks for a different location.",
             main_agent.global_install_root
@@ -111,22 +112,24 @@ pub fn build_agent_system_prompt(
         AgentPromptKind::MainForeground => {
             parts.push("You are the primary agent for this user-facing conversation.".to_string());
             parts.push("If the user asks about earlier chat content, a previous session, something you sent before, or historical work, use the available workspace history tools before saying you cannot remember.".to_string());
-            parts.push("When a distinct chunk of work would be better handled by delegation, use subagents and choose the model whose description best matches the task instead of defaulting mechanically.".to_string());
+            parts.push("When a small, bounded task would consume context without needing your full attention, delegate it to a subagent early instead of carrying that work in your own context.".to_string());
+            parts.push("Use subagents aggressively for open-ended search, multi-file locating, fact gathering, and other side tasks that can run in parallel while you keep the main thread moving.".to_string());
+            parts.push("Choose the subagent model deliberately based on the model descriptions instead of defaulting mechanically.".to_string());
         }
         AgentPromptKind::MainBackground => {
             parts.push("Plan the task decomposition carefully. Split work into as few large delegated chunks as practical, choose models deliberately, and avoid over-fragmenting the work.".to_string());
             parts.push("Match delegated work to the model that is most suited to it based on the model descriptions. Use subagents to exploit those strengths rather than routing everything through the current model.".to_string());
+            parts.push("Prefer offloading bounded side tasks to subagents so the main background agent can preserve context for coordination and final integration.".to_string());
             parts.push("If you delegate a chunk to one or more subagents, wait until all required subagent results are available before you return your final answer.".to_string());
             parts.push("When a later subagent will continue from files written by an earlier subagent, prefer not to reread large generated content unless it is actually necessary. Instead, rely on the earlier subagent's concise summary of what it created and inspect the files only when needed.".to_string());
             parts.push("When you ask a subagent to write substantial content, require it to summarize what it created so downstream work can continue without rereading everything.".to_string());
             parts.push("If you need historical information from earlier workspaces, use the available workspace history tools instead of assuming the information is unavailable.".to_string());
         }
         AgentPromptKind::SubAgent => {
-            parts.push(
-                "Focus on the delegated task and return concise results for the caller."
-                    .to_string(),
-            );
+            parts.push("Focus only on the delegated task. Do not broaden scope unless the caller explicitly needs it.".to_string());
+            parts.push("Subagents are for small, bounded tasks. Optimize for fast completion and low context growth, not for taking over the whole problem.".to_string());
             parts.push("When you generate substantial files or large content, end by clearly summarizing what you created, where it lives, and what a downstream agent should know before continuing. Keep that summary concise.".to_string());
+            parts.push("Return one concise final summary for the caller. Do not ask the caller to continue an extended back-and-forth with you.".to_string());
         }
     }
 
@@ -301,7 +304,7 @@ mod tests {
             global_install_root: "/opt".to_string(),
             language: "zh-CN".to_string(),
             timeout_seconds: Some(60.0),
-            enabled_tools: vec!["read_file".to_string()],
+            enabled_tools: vec!["file_read".to_string()],
             max_tool_roundtrips: 8,
             enable_context_compression: true,
             context_compaction: ContextCompactionConfig {
@@ -335,14 +338,18 @@ mod tests {
         assert!(prompt.contains("Current workspace summary."));
         assert!(prompt.contains("workspace_id=workspace-1"));
         assert!(prompt.contains("use the available workspace history tools"));
-        assert!(prompt.contains("choose the model whose description best matches the task"));
+        assert!(
+            prompt
+                .contains("Choose the subagent model deliberately based on the model descriptions")
+        );
         assert!(prompt.contains("- main: General-purpose test model"));
         assert!(!prompt.contains("vision-only"));
         assert!(prompt.contains("you must use the user_tell tool"));
         assert!(prompt.contains("If a user message starts with [Interrupted Follow-up]"));
         assert!(prompt.contains("If a user message starts with [Queued User Updates]"));
         assert!(prompt.contains("shared_profile_upload"));
-        assert!(prompt.contains("use read_file to inspect that workspace file"));
+        assert!(prompt.contains("use file_read to inspect that workspace file"));
+        assert!(prompt.contains("use glob to find files by path pattern"));
         assert!(!prompt.contains("Use subagent_create to start delegated work"));
         assert!(!prompt.contains("prefer leaving stdout/stderr unredirected"));
         assert!(!prompt.contains("Use only tools that are actually available to this agent"));
@@ -443,7 +450,7 @@ mod tests {
             global_install_root: "/opt".to_string(),
             language: "zh-CN".to_string(),
             timeout_seconds: Some(60.0),
-            enabled_tools: vec!["read_file".to_string()],
+            enabled_tools: vec!["file_read".to_string()],
             max_tool_roundtrips: 8,
             enable_context_compression: true,
             context_compaction: ContextCompactionConfig {
