@@ -8,14 +8,15 @@ use crate::backend::{
 use crate::bootstrap::AgentWorkspace;
 use crate::channel::{Channel, IncomingMessage};
 use crate::channel_auth::{
-    AdminAuthorizeOutcome, ChannelAuthorizationManager, ConversationApprovalSnapshot,
-    ConversationApprovalState,
+    AdminAuthorizeOutcome, ChannelAdminSnapshot, ChannelAuthorizationManager,
+    ConversationApprovalSnapshot, ConversationApprovalState,
 };
 use crate::channels::command_line::CommandLineChannel;
 use crate::channels::telegram::TelegramChannel;
 use crate::config::{
-    BotCommandConfig, ChannelConfig, MainAgentConfig, ModelCapability, ModelConfig, SandboxConfig,
-    SandboxMode, ServerConfig, ToolingConfig, ToolingTarget, default_bot_commands,
+    AgentConfig, BotCommandConfig, ChannelConfig, MainAgentConfig, ModelCapability, ModelConfig,
+    SandboxConfig, SandboxMode, ServerConfig, ToolingConfig, ToolingTarget, default_bot_commands,
+    default_telegram_commands,
 };
 use crate::conversation::{ConversationManager, ConversationSettings};
 use crate::cron::{
@@ -94,6 +95,7 @@ struct BackgroundJobRequest {
     parent_agent_id: Option<uuid::Uuid>,
     cron_task_id: Option<uuid::Uuid>,
     session: SessionSnapshot,
+    agent_backend: AgentBackendKind,
     model_key: String,
     prompt: String,
     sink: SinkTarget,
@@ -159,6 +161,7 @@ struct ServerRuntime {
     sessions: Arc<Mutex<SessionManager>>,
     workspace_manager: WorkspaceManager,
     active_workspace_ids: Vec<String>,
+    selected_agent_backend: Option<AgentBackendKind>,
     selected_main_model_key: Option<String>,
     selected_reasoning_effort: Option<String>,
     selected_context_compaction_enabled: Option<bool>,
@@ -166,8 +169,8 @@ struct ServerRuntime {
     channels: Arc<HashMap<String, Arc<dyn Channel>>>,
     command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     models: BTreeMap<String, ModelConfig>,
+    agent: AgentConfig,
     tooling: ToolingConfig,
-    chat_model_keys: Vec<String>,
     main_agent: MainAgentConfig,
     sandbox: SandboxConfig,
     sink_router: Arc<RwLock<SinkRouter>>,
@@ -280,6 +283,51 @@ impl SummaryTracker {
 }
 
 impl ServerRuntime {
+    fn available_agent_models(&self, backend: AgentBackendKind) -> Vec<String> {
+        self.agent
+            .available_models(backend)
+            .iter()
+            .filter(|model_key| self.models.contains_key(model_key.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    fn inferred_agent_backend_for_model(&self, model_key: &str) -> Option<AgentBackendKind> {
+        let backends = self.agent.backends_for_model(model_key);
+        (backends.len() == 1).then_some(backends[0])
+    }
+
+    fn selected_agent_backend(&self) -> Option<AgentBackendKind> {
+        self.selected_agent_backend.or_else(|| {
+            self.selected_main_model_key
+                .as_deref()
+                .and_then(|model_key| self.inferred_agent_backend_for_model(model_key))
+        })
+    }
+
+    fn effective_agent_backend(&self) -> Result<AgentBackendKind> {
+        self.selected_agent_backend().ok_or_else(|| {
+            anyhow!("this conversation does not have an agent backend yet; choose one with /agent")
+        })
+    }
+
+    fn ensure_model_available_for_backend(
+        &self,
+        backend: AgentBackendKind,
+        model_key: &str,
+    ) -> Result<()> {
+        if self.agent.is_model_available(backend, model_key) {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "model '{}' is not available for agent backend '{}'",
+            model_key,
+            serde_json::to_string(&backend)
+                .unwrap_or_else(|_| "\"unknown\"".to_string())
+                .trim_matches('"')
+        ))
+    }
+
     fn resolved_codex_auth(&self, model: &ModelConfig) -> Result<Option<CodexAuthConfig>> {
         if model.upstream_auth_kind() != agent_frame::config::UpstreamAuthKind::CodexSubscription {
             return Ok(None);
@@ -292,9 +340,12 @@ impl ServerRuntime {
     }
 
     fn effective_main_model_key(&self) -> Result<String> {
-        self.selected_main_model_key.clone().ok_or_else(|| {
-            anyhow!("this conversation does not have a main model yet; choose one with /model")
-        })
+        let model_key = self.selected_main_model_key.clone().ok_or_else(|| {
+            anyhow!("this conversation does not have a main model yet; choose one with /agent")
+        })?;
+        let backend = self.effective_agent_backend()?;
+        self.ensure_model_available_for_backend(backend, &model_key)?;
+        Ok(model_key)
     }
     fn model_config(&self, model_key: &str) -> Result<&ModelConfig> {
         self.models
@@ -806,8 +857,10 @@ impl ServerRuntime {
         model_key: Option<String>,
         charge_seconds: Option<f64>,
     ) -> Result<Value> {
+        let agent_backend = self.effective_agent_backend()?;
         let model_key = model_key.unwrap_or(self.effective_main_model_key()?);
         self.model_config(&model_key)?;
+        self.ensure_model_available_for_backend(agent_backend, &model_key)?;
         let default_charge_seconds = self.default_subagent_charge_seconds(&model_key)?;
         let initial_charge_seconds = charge_seconds.unwrap_or(default_charge_seconds);
         if initial_charge_seconds <= 0.0 {
@@ -829,6 +882,7 @@ impl ServerRuntime {
             session.workspace_id.clone(),
             session.workspace_root.clone(),
             runtime_state_root,
+            agent_backend,
             model_key.clone(),
             description.clone(),
             default_charge_seconds,
@@ -1241,7 +1295,7 @@ impl ServerRuntime {
                 .collect::<Vec<_>>())
         })?;
         for subagent in subagents {
-            let (model_key, messages, turn_count) = {
+            let (agent_backend, model_key, messages, turn_count) = {
                 let inner = subagent
                     .inner
                     .lock()
@@ -1269,12 +1323,12 @@ impl ServerRuntime {
                     continue;
                 }
                 (
+                    inner.persisted.agent_backend,
                     inner.persisted.model_key.clone(),
                     inner.persisted.messages.clone(),
                     inner.persisted.turn_count,
                 )
             };
-            let model = self.model_config(&model_key)?;
             let subagent_session =
                 self.subagent_session_snapshot(&subagent, messages.len(), &model_key);
             let config = self.build_agent_frame_config(
@@ -1290,7 +1344,7 @@ impl ServerRuntime {
                 subagent.id,
                 None,
             );
-            let report = run_backend_compaction(model.backend, messages, config, extra_tools)?;
+            let report = run_backend_compaction(agent_backend, messages, config, extra_tools)?;
             if !report.compacted {
                 continue;
             }
@@ -1669,6 +1723,11 @@ impl ServerRuntime {
             self.resolve_web_search_configs(model_key, model);
         let (native_image_generation, image_generation_tool_upstream) =
             self.resolve_native_image_generation(model_key, model);
+        let prompt_agent_backend = self
+            .selected_agent_backend()
+            .or_else(|| self.inferred_agent_backend_for_model(model_key))
+            .unwrap_or(AgentBackendKind::AgentFrame);
+        let prompt_available_models = self.available_agent_models(prompt_agent_backend);
 
         Ok(FrameAgentConfig {
             enabled_tools: self.main_agent.enabled_tools.clone(),
@@ -1705,7 +1764,7 @@ impl ServerRuntime {
                 model_key,
                 model,
                 &self.models,
-                &self.chat_model_keys,
+                &prompt_available_models,
                 &self.main_agent,
                 &commands,
             ),
@@ -2302,6 +2361,7 @@ impl ServerRuntime {
                             name: string_arg_required(object, "name")?,
                             description: string_arg_required(object, "description")?,
                             schedule: string_arg_required(object, "schedule")?,
+                            agent_backend: runtime.effective_agent_backend()?,
                             model_key: runtime.effective_main_model_key()?,
                             prompt: string_arg_required(object, "task")?,
                             sink,
@@ -2372,6 +2432,7 @@ impl ServerRuntime {
                             name: optional_string_arg(object, "name")?,
                             description: optional_string_arg(object, "description")?,
                             schedule: optional_string_arg(object, "schedule")?,
+                            agent_backend: None,
                             model_key: optional_string_arg(object, "model")?,
                             prompt: optional_string_arg(object, "task")?,
                             sink,
@@ -2453,19 +2514,23 @@ impl ServerRuntime {
         tools
     }
 
-    fn build_backend_execution_options(&self) -> BackendExecutionOptions {
+    fn build_backend_execution_options(
+        &self,
+        backend: AgentBackendKind,
+    ) -> BackendExecutionOptions {
         BackendExecutionOptions {
             zgent_allowed_subagent_models: self
-                .models
-                .iter()
-                .filter(|(_, model)| model.can_be_agent_model())
-                .map(|(alias, model)| ZgentSubagentModel {
-                    alias: alias.clone(),
-                    description: if model.description.trim().is_empty() {
-                        model.model.clone()
-                    } else {
-                        model.description.clone()
-                    },
+                .available_agent_models(backend)
+                .into_iter()
+                .filter_map(|alias| {
+                    self.models.get(&alias).map(|model| ZgentSubagentModel {
+                        alias: alias.clone(),
+                        description: if model.description.trim().is_empty() {
+                            model.model.clone()
+                        } else {
+                            model.description.clone()
+                        },
+                    })
                 })
                 .collect(),
         }
@@ -2497,6 +2562,7 @@ impl ServerRuntime {
         session: SessionSnapshot,
         kind: AgentPromptKind,
         agent_id: uuid::Uuid,
+        agent_backend: AgentBackendKind,
         model_key: String,
         previous_messages: Vec<ChatMessage>,
         prompt: String,
@@ -2537,13 +2603,13 @@ impl ServerRuntime {
                 config.runtime_state_root.display()
             )
         })?;
-        let backend = self.model_config(&model_key)?.backend;
+        self.ensure_model_available_for_backend(agent_backend, &model_key)?;
         let extra_tools =
             self.build_extra_tools(&session, kind, agent_id, execution_control.clone());
-        let backend_execution_options = self.build_backend_execution_options();
+        let backend_execution_options = self.build_backend_execution_options(agent_backend);
         if matches!(self.sandbox.mode, crate::config::SandboxMode::Disabled) {
             run_backend_session(
-                backend,
+                agent_backend,
                 previous_messages,
                 prompt,
                 config,
@@ -2554,7 +2620,7 @@ impl ServerRuntime {
         } else {
             let result = run_turn_in_child_process(
                 &self.sandbox,
-                backend,
+                agent_backend,
                 previous_messages,
                 prompt,
                 config,
@@ -2578,6 +2644,7 @@ impl ServerRuntime {
         session: SessionSnapshot,
         kind: AgentPromptKind,
         agent_id: uuid::Uuid,
+        agent_backend: AgentBackendKind,
         model_key: String,
         previous_messages: Vec<ChatMessage>,
         prompt: String,
@@ -2617,12 +2684,14 @@ impl ServerRuntime {
             observer(execution_control.clone());
         }
         let worker_session = session;
+        let worker_agent_backend = agent_backend;
         let worker_model_key = model_key;
         let join_handle = tokio::task::spawn_blocking(move || {
             runtime.run_agent_turn_sync(
                 worker_session,
                 kind,
                 agent_id,
+                worker_agent_backend,
                 worker_model_key,
                 previous_messages,
                 prompt,
@@ -2726,6 +2795,7 @@ impl ServerRuntime {
         session: SessionSnapshot,
         kind: AgentPromptKind,
         agent_id: uuid::Uuid,
+        agent_backend: AgentBackendKind,
         model_key: String,
         previous_messages: Vec<ChatMessage>,
         prompt: String,
@@ -2769,12 +2839,14 @@ impl ServerRuntime {
         let runtime = self.clone();
         let timeout_label = timeout_label.to_string();
         let worker_session = session;
+        let worker_agent_backend = agent_backend;
         let worker_model_key = model_key;
         let handle = std::thread::spawn(move || {
             runtime.run_agent_turn_sync(
                 worker_session,
                 kind,
                 agent_id,
+                worker_agent_backend,
                 worker_model_key,
                 previous_messages,
                 prompt,
@@ -2935,7 +3007,7 @@ impl ServerRuntime {
     fn run_subagent_worker(&self, subagent: Arc<HostedSubagent>) -> Result<()> {
         let _slot = self.try_acquire_subagent_slot()?;
         loop {
-            let (model_key, previous_messages, prompt, timeout_seconds) = {
+            let (agent_backend, model_key, previous_messages, prompt, timeout_seconds) = {
                 let mut inner = subagent
                     .inner
                     .lock()
@@ -2985,6 +3057,7 @@ impl ServerRuntime {
                 inner.persisted.updated_at = Utc::now();
                 Self::persist_subagent_locked(&subagent, &inner)?;
                 (
+                    inner.persisted.agent_backend,
                     inner.persisted.model_key.clone(),
                     inner.persisted.messages.clone(),
                     prompt,
@@ -3034,6 +3107,7 @@ impl ServerRuntime {
                 session.clone(),
                 AgentPromptKind::SubAgent,
                 subagent.id,
+                agent_backend,
                 model_key.clone(),
                 previous_messages,
                 prompt,
@@ -3178,11 +3252,13 @@ impl ServerRuntime {
         sink: SinkTarget,
     ) -> Result<Value> {
         let background_agent_id = uuid::Uuid::new_v4();
+        let agent_backend = self.effective_agent_backend()?;
         let model_key = match model_key {
             Some(model_key) => model_key,
             None => self.effective_main_model_key()?,
         };
         self.model_config(&model_key)?;
+        self.ensure_model_available_for_backend(agent_backend, &model_key)?;
         let background_session =
             self.create_background_session_for_conversation(&session.address, background_agent_id)?;
         self.register_managed_agent(
@@ -3199,6 +3275,7 @@ impl ServerRuntime {
                 parent_agent_id: Some(parent_agent_id),
                 cron_task_id: None,
                 session: background_session.clone(),
+                agent_backend,
                 model_key: model_key.clone(),
                 prompt,
                 sink: sink.clone(),
@@ -3230,6 +3307,7 @@ impl ServerRuntime {
         &self,
         session: &SessionSnapshot,
         agent_id: uuid::Uuid,
+        agent_backend: AgentBackendKind,
         model_key: &str,
         prompt: String,
         join_label: &str,
@@ -3239,6 +3317,7 @@ impl ServerRuntime {
             session.clone(),
             AgentPromptKind::MainBackground,
             agent_id,
+            agent_backend,
             model_key.to_string(),
             session.agent_messages.clone(),
             prompt,
@@ -3283,6 +3362,7 @@ impl ServerRuntime {
             .run_background_agent_turn(
                 &session,
                 job.agent_id,
+                job.agent_backend,
                 &job.model_key,
                 job.prompt.clone(),
                 "background agent task join failed",
@@ -3505,6 +3585,7 @@ impl ServerRuntime {
             .run_background_agent_turn(
                 &session,
                 recovery_agent_id,
+                job.agent_backend,
                 &job.model_key,
                 recovery_prompt,
                 "background failure recovery task join failed",
@@ -3698,6 +3779,7 @@ impl ServerRuntime {
         request: CronCreateRequest,
     ) -> Result<Value> {
         self.model_config(&request.model_key)?;
+        self.ensure_model_available_for_backend(request.agent_backend, &request.model_key)?;
         let mut manager = self
             .cron_manager
             .lock()
@@ -3716,13 +3798,16 @@ impl ServerRuntime {
     }
 
     fn update_cron_task(&self, id: uuid::Uuid, request: CronUpdateRequest) -> Result<Value> {
-        if let Some(model_key) = request.model_key.as_deref() {
-            self.model_config(model_key)?;
-        }
         let mut manager = self
             .cron_manager
             .lock()
             .map_err(|_| anyhow!("cron manager lock poisoned"))?;
+        let current = manager.get(id)?;
+        let effective_backend = request.agent_backend.unwrap_or(current.agent_backend);
+        if let Some(model_key) = request.model_key.as_deref() {
+            self.model_config(model_key)?;
+            self.ensure_model_available_for_backend(effective_backend, model_key)?;
+        }
         let view = manager.update(id, request)?;
         Ok(serde_json::to_value(view).context("failed to serialize cron task")?)
     }
@@ -3815,6 +3900,7 @@ impl ServerRuntime {
                 parent_agent_id: None,
                 cron_task_id: Some(task.id),
                 session,
+                agent_backend: task.agent_backend,
                 model_key: task.model_key.clone(),
                 prompt: task.prompt.clone(),
                 sink: task.sink.clone(),
@@ -3849,6 +3935,7 @@ pub struct Server {
     telegram_channel_ids: Arc<HashSet<String>>,
     command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     models: BTreeMap<String, ModelConfig>,
+    agent: AgentConfig,
     tooling: ToolingConfig,
     chat_model_keys: Vec<String>,
     main_agent: MainAgentConfig,
@@ -3878,6 +3965,18 @@ impl Server {
         self.telegram_channel_ids.contains(&address.channel_id)
     }
 
+    fn allows_fast_path_agent_selection(&self, address: &ChannelAddress) -> Result<bool> {
+        if !self.requires_channel_authorization(address) {
+            return Ok(true);
+        }
+        Ok(self.with_channel_auth(|auth| {
+            Ok(matches!(
+                auth.current_conversation_state(address),
+                Some(ConversationApprovalState::Approved)
+            ))
+        })?)
+    }
+
     fn is_private_conversation(address: &ChannelAddress) -> bool {
         if let Ok(conversation_id) = address.conversation_id.parse::<i64>() {
             conversation_id > 0
@@ -3889,12 +3988,132 @@ impl Server {
         }
     }
 
-    fn render_chat_approval_state(state: ConversationApprovalState) -> &'static str {
+    fn render_chat_approval_label(state: ConversationApprovalState) -> &'static str {
         match state {
-            ConversationApprovalState::Pending => "waiting_application",
-            ConversationApprovalState::Approved => "approved",
-            ConversationApprovalState::Rejected => "rejected",
+            ConversationApprovalState::Pending => "Pending Review",
+            ConversationApprovalState::Approved => "Approved",
+            ConversationApprovalState::Rejected => "Rejected",
         }
+    }
+
+    fn format_chat_approval_subject(
+        item: &ConversationApprovalSnapshot,
+        admin_private_conversation_id: Option<&str>,
+    ) -> String {
+        let mut parts = vec![format!("`{}`", item.conversation_id)];
+        if item.display_name.is_some() || item.user_id.is_some() {
+            let mut details = Vec::new();
+            if let Some(name) = item.display_name.as_deref()
+                && !name.trim().is_empty()
+            {
+                details.push(name.trim().to_string());
+            }
+            if let Some(user_id) = item.user_id.as_deref()
+                && !user_id.trim().is_empty()
+            {
+                details.push(format!("user `{}`", user_id.trim()));
+            }
+            if !details.is_empty() {
+                parts.push(format!("({})", details.join(", ")));
+            }
+        }
+        if admin_private_conversation_id == Some(item.conversation_id.as_str()) {
+            parts.push("[admin private chat]".to_string());
+        }
+        parts.join(" ")
+    }
+
+    fn format_admin_chat_list_text(
+        address: &ChannelAddress,
+        admin: Option<ChannelAdminSnapshot>,
+        items: &[ConversationApprovalSnapshot],
+    ) -> String {
+        let pending = items
+            .iter()
+            .filter(|item| item.state == ConversationApprovalState::Pending)
+            .collect::<Vec<_>>();
+        let approved = items
+            .iter()
+            .filter(|item| item.state == ConversationApprovalState::Approved)
+            .collect::<Vec<_>>();
+        let rejected = items
+            .iter()
+            .filter(|item| item.state == ConversationApprovalState::Rejected)
+            .collect::<Vec<_>>();
+
+        let mut lines = vec![
+            format!("Approval dashboard for channel `{}`", address.channel_id),
+            format!(
+                "Summary: {} pending, {} approved, {} rejected",
+                pending.len(),
+                approved.len(),
+                rejected.len()
+            ),
+        ];
+
+        if let Some(ref admin) = admin {
+            let admin_name = admin
+                .display_name
+                .as_deref()
+                .filter(|value: &&str| !value.trim().is_empty())
+                .unwrap_or("unknown");
+            lines.push(format!(
+                "Administrator: {} (user `{}`)",
+                admin_name, admin.user_id
+            ));
+            if let Some(private_chat) = admin.private_conversation_id.as_deref() {
+                lines.push(format!("Admin private chat: `{}`", private_chat));
+            }
+        }
+
+        let admin_private_conversation_id = admin
+            .as_ref()
+            .and_then(|value| value.private_conversation_id.as_deref());
+
+        if !pending.is_empty() {
+            lines.push(String::new());
+            lines.push(format!(
+                "{}",
+                Self::render_chat_approval_label(ConversationApprovalState::Pending)
+            ));
+            for item in pending {
+                lines.push(format!(
+                    "- {}",
+                    Self::format_chat_approval_subject(item, admin_private_conversation_id)
+                ));
+                lines.push(format!(
+                    "  updated: `{}`",
+                    item.updated_at.format("%Y-%m-%d %H:%M UTC")
+                ));
+                lines.push(format!(
+                    "  approve: `/admin_chat_approve {}`",
+                    item.conversation_id
+                ));
+                lines.push(format!(
+                    "  reject: `/admin_chat_reject {}`",
+                    item.conversation_id
+                ));
+            }
+        }
+
+        for (state, bucket) in [
+            (ConversationApprovalState::Approved, approved),
+            (ConversationApprovalState::Rejected, rejected),
+        ] {
+            if bucket.is_empty() {
+                continue;
+            }
+            lines.push(String::new());
+            lines.push(Self::render_chat_approval_label(state).to_string());
+            for item in bucket {
+                lines.push(format!(
+                    "- {}",
+                    Self::format_chat_approval_subject(item, admin_private_conversation_id)
+                ));
+            }
+        }
+
+        lines.join("\n")
     }
 
     async fn handle_admin_authorize_command(
@@ -3968,27 +4187,10 @@ impl Server {
             .await?;
             return Ok(());
         }
-        let mut lines = vec!["Chat approvals:".to_string()];
-        for item in items {
-            let user = item
-                .user_id
-                .as_deref()
-                .map(|value| format!(" user={value}"))
-                .unwrap_or_default();
-            let name = item
-                .display_name
-                .as_deref()
-                .map(|value| format!(" name={value}"))
-                .unwrap_or_default();
-            lines.push(format!(
-                "- {} [{}]{}{}",
-                item.conversation_id,
-                Self::render_chat_approval_state(item.state),
-                user,
-                name
-            ));
-        }
-        self.send_channel_message(channel, address, OutgoingMessage::text(lines.join("\n")))
+        let admin =
+            self.with_channel_auth(|auth| Ok(auth.admin_for_channel(&address.channel_id)))?;
+        let text = Self::format_admin_chat_list_text(address, admin, &items);
+        self.send_channel_message(channel, address, OutgoingMessage::text(text))
             .await
     }
 
@@ -4125,25 +4327,31 @@ impl Server {
         &self,
         address: &ChannelAddress,
     ) -> Result<Option<String>> {
+        let current_backend = self.selected_agent_backend(address)?;
         let Some(model_key) = self.selected_main_model_key(address)? else {
             return Ok(None);
         };
-        if self.models.contains_key(&model_key) {
+        if self.models.contains_key(&model_key)
+            && current_backend
+                .is_none_or(|backend| self.agent.is_model_available(backend, &model_key))
+        {
             return Ok(None);
         }
         self.with_conversations(|conversations| {
-            conversations.set_main_model(address, None).map(|_| ())
+            conversations
+                .set_agent_selection(address, current_backend, None)
+                .map(|_| ())
         })?;
         Ok(Some(model_key))
     }
 
     fn foreground_uses_native_zgent(
         &self,
-        _address: &ChannelAddress,
+        address: &ChannelAddress,
         model_key: &str,
     ) -> Result<bool> {
-        let model = self.model_config_or_main(model_key)?;
-        if model.backend != AgentBackendKind::Zgent {
+        self.ensure_model_available_for_backend(self.effective_agent_backend(address)?, model_key)?;
+        if self.effective_agent_backend(address)? != AgentBackendKind::Zgent {
             return Ok(false);
         }
         if !zgent_native_kernel_runtime_available() {
@@ -4182,7 +4390,7 @@ impl Server {
             session.agent_id,
             None,
         );
-        let options = runtime.build_backend_execution_options();
+        let options = runtime.build_backend_execution_options(AgentBackendKind::Zgent);
         let existing_remote_session_id = self
             .with_sessions(|sessions| sessions.zgent_native_state(&session.address))?
             .filter(|state| state.model_key.as_deref() == Some(model_key))
@@ -4283,7 +4491,7 @@ impl Server {
             channel,
             address,
             OutgoingMessage::text(format!(
-                "The previously selected model `{}` is no longer available in the current config. Please run `/model` to choose a new model.",
+                "The previously selected model `{}` is no longer available for the current agent setup. Please run `/agent` to choose again.",
                 missing_model_key
             )),
         )
@@ -4350,7 +4558,7 @@ impl Server {
                 ChannelConfig::Telegram(telegram) => {
                     let id = telegram.id.clone();
                     telegram_channel_ids.insert(id.clone());
-                    command_catalog.insert(id.clone(), telegram.commands.clone());
+                    command_catalog.insert(id.clone(), default_telegram_commands());
                     channels.insert(id, Arc::new(TelegramChannel::from_config(telegram)?));
                 }
             }
@@ -4403,6 +4611,7 @@ impl Server {
             telegram_channel_ids: Arc::new(telegram_channel_ids),
             command_catalog,
             models: config.models,
+            agent: config.agent,
             tooling,
             chat_model_keys: config.chat_model_keys,
             main_agent: config.main_agent,
@@ -4494,8 +4703,9 @@ impl Server {
                 maybe_message = receiver.recv(), if !receiver_closed => {
                     match maybe_message {
                         Some(message) => {
-                            if let Some(outgoing) =
-                                fast_path_model_selection_message(&server.workdir, &server.models, &server.chat_model_keys, &message)
+                            if server.allows_fast_path_agent_selection(&message.address)?
+                                && let Some(outgoing) =
+                                    fast_path_agent_selection_message(&server.workdir, &server.models, &server.agent, &message)
                             {
                                 if let Some(channel) = server.channels.get(&message.address.channel_id) {
                                     if let Err(error) = channel.send(&message.address, outgoing).await {
@@ -4744,8 +4954,13 @@ impl Server {
         }
 
         let persistence_system_prompt = config.system_prompt.clone();
-        let report = run_backend_compaction(model.backend, source_messages, config, extra_tools)
-            .with_context(|| format!("failed to compact idle session {}", session.id))?;
+        let report = run_backend_compaction(
+            self.effective_agent_backend(&session.address)?,
+            source_messages,
+            config,
+            extra_tools,
+        )
+        .with_context(|| format!("failed to compact idle session {}", session.id))?;
         if !report.compacted {
             self.with_sessions(|sessions| sessions.clear_idle_compaction_retry(&session.address))?;
             return Ok(false);
@@ -4808,6 +5023,7 @@ impl Server {
                 .into_iter()
                 .map(|session| session.workspace_id)
                 .collect(),
+            selected_agent_backend: None,
             selected_main_model_key: None,
             selected_reasoning_effort: None,
             selected_context_compaction_enabled: None,
@@ -4815,8 +5031,8 @@ impl Server {
             channels: Arc::clone(&self.channels),
             command_catalog: self.command_catalog.clone(),
             models: self.models.clone(),
+            agent: self.agent.clone(),
             tooling: self.tooling.clone(),
-            chat_model_keys: self.chat_model_keys.clone(),
             main_agent: self.main_agent.clone(),
             sandbox: self.sandbox.clone(),
             sink_router: Arc::clone(&self.sink_router),
@@ -4848,6 +5064,7 @@ impl Server {
                 .ensure_conversation(address)
                 .map(|snapshot| snapshot.settings)
         })?;
+        runtime.selected_agent_backend = settings.agent_backend;
         runtime.selected_main_model_key = settings.main_model.clone();
         runtime.selected_reasoning_effort = settings.reasoning_effort.clone();
         runtime.selected_context_compaction_enabled = settings.context_compaction_enabled;
@@ -5073,7 +5290,7 @@ impl Server {
                 .await?;
                 return Ok(());
             }
-            if self.selected_main_model_key(&incoming.address)?.is_some() {
+            if self.has_complete_agent_selection(&incoming.address)? {
                 let welcome = match self.initialize_foreground_session(&session, true).await {
                     Ok(welcome) => welcome,
                     Err(error) => {
@@ -5088,9 +5305,9 @@ impl Server {
                 self.send_channel_message(
                     &channel,
                     &incoming.address,
-                    self.model_selection_message(
+                    self.agent_selection_message(
                         &incoming.address,
-                        "Choose a model for this conversation before activating a workspace.",
+                        "Choose an agent backend and model for this conversation before activating a workspace.",
                     )?,
                 )
                 .await?;
@@ -5121,7 +5338,7 @@ impl Server {
             return Ok(());
         }
 
-        if parse_model_command(incoming.text.as_deref()).is_none()
+        if parse_agent_command(incoming.text.as_deref()).is_none()
             && let Some(missing_model_key) =
                 self.clear_missing_selected_main_model(&incoming.address)?
         {
@@ -5136,13 +5353,13 @@ impl Server {
             .map(str::trim)
             .is_some_and(|text| command_matches(text, "/status"))
         {
-            let Some(effective_model_key) = self.selected_main_model_key(&incoming.address)? else {
+            let Ok(effective_model_key) = self.effective_main_model_key(&incoming.address) else {
                 self.send_channel_message(
                     &channel,
                     &incoming.address,
-                    self.model_selection_message(
+                    self.agent_selection_message(
                         &incoming.address,
-                        "Choose a model for this conversation before using `/status`.",
+                        "Choose an agent backend and model for this conversation before using `/status`.",
                     )?,
                 )
                 .await?;
@@ -5165,13 +5382,13 @@ impl Server {
             .map(str::trim)
             .is_some_and(|text| command_matches(text, "/compact"))
         {
-            let Some(effective_model_key) = self.selected_main_model_key(&incoming.address)? else {
+            let Ok(effective_model_key) = self.effective_main_model_key(&incoming.address) else {
                 self.send_channel_message(
                     &channel,
                     &incoming.address,
-                    self.model_selection_message(
+                    self.agent_selection_message(
                         &incoming.address,
-                        "Choose a model for this conversation before using `/compact`.",
+                        "Choose an agent backend and model for this conversation before using `/compact`.",
                     )?,
                 )
                 .await?;
@@ -5232,72 +5449,124 @@ impl Server {
             return Ok(());
         }
 
-        if let Some(argument) = parse_model_command(incoming.text.as_deref()) {
-            if argument.is_none() {
-                let _ = self.clear_missing_selected_main_model(&incoming.address)?;
-            }
-            if let Some(model_key) = argument {
-                if !self.models.contains_key(&model_key) {
-                    let error = anyhow!("unknown model {}", model_key);
-                    self.send_user_error_message(&channel, &incoming.address, &error)
-                        .await;
-                    return Err(error);
+        if let Some(command) = parse_agent_command(incoming.text.as_deref()) {
+            match command {
+                AgentCommand::ShowSelection => {
+                    self.send_channel_message(
+                        &channel,
+                        &incoming.address,
+                        self.agent_backend_selection_message(
+                            &incoming.address,
+                            "Choose an agent backend for this conversation.",
+                        )?,
+                    )
+                    .await?;
+                    return Ok(());
                 }
-                let current_model_key = self.selected_main_model_key(&incoming.address)?;
-                if current_model_key.as_deref() == Some(model_key.as_str()) {
+                AgentCommand::SelectBackend(backend) => {
+                    self.send_channel_message(
+                        &channel,
+                        &incoming.address,
+                        self.agent_model_selection_message(
+                            &incoming.address,
+                            backend,
+                            "Choose a model for this agent backend.",
+                        )?,
+                    )
+                    .await?;
+                    return Ok(());
+                }
+                AgentCommand::SelectModel { backend, model_key } => {
+                    if !self.models.contains_key(&model_key) {
+                        let error = anyhow!("unknown model {}", model_key);
+                        self.send_user_error_message(&channel, &incoming.address, &error)
+                            .await;
+                        return Err(error);
+                    }
+                    let selected_backend = backend
+                        .or(self.selected_agent_backend(&incoming.address)?)
+                        .or_else(|| self.inferred_agent_backend_for_model(&model_key))
+                        .ok_or_else(|| {
+                            anyhow!("please choose an agent backend first with `/agent`")
+                        })?;
+                    self.ensure_model_available_for_backend(selected_backend, &model_key)?;
+                    let stored_settings =
+                        self.effective_conversation_settings(&incoming.address)?;
+                    let current_backend = self.selected_agent_backend(&incoming.address)?;
+                    let current_model_key = self.selected_main_model_key(&incoming.address)?;
+                    if current_backend == Some(selected_backend)
+                        && current_model_key.as_deref() == Some(model_key.as_str())
+                    {
+                        if stored_settings.agent_backend != Some(selected_backend) {
+                            self.with_conversations(|conversations| {
+                                conversations.set_agent_selection(
+                                    &incoming.address,
+                                    Some(selected_backend),
+                                    Some(model_key.clone()),
+                                )
+                            })?;
+                            self.send_channel_message(
+                                &channel,
+                                &incoming.address,
+                                OutgoingMessage::text(format!(
+                                    "Conversation agent updated to `{}` with model `{}`.",
+                                    Self::render_agent_backend_value(selected_backend),
+                                    model_key
+                                )),
+                            )
+                            .await?;
+                            return Ok(());
+                        }
+                        self.send_channel_message(
+                            &channel,
+                            &incoming.address,
+                            OutgoingMessage::text(format!(
+                                "Conversation agent is already `{}` with model `{}`. No change was made.",
+                                Self::render_agent_backend_value(selected_backend),
+                                model_key
+                            )),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    let compacted = if let Some(previous_model_key) = current_model_key {
+                        let session = self.ensure_foreground_session(&incoming.address)?;
+                        self.compact_session_now(&session, &previous_model_key, false)
+                            .await
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    let conversation = self.with_conversations(|conversations| {
+                        conversations.set_agent_selection(
+                            &incoming.address,
+                            Some(selected_backend),
+                            Some(model_key.clone()),
+                        )
+                    })?;
+                    let effective_model_key = conversation
+                        .settings
+                        .main_model
+                        .clone()
+                        .expect("model just set");
                     self.send_channel_message(
                         &channel,
                         &incoming.address,
                         OutgoingMessage::text(format!(
-                            "Conversation model is already `{}`. No change was made.",
-                            model_key
+                            "Conversation agent updated to `{}` with model `{}`.{}",
+                            Self::render_agent_backend_value(selected_backend),
+                            effective_model_key,
+                            if compacted {
+                                " Existing context was compacted before the switch."
+                            } else {
+                                ""
+                            }
                         )),
                     )
                     .await?;
                     return Ok(());
                 }
-                let compacted = if let Some(previous_model_key) = current_model_key {
-                    let session = self.ensure_foreground_session(&incoming.address)?;
-                    self.compact_session_now(&session, &previous_model_key, false)
-                        .await
-                        .unwrap_or(false)
-                } else {
-                    false
-                };
-                let conversation = self.with_conversations(|conversations| {
-                    conversations.set_main_model(&incoming.address, Some(model_key.clone()))
-                })?;
-                let effective_model_key = conversation
-                    .settings
-                    .main_model
-                    .clone()
-                    .expect("model just set");
-                self.send_channel_message(
-                    &channel,
-                    &incoming.address,
-                    OutgoingMessage::text(format!(
-                        "Conversation model updated to `{}`.{}",
-                        effective_model_key,
-                        if compacted {
-                            " Existing context was compacted before the switch."
-                        } else {
-                            ""
-                        }
-                    )),
-                )
-                .await?;
-                return Ok(());
             }
-            self.send_channel_message(
-                &channel,
-                &incoming.address,
-                self.model_selection_message(
-                    &incoming.address,
-                    "Choose a model for this conversation.",
-                )?,
-            )
-            .await?;
-            return Ok(());
         }
 
         if let Some(argument) = parse_sandbox_command(incoming.text.as_deref()) {
@@ -5538,8 +5807,11 @@ impl Server {
                     }
                 };
             self.with_conversations(|conversations| {
-                conversations
-                    .set_main_model(&incoming.address, loaded.bundle.settings.main_model.clone())
+                conversations.set_agent_selection(
+                    &incoming.address,
+                    loaded.bundle.settings.agent_backend,
+                    loaded.bundle.settings.main_model.clone(),
+                )
             })?;
             self.with_conversations(|conversations| {
                 conversations
@@ -5646,6 +5918,11 @@ impl Server {
                 .await?;
                 return Ok(());
             };
+            if let Some(agent_backend) = pending_continue.agent_backend {
+                self.with_conversations(|conversations| {
+                    conversations.set_agent_backend(&incoming.address, Some(agent_backend))
+                })?;
+            }
             channel
                 .set_processing(&incoming.address, ProcessingState::Typing)
                 .await
@@ -5811,14 +6088,14 @@ impl Server {
             }
         }
 
-        if self.selected_main_model_key(&incoming.address)?.is_none() {
+        if !self.has_complete_agent_selection(&incoming.address)? {
             self.send_channel_message(
                 &channel,
                 &incoming.address,
-                self.model_selection_message(
-                    &incoming.address,
-                    "Choose a model for this conversation before sending messages.",
-                )?,
+                    self.agent_selection_message(
+                        &incoming.address,
+                        "Choose an agent backend and model for this conversation before sending messages.",
+                    )?,
             )
             .await?;
             return Ok(());
@@ -5888,7 +6165,9 @@ impl Server {
             incoming.text.as_deref(),
             &stored_attachments,
             &effective_model,
-            backend_supports_native_multimodal_input(effective_model.backend),
+            backend_supports_native_multimodal_input(
+                self.effective_agent_backend(&incoming.address)?,
+            ),
         )?;
         let synthetic_system_messages = build_synthetic_system_messages(
             skill_updates_prefix.as_deref(),
@@ -6265,7 +6544,7 @@ impl Server {
         }
         let persistence_system_prompt = config.system_prompt.clone();
         let report = run_backend_compaction(
-            model.backend,
+            self.effective_agent_backend(&session.address)?,
             session.agent_messages.clone(),
             config,
             extra_tools,
@@ -6409,7 +6688,6 @@ impl Server {
 
         let mut previous_messages = session.agent_messages.clone();
         let effective_model_key = self.effective_main_model_key(&session.address)?;
-        let effective_model = self.model_config_or_main(&effective_model_key)?.clone();
         if self.effective_context_compaction_enabled(&session.address)?
             && session.agent_message_count > 1
         {
@@ -6428,7 +6706,7 @@ impl Server {
                 None,
             );
             let compaction = run_backend_compaction(
-                effective_model.backend,
+                self.effective_agent_backend(&session.address)?,
                 previous_messages.clone(),
                 config,
                 extra_tools,
@@ -6462,6 +6740,7 @@ impl Server {
                 session.clone(),
                 AgentPromptKind::MainForeground,
                 session.agent_id,
+                self.effective_agent_backend(&session.address)?,
                 effective_model_key.clone(),
                 previous_messages,
                 prompt,
@@ -6632,6 +6911,7 @@ impl Server {
                 session.clone(),
                 AgentPromptKind::MainForeground,
                 session.agent_id,
+                self.effective_agent_backend(&session.address)?,
                 model_key.to_string(),
                 previous_messages.clone(),
                 String::new(),
@@ -6693,8 +6973,12 @@ impl Server {
                     });
                 Ok(ForegroundTurnOutcome::Failed {
                     pending_continue: PendingContinueState {
+                        agent_backend: Some(self.effective_agent_backend(&session.address)?),
                         model_key: model_key.to_string(),
-                        progress_summary: summarize_resume_progress(&resume_messages),
+                        progress_summary: summarize_resume_progress(
+                            &self.main_agent.language,
+                            &resume_messages,
+                        ),
                         error_summary: format!("{error:#}"),
                         failed_at: Utc::now(),
                         resume_messages,
@@ -6723,10 +7007,56 @@ impl Server {
         Ok(self.effective_conversation_settings(address)?.main_model)
     }
 
-    fn effective_main_model_key(&self, address: &ChannelAddress) -> Result<String> {
-        self.selected_main_model_key(address)?.ok_or_else(|| {
-            anyhow!("this conversation does not have a main model yet; choose one with /model")
+    fn inferred_agent_backend_for_model(&self, model_key: &str) -> Option<AgentBackendKind> {
+        let backends = self.agent.backends_for_model(model_key);
+        (backends.len() == 1).then_some(backends[0])
+    }
+
+    fn selected_agent_backend(&self, address: &ChannelAddress) -> Result<Option<AgentBackendKind>> {
+        let settings = self.effective_conversation_settings(address)?;
+        Ok(settings.agent_backend.or_else(|| {
+            settings
+                .main_model
+                .as_deref()
+                .and_then(|model_key| self.inferred_agent_backend_for_model(model_key))
+        }))
+    }
+
+    fn effective_agent_backend(&self, address: &ChannelAddress) -> Result<AgentBackendKind> {
+        self.selected_agent_backend(address)?.ok_or_else(|| {
+            anyhow!("this conversation does not have an agent backend yet; choose one with /agent")
         })
+    }
+
+    fn has_complete_agent_selection(&self, address: &ChannelAddress) -> Result<bool> {
+        Ok(self.selected_agent_backend(address)?.is_some()
+            && self.selected_main_model_key(address)?.is_some())
+    }
+
+    fn ensure_model_available_for_backend(
+        &self,
+        backend: AgentBackendKind,
+        model_key: &str,
+    ) -> Result<()> {
+        if self.agent.is_model_available(backend, model_key) {
+            return Ok(());
+        }
+        Err(anyhow!(
+            "model '{}' is not available for agent backend '{}'",
+            model_key,
+            serde_json::to_string(&backend)
+                .unwrap_or_else(|_| "\"unknown\"".to_string())
+                .trim_matches('"')
+        ))
+    }
+
+    fn effective_main_model_key(&self, address: &ChannelAddress) -> Result<String> {
+        let model_key = self.selected_main_model_key(address)?.ok_or_else(|| {
+            anyhow!("this conversation does not have a main model yet; choose one with /agent")
+        })?;
+        let backend = self.effective_agent_backend(address)?;
+        self.ensure_model_available_for_backend(backend, &model_key)?;
+        Ok(model_key)
     }
 
     fn effective_sandbox_mode(&self, address: &ChannelAddress) -> Result<SandboxMode> {
@@ -6763,34 +7093,98 @@ impl Server {
         })
     }
 
-    fn model_selection_message(
+    fn render_agent_backend_value(backend: AgentBackendKind) -> &'static str {
+        match backend {
+            AgentBackendKind::AgentFrame => "agent_frame",
+            AgentBackendKind::Zgent => "zgent",
+        }
+    }
+
+    fn available_agent_models(&self, backend: AgentBackendKind) -> Vec<String> {
+        self.agent
+            .available_models(backend)
+            .iter()
+            .filter(|model_key| self.models.contains_key(model_key.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    fn agent_backend_selection_message(
         &self,
         address: &ChannelAddress,
         intro: &str,
     ) -> Result<OutgoingMessage> {
-        let current = self.selected_main_model_key(address)?;
-        let mut options = self
-            .chat_model_keys
-            .iter()
-            .filter(|model_key| self.models.contains_key(model_key.as_str()))
-            .cloned()
-            .map(|model_key| ShowOption {
-                label: model_key.clone(),
-                value: format!("/model {}", model_key),
+        let current_backend = self.selected_agent_backend(address)?;
+        let current_model = self.selected_main_model_key(address)?;
+        let mut options = [AgentBackendKind::AgentFrame, AgentBackendKind::Zgent]
+            .into_iter()
+            .filter(|backend| !self.available_agent_models(*backend).is_empty())
+            .map(|backend| ShowOption {
+                label: Self::render_agent_backend_value(backend).to_string(),
+                value: format!("/agent {}", Self::render_agent_backend_value(backend)),
             })
             .collect::<Vec<_>>();
         options.sort_by(|left, right| left.label.cmp(&right.label));
         Ok(OutgoingMessage::with_options(
             format!(
-                "{}\nCurrent conversation model: {}\nChoose a model below or send `/model <name>`.",
+                "{}\nCurrent agent backend: {}\nCurrent conversation model: {}\nChoose a backend below or send `/agent <agent_frame|zgent>`.",
                 intro,
-                current
+                current_backend
+                    .map(|value| format!("`{}`", Self::render_agent_backend_value(value)))
+                    .unwrap_or_else(|| "`<not selected>`".to_string()),
+                current_model
                     .map(|value| format!("`{}`", value))
                     .unwrap_or_else(|| "`<not selected>`".to_string())
+            ),
+            "Choose a backend",
+            options,
+        ))
+    }
+
+    fn agent_model_selection_message(
+        &self,
+        address: &ChannelAddress,
+        backend: AgentBackendKind,
+        intro: &str,
+    ) -> Result<OutgoingMessage> {
+        let current_model = self.selected_main_model_key(address)?;
+        let mut options = self
+            .available_agent_models(backend)
+            .into_iter()
+            .map(|model_key| ShowOption {
+                label: model_key.clone(),
+                value: format!(
+                    "/agent {} {}",
+                    Self::render_agent_backend_value(backend),
+                    model_key
+                ),
+            })
+            .collect::<Vec<_>>();
+        options.sort_by(|left, right| left.label.cmp(&right.label));
+        Ok(OutgoingMessage::with_options(
+            format!(
+                "{}\nCurrent agent backend: `{}`\nCurrent conversation model: {}\nChoose a model below or send `/agent {} <model>`.",
+                intro,
+                Self::render_agent_backend_value(backend),
+                current_model
+                    .map(|value| format!("`{}`", value))
+                    .unwrap_or_else(|| "`<not selected>`".to_string()),
+                Self::render_agent_backend_value(backend),
             ),
             "Choose a model",
             options,
         ))
+    }
+
+    fn agent_selection_message(
+        &self,
+        address: &ChannelAddress,
+        intro: &str,
+    ) -> Result<OutgoingMessage> {
+        if let Some(backend) = self.selected_agent_backend(address)? {
+            return self.agent_model_selection_message(address, backend, intro);
+        }
+        self.agent_backend_selection_message(address, intro)
     }
 
     fn reasoning_effort_message(&self, address: &ChannelAddress) -> Result<OutgoingMessage> {
@@ -7123,17 +7517,18 @@ fn spawn_channel_supervisor(channel: Arc<dyn Channel>, sender: mpsc::Sender<Inco
 #[cfg(test)]
 mod tests {
     use super::{
-        ForegroundRuntimePhase, SinkTarget, TokenUsage,
+        AgentCommand, ForegroundRuntimePhase, Server, SinkTarget, TokenUsage,
         background_timeout_with_active_children_text, build_previous_messages_for_turn,
         build_synthetic_system_messages, build_user_turn_message, channel_restart_backoff_seconds,
         conversation_memory_root, estimate_compaction_savings_usd, estimate_cost_usd,
-        extract_attachment_references, format_session_status, is_timeout_like, memory_search_files,
-        normalize_messages_for_persistence, parse_model_command, parse_oldspace_command,
-        parse_sandbox_command, parse_set_api_timeout_command, parse_sink_target,
-        parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
-        parse_think_command, persist_compaction_artifacts, request_yield_for_incoming,
-        rollout_read_file, rollout_search_files, send_outgoing_message_now,
-        should_attempt_idle_context_compaction, should_emit_profile_change_prompt,
+        extract_attachment_references, fast_path_agent_selection_message, format_session_status,
+        is_timeout_like, memory_search_files, normalize_messages_for_persistence,
+        parse_agent_command, parse_model_command, parse_oldspace_command, parse_sandbox_command,
+        parse_set_api_timeout_command, parse_sink_target, parse_snap_list_command,
+        parse_snap_load_command, parse_snap_save_command, parse_think_command,
+        persist_compaction_artifacts, request_yield_for_incoming, rollout_read_file,
+        rollout_search_files, send_outgoing_message_now, should_attempt_idle_context_compaction,
+        should_emit_profile_change_prompt, summarize_resume_progress,
         sync_workspace_shared_profile_files, tag_interrupted_followup_text,
         update_active_foreground_phase, upload_workspace_shared_profile_files,
         user_facing_continue_error_text, workspace_visible_in_list,
@@ -7141,7 +7536,11 @@ mod tests {
     use crate::backend::AgentBackendKind;
     use crate::bootstrap::AgentWorkspace;
     use crate::channel::{Channel, IncomingMessage};
+    use crate::channel_auth::{
+        ChannelAdminSnapshot, ConversationApprovalSnapshot, ConversationApprovalState,
+    };
     use crate::config::{ModelCapability, ModelConfig};
+    use crate::conversation::ConversationManager;
     use crate::domain::ChannelAddress;
     use crate::domain::{AttachmentKind, OutgoingMessage, ProcessingState, StoredAttachment};
     use crate::session::{PendingContinueState, SessionSnapshot};
@@ -7890,9 +8289,48 @@ mod tests {
         let en = user_facing_continue_error_text("en", &error, "tool phase reached");
 
         assert!(zh.contains("自动上下文压缩失败"));
+        assert!(zh.contains("失败原因"));
         assert!(zh.contains("/continue"));
         assert!(en.contains("Automatic context compaction failed"));
+        assert!(en.contains("Failure reason"));
         assert!(en.contains("/continue"));
+    }
+
+    #[test]
+    fn summarize_resume_progress_reports_tool_stage_in_chinese() {
+        let messages = vec![
+            ChatMessage::text("user", "继续处理"),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                name: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    kind: "function".to_string(),
+                    function: FunctionCall {
+                        name: "exec_wait".to_string(),
+                        arguments: Some("{}".to_string()),
+                    },
+                }]),
+            },
+        ];
+
+        let summary = summarize_resume_progress("zh-CN", &messages);
+        assert!(summary.contains("工具阶段"));
+        assert!(summary.contains("exec_wait"));
+    }
+
+    #[test]
+    fn summarize_resume_progress_reports_partial_text_in_chinese() {
+        let messages = vec![
+            ChatMessage::text("user", "继续处理"),
+            ChatMessage::text("assistant", "已经查到原因，正在整理修复方案。"),
+        ];
+
+        let summary = summarize_resume_progress("zh-CN", &messages);
+        assert!(summary.contains("已保留部分助手输出"));
+        assert!(summary.contains("已经查到原因"));
     }
 
     #[test]
@@ -7977,7 +8415,22 @@ mod tests {
     }
 
     #[test]
-    fn parses_model_sandbox_and_think_commands_with_optional_arguments() {
+    fn parses_agent_sandbox_and_think_commands_with_optional_arguments() {
+        assert!(matches!(
+            parse_agent_command(Some("/agent")),
+            Some(AgentCommand::ShowSelection)
+        ));
+        assert!(matches!(
+            parse_agent_command(Some("/agent agent_frame")),
+            Some(AgentCommand::SelectBackend(AgentBackendKind::AgentFrame))
+        ));
+        assert!(matches!(
+            parse_agent_command(Some("/agent zgent demo-model")),
+            Some(AgentCommand::SelectModel {
+                backend: Some(AgentBackendKind::Zgent),
+                model_key
+            }) if model_key == "demo-model"
+        ));
         assert_eq!(parse_model_command(Some("/model")), Some(None));
         assert_eq!(
             parse_model_command(Some("/model demo-model")),
@@ -8043,6 +8496,7 @@ mod tests {
         let session_messages = vec![ChatMessage::text("assistant", "current session tail")];
         let resume_messages = vec![ChatMessage::text("assistant", "preserved failure point")];
         let pending_continue = PendingContinueState {
+            agent_backend: Some(AgentBackendKind::AgentFrame),
             model_key: "demo-model".to_string(),
             resume_messages: resume_messages.clone(),
             original_user_text: Some("original request".to_string()),
@@ -8078,6 +8532,124 @@ mod tests {
                 .and_then(|value| value.as_str()),
             Some("new user message")
         );
+    }
+
+    #[test]
+    fn fast_path_skips_prompt_and_backfills_unique_backend_selection() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = ChannelAddress {
+            channel_id: "telegram-main".to_string(),
+            conversation_id: "-1003336174206".to_string(),
+            user_id: Some("1717801091".to_string()),
+            display_name: Some("Jeremy Guo".to_string()),
+        };
+        let mut conversations = ConversationManager::new(temp_dir.path()).unwrap();
+        conversations
+            .set_main_model(&address, Some("gpt54".to_string()))
+            .unwrap();
+
+        let mut models = std::collections::BTreeMap::new();
+        models.insert(
+            "gpt54".to_string(),
+            ModelConfig {
+                model_type: crate::config::ModelType::Openrouter,
+                api_endpoint: "https://example.com/v1".to_string(),
+                model: "gpt-5.4".to_string(),
+                backend: AgentBackendKind::AgentFrame,
+                supports_vision_input: false,
+                image_tool_model: None,
+                web_search_model: None,
+                api_key: None,
+                api_key_env: "TEST_API_KEY".to_string(),
+                chat_completions_path: "/chat/completions".to_string(),
+                codex_home: None,
+                auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
+                timeout_seconds: 60.0,
+                context_window_tokens: 128_000,
+                cache_ttl: None,
+                reasoning: None,
+                headers: serde_json::Map::new(),
+                description: "demo".to_string(),
+                agent_model_enabled: true,
+                capabilities: vec![ModelCapability::Chat],
+                native_web_search: None,
+                external_web_search: None,
+            },
+        );
+        let agent = crate::config::AgentConfig {
+            agent_frame: crate::config::AgentBackendConfig {
+                available_models: vec!["gpt54".to_string()],
+            },
+            zgent: crate::config::AgentBackendConfig::default(),
+        };
+        let message = IncomingMessage {
+            remote_message_id: "msg-1".to_string(),
+            address: address.clone(),
+            text: Some("继续".to_string()),
+            attachments: Vec::new(),
+            control: None,
+        };
+
+        let outgoing =
+            fast_path_agent_selection_message(temp_dir.path(), &models, &agent, &message);
+        assert!(outgoing.is_none());
+
+        let reloaded = ConversationManager::new(temp_dir.path()).unwrap();
+        let snapshot = reloaded.get_snapshot(&address).unwrap();
+        assert_eq!(snapshot.settings.main_model.as_deref(), Some("gpt54"));
+        assert_eq!(
+            snapshot.settings.agent_backend,
+            Some(AgentBackendKind::AgentFrame)
+        );
+    }
+
+    #[test]
+    fn admin_chat_list_text_groups_entries_and_includes_actions() {
+        let address = ChannelAddress {
+            channel_id: "telegram-main".to_string(),
+            conversation_id: "1717801091".to_string(),
+            user_id: Some("1717801091".to_string()),
+            display_name: Some("Jeremy Guo".to_string()),
+        };
+        let admin = Some(ChannelAdminSnapshot {
+            user_id: "1717801091".to_string(),
+            display_name: Some("Jeremy Guo".to_string()),
+            private_conversation_id: Some("1717801091".to_string()),
+        });
+        let now = Utc::now();
+        let items = vec![
+            ConversationApprovalSnapshot {
+                conversation_id: "-1001".to_string(),
+                user_id: Some("user-1".to_string()),
+                display_name: Some("Alice".to_string()),
+                state: ConversationApprovalState::Pending,
+                updated_at: now,
+            },
+            ConversationApprovalSnapshot {
+                conversation_id: "1717801091".to_string(),
+                user_id: Some("1717801091".to_string()),
+                display_name: Some("Jeremy Guo".to_string()),
+                state: ConversationApprovalState::Approved,
+                updated_at: now,
+            },
+            ConversationApprovalSnapshot {
+                conversation_id: "-1002".to_string(),
+                user_id: Some("user-2".to_string()),
+                display_name: Some("Bob".to_string()),
+                state: ConversationApprovalState::Rejected,
+                updated_at: now,
+            },
+        ];
+
+        let text = Server::format_admin_chat_list_text(&address, admin, &items);
+        assert!(text.contains("Approval dashboard for channel `telegram-main`"));
+        assert!(text.contains("Summary: 1 pending, 1 approved, 1 rejected"));
+        assert!(text.contains("Pending Review"));
+        assert!(text.contains("/admin_chat_approve -1001"));
+        assert!(text.contains("/admin_chat_reject -1001"));
+        assert!(text.contains("Approved"));
+        assert!(text.contains("[admin private chat]"));
+        assert!(text.contains("Rejected"));
     }
 
     #[test]

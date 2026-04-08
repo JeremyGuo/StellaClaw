@@ -313,18 +313,19 @@ pub(super) fn user_facing_continue_error_text(
 ) -> String {
     let language = language.to_ascii_lowercase();
     let error_text = format!("{error:#}").to_ascii_lowercase();
+    let reason_summary = summarize_continue_error_reason(error);
     if error_text.contains("tool-wait context compaction failed")
         || error_text.contains("threshold context compaction failed")
     {
         if language.starts_with("zh") {
             return format!(
-                "自动上下文压缩失败了，但系统已经保留到最近的稳定位置。\n\n当前进度：{}\n\n发送 /continue 可以从这里继续。",
-                progress_summary
+                "自动上下文压缩失败了，但系统已经保留到最近的稳定位置。\n\n当前进度：{}\n失败原因：{}\n\n发送 /continue 可以从这里继续。",
+                progress_summary, reason_summary
             );
         }
         return format!(
-            "Automatic context compaction failed, but the session has been preserved at the latest stable point.\n\nProgress so far: {}\n\nSend /continue to resume from there.",
-            progress_summary
+            "Automatic context compaction failed, but the session has been preserved at the latest stable point.\n\nProgress so far: {}\nFailure reason: {}\n\nSend /continue to resume from there.",
+            progress_summary, reason_summary
         );
     }
     let upstream_like = error_text.contains("upstream")
@@ -334,29 +335,49 @@ pub(super) fn user_facing_continue_error_text(
     if language.starts_with("zh") {
         if upstream_like {
             format!(
-                "这一轮在调用上游模型时失败了，但系统已经保留到最近的稳定位置。\n\n当前进度：{}\n\n发送 /continue 可以从这里继续。",
-                progress_summary
+                "这一轮在调用上游模型时失败了，但系统已经保留到最近的稳定位置。\n\n当前进度：{}\n失败原因：{}\n\n发送 /continue 可以从这里继续。",
+                progress_summary, reason_summary
             )
         } else {
             format!(
-                "这一轮在完成前失败了，但系统已经保留到最近的稳定位置。\n\n当前进度：{}\n\n发送 /continue 可以尝试继续。",
-                progress_summary
+                "这一轮在完成前失败了，但系统已经保留到最近的稳定位置。\n\n当前进度：{}\n失败原因：{}\n\n发送 /continue 可以尝试继续。",
+                progress_summary, reason_summary
             )
         }
     } else if upstream_like {
         format!(
-            "This turn failed while calling the upstream model, but the session has been preserved at the latest stable point.\n\nProgress so far: {}\n\nSend /continue to resume from there.",
-            progress_summary
+            "This turn failed while calling the upstream model, but the session has been preserved at the latest stable point.\n\nProgress so far: {}\nFailure reason: {}\n\nSend /continue to resume from there.",
+            progress_summary, reason_summary
         )
     } else {
         format!(
-            "This turn failed before finishing, but the session has been preserved at the latest stable point.\n\nProgress so far: {}\n\nSend /continue to try resuming from there.",
-            progress_summary
+            "This turn failed before finishing, but the session has been preserved at the latest stable point.\n\nProgress so far: {}\nFailure reason: {}\n\nSend /continue to try resuming from there.",
+            progress_summary, reason_summary
         )
     }
 }
 
-pub(super) fn summarize_resume_progress(messages: &[ChatMessage]) -> String {
+fn summarize_continue_error_reason(error: &anyhow::Error) -> String {
+    let summary = error
+        .chain()
+        .map(|cause| cause.to_string())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
+        .fold(Vec::<String>::new(), |mut acc, text| {
+            if acc.last() != Some(&text) {
+                acc.push(text);
+            }
+            acc
+        });
+    if summary.is_empty() {
+        return "unknown error".to_string();
+    }
+    summary.into_iter().take(3).collect::<Vec<_>>().join(" -> ")
+}
+
+pub(super) fn summarize_resume_progress(language: &str, messages: &[ChatMessage]) -> String {
+    let language = language.to_ascii_lowercase();
+    let zh = language.starts_with("zh");
     let last_user_index = messages
         .iter()
         .rposition(|message| message.role == "user")
@@ -376,39 +397,80 @@ pub(super) fn summarize_resume_progress(messages: &[ChatMessage]) -> String {
                 .map(|tool_call| tool_call.function.name.clone())
         })
         .collect::<Vec<_>>();
+    let recent_tools = tool_names.iter().rev().take(3).cloned().collect::<Vec<_>>();
+    let recent_tools_text = recent_tools
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let assistant_tool_call_count = trailing
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .filter_map(|message| message.tool_calls.as_ref())
+        .map(Vec::len)
+        .sum::<usize>();
+    let partial_text = trailing
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .filter_map(|message| message.content.as_ref())
+        .filter_map(Value::as_str)
+        .find(|text| !text.trim().is_empty())
+        .map(str::trim)
+        .map(|text| text.chars().take(120).collect::<String>());
     if tool_result_count > 0 {
-        let recent_tools = tool_names.iter().rev().take(3).cloned().collect::<Vec<_>>();
-        if recent_tools.is_empty() {
+        if zh {
+            if recent_tools_text.is_empty() {
+                format!("上一轮已经执行到工具阶段，并保留了 {tool_result_count} 条工具结果")
+            } else {
+                format!(
+                    "上一轮已经执行到工具阶段，并保留了 {tool_result_count} 条工具结果；最近工具：{recent_tools_text}"
+                )
+            }
+        } else if recent_tools_text.is_empty() {
             format!(
                 "the previous turn already reached tool execution and preserved {tool_result_count} tool result(s)"
             )
         } else {
             format!(
                 "the previous turn already reached tool execution and preserved {} tool result(s); recent tools: {}",
-                tool_result_count,
-                recent_tools
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                tool_result_count, recent_tools_text
+            )
+        }
+    } else if assistant_tool_call_count > 0 {
+        if zh {
+            if recent_tools_text.is_empty() {
+                format!(
+                    "上一轮已经进入工具阶段，并保留了 {assistant_tool_call_count} 个待继续的工具调用"
+                )
+            } else {
+                format!(
+                    "上一轮已经进入工具阶段，并保留了 {assistant_tool_call_count} 个待继续的工具调用；最近工具：{recent_tools_text}"
+                )
+            }
+        } else if recent_tools_text.is_empty() {
+            format!(
+                "the previous turn already planned {assistant_tool_call_count} tool call(s) and was preserved at that stage"
+            )
+        } else {
+            format!(
+                "the previous turn already planned {assistant_tool_call_count} tool call(s) and was preserved at that stage; recent tools: {recent_tools_text}"
+            )
+        }
+    } else if let Some(text) = partial_text {
+        if zh {
+            format!("上一轮已保留部分助手输出：{}", text)
+        } else {
+            format!(
+                "the previous turn preserved partial assistant progress: {}",
+                text
             )
         }
     } else {
-        let partial_text = trailing
-            .iter()
-            .filter(|message| message.role == "assistant")
-            .filter_map(|message| message.content.as_ref())
-            .filter_map(Value::as_str)
-            .find(|text| !text.trim().is_empty())
-            .map(str::trim)
-            .map(|text| text.chars().take(120).collect::<String>());
-        match partial_text {
-            Some(text) => format!(
-                "the previous turn preserved partial assistant progress: {}",
-                text
-            ),
-            None => "the previous turn was preserved before the assistant could finish responding"
-                .to_string(),
+        if zh {
+            "上一轮在助手完成回复前已经保留到最近的稳定位置".to_string()
+        } else {
+            "the previous turn was preserved before the assistant could finish responding"
+                .to_string()
         }
     }
 }

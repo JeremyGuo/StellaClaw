@@ -1,7 +1,7 @@
 use crate::channel::{
     AttachmentSource, Channel, IncomingControl, IncomingMessage, PendingAttachment,
 };
-use crate::config::{BotCommandConfig, TelegramChannelConfig};
+use crate::config::{BotCommandConfig, TelegramChannelConfig, default_telegram_commands};
 use crate::domain::{
     AttachmentKind, ChannelAddress, OutgoingAttachment, OutgoingMessage, ProcessingState,
     ShowOptions,
@@ -64,7 +64,7 @@ impl TelegramChannel {
             api_base_url: config.api_base_url.trim_end_matches('/').to_string(),
             poll_timeout_seconds: config.poll_timeout_seconds,
             poll_interval_ms: config.poll_interval_ms,
-            commands: config.commands,
+            commands: default_telegram_commands(),
             client: Client::new(),
             bot_username: Mutex::new(None),
             bot_user_id: Mutex::new(None),

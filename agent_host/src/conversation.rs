@@ -1,3 +1,4 @@
+use crate::backend::AgentBackendKind;
 use crate::config::SandboxMode;
 use crate::domain::ChannelAddress;
 use anyhow::{Context, Result, anyhow};
@@ -13,6 +14,8 @@ fn default_chat_version_id() -> Uuid {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationSettings {
+    #[serde(default)]
+    pub agent_backend: Option<AgentBackendKind>,
     #[serde(default)]
     pub main_model: Option<String>,
     #[serde(default)]
@@ -30,6 +33,7 @@ pub struct ConversationSettings {
 impl Default for ConversationSettings {
     fn default() -> Self {
         Self {
+            agent_backend: None,
             main_model: None,
             sandbox_mode: None,
             reasoning_effort: None,
@@ -156,6 +160,44 @@ impl ConversationManager {
             .conversations
             .get_mut(&key)
             .ok_or_else(|| anyhow!("missing conversation {}", key))?;
+        state.settings.main_model = model_key;
+        state.persist()?;
+        Ok(state.snapshot())
+    }
+
+    pub fn set_agent_backend(
+        &mut self,
+        address: &ChannelAddress,
+        backend: Option<AgentBackendKind>,
+    ) -> Result<ConversationSnapshot> {
+        let key = address.session_key();
+        if !self.conversations.contains_key(&key) {
+            self.ensure_conversation(address)?;
+        }
+        let state = self
+            .conversations
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("missing conversation {}", key))?;
+        state.settings.agent_backend = backend;
+        state.persist()?;
+        Ok(state.snapshot())
+    }
+
+    pub fn set_agent_selection(
+        &mut self,
+        address: &ChannelAddress,
+        backend: Option<AgentBackendKind>,
+        model_key: Option<String>,
+    ) -> Result<ConversationSnapshot> {
+        let key = address.session_key();
+        if !self.conversations.contains_key(&key) {
+            self.ensure_conversation(address)?;
+        }
+        let state = self
+            .conversations
+            .get_mut(&key)
+            .ok_or_else(|| anyhow!("missing conversation {}", key))?;
+        state.settings.agent_backend = backend;
         state.settings.main_model = model_key;
         state.persist()?;
         Ok(state.snapshot())

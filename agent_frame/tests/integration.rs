@@ -1016,6 +1016,14 @@ fn run_session_auto_compacts_before_next_turn() -> Result<()> {
             .any(|content| content.contains("Compress the older conversation history"))
     );
     assert!(
+        requests[0]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .any(|content| content.contains("if an older start-type task is still active"))
+    );
+    assert!(
         requests
             .iter()
             .skip(1)

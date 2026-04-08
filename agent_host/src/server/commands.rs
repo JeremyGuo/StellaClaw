@@ -1,5 +1,14 @@
 use super::*;
 
+pub(super) enum AgentCommand {
+    ShowSelection,
+    SelectBackend(AgentBackendKind),
+    SelectModel {
+        backend: Option<AgentBackendKind>,
+        model_key: String,
+    },
+}
+
 pub(super) fn format_api_timeout_update(
     session: &SessionSnapshot,
     model_timeout_seconds: f64,
@@ -53,6 +62,37 @@ pub(super) fn parse_set_api_timeout_command(text: Option<&str>) -> Option<String
     }
 }
 
+pub(super) fn parse_agent_command(text: Option<&str>) -> Option<AgentCommand> {
+    let text = normalized_command_text(text?)?;
+    let suffix = text
+        .strip_prefix("/agent")
+        .or_else(|| text.strip_prefix("/model"))?
+        .trim();
+    if suffix.is_empty() {
+        return Some(AgentCommand::ShowSelection);
+    }
+
+    let parts = suffix.split_whitespace().collect::<Vec<_>>();
+    match parts.as_slice() {
+        [backend] => parse_agent_backend_value(backend)
+            .map(AgentCommand::SelectBackend)
+            .or_else(|| {
+                Some(AgentCommand::SelectModel {
+                    backend: None,
+                    model_key: (*backend).to_string(),
+                })
+            }),
+        [backend, model_key] => {
+            parse_agent_backend_value(backend).map(|backend| AgentCommand::SelectModel {
+                backend: Some(backend),
+                model_key: (*model_key).to_string(),
+            })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
 pub(super) fn parse_model_command(text: Option<&str>) -> Option<Option<String>> {
     parse_optional_command_argument(text, "/model")
 }
@@ -188,6 +228,14 @@ pub(super) fn parse_reasoning_effort_value(value: &str) -> Option<&'static str> 
         "low" => Some("low"),
         "medium" => Some("medium"),
         "high" => Some("high"),
+        _ => None,
+    }
+}
+
+pub(super) fn parse_agent_backend_value(value: &str) -> Option<AgentBackendKind> {
+    match value.trim() {
+        "agent_frame" => Some(AgentBackendKind::AgentFrame),
+        "zgent" => Some(AgentBackendKind::Zgent),
         _ => None,
     }
 }

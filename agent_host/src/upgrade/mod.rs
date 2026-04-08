@@ -6,9 +6,10 @@ mod v0_5;
 mod v0_6;
 mod v0_7;
 mod v0_8;
+mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.8";
+pub const LATEST_WORKDIR_VERSION: &str = "0.9";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -24,11 +25,12 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 4] = [
+    let upgraders: [&dyn WorkdirUpgrader; 5] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
         &v0_8::Upgrade,
+        &v0_9::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -61,6 +63,7 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.5" => Ok("0.5"),
         "0.6" => Ok("0.6"),
         "0.7" => Ok("0.7"),
+        "0.8" => Ok("0.8"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -144,5 +147,187 @@ mod tests {
             conversation["settings"]["workspace_id"].as_str(),
             Some("workspace-1")
         );
+    }
+
+    #[test]
+    fn v0_8_workdir_upgrade_backfills_agent_backend_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.8\n").unwrap();
+
+        let conversation_dir = temp_dir
+            .path()
+            .join("conversations")
+            .join(Uuid::new_v4().to_string());
+        let snapshot_dir = temp_dir.path().join("snapshots").join("snap-1");
+        let session_dir = temp_dir
+            .path()
+            .join("sessions")
+            .join(Uuid::new_v4().to_string());
+        let subagent_dir = temp_dir
+            .path()
+            .join("agent")
+            .join("runtime")
+            .join("workspace-1")
+            .join("agent_frame")
+            .join("subagents");
+        fs::create_dir_all(&conversation_dir).unwrap();
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::create_dir_all(&subagent_dir).unwrap();
+        fs::create_dir_all(temp_dir.path().join("cron")).unwrap();
+
+        let address = json!({
+            "channel_id": "telegram-main",
+            "conversation_id": "123",
+            "user_id": "user-1",
+            "display_name": "User"
+        });
+
+        fs::write(
+            conversation_dir.join("conversation.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": Uuid::new_v4(),
+                "address": address,
+                "settings": {
+                    "main_model": "main"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            snapshot_dir.join("metadata.json"),
+            serde_json::to_string_pretty(&json!({
+                "name": "snap-1",
+                "saved_at": "2026-04-08T00:00:00Z",
+                "source_channel_id": "telegram-main",
+                "source_conversation_id": "123",
+                "main_model": "main",
+                "sandbox_mode": "bubblewrap"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            snapshot_dir.join("snapshot.json"),
+            serde_json::to_string_pretty(&json!({
+                "saved_at": "2026-04-08T00:00:00Z",
+                "source_address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "123",
+                    "user_id": "user-1",
+                    "display_name": "User"
+                },
+                "settings": {
+                    "main_model": "main",
+                    "sandbox_mode": "bubblewrap",
+                    "workspace_id": "workspace-1",
+                    "chat_version_id": Uuid::new_v4()
+                },
+                "session": {
+                    "id": Uuid::new_v4()
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("cron").join("tasks.json"),
+            serde_json::to_string_pretty(&json!({
+                "tasks": [{
+                    "id": Uuid::new_v4(),
+                    "name": "daily",
+                    "description": "demo",
+                    "schedule": "0 * * * *",
+                    "model_key": "main",
+                    "prompt": "hello",
+                    "sink": {"kind": "conversation"},
+                    "address": {
+                        "channel_id": "telegram-main",
+                        "conversation_id": "123",
+                        "user_id": "user-1",
+                        "display_name": "User"
+                    },
+                    "enabled": true,
+                    "created_at": "2026-04-08T00:00:00Z",
+                    "updated_at": "2026-04-08T00:00:00Z"
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": Uuid::new_v4(),
+                "pending_continue": {
+                    "model_key": "main",
+                    "resume_messages": [],
+                    "error_summary": "failed",
+                    "progress_summary": "preserved",
+                    "failed_at": "2026-04-08T00:00:00Z"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            subagent_dir.join("subagent.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": Uuid::new_v4(),
+                "parent_agent_id": Uuid::new_v4(),
+                "session_id": Uuid::new_v4(),
+                "channel_id": "telegram-main",
+                "conversation_id": "123",
+                "workspace_id": "workspace-1",
+                "model_key": "main"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+        assert!(upgraded);
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("VERSION"))
+                .unwrap()
+                .trim(),
+            LATEST_WORKDIR_VERSION
+        );
+
+        let conversation: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(conversation_dir.join("conversation.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(conversation["settings"]["agent_backend"].is_null());
+
+        let snapshot_metadata: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(snapshot_dir.join("metadata.json")).unwrap())
+                .unwrap();
+        assert!(snapshot_metadata["agent_backend"].is_null());
+
+        let snapshot_bundle: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(snapshot_dir.join("snapshot.json")).unwrap())
+                .unwrap();
+        assert!(snapshot_bundle["settings"]["agent_backend"].is_null());
+
+        let cron: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(temp_dir.path().join("cron").join("tasks.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            cron["tasks"][0]["agent_backend"].as_str(),
+            Some("agent_frame")
+        );
+
+        let session: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
+                .unwrap();
+        assert!(session["pending_continue"]["agent_backend"].is_null());
+
+        let subagent: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(subagent_dir.join("subagent.json")).unwrap())
+                .unwrap();
+        assert_eq!(subagent["agent_backend"].as_str(), Some("agent_frame"));
     }
 }

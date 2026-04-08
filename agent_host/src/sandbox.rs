@@ -115,6 +115,14 @@ pub fn run_child_stdio() -> Result<()> {
             }
         }
     })
+    .with_stable_report_callback({
+        let writer = Arc::clone(&writer);
+        move |report| {
+            if let Ok(mut writer) = writer.lock() {
+                let _ = write_json_line(&mut *writer, &ChildToParentMessage::StableReport(report));
+            }
+        }
+    })
     .with_event_callback({
         let writer = Arc::clone(&writer);
         move |event| {
@@ -370,6 +378,11 @@ pub fn run_turn_in_child_process(
                     control.emit_checkpoint_report(report);
                 }
             }
+            ChildToParentMessage::StableReport(report) => {
+                if let Some(control) = &control {
+                    control.emit_stable_report_external(report);
+                }
+            }
             ChildToParentMessage::ToolRequest {
                 request_id,
                 tool_name,
@@ -473,7 +486,7 @@ fn build_bubblewrap_command(
     bind_path_to(
         &mut command,
         current_exe,
-        Path::new("/__agent_host/bin/agent_host"),
+        Path::new("/__agent_host/bin/partyclaw"),
         true,
     )?;
     if let Some(home_dir) = discover_home_dir() {
@@ -500,7 +513,7 @@ fn build_bubblewrap_command(
             bind_path_to(&mut command, skills_source_root, skill_dir, false)?;
         }
     }
-    command.arg("/__agent_host/bin/agent_host");
+    command.arg("/__agent_host/bin/partyclaw");
     Ok(command)
 }
 

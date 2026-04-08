@@ -1,3 +1,4 @@
+use crate::backend::AgentBackendKind;
 use crate::domain::ChannelAddress;
 use crate::sink::SinkTarget;
 use anyhow::{Context, Result, anyhow};
@@ -24,6 +25,8 @@ pub struct CronTaskRecord {
     pub name: String,
     pub description: String,
     pub schedule: String,
+    #[serde(default)]
+    pub agent_backend: AgentBackendKind,
     pub model_key: String,
     pub prompt: String,
     pub sink: SinkTarget,
@@ -52,6 +55,8 @@ pub struct CronTaskView {
     pub name: String,
     pub description: String,
     pub schedule: String,
+    #[serde(default)]
+    pub agent_backend: AgentBackendKind,
     pub model_key: String,
     pub enabled: bool,
     #[serde(default)]
@@ -77,6 +82,7 @@ pub struct CronCreateRequest {
     pub name: String,
     pub description: String,
     pub schedule: String,
+    pub agent_backend: AgentBackendKind,
     pub model_key: String,
     pub prompt: String,
     pub sink: SinkTarget,
@@ -90,6 +96,7 @@ pub struct CronUpdateRequest {
     pub name: Option<String>,
     pub description: Option<String>,
     pub schedule: Option<String>,
+    pub agent_backend: Option<AgentBackendKind>,
     pub model_key: Option<String>,
     pub prompt: Option<String>,
     pub sink: Option<SinkTarget>,
@@ -171,6 +178,7 @@ impl CronManager {
             name: request.name.trim().to_string(),
             description: request.description.trim().to_string(),
             schedule: request.schedule.trim().to_string(),
+            agent_backend: request.agent_backend,
             model_key: request.model_key,
             prompt: request.prompt,
             sink: request.sink,
@@ -209,6 +217,9 @@ impl CronManager {
             validate_schedule(&schedule)?;
             task.schedule = schedule.trim().to_string();
             task.last_scheduled_for = None;
+        }
+        if let Some(agent_backend) = request.agent_backend {
+            task.agent_backend = agent_backend;
         }
         if let Some(model_key) = request.model_key {
             task.model_key = model_key;
@@ -341,6 +352,7 @@ fn task_view(task: &CronTaskRecord) -> Result<CronTaskView> {
         name: task.name.clone(),
         description: task.description.clone(),
         schedule: task.schedule.clone(),
+        agent_backend: task.agent_backend,
         model_key: task.model_key.clone(),
         enabled: task.enabled,
         checker: task.checker.clone(),
@@ -413,6 +425,7 @@ fn validate_checker(checker: &CronCheckerConfig) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{CronCreateRequest, CronManager};
+    use crate::backend::AgentBackendKind;
     use crate::domain::ChannelAddress;
     use crate::sink::SinkTarget;
     use tempfile::TempDir;
@@ -426,6 +439,7 @@ mod tests {
                 name: "heartbeat".to_string(),
                 description: "send a heartbeat".to_string(),
                 schedule: "*/5 * * * * * *".to_string(),
+                agent_backend: AgentBackendKind::AgentFrame,
                 model_key: "main".to_string(),
                 prompt: "ping".to_string(),
                 sink: SinkTarget::Direct(ChannelAddress {

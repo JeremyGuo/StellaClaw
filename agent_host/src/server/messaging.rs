@@ -212,10 +212,10 @@ pub(super) fn tag_interrupted_followup_text(text: Option<String>) -> Option<Stri
     }
 }
 
-pub(super) fn fast_path_model_selection_message(
+pub(super) fn fast_path_agent_selection_message(
     workdir: &Path,
     models: &BTreeMap<String, ModelConfig>,
-    chat_model_keys: &[String],
+    agent: &AgentConfig,
     message: &IncomingMessage,
 ) -> Option<OutgoingMessage> {
     if message.control.is_some() {
@@ -229,30 +229,74 @@ pub(super) fn fast_path_model_selection_message(
         return None;
     }
 
-    let settings = ConversationManager::new(workdir)
-        .ok()
-        .and_then(|manager| manager.get_snapshot(&message.address))
+    let mut manager = ConversationManager::new(workdir).ok()?;
+    let settings = manager
+        .get_snapshot(&message.address)
         .map(|snapshot| snapshot.settings)
         .unwrap_or_default();
-    if settings.main_model.is_some() {
+    let inferred_backend = settings.main_model.as_deref().and_then(|model_key| {
+        let backends = agent.backends_for_model(model_key);
+        (backends.len() == 1).then_some(backends[0])
+    });
+    let effective_backend = settings.agent_backend.or(inferred_backend);
+    if settings.agent_backend.is_none()
+        && settings.main_model.is_some()
+        && let Some(backend) = inferred_backend
+    {
+        let _ = manager.set_agent_backend(&message.address, Some(backend));
+    }
+    if effective_backend.is_some() && settings.main_model.is_some() {
         return None;
     }
 
-    let mut options = chat_model_keys
-        .iter()
-        .filter(|model_key| models.contains_key(model_key.as_str()))
-        .cloned()
-        .map(|model_key| ShowOption {
-            label: model_key.clone(),
-            value: format!("/model {}", model_key),
+    if let Some(backend) = effective_backend {
+        let mut options = agent
+            .available_models(backend)
+            .iter()
+            .filter(|model_key| models.contains_key(model_key.as_str()))
+            .cloned()
+            .map(|model_key| ShowOption {
+                label: model_key.clone(),
+                value: format!(
+                    "/agent {} {}",
+                    render_agent_backend_value(backend),
+                    model_key
+                ),
+            })
+            .collect::<Vec<_>>();
+        options.sort_by(|left, right| left.label.cmp(&right.label));
+        return Some(OutgoingMessage::with_options(
+            format!(
+                "This conversation has no model yet.\nCurrent agent backend: `{}`\nCurrent conversation model: `<not selected>`\nChoose a model below or send `/agent {} <model>`.",
+                render_agent_backend_value(backend),
+                render_agent_backend_value(backend),
+            ),
+            "Choose a model",
+            options,
+        ));
+    }
+
+    let mut options = [AgentBackendKind::AgentFrame, AgentBackendKind::Zgent]
+        .into_iter()
+        .filter(|backend| !agent.available_models(*backend).is_empty())
+        .map(|backend| ShowOption {
+            label: render_agent_backend_value(backend).to_string(),
+            value: format!("/agent {}", render_agent_backend_value(backend)),
         })
         .collect::<Vec<_>>();
     options.sort_by(|left, right| left.label.cmp(&right.label));
     Some(OutgoingMessage::with_options(
-        "This conversation has no model yet. Choose one to start a new session.\nCurrent conversation model: `<not selected>`\nChoose a model below or send `/model <name>`.",
-        "Choose a model",
+        "This conversation has no agent selection yet.\nCurrent agent backend: `<not selected>`\nCurrent conversation model: `<not selected>`\nChoose a backend below or send `/agent <agent_frame|zgent>`.",
+        "Choose a backend",
         options,
     ))
+}
+
+fn render_agent_backend_value(backend: AgentBackendKind) -> &'static str {
+    match backend {
+        AgentBackendKind::AgentFrame => "agent_frame",
+        AgentBackendKind::Zgent => "zgent",
+    }
 }
 
 pub(super) fn build_user_turn_message(

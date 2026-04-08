@@ -249,7 +249,12 @@ fn resolve_app_bridge_program() -> Result<PathBuf> {
     if current
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "agent_host" || name == "agent_host.exe")
+        .is_some_and(|name| {
+            matches!(
+                name,
+                "partyclaw" | "partyclaw.exe" | "agent_host" | "agent_host.exe"
+            )
+        })
     {
         return Ok(current);
     }
@@ -261,13 +266,16 @@ fn resolve_app_bridge_program() -> Result<PathBuf> {
             .is_some_and(|name| name == "deps");
         let is_test_binary = file_name.to_str().is_some_and(|name| name.contains('-'));
         if in_deps_dir && is_test_binary {
-            let candidate = parent.parent().unwrap_or(parent).join(if cfg!(windows) {
-                "agent_host.exe"
+            let binary_names = if cfg!(windows) {
+                ["partyclaw.exe", "agent_host.exe"]
             } else {
-                "agent_host"
-            });
-            if candidate.exists() {
-                return Ok(candidate);
+                ["partyclaw", "agent_host"]
+            };
+            for binary_name in binary_names {
+                let candidate = parent.parent().unwrap_or(parent).join(binary_name);
+                if candidate.exists() {
+                    return Ok(candidate);
+                }
             }
         }
     }

@@ -19,15 +19,17 @@ mod v0_5;
 mod v0_6;
 mod v0_7;
 mod v0_8;
+mod v0_9;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.8";
+pub const LATEST_CONFIG_VERSION: &str = "0.9";
 pub const VERSION_0_2: &str = "0.2";
 pub const VERSION_0_3: &str = "0.3";
 pub const VERSION_0_4: &str = "0.4";
 pub const VERSION_0_5: &str = "0.5";
 pub const VERSION_0_6: &str = "0.6";
 pub const VERSION_0_7: &str = "0.7";
+pub const VERSION_0_8: &str = "0.8";
 
 trait ConfigLoader {
     fn version(&self) -> &'static str;
@@ -70,7 +72,7 @@ pub struct ModelConfig {
     pub model_type: ModelType,
     pub api_endpoint: String,
     pub model: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing, skip_deserializing)]
     pub backend: AgentBackendKind,
     #[serde(default)]
     pub supports_vision_input: bool,
@@ -157,6 +159,69 @@ pub enum ModelCapability {
     ImageOut,
     Pdf,
     AudioIn,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AgentBackendConfig {
+    #[serde(default)]
+    pub available_models: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AgentConfig {
+    #[serde(default)]
+    pub agent_frame: AgentBackendConfig,
+    #[serde(default)]
+    pub zgent: AgentBackendConfig,
+}
+
+impl AgentConfig {
+    pub fn backend_config(&self, backend: AgentBackendKind) -> &AgentBackendConfig {
+        match backend {
+            AgentBackendKind::AgentFrame => &self.agent_frame,
+            AgentBackendKind::Zgent => &self.zgent,
+        }
+    }
+
+    pub fn backend_config_mut(&mut self, backend: AgentBackendKind) -> &mut AgentBackendConfig {
+        match backend {
+            AgentBackendKind::AgentFrame => &mut self.agent_frame,
+            AgentBackendKind::Zgent => &mut self.zgent,
+        }
+    }
+
+    pub fn available_models(&self, backend: AgentBackendKind) -> &[String] {
+        &self.backend_config(backend).available_models
+    }
+
+    pub fn is_model_available(&self, backend: AgentBackendKind, model_key: &str) -> bool {
+        self.available_models(backend)
+            .iter()
+            .any(|value| value == model_key)
+    }
+
+    pub fn backends_for_model(&self, model_key: &str) -> Vec<AgentBackendKind> {
+        [AgentBackendKind::AgentFrame, AgentBackendKind::Zgent]
+            .into_iter()
+            .filter(|backend| self.is_model_available(*backend, model_key))
+            .collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.agent_frame.available_models.is_empty() && self.zgent.available_models.is_empty()
+    }
+
+    pub fn all_available_models(&self) -> Vec<String> {
+        let mut result = Vec::new();
+        for backend in [AgentBackendKind::AgentFrame, AgentBackendKind::Zgent] {
+            for model_key in self.available_models(backend) {
+                if !result.iter().any(|value| value == model_key) {
+                    result.push(model_key.clone());
+                }
+            }
+        }
+        result
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -399,6 +464,8 @@ pub enum ChannelConfig {
 pub struct ServerConfig {
     pub version: String,
     pub models: BTreeMap<String, ModelConfig>,
+    #[serde(default)]
+    pub agent: AgentConfig,
     pub model_catalog: ModelCatalogConfig,
     #[serde(default)]
     pub tooling: ToolingConfig,
@@ -572,8 +639,8 @@ pub fn default_bot_commands() -> Vec<BotCommandConfig> {
             description: "Show or set automatic context compaction".to_string(),
         },
         BotCommandConfig {
-            command: "model".to_string(),
-            description: "Show or set the conversation model".to_string(),
+            command: "agent".to_string(),
+            description: "Show or set the conversation agent backend and model".to_string(),
         },
         BotCommandConfig {
             command: "sandbox".to_string(),
@@ -606,7 +673,7 @@ pub fn default_bot_commands() -> Vec<BotCommandConfig> {
     ]
 }
 
-fn default_telegram_commands() -> Vec<BotCommandConfig> {
+pub(crate) fn default_telegram_commands() -> Vec<BotCommandConfig> {
     let mut commands = default_bot_commands();
     commands.splice(
         0..0,
@@ -658,7 +725,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let loaders: [&dyn ConfigLoader; 8] = [
+    let loaders: [&dyn ConfigLoader; 9] = [
         &v0_1::LegacyConfigLoader,
         &v0_2::VersionedConfigLoader,
         &v0_3::VersionedConfigLoader,
@@ -667,6 +734,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         &v0_6::LatestConfigLoader,
         &v0_7::LatestConfigLoader,
         &v0_8::LatestConfigLoader,
+        &v0_9::LatestConfigLoader,
     ];
     let loader = loaders
         .into_iter()
@@ -680,6 +748,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
 pub(crate) fn build_server_config(
     version: String,
     mut models: BTreeMap<String, ModelConfig>,
+    mut agent: AgentConfig,
     mut model_catalog: ModelCatalogConfig,
     tooling: ToolingConfig,
     mut chat_model_keys: Vec<String>,
@@ -704,6 +773,30 @@ pub(crate) fn build_server_config(
             .filter_map(|(name, model)| model.can_be_agent_model().then_some(name.clone()))
             .collect();
     }
+    if agent.is_empty() {
+        for (name, model) in &models {
+            if !model.can_be_agent_model() {
+                continue;
+            }
+            let available_models = &mut agent.backend_config_mut(model.backend).available_models;
+            if !available_models.iter().any(|value| value == name) {
+                available_models.push(name.clone());
+            }
+        }
+    }
+    for backend in [AgentBackendKind::AgentFrame, AgentBackendKind::Zgent] {
+        let mut normalized = Vec::new();
+        for model_key in agent.available_models(backend) {
+            if !normalized.iter().any(|value| value == model_key) {
+                normalized.push(model_key.clone());
+            }
+        }
+        agent.backend_config_mut(backend).available_models = normalized;
+    }
+    let configured_chat_models = agent.all_available_models();
+    if !configured_chat_models.is_empty() {
+        chat_model_keys = configured_chat_models;
+    }
     if model_catalog.chat.is_empty() {
         model_catalog.chat = models
             .iter()
@@ -721,6 +814,7 @@ pub(crate) fn build_server_config(
     ServerConfig {
         version,
         models,
+        agent,
         model_catalog,
         tooling,
         chat_model_keys,
@@ -742,7 +836,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
     let config = {
-        let loaders: [&dyn ConfigLoader; 8] = [
+        let loaders: [&dyn ConfigLoader; 9] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
             &v0_3::VersionedConfigLoader,
@@ -751,6 +845,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
             &v0_6::LatestConfigLoader,
             &v0_7::LatestConfigLoader,
             &v0_8::LatestConfigLoader,
+            &v0_9::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()
@@ -785,7 +880,6 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
         model_type: ModelType,
         api_endpoint: &'a str,
         model: &'a str,
-        backend: AgentBackendKind,
         #[serde(skip_serializing_if = "slice_is_empty")]
         capabilities: &'a [ModelCapability],
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -818,9 +912,16 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
     }
 
     #[derive(Serialize)]
+    struct PersistedAgentConfig<'a> {
+        agent_frame: &'a AgentBackendConfig,
+        zgent: &'a AgentBackendConfig,
+    }
+
+    #[derive(Serialize)]
     struct PersistedServerConfig<'a> {
         version: &'a str,
         models: BTreeMap<String, PersistedModelConfig<'a>>,
+        agent: PersistedAgentConfig<'a>,
         #[serde(skip_serializing_if = "ToolingConfig::is_empty")]
         tooling: &'a ToolingConfig,
         main_agent: PersistedMainAgentConfig<'a>,
@@ -840,7 +941,6 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
                     model_type: model.model_type,
                     api_endpoint: &model.api_endpoint,
                     model: &model.model,
-                    backend: model.backend,
                     capabilities: &model.capabilities,
                     api_key: &model.api_key,
                     api_key_env: &model.api_key_env,
@@ -868,6 +968,10 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
     let persisted = PersistedServerConfig {
         version: LATEST_CONFIG_VERSION,
         models: persisted_models,
+        agent: PersistedAgentConfig {
+            agent_frame: &config.agent.agent_frame,
+            zgent: &config.agent.zgent,
+        },
         tooling: &config.tooling,
         main_agent: PersistedMainAgentConfig {
             model: &config.main_agent.model,
@@ -920,24 +1024,6 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
             "main_agent.idle_compaction.poll_interval_seconds must be at least 1"
         ));
     }
-    if let Some(model) = config.main_agent.model.as_deref() {
-        if !config.models.contains_key(model) {
-            return Err(anyhow!(
-                "main_agent.model '{}' does not exist in models",
-                model
-            ));
-        }
-        if !config
-            .models
-            .get(model)
-            .is_some_and(ModelConfig::can_be_agent_model)
-        {
-            return Err(anyhow!(
-                "main_agent.model '{}' must reference an enabled agent chat model",
-                model
-            ));
-        }
-    }
     if config
         .main_agent
         .timeout_seconds
@@ -946,13 +1032,6 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
         return Err(anyhow!(
             "main_agent.timeout_seconds must be greater than or equal to 0"
         ));
-    }
-    for channel in &config.channels {
-        if let ChannelConfig::Telegram(telegram) = channel {
-            validate_bot_commands(&telegram.commands).with_context(|| {
-                format!("invalid telegram commands for channel {}", telegram.id)
-            })?;
-        }
     }
     for (model_name, model) in &config.models {
         if model.api_endpoint.trim().is_empty() || model.model.trim().is_empty() {
@@ -966,21 +1045,6 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
                 "model '{}' uses codex-subscription and must include codex_home",
                 model_name
             ));
-        }
-        if model.backend == AgentBackendKind::Zgent {
-            if !zgent_runtime_available() {
-                return Err(anyhow!(
-                    "model '{}' uses zgent backend but the local ./zgent runtime directory is unavailable",
-                    model_name
-                ));
-            }
-            if model.chat_completions_path != default_chat_completions_path() {
-                return Err(anyhow!(
-                    "model '{}' uses zgent backend but chat_completions_path must be '{}'",
-                    model_name,
-                    default_chat_completions_path()
-                ));
-            }
         }
         if let Some(image_tool_model) = &model.image_tool_model
             && image_tool_model != "self"
@@ -1004,6 +1068,42 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
                 model_name,
                 web_search_model
             ));
+        }
+    }
+    for backend in [AgentBackendKind::AgentFrame, AgentBackendKind::Zgent] {
+        let available_models = config.agent.available_models(backend);
+        if backend == AgentBackendKind::Zgent
+            && !available_models.is_empty()
+            && !zgent_runtime_available()
+        {
+            return Err(anyhow!(
+                "agent.zgent.available_models is configured but the local ./zgent runtime directory is unavailable"
+            ));
+        }
+        for model_key in available_models {
+            let Some(model) = config.models.get(model_key) else {
+                return Err(anyhow!(
+                    "agent.{}.available_models references unknown model alias '{}'",
+                    agent_backend_field_name(backend),
+                    model_key
+                ));
+            };
+            if !model.can_be_agent_model() {
+                return Err(anyhow!(
+                    "agent.{}.available_models references model '{}' which is not an enabled agent chat model",
+                    agent_backend_field_name(backend),
+                    model_key
+                ));
+            }
+            if backend == AgentBackendKind::Zgent
+                && model.chat_completions_path != default_chat_completions_path()
+            {
+                return Err(anyhow!(
+                    "agent.zgent.available_models references model '{}' but chat_completions_path must be '{}'",
+                    model_key,
+                    default_chat_completions_path()
+                ));
+            }
         }
     }
     validate_tooling_target(
@@ -1037,6 +1137,13 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
         ModelCapability::AudioIn,
     )?;
     Ok(())
+}
+
+fn agent_backend_field_name(backend: AgentBackendKind) -> &'static str {
+    match backend {
+        AgentBackendKind::AgentFrame => "agent_frame",
+        AgentBackendKind::Zgent => "zgent",
+    }
 }
 
 fn validate_tooling_target(
@@ -1198,39 +1305,6 @@ pub fn resolve_model_api_keys(config: &ServerConfig) -> Vec<ResolvedModelApiKey>
     );
 
     resolved
-}
-
-fn validate_bot_commands(commands: &[BotCommandConfig]) -> Result<()> {
-    if commands.len() > 100 {
-        return Err(anyhow!("telegram supports at most 100 commands"));
-    }
-
-    for command in commands {
-        if command.command.is_empty() || command.command.len() > 32 {
-            return Err(anyhow!(
-                "command '{}' must be 1-32 characters",
-                command.command
-            ));
-        }
-        if !command
-            .command
-            .chars()
-            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
-        {
-            return Err(anyhow!(
-                "command '{}' must use only lowercase letters, digits, and underscores",
-                command.command
-            ));
-        }
-        if command.description.trim().is_empty() || command.description.len() > 256 {
-            return Err(anyhow!(
-                "description for command '{}' must be 1-256 characters",
-                command.command
-            ));
-        }
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1798,7 +1872,7 @@ mod tests {
 
         let written = fs::read_to_string(&config_path).unwrap();
         let written_json: serde_json::Value = serde_json::from_str(&written).unwrap();
-        assert!(written.contains("\"version\": \"0.8\""));
+        assert!(written.contains("\"version\": \"0.9\""));
         assert!(written.contains("\"web_search\": \"main_web_search\""));
         assert!(written.contains("\"models\": {"));
         assert!(!written.contains("\"tooling\": {"));
@@ -1879,7 +1953,7 @@ mod tests {
             &config_path,
             r#"
             {
-              "version": "0.8",
+              "version": "0.9",
               "models": {
                 "gpt54": {
                   "type": "codex-subscription",
@@ -1896,6 +1970,14 @@ mod tests {
                   "description": "search",
                   "capabilities": ["chat", "web_search"],
                   "agent_model_enabled": false
+                }
+              },
+              "agent": {
+                "agent_frame": {
+                  "available_models": ["gpt54"]
+                },
+                "zgent": {
+                  "available_models": []
                 }
               },
               "tooling": {
@@ -1918,6 +2000,10 @@ mod tests {
 
         let config = load_server_config_file(&config_path).unwrap();
         assert_eq!(config.chat_model_keys, vec!["gpt54".to_string()]);
+        assert_eq!(
+            config.agent.agent_frame.available_models,
+            vec!["gpt54".to_string()]
+        );
         assert!(config.models["gpt54"].has_capability(super::ModelCapability::WebSearch));
         assert!(config.models["gpt54"].supports_image_input());
         assert!(!config.models["sonar"].agent_model_enabled);
@@ -1989,7 +2075,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_agent_models_are_excluded_from_chat_model_keys_and_main_model_selection() {
+    fn disabled_agent_models_do_not_block_config_loading() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.json");
         fs::write(
@@ -2028,11 +2114,8 @@ mod tests {
         )
         .unwrap();
 
-        let error = load_server_config_file(&config_path)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            error.contains("main_agent.model 'helper' must reference an enabled agent chat model")
-        );
+        let config = load_server_config_file(&config_path).unwrap();
+        assert_eq!(config.main_agent.model.as_deref(), Some("helper"));
+        assert!(!config.models["helper"].agent_model_enabled);
     }
 }

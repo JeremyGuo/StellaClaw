@@ -1,3 +1,4 @@
+use crate::backend::AgentBackendKind;
 use crate::domain::{ChannelAddress, MessageRole, SessionMessage, StoredAttachment};
 use crate::workspace::WorkspaceManager;
 use agent_frame::{ChatMessage, ResponseCheckpoint, SessionCompactionStats, TokenUsage};
@@ -80,6 +81,8 @@ pub struct SessionCheckpointData {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PendingContinueState {
+    #[serde(default)]
+    pub agent_backend: Option<AgentBackendKind>,
     pub model_key: String,
     #[serde(default)]
     pub resume_messages: Vec<ChatMessage>,

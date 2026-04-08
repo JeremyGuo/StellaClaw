@@ -568,6 +568,22 @@ struct ProcessMetadata {
     requests_dir: String,
 }
 
+#[derive(serde::Deserialize)]
+struct LegacyProcessMetadata {
+    exec_id: String,
+    pid: u32,
+    command: String,
+    cwd: String,
+    stdout_path: String,
+    stderr_path: String,
+    exit_code_path: String,
+}
+
+enum ProcessMetadataRecord {
+    Current(ProcessMetadata),
+    Legacy(LegacyProcessMetadata),
+}
+
 static LIVE_PROCESSES: std::sync::OnceLock<Mutex<BTreeMap<String, ProcessMetadata>>> =
     std::sync::OnceLock::new();
 
@@ -579,11 +595,49 @@ fn process_meta_path(dir: &Path, exec_id: &str) -> PathBuf {
     dir.join(format!("{}.json", exec_id))
 }
 
+fn parse_process_metadata_record(raw: &str) -> Result<ProcessMetadataRecord> {
+    match serde_json::from_str::<ProcessMetadata>(raw) {
+        Ok(metadata) => Ok(ProcessMetadataRecord::Current(metadata)),
+        Err(current_err) => match serde_json::from_str::<LegacyProcessMetadata>(raw) {
+            Ok(metadata) => Ok(ProcessMetadataRecord::Legacy(metadata)),
+            Err(_) => Err(current_err).context("failed to parse process metadata"),
+        },
+    }
+}
+
+fn legacy_process_metadata_to_current(
+    dir: &Path,
+    metadata: LegacyProcessMetadata,
+) -> ProcessMetadata {
+    ProcessMetadata {
+        exec_id: metadata.exec_id.clone(),
+        worker_pid: metadata.pid,
+        command: metadata.command,
+        cwd: metadata.cwd,
+        stdout_path: metadata.stdout_path,
+        stderr_path: metadata.stderr_path,
+        status_path: dir
+            .join(format!("{}.status.json", metadata.exec_id))
+            .display()
+            .to_string(),
+        worker_exit_code_path: metadata.exit_code_path,
+        requests_dir: dir
+            .join(format!("{}.requests", metadata.exec_id))
+            .display()
+            .to_string(),
+    }
+}
+
 fn read_process_metadata(dir: &Path, exec_id: &str) -> Result<ProcessMetadata> {
     let path = process_meta_path(dir, exec_id);
     let raw =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&raw).context("failed to parse process metadata")
+    match parse_process_metadata_record(&raw)? {
+        ProcessMetadataRecord::Current(metadata) => Ok(metadata),
+        ProcessMetadataRecord::Legacy(metadata) => {
+            Ok(legacy_process_metadata_to_current(dir, metadata))
+        }
+    }
 }
 
 fn write_process_metadata(dir: &Path, metadata: &ProcessMetadata) -> Result<()> {
@@ -885,9 +939,20 @@ fn list_active_exec_summaries(runtime_state_root: &Path) -> Result<Vec<String>> 
         }
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let metadata: ProcessMetadata =
-            serde_json::from_str(&raw).context("failed to parse process metadata")?;
-        let snapshot = read_process_snapshot(&state_dir, &metadata.exec_id, 0, 0)?;
+        let (metadata, allow_missing_snapshot) = match parse_process_metadata_record(&raw)? {
+            ProcessMetadataRecord::Current(metadata) => (metadata, false),
+            // Older workdirs can still contain pre-worker exec metadata files.
+            // Skip them for runtime summaries so compaction stays best-effort.
+            ProcessMetadataRecord::Legacy(metadata) => (
+                legacy_process_metadata_to_current(&state_dir, metadata),
+                true,
+            ),
+        };
+        let snapshot = match read_process_snapshot(&state_dir, &metadata.exec_id, 0, 0) {
+            Ok(snapshot) => snapshot,
+            Err(_) if allow_missing_snapshot => continue,
+            Err(err) => return Err(err),
+        };
         if !snapshot
             .get("running")
             .and_then(Value::as_bool)
@@ -1373,22 +1438,30 @@ fn resolve_tool_worker_executable() -> Result<PathBuf> {
             return Ok(candidate);
         }
     }
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_partyclaw") {
+        let candidate = PathBuf::from(path);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
     let current = std::env::current_exe().context("failed to resolve current executable")?;
     if current
         .file_stem()
         .and_then(|value| value.to_str())
-        .is_some_and(|name| name == "agent_host" || name == "run_agent")
+        .is_some_and(|name| matches!(name, "partyclaw" | "agent_host" | "run_agent"))
     {
         return Ok(current);
     }
     let mut candidates = Vec::new();
     if let Some(parent) = current.parent() {
         candidates.push(parent.join("run_agent"));
+        candidates.push(parent.join("partyclaw"));
         candidates.push(parent.join("agent_host"));
         if parent.file_name().and_then(|value| value.to_str()) == Some("deps")
             && let Some(grandparent) = parent.parent()
         {
             candidates.push(grandparent.join("run_agent"));
+            candidates.push(grandparent.join("partyclaw"));
             candidates.push(grandparent.join("agent_host"));
         }
     }
@@ -1735,9 +1808,18 @@ fn cleanup_exec_processes(runtime_state_root: &Path) -> Result<usize> {
     for path in iter_metadata_json_files(&state_dir)? {
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let metadata: ProcessMetadata =
-            serde_json::from_str(&raw).context("failed to parse process metadata")?;
-        let snapshot = read_process_snapshot(&state_dir, &metadata.exec_id, 0, 0).ok();
+        let (metadata, allow_missing_snapshot) = match parse_process_metadata_record(&raw)? {
+            ProcessMetadataRecord::Current(metadata) => (metadata, false),
+            ProcessMetadataRecord::Legacy(metadata) => (
+                legacy_process_metadata_to_current(&state_dir, metadata),
+                true,
+            ),
+        };
+        let snapshot = match read_process_snapshot(&state_dir, &metadata.exec_id, 0, 0) {
+            Ok(snapshot) => Some(snapshot),
+            Err(_) if allow_missing_snapshot => None,
+            Err(err) => return Err(err),
+        };
         let running = snapshot
             .as_ref()
             .and_then(|value| value.get("running"))
@@ -3542,6 +3624,84 @@ mod tests {
         assert!(summary.contains("download_id=`download-1`"));
         assert!(summary.contains("Active subagents:"));
         assert!(summary.contains("subagent-1"));
+    }
+
+    #[test]
+    fn active_runtime_state_summary_ignores_legacy_exec_metadata_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let runtime_state_root = temp_dir.path();
+        let processes_dir = runtime_state_root.join("agent_frame").join("processes");
+        fs::create_dir_all(&processes_dir).unwrap();
+
+        let legacy_exec_id = "legacy-exec";
+        fs::write(
+            process_meta_path(&processes_dir, legacy_exec_id),
+            serde_json::to_vec_pretty(&json!({
+                "exec_id": legacy_exec_id,
+                "pid": 12345,
+                "command": "sleep 10",
+                "cwd": "/tmp/legacy",
+                "stdout_path": processes_dir.join(format!("{legacy_exec_id}.stdout")).display().to_string(),
+                "stderr_path": processes_dir.join(format!("{legacy_exec_id}.stderr")).display().to_string(),
+                "exit_code_path": processes_dir.join(format!("{legacy_exec_id}.exit")).display().to_string(),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let current_exec_id = "current-exec";
+        let current_status_path = processes_dir.join(format!("{current_exec_id}.status.json"));
+        fs::write(
+            &current_status_path,
+            serde_json::to_vec_pretty(&json!({
+                "exec_id": current_exec_id,
+                "pid": std::process::id(),
+                "command": "sleep 10",
+                "cwd": "/tmp/current",
+                "running": true,
+                "completed": false,
+                "returncode": json!(null),
+                "stdin_closed": false,
+                "failed": false,
+                "error": json!(null),
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let current_metadata = ProcessMetadata {
+            exec_id: current_exec_id.to_string(),
+            worker_pid: std::process::id(),
+            command: "sleep 10".to_string(),
+            cwd: "/tmp/current".to_string(),
+            stdout_path: processes_dir
+                .join(format!("{current_exec_id}.stdout"))
+                .display()
+                .to_string(),
+            stderr_path: processes_dir
+                .join(format!("{current_exec_id}.stderr"))
+                .display()
+                .to_string(),
+            status_path: current_status_path.display().to_string(),
+            worker_exit_code_path: processes_dir
+                .join(format!("{current_exec_id}.worker.exit"))
+                .display()
+                .to_string(),
+            requests_dir: processes_dir
+                .join(format!("{current_exec_id}.requests"))
+                .display()
+                .to_string(),
+        };
+        fs::write(
+            process_meta_path(&processes_dir, current_exec_id),
+            serde_json::to_vec_pretty(&current_metadata).unwrap(),
+        )
+        .unwrap();
+
+        let summary = active_runtime_state_summary(runtime_state_root)
+            .unwrap()
+            .expect("expected active runtime summary");
+        assert!(summary.contains("current-exec"));
+        assert!(!summary.contains("legacy-exec"));
     }
 
     #[test]

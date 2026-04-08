@@ -94,12 +94,12 @@ The production layer that wraps `agent_frame` into a long-running, multi-channel
 
 | Feature | Description |
 |:--------|:------------|
-| 💬 **Conversation management** | Channel → Conversation → Session → Agent layered model; per-conversation model, sandbox, and compaction settings |
+| 💬 **Conversation management** | Channel → Conversation → Session → Agent layered model; per-conversation agent backend, model, sandbox, and compaction settings |
 | 💾 **Session persistence** | State survives process restarts; attachment lifecycle managed automatically |
 | 📋 **Agent registry** | Background and subagent state persisted across restarts |
 | ⏰ **Cron tasks** | Scheduled work with optional checker commands, stored durably; inherits creator conversation's model |
 | 📡 **Background sinks** | Direct routing, broadcast topics, multi-target fan-out |
-| 🔄 **Model switching** | `/model` to switch mid-conversation with automatic context compression |
+| 🔄 **Agent switching** | `/agent` to choose backend + model mid-conversation with automatic context compression |
 | ⚙️ **Conversation-scoped controls** | `/think`, `/sandbox`, `/compact`, `/compact_mode`, `/set_api_timeout` |
 | 📸 **Snapshots** | `/snapsave`, `/snapload`, `/snaplist` for global conversation state snapshots |
 | 🔒 **Sandbox execution** | Three modes: `disabled`, `subprocess`, `bubblewrap` — per-conversation configurable via `/sandbox` |
@@ -114,17 +114,17 @@ The production layer that wraps `agent_frame` into a long-running, multi-channel
 
 ```
 Channel (e.g. Telegram)
-  └─ Conversation (persistent: model, sandbox mode, workspace)
+  └─ Conversation (persistent: agent backend, model, sandbox mode, workspace)
        └─ Session (one active agent turn)
             └─ Agent Topology (main agent, subagents, background agents)
 ```
 
-- `/new` starts a fresh conversation. If no model is selected, prompts the user first.
-- `/model` switches the main model with automatic context compression.
+- `/new` starts a fresh conversation. If no agent is selected, prompts the user first.
+- `/agent` first selects an agent backend, then selects the model for that backend with automatic context compression when switching.
 - `/sandbox` toggles sandbox mode (`disabled` / `subprocess` / `bubblewrap`).
 - `/compact` performs a one-off compaction; `/compact_mode` shows or toggles automatic compaction for the current conversation.
 - `/continue` retries the latest interrupted turn from its stored resume context. If the user keeps talking instead, the follow-up message is appended to that stored resume context.
-- Cron tasks and background agents inherit the creating conversation's model.
+- Cron tasks and background agents inherit the creating conversation's agent backend and model.
 - Session destroy paths such as `/new` tear down session-bound `exec`, `file_download`, `image`, and subagent runtime tasks.
 
 ---
@@ -248,7 +248,7 @@ Each named entry under `models` describes one LLM endpoint. `main_agent.model` s
 | **Long message splitting** | Auto-splits replies that exceed Telegram's length limit |
 | **Group chat** | Recognizes `@botname`-suffixed commands; two-person groups treated as direct chat |
 | **Retry & queuing** | Send-side retry with FIFO fallback on failure |
-| **Interactive commands** | `/new`, `/oldspace`, `/help`, `/status`, `/compact`, `/compact_mode`, `/model`, `/sandbox`, `/think`, `/set_api_timeout`, `/snapsave`, `/snapload`, `/snaplist`, `/continue` |
+| **Interactive commands** | `/new`, `/oldspace`, `/help`, `/status`, `/compact`, `/compact_mode`, `/agent`, `/sandbox`, `/think`, `/set_api_timeout`, `/snapsave`, `/snapload`, `/snaplist`, `/continue` |
 
 ---
 
@@ -322,7 +322,7 @@ TELEGRAM_BOT_TOKEN=...             # For Telegram channel (agent_host)
 ### 4. Direct Binary Run
 
 ```bash
-cargo run --release --manifest-path agent_host/Cargo.toml -- \
+cargo run --release --manifest-path agent_host/Cargo.toml --bin partyclaw -- \
   --config /path/to/config.json \
   --workdir /path/to/workdir
 ```
@@ -367,7 +367,7 @@ The `backend` field in each model profile selects the agent execution backend. D
 | Trigger | Action |
 |:--------|:-------|
 | Push / Pull Request | `cargo fmt --check` + `cargo test` for both crates |
-| Version tag `v*.*.*` | Release binaries: `agent_host`, `agent_frame/run_agent` |
+| Version tag `v*.*.*` | Release binaries: `partyclaw`, `agent_frame/run_agent` |
 
 > Unified Cargo `target/` directory — avoids duplicate `agent_host/target` and `agent_frame/target` build bloat.
 

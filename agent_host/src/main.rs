@@ -1,3 +1,6 @@
+mod config_editor;
+mod setup;
+
 use agent_host::Server;
 use agent_host::config::{load_server_config_file_and_upgrade, resolve_model_api_keys};
 use agent_host::env::load_dotenv_files;
@@ -6,11 +9,13 @@ use agent_host::sandbox::run_child_stdio;
 use agent_host::zgent::app_bridge::run_zgent_app_bridge_stdio;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use config_editor::run_config_editor;
+use setup::run_setup;
 use std::path::PathBuf;
 use tracing::{error, info};
 
 #[derive(Parser, Debug)]
-#[command(name = "agent_host")]
+#[command(name = "partyclaw")]
 struct Args {
     #[command(subcommand)]
     command: Option<AgentHostCommand>,
@@ -22,6 +27,14 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum AgentHostCommand {
+    #[command(name = "config")]
+    Config { path: PathBuf },
+    #[command(name = "setup")]
+    Setup {
+        config: PathBuf,
+        workdir: PathBuf,
+        service_name: Option<String>,
+    },
     #[command(name = "run-child", hide = true)]
     RunChild,
     #[command(name = "run-tool-worker", hide = true)]
@@ -43,6 +56,12 @@ enum AgentHostCommand {
 fn main() -> Result<()> {
     let args = Args::parse();
     match args.command {
+        Some(AgentHostCommand::Config { path }) => return run_config_editor(&path),
+        Some(AgentHostCommand::Setup {
+            config,
+            workdir,
+            service_name,
+        }) => return run_setup(&config, &workdir, service_name.as_deref()),
         Some(AgentHostCommand::RunChild) => return run_child_stdio(),
         Some(AgentHostCommand::RunToolWorker { job_file }) => {
             return agent_frame::tool_worker::run_job_file(&job_file);
@@ -79,7 +98,7 @@ async fn run_server(args: Args) -> Result<()> {
         kind = "startup",
         workdir = %workdir.display(),
         config = %config_path.display(),
-        "starting agent_host"
+        "starting partyclaw"
     );
     for dotenv_path in loaded_dotenvs {
         info!(
@@ -114,14 +133,14 @@ async fn run_server(args: Args) -> Result<()> {
             log_stream = "server",
             kind = "fatal_error",
             error = %error,
-            "agent_host exited with error"
+            "partyclaw exited with error"
         );
         return Err(error);
     }
     info!(
         log_stream = "server",
         kind = "shutdown",
-        "agent_host stopped"
+        "partyclaw stopped"
     );
     Ok(())
 }

@@ -436,6 +436,7 @@ pub struct SessionExecutionControl {
     signal_sender: Sender<ExecutionSignal>,
     signal_receiver: Receiver<ExecutionSignal>,
     checkpoint_callback: Option<Arc<dyn Fn(SessionRunReport) + Send + Sync>>,
+    stable_report_callback: Option<Arc<dyn Fn(SessionRunReport) + Send + Sync>>,
     event_callback: Option<Arc<dyn Fn(SessionEvent) + Send + Sync>>,
     stable_prefix_messages: Arc<Mutex<Vec<ChatMessage>>>,
     stable_report: Arc<Mutex<Option<SessionRunReport>>>,
@@ -472,6 +473,7 @@ impl SessionExecutionControl {
             signal_sender,
             signal_receiver,
             checkpoint_callback: None,
+            stable_report_callback: None,
             event_callback: None,
             stable_prefix_messages: Arc::new(Mutex::new(Vec::new())),
             stable_report: Arc::new(Mutex::new(None)),
@@ -491,11 +493,20 @@ impl SessionExecutionControl {
             signal_sender,
             signal_receiver,
             checkpoint_callback: Some(Arc::new(callback)),
+            stable_report_callback: None,
             event_callback: None,
             stable_prefix_messages: Arc::new(Mutex::new(Vec::new())),
             stable_report: Arc::new(Mutex::new(None)),
             pending_prefix_rewrite: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn with_stable_report_callback(
+        mut self,
+        callback: impl Fn(SessionRunReport) + Send + Sync + 'static,
+    ) -> Self {
+        self.stable_report_callback = Some(Arc::new(callback));
+        self
     }
 
     pub fn with_event_callback(
@@ -541,6 +552,10 @@ impl SessionExecutionControl {
         if let Some(callback) = &self.checkpoint_callback {
             callback(report);
         }
+    }
+
+    pub fn emit_stable_report_external(&self, report: SessionRunReport) {
+        self.store_stable_report(report);
     }
 
     pub fn emit_event_external(&self, event: SessionEvent) {
@@ -624,6 +639,15 @@ impl SessionExecutionControl {
         });
     }
 
+    fn store_stable_report(&self, report: SessionRunReport) {
+        if let Ok(mut stable_report) = self.stable_report.lock() {
+            *stable_report = Some(report.clone());
+        }
+        if let Some(callback) = &self.stable_report_callback {
+            callback(report);
+        }
+    }
+
     fn set_stable_prefix_messages(&self, messages: &[ChatMessage]) {
         if let Ok(mut stable_prefix) = self.stable_prefix_messages.lock() {
             *stable_prefix = messages.to_vec();
@@ -637,15 +661,13 @@ impl SessionExecutionControl {
         compaction: &SessionCompactionStats,
         response_checkpoint: Option<ResponseCheckpoint>,
     ) {
-        if let Ok(mut stable_report) = self.stable_report.lock() {
-            *stable_report = Some(SessionRunReport {
-                messages: messages.to_vec(),
-                usage: usage.clone(),
-                compaction: compaction.clone(),
-                yielded: false,
-                response_checkpoint,
-            });
-        }
+        self.store_stable_report(SessionRunReport {
+            messages: messages.to_vec(),
+            usage: usage.clone(),
+            compaction: compaction.clone(),
+            yielded: false,
+            response_checkpoint,
+        });
     }
 
     fn take_pending_prefix_rewrite(&self) -> Option<PendingPrefixRewrite> {
@@ -764,7 +786,8 @@ pub fn run_session_with_report_controlled(
         messages.push(ChatMessage::text("user", prompt));
     }
 
-    for round_index in 0..config.max_tool_roundtrips {
+    let mut round_index = 0usize;
+    loop {
         if let Some(control) = &control {
             control.ensure_not_cancelled()?;
             apply_pending_prefix_rewrite(control, &mut messages, &mut usage, &mut compaction_stats);
@@ -1087,12 +1110,10 @@ pub fn run_session_with_report_controlled(
                 response_checkpoint,
             });
         }
+        round_index = round_index
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("agent round index overflowed"))?;
     }
-
-    Err(anyhow!(
-        "Agent stopped after exceeding max_tool_roundtrips={}",
-        config.max_tool_roundtrips
-    ))
 }
 
 fn start_pending_tool_wait_compaction(
@@ -1239,6 +1260,7 @@ mod tests {
     use crate::message::ChatMessage;
     use serde_json::Value;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
@@ -1462,6 +1484,34 @@ mod tests {
             .expect("stable report should be recorded");
         assert_eq!(stable_report.messages, messages);
         assert_eq!(stable_report.response_checkpoint, response_checkpoint);
+    }
+
+    #[test]
+    fn stable_report_callback_receives_and_persists_latest_report() {
+        let reports = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&reports);
+        let control = SessionExecutionControl::new().with_stable_report_callback(move |report| {
+            captured.lock().unwrap().push(report);
+        });
+        let messages = vec![ChatMessage::text("assistant", "tool plan")];
+        let response_checkpoint = Some(ResponseCheckpoint::for_messages("resp-2", &messages));
+
+        control.set_stable_report(
+            &messages,
+            &TokenUsage::default(),
+            &SessionCompactionStats::default(),
+            response_checkpoint.clone(),
+        );
+
+        let snapshot = control
+            .stable_report_snapshot()
+            .expect("stable report should be recorded");
+        assert_eq!(snapshot.messages, messages);
+        assert_eq!(snapshot.response_checkpoint, response_checkpoint);
+
+        let captured = reports.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].messages, messages);
     }
 }
 

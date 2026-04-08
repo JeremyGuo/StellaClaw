@@ -1,189 +1,117 @@
 {
-  "version": "0.8",
+  "agent": {
+    "agent_frame": {
+      "available_models": [
+        "gpt54"
+      ]
+    },
+    "zgent": {
+      "available_models": [
+        "opus-4.6"
+      ]
+    }
+  },
+  "channels": [
+    {
+      "bot_token_env": "TELEGRAM_BOT_TOKEN",
+      "id": "telegram-main",
+      "kind": "telegram"
+    }
+  ],
+  "cron_poll_interval_seconds": 5,
+  "main_agent": {
+    "context_compaction": {
+      "recent_fidelity_target_ratio": 0.18,
+      "token_limit_override": null,
+      "trigger_ratio": 0.9
+    },
+    "enable_context_compression": true,
+    "global_install_root": "/opt",
+    "idle_compaction": {
+      "enabled": false,
+      "min_ratio": 0.5,
+      "poll_interval_seconds": 15
+    },
+    "language": "zh-CN",
+    "timeout_observation_compaction": {
+      "enabled": true
+    }
+  },
+  "max_global_sub_agents": 4,
   "models": {
-    "gpt54": {
-      "type": "codex-subscription",
-      "api_endpoint": "https://chatgpt.com/backend-api/codex",
-      "model": "gpt-5.4",
-      "backend": "agent_frame",
-      "capabilities": [
-        "chat",
-        "image_in"
-      ],
-      "native_web_search": {
-        "enabled": false,
-        "payload": {}
-      },
-      "api_key_env": "OPENAI_API_KEY",
-      "chat_completions_path": "/responses",
-      "codex_home": "/home/jeremyguo/.codex",
-      "auth_credentials_store_mode": "auto",
-      "timeout_seconds": 300.0,
-      "context_window_tokens": 262144,
-      "description": "A general model for processing, which should be used at most works.",
-      "supports_vision_input": true
-    },
-    "sonar_pro": {
-      "type": "openrouter",
-      "api_endpoint": "https://openrouter.ai/api/v1",
-      "model": "perplexity/sonar-pro",
-      "backend": "agent_frame",
-      "agent_model_enabled": false,
-      "capabilities": [
-        "web_search"
-      ],
-      "api_key_env": "OPENROUTER_API_KEY",
-      "chat_completions_path": "/chat/completions",
-      "timeout_seconds": 60.0,
-      "context_window_tokens": 131072,
-      "description": "Fallback external web search model when the active model cannot use native search."
-    },
     "gemini3.1-flash-image": {
-      "type": "openrouter-resp",
-      "api_endpoint": "https://openrouter.ai/api/v1",
-      "model": "google/gemini-3.1-flash-image-preview",
-      "backend": "agent_frame",
       "agent_model_enabled": false,
+      "api_endpoint": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
       "capabilities": [
         "chat",
         "image_in",
         "image_out"
       ],
-      "api_key_env": "OPENROUTER_API_KEY",
       "chat_completions_path": "/responses",
-      "timeout_seconds": 120.0,
       "context_window_tokens": 262144,
-      "description": "OpenRouter Responses image model for multimodal generation with text and reference image input."
+      "description": "OpenRouter Responses image model for multimodal generation with text and reference image input.",
+      "model": "google/gemini-3.1-flash-image-preview",
+      "timeout_seconds": 120.0,
+      "type": "openrouter-resp"
     },
-    "opus-4.6": {
-      "type": "openrouter",
-      "api_endpoint": "https://openrouter.ai/api/v1",
-      "model": "anthropic/claude-opus-4.6",
-      "backend": "zgent",
+    "gpt54": {
+      "api_endpoint": "https://chatgpt.com/backend-api/codex",
+      "api_key_env": "OPENAI_API_KEY",
+      "auth_credentials_store_mode": "auto",
       "capabilities": [
         "chat",
         "image_in"
       ],
-      "api_key_env": "OPENROUTER_API_KEY",
-      "timeout_seconds": 300.0,
+      "chat_completions_path": "/responses",
+      "codex_home": "/home/jeremyguo/.codex",
       "context_window_tokens": 262144,
-      "description": "Claude Opus 4.6 via OpenRouter using the native ZGent backend."
-    }
-  },
-  "tooling": {
-    "web_search": "sonar_pro:self",
-    "image": "gpt54:self",
-    "image_gen": "gemini3.1-flash-image"
-  },
-  "main_agent": {
-    "model": "gpt54",
-    "global_install_root": "/opt",
-    "language": "zh-CN",
-    "max_tool_roundtrips": 120,
-    "enable_context_compression": true,
-    "context_compaction": {
-      "trigger_ratio": 0.9,
-      "token_limit_override": null,
-      "recent_fidelity_target_ratio": 0.18
+      "description": "A general model for processing, which should be used at most works.",
+      "model": "gpt-5.4",
+      "native_web_search": {
+        "enabled": false,
+        "payload": {}
+      },
+      "supports_vision_input": true,
+      "timeout_seconds": 300.0,
+      "type": "codex-subscription"
     },
-    "idle_compaction": {
-      "enabled": false,
-      "poll_interval_seconds": 15,
-      "min_ratio": 0.5
+    "opus-4.6": {
+      "api_endpoint": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "capabilities": [
+        "chat",
+        "image_in"
+      ],
+      "context_window_tokens": 262144,
+      "description": "Claude Opus 4.6 via OpenRouter using the native ZGent backend.",
+      "model": "anthropic/claude-opus-4.6",
+      "timeout_seconds": 300.0,
+      "type": "openrouter"
     },
-    "timeout_observation_compaction": {
-      "enabled": true
+    "sonar_pro": {
+      "agent_model_enabled": false,
+      "api_endpoint": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "capabilities": [
+        "web_search"
+      ],
+      "chat_completions_path": "/chat/completions",
+      "context_window_tokens": 131072,
+      "description": "Fallback external web search model when the active model cannot use native search.",
+      "model": "perplexity/sonar-pro",
+      "timeout_seconds": 60.0,
+      "type": "openrouter"
     }
   },
   "sandbox": {
-    "mode": "bubblewrap",
-    "bubblewrap_binary": "bwrap"
+    "bubblewrap_binary": "bwrap",
+    "mode": "bubblewrap"
   },
-  "max_global_sub_agents": 4,
-  "cron_poll_interval_seconds": 5,
-  "channels": [
-    {
-      "kind": "telegram",
-      "id": "telegram-main",
-      "bot_token": null,
-      "bot_token_env": "TELEGRAM_BOT_TOKEN",
-      "api_base_url": "https://api.telegram.org",
-      "poll_timeout_seconds": 30,
-      "poll_interval_ms": 250,
-      "commands": [
-        {
-          "command": "admin_authorize",
-          "description": "Authorize yourself as this channel's admin from a private chat"
-        },
-        {
-          "command": "admin_chat_list",
-          "description": "List approval state for this channel's chats"
-        },
-        {
-          "command": "admin_chat_approve",
-          "description": "Approve a chat id for this channel"
-        },
-        {
-          "command": "admin_chat_reject",
-          "description": "Reject a chat id for this channel"
-        },
-        {
-          "command": "new",
-          "description": "Start a new session"
-        },
-        {
-          "command": "oldspace",
-          "description": "Reactivate an older workspace by id"
-        },
-        {
-          "command": "help",
-          "description": "Show available commands"
-        },
-        {
-          "command": "status",
-          "description": "Show current session usage and timeout settings"
-        },
-        {
-          "command": "compact",
-          "description": "Compact the current conversation context now"
-        },
-        {
-          "command": "compact_mode",
-          "description": "Show or set automatic context compaction"
-        },
-        {
-          "command": "model",
-          "description": "Show or set the conversation model"
-        },
-        {
-          "command": "sandbox",
-          "description": "Show or set the conversation sandbox mode"
-        },
-        {
-          "command": "think",
-          "description": "Show or set the conversation reasoning effort"
-        },
-        {
-          "command": "set_api_timeout",
-          "description": "Set session API timeout in seconds"
-        },
-        {
-          "command": "snapsave",
-          "description": "Save a named global snapshot"
-        },
-        {
-          "command": "snapload",
-          "description": "Load a named global snapshot"
-        },
-        {
-          "command": "snaplist",
-          "description": "List saved global snapshots"
-        },
-        {
-          "command": "continue",
-          "description": "Continue the latest interrupted turn"
-        }
-      ]
-    }
-  ]
+  "tooling": {
+    "image": "gpt54:self",
+    "image_gen": "gemini3.1-flash-image",
+    "web_search": "sonar_pro"
+  },
+  "version": "0.9"
 }

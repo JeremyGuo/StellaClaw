@@ -15,6 +15,8 @@ pub struct SnapshotRecord {
     pub source_channel_id: String,
     pub source_conversation_id: String,
     #[serde(default)]
+    pub agent_backend: Option<crate::backend::AgentBackendKind>,
+    #[serde(default)]
     pub main_model: Option<String>,
     #[serde(default)]
     pub sandbox_mode: Option<crate::config::SandboxMode>,
@@ -108,6 +110,7 @@ impl SnapshotManager {
             saved_at: bundle.saved_at,
             source_channel_id: address.channel_id.clone(),
             source_conversation_id: address.conversation_id.clone(),
+            agent_backend: bundle.settings.agent_backend,
             main_model: bundle.settings.main_model.clone(),
             sandbox_mode: bundle.settings.sandbox_mode,
         };

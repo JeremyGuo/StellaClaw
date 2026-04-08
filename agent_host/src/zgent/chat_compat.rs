@@ -152,7 +152,8 @@ pub(crate) fn run_zgent_session_with_report_controlled(
     }
 
     let mut usage = TokenUsage::default();
-    for _round_index in 0..tool_config.max_tool_roundtrips {
+    let mut round_index = 0usize;
+    loop {
         if let Some(control) = &control {
             ensure_not_cancelled(control)?;
         }
@@ -218,12 +219,10 @@ pub(crate) fn run_zgent_session_with_report_controlled(
                 normalize_tool_result(result),
             ));
         }
+        round_index = round_index
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("zgent compatibility round index overflowed"))?;
     }
-
-    Err(anyhow!(
-        "Agent stopped after exceeding max_tool_roundtrips={}",
-        tool_config.max_tool_roundtrips
-    ))
 }
 
 fn send_zgent_chat_completion(

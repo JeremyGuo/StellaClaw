@@ -1,9 +1,9 @@
 use super::{
-    ChannelConfig, ConfigLoader, LATEST_CONFIG_VERSION, LEGACY_CONFIG_VERSION, MainAgentConfig,
-    ModelCatalogConfig, ModelConfig, ModelType, SandboxConfig, ServerConfig, build_server_config,
-    default_api_key_env, default_chat_completions_path, default_context_window_tokens,
-    default_cron_poll_interval_seconds, default_max_global_sub_agents,
-    default_model_timeout_seconds,
+    AgentConfig, ChannelConfig, ConfigLoader, LATEST_CONFIG_VERSION, LEGACY_CONFIG_VERSION,
+    MainAgentConfig, ModelCatalogConfig, ModelConfig, ModelType, SandboxConfig, ServerConfig,
+    build_server_config, default_api_key_env, default_chat_completions_path,
+    default_context_window_tokens, default_cron_poll_interval_seconds,
+    default_max_global_sub_agents, default_model_timeout_seconds,
 };
 use crate::backend::AgentBackendKind;
 use agent_frame::config::{
@@ -126,6 +126,7 @@ impl ConfigLoader for LegacyConfigLoader {
         Ok(build_server_config(
             LATEST_CONFIG_VERSION.to_string(),
             models,
+            AgentConfig::default(),
             model_catalog,
             super::ToolingConfig::default(),
             chat_model_keys,

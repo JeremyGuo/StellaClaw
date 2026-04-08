@@ -43,6 +43,7 @@ pub enum ChildToParentMessage {
     Started,
     SessionEvent(SessionEvent),
     Checkpoint(SessionRunReport),
+    StableReport(SessionRunReport),
     ToolRequest {
         request_id: String,
         tool_name: String,

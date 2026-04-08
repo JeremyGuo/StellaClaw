@@ -1,3 +1,4 @@
+use crate::backend::AgentBackendKind;
 use crate::domain::ChannelAddress;
 use agent_frame::{ChatMessage, SessionCompactionStats, SessionExecutionControl, TokenUsage};
 use anyhow::{Context, Result, anyhow};
@@ -36,6 +37,7 @@ pub struct PersistedSubagentState {
     pub channel_id: String,
     pub conversation_id: String,
     pub workspace_id: String,
+    pub agent_backend: AgentBackendKind,
     pub model_key: String,
     pub description: String,
     pub workbook_relative_path: String,
@@ -99,6 +101,7 @@ impl HostedSubagent {
         workspace_id: String,
         workspace_root: PathBuf,
         runtime_state_root: PathBuf,
+        agent_backend: AgentBackendKind,
         model_key: String,
         description: String,
         default_charge_seconds: f64,
@@ -129,6 +132,7 @@ impl HostedSubagent {
             channel_id: address.channel_id.clone(),
             conversation_id: address.conversation_id.clone(),
             workspace_id: workspace_id.clone(),
+            agent_backend,
             model_key,
             description,
             workbook_relative_path: format!(".subagent/{workbook_file_name}"),

@@ -1,6 +1,21 @@
 ---
-version: 0.8.4
+version: 0.9.0
 ---
+
+# 0.9.0
+
+- 升级 `config` 保存格式到 `0.9`，并同时升级 `workdir` 结构版本到 `0.9`：
+  `models.<alias>` 不再在配置文件里声明 `backend`；新的根级 `agent` 配置改为按 backend 维护 `available_models`，conversation / snapshot / cron / subagent / pending_continue 等持久化状态也新增了 agent backend 选择字段。
+- 将 agent backend 与 model 选择解耦：
+  前台 conversation、background agent、cron 和 subagent 现在都会显式保存并校验各自的 agent backend，不再从 `model.backend` 反推，避免把某个 backend 不支持的 provider 误配进去后直接在启动或恢复时崩掉。
+- 收紧 backend 内可见模型范围：
+  `agent_frame` / `zgent` 只会暴露各自 `available_models` 里的候选模型；subagent 也只能启动当前 backend 下允许的模型，不再看到其他 backend 的 provider。
+- 调整前端交互命令：
+  用户侧主命令由 `/model` 切换为 `/agent`，交互顺序改为先选 backend 再选 model；对话缺少完整 agent 选择时，按钮与提示也会按这个两步流程引导。
+- 修复未认证对话的首条消息流程：
+  Telegram 等需要审批的 conversation 现在会先经过安全认证，再决定是否弹出 agent/backend 选择，不会再出现“第一句话先触发模型选择、跳过认证提示”的顺序错误。
+- 明确本次同时影响 `config` 与 `workdir`：
+  新增 `0.8 -> 0.9` workdir upgrade step，并把 root `VERSION` 按规则提升到 `0.9.0`。
 
 # 0.8.4
 
@@ -12,6 +27,14 @@ version: 0.8.4
   前台 session 被销毁时，运行中的 `exec` 仍会被统一 kill，不会残留到 session 生命周期之外。
 - 补强前台 turn 失败时的恢复点选择：
   `agent_frame` 现在会持续维护最近的 stable report；如果这一轮在 `tool-wait context compaction` 或后续模型调用阶段失败，但尚未 emit 正式 checkpoint，`pending_continue` 会回退到最近稳定前缀，而不是整轮 turn 开始前的 `previous_messages`。
+- 改进 `/continue` 失败提示的可读性：
+  `progress_summary` 现在会优先描述已保留的工具阶段、最近工具或部分助手输出；同时失败提示会附带压缩失败/上游失败的精简原因，减少只看到泛化英文提示的情况。
+- 提高旧版 `exec` 运行态元数据的兼容性：
+  自动上下文压缩和 runtime 清理在扫描 `agent_frame/processes/*.json` 时，遇到缺少 `worker_pid` 的旧格式 metadata 会跳过兼容处理，不再因为历史遗留文件直接让整轮 compaction 失败。
+- 修复 sandbox 子进程模式下的稳定恢复点同步：
+  `subprocess` / `bubblewrap` 前台 turn 现在会把 child 内存里的最近 stable report 通过 RPC 同步回 parent；因此即使正式 checkpoint 还没 emit，只要子进程已经进入稳定点，失败后的 `/continue` 也能继承这部分进度。
+- 收紧 compaction 对活跃长任务的摘要约束：
+  compaction prompt 现在明确要求只为仍在运行的 `*_start` 任务保留 continuation-critical ID（如 `exec_id` / `download_id` / subagent id）及必要引用；已结束任务不再强制保留其 ID，中间 tool 调用过程只需保留紧凑摘要。
 - 明确本次只影响 `workdir`，不影响 `config`：
   新增 `0.7 -> 0.8` workdir upgrade step；升级时会清理旧版 `exec` runtime state，避免旧格式元数据与新版后台 worker 模式混用。
 

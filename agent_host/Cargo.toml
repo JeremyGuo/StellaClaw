@@ -2,6 +2,11 @@
 name = "agent_host"
 version = "0.1.0"
 edition = "2024"
+autobins = false
+
+[[bin]]
+name = "partyclaw"
+path = "src/main.rs"
 
 [dependencies]
 agent_frame = { path = "../agent_frame" }
@@ -11,8 +16,10 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 clap = { version = "4.5", features = ["derive"] }
 cron = "0.12"
+crossterm = "0.28"
 dotenvy = "0.15"
 humantime = "2.1"
+ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 pulldown-cmark = "0.13"
 serde = { version = "1.0", features = ["derive"] }
