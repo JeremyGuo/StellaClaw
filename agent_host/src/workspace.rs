@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+pub const CONTEXT_ATTACHMENT_STORE_DIR_NAME: &str = ".context_attachments";
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceRecord {
     pub id: String,
@@ -670,6 +672,17 @@ impl WorkspaceManager {
                 record.files_dir.join("upload").display()
             )
         })?;
+        fs::create_dir_all(record.files_dir.join(CONTEXT_ATTACHMENT_STORE_DIR_NAME)).with_context(
+            || {
+                format!(
+                    "failed to create {}",
+                    record
+                        .files_dir
+                        .join(CONTEXT_ATTACHMENT_STORE_DIR_NAME)
+                        .display()
+                )
+            },
+        )?;
         fs::create_dir_all(&record.mounts_dir)
             .with_context(|| format!("failed to create {}", record.mounts_dir.display()))?;
         self.normalize_skill_memory_layout(record)?;

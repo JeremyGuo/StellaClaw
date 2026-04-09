@@ -499,6 +499,121 @@ pub(super) fn build_previous_messages_for_turn_with_prompt(
     (previous_messages, rebuilt_system_prompt)
 }
 
+fn placeholder_text_item(text: String) -> Value {
+    json!({
+        "type": "text",
+        "text": text,
+    })
+}
+
+fn downgraded_multimodal_placeholder(
+    item_type: &str,
+    item: &Value,
+    capability_text: &str,
+) -> Option<String> {
+    match item_type {
+        "image_url" | "input_image" => Some(format!(
+            "[Earlier image omitted because the current {capability_text} does not accept image input.]"
+        )),
+        "file" | "input_file" => {
+            let file_value = if item_type == "file" {
+                item.get("file")
+            } else {
+                Some(item)
+            }?;
+            let filename = file_value
+                .get("filename")
+                .and_then(Value::as_str)
+                .unwrap_or("document");
+            Some(format!(
+                "[Earlier file omitted because the current {capability_text} does not accept file input: {filename}]"
+            ))
+        }
+        "input_audio" => Some(format!(
+            "[Earlier audio omitted because the current {capability_text} does not accept audio input.]"
+        )),
+        _ => None,
+    }
+}
+
+fn sanitize_message_content_for_model_capabilities(
+    content: &Option<Value>,
+    allow_images: bool,
+    allow_files: bool,
+    allow_audio: bool,
+    capability_text: &str,
+) -> Option<Value> {
+    let Some(Value::Array(items)) = content else {
+        return content.clone();
+    };
+
+    let mut sanitized = Vec::with_capacity(items.len());
+    for item in items {
+        let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+            sanitized.push(item.clone());
+            continue;
+        };
+        match item_type {
+            "image_url" | "input_image" if !allow_images => {
+                if let Some(text) =
+                    downgraded_multimodal_placeholder(item_type, item, capability_text)
+                {
+                    sanitized.push(placeholder_text_item(text));
+                }
+            }
+            "file" | "input_file" if !allow_files => {
+                if let Some(text) =
+                    downgraded_multimodal_placeholder(item_type, item, capability_text)
+                {
+                    sanitized.push(placeholder_text_item(text));
+                }
+            }
+            "input_audio" if !allow_audio => {
+                if let Some(text) =
+                    downgraded_multimodal_placeholder(item_type, item, capability_text)
+                {
+                    sanitized.push(placeholder_text_item(text));
+                }
+            }
+            _ => sanitized.push(item.clone()),
+        }
+    }
+
+    Some(Value::Array(sanitized))
+}
+
+pub(super) fn sanitize_messages_for_model_capabilities(
+    messages: &[ChatMessage],
+    model: &ModelConfig,
+    backend_supports_native_multimodal: bool,
+) -> Vec<ChatMessage> {
+    let allow_images = backend_supports_native_multimodal && model.supports_image_input();
+    let allow_files =
+        backend_supports_native_multimodal && model.has_capability(ModelCapability::Pdf);
+    let allow_audio =
+        backend_supports_native_multimodal && model.has_capability(ModelCapability::AudioIn);
+    let capability_text = if backend_supports_native_multimodal {
+        "model"
+    } else {
+        "backend/model combination"
+    };
+
+    messages
+        .iter()
+        .map(|message| {
+            let mut sanitized = message.clone();
+            sanitized.content = sanitize_message_content_for_model_capabilities(
+                &message.content,
+                allow_images,
+                allow_files,
+                allow_audio,
+                capability_text,
+            );
+            sanitized
+        })
+        .collect()
+}
+
 fn system_message_text(message: &ChatMessage) -> Option<&str> {
     if message.role != "system" {
         return None;

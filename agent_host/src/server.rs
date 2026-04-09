@@ -4113,6 +4113,64 @@ impl Server {
         Ok(Some(model_key))
     }
 
+    fn normalize_session_history_after_agent_switch(
+        &self,
+        address: &ChannelAddress,
+        selected_backend: AgentBackendKind,
+        model_key: &str,
+    ) -> Result<bool> {
+        let Some(session) = self.with_sessions(|sessions| Ok(sessions.get_snapshot(address)))?
+        else {
+            return Ok(false);
+        };
+        let model = self.model_config_or_main(model_key)?.clone();
+        let backend_supports_native = backend_supports_native_multimodal_input(selected_backend);
+        let rewritten_messages = downgrade_messages_for_model_switch(
+            &session.agent_messages,
+            &session.workspace_root,
+            &model,
+            backend_supports_native,
+        )?;
+        let session_changed =
+            rewritten_messages != session.agent_messages || session.response_checkpoint.is_some();
+
+        let mut pending_changed = false;
+        let rewritten_pending = session
+            .pending_continue
+            .clone()
+            .map(|mut pending| -> Result<PendingContinueState> {
+                let rewritten_resume = downgrade_messages_for_model_switch(
+                    &pending.resume_messages,
+                    &session.workspace_root,
+                    &model,
+                    backend_supports_native,
+                )?;
+                pending_changed = rewritten_resume != pending.resume_messages
+                    || pending.model_key != model_key
+                    || pending.agent_backend != Some(selected_backend)
+                    || pending.response_checkpoint.is_some();
+                pending.resume_messages = rewritten_resume;
+                pending.model_key = model_key.to_string();
+                pending.agent_backend = Some(selected_backend);
+                pending.response_checkpoint = None;
+                Ok(pending)
+            })
+            .transpose()?;
+
+        if !session_changed && !pending_changed {
+            return Ok(false);
+        }
+
+        self.with_sessions(|sessions| {
+            sessions.rewrite_history_after_model_switch(
+                address,
+                rewritten_messages,
+                rewritten_pending,
+            )
+        })?;
+        Ok(true)
+    }
+
     fn foreground_uses_native_zgent(
         &self,
         address: &ChannelAddress,
@@ -4787,9 +4845,15 @@ impl Server {
         }
 
         let persistence_system_prompt = config.system_prompt.clone();
+        let effective_backend = self.effective_agent_backend(&session.address)?;
+        let sanitized_source_messages = sanitize_messages_for_model_capabilities(
+            &source_messages,
+            &model,
+            backend_supports_native_multimodal_input(effective_backend),
+        );
         let report = run_backend_compaction(
-            self.effective_agent_backend(&session.address)?,
-            source_messages,
+            effective_backend,
+            sanitized_source_messages,
             config,
             extra_tools,
         )
@@ -5377,6 +5441,11 @@ impl Server {
                             Some(model_key.clone()),
                         )
                     })?;
+                    let history_normalized = self.normalize_session_history_after_agent_switch(
+                        &incoming.address,
+                        selected_backend,
+                        &model_key,
+                    )?;
                     let effective_model_key = conversation
                         .settings
                         .main_model
@@ -5386,11 +5455,16 @@ impl Server {
                         &channel,
                         &incoming.address,
                         OutgoingMessage::text(format!(
-                            "Conversation agent updated to `{}` with model `{}`.{}",
+                            "Conversation agent updated to `{}` with model `{}`.{}{}",
                             Self::render_agent_backend_value(selected_backend),
                             effective_model_key,
                             if compacted {
                                 " Existing context was compacted before the switch."
+                            } else {
+                                ""
+                            },
+                            if history_normalized {
+                                " Historical multimodal context was downgraded for the selected model and saved under `.context_attachments/` in the workspace."
                             } else {
                                 ""
                             }
@@ -6421,12 +6495,15 @@ impl Server {
             config.context_compaction.token_limit_override = Some(manual_compact_min_tokens);
         }
         let persistence_system_prompt = config.system_prompt.clone();
-        let report = run_backend_compaction(
-            self.effective_agent_backend(&session.address)?,
-            session.agent_messages.clone(),
-            config,
-            extra_tools,
-        )?;
+        let effective_backend = self.effective_agent_backend(&session.address)?;
+        let model = self.model_config_or_main(model_key)?;
+        let sanitized_messages = sanitize_messages_for_model_capabilities(
+            &session.agent_messages,
+            model,
+            backend_supports_native_multimodal_input(effective_backend),
+        );
+        let report =
+            run_backend_compaction(effective_backend, sanitized_messages, config, extra_tools)?;
         if !report.compacted {
             return Ok(false);
         }
@@ -6588,7 +6665,13 @@ impl Server {
             );
             let compaction = run_backend_compaction(
                 self.effective_agent_backend(&session.address)?,
-                previous_messages.clone(),
+                sanitize_messages_for_model_capabilities(
+                    &previous_messages,
+                    self.model_config_or_main(&effective_model_key)?,
+                    backend_supports_native_multimodal_input(
+                        self.effective_agent_backend(&session.address)?,
+                    ),
+                ),
                 config,
                 extra_tools,
             )?;
@@ -6733,6 +6816,13 @@ impl Server {
         original_user_text: Option<String>,
         original_attachments: Vec<StoredAttachment>,
     ) -> Result<ForegroundTurnOutcome> {
+        let effective_backend = self.effective_agent_backend(&session.address)?;
+        let model = self.model_config_or_main(model_key)?.clone();
+        let previous_messages = sanitize_messages_for_model_capabilities(
+            &previous_messages,
+            &model,
+            backend_supports_native_multimodal_input(effective_backend),
+        );
         if self.foreground_uses_native_zgent(&session.address, model_key)? {
             let active = self.ensure_native_zgent_session(session, model_key)?;
             active.busy.store(true, Ordering::SeqCst);
@@ -6792,7 +6882,7 @@ impl Server {
                 session.clone(),
                 AgentPromptKind::MainForeground,
                 session.agent_id,
-                self.effective_agent_backend(&session.address)?,
+                effective_backend,
                 model_key.to_string(),
                 previous_messages.clone(),
                 String::new(),
@@ -7426,21 +7516,22 @@ mod tests {
         SummaryTracker, TokenUsage, background_timeout_with_active_children_text,
         build_previous_messages_for_turn_with_prompt, build_synthetic_system_messages,
         build_user_turn_message, channel_restart_backoff_seconds, conversation_memory_root,
-        estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
-        fast_path_agent_selection_message, format_session_status, infer_single_agent_backend,
-        is_timeout_like, memory_search_files, normalize_messages_for_persistence,
-        parse_agent_command, parse_model_command, parse_oldspace_command, parse_sandbox_command,
-        parse_set_api_timeout_command, parse_sink_target, parse_snap_list_command,
-        parse_snap_load_command, parse_snap_save_command, parse_think_command,
-        persist_compaction_artifacts, rebuild_canonical_system_prompt,
-        render_last_user_message_time_tip, render_model_catalog_change_notice,
-        render_system_date_on_user_message, request_yield_for_incoming, rollout_read_file,
-        rollout_search_files, select_image_generation_routing, send_outgoing_message_now,
-        should_attempt_idle_context_compaction, should_emit_runtime_change_prompt,
-        summarize_resume_progress, sync_workspace_shared_profile_files,
-        tag_interrupted_followup_text, update_active_foreground_phase,
-        upload_workspace_shared_profile_files, user_facing_continue_error_text,
-        workspace_visible_in_list,
+        downgrade_messages_for_model_switch, estimate_compaction_savings_usd, estimate_cost_usd,
+        extract_attachment_references, fast_path_agent_selection_message, format_session_status,
+        infer_single_agent_backend, is_timeout_like, memory_search_files,
+        normalize_messages_for_persistence, parse_agent_command, parse_model_command,
+        parse_oldspace_command, parse_sandbox_command, parse_set_api_timeout_command,
+        parse_sink_target, parse_snap_list_command, parse_snap_load_command,
+        parse_snap_save_command, parse_think_command, persist_compaction_artifacts,
+        rebuild_canonical_system_prompt, render_last_user_message_time_tip,
+        render_model_catalog_change_notice, render_system_date_on_user_message,
+        request_yield_for_incoming, rollout_read_file, rollout_search_files,
+        sanitize_messages_for_model_capabilities, select_image_generation_routing,
+        send_outgoing_message_now, should_attempt_idle_context_compaction,
+        should_emit_runtime_change_prompt, summarize_resume_progress,
+        sync_workspace_shared_profile_files, tag_interrupted_followup_text,
+        update_active_foreground_phase, upload_workspace_shared_profile_files,
+        user_facing_continue_error_text, workspace_visible_in_list,
     };
     use crate::agent_status::AgentRegistry;
     use crate::backend::AgentBackendKind;
@@ -7462,7 +7553,7 @@ mod tests {
     use crate::session::{ModelCatalogChangeNotice, PendingContinueState, SessionSnapshot};
     use crate::sink::SinkRouter;
     use crate::snapshot::SnapshotManager;
-    use crate::workspace::WorkspaceManager;
+    use crate::workspace::{CONTEXT_ATTACHMENT_STORE_DIR_NAME, WorkspaceManager};
     use agent_frame::config::MemorySystem;
     use agent_frame::message::{FunctionCall, ToolCall};
     use agent_frame::{
@@ -7798,6 +7889,262 @@ mod tests {
         assert_eq!(items[1]["type"], "image_url");
         let url = items[1]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn sanitizes_historical_multimodal_messages_for_non_vision_models() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(Value::Array(vec![
+                json!({
+                    "type": "text",
+                    "text": "先看这张图"
+                }),
+                json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,AAAA"
+                    }
+                }),
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+        let model = ModelConfig {
+            model_type: crate::config::ModelType::Openrouter,
+            api_endpoint: "https://example.com/v1".to_string(),
+            model: "demo-chat".to_string(),
+            backend: AgentBackendKind::AgentFrame,
+            supports_vision_input: false,
+            image_tool_model: None,
+            web_search_model: None,
+            api_key: None,
+            api_key_env: "TEST_API_KEY".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 128_000,
+            cache_ttl: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            description: "chat".to_string(),
+            agent_model_enabled: true,
+            native_web_search: None,
+            external_web_search: None,
+            capabilities: vec![ModelCapability::Chat],
+        };
+
+        let sanitized = sanitize_messages_for_model_capabilities(&messages, &model, true);
+        let items = sanitized[0]
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["type"], "text");
+        assert_eq!(items[0]["text"], "先看这张图");
+        assert_eq!(items[1]["type"], "text");
+        assert!(
+            items[1]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("does not accept image input"))
+        );
+    }
+
+    #[test]
+    fn model_switch_downgrades_multimodal_history_into_workspace_references() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(Value::Array(vec![
+                json!({
+                    "type": "text",
+                    "text": "先看这张图"
+                }),
+                json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,AQID"
+                    }
+                }),
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+        let model = ModelConfig {
+            model_type: crate::config::ModelType::Openrouter,
+            api_endpoint: "https://example.com/v1".to_string(),
+            model: "demo-chat".to_string(),
+            backend: AgentBackendKind::AgentFrame,
+            supports_vision_input: false,
+            image_tool_model: None,
+            web_search_model: None,
+            api_key: None,
+            api_key_env: "TEST_API_KEY".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 128_000,
+            cache_ttl: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            description: "chat".to_string(),
+            agent_model_enabled: true,
+            native_web_search: None,
+            external_web_search: None,
+            capabilities: vec![ModelCapability::Chat],
+        };
+
+        let rewritten =
+            downgrade_messages_for_model_switch(&messages, &workspace_root, &model, true).unwrap();
+
+        let items = rewritten[0]
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(items[1]["type"], "text");
+        let text = items[1]["text"].as_str().unwrap();
+        assert!(text.contains("downgraded during model switch"));
+        assert!(text.contains(CONTEXT_ATTACHMENT_STORE_DIR_NAME));
+
+        let store_root = workspace_root.join(CONTEXT_ATTACHMENT_STORE_DIR_NAME);
+        let batch_dir = fs::read_dir(&store_root)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let artifact_path = fs::read_dir(&batch_dir)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(fs::read(&artifact_path).unwrap(), vec![1_u8, 2, 3]);
+        let relative = artifact_path
+            .strip_prefix(&workspace_root)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(text.contains(&relative));
+    }
+
+    #[test]
+    fn model_switch_keeps_supported_multimodal_history_untouched() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(Value::Array(vec![
+                json!({
+                    "type": "text",
+                    "text": "继续参考这张图"
+                }),
+                json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,AQID"
+                    }
+                }),
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+        let model = ModelConfig {
+            model_type: crate::config::ModelType::Openrouter,
+            api_endpoint: "https://example.com/v1".to_string(),
+            model: "demo-vision".to_string(),
+            backend: AgentBackendKind::AgentFrame,
+            supports_vision_input: false,
+            image_tool_model: None,
+            web_search_model: None,
+            api_key: None,
+            api_key_env: "TEST_API_KEY".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 128_000,
+            cache_ttl: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            description: "vision".to_string(),
+            agent_model_enabled: true,
+            native_web_search: None,
+            external_web_search: None,
+            capabilities: vec![ModelCapability::Chat, ModelCapability::ImageIn],
+        };
+
+        let rewritten =
+            downgrade_messages_for_model_switch(&messages, &workspace_root, &model, true).unwrap();
+
+        assert_eq!(rewritten, messages);
+        assert!(
+            !workspace_root
+                .join(CONTEXT_ATTACHMENT_STORE_DIR_NAME)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn preserves_historical_multimodal_messages_for_vision_models() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(Value::Array(vec![
+                json!({
+                    "type": "text",
+                    "text": "请继续参考前面的图片"
+                }),
+                json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/png;base64,AAAA"
+                    }
+                }),
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+        let model = ModelConfig {
+            model_type: crate::config::ModelType::Openrouter,
+            api_endpoint: "https://example.com/v1".to_string(),
+            model: "demo-vision".to_string(),
+            backend: AgentBackendKind::AgentFrame,
+            supports_vision_input: false,
+            image_tool_model: None,
+            web_search_model: None,
+            api_key: None,
+            api_key_env: "TEST_API_KEY".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 128_000,
+            cache_ttl: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            description: "vision".to_string(),
+            agent_model_enabled: true,
+            native_web_search: None,
+            external_web_search: None,
+            capabilities: vec![ModelCapability::Chat, ModelCapability::ImageIn],
+        };
+
+        let sanitized = sanitize_messages_for_model_capabilities(&messages, &model, true);
+        let items = sanitized[0]
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(items[1]["type"], "image_url");
     }
 
     #[test]

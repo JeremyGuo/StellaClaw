@@ -883,7 +883,17 @@ pub(super) fn estimate_current_context_tokens_for_session(
         &extra_tools,
     )?;
     let tools = registry.into_values().collect::<Vec<_>>();
-    Ok(estimate_session_tokens(&session.agent_messages, &tools, ""))
+    let model = runtime.model_config(model_key)?;
+    let effective_backend = runtime
+        .selected_agent_backend()
+        .or_else(|| runtime.inferred_agent_backend_for_model(model_key))
+        .unwrap_or(AgentBackendKind::AgentFrame);
+    let sanitized_messages = sanitize_messages_for_model_capabilities(
+        &session.agent_messages,
+        model,
+        backend_supports_native_multimodal_input(effective_backend),
+    );
+    Ok(estimate_session_tokens(&sanitized_messages, &tools, ""))
 }
 
 pub(super) fn effective_context_window_limit_for_session(

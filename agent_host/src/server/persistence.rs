@@ -73,6 +73,264 @@ where
     serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
 }
 
+fn preferred_extension(
+    filename_hint: Option<&str>,
+    media_type_hint: Option<&str>,
+    fallback: &str,
+) -> String {
+    filename_hint
+        .and_then(|name| {
+            Path::new(name)
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .and_then(sanitize_extension)
+        })
+        .or_else(|| media_type_hint.and_then(extension_from_media_type))
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn sanitize_extension(value: &str) -> Option<&str> {
+    let trimmed = value.trim().trim_start_matches('.');
+    if trimmed.is_empty() || !trimmed.chars().all(|ch| ch.is_ascii_alphanumeric()) {
+        return None;
+    }
+    Some(trimmed)
+}
+
+fn extension_from_media_type(media_type: &str) -> Option<&'static str> {
+    match media_type {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/jpg" => Some("jpg"),
+        "image/webp" => Some("webp"),
+        "image/gif" => Some("gif"),
+        "image/bmp" => Some("bmp"),
+        "image/svg+xml" => Some("svg"),
+        "application/pdf" => Some("pdf"),
+        "text/plain" => Some("txt"),
+        "application/json" => Some("json"),
+        "audio/mpeg" => Some("mp3"),
+        "audio/mp3" => Some("mp3"),
+        "audio/wav" => Some("wav"),
+        "audio/x-wav" => Some("wav"),
+        "audio/ogg" => Some("ogg"),
+        "audio/flac" => Some("flac"),
+        "audio/mp4" => Some("m4a"),
+        _ => None,
+    }
+}
+
+fn decode_base64_payload(value: &str) -> Option<Vec<u8>> {
+    base64::engine::general_purpose::STANDARD.decode(value).ok()
+}
+
+fn decode_data_url_payload(value: &str) -> Option<(Vec<u8>, Option<String>)> {
+    let payload = value.strip_prefix("data:")?;
+    let (metadata, encoded) = payload.split_once(',')?;
+    let media_type = metadata
+        .strip_suffix(";base64")
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())?;
+    let bytes = decode_base64_payload(encoded)?;
+    Some((bytes, Some(media_type)))
+}
+
+fn persist_model_switch_artifact(
+    workspace_root: &Path,
+    batch_dir: &mut Option<PathBuf>,
+    artifact_index: usize,
+    item_type: &str,
+    item: &Value,
+) -> Result<String> {
+    let kind_label = match item_type {
+        "image_url" | "input_image" => "image",
+        "file" | "input_file" => "file",
+        "input_audio" => "audio",
+        _ => "item",
+    };
+    let directory = if let Some(existing) = batch_dir {
+        existing.clone()
+    } else {
+        let created = workspace_root
+            .join(crate::workspace::CONTEXT_ATTACHMENT_STORE_DIR_NAME)
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&created)
+            .with_context(|| format!("failed to create {}", created.display()))?;
+        *batch_dir = Some(created.clone());
+        created
+    };
+
+    let binary_target = match item_type {
+        "image_url" | "input_image" => {
+            extract_model_switch_image_bytes(item_type, item).map(|(bytes, ext)| {
+                (
+                    bytes,
+                    format!("history-{kind_label}-{artifact_index}.{ext}"),
+                )
+            })
+        }
+        "file" | "input_file" => {
+            extract_model_switch_file_bytes(item_type, item).map(|(bytes, ext)| {
+                (
+                    bytes,
+                    format!("history-{kind_label}-{artifact_index}.{ext}"),
+                )
+            })
+        }
+        "input_audio" => extract_model_switch_audio_bytes(item).map(|(bytes, ext)| {
+            (
+                bytes,
+                format!("history-{kind_label}-{artifact_index}.{ext}"),
+            )
+        }),
+        _ => None,
+    };
+
+    let target_path = if let Some((bytes, file_name)) = binary_target {
+        let path = directory.join(file_name);
+        fs::write(&path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
+        path
+    } else {
+        let path = directory.join(format!("history-{kind_label}-{artifact_index}.json"));
+        write_json_pretty(&path, item)?;
+        path
+    };
+
+    relative_attachment_path(workspace_root, &target_path)
+}
+
+fn extract_model_switch_image_bytes(item_type: &str, item: &Value) -> Option<(Vec<u8>, String)> {
+    let image_url = if item_type == "image_url" {
+        item.get("image_url").and_then(|value| {
+            value
+                .get("url")
+                .and_then(Value::as_str)
+                .or_else(|| value.as_str())
+        })
+    } else {
+        item.get("image_url").and_then(Value::as_str)
+    }?;
+    let (bytes, media_type) = decode_data_url_payload(image_url)?;
+    let extension = preferred_extension(None, media_type.as_deref(), "bin");
+    Some((bytes, extension))
+}
+
+fn extract_model_switch_file_bytes(item_type: &str, item: &Value) -> Option<(Vec<u8>, String)> {
+    let file_value = if item_type == "file" {
+        item.get("file")
+    } else {
+        Some(item)
+    }?;
+    let filename_hint = file_value.get("filename").and_then(Value::as_str);
+    let file_data = file_value.get("file_data").and_then(Value::as_str)?;
+    if let Some((bytes, media_type)) = decode_data_url_payload(file_data) {
+        let extension = preferred_extension(filename_hint, media_type.as_deref(), "bin");
+        return Some((bytes, extension));
+    }
+    let bytes = decode_base64_payload(file_data)?;
+    let extension = preferred_extension(filename_hint, None, "bin");
+    Some((bytes, extension))
+}
+
+fn extract_model_switch_audio_bytes(item: &Value) -> Option<(Vec<u8>, String)> {
+    let audio = item.get("input_audio").and_then(Value::as_object)?;
+    let data = audio.get("data").and_then(Value::as_str)?;
+    let format = audio.get("format").and_then(Value::as_str);
+    let bytes = decode_base64_payload(data)?;
+    let extension = format
+        .and_then(sanitize_extension)
+        .unwrap_or("bin")
+        .to_string();
+    Some((bytes, extension))
+}
+
+fn model_switch_placeholder_text(
+    item_type: &str,
+    capability_text: &str,
+    relative_path: &str,
+) -> String {
+    match item_type {
+        "image_url" | "input_image" => format!(
+            "[Earlier image downgraded during model switch because the {capability_text} does not accept image input. Reference saved at {relative_path}. Inspect it with tools if needed.]"
+        ),
+        "file" | "input_file" => format!(
+            "[Earlier file downgraded during model switch because the {capability_text} does not accept file input. Reference saved at {relative_path}. Inspect it with tools if needed.]"
+        ),
+        "input_audio" => format!(
+            "[Earlier audio downgraded during model switch because the {capability_text} does not accept audio input. Reference saved at {relative_path}. Inspect it with tools if needed.]"
+        ),
+        _ => format!(
+            "[Earlier multimodal content downgraded during model switch. Reference saved at {relative_path}. Inspect it with tools if needed.]"
+        ),
+    }
+}
+
+pub(super) fn downgrade_messages_for_model_switch(
+    messages: &[ChatMessage],
+    workspace_root: &Path,
+    model: &ModelConfig,
+    backend_supports_native_multimodal: bool,
+) -> Result<Vec<ChatMessage>> {
+    let allow_images = backend_supports_native_multimodal && model.supports_image_input();
+    let allow_files =
+        backend_supports_native_multimodal && model.has_capability(ModelCapability::Pdf);
+    let allow_audio =
+        backend_supports_native_multimodal && model.has_capability(ModelCapability::AudioIn);
+    let capability_text = if backend_supports_native_multimodal {
+        "selected model"
+    } else {
+        "selected backend/model combination"
+    };
+
+    let mut batch_dir = None;
+    let mut artifact_index = 0usize;
+    let mut rewritten_messages = Vec::with_capacity(messages.len());
+    for message in messages {
+        let Some(Value::Array(items)) = &message.content else {
+            rewritten_messages.push(message.clone());
+            continue;
+        };
+        let mut rewritten = message.clone();
+        let mut rewritten_items = Vec::with_capacity(items.len());
+        let mut changed = false;
+        for item in items {
+            let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+                rewritten_items.push(item.clone());
+                continue;
+            };
+            let should_downgrade = match item_type {
+                "image_url" | "input_image" => !allow_images,
+                "file" | "input_file" => !allow_files,
+                "input_audio" => !allow_audio,
+                _ => false,
+            };
+            if !should_downgrade {
+                rewritten_items.push(item.clone());
+                continue;
+            }
+            artifact_index = artifact_index.saturating_add(1);
+            let relative_path = persist_model_switch_artifact(
+                workspace_root,
+                &mut batch_dir,
+                artifact_index,
+                item_type,
+                item,
+            )?;
+            rewritten_items.push(json!({
+                "type": "text",
+                "text": model_switch_placeholder_text(item_type, capability_text, &relative_path),
+            }));
+            changed = true;
+        }
+        if changed {
+            rewritten.content = Some(Value::Array(rewritten_items));
+        }
+        rewritten_messages.push(rewritten);
+    }
+    Ok(rewritten_messages)
+}
+
 fn merge_unique_strings(existing: &mut Vec<String>, incoming: impl IntoIterator<Item = String>) {
     for value in incoming {
         let trimmed = value.trim();

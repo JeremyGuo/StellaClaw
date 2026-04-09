@@ -798,6 +798,35 @@ impl SessionManager {
         Ok(())
     }
 
+    pub fn rewrite_history_after_model_switch(
+        &mut self,
+        address: &ChannelAddress,
+        messages: Vec<ChatMessage>,
+        pending_continue: Option<PendingContinueState>,
+    ) -> Result<()> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        session.agent_messages = messages;
+        session.response_checkpoint = None;
+        session.pending_continue = pending_continue.map(|mut pending| {
+            pending.response_checkpoint = None;
+            pending
+        });
+        info!(
+            log_stream = "session",
+            log_key = %session.id,
+            kind = "history_rewritten_after_model_switch",
+            agent_message_count = session.agent_messages.len() as u64,
+            has_pending_continue = session.pending_continue.is_some(),
+            "rewrote persisted conversation history after model switch"
+        );
+        session.persist()?;
+        Ok(())
+    }
+
     pub fn set_api_timeout_override(
         &mut self,
         address: &ChannelAddress,

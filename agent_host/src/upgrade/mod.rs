@@ -6,6 +6,7 @@ mod v0_10;
 mod v0_11;
 mod v0_12;
 mod v0_13;
+mod v0_14;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -13,7 +14,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.13";
+pub const LATEST_WORKDIR_VERSION: &str = "0.14";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -29,7 +30,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 9] = [
+    let upgraders: [&dyn WorkdirUpgrader; 10] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
@@ -39,6 +40,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
         &v0_11::Upgrade,
         &v0_12::Upgrade,
         &v0_13::Upgrade,
+        &v0_14::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -76,6 +78,7 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.10" => Ok("0.10"),
         "0.11" => Ok("0.11"),
         "0.12" => Ok("0.12"),
+        "0.13" => Ok("0.13"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -442,6 +445,23 @@ mod tests {
         assert_eq!(
             session["last_user_message_at"].as_str(),
             Some("2026-04-09T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn v0_13_workdir_upgrade_seeds_context_attachment_store_dirs() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.13\n").unwrap();
+        let workspace_files_dir = temp_dir.path().join("workspaces/workspace-1/files");
+        fs::create_dir_all(&workspace_files_dir).unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        assert!(
+            workspace_files_dir
+                .join(crate::workspace::CONTEXT_ATTACHMENT_STORE_DIR_NAME)
+                .is_dir()
         );
     }
 }

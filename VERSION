@@ -1,5 +1,16 @@
-version: 0.12.0
+version: 0.12.1
 ---
+
+# 0.12.1
+
+- 升级 `workdir` 结构版本到 `0.14`：
+  每个 workspace 的 `files/` 根目录新增隐藏的 `.context_attachments/` 目录，用来承接模型切换时从历史上下文中拆出的多模态引用文件；升级会为已有 workspace 补齐该目录。
+- 在 `/agent` 切换模型时显式自愈历史多模态上下文：
+  当前台会话已有历史 `agent_messages` 或 `pending_continue.resume_messages` 包含图片、文件或音频，而新选中的 backend/model 不再支持对应输入时，系统现在会把这些内联 payload 单向降级成普通文本引用，并把可落盘的原始内容保存到 workspace 的 `.context_attachments/<uuid>/` 下面，避免后续继续对话时把失配模态再次直接发给上游。
+- `/agent` 切换同时会同步清理续跑状态：
+  如果会话存在 `pending_continue`，其 `resume_messages`、`agent_backend`、`model_key` 与相关 checkpoint 会在切换时一起对齐到新的选择，避免用户重新选完模型后 `/continue` 仍偷偷沿用旧模型和旧断点。
+- 明确本次只影响 `workdir`，不影响 `config`：
+  新增 `0.13 -> 0.14` workdir upgrade step；按版本策略将仓库版本从 `0.12.0` 提升到 `0.12.1`。
 
 # 0.12.0
 
