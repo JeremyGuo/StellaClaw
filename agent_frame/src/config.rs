@@ -354,15 +354,19 @@ fn default_enable_timeout_observation_compaction() -> bool {
     true
 }
 
-fn resolve_path(path: &str, base_dir: &Path) -> PathBuf {
-    let expanded = if let Some(stripped) = path.strip_prefix("~/") {
+pub fn expand_home_path(path: &str) -> PathBuf {
+    if let Some(stripped) = path.strip_prefix("~/") {
         std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("~"))
             .join(stripped)
     } else {
         PathBuf::from(path)
-    };
+    }
+}
+
+fn resolve_path(path: &str, base_dir: &Path) -> PathBuf {
+    let expanded = expand_home_path(path);
 
     if expanded.is_absolute() {
         expanded
@@ -392,7 +396,7 @@ fn resolve_upstream(raw: UpstreamConfigRaw) -> UpstreamConfig {
         api_key: raw.api_key,
         api_key_env: raw.api_key_env,
         chat_completions_path: raw.chat_completions_path,
-        codex_home: raw.codex_home.map(PathBuf::from),
+        codex_home: raw.codex_home.as_deref().map(expand_home_path),
         codex_auth: raw.codex_auth,
         auth_credentials_store_mode: raw.auth_credentials_store_mode,
         timeout_seconds: raw.timeout_seconds,
@@ -549,8 +553,9 @@ pub fn load_config_file(path: impl AsRef<Path>) -> Result<AgentConfig> {
 
 #[cfg(test)]
 mod tests {
-    use super::load_config_value;
+    use super::{expand_home_path, load_config_value};
     use serde_json::json;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
     #[test]
@@ -569,5 +574,28 @@ mod tests {
         .unwrap();
 
         assert_eq!(config.enabled_tools, vec!["file_read", "file_write"]);
+    }
+
+    #[test]
+    fn load_config_value_expands_tilde_in_codex_home() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = load_config_value(
+            json!({
+                "upstream": {
+                    "base_url": "https://example.com/v1",
+                    "model": "demo",
+                    "auth_kind": "codex_subscription",
+                    "codex_home": "~/.codex"
+                }
+            }),
+            temp_dir.path(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.upstream.codex_home,
+            Some(expand_home_path("~/.codex"))
+        );
+        assert_ne!(config.upstream.codex_home, Some(PathBuf::from("~/.codex")));
     }
 }

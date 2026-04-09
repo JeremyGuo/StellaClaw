@@ -369,11 +369,11 @@ impl ServerRuntime {
         if model.upstream_auth_kind() != agent_frame::config::UpstreamAuthKind::CodexSubscription {
             return Ok(None);
         }
-        let codex_home = model
-            .codex_home
+        let resolved_codex_home = model.resolved_codex_home();
+        let codex_home = resolved_codex_home
             .as_deref()
             .ok_or_else(|| anyhow!("codex subscription config must include codex_home"))?;
-        Ok(Some(load_codex_auth_tokens(Path::new(codex_home))?))
+        Ok(Some(load_codex_auth_tokens(codex_home)?))
     }
 
     fn effective_main_model_key(&self) -> Result<String> {
@@ -427,7 +427,7 @@ impl ServerRuntime {
             api_key: model.api_key.clone(),
             api_key_env: model.api_key_env.clone(),
             chat_completions_path: model.chat_completions_path.clone(),
-            codex_home: model.codex_home.clone().map(Into::into),
+            codex_home: model.resolved_codex_home(),
             codex_auth: self.resolved_codex_auth(model)?,
             auth_credentials_store_mode: model.auth_credentials_store_mode,
             timeout_seconds,

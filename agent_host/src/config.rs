@@ -2,14 +2,14 @@ use crate::backend::AgentBackendKind;
 use crate::zgent::zgent_runtime_available;
 use agent_frame::config::{
     AuthCredentialsStoreMode, ExternalWebSearchConfig, MemorySystem, NativeWebSearchConfig,
-    ReasoningConfig, UpstreamApiKind, UpstreamAuthKind,
+    ReasoningConfig, UpstreamApiKind, UpstreamAuthKind, expand_home_path,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 mod v0_1;
 mod v0_10;
@@ -160,6 +160,10 @@ impl ModelConfig {
 
     pub fn can_be_agent_model(&self) -> bool {
         self.agent_model_enabled && self.has_capability(ModelCapability::Chat)
+    }
+
+    pub fn resolved_codex_home(&self) -> Option<PathBuf> {
+        self.codex_home.as_deref().map(expand_home_path)
     }
 }
 
@@ -1411,8 +1415,8 @@ pub fn resolve_model_api_keys(config: &ServerConfig) -> Vec<ResolvedModelApiKey>
 mod tests {
     use super::{
         ChannelConfig, LATEST_CONFIG_VERSION, MainAgentConfig, ModelType,
-        default_dingtalk_commands, default_telegram_commands, load_server_config_file,
-        load_server_config_file_and_upgrade, resolve_model_api_keys,
+        default_dingtalk_commands, default_telegram_commands, expand_home_path,
+        load_server_config_file, load_server_config_file_and_upgrade, resolve_model_api_keys,
     };
     use crate::backend::AgentBackendKind;
     use crate::zgent::zgent_runtime_available;
@@ -2152,6 +2156,10 @@ mod tests {
         );
         assert!(config.models["gpt54"].has_capability(super::ModelCapability::WebSearch));
         assert!(config.models["gpt54"].supports_image_input());
+        assert_eq!(
+            config.models["gpt54"].resolved_codex_home(),
+            Some(expand_home_path("~/.codex"))
+        );
         assert!(!config.models["sonar"].agent_model_enabled);
         assert_eq!(
             config
