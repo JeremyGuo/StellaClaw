@@ -325,7 +325,11 @@ impl ServerRuntime {
 
     fn inferred_agent_backend_for_model(&self, model_key: &str) -> Option<AgentBackendKind> {
         let backends = self.agent.backends_for_model(model_key);
-        (backends.len() == 1).then_some(backends[0])
+        if backends.len() == 1 {
+            Some(backends[0])
+        } else {
+            None
+        }
     }
 
     fn selected_agent_backend(&self) -> Option<AgentBackendKind> {
