@@ -30,7 +30,7 @@
       "chat_completions_path": "/chat/completions",
       "auth_credentials_store_mode": "auto",
       "timeout_seconds": 300.0,
-      "context_window_tokens": 262144,
+      "context_window_tokens": 200000,
       "description": "Good at creating beautiful web pages in HTML/CSS."
     },
     "gpt54": {
