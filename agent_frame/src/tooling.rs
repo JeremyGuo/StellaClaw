@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
-use walkdir::WalkDir;
+use walkdir::{DirEntry, WalkDir};
 
 type ToolHandler = dyn Fn(Value) -> Result<Value> + Send + Sync + 'static;
 
@@ -367,6 +367,7 @@ const FILE_READ_MAX_LINE_LENGTH: usize = 2_000;
 const FILE_READ_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const SEARCH_MAX_RESULTS: usize = 100;
 const LS_MAX_ENTRIES: usize = 1_000;
+const LS_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 struct SearchMatch {
@@ -443,6 +444,47 @@ fn collect_walk_paths(base_path: &Path, include_directories: bool) -> Vec<PathBu
         .collect()
 }
 
+fn is_common_ls_skip_dir_name(name: &str) -> bool {
+    matches!(
+        name,
+        "__pycache__" | "node_modules" | "target" | "dist" | "build" | "coverage" | "venv"
+    )
+}
+
+fn should_skip_ls_entry(entry: &DirEntry, base_path: &Path) -> bool {
+    let path = entry.path();
+    if path == base_path {
+        return false;
+    }
+
+    let name = entry.file_name().to_string_lossy();
+    if name.starts_with('.') {
+        return true;
+    }
+
+    entry.file_type().is_dir() && is_common_ls_skip_dir_name(&name)
+}
+
+fn collect_ls_paths(base_path: &Path) -> Vec<PathBuf> {
+    WalkDir::new(base_path)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|entry| !should_skip_ls_entry(entry, base_path))
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.into_path();
+            if path == base_path {
+                return None;
+            }
+            if path.is_dir() || path.is_file() {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 #[derive(Default)]
 pub struct InterruptSignal {
     flag: AtomicBool,
@@ -501,6 +543,22 @@ fn file_read_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSig
             let path = resolve_path(&file_path, &workspace_root);
             if path.is_dir() {
                 return Err(anyhow!("{} is a directory, not a file", path.display()));
+            }
+
+            let has_explicit_window = arguments.contains_key("offset")
+                || arguments.contains_key("offset_lines")
+                || arguments.contains_key("limit")
+                || arguments.contains_key("limit_lines");
+            let file_size = fs::metadata(&path)
+                .with_context(|| format!("failed to stat {}", path.display()))?
+                .len();
+            if file_size > FILE_READ_MAX_OUTPUT_BYTES as u64 && !has_explicit_window {
+                return Err(anyhow!(
+                    "{} is {} bytes, which exceeds the direct-read limit of {} bytes; provide offset and/or limit",
+                    path.display(),
+                    file_size,
+                    FILE_READ_MAX_OUTPUT_BYTES
+                ));
             }
 
             let encoding = string_arg_with_default(arguments, "encoding", "utf-8")?;
@@ -757,7 +815,7 @@ fn grep_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>
 fn ls_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "ls",
-        "List files and directories under a path. Returns a truncated tree-friendly entry list for large directories.",
+        "List non-hidden files and directories under a path. Skips common cache/build directories by default and truncates large outputs by entry count and total output size.",
         json!({
             "type": "object",
             "properties": {
@@ -778,7 +836,7 @@ fn ls_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) 
                 return Err(anyhow!("{} is not a directory", base_path.display()));
             }
 
-            let mut entries = collect_walk_paths(&base_path, true)
+            let mut entries = collect_ls_paths(&base_path)
                 .into_iter()
                 .map(|path| {
                     let entry_type = if path.is_dir() { "directory" } else { "file" };
@@ -795,13 +853,28 @@ fn ls_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) 
                     .cmp(right["path"].as_str().unwrap_or_default())
             });
             let total_entries = entries.len();
-            let truncated = total_entries > LS_MAX_ENTRIES;
-            entries.truncate(LS_MAX_ENTRIES);
+            let mut kept_entries = Vec::new();
+            let mut serialized_entries_bytes = 0usize;
+            for entry in entries {
+                if kept_entries.len() >= LS_MAX_ENTRIES {
+                    break;
+                }
+                let serialized_len = serde_json::to_string_pretty(&entry)
+                    .map(|value| value.len())
+                    .unwrap_or_default();
+                let separator_len = if kept_entries.is_empty() { 0 } else { 2 };
+                if serialized_entries_bytes + separator_len + serialized_len > LS_MAX_OUTPUT_BYTES {
+                    break;
+                }
+                serialized_entries_bytes += separator_len + serialized_len;
+                kept_entries.push(entry);
+            }
+            let truncated = kept_entries.len() < total_entries;
             Ok(json!({
                 "path": base_path.display().to_string(),
                 "num_entries": total_entries,
                 "truncated": truncated,
-                "entries": entries
+                "entries": kept_entries
             }))
         },
     )
@@ -3489,9 +3562,10 @@ pub mod macro_support {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackgroundTaskMetadata, ProcessMetadata, Tool, active_runtime_state_summary,
-        build_tool_registry_with_cancel, execute_tool_call, process_is_running, process_meta_path,
-        terminate_runtime_state_tasks, write_background_task_metadata,
+        BackgroundTaskMetadata, FILE_READ_MAX_OUTPUT_BYTES, LS_MAX_ENTRIES, ProcessMetadata, Tool,
+        active_runtime_state_summary, build_tool_registry_with_cancel, execute_tool_call,
+        process_is_running, process_meta_path, terminate_runtime_state_tasks,
+        write_background_task_metadata,
     };
     use crate::config::{
         AuthCredentialsStoreMode, UpstreamApiKind, UpstreamAuthKind, UpstreamConfig,
@@ -3711,6 +3785,215 @@ mod tests {
                 .iter()
                 .any(|entry| entry["path"].as_str() == Some("main.rs"))
         );
+    }
+
+    #[test]
+    fn ls_skips_hidden_and_common_cache_directories() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        let visible_dir = workspace_root.join("src");
+        let hidden_dir = workspace_root.join(".venv_tools");
+        let cache_dir = workspace_root.join("node_modules");
+        fs::create_dir_all(&visible_dir).unwrap();
+        fs::create_dir_all(&hidden_dir).unwrap();
+        fs::create_dir_all(&cache_dir).unwrap();
+        fs::write(visible_dir.join("main.rs"), "fn main() {}\n").unwrap();
+        fs::write(hidden_dir.join("ignored.py"), "print('ignore')\n").unwrap();
+        fs::write(cache_dir.join("ignored.js"), "console.log('ignore')\n").unwrap();
+        fs::write(workspace_root.join(".env"), "SECRET=1\n").unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = UpstreamConfig {
+            base_url: "https://example.com".to_string(),
+            model: "demo".to_string(),
+            api_kind: UpstreamApiKind::Responses,
+            auth_kind: UpstreamAuthKind::ApiKey,
+            supports_vision_input: false,
+            supports_pdf_input: false,
+            supports_audio_input: false,
+            api_key: None,
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            chat_completions_path: "/responses".to_string(),
+            codex_home: None,
+            codex_auth: None,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 200_000,
+            cache_control: None,
+            prompt_cache_retention: None,
+            prompt_cache_key: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            native_web_search: None,
+            external_web_search: None,
+            native_image_input: false,
+            native_pdf_input: false,
+            native_audio_input: false,
+            native_image_generation: false,
+        };
+        let registry = build_tool_registry_with_cancel(
+            &[],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let ls_result = registry["ls"].invoke(json!({"path":"."})).unwrap();
+        let entries = ls_result["entries"].as_array().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry["path"].as_str() == Some("src/main.rs"))
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry["path"].as_str().unwrap_or_default().starts_with('.'))
+        );
+        assert!(entries.iter().all(|entry| {
+            !entry["path"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("node_modules/")
+        }));
+    }
+
+    #[test]
+    fn ls_truncates_when_output_byte_budget_is_hit() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        let crowded_dir = workspace_root.join("crowded");
+        fs::create_dir_all(&crowded_dir).unwrap();
+        for index in 0..400 {
+            let filename = format!("very_long_filename_{index:04}_{}.txt", "x".repeat(160));
+            fs::write(crowded_dir.join(filename), "data\n").unwrap();
+        }
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = UpstreamConfig {
+            base_url: "https://example.com".to_string(),
+            model: "demo".to_string(),
+            api_kind: UpstreamApiKind::Responses,
+            auth_kind: UpstreamAuthKind::ApiKey,
+            supports_vision_input: false,
+            supports_pdf_input: false,
+            supports_audio_input: false,
+            api_key: None,
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            chat_completions_path: "/responses".to_string(),
+            codex_home: None,
+            codex_auth: None,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 200_000,
+            cache_control: None,
+            prompt_cache_retention: None,
+            prompt_cache_key: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            native_web_search: None,
+            external_web_search: None,
+            native_image_input: false,
+            native_pdf_input: false,
+            native_audio_input: false,
+            native_image_generation: false,
+        };
+        let registry = build_tool_registry_with_cancel(
+            &[],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let ls_result = registry["ls"].invoke(json!({"path":"crowded"})).unwrap();
+        let returned_entries = ls_result["entries"].as_array().unwrap();
+        assert_eq!(ls_result["num_entries"].as_u64(), Some(400));
+        assert_eq!(ls_result["truncated"].as_bool(), Some(true));
+        assert!(returned_entries.len() < 400);
+        assert!(returned_entries.len() < LS_MAX_ENTRIES);
+    }
+
+    #[test]
+    fn file_read_rejects_large_files_without_explicit_window() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let large_file = workspace_root.join("large.txt");
+        fs::write(&large_file, "x".repeat(FILE_READ_MAX_OUTPUT_BYTES + 1024)).unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = UpstreamConfig {
+            base_url: "https://example.com".to_string(),
+            model: "demo".to_string(),
+            api_kind: UpstreamApiKind::Responses,
+            auth_kind: UpstreamAuthKind::ApiKey,
+            supports_vision_input: false,
+            supports_pdf_input: false,
+            supports_audio_input: false,
+            api_key: None,
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            chat_completions_path: "/responses".to_string(),
+            codex_home: None,
+            codex_auth: None,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 200_000,
+            cache_control: None,
+            prompt_cache_retention: None,
+            prompt_cache_key: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            native_web_search: None,
+            external_web_search: None,
+            native_image_input: false,
+            native_pdf_input: false,
+            native_audio_input: false,
+            native_image_generation: false,
+        };
+        let registry = build_tool_registry_with_cancel(
+            &[],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let error = registry["file_read"]
+            .invoke(json!({"file_path":"large.txt"}))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("provide offset and/or limit"));
+
+        let ok = registry["file_read"]
+            .invoke(json!({"file_path":"large.txt","offset":1,"limit":10}))
+            .unwrap();
+        assert_eq!(ok["start_line"].as_u64(), Some(1));
     }
 
     #[test]

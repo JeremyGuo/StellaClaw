@@ -13,11 +13,21 @@ SEMVER_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$")
 def load_version_file(path: pathlib.Path) -> tuple[str, str]:
     text = path.read_text(encoding="utf-8")
     match = re.search(r"(?ms)^---\n(.*?)\n---\n", text)
-    if not match:
-        raise ValueError("VERSION file is missing frontmatter")
+    if match:
+        meta_block = match.group(1)
+        body = text[match.end() :].lstrip()
+    else:
+        shorthand_match = re.match(
+            r"(?ms)^(version\s*:\s*.+?)\n---\n",
+            text,
+        )
+        if not shorthand_match:
+            raise ValueError("VERSION file is missing frontmatter")
+        meta_block = shorthand_match.group(1)
+        body = text[shorthand_match.end() :].lstrip()
 
     meta = {}
-    for raw_line in match.group(1).splitlines():
+    for raw_line in meta_block.splitlines():
         line = raw_line.strip()
         if not line or ":" not in line:
             continue
@@ -32,7 +42,6 @@ def load_version_file(path: pathlib.Path) -> tuple[str, str]:
             f"VERSION frontmatter must use SemVer or SemVer prerelease, got '{version}'"
         )
 
-    body = text[match.end() :].lstrip()
     return version, body
 
 

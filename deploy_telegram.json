@@ -1,8 +1,94 @@
 {
+  "version": "0.12",
+  "models": {
+    "gemini3.1-flash-image": {
+      "type": "openrouter-resp",
+      "api_endpoint": "https://openrouter.ai/api/v1",
+      "model": "google/gemini-3.1-flash-image-preview",
+      "capabilities": [
+        "chat",
+        "image_in",
+        "image_out"
+      ],
+      "api_key_env": "OPENROUTER_API_KEY",
+      "chat_completions_path": "/responses",
+      "auth_credentials_store_mode": "auto",
+      "timeout_seconds": 120.0,
+      "context_window_tokens": 262144,
+      "description": "OpenRouter Responses image model for multimodal generation with text and reference image input.",
+      "agent_model_enabled": false,
+      "supports_vision_input": true
+    },
+    "glm-5.1": {
+      "type": "openrouter",
+      "api_endpoint": "https://openrouter.ai/api/v1",
+      "model": "z-ai/glm-5.1",
+      "capabilities": [
+        "chat"
+      ],
+      "api_key_env": "OPENROUTER_API_KEY",
+      "chat_completions_path": "/chat/completions",
+      "auth_credentials_store_mode": "auto",
+      "timeout_seconds": 300.0,
+      "context_window_tokens": 262144,
+      "description": "Good at creating beautiful web pages in HTML/CSS."
+    },
+    "gpt54": {
+      "type": "codex-subscription",
+      "api_endpoint": "https://chatgpt.com/backend-api/codex",
+      "model": "gpt-5.4",
+      "capabilities": [
+        "chat",
+        "image_in"
+      ],
+      "api_key_env": "OPENAI_API_KEY",
+      "chat_completions_path": "/responses",
+      "codex_home": "/home/jeremyguo/.codex",
+      "auth_credentials_store_mode": "auto",
+      "timeout_seconds": 300.0,
+      "context_window_tokens": 262144,
+      "description": "A general model for processing, which should be used at most works.",
+      "native_web_search": {
+        "enabled": false,
+        "payload": {}
+      },
+      "supports_vision_input": true
+    },
+    "opus-4.6": {
+      "type": "openrouter",
+      "api_endpoint": "https://openrouter.ai/api/v1",
+      "model": "anthropic/claude-opus-4.6",
+      "capabilities": [
+        "chat",
+        "image_in"
+      ],
+      "api_key_env": "OPENROUTER_API_KEY",
+      "chat_completions_path": "/chat/completions",
+      "auth_credentials_store_mode": "auto",
+      "timeout_seconds": 300.0,
+      "context_window_tokens": 262144,
+      "description": "Don't use this model as subagent.",
+      "supports_vision_input": true
+    },
+    "sonar_pro": {
+      "type": "openrouter",
+      "api_endpoint": "https://openrouter.ai/api/v1",
+      "model": "perplexity/sonar-pro",
+      "capabilities": [
+        "web_search"
+      ],
+      "api_key_env": "OPENROUTER_API_KEY",
+      "chat_completions_path": "/chat/completions",
+      "auth_credentials_store_mode": "auto",
+      "timeout_seconds": 60.0,
+      "context_window_tokens": 131072,
+      "description": "Fallback external web search model when the active model cannot use native search.",
+      "agent_model_enabled": false
+    }
+  },
   "agent": {
     "agent_frame": {
       "available_models": [
-        "gpt54",
         "opus-4.6",
         "glm-5.1"
       ]
@@ -13,11 +99,51 @@
       ]
     }
   },
+  "tooling": {
+    "web_search": "sonar_pro",
+    "image": "gpt54:self",
+    "image_gen": "gemini3.1-flash-image"
+  },
+  "main_agent": {
+    "model": null,
+    "global_install_root": "/opt",
+    "language": "zh-CN",
+    "time_awareness": {
+      "emit_system_date_on_user_message": true,
+      "emit_idle_time_gap_hint": true
+    },
+    "max_tool_roundtrips": 120,
+    "enable_context_compression": true,
+    "context_compaction": {
+      "trigger_ratio": 0.9,
+      "token_limit_override": null,
+      "recent_fidelity_target_ratio": 0.18
+    },
+    "idle_compaction": {
+      "enabled": true,
+      "poll_interval_seconds": 15,
+      "min_ratio": 0.5
+    },
+    "timeout_observation_compaction": {
+      "enabled": true
+    },
+    "memory_system": "claude_code"
+  },
+  "sandbox": {
+    "mode": "bubblewrap",
+    "bubblewrap_binary": "bwrap"
+  },
+  "max_global_sub_agents": 4,
+  "cron_poll_interval_seconds": 5,
   "channels": [
     {
-      "api_base_url": "https://api.telegram.org",
+      "kind": "telegram",
+      "id": "telegram-main",
       "bot_token": null,
       "bot_token_env": "TELEGRAM_BOT_TOKEN",
+      "api_base_url": "https://api.telegram.org",
+      "poll_timeout_seconds": 30,
+      "poll_interval_ms": 250,
       "commands": [
         {
           "command": "admin_authorize",
@@ -87,130 +213,7 @@
           "command": "continue",
           "description": "Continue the latest interrupted turn"
         }
-      ],
-      "id": "telegram-main",
-      "kind": "telegram",
-      "poll_interval_ms": 250,
-      "poll_timeout_seconds": 30
+      ]
     }
-  ],
-  "cron_poll_interval_seconds": 5,
-  "main_agent": {
-    "context_compaction": {
-      "recent_fidelity_target_ratio": 0.18,
-      "token_limit_override": null,
-      "trigger_ratio": 0.9
-    },
-    "enable_context_compression": true,
-    "global_install_root": "/opt",
-    "idle_compaction": {
-      "enabled": true,
-      "min_ratio": 0.5,
-      "poll_interval_seconds": 15
-    },
-    "language": "zh-CN",
-    "max_tool_roundtrips": 120,
-    "memory_system": "claude_code",
-    "model": null,
-    "timeout_observation_compaction": {
-      "enabled": true
-    }
-  },
-  "max_global_sub_agents": 4,
-  "models": {
-    "gemini3.1-flash-image": {
-      "agent_model_enabled": false,
-      "api_endpoint": "https://openrouter.ai/api/v1",
-      "api_key_env": "OPENROUTER_API_KEY",
-      "auth_credentials_store_mode": "auto",
-      "capabilities": [
-        "chat",
-        "image_in",
-        "image_out"
-      ],
-      "chat_completions_path": "/responses",
-      "context_window_tokens": 262144,
-      "description": "OpenRouter Responses image model for multimodal generation with text and reference image input.",
-      "model": "google/gemini-3.1-flash-image-preview",
-      "supports_vision_input": true,
-      "timeout_seconds": 120.0,
-      "type": "openrouter-resp"
-    },
-    "glm-5.1": {
-      "api_endpoint": "https://openrouter.ai/api/v1",
-      "api_key_env": "OPENROUTER_API_KEY",
-      "auth_credentials_store_mode": "auto",
-      "capabilities": [
-        "chat"
-      ],
-      "chat_completions_path": "/chat/completions",
-      "context_window_tokens": 262144,
-      "description": "Good at creating beautiful web pages in HTML/CSS.",
-      "model": "z-ai/glm-5.1",
-      "timeout_seconds": 300.0,
-      "type": "openrouter"
-    },
-    "gpt54": {
-      "api_endpoint": "https://chatgpt.com/backend-api/codex",
-      "api_key_env": "OPENAI_API_KEY",
-      "auth_credentials_store_mode": "auto",
-      "capabilities": [
-        "chat",
-        "image_in"
-      ],
-      "chat_completions_path": "/responses",
-      "codex_home": "/home/jeremyguo/.codex",
-      "context_window_tokens": 262144,
-      "description": "A general model for processing, which should be used at most works.",
-      "model": "gpt-5.4",
-      "native_web_search": {
-        "enabled": false,
-        "payload": {}
-      },
-      "supports_vision_input": true,
-      "timeout_seconds": 300.0,
-      "type": "codex-subscription"
-    },
-    "opus-4.6": {
-      "api_endpoint": "https://openrouter.ai/api/v1",
-      "api_key_env": "OPENROUTER_API_KEY",
-      "auth_credentials_store_mode": "auto",
-      "capabilities": [
-        "chat",
-        "image_in"
-      ],
-      "chat_completions_path": "/chat/completions",
-      "context_window_tokens": 262144,
-      "description": "Don't use this model as subagent.",
-      "model": "anthropic/claude-opus-4.6",
-      "supports_vision_input": true,
-      "timeout_seconds": 300.0,
-      "type": "openrouter"
-    },
-    "sonar_pro": {
-      "agent_model_enabled": false,
-      "api_endpoint": "https://openrouter.ai/api/v1",
-      "api_key_env": "OPENROUTER_API_KEY",
-      "auth_credentials_store_mode": "auto",
-      "capabilities": [
-        "web_search"
-      ],
-      "chat_completions_path": "/chat/completions",
-      "context_window_tokens": 131072,
-      "description": "Fallback external web search model when the active model cannot use native search.",
-      "model": "perplexity/sonar-pro",
-      "timeout_seconds": 60.0,
-      "type": "openrouter"
-    }
-  },
-  "sandbox": {
-    "bubblewrap_binary": "bwrap",
-    "mode": "bubblewrap"
-  },
-  "tooling": {
-    "image": "gpt54:self",
-    "image_gen": "gemini3.1-flash-image",
-    "web_search": "sonar_pro"
-  },
-  "version": "0.10"
+  ]
 }

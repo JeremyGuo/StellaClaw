@@ -21,8 +21,11 @@ impl WorkdirUpgrader for Upgrade {
                 .with_context(|| format!("failed to create {}", parent.display()))?;
         }
         if !template_path.exists() {
-            fs::write(&template_path, crate::bootstrap::default_partclaw_template())
-                .with_context(|| format!("failed to write {}", template_path.display()))?;
+            fs::write(
+                &template_path,
+                crate::bootstrap::default_partclaw_template(),
+            )
+            .with_context(|| format!("failed to write {}", template_path.display()))?;
         }
 
         let workspaces_root = workdir.join("workspaces");

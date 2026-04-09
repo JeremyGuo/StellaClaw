@@ -54,6 +54,16 @@ pub(super) fn compose_user_prompt(text: Option<&str>, attachments: &[StoredAttac
     }
 }
 
+fn prepend_system_date_section(
+    mut sections: Vec<String>,
+    system_date: Option<&str>,
+) -> Vec<String> {
+    if let Some(system_date) = system_date.map(str::trim).filter(|value| !value.is_empty()) {
+        sections.insert(0, system_date.to_string());
+    }
+    sections
+}
+
 pub(super) fn coalesce_buffered_conversation_messages(
     initial: IncomingMessage,
     pending_messages: &mut VecDeque<IncomingMessage>,
@@ -304,6 +314,7 @@ pub(super) fn build_user_turn_message(
     attachments: &[StoredAttachment],
     model: &ModelConfig,
     backend_supports_native_multimodal: bool,
+    system_date: Option<&str>,
 ) -> Result<ChatMessage> {
     let image_attachments = attachments
         .iter()
@@ -315,7 +326,8 @@ pub(super) fn build_user_turn_message(
     {
         return Ok(ChatMessage::text(
             "user",
-            compose_user_prompt(text, attachments),
+            prepend_system_date_section(vec![compose_user_prompt(text, attachments)], system_date)
+                .join("\n\n"),
         ));
     }
 
@@ -358,6 +370,7 @@ pub(super) fn build_user_turn_message(
             image_attachments.len()
         ));
     }
+    let text_sections = prepend_system_date_section(text_sections, system_date);
 
     let mut content = vec![json!({
         "type": "text",
@@ -388,7 +401,10 @@ pub(super) fn build_synthetic_system_messages(
     profile_change_notices: &[SharedProfileChangeNotice],
 ) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
-    if let Some(user_time_tip) = user_time_tip.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(user_time_tip) = user_time_tip
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         messages.push(ChatMessage::text("system", user_time_tip));
     }
     for notice in profile_change_notices {
@@ -433,6 +449,14 @@ pub(super) fn render_last_user_message_time_tip(
         "[System Tip: {:.1} hours since the last user message.]",
         elapsed_hours
     ))
+}
+
+pub(super) fn render_system_date_on_user_message(now: chrono::DateTime<chrono::Utc>) -> String {
+    let local_now = now.with_timezone(&chrono::Local);
+    format!(
+        "[System Date: {}]",
+        local_now.format("%Y-%m-%d %H:%M:%S %:z")
+    )
 }
 
 pub(super) fn render_model_catalog_change_notice(

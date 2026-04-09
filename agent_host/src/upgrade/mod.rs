@@ -436,10 +436,9 @@ mod tests {
         let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
 
         assert!(upgraded);
-        let session: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(session_dir.join("session.json")).unwrap(),
-        )
-        .unwrap();
+        let session: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
+                .unwrap();
         assert_eq!(
             session["last_user_message_at"].as_str(),
             Some("2026-04-09T00:00:00Z")

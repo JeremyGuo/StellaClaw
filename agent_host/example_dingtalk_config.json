@@ -10,22 +10,11 @@
       "cache_ttl": "5m",
       "context_window_tokens": 128000,
       "native_web_search": {
-        "enabled": true,
+        "enabled": false,
         "payload": {
           "web_search_options": {
             "search_context_size": "medium"
           }
-        }
-      },
-      "external_web_search": {
-        "base_url": "https://openrouter.ai/api/v1",
-        "model": "perplexity/sonar",
-        "api_key_env": "OPENROUTER_API_KEY",
-        "chat_completions_path": "/chat/completions",
-        "timeout_seconds": 60,
-        "headers": {
-          "HTTP-Referer": "https://example.com",
-          "X-Title": "AgentHost External Search"
         }
       },
       "description": "Fast general-purpose chat model for the foreground agent."
@@ -55,22 +44,11 @@
   },
   "channels": [
     {
-      "kind": "telegram",
-      "id": "telegram-main",
-      "bot_token_env": "TELEGRAM_BOT_TOKEN",
-      "api_base_url": "https://api.telegram.org",
-      "poll_timeout_seconds": 30,
-      "poll_interval_ms": 250,
-      "commands": [
-        {
-          "command": "new",
-          "description": "Start a new session"
-        },
-        {
-          "command": "help",
-          "description": "Show available commands"
-        }
-      ]
+      "kind": "dingtalk",
+      "id": "dingtalk-main",
+      "client_id_env": "DINGTALK_CLIENT_ID",
+      "client_secret_env": "DINGTALK_CLIENT_SECRET",
+      "api_base_url": "https://api.dingtalk.com"
     }
   ]
 }

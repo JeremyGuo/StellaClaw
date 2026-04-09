@@ -12,6 +12,9 @@ use std::fs;
 use std::path::Path;
 
 mod v0_1;
+mod v0_10;
+mod v0_11;
+mod v0_12;
 mod v0_2;
 mod v0_3;
 mod v0_4;
@@ -20,10 +23,9 @@ mod v0_6;
 mod v0_7;
 mod v0_8;
 mod v0_9;
-mod v0_10;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.10";
+pub const LATEST_CONFIG_VERSION: &str = "0.12";
 pub const VERSION_0_2: &str = "0.2";
 pub const VERSION_0_3: &str = "0.3";
 pub const VERSION_0_4: &str = "0.4";
@@ -32,6 +34,8 @@ pub const VERSION_0_6: &str = "0.6";
 pub const VERSION_0_7: &str = "0.7";
 pub const VERSION_0_8: &str = "0.8";
 pub const VERSION_0_9: &str = "0.9";
+pub const VERSION_0_10: &str = "0.10";
+pub const VERSION_0_11: &str = "0.11";
 
 trait ConfigLoader {
     fn version(&self) -> &'static str;
@@ -66,6 +70,21 @@ pub struct TelegramChannelConfig {
     pub poll_interval_ms: u64,
     #[serde(default = "default_telegram_commands")]
     pub commands: Vec<BotCommandConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DingtalkChannelConfig {
+    pub id: String,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default = "default_dingtalk_client_id_env")]
+    pub client_id_env: String,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default = "default_dingtalk_client_secret_env")]
+    pub client_secret_env: String,
+    #[serde(default = "default_dingtalk_api_base_url")]
+    pub api_base_url: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -338,6 +357,23 @@ pub struct TimeoutObservationCompactionConfig {
     pub enabled: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TimeAwarenessConfig {
+    #[serde(default = "default_emit_system_date_on_user_message")]
+    pub emit_system_date_on_user_message: bool,
+    #[serde(default = "default_emit_idle_time_gap_hint")]
+    pub emit_idle_time_gap_hint: bool,
+}
+
+impl Default for TimeAwarenessConfig {
+    fn default() -> Self {
+        Self {
+            emit_system_date_on_user_message: default_emit_system_date_on_user_message(),
+            emit_idle_time_gap_hint: default_emit_idle_time_gap_hint(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct MainAgentConfig {
     #[serde(default)]
@@ -360,6 +396,8 @@ pub struct MainAgentConfig {
     pub idle_compaction: IdleCompactionConfig,
     #[serde(default)]
     pub timeout_observation_compaction: TimeoutObservationCompactionConfig,
+    #[serde(default)]
+    pub time_awareness: TimeAwarenessConfig,
     #[serde(default)]
     pub memory_system: MemorySystem,
 }
@@ -386,6 +424,8 @@ struct MainAgentConfigRaw {
     idle_compaction: Option<IdleCompactionConfig>,
     #[serde(default)]
     timeout_observation_compaction: Option<TimeoutObservationCompactionConfig>,
+    #[serde(default)]
+    time_awareness: Option<TimeAwarenessConfig>,
     #[serde(default)]
     memory_system: MemorySystem,
     #[serde(default = "default_compact_trigger_ratio")]
@@ -438,6 +478,7 @@ impl<'de> Deserialize<'de> for MainAgentConfig {
                 min_ratio: raw.idle_compact_min_ratio,
             }),
             timeout_observation_compaction: raw.timeout_observation_compaction.unwrap_or_default(),
+            time_awareness: raw.time_awareness.unwrap_or_default(),
             memory_system: raw.memory_system,
         })
     }
@@ -465,6 +506,7 @@ pub struct SandboxConfig {
 pub enum ChannelConfig {
     CommandLine(CommandLineChannelConfig),
     Telegram(TelegramChannelConfig),
+    Dingtalk(DingtalkChannelConfig),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -629,12 +671,32 @@ fn default_enable_timeout_observation_compaction() -> bool {
     true
 }
 
+fn default_emit_system_date_on_user_message() -> bool {
+    false
+}
+
+fn default_emit_idle_time_gap_hint() -> bool {
+    true
+}
+
 fn default_telegram_bot_token_env() -> String {
     "TELEGRAM_BOT_TOKEN".to_string()
 }
 
+fn default_dingtalk_client_id_env() -> String {
+    "DINGTALK_CLIENT_ID".to_string()
+}
+
+fn default_dingtalk_client_secret_env() -> String {
+    "DINGTALK_CLIENT_SECRET".to_string()
+}
+
 fn default_telegram_api_base_url() -> String {
     "https://api.telegram.org".to_string()
+}
+
+fn default_dingtalk_api_base_url() -> String {
+    "https://api.dingtalk.com".to_string()
 }
 
 fn default_poll_timeout_seconds() -> u64 {
@@ -729,6 +791,10 @@ pub(crate) fn default_telegram_commands() -> Vec<BotCommandConfig> {
     commands
 }
 
+pub(crate) fn default_dingtalk_commands() -> Vec<BotCommandConfig> {
+    default_bot_commands()
+}
+
 pub(crate) fn default_max_global_sub_agents() -> usize {
     4
 }
@@ -754,7 +820,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let loaders: [&dyn ConfigLoader; 10] = [
+    let loaders: [&dyn ConfigLoader; 12] = [
         &v0_1::LegacyConfigLoader,
         &v0_2::VersionedConfigLoader,
         &v0_3::VersionedConfigLoader,
@@ -765,6 +831,8 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         &v0_8::LatestConfigLoader,
         &v0_9::LatestConfigLoader,
         &v0_10::LatestConfigLoader,
+        &v0_11::LatestConfigLoader,
+        &v0_12::LatestConfigLoader,
     ];
     let loader = loaders
         .into_iter()
@@ -866,7 +934,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
     let config = {
-        let loaders: [&dyn ConfigLoader; 10] = [
+        let loaders: [&dyn ConfigLoader; 12] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
             &v0_3::VersionedConfigLoader,
@@ -877,6 +945,8 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
             &v0_8::LatestConfigLoader,
             &v0_9::LatestConfigLoader,
             &v0_10::LatestConfigLoader,
+            &v0_11::LatestConfigLoader,
+            &v0_12::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()
@@ -903,6 +973,7 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
         context_compaction: &'a ContextCompactionConfig,
         idle_compaction: &'a IdleCompactionConfig,
         timeout_observation_compaction: &'a TimeoutObservationCompactionConfig,
+        time_awareness: &'a TimeAwarenessConfig,
         memory_system: MemorySystem,
     }
 
@@ -1014,6 +1085,7 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
             context_compaction: &config.main_agent.context_compaction,
             idle_compaction: &config.main_agent.idle_compaction,
             timeout_observation_compaction: &config.main_agent.timeout_observation_compaction,
+            time_awareness: &config.main_agent.time_awareness,
             memory_system: config.main_agent.memory_system,
         },
         sandbox: &config.sandbox,
@@ -1344,8 +1416,8 @@ pub fn resolve_model_api_keys(config: &ServerConfig) -> Vec<ResolvedModelApiKey>
 mod tests {
     use super::{
         ChannelConfig, LATEST_CONFIG_VERSION, MainAgentConfig, ModelType,
-        default_telegram_commands, load_server_config_file, load_server_config_file_and_upgrade,
-        resolve_model_api_keys,
+        default_dingtalk_commands, default_telegram_commands, load_server_config_file,
+        load_server_config_file_and_upgrade, resolve_model_api_keys,
     };
     use crate::backend::AgentBackendKind;
     use crate::zgent::zgent_runtime_available;
@@ -1389,6 +1461,51 @@ mod tests {
             }
             _ => panic!("expected telegram channel"),
         }
+    }
+
+    #[test]
+    fn dingtalk_channel_defaults_to_env_based_credentials() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "models": {
+                "main": {
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-model",
+                  "description": "demo"
+                }
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "dingtalk",
+                  "id": "dingtalk-main"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = load_server_config_file(&config_path).unwrap();
+        match &config.channels[0] {
+            ChannelConfig::Dingtalk(dingtalk) => {
+                assert_eq!(dingtalk.client_id_env, "DINGTALK_CLIENT_ID");
+                assert_eq!(dingtalk.client_secret_env, "DINGTALK_CLIENT_SECRET");
+                assert_eq!(dingtalk.api_base_url, "https://api.dingtalk.com");
+            }
+            _ => panic!("expected dingtalk channel"),
+        }
+    }
+
+    #[test]
+    fn dingtalk_commands_default_to_builtin_list() {
+        assert_eq!(default_dingtalk_commands(), super::default_bot_commands());
     }
 
     #[test]
@@ -2106,6 +2223,104 @@ mod tests {
                 .to_string()
                 .contains("tooling.web_search references model 'helper' which does not declare capability 'web_search'")
         );
+    }
+
+    #[test]
+    fn image_generation_tooling_targets_require_image_out_capability() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.11",
+              "models": {
+                "main": {
+                  "type": "openrouter",
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-main",
+                  "description": "demo",
+                  "capabilities": ["chat"]
+                },
+                "helper": {
+                  "type": "openrouter-resp",
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-helper",
+                  "description": "helper",
+                  "capabilities": ["chat", "image_in"]
+                }
+              },
+              "tooling": {
+                "image_gen": "helper"
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let error = load_server_config_file(&config_path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("tooling.image_gen references model 'helper' which does not declare capability 'image_out'")
+        );
+    }
+
+    #[test]
+    fn v0_11_configs_upgrade_with_time_awareness_defaults() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.11",
+              "models": {
+                "main": {
+                  "type": "openrouter",
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-main",
+                  "description": "demo",
+                  "capabilities": ["chat"]
+                }
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let (config, upgraded) = load_server_config_file_and_upgrade(&config_path).unwrap();
+        assert!(upgraded);
+        assert_eq!(config.version, LATEST_CONFIG_VERSION);
+        assert!(
+            !config
+                .main_agent
+                .time_awareness
+                .emit_system_date_on_user_message
+        );
+        assert!(config.main_agent.time_awareness.emit_idle_time_gap_hint);
+
+        let written = fs::read_to_string(&config_path).unwrap();
+        assert!(written.contains("\"version\": \"0.12\""));
+        assert!(written.contains("\"time_awareness\""));
     }
 
     #[test]

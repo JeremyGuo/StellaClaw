@@ -295,9 +295,8 @@ pub(super) fn ensure_workspace_partclaw_file(
             )
         })?;
     } else {
-        fs::write(&target_path, crate::bootstrap::default_partclaw_template()).with_context(
-            || format!("failed to write {}", target_path.display()),
-        )?;
+        fs::write(&target_path, crate::bootstrap::default_partclaw_template())
+            .with_context(|| format!("failed to write {}", target_path.display()))?;
     }
     Ok(())
 }

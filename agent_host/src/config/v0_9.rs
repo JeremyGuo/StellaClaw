@@ -1,9 +1,8 @@
 use super::{
     AgentConfig, ChannelConfig, ConfigLoader, LATEST_CONFIG_VERSION, MainAgentConfig,
     ModelCapability, ModelCatalogConfig, ModelConfig, ModelType, SandboxConfig, ServerConfig,
-    VERSION_0_9,
-    ToolingConfig, build_server_config, default_agent_model_enabled, default_api_key_env,
-    default_chat_completions_path, default_codex_subscription_endpoint,
+    ToolingConfig, VERSION_0_9, build_server_config, default_agent_model_enabled,
+    default_api_key_env, default_chat_completions_path, default_codex_subscription_endpoint,
     default_context_window_tokens, default_cron_poll_interval_seconds,
     default_max_global_sub_agents, default_model_timeout_seconds, default_responses_path,
 };

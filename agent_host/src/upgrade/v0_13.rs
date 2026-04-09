@@ -41,16 +41,20 @@ impl WorkdirUpgrader for Upgrade {
                 continue;
             }
 
-            let has_user_message = object
-                .get("history")
-                .and_then(Value::as_array)
-                .is_some_and(|history| {
-                    history.iter().any(|message| {
-                        message.get("role").and_then(Value::as_str) == Some("user")
-                    })
-                });
+            let has_user_message =
+                object
+                    .get("history")
+                    .and_then(Value::as_array)
+                    .is_some_and(|history| {
+                        history.iter().any(|message| {
+                            message.get("role").and_then(Value::as_str) == Some("user")
+                        })
+                    });
             let inferred_last_user_message_at = if has_user_message {
-                object.get("last_agent_returned_at").cloned().unwrap_or(Value::Null)
+                object
+                    .get("last_agent_returned_at")
+                    .cloned()
+                    .unwrap_or(Value::Null)
             } else {
                 Value::Null
             };

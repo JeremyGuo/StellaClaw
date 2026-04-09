@@ -1,5 +1,29 @@
-version: 0.10.1
+version: 0.12.0
 ---
+
+# 0.12.0
+
+- 升级 `config` 保存格式到 `0.12`，本次不影响 `workdir`：
+  `main_agent` 新增 `time_awareness` 配置段，支持分别控制 `emit_system_date_on_user_message` 与 `emit_idle_time_gap_hint` 两个时间感知开关。
+- 为每条普通用户消息增加可选的系统日期注入能力：
+  当 `main_agent.time_awareness.emit_system_date_on_user_message = true` 时，运行时会在用户 turn 内容前注入一段 `[System Date: YYYY-MM-DD HH:MM:SS +TZ]`，给模型稳定提供当前本地日期与时间。
+- 把“长时间静默后的时间提示”收敛成显式配置：
+  现有的长静默提示逻辑改为受 `main_agent.time_awareness.emit_idle_time_gap_hint` 控制；默认继续保持开启，方便旧配置升级后延续原有行为。
+- 同步更新配置编辑器与示例：
+  TUI config editor 新增这两个开关字段；最新 skeleton、`agent_host/example_config.json`、`agent_host/example_telegram_config.json`、`agent_host/example_dingtalk_config.json` 以及仓库根的 `deploy_telegram.json` 都已补齐到新格式。
+- 明确本次只影响 `config`，不影响 `workdir`：
+  新增 `0.11 -> 0.12` config loader；按版本策略将仓库版本从 `0.11.0` 提升到 `0.12.0`。
+
+# 0.11.0
+
+- 升级 `config` 保存格式到 `0.11`，本次不影响 `workdir`：
+  新增 `dingtalk` channel 配置类型，支持 `client_id` / `client_id_env`、`client_secret` / `client_secret_env` 与 `api_base_url` 字段，用于通过 DingTalk Stream 模式接入应用机器人。
+- 新增 DingTalk Channel 最小可用接入：
+  `agent_host` 现在可以建立 DingTalk Stream 长连接接收机器人消息，按群聊与单聊会话映射为独立 `conversation_id`，并使用回调里的 `sessionWebhook` 回复当前会话文本消息；`typing` 当前为 no-op。
+- 同步更新配置编辑与示例：
+  TUI config editor 现已支持创建和编辑 `dingtalk` channel，仓库新增 `agent_host/example_dingtalk_config.json`，现有示例配置文件也补齐到最新 `config` 版本号。
+- 明确本次只影响 `config`，不影响 `workdir`：
+  新增 `0.10 -> 0.11` config loader；按版本策略将仓库版本从 `0.10.1` 提升到 `0.11.0`。
 
 # 0.10.1
 

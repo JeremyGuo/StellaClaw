@@ -12,11 +12,12 @@ use crate::channel_auth::{
     ConversationApprovalSnapshot, ConversationApprovalState,
 };
 use crate::channels::command_line::CommandLineChannel;
+use crate::channels::dingtalk::DingtalkChannel;
 use crate::channels::telegram::TelegramChannel;
 use crate::config::{
     AgentConfig, BotCommandConfig, ChannelConfig, MainAgentConfig, ModelCapability, ModelConfig,
     SandboxConfig, SandboxMode, ServerConfig, ToolingConfig, ToolingTarget, default_bot_commands,
-    default_telegram_commands,
+    default_dingtalk_commands, default_telegram_commands,
 };
 use crate::conversation::{ConversationManager, ConversationSettings};
 use crate::cron::{
@@ -155,6 +156,33 @@ impl ToolingFamily {
             Self::Pdf => ModelCapability::Pdf,
             Self::AudioInput => ModelCapability::AudioIn,
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageGenerationRouting {
+    Disabled,
+    Native,
+    Tool,
+}
+
+fn select_image_generation_routing(
+    target: Option<&ToolingTarget>,
+    model: &ModelConfig,
+) -> ImageGenerationRouting {
+    let self_supported = model.has_capability(ModelCapability::ImageOut)
+        && model.upstream_api_kind() == UpstreamApiKind::Responses;
+
+    match target {
+        None => {
+            if self_supported {
+                ImageGenerationRouting::Native
+            } else {
+                ImageGenerationRouting::Disabled
+            }
+        }
+        Some(target) if target.prefer_self && self_supported => ImageGenerationRouting::Native,
+        Some(_) => ImageGenerationRouting::Tool,
     }
 }
 
@@ -590,13 +618,12 @@ impl ServerRuntime {
         active_model_key: &str,
         model: &ModelConfig,
     ) -> (bool, Option<UpstreamConfig>) {
-        let Some(target) = self.tooling_target(ToolingFamily::ImageGen) else {
-            return (false, None);
-        };
-        if model.has_capability(ModelCapability::ImageOut) {
-            if model.upstream_api_kind() == UpstreamApiKind::Responses {
-                return (true, None);
-            }
+        let target = self.tooling_target(ToolingFamily::ImageGen);
+        if matches!(
+            target,
+            Some(target) if target.prefer_self && model.has_capability(ModelCapability::ImageOut)
+        ) && model.upstream_api_kind() != UpstreamApiKind::Responses
+        {
             warn!(
                 log_stream = "server",
                 kind = "tooling_image_generation_self_requires_responses",
@@ -606,18 +633,26 @@ impl ServerRuntime {
                 "native provider image generation is only enabled for responses-based upstreams; falling back to the configured alias"
             );
         }
-        match self.resolve_named_tool_upstream(ToolingFamily::ImageGen, active_model_key) {
-            Ok(upstream) => (false, upstream),
-            Err(error) => {
-                warn!(
-                    log_stream = "server",
-                    kind = "tooling_image_generation_resolve_failed",
-                    active_model_key,
-                    target = %target.alias,
-                    error = %error,
-                    "failed to resolve external image generation tooling model"
-                );
-                (false, None)
+        match select_image_generation_routing(target, model) {
+            ImageGenerationRouting::Native => (true, None),
+            ImageGenerationRouting::Disabled => (false, None),
+            ImageGenerationRouting::Tool => {
+                match self.resolve_named_tool_upstream(ToolingFamily::ImageGen, active_model_key) {
+                    Ok(upstream) => (false, upstream),
+                    Err(error) => {
+                        warn!(
+                            log_stream = "server",
+                            kind = "tooling_image_generation_resolve_failed",
+                            active_model_key,
+                            target = %target
+                                .expect("tool routing requires a configured target")
+                                .alias,
+                            error = %error,
+                            "failed to resolve external image generation tooling model"
+                        );
+                        (false, None)
+                    }
+                }
             }
         }
     }
@@ -4288,6 +4323,11 @@ impl Server {
                     command_catalog.insert(id.clone(), default_telegram_commands());
                     channels.insert(id, Arc::new(TelegramChannel::from_config(telegram)?));
                 }
+                ChannelConfig::Dingtalk(dingtalk) => {
+                    let id = dingtalk.id.clone();
+                    command_catalog.insert(id.clone(), default_dingtalk_commands());
+                    channels.insert(id, Arc::new(DingtalkChannel::from_config(dingtalk)?));
+                }
             }
         }
 
@@ -4305,11 +4345,7 @@ impl Server {
             "server initialized"
         );
 
-        for family in [
-            ToolingFamily::ImageGen,
-            ToolingFamily::Pdf,
-            ToolingFamily::AudioInput,
-        ] {
+        for family in [ToolingFamily::Pdf, ToolingFamily::AudioInput] {
             if let Some(target) = family.target(&tooling) {
                 warn!(
                     log_stream = "server",
@@ -5668,7 +5704,9 @@ impl Server {
             );
             if rebuilt_system_prompt {
                 self.with_conversations(|conversations| {
-                    conversations.rotate_chat_version_id(&incoming.address).map(|_| ())
+                    conversations
+                        .rotate_chat_version_id(&incoming.address)
+                        .map(|_| ())
                 })?;
             }
             let outcome = self
@@ -5905,7 +5943,18 @@ impl Server {
         } else {
             None
         };
-        let user_time_tip = render_last_user_message_time_tip(&session, Utc::now());
+        let now = Utc::now();
+        let user_time_tip = self
+            .main_agent
+            .time_awareness
+            .emit_idle_time_gap_hint
+            .then(|| render_last_user_message_time_tip(&session, now))
+            .flatten();
+        let system_date = self
+            .main_agent
+            .time_awareness
+            .emit_system_date_on_user_message
+            .then(|| render_system_date_on_user_message(now));
         let effective_model_key = self.effective_main_model_key(&incoming.address)?;
         let effective_model = self.model_config_or_main(&effective_model_key)?.clone();
         let user_message = build_user_turn_message(
@@ -5915,6 +5964,7 @@ impl Server {
             backend_supports_native_multimodal_input(
                 self.effective_agent_backend(&incoming.address)?,
             ),
+            system_date.as_deref(),
         )?;
         let synthetic_system_messages = build_synthetic_system_messages(
             user_time_tip.as_deref(),
@@ -5927,16 +5977,19 @@ impl Server {
             .system_prompt;
         let pending_continue =
             self.with_sessions(|sessions| sessions.pending_continue(&incoming.address))?;
-        let (previous_messages, rebuilt_system_prompt) = build_previous_messages_for_turn_with_prompt(
-            &session.agent_messages,
-            pending_continue.as_ref(),
-            &synthetic_system_messages,
-            Some(user_message),
-            Some(&persistence_system_prompt),
-        );
+        let (previous_messages, rebuilt_system_prompt) =
+            build_previous_messages_for_turn_with_prompt(
+                &session.agent_messages,
+                pending_continue.as_ref(),
+                &synthetic_system_messages,
+                Some(user_message),
+                Some(&persistence_system_prompt),
+            );
         if rebuilt_system_prompt {
             self.with_conversations(|conversations| {
-                conversations.rotate_chat_version_id(&incoming.address).map(|_| ())
+                conversations
+                    .rotate_chat_version_id(&incoming.address)
+                    .map(|_| ())
             })?;
         }
 
@@ -7300,9 +7353,9 @@ fn spawn_channel_supervisor(channel: Arc<dyn Channel>, sender: mpsc::Sender<Inco
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentCommand, ForegroundRuntimePhase, Server, SinkTarget, TokenUsage,
-        background_timeout_with_active_children_text, build_previous_messages_for_turn_with_prompt,
-        build_synthetic_system_messages,
+        AgentCommand, ForegroundRuntimePhase, ImageGenerationRouting, Server, SinkTarget,
+        TokenUsage, background_timeout_with_active_children_text,
+        build_previous_messages_for_turn_with_prompt, build_synthetic_system_messages,
         build_user_turn_message, channel_restart_backoff_seconds, conversation_memory_root,
         estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
         fast_path_agent_selection_message, format_session_status, is_timeout_like,
@@ -7312,12 +7365,13 @@ mod tests {
         parse_snap_load_command, parse_snap_save_command, parse_think_command,
         persist_compaction_artifacts, rebuild_canonical_system_prompt,
         render_last_user_message_time_tip, render_model_catalog_change_notice,
-        request_yield_for_incoming, rollout_read_file, rollout_search_files,
-        send_outgoing_message_now, should_attempt_idle_context_compaction,
-        should_emit_runtime_change_prompt, summarize_resume_progress,
-        sync_workspace_shared_profile_files, tag_interrupted_followup_text,
-        update_active_foreground_phase, upload_workspace_shared_profile_files,
-        user_facing_continue_error_text, workspace_visible_in_list,
+        render_system_date_on_user_message, request_yield_for_incoming, rollout_read_file,
+        rollout_search_files, select_image_generation_routing, send_outgoing_message_now,
+        should_attempt_idle_context_compaction, should_emit_runtime_change_prompt,
+        summarize_resume_progress, sync_workspace_shared_profile_files,
+        tag_interrupted_followup_text, update_active_foreground_phase,
+        upload_workspace_shared_profile_files, user_facing_continue_error_text,
+        workspace_visible_in_list,
     };
     use crate::backend::AgentBackendKind;
     use crate::bootstrap::AgentWorkspace;
@@ -7325,7 +7379,7 @@ mod tests {
     use crate::channel_auth::{
         ChannelAdminSnapshot, ConversationApprovalSnapshot, ConversationApprovalState,
     };
-    use crate::config::{ModelCapability, ModelConfig};
+    use crate::config::{ModelCapability, ModelConfig, ToolingTarget};
     use crate::conversation::ConversationManager;
     use crate::domain::ChannelAddress;
     use crate::domain::{AttachmentKind, OutgoingMessage, ProcessingState, StoredAttachment};
@@ -7551,13 +7605,20 @@ mod tests {
             capabilities: vec![ModelCapability::ImageIn],
         };
 
-        let message =
-            build_user_turn_message(Some("看看这张图"), &[attachment], &model, true).unwrap();
+        let message = build_user_turn_message(
+            Some("看看这张图"),
+            &[attachment],
+            &model,
+            true,
+            Some("[System Date: 2026-04-10 01:23:45 +08:00]"),
+        )
+        .unwrap();
 
         let content = message.content.unwrap();
         let items = content.as_array().unwrap();
         assert_eq!(items[0]["type"], "text");
         let text = items[0]["text"].as_str().unwrap();
+        assert!(text.contains("[System Date: 2026-04-10 01:23:45 +08:00]"));
         assert!(text.contains("already directly visible in this request"));
         assert!(text.contains("instead of calling the image tool again"));
         assert_eq!(items[1]["type"], "image_url");
@@ -7586,6 +7647,108 @@ mod tests {
         assert_eq!(sent_messages.len(), 1);
         assert_eq!(sent_messages[0].0, address);
         assert_eq!(sent_messages[0].1.text.as_deref(), Some("still working"));
+    }
+
+    #[test]
+    fn image_generation_routing_defaults_to_native_only_when_unconfigured() {
+        let model = ModelConfig {
+            model_type: crate::config::ModelType::OpenrouterResp,
+            api_endpoint: "https://example.com/v1".to_string(),
+            model: "demo-image".to_string(),
+            backend: AgentBackendKind::AgentFrame,
+            supports_vision_input: false,
+            image_tool_model: None,
+            web_search_model: None,
+            api_key: None,
+            api_key_env: "TEST_API_KEY".to_string(),
+            chat_completions_path: "/responses".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 128_000,
+            cache_ttl: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            description: "image model".to_string(),
+            agent_model_enabled: true,
+            native_web_search: None,
+            external_web_search: None,
+            capabilities: vec![ModelCapability::Chat, ModelCapability::ImageOut],
+        };
+
+        assert_eq!(
+            select_image_generation_routing(None, &model),
+            ImageGenerationRouting::Native
+        );
+        assert_eq!(
+            select_image_generation_routing(
+                Some(&ToolingTarget {
+                    alias: "helper".to_string(),
+                    prefer_self: false,
+                }),
+                &model,
+            ),
+            ImageGenerationRouting::Tool
+        );
+        assert_eq!(
+            select_image_generation_routing(
+                Some(&ToolingTarget {
+                    alias: "helper".to_string(),
+                    prefer_self: true,
+                }),
+                &model,
+            ),
+            ImageGenerationRouting::Native
+        );
+    }
+
+    #[test]
+    fn image_generation_routing_falls_back_to_tool_when_self_is_unavailable() {
+        let completion_model = ModelConfig {
+            model_type: crate::config::ModelType::Openrouter,
+            api_endpoint: "https://example.com/v1".to_string(),
+            model: "demo-image".to_string(),
+            backend: AgentBackendKind::AgentFrame,
+            supports_vision_input: false,
+            image_tool_model: None,
+            web_search_model: None,
+            api_key: None,
+            api_key_env: "TEST_API_KEY".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            context_window_tokens: 128_000,
+            cache_ttl: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            description: "image model".to_string(),
+            agent_model_enabled: true,
+            native_web_search: None,
+            external_web_search: None,
+            capabilities: vec![ModelCapability::Chat, ModelCapability::ImageOut],
+        };
+        let non_image_model = ModelConfig {
+            capabilities: vec![ModelCapability::Chat],
+            ..completion_model.clone()
+        };
+        let self_target = ToolingTarget {
+            alias: "helper".to_string(),
+            prefer_self: true,
+        };
+
+        assert_eq!(
+            select_image_generation_routing(Some(&self_target), &completion_model),
+            ImageGenerationRouting::Tool
+        );
+        assert_eq!(
+            select_image_generation_routing(Some(&self_target), &non_image_model),
+            ImageGenerationRouting::Tool
+        );
+        assert_eq!(
+            select_image_generation_routing(None, &completion_model),
+            ImageGenerationRouting::Disabled
+        );
     }
 
     #[test]
@@ -7801,6 +7964,21 @@ mod tests {
         };
 
         assert!(render_last_user_message_time_tip(&session, now).is_none());
+    }
+
+    #[test]
+    fn system_date_is_formatted_for_user_message_prefix() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-04-09T16:52:45Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        let rendered = render_system_date_on_user_message(now);
+        let expected = format!(
+            "[System Date: {}]",
+            now.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S %:z")
+        );
+        assert_eq!(rendered, expected);
     }
 
     #[test]
@@ -8406,14 +8584,13 @@ mod tests {
             failed_at: Utc::now(),
         };
 
-        let (continue_messages, rebuilt_continue) =
-            build_previous_messages_for_turn_with_prompt(
-                &session_messages,
-                Some(&pending_continue),
-                &[],
-                None,
-                None,
-            );
+        let (continue_messages, rebuilt_continue) = build_previous_messages_for_turn_with_prompt(
+            &session_messages,
+            Some(&pending_continue),
+            &[],
+            None,
+            None,
+        );
         assert!(!rebuilt_continue);
         assert_eq!(continue_messages, resume_messages);
 

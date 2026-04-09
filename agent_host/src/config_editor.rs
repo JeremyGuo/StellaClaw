@@ -20,7 +20,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const TOOLING_FIELD_COUNT: usize = 5;
-const MAIN_AGENT_FIELD_COUNT: usize = 11;
+const MAIN_AGENT_FIELD_COUNT: usize = 13;
 const RUNTIME_FIELD_COUNT: usize = 2;
 const SANDBOX_FIELD_COUNT: usize = 2;
 
@@ -268,7 +268,7 @@ impl ConfigEditorApp {
             Line::from("  Main Agent: adjust defaults for the foreground agent"),
             Line::from("  Runtime: service-level counters and polling settings"),
             Line::from("  Sandbox: choose disabled / subprocess / bubblewrap"),
-            Line::from("  Channels: configure Telegram or command-line channels"),
+            Line::from("  Channels: configure Telegram, DingTalk, or command-line channels"),
             Line::from(""),
             Line::from("Global keys"),
             Line::from("  Up / Down: move in the focused pane"),
@@ -396,6 +396,26 @@ impl ConfigEditorApp {
                 nested_string(&self.value, &["main_agent", "memory_system"])
                     .unwrap_or("layered")
                     .to_string(),
+            ),
+            (
+                "time_awareness.emit_system_date_on_user_message",
+                bool_string(nested_bool(
+                    &self.value,
+                    &[
+                        "main_agent",
+                        "time_awareness",
+                        "emit_system_date_on_user_message",
+                    ],
+                    false,
+                )),
+            ),
+            (
+                "time_awareness.emit_idle_time_gap_hint",
+                bool_string(nested_bool(
+                    &self.value,
+                    &["main_agent", "time_awareness", "emit_idle_time_gap_hint"],
+                    true,
+                )),
             ),
             (
                 "enable_context_compression",
@@ -813,7 +833,7 @@ impl ConfigEditorApp {
                     "Channel form: Up/Down move field  Enter edit  s save channel  Esc cancel",
                 ),
                 Line::from(
-                    "Telegram only needs bot_token_env. Command line keeps the local shell defaults.",
+                    "Telegram needs bot_token_env, DingTalk needs client env vars, and command_line keeps the local shell defaults.",
                 ),
             ],
         }
@@ -1457,8 +1477,16 @@ impl ConfigEditorApp {
                     ChannelFormField::Kind => {
                         self.modal = Some(ModalState::Select(SelectState {
                             title: "Channel Kind".to_string(),
-                            options: vec!["command_line".to_string(), "telegram".to_string()],
-                            selected: if kind == "telegram" { 1 } else { 0 },
+                            options: vec![
+                                "command_line".to_string(),
+                                "telegram".to_string(),
+                                "dingtalk".to_string(),
+                            ],
+                            selected: match kind.as_str() {
+                                "telegram" => 1,
+                                "dingtalk" => 2,
+                                _ => 0,
+                            },
                             target: SelectTarget::ChannelKind,
                         }));
                     }
@@ -1722,7 +1750,7 @@ impl ConfigEditorApp {
                 Ok(())
             }
             SelectTarget::ChannelKind => {
-                let kinds = ["command_line", "telegram"];
+                let kinds = ["command_line", "telegram", "dingtalk"];
                 let value = kinds
                     .get(selected)
                     .ok_or_else(|| anyhow!("invalid channel kind selection"))?;
@@ -1827,6 +1855,10 @@ impl ConfigEditorApp {
     fn toggle_main_agent_bool(&mut self, field: MainAgentField) {
         let value = !self.main_agent_bool_value(field);
         let target = match field {
+            MainAgentField::TimeAwarenessEmitSystemDateOnUserMessage
+            | MainAgentField::TimeAwarenessEmitIdleTimeGapHint => {
+                ensure_nested_object_mut(&mut self.value, &["main_agent", "time_awareness"])
+            }
             MainAgentField::EnableContextCompression => {
                 ensure_nested_object_mut(&mut self.value, &["main_agent"])
             }
@@ -1858,7 +1890,9 @@ impl ConfigEditorApp {
                     _ => set_optional_trimmed_string(main_agent, field.key(), raw),
                 }
             }
-            MainAgentField::EnableContextCompression
+            MainAgentField::TimeAwarenessEmitSystemDateOnUserMessage
+            | MainAgentField::TimeAwarenessEmitIdleTimeGapHint
+            | MainAgentField::EnableContextCompression
             | MainAgentField::IdleCompactionEnabled
             | MainAgentField::TimeoutObservationCompactionEnabled => {
                 return Ok(());
@@ -2048,10 +2082,29 @@ impl ConfigEditorApp {
             set_optional_trimmed_string(&mut channel, "prompt", &form.prompt);
             channel.remove("bot_token");
             channel.remove("bot_token_env");
+            channel.remove("client_id");
+            channel.remove("client_id_env");
+            channel.remove("client_secret");
+            channel.remove("client_secret_env");
+            channel.remove("api_base_url");
             channel.remove("commands");
-        } else {
+        } else if form.kind == "telegram" {
             set_optional_trimmed_string(&mut channel, "bot_token_env", &form.bot_token_env);
             channel.remove("bot_token");
+            channel.remove("client_id");
+            channel.remove("client_id_env");
+            channel.remove("client_secret");
+            channel.remove("client_secret_env");
+            channel.remove("commands");
+            channel.remove("prompt");
+        } else {
+            set_optional_trimmed_string(&mut channel, "client_id_env", &form.client_id_env);
+            set_optional_trimmed_string(&mut channel, "client_secret_env", &form.client_secret_env);
+            set_optional_trimmed_string(&mut channel, "api_base_url", &form.api_base_url);
+            channel.remove("client_id");
+            channel.remove("client_secret");
+            channel.remove("bot_token");
+            channel.remove("bot_token_env");
             channel.remove("commands");
             channel.remove("prompt");
         }
@@ -2162,6 +2215,20 @@ impl ConfigEditorApp {
                     .unwrap_or("layered")
                     .to_string()
             }
+            MainAgentField::TimeAwarenessEmitSystemDateOnUserMessage => bool_string(nested_bool(
+                &self.value,
+                &[
+                    "main_agent",
+                    "time_awareness",
+                    "emit_system_date_on_user_message",
+                ],
+                false,
+            )),
+            MainAgentField::TimeAwarenessEmitIdleTimeGapHint => bool_string(nested_bool(
+                &self.value,
+                &["main_agent", "time_awareness", "emit_idle_time_gap_hint"],
+                true,
+            )),
             MainAgentField::EnableContextCompression => bool_string(nested_bool(
                 &self.value,
                 &["main_agent", "enable_context_compression"],
@@ -2210,6 +2277,20 @@ impl ConfigEditorApp {
 
     fn main_agent_bool_value(&self, field: MainAgentField) -> bool {
         match field {
+            MainAgentField::TimeAwarenessEmitSystemDateOnUserMessage => nested_bool(
+                &self.value,
+                &[
+                    "main_agent",
+                    "time_awareness",
+                    "emit_system_date_on_user_message",
+                ],
+                false,
+            ),
+            MainAgentField::TimeAwarenessEmitIdleTimeGapHint => nested_bool(
+                &self.value,
+                &["main_agent", "time_awareness", "emit_idle_time_gap_hint"],
+                true,
+            ),
             MainAgentField::EnableContextCompression => nested_bool(
                 &self.value,
                 &["main_agent", "enable_context_compression"],
@@ -2388,7 +2469,7 @@ struct ChannelKindWizardState {
 }
 
 impl ChannelKindWizardState {
-    const OPTIONS: [&str; 2] = ["telegram", "command_line"];
+    const OPTIONS: [&str; 3] = ["telegram", "dingtalk", "command_line"];
 
     fn selected_kind(&self) -> &'static str {
         Self::OPTIONS
@@ -2501,6 +2582,8 @@ enum MainAgentField {
     GlobalInstallRoot,
     Language,
     MemorySystem,
+    TimeAwarenessEmitSystemDateOnUserMessage,
+    TimeAwarenessEmitIdleTimeGapHint,
     EnableContextCompression,
     ContextTriggerRatio,
     ContextTokenLimitOverride,
@@ -2517,13 +2600,15 @@ impl MainAgentField {
             0 => Self::GlobalInstallRoot,
             1 => Self::Language,
             2 => Self::MemorySystem,
-            3 => Self::EnableContextCompression,
-            4 => Self::ContextTriggerRatio,
-            5 => Self::ContextTokenLimitOverride,
-            6 => Self::ContextRecentFidelityTargetRatio,
-            7 => Self::IdleCompactionEnabled,
-            8 => Self::IdleCompactionPollIntervalSeconds,
-            9 => Self::IdleCompactionMinRatio,
+            3 => Self::TimeAwarenessEmitSystemDateOnUserMessage,
+            4 => Self::TimeAwarenessEmitIdleTimeGapHint,
+            5 => Self::EnableContextCompression,
+            6 => Self::ContextTriggerRatio,
+            7 => Self::ContextTokenLimitOverride,
+            8 => Self::ContextRecentFidelityTargetRatio,
+            9 => Self::IdleCompactionEnabled,
+            10 => Self::IdleCompactionPollIntervalSeconds,
+            11 => Self::IdleCompactionMinRatio,
             _ => Self::TimeoutObservationCompactionEnabled,
         }
     }
@@ -2533,6 +2618,8 @@ impl MainAgentField {
             Self::GlobalInstallRoot => "global_install_root",
             Self::Language => "language",
             Self::MemorySystem => "memory_system",
+            Self::TimeAwarenessEmitSystemDateOnUserMessage => "emit_system_date_on_user_message",
+            Self::TimeAwarenessEmitIdleTimeGapHint => "emit_idle_time_gap_hint",
             Self::EnableContextCompression => "enable_context_compression",
             Self::ContextTriggerRatio => "trigger_ratio",
             Self::ContextTokenLimitOverride => "token_limit_override",
@@ -2549,6 +2636,10 @@ impl MainAgentField {
             Self::GlobalInstallRoot => "main_agent.global_install_root",
             Self::Language => "main_agent.language",
             Self::MemorySystem => "main_agent.memory_system",
+            Self::TimeAwarenessEmitSystemDateOnUserMessage => {
+                "time_awareness.emit_system_date_on_user_message"
+            }
+            Self::TimeAwarenessEmitIdleTimeGapHint => "time_awareness.emit_idle_time_gap_hint",
             Self::EnableContextCompression => "main_agent.enable_context_compression",
             Self::ContextTriggerRatio => "context_compaction.trigger_ratio",
             Self::ContextTokenLimitOverride => "context_compaction.token_limit_override",
@@ -2565,7 +2656,9 @@ impl MainAgentField {
     fn is_bool(self) -> bool {
         matches!(
             self,
-            Self::EnableContextCompression
+            Self::TimeAwarenessEmitSystemDateOnUserMessage
+                | Self::TimeAwarenessEmitIdleTimeGapHint
+                | Self::EnableContextCompression
                 | Self::IdleCompactionEnabled
                 | Self::TimeoutObservationCompactionEnabled
         )
@@ -2576,6 +2669,12 @@ impl MainAgentField {
             Self::GlobalInstallRoot => "Directory used for global installs",
             Self::Language => "Language tag such as zh-CN or en-US",
             Self::MemorySystem => "Choose layered memory or Claude-style PARTCLAW memory",
+            Self::TimeAwarenessEmitSystemDateOnUserMessage => {
+                "Prefix every user turn with the current local system date and time"
+            }
+            Self::TimeAwarenessEmitIdleTimeGapHint => {
+                "Add a system tip after long idle gaps before the next user turn"
+            }
             Self::EnableContextCompression => "Toggle context compaction",
             Self::ContextTriggerRatio => "Float between 0 and 1",
             Self::ContextTokenLimitOverride => "Optional integer, blank clears it",
@@ -3102,6 +3201,9 @@ enum ChannelFormField {
     Id,
     Prompt,
     BotTokenEnv,
+    ClientIdEnv,
+    ClientSecretEnv,
+    ApiBaseUrl,
 }
 
 impl ChannelFormField {
@@ -3111,15 +3213,21 @@ impl ChannelFormField {
             Self::Id => "id",
             Self::Prompt => "prompt",
             Self::BotTokenEnv => "bot_token_env",
+            Self::ClientIdEnv => "client_id_env",
+            Self::ClientSecretEnv => "client_secret_env",
+            Self::ApiBaseUrl => "api_base_url",
         }
     }
 
     fn help(self) -> &'static str {
         match self {
-            Self::Kind => "Choose command_line or telegram",
+            Self::Kind => "Choose command_line, telegram, or dingtalk",
             Self::Id => "Stable channel identifier",
             Self::Prompt => "CLI prompt text such as you> ",
             Self::BotTokenEnv => "Environment variable for Telegram bot token",
+            Self::ClientIdEnv => "Environment variable for DingTalk client id",
+            Self::ClientSecretEnv => "Environment variable for DingTalk client secret",
+            Self::ApiBaseUrl => "DingTalk API base URL",
         }
     }
 }
@@ -3133,6 +3241,9 @@ struct ChannelFormState {
     id: String,
     prompt: String,
     bot_token_env: String,
+    client_id_env: String,
+    client_secret_env: String,
+    api_base_url: String,
 }
 
 impl ChannelFormState {
@@ -3145,6 +3256,9 @@ impl ChannelFormState {
             id: String::new(),
             prompt: "you> ".to_string(),
             bot_token_env: "TELEGRAM_BOT_TOKEN".to_string(),
+            client_id_env: "DINGTALK_CLIENT_ID".to_string(),
+            client_secret_env: "DINGTALK_CLIENT_SECRET".to_string(),
+            api_base_url: "https://api.dingtalk.com".to_string(),
         }
     }
 
@@ -3166,6 +3280,21 @@ impl ChannelFormState {
                 .and_then(Value::as_str)
                 .unwrap_or("TELEGRAM_BOT_TOKEN")
                 .to_string(),
+            client_id_env: raw
+                .get("client_id_env")
+                .and_then(Value::as_str)
+                .unwrap_or("DINGTALK_CLIENT_ID")
+                .to_string(),
+            client_secret_env: raw
+                .get("client_secret_env")
+                .and_then(Value::as_str)
+                .unwrap_or("DINGTALK_CLIENT_SECRET")
+                .to_string(),
+            api_base_url: raw
+                .get("api_base_url")
+                .and_then(Value::as_str)
+                .unwrap_or("https://api.dingtalk.com")
+                .to_string(),
         }
     }
 
@@ -3176,11 +3305,19 @@ impl ChannelFormState {
                 ("id", self.id.clone()),
                 ("prompt", self.prompt.clone()),
             ]
-        } else {
+        } else if self.kind == "telegram" {
             vec![
                 ("kind", self.kind.clone()),
                 ("id", self.id.clone()),
                 ("bot_token_env", self.bot_token_env.clone()),
+            ]
+        } else {
+            vec![
+                ("kind", self.kind.clone()),
+                ("id", self.id.clone()),
+                ("client_id_env", self.client_id_env.clone()),
+                ("client_secret_env", self.client_secret_env.clone()),
+                ("api_base_url", self.api_base_url.clone()),
             ]
         }
     }
@@ -3192,11 +3329,19 @@ impl ChannelFormState {
                 1 => ChannelFormField::Id,
                 _ => ChannelFormField::Prompt,
             }
-        } else {
+        } else if self.kind == "telegram" {
             match self.selected {
                 0 => ChannelFormField::Kind,
                 1 => ChannelFormField::Id,
                 _ => ChannelFormField::BotTokenEnv,
+            }
+        } else {
+            match self.selected {
+                0 => ChannelFormField::Kind,
+                1 => ChannelFormField::Id,
+                2 => ChannelFormField::ClientIdEnv,
+                3 => ChannelFormField::ClientSecretEnv,
+                _ => ChannelFormField::ApiBaseUrl,
             }
         }
     }
@@ -3207,6 +3352,9 @@ impl ChannelFormState {
             ChannelFormField::Id => self.id.clone(),
             ChannelFormField::Prompt => self.prompt.clone(),
             ChannelFormField::BotTokenEnv => self.bot_token_env.clone(),
+            ChannelFormField::ClientIdEnv => self.client_id_env.clone(),
+            ChannelFormField::ClientSecretEnv => self.client_secret_env.clone(),
+            ChannelFormField::ApiBaseUrl => self.api_base_url.clone(),
         }
     }
 
@@ -3216,6 +3364,9 @@ impl ChannelFormState {
             ChannelFormField::Id => self.id = value,
             ChannelFormField::Prompt => self.prompt = value,
             ChannelFormField::BotTokenEnv => self.bot_token_env = value,
+            ChannelFormField::ClientIdEnv => self.client_id_env = value,
+            ChannelFormField::ClientSecretEnv => self.client_secret_env = value,
+            ChannelFormField::ApiBaseUrl => self.api_base_url = value,
         }
     }
 }
@@ -3319,6 +3470,18 @@ fn channel_kind_wizard_text(kind: &str) -> String {
             "",
             "Adds a local CLI entrypoint.",
             "You only need an id and an optional prompt string.",
+        ]
+        .join("\n"),
+        "dingtalk" => [
+            "DingTalk Channel",
+            "",
+            "Adds a DingTalk Stream bot entrypoint.",
+            "You need environment variables for the DingTalk client id and client secret.",
+            "",
+            "Built in automatically",
+            "  Stream websocket subscriptions",
+            "  sessionWebhook-based replies",
+            "  default api.dingtalk.com endpoint",
         ]
         .join("\n"),
         _ => [
@@ -3448,11 +3611,11 @@ fn channel_field_guide_text(form: &ChannelFormState, field: ChannelFormField) ->
         ChannelFormField::Kind => (
             "Which integration should be created for this channel.",
             form.kind.as_str(),
-            "Telegram manages bot commands internally. Command-line only needs a prompt.",
+            "Telegram manages bot commands internally. DingTalk uses Stream mode credentials. Command-line only needs a prompt.",
         ),
         ChannelFormField::Id => (
             "A stable unique channel id.",
-            "telegram-main or local-cli",
+            "telegram-main, dingtalk-main, or local-cli",
             "This id is how the runtime tracks the channel internally.",
         ),
         ChannelFormField::Prompt => (
@@ -3464,6 +3627,21 @@ fn channel_field_guide_text(form: &ChannelFormState, field: ChannelFormField) ->
             "The environment variable that holds the Telegram bot token.",
             "TELEGRAM_BOT_TOKEN",
             "Telegram commands, polling defaults, and API base URL are handled automatically unless an older config already overrides them.",
+        ),
+        ChannelFormField::ClientIdEnv => (
+            "The environment variable that holds the DingTalk client id.",
+            "DINGTALK_CLIENT_ID",
+            "Only used by dingtalk channels. This is the app Client ID from DingTalk developer console.",
+        ),
+        ChannelFormField::ClientSecretEnv => (
+            "The environment variable that holds the DingTalk client secret.",
+            "DINGTALK_CLIENT_SECRET",
+            "Only used by dingtalk channels. Keep the secret out of the JSON config.",
+        ),
+        ChannelFormField::ApiBaseUrl => (
+            "The DingTalk API base URL.",
+            "https://api.dingtalk.com",
+            "Usually keep the default unless you need a special endpoint for testing.",
         ),
     };
     format!(
@@ -3745,6 +3923,21 @@ fn channel_summary_text(channel: &ChannelSummary) -> String {
         .get("bot_token_env")
         .and_then(Value::as_str)
         .unwrap_or("TELEGRAM_BOT_TOKEN");
+    let client_id_env = channel
+        .raw
+        .get("client_id_env")
+        .and_then(Value::as_str)
+        .unwrap_or("DINGTALK_CLIENT_ID");
+    let client_secret_env = channel
+        .raw
+        .get("client_secret_env")
+        .and_then(Value::as_str)
+        .unwrap_or("DINGTALK_CLIENT_SECRET");
+    let api_base_url = channel
+        .raw
+        .get("api_base_url")
+        .and_then(Value::as_str)
+        .unwrap_or("https://api.dingtalk.com");
     let prompt = channel
         .raw
         .get("prompt")
@@ -3754,6 +3947,10 @@ fn channel_summary_text(channel: &ChannelSummary) -> String {
         "telegram" => format!(
             "当前频道: {}\n类型: telegram\nbot_token_env: {}\n内建命令列表和默认 polling 会自动处理。",
             channel.id, bot_token_env
+        ),
+        "dingtalk" => format!(
+            "当前频道: {}\n类型: dingtalk\nclient_id_env: {}\nclient_secret_env: {}\napi_base_url: {}\n使用 Stream 模式收消息，并通过 sessionWebhook 回复当前会话。",
+            channel.id, client_id_env, client_secret_env, api_base_url
         ),
         "command_line" => format!(
             "当前频道: {}\n类型: command_line\nprompt: {}",
@@ -3841,6 +4038,10 @@ fn latest_server_config_skeleton() -> Value {
             },
             "language": "zh-CN",
             "memory_system": "layered",
+            "time_awareness": {
+                "emit_system_date_on_user_message": false,
+                "emit_idle_time_gap_hint": true
+            },
             "enable_context_compression": true,
             "context_compaction": {
                 "trigger_ratio": 0.9,
@@ -4084,6 +4285,10 @@ mod tests {
         let skeleton = latest_server_config_skeleton();
         assert_eq!(skeleton["version"], json!(LATEST_CONFIG_VERSION));
         assert_eq!(skeleton["main_agent"]["memory_system"], json!("layered"));
+        assert_eq!(
+            skeleton["main_agent"]["time_awareness"]["emit_system_date_on_user_message"],
+            json!(false)
+        );
     }
 
     #[test]
@@ -4110,6 +4315,10 @@ mod tests {
                 "global_install_root": "/opt",
                 "language": "zh-CN",
                 "memory_system": "claude_code",
+                "time_awareness": {
+                    "emit_system_date_on_user_message": true,
+                    "emit_idle_time_gap_hint": true
+                },
                 "enable_context_compression": true,
                 "context_compaction": {
                     "trigger_ratio": 0.9,

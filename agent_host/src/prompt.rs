@@ -99,7 +99,7 @@ pub fn build_agent_system_prompt(
         "If a user message starts with [Interrupted Follow-up], it means the user sent that message while you were still working on the previous turn. Treat it as a new user input that may or may not change your current plan. If the message is only asking for progress, status, or whether you are still working, do not treat it as a stop signal. In that case, send a brief visible status update with user_tell and then continue the current task. Only stop, replan, or answer directly when the user explicitly asks you to stop, change direction, or when the new message clearly makes the previous task no longer appropriate.".to_string(),
         "If a user message starts with [Queued User Updates], it means multiple follow-up messages arrived while you were still working. Treat newer items as newer steering, but do not assume they cancel the current task unless they clearly do so. If the newest update is only a progress check or lightweight coordination, acknowledge it with user_tell and continue working. Only convert the turn into a direct final reply when the user explicitly changes the objective or asks for an immediate answer instead of continued execution.".to_string(),
         "USER.md and IDENTITY.md are copied into the workspace root. A running foreground turn keeps its current system prompt until that turn finishes, so mid-run shared-profile updates still arrive as system messages. On later user turns the runtime may rebuild the canonical system prompt when durable prompt inputs changed. If a system message says one of those files changed, use file_read to inspect that workspace file: always reread IDENTITY.md immediately so your current behavior follows the updated persona, and read USER.md when you need refreshed user info. If you edit either file, call shared_profile_upload right away, then use file_read on ./IDENTITY.md after changing it.".to_string(),
-        "For repository exploration, prefer the dedicated tools over shell commands: use glob to find files by path pattern, grep to find files by content pattern, ls to inspect directories, and file_read to read file contents. Only fall back to shell search commands when those tools are insufficient.".to_string(),
+        "For repository exploration, prefer the dedicated tools over shell commands: use glob to find files by path pattern and grep to find files by content pattern first. Use ls only after you have narrowed the search to a specific directory, and use file_read to read file contents. Only fall back to shell search commands when those tools are insufficient.".to_string(),
         format!(
             "Some system-wide software packages are installed under {}. If you need to install global software packages, install them under that directory unless the user explicitly asks for a different location.",
             main_agent.global_install_root
@@ -242,7 +242,7 @@ mod tests {
     use crate::bootstrap::AgentWorkspace;
     use crate::config::{
         ContextCompactionConfig, IdleCompactionConfig, MainAgentConfig, ModelConfig,
-        TimeoutObservationCompactionConfig,
+        TimeAwarenessConfig, TimeoutObservationCompactionConfig,
     };
     use crate::domain::ChannelAddress;
     use crate::session::SessionSnapshot;
@@ -352,6 +352,7 @@ mod tests {
                 min_ratio: 0.5,
             },
             timeout_observation_compaction: TimeoutObservationCompactionConfig { enabled: true },
+            time_awareness: TimeAwarenessConfig::default(),
             memory_system: agent_frame::config::MemorySystem::Layered,
         };
 
@@ -373,10 +374,17 @@ mod tests {
         assert!(prompt.contains("Current workspace summary."));
         assert!(prompt.contains("workspace_id=workspace-1"));
         assert!(prompt.contains("use the available workspace history tools"));
-        assert!(prompt.contains("Anti-fabrication rules: if you are unsure, do not answer from memory."));
+        assert!(
+            prompt
+                .contains("Anti-fabrication rules: if you are unsure, do not answer from memory.")
+        );
         assert!(prompt.contains("verify that it exists in this repository or local environment"));
         assert!(prompt.contains("Default workflow: explore the relevant code and config"));
-        assert!(prompt.contains("Treat AGENTS.md and similar repository instruction files as scoped rules"));
+        assert!(
+            prompt.contains(
+                "Treat AGENTS.md and similar repository instruction files as scoped rules"
+            )
+        );
         assert!(
             prompt
                 .contains("Choose the subagent model deliberately based on the model descriptions")
@@ -390,6 +398,10 @@ mod tests {
         assert!(prompt.contains("shared_profile_upload"));
         assert!(prompt.contains("use file_read to inspect that workspace file"));
         assert!(prompt.contains("use glob to find files by path pattern"));
+        assert!(
+            prompt
+                .contains("Use ls only after you have narrowed the search to a specific directory")
+        );
         assert!(!prompt.contains("Use subagent_create to start delegated work"));
         assert!(!prompt.contains("prefer leaving stdout/stderr unredirected"));
         assert!(!prompt.contains("Use only tools that are actually available to this agent"));
@@ -506,6 +518,7 @@ mod tests {
                 min_ratio: 0.5,
             },
             timeout_observation_compaction: TimeoutObservationCompactionConfig { enabled: true },
+            time_awareness: TimeAwarenessConfig::default(),
             memory_system: agent_frame::config::MemorySystem::Layered,
         };
 
@@ -645,6 +658,7 @@ mod tests {
                 min_ratio: 0.5,
             },
             timeout_observation_compaction: TimeoutObservationCompactionConfig { enabled: true },
+            time_awareness: TimeAwarenessConfig::default(),
             memory_system: agent_frame::config::MemorySystem::ClaudeCode,
         };
 
@@ -662,7 +676,10 @@ mod tests {
         );
 
         assert!(prompt.contains("Memory mode: claude_code."));
-        assert!(prompt.contains("PARTCLAW.md in the workspace root is the durable project memory file."));
+        assert!(
+            prompt
+                .contains("PARTCLAW.md in the workspace root is the durable project memory file.")
+        );
         assert!(prompt.contains("record those confirmed facts in PARTCLAW.md"));
         assert!(prompt.contains("Remember the deployment checklist."));
     }

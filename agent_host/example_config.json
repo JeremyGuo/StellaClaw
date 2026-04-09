@@ -1,4 +1,5 @@
 {
+  "version": "0.12",
   "models": {
     "main": {
       "backend": "agent_frame",
@@ -34,6 +35,10 @@
     "model": "main",
     "language": "zh-CN",
     "memory_system": "layered",
+    "time_awareness": {
+      "emit_system_date_on_user_message": false,
+      "emit_idle_time_gap_hint": true
+    },
     "context_compaction": {
       "trigger_ratio": 0.9,
       "token_limit_override": null,
