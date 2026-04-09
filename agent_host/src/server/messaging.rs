@@ -127,7 +127,7 @@ fn render_buffered_followup_messages(messages: &[(Option<&str>, usize)]) -> Stri
     sections.join("\n\n")
 }
 
-pub(super) fn should_emit_profile_change_prompt(text: Option<&str>) -> bool {
+pub(super) fn should_emit_runtime_change_prompt(text: Option<&str>) -> bool {
     let trimmed = text.map(str::trim_start).unwrap_or("");
     !trimmed.starts_with(INTERRUPTED_FOLLOWUP_MARKER)
         && !trimmed.starts_with(QUEUED_USER_UPDATES_MARKER)
@@ -382,10 +382,15 @@ pub(super) fn build_user_turn_message(
 }
 
 pub(super) fn build_synthetic_system_messages(
+    user_time_tip: Option<&str>,
+    model_catalog_change_notice: Option<&str>,
     skill_updates_prefix: Option<&str>,
     profile_change_notices: &[SharedProfileChangeNotice],
 ) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
+    if let Some(user_time_tip) = user_time_tip.map(str::trim).filter(|value| !value.is_empty()) {
+        messages.push(ChatMessage::text("system", user_time_tip));
+    }
     for notice in profile_change_notices {
         let text = match notice {
             SharedProfileChangeNotice::UserUpdated => {
@@ -397,6 +402,12 @@ pub(super) fn build_synthetic_system_messages(
         };
         messages.push(ChatMessage::text("system", text));
     }
+    if let Some(model_catalog_change_notice) = model_catalog_change_notice
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        messages.push(ChatMessage::text("system", model_catalog_change_notice));
+    }
     if let Some(skill_updates_prefix) = skill_updates_prefix
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -406,20 +417,62 @@ pub(super) fn build_synthetic_system_messages(
     messages
 }
 
-pub(super) fn build_previous_messages_for_turn(
+pub(super) fn render_last_user_message_time_tip(
+    session: &SessionSnapshot,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let last_user_message_at = session.last_user_message_at?;
+    let last_agent_returned_at = session.last_agent_returned_at?;
+    let idle_seconds = (now - last_agent_returned_at).num_seconds().max(0);
+    if idle_seconds < 5 * 60 {
+        return None;
+    }
+    let elapsed_seconds = (now - last_user_message_at).num_seconds().max(0);
+    let elapsed_hours = elapsed_seconds as f64 / 3600.0;
+    Some(format!(
+        "[System Tip: {:.1} hours since the last user message.]",
+        elapsed_hours
+    ))
+}
+
+pub(super) fn render_model_catalog_change_notice(
+    notices: &[ModelCatalogChangeNotice],
+    model_catalog: &str,
+) -> Option<String> {
+    if notices.is_empty() {
+        return None;
+    }
+    let model_catalog = model_catalog.trim();
+    if model_catalog.is_empty() {
+        return Some(
+            "[System Message: Available models changed since earlier in this session. Treat the current system prompt as authoritative for the latest model list.]"
+                .to_string(),
+        );
+    }
+    Some(format!(
+        "[System Message: Available models changed since earlier in this session. The current model catalog for this run is authoritative.\nAvailable models:\n{}]",
+        model_catalog
+    ))
+}
+
+pub(super) fn build_previous_messages_for_turn_with_prompt(
     session_agent_messages: &[ChatMessage],
     pending_continue: Option<&PendingContinueState>,
     injected_messages: &[ChatMessage],
     next_user_message: Option<ChatMessage>,
-) -> Vec<ChatMessage> {
-    let mut previous_messages = pending_continue
+    canonical_system_prompt: Option<&str>,
+) -> (Vec<ChatMessage>, bool) {
+    let base_messages = pending_continue
         .map(|pending| pending.resume_messages.clone())
         .unwrap_or_else(|| session_agent_messages.to_vec());
+    let (mut previous_messages, rebuilt_system_prompt) = canonical_system_prompt
+        .map(|prompt| rebuild_canonical_system_prompt(&base_messages, prompt))
+        .unwrap_or_else(|| (base_messages, false));
     previous_messages.extend(injected_messages.iter().cloned());
     if let Some(next_user_message) = next_user_message {
         previous_messages.push(next_user_message);
     }
-    previous_messages
+    (previous_messages, rebuilt_system_prompt)
 }
 
 fn system_message_text(message: &ChatMessage) -> Option<&str> {
@@ -427,6 +480,39 @@ fn system_message_text(message: &ChatMessage) -> Option<&str> {
         return None;
     }
     message.content.as_ref().and_then(Value::as_str)
+}
+
+pub(super) fn rebuild_canonical_system_prompt(
+    messages: &[ChatMessage],
+    canonical_system_prompt: &str,
+) -> (Vec<ChatMessage>, bool) {
+    let mut leading_system_count = 0usize;
+    while leading_system_count < messages.len()
+        && system_message_text(&messages[leading_system_count]).is_some()
+    {
+        leading_system_count += 1;
+    }
+
+    if leading_system_count == 1
+        && system_message_text(&messages[0]) == Some(canonical_system_prompt)
+    {
+        return (messages.to_vec(), false);
+    }
+
+    if leading_system_count == 0 {
+        if messages.is_empty() {
+            return (Vec::new(), false);
+        }
+        let mut rebuilt = Vec::with_capacity(messages.len() + 1);
+        rebuilt.push(ChatMessage::text("system", canonical_system_prompt));
+        rebuilt.extend_from_slice(messages);
+        return (rebuilt, true);
+    }
+
+    let mut rebuilt = Vec::with_capacity(messages.len() - leading_system_count + 1);
+    rebuilt.push(ChatMessage::text("system", canonical_system_prompt));
+    rebuilt.extend(messages.iter().skip(leading_system_count).cloned());
+    (rebuilt, true)
 }
 
 pub(super) fn normalize_messages_for_persistence(

@@ -1,6 +1,7 @@
 use crate::bootstrap::AgentWorkspace;
 use crate::config::{BotCommandConfig, MainAgentConfig, ModelConfig};
 use crate::session::SessionSnapshot;
+use agent_frame::config::MemorySystem;
 use std::collections::BTreeMap;
 use std::fs;
 
@@ -9,6 +10,25 @@ pub enum AgentPromptKind {
     MainForeground,
     MainBackground,
     SubAgent,
+}
+
+pub fn render_available_models_catalog(
+    models: &BTreeMap<String, ModelConfig>,
+    chat_model_keys: &[String],
+) -> String {
+    chat_model_keys
+        .iter()
+        .filter_map(|name| models.get_key_value(name))
+        .map(|(name, config)| {
+            let description = if config.description.trim().is_empty() {
+                "No description provided."
+            } else {
+                config.description.trim()
+            };
+            format!("- {}: {}", name, description)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 pub fn build_agent_system_prompt(
@@ -34,6 +54,13 @@ pub fn build_agent_system_prompt(
     let current_agents_markdown = fs::read_to_string(&workspace.agents_md_path)
         .ok()
         .unwrap_or_else(|| workspace.agents_markdown.clone());
+    let current_partclaw_markdown = if main_agent.memory_system == MemorySystem::ClaudeCode {
+        fs::read_to_string(session.workspace_root.join("PARTCLAW.md"))
+            .ok()
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     let header = match kind {
         AgentPromptKind::MainForeground => "[AgentHost Main Foreground Agent]",
@@ -61,13 +88,17 @@ pub fn build_agent_system_prompt(
         header.to_string(),
         role_line.to_string(),
         "Your primary writable workspace is the current workspace root for this session.".to_string(),
+        "Anti-fabrication rules: if you are unsure, do not answer from memory. Inspect the codebase, search history, or run a narrow verification step first. Do not guess.".to_string(),
+        "Before using any library, framework, command, flag, file path, or project capability, verify that it exists in this repository or local environment instead of assuming it exists.".to_string(),
+        "Default workflow: explore the relevant code and config, understand local conventions, implement the root cause, run focused verification, then run lint, typecheck, or other project checks if they exist and are relevant.".to_string(),
+        "Treat AGENTS.md and similar repository instruction files as scoped rules, not background lore. The runtime notes may not include every deeper rule file. When you start working in a subdirectory, check whether that subtree has a more local AGENTS.md or similar instruction file before editing there; when rules conflict, follow the more local file.".to_string(),
         skill_line.to_string(),
         "The path ./.skill_memory is shared persistent memory for skills. Do not proactively read from or write to ./.skill_memory unless a loaded skill explicitly instructs you to use it.".to_string(),
         "If you want to say something to the user while you are still working and before the turn is ready to finish, you must use the user_tell tool instead of only writing that text in an assistant message with tool_calls. Mid-task progress updates, coordination, status pings, and transitional explanations must go through user_tell so the user actually receives them as chat bubbles.".to_string(),
         "A progress check is not a stop signal. Do not end an in-progress task early just because the user asks for status. Use user_tell for the status update, then keep going unless the user explicitly redirects or stops the work.".to_string(),
         "If a user message starts with [Interrupted Follow-up], it means the user sent that message while you were still working on the previous turn. Treat it as a new user input that may or may not change your current plan. If the message is only asking for progress, status, or whether you are still working, do not treat it as a stop signal. In that case, send a brief visible status update with user_tell and then continue the current task. Only stop, replan, or answer directly when the user explicitly asks you to stop, change direction, or when the new message clearly makes the previous task no longer appropriate.".to_string(),
         "If a user message starts with [Queued User Updates], it means multiple follow-up messages arrived while you were still working. Treat newer items as newer steering, but do not assume they cancel the current task unless they clearly do so. If the newest update is only a progress check or lightweight coordination, acknowledge it with user_tell and continue working. Only convert the turn into a direct final reply when the user explicitly changes the objective or asks for an immediate answer instead of continued execution.".to_string(),
-        "USER.md and IDENTITY.md are copied into the workspace root. The current foreground run keeps a fixed system prompt, so shared-profile updates do not rewrite that prompt mid-run. If a system message says one of those files changed, use file_read to inspect that workspace file: always reread IDENTITY.md immediately so your current behavior follows the updated persona, and read USER.md when you need refreshed user info. If you edit either file, call shared_profile_upload right away, then use file_read on ./IDENTITY.md after changing it.".to_string(),
+        "USER.md and IDENTITY.md are copied into the workspace root. A running foreground turn keeps its current system prompt until that turn finishes, so mid-run shared-profile updates still arrive as system messages. On later user turns the runtime may rebuild the canonical system prompt when durable prompt inputs changed. If a system message says one of those files changed, use file_read to inspect that workspace file: always reread IDENTITY.md immediately so your current behavior follows the updated persona, and read USER.md when you need refreshed user info. If you edit either file, call shared_profile_upload right away, then use file_read on ./IDENTITY.md after changing it.".to_string(),
         "For repository exploration, prefer the dedicated tools over shell commands: use glob to find files by path pattern, grep to find files by content pattern, ls to inspect directories, and file_read to read file contents. Only fall back to shell search commands when those tools are insufficient.".to_string(),
         format!(
             "Some system-wide software packages are installed under {}. If you need to install global software packages, install them under that directory unless the user explicitly asks for a different location.",
@@ -91,19 +122,7 @@ pub fn build_agent_system_prompt(
         ),
     ];
 
-    let model_catalog = chat_model_keys
-        .iter()
-        .filter_map(|name| models.get_key_value(name))
-        .map(|(name, config)| {
-            let description = if config.description.trim().is_empty() {
-                "No description provided."
-            } else {
-                config.description.trim()
-            };
-            format!("- {}: {}", name, description)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let model_catalog = render_available_models_catalog(models, chat_model_keys);
     if !model_catalog.is_empty() {
         parts.push("Available models:".to_string());
         parts.extend(model_catalog.lines().map(ToOwned::to_owned));
@@ -154,6 +173,18 @@ pub fn build_agent_system_prompt(
     if !current_agents_markdown.trim().is_empty() {
         parts.push("Runtime notes:".to_string());
         parts.push(current_agents_markdown.trim().to_string());
+    }
+
+    if main_agent.memory_system == MemorySystem::ClaudeCode {
+        parts.push("Memory mode: claude_code.".to_string());
+        parts.push("In this mode, PARTCLAW.md in the workspace root is the durable project memory file. Keep it concise and factual. Update it when long-lived project facts, conventions, plans, or handoff notes change in ways future turns should remember after compaction. Do not use PARTCLAW.md for transient per-turn chatter.".to_string());
+        parts.push("When you confirm durable project facts such as build, test, lint, or typecheck commands, stable code style rules, important architecture facts, or handoff-critical decisions, record those confirmed facts in PARTCLAW.md instead of leaving future turns to rediscover or guess them.".to_string());
+        if !current_partclaw_markdown.trim().is_empty() {
+            parts.push("PARTCLAW.md:".to_string());
+            parts.push(current_partclaw_markdown.trim().to_string());
+        }
+    } else {
+        parts.push("Memory mode: layered.".to_string());
     }
 
     let _ = commands;
@@ -254,6 +285,7 @@ mod tests {
             message_count: 0,
             agent_message_count: 0,
             agent_messages: Vec::new(),
+            last_user_message_at: None,
             last_agent_returned_at: None,
             last_compacted_at: None,
             turn_count: 0,
@@ -264,6 +296,7 @@ mod tests {
             skill_states: HashMap::new(),
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
+            seen_model_catalog_version: None,
             idle_compaction_retry: None,
             zgent_native: None,
             pending_continue: None,
@@ -319,6 +352,7 @@ mod tests {
                 min_ratio: 0.5,
             },
             timeout_observation_compaction: TimeoutObservationCompactionConfig { enabled: true },
+            memory_system: agent_frame::config::MemorySystem::Layered,
         };
 
         let prompt = build_agent_system_prompt(
@@ -339,6 +373,10 @@ mod tests {
         assert!(prompt.contains("Current workspace summary."));
         assert!(prompt.contains("workspace_id=workspace-1"));
         assert!(prompt.contains("use the available workspace history tools"));
+        assert!(prompt.contains("Anti-fabrication rules: if you are unsure, do not answer from memory."));
+        assert!(prompt.contains("verify that it exists in this repository or local environment"));
+        assert!(prompt.contains("Default workflow: explore the relevant code and config"));
+        assert!(prompt.contains("Treat AGENTS.md and similar repository instruction files as scoped rules"));
         assert!(
             prompt
                 .contains("Choose the subagent model deliberately based on the model descriptions")
@@ -404,6 +442,7 @@ mod tests {
             message_count: 0,
             agent_message_count: 0,
             agent_messages: Vec::new(),
+            last_user_message_at: None,
             last_agent_returned_at: None,
             last_compacted_at: None,
             turn_count: 0,
@@ -414,6 +453,7 @@ mod tests {
             skill_states: HashMap::new(),
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
+            seen_model_catalog_version: None,
             idle_compaction_retry: None,
             zgent_native: None,
             pending_continue: None,
@@ -466,6 +506,7 @@ mod tests {
                 min_ratio: 0.5,
             },
             timeout_observation_compaction: TimeoutObservationCompactionConfig { enabled: true },
+            memory_system: agent_frame::config::MemorySystem::Layered,
         };
 
         let prompt = build_agent_system_prompt(
@@ -486,5 +527,143 @@ mod tests {
         assert!(prompt.contains("runtime notes"));
         assert!(!prompt.contains("Stale Identity"));
         assert!(!prompt.contains("name: Stale User"));
+    }
+
+    #[test]
+    fn prompt_embeds_partclaw_memory_in_claude_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let agent_dir = temp_dir.path().join("agent");
+        let rundir = temp_dir.path().join("rundir");
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(&agent_dir).unwrap();
+        fs::create_dir_all(&rundir).unwrap();
+        fs::create_dir_all(&workspace_root).unwrap();
+        let user_md_path = agent_dir.join("USER.md");
+        let identity_md_path = agent_dir.join("IDENTITY.md");
+        let agents_md_path = rundir.join("AGENTS.md");
+        fs::write(&user_md_path, "---\nname: User\n---\n").unwrap();
+        fs::write(&identity_md_path, "You are Fresh Identity.\n").unwrap();
+        fs::write(&agents_md_path, "").unwrap();
+        fs::write(
+            workspace_root.join("PARTCLAW.md"),
+            "# PARTCLAW\nRemember the deployment checklist.\n",
+        )
+        .unwrap();
+
+        let workspace = AgentWorkspace {
+            root_dir: temp_dir.path().to_path_buf(),
+            rundir: rundir.clone(),
+            agent_dir: agent_dir.clone(),
+            skills_dir: rundir.join(".skills"),
+            skill_creator_dir: rundir.join(".skills/skill-creator"),
+            tmp_dir: rundir.join("tmp"),
+            identity_md_path: identity_md_path.clone(),
+            user_md_path: user_md_path.clone(),
+            agents_md_path: agents_md_path.clone(),
+            identity_prompt: "Stale Identity".to_string(),
+            user_profile_markdown: "---\nname: Stale User\n---".to_string(),
+            raw_identity_markdown: "Stale Identity".to_string(),
+            agents_markdown: String::new(),
+        };
+        let session = SessionSnapshot {
+            id: Uuid::nil(),
+            agent_id: Uuid::nil(),
+            address: ChannelAddress {
+                channel_id: "telegram-main".to_string(),
+                conversation_id: "123".to_string(),
+                user_id: None,
+                display_name: None,
+            },
+            root_dir: temp_dir.path().join("sessions/test"),
+            attachments_dir: workspace_root.join("upload"),
+            workspace_id: "workspace-1".to_string(),
+            workspace_root: workspace_root.clone(),
+            message_count: 0,
+            agent_message_count: 0,
+            agent_messages: Vec::new(),
+            last_user_message_at: None,
+            last_agent_returned_at: None,
+            last_compacted_at: None,
+            turn_count: 0,
+            last_compacted_turn_count: 0,
+            cumulative_usage: agent_frame::TokenUsage::default(),
+            cumulative_compaction: agent_frame::SessionCompactionStats::default(),
+            api_timeout_override_seconds: None,
+            skill_states: HashMap::new(),
+            seen_user_profile_version: None,
+            seen_identity_profile_version: None,
+            seen_model_catalog_version: None,
+            idle_compaction_retry: None,
+            zgent_native: None,
+            pending_continue: None,
+            response_checkpoint: None,
+            pending_workspace_summary: false,
+            close_after_summary: false,
+        };
+        let model = ModelConfig {
+            model_type: crate::config::ModelType::Openrouter,
+            api_endpoint: "https://example.com/v1".to_string(),
+            model: "example-model".to_string(),
+            backend: AgentBackendKind::AgentFrame,
+            supports_vision_input: false,
+            image_tool_model: None,
+            web_search_model: None,
+            api_key: None,
+            api_key_env: "TEST_API_KEY".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
+            headers: serde_json::Map::new(),
+            context_window_tokens: 100_000,
+            description: "General-purpose test model".to_string(),
+            agent_model_enabled: true,
+            timeout_seconds: 30.0,
+            cache_ttl: None,
+            reasoning: None,
+            native_web_search: None,
+            external_web_search: None,
+            capabilities: Vec::new(),
+        };
+        let mut models = BTreeMap::new();
+        models.insert("main".to_string(), model.clone());
+        let main_agent = MainAgentConfig {
+            model: Some("main".to_string()),
+            global_install_root: "/opt".to_string(),
+            language: "zh-CN".to_string(),
+            timeout_seconds: Some(60.0),
+            enabled_tools: vec!["file_read".to_string()],
+            max_tool_roundtrips: 8,
+            enable_context_compression: true,
+            context_compaction: ContextCompactionConfig {
+                trigger_ratio: 0.9,
+                token_limit_override: None,
+                recent_fidelity_target_ratio: 0.18,
+            },
+            idle_compaction: IdleCompactionConfig {
+                enabled: false,
+                poll_interval_seconds: 15,
+                min_ratio: 0.5,
+            },
+            timeout_observation_compaction: TimeoutObservationCompactionConfig { enabled: true },
+            memory_system: agent_frame::config::MemorySystem::ClaudeCode,
+        };
+
+        let prompt = build_agent_system_prompt(
+            &workspace,
+            &session,
+            "",
+            AgentPromptKind::MainForeground,
+            "main",
+            &model,
+            &models,
+            &["main".to_string()],
+            &main_agent,
+            &[],
+        );
+
+        assert!(prompt.contains("Memory mode: claude_code."));
+        assert!(prompt.contains("PARTCLAW.md in the workspace root is the durable project memory file."));
+        assert!(prompt.contains("record those confirmed facts in PARTCLAW.md"));
+        assert!(prompt.contains("Remember the deployment checklist."));
     }
 }

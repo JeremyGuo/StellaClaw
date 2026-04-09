@@ -26,11 +26,14 @@ use crate::domain::{
     AttachmentKind, ChannelAddress, OutgoingAttachment, OutgoingMessage, ProcessingState,
     ShowOption, StoredAttachment,
 };
-use crate::prompt::{AgentPromptKind, build_agent_system_prompt, greeting_for_language};
+use crate::prompt::{
+    AgentPromptKind, build_agent_system_prompt, greeting_for_language,
+    render_available_models_catalog,
+};
 use crate::sandbox::run_turn_in_child_process;
 use crate::session::{
-    PendingContinueState, SessionManager, SessionSkillObservation, SessionSnapshot,
-    SharedProfileChangeNotice, SkillChangeNotice, ZgentNativeSessionState,
+    ModelCatalogChangeNotice, PendingContinueState, SessionManager, SessionSkillObservation,
+    SessionSnapshot, SharedProfileChangeNotice, SkillChangeNotice, ZgentNativeSessionState,
 };
 use crate::sink::{SinkRouter, SinkTarget};
 use crate::snapshot::{SnapshotBundle, SnapshotManager};
@@ -1088,6 +1091,7 @@ impl ServerRuntime {
             message_count,
             agent_message_count: message_count,
             agent_messages: Vec::new(),
+            last_user_message_at: None,
             last_agent_returned_at: None,
             last_compacted_at: None,
             turn_count: 0,
@@ -1098,6 +1102,7 @@ impl ServerRuntime {
             skill_states: HashMap::new(),
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
+            seen_model_catalog_version: None,
             idle_compaction_retry: None,
             zgent_native: None,
             pending_continue: None,
@@ -1613,6 +1618,7 @@ impl ServerRuntime {
                 agent_frame::config::TimeoutObservationCompactionConfig {
                     enabled: self.main_agent.timeout_observation_compaction.enabled,
                 },
+            memory_system: self.main_agent.memory_system,
         })
     }
 
@@ -1763,7 +1769,8 @@ impl ServerRuntime {
         if matches!(
             kind,
             AgentPromptKind::MainForeground | AgentPromptKind::MainBackground
-        ) {
+        ) && self.main_agent.memory_system == agent_frame::config::MemorySystem::Layered
+        {
             let runtime = self.clone();
             let memory_session = session.clone();
             tools.push(Tool::new(
@@ -2803,6 +2810,7 @@ impl ServerRuntime {
             message_count: 0,
             agent_message_count: previous_messages.len(),
             agent_messages: previous_messages.clone(),
+            last_user_message_at: None,
             last_agent_returned_at: None,
             last_compacted_at: None,
             turn_count: 0,
@@ -2813,6 +2821,7 @@ impl ServerRuntime {
             skill_states: HashMap::new(),
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
+            seen_model_catalog_version: None,
             idle_compaction_retry: None,
             zgent_native: None,
             pending_continue: None,
@@ -5650,11 +5659,23 @@ impl Server {
                 incoming.address.clone(),
                 ProcessingState::Typing,
             );
+            let persistence_system_prompt = self
+                .build_foreground_agent(&session, &pending_continue.model_key)?
+                .system_prompt;
+            let (resume_messages, rebuilt_system_prompt) = rebuild_canonical_system_prompt(
+                &pending_continue.resume_messages,
+                &persistence_system_prompt,
+            );
+            if rebuilt_system_prompt {
+                self.with_conversations(|conversations| {
+                    conversations.rotate_chat_version_id(&incoming.address).map(|_| ())
+                })?;
+            }
             let outcome = self
                 .run_main_agent_turn_with_previous_messages(
                     &session,
                     &pending_continue.model_key,
-                    pending_continue.resume_messages.clone(),
+                    resume_messages,
                     pending_continue.original_user_text.clone(),
                     pending_continue.original_attachments.clone(),
                 )
@@ -5663,9 +5684,6 @@ impl Server {
             if let Some(stop_sender) = typing_guard {
                 let _ = stop_sender.send(());
             }
-            let persistence_system_prompt = self
-                .build_foreground_agent(&session, &pending_continue.model_key)?
-                .system_prompt;
             if let Err(error) = &outcome {
                 channel
                     .set_processing(&incoming.address, ProcessingState::Idle)
@@ -5870,13 +5888,24 @@ impl Server {
         let skill_updates_prefix = self.observe_runtime_skill_changes(&session)?;
         let workspace_profile_notices = self.sync_runtime_profile_files(&session)?;
         self.observe_runtime_profile_changes(&session)?;
+        self.observe_runtime_model_catalog_changes(&session)?;
         self.stage_runtime_profile_change_notices(&session, &workspace_profile_notices)?;
-        let profile_change_notices = if should_emit_profile_change_prompt(incoming.text.as_deref())
-        {
+        let should_emit_runtime_change_notice =
+            should_emit_runtime_change_prompt(incoming.text.as_deref());
+        let profile_change_notices = if should_emit_runtime_change_notice {
             self.take_runtime_profile_change_notices(&session)?
         } else {
             Vec::new()
         };
+        let model_catalog_change_notice = if should_emit_runtime_change_notice {
+            render_model_catalog_change_notice(
+                &self.take_runtime_model_catalog_change_notices(&session)?,
+                &self.current_runtime_model_catalog(),
+            )
+        } else {
+            None
+        };
+        let user_time_tip = render_last_user_message_time_tip(&session, Utc::now());
         let effective_model_key = self.effective_main_model_key(&incoming.address)?;
         let effective_model = self.model_config_or_main(&effective_model_key)?.clone();
         let user_message = build_user_turn_message(
@@ -5888,6 +5917,8 @@ impl Server {
             ),
         )?;
         let synthetic_system_messages = build_synthetic_system_messages(
+            user_time_tip.as_deref(),
+            model_catalog_change_notice.as_deref(),
             skill_updates_prefix.as_deref(),
             &profile_change_notices,
         );
@@ -5896,12 +5927,18 @@ impl Server {
             .system_prompt;
         let pending_continue =
             self.with_sessions(|sessions| sessions.pending_continue(&incoming.address))?;
-        let previous_messages = build_previous_messages_for_turn(
+        let (previous_messages, rebuilt_system_prompt) = build_previous_messages_for_turn_with_prompt(
             &session.agent_messages,
             pending_continue.as_ref(),
             &synthetic_system_messages,
             Some(user_message),
+            Some(&persistence_system_prompt),
         );
+        if rebuilt_system_prompt {
+            self.with_conversations(|conversations| {
+                conversations.rotate_chat_version_id(&incoming.address).map(|_| ())
+            })?;
+        }
 
         channel
             .set_processing(&incoming.address, ProcessingState::Typing)
@@ -6301,6 +6338,9 @@ impl Server {
         session: &SessionSnapshot,
         show_reply: bool,
     ) -> Result<OutgoingMessage> {
+        if self.main_agent.memory_system == agent_frame::config::MemorySystem::ClaudeCode {
+            ensure_workspace_partclaw_file(&self.agent_workspace, &session.workspace_root)?;
+        }
         let greeting = ChatMessage::text("user", greeting_for_language(&self.main_agent.language));
         let effective_model_key = self.effective_main_model_key(&session.address)?;
         let persistence_system_prompt = self
@@ -7043,6 +7083,9 @@ impl Server {
         &self,
         session: &SessionSnapshot,
     ) -> Result<Vec<SharedProfileChangeNotice>> {
+        if self.main_agent.memory_system == agent_frame::config::MemorySystem::ClaudeCode {
+            ensure_workspace_partclaw_file(&self.agent_workspace, &session.workspace_root)?;
+        }
         sync_workspace_shared_profile_files(&self.agent_workspace, &session.workspace_root)
     }
 
@@ -7071,6 +7114,28 @@ impl Server {
             )?;
             Ok(())
         })
+    }
+
+    fn current_runtime_model_catalog(&self) -> String {
+        render_available_models_catalog(&self.models, &self.chat_model_keys)
+    }
+
+    fn observe_runtime_model_catalog_changes(
+        &self,
+        session: &SessionSnapshot,
+    ) -> Result<Vec<ModelCatalogChangeNotice>> {
+        let catalog = self.current_runtime_model_catalog();
+        let version = stable_content_version(&catalog);
+        self.with_sessions(|sessions| {
+            sessions.observe_model_catalog_changes(&session.address, version)
+        })
+    }
+
+    fn take_runtime_model_catalog_change_notices(
+        &self,
+        session: &SessionSnapshot,
+    ) -> Result<Vec<ModelCatalogChangeNotice>> {
+        self.with_sessions(|sessions| sessions.take_model_catalog_change_notices(&session.address))
     }
 
     fn stage_runtime_profile_change_notices(
@@ -7236,17 +7301,20 @@ fn spawn_channel_supervisor(channel: Arc<dyn Channel>, sender: mpsc::Sender<Inco
 mod tests {
     use super::{
         AgentCommand, ForegroundRuntimePhase, Server, SinkTarget, TokenUsage,
-        background_timeout_with_active_children_text, build_previous_messages_for_turn,
-        build_synthetic_system_messages, build_user_turn_message, channel_restart_backoff_seconds,
-        conversation_memory_root, estimate_compaction_savings_usd, estimate_cost_usd,
-        extract_attachment_references, fast_path_agent_selection_message, format_session_status,
-        is_timeout_like, memory_search_files, normalize_messages_for_persistence,
-        parse_agent_command, parse_model_command, parse_oldspace_command, parse_sandbox_command,
+        background_timeout_with_active_children_text, build_previous_messages_for_turn_with_prompt,
+        build_synthetic_system_messages,
+        build_user_turn_message, channel_restart_backoff_seconds, conversation_memory_root,
+        estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
+        fast_path_agent_selection_message, format_session_status, is_timeout_like,
+        memory_search_files, normalize_messages_for_persistence, parse_agent_command,
+        parse_model_command, parse_oldspace_command, parse_sandbox_command,
         parse_set_api_timeout_command, parse_sink_target, parse_snap_list_command,
         parse_snap_load_command, parse_snap_save_command, parse_think_command,
-        persist_compaction_artifacts, request_yield_for_incoming, rollout_read_file,
-        rollout_search_files, send_outgoing_message_now, should_attempt_idle_context_compaction,
-        should_emit_profile_change_prompt, summarize_resume_progress,
+        persist_compaction_artifacts, rebuild_canonical_system_prompt,
+        render_last_user_message_time_tip, render_model_catalog_change_notice,
+        request_yield_for_incoming, rollout_read_file, rollout_search_files,
+        send_outgoing_message_now, should_attempt_idle_context_compaction,
+        should_emit_runtime_change_prompt, summarize_resume_progress,
         sync_workspace_shared_profile_files, tag_interrupted_followup_text,
         update_active_foreground_phase, upload_workspace_shared_profile_files,
         user_facing_continue_error_text, workspace_visible_in_list,
@@ -7261,7 +7329,7 @@ mod tests {
     use crate::conversation::ConversationManager;
     use crate::domain::ChannelAddress;
     use crate::domain::{AttachmentKind, OutgoingMessage, ProcessingState, StoredAttachment};
-    use crate::session::{PendingContinueState, SessionSnapshot};
+    use crate::session::{ModelCatalogChangeNotice, PendingContinueState, SessionSnapshot};
     use agent_frame::message::{FunctionCall, ToolCall};
     use agent_frame::{
         ChatMessage, ContextCompactionReport, SessionCompactionStats, SessionEvent,
@@ -7303,6 +7371,7 @@ mod tests {
             message_count: 0,
             agent_message_count: 4,
             agent_messages: Vec::new(),
+            last_user_message_at: None,
             last_agent_returned_at: None,
             last_compacted_at: None,
             turn_count: 1,
@@ -7313,6 +7382,7 @@ mod tests {
             skill_states: HashMap::new(),
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
+            seen_model_catalog_version: None,
             idle_compaction_retry: None,
             zgent_native: None,
             pending_continue: None,
@@ -7573,6 +7643,8 @@ mod tests {
     #[test]
     fn synthetic_skill_updates_are_system_messages_not_user_prefixes() {
         let injected = build_synthetic_system_messages(
+            None,
+            None,
             Some("[Runtime Skill Updates]\nSkill \"search\" updated to version 3."),
             &[],
         );
@@ -7583,15 +7655,96 @@ mod tests {
             Some("[Runtime Skill Updates]\nSkill \"search\" updated to version 3.")
         );
 
-        let previous = build_previous_messages_for_turn(
+        let (previous, rebuilt) = build_previous_messages_for_turn_with_prompt(
             &[ChatMessage::text("assistant", "existing context")],
             None,
             &injected,
             Some(ChatMessage::text("user", "继续")),
+            None,
         );
+        assert!(!rebuilt);
         assert_eq!(previous.len(), 3);
         assert_eq!(previous[1].role, "system");
         assert_eq!(previous[2].role, "user");
+    }
+
+    #[test]
+    fn canonical_system_prompt_is_rebuilt_before_new_turn() {
+        let (rewritten, rebuilt) = rebuild_canonical_system_prompt(
+            &[
+                ChatMessage::text("system", "old prompt"),
+                ChatMessage::text("assistant", "existing context"),
+            ],
+            "new prompt",
+        );
+
+        assert!(rebuilt);
+        assert_eq!(
+            rewritten[0].content.as_ref().and_then(Value::as_str),
+            Some("new prompt")
+        );
+        assert_eq!(
+            rewritten[1].content.as_ref().and_then(Value::as_str),
+            Some("existing context")
+        );
+    }
+
+    #[test]
+    fn previous_messages_builder_rewrites_only_canonical_prefix() {
+        let injected = build_synthetic_system_messages(
+            None,
+            Some("[System Message: models changed]"),
+            None,
+            &[],
+        );
+        let (previous, rebuilt) = build_previous_messages_for_turn_with_prompt(
+            &[
+                ChatMessage::text("system", "old prompt"),
+                ChatMessage::text("assistant", "existing context"),
+            ],
+            None,
+            &injected,
+            Some(ChatMessage::text("user", "继续")),
+            Some("new prompt"),
+        );
+
+        assert!(rebuilt);
+        assert_eq!(
+            previous[0].content.as_ref().and_then(Value::as_str),
+            Some("new prompt")
+        );
+        assert_eq!(
+            previous[1].content.as_ref().and_then(Value::as_str),
+            Some("existing context")
+        );
+        assert_eq!(previous[2].role, "system");
+        assert_eq!(previous[3].role, "user");
+    }
+
+    #[test]
+    fn synthetic_model_catalog_updates_are_system_messages() {
+        let notice = render_model_catalog_change_notice(
+            &[ModelCatalogChangeNotice::Updated],
+            "- gpt54: primary\n- opus-4.6: large-context",
+        )
+        .unwrap();
+        let injected = build_synthetic_system_messages(None, Some(&notice), None, &[]);
+        assert_eq!(injected.len(), 1);
+        assert_eq!(injected[0].role, "system");
+        assert!(
+            injected[0]
+                .content
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("Available models changed"))
+        );
+        assert!(
+            injected[0]
+                .content
+                .as_ref()
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("- opus-4.6: large-context"))
+        );
     }
 
     #[test]
@@ -7625,14 +7778,40 @@ mod tests {
     }
 
     #[test]
-    fn profile_change_prompts_are_suppressed_for_interrupted_messages() {
-        assert!(!should_emit_profile_change_prompt(Some(
+    fn user_time_tip_is_emitted_after_five_minutes_of_idle_time() {
+        let now = Utc::now();
+        let session = SessionSnapshot {
+            last_user_message_at: Some(now - ChronoDuration::minutes(6)),
+            last_agent_returned_at: Some(now - ChronoDuration::minutes(5)),
+            ..build_test_session(&TempDir::new().unwrap())
+        };
+
+        let tip = render_last_user_message_time_tip(&session, now).expect("tip should exist");
+        assert!(tip.starts_with("[System Tip: "));
+        assert!(tip.contains("hours since the last user message"));
+    }
+
+    #[test]
+    fn user_time_tip_is_not_emitted_before_five_minutes_of_idle_time() {
+        let now = Utc::now();
+        let session = SessionSnapshot {
+            last_user_message_at: Some(now - ChronoDuration::minutes(10)),
+            last_agent_returned_at: Some(now - ChronoDuration::minutes(4)),
+            ..build_test_session(&TempDir::new().unwrap())
+        };
+
+        assert!(render_last_user_message_time_tip(&session, now).is_none());
+    }
+
+    #[test]
+    fn runtime_change_prompts_are_suppressed_for_interrupted_messages() {
+        assert!(!should_emit_runtime_change_prompt(Some(
             "[Interrupted Follow-up]\n进度如何？"
         )));
-        assert!(!should_emit_profile_change_prompt(Some(
+        assert!(!should_emit_runtime_change_prompt(Some(
             "[Queued User Updates]\nFollow-up 1:\n继续"
         )));
-        assert!(should_emit_profile_change_prompt(Some("正常对话")));
+        assert!(should_emit_runtime_change_prompt(Some("正常对话")));
     }
 
     #[test]
@@ -7911,6 +8090,7 @@ mod tests {
             message_count: 0,
             agent_message_count: 3,
             agent_messages: Vec::new(),
+            last_user_message_at: None,
             last_agent_returned_at: Some(now - ChronoDuration::seconds(400)),
             last_compacted_at: None,
             turn_count: 2,
@@ -7921,6 +8101,7 @@ mod tests {
             skill_states: HashMap::new(),
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
+            seen_model_catalog_version: None,
             idle_compaction_retry: None,
             zgent_native: None,
             pending_continue: None,
@@ -8225,16 +8406,25 @@ mod tests {
             failed_at: Utc::now(),
         };
 
-        let continue_messages =
-            build_previous_messages_for_turn(&session_messages, Some(&pending_continue), &[], None);
+        let (continue_messages, rebuilt_continue) =
+            build_previous_messages_for_turn_with_prompt(
+                &session_messages,
+                Some(&pending_continue),
+                &[],
+                None,
+                None,
+            );
+        assert!(!rebuilt_continue);
         assert_eq!(continue_messages, resume_messages);
 
-        let followup_messages = build_previous_messages_for_turn(
+        let (followup_messages, rebuilt_followup) = build_previous_messages_for_turn_with_prompt(
             &session_messages,
             Some(&pending_continue),
             &[],
             Some(ChatMessage::text("user", "new user message")),
+            None,
         );
+        assert!(!rebuilt_followup);
         assert_eq!(followup_messages.len(), 2);
         assert_eq!(
             followup_messages[0]

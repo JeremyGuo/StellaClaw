@@ -1,5 +1,40 @@
-version: 0.9.3
+version: 0.10.1
 ---
+
+# 0.10.1
+
+- 升级 `workdir` 结构版本到 `0.13`：
+  foreground / background session 持久化状态新增 `last_user_message_at`，用于在下一条普通用户消息进入前判断用户已经沉默了多久；升级会为已有 session 尽力回填该字段，没有可推断值时保持为空。
+- 为长时间静默后的下一条用户消息增加时间感知提示：
+  如果上一轮 agent 返回后，用户至少 5 分钟没有继续说话，那么下一条普通用户消息前会自动插入一条 `[System Tip: X.X hours since the last user message.]`，让模型在继续对话时对时间流逝有基本感知。
+- 明确本次只影响 `workdir`，不影响 `config`：
+  新增 `0.12 -> 0.13` workdir upgrade step；按版本策略将仓库版本从 `0.10.0` 提升到 `0.10.1`。
+
+# 0.10.0
+
+- 升级 `config` 保存格式到 `0.10`，并同时升级 `workdir` 结构版本到 `0.12`：
+  `main_agent` 新增 `memory_system` 配置，可在现有分层 memory 与 Claude Code 风格 memory 之间切换；workdir 会为 `rundir` 和各 workspace root 自动补齐 `PARTCLAW.md` 模板文件。
+- 新增 Claude Code 风格 memory 模式：
+  当前台 agent 选择 `main_agent.memory_system = "claude_code"` 时，system prompt 会嵌入 workspace 根目录的 `PARTCLAW.md` 作为持久项目记忆，context compaction 改为输出 Claude 风格的压缩摘要，并额外明确要求保留仍在后台运行的 continuation-critical 标识，例如未结束的 `exec_id`、`download_id`、文件下载 id 和 subagent id，避免压缩后无法继续回写或观察。
+- 调整 memory 能力暴露与持久化路径：
+  Claude 风格模式下不再向前台 agent 暴露 `memory_search` / `rollout_search` / `rollout_read` 这类分层 memory 检索工具；旧的分层 compaction 产物仍保留在 `layered` 模式下使用。
+- 收紧 system prompt 一致性恢复逻辑：
+  当普通用户消息到来或 `/continue` 恢复前，如果持久化消息里的 canonical system prompt 与当前应构建出的 system prompt 不一致，AgentHost 现在会在保留后续消息历史的前提下直接重建 canonical system prompt；运行期动态插入的 shared profile / model catalog / skill update 等 system message 仍按临时消息处理，不会阻止重建。
+- 明确本次同时影响 `config` 与 `workdir`：
+  新增 `0.9 -> 0.10` config loader 与 `0.11 -> 0.12` workdir upgrade step；按版本策略将仓库版本从 `0.9.4` 提升到 `0.10.0`。
+
+# 0.9.4
+
+- 升级 `workdir` 结构版本到 `0.11`：
+  foreground session 持久化新增模型目录观察状态，用来记录每个 session 上次看到的可用模型列表版本，以及下一条普通用户消息前是否还需要补发模型目录变化提示。
+- 为每个 foreground session 增加模型目录变更检测：
+  当当前可用 agent model 的数量、名称或 description 发生变化时，AgentHost 会像 `USER.md` / `IDENTITY.md` 变更提示那样，在下一条普通用户消息前插入一条 `[System Message]`，告知模型“当前可用模型列表和 description 已变化”，并附上新的完整列表。
+- 收紧中断追问场景下的变更提示注入：
+  `[Interrupted Follow-up]` 和 `[Queued User Updates]` 这类中途插话不会立刻消费模型目录 / shared profile 变更提示；这些提示会继续保留到下一条正常用户消息，避免在“进度如何”这类插话里平白膨胀上下文。
+- 调整 compaction 提示词对临时 runtime system message 的处理：
+  自动上下文压缩现在明确要求忽略“shared profile changed / runtime skill updates / available models changed”这类会在后续 turn 重新构造的临时 system message，避免把它们错误写回压缩摘要。
+- 明确本次只影响 `workdir`，不影响 `config`：
+  新增 `0.10 -> 0.11` workdir upgrade step；按版本策略将仓库版本从 `0.9.3` 提升到 `0.9.4`。
 
 # 0.9.3
 

@@ -277,6 +277,31 @@ pub(super) fn sync_workspace_shared_profile_files(
     Ok(notices)
 }
 
+pub(super) fn ensure_workspace_partclaw_file(
+    agent_workspace: &AgentWorkspace,
+    workspace_root: &Path,
+) -> Result<()> {
+    let target_path = workspace_root.join("PARTCLAW.md");
+    if target_path.exists() {
+        return Ok(());
+    }
+    let source_path = agent_workspace.rundir.join("PARTCLAW.md");
+    if source_path.is_file() {
+        fs::copy(&source_path, &target_path).with_context(|| {
+            format!(
+                "failed to copy {} to {}",
+                source_path.display(),
+                target_path.display()
+            )
+        })?;
+    } else {
+        fs::write(&target_path, crate::bootstrap::default_partclaw_template()).with_context(
+            || format!("failed to write {}", target_path.display()),
+        )?;
+    }
+    Ok(())
+}
+
 pub(super) fn upload_workspace_shared_profile_files(
     agent_workspace: &AgentWorkspace,
     workspace_root: &Path,

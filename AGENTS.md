@@ -33,6 +33,13 @@ If a change affects config structure or config serialization format:
 
 Keep old config loaders working so existing saved configs can still be loaded and upgraded.
 
+If a change adds, removes, renames, or changes a user-facing config field:
+
+- update the TUI config editor in `agent_host/src/config_editor.rs` so the field is visible and editable there as well
+- update the latest config skeleton and any relevant example config files
+- if the field only accepts a fixed set of values, expose it in the TUI as an explicit selection list instead of free-form text input
+- do not make users guess valid enum-like values from documentation or source code
+
 ## Rule 3: Top-Level VERSION Bump Policy
 
 The repository root `VERSION` file must follow this policy:
@@ -62,5 +69,7 @@ Before pushing schema-related changes, verify:
 - whether `config` changed
 - whether `workdir` changed
 - whether upgrade code was added where required
+- whether `agent_host/src/config_editor.rs` was updated for any user-facing config change
+- whether fixed-choice config fields use a TUI selection list instead of raw text entry
 - whether `VERSION` was updated according to the policy above
 - whether the changelog explains the migration clearly

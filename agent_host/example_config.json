@@ -33,6 +33,7 @@
   "main_agent": {
     "model": "main",
     "language": "zh-CN",
+    "memory_system": "layered",
     "context_compaction": {
       "trigger_ratio": 0.9,
       "token_limit_override": null,

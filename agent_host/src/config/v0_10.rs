@@ -1,7 +1,6 @@
 use super::{
     AgentConfig, ChannelConfig, ConfigLoader, LATEST_CONFIG_VERSION, MainAgentConfig,
     ModelCapability, ModelCatalogConfig, ModelConfig, ModelType, SandboxConfig, ServerConfig,
-    VERSION_0_9,
     ToolingConfig, build_server_config, default_agent_model_enabled, default_api_key_env,
     default_chat_completions_path, default_codex_subscription_endpoint,
     default_context_window_tokens, default_cron_poll_interval_seconds,
@@ -81,16 +80,16 @@ struct VersionedModelConfigRaw {
 
 impl ConfigLoader for LatestConfigLoader {
     fn version(&self) -> &'static str {
-        VERSION_0_9
+        LATEST_CONFIG_VERSION
     }
 
     fn load_and_upgrade(&self, value: Value) -> Result<ServerConfig> {
         let raw: VersionedServerConfigRaw =
             serde_json::from_value(value).context("failed to parse latest server config")?;
-        if raw.version != VERSION_0_9 {
+        if raw.version != LATEST_CONFIG_VERSION {
             return Err(anyhow!(
-                "config loader expected version '{}' but received '{}'",
-                VERSION_0_9,
+                "latest config loader expected version '{}' but received '{}'",
+                LATEST_CONFIG_VERSION,
                 raw.version
             ));
         }

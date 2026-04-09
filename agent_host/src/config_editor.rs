@@ -1,3 +1,4 @@
+use agent_frame::config::MemorySystem;
 use agent_host::config::{LATEST_CONFIG_VERSION, load_server_config_file};
 use anyhow::{Context, Result, anyhow, bail};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -19,7 +20,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const TOOLING_FIELD_COUNT: usize = 5;
-const MAIN_AGENT_FIELD_COUNT: usize = 10;
+const MAIN_AGENT_FIELD_COUNT: usize = 11;
 const RUNTIME_FIELD_COUNT: usize = 2;
 const SANDBOX_FIELD_COUNT: usize = 2;
 
@@ -388,6 +389,12 @@ impl ConfigEditorApp {
                 "language",
                 nested_string(&self.value, &["main_agent", "language"])
                     .unwrap_or("zh-CN")
+                    .to_string(),
+            ),
+            (
+                "memory_system",
+                nested_string(&self.value, &["main_agent", "memory_system"])
+                    .unwrap_or("layered")
                     .to_string(),
             ),
             (
@@ -1212,6 +1219,13 @@ impl ConfigEditorApp {
                 let field = MainAgentField::from_index(self.main_agent_selected);
                 if field.is_bool() {
                     self.toggle_main_agent_bool(field);
+                } else if field == MainAgentField::MemorySystem {
+                    self.modal = Some(ModalState::Select(SelectState {
+                        title: "Main Agent Memory System".to_string(),
+                        options: vec!["layered".to_string(), "claude_code".to_string()],
+                        selected: current_memory_system_index(&self.value),
+                        target: SelectTarget::MainAgentMemorySystem,
+                    }));
                 } else {
                     self.open_text_input(
                         field.title(),
@@ -1690,6 +1704,13 @@ impl ConfigEditorApp {
                     .ok_or_else(|| anyhow!("invalid sandbox mode selection"))?;
                 self.set_sandbox_value(SandboxField::Mode, value)
             }
+            SelectTarget::MainAgentMemorySystem => {
+                let systems = ["layered", "claude_code"];
+                let value = systems
+                    .get(selected)
+                    .ok_or_else(|| anyhow!("invalid memory system selection"))?;
+                self.set_main_agent_value(MainAgentField::MemorySystem, value)
+            }
             SelectTarget::ModelForm(ModelFormField::ModelType) => {
                 let types = ["openrouter", "openrouter-resp", "codex-subscription"];
                 let value = types
@@ -1825,9 +1846,17 @@ impl ConfigEditorApp {
 
     fn set_main_agent_value(&mut self, field: MainAgentField, raw: &str) -> Result<()> {
         match field {
-            MainAgentField::GlobalInstallRoot | MainAgentField::Language => {
+            MainAgentField::GlobalInstallRoot
+            | MainAgentField::Language
+            | MainAgentField::MemorySystem => {
                 let main_agent = ensure_nested_object_mut(&mut self.value, &["main_agent"]);
-                set_optional_trimmed_string(main_agent, field.key(), raw);
+                match field {
+                    MainAgentField::MemorySystem => {
+                        let memory_system = parse_memory_system(raw)?;
+                        set_string(main_agent, field.key(), memory_system.as_config_value());
+                    }
+                    _ => set_optional_trimmed_string(main_agent, field.key(), raw),
+                }
             }
             MainAgentField::EnableContextCompression
             | MainAgentField::IdleCompactionEnabled
@@ -2128,6 +2157,11 @@ impl ConfigEditorApp {
             MainAgentField::Language => nested_string(&self.value, &["main_agent", "language"])
                 .unwrap_or("zh-CN")
                 .to_string(),
+            MainAgentField::MemorySystem => {
+                nested_string(&self.value, &["main_agent", "memory_system"])
+                    .unwrap_or("layered")
+                    .to_string()
+            }
             MainAgentField::EnableContextCompression => bool_string(nested_bool(
                 &self.value,
                 &["main_agent", "enable_context_compression"],
@@ -2417,6 +2451,7 @@ enum InputTarget {
 #[derive(Clone, Copy)]
 enum SelectTarget {
     SandboxMode,
+    MainAgentMemorySystem,
     ModelForm(ModelFormField),
     ChannelKind,
 }
@@ -2461,10 +2496,11 @@ impl ToolingField {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum MainAgentField {
     GlobalInstallRoot,
     Language,
+    MemorySystem,
     EnableContextCompression,
     ContextTriggerRatio,
     ContextTokenLimitOverride,
@@ -2480,13 +2516,14 @@ impl MainAgentField {
         match index {
             0 => Self::GlobalInstallRoot,
             1 => Self::Language,
-            2 => Self::EnableContextCompression,
-            3 => Self::ContextTriggerRatio,
-            4 => Self::ContextTokenLimitOverride,
-            5 => Self::ContextRecentFidelityTargetRatio,
-            6 => Self::IdleCompactionEnabled,
-            7 => Self::IdleCompactionPollIntervalSeconds,
-            8 => Self::IdleCompactionMinRatio,
+            2 => Self::MemorySystem,
+            3 => Self::EnableContextCompression,
+            4 => Self::ContextTriggerRatio,
+            5 => Self::ContextTokenLimitOverride,
+            6 => Self::ContextRecentFidelityTargetRatio,
+            7 => Self::IdleCompactionEnabled,
+            8 => Self::IdleCompactionPollIntervalSeconds,
+            9 => Self::IdleCompactionMinRatio,
             _ => Self::TimeoutObservationCompactionEnabled,
         }
     }
@@ -2495,6 +2532,7 @@ impl MainAgentField {
         match self {
             Self::GlobalInstallRoot => "global_install_root",
             Self::Language => "language",
+            Self::MemorySystem => "memory_system",
             Self::EnableContextCompression => "enable_context_compression",
             Self::ContextTriggerRatio => "trigger_ratio",
             Self::ContextTokenLimitOverride => "token_limit_override",
@@ -2510,6 +2548,7 @@ impl MainAgentField {
         match self {
             Self::GlobalInstallRoot => "main_agent.global_install_root",
             Self::Language => "main_agent.language",
+            Self::MemorySystem => "main_agent.memory_system",
             Self::EnableContextCompression => "main_agent.enable_context_compression",
             Self::ContextTriggerRatio => "context_compaction.trigger_ratio",
             Self::ContextTokenLimitOverride => "context_compaction.token_limit_override",
@@ -2536,6 +2575,7 @@ impl MainAgentField {
         match self {
             Self::GlobalInstallRoot => "Directory used for global installs",
             Self::Language => "Language tag such as zh-CN or en-US",
+            Self::MemorySystem => "Choose layered memory or Claude-style PARTCLAW memory",
             Self::EnableContextCompression => "Toggle context compaction",
             Self::ContextTriggerRatio => "Float between 0 and 1",
             Self::ContextTokenLimitOverride => "Optional integer, blank clears it",
@@ -3669,6 +3709,36 @@ fn current_sandbox_mode_index(value: &Value) -> usize {
     }
 }
 
+fn current_memory_system_index(value: &Value) -> usize {
+    match nested_string(value, &["main_agent", "memory_system"]).unwrap_or("layered") {
+        "claude_code" => 1,
+        _ => 0,
+    }
+}
+
+fn parse_memory_system(raw: &str) -> Result<MemorySystem> {
+    match raw.trim() {
+        "layered" => Ok(MemorySystem::Layered),
+        "claude_code" => Ok(MemorySystem::ClaudeCode),
+        other => Err(anyhow!(
+            "invalid memory system `{other}`; expected `layered` or `claude_code`"
+        )),
+    }
+}
+
+trait MemorySystemConfigValue {
+    fn as_config_value(self) -> &'static str;
+}
+
+impl MemorySystemConfigValue for MemorySystem {
+    fn as_config_value(self) -> &'static str {
+        match self {
+            MemorySystem::Layered => "layered",
+            MemorySystem::ClaudeCode => "claude_code",
+        }
+    }
+}
+
 fn channel_summary_text(channel: &ChannelSummary) -> String {
     let bot_token_env = channel
         .raw
@@ -3770,6 +3840,7 @@ fn latest_server_config_skeleton() -> Value {
                 "/opt"
             },
             "language": "zh-CN",
+            "memory_system": "layered",
             "enable_context_compression": true,
             "context_compaction": {
                 "trigger_ratio": 0.9,
@@ -3970,7 +4041,7 @@ fn bool_string(value: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ModelFormState, format_json_document, latest_server_config_skeleton,
+        LATEST_CONFIG_VERSION, ModelFormState, format_json_document, latest_server_config_skeleton,
         load_or_create_json_document, model_capability_options, parse_json_document,
         validate_json_document,
     };
@@ -4011,13 +4082,14 @@ mod tests {
     #[test]
     fn latest_skeleton_uses_latest_version() {
         let skeleton = latest_server_config_skeleton();
-        assert_eq!(skeleton["version"], json!("0.9"));
+        assert_eq!(skeleton["version"], json!(LATEST_CONFIG_VERSION));
+        assert_eq!(skeleton["main_agent"]["memory_system"], json!("layered"));
     }
 
     #[test]
     fn validation_accepts_minimal_valid_config() {
         let value = json!({
-            "version": "0.9",
+            "version": LATEST_CONFIG_VERSION,
             "models": {
                 "main": {
                     "type": "openrouter",
@@ -4037,6 +4109,7 @@ mod tests {
             "main_agent": {
                 "global_install_root": "/opt",
                 "language": "zh-CN",
+                "memory_system": "claude_code",
                 "enable_context_compression": true,
                 "context_compaction": {
                     "trigger_ratio": 0.9,
@@ -4068,7 +4141,7 @@ mod tests {
 
         let summary = validate_json_document(&value).unwrap();
 
-        assert!(summary.contains("version 0.9"));
+        assert!(summary.contains(&format!("version {LATEST_CONFIG_VERSION}")));
         assert!(summary.contains("1 model(s)"));
         assert!(summary.contains("1 channel(s)"));
     }

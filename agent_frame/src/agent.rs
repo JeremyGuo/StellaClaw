@@ -1256,7 +1256,7 @@ mod tests {
         finish_pending_tool_wait_compaction, start_pending_tool_wait_compaction,
         synthetic_user_message_from_tool_result,
     };
-    use crate::config::{AgentConfig, CacheControlConfig, UpstreamConfig};
+    use crate::config::{AgentConfig, CacheControlConfig, MemorySystem, UpstreamConfig};
     use crate::message::ChatMessage;
     use serde_json::Value;
     use std::path::PathBuf;
@@ -1319,6 +1319,7 @@ mod tests {
             timeout_observation_compaction: crate::config::TimeoutObservationCompactionConfig {
                 enabled: true,
             },
+            memory_system: MemorySystem::Layered,
         };
         let stable_prefix = vec![
             ChatMessage::text("system", "[AgentFrame Runtime]\n\nTest system prompt."),

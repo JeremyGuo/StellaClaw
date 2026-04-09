@@ -3,7 +3,8 @@
     "agent_frame": {
       "available_models": [
         "gpt54",
-        "opus-4.6"
+        "opus-4.6",
+        "glm-5.1"
       ]
     },
     "zgent": {
@@ -14,9 +15,83 @@
   },
   "channels": [
     {
+      "api_base_url": "https://api.telegram.org",
+      "bot_token": null,
       "bot_token_env": "TELEGRAM_BOT_TOKEN",
+      "commands": [
+        {
+          "command": "admin_authorize",
+          "description": "Authorize yourself as this channel's admin from a private chat"
+        },
+        {
+          "command": "admin_chat_list",
+          "description": "List approval state for this channel's chats"
+        },
+        {
+          "command": "admin_chat_approve",
+          "description": "Approve a chat id for this channel"
+        },
+        {
+          "command": "admin_chat_reject",
+          "description": "Reject a chat id for this channel"
+        },
+        {
+          "command": "oldspace",
+          "description": "Reactivate an older workspace by id"
+        },
+        {
+          "command": "help",
+          "description": "Show available commands"
+        },
+        {
+          "command": "status",
+          "description": "Show current session usage and timeout settings"
+        },
+        {
+          "command": "compact",
+          "description": "Compact the current conversation context now"
+        },
+        {
+          "command": "compact_mode",
+          "description": "Show or set automatic context compaction"
+        },
+        {
+          "command": "agent",
+          "description": "Show or set the conversation agent backend and model"
+        },
+        {
+          "command": "sandbox",
+          "description": "Show or set the conversation sandbox mode"
+        },
+        {
+          "command": "think",
+          "description": "Show or set the conversation reasoning effort"
+        },
+        {
+          "command": "set_api_timeout",
+          "description": "Set session API timeout in seconds"
+        },
+        {
+          "command": "snapsave",
+          "description": "Save a named global snapshot"
+        },
+        {
+          "command": "snapload",
+          "description": "Load a named global snapshot"
+        },
+        {
+          "command": "snaplist",
+          "description": "List saved global snapshots"
+        },
+        {
+          "command": "continue",
+          "description": "Continue the latest interrupted turn"
+        }
+      ],
       "id": "telegram-main",
-      "kind": "telegram"
+      "kind": "telegram",
+      "poll_interval_ms": 250,
+      "poll_timeout_seconds": 30
     }
   ],
   "cron_poll_interval_seconds": 5,
@@ -34,6 +109,9 @@
       "poll_interval_seconds": 15
     },
     "language": "zh-CN",
+    "max_tool_roundtrips": 120,
+    "memory_system": "claude_code",
+    "model": null,
     "timeout_observation_compaction": {
       "enabled": true
     }
@@ -44,6 +122,7 @@
       "agent_model_enabled": false,
       "api_endpoint": "https://openrouter.ai/api/v1",
       "api_key_env": "OPENROUTER_API_KEY",
+      "auth_credentials_store_mode": "auto",
       "capabilities": [
         "chat",
         "image_in",
@@ -53,8 +132,23 @@
       "context_window_tokens": 262144,
       "description": "OpenRouter Responses image model for multimodal generation with text and reference image input.",
       "model": "google/gemini-3.1-flash-image-preview",
+      "supports_vision_input": true,
       "timeout_seconds": 120.0,
       "type": "openrouter-resp"
+    },
+    "glm-5.1": {
+      "api_endpoint": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "auth_credentials_store_mode": "auto",
+      "capabilities": [
+        "chat"
+      ],
+      "chat_completions_path": "/chat/completions",
+      "context_window_tokens": 262144,
+      "description": "Good at creating beautiful web pages in HTML/CSS.",
+      "model": "z-ai/glm-5.1",
+      "timeout_seconds": 300.0,
+      "type": "openrouter"
     },
     "gpt54": {
       "api_endpoint": "https://chatgpt.com/backend-api/codex",
@@ -78,7 +172,6 @@
       "type": "codex-subscription"
     },
     "opus-4.6": {
-      "agent_model_enabled": true,
       "api_endpoint": "https://openrouter.ai/api/v1",
       "api_key_env": "OPENROUTER_API_KEY",
       "auth_credentials_store_mode": "auto",
@@ -86,10 +179,11 @@
         "chat",
         "image_in"
       ],
+      "chat_completions_path": "/chat/completions",
       "context_window_tokens": 262144,
-      "description": "Claude Opus 4.6 via OpenRouter using the native ZGent backend.",
+      "description": "Don't use this model as subagent.",
       "model": "anthropic/claude-opus-4.6",
-      "supports_vision_input": false,
+      "supports_vision_input": true,
       "timeout_seconds": 300.0,
       "type": "openrouter"
     },
@@ -97,6 +191,7 @@
       "agent_model_enabled": false,
       "api_endpoint": "https://openrouter.ai/api/v1",
       "api_key_env": "OPENROUTER_API_KEY",
+      "auth_credentials_store_mode": "auto",
       "capabilities": [
         "web_search"
       ],
@@ -117,5 +212,5 @@
     "image_gen": "gemini3.1-flash-image",
     "web_search": "sonar_pro"
   },
-  "version": "0.9"
+  "version": "0.10"
 }

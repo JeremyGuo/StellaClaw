@@ -1,4 +1,4 @@
-use crate::config::AgentConfig;
+use crate::config::{AgentConfig, MemorySystem};
 use crate::llm::{ChatCompletionSession, TokenUsage, create_chat_completion};
 use crate::message::ChatMessage;
 use crate::tooling::Tool;
@@ -380,7 +380,21 @@ fn build_summary_request(
     request_messages.push(ChatMessage::text(
         "user",
         format!(
-            "Compress the older conversation history in this same transcript.\n\nReturn a JSON object with exactly these top-level keys:\n- old_summary\n- new_summary\n- keywords\n- important_refs\n- memory_hints\n- next_step\n\nMeaning:\n- old_summary: further compress the previously compacted old history. If there is no previous compacted old history, return an empty string.\n- new_summary: summarize only the older conversation history that appears before the most recent {preserved_recent_count} message(s) immediately preceding this request.\n- keywords: short retrieval keywords.\n- important_refs: object with arrays paths, commands, errors, urls, ids.\n- memory_hints: array of {{ group, conclusions }} for higher-level memory grouping.\n- next_step: one short recommended next step.\n\nRules:\n- keep summaries concise and factual\n- redact long secrets; mention that a secret or cookie was provided without copying the full value\n- do not invent details\n- do not restate or summarize shared context content from the system prompt, skills metadata, USER, or IDENTITY\n- the most recent {preserved_recent_count} message(s) immediately preceding this request are preserved separately as the recent high-fidelity zone; do not summarize them except for a tiny pointer when continuity absolutely requires it\n- if an earlier assistant message beginning with {COMPACTION_MARKER} exists in the older history, further compress its Old Summary into old_summary\n- if an older start-type task is still active, preserve the continuation-critical identifier needed to resume it safely, especially exec_id, download_id, or subagent id, plus any path, cwd, or url needed to continue unfinished work\n- if that start-type task has already finished or is no longer active, you do not need to preserve its identifier just because it appeared earlier\n- intermediate tool calls and tool results do not need to be reproduced step by step; summarize their outcome compactly unless a still-active task needs a specific identifier or reference to continue safely\n- old_summary and new_summary should each be markdown bullet summaries\n- if a field has no content, use an empty string or empty array\n- return JSON only"
+            "Compress the older conversation history in this same transcript.\n\nReturn a JSON object with exactly these top-level keys:\n- old_summary\n- new_summary\n- keywords\n- important_refs\n- memory_hints\n- next_step\n\nMeaning:\n- old_summary: further compress the previously compacted old history. If there is no previous compacted old history, return an empty string.\n- new_summary: summarize only the older conversation history that appears before the most recent {preserved_recent_count} message(s) immediately preceding this request.\n- keywords: short retrieval keywords.\n- important_refs: object with arrays paths, commands, errors, urls, ids.\n- memory_hints: array of {{ group, conclusions }} for higher-level memory grouping.\n- next_step: one short recommended next step.\n\nRules:\n- keep summaries concise and factual\n- redact long secrets; mention that a secret or cookie was provided without copying the full value\n- do not invent details\n- do not restate or summarize shared context content from the system prompt, skills metadata, USER, or IDENTITY\n- ignore transient runtime system messages that only announce refreshed shared profiles, runtime skill updates, or available model catalog changes; those are reconstructed separately and should not be preserved in the compaction summary\n- the most recent {preserved_recent_count} message(s) immediately preceding this request are preserved separately as the recent high-fidelity zone; do not summarize them except for a tiny pointer when continuity absolutely requires it\n- if an earlier assistant message beginning with {COMPACTION_MARKER} exists in the older history, further compress its Old Summary into old_summary\n- if an older start-type task is still active, preserve the continuation-critical identifier needed to resume it safely, especially exec_id, download_id, or subagent id, plus any path, cwd, or url needed to continue unfinished work\n- if that start-type task has already finished or is no longer active, you do not need to preserve its identifier just because it appeared earlier\n- intermediate tool calls and tool results do not need to be reproduced step by step; summarize their outcome compactly unless a still-active task needs a specific identifier or reference to continue safely\n- old_summary and new_summary should each be markdown bullet summaries\n- if a field has no content, use an empty string or empty array\n- return JSON only"
+        ),
+    ));
+    request_messages
+}
+
+fn build_claude_code_summary_request(
+    messages: &[ChatMessage],
+    preserved_recent_count: usize,
+) -> Vec<ChatMessage> {
+    let mut request_messages = messages.to_vec();
+    request_messages.push(ChatMessage::text(
+        "user",
+        format!(
+            "Provide a detailed but concise summary of our conversation above.\n\nFocus on information that would be helpful for continuing the conversation, including what we did, what we're doing, which files we're working on, and what we're going to do next.\n\nRules:\n- keep the summary factual, compact, and continuation-oriented\n- redact long secrets; mention that a secret or cookie was provided without copying the full value\n- do not invent details\n- do not restate shared context content from the system prompt, skills metadata, USER, IDENTITY, or PARTCLAW\n- ignore transient runtime system messages that only announce refreshed shared profiles, runtime skill updates, or available model catalog changes; those are reconstructed separately and should not be preserved in the summary\n- the most recent {preserved_recent_count} message(s) immediately preceding this request are preserved separately as the recent high-fidelity zone; do not summarize them except for a tiny pointer when continuity absolutely requires it\n- if an unfinished long-running task still matters, preserve the continuation-critical identifier needed to resume or write back safely, especially exec_id, download_id, file_download id, subagent id, plus any path, cwd, url, or pending destination needed to finish the task\n- never drop the identifiers for background work that is still running or waiting to be observed; losing those ids can prevent safe completion\n- if a task is already finished or no longer relevant, you do not need to preserve its identifier just because it appeared earlier\n- intermediate tool calls and tool results do not need to be reproduced step by step; summarize the outcome compactly unless an unfinished task needs exact references\n- return plain text only"
         ),
     ));
     request_messages
@@ -416,17 +430,35 @@ fn render_structured_summary(output: &StructuredCompactionOutput) -> String {
     sections.join("\n\n")
 }
 
+fn render_claude_code_summary(summary_text: &str) -> String {
+    format!(
+        "{COMPACTION_MARKER}\n\nOlder conversation history has been compacted into the summary below.\n\n{}",
+        summary_text.trim()
+    )
+}
+
+enum GeneratedCompactionSummary {
+    Structured(StructuredCompactionOutput),
+    ClaudeCode(String),
+}
+
 fn generate_summary(
     config: &AgentConfig,
     messages: &[ChatMessage],
     preserved_recent_count: usize,
     session: Option<&mut ChatCompletionSession>,
-) -> Result<(StructuredCompactionOutput, TokenUsage)> {
+) -> Result<(GeneratedCompactionSummary, TokenUsage)> {
     let mut extra_payload = Map::new();
     extra_payload.insert("max_completion_tokens".to_string(), Value::from(1_200_u64));
+    let request_messages = match config.memory_system {
+        MemorySystem::Layered => build_summary_request(messages, preserved_recent_count),
+        MemorySystem::ClaudeCode => {
+            build_claude_code_summary_request(messages, preserved_recent_count)
+        }
+    };
     let summary_message = create_chat_completion(
         &config.upstream,
-        &build_summary_request(messages, preserved_recent_count),
+        &request_messages,
         &[],
         Some(extra_payload),
         session,
@@ -435,10 +467,13 @@ fn generate_summary(
     if summary_text.trim().is_empty() {
         return Err(anyhow!("context compression summary came back empty"));
     }
-    Ok((
-        parse_structured_summary(&summary_text)?,
-        summary_message.usage,
-    ))
+    let generated = match config.memory_system {
+        MemorySystem::Layered => {
+            GeneratedCompactionSummary::Structured(parse_structured_summary(&summary_text)?)
+        }
+        MemorySystem::ClaudeCode => GeneratedCompactionSummary::ClaudeCode(summary_text),
+    };
+    Ok((generated, summary_message.usage))
 }
 
 fn find_originating_tool_use_index(
@@ -537,11 +572,19 @@ fn compact_history_once(
     }
     let messages_to_summarize = &body[..split_index];
     let recent_messages = &body[split_index..];
-    let (structured_output, usage) =
+    let (generated_summary, usage) =
         generate_summary(config, messages, recent_messages.len(), session)?;
     let runtime_state = active_runtime_state_summary(&config.runtime_state_root)?;
-    let summary_message =
-        ChatMessage::text("assistant", render_structured_summary(&structured_output));
+    let (summary_message, structured_output) = match generated_summary {
+        GeneratedCompactionSummary::Structured(structured_output) => (
+            ChatMessage::text("assistant", render_structured_summary(&structured_output)),
+            Some(structured_output),
+        ),
+        GeneratedCompactionSummary::ClaudeCode(summary_text) => (
+            ChatMessage::text("assistant", render_claude_code_summary(&summary_text)),
+            None,
+        ),
+    };
     let mut compacted = system_prefix;
     compacted.push(summary_message);
     if let Some(runtime_state) = runtime_state.filter(|value| !value.trim().is_empty()) {
@@ -551,7 +594,7 @@ fn compact_history_once(
     Ok((
         compacted,
         usage,
-        Some(structured_output),
+        structured_output,
         messages_to_summarize.to_vec(),
     ))
 }

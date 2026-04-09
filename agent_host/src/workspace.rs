@@ -1171,6 +1171,11 @@ mod tests {
         fs::create_dir_all(temp_dir.path().join("agent")).unwrap();
         fs::write(temp_dir.path().join("rundir/AGENTS.md"), "template agents").unwrap();
         fs::write(
+            temp_dir.path().join("rundir/PARTCLAW.md"),
+            "template partclaw",
+        )
+        .unwrap();
+        fs::write(
             temp_dir.path().join("rundir/.skills/template.txt"),
             "skill template",
         )
@@ -1198,6 +1203,10 @@ mod tests {
         assert_eq!(
             fs::read_to_string(created.files_dir.join("IDENTITY.md")).unwrap(),
             "shared identity"
+        );
+        assert_eq!(
+            fs::read_to_string(created.files_dir.join("PARTCLAW.md")).unwrap(),
+            "template partclaw"
         );
     }
 

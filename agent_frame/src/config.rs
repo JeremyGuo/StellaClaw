@@ -158,6 +158,14 @@ pub struct TimeoutObservationCompactionConfig {
     pub enabled: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemorySystem {
+    #[default]
+    Layered,
+    ClaudeCode,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentConfig {
     #[serde(default)]
@@ -187,6 +195,8 @@ pub struct AgentConfig {
     pub context_compaction: ContextCompactionConfig,
     #[serde(default)]
     pub timeout_observation_compaction: TimeoutObservationCompactionConfig,
+    #[serde(default)]
+    pub memory_system: MemorySystem,
 }
 
 #[derive(Deserialize)]
@@ -220,6 +230,8 @@ struct AgentConfigRaw {
     context_compaction: Option<ContextCompactionConfig>,
     #[serde(default)]
     timeout_observation_compaction: Option<TimeoutObservationCompactionConfig>,
+    #[serde(default)]
+    memory_system: MemorySystem,
     #[serde(default = "default_compact_trigger_ratio")]
     compact_trigger_ratio: f64,
     #[serde(default = "default_effective_context_window_percent")]
@@ -521,6 +533,7 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
             recent_fidelity_target_ratio: raw.recent_fidelity_target_ratio,
         }),
         timeout_observation_compaction: raw.timeout_observation_compaction.unwrap_or_default(),
+        memory_system: raw.memory_system,
     })
 }
 

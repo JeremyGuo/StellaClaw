@@ -31,6 +31,20 @@ const IDENTITY_TEMPLATE: &str = r#"# Your name - What should they call you?
 
 const AGENTS_TEMPLATE: &str = "";
 
+const PARTCLAW_TEMPLATE: &str = r#"# PARTCLAW
+
+Use this file as concise durable project memory when the runtime is configured to use the `claude_code` memory system.
+
+Good content for this file:
+- stable project conventions and constraints
+- important architectural decisions
+- current long-lived plan or handoff notes
+- durable facts a later turn should know even after context compaction
+
+Avoid putting transient turn-by-turn chatter here.
+Keep the file short, factual, and easy to reread.
+"#;
+
 const SKILL_CREATOR_TEMPLATE: &str = r#"---
 name: skill-creator
 description: Create new skills or improve existing skills. Use when the user wants to turn a workflow into a reusable skill, revise a skill's trigger wording, reorganize skill resources, or persist a staged skill with skill_create or skill_update.
@@ -166,11 +180,13 @@ impl AgentWorkspace {
         let user_md_path = agent_dir.join("USER.md");
         let identity_md_path = agent_dir.join("IDENTITY.md");
         let agents_md_path = rundir.join("AGENTS.md");
+        let partclaw_md_path = rundir.join("PARTCLAW.md");
         let skill_creator_md_path = skill_creator_dir.join("SKILL.md");
 
         ensure_seed_file(&user_md_path, USER_TEMPLATE)?;
         ensure_seed_file(&identity_md_path, IDENTITY_TEMPLATE)?;
         ensure_seed_file(&agents_md_path, AGENTS_TEMPLATE)?;
+        ensure_seed_file(&partclaw_md_path, PARTCLAW_TEMPLATE)?;
         ensure_seed_file(&skill_creator_md_path, SKILL_CREATOR_TEMPLATE)?;
 
         let user_profile_markdown = fs::read_to_string(&user_md_path)
@@ -197,6 +213,10 @@ impl AgentWorkspace {
             agents_markdown,
         })
     }
+}
+
+pub fn default_partclaw_template() -> &'static str {
+    PARTCLAW_TEMPLATE
 }
 
 fn ensure_seed_file(path: &Path, template: &str) -> Result<()> {
@@ -251,6 +271,7 @@ mod tests {
         assert!(workspace.user_md_path.exists());
         assert!(workspace.identity_md_path.exists());
         assert!(workspace.agents_md_path.exists());
+        assert!(temp_dir.path().join("rundir/PARTCLAW.md").exists());
         assert!(workspace.tmp_dir.exists());
         assert!(
             workspace

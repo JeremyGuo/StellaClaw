@@ -1,8 +1,8 @@
 use crate::backend::AgentBackendKind;
 use crate::zgent::zgent_runtime_available;
 use agent_frame::config::{
-    AuthCredentialsStoreMode, ExternalWebSearchConfig, NativeWebSearchConfig, ReasoningConfig,
-    UpstreamApiKind, UpstreamAuthKind,
+    AuthCredentialsStoreMode, ExternalWebSearchConfig, MemorySystem, NativeWebSearchConfig,
+    ReasoningConfig, UpstreamApiKind, UpstreamAuthKind,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -20,9 +20,10 @@ mod v0_6;
 mod v0_7;
 mod v0_8;
 mod v0_9;
+mod v0_10;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.9";
+pub const LATEST_CONFIG_VERSION: &str = "0.10";
 pub const VERSION_0_2: &str = "0.2";
 pub const VERSION_0_3: &str = "0.3";
 pub const VERSION_0_4: &str = "0.4";
@@ -30,6 +31,7 @@ pub const VERSION_0_5: &str = "0.5";
 pub const VERSION_0_6: &str = "0.6";
 pub const VERSION_0_7: &str = "0.7";
 pub const VERSION_0_8: &str = "0.8";
+pub const VERSION_0_9: &str = "0.9";
 
 trait ConfigLoader {
     fn version(&self) -> &'static str;
@@ -358,6 +360,8 @@ pub struct MainAgentConfig {
     pub idle_compaction: IdleCompactionConfig,
     #[serde(default)]
     pub timeout_observation_compaction: TimeoutObservationCompactionConfig,
+    #[serde(default)]
+    pub memory_system: MemorySystem,
 }
 
 #[derive(Debug, Deserialize)]
@@ -382,6 +386,8 @@ struct MainAgentConfigRaw {
     idle_compaction: Option<IdleCompactionConfig>,
     #[serde(default)]
     timeout_observation_compaction: Option<TimeoutObservationCompactionConfig>,
+    #[serde(default)]
+    memory_system: MemorySystem,
     #[serde(default = "default_compact_trigger_ratio")]
     compact_trigger_ratio: f64,
     #[serde(default = "default_effective_context_window_percent")]
@@ -432,6 +438,7 @@ impl<'de> Deserialize<'de> for MainAgentConfig {
                 min_ratio: raw.idle_compact_min_ratio,
             }),
             timeout_observation_compaction: raw.timeout_observation_compaction.unwrap_or_default(),
+            memory_system: raw.memory_system,
         })
     }
 }
@@ -747,7 +754,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let loaders: [&dyn ConfigLoader; 9] = [
+    let loaders: [&dyn ConfigLoader; 10] = [
         &v0_1::LegacyConfigLoader,
         &v0_2::VersionedConfigLoader,
         &v0_3::VersionedConfigLoader,
@@ -757,6 +764,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         &v0_7::LatestConfigLoader,
         &v0_8::LatestConfigLoader,
         &v0_9::LatestConfigLoader,
+        &v0_10::LatestConfigLoader,
     ];
     let loader = loaders
         .into_iter()
@@ -858,7 +866,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
     let config = {
-        let loaders: [&dyn ConfigLoader; 9] = [
+        let loaders: [&dyn ConfigLoader; 10] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
             &v0_3::VersionedConfigLoader,
@@ -868,6 +876,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
             &v0_7::LatestConfigLoader,
             &v0_8::LatestConfigLoader,
             &v0_9::LatestConfigLoader,
+            &v0_10::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()
@@ -894,6 +903,7 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
         context_compaction: &'a ContextCompactionConfig,
         idle_compaction: &'a IdleCompactionConfig,
         timeout_observation_compaction: &'a TimeoutObservationCompactionConfig,
+        memory_system: MemorySystem,
     }
 
     #[derive(Serialize)]
@@ -1004,6 +1014,7 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
             context_compaction: &config.main_agent.context_compaction,
             idle_compaction: &config.main_agent.idle_compaction,
             timeout_observation_compaction: &config.main_agent.timeout_observation_compaction,
+            memory_system: config.main_agent.memory_system,
         },
         sandbox: &config.sandbox,
         max_global_sub_agents: config.max_global_sub_agents,
@@ -1895,7 +1906,7 @@ mod tests {
 
         let written = fs::read_to_string(&config_path).unwrap();
         let written_json: serde_json::Value = serde_json::from_str(&written).unwrap();
-        assert!(written.contains("\"version\": \"0.9\""));
+        assert!(written.contains(&format!("\"version\": \"{LATEST_CONFIG_VERSION}\"")));
         assert!(written.contains("\"web_search\": \"main_web_search\""));
         assert!(written.contains("\"models\": {"));
         assert!(!written.contains("\"tooling\": {"));

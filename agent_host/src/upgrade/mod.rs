@@ -3,6 +3,9 @@ use std::fs;
 use std::path::Path;
 
 mod v0_10;
+mod v0_11;
+mod v0_12;
+mod v0_13;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -10,7 +13,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.10";
+pub const LATEST_WORKDIR_VERSION: &str = "0.13";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -26,13 +29,16 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 6] = [
+    let upgraders: [&dyn WorkdirUpgrader; 9] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
         &v0_8::Upgrade,
         &v0_9::Upgrade,
         &v0_10::Upgrade,
+        &v0_11::Upgrade,
+        &v0_12::Upgrade,
+        &v0_13::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -67,6 +73,9 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.7" => Ok("0.7"),
         "0.8" => Ok("0.8"),
         "0.9" => Ok("0.9"),
+        "0.10" => Ok("0.10"),
+        "0.11" => Ok("0.11"),
+        "0.12" => Ok("0.12"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -370,5 +379,70 @@ mod tests {
         assert!(!processes_dir.exists());
         assert!(!tool_workers_dir.join("exec-1.job.json").exists());
         assert!(tool_workers_dir.join("image-1.job.json").exists());
+    }
+
+    #[test]
+    fn v0_11_workdir_upgrade_seeds_partclaw_files() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.11\n").unwrap();
+        let workspace_files_dir = temp_dir.path().join("workspaces/workspace-1/files");
+        fs::create_dir_all(&workspace_files_dir).unwrap();
+        fs::create_dir_all(temp_dir.path().join("rundir")).unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("VERSION"))
+                .unwrap()
+                .trim(),
+            LATEST_WORKDIR_VERSION
+        );
+        assert!(temp_dir.path().join("rundir/PARTCLAW.md").is_file());
+        assert!(workspace_files_dir.join("PARTCLAW.md").is_file());
+    }
+
+    #[test]
+    fn v0_12_workdir_upgrade_backfills_last_user_message_timestamp() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.12\n").unwrap();
+        let session_dir = temp_dir
+            .path()
+            .join("sessions")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": Uuid::new_v4(),
+                "agent_id": Uuid::new_v4(),
+                "address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "123",
+                    "user_id": "user-1",
+                    "display_name": "User"
+                },
+                "workspace_id": "workspace-1",
+                "history": [
+                    { "role": "user", "text": "hello", "attachments": [] },
+                    { "role": "assistant", "text": "world", "attachments": [] }
+                ],
+                "last_agent_returned_at": "2026-04-09T00:00:00Z"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        let session: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(session_dir.join("session.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            session["last_user_message_at"].as_str(),
+            Some("2026-04-09T00:00:00Z")
+        );
     }
 }

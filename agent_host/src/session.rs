@@ -47,12 +47,19 @@ pub enum SharedProfileChangeNotice {
     IdentityUpdated,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModelCatalogChangeNotice {
+    Updated,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SessionCheckpointData {
     #[serde(default)]
     pub history: Vec<SessionMessage>,
     #[serde(default)]
     pub agent_messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub last_user_message_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub last_agent_returned_at: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -77,6 +84,10 @@ pub struct SessionCheckpointData {
     pub pending_user_profile_notice: bool,
     #[serde(default)]
     pub pending_identity_profile_notice: bool,
+    #[serde(default)]
+    pub seen_model_catalog_version: Option<String>,
+    #[serde(default)]
+    pub pending_model_catalog_notice: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -131,6 +142,7 @@ pub struct SessionSnapshot {
     pub message_count: usize,
     pub agent_message_count: usize,
     pub agent_messages: Vec<ChatMessage>,
+    pub last_user_message_at: Option<DateTime<Utc>>,
     pub last_agent_returned_at: Option<DateTime<Utc>>,
     pub last_compacted_at: Option<DateTime<Utc>>,
     pub turn_count: u64,
@@ -141,6 +153,7 @@ pub struct SessionSnapshot {
     pub skill_states: HashMap<String, SessionSkillState>,
     pub seen_user_profile_version: Option<String>,
     pub seen_identity_profile_version: Option<String>,
+    pub seen_model_catalog_version: Option<String>,
     pub idle_compaction_retry: Option<IdleCompactionRetryState>,
     pub zgent_native: Option<ZgentNativeSessionState>,
     pub pending_continue: Option<PendingContinueState>,
@@ -169,6 +182,7 @@ struct Session {
     workspace_root: PathBuf,
     history: Vec<SessionMessage>,
     agent_messages: Vec<ChatMessage>,
+    last_user_message_at: Option<DateTime<Utc>>,
     last_agent_returned_at: Option<DateTime<Utc>>,
     last_compacted_at: Option<DateTime<Utc>>,
     turn_count: u64,
@@ -179,8 +193,10 @@ struct Session {
     skill_states: HashMap<String, SessionSkillState>,
     seen_user_profile_version: Option<String>,
     seen_identity_profile_version: Option<String>,
+    seen_model_catalog_version: Option<String>,
     pending_user_profile_notice: bool,
     pending_identity_profile_notice: bool,
+    pending_model_catalog_notice: bool,
     idle_compaction_retry: Option<IdleCompactionRetryState>,
     zgent_native: Option<ZgentNativeSessionState>,
     pending_continue: Option<PendingContinueState>,
@@ -207,6 +223,7 @@ impl Session {
             message_count: self.history.len(),
             agent_message_count: self.agent_messages.len(),
             agent_messages: self.agent_messages.clone(),
+            last_user_message_at: self.last_user_message_at,
             last_agent_returned_at: self.last_agent_returned_at,
             last_compacted_at: self.last_compacted_at,
             turn_count: self.turn_count,
@@ -217,6 +234,7 @@ impl Session {
             skill_states: self.skill_states.clone(),
             seen_user_profile_version: self.seen_user_profile_version.clone(),
             seen_identity_profile_version: self.seen_identity_profile_version.clone(),
+            seen_model_catalog_version: self.seen_model_catalog_version.clone(),
             idle_compaction_retry: self.idle_compaction_retry.clone(),
             zgent_native: self.zgent_native.clone(),
             pending_continue: self.pending_continue.clone(),
@@ -232,6 +250,9 @@ impl Session {
         text: Option<String>,
         attachments: Vec<StoredAttachment>,
     ) {
+        if role == MessageRole::User {
+            self.last_user_message_at = Some(Utc::now());
+        }
         self.history.push(SessionMessage {
             role,
             text,
@@ -248,6 +269,7 @@ impl Session {
             workspace_id: Some(self.workspace_id.clone()),
             history: self.history.clone(),
             agent_messages: self.agent_messages.clone(),
+            last_user_message_at: self.last_user_message_at,
             last_agent_returned_at: self.last_agent_returned_at,
             last_compacted_at: self.last_compacted_at,
             turn_count: self.turn_count,
@@ -260,6 +282,8 @@ impl Session {
             seen_identity_profile_version: self.seen_identity_profile_version.clone(),
             pending_user_profile_notice: self.pending_user_profile_notice,
             pending_identity_profile_notice: self.pending_identity_profile_notice,
+            seen_model_catalog_version: self.seen_model_catalog_version.clone(),
+            pending_model_catalog_notice: self.pending_model_catalog_notice,
             idle_compaction_retry: self.idle_compaction_retry.clone(),
             zgent_native: self.zgent_native.clone(),
             pending_continue: self.pending_continue.clone(),
@@ -300,6 +324,7 @@ impl Session {
             workspace_root,
             history: persisted.history,
             agent_messages,
+            last_user_message_at: persisted.last_user_message_at,
             last_agent_returned_at: persisted.last_agent_returned_at,
             last_compacted_at: persisted.last_compacted_at,
             turn_count: persisted.turn_count,
@@ -310,8 +335,10 @@ impl Session {
             skill_states: persisted.skill_states,
             seen_user_profile_version: persisted.seen_user_profile_version,
             seen_identity_profile_version: persisted.seen_identity_profile_version,
+            seen_model_catalog_version: persisted.seen_model_catalog_version,
             pending_user_profile_notice: persisted.pending_user_profile_notice,
             pending_identity_profile_notice: persisted.pending_identity_profile_notice,
+            pending_model_catalog_notice: persisted.pending_model_catalog_notice,
             idle_compaction_retry: persisted.idle_compaction_retry,
             zgent_native: persisted.zgent_native,
             pending_continue,
@@ -409,6 +436,8 @@ struct PersistedSession {
     #[serde(default)]
     agent_messages: Vec<ChatMessage>,
     #[serde(default)]
+    last_user_message_at: Option<DateTime<Utc>>,
+    #[serde(default)]
     last_agent_returned_at: Option<DateTime<Utc>>,
     #[serde(default)]
     last_compacted_at: Option<DateTime<Utc>>,
@@ -429,9 +458,13 @@ struct PersistedSession {
     #[serde(default)]
     seen_identity_profile_version: Option<String>,
     #[serde(default)]
+    seen_model_catalog_version: Option<String>,
+    #[serde(default)]
     pending_user_profile_notice: bool,
     #[serde(default)]
     pending_identity_profile_notice: bool,
+    #[serde(default)]
+    pending_model_catalog_notice: bool,
     #[serde(default)]
     idle_compaction_retry: Option<IdleCompactionRetryState>,
     #[serde(default)]
@@ -664,6 +697,7 @@ impl SessionManager {
         Ok(SessionCheckpointData {
             history: session.history.clone(),
             agent_messages: session.agent_messages.clone(),
+            last_user_message_at: session.last_user_message_at,
             last_agent_returned_at: session.last_agent_returned_at,
             last_compacted_at: session.last_compacted_at,
             turn_count: session.turn_count,
@@ -676,6 +710,8 @@ impl SessionManager {
             seen_identity_profile_version: session.seen_identity_profile_version.clone(),
             pending_user_profile_notice: session.pending_user_profile_notice,
             pending_identity_profile_notice: session.pending_identity_profile_notice,
+            seen_model_catalog_version: session.seen_model_catalog_version.clone(),
+            pending_model_catalog_notice: session.pending_model_catalog_notice,
         })
     }
 
@@ -706,6 +742,7 @@ impl SessionManager {
             workspace_root,
             history: checkpoint.history,
             agent_messages: checkpoint.agent_messages,
+            last_user_message_at: checkpoint.last_user_message_at,
             last_agent_returned_at: checkpoint.last_agent_returned_at,
             last_compacted_at: checkpoint.last_compacted_at,
             turn_count: checkpoint.turn_count,
@@ -718,6 +755,8 @@ impl SessionManager {
             seen_identity_profile_version: checkpoint.seen_identity_profile_version,
             pending_user_profile_notice: checkpoint.pending_user_profile_notice,
             pending_identity_profile_notice: checkpoint.pending_identity_profile_notice,
+            seen_model_catalog_version: checkpoint.seen_model_catalog_version,
+            pending_model_catalog_notice: checkpoint.pending_model_catalog_notice,
             idle_compaction_retry: None,
             zgent_native: None,
             pending_continue: None,
@@ -921,6 +960,32 @@ impl SessionManager {
         Ok(notices)
     }
 
+    pub fn observe_model_catalog_changes(
+        &mut self,
+        address: &ChannelAddress,
+        model_catalog_version: String,
+    ) -> Result<Vec<ModelCatalogChangeNotice>> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        let mut notices = Vec::new();
+        match session.seen_model_catalog_version.as_deref() {
+            None => {
+                session.seen_model_catalog_version = Some(model_catalog_version);
+            }
+            Some(previous) if previous != model_catalog_version => {
+                session.seen_model_catalog_version = Some(model_catalog_version);
+                session.pending_model_catalog_notice = true;
+                notices.push(ModelCatalogChangeNotice::Updated);
+            }
+            Some(_) => {}
+        }
+        session.persist()?;
+        Ok(notices)
+    }
+
     pub fn stage_shared_profile_change_notices(
         &mut self,
         address: &ChannelAddress,
@@ -965,6 +1030,24 @@ impl SessionManager {
         if session.pending_identity_profile_notice {
             notices.push(SharedProfileChangeNotice::IdentityUpdated);
             session.pending_identity_profile_notice = false;
+        }
+        session.persist()?;
+        Ok(notices)
+    }
+
+    pub fn take_model_catalog_change_notices(
+        &mut self,
+        address: &ChannelAddress,
+    ) -> Result<Vec<ModelCatalogChangeNotice>> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        let mut notices = Vec::new();
+        if session.pending_model_catalog_notice {
+            notices.push(ModelCatalogChangeNotice::Updated);
+            session.pending_model_catalog_notice = false;
         }
         session.persist()?;
         Ok(notices)
@@ -1324,6 +1407,7 @@ impl SessionManager {
             workspace_root: workspace.files_dir,
             history: Vec::new(),
             agent_messages: Vec::new(),
+            last_user_message_at: None,
             last_agent_returned_at: None,
             last_compacted_at: None,
             turn_count: 0,
@@ -1334,8 +1418,10 @@ impl SessionManager {
             skill_states: HashMap::new(),
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
+            seen_model_catalog_version: None,
             pending_user_profile_notice: false,
             pending_identity_profile_notice: false,
+            pending_model_catalog_notice: false,
             idle_compaction_retry: None,
             zgent_native: None,
             pending_continue: None,
@@ -1420,8 +1506,8 @@ fn load_persisted_sessions(
 #[cfg(test)]
 mod tests {
     use super::{
-        SessionManager, SessionSkillObservation, SharedProfileChangeNotice, SkillChangeNotice,
-        sanitize_persisted_agent_messages,
+        ModelCatalogChangeNotice, SessionManager, SessionSkillObservation,
+        SharedProfileChangeNotice, SkillChangeNotice, sanitize_persisted_agent_messages,
     };
     use crate::domain::{ChannelAddress, StoredAttachment};
     use crate::workspace::WorkspaceManager;
@@ -1679,6 +1765,36 @@ mod tests {
                 SharedProfileChangeNotice::UserUpdated,
                 SharedProfileChangeNotice::IdentityUpdated
             ]
+        );
+    }
+
+    #[test]
+    fn model_catalog_changes_queue_until_taken() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        sessions.ensure_foreground(&address).unwrap();
+
+        let first = sessions
+            .observe_model_catalog_changes(&address, "models-v1".to_string())
+            .unwrap();
+        assert!(first.is_empty());
+
+        let second = sessions
+            .observe_model_catalog_changes(&address, "models-v2".to_string())
+            .unwrap();
+        assert_eq!(second, vec![ModelCatalogChangeNotice::Updated]);
+
+        let queued = sessions
+            .take_model_catalog_change_notices(&address)
+            .unwrap();
+        assert_eq!(queued, vec![ModelCatalogChangeNotice::Updated]);
+        assert!(
+            sessions
+                .take_model_catalog_change_notices(&address)
+                .unwrap()
+                .is_empty()
         );
     }
 
