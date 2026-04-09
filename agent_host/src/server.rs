@@ -4252,12 +4252,68 @@ impl Server {
         self.send_channel_message(
             channel,
             address,
-            OutgoingMessage::text(format!(
-                "The previously selected model `{}` is no longer available for the current agent setup. Please run `/agent` to choose again.",
-                missing_model_key
-            )),
+            self.agent_backend_selection_message(
+                address,
+                &format!(
+                    "The previously selected model `{}` is no longer available for the current agent setup. `/agent` has been opened automatically below so you can choose again.",
+                    missing_model_key
+                ),
+            )?,
         )
         .await
+    }
+
+    async fn pause_idle_compaction_and_prompt_agent_selection(
+        &self,
+        session: &SessionSnapshot,
+        missing_model_key: &str,
+    ) -> Result<()> {
+        self.with_sessions(|sessions| sessions.clear_idle_compaction_retry(&session.address))?;
+        let Some(channel) = self.channels.get(&session.address.channel_id).cloned() else {
+            warn!(
+                log_stream = "session",
+                log_key = %session.id,
+                kind = "idle_context_compaction_paused_missing_model_channel_missing",
+                channel_id = %session.address.channel_id,
+                conversation_id = %session.address.conversation_id,
+                missing_model = %missing_model_key,
+                "paused idle context compaction for missing model, but could not find channel to open /agent"
+            );
+            return Ok(());
+        };
+        let message = self.agent_backend_selection_message(
+            &session.address,
+            &format!(
+                "The previously selected model `{}` is no longer available for the current agent setup. Idle compaction has been paused for this conversation, and `/agent` has been opened automatically below so you can choose again.",
+                missing_model_key
+            ),
+        )?;
+        if let Err(error) = self
+            .send_channel_message(&channel, &session.address, message)
+            .await
+        {
+            warn!(
+                log_stream = "session",
+                log_key = %session.id,
+                kind = "idle_context_compaction_paused_missing_model_prompt_failed",
+                channel_id = %session.address.channel_id,
+                conversation_id = %session.address.conversation_id,
+                missing_model = %missing_model_key,
+                error = %format!("{error:#}"),
+                "paused idle context compaction for missing model, but failed to open /agent"
+            );
+            return Ok(());
+        }
+        info!(
+            log_stream = "session",
+            log_key = %session.id,
+            kind = "idle_context_compaction_paused_missing_model",
+            channel_id = %session.address.channel_id,
+            conversation_id = %session.address.conversation_id,
+            missing_model = %missing_model_key,
+            "paused idle context compaction and opened /agent because the selected model is no longer available"
+        );
+        Ok(())
     }
 
     fn with_sessions<T>(&self, f: impl FnOnce(&mut SessionManager) -> Result<T>) -> Result<T> {
@@ -4658,6 +4714,14 @@ impl Server {
         force_retry: bool,
     ) -> Result<bool> {
         if !self.effective_context_compaction_enabled(&session.address)? {
+            return Ok(false);
+        }
+        if let Some(missing_model_key) = self.clear_missing_selected_main_model(&session.address)? {
+            self.pause_idle_compaction_and_prompt_agent_selection(session, &missing_model_key)
+                .await?;
+            return Ok(false);
+        }
+        if self.selected_main_model_key(&session.address)?.is_none() {
             return Ok(false);
         }
         let model_key = self.effective_main_model_key(&session.address)?;
@@ -7354,7 +7418,7 @@ fn spawn_channel_supervisor(channel: Arc<dyn Channel>, sender: mpsc::Sender<Inco
 mod tests {
     use super::{
         AgentCommand, ForegroundRuntimePhase, ImageGenerationRouting, Server, SinkTarget,
-        TokenUsage, background_timeout_with_active_children_text,
+        SummaryTracker, TokenUsage, background_timeout_with_active_children_text,
         build_previous_messages_for_turn_with_prompt, build_synthetic_system_messages,
         build_user_turn_message, channel_restart_backoff_seconds, conversation_memory_root,
         estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
@@ -7373,17 +7437,28 @@ mod tests {
         upload_workspace_shared_profile_files, user_facing_continue_error_text,
         workspace_visible_in_list,
     };
+    use crate::agent_status::AgentRegistry;
     use crate::backend::AgentBackendKind;
     use crate::bootstrap::AgentWorkspace;
     use crate::channel::{Channel, IncomingMessage};
+    use crate::channel_auth::ChannelAuthorizationManager;
     use crate::channel_auth::{
         ChannelAdminSnapshot, ConversationApprovalSnapshot, ConversationApprovalState,
     };
-    use crate::config::{ModelCapability, ModelConfig, ToolingTarget};
+    use crate::config::{
+        AgentBackendConfig, AgentConfig, MainAgentConfig, ModelCapability, ModelConfig,
+        SandboxConfig, ToolingConfig, ToolingTarget,
+    };
     use crate::conversation::ConversationManager;
+    use crate::cron::CronManager;
     use crate::domain::ChannelAddress;
     use crate::domain::{AttachmentKind, OutgoingMessage, ProcessingState, StoredAttachment};
+    use crate::session::SessionManager;
     use crate::session::{ModelCatalogChangeNotice, PendingContinueState, SessionSnapshot};
+    use crate::sink::SinkRouter;
+    use crate::snapshot::SnapshotManager;
+    use crate::workspace::WorkspaceManager;
+    use agent_frame::config::MemorySystem;
     use agent_frame::message::{FunctionCall, ToolCall};
     use agent_frame::{
         ChatMessage, ContextCompactionReport, SessionCompactionStats, SessionEvent,
@@ -7394,13 +7469,15 @@ mod tests {
     use async_trait::async_trait;
     use chrono::{Duration as ChronoDuration, Utc};
     use serde_json::{Value, json};
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap, HashSet};
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
+    use tokio::sync::{Notify, RwLock};
     use uuid::Uuid;
 
     #[derive(Default)]
@@ -7443,6 +7520,98 @@ mod tests {
             response_checkpoint: None,
             pending_workspace_summary: false,
             close_after_summary: false,
+        }
+    }
+
+    fn build_test_server(temp_dir: &TempDir, channel: Arc<dyn Channel>) -> Server {
+        let agent_workspace = AgentWorkspace::initialize(temp_dir.path()).unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let sessions = SessionManager::new(temp_dir.path(), workspace_manager.clone()).unwrap();
+        let snapshots = SnapshotManager::new(temp_dir.path()).unwrap();
+        let conversations = ConversationManager::new(temp_dir.path()).unwrap();
+        let cron_manager = CronManager::load_or_create(temp_dir.path()).unwrap();
+        let agent_registry = AgentRegistry::load_or_create(temp_dir.path()).unwrap();
+        let channel_auth = ChannelAuthorizationManager::new(temp_dir.path()).unwrap();
+        let (background_job_sender, background_job_receiver) = mpsc::channel(8);
+
+        let mut models = BTreeMap::new();
+        models.insert(
+            "demo-model".to_string(),
+            ModelConfig {
+                model_type: crate::config::ModelType::OpenrouterResp,
+                api_endpoint: "https://example.com/v1".to_string(),
+                model: "demo-model".to_string(),
+                backend: AgentBackendKind::AgentFrame,
+                supports_vision_input: false,
+                image_tool_model: None,
+                web_search_model: None,
+                api_key: None,
+                api_key_env: "TEST_API_KEY".to_string(),
+                chat_completions_path: "/responses".to_string(),
+                codex_home: None,
+                auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
+                timeout_seconds: 30.0,
+                context_window_tokens: 128_000,
+                cache_ttl: None,
+                reasoning: None,
+                headers: serde_json::Map::new(),
+                description: "demo".to_string(),
+                agent_model_enabled: true,
+                native_web_search: None,
+                external_web_search: None,
+                capabilities: vec![ModelCapability::Chat],
+            },
+        );
+
+        Server {
+            workdir: temp_dir.path().to_path_buf(),
+            agent_workspace,
+            workspace_manager,
+            channels: Arc::new(HashMap::from([("telegram-main".to_string(), channel)])),
+            telegram_channel_ids: Arc::new(HashSet::new()),
+            command_catalog: HashMap::new(),
+            models,
+            agent: AgentConfig {
+                agent_frame: AgentBackendConfig {
+                    available_models: vec!["demo-model".to_string()],
+                },
+                zgent: AgentBackendConfig::default(),
+            },
+            tooling: ToolingConfig::default(),
+            chat_model_keys: vec!["demo-model".to_string()],
+            main_agent: MainAgentConfig {
+                model: None,
+                timeout_seconds: None,
+                global_install_root: "/opt".to_string(),
+                language: "zh-CN".to_string(),
+                enabled_tools: Vec::new(),
+                max_tool_roundtrips: 4,
+                enable_context_compression: true,
+                context_compaction: Default::default(),
+                idle_compaction: Default::default(),
+                timeout_observation_compaction: Default::default(),
+                time_awareness: Default::default(),
+                memory_system: MemorySystem::default(),
+            },
+            sandbox: SandboxConfig::default(),
+            conversations: Arc::new(Mutex::new(conversations)),
+            snapshots: Arc::new(Mutex::new(snapshots)),
+            sessions: Arc::new(Mutex::new(sessions)),
+            sink_router: Arc::new(RwLock::new(SinkRouter::new())),
+            cron_manager: Arc::new(Mutex::new(cron_manager)),
+            agent_registry: Arc::new(Mutex::new(agent_registry)),
+            agent_registry_notify: Arc::new(Notify::new()),
+            max_global_sub_agents: 4,
+            subagent_count: Arc::new(AtomicUsize::new(0)),
+            cron_poll_interval_seconds: 60,
+            background_job_sender,
+            background_job_receiver: Some(background_job_receiver),
+            summary_tracker: Arc::new(SummaryTracker::new()),
+            active_foreground_controls: Arc::new(Mutex::new(HashMap::new())),
+            active_foreground_phases: Arc::new(Mutex::new(HashMap::new())),
+            active_native_zgent_sessions: Arc::new(Mutex::new(HashMap::new())),
+            subagents: Arc::new(Mutex::new(HashMap::new())),
+            channel_auth: Arc::new(Mutex::new(channel_auth)),
         }
     }
 
@@ -8458,6 +8627,77 @@ mod tests {
 
         assert!(text.contains("Idle compaction retry: 待重试"));
         assert!(text.contains("upstream timeout while compacting older messages"));
+    }
+
+    #[tokio::test]
+    async fn idle_compaction_pauses_and_opens_agent_selection_when_model_disappears() {
+        let temp_dir = TempDir::new().unwrap();
+        let channel = Arc::new(RecordingChannel::default());
+        let server = build_test_server(&temp_dir, channel.clone());
+        let session = build_test_session(&temp_dir);
+
+        server
+            .with_conversations(|conversations| {
+                conversations.set_agent_selection(
+                    &session.address,
+                    Some(AgentBackendKind::AgentFrame),
+                    Some("missing-model".to_string()),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        server
+            .with_sessions(|sessions| {
+                sessions.ensure_foreground(&session.address)?;
+                sessions.mark_idle_compaction_retry_needed(
+                    &session.address,
+                    "model disappeared".to_string(),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let compacted = server
+            .attempt_idle_context_compaction(&session, false)
+            .await
+            .unwrap();
+
+        assert!(!compacted);
+        let conversation = server
+            .with_conversations(|conversations| {
+                Ok(conversations
+                    .get_snapshot(&session.address)
+                    .expect("conversation should exist"))
+            })
+            .unwrap();
+        assert_eq!(
+            conversation.settings.agent_backend,
+            Some(AgentBackendKind::AgentFrame)
+        );
+        assert_eq!(conversation.settings.main_model, None);
+        let session_snapshot = server
+            .with_sessions(|sessions| Ok(sessions.get_snapshot(&session.address).unwrap()))
+            .unwrap();
+        assert!(session_snapshot.idle_compaction_retry.is_none());
+
+        let sent_messages = channel.sent_messages.lock().unwrap();
+        assert_eq!(sent_messages.len(), 1);
+        assert!(
+            sent_messages[0]
+                .1
+                .text
+                .as_deref()
+                .unwrap()
+                .contains("Idle compaction has been paused")
+        );
+        let options = sent_messages[0].1.options.as_ref().expect("show options");
+        assert_eq!(options.prompt, "Choose a backend");
+        assert!(
+            options
+                .options
+                .iter()
+                .any(|option| option.value == "/agent agent_frame")
+        );
     }
 
     #[test]
