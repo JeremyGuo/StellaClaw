@@ -31,7 +31,7 @@ use crate::prompt::{
     AgentPromptKind, build_agent_system_prompt, greeting_for_language,
     render_available_models_catalog,
 };
-use crate::sandbox::run_turn_in_child_process;
+use crate::sandbox::{bubblewrap_is_available, run_turn_in_child_process};
 use crate::session::{
     ModelCatalogChangeNotice, PendingContinueState, SessionManager, SessionSkillObservation,
     SessionSnapshot, SharedProfileChangeNotice, SkillChangeNotice, ZgentNativeSessionState,
@@ -6444,7 +6444,7 @@ impl Server {
 
     fn available_sandbox_modes(&self) -> Vec<SandboxMode> {
         let mut modes = vec![SandboxMode::Disabled, SandboxMode::Subprocess];
-        if cfg!(target_os = "linux") {
+        if bubblewrap_is_available(&self.sandbox) {
             modes.push(SandboxMode::Bubblewrap);
         }
         modes

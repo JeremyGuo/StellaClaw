@@ -1113,11 +1113,6 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
         return Err(anyhow!("cron_poll_interval_seconds must be at least 1"));
     }
     if config.sandbox.mode == SandboxMode::Bubblewrap {
-        if !cfg!(target_os = "linux") {
-            return Err(anyhow!(
-                "sandbox mode 'bubblewrap' requires Linux with bubblewrap installed"
-            ));
-        }
         if config.sandbox.bubblewrap_binary.trim().is_empty() {
             return Err(anyhow!("sandbox.bubblewrap_binary must not be empty"));
         }

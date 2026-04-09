@@ -2,17 +2,20 @@ mod config_editor;
 mod setup;
 
 use agent_host::Server;
-use agent_host::config::{load_server_config_file_and_upgrade, resolve_model_api_keys};
+use agent_host::config::{
+    SandboxMode, load_server_config_file_and_upgrade, resolve_model_api_keys,
+};
 use agent_host::env::load_dotenv_files;
 use agent_host::logging::init_logging;
-use agent_host::sandbox::run_child_stdio;
+use agent_host::sandbox::{bubblewrap_support_error, run_child_stdio};
 use agent_host::zgent::app_bridge::run_zgent_app_bridge_stdio;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config_editor::run_config_editor;
 use setup::run_setup;
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(name = "partyclaw")]
@@ -23,6 +26,8 @@ struct Args {
     config: Option<PathBuf>,
     #[arg(long)]
     workdir: Option<PathBuf>,
+    #[arg(long)]
+    sandbox_auto: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -108,7 +113,7 @@ async fn run_server(args: Args) -> Result<()> {
             "loaded .env file"
         );
     }
-    let (config, upgraded_config) = load_server_config_file_and_upgrade(config_path)?;
+    let (mut config, upgraded_config) = load_server_config_file_and_upgrade(config_path)?;
     if upgraded_config {
         info!(
             log_stream = "server",
@@ -125,6 +130,48 @@ async fn run_server(args: Args) -> Result<()> {
                 "[DEBUG_API_KEY] model={} source={} api_key={}",
                 item.model_name, item.source, value
             );
+        }
+    }
+    if config.sandbox.mode == SandboxMode::Bubblewrap {
+        if let Some(reason) = bubblewrap_support_error(&config.sandbox) {
+            if args.sandbox_auto || !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+                warn!(
+                    log_stream = "server",
+                    kind = "sandbox_auto_fallback",
+                    reason = %reason,
+                    "sandbox mode 'bubblewrap' is not supported; falling back to subprocess"
+                );
+                config.sandbox.mode = SandboxMode::Subprocess;
+            } else {
+                let mut stdout = io::stdout();
+                writeln!(
+                    stdout,
+                    "Sandbox mode 'bubblewrap' is not supported on this system: {reason}"
+                )
+                .ok();
+                write!(
+                    stdout,
+                    "Continue with sandbox mode 'subprocess' instead? [y/N]: "
+                )
+                .ok();
+                let _ = stdout.flush();
+                let mut line = String::new();
+                let _ = io::stdin().read_line(&mut line);
+                let answer = line.trim().to_ascii_lowercase();
+                if answer == "y" || answer == "yes" {
+                    warn!(
+                        log_stream = "server",
+                        kind = "sandbox_prompt_fallback",
+                        reason = %reason,
+                        "sandbox mode 'bubblewrap' is not supported; falling back to subprocess"
+                    );
+                    config.sandbox.mode = SandboxMode::Subprocess;
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "sandbox mode 'bubblewrap' is not supported on this system: {reason}"
+                    ));
+                }
+            }
         }
     }
     let server = Server::from_config(config, workdir)?;

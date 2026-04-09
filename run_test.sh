@@ -29,4 +29,5 @@ mkdir -p "$WORKDIR"
 
 exec cargo run --manifest-path "$SCRIPT_DIR/agent_host/Cargo.toml" -- \
   --config "$CONFIG_PATH" \
-  --workdir "$WORKDIR"
+  --workdir "$WORKDIR" \
+  --sandbox-auto

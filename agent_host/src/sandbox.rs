@@ -41,6 +41,44 @@ fn read_json_line<T: DeserializeOwned>(reader: &mut impl BufRead) -> Result<Opti
     Ok(Some(parsed))
 }
 
+pub fn bubblewrap_support_error(sandbox: &SandboxConfig) -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return Some(
+            "sandbox mode 'bubblewrap' requires Linux with bubblewrap installed".to_string(),
+        );
+    }
+    let binary = sandbox.bubblewrap_binary.trim();
+    if binary.is_empty() {
+        return Some("sandbox.bubblewrap_binary must not be empty".to_string());
+    }
+    if !binary_in_path(binary) {
+        return Some(format!(
+            "sandbox.bubblewrap_binary '{}' was not found in PATH",
+            binary
+        ));
+    }
+    None
+}
+
+pub fn bubblewrap_is_available(sandbox: &SandboxConfig) -> bool {
+    bubblewrap_support_error(sandbox).is_none()
+}
+
+fn binary_in_path(binary: &str) -> bool {
+    if binary.contains('/') {
+        return Path::new(binary).is_file();
+    }
+    let Some(paths) = env::var_os("PATH") else {
+        return false;
+    };
+    for dir in env::split_paths(&paths) {
+        if dir.join(binary).is_file() {
+            return true;
+        }
+    }
+    false
+}
+
 fn next_request_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(1);
     format!("tool-req-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
