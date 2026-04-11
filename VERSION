@@ -1,5 +1,12 @@
-version: 0.14.6
+version: 0.14.7
 ---
+
+# 0.14.7
+
+- 修复阈值上下文压缩在包含工具调用历史时的兼容性问题：
+  compaction 请求发送给上游前会把 `assistant.tool_calls` 与 `tool` 角色结果渲染为普通文本 transcript，不再把协议级 tool-call 消息发给不带 `tools` 定义的压缩模型，避免部分 Chat Completions 兼容服务返回 `NoneType object is not iterable`。
+- 本次不影响 `config` 或 `workdir` schema：
+  没有新增用户配置字段、config loader 或 workdir upgrade step；按 patch 发布将仓库版本从 `0.14.6` 提升到 `0.14.7`。
 
 # 0.14.6
 

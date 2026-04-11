@@ -1,6 +1,6 @@
 use crate::config::{AgentConfig, MemorySystem};
 use crate::llm::{ChatCompletionSession, TokenUsage, create_chat_completion};
-use crate::message::ChatMessage;
+use crate::message::{ChatMessage, ToolCall};
 use crate::tooling::Tool;
 use crate::tooling::active_runtime_state_summary;
 use anyhow::{Context, Result, anyhow};
@@ -201,12 +201,72 @@ fn sanitize_content_for_compaction_request(content: &Option<Value>) -> Option<Va
     }
 }
 
+fn sanitized_content_text_for_compaction_request(content: &Option<Value>) -> String {
+    content_to_text(&sanitize_content_for_compaction_request(content))
+}
+
+fn render_tool_call_for_compaction_request(tool_call: &ToolCall) -> String {
+    let arguments = tool_call.function.arguments.as_deref().unwrap_or_default();
+    if arguments.trim().is_empty() {
+        format!(
+            "[tool call: {} id={}]",
+            tool_call.function.name, tool_call.id
+        )
+    } else {
+        format!(
+            "[tool call: {} id={}]\n{}",
+            tool_call.function.name, tool_call.id, arguments
+        )
+    }
+}
+
+fn render_tool_result_for_compaction_request(message: &ChatMessage) -> String {
+    let mut label = message.name.as_deref().unwrap_or("tool").to_string();
+    if let Some(tool_call_id) = message.tool_call_id.as_deref() {
+        label.push_str(" id=");
+        label.push_str(tool_call_id);
+    }
+    let content = sanitized_content_text_for_compaction_request(&message.content);
+    if content.trim().is_empty() {
+        format!("[tool result: {label}]")
+    } else {
+        format!("[tool result: {label}]\n{content}")
+    }
+}
+
 fn sanitize_messages_for_compaction_request(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     messages
         .iter()
-        .map(|message| ChatMessage {
-            content: sanitize_content_for_compaction_request(&message.content),
-            ..message.clone()
+        .map(|message| {
+            let role = if message.role == "tool" {
+                "user".to_string()
+            } else {
+                message.role.clone()
+            };
+            let content = if message.role == "tool" {
+                render_tool_result_for_compaction_request(message)
+            } else {
+                let mut parts = Vec::new();
+                let content = sanitized_content_text_for_compaction_request(&message.content);
+                if !content.trim().is_empty() {
+                    parts.push(content);
+                }
+                if let Some(tool_calls) = &message.tool_calls {
+                    parts.extend(
+                        tool_calls
+                            .iter()
+                            .map(render_tool_call_for_compaction_request),
+                    );
+                }
+                parts.join("\n\n")
+            };
+            ChatMessage {
+                role,
+                content: Some(Value::String(content)),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }
         })
         .collect()
 }
@@ -972,6 +1032,49 @@ mod tests {
         assert!(!serialized.contains("UNIQUE_FILE_PAYLOAD"));
         assert!(!serialized.contains("UNIQUE_AUDIO_PAYLOAD"));
         assert!(!serialized.contains("data:image/png;base64"));
+    }
+
+    #[test]
+    fn compaction_request_renders_tool_protocol_as_plain_text() {
+        let messages = vec![
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(json!("I will inspect the file.")),
+                name: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "call_1".to_string(),
+                    kind: "function".to_string(),
+                    function: crate::message::FunctionCall {
+                        name: "file_read".to_string(),
+                        arguments: Some("{\"file_path\":\"src/lib.rs\"}".to_string()),
+                    },
+                }]),
+            },
+            ChatMessage::tool_output("call_1", "file_read", "{\"content\":\"hello\"}"),
+        ];
+
+        let sanitized = sanitize_messages_for_compaction_request(&messages);
+
+        assert_eq!(sanitized[0].role, "assistant");
+        assert_eq!(sanitized[0].tool_calls, None);
+        assert_eq!(sanitized[0].tool_call_id, None);
+        assert_eq!(sanitized[0].name, None);
+        assert_eq!(sanitized[1].role, "user");
+        assert_eq!(sanitized[1].tool_calls, None);
+        assert_eq!(sanitized[1].tool_call_id, None);
+        assert_eq!(sanitized[1].name, None);
+
+        let serialized = serde_json::to_string(&sanitized).unwrap();
+        assert!(serialized.contains("I will inspect the file."));
+        assert!(serialized.contains("[tool call: file_read id=call_1]"));
+        assert!(serialized.contains("{\\\"file_path\\\":\\\"src/lib.rs\\\"}"));
+        assert!(serialized.contains("[tool result: file_read id=call_1]"));
+        assert!(serialized.contains("{\\\"content\\\":\\\"hello\\\"}"));
+        assert!(!serialized.contains("\"tool_calls\""));
+        assert!(!serialized.contains("\"tool_call_id\""));
+        assert!(!serialized.contains("\"name\""));
+        assert!(!serialized.contains("\"role\":\"tool\""));
     }
 
     #[test]
