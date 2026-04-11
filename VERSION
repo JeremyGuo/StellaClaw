@@ -1,5 +1,12 @@
-version: 0.14.0
+version: 0.14.1
 ---
+
+# 0.14.1
+
+- 修复 bubblewrap 常驻子进程被 SIGKILL 的问题：
+  `bwrap --die-with-parent` 使用 `PR_SET_PDEATHSIG(SIGKILL)` 跟踪的是**产生子进程的线程**而非进程；`PersistentChildRuntime::spawn()` 在 `tokio::task::spawn_blocking()` 内运行，当 tokio blocking pool 空闲线程被回收（~10s）后，Linux 会向 bwrap 子进程发送 SIGKILL，即使父进程仍然存活。修复方式：新增 `spawn_with_persistent_parent_thread()`，从一个专用的 `bwrap-parent-keeper` 线程产生子进程，该线程会一直 park 到子进程退出，避免线程回收触发误杀。
+- 明确本次不影响 `config` 与 `workdir` schema：
+  没有新增 config loader，也没有新增 workdir upgrade step；这是一次运行时 bug 修复。
 
 # 0.14.0
 
