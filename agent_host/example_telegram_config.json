@@ -1,5 +1,5 @@
 {
-  "version": "0.13",
+  "version": "0.14",
   "models": {
     "main": {
       "backend": "agent_frame",
@@ -8,6 +8,9 @@
       "supports_vision_input": true,
       "api_key_env": "OPENROUTER_API_KEY",
       "cache_ttl": "5m",
+      "retry_mode": {
+        "mode": "no"
+      },
       "context_window_tokens": 128000,
       "native_web_search": {
         "enabled": true,

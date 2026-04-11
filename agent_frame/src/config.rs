@@ -30,6 +30,22 @@ pub enum AuthCredentialsStoreMode {
     Ephemeral,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum RetryModeConfig {
+    No,
+    Random {
+        max_retries: u32,
+        retry_random_mean: f64,
+    },
+}
+
+impl Default for RetryModeConfig {
+    fn default() -> Self {
+        Self::No
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UpstreamConfig {
     pub base_url: String,
@@ -58,6 +74,8 @@ pub struct UpstreamConfig {
     pub auth_credentials_store_mode: AuthCredentialsStoreMode,
     #[serde(default = "default_timeout_seconds")]
     pub timeout_seconds: f64,
+    #[serde(default)]
+    pub retry_mode: RetryModeConfig,
     #[serde(default = "default_context_window_tokens")]
     pub context_window_tokens: usize,
     #[serde(default)]
@@ -265,6 +283,8 @@ struct UpstreamConfigRaw {
     auth_credentials_store_mode: AuthCredentialsStoreMode,
     #[serde(default = "default_timeout_seconds")]
     timeout_seconds: f64,
+    #[serde(default)]
+    retry_mode: RetryModeConfig,
     #[serde(default = "default_context_window_tokens")]
     context_window_tokens: usize,
     #[serde(default)]
@@ -395,6 +415,7 @@ fn resolve_upstream(raw: UpstreamConfigRaw) -> UpstreamConfig {
         codex_auth: raw.codex_auth,
         auth_credentials_store_mode: raw.auth_credentials_store_mode,
         timeout_seconds: raw.timeout_seconds,
+        retry_mode: raw.retry_mode,
         context_window_tokens: raw.context_window_tokens,
         cache_control: raw.cache_control,
         prompt_cache_retention: raw.prompt_cache_retention,
@@ -429,6 +450,26 @@ fn normalize_enabled_tools(enabled_tools: Vec<String>) -> Vec<String> {
     normalized
 }
 
+fn validate_retry_mode(label: &str, retry_mode: &RetryModeConfig) -> Result<()> {
+    match retry_mode {
+        RetryModeConfig::No => Ok(()),
+        RetryModeConfig::Random {
+            max_retries,
+            retry_random_mean,
+        } => {
+            if *max_retries == 0 {
+                return Err(anyhow!("{label}.max_retries must be at least 1"));
+            }
+            if !retry_random_mean.is_finite() || *retry_random_mean <= 0.0 {
+                return Err(anyhow!(
+                    "{label}.retry_random_mean must be greater than 0 seconds"
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
 #[derive(Deserialize)]
 struct CodexAuthFile {
     #[serde(default)]
@@ -454,6 +495,7 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
     if raw.upstream.base_url.trim().is_empty() || raw.upstream.model.trim().is_empty() {
         return Err(anyhow!("config.upstream must include base_url and model"));
     }
+    validate_retry_mode("config.upstream.retry_mode", &raw.upstream.retry_mode)?;
     if let Some(image_tool_upstream) = &raw.image_tool_upstream
         && (image_tool_upstream.base_url.trim().is_empty()
             || image_tool_upstream.model.trim().is_empty())
@@ -461,6 +503,12 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
         return Err(anyhow!(
             "config.image_tool_upstream must include base_url and model when provided"
         ));
+    }
+    if let Some(image_tool_upstream) = &raw.image_tool_upstream {
+        validate_retry_mode(
+            "config.image_tool_upstream.retry_mode",
+            &image_tool_upstream.retry_mode,
+        )?;
     }
     for (label, upstream) in [
         ("config.pdf_tool_upstream", raw.pdf_tool_upstream.as_ref()),
@@ -479,6 +527,9 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
             return Err(anyhow!(
                 "{label} must include base_url and model when provided"
             ));
+        }
+        if let Some(upstream) = upstream {
+            validate_retry_mode(&format!("{label}.retry_mode"), &upstream.retry_mode)?;
         }
     }
 

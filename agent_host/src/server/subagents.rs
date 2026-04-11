@@ -266,12 +266,7 @@ impl ServerRuntime {
         Ok(destroyed)
     }
 
-    fn subagent_session_snapshot(
-        &self,
-        subagent: &HostedSubagent,
-        message_count: usize,
-        _model_key: &str,
-    ) -> SessionSnapshot {
+    fn subagent_session_snapshot(&self, subagent: &HostedSubagent) -> SessionSnapshot {
         SessionSnapshot {
             id: subagent.session_id,
             agent_id: subagent.id,
@@ -280,7 +275,6 @@ impl ServerRuntime {
             attachments_dir: subagent.workspace_root.join("upload"),
             workspace_id: subagent.workspace_id.clone(),
             workspace_root: subagent.workspace_root.clone(),
-            message_count,
             last_user_message_at: None,
             last_agent_returned_at: None,
             last_compacted_at: None,
@@ -293,7 +287,6 @@ impl ServerRuntime {
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
             seen_model_catalog_version: None,
-            idle_compaction_retry: None,
             zgent_native: None,
             pending_workspace_summary: false,
             close_after_summary: false,
@@ -346,8 +339,7 @@ impl ServerRuntime {
                     inner.persisted.turn_count,
                 )
             };
-            let subagent_session =
-                self.subagent_session_snapshot(&subagent, messages.len(), &model_key);
+            let subagent_session = self.subagent_session_snapshot(&subagent);
             let config = self.build_agent_frame_config(
                 &subagent_session,
                 &subagent.workspace_root,
@@ -485,7 +477,6 @@ impl ServerRuntime {
             attachments_dir: subagent.workspace_root.join("upload"),
             workspace_id: subagent.workspace_id.clone(),
             workspace_root: subagent.workspace_root.clone(),
-            message_count: 0,
             last_user_message_at: None,
             last_agent_returned_at: None,
             last_compacted_at: None,
@@ -498,7 +489,6 @@ impl ServerRuntime {
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
             seen_model_catalog_version: None,
-            idle_compaction_retry: None,
             zgent_native: None,
             pending_workspace_summary: false,
             close_after_summary: false,

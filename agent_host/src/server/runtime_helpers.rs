@@ -541,8 +541,8 @@ pub(super) fn format_session_status(
                 }
             ),
             format!(
-                "Idle compaction retry: {}",
-                format_idle_compaction_retry_status("zh", session)
+                "Idle compaction error: {}",
+                format_idle_compaction_error_status("zh", session)
             ),
             format!("Turns: {}", session.turn_count),
             format!(
@@ -633,8 +633,8 @@ pub(super) fn format_session_status(
                 }
             ),
             format!(
-                "Idle compaction retry: {}",
-                format_idle_compaction_retry_status("en", session)
+                "Idle compaction error: {}",
+                format_idle_compaction_error_status("en", session)
             ),
             format!("Turns: {}", session.turn_count),
             format!(
@@ -708,44 +708,32 @@ pub(super) fn format_session_status(
     }
 }
 
-fn format_idle_compaction_retry_status(language: &str, session: &SessionSnapshot) -> String {
-    let Some(retry) = session.idle_compaction_retry.as_ref() else {
+fn format_idle_compaction_error_status(language: &str, session: &SessionSnapshot) -> String {
+    if session.session_state.errno != Some(SessionErrno::IdleCompactionFailure) {
         return if language.starts_with("zh") {
             "无".to_string()
         } else {
             "none".to_string()
         };
-    };
+    }
 
-    let age = retry
-        .failed_at
-        .map(|failed_at| {
-            let seconds = (Utc::now() - failed_at).num_seconds().max(0);
-            if language.starts_with("zh") {
-                format!("{seconds}s前")
-            } else {
-                format!("{seconds}s ago")
-            }
-        })
-        .unwrap_or_else(|| {
-            if language.starts_with("zh") {
-                "时间未知".to_string()
-            } else {
-                "time unknown".to_string()
-            }
-        });
-    let summary = summarize_idle_compaction_retry_error(&retry.error_summary);
-    if language.starts_with("zh") {
-        format!("待重试 ({age}): {summary}")
+    let summary = summarize_idle_compaction_error(session.session_state.errinfo.as_deref());
+    if summary.is_empty() {
+        if language.starts_with("zh") {
+            "失败，原因未知".to_string()
+        } else {
+            "failed, reason unknown".to_string()
+        }
     } else {
-        format!("pending ({age}): {summary}")
+        summary
     }
 }
 
-fn summarize_idle_compaction_retry_error(error_summary: &str) -> String {
+fn summarize_idle_compaction_error(error_summary: Option<&str>) -> String {
     const MAX_CHARS: usize = 120;
 
     let normalized = error_summary
+        .unwrap_or_default()
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");

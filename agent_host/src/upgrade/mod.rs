@@ -11,6 +11,7 @@ mod v0_15;
 mod v0_16;
 mod v0_17;
 mod v0_18;
+mod v0_19;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -18,7 +19,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.18";
+pub const LATEST_WORKDIR_VERSION: &str = "0.19";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -34,7 +35,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 14] = [
+    let upgraders: [&dyn WorkdirUpgrader; 15] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
@@ -49,6 +50,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
         &v0_16::Upgrade,
         &v0_17::Upgrade,
         &v0_18::Upgrade,
+        &v0_19::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -91,6 +93,7 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.15" => Ok("0.15"),
         "0.16" => Ok("0.16"),
         "0.17" => Ok("0.17"),
+        "0.18" => Ok("0.18"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -674,6 +677,59 @@ mod tests {
         assert_eq!(
             session["session_state"]["messages"][0]["content"].as_str(),
             Some("stable")
+        );
+    }
+
+    #[test]
+    fn v0_18_workdir_upgrade_removes_idle_compaction_retry_field() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.18\n").unwrap();
+
+        let session_dir = temp_dir
+            .path()
+            .join("sessions")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": Uuid::new_v4(),
+                "agent_id": Uuid::new_v4(),
+                "address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "123",
+                    "user_id": "user-1",
+                    "display_name": "User"
+                },
+                "idle_compaction_retry": {
+                    "error_summary": "old retry marker",
+                    "failed_at": "2026-04-11T00:00:00Z"
+                },
+                "session_state": {
+                    "messages": [{"role": "assistant", "content": "stable"}],
+                    "pending_messages": [],
+                    "phase": "end",
+                    "errno": "idle_compaction_failure",
+                    "errinfo": "old retry marker"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+        assert!(upgraded);
+        let session: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
+                .unwrap();
+        assert!(session.get("idle_compaction_retry").is_none());
+        assert_eq!(
+            session["session_state"]["errno"].as_str(),
+            Some("idle_compaction_failure")
+        );
+        assert_eq!(
+            session["session_state"]["errinfo"].as_str(),
+            Some("old retry marker")
         );
     }
 }

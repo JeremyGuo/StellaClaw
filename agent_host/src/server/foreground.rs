@@ -148,37 +148,6 @@ impl Server {
         let session = self
             .with_sessions(|sessions| Ok(sessions.get_snapshot(&incoming.address)))?
             .expect("session should exist after initialization");
-        if session.idle_compaction_retry.is_some() {
-            info!(
-                log_stream = "session",
-                log_key = %session.id,
-                kind = "idle_context_compaction_retry_started_on_user_message",
-                channel_id = %incoming.address.channel_id,
-                conversation_id = %incoming.address.conversation_id,
-                "retrying idle context compaction before handling user message"
-            );
-            match self.attempt_idle_context_compaction(&session, true).await {
-                Ok(_) => {}
-                Err(error) => {
-                    self.with_sessions(|sessions| {
-                        sessions
-                            .exhaust_idle_compaction_retry(&incoming.address, format!("{error:#}"))
-                    })?;
-                    warn!(
-                        log_stream = "session",
-                        log_key = %session.id,
-                        kind = "idle_context_compaction_retry_exhausted_on_user_message",
-                        channel_id = %incoming.address.channel_id,
-                        conversation_id = %incoming.address.conversation_id,
-                        error = %format!("{error:#}"),
-                        "idle context compaction retry failed before handling user message and will not be queued again"
-                    );
-                }
-            }
-        }
-        let session = self
-            .with_sessions(|sessions| Ok(sessions.get_snapshot(&incoming.address)))?
-            .expect("session should exist after idle retry");
 
         let stored_attachments = if incoming.stored_attachments.is_empty() {
             self.materialize_attachments(&session.attachments_dir, incoming.attachments)

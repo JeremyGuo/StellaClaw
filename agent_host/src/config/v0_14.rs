@@ -1,13 +1,15 @@
 use super::{
     AgentConfig, ChannelConfig, ConfigLoader, LATEST_CONFIG_VERSION, MainAgentConfig,
     ModelCapability, ModelCatalogConfig, ModelConfig, ModelType, SandboxConfig, ServerConfig,
-    ToolingConfig, VERSION_0_13, build_server_config, default_agent_model_enabled,
-    default_api_key_env, default_chat_completions_path, default_codex_subscription_endpoint,
+    ToolingConfig, build_server_config, default_agent_model_enabled, default_api_key_env,
+    default_chat_completions_path, default_codex_subscription_endpoint,
     default_context_window_tokens, default_cron_poll_interval_seconds,
     default_max_global_sub_agents, default_model_timeout_seconds, default_responses_path,
 };
 use crate::backend::AgentBackendKind;
-use agent_frame::config::{AuthCredentialsStoreMode, NativeWebSearchConfig, ReasoningConfig};
+use agent_frame::config::{
+    AuthCredentialsStoreMode, NativeWebSearchConfig, ReasoningConfig, RetryModeConfig,
+};
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -62,6 +64,8 @@ struct VersionedModelConfigRaw {
     pub auth_credentials_store_mode: AuthCredentialsStoreMode,
     #[serde(default = "default_model_timeout_seconds")]
     pub timeout_seconds: f64,
+    #[serde(default)]
+    pub retry_mode: RetryModeConfig,
     #[serde(default = "default_context_window_tokens")]
     pub context_window_tokens: usize,
     #[serde(default)]
@@ -80,16 +84,16 @@ struct VersionedModelConfigRaw {
 
 impl ConfigLoader for LatestConfigLoader {
     fn version(&self) -> &'static str {
-        VERSION_0_13
+        LATEST_CONFIG_VERSION
     }
 
     fn load_and_upgrade(&self, value: Value) -> Result<ServerConfig> {
         let raw: VersionedServerConfigRaw =
             serde_json::from_value(value).context("failed to parse latest server config")?;
-        if raw.version != VERSION_0_13 {
+        if raw.version != LATEST_CONFIG_VERSION {
             return Err(anyhow!(
                 "latest config loader expected version '{}' but received '{}'",
-                VERSION_0_13,
+                LATEST_CONFIG_VERSION,
                 raw.version
             ));
         }
@@ -144,7 +148,7 @@ fn upgrade_versioned_model(raw: VersionedModelConfigRaw) -> ModelConfig {
         codex_home: raw.codex_home,
         auth_credentials_store_mode: raw.auth_credentials_store_mode,
         timeout_seconds: raw.timeout_seconds,
-        retry_mode: Default::default(),
+        retry_mode: raw.retry_mode,
         context_window_tokens: raw.context_window_tokens,
         cache_ttl: raw.cache_ttl,
         reasoning: raw.reasoning,

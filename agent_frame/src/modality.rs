@@ -306,6 +306,7 @@ mod tests {
                 codex_auth: None,
                 auth_credentials_store_mode: Default::default(),
                 timeout_seconds: 30.0,
+                retry_mode: Default::default(),
                 context_window_tokens: 100000,
                 cache_control: None,
                 prompt_cache_retention: None,

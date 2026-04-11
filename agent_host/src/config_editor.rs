@@ -1398,6 +1398,14 @@ impl ConfigEditorApp {
                             target: SelectTarget::ModelForm(field),
                         }));
                     }
+                    ModelFormField::RetryMode => {
+                        self.modal = Some(ModalState::Select(SelectState {
+                            title: "Retry Mode".to_string(),
+                            options: vec!["no".to_string(), "random".to_string()],
+                            selected: retry_mode_index(&current_value),
+                            target: SelectTarget::ModelForm(field),
+                        }));
+                    }
                     ModelFormField::Capabilities => {
                         self.open_model_capabilities_picker();
                     }
@@ -1745,6 +1753,19 @@ impl ConfigEditorApp {
                 }
                 Ok(())
             }
+            SelectTarget::ModelForm(ModelFormField::RetryMode) => {
+                let modes = ["no", "random"];
+                let value = modes
+                    .get(selected)
+                    .ok_or_else(|| anyhow!("invalid retry mode selection"))?;
+                if let ScreenState::ModelForm(form) = &mut self.screen {
+                    form.retry_mode = (*value).to_string();
+                    form.selected = form
+                        .selected
+                        .min(form.visible_fields().len().saturating_sub(1));
+                }
+                Ok(())
+            }
             SelectTarget::ChannelKind => {
                 let kinds = ["command_line", "telegram", "dingtalk"];
                 let value = kinds
@@ -2009,6 +2030,12 @@ impl ConfigEditorApp {
         } else {
             model.remove("timeout_seconds");
         }
+        set_retry_mode_object(
+            &mut model,
+            &form.retry_mode,
+            &form.retry_max_retries,
+            &form.retry_random_mean,
+        )?;
         if let Some(value) = parse_u64(&form.context_window_tokens)? {
             set_u64(&mut model, "context_window_tokens", value);
         } else {
@@ -2766,7 +2793,7 @@ impl SandboxField {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ModelFormField {
     Alias,
     ModelType,
@@ -2777,6 +2804,9 @@ enum ModelFormField {
     CodexHome,
     AuthCredentialsStoreMode,
     TimeoutSeconds,
+    RetryMode,
+    RetryMaxRetries,
+    RetryRandomMean,
     ContextWindowTokens,
     Capabilities,
     SupportsVisionInput,
@@ -2801,6 +2831,9 @@ impl ModelFormField {
             Self::CodexHome => "codex_home",
             Self::AuthCredentialsStoreMode => "auth_credentials_store_mode",
             Self::TimeoutSeconds => "timeout_seconds",
+            Self::RetryMode => "retry_mode.mode",
+            Self::RetryMaxRetries => "retry_mode.max_retries",
+            Self::RetryRandomMean => "retry_mode.retry_random_mean",
             Self::ContextWindowTokens => "context_window_tokens",
             Self::Capabilities => "capabilities",
             Self::SupportsVisionInput => "supports_vision_input",
@@ -2825,6 +2858,9 @@ impl ModelFormField {
             Self::CodexHome => "Required for codex-subscription models",
             Self::AuthCredentialsStoreMode => "file, keyring, auto, or ephemeral",
             Self::TimeoutSeconds => "Floating-point number",
+            Self::RetryMode => "Select no or random",
+            Self::RetryMaxRetries => "Integer retry attempt count",
+            Self::RetryRandomMean => "Mean random delay in seconds",
             Self::ContextWindowTokens => "Integer token window size",
             Self::Capabilities => "Pick one or more capability names",
             Self::SupportsVisionInput => "Toggle for image input support",
@@ -2866,6 +2902,9 @@ struct ModelFormState {
     codex_home: String,
     auth_credentials_store_mode: String,
     timeout_seconds: String,
+    retry_mode: String,
+    retry_max_retries: String,
+    retry_random_mean: String,
     context_window_tokens: String,
     capabilities: String,
     supports_vision_input: bool,
@@ -2894,6 +2933,9 @@ impl ModelFormState {
             codex_home: defaults.codex_home.to_string(),
             auth_credentials_store_mode: defaults.auth_credentials_store_mode.to_string(),
             timeout_seconds: "120".to_string(),
+            retry_mode: "no".to_string(),
+            retry_max_retries: "2".to_string(),
+            retry_random_mean: "8".to_string(),
             context_window_tokens: "128000".to_string(),
             capabilities: defaults.capabilities.to_string(),
             supports_vision_input: defaults.supports_vision_input,
@@ -2957,6 +2999,25 @@ impl ModelFormState {
                 .get("timeout_seconds")
                 .and_then(value_to_string)
                 .unwrap_or_else(|| "120".to_string()),
+            retry_mode: raw
+                .get("retry_mode")
+                .and_then(Value::as_object)
+                .and_then(|retry| retry.get("mode"))
+                .and_then(Value::as_str)
+                .unwrap_or("no")
+                .to_string(),
+            retry_max_retries: raw
+                .get("retry_mode")
+                .and_then(Value::as_object)
+                .and_then(|retry| retry.get("max_retries"))
+                .and_then(value_to_string)
+                .unwrap_or_else(|| "2".to_string()),
+            retry_random_mean: raw
+                .get("retry_mode")
+                .and_then(Value::as_object)
+                .and_then(|retry| retry.get("retry_random_mean"))
+                .and_then(value_to_string)
+                .unwrap_or_else(|| "8".to_string()),
             context_window_tokens: raw
                 .get("context_window_tokens")
                 .and_then(value_to_string)
@@ -3022,6 +3083,7 @@ impl ModelFormState {
             ModelFormField::ApiKeyEnv,
             ModelFormField::ChatCompletionsPath,
             ModelFormField::TimeoutSeconds,
+            ModelFormField::RetryMode,
             ModelFormField::ContextWindowTokens,
             ModelFormField::Capabilities,
             ModelFormField::SupportsVisionInput,
@@ -3036,6 +3098,14 @@ impl ModelFormState {
         if self.model_type == "codex-subscription" {
             fields.insert(6, ModelFormField::CodexHome);
             fields.insert(7, ModelFormField::AuthCredentialsStoreMode);
+        }
+        if self.retry_mode == "random"
+            && let Some(index) = fields
+                .iter()
+                .position(|field| *field == ModelFormField::RetryMode)
+        {
+            fields.insert(index + 1, ModelFormField::RetryMaxRetries);
+            fields.insert(index + 2, ModelFormField::RetryRandomMean);
         }
         fields
     }
@@ -3087,6 +3157,9 @@ impl ModelFormState {
             ModelFormField::CodexHome => self.codex_home.clone(),
             ModelFormField::AuthCredentialsStoreMode => self.auth_credentials_store_mode.clone(),
             ModelFormField::TimeoutSeconds => self.timeout_seconds.clone(),
+            ModelFormField::RetryMode => self.retry_mode.clone(),
+            ModelFormField::RetryMaxRetries => self.retry_max_retries.clone(),
+            ModelFormField::RetryRandomMean => self.retry_random_mean.clone(),
             ModelFormField::ContextWindowTokens => self.context_window_tokens.clone(),
             ModelFormField::Capabilities => self.capabilities.clone(),
             ModelFormField::SupportsVisionInput => bool_string(self.supports_vision_input),
@@ -3111,6 +3184,9 @@ impl ModelFormState {
             ModelFormField::CodexHome => self.codex_home = value,
             ModelFormField::AuthCredentialsStoreMode => self.auth_credentials_store_mode = value,
             ModelFormField::TimeoutSeconds => self.timeout_seconds = value,
+            ModelFormField::RetryMode => self.retry_mode = value,
+            ModelFormField::RetryMaxRetries => self.retry_max_retries = value,
+            ModelFormField::RetryRandomMean => self.retry_random_mean = value,
             ModelFormField::ContextWindowTokens => self.context_window_tokens = value,
             ModelFormField::Capabilities => self.capabilities = value,
             ModelFormField::ImageToolModel => self.image_tool_model = value,
@@ -3168,6 +3244,12 @@ impl ModelFormState {
             self.supports_vision_input,
         );
         set_bool(&mut model, "agent_model_enabled", self.agent_model_enabled);
+        let _ = set_retry_mode_object(
+            &mut model,
+            &self.retry_mode,
+            &self.retry_max_retries,
+            &self.retry_random_mean,
+        );
         if !self.capabilities.trim().is_empty() {
             model.insert(
                 "capabilities".to_string(),
@@ -3542,6 +3624,21 @@ fn model_field_guide_text(form: &ModelFormState, field: ModelFormField) -> Strin
             "120 or 300",
             "This accepts floating-point numbers.",
         ),
+        ModelFormField::RetryMode => (
+            "How failed upstream requests should be retried.",
+            "no or random",
+            "Use no to return failures immediately, or random to wait before retrying.",
+        ),
+        ModelFormField::RetryMaxRetries => (
+            "Maximum number of retry attempts after the first failure.",
+            "2",
+            "Only used when retry_mode.mode is random.",
+        ),
+        ModelFormField::RetryRandomMean => (
+            "Mean wait time in seconds for random retry delay.",
+            "8",
+            "Only used when retry_mode.mode is random.",
+        ),
         ModelFormField::ContextWindowTokens => (
             "Approximate context window size of the upstream model.",
             "128000 or 262144",
@@ -3874,6 +3971,13 @@ fn model_type_index(model_type: &str) -> usize {
     }
 }
 
+fn retry_mode_index(retry_mode: &str) -> usize {
+    match retry_mode {
+        "random" => 1,
+        _ => 0,
+    }
+}
+
 fn current_sandbox_mode_index(value: &Value) -> usize {
     match nested_string(value, &["sandbox", "mode"]).unwrap_or("subprocess") {
         "subprocess" | "disabled" => 0,
@@ -4168,6 +4272,31 @@ fn set_u64(object: &mut Map<String, Value>, key: &str, value: u64) {
 fn set_f64(object: &mut Map<String, Value>, key: &str, value: f64) -> Result<()> {
     let number = Number::from_f64(value).ok_or_else(|| anyhow!("invalid floating-point value"))?;
     object.insert(key.to_string(), Value::Number(number));
+    Ok(())
+}
+
+fn set_retry_mode_object(
+    object: &mut Map<String, Value>,
+    mode: &str,
+    max_retries: &str,
+    retry_random_mean: &str,
+) -> Result<()> {
+    let mut retry_mode = Map::new();
+    match mode {
+        "random" => {
+            retry_mode.insert("mode".to_string(), Value::String("random".to_string()));
+            let max_retries = parse_u64(max_retries)?
+                .ok_or_else(|| anyhow!("retry_mode.max_retries must not be empty"))?;
+            let retry_random_mean = parse_f64(retry_random_mean)?
+                .ok_or_else(|| anyhow!("retry_mode.retry_random_mean must not be empty"))?;
+            set_u64(&mut retry_mode, "max_retries", max_retries);
+            set_f64(&mut retry_mode, "retry_random_mean", retry_random_mean)?;
+        }
+        _ => {
+            retry_mode.insert("mode".to_string(), Value::String("no".to_string()));
+        }
+    }
+    object.insert("retry_mode".to_string(), Value::Object(retry_mode));
     Ok(())
 }
 

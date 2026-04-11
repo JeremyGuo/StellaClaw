@@ -1,7 +1,8 @@
 mod providers;
 
 use crate::config::{
-    AuthCredentialsStoreMode, CodexAuthConfig, UpstreamApiKind, UpstreamAuthKind, UpstreamConfig,
+    AuthCredentialsStoreMode, CodexAuthConfig, RetryModeConfig, UpstreamApiKind, UpstreamAuthKind,
+    UpstreamConfig,
 };
 use crate::message::ChatMessage;
 use crate::tooling::Tool;
@@ -12,7 +13,11 @@ use serde_json::{Map, Value, json};
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+static RETRY_RANDOM_SEED: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Deserialize)]
 pub(super) struct ChatCompletionChoice {
@@ -127,21 +132,90 @@ pub(crate) fn create_chat_completion(
     messages: &[ChatMessage],
     tools: &[Tool],
     extra_payload: Option<Map<String, Value>>,
-    session: Option<&mut ChatCompletionSession>,
+    mut session: Option<&mut ChatCompletionSession>,
 ) -> Result<ChatCompletionOutcome> {
-    providers::provider_for(upstream).create_completion(
-        upstream,
-        messages,
-        tools,
-        extra_payload,
-        session,
-    )
+    let max_retries = match upstream.retry_mode {
+        RetryModeConfig::No => 0,
+        RetryModeConfig::Random { max_retries, .. } => max_retries,
+    };
+    let mut attempt = 0;
+
+    loop {
+        let result = providers::provider_for(upstream).create_completion(
+            upstream,
+            messages,
+            tools,
+            extra_payload.clone(),
+            session.as_deref_mut(),
+        );
+
+        match result {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) if attempt < max_retries && should_retry_completion_error(&error) => {
+                attempt += 1;
+                if let Some(delay) = retry_delay_duration(&upstream.retry_mode) {
+                    thread::sleep(delay);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 pub(crate) fn start_chat_completion_session(
     upstream: &UpstreamConfig,
 ) -> Result<Option<ChatCompletionSession>> {
     providers::provider_for(upstream).start_session(upstream)
+}
+
+fn should_retry_completion_error(error: &anyhow::Error) -> bool {
+    let text = error.to_string().to_lowercase();
+    !(text.contains("previous_response_id") || text.contains("previous response id"))
+}
+
+fn retry_delay_duration(retry_mode: &RetryModeConfig) -> Option<Duration> {
+    match retry_mode {
+        RetryModeConfig::No => None,
+        RetryModeConfig::Random {
+            retry_random_mean, ..
+        } => Some(Duration::from_secs_f64(retry_random_delay_seconds(
+            *retry_random_mean,
+        ))),
+    }
+}
+
+fn retry_random_delay_seconds(mean_seconds: f64) -> f64 {
+    if !mean_seconds.is_finite() || mean_seconds <= 0.0 {
+        return 0.0;
+    }
+
+    let mut normalish = 0.0;
+    for _ in 0..12 {
+        normalish += next_retry_uniform();
+    }
+    normalish -= 6.0;
+
+    let stddev = mean_seconds / 3.0;
+    let delay = mean_seconds + normalish * stddev;
+    delay.clamp(0.0, mean_seconds * 2.0)
+}
+
+fn next_retry_uniform() -> f64 {
+    let mut seed = RETRY_RANDOM_SEED.load(Ordering::Relaxed);
+    if seed == 0 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos() as u64)
+            .unwrap_or(0);
+        seed = now ^ 0x9E37_79B9_7F4A_7C15;
+    }
+
+    seed ^= seed << 7;
+    seed ^= seed >> 9;
+    seed ^= seed << 8;
+    RETRY_RANDOM_SEED.store(seed, Ordering::Relaxed);
+
+    (seed as f64) / (u64::MAX as f64)
 }
 
 pub(super) fn build_responses_tools_payload(
@@ -865,6 +939,7 @@ mod tests {
             codex_auth: None,
             auth_credentials_store_mode: AuthCredentialsStoreMode::Auto,
             timeout_seconds: 30.0,
+            retry_mode: Default::default(),
             context_window_tokens: 200_000,
             cache_control: None,
             prompt_cache_retention: None,

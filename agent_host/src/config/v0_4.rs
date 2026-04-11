@@ -188,6 +188,7 @@ fn upgrade_versioned_model(
         codex_home: raw.codex_home,
         auth_credentials_store_mode: raw.auth_credentials_store_mode,
         timeout_seconds: raw.timeout_seconds,
+        retry_mode: Default::default(),
         context_window_tokens: raw.context_window_tokens,
         cache_ttl: raw.cache_ttl,
         reasoning: raw.reasoning,

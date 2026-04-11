@@ -102,6 +102,7 @@ impl ConfigLoader for LegacyConfigLoader {
                     codex_home: None,
                     auth_credentials_store_mode: AuthCredentialsStoreMode::Auto,
                     timeout_seconds: model.timeout_seconds,
+                    retry_mode: Default::default(),
                     context_window_tokens: model.context_window_tokens,
                     cache_ttl: model.cache_ttl,
                     reasoning: model.reasoning,

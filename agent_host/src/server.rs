@@ -528,6 +528,7 @@ impl ServerRuntime {
             codex_auth: self.resolved_codex_auth(model)?,
             auth_credentials_store_mode: model.auth_credentials_store_mode,
             timeout_seconds,
+            retry_mode: model.retry_mode.clone(),
             context_window_tokens: model.context_window_tokens,
             cache_control: openrouter_automatic_cache_control(model),
             prompt_cache_retention,
@@ -2927,7 +2928,7 @@ impl Server {
         session: &SessionSnapshot,
         missing_model_key: &str,
     ) -> Result<()> {
-        self.with_sessions(|sessions| sessions.clear_idle_compaction_retry(&session.address))?;
+        self.with_sessions(|sessions| sessions.clear_idle_compaction_failure(&session.address))?;
         let Some(channel) = self.channels.get(&session.address.channel_id).cloned() else {
             warn!(
                 log_stream = "session",
@@ -3350,8 +3351,7 @@ impl Server {
         for session in snapshots {
             if let Err(error) = self.attempt_idle_context_compaction(&session, false).await {
                 self.with_sessions(|sessions| {
-                    sessions
-                        .mark_idle_compaction_retry_needed(&session.address, format!("{error:#}"))
+                    sessions.mark_idle_compaction_failed(&session.address, format!("{error:#}"))
                 })?;
                 warn!(
                     log_stream = "session",
@@ -3451,7 +3451,9 @@ impl Server {
             run_backend_compaction(effective_backend, source_messages, config, extra_tools)
                 .with_context(|| format!("failed to compact idle session {}", session.id))?;
         if !report.compacted {
-            self.with_sessions(|sessions| sessions.clear_idle_compaction_retry(&session.address))?;
+            self.with_sessions(|sessions| {
+                sessions.clear_idle_compaction_failure(&session.address)
+            })?;
             return Ok(false);
         }
         let normalized_messages = normalize_messages_for_persistence(
@@ -4662,7 +4664,6 @@ mod tests {
             attachments_dir: temp_dir.path().join("workspace").join("upload"),
             workspace_id: "workspace-1".to_string(),
             workspace_root: temp_dir.path().join("workspace"),
-            message_count: 0,
             last_user_message_at: None,
             last_agent_returned_at: None,
             last_compacted_at: None,
@@ -4675,7 +4676,6 @@ mod tests {
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
             seen_model_catalog_version: None,
-            idle_compaction_retry: None,
             zgent_native: None,
             pending_workspace_summary: false,
             close_after_summary: false,
@@ -4711,6 +4711,7 @@ mod tests {
                 codex_home: None,
                 auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
                 timeout_seconds: 30.0,
+                retry_mode: Default::default(),
                 context_window_tokens: 128_000,
                 cache_ttl: None,
                 reasoning: None,
@@ -4924,6 +4925,7 @@ mod tests {
             codex_home: None,
             auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
             timeout_seconds: 30.0,
+            retry_mode: Default::default(),
             context_window_tokens: 128_000,
             cache_ttl: None,
             reasoning: None,
@@ -4990,6 +4992,7 @@ mod tests {
             codex_home: None,
             auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
             timeout_seconds: 30.0,
+            retry_mode: Default::default(),
             context_window_tokens: 128_000,
             cache_ttl: None,
             reasoning: None,
@@ -5057,6 +5060,7 @@ mod tests {
             codex_home: None,
             auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
             timeout_seconds: 30.0,
+            retry_mode: Default::default(),
             context_window_tokens: 128_000,
             cache_ttl: None,
             reasoning: None,
@@ -5110,6 +5114,7 @@ mod tests {
             codex_home: None,
             auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
             timeout_seconds: 30.0,
+            retry_mode: Default::default(),
             context_window_tokens: 128_000,
             cache_ttl: None,
             reasoning: None,
@@ -5687,7 +5692,6 @@ mod tests {
             attachments_dir: PathBuf::from("/tmp/workspaces/workspace-1/files/upload"),
             workspace_id: "workspace-1".to_string(),
             workspace_root: PathBuf::from("/tmp/workspaces/workspace-1/files"),
-            message_count: 0,
             last_user_message_at: None,
             last_agent_returned_at: Some(now - ChronoDuration::seconds(400)),
             last_compacted_at: None,
@@ -5700,7 +5704,6 @@ mod tests {
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
             seen_model_catalog_version: None,
-            idle_compaction_retry: None,
             zgent_native: None,
             pending_workspace_summary: false,
             close_after_summary: false,
@@ -5886,13 +5889,12 @@ mod tests {
     }
 
     #[test]
-    fn session_status_surfaces_idle_compaction_retry_state() {
+    fn session_status_surfaces_idle_compaction_error_state() {
         let temp_dir = TempDir::new().unwrap();
         let mut session = build_test_session(&temp_dir);
-        session.idle_compaction_retry = Some(crate::session::IdleCompactionRetryState {
-            error_summary: "upstream timeout while compacting older messages".to_string(),
-            failed_at: Some(Utc::now() - ChronoDuration::seconds(42)),
-        });
+        session.session_state.errno = Some(crate::session::SessionErrno::IdleCompactionFailure);
+        session.session_state.errinfo =
+            Some("upstream timeout while compacting older messages".to_string());
         let model = ModelConfig {
             model_type: crate::config::ModelType::Openrouter,
             model: "anthropic/claude-sonnet-4.6".to_string(),
@@ -5907,6 +5909,7 @@ mod tests {
             codex_home: None,
             auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
             timeout_seconds: 120.0,
+            retry_mode: Default::default(),
             context_window_tokens: 128_000,
             cache_ttl: None,
             reasoning: None,
@@ -5931,7 +5934,11 @@ mod tests {
             true,
         );
 
-        assert!(text.contains("Idle compaction retry: 待重试"));
+        assert!(
+            text.contains(
+                "Idle compaction error: upstream timeout while compacting older messages"
+            )
+        );
         assert!(text.contains("upstream timeout while compacting older messages"));
     }
 
@@ -5955,7 +5962,7 @@ mod tests {
         server
             .with_sessions(|sessions| {
                 sessions.ensure_foreground(&session.address)?;
-                sessions.mark_idle_compaction_retry_needed(
+                sessions.mark_idle_compaction_failed(
                     &session.address,
                     "model disappeared".to_string(),
                 )?;
@@ -5984,7 +5991,7 @@ mod tests {
         let session_snapshot = server
             .with_sessions(|sessions| Ok(sessions.get_snapshot(&session.address).unwrap()))
             .unwrap();
-        assert!(session_snapshot.idle_compaction_retry.is_none());
+        assert_eq!(session_snapshot.session_state.errno, None);
 
         let sent_messages = channel.sent_messages.lock().unwrap();
         assert_eq!(sent_messages.len(), 1);
@@ -6131,6 +6138,7 @@ mod tests {
                 codex_home: None,
                 auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
                 timeout_seconds: 60.0,
+                retry_mode: Default::default(),
                 context_window_tokens: 128_000,
                 cache_ttl: None,
                 reasoning: None,
@@ -6270,6 +6278,7 @@ mod tests {
             codex_home: None,
             auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
             timeout_seconds: 300.0,
+            retry_mode: Default::default(),
             context_window_tokens: 262_144,
             cache_ttl: cache_ttl.map(str::to_string),
             reasoning: None,

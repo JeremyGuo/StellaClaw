@@ -2,7 +2,7 @@ use crate::backend::AgentBackendKind;
 use crate::zgent::zgent_runtime_available;
 use agent_frame::config::{
     AuthCredentialsStoreMode, ExternalWebSearchConfig, MemorySystem, NativeWebSearchConfig,
-    ReasoningConfig, UpstreamApiKind, UpstreamAuthKind, expand_home_path,
+    ReasoningConfig, RetryModeConfig, UpstreamApiKind, UpstreamAuthKind, expand_home_path,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,7 @@ mod v0_10;
 mod v0_11;
 mod v0_12;
 mod v0_13;
+mod v0_14;
 mod v0_2;
 mod v0_3;
 mod v0_4;
@@ -26,7 +27,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.13";
+pub const LATEST_CONFIG_VERSION: &str = "0.14";
 pub const VERSION_0_2: &str = "0.2";
 pub const VERSION_0_3: &str = "0.3";
 pub const VERSION_0_4: &str = "0.4";
@@ -38,6 +39,7 @@ pub const VERSION_0_9: &str = "0.9";
 pub const VERSION_0_10: &str = "0.10";
 pub const VERSION_0_11: &str = "0.11";
 pub const VERSION_0_12: &str = "0.12";
+pub const VERSION_0_13: &str = "0.13";
 
 trait ConfigLoader {
     fn version(&self) -> &'static str;
@@ -116,6 +118,8 @@ pub struct ModelConfig {
     pub auth_credentials_store_mode: AuthCredentialsStoreMode,
     #[serde(default = "default_model_timeout_seconds")]
     pub timeout_seconds: f64,
+    #[serde(default)]
+    pub retry_mode: RetryModeConfig,
     #[serde(default = "default_context_window_tokens")]
     pub context_window_tokens: usize,
     #[serde(default)]
@@ -822,7 +826,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let loaders: [&dyn ConfigLoader; 13] = [
+    let loaders: [&dyn ConfigLoader; 14] = [
         &v0_1::LegacyConfigLoader,
         &v0_2::VersionedConfigLoader,
         &v0_3::VersionedConfigLoader,
@@ -836,6 +840,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         &v0_11::LatestConfigLoader,
         &v0_12::LatestConfigLoader,
         &v0_13::LatestConfigLoader,
+        &v0_14::LatestConfigLoader,
     ];
     let loader = loaders
         .into_iter()
@@ -937,7 +942,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
     let config = {
-        let loaders: [&dyn ConfigLoader; 13] = [
+        let loaders: [&dyn ConfigLoader; 14] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
             &v0_3::VersionedConfigLoader,
@@ -951,6 +956,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
             &v0_11::LatestConfigLoader,
             &v0_12::LatestConfigLoader,
             &v0_13::LatestConfigLoader,
+            &v0_14::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()
@@ -997,6 +1003,7 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
         codex_home: &'a Option<String>,
         auth_credentials_store_mode: AuthCredentialsStoreMode,
         timeout_seconds: f64,
+        retry_mode: &'a RetryModeConfig,
         context_window_tokens: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_ttl: &'a Option<String>,
@@ -1055,6 +1062,7 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
                     codex_home: &model.codex_home,
                     auth_credentials_store_mode: model.auth_credentials_store_mode,
                     timeout_seconds: model.timeout_seconds,
+                    retry_mode: &model.retry_mode,
                     context_window_tokens: model.context_window_tokens,
                     cache_ttl: &model.cache_ttl,
                     reasoning: &model.reasoning,
@@ -1150,6 +1158,7 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
                 model_name
             ));
         }
+        validate_model_retry_mode(model_name, &model.retry_mode)?;
         if let Some(image_tool_model) = &model.image_tool_model
             && image_tool_model != "self"
             && !config.models.contains_key(image_tool_model)
@@ -1281,6 +1290,30 @@ fn validate_tooling_target(
         ));
     }
     Ok(())
+}
+
+fn validate_model_retry_mode(model_name: &str, retry_mode: &RetryModeConfig) -> Result<()> {
+    match retry_mode {
+        RetryModeConfig::No => Ok(()),
+        RetryModeConfig::Random {
+            max_retries,
+            retry_random_mean,
+        } => {
+            if *max_retries == 0 {
+                return Err(anyhow!(
+                    "model '{}'.retry_mode.max_retries must be at least 1",
+                    model_name
+                ));
+            }
+            if !retry_random_mean.is_finite() || *retry_random_mean <= 0.0 {
+                return Err(anyhow!(
+                    "model '{}'.retry_mode.retry_random_mean must be greater than 0 seconds",
+                    model_name
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn normalize_model_capabilities(

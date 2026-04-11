@@ -1276,6 +1276,7 @@ mod tests {
                 codex_auth: None,
                 auth_credentials_store_mode: crate::config::AuthCredentialsStoreMode::Auto,
                 timeout_seconds: 30.0,
+                retry_mode: Default::default(),
                 context_window_tokens: 1000,
                 cache_control: Some(CacheControlConfig {
                     cache_type: "ephemeral".to_string(),

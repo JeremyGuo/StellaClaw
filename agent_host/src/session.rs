@@ -90,14 +90,6 @@ pub struct SessionCheckpointData {
     pub pending_model_catalog_notice: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct IdleCompactionRetryState {
-    #[serde(default)]
-    pub error_summary: String,
-    #[serde(default)]
-    pub failed_at: Option<DateTime<Utc>>,
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ZgentNativeSessionState {
     #[serde(default)]
@@ -133,7 +125,6 @@ pub struct SessionSnapshot {
     pub attachments_dir: PathBuf,
     pub workspace_id: String,
     pub workspace_root: PathBuf,
-    pub message_count: usize,
     pub last_user_message_at: Option<DateTime<Utc>>,
     pub last_agent_returned_at: Option<DateTime<Utc>>,
     pub last_compacted_at: Option<DateTime<Utc>>,
@@ -146,7 +137,6 @@ pub struct SessionSnapshot {
     pub seen_user_profile_version: Option<String>,
     pub seen_identity_profile_version: Option<String>,
     pub seen_model_catalog_version: Option<String>,
-    pub idle_compaction_retry: Option<IdleCompactionRetryState>,
     pub zgent_native: Option<ZgentNativeSessionState>,
     pub pending_workspace_summary: bool,
     pub close_after_summary: bool,
@@ -203,7 +193,6 @@ struct Session {
     pending_user_profile_notice: bool,
     pending_identity_profile_notice: bool,
     pending_model_catalog_notice: bool,
-    idle_compaction_retry: Option<IdleCompactionRetryState>,
     zgent_native: Option<ZgentNativeSessionState>,
     session_state: DurableSessionState,
     pending_workspace_summary: bool,
@@ -225,7 +214,6 @@ impl Session {
             attachments_dir: self.attachments_dir.clone(),
             workspace_id: self.workspace_id.clone(),
             workspace_root: self.workspace_root.clone(),
-            message_count: self.history.len(),
             last_user_message_at: self.last_user_message_at,
             last_agent_returned_at: self.last_agent_returned_at,
             last_compacted_at: self.last_compacted_at,
@@ -238,7 +226,6 @@ impl Session {
             seen_user_profile_version: self.seen_user_profile_version.clone(),
             seen_identity_profile_version: self.seen_identity_profile_version.clone(),
             seen_model_catalog_version: self.seen_model_catalog_version.clone(),
-            idle_compaction_retry: self.idle_compaction_retry.clone(),
             zgent_native: self.zgent_native.clone(),
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
@@ -270,7 +257,7 @@ impl Session {
             address: self.address.clone(),
             workspace_id: Some(self.workspace_id.clone()),
             history: self.history.clone(),
-            legacy_agent_messages: self.session_state.messages.clone(),
+            legacy_agent_messages: Vec::new(),
             last_user_message_at: self.last_user_message_at,
             last_agent_returned_at: self.last_agent_returned_at,
             last_compacted_at: self.last_compacted_at,
@@ -286,7 +273,6 @@ impl Session {
             pending_identity_profile_notice: self.pending_identity_profile_notice,
             seen_model_catalog_version: self.seen_model_catalog_version.clone(),
             pending_model_catalog_notice: self.pending_model_catalog_notice,
-            idle_compaction_retry: self.idle_compaction_retry.clone(),
             zgent_native: self.zgent_native.clone(),
             session_state: Some(self.session_state.clone()),
             pending_workspace_summary: self.pending_workspace_summary,
@@ -352,7 +338,6 @@ impl Session {
             pending_user_profile_notice: persisted.pending_user_profile_notice,
             pending_identity_profile_notice: persisted.pending_identity_profile_notice,
             pending_model_catalog_notice: persisted.pending_model_catalog_notice,
-            idle_compaction_retry: persisted.idle_compaction_retry,
             zgent_native: persisted.zgent_native,
             session_state,
             pending_workspace_summary: persisted.pending_workspace_summary,
@@ -409,7 +394,6 @@ fn record_turn(
     session.turn_count = session.turn_count.saturating_add(1);
     session.cumulative_usage.add_assign(usage);
     accumulate_compaction_stats(session, compaction);
-    session.idle_compaction_retry = None;
     info!(
         log_stream = "session",
         log_key = %session.id,
@@ -503,8 +487,6 @@ struct PersistedSession {
     pending_identity_profile_notice: bool,
     #[serde(default)]
     pending_model_catalog_notice: bool,
-    #[serde(default)]
-    idle_compaction_retry: Option<IdleCompactionRetryState>,
     #[serde(default)]
     zgent_native: Option<ZgentNativeSessionState>,
     #[serde(default)]
@@ -795,7 +777,6 @@ impl SessionManager {
             pending_identity_profile_notice: checkpoint.pending_identity_profile_notice,
             seen_model_catalog_version: checkpoint.seen_model_catalog_version,
             pending_model_catalog_notice: checkpoint.pending_model_catalog_notice,
-            idle_compaction_retry: None,
             zgent_native: None,
             session_state: DurableSessionState {
                 messages: checkpoint_messages,
@@ -1268,7 +1249,6 @@ impl SessionManager {
         session.last_compacted_at = Some(Utc::now());
         session.last_compacted_turn_count = session.turn_count;
         accumulate_compaction_stats(session, compaction);
-        session.idle_compaction_retry = None;
         if session.session_state.errno == Some(SessionErrno::IdleCompactionFailure) {
             session.session_state.errno = None;
             session.session_state.errinfo = None;
@@ -1285,7 +1265,7 @@ impl SessionManager {
         Ok(())
     }
 
-    pub fn mark_idle_compaction_retry_needed(
+    pub fn mark_idle_compaction_failed(
         &mut self,
         address: &ChannelAddress,
         error_summary: String,
@@ -1295,47 +1275,22 @@ impl SessionManager {
             .foreground_sessions
             .get_mut(&key)
             .with_context(|| format!("no active session for {}", key))?;
-        session.idle_compaction_retry = Some(IdleCompactionRetryState {
-            error_summary,
-            failed_at: Some(Utc::now()),
-        });
         session.session_state.errno = Some(SessionErrno::IdleCompactionFailure);
-        session.session_state.errinfo = session
-            .idle_compaction_retry
-            .as_ref()
-            .map(|state| state.error_summary.clone());
+        session.session_state.errinfo = Some(error_summary);
         session.persist()?;
         Ok(())
     }
 
-    pub fn clear_idle_compaction_retry(&mut self, address: &ChannelAddress) -> Result<()> {
+    pub fn clear_idle_compaction_failure(&mut self, address: &ChannelAddress) -> Result<()> {
         let key = address.session_key();
         let session = self
             .foreground_sessions
             .get_mut(&key)
             .with_context(|| format!("no active session for {}", key))?;
-        session.idle_compaction_retry = None;
         if session.session_state.errno == Some(SessionErrno::IdleCompactionFailure) {
             session.session_state.errno = None;
             session.session_state.errinfo = None;
         }
-        session.persist()?;
-        Ok(())
-    }
-
-    pub fn exhaust_idle_compaction_retry(
-        &mut self,
-        address: &ChannelAddress,
-        error_summary: String,
-    ) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        session.idle_compaction_retry = None;
-        session.session_state.errno = Some(SessionErrno::IdleCompactionFailure);
-        session.session_state.errinfo = Some(error_summary);
         session.persist()?;
         Ok(())
     }
@@ -1476,7 +1431,6 @@ impl SessionManager {
             pending_user_profile_notice: false,
             pending_identity_profile_notice: false,
             pending_model_catalog_notice: false,
-            idle_compaction_retry: None,
             zgent_native: None,
             session_state: DurableSessionState::default(),
             pending_workspace_summary: false,
@@ -1853,7 +1807,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_compaction_retry_state_can_be_set_and_cleared() {
+    fn idle_compaction_failure_can_be_set_and_cleared() {
         let temp_dir = TempDir::new().unwrap();
         let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
@@ -1861,47 +1815,22 @@ mod tests {
         sessions.ensure_foreground(&address).unwrap();
 
         sessions
-            .mark_idle_compaction_retry_needed(&address, "idle compaction failed".to_string())
+            .mark_idle_compaction_failed(&address, "idle compaction failed".to_string())
             .unwrap();
         let snapshot = sessions.get_snapshot(&address).unwrap();
-        assert_eq!(
-            snapshot
-                .idle_compaction_retry
-                .as_ref()
-                .map(|state| state.error_summary.as_str()),
-            Some("idle compaction failed")
-        );
-
-        sessions.clear_idle_compaction_retry(&address).unwrap();
-        let snapshot = sessions.get_snapshot(&address).unwrap();
-        assert!(snapshot.idle_compaction_retry.is_none());
-    }
-
-    #[test]
-    fn idle_compaction_retry_can_be_exhausted_without_clearing_error_state() {
-        let temp_dir = TempDir::new().unwrap();
-        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
-        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
-        let address = test_address();
-        sessions.ensure_foreground(&address).unwrap();
-
-        sessions
-            .mark_idle_compaction_retry_needed(&address, "initial failure".to_string())
-            .unwrap();
-        sessions
-            .exhaust_idle_compaction_retry(&address, "retry failed too".to_string())
-            .unwrap();
-
-        let snapshot = sessions.get_snapshot(&address).unwrap();
-        assert!(snapshot.idle_compaction_retry.is_none());
         assert_eq!(
             snapshot.session_state.errno,
             Some(SessionErrno::IdleCompactionFailure)
         );
         assert_eq!(
             snapshot.session_state.errinfo.as_deref(),
-            Some("retry failed too")
+            Some("idle compaction failed")
         );
+
+        sessions.clear_idle_compaction_failure(&address).unwrap();
+        let snapshot = sessions.get_snapshot(&address).unwrap();
+        assert_eq!(snapshot.session_state.errno, None);
+        assert_eq!(snapshot.session_state.errinfo, None);
     }
 
     #[test]
@@ -2148,7 +2077,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(restored.workspace_id, workspace.id);
-        assert_eq!(restored.message_count, 1);
         assert_eq!(restored.stable_message_count(), 1);
     }
 

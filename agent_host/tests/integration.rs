@@ -162,7 +162,6 @@ fn session_manager_restores_persisted_foreground_session_after_restart() {
     assert_eq!(restored.agent_id, original.agent_id);
     assert_eq!(restored.workspace_id, original.workspace_id);
     assert_eq!(restored.workspace_root, original.workspace_root);
-    assert_eq!(restored.message_count, 1);
     assert_eq!(restored.stable_message_count(), 1);
     assert_eq!(restored.turn_count, 1);
     assert_eq!(restored.api_timeout_override_seconds, Some(321.0));

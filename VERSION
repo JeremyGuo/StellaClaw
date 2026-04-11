@@ -1,8 +1,22 @@
-version: 0.13.0
+version: 0.14.0
 ---
 
-# 0.13.0
+# 0.14.0
 
+- 升级 `config` 保存格式到 `0.14`：
+  每个模型配置新增 `retry_mode` object，默认 `{"mode":"no"}`，失败时立即返回用户；`{"mode":"random","max_retries":N,"retry_random_mean":S}` 会在失败后按近似正态分布随机等待后重试。
+- `agent_frame` 上游请求统一支持按模型重试：
+  主对话、工具模型和压缩调用都会读取对应模型的 `retry_mode`；已有 `previous_response_id` fallback 的错误不会先消耗随机重试。
+- TUI config editor 新增 `retry_mode.mode` 选择框，并在选择 `random` 时显示 `max_retries` 与 `retry_random_mean`；最新示例配置与部署模板均补齐到 `0.14`。
+- `deploy_telegram.json` 的 `opus-4.6` 已启用 random retry：
+  最大重试 2 次，随机等待均值 8 秒；其他模型保持默认 `no`。
+- 本次同时包含 `workdir` `0.18 -> 0.19` 的 SessionState 冗余字段清理；最终仓库版本按 config schema 变更策略提升到 `0.14.0`，不再单独停留在 patch 版本。
+- 升级 `workdir` 结构版本到 `0.19`：
+  最新 `sessions/*/session.json` 不再持久化旧的 `idle_compaction_retry` 专用状态；新增 `0.18 -> 0.19` upgrade step 会移除该字段，idle compaction 失败继续只通过 `session_state.errno/errinfo` 表达。
+- 继续收敛 SessionState 作为 durable 会话真相：
+  移除 `SessionSnapshot.message_count` 这类旧 history 计数字段，并清理不再序列化的 `agent_messages` legacy 写入 clone；旧 snapshot / workdir 读取兼容仍保留在反序列化路径中。
+- 明确本次只影响 `workdir`，不影响 `config`：
+  新增 `0.18 -> 0.19` workdir upgrade step；按版本策略将仓库版本从 `0.13.0` 提升到 `0.13.1`。
 - 升级 `config` 保存格式到 `0.13`，本次不影响 `workdir`：
   删除 `sandbox.mode = "disabled"` 这一用户可选模式，最新配置与 TUI 只保留 `subprocess` / `bubblewrap`；旧配置里残留的 `"disabled"` 会在加载时自动视为 `"subprocess"` 并在升级后写回最新版本。
 - 前台 `agent_frame` 开始支持会话级常驻 child runtime：

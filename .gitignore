@@ -18,3 +18,5 @@ sessions/
 deploy*
 learnable_materials/
 /zgent*
+
+.codex
