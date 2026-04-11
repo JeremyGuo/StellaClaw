@@ -100,8 +100,7 @@ fn spawn_with_persistent_parent_thread(mut command: Command) -> Result<Child> {
                     // Check if child is still alive via kill(pid, 0).
                     // SAFETY: kill with signal 0 performs an existence check
                     // without sending any signal.
-                    let alive =
-                        unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+                    let alive = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
                     if !alive {
                         break;
                     }
