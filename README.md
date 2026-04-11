@@ -176,6 +176,24 @@ Bubblewrap mode exposes only the current workspace, runtime dir, `.skills/`, and
 
 ---
 
+## TUI Config Editor
+
+ClawParty ships with a built-in terminal UI for editing configurations — no need to hand-edit JSON:
+
+```bash
+./target/release/partyclaw config deploy_telegram.json
+```
+
+<div align="center">
+  <img src="docs/imgs/tui_config_editor.jpg" alt="TUI Config Editor" width="720" />
+  <br />
+  <sub><code>partyclaw config</code> — browse, edit, validate, and save configurations interactively</sub>
+</div>
+
+Sections include Models, Tooling, Main Agent, Runtime, Sandbox, and Channels. Supports keyboard navigation, inline validation, and one-key bootstrap for new configs.
+
+---
+
 ## Quick Start
 
 ### 1. Environment
