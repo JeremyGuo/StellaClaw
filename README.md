@@ -12,7 +12,7 @@
 
 ## What is ClawParty?
 
-ClawParty is a **production-grade agent hosting framework** that turns LLM agents into always-on, multi-channel services. Unlike CLI-only tools like Claude Code or OpenClaw, ClawParty is designed from day one as a **persistent service** — it runs 24/7, connects to messaging platforms like Telegram, and manages multiple independent conversations concurrently.
+ClawParty is a **production-grade agent hosting framework** that turns LLM agents into always-on, multi-channel services. It is designed from day one as a **persistent service** — it runs 24/7, connects to messaging platforms like Telegram, and manages multiple independent conversations concurrently.
 
 <div align="center">
 <table><tr>
@@ -50,21 +50,23 @@ There are several ways to run LLM agents today. Here's where ClawParty fits:
 
 | | **Claude Code** | **OpenClaw** | **ClawParty** |
 |:--|:----------------|:-------------|:--------------|
-| **What is it** | Anthropic's official CLI coding agent | Open-source self-hosted personal AI assistant | Self-hosted multi-agent service framework |
-| **Primary use case** | Interactive coding in a terminal | Personal automation across messaging apps | Developer / engineering workflows as always-on services |
-| **Stack** | Closed-source, Node.js | Open-source, JS/Python | Open-source, Rust |
-| **Deployment** | CLI, one session at a time | Local daemon or one-click cloud | `systemd` service, multi-conversation |
-| **Channels** | Terminal only | 50+ (WhatsApp, Telegram, Slack, Discord, …) | Telegram, DingTalk, CLI — extensible |
-| **Agent topology** | Single agent | Multi-agent routing, skill-based | Main + sub-agents + background agents, per-conversation |
-| **Interruption** | Kill & restart | — | Mid-turn yield: new messages interrupt gracefully, no work lost |
-| **Sandbox** | OS-level only | Optional container | Three modes: disabled / subprocess / bubblewrap (namespace isolation) |
-| **Memory** | Session-scoped | Persistent (SQLite / Markdown) | Multi-layer: compaction + idle compaction + conversation memory + shared profiles |
-| **Scheduling** | None | Cron, webhooks, wakeups | Cron with checker commands + configurable sink routing |
-| **Skills / Plugins** | — | 5,400+ via ClawHub | `SKILL.md`-based reusable workflows with runtime change detection |
-| **Model flexibility** | Claude only | Multi-model | Multiple providers per instance, per-conversation switching |
-| **Coding tool depth** | Deep (native) | General-purpose | Deep: 40+ built-in tools (file I/O, shell with PTY, grep/glob, patch, sub-agents) |
+| **What is it** | Anthropic's official CLI coding agent | Open-source personal AI assistant with massive channel ecosystem | Self-hosted multi-agent service framework |
+| **Primary use case** | Interactive coding in a terminal | Personal automation across 90+ messaging platforms and companion apps | Developer / engineering workflows as always-on services |
+| **Stack** | Closed-source, Node.js | Open-source, TypeScript/Node.js (~1M LoC) | Open-source, Rust (~54K LoC) |
+| **Runtime model** | CLI process, one session at a time | WebSocket Gateway daemon + Node runner; companion apps (macOS, iOS, Android) + ACP bridge for IDE integration | `systemd` daemon, single binary, multi-conversation |
+| **Channels** | Terminal only | 90+ extensions (Telegram, WhatsApp, Discord, Slack, Feishu, Teams, IRC, …) | Telegram, DingTalk, CLI — extensible |
+| **Agent topology** | Single agent | Multi-agent: subagent registry, skill-based routing, agent scopes | Main + sub-agents + background agents, per-conversation with configurable sinks |
+| **Interruption** | Kill & restart | `chat.abort` cancels active runs | Mid-turn yield at safe tool boundaries: new messages interrupt gracefully, no work lost, agent sees new context |
+| **Sandbox** | OS-level only | Docker containers with remote FS bridge, SSH backend, network modes | Three modes: disabled / subprocess / bubblewrap (Linux namespace isolation, no Docker dependency) |
+| **Memory** | Session-scoped | Context engine with compaction, session transcripts, QMD memory format | Multi-layer: threshold / idle / timeout-observation compaction + conversation memory files + shared user/identity profiles |
+| **Scheduling** | None | Cron, webhooks, wakeups | Cron with checker commands + configurable sink routing (direct, broadcast, multi-target) |
+| **Skills / Plugins** | — | 53 built-in skills + 5,400+ via ClawHub + MCP server support | `SKILL.md`-based reusable workflows with runtime change detection + persistent skill memory |
+| **Model flexibility** | Claude only | Multi-provider (Anthropic, OpenAI, Google, DeepSeek, vLLM, Groq, …) with model fallback chains | Multiple providers per instance (OpenRouter, Codex WS, custom), per-conversation model switching |
+| **Coding tool depth** | Deep (native) | Full tool suite (bash, file I/O, web, subagents, image, TTS, video, MCP tools, canvas) | Deep: 40+ built-in tools (file I/O, shell with PTY, grep/glob, patch, sub-agents, cron, workspace management) |
+| **Config UX** | CLI flags | YAML config + TUI wizard + Control UI web panel | JSON config + built-in Ratatui TUI editor with one-key bootstrap |
+| **Codebase weight** | Closed | ~6K source files, ~1M lines, 90+ extensions, 4 companion apps | 2 crates, ~50 source files, ~54K lines — single binary, no runtime dependencies |
 
-**TL;DR**: Claude Code is the polished single-user coding CLI. OpenClaw is the Swiss-army-knife personal assistant with massive platform coverage. ClawParty sits in between — it's a **lightweight, Rust-native service** focused on engineering workflows, with deep coding tools, robust crash recovery, and the ability to run multiple independent agent conversations as a persistent daemon.
+**TL;DR**: Claude Code is the polished single-user coding CLI. OpenClaw is the full-featured personal assistant platform with massive channel and plugin coverage, companion apps, and IDE integration. ClawParty is a **lean, Rust-native service** focused on engineering workflows — with deep coding tools, crash-safe state persistence, cooperative turn interruption, and the ability to run multiple isolated agent conversations as a single lightweight daemon.
 
 ### Key Design Principles
 
