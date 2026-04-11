@@ -112,7 +112,7 @@
   <rect width="1200" height="880" fill="url(#dotGrid)"/>
 
   <!-- ==================== TITLE ==================== -->
-  <text x="600" y="42" text-anchor="middle" font-family="'Inter','Segoe UI',system-ui,sans-serif" font-size="26" font-weight="700" fill="#f1f5f9">ClawParty 2.0 — System Architecture</text>
+  <text x="600" y="42" text-anchor="middle" font-family="'Inter','Segoe UI',system-ui,sans-serif" font-size="26" font-weight="700" fill="#f1f5f9">ClawParty — System Architecture</text>
   <text x="600" y="67" text-anchor="middle" font-family="'Inter','Segoe UI',system-ui,sans-serif" font-size="13" fill="#64748b">Layered overview: channels → session → agents → scheduling</text>
 
   <!-- ==================== LAYER 1: CHANNELS ==================== -->

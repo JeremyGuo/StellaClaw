@@ -1,23 +1,14 @@
 <div align="center">
 
-<!-- Logo / Hero SVG -->
-<img src="docs/imgs/hero_banner.svg" alt="ClawParty" width="820" />
-
-<br />
+# 🦀 ClawParty
 
 **A self-hosted, multi-agent service framework built in Rust.**
 
-[![CI](https://img.shields.io/badge/CI-cargo_test-green?logo=github-actions&logoColor=white)](#ci--cd)
-[![Rust](https://img.shields.io/badge/Rust-2024_Edition-orange?logo=rust&logoColor=white)](#)
-[![License](https://img.shields.io/badge/license-MIT-blue)](#)
-[![LoC](https://img.shields.io/badge/Rust_LoC-53K+-8b5cf6)](#)
-[![Version](https://img.shields.io/badge/version-0.14.0-brightgreen)](#)
-
 *Agents as services, not scripts.*
 
-</div>
-
 ---
+
+</div>
 
 ## What is ClawParty?
 
@@ -79,18 +70,18 @@ Create a new group, add the bot, and you have a fresh conversation — no comman
 
 ## Native Multimodal
 
-ClawParty handles multimodal content natively across the full pipeline:
+ClawParty handles multimodal content **natively** across the full pipeline — not bolted on, but designed into the channel and tool layers from the start:
 
 | Capability | How it works |
 |:-----------|:-------------|
-| 📷 **Image input** | Send images in chat → model sees them directly (vision-capable models) |
-| 🎨 **Image generation** | `image_generate` tool → helper model creates images → sent back in chat |
-| 📄 **PDF input** | Send PDFs → extracted and passed to the model |
-| 🎵 **Audio input** | Voice messages → transcribed and passed to the model |
-| 📎 **File attachments** | Upload files → stored in workspace, accessible to tools |
-| 🖼️ **Image output** | Agents can generate plots, diagrams, screenshots → delivered as attachments |
+| 📷 **Image input** | Send images in chat → model sees them directly via vision-capable models |
+| 🎨 **Image generation** | `image_generate` tool → helper model creates images → delivered back in chat |
+| 📄 **PDF input** | Send PDF files → content extracted and passed to the model |
+| 🎵 **Audio input** | Send voice messages → transcribed and injected into context |
+| 📎 **File attachments** | Upload any file → stored in workspace, accessible to all tools |
+| 🖼️ **Image output** | Agents generate plots, diagrams, screenshots → sent as chat attachments |
 
-All multimodal routing is configurable per model via `capabilities` and `tooling` helper model assignments.
+Multimodal routing is **per-model configurable**: each model declares its `capabilities` (e.g., `image_in`, `audio_in`), and helper models can be assigned for specific tooling tasks (image generation, web search, etc.). The channel layer handles format conversion transparently — the agent just works.
 
 ---
 

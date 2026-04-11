@@ -64,7 +64,7 @@ ax.set_ylim(0, 10)
 ax.axis('off')
 
 # ── Title ──
-txt(ax, 7, 9.55, 'ClawParty 2.0 — System Architecture',
+txt(ax, 7, 9.55, 'ClawParty — System Architecture',
     size=18, color=WHITE, bold=True)
 txt(ax, 7, 9.2, 'Layered overview: channels → session → agents → scheduling',
     size=9, color=MUTED)
@@ -150,7 +150,7 @@ for i, (lc, lt) in enumerate(legend_items):
     txt(ax, lx + 0.42, 0.14, lt, size=8, color=SUBTEXT, ha='left')
 
 fig1.tight_layout(pad=0.3)
-fig1.savefig('/Users/jeremyguo/Projects/ClawParty2.0/docs/imgs/architecture.png',
+fig1.savefig('/Users/jeremyguo/Projects/ClawParty/docs/imgs/architecture.png',
              dpi=180, bbox_inches='tight', facecolor=BG)
 plt.close(fig1)
 print("architecture.png saved")
@@ -270,7 +270,7 @@ txt(ax2, 8, 0.1,
     size=8.5, color='#475569', style='italic')
 
 fig2.tight_layout(pad=0.3)
-fig2.savefig('/Users/jeremyguo/Projects/ClawParty2.0/docs/imgs/workspace_lifecycle.png',
+fig2.savefig('/Users/jeremyguo/Projects/ClawParty/docs/imgs/workspace_lifecycle.png',
              dpi=180, bbox_inches='tight', facecolor=BG2)
 plt.close(fig2)
 print("workspace_lifecycle.png saved")
