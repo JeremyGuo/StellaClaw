@@ -1,5 +1,10 @@
-version: 0.14.2
+version: 0.14.3
 ---
+
+# 0.14.3
+
+- 修复 `agent_frame` 在 musl 目标下交叉编译失败的问题：
+  `libc::ioctl` 的 `request` 参数在 glibc 上是 `c_ulong`（`u64`），在 musl 上是 `c_int`（`i32`）；将 `TIOCSCTTY as libc::c_ulong` 改为 `TIOCSCTTY as _` 让编译器自动推导，兼容两种 libc。
 
 # 0.14.2
 

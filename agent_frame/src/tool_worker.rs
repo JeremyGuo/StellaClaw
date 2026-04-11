@@ -1005,7 +1005,7 @@ fn run_exec_job(
                     if libc::setsid() == -1 {
                         return Err(std::io::Error::last_os_error());
                     }
-                    if libc::ioctl(slave_fd, libc::TIOCSCTTY as libc::c_ulong, 0) == -1 {
+                    if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) == -1 {
                         return Err(std::io::Error::last_os_error());
                     }
                     if libc::dup2(slave_fd, libc::STDIN_FILENO) == -1
