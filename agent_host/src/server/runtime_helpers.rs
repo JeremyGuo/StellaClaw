@@ -804,8 +804,10 @@ pub(super) fn openrouter_automatic_cache_control(
 }
 
 fn supports_openrouter_anthropic_automatic_cache(model: &ModelConfig) -> bool {
-    model.model_type == crate::config::ModelType::Openrouter
-        && model.api_endpoint.contains("openrouter.ai")
+    matches!(
+        model.model_type,
+        crate::config::ModelType::Openrouter | crate::config::ModelType::OpenrouterResp
+    ) && model.api_endpoint.contains("openrouter.ai")
         && model.model.starts_with("anthropic/claude-")
 }
 

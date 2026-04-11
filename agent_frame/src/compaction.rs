@@ -5,7 +5,7 @@ use crate::tooling::Tool;
 use crate::tooling::active_runtime_state_summary;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 pub const COMPACTION_MARKER: &str = "[AgentFrame Context Compression]";
 
@@ -111,6 +111,104 @@ fn content_to_text(content: &Option<Value>) -> String {
         Some(other) => serde_json::to_string(other).unwrap_or_default(),
         None => String::new(),
     }
+}
+
+fn compaction_text_item(text: impl Into<String>) -> Value {
+    json!({
+        "type": "text",
+        "text": text.into(),
+    })
+}
+
+fn image_url_from_content_item(object: &Map<String, Value>) -> Option<&str> {
+    object.get("image_url").and_then(|value| match value {
+        Value::String(url) => Some(url.as_str()),
+        Value::Object(map) => map.get("url").and_then(Value::as_str),
+        _ => None,
+    })
+}
+
+fn image_placeholder_for_compaction(image_url: Option<&str>) -> String {
+    let Some(image_url) = image_url else {
+        return "[image omitted during context compression]".to_string();
+    };
+    if image_url
+        .get(.."data:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    {
+        let media_type = image_url
+            .strip_prefix("data:")
+            .and_then(|rest| rest.split(';').next())
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("image");
+        format!("[image omitted during context compression: inline {media_type}]")
+    } else {
+        format!("[image omitted during context compression: {image_url}]")
+    }
+}
+
+fn file_placeholder_for_compaction(item_type: &str, item: &Value) -> String {
+    let file_value = if item_type == "file" {
+        item.get("file").unwrap_or(item)
+    } else {
+        item
+    };
+    let filename = file_value
+        .get("filename")
+        .and_then(Value::as_str)
+        .unwrap_or("document");
+    format!("[file omitted during context compression: {filename}]")
+}
+
+fn audio_placeholder_for_compaction(object: &Map<String, Value>) -> String {
+    let format = object
+        .get("input_audio")
+        .and_then(Value::as_object)
+        .and_then(|audio| audio.get("format"))
+        .and_then(Value::as_str)
+        .unwrap_or("audio");
+    format!("[audio omitted during context compression: {format}]")
+}
+
+fn sanitize_content_item_for_compaction_request(item: &Value) -> Value {
+    let Some(object) = item.as_object() else {
+        return item.clone();
+    };
+    let Some(item_type) = object.get("type").and_then(Value::as_str) else {
+        return item.clone();
+    };
+    match item_type {
+        "input_image" | "image_url" => compaction_text_item(image_placeholder_for_compaction(
+            image_url_from_content_item(object),
+        )),
+        "file" | "input_file" => {
+            compaction_text_item(file_placeholder_for_compaction(item_type, item))
+        }
+        "input_audio" => compaction_text_item(audio_placeholder_for_compaction(object)),
+        _ => item.clone(),
+    }
+}
+
+fn sanitize_content_for_compaction_request(content: &Option<Value>) -> Option<Value> {
+    match content {
+        Some(Value::Array(items)) => Some(Value::Array(
+            items
+                .iter()
+                .map(sanitize_content_item_for_compaction_request)
+                .collect(),
+        )),
+        _ => content.clone(),
+    }
+}
+
+fn sanitize_messages_for_compaction_request(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    messages
+        .iter()
+        .map(|message| ChatMessage {
+            content: sanitize_content_for_compaction_request(&message.content),
+            ..message.clone()
+        })
+        .collect()
 }
 
 fn estimate_text_tokens(text: &str) -> usize {
@@ -456,6 +554,7 @@ fn generate_summary(
             build_claude_code_summary_request(messages, preserved_recent_count)
         }
     };
+    let request_messages = sanitize_messages_for_compaction_request(&request_messages);
     let summary_message = create_chat_completion(
         &config.upstream,
         &request_messages,
@@ -699,7 +798,8 @@ mod tests {
         COMPACTION_MARKER, adjust_split_index_to_preserve_tool_context, content_to_text,
         estimate_message_tokens, estimate_text_tokens, extract_previous_compaction_summary,
         find_originating_tool_use_index, parse_structured_summary,
-        recent_tail_start_by_token_budget, split_compaction_inputs,
+        recent_tail_start_by_token_budget, sanitize_messages_for_compaction_request,
+        split_compaction_inputs,
     };
     use crate::message::{ChatMessage, ToolCall};
     use serde_json::json;
@@ -812,6 +912,66 @@ mod tests {
         assert!(naive > 10_000);
         assert!(discounted < naive);
         assert!(discounted < naive.saturating_sub(2_000));
+    }
+
+    #[test]
+    fn compaction_request_replaces_inline_media_payloads_with_placeholders() {
+        let image_payload = "UNIQUE_IMAGE_PAYLOAD".repeat(512);
+        let file_payload = "UNIQUE_FILE_PAYLOAD".repeat(512);
+        let audio_payload = "UNIQUE_AUDIO_PAYLOAD".repeat(512);
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(json!([
+                {
+                    "type": "text",
+                    "text": "Keep the textual instruction."
+                },
+                {
+                    "type": "input_image",
+                    "image_url": format!("data:image/png;base64,{image_payload}")
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "https://example.com/screenshot.png"
+                    }
+                },
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": "report.pdf",
+                        "file_data": file_payload
+                    }
+                },
+                {
+                    "type": "input_audio",
+                    "input_audio": {
+                        "format": "wav",
+                        "data": audio_payload
+                    }
+                }
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let sanitized = sanitize_messages_for_compaction_request(&messages);
+        let serialized = serde_json::to_string(&sanitized).unwrap();
+
+        assert!(serialized.contains("Keep the textual instruction."));
+        assert!(
+            serialized.contains("[image omitted during context compression: inline image/png]")
+        );
+        assert!(serialized.contains(
+            "[image omitted during context compression: https://example.com/screenshot.png]"
+        ));
+        assert!(serialized.contains("[file omitted during context compression: report.pdf]"));
+        assert!(serialized.contains("[audio omitted during context compression: wav]"));
+        assert!(!serialized.contains("UNIQUE_IMAGE_PAYLOAD"));
+        assert!(!serialized.contains("UNIQUE_FILE_PAYLOAD"));
+        assert!(!serialized.contains("UNIQUE_AUDIO_PAYLOAD"));
+        assert!(!serialized.contains("data:image/png;base64"));
     }
 
     #[test]

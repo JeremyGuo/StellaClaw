@@ -1,4 +1,7 @@
-use super::{UpstreamProvider, openrouter_responses::responses_reasoning_payload};
+use super::{
+    UpstreamProvider,
+    openrouter_responses::{insert_responses_cache_payload, responses_reasoning_payload},
+};
 use crate::config::{ReasoningConfig, UpstreamApiKind, UpstreamConfig};
 use crate::llm::{
     ChatCompletionOutcome, ChatCompletionSession, account_id_from_access_token,
@@ -116,6 +119,7 @@ fn build_responses_request_payload(
     if let Some(reasoning) = codex_reasoning_payload(upstream.reasoning.as_ref())? {
         payload.insert("reasoning".to_string(), reasoning);
     }
+    insert_responses_cache_payload(&mut payload, upstream)?;
     let response_tools = build_responses_tools_payload(upstream, tools);
     if include_tools && !response_tools.is_empty() {
         payload.insert("tools".to_string(), Value::Array(response_tools));
@@ -678,6 +682,31 @@ mod tests {
         assert!(payload.get("tools").is_some());
         assert_eq!(payload["parallel_tool_calls"], Value::Bool(true));
         assert_eq!(payload["tool_choice"], Value::String("auto".to_string()));
+    }
+
+    #[test]
+    fn request_payload_includes_prompt_cache_fields() {
+        let mut upstream = test_upstream();
+        upstream.prompt_cache_key = Some("session-key".to_string());
+        upstream.prompt_cache_retention = Some("24h".to_string());
+
+        let payload = build_responses_request_payload(
+            &upstream,
+            &[crate::message::ChatMessage::text("user", "hello")],
+            &[],
+            None,
+            true,
+        )
+        .expect("payload should build");
+
+        assert_eq!(
+            payload["prompt_cache_key"],
+            Value::String("session-key".to_string())
+        );
+        assert_eq!(
+            payload["prompt_cache_retention"],
+            Value::String("24h".to_string())
+        );
     }
 
     #[test]

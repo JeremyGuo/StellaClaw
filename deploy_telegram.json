@@ -37,7 +37,7 @@
         "mode": "no"
       },
       "context_window_tokens": 200000,
-      "description": "Good at creating beautiful web pages in HTML/CSS."
+      "description": "Don't use this model as subagent, unless you are this model, or with the permission of user."
     },
     "gpt54": {
       "type": "codex-subscription",
@@ -56,7 +56,7 @@
         "mode": "no"
       },
       "context_window_tokens": 262144,
-      "description": "A general model for processing, which should be used at most works.",
+      "description": "Don't use this model as subagent, unless you are this model, or with the permission of user.",
       "native_web_search": {
         "enabled": false,
         "payload": {}
@@ -81,7 +81,7 @@
         "retry_random_mean": 8
       },
       "context_window_tokens": 262144,
-      "description": "Don't use this model as subagent.",
+      "description": "Don't use this model as subagent, unless you are this model, or with the permission of user.",
       "supports_vision_input": true
     },
     "sonar_pro": {
@@ -107,7 +107,8 @@
     "agent_frame": {
       "available_models": [
         "opus-4.6",
-        "glm-5.1"
+        "glm-5.1",
+        "gpt54"
       ]
     },
     "zgent": {

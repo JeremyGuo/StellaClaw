@@ -1,4 +1,4 @@
-use super::UpstreamProvider;
+use super::{UpstreamProvider, openrouter::openrouter_cache_control_payload};
 use crate::config::{ReasoningConfig, UpstreamConfig};
 use crate::llm::{
     ChatCompletionOutcome, ChatCompletionSession, build_chat_completions_url,
@@ -43,6 +43,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
         if let Some(reasoning) = responses_reasoning_payload(upstream.reasoning.as_ref())? {
             payload.insert("reasoning".to_string(), reasoning);
         }
+        insert_responses_cache_payload(&mut payload, upstream)?;
         let response_tools = build_responses_tools_payload(upstream, tools);
         if !response_tools.is_empty() {
             payload.insert("tools".to_string(), Value::Array(response_tools));
@@ -101,6 +102,32 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
     }
 }
 
+pub(super) fn insert_responses_cache_payload(
+    payload: &mut Map<String, Value>,
+    upstream: &UpstreamConfig,
+) -> Result<()> {
+    if let Some(cache_control) = &upstream.cache_control {
+        payload.insert(
+            "cache_control".to_string(),
+            openrouter_cache_control_payload(cache_control)
+                .context("failed to serialize cache_control")?,
+        );
+    }
+    if let Some(prompt_cache_key) = upstream.prompt_cache_key.as_ref() {
+        payload.insert(
+            "prompt_cache_key".to_string(),
+            Value::String(prompt_cache_key.clone()),
+        );
+    }
+    if let Some(prompt_cache_retention) = upstream.prompt_cache_retention.as_ref() {
+        payload.insert(
+            "prompt_cache_retention".to_string(),
+            Value::String(prompt_cache_retention.clone()),
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn responses_reasoning_payload(
     reasoning: Option<&ReasoningConfig>,
 ) -> Result<Option<Value>> {
@@ -121,4 +148,65 @@ pub(crate) fn responses_reasoning_payload(
         payload.insert("enabled".to_string(), Value::Bool(enabled));
     }
     Ok((!payload.is_empty()).then_some(Value::Object(payload)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::insert_responses_cache_payload;
+    use crate::config::{
+        AuthCredentialsStoreMode, CacheControlConfig, UpstreamApiKind, UpstreamAuthKind,
+        UpstreamConfig,
+    };
+    use serde_json::{Map, Value, json};
+
+    fn test_upstream() -> UpstreamConfig {
+        UpstreamConfig {
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            model: "anthropic/claude-opus-4.6".to_string(),
+            api_kind: UpstreamApiKind::Responses,
+            auth_kind: UpstreamAuthKind::ApiKey,
+            supports_vision_input: true,
+            supports_pdf_input: false,
+            supports_audio_input: false,
+            api_key: None,
+            api_key_env: "OPENROUTER_API_KEY".to_string(),
+            chat_completions_path: "/responses".to_string(),
+            codex_home: None,
+            codex_auth: None,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            retry_mode: Default::default(),
+            context_window_tokens: 128_000,
+            cache_control: Some(CacheControlConfig {
+                cache_type: "ephemeral".to_string(),
+                ttl: Some("5m".to_string()),
+            }),
+            prompt_cache_retention: Some("5m".to_string()),
+            prompt_cache_key: Some("session-version".to_string()),
+            reasoning: None,
+            headers: Default::default(),
+            native_web_search: None,
+            external_web_search: None,
+            native_image_input: false,
+            native_pdf_input: false,
+            native_audio_input: false,
+            native_image_generation: false,
+        }
+    }
+
+    #[test]
+    fn responses_cache_payload_forwards_cache_fields() {
+        let mut payload = Map::new();
+        insert_responses_cache_payload(&mut payload, &test_upstream()).unwrap();
+
+        assert_eq!(payload["cache_control"], json!({ "type": "ephemeral" }));
+        assert_eq!(
+            payload["prompt_cache_key"],
+            Value::String("session-version".to_string())
+        );
+        assert_eq!(
+            payload["prompt_cache_retention"],
+            Value::String("5m".to_string())
+        );
+    }
 }

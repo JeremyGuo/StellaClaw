@@ -1356,6 +1356,60 @@ fn upstream_cache_control_and_reasoning_are_forwarded() -> Result<()> {
 }
 
 #[test]
+fn responses_upstream_cache_fields_are_forwarded() -> Result<()> {
+    let server = TestServer::start();
+    server.push_response(json!({
+        "id": "resp_1",
+        "output": [{
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": "ok"
+            }]
+        }],
+        "usage": {
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "total_tokens": 12,
+            "input_tokens_details": {
+                "cache_read_input_tokens": 5,
+                "cache_creation_input_tokens": 3
+            }
+        }
+    }));
+
+    let config = load_config_value(
+        json!({
+            "enabled_tools": [],
+            "upstream": {
+                "base_url": server.address,
+                "model": "anthropic/claude-opus-4.6",
+                "api_kind": "responses",
+                "chat_completions_path": "/responses",
+                "cache_control": {
+                    "type": "ephemeral",
+                    "ttl": "1h"
+                },
+                "prompt_cache_key": "conversation-key",
+                "prompt_cache_retention": "1h"
+            }
+        }),
+        ".",
+    )?;
+
+    let messages = run_session(Vec::new(), "hello", config, Vec::new())?;
+    assert_eq!(extract_assistant_text(&messages), "ok");
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(requests[0]["cache_control"]["ttl"], "1h");
+    assert_eq!(requests[0]["prompt_cache_key"], "conversation-key");
+    assert_eq!(requests[0]["prompt_cache_retention"], "1h");
+    Ok(())
+}
+
+#[test]
 fn run_session_state_aggregates_usage_across_tool_roundtrips() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let server = TestServer::start();

@@ -6337,6 +6337,22 @@ mod tests {
     }
 
     #[test]
+    fn openrouter_responses_claude_defaults_to_five_minute_automatic_cache() {
+        let mut model = openrouter_test_model("anthropic/claude-opus-4.6", None);
+        model.model_type = crate::config::ModelType::OpenrouterResp;
+        model.chat_completions_path = "/responses".to_string();
+
+        let cache_control = openrouter_automatic_cache_control(&model).unwrap();
+
+        assert_eq!(
+            openrouter_automatic_cache_ttl(&model).as_deref(),
+            Some("5m")
+        );
+        assert_eq!(cache_control.cache_type, "ephemeral");
+        assert_eq!(cache_control.ttl.as_deref(), Some("5m"));
+    }
+
+    #[test]
     fn openrouter_non_claude_does_not_get_anthropic_cache_control() {
         let model = openrouter_test_model("z-ai/glm-5.1", None);
 

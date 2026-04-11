@@ -125,7 +125,9 @@ impl UpstreamProvider for OpenRouterProvider {
     }
 }
 
-fn openrouter_cache_control_payload(cache_control: &CacheControlConfig) -> Result<Value> {
+pub(super) fn openrouter_cache_control_payload(
+    cache_control: &CacheControlConfig,
+) -> Result<Value> {
     let mut cache_control = cache_control.clone();
     if cache_control
         .ttl

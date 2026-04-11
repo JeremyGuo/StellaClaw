@@ -1,5 +1,16 @@
-version: 0.14.4
+version: 0.14.5
 ---
+
+# 0.14.5
+
+- 压缩上下文请求会在发送给上游前清理内联多模态 payload：
+  图片、文件与音频内容会被替换为文本占位符，避免 context compression 阶段重复上传大体积 base64 数据；原始会话内容不变。
+- OpenRouter Responses / Codex subscription 请求补齐 prompt cache 字段转发：
+  `cache_control`、`prompt_cache_key` 与 `prompt_cache_retention` 现在会随 Responses payload 一起发送，OpenRouter Responses Claude 模型也会获得默认 5 分钟 ephemeral cache。
+- 更新部署模板中的模型可用性：
+  `deploy_telegram.json` 将 `gpt54` 加入 `agent_frame.available_models`，并收紧部分模型说明，避免默认被随意用作 subagent。
+- 本次不影响 `config` 或 `workdir` schema：
+  没有新增用户配置字段、config loader 或 workdir upgrade step；按 patch 发布将仓库版本从 `0.14.4` 提升到 `0.14.5`。
 
 # 0.14.4
 
