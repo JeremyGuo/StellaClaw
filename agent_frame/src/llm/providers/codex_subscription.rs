@@ -72,10 +72,13 @@ impl UpstreamProvider for CodexSubscriptionProvider {
                         let (response, socket) = send_responses_websocket_request_with_retries(
                             upstream, payload,
                         )
-                        .with_context(|| {
-                            format!(
-                                "existing codex websocket session could not be recovered: {error:#}"
-                            )
+                        .map_err(|recovery_error| {
+                            if let Ok(socket) = establish_codex_websocket(upstream) {
+                                session.socket = socket;
+                            }
+                            recovery_error.context(format!(
+                                "existing codex websocket session failed and recovery request also failed; original stale-session error: {error:#}"
+                            ))
                         })?;
                         session.socket = socket;
                         response

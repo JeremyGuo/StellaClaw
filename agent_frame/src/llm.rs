@@ -21,6 +21,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static RETRY_RANDOM_SEED: AtomicU64 = AtomicU64::new(0);
 const MAX_INLINE_IMAGE_DIMENSION: u32 = 2000;
+const MAX_INLINE_IMAGE_DATA_URL_CHARS_PER_REQUEST: usize = 6_000_000;
 
 #[derive(Deserialize)]
 pub(super) struct ChatCompletionChoice {
@@ -411,6 +412,10 @@ pub(super) fn build_responses_input(
         }
     }
 
+    bound_responses_inline_images_for_request(
+        &mut input,
+        MAX_INLINE_IMAGE_DATA_URL_CHARS_PER_REQUEST,
+    );
     let instructions = (!instructions.is_empty()).then(|| instructions.join("\n\n"));
     Ok((instructions, input))
 }
@@ -427,6 +432,10 @@ pub(super) fn chat_completions_messages_payload(messages: &[ChatMessage]) -> Res
         }
         payload_messages.push(payload);
     }
+    bound_chat_completions_inline_images_for_request(
+        &mut payload_messages,
+        MAX_INLINE_IMAGE_DATA_URL_CHARS_PER_REQUEST,
+    );
     Ok(Value::Array(payload_messages))
 }
 
@@ -592,6 +601,107 @@ fn user_content_to_responses_items(content: Option<&Value>) -> Result<Vec<Value>
 
 fn normalize_inline_image_url(url: &str) -> String {
     normalize_inline_image_data_url(url).unwrap_or_else(|| url.to_string())
+}
+
+fn bound_responses_inline_images_for_request(input: &mut [Value], budget: usize) {
+    let mut used = 0usize;
+    for message in input.iter_mut().rev() {
+        let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        bound_inline_image_items(
+            content,
+            budget,
+            &mut used,
+            "input_text",
+            response_input_image_url,
+        );
+    }
+}
+
+fn bound_chat_completions_inline_images_for_request(messages: &mut [Value], budget: usize) {
+    let mut used = 0usize;
+    for message in messages.iter_mut().rev() {
+        let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        bound_inline_image_items(
+            content,
+            budget,
+            &mut used,
+            "text",
+            chat_completion_image_url,
+        );
+    }
+}
+
+fn bound_inline_image_items(
+    items: &mut [Value],
+    budget: usize,
+    used: &mut usize,
+    text_type: &str,
+    image_url: fn(&Value) -> Option<&str>,
+) {
+    for item in items.iter_mut().rev() {
+        let Some(url) = image_url(item) else {
+            continue;
+        };
+        let Some(chars) = inline_image_data_url_chars(url) else {
+            continue;
+        };
+        if used.saturating_add(chars) <= budget {
+            *used = used.saturating_add(chars);
+            continue;
+        }
+        *item = json!({
+            "type": text_type,
+            "text": inline_image_omitted_text(url, chars, budget),
+        });
+    }
+}
+
+fn response_input_image_url(item: &Value) -> Option<&str> {
+    let object = item.as_object()?;
+    let kind = object.get("type")?.as_str()?;
+    if kind != "input_image" && kind != "image_url" {
+        return None;
+    }
+    object.get("image_url").and_then(|value| match value {
+        Value::String(url) => Some(url.as_str()),
+        Value::Object(map) => map.get("url").and_then(Value::as_str),
+        _ => None,
+    })
+}
+
+fn chat_completion_image_url(item: &Value) -> Option<&str> {
+    let object = item.as_object()?;
+    if object.get("type")?.as_str()? != "image_url" {
+        return None;
+    }
+    object.get("image_url").and_then(|value| match value {
+        Value::String(url) => Some(url.as_str()),
+        Value::Object(map) => map.get("url").and_then(Value::as_str),
+        _ => None,
+    })
+}
+
+fn inline_image_data_url_chars(url: &str) -> Option<usize> {
+    parse_inline_image_data_url(url).map(str::len)
+}
+
+fn inline_image_media_type(url: &str) -> &str {
+    let metadata = url
+        .strip_prefix("data:")
+        .and_then(|rest| rest.split_once(',').map(|(metadata, _)| metadata))
+        .unwrap_or("image");
+    metadata.split(';').next().unwrap_or("image")
+}
+
+fn inline_image_omitted_text(url: &str, chars: usize, budget: usize) -> String {
+    format!(
+        "[image omitted from this model request to keep inline image payload under {budget} characters: inline {}, {chars} base64 characters. Load the specific image again if direct visual inspection is needed.]",
+        inline_image_media_type(url)
+    )
 }
 
 fn normalize_inline_image_data_url(url: &str) -> Option<String> {
@@ -963,6 +1073,10 @@ mod tests {
         image::load_from_memory(&bytes).unwrap().dimensions()
     }
 
+    fn fake_image_data_url(payload_chars: usize) -> String {
+        format!("data:image/png;base64,{}", "A".repeat(payload_chars))
+    }
+
     #[test]
     fn extracts_error_payloads_before_choices_decoding() {
         let body = json!({
@@ -1215,6 +1329,55 @@ mod tests {
         let (width, height) = data_url_dimensions(url);
         assert!(width <= 2000);
         assert!(height <= 2000);
+    }
+
+    #[test]
+    fn responses_input_omits_older_inline_images_over_payload_budget() {
+        let older = fake_image_data_url(80);
+        let newer = fake_image_data_url(80);
+        let mut input = vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [
+                { "type": "input_image", "image_url": older },
+                { "type": "input_image", "image_url": newer }
+            ]
+        })];
+
+        super::bound_responses_inline_images_for_request(&mut input, 100);
+
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert!(
+            input[0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("image omitted from this model request")
+        );
+        assert_eq!(input[0]["content"][1]["type"], "input_image");
+    }
+
+    #[test]
+    fn chat_completions_payload_omits_older_inline_images_over_payload_budget() {
+        let older = fake_image_data_url(80);
+        let newer = fake_image_data_url(80);
+        let mut messages = vec![json!({
+            "role": "user",
+            "content": [
+                { "type": "image_url", "image_url": { "url": older } },
+                { "type": "image_url", "image_url": { "url": newer } }
+            ]
+        })];
+
+        super::bound_chat_completions_inline_images_for_request(&mut messages, 100);
+
+        assert_eq!(messages[0]["content"][0]["type"], "text");
+        assert!(
+            messages[0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("image omitted from this model request")
+        );
+        assert_eq!(messages[0]["content"][1]["type"], "image_url");
     }
 
     #[test]

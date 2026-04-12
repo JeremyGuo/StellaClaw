@@ -1,5 +1,14 @@
-version: 0.14.10
+version: 0.14.11
 ---
+
+# 0.14.11
+
+- 修复 Codex subscription 在大批量图片上下文下容易失败的问题：
+  模型请求构造阶段会限制单次请求内联图片 data URL 总 payload，优先保留最近图片，超过预算的旧图片会以文本占位符替代，避免一次上传十余 MB base64 导致 WebSocket 在 `response.completed` 前被上游关闭。
+- 改进 Codex WebSocket 恢复路径：
+  旧连接发送失败后，如果恢复请求仍失败，会尽力替换掉已关闭的 socket，避免后续 `/continue` 先复用坏连接并报 `Sending after closing`。
+- 本次不影响 `config` 或 `workdir` schema：
+  没有新增用户配置字段、config loader 或 workdir upgrade step；按 patch 发布将仓库版本从 `0.14.10` 提升到 `0.14.11`。
 
 # 0.14.10
 
