@@ -1,5 +1,14 @@
-version: 0.14.9
+version: 0.14.10
 ---
+
+# 0.14.10
+
+- 修复 Codex subscription 前台 turn 可能无限卡住的问题：
+  WebSocket 连接现在会把模型 `timeout_seconds` 应用到底层 TCP read/write timeout，避免上游不返回 `response.completed` 或 `response.failed` 时一直阻塞并持续发送 typing。
+- 修复 Codex subscription 请求携带不兼容 prompt cache 字段的问题：
+  ChatGPT Codex WebSocket 请求不再发送 `prompt_cache_key` / `prompt_cache_retention`，避免上游返回 `Unsupported parameter: prompt_cache_retention`。
+- 本次不影响 `config` 或 `workdir` schema：
+  没有新增用户配置字段、config loader 或 workdir upgrade step；按 patch 发布将仓库版本从 `0.14.9` 提升到 `0.14.10`。
 
 # 0.14.9
 

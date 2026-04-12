@@ -862,12 +862,9 @@ pub(super) fn compaction_stats_from_report(
 
 pub(super) fn default_prompt_cache_retention(
     cache_ttl: Option<&str>,
-    model: &ModelConfig,
+    _model: &ModelConfig,
 ) -> Option<String> {
-    cache_ttl.map(str::to_string).or_else(|| {
-        (model.upstream_auth_kind() == agent_frame::config::UpstreamAuthKind::CodexSubscription)
-            .then(|| "24h".to_string())
-    })
+    cache_ttl.map(str::to_string)
 }
 
 pub(super) fn effective_reasoning_config(

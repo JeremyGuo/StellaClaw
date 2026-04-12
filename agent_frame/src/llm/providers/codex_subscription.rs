@@ -1,7 +1,4 @@
-use super::{
-    UpstreamProvider,
-    openrouter_responses::{insert_responses_cache_payload, responses_reasoning_payload},
-};
+use super::{UpstreamProvider, openrouter_responses::responses_reasoning_payload};
 use crate::config::{ReasoningConfig, UpstreamApiKind, UpstreamConfig};
 use crate::llm::{
     ChatCompletionOutcome, ChatCompletionSession, account_id_from_access_token,
@@ -119,7 +116,6 @@ fn build_responses_request_payload(
     if let Some(reasoning) = codex_reasoning_payload(upstream.reasoning.as_ref())? {
         payload.insert("reasoning".to_string(), reasoning);
     }
-    insert_responses_cache_payload(&mut payload, upstream)?;
     let response_tools = build_responses_tools_payload(upstream, tools);
     if include_tools && !response_tools.is_empty() {
         payload.insert("tools".to_string(), Value::Array(response_tools));
@@ -188,6 +184,9 @@ fn should_recover_codex_websocket_error(error: &anyhow::Error) -> bool {
 
 fn is_probable_retryable_websocket_error(error: &anyhow::Error) -> bool {
     let text = format!("{error:#}").to_ascii_lowercase();
+    if text.contains("timed out") || text.contains("would block") {
+        return false;
+    }
     text.contains("websocket_connection_limit_reached")
         || text.contains("responses websocket connection limit reached")
         || text.contains("failed to establish codex websocket")
@@ -351,8 +350,34 @@ fn connect_codex_websocket(
         }
     }
 
-    let (socket, _) = connect(request).context("failed to establish codex websocket")?;
+    let (mut socket, _) = connect(request).context("failed to establish codex websocket")?;
+    set_codex_socket_timeout(&mut socket, codex_socket_timeout(upstream))?;
     Ok(socket)
+}
+
+fn codex_socket_timeout(upstream: &UpstreamConfig) -> Option<Duration> {
+    (upstream.timeout_seconds > 0.0).then(|| Duration::from_secs_f64(upstream.timeout_seconds))
+}
+
+fn set_codex_socket_timeout(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    timeout: Option<Duration>,
+) -> Result<()> {
+    match socket.get_mut() {
+        MaybeTlsStream::Plain(stream) => set_tcp_stream_timeout(stream, timeout),
+        MaybeTlsStream::Rustls(stream) => set_tcp_stream_timeout(&stream.sock, timeout),
+        _ => Ok(()),
+    }
+}
+
+fn set_tcp_stream_timeout(stream: &TcpStream, timeout: Option<Duration>) -> Result<()> {
+    stream
+        .set_read_timeout(timeout)
+        .context("failed to set codex websocket read timeout")?;
+    stream
+        .set_write_timeout(timeout)
+        .context("failed to set codex websocket write timeout")?;
+    Ok(())
 }
 
 fn send_response_create(
@@ -685,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn request_payload_includes_prompt_cache_fields() {
+    fn request_payload_omits_unsupported_prompt_cache_fields() {
         let mut upstream = test_upstream();
         upstream.prompt_cache_key = Some("session-key".to_string());
         upstream.prompt_cache_retention = Some("24h".to_string());
@@ -699,14 +724,8 @@ mod tests {
         )
         .expect("payload should build");
 
-        assert_eq!(
-            payload["prompt_cache_key"],
-            Value::String("session-key".to_string())
-        );
-        assert_eq!(
-            payload["prompt_cache_retention"],
-            Value::String("24h".to_string())
-        );
+        assert!(payload.get("prompt_cache_key").is_none());
+        assert!(payload.get("prompt_cache_retention").is_none());
     }
 
     #[test]
@@ -722,6 +741,9 @@ mod tests {
         )));
         assert!(!is_probable_retryable_websocket_error(&anyhow!(
             "codex websocket request failed: invalid schema"
+        )));
+        assert!(!is_probable_retryable_websocket_error(&anyhow!(
+            "failed to read codex websocket event: IO error: timed out"
         )));
     }
 
