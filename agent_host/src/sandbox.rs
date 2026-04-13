@@ -680,11 +680,15 @@ fn build_bubblewrap_command(
         command.args(["--ro-bind", "/etc", "/etc"]);
     }
     if Path::new("/run").exists() {
-        command.args(["--ro-bind", "/run", "/run"]);
-    }
-    let docker_socket = Path::new("/run/docker.sock");
-    if cfg!(target_os = "linux") && sandbox.map_docker_socket && docker_socket.exists() {
-        command.args(["--bind", "/run/docker.sock", "/run/docker.sock"]);
+        command.args(["--dir", "/run"]);
+        if Path::new("/run/systemd/resolve").exists() {
+            command.args(["--dir", "/run/systemd"]);
+            command.args(["--ro-bind", "/run/systemd/resolve", "/run/systemd/resolve"]);
+        }
+        let docker_socket = Path::new("/run/docker.sock");
+        if sandbox.map_docker_socket && docker_socket.exists() {
+            command.args(["--bind", "/run/docker.sock", "/run/docker.sock"]);
+        }
     }
     command.args(["--dev", "/dev"]);
     command.args(["--proc", "/proc"]);
@@ -933,6 +937,60 @@ mod tests {
             args.iter()
                 .any(|arg| arg == &missing_global_install_root.to_string_lossy()),
             "bubblewrap args did not reference created global_install_root: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn bubblewrap_does_not_bind_entire_run_by_default() {
+        let temp_dir = TempDir::new().unwrap();
+        let current_exe = temp_dir.path().join("partyclaw");
+        let workspace_root = temp_dir.path().join("workspace");
+        let runtime_state_root = temp_dir.path().join("runtime");
+        let global_install_root = temp_dir.path().join("global");
+
+        fs::write(&current_exe, b"binary").unwrap();
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        fs::create_dir_all(&global_install_root).unwrap();
+
+        let command = build_bubblewrap_command(
+            &SandboxConfig {
+                mode: SandboxMode::Bubblewrap,
+                bubblewrap_binary: "bwrap".to_string(),
+                map_docker_socket: false,
+            },
+            &current_exe,
+            &workspace_root,
+            &runtime_state_root,
+            &global_install_root,
+            &workspace_root.join(".skill_memory"),
+            &temp_dir.path().join("skill_memory"),
+            &temp_dir.path().join("skills-source"),
+            &[],
+        )
+        .unwrap();
+
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        let whole_run_bind = vec![
+            "--ro-bind".to_string(),
+            "/run".to_string(),
+            "/run".to_string(),
+        ];
+        assert!(
+            !args
+                .windows(whole_run_bind.len())
+                .any(|window| window == whole_run_bind),
+            "bubblewrap args unexpectedly expose all of /run: {:?}",
+            args
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "/run/docker.sock"),
+            "bubblewrap args unexpectedly expose Docker socket: {:?}",
             args
         );
     }

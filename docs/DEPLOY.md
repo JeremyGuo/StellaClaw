@@ -117,7 +117,7 @@ TELEGRAM_BOT_TOKEN=...
 - `Sandbox`: Linux 可选 `bubblewrap` 或 `subprocess`；需要让 bubblewrap 沙盒内命令访问宿主 Docker 时，显式打开 `map_docker_socket`
 - `Channels`: Telegram 的 `bot_token_env` 是否是 `TELEGRAM_BOT_TOKEN`
 
-`sandbox.map_docker_socket` 默认是 `false`。只有在 Linux + `sandbox.mode = "bubblewrap"` + 宿主存在 `/run/docker.sock` 时才会把 Docker socket 映射进沙盒；macOS、Windows 和 `subprocess` 沙盒会直接跳过这个功能。
+`sandbox.map_docker_socket` 默认是 `false`。只有在 Linux + `sandbox.mode = "bubblewrap"` + 宿主存在 `/run/docker.sock` 时才会把 Docker socket 映射进沙盒；macOS、Windows 和 `subprocess` 沙盒会直接跳过这个功能。bubblewrap 沙盒不会整体映射 `/run`，只会额外保留 `/run/systemd/resolve` 以兼容常见 DNS 配置。
 
 如果开启 Docker socket 映射，请确保运行服务的 Linux 用户本身已经属于 `docker` 组：
 

@@ -1,5 +1,12 @@
-version: 0.15.0
+version: 0.15.1
 ---
+
+# 0.15.1
+
+- 修复 `sandbox.map_docker_socket=false` 时 bubblewrap 仍通过 `--ro-bind /run /run` 暴露 `/run/docker.sock` 的问题：
+  不再整体绑定 `/run`，仅保留 `/run/systemd/resolve` 只读绑定以兼容常见的 `systemd-resolved` DNS 配置；Docker socket 只在显式开启 `map_docker_socket` 时单独绑定。
+- 本次不影响 `config` schema 和 `workdir` schema：
+  仅修正 Linux bubblewrap 挂载行为，按普通 bug fix 将仓库版本从 `0.15.0` 提升到 `0.15.1`。
 
 # 0.15.0
 
