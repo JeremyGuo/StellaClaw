@@ -112,6 +112,37 @@ pub enum IncomingControl {
     ConversationClosed { reason: String },
 }
 
+#[derive(Clone, Debug)]
+pub enum ConversationProbe {
+    Available { member_count: Option<u64> },
+    Unavailable { reason: String },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgressFeedbackFinalState {
+    Done,
+    Failed,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProgressFeedback {
+    pub turn_id: String,
+    pub text: String,
+    pub important: bool,
+    pub final_state: Option<ProgressFeedbackFinalState>,
+    pub message_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum ProgressFeedbackUpdate {
+    #[default]
+    Unchanged,
+    StoreMessage {
+        message_id: String,
+    },
+    ClearMessage,
+}
+
 #[async_trait]
 pub trait Channel: Send + Sync {
     fn id(&self) -> &str;
@@ -137,6 +168,21 @@ pub trait Channel: Send + Sync {
     async fn send(&self, address: &ChannelAddress, message: OutgoingMessage) -> Result<()>;
 
     async fn set_processing(&self, address: &ChannelAddress, state: ProcessingState) -> Result<()>;
+
+    async fn probe_conversation(
+        &self,
+        _address: &ChannelAddress,
+    ) -> Result<Option<ConversationProbe>> {
+        Ok(None)
+    }
+
+    async fn update_progress_feedback(
+        &self,
+        _address: &ChannelAddress,
+        _feedback: ProgressFeedback,
+    ) -> Result<ProgressFeedbackUpdate> {
+        Ok(ProgressFeedbackUpdate::Unchanged)
+    }
 
     fn processing_keepalive_interval(&self, _state: ProcessingState) -> Option<Duration> {
         None

@@ -283,17 +283,29 @@ pub fn run_child_stdio() -> Result<()> {
     while let Ok(command) = command_receiver.recv() {
         match command {
             ChildCommand::RunTurn(payload) => {
-                let control = SessionExecutionControl::new().with_event_callback({
-                    let writer = Arc::clone(&writer);
-                    move |event| {
-                        if let Ok(mut writer) = writer.lock() {
-                            let _ = write_json_line(
-                                &mut *writer,
-                                &ChildToParentMessage::SessionEvent(event),
-                            );
+                let control = SessionExecutionControl::new()
+                    .with_event_callback({
+                        let writer = Arc::clone(&writer);
+                        move |event| {
+                            if let Ok(mut writer) = writer.lock() {
+                                let _ = write_json_line(
+                                    &mut *writer,
+                                    &ChildToParentMessage::SessionEvent(event),
+                                );
+                            }
                         }
-                    }
-                });
+                    })
+                    .with_progress_callback({
+                        let writer = Arc::clone(&writer);
+                        move |progress| {
+                            if let Ok(mut writer) = writer.lock() {
+                                let _ = write_json_line(
+                                    &mut *writer,
+                                    &ChildToParentMessage::ExecutionProgress(progress),
+                                );
+                            }
+                        }
+                    });
                 {
                     let mut active = current_control
                         .lock()
@@ -499,6 +511,11 @@ impl PersistentChildRuntime {
                 ChildToParentMessage::SessionEvent(event) => {
                     if let Some(control) = &control {
                         control.emit_event_external(event);
+                    }
+                }
+                ChildToParentMessage::ExecutionProgress(progress) => {
+                    if let Some(control) = &control {
+                        control.emit_progress_external(progress);
                     }
                 }
                 ChildToParentMessage::ToolRequest {

@@ -5,7 +5,7 @@ use crate::backend::{
     compact_session_messages_with_report as run_backend_compaction,
 };
 use crate::bootstrap::AgentWorkspace;
-use crate::channel::{Channel, IncomingMessage};
+use crate::channel::{Channel, ConversationProbe, IncomingMessage};
 use crate::channel_auth::{
     AdminAuthorizeOutcome, ChannelAdminSnapshot, ChannelAuthorizationManager,
     ConversationApprovalSnapshot, ConversationApprovalState,
@@ -35,8 +35,9 @@ use crate::sandbox::{
     is_child_transport_error, run_one_shot_child_turn,
 };
 use crate::session::{
-    ModelCatalogChangeNotice, SessionErrno, SessionManager, SessionPhase, SessionSkillObservation,
-    SessionSnapshot, SharedProfileChangeNotice, SkillChangeNotice, ZgentNativeSessionState,
+    ModelCatalogChangeNotice, SessionErrno, SessionManager, SessionPhase,
+    SessionProgressMessageState, SessionSkillObservation, SessionSnapshot,
+    SharedProfileChangeNotice, SkillChangeNotice, ZgentNativeSessionState,
 };
 use crate::sink::{SinkRouter, SinkTarget};
 use crate::snapshot::{SnapshotBundle, SnapshotManager};
@@ -55,7 +56,7 @@ use agent_frame::config::{
 use agent_frame::skills::discover_skills;
 use agent_frame::tooling::{build_tool_registry, terminate_runtime_state_tasks};
 use agent_frame::{
-    ChatMessage, ContextCompactionReport, SessionCompactionStats, SessionEvent,
+    ChatMessage, ContextCompactionReport, ExecutionProgress, SessionCompactionStats, SessionEvent,
     SessionExecutionControl, SessionState, StructuredCompactionOutput, TokenUsage, Tool,
     estimate_session_tokens, extract_assistant_text,
 };
@@ -85,6 +86,7 @@ mod commands;
 mod foreground;
 mod messaging;
 mod persistence;
+mod progress;
 mod runtime_helpers;
 mod security;
 mod subagents;
@@ -99,6 +101,9 @@ const ATTACHMENT_CLOSE_TAG: &str = "</attachment>";
 const INTERRUPTED_FOLLOWUP_MARKER: &str = "[Interrupted Follow-up]";
 const QUEUED_USER_UPDATES_MARKER: &str = "[Queued User Updates]";
 const CHANNEL_RESTART_MAX_BACKOFF_SECONDS: u64 = 30;
+const CONVERSATION_CLEANUP_POLL_SECONDS: u64 = 300;
+const SYSTEM_RESTART_NOTICE: &str =
+    "[System Restarted: All previous long run execution tools with IDs are all ended]";
 
 #[derive(Clone, Debug)]
 struct BackgroundJobRequest {
@@ -2152,6 +2157,7 @@ impl ServerRuntime {
     ) -> Result<TimedRunOutcome> {
         enum DriverEvent {
             Runtime(SessionEvent),
+            Progress(ExecutionProgress),
             Completed(Result<SessionState>),
         }
 
@@ -2162,10 +2168,19 @@ impl ServerRuntime {
         let phase_session_key = event_session.address.session_key();
         let active_foreground_phases = Arc::clone(&self.active_foreground_phases);
         let (event_sender, mut event_receiver) = mpsc::unbounded_channel();
-        let execution_control = SessionExecutionControl::new().with_event_callback(move |event| {
-            update_active_foreground_phase(&active_foreground_phases, &phase_session_key, &event);
-            let _ = event_sender.send(event);
-        });
+        let (progress_sender, mut progress_receiver) = mpsc::unbounded_channel();
+        let execution_control = SessionExecutionControl::new()
+            .with_event_callback(move |event| {
+                update_active_foreground_phase(
+                    &active_foreground_phases,
+                    &phase_session_key,
+                    &event,
+                );
+                let _ = event_sender.send(event);
+            })
+            .with_progress_callback(move |progress| {
+                let _ = progress_sender.send(progress);
+            });
         if let Some(observer) = control_observer {
             if let Ok(mut phases) = self.active_foreground_phases.lock() {
                 phases.insert(
@@ -2204,6 +2219,14 @@ impl ServerRuntime {
         {
             let driver_sender = driver_sender.clone();
             relay_tasks.push(tokio::spawn(async move {
+                while let Some(progress) = progress_receiver.recv().await {
+                    let _ = driver_sender.send(DriverEvent::Progress(progress));
+                }
+            }));
+        }
+        {
+            let driver_sender = driver_sender.clone();
+            relay_tasks.push(tokio::spawn(async move {
                 let result = join_handle
                     .await
                     .context(join_label)
@@ -2215,6 +2238,14 @@ impl ServerRuntime {
         while let Some(driver_event) = driver_receiver.recv().await {
             match driver_event {
                 DriverEvent::Runtime(event) => {
+                    if matches!(kind, AgentPromptKind::MainForeground) {
+                        self.send_progress_feedback_for_event(
+                            &event_session,
+                            &event_model_key,
+                            &event,
+                        )
+                        .await;
+                    }
                     if matches!(kind, AgentPromptKind::MainForeground)
                         && let SessionEvent::CompactionCompleted {
                             compacted: true,
@@ -2246,6 +2277,16 @@ impl ServerRuntime {
                     }
                     log_agent_frame_event(agent_id, &event_session, kind, &event_model_key, &event);
                 }
+                DriverEvent::Progress(progress) => {
+                    if matches!(kind, AgentPromptKind::MainForeground) {
+                        self.send_progress_feedback_for_progress(
+                            &event_session,
+                            &event_model_key,
+                            &progress,
+                        )
+                        .await;
+                    }
+                }
                 DriverEvent::Completed(result) => {
                     for task in relay_tasks {
                         task.abort();
@@ -2253,6 +2294,14 @@ impl ServerRuntime {
                     let state = match result {
                         Ok(state) => state,
                         Err(error) => {
+                            if matches!(kind, AgentPromptKind::MainForeground) {
+                                self.send_progress_feedback_for_failure(
+                                    &event_session,
+                                    &event_model_key,
+                                    &error,
+                                )
+                                .await;
+                            }
                             return Ok(TimedRunOutcome::Failed(error));
                         }
                     };
@@ -2655,6 +2704,7 @@ pub struct Server {
     /// foreground turn is running, the session key is inserted here so that
     /// `should_auto_resume_yielded_session` knows not to auto-resume.
     pending_foreground_interrupts: Arc<Mutex<HashSet<String>>>,
+    pending_process_restart_notices: Arc<Mutex<HashSet<String>>>,
     active_foreground_agent_frame_runtimes:
         Arc<Mutex<HashMap<String, Arc<Mutex<ActiveForegroundAgentFrameRuntime>>>>>,
     active_native_zgent_sessions: Arc<Mutex<HashMap<String, Arc<ActiveNativeZgentSession>>>>,
@@ -3084,11 +3134,23 @@ impl Server {
         let agent_registry = Arc::new(Mutex::new(AgentRegistry::load_or_create(&workdir)?));
         let agent_registry_notify = Arc::new(Notify::new());
 
+        let session_manager = SessionManager::new(&workdir, workspace_manager.clone())?;
+        let pending_process_restart_notices = session_manager
+            .list_foreground_snapshots()
+            .into_iter()
+            .map(|session| session.address.session_key())
+            .collect::<HashSet<_>>();
+        if !pending_process_restart_notices.is_empty() {
+            info!(
+                log_stream = "server",
+                kind = "process_restart_notice_armed",
+                session_count = pending_process_restart_notices.len() as u64,
+                "armed one-shot process restart notices for existing foreground sessions"
+            );
+        }
+
         Ok(Self {
-            sessions: Arc::new(Mutex::new(SessionManager::new(
-                &workdir,
-                workspace_manager.clone(),
-            )?)),
+            sessions: Arc::new(Mutex::new(session_manager)),
             workdir: workdir.clone(),
             agent_workspace,
             workspace_manager,
@@ -3116,6 +3178,7 @@ impl Server {
             active_foreground_controls: Arc::new(Mutex::new(HashMap::new())),
             active_foreground_phases: Arc::new(Mutex::new(HashMap::new())),
             pending_foreground_interrupts: Arc::new(Mutex::new(HashSet::new())),
+            pending_process_restart_notices: Arc::new(Mutex::new(pending_process_restart_notices)),
             active_foreground_agent_frame_runtimes: Arc::new(Mutex::new(HashMap::new())),
             active_native_zgent_sessions: Arc::new(Mutex::new(HashMap::new())),
             subagents: Arc::new(Mutex::new(HashMap::new())),
@@ -3146,6 +3209,24 @@ impl Server {
                 }
             });
         }
+        {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move {
+                let mut ticker = interval(Duration::from_secs(CONVERSATION_CLEANUP_POLL_SECONDS));
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                loop {
+                    ticker.tick().await;
+                    if let Err(error) = server.prune_closed_conversations_once().await {
+                        error!(
+                            log_stream = "server",
+                            kind = "conversation_cleanup_failed",
+                            error = %format!("{error:#}"),
+                            "conversation cleanup failed"
+                        );
+                    }
+                }
+            });
+        }
         if let Some(mut background_receiver) = background_receiver {
             let runtime = server.tool_runtime();
             tokio::spawn(async move {
@@ -3169,6 +3250,20 @@ impl Server {
             spawn_channel_supervisor(Arc::clone(channel), sender.clone());
         }
         drop(sender);
+        {
+            let runtime = server.tool_runtime();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                if let Err(error) = runtime.cleanup_stale_progress_messages_once().await {
+                    error!(
+                        log_stream = "server",
+                        kind = "stale_progress_cleanup_failed",
+                        error = %format!("{error:#}"),
+                        "failed to clean up stale progress messages after startup"
+                    );
+                }
+            });
+        }
 
         let mut idle_compaction_ticker = interval(Duration::from_secs(
             server.main_agent.idle_compaction.poll_interval_seconds,
@@ -3206,6 +3301,20 @@ impl Server {
                                         );
                                     }
                                 }
+                                continue;
+                            }
+                            if is_out_of_band_command(message.text.as_deref()) {
+                                let server = Arc::clone(&server);
+                                tokio::spawn(async move {
+                                    if let Err(error) = server.handle_incoming(message).await {
+                                        error!(
+                                            log_stream = "server",
+                                            kind = "handle_out_of_band_command_failed",
+                                            error = %format!("{error:#}"),
+                                            "failed to handle out-of-band command"
+                                        );
+                                    }
+                                });
                                 continue;
                             }
                             let Some(message) = server
@@ -4593,22 +4702,23 @@ fn spawn_channel_supervisor(channel: Arc<dyn Channel>, sender: mpsc::Sender<Inco
 mod tests {
     use super::foreground::register_active_foreground_control;
     use super::{
-        AgentCommand, ForegroundRuntimePhase, ImageGenerationRouting, Server, SinkTarget,
-        SummaryTracker, TokenUsage, background_timeout_with_active_children_text,
-        build_synthetic_system_messages, build_user_turn_message, channel_restart_backoff_seconds,
+        AgentCommand, ForegroundRuntimePhase, ImageGenerationRouting, SYSTEM_RESTART_NOTICE,
+        Server, SinkTarget, SummaryTracker, TokenUsage,
+        background_timeout_with_active_children_text, build_synthetic_system_messages,
+        build_user_turn_message, channel_restart_backoff_seconds,
         coalesce_buffered_conversation_messages, conversation_memory_root,
         estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
         fast_path_agent_selection_message, format_session_status, infer_single_agent_backend,
-        is_timeout_like, memory_search_files, normalize_messages_for_persistence,
-        openrouter_automatic_cache_control, openrouter_automatic_cache_ttl, parse_agent_command,
-        parse_model_command, parse_sandbox_command, parse_set_api_timeout_command,
-        parse_sink_target, parse_snap_list_command, parse_snap_load_command,
-        parse_snap_save_command, parse_think_command, persist_compaction_artifacts,
-        rebuild_canonical_system_prompt, render_last_user_message_time_tip,
-        render_model_catalog_change_notice, render_system_date_on_user_message,
-        request_yield_for_incoming, rollout_read_file, rollout_search_files,
-        sanitize_messages_for_model_capabilities, select_image_generation_routing,
-        send_outgoing_message_now, session_errno_for_turn_error,
+        is_out_of_band_command, is_timeout_like, memory_search_files,
+        normalize_messages_for_persistence, openrouter_automatic_cache_control,
+        openrouter_automatic_cache_ttl, parse_agent_command, parse_model_command,
+        parse_sandbox_command, parse_set_api_timeout_command, parse_sink_target,
+        parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
+        parse_think_command, persist_compaction_artifacts, rebuild_canonical_system_prompt,
+        render_last_user_message_time_tip, render_model_catalog_change_notice,
+        render_system_date_on_user_message, request_yield_for_incoming, rollout_read_file,
+        rollout_search_files, sanitize_messages_for_model_capabilities,
+        select_image_generation_routing, send_outgoing_message_now, session_errno_for_turn_error,
         should_attempt_idle_context_compaction, should_emit_runtime_change_prompt,
         summarize_resume_progress, sync_workspace_shared_profile_files,
         tag_interrupted_followup_text, update_active_foreground_phase,
@@ -4618,7 +4728,7 @@ mod tests {
     use crate::agent_status::AgentRegistry;
     use crate::backend::AgentBackendKind;
     use crate::bootstrap::AgentWorkspace;
-    use crate::channel::{Channel, IncomingMessage};
+    use crate::channel::{Channel, ConversationProbe, IncomingMessage};
     use crate::channel_auth::ChannelAuthorizationManager;
     use crate::channel_auth::{
         ChannelAdminSnapshot, ConversationApprovalSnapshot, ConversationApprovalState,
@@ -4661,6 +4771,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingChannel {
         sent_messages: Mutex<Vec<(ChannelAddress, OutgoingMessage)>>,
+        probe_member_counts: Mutex<HashMap<String, u64>>,
+        probe_unavailable: Mutex<HashMap<String, String>>,
     }
 
     fn build_test_session(temp_dir: &TempDir) -> SessionSnapshot {
@@ -4784,6 +4896,7 @@ mod tests {
             active_foreground_controls: Arc::new(Mutex::new(HashMap::new())),
             active_foreground_phases: Arc::new(Mutex::new(HashMap::new())),
             pending_foreground_interrupts: Arc::new(Mutex::new(HashSet::new())),
+            pending_process_restart_notices: Arc::new(Mutex::new(HashSet::new())),
             active_foreground_agent_frame_runtimes: Arc::new(Mutex::new(HashMap::new())),
             active_native_zgent_sessions: Arc::new(Mutex::new(HashMap::new())),
             subagents: Arc::new(Mutex::new(HashMap::new())),
@@ -4890,6 +5003,33 @@ mod tests {
             _state: ProcessingState,
         ) -> anyhow::Result<()> {
             Ok(())
+        }
+
+        async fn probe_conversation(
+            &self,
+            address: &ChannelAddress,
+        ) -> anyhow::Result<Option<ConversationProbe>> {
+            if let Some(reason) = self
+                .probe_unavailable
+                .lock()
+                .unwrap()
+                .get(&address.conversation_id)
+                .cloned()
+            {
+                return Ok(Some(ConversationProbe::Unavailable { reason }));
+            }
+            if let Some(count) = self
+                .probe_member_counts
+                .lock()
+                .unwrap()
+                .get(&address.conversation_id)
+                .copied()
+            {
+                return Ok(Some(ConversationProbe::Available {
+                    member_count: Some(count),
+                }));
+            }
+            Ok(None)
         }
     }
 
@@ -5196,6 +5336,16 @@ mod tests {
     }
 
     #[test]
+    fn status_and_help_commands_are_out_of_band_even_with_bot_mentions() {
+        assert!(is_out_of_band_command(Some("/status")));
+        assert!(is_out_of_band_command(Some("/status@party_claw_bot")));
+        assert!(is_out_of_band_command(Some("  /help@party_claw_bot  ")));
+        assert!(!is_out_of_band_command(Some("/compact")));
+        assert!(!is_out_of_band_command(Some("普通消息")));
+        assert!(!is_out_of_band_command(None));
+    }
+
+    #[test]
     fn yield_request_detects_compaction_in_progress() {
         let address = ChannelAddress {
             channel_id: "telegram".to_string(),
@@ -5294,6 +5444,7 @@ mod tests {
         let injected = build_synthetic_system_messages(
             None,
             None,
+            None,
             Some("[Runtime Skill Updates]\nSkill \"search\" updated to version 3."),
             &[],
         );
@@ -5310,6 +5461,24 @@ mod tests {
         assert_eq!(previous.len(), 3);
         assert_eq!(previous[1].role, "system");
         assert_eq!(previous[2].role, "user");
+    }
+
+    #[test]
+    fn synthetic_process_restart_notice_is_first_system_message() {
+        let injected = build_synthetic_system_messages(
+            Some(SYSTEM_RESTART_NOTICE),
+            Some("[System Tip: 2.0 hours since the last user message.]"),
+            None,
+            None,
+            &[],
+        );
+
+        assert_eq!(injected.len(), 2);
+        assert_eq!(
+            injected[0].content.as_ref().and_then(Value::as_str),
+            Some(SYSTEM_RESTART_NOTICE)
+        );
+        assert_eq!(injected[1].role, "system");
     }
 
     #[test]
@@ -5336,6 +5505,7 @@ mod tests {
     #[test]
     fn previous_messages_builder_rewrites_only_canonical_prefix() {
         let injected = build_synthetic_system_messages(
+            None,
             None,
             Some("[System Message: models changed]"),
             None,
@@ -5371,7 +5541,7 @@ mod tests {
             "- gpt54: primary\n- opus-4.6: large-context",
         )
         .unwrap();
-        let injected = build_synthetic_system_messages(None, Some(&notice), None, &[]);
+        let injected = build_synthetic_system_messages(None, None, Some(&notice), None, &[]);
         assert_eq!(injected.len(), 1);
         assert_eq!(injected[0].role, "system");
         assert!(
@@ -6314,6 +6484,106 @@ mod tests {
         assert!(text.contains("Approved"));
         assert!(text.contains("[admin private chat]"));
         assert!(text.contains("Rejected"));
+    }
+
+    #[tokio::test]
+    async fn prunes_telegram_groups_with_one_or_fewer_members() {
+        let temp_dir = TempDir::new().unwrap();
+        let channel = Arc::new(RecordingChannel::default());
+        channel
+            .probe_member_counts
+            .lock()
+            .unwrap()
+            .insert("-1001".to_string(), 1);
+        let channel_for_server: Arc<dyn Channel> = channel;
+        let mut server = build_test_server(&temp_dir, channel_for_server);
+        server.telegram_channel_ids = Arc::new(HashSet::from(["telegram-main".to_string()]));
+
+        let admin = ChannelAddress {
+            channel_id: "telegram-main".to_string(),
+            conversation_id: "1717801091".to_string(),
+            user_id: Some("1717801091".to_string()),
+            display_name: Some("Admin".to_string()),
+        };
+        let group = ChannelAddress {
+            channel_id: "telegram-main".to_string(),
+            conversation_id: "-1001".to_string(),
+            user_id: Some("42".to_string()),
+            display_name: Some("Group User".to_string()),
+        };
+        server
+            .with_channel_auth(|auth| {
+                auth.authorize_admin(&admin)?;
+                auth.ensure_pending_conversation(&group)?;
+                auth.approve_conversation("telegram-main", "-1001")?;
+                Ok(())
+            })
+            .unwrap();
+        server
+            .with_conversations(|conversations| {
+                conversations.ensure_conversation(&group)?;
+                Ok(())
+            })
+            .unwrap();
+
+        server.prune_closed_conversations_once().await.unwrap();
+
+        let state = server
+            .with_channel_auth(|auth| Ok(auth.current_conversation_state(&group)))
+            .unwrap();
+        assert_eq!(state, None);
+        let conversation_exists = server
+            .with_conversations(|conversations| Ok(conversations.get_snapshot(&group).is_some()))
+            .unwrap();
+        assert!(!conversation_exists);
+    }
+
+    #[tokio::test]
+    async fn prunes_rejected_telegram_groups_without_probe() {
+        let temp_dir = TempDir::new().unwrap();
+        let channel_for_server: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        let mut server = build_test_server(&temp_dir, channel_for_server);
+        server.telegram_channel_ids = Arc::new(HashSet::from(["telegram-main".to_string()]));
+
+        let admin = ChannelAddress {
+            channel_id: "telegram-main".to_string(),
+            conversation_id: "1717801091".to_string(),
+            user_id: Some("1717801091".to_string()),
+            display_name: Some("Admin".to_string()),
+        };
+        let group = ChannelAddress {
+            channel_id: "telegram-main".to_string(),
+            conversation_id: "-1002".to_string(),
+            user_id: Some("43".to_string()),
+            display_name: Some("Rejected Group User".to_string()),
+        };
+        server
+            .with_channel_auth(|auth| {
+                auth.authorize_admin(&admin)?;
+                auth.ensure_pending_conversation(&group)?;
+                auth.reject_conversation("telegram-main", "-1002")?;
+                Ok(())
+            })
+            .unwrap();
+        server
+            .with_conversations(|conversations| {
+                conversations.ensure_conversation(&group)?;
+                Ok(())
+            })
+            .unwrap();
+
+        server.prune_closed_conversations_once().await.unwrap();
+
+        let items = server
+            .with_channel_auth(|auth| {
+                Ok(auth.list_conversations_including_rejected("telegram-main"))
+            })
+            .unwrap();
+        assert!(
+            items
+                .iter()
+                .all(|item| item.conversation_id != group.conversation_id)
+        );
     }
 
     fn openrouter_test_model(model: &str, cache_ttl: Option<&str>) -> ModelConfig {

@@ -1241,6 +1241,7 @@ pub(super) fn log_agent_frame_event(
             round_index,
             tool_name,
             tool_call_id,
+            arguments: _,
         } => info!(
             log_stream = "agent",
             log_key = %agent_id,

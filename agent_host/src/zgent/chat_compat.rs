@@ -297,6 +297,8 @@ fn compose_zgent_system_prompt(
         ZGENT_COMPAT_MARKER.to_string(),
         "You are running inside ZGent through AgentHost's compatibility layer. Use tools when they materially help.".to_string(),
         "Only tools that explicitly expose timeout fields require the model to choose timeout_seconds.".to_string(),
+        "Some filesystem and exec tools support optional remote=\"<host>|local\" for one-off SSH execution. Omit remote for local work; remote=\"\" and remote=\"local\" are treated as local but waste tokens. For remote work, use an actual SSH alias such as remote=\"wuwen-dev6\". Never pass the literal placeholder remote=\"host\".".to_string(),
+        "When a supported tool needs to operate on a remote SSH host, prefer the tool's remote argument with the actual host alias over manually wrapping commands with ssh host. Use manual ssh only as a fallback when the tool remote option cannot express the operation.".to_string(),
         "exec_start waits for short commands by default. Set return_immediate=true for long-running servers, watchers, daemons, interactive commands, or background work.".to_string(),
         "When multiple exec commands have no causal dependency, issue them in the same tool-call batch instead of serializing them across model rounds.".to_string(),
         "Use non-interactive exec commands where possible. If large output is expected, set max_output_chars=0 and inspect the returned workspace-relative stdout_path and stderr_path with targeted follow-up commands.".to_string(),

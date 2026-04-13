@@ -186,6 +186,13 @@ pub(super) fn command_matches(text: &str, command: &str) -> bool {
     normalized_command_text(text).as_deref() == Some(command)
 }
 
+pub(super) fn is_out_of_band_command(text: Option<&str>) -> bool {
+    let Some(text) = text else {
+        return false;
+    };
+    command_matches(text, "/help") || command_matches(text, "/status")
+}
+
 pub(super) fn command_starts_with(text: &str, command: &str) -> bool {
     normalized_command_text(text)
         .as_deref()

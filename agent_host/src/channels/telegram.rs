@@ -1,5 +1,6 @@
 use crate::channel::{
-    AttachmentSource, Channel, IncomingControl, IncomingMessage, PendingAttachment,
+    AttachmentSource, Channel, ConversationProbe, IncomingControl, IncomingMessage,
+    PendingAttachment, ProgressFeedback, ProgressFeedbackFinalState, ProgressFeedbackUpdate,
 };
 use crate::config::{BotCommandConfig, TelegramChannelConfig, default_telegram_commands};
 use crate::domain::{
@@ -33,6 +34,7 @@ pub struct TelegramChannel {
     bot_user_id: Mutex<Option<i64>>,
     chat_member_counts: Mutex<HashMap<i64, (u64, Instant)>>,
     pending_outbound: Mutex<VecDeque<PendingOutbound>>,
+    progress_messages: Mutex<HashMap<String, TelegramProgressMessage>>,
 }
 
 #[derive(Clone, Debug)]
@@ -41,11 +43,19 @@ struct PendingOutbound {
     message: OutgoingMessage,
 }
 
+#[derive(Clone, Debug)]
+struct TelegramProgressMessage {
+    message_id: i64,
+    last_text: String,
+    last_update: Instant,
+}
+
 impl TelegramChannel {
     const MAX_POLL_BACKOFF_SECONDS: u64 = 30;
     const MAX_SEND_RETRIES: u32 = 3;
     const MAX_MESSAGE_CHARS: usize = 4096;
     const MAX_CAPTION_CHARS: usize = 1024;
+    const MIN_PROGRESS_EDIT_INTERVAL: Duration = Duration::from_secs(3);
 
     pub fn from_config(config: TelegramChannelConfig) -> Result<Self> {
         let bot_token = match config.bot_token {
@@ -70,6 +80,7 @@ impl TelegramChannel {
             bot_user_id: Mutex::new(None),
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
+            progress_messages: Mutex::new(HashMap::new()),
         })
     }
 
@@ -244,6 +255,10 @@ impl TelegramChannel {
             || message.contains("connection reset")
             || message.contains("connection refused")
             || message.contains("broken pipe")
+    }
+
+    fn progress_message_key(address: &ChannelAddress, turn_id: &str) -> String {
+        format!("{}:{}", address.session_key(), turn_id)
     }
 
     async fn flush_pending_outbound_queue(&self, trigger: &str) {
@@ -569,6 +584,22 @@ impl TelegramChannel {
         }
     }
 
+    async fn probe_group_member_count(&self, chat_id: i64) -> Result<u64> {
+        let count = self
+            .call_api::<u64>(
+                "getChatMemberCount",
+                json!({
+                    "chat_id": chat_id,
+                }),
+            )
+            .await?;
+        self.chat_member_counts
+            .lock()
+            .await
+            .insert(chat_id, (count, Instant::now()));
+        Ok(count)
+    }
+
     async fn bot_was_removed_from_chat(&self, message: &TelegramMessage) -> bool {
         let Some(left_chat_member) = message.left_chat_member.as_ref() else {
             return false;
@@ -818,6 +849,29 @@ impl TelegramChannel {
         self.call_api::<serde_json::Value>("editMessageText", payload)
             .await?;
         Ok(())
+    }
+
+    async fn send_progress_text(&self, chat_id: &str, text: &str) -> Result<i64> {
+        let rendered = render_markdown_chunks_to_telegram_entities(text, Self::MAX_MESSAGE_CHARS)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| TelegramRenderedText {
+                text: text.to_string(),
+                entities: Vec::new(),
+            });
+        self.send_rendered_text_chunk(chat_id, rendered, None).await
+    }
+
+    async fn edit_progress_text(&self, chat_id: &str, message_id: i64, text: &str) -> Result<()> {
+        let rendered = render_markdown_chunks_to_telegram_entities(text, Self::MAX_MESSAGE_CHARS)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| TelegramRenderedText {
+                text: text.to_string(),
+                entities: Vec::new(),
+            });
+        self.edit_rendered_text_chunk(chat_id, message_id, rendered, None)
+            .await
     }
 
     async fn delete_message(&self, chat_id: &str, message_id: i64) -> Result<()> {
@@ -1229,6 +1283,127 @@ impl Channel for TelegramChannel {
             Some(Duration::from_secs(4))
         } else {
             None
+        }
+    }
+
+    async fn update_progress_feedback(
+        &self,
+        address: &ChannelAddress,
+        feedback: ProgressFeedback,
+    ) -> Result<ProgressFeedbackUpdate> {
+        let key = Self::progress_message_key(address, &feedback.turn_id);
+        let persisted_message_id = feedback
+            .message_id
+            .as_deref()
+            .and_then(|value| value.parse::<i64>().ok());
+        if feedback.final_state == Some(ProgressFeedbackFinalState::Done) {
+            let existing = self.progress_messages.lock().await.remove(&key);
+            let message_id = existing
+                .map(|existing| existing.message_id)
+                .or(persisted_message_id);
+            if let Some(message_id) = message_id
+                && let Err(error) = self
+                    .delete_message(&address.conversation_id, message_id)
+                    .await
+            {
+                warn!(
+                    log_stream = "channel",
+                    log_key = %self.id,
+                    kind = "telegram_progress_delete_failed",
+                    conversation_id = %address.conversation_id,
+                    error = %format!("{error:#}"),
+                    "failed to delete telegram progress message"
+                );
+            }
+            return Ok(ProgressFeedbackUpdate::ClearMessage);
+        }
+
+        let now = Instant::now();
+        let existing = self
+            .progress_messages
+            .lock()
+            .await
+            .get(&key)
+            .cloned()
+            .or_else(|| {
+                persisted_message_id.map(|message_id| TelegramProgressMessage {
+                    message_id,
+                    last_text: String::new(),
+                    last_update: now
+                        .checked_sub(Self::MIN_PROGRESS_EDIT_INTERVAL)
+                        .unwrap_or(now),
+                })
+            });
+        let Some(existing) = existing else {
+            let message_id = self
+                .send_progress_text(&address.conversation_id, &feedback.text)
+                .await?;
+            self.progress_messages.lock().await.insert(
+                key,
+                TelegramProgressMessage {
+                    message_id,
+                    last_text: feedback.text,
+                    last_update: now,
+                },
+            );
+            return Ok(ProgressFeedbackUpdate::StoreMessage {
+                message_id: message_id.to_string(),
+            });
+        };
+
+        if existing.last_text == feedback.text {
+            return Ok(ProgressFeedbackUpdate::Unchanged);
+        }
+        let is_final = feedback.final_state.is_some();
+        if !feedback.important
+            && !is_final
+            && now.duration_since(existing.last_update) < Self::MIN_PROGRESS_EDIT_INTERVAL
+        {
+            return Ok(ProgressFeedbackUpdate::Unchanged);
+        }
+
+        self.edit_progress_text(
+            &address.conversation_id,
+            existing.message_id,
+            &feedback.text,
+        )
+        .await?;
+        if is_final {
+            self.progress_messages.lock().await.remove(&key);
+            return Ok(ProgressFeedbackUpdate::ClearMessage);
+        } else {
+            self.progress_messages.lock().await.insert(
+                key,
+                TelegramProgressMessage {
+                    message_id: existing.message_id,
+                    last_text: feedback.text,
+                    last_update: now,
+                },
+            );
+        }
+        Ok(ProgressFeedbackUpdate::Unchanged)
+    }
+
+    async fn probe_conversation(
+        &self,
+        address: &ChannelAddress,
+    ) -> Result<Option<ConversationProbe>> {
+        let Ok(chat_id) = address.conversation_id.parse::<i64>() else {
+            return Ok(None);
+        };
+        if chat_id >= 0 {
+            return Ok(None);
+        }
+        match self.probe_group_member_count(chat_id).await {
+            Ok(count) => Ok(Some(ConversationProbe::Available {
+                member_count: Some(count),
+            })),
+            Err(error) if self.is_terminal_chat_error(&error) => {
+                Ok(Some(ConversationProbe::Unavailable {
+                    reason: format!("{error:#}"),
+                }))
+            }
+            Err(error) => Err(error.context("failed to probe telegram conversation")),
         }
     }
 }
@@ -3504,6 +3679,7 @@ mod tests {
             bot_user_id: Mutex::new(None),
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
+            progress_messages: Mutex::new(HashMap::new()),
         };
 
         let redacted = channel
@@ -3526,6 +3702,7 @@ mod tests {
             bot_user_id: Mutex::new(None),
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
+            progress_messages: Mutex::new(HashMap::new()),
         };
 
         let error = anyhow!("telegram API sendMessage failed: Too Many Requests");
@@ -3546,6 +3723,7 @@ mod tests {
             bot_user_id: Mutex::new(None),
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
+            progress_messages: Mutex::new(HashMap::new()),
         };
 
         let error = anyhow!("telegram API sendMessage failed: Bad Request: chat not found");
@@ -3566,6 +3744,7 @@ mod tests {
             bot_user_id: Mutex::new(None),
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
+            progress_messages: Mutex::new(HashMap::new()),
         };
 
         assert!(channel.is_terminal_chat_error(&anyhow!(
@@ -3594,6 +3773,7 @@ mod tests {
             bot_user_id: Mutex::new(Some(42)),
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
+            progress_messages: Mutex::new(HashMap::new()),
         };
         let message = TelegramMessage {
             message_id: 1,
@@ -3631,6 +3811,7 @@ mod tests {
             bot_user_id: Mutex::new(Some(42)),
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
+            progress_messages: Mutex::new(HashMap::new()),
         };
         let message = TelegramMessage {
             message_id: 1,
@@ -3668,6 +3849,7 @@ mod tests {
             bot_user_id: Mutex::new(Some(42)),
             chat_member_counts: Mutex::new(HashMap::new()),
             pending_outbound: Mutex::new(VecDeque::new()),
+            progress_messages: Mutex::new(HashMap::new()),
         };
         let message = TelegramMessage {
             message_id: 1,
@@ -3705,6 +3887,7 @@ mod tests {
             bot_user_id: Mutex::new(Some(42)),
             chat_member_counts: Mutex::new(HashMap::from([(-5158767783, (2, Instant::now()))])),
             pending_outbound: Mutex::new(VecDeque::new()),
+            progress_messages: Mutex::new(HashMap::new()),
         };
         let message = TelegramMessage {
             message_id: 1,

@@ -367,12 +367,17 @@ const FILE_READ_MAX_LINE_LENGTH: usize = 2_000;
 const FILE_READ_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 const SEARCH_MAX_RESULTS: usize = 100;
 const LS_MAX_ENTRIES: usize = 1_000;
-const LS_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone)]
 struct SearchMatch {
     path: String,
     mtime_ms: u128,
+}
+
+#[derive(Clone)]
+struct LsEntry {
+    path: String,
+    is_dir: bool,
 }
 
 fn truncate_line_for_file_read(line: &str) -> (String, bool) {
@@ -465,24 +470,607 @@ fn should_skip_ls_entry(entry: &DirEntry, base_path: &Path) -> bool {
     entry.file_type().is_dir() && is_common_ls_skip_dir_name(&name)
 }
 
-fn collect_ls_paths(base_path: &Path) -> Vec<PathBuf> {
-    WalkDir::new(base_path)
+fn collect_ls_paths(base_path: &Path, max_entries: usize) -> (Vec<PathBuf>, bool) {
+    let mut paths = Vec::new();
+    for entry in WalkDir::new(base_path)
         .follow_links(false)
         .into_iter()
         .filter_entry(|entry| !should_skip_ls_entry(entry, base_path))
-        .filter_map(|entry| entry.ok())
-        .filter_map(|entry| {
-            let path = entry.into_path();
-            if path == base_path {
-                return None;
-            }
-            if path.is_dir() || path.is_file() {
-                Some(path)
-            } else {
-                None
-            }
+    {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.into_path();
+        if path == base_path || !(path.is_dir() || path.is_file()) {
+            continue;
+        }
+        if paths.len() >= max_entries {
+            return (paths, true);
+        }
+        paths.push(path);
+    }
+    (paths, false)
+}
+
+fn path_with_trailing_slash(path: &Path) -> String {
+    let mut display = path.to_string_lossy().replace('\\', "/");
+    if !display.ends_with('/') {
+        display.push('/');
+    }
+    display
+}
+
+fn render_ls_tree(base_path: &Path, mut entries: Vec<LsEntry>, truncated: bool) -> String {
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    let mut lines = Vec::new();
+    if truncated {
+        lines.push(format!("num_entries: >{LS_MAX_ENTRIES}"));
+        lines.push("truncated: true".to_string());
+        lines.push(format!(
+            "There are more than {LS_MAX_ENTRIES} files and directories under {}. Use ls with a more specific path, or use glob/grep to narrow the search. The first {LS_MAX_ENTRIES} files and directories are included below:",
+            base_path.display()
+        ));
+        lines.push(String::new());
+    } else {
+        lines.push(format!("num_entries: {}", entries.len()));
+        lines.push("truncated: false".to_string());
+        lines.push(String::new());
+    }
+    lines.push(format!("- {}", path_with_trailing_slash(base_path)));
+    for entry in entries {
+        let components = entry
+            .path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>();
+        let Some(name) = components.last() else {
+            continue;
+        };
+        let indent = "  ".repeat(components.len());
+        let suffix = if entry.is_dir { "/" } else { "" };
+        lines.push(format!("{indent}- {name}{suffix}"));
+    }
+    lines.join("\n")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ExecutionTarget {
+    Local,
+    RemoteSsh { host: String },
+}
+
+impl ExecutionTarget {
+    fn remote_name(&self) -> &str {
+        match self {
+            Self::Local => "local",
+            Self::RemoteSsh { host } => host,
+        }
+    }
+}
+
+fn validate_remote_host(host: &str) -> Result<String> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() || trimmed == "local" {
+        return Ok("local".to_string());
+    }
+    if matches!(trimmed, "host" | "<host>" | "<host>|local") {
+        return Err(anyhow!(
+            "remote must be an actual SSH host alias or local; omit remote or use an empty string for local work"
+        ));
+    }
+    if trimmed.starts_with('-') {
+        return Err(anyhow!("remote SSH host must not start with '-'"));
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(anyhow!("remote SSH host must not contain whitespace"));
+    }
+    if trimmed.chars().any(|ch| ch.is_control()) {
+        return Err(anyhow!(
+            "remote SSH host must not contain control characters"
+        ));
+    }
+    if trimmed.chars().any(|ch| {
+        matches!(
+            ch,
+            '\'' | '"' | '`' | '$' | ';' | '&' | '|' | '<' | '>' | '(' | ')'
+        )
+    }) {
+        return Err(anyhow!(
+            "remote SSH host must not contain shell metacharacters"
+        ));
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err(anyhow!("remote SSH host must not contain path separators"));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn remote_schema_property() -> Value {
+    json!({
+        "type": "string",
+        "description": "Optional execution target. Format: \"<host>|local\". Omit remote, set remote=\"\", or set remote=\"local\" for local execution. For SSH execution, use an actual SSH alias such as \"wuwen-dev6\"; do not pass the literal placeholder \"host\"."
+    })
+}
+
+fn execution_target_arg(arguments: &Map<String, Value>) -> Result<ExecutionTarget> {
+    let Some(value) = arguments.get("remote") else {
+        return Ok(ExecutionTarget::Local);
+    };
+    let remote = value
+        .as_str()
+        .ok_or_else(|| anyhow!("argument remote must be a string"))?;
+    let host = validate_remote_host(remote)?;
+    if host == "local" {
+        Ok(ExecutionTarget::Local)
+    } else {
+        Ok(ExecutionTarget::RemoteSsh { host })
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn resolve_ssh_executable() -> String {
+    std::env::var("AGENT_FRAME_SSH_BIN").unwrap_or_else(|_| "ssh".to_string())
+}
+
+fn ssh_command(host: &str, tty: bool) -> Command {
+    let mut command = Command::new(resolve_ssh_executable());
+    command
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10");
+    if tty {
+        command.arg("-tt");
+    } else {
+        command.arg("-T");
+    }
+    command.arg(host).arg("--");
+    command
+}
+
+fn remote_workspace_root(workspace_root: &Path) -> String {
+    workspace_root.to_string_lossy().to_string()
+}
+
+fn remote_python_command(script: &str) -> String {
+    format!(
+        "if command -v python3 >/dev/null 2>&1; then exec python3 -c {}; elif command -v python >/dev/null 2>&1; then exec python -c {}; else echo 'remote file tools require Python 3 on this host; install python3/python or use exec_start remote=\"<host>\" for shell-only commands' >&2; exit 127; fi",
+        shell_quote(script),
+        shell_quote(script)
+    )
+}
+
+fn run_remote_command(
+    host: &str,
+    remote_cwd: &str,
+    command_args: &[String],
+    stdin: Option<&[u8]>,
+) -> Result<std::process::Output> {
+    let mut script = format!("cd {} &&", shell_quote(remote_cwd));
+    for arg in command_args {
+        script.push(' ');
+        script.push_str(&shell_quote(arg));
+    }
+    let mut command = ssh_command(host, false);
+    command
+        .arg("sh")
+        .arg("-lc")
+        .arg(script)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
         })
-        .collect()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to spawn ssh for remote host {}", host))?;
+    if let Some(stdin) = stdin {
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow!("failed to open ssh stdin"))?
+            .write_all(stdin)
+            .context("failed to write ssh stdin")?;
+    }
+    let _ = child.stdin.take();
+    child
+        .wait_with_output()
+        .with_context(|| format!("failed to wait for ssh host {}", host))
+}
+
+const REMOTE_FILE_TOOL_PY: &str = r#"
+import fnmatch
+import json
+import os
+import re
+import sys
+
+FILE_READ_DEFAULT_LIMIT = 2000
+FILE_READ_MAX_LINE_LENGTH = 2000
+FILE_READ_MAX_OUTPUT_BYTES = 256 * 1024
+SEARCH_MAX_RESULTS = 100
+LS_MAX_ENTRIES = 1000
+COMMON_LS_SKIP_DIRS = {"__pycache__", "node_modules", "target", "dist", "build", "coverage", "venv"}
+
+def resolve(path, root):
+    if os.path.isabs(path):
+        return os.path.abspath(path)
+    return os.path.abspath(os.path.join(root, path))
+
+def truncate_line(line):
+    if len(line) <= FILE_READ_MAX_LINE_LENGTH:
+        return line, False
+    return line[:FILE_READ_MAX_LINE_LENGTH] + "...", True
+
+def file_mtime_ms(path):
+    try:
+        return int(os.path.getmtime(path) * 1000)
+    except OSError:
+        return 0
+
+def walk_files(base):
+    paths = []
+    for root, dirs, files in os.walk(base, followlinks=False):
+        for name in files:
+            path = os.path.join(root, name)
+            if os.path.isfile(path):
+                paths.append(path)
+    return paths
+
+def handle_file_read(args, workspace_root):
+    file_path = args.get("file_path", args.get("path"))
+    if not isinstance(file_path, str):
+        raise ValueError("missing required argument: file_path")
+    path = resolve(file_path, workspace_root)
+    if os.path.isdir(path):
+        raise ValueError(f"{path} is a directory, not a file")
+    has_explicit_window = any(key in args for key in ("offset", "offset_lines", "limit", "limit_lines"))
+    file_size = os.path.getsize(path)
+    if file_size > FILE_READ_MAX_OUTPUT_BYTES and not has_explicit_window:
+        raise ValueError(f"{path} is {file_size} bytes, which exceeds the direct-read limit of {FILE_READ_MAX_OUTPUT_BYTES} bytes; provide offset and/or limit")
+    encoding = args.get("encoding", "utf-8")
+    if str(encoding).lower() != "utf-8":
+        raise ValueError("only utf-8 encoding is supported")
+    if "offset_lines" in args and "offset" not in args:
+        offset = int(args["offset_lines"]) + 1
+    else:
+        offset = int(args.get("offset", 1))
+    if "limit_lines" in args and "limit" not in args:
+        limit = int(args["limit_lines"])
+    else:
+        limit = int(args.get("limit", FILE_READ_DEFAULT_LIMIT))
+    start_line = 0 if offset == 0 else max(offset, 1)
+    line_offset = 0 if start_line == 0 else start_line - 1
+    with open(path, "r", encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+    content = []
+    content_bytes = 0
+    truncated_long_lines = False
+    truncated_by_bytes = False
+    for index, line in list(enumerate(lines))[line_offset:line_offset + limit]:
+        display_line, was_truncated = truncate_line(line)
+        truncated_long_lines = truncated_long_lines or was_truncated
+        next_line = f"{index + 1}: {display_line}"
+        separator = 0 if not content else 1
+        if content_bytes + separator + len(next_line.encode("utf-8")) > FILE_READ_MAX_OUTPUT_BYTES:
+            truncated_by_bytes = True
+            break
+        content.append(next_line)
+        content_bytes += separator + len(next_line.encode("utf-8"))
+    selected_line_count = len(content)
+    if selected_line_count == 0:
+        end_line = max(start_line - 1, 0)
+    elif start_line == 0:
+        end_line = selected_line_count - 1
+    else:
+        end_line = start_line + selected_line_count - 1
+    truncated_by_lines = line_offset + selected_line_count < len(lines)
+    return {
+        "file_path": path,
+        "start_line": start_line,
+        "end_line": end_line,
+        "total_lines": len(lines),
+        "truncated": truncated_by_lines or truncated_by_bytes or truncated_long_lines,
+        "truncated_by_lines": truncated_by_lines,
+        "truncated_by_bytes": truncated_by_bytes,
+        "truncated_long_lines": truncated_long_lines,
+        "content": "\n".join(content),
+    }
+
+def handle_file_write(args, workspace_root):
+    file_path = args.get("file_path", args.get("path"))
+    if not isinstance(file_path, str):
+        raise ValueError("missing required argument: file_path")
+    content = args.get("content")
+    if not isinstance(content, str):
+        raise ValueError("argument content must be a string")
+    mode = args.get("mode", "overwrite")
+    encoding = args.get("encoding", "utf-8")
+    if str(encoding).lower() != "utf-8":
+        raise ValueError("only utf-8 encoding is supported")
+    path = resolve(file_path, workspace_root)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    open_mode = "a" if mode == "append" else "w"
+    with open(path, open_mode, encoding="utf-8") as handle:
+        handle.write(content)
+    return {"file_path": path, "mode": mode, "bytes_written": len(content.encode("utf-8"))}
+
+def handle_glob(args, workspace_root):
+    pattern = args.get("pattern")
+    if not isinstance(pattern, str):
+        raise ValueError("missing required argument: pattern")
+    base = resolve(args.get("path", "."), workspace_root)
+    if not os.path.exists(base):
+        raise ValueError(f"{base} does not exist")
+    matches = []
+    for path in walk_files(base):
+        rel = os.path.relpath(path, base).replace(os.sep, "/")
+        if fnmatch.fnmatch(rel, pattern):
+            matches.append({"path": path, "mtime_ms": file_mtime_ms(path)})
+    matches.sort(key=lambda item: (-item["mtime_ms"], item["path"]))
+    total = len(matches)
+    return {
+        "pattern": pattern,
+        "path": base,
+        "num_files": total,
+        "truncated": total > SEARCH_MAX_RESULTS,
+        "filenames": [item["path"] for item in matches[:SEARCH_MAX_RESULTS]],
+    }
+
+def handle_grep(args, workspace_root):
+    pattern = args.get("pattern")
+    if not isinstance(pattern, str):
+        raise ValueError("missing required argument: pattern")
+    base = resolve(args.get("path", "."), workspace_root)
+    if not os.path.exists(base):
+        raise ValueError(f"{base} does not exist")
+    include = args.get("include")
+    regex = re.compile(pattern)
+    matches = []
+    for path in walk_files(base):
+        rel = os.path.relpath(path, base).replace(os.sep, "/")
+        if include and not fnmatch.fnmatch(rel, include):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                text = handle.read()
+        except (UnicodeDecodeError, OSError):
+            continue
+        if regex.search(text):
+            matches.append({"path": path, "mtime_ms": file_mtime_ms(path)})
+    matches.sort(key=lambda item: (-item["mtime_ms"], item["path"]))
+    total = len(matches)
+    return {
+        "pattern": pattern,
+        "path": base,
+        "include": include,
+        "num_files": total,
+        "truncated": total > SEARCH_MAX_RESULTS,
+        "filenames": [item["path"] for item in matches[:SEARCH_MAX_RESULTS]],
+    }
+
+def should_skip_ls(root, name, is_dir, base):
+    path = os.path.join(root, name)
+    if path == base:
+        return False
+    if name.startswith("."):
+        return True
+    return is_dir and name in COMMON_LS_SKIP_DIRS
+
+def handle_ls(args, workspace_root):
+    path_arg = args.get("path")
+    if not isinstance(path_arg, str):
+        raise ValueError("missing required argument: path")
+    base = resolve(path_arg, workspace_root)
+    if not os.path.exists(base):
+        raise ValueError(f"{base} does not exist")
+    if not os.path.isdir(base):
+        raise ValueError(f"{base} is not a directory")
+    entries = []
+    truncated = False
+    for root, dirs, files in os.walk(base, followlinks=False):
+        dirs[:] = [name for name in dirs if not should_skip_ls(root, name, True, base)]
+        for name in dirs:
+            if len(entries) >= LS_MAX_ENTRIES:
+                truncated = True
+                break
+            path = os.path.join(root, name)
+            entries.append((os.path.relpath(path, base).replace(os.sep, "/"), True))
+        if truncated:
+            break
+        for name in files:
+            if should_skip_ls(root, name, False, base):
+                continue
+            if len(entries) >= LS_MAX_ENTRIES:
+                truncated = True
+                break
+            path = os.path.join(root, name)
+            entries.append((os.path.relpath(path, base).replace(os.sep, "/"), False))
+        if truncated:
+            break
+    entries.sort(key=lambda item: item[0])
+    lines = []
+    if truncated:
+        lines.append(f"num_entries: >{LS_MAX_ENTRIES}")
+        lines.append("truncated: true")
+        lines.append(f"There are more than {LS_MAX_ENTRIES} files and directories under {base}. Use ls with a more specific path, or use glob/grep to narrow the search. The first {LS_MAX_ENTRIES} files and directories are included below:")
+        lines.append("")
+    else:
+        lines.append(f"num_entries: {len(entries)}")
+        lines.append("truncated: false")
+        lines.append("")
+    display_base = base.replace(os.sep, "/")
+    if not display_base.endswith("/"):
+        display_base += "/"
+    lines.append(f"- {display_base}")
+    for rel_path, is_dir in entries:
+        parts = [part for part in rel_path.split("/") if part]
+        if not parts:
+            continue
+        indent = "  " * len(parts)
+        suffix = "/" if is_dir else ""
+        lines.append(f"{indent}- {parts[-1]}{suffix}")
+    return "\n".join(lines)
+
+def handle_edit(args, workspace_root):
+    path_arg = args.get("path")
+    if not isinstance(path_arg, str):
+        raise ValueError("missing required argument: path")
+    old_text = args.get("old_text")
+    new_text = args.get("new_text")
+    if not isinstance(old_text, str):
+        raise ValueError("argument old_text must be a string")
+    if not isinstance(new_text, str):
+        raise ValueError("argument new_text must be a string")
+    encoding = args.get("encoding", "utf-8")
+    if str(encoding).lower() != "utf-8":
+        raise ValueError("only utf-8 encoding is supported")
+    path = resolve(path_arg, workspace_root)
+    replace_all = bool(args.get("replace_all", False))
+    create_if_missing = bool(args.get("create_if_missing", False))
+    if not os.path.exists(path) and create_if_missing:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(new_text)
+        return {"path": path, "created": True, "replacements": 1, "bytes_written": len(new_text.encode("utf-8"))}
+    with open(path, "r", encoding="utf-8") as handle:
+        content = handle.read()
+    replacements = content.count(old_text)
+    if replacements == 0:
+        raise ValueError(f"old_text was not found in {path}")
+    updated = content.replace(old_text, new_text) if replace_all else content.replace(old_text, new_text, 1)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(updated)
+    return {"path": path, "created": False, "replacements": replacements if replace_all else 1, "bytes_written": len(updated.encode("utf-8"))}
+
+handlers = {
+    "file_read": handle_file_read,
+    "file_write": handle_file_write,
+    "glob": handle_glob,
+    "grep": handle_grep,
+    "ls": handle_ls,
+    "edit": handle_edit,
+}
+
+try:
+    payload = json.load(sys.stdin)
+    operation = payload["operation"]
+    workspace_root = payload["workspace_root"]
+    result = handlers[operation](payload.get("arguments", {}), workspace_root)
+    print(json.dumps({"ok": True, "result": result}, ensure_ascii=False))
+except Exception as error:
+    print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
+"#;
+
+fn run_remote_file_tool(
+    host: &str,
+    workspace_root: &Path,
+    operation: &str,
+    arguments: &Map<String, Value>,
+) -> Result<Value> {
+    let remote_root = remote_workspace_root(workspace_root);
+    let payload = json!({
+        "operation": operation,
+        "workspace_root": remote_root,
+        "arguments": arguments,
+    });
+    let stdin = serde_json::to_vec(&payload).context("failed to serialize remote tool payload")?;
+    let output = run_remote_command(
+        host,
+        &remote_workspace_root(workspace_root),
+        &[
+            "sh".to_string(),
+            "-lc".to_string(),
+            remote_python_command(REMOTE_FILE_TOOL_PY),
+        ],
+        Some(&stdin),
+    )?;
+    if !output.status.success() {
+        return Err(anyhow!(
+            "remote {} tool failed on {} with {}: {}",
+            operation,
+            host,
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let wrapper: Value = serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "failed to parse remote {} JSON from {}: {}",
+            operation,
+            host,
+            String::from_utf8_lossy(&output.stdout)
+        )
+    })?;
+    let ok = wrapper.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    if !ok {
+        let error = wrapper
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("remote tool failed");
+        return Err(anyhow!(
+            "remote {} on {} failed: {}",
+            operation,
+            host,
+            error
+        ));
+    }
+    let mut result = wrapper.get("result").cloned().unwrap_or(Value::Null);
+    if let Some(text) = result.as_str() {
+        return Ok(Value::String(format!("remote: {host}\n{text}")));
+    }
+    if let Some(object) = result.as_object_mut() {
+        object.insert("remote".to_string(), Value::String(host.to_string()));
+    }
+    Ok(result)
+}
+
+fn run_remote_apply_patch(
+    host: &str,
+    workspace_root: &Path,
+    patch: &str,
+    strip: usize,
+    reverse: bool,
+    check: bool,
+) -> Result<Value> {
+    let mut args = vec![
+        "git".to_string(),
+        "apply".to_string(),
+        "--recount".to_string(),
+        "--whitespace=nowarn".to_string(),
+        format!("-p{}", strip),
+    ];
+    if reverse {
+        args.push("--reverse".to_string());
+    }
+    if check {
+        args.push("--check".to_string());
+    }
+    let output = run_remote_command(
+        host,
+        &remote_workspace_root(workspace_root),
+        &args,
+        Some(patch.as_bytes()),
+    )?;
+    Ok(json!({
+        "remote": host,
+        "applied": output.status.success(),
+        "returncode": output.status.code().unwrap_or(-1),
+        "stdout": String::from_utf8_lossy(&output.stdout),
+        "stderr": String::from_utf8_lossy(&output.stderr)
+    }))
 }
 
 #[derive(Default)]
@@ -524,13 +1112,14 @@ impl InterruptSignal {
 fn file_read_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "file_read",
-        "Read a UTF-8 text file from the local filesystem. Supports file_path plus optional offset and limit for large files.",
+        "Read a UTF-8 text file. Supports file_path plus optional offset and limit for large files. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local reads.",
         json!({
             "type": "object",
             "properties": {
                 "file_path": {"type": "string"},
                 "offset": {"type": "integer"},
-                "limit": {"type": "integer"}
+                "limit": {"type": "integer"},
+                "remote": remote_schema_property()
             },
             "required": ["file_path"],
             "additionalProperties": false
@@ -539,6 +1128,9 @@ fn file_read_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSig
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
+                return run_remote_file_tool(&host, &workspace_root, "file_read", arguments);
+            }
             let file_path = string_arg_with_alias(arguments, "file_path", "path")?;
             let path = resolve_path(&file_path, &workspace_root);
             if path.is_dir() {
@@ -635,14 +1227,15 @@ fn file_read_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSig
 fn file_write_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "file_write",
-        "Write a UTF-8 text file.",
+        "Write a UTF-8 text file. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local writes.",
         json!({
             "type": "object",
             "properties": {
                 "file_path": {"type": "string"},
                 "content": {"type": "string"},
                 "mode": {"type": "string", "enum": ["overwrite", "append"]},
-                "encoding": {"type": "string"}
+                "encoding": {"type": "string"},
+                "remote": remote_schema_property()
             },
             "required": ["file_path", "content"],
             "additionalProperties": false
@@ -651,6 +1244,9 @@ fn file_write_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSi
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
+                return run_remote_file_tool(&host, &workspace_root, "file_write", arguments);
+            }
             let file_path = string_arg_with_alias(arguments, "file_path", "path")?;
             let path = resolve_path(&file_path, &workspace_root);
             let content = string_arg(arguments, "content")?;
@@ -689,12 +1285,13 @@ fn file_write_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSi
 fn glob_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "glob",
-        "Fast file pattern matching tool. Supports glob patterns like **/*.rs and src/**/*.ts.",
+        "Fast file pattern matching tool. Supports glob patterns like **/*.rs and src/**/*.ts. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local matching.",
         json!({
             "type": "object",
             "properties": {
                 "pattern": {"type": "string"},
-                "path": {"type": "string"}
+                "path": {"type": "string"},
+                "remote": remote_schema_property()
             },
             "required": ["pattern"],
             "additionalProperties": false
@@ -703,6 +1300,9 @@ fn glob_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
+                return run_remote_file_tool(&host, &workspace_root, "glob", arguments);
+            }
             let pattern = string_arg(arguments, "pattern")?;
             let base_path = resolve_path(
                 &string_arg_with_default(arguments, "path", ".")?,
@@ -746,13 +1346,14 @@ fn glob_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>
 fn grep_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "grep",
-        "Fast content search tool. Searches file contents with a regex pattern and returns matching file paths.",
+        "Fast content search tool. Searches file contents with a regex pattern and returns matching file paths. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local search.",
         json!({
             "type": "object",
             "properties": {
                 "pattern": {"type": "string"},
                 "path": {"type": "string"},
-                "include": {"type": "string"}
+                "include": {"type": "string"},
+                "remote": remote_schema_property()
             },
             "required": ["pattern"],
             "additionalProperties": false
@@ -761,6 +1362,9 @@ fn grep_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
+                return run_remote_file_tool(&host, &workspace_root, "grep", arguments);
+            }
             let pattern = string_arg(arguments, "pattern")?;
             let base_path = resolve_path(
                 &string_arg_with_default(arguments, "path", ".")?,
@@ -815,11 +1419,12 @@ fn grep_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>
 fn ls_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "ls",
-        "List non-hidden files and directories under a path. Skips common cache/build directories by default and truncates large outputs by entry count and total output size.",
+        "List a recursive directory tree for non-hidden files and directories under a path. Skips common cache/build directories by default. Large trees are truncated to the first 1000 files and directories; pass a more specific path or use glob/grep when you know what to search for. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local listing.",
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string"}
+                "path": {"type": "string"},
+                "remote": remote_schema_property()
             },
             "required": ["path"],
             "additionalProperties": false
@@ -828,6 +1433,9 @@ fn ls_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) 
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
+                return run_remote_file_tool(&host, &workspace_root, "ls", arguments);
+            }
             let base_path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
             if !base_path.exists() {
                 return Err(anyhow!("{} does not exist", base_path.display()));
@@ -836,46 +1444,17 @@ fn ls_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) 
                 return Err(anyhow!("{} is not a directory", base_path.display()));
             }
 
-            let mut entries = collect_ls_paths(&base_path)
-                .into_iter()
-                .map(|path| {
-                    let entry_type = if path.is_dir() { "directory" } else { "file" };
-                    json!({
-                        "path": relative_display_path(&path, &base_path),
-                        "type": entry_type
-                    })
-                })
-                .collect::<Vec<_>>();
-            entries.sort_by(|left, right| {
-                left["path"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .cmp(right["path"].as_str().unwrap_or_default())
-            });
-            let total_entries = entries.len();
-            let mut kept_entries = Vec::new();
-            let mut serialized_entries_bytes = 0usize;
-            for entry in entries {
-                if kept_entries.len() >= LS_MAX_ENTRIES {
-                    break;
-                }
-                let serialized_len = serde_json::to_string_pretty(&entry)
-                    .map(|value| value.len())
-                    .unwrap_or_default();
-                let separator_len = if kept_entries.is_empty() { 0 } else { 2 };
-                if serialized_entries_bytes + separator_len + serialized_len > LS_MAX_OUTPUT_BYTES {
-                    break;
-                }
-                serialized_entries_bytes += separator_len + serialized_len;
-                kept_entries.push(entry);
+            let (paths, truncated) = collect_ls_paths(&base_path, LS_MAX_ENTRIES);
+            let mut entries = Vec::new();
+            for path in paths {
+                entries.push(LsEntry {
+                    path: relative_display_path(&path, &base_path),
+                    is_dir: path.is_dir(),
+                });
             }
-            let truncated = kept_entries.len() < total_entries;
-            Ok(json!({
-                "path": base_path.display().to_string(),
-                "num_entries": total_entries,
-                "truncated": truncated,
-                "entries": kept_entries
-            }))
+            Ok(Value::String(render_ls_tree(
+                &base_path, entries, truncated,
+            )))
         },
     )
 }
@@ -883,7 +1462,7 @@ fn ls_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) 
 fn edit_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "edit",
-        "Edit a UTF-8 text file by replacing old_text with new_text.",
+        "Edit a UTF-8 text file by replacing old_text with new_text. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local edits.",
         json!({
             "type": "object",
             "properties": {
@@ -892,7 +1471,8 @@ fn edit_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>
                 "new_text": {"type": "string"},
                 "replace_all": {"type": "boolean"},
                 "create_if_missing": {"type": "boolean"},
-                "encoding": {"type": "string"}
+                "encoding": {"type": "string"},
+                "remote": remote_schema_property()
             },
             "required": ["path", "old_text", "new_text"],
             "additionalProperties": false
@@ -901,6 +1481,9 @@ fn edit_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
+                return run_remote_file_tool(&host, &workspace_root, "edit", arguments);
+            }
             let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
             let old_text = string_arg(arguments, "old_text")?;
             let new_text = string_arg(arguments, "new_text")?;
@@ -1024,6 +1607,8 @@ struct ProcessMetadata {
     worker_pid: u32,
     #[serde(default)]
     tty: bool,
+    #[serde(default = "default_remote_local")]
+    remote: String,
     command: String,
     cwd: String,
     stdout_path: String,
@@ -1031,6 +1616,10 @@ struct ProcessMetadata {
     status_path: String,
     worker_exit_code_path: String,
     requests_dir: String,
+}
+
+fn default_remote_local() -> String {
+    "local".to_string()
 }
 
 #[derive(serde::Deserialize)]
@@ -1078,6 +1667,7 @@ fn legacy_process_metadata_to_current(
         exec_id: metadata.exec_id.clone(),
         worker_pid: metadata.pid,
         tty: false,
+        remote: default_remote_local(),
         command: metadata.command,
         cwd: metadata.cwd,
         stdout_path: metadata.stdout_path,
@@ -1408,6 +1998,7 @@ fn write_exec_snapshot(
             "command".to_string(),
             Value::String(metadata.command.clone()),
         ),
+        ("remote".to_string(), Value::String(metadata.remote.clone())),
         ("cwd".to_string(), Value::String(metadata.cwd.clone())),
         ("running".to_string(), Value::Bool(running)),
         ("completed".to_string(), Value::Bool(completed)),
@@ -1433,6 +2024,7 @@ fn spawn_managed_process(
     command: &str,
     cwd: &Path,
     tty: bool,
+    target: &ExecutionTarget,
 ) -> Result<ProcessMetadata> {
     let exec_id = Uuid::new_v4().to_string();
     let output_dir = workspace_root.join(".agent_frame").join("exec");
@@ -1451,6 +2043,7 @@ fn spawn_managed_process(
             "tty": tty,
             "pid": Value::Null,
             "command": command,
+            "remote": target.remote_name(),
             "cwd": cwd.display().to_string(),
             "running": true,
             "completed": false,
@@ -1469,6 +2062,10 @@ fn spawn_managed_process(
         &ToolWorkerJob::Exec {
             exec_id: exec_id.clone(),
             tty,
+            remote: match target {
+                ExecutionTarget::Local => None,
+                ExecutionTarget::RemoteSsh { host } => Some(host.clone()),
+            },
             command: command.to_string(),
             cwd: cwd.display().to_string(),
             status_path: status_path.display().to_string(),
@@ -1481,6 +2078,7 @@ fn spawn_managed_process(
         exec_id: exec_id.clone(),
         worker_pid: worker.pid,
         tty,
+        remote: target.remote_name().to_string(),
         command: command.to_string(),
         cwd: cwd.display().to_string(),
         stdout_path: stdout_path.display().to_string(),
@@ -1531,6 +2129,7 @@ fn read_process_snapshot(
             "tty": metadata.tty,
             "pid": pid,
             "command": metadata.command,
+            "remote": metadata.remote,
             "cwd": metadata.cwd,
             "running": false,
             "completed": false,
@@ -1609,8 +2208,8 @@ fn list_active_exec_summaries(runtime_state_root: &Path) -> Result<Vec<String>> 
             .and_then(Value::as_u64)
             .unwrap_or(metadata.worker_pid as u64);
         entries.push(format!(
-            "- exec_id=`{}` pid={} tty={} cwd=`{}` command=`{}`",
-            metadata.exec_id, pid, metadata.tty, metadata.cwd, metadata.command
+            "- exec_id=`{}` pid={} remote=`{}` tty={} cwd=`{}` command=`{}`",
+            metadata.exec_id, pid, metadata.remote, metadata.tty, metadata.cwd, metadata.command
         ));
     }
     entries.sort();
@@ -1803,7 +2402,7 @@ fn exec_start_tool(
 ) -> Tool {
     Tool::new_interruptible(
         "exec_start",
-        "Start a shell command or executable. By default this waits up to wait_timeout_seconds for completion and returns the final status. Set return_immediate=true for long-running, server, daemon, watch, or interactive commands. If the default wait times out, on_timeout=continue leaves the process running while on_timeout=kill terminates it. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths.",
+        "Start a shell command or executable. By default this waits up to wait_timeout_seconds for completion and returns the final status. Set return_immediate=true for long-running, server, daemon, watch, or interactive commands. If the default wait times out, on_timeout=continue leaves the process running while on_timeout=kill terminates it. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths. Optional remote=\"<host>|local\" runs this single command over SSH when set to an actual host alias; omit remote or set remote=\"\" for local commands.",
         json!({
             "type": "object",
             "properties": {
@@ -1816,7 +2415,8 @@ fn exec_start_tool(
                 "return_immediate": {"type": "boolean"},
                 "wait_timeout_seconds": {"type": "number"},
                 "on_timeout": {"type": "string", "enum": ["continue", "kill", "CONTINUE", "KILL"]},
-                "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000}
+                "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000},
+                "remote": remote_schema_property()
             },
             "required": ["command"],
             "additionalProperties": false
@@ -1825,6 +2425,7 @@ fn exec_start_tool(
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            let target = execution_target_arg(arguments)?;
             let command = string_arg(arguments, "command")?;
             let include_stdout = arguments
                 .get("include_stdout")
@@ -1861,6 +2462,7 @@ fn exec_start_tool(
                 &command,
                 &cwd,
                 tty,
+                &target,
             )?;
             let mut result = if return_immediate {
                 read_process_snapshot(
@@ -1905,14 +2507,15 @@ fn exec_observe_tool(
 ) -> Tool {
     Tool::new(
         "exec_observe",
-        "Observe the latest output of a previously started exec process by exec_id. start=0 and limit=2 means the last two lines. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths.",
+        "Observe the latest output of a previously started exec process by exec_id. start=0 and limit=2 means the last two lines. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths. Remote host is inferred from exec_id; do not repeat remote unless a future tool version asks for it.",
         json!({
             "type": "object",
             "properties": {
                 "exec_id": {"type": "string"},
                 "start": {"type": "integer"},
                 "limit": {"type": "integer"},
-                "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000}
+                "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000},
+                "remote": remote_schema_property()
             },
             "required": ["exec_id"],
             "additionalProperties": false
@@ -1945,7 +2548,7 @@ fn exec_wait_tool(
 ) -> Tool {
     Tool::new_interruptible(
         "exec_wait",
-        "Wait on a previously started exec process by exec_id. Optionally write input to stdin before waiting. If interrupted by a newer user message or timeout observation, return immediately and leave the process running. If the process does not finish before wait_timeout_seconds, on_timeout=continue leaves it running while on_timeout=kill terminates it. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths.",
+        "Wait on a previously started exec process by exec_id. Optionally write input to stdin before waiting. If interrupted by a newer user message or timeout observation, return immediately and leave the process running. If the process does not finish before wait_timeout_seconds, on_timeout=continue leaves it running while on_timeout=kill terminates it. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths. Remote host is inferred from exec_id; do not repeat remote unless a future tool version asks for it.",
         json!({
             "type": "object",
             "properties": {
@@ -1956,7 +2559,8 @@ fn exec_wait_tool(
                 "start": {"type": "integer"},
                 "limit": {"type": "integer"},
                 "on_timeout": {"type": "string", "enum": ["continue", "kill", "CONTINUE", "KILL"]},
-                "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000}
+                "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000},
+                "remote": remote_schema_property()
             },
             "required": ["exec_id", "wait_timeout_seconds"],
             "additionalProperties": false
@@ -2008,11 +2612,12 @@ fn exec_wait_tool(
 fn exec_kill_tool(runtime_state_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "exec_kill",
-        "Immediately stop a previously started exec process by exec_id.",
+        "Immediately stop a previously started exec process by exec_id. Remote host is inferred from exec_id.",
         json!({
             "type": "object",
             "properties": {
-                "exec_id": {"type": "string"}
+                "exec_id": {"type": "string"},
+                "remote": remote_schema_property()
             },
             "required": ["exec_id"],
             "additionalProperties": false
@@ -2044,6 +2649,7 @@ fn exec_kill_tool(runtime_state_root: PathBuf, _cancel_flag: Option<Arc<Interrup
                     .map(Value::from)
                     .unwrap_or(Value::Null),
                 "command": metadata.command,
+                "remote": metadata.remote,
                 "cwd": metadata.cwd,
                 "running": false,
                 "completed": true,
@@ -2057,14 +2663,15 @@ fn exec_kill_tool(runtime_state_root: PathBuf, _cancel_flag: Option<Arc<Interrup
 fn apply_patch_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
     Tool::new(
         "apply_patch",
-        "Apply a unified diff patch inside the workspace using git apply. The patch must be a valid unified diff.",
+        "Apply a unified diff patch inside the workspace using git apply. The patch must be a valid unified diff. Optional remote=\"<host>|local\" applies this single patch over SSH when set to an actual host alias; omit remote or set remote=\"\" for local patches.",
         json!({
             "type": "object",
             "properties": {
                 "patch": {"type": "string"},
                 "strip": {"type": "integer"},
                 "reverse": {"type": "boolean"},
-                "check": {"type": "boolean"}
+                "check": {"type": "boolean"},
+                "remote": remote_schema_property()
             },
             "required": ["patch"],
             "additionalProperties": false
@@ -2083,6 +2690,16 @@ fn apply_patch_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptS
                 .get("check")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
+                return run_remote_apply_patch(
+                    &host,
+                    &workspace_root,
+                    &patch,
+                    strip,
+                    reverse,
+                    check,
+                );
+            }
             let patch_workspace_root = workspace_root.clone();
 
             let mut command = Command::new("git");
@@ -3919,21 +4536,122 @@ pub mod macro_support {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackgroundTaskMetadata, FILE_READ_MAX_OUTPUT_BYTES, LS_MAX_ENTRIES, ProcessMetadata, Tool,
-        active_runtime_state_summary, build_tool_registry_with_cancel, execute_tool_call,
-        process_is_running, process_meta_path, terminate_runtime_state_tasks,
-        write_background_task_metadata,
+        BackgroundTaskMetadata, ExecutionTarget, FILE_READ_MAX_OUTPUT_BYTES, LS_MAX_ENTRIES,
+        ProcessMetadata, Tool, active_runtime_state_summary, build_tool_registry_with_cancel,
+        execute_tool_call, execution_target_arg, process_is_running, process_meta_path,
+        terminate_runtime_state_tasks, write_background_task_metadata,
     };
     use crate::config::{
         AuthCredentialsStoreMode, UpstreamApiKind, UpstreamAuthKind, UpstreamConfig,
     };
     use serde_json::json;
+    use std::ffi::OsString;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
+    use std::sync::{Mutex, OnceLock};
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    fn test_upstream() -> UpstreamConfig {
+        UpstreamConfig {
+            base_url: "https://example.com".to_string(),
+            model: "demo".to_string(),
+            api_kind: UpstreamApiKind::Responses,
+            auth_kind: UpstreamAuthKind::ApiKey,
+            supports_vision_input: false,
+            supports_pdf_input: false,
+            supports_audio_input: false,
+            api_key: None,
+            api_key_env: "OPENAI_API_KEY".to_string(),
+            chat_completions_path: "/responses".to_string(),
+            codex_home: None,
+            codex_auth: None,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            retry_mode: Default::default(),
+            context_window_tokens: 200_000,
+            cache_control: None,
+            prompt_cache_retention: None,
+            prompt_cache_key: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            native_web_search: None,
+            external_web_search: None,
+            native_image_input: false,
+            native_pdf_input: false,
+            native_audio_input: false,
+            native_image_generation: false,
+        }
+    }
+
+    fn env_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(self.key, previous);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn write_fake_ssh(temp_dir: &TempDir) -> PathBuf {
+        write_fake_ssh_with_path(temp_dir, "exec \"$@\"")
+    }
+
+    #[cfg(unix)]
+    fn write_fake_ssh_with_path(temp_dir: &TempDir, path_line: &str) -> PathBuf {
+        let path = temp_dir.path().join("fake-ssh");
+        fs::write(
+            &path,
+            format!(
+                r#"#!/bin/sh
+while [ "$1" = "-o" ]; do
+  shift 2
+done
+if [ "$1" = "-T" ] || [ "$1" = "-tt" ]; then
+  shift
+fi
+shift
+if [ "$1" = "--" ]; then
+  shift
+fi
+{path_line}
+"#
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
 
     #[test]
     fn openai_tool_description_includes_execution_mode_guidance() {
@@ -4132,18 +4850,278 @@ mod tests {
         );
 
         let ls_result = registry["ls"].invoke(json!({"path":"src"})).unwrap();
-        assert!(
-            ls_result["num_entries"]
-                .as_u64()
-                .is_some_and(|count| count >= 2)
+        let ls_result = ls_result.as_str().unwrap();
+        assert!(ls_result.contains("num_entries: 2"));
+        assert!(ls_result.contains("truncated: false"));
+        assert!(ls_result.contains("- main.rs"));
+        assert!(ls_result.contains("- lib.rs"));
+        assert!(!ls_result.contains("\"entries\""));
+        assert!(!ls_result.contains("\"type\""));
+    }
+
+    #[test]
+    fn supported_tools_expose_optional_remote_parameter() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = test_upstream();
+        let registry = build_tool_registry_with_cancel(
+            &[],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        for name in [
+            "file_read",
+            "file_write",
+            "glob",
+            "grep",
+            "ls",
+            "edit",
+            "exec_start",
+            "exec_observe",
+            "exec_wait",
+            "exec_kill",
+            "apply_patch",
+        ] {
+            let tool = registry.get(name).expect("tool should be registered");
+            let remote = &tool.parameters["properties"]["remote"];
+            assert_eq!(remote["type"], "string");
+            assert!(
+                remote["description"]
+                    .as_str()
+                    .is_some_and(|description| description.contains("<host>|local")),
+                "remote schema should document the accepted target format for {name}"
+            );
+            let required = tool.parameters["required"].as_array().unwrap();
+            assert!(
+                !required.iter().any(|item| item.as_str() == Some("remote")),
+                "remote must stay optional for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_remote_argument_is_treated_as_local() {
+        let arguments = json!({"remote": ""});
+        let target = execution_target_arg(arguments.as_object().unwrap()).unwrap();
+        assert_eq!(target, ExecutionTarget::Local);
+    }
+
+    #[test]
+    fn placeholder_remote_argument_is_rejected() {
+        let arguments = json!({"remote": "host"});
+        let error = execution_target_arg(arguments.as_object().unwrap()).unwrap_err();
+        assert!(format!("{error:#}").contains("actual SSH host alias"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_filesystem_tools_use_ssh_and_omit_local_state() {
+        let _env_guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_dir = TempDir::new().unwrap();
+        let fake_ssh = write_fake_ssh(&temp_dir);
+        let _ssh_guard = EnvVarGuard::set("AGENT_FRAME_SSH_BIN", fake_ssh.as_os_str());
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(workspace_root.join("src")).unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = test_upstream();
+        let registry = build_tool_registry_with_cancel(
+            &[],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let write_result = registry["file_write"]
+            .invoke(json!({
+                "file_path": "src/remote.txt",
+                "content": "alpha\nbeta\n",
+                "remote": "fake-host"
+            }))
+            .unwrap();
+        assert_eq!(write_result["remote"].as_str(), Some("fake-host"));
+        assert_eq!(
+            fs::read_to_string(workspace_root.join("src/remote.txt")).unwrap(),
+            "alpha\nbeta\n"
         );
+
+        let read_result = registry["file_read"]
+            .invoke(json!({
+                "file_path": "src/remote.txt",
+                "offset": 1,
+                "limit": 10,
+                "remote": "fake-host"
+            }))
+            .unwrap();
+        assert_eq!(read_result["remote"].as_str(), Some("fake-host"));
         assert!(
-            ls_result["entries"]
-                .as_array()
+            read_result["content"]
+                .as_str()
                 .unwrap()
-                .iter()
-                .any(|entry| entry["path"].as_str() == Some("main.rs"))
+                .contains("1: alpha")
         );
+
+        let grep_result = registry["grep"]
+            .invoke(json!({
+                "pattern": "beta",
+                "path": "src",
+                "include": "*.txt",
+                "remote": "fake-host"
+            }))
+            .unwrap();
+        assert_eq!(grep_result["num_files"].as_u64(), Some(1));
+
+        let ls_result = registry["ls"]
+            .invoke(json!({
+                "path": "src",
+                "remote": "fake-host"
+            }))
+            .unwrap();
+        let ls_result = ls_result.as_str().unwrap();
+        assert!(ls_result.contains("remote: fake-host"));
+        assert!(ls_result.contains("num_entries: 1"));
+        assert!(ls_result.contains("truncated: false"));
+        assert!(ls_result.contains("- remote.txt"));
+
+        let remote_crowded_dir = workspace_root.join("crowded");
+        fs::create_dir_all(&remote_crowded_dir).unwrap();
+        for index in 0..(LS_MAX_ENTRIES + 5) {
+            fs::write(
+                remote_crowded_dir.join(format!("file_{index:04}.txt")),
+                "data\n",
+            )
+            .unwrap();
+        }
+        let remote_crowded_result = registry["ls"]
+            .invoke(json!({
+                "path": "crowded",
+                "remote": "fake-host"
+            }))
+            .unwrap();
+        let remote_crowded_result = remote_crowded_result.as_str().unwrap();
+        assert!(remote_crowded_result.contains("remote: fake-host"));
+        assert!(remote_crowded_result.contains("num_entries: >1000"));
+        assert!(remote_crowded_result.contains("truncated: true"));
+        assert!(!remote_crowded_result.contains("\"entries\""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_file_tools_fall_back_to_python_when_python3_is_missing() {
+        let _env_guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_dir = TempDir::new().unwrap();
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", bin_dir.join("sh")).unwrap();
+        let python3_path = std::env::var("PATH")
+            .unwrap_or_default()
+            .split(':')
+            .map(|path| std::path::Path::new(path).join("python3"))
+            .find(|path| path.is_file())
+            .expect("test host must have python3 on PATH");
+        std::os::unix::fs::symlink(python3_path, bin_dir.join("python")).unwrap();
+        let fake_ssh = write_fake_ssh_with_path(
+            &temp_dir,
+            &format!("PATH='{}' exec \"$@\"", bin_dir.display()),
+        );
+        let _ssh_guard = EnvVarGuard::set("AGENT_FRAME_SSH_BIN", fake_ssh.as_os_str());
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(workspace_root.join("src")).unwrap();
+        fs::write(workspace_root.join("src/fallback.txt"), "ok\n").unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = test_upstream();
+        let registry = build_tool_registry_with_cancel(
+            &[],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let ls_result = registry["ls"]
+            .invoke(json!({"path": "src", "remote": "fake-host"}))
+            .unwrap();
+        let ls_result = ls_result.as_str().unwrap();
+        assert!(ls_result.contains("remote: fake-host"));
+        assert!(ls_result.contains("- fallback.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_file_tools_report_missing_python_clearly() {
+        let _env_guard = env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_dir = TempDir::new().unwrap();
+        let bin_dir = temp_dir.path().join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", bin_dir.join("sh")).unwrap();
+        let fake_ssh = write_fake_ssh_with_path(
+            &temp_dir,
+            &format!("PATH='{}' exec \"$@\"", bin_dir.display()),
+        );
+        let _ssh_guard = EnvVarGuard::set("AGENT_FRAME_SSH_BIN", fake_ssh.as_os_str());
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(workspace_root.join("src")).unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = test_upstream();
+        let registry = build_tool_registry_with_cancel(
+            &[],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let error = registry["ls"]
+            .invoke(json!({"path": "src", "remote": "fake-host"}))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("remote file tools require Python 3"));
     }
 
     #[test]
@@ -4208,33 +5186,22 @@ mod tests {
         .unwrap();
 
         let ls_result = registry["ls"].invoke(json!({"path":"."})).unwrap();
-        let entries = ls_result["entries"].as_array().unwrap();
-        assert!(
-            entries
-                .iter()
-                .any(|entry| entry["path"].as_str() == Some("src/main.rs"))
-        );
-        assert!(
-            entries
-                .iter()
-                .all(|entry| !entry["path"].as_str().unwrap_or_default().starts_with('.'))
-        );
-        assert!(entries.iter().all(|entry| {
-            !entry["path"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("node_modules/")
-        }));
+        let ls_result = ls_result.as_str().unwrap();
+        assert!(ls_result.contains("- src/"));
+        assert!(ls_result.contains("  - main.rs"));
+        assert!(!ls_result.contains(".venv_tools"));
+        assert!(!ls_result.contains("node_modules"));
+        assert!(!ls_result.contains("target"));
     }
 
     #[test]
-    fn ls_truncates_when_output_byte_budget_is_hit() {
+    fn ls_truncates_when_entry_limit_is_hit() {
         let temp_dir = TempDir::new().unwrap();
         let workspace_root = temp_dir.path().join("workspace");
         let crowded_dir = workspace_root.join("crowded");
         fs::create_dir_all(&crowded_dir).unwrap();
-        for index in 0..400 {
-            let filename = format!("very_long_filename_{index:04}_{}.txt", "x".repeat(160));
+        for index in 0..(LS_MAX_ENTRIES + 25) {
+            let filename = format!("file_{index:04}.txt");
             fs::write(crowded_dir.join(filename), "data\n").unwrap();
         }
         let runtime_state_root = temp_dir.path().join("runtime");
@@ -4285,11 +5252,17 @@ mod tests {
         .unwrap();
 
         let ls_result = registry["ls"].invoke(json!({"path":"crowded"})).unwrap();
-        let returned_entries = ls_result["entries"].as_array().unwrap();
-        assert_eq!(ls_result["num_entries"].as_u64(), Some(400));
-        assert_eq!(ls_result["truncated"].as_bool(), Some(true));
-        assert!(returned_entries.len() < 400);
-        assert!(returned_entries.len() < LS_MAX_ENTRIES);
+        let ls_result = ls_result.as_str().unwrap();
+        assert!(ls_result.contains("num_entries: >1000"));
+        assert!(ls_result.contains("truncated: true"));
+        assert!(ls_result.contains("There are more than 1000 files and directories"));
+        let printed_nodes = ls_result
+            .lines()
+            .filter(|line| line.trim_start().starts_with("- "))
+            .count();
+        assert!(printed_nodes <= LS_MAX_ENTRIES + 1);
+        assert!(!ls_result.contains("\"entries\""));
+        assert!(!ls_result.contains("\"type\""));
     }
 
     #[test]
@@ -4691,6 +5664,7 @@ mod tests {
             exec_id: "exec-1".to_string(),
             worker_pid: std::process::id(),
             tty: false,
+            remote: "local".to_string(),
             command: "sleep 10".to_string(),
             cwd: "/tmp/demo".to_string(),
             stdout_path: processes_dir.join("exec-1.stdout").display().to_string(),
@@ -4736,6 +5710,7 @@ mod tests {
             exec_id: "exec-finished".to_string(),
             worker_pid: std::process::id(),
             tty: false,
+            remote: "local".to_string(),
             command: "echo done".to_string(),
             cwd: "/tmp/finished".to_string(),
             stdout_path: processes_dir
@@ -4868,6 +5843,7 @@ mod tests {
             exec_id: current_exec_id.to_string(),
             worker_pid: std::process::id(),
             tty: false,
+            remote: "local".to_string(),
             command: "sleep 10".to_string(),
             cwd: "/tmp/current".to_string(),
             stdout_path: processes_dir
@@ -4944,6 +5920,7 @@ mod tests {
             exec_id: "exec-cleanup".to_string(),
             worker_pid: exec_child.id(),
             tty: false,
+            remote: "local".to_string(),
             command: "sleep 30".to_string(),
             cwd: "/tmp".to_string(),
             stdout_path: processes_dir

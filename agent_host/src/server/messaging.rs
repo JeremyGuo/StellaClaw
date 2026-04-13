@@ -398,12 +398,19 @@ pub(super) fn build_user_turn_message(
 }
 
 pub(super) fn build_synthetic_system_messages(
+    process_restart_notice: Option<&str>,
     user_time_tip: Option<&str>,
     model_catalog_change_notice: Option<&str>,
     skill_updates_prefix: Option<&str>,
     profile_change_notices: &[SharedProfileChangeNotice],
 ) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
+    if let Some(process_restart_notice) = process_restart_notice
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        messages.push(ChatMessage::text("system", process_restart_notice));
+    }
     if let Some(user_time_tip) = user_time_tip
         .map(str::trim)
         .filter(|value| !value.is_empty())

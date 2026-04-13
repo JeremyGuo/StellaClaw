@@ -232,12 +232,52 @@ impl ChannelAuthorizationManager {
     }
 
     pub fn list_conversations(&self, channel_id: &str) -> Vec<ConversationApprovalSnapshot> {
+        self.list_conversations_filtered(channel_id, false)
+    }
+
+    pub fn list_conversations_including_rejected(
+        &self,
+        channel_id: &str,
+    ) -> Vec<ConversationApprovalSnapshot> {
+        self.list_conversations_filtered(channel_id, true)
+    }
+
+    pub fn remove_conversation(
+        &mut self,
+        channel_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationApprovalSnapshot>> {
+        let Some(channel) = self.channels.get_mut(channel_id) else {
+            return Ok(None);
+        };
+        let Some(record) = channel.conversations.remove(conversation_id) else {
+            return Ok(None);
+        };
+        let snapshot = ConversationApprovalSnapshot {
+            conversation_id: record.conversation_id,
+            user_id: record.user_id,
+            display_name: record.display_name,
+            state: record.state,
+            updated_at: record.updated_at,
+        };
+        self.persist()?;
+        Ok(Some(snapshot))
+    }
+
+    fn list_conversations_filtered(
+        &self,
+        channel_id: &str,
+        include_rejected: bool,
+    ) -> Vec<ConversationApprovalSnapshot> {
         let Some(channel) = self.channels.get(channel_id) else {
             return Vec::new();
         };
         let mut items = channel
             .conversations
             .values()
+            .filter(|record| {
+                include_rejected || record.state != ConversationApprovalState::Rejected
+            })
             .map(|record| ConversationApprovalSnapshot {
                 conversation_id: record.conversation_id.clone(),
                 user_id: record.user_id.clone(),
@@ -347,5 +387,40 @@ mod tests {
             .approve_conversation("telegram-main", "-100123")
             .unwrap();
         assert_eq!(approved.state, ConversationApprovalState::Approved);
+    }
+
+    #[test]
+    fn rejected_conversations_are_hidden_from_admin_list_but_removable() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = ChannelAuthorizationManager::new(temp_dir.path()).unwrap();
+        manager.authorize_admin(&private_address()).unwrap();
+        manager
+            .ensure_pending_conversation(&group_address())
+            .unwrap();
+        manager
+            .reject_conversation("telegram-main", "-100123")
+            .unwrap();
+
+        let visible = manager.list_conversations("telegram-main");
+        assert!(
+            visible
+                .iter()
+                .all(|item| item.state != ConversationApprovalState::Rejected)
+        );
+        let all = manager.list_conversations_including_rejected("telegram-main");
+        assert!(all.iter().any(|item| item.conversation_id == "-100123"
+            && item.state == ConversationApprovalState::Rejected));
+
+        let removed = manager
+            .remove_conversation("telegram-main", "-100123")
+            .unwrap();
+        assert!(removed.is_some());
+        let reloaded = ChannelAuthorizationManager::new(temp_dir.path()).unwrap();
+        assert!(
+            reloaded
+                .list_conversations_including_rejected("telegram-main")
+                .iter()
+                .all(|item| item.conversation_id != "-100123")
+        );
     }
 }

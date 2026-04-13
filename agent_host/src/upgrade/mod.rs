@@ -12,6 +12,8 @@ mod v0_16;
 mod v0_17;
 mod v0_18;
 mod v0_19;
+mod v0_20;
+mod v0_21;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -19,7 +21,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.19";
+pub const LATEST_WORKDIR_VERSION: &str = "0.21";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -35,7 +37,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 15] = [
+    let upgraders: [&dyn WorkdirUpgrader; 17] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
@@ -51,6 +53,8 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
         &v0_17::Upgrade,
         &v0_18::Upgrade,
         &v0_19::Upgrade,
+        &v0_20::Upgrade,
+        &v0_21::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -94,6 +98,8 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.16" => Ok("0.16"),
         "0.17" => Ok("0.17"),
         "0.18" => Ok("0.18"),
+        "0.19" => Ok("0.19"),
+        "0.20" => Ok("0.20"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -400,6 +406,94 @@ mod tests {
     }
 
     #[test]
+    fn v0_20_workdir_upgrade_backfills_exec_remote_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.19\n").unwrap();
+
+        let processes_dir = temp_dir
+            .path()
+            .join("agent")
+            .join("runtime")
+            .join("workspace-1")
+            .join("agent_frame")
+            .join("processes");
+        let tool_workers_dir = temp_dir
+            .path()
+            .join("agent")
+            .join("runtime")
+            .join("workspace-1")
+            .join("agent_frame")
+            .join("tool_workers");
+        fs::create_dir_all(&processes_dir).unwrap();
+        fs::create_dir_all(&tool_workers_dir).unwrap();
+        fs::write(
+            processes_dir.join("exec-1.json"),
+            serde_json::to_string_pretty(&json!({
+                "exec_id": "exec-1",
+                "worker_pid": 123,
+                "tty": false,
+                "command": "printf ok",
+                "cwd": "/tmp",
+                "stdout_path": "/tmp/exec-1.stdout",
+                "stderr_path": "/tmp/exec-1.stderr",
+                "status_path": "/tmp/exec-1.status.json",
+                "worker_exit_code_path": "/tmp/exec-1.worker.exit",
+                "requests_dir": "/tmp/exec-1.requests"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            tool_workers_dir.join("job-1.json"),
+            serde_json::to_string_pretty(&json!({
+                "kind": "exec",
+                "exec_id": "exec-1",
+                "tty": false,
+                "command": "printf ok",
+                "cwd": "/tmp",
+                "status_path": "/tmp/exec-1.status.json",
+                "stdout_path": "/tmp/exec-1.stdout",
+                "stderr_path": "/tmp/exec-1.stderr",
+                "requests_dir": "/tmp/exec-1.requests"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            processes_dir.join("exec-1.status.json"),
+            serde_json::to_string_pretty(&json!({
+                "exec_id": "exec-1",
+                "running": false
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+        assert!(upgraded);
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("VERSION"))
+                .unwrap()
+                .trim(),
+            LATEST_WORKDIR_VERSION
+        );
+
+        let metadata: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(processes_dir.join("exec-1.json")).unwrap())
+                .unwrap();
+        let status: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(processes_dir.join("exec-1.status.json")).unwrap(),
+        )
+        .unwrap();
+        let job: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(tool_workers_dir.join("job-1.json")).unwrap())
+                .unwrap();
+        assert_eq!(metadata["remote"].as_str(), Some("local"));
+        assert_eq!(status["remote"].as_str(), Some("local"));
+        assert!(job.get("remote").is_some_and(|value| value.is_null()));
+    }
+
+    #[test]
     fn v0_11_workdir_upgrade_seeds_partclaw_files() {
         let temp_dir = TempDir::new().unwrap();
         fs::write(temp_dir.path().join("VERSION"), "0.11\n").unwrap();
@@ -539,6 +633,46 @@ mod tests {
             Some("legacy failure")
         );
         assert!(session.get("pending_continue").is_none());
+    }
+
+    #[test]
+    fn v0_21_workdir_upgrade_backfills_progress_message_slot() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.20\n").unwrap();
+        let session_dir = temp_dir
+            .path()
+            .join("sessions")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": Uuid::new_v4(),
+                "agent_id": Uuid::new_v4(),
+                "address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "123"
+                },
+                "session_state": {
+                    "messages": [],
+                    "pending_messages": [],
+                    "phase": "end",
+                    "errno": null,
+                    "errinfo": null
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        let session: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
+                .unwrap();
+        assert!(session["session_state"].get("progress_message").is_some());
+        assert!(session["session_state"]["progress_message"].is_null());
     }
 
     #[test]

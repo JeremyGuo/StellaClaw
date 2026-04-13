@@ -498,6 +498,7 @@ impl ServerRuntime {
                 phase: crate::session::SessionPhase::End,
                 errno: None,
                 errinfo: None,
+                progress_message: None,
             },
         };
         let upstream_timeout_seconds = self.model_upstream_timeout_seconds(&model_key)?;

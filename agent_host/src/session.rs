@@ -102,6 +102,12 @@ pub struct ZgentNativeSessionState {
     pub context_window_size: Option<u32>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionProgressMessageState {
+    pub turn_id: String,
+    pub message_id: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DurableSessionState {
     #[serde(default)]
@@ -114,6 +120,8 @@ pub struct DurableSessionState {
     pub errno: Option<SessionErrno>,
     #[serde(default)]
     pub errinfo: Option<String>,
+    #[serde(default)]
+    pub progress_message: Option<SessionProgressMessageState>,
 }
 
 #[derive(Clone, Debug)]
@@ -312,6 +320,7 @@ impl Session {
                 phase: SessionPhase::End,
                 errno: None,
                 errinfo: None,
+                progress_message: None,
             });
         Ok(Self {
             kind: persisted.kind,
@@ -625,6 +634,21 @@ impl SessionManager {
             .map(Session::snapshot)
     }
 
+    pub fn set_progress_message(
+        &mut self,
+        address: &ChannelAddress,
+        progress_message: Option<SessionProgressMessageState>,
+    ) -> Result<()> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        session.session_state.progress_message = progress_message;
+        session.persist()?;
+        Ok(())
+    }
+
     pub fn list_foreground_snapshots(&self) -> Vec<SessionSnapshot> {
         self.foreground_sessions
             .values()
@@ -784,6 +808,7 @@ impl SessionManager {
                 phase: SessionPhase::End,
                 errno: None,
                 errinfo: None,
+                progress_message: None,
             },
             pending_workspace_summary: false,
             close_after_summary: false,

@@ -19,6 +19,22 @@ pub(super) fn register_active_foreground_control(
 }
 
 impl Server {
+    fn take_process_restart_notice(&self, address: &ChannelAddress) -> Option<&'static str> {
+        let session_key = address.session_key();
+        let mut pending = self.pending_process_restart_notices.lock().ok()?;
+        if pending.remove(&session_key) {
+            info!(
+                log_stream = "session",
+                log_key = %session_key,
+                kind = "process_restart_notice_emitted",
+                "emitted one-shot process restart notice for foreground session"
+            );
+            Some(SYSTEM_RESTART_NOTICE)
+        } else {
+            None
+        }
+    }
+
     pub(super) async fn handle_continue_command(
         &self,
         channel: &Arc<dyn Channel>,
@@ -70,7 +86,15 @@ impl Server {
             }
             resume_messages
         };
-        let mut ephemeral_system_messages = Vec::new();
+        let synthetic_system_messages = build_synthetic_system_messages(
+            self.take_process_restart_notice(&incoming.address),
+            None,
+            None,
+            None,
+            &[],
+        );
+        next_previous_messages.extend(synthetic_system_messages.iter().cloned());
+        let mut ephemeral_system_messages = synthetic_system_messages.clone();
         let outcome = self
             .run_foreground_turn_until_settled(
                 &mut active_session,
@@ -105,7 +129,7 @@ impl Server {
                     &state.usage,
                     &state.compaction,
                     &persistence_system_prompt,
-                    &[],
+                    &synthetic_system_messages,
                     Some(&outgoing),
                 )
                 .context("failed to persist continued agent_frame messages")?;
@@ -129,7 +153,7 @@ impl Server {
                         &active_session,
                         outcome,
                         &persistence_system_prompt,
-                        &[],
+                        &synthetic_system_messages,
                     )
                     .await?
                 {
@@ -237,6 +261,7 @@ impl Server {
             .with_sessions(|sessions| Ok(sessions.get_snapshot(&incoming.address)))?
             .expect("session should exist after staging pending user message");
         let synthetic_system_messages = build_synthetic_system_messages(
+            self.take_process_restart_notice(&incoming.address),
             user_time_tip.as_deref(),
             model_catalog_change_notice.as_deref(),
             skill_updates_prefix.as_deref(),

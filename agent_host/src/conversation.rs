@@ -147,6 +147,21 @@ impl ConversationManager {
             .map(ConversationState::snapshot)
     }
 
+    pub fn remove_conversation(
+        &mut self,
+        address: &ChannelAddress,
+    ) -> Result<Option<ConversationSnapshot>> {
+        let Some(state) = self.conversations.remove(&address.session_key()) else {
+            return Ok(None);
+        };
+        let snapshot = state.snapshot();
+        if state.root_dir.exists() {
+            fs::remove_dir_all(&state.root_dir)
+                .with_context(|| format!("failed to remove {}", state.root_dir.display()))?;
+        }
+        Ok(Some(snapshot))
+    }
+
     pub fn set_main_model(
         &mut self,
         address: &ChannelAddress,
@@ -391,5 +406,21 @@ mod tests {
             original.settings.chat_version_id,
             rotated.settings.chat_version_id
         );
+    }
+
+    #[test]
+    fn remove_conversation_deletes_persisted_state() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = test_address();
+        let mut manager = ConversationManager::new(temp_dir.path()).unwrap();
+
+        let snapshot = manager.ensure_conversation(&address).unwrap();
+        assert!(snapshot.root_dir.exists());
+        let removed = manager.remove_conversation(&address).unwrap();
+
+        assert!(removed.is_some());
+        assert!(!snapshot.root_dir.exists());
+        let reloaded = ConversationManager::new(temp_dir.path()).unwrap();
+        assert!(reloaded.get_snapshot(&address).is_none());
     }
 }

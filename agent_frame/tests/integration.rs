@@ -6,8 +6,8 @@ use agent_frame::tooling::{
     build_tool_registry, execute_tool_call, terminate_all_managed_processes,
 };
 use agent_frame::{
-    AgentConfig, ExternalWebSearchConfig, NativeWebSearchConfig, SessionEvent,
-    SessionExecutionControl, SessionState, Tool, UpstreamConfig,
+    AgentConfig, ExecutionProgressPhase, ExternalWebSearchConfig, NativeWebSearchConfig,
+    SessionEvent, SessionExecutionControl, SessionState, Tool, ToolExecutionStatus, UpstreamConfig,
     compact_session_messages_with_report, extract_assistant_text, load_config_value, run_session,
     run_session_state, run_session_state_controlled,
 };
@@ -15,9 +15,12 @@ use anyhow::Result;
 use assert_cmd::Command;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -42,6 +45,59 @@ fn acquire_process_test_lock() -> std::sync::MutexGuard<'static, ()> {
     process_test_lock()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        unsafe {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn write_fake_ssh(temp_dir: &TempDir) -> PathBuf {
+    let path = temp_dir.path().join("fake-ssh");
+    fs::write(
+        &path,
+        r#"#!/bin/sh
+while [ "$1" = "-o" ]; do
+  shift 2
+done
+if [ "$1" = "-T" ] || [ "$1" = "-tt" ]; then
+  shift
+fi
+shift
+if [ "$1" = "--" ]; then
+  shift
+fi
+exec "$@"
+"#,
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&path, permissions).unwrap();
+    path
 }
 
 fn structured_compaction_response_text() -> String {
@@ -744,6 +800,73 @@ fn exec_wait_accepts_input_from_a_fresh_registry_instance() -> Result<()> {
             .unwrap_or_default()
             .contains("got:hello")
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_start_supports_per_tool_remote_ssh() -> Result<()> {
+    let _guard = acquire_process_test_lock();
+    let temp_dir = TempDir::new()?;
+    let fake_ssh = write_fake_ssh(&temp_dir);
+    let _ssh_guard = EnvVarGuard::set("AGENT_FRAME_SSH_BIN", fake_ssh.as_os_str());
+    let workspace_root = temp_dir.path().join("workspace");
+    let runtime_state_root = temp_dir.path().join("runtime");
+    fs::create_dir_all(&workspace_root)?;
+    fs::create_dir_all(&runtime_state_root)?;
+
+    let registry = build_tool_registry(
+        &[
+            "exec_start".to_string(),
+            "exec_wait".to_string(),
+            "exec_observe".to_string(),
+            "exec_kill".to_string(),
+        ],
+        &workspace_root,
+        &runtime_state_root,
+        &test_upstream("http://127.0.0.1:1"),
+        None,
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+    )?;
+
+    let completed = execute_tool_call(
+        &registry,
+        "exec_start",
+        Some(r#"{"command":"printf remote-ok","remote":"fake-host"}"#),
+    );
+    let completed_json: Value = serde_json::from_str(&completed)?;
+    assert_eq!(completed_json["completed"], json!(true));
+    assert_eq!(completed_json["remote"], json!("fake-host"));
+    assert_eq!(completed_json["stdout"], json!("remote-ok"));
+
+    let started = execute_tool_call(
+        &registry,
+        "exec_start",
+        Some(
+            r#"{"command":"sleep 0.2; printf remote-bg","remote":"fake-host","return_immediate":true}"#,
+        ),
+    );
+    let started_json: Value = serde_json::from_str(&started)?;
+    let exec_id = started_json["exec_id"].as_str().unwrap();
+    assert_eq!(started_json["remote"], json!("fake-host"));
+
+    let waited = execute_tool_call(
+        &registry,
+        "exec_wait",
+        Some(&format!(
+            r#"{{"exec_id":"{}","wait_timeout_seconds":2.0}}"#,
+            exec_id
+        )),
+    );
+    let waited_json: Value = serde_json::from_str(&waited)?;
+    assert_eq!(waited_json["completed"], json!(true));
+    assert_eq!(waited_json["remote"], json!("fake-host"));
+    assert_eq!(waited_json["stdout"], json!("remote-bg"));
     Ok(())
 }
 
@@ -1546,7 +1669,7 @@ fn run_session_state_aggregates_usage_across_tool_roundtrips() -> Result<()> {
         temp_dir.path(),
     )?;
 
-    let report = run_session_state_until_end(
+    let report = run_session_state_controlled(
         Vec::new(),
         "What is 6 times 7?",
         config,
@@ -1665,7 +1788,7 @@ fn controlled_run_emits_checkpoint_and_honors_cancellation() -> Result<()> {
     };
     *control_holder.lock().unwrap() = Some(control.clone());
 
-    let report = run_session_state_controlled(
+    let report = run_session_state_until_end(
         Vec::new(),
         "What is 6 times 7?",
         config,
@@ -1924,6 +2047,96 @@ fn tool_calls_in_one_round_execute_in_parallel() -> Result<()> {
     let elapsed = started.elapsed();
     assert_eq!(extract_assistant_text(&report.messages), "done");
     assert!(elapsed < Duration::from_millis(430));
+    Ok(())
+}
+
+#[test]
+fn controlled_run_emits_execution_progress_snapshots() -> Result<()> {
+    let server = TestServer::start();
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "working",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "multiply",
+                        "arguments": "{\"a\":6,\"b\":7}"
+                    }
+                }]
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 21,
+            "completion_tokens": 5,
+            "total_tokens": 26
+        }
+    }));
+    server.push_response(json!({
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": "done"
+            }
+        }],
+        "usage": {
+            "prompt_tokens": 30,
+            "completion_tokens": 7,
+            "total_tokens": 37
+        }
+    }));
+
+    let multiply = tool! {
+        description: "Multiply two integers.",
+        fn multiply(a: i64, b: i64) -> i64 {
+            a * b
+        }
+    };
+    let config = load_config_value(
+        json!({
+            "enabled_tools": [],
+            "upstream": {"base_url": server.address, "model": "fake-model"},
+            "system_prompt": "Test system prompt."
+        }),
+        ".",
+    )?;
+    let progress = Arc::new(Mutex::new(Vec::new()));
+    let control = SessionExecutionControl::new().with_progress_callback({
+        let progress = Arc::clone(&progress);
+        move |snapshot| progress.lock().unwrap().push(snapshot)
+    });
+
+    let report = run_session_state_until_end(
+        Vec::new(),
+        "What is 6 times 7?",
+        config,
+        vec![multiply],
+        Some(control),
+    )?;
+
+    assert_eq!(extract_assistant_text(&report.messages), "done");
+    let progress = progress.lock().unwrap();
+    assert!(
+        progress
+            .iter()
+            .any(|item| item.phase == ExecutionProgressPhase::Thinking)
+    );
+    assert!(progress.iter().any(|item| {
+        item.phase == ExecutionProgressPhase::Tools
+            && item
+                .tools
+                .iter()
+                .any(|tool| tool.status == ToolExecutionStatus::Running)
+    }));
+    assert!(progress.iter().any(|item| {
+        item.phase == ExecutionProgressPhase::Tools
+            && item
+                .tools
+                .iter()
+                .any(|tool| tool.status == ToolExecutionStatus::Completed)
+    }));
     Ok(())
 }
 

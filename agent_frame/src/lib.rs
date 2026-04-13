@@ -12,8 +12,9 @@ pub mod tooling;
 pub use serde_json;
 
 pub use agent::{
-    ExecutionSignal, PersistentSessionRuntime, SessionCompactionStats, SessionErrno, SessionEvent,
-    SessionExecutionControl, SessionPhase, SessionState, compact_session_messages,
+    ExecutionProgress, ExecutionProgressPhase, ExecutionSignal, PersistentSessionRuntime,
+    SessionCompactionStats, SessionErrno, SessionEvent, SessionExecutionControl, SessionPhase,
+    SessionState, ToolExecutionProgress, ToolExecutionStatus, compact_session_messages,
     compact_session_messages_with_report, extract_assistant_text, run_session, run_session_state,
     run_session_state_controlled, run_session_state_controlled_persistent,
 };

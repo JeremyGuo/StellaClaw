@@ -71,6 +71,8 @@ pub enum ToolWorkerJob {
         exec_id: String,
         #[serde(default)]
         tty: bool,
+        #[serde(default)]
+        remote: Option<String>,
         command: String,
         cwd: String,
         status_path: String,
@@ -166,6 +168,7 @@ fn run_job(job: ToolWorkerJob) -> Result<()> {
         ToolWorkerJob::Exec {
             exec_id,
             tty,
+            remote,
             command,
             cwd,
             status_path,
@@ -175,6 +178,7 @@ fn run_job(job: ToolWorkerJob) -> Result<()> {
         } => run_exec_job(
             &exec_id,
             tty,
+            remote.as_deref(),
             &command,
             Path::new(&cwd),
             Path::new(&status_path),
@@ -211,6 +215,7 @@ fn write_json_file(path: &Path, value: &Value) -> Result<()> {
 fn exec_status_json(
     exec_id: &str,
     tty: bool,
+    remote: Option<&str>,
     command: &str,
     cwd: &Path,
     pid: Option<u32>,
@@ -226,6 +231,7 @@ fn exec_status_json(
         "tty": tty,
         "pid": pid,
         "command": command,
+        "remote": remote.unwrap_or("local"),
         "cwd": cwd.display().to_string(),
         "running": running,
         "completed": completed,
@@ -240,6 +246,7 @@ fn write_exec_status(
     status_path: &Path,
     exec_id: &str,
     tty: bool,
+    remote: Option<&str>,
     command: &str,
     cwd: &Path,
     pid: Option<u32>,
@@ -255,6 +262,7 @@ fn write_exec_status(
         &exec_status_json(
             exec_id,
             tty,
+            remote,
             command,
             cwd,
             pid,
@@ -931,6 +939,87 @@ fn build_shell_command(command: &str) -> Command {
     }
 }
 
+fn validate_remote_host(host: &str) -> Result<String> {
+    let trimmed = host.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("remote worker SSH host must not be empty"));
+    }
+    if trimmed == "local" {
+        return Ok("local".to_string());
+    }
+    if matches!(trimmed, "host" | "<host>" | "<host>|local") {
+        return Err(anyhow!(
+            "remote must be an actual SSH host alias or local; do not pass a placeholder"
+        ));
+    }
+    if trimmed.starts_with('-') {
+        return Err(anyhow!("remote SSH host must not start with '-'"));
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(anyhow!("remote SSH host must not contain whitespace"));
+    }
+    if trimmed.chars().any(|ch| ch.is_control()) {
+        return Err(anyhow!(
+            "remote SSH host must not contain control characters"
+        ));
+    }
+    if trimmed.chars().any(|ch| {
+        matches!(
+            ch,
+            '\'' | '"' | '`' | '$' | ';' | '&' | '|' | '<' | '>' | '(' | ')'
+        )
+    }) {
+        return Err(anyhow!(
+            "remote SSH host must not contain shell metacharacters"
+        ));
+    }
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        return Err(anyhow!("remote SSH host must not contain path separators"));
+    }
+    Ok(trimmed.to_string())
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn resolve_ssh_executable() -> String {
+    std::env::var("AGENT_FRAME_SSH_BIN").unwrap_or_else(|_| "ssh".to_string())
+}
+
+fn build_remote_shell_command(host: &str, command: &str, cwd: &Path, tty: bool) -> Result<Command> {
+    let host = validate_remote_host(host)?;
+    if host == "local" {
+        return Ok(build_shell_command(command));
+    }
+    let remote_script = format!(
+        "AGENT_FRAME_EXEC_COMMAND={}; cd {} && eval \"$AGENT_FRAME_EXEC_COMMAND\"",
+        shell_quote(command),
+        shell_quote(&cwd.display().to_string())
+    );
+    let mut command_builder = Command::new(resolve_ssh_executable());
+    command_builder
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10");
+    if tty {
+        command_builder.arg("-tt");
+    } else {
+        command_builder.arg("-T");
+    }
+    command_builder
+        .arg(host)
+        .arg("--")
+        .arg("sh")
+        .arg("-lc")
+        .arg(remote_script);
+    Ok(command_builder)
+}
+
 #[cfg(unix)]
 fn spawn_pty_output_reader(
     reader: File,
@@ -984,6 +1073,7 @@ fn join_pty_output_reader(handle: thread::JoinHandle<Result<()>>) -> Result<()> 
 #[cfg(unix)]
 fn spawn_exec_child(
     tty: bool,
+    remote: Option<&str>,
     command: &str,
     cwd: &Path,
     stdout_file: File,
@@ -1008,12 +1098,17 @@ fn spawn_exec_child(
         let master_fd = pty.master.as_raw_fd();
         let slave_fd = pty.slave.as_raw_fd();
 
-        let mut command_builder = build_shell_command(command);
+        let mut command_builder = match remote {
+            Some(host) if host != "local" => build_remote_shell_command(host, command, cwd, true)?,
+            _ => build_shell_command(command),
+        };
         command_builder
-            .current_dir(cwd)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
+        if remote.is_none() || remote == Some("local") {
+            command_builder.current_dir(cwd);
+        }
         // PTY-backed commands need a controlling terminal and their own process group.
         unsafe {
             command_builder.pre_exec(move || {
@@ -1050,8 +1145,14 @@ fn spawn_exec_child(
         let reader_handle = Some(spawn_pty_output_reader(reader_master, stdout_path)?);
         Ok((child, stdin, reader_handle))
     } else {
-        let mut child = build_shell_command(command)
-            .current_dir(cwd)
+        let mut command_builder = match remote {
+            Some(host) if host != "local" => build_remote_shell_command(host, command, cwd, false)?,
+            _ => build_shell_command(command),
+        };
+        if remote.is_none() || remote == Some("local") {
+            command_builder.current_dir(cwd);
+        }
+        let mut child = command_builder
             .stdin(Stdio::piped())
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file))
@@ -1065,6 +1166,7 @@ fn spawn_exec_child(
 #[cfg(not(unix))]
 fn spawn_exec_child(
     _tty: bool,
+    remote: Option<&str>,
     command: &str,
     cwd: &Path,
     stdout_file: File,
@@ -1075,8 +1177,14 @@ fn spawn_exec_child(
     Option<ExecInputWriter>,
     Option<thread::JoinHandle<Result<()>>>,
 )> {
-    let mut child = build_shell_command(command)
-        .current_dir(cwd)
+    let mut command_builder = match remote {
+        Some(host) if host != "local" => build_remote_shell_command(host, command, cwd, false)?,
+        _ => build_shell_command(command),
+    };
+    if remote.is_none() || remote == Some("local") {
+        command_builder.current_dir(cwd);
+    }
+    let mut child = command_builder
         .stdin(Stdio::piped())
         .stdout(Stdio::from(stdout_file))
         .stderr(Stdio::from(stderr_file))
@@ -1089,6 +1197,7 @@ fn spawn_exec_child(
 fn run_exec_job(
     exec_id: &str,
     tty: bool,
+    remote: Option<&str>,
     command: &str,
     cwd: &Path,
     status_path: &Path,
@@ -1116,6 +1225,7 @@ fn run_exec_job(
 
         let (mut child, mut stdin, reader_handle) = spawn_exec_child(
             effective_tty,
+            remote,
             command,
             cwd,
             stdout_file,
@@ -1130,6 +1240,7 @@ fn run_exec_job(
             status_path,
             exec_id,
             effective_tty,
+            remote,
             command,
             cwd,
             Some(pid),
@@ -1148,6 +1259,7 @@ fn run_exec_job(
                     status_path,
                     exec_id,
                     effective_tty,
+                    remote,
                     command,
                     cwd,
                     Some(pid),
@@ -1171,6 +1283,7 @@ fn run_exec_job(
                     status_path,
                     exec_id,
                     effective_tty,
+                    remote,
                     command,
                     cwd,
                     Some(pid),
@@ -1192,6 +1305,7 @@ fn run_exec_job(
             status_path,
             exec_id,
             effective_tty,
+            remote,
             command,
             cwd,
             None,

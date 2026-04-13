@@ -16,18 +16,7 @@ impl Server {
                     reason = reason,
                     "channel reported that the conversation should be closed"
                 );
-                self.destroy_foreground_session(&incoming.address)?;
-                let disabled = self.disable_cron_tasks_for_conversation(&incoming.address)?;
-                if disabled > 0 {
-                    warn!(
-                        log_stream = "cron",
-                        kind = "cron_tasks_auto_disabled_for_closed_conversation",
-                        channel_id = %incoming.address.channel_id,
-                        conversation_id = %incoming.address.conversation_id,
-                        disabled_count = disabled as u64,
-                        "disabled cron tasks because the conversation was closed"
-                    );
-                }
+                self.close_and_remove_conversation(&incoming.address, reason)?;
                 Ok(true)
             }
         }
@@ -61,6 +50,111 @@ impl Server {
                 .as_deref()
                 .is_some_and(|user_id| user_id == address.conversation_id)
         }
+    }
+
+    fn is_group_conversation_id(conversation_id: &str) -> bool {
+        conversation_id
+            .parse::<i64>()
+            .map(|value| value < 0)
+            .unwrap_or_else(|_| conversation_id.trim_start().starts_with('-'))
+    }
+
+    fn conversation_address_from_auth_snapshot(
+        channel_id: &str,
+        item: &ConversationApprovalSnapshot,
+    ) -> ChannelAddress {
+        ChannelAddress {
+            channel_id: channel_id.to_string(),
+            conversation_id: item.conversation_id.clone(),
+            user_id: item.user_id.clone(),
+            display_name: item.display_name.clone(),
+        }
+    }
+
+    fn close_and_remove_conversation(&self, address: &ChannelAddress, reason: &str) -> Result<()> {
+        self.destroy_foreground_session(address)?;
+        self.with_conversations(|conversations| {
+            conversations.remove_conversation(address)?;
+            Ok(())
+        })?;
+        let removed_auth = self.with_channel_auth(|auth| {
+            auth.remove_conversation(&address.channel_id, &address.conversation_id)
+        })?;
+        let disabled = self.disable_cron_tasks_for_conversation(address)?;
+        if disabled > 0 {
+            warn!(
+                log_stream = "cron",
+                kind = "cron_tasks_auto_disabled_for_removed_conversation",
+                channel_id = %address.channel_id,
+                conversation_id = %address.conversation_id,
+                disabled_count = disabled as u64,
+                "disabled cron tasks because the conversation was removed"
+            );
+        }
+        info!(
+            log_stream = "session",
+            kind = "conversation_removed",
+            channel_id = %address.channel_id,
+            conversation_id = %address.conversation_id,
+            auth_record_removed = removed_auth.is_some(),
+            reason = reason,
+            "removed closed conversation"
+        );
+        Ok(())
+    }
+
+    pub(super) async fn prune_closed_conversations_once(&self) -> Result<()> {
+        let channel_ids = self
+            .telegram_channel_ids
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        for channel_id in channel_ids {
+            let items = self.with_channel_auth(|auth| {
+                Ok(auth.list_conversations_including_rejected(&channel_id))
+            })?;
+            let Some(channel) = self.channels.get(&channel_id).cloned() else {
+                continue;
+            };
+            for item in items {
+                if !Self::is_group_conversation_id(&item.conversation_id) {
+                    continue;
+                }
+                let address = Self::conversation_address_from_auth_snapshot(&channel_id, &item);
+                if item.state == ConversationApprovalState::Rejected {
+                    self.close_and_remove_conversation(
+                        &address,
+                        "conversation was rejected by administrator",
+                    )?;
+                    continue;
+                }
+                match channel.probe_conversation(&address).await {
+                    Ok(Some(ConversationProbe::Available {
+                        member_count: Some(count),
+                    })) if count <= 1 => {
+                        self.close_and_remove_conversation(
+                            &address,
+                            &format!("telegram member_count is {count}"),
+                        )?;
+                    }
+                    Ok(Some(ConversationProbe::Unavailable { reason })) => {
+                        self.close_and_remove_conversation(&address, &reason)?;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(
+                            log_stream = "channel",
+                            log_key = %channel_id,
+                            kind = "conversation_probe_failed",
+                            conversation_id = %address.conversation_id,
+                            error = %format!("{error:#}"),
+                            "conversation probe failed; keeping conversation"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn render_chat_approval_label(state: ConversationApprovalState) -> &'static str {
@@ -300,13 +394,30 @@ impl Server {
                 auth.reject_conversation(&address.channel_id, conversation_id)
             }
         })?;
-        let action = if approve { "approved" } else { "rejected" };
+        if !approve {
+            let rejected_address =
+                Self::conversation_address_from_auth_snapshot(&address.channel_id, &snapshot);
+            self.close_and_remove_conversation(
+                &rejected_address,
+                "conversation was rejected by administrator",
+            )?;
+            self.send_channel_message(
+                channel,
+                address,
+                OutgoingMessage::text(format!(
+                    "Conversation `{}` was rejected and removed.",
+                    snapshot.conversation_id
+                )),
+            )
+            .await?;
+            return Ok(());
+        }
         self.send_channel_message(
             channel,
             address,
             OutgoingMessage::text(format!(
                 "Conversation `{}` is now `{}`.",
-                snapshot.conversation_id, action
+                snapshot.conversation_id, "approved"
             )),
         )
         .await
@@ -431,18 +542,10 @@ impl Server {
                         error = %format!("{error:#}"),
                         "channel send indicates the conversation no longer exists; closing foreground session"
                     );
-                    self.destroy_foreground_session(address)?;
-                    let disabled = self.disable_cron_tasks_for_conversation(address)?;
-                    if disabled > 0 {
-                        warn!(
-                            log_stream = "cron",
-                            kind = "cron_tasks_auto_disabled_after_send_error",
-                            channel_id = %address.channel_id,
-                            conversation_id = %address.conversation_id,
-                            disabled_count = disabled as u64,
-                            "disabled cron tasks because the conversation no longer exists"
-                        );
-                    }
+                    self.close_and_remove_conversation(
+                        address,
+                        &format!("channel send failed: {error:#}"),
+                    )?;
                 }
                 Err(error)
             }

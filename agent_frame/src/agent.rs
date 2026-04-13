@@ -476,6 +476,7 @@ pub enum SessionEvent {
         round_index: usize,
         tool_name: String,
         tool_call_id: String,
+        arguments: Option<String>,
     },
     ToolCallCompleted {
         round_index: usize,
@@ -499,6 +500,37 @@ pub enum SessionEvent {
     },
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionProgressPhase {
+    Thinking,
+    Tools,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolExecutionStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ToolExecutionProgress {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub arguments: Option<String>,
+    pub status: ToolExecutionStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExecutionProgress {
+    pub round_index: usize,
+    pub phase: ExecutionProgressPhase,
+    #[serde(default)]
+    pub tools: Vec<ToolExecutionProgress>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum ExecutionSignal {
     Cancel,
@@ -515,6 +547,7 @@ pub struct SessionExecutionControl {
     signal_sender: Sender<ExecutionSignal>,
     signal_receiver: Receiver<ExecutionSignal>,
     event_callback: Option<Arc<dyn Fn(SessionEvent) + Send + Sync>>,
+    progress_callback: Option<Arc<dyn Fn(ExecutionProgress) + Send + Sync>>,
     stable_prefix_messages: Arc<Mutex<Vec<ChatMessage>>>,
     pending_prefix_rewrite: Arc<Mutex<Option<PendingPrefixRewrite>>>,
 }
@@ -574,6 +607,7 @@ impl SessionExecutionControl {
             signal_sender,
             signal_receiver,
             event_callback: None,
+            progress_callback: None,
             stable_prefix_messages: Arc::new(Mutex::new(Vec::new())),
             pending_prefix_rewrite: Arc::new(Mutex::new(None)),
         }
@@ -584,6 +618,14 @@ impl SessionExecutionControl {
         callback: impl Fn(SessionEvent) + Send + Sync + 'static,
     ) -> Self {
         self.event_callback = Some(Arc::new(callback));
+        self
+    }
+
+    pub fn with_progress_callback(
+        mut self,
+        callback: impl Fn(ExecutionProgress) + Send + Sync + 'static,
+    ) -> Self {
+        self.progress_callback = Some(Arc::new(callback));
         self
     }
 
@@ -620,6 +662,10 @@ impl SessionExecutionControl {
 
     pub fn emit_event_external(&self, event: SessionEvent) {
         self.emit_event(event);
+    }
+
+    pub fn emit_progress_external(&self, progress: ExecutionProgress) {
+        self.emit_progress(progress);
     }
 
     fn take_timeout_observation_requested(&self) -> bool {
@@ -687,6 +733,12 @@ impl SessionExecutionControl {
     fn emit_event(&self, event: SessionEvent) {
         if let Some(callback) = &self.event_callback {
             callback(event);
+        }
+    }
+
+    fn emit_progress(&self, progress: ExecutionProgress) {
+        if let Some(callback) = &self.progress_callback {
+            callback(progress);
         }
     }
 }
@@ -890,6 +942,11 @@ fn run_session_state_controlled_internal(
                 round_index,
                 message_count: messages.len(),
             });
+            control.emit_progress(ExecutionProgress {
+                round_index,
+                phase: ExecutionProgressPhase::Thinking,
+                tools: Vec::new(),
+            });
         }
         let request_messages = materialize_messages_for_upstream(&messages, &config)?;
         let continuation_messages = runtime
@@ -988,11 +1045,26 @@ fn run_session_state_controlled_internal(
             control.ensure_not_cancelled()?;
             apply_pending_prefix_rewrite(control, &mut messages, &mut usage, &mut compaction_stats);
             control.set_stable_prefix_messages(&messages);
+            let tool_progress = tool_calls
+                .iter()
+                .map(|tool_call| ToolExecutionProgress {
+                    tool_call_id: tool_call.id.clone(),
+                    tool_name: tool_call.function.name.clone(),
+                    arguments: tool_call.function.arguments.clone(),
+                    status: ToolExecutionStatus::Running,
+                })
+                .collect::<Vec<_>>();
+            control.emit_progress(ExecutionProgress {
+                round_index,
+                phase: ExecutionProgressPhase::Tools,
+                tools: tool_progress,
+            });
             for tool_call in &tool_calls {
                 control.emit_event(SessionEvent::ToolCallStarted {
                     round_index,
                     tool_name: tool_call.function.name.clone(),
                     tool_call_id: tool_call.id.clone(),
+                    arguments: tool_call.function.arguments.clone(),
                 });
             }
         }
@@ -1004,12 +1076,14 @@ fn run_session_state_controlled_internal(
             Some(last_model_response_at),
         )?;
         let mut handles = Vec::with_capacity(tool_calls.len());
+        let (completed_sender, completed_receiver) = mpsc::channel();
         for tool_call in &tool_calls {
             let tool_name = tool_call.function.name.clone();
             let tool_call_id = tool_call.id.clone();
             let raw_arguments = tool_call.function.arguments.clone();
             let maybe_tool = registry.get(&tool_name).cloned();
-            handles.push(thread::spawn(move || -> CompletedToolCall {
+            let completed_sender = completed_sender.clone();
+            handles.push(thread::spawn(move || {
                 let result = match maybe_tool {
                     Some(tool) => execute_tool(&tool, raw_arguments.as_deref()),
                     None => {
@@ -1017,22 +1091,60 @@ fn run_session_state_controlled_internal(
                             .to_string()
                     }
                 };
-                CompletedToolCall {
+                let completed = CompletedToolCall {
                     tool_call_id,
                     tool_name,
                     result,
-                }
+                };
+                let _ = completed_sender.send(completed);
             }));
         }
+        drop(completed_sender);
 
         let mut completed = Vec::with_capacity(handles.len());
-        for handle in handles {
-            completed.push(
-                handle
-                    .join()
-                    .map_err(|_| anyhow!("tool worker thread panicked"))?,
-            );
+        let mut tool_progress = tool_calls
+            .iter()
+            .map(|tool_call| ToolExecutionProgress {
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.function.name.clone(),
+                arguments: tool_call.function.arguments.clone(),
+                status: ToolExecutionStatus::Running,
+            })
+            .collect::<Vec<_>>();
+        while completed.len() < handles.len() {
+            let completed_tool = completed_receiver
+                .recv()
+                .map_err(|_| anyhow!("tool worker channel closed unexpectedly"))?;
+            if let Some(progress) = tool_progress
+                .iter_mut()
+                .find(|item| item.tool_call_id == completed_tool.tool_call_id)
+            {
+                progress.status = if tool_result_looks_like_error(&completed_tool.result) {
+                    ToolExecutionStatus::Failed
+                } else {
+                    ToolExecutionStatus::Completed
+                };
+            }
+            if let Some(control) = &control {
+                control.emit_progress(ExecutionProgress {
+                    round_index,
+                    phase: ExecutionProgressPhase::Tools,
+                    tools: tool_progress.clone(),
+                });
+            }
+            completed.push(completed_tool);
         }
+        for handle in handles {
+            handle
+                .join()
+                .map_err(|_| anyhow!("tool worker thread panicked"))?;
+        }
+        completed.sort_by_key(|completed_tool| {
+            tool_calls
+                .iter()
+                .position(|tool_call| tool_call.id == completed_tool.tool_call_id)
+                .unwrap_or(usize::MAX)
+        });
         enforce_image_load_batch_limit(&mut completed);
         finish_pending_tool_wait_compaction(pending_compaction)?;
 

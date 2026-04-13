@@ -1,5 +1,23 @@
-version: 0.15.1
+version: 0.15.3
 ---
+
+# 0.15.3
+
+- 新增实时 interactive channel feedback：
+  AgentFrame 会通过独立 progress API 向 AgentHost 推送当前执行状态；模型调用阶段显示“思考中...”，工具执行阶段显示当前工具列表以及每个工具的执行中/已完成/失败状态。
+- Telegram 进度消息现在绑定到 foreground session 的 `session_state.progress_message`：
+  首次发送进度消息后持久化 channel message id，正常完成时删除并清理；服务重启后会扫描旧的 progress message id 并尽力删除，避免“正在执行”消息长期残留。
+- 升级 `workdir` 结构版本到 `0.21`：
+  `0.20 -> 0.21` upgrade step 会为旧 session 的 `session_state` 回填 `progress_message: null`；本次不影响 `config` schema。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  新增 workdir upgrade step；按 workdir-only 变更策略将仓库版本从 `0.15.2` 提升到 `0.15.3`。
+- 新增 Per-Tool Remote SSH Execution：
+  `exec_start`、`file_read`、`file_write`、`glob`、`grep`、`ls`、`edit` 与 `apply_patch` 支持可选 `remote="host"`，单次工具调用通过本机 `ssh host` 在远端执行；本地操作仍默认 local，prompt 明确要求省略 `remote` 以节省 Token。
+- `exec_wait`、`exec_observe` 与 `exec_kill` 会通过 `exec_id` 复用进程 metadata 中记录的 `remote`，不要求模型重复填写远端 host。
+- 升级 `workdir` 结构版本到 `0.20`：
+  exec 进程 metadata/status 新增 `remote` 字段，exec worker job 也会携带远端信息；`0.19 -> 0.20` upgrade step 会为旧 metadata/status 回填 `"local"`，并为旧 exec worker job 回填 `null`；本次不影响 `config` schema。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  新增 workdir upgrade step；按 workdir-only 变更策略将仓库版本从 `0.15.1` 提升到 `0.15.2`。
 
 # 0.15.1
 

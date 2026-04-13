@@ -1,6 +1,6 @@
 use crate::backend::{AgentBackendKind, BackendExecutionOptions};
 use agent_frame::config::AgentConfig as FrameAgentConfig;
-use agent_frame::{ChatMessage, SessionEvent, SessionState};
+use agent_frame::{ChatMessage, ExecutionProgress, SessionEvent, SessionState};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -43,6 +43,7 @@ pub enum ParentToChildMessage {
 pub enum ChildToParentMessage {
     Started,
     SessionEvent(SessionEvent),
+    ExecutionProgress(ExecutionProgress),
     ToolRequest {
         request_id: String,
         tool_name: String,
