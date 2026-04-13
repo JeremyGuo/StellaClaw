@@ -1,5 +1,16 @@
-version: 0.14.12
+version: 0.15.0
 ---
+
+# 0.15.0
+
+- 新增 `sandbox.map_docker_socket` 配置：
+  Docker socket 映射改为显式开关，默认关闭；只有 Linux + `bubblewrap` + `map_docker_socket=true` + `/run/docker.sock` 存在时才会把 Docker socket bind 进沙盒，macOS、Windows 和 `subprocess` 模式会跳过该功能。
+- 更新配置版本到 `0.15`：
+  新增 `agent_host/src/config/v0_15.rs` loader，保留 `0.14` 及更早配置升级路径；TUI 配置编辑器、最新配置骨架和示例配置均补齐 `sandbox.map_docker_socket`。
+- 更新部署文档：
+  `docs/DEPLOY.md` 说明 Docker socket 映射的正确开启方式，并明确不要在 systemd user service 中手工加入 `SupplementaryGroups=docker`，避免 `status=216/GROUP`。
+- 本次影响 `config` schema，不影响 `workdir` schema：
+  没有新增 workdir upgrade step；按配置变更策略将仓库版本从 `0.14.12` 提升到 `0.15.0`。
 
 # 0.14.12
 

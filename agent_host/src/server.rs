@@ -440,6 +440,7 @@ impl ServerRuntime {
             &SandboxConfig {
                 mode: effective_sandbox_mode,
                 bubblewrap_binary: self.sandbox.bubblewrap_binary.clone(),
+                map_docker_socket: self.sandbox.map_docker_socket,
             },
             &config.workspace_root,
             &config.runtime_state_root,
@@ -2109,6 +2110,7 @@ impl ServerRuntime {
             let sandbox = SandboxConfig {
                 mode: effective_sandbox_mode,
                 bubblewrap_binary: self.sandbox.bubblewrap_binary.clone(),
+                map_docker_socket: self.sandbox.map_docker_socket,
             };
             let result = run_one_shot_child_turn(
                 &sandbox,

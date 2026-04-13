@@ -1,5 +1,5 @@
 {
-  "version": "0.14",
+  "version": "0.15",
   "models": {
     "gemini3.1-flash-image": {
       "type": "openrouter-resp",
@@ -149,7 +149,8 @@
   },
   "sandbox": {
     "mode": "bubblewrap",
-    "bubblewrap_binary": "bwrap"
+    "bubblewrap_binary": "bwrap",
+    "map_docker_socket": false
   },
   "max_global_sub_agents": 4,
   "cron_poll_interval_seconds": 5,

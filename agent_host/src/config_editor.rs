@@ -22,7 +22,7 @@ use uuid::Uuid;
 const TOOLING_FIELD_COUNT: usize = 5;
 const MAIN_AGENT_FIELD_COUNT: usize = 13;
 const RUNTIME_FIELD_COUNT: usize = 2;
-const SANDBOX_FIELD_COUNT: usize = 2;
+const SANDBOX_FIELD_COUNT: usize = 3;
 
 pub fn run_config_editor(path: &Path) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -531,6 +531,14 @@ impl ConfigEditorApp {
                 nested_string(&self.value, &["sandbox", "bubblewrap_binary"])
                     .unwrap_or("bwrap")
                     .to_string(),
+            ),
+            (
+                "map_docker_socket",
+                bool_string(nested_bool(
+                    &self.value,
+                    &["sandbox", "map_docker_socket"],
+                    false,
+                )),
             ),
         ];
         render_field_list(
@@ -1309,6 +1317,15 @@ impl ConfigEditorApp {
                             InputTarget::Sandbox(field),
                         );
                     }
+                    SandboxField::MapDockerSocket => {
+                        self.toggle_sandbox_bool(field);
+                    }
+                }
+            }
+            KeyCode::Char(' ') => {
+                let field = SandboxField::from_index(self.sandbox_selected);
+                if field.is_bool() {
+                    self.toggle_sandbox_bool(field);
                 }
             }
             _ => {}
@@ -1976,10 +1993,25 @@ impl ConfigEditorApp {
             SandboxField::BubblewrapBinary => {
                 set_optional_trimmed_string(sandbox, field.key(), raw)
             }
+            SandboxField::MapDockerSocket => {
+                let parsed = parse_bool(raw, field.title())?;
+                set_bool(sandbox, field.key(), parsed);
+            }
         }
         self.dirty = true;
         self.status = StatusMessage::success(format!("Updated sandbox {}.", field.key()));
         Ok(())
+    }
+
+    fn toggle_sandbox_bool(&mut self, field: SandboxField) {
+        if !field.is_bool() {
+            return;
+        }
+        let value = !nested_bool(&self.value, &["sandbox", field.key()], false);
+        let sandbox = ensure_nested_object_mut(&mut self.value, &["sandbox"]);
+        set_bool(sandbox, field.key(), value);
+        self.dirty = true;
+        self.status = StatusMessage::success(format!("Set sandbox {} to {}.", field.key(), value));
     }
 
     fn apply_model_form(&mut self, form: &ModelFormState) -> Result<String> {
@@ -2754,13 +2786,15 @@ impl RuntimeField {
 enum SandboxField {
     Mode,
     BubblewrapBinary,
+    MapDockerSocket,
 }
 
 impl SandboxField {
     fn from_index(index: usize) -> Self {
         match index {
             0 => Self::Mode,
-            _ => Self::BubblewrapBinary,
+            1 => Self::BubblewrapBinary,
+            _ => Self::MapDockerSocket,
         }
     }
 
@@ -2768,6 +2802,7 @@ impl SandboxField {
         match self {
             Self::Mode => "mode",
             Self::BubblewrapBinary => "bubblewrap_binary",
+            Self::MapDockerSocket => "map_docker_socket",
         }
     }
 
@@ -2775,6 +2810,7 @@ impl SandboxField {
         match self {
             Self::Mode => "sandbox.mode",
             Self::BubblewrapBinary => "sandbox.bubblewrap_binary",
+            Self::MapDockerSocket => "sandbox.map_docker_socket",
         }
     }
 
@@ -2782,6 +2818,9 @@ impl SandboxField {
         match self {
             Self::Mode => "Choose subprocess or bubblewrap",
             Self::BubblewrapBinary => "Executable name for bubblewrap, typically bwrap",
+            Self::MapDockerSocket => {
+                "Linux bubblewrap only: bind /run/docker.sock into the sandbox"
+            }
         }
     }
 
@@ -2789,7 +2828,12 @@ impl SandboxField {
         match self {
             Self::Mode => "subprocess",
             Self::BubblewrapBinary => "bwrap",
+            Self::MapDockerSocket => "false",
         }
+    }
+
+    fn is_bool(self) -> bool {
+        matches!(self, Self::MapDockerSocket)
     }
 }
 
@@ -4003,6 +4047,16 @@ fn parse_memory_system(raw: &str) -> Result<MemorySystem> {
     }
 }
 
+fn parse_bool(raw: &str, field_name: &str) -> Result<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "on" | "1" => Ok(true),
+        "false" | "no" | "off" | "0" => Ok(false),
+        other => Err(anyhow!(
+            "invalid boolean `{other}` for {field_name}; expected true or false"
+        )),
+    }
+}
+
 trait MemorySystemConfigValue {
     fn as_config_value(self) -> &'static str;
 }
@@ -4158,7 +4212,8 @@ fn latest_server_config_skeleton() -> Value {
         },
         "sandbox": {
             "mode": "subprocess",
-            "bubblewrap_binary": "bwrap"
+            "bubblewrap_binary": "bwrap",
+            "map_docker_socket": false
         },
         "max_global_sub_agents": 4,
         "cron_poll_interval_seconds": 5,
@@ -4410,6 +4465,7 @@ mod tests {
         assert_eq!(skeleton["version"], json!(LATEST_CONFIG_VERSION));
         assert_eq!(skeleton["main_agent"]["memory_system"], json!("layered"));
         assert_eq!(skeleton["sandbox"]["mode"], json!("subprocess"));
+        assert_eq!(skeleton["sandbox"]["map_docker_socket"], json!(false));
         assert_eq!(
             skeleton["main_agent"]["time_awareness"]["emit_system_date_on_user_message"],
             json!(false)
@@ -4461,7 +4517,8 @@ mod tests {
             },
             "sandbox": {
                 "mode": "subprocess",
-                "bubblewrap_binary": "bwrap"
+                "bubblewrap_binary": "bwrap",
+                "map_docker_socket": false
             },
             "max_global_sub_agents": 4,
             "cron_poll_interval_seconds": 5,

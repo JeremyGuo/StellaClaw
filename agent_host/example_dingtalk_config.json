@@ -1,5 +1,5 @@
 {
-  "version": "0.14",
+  "version": "0.15",
   "models": {
     "main": {
       "backend": "agent_frame",
@@ -44,6 +44,11 @@
     "timeout_observation_compaction": {
       "enabled": true
     }
+  },
+  "sandbox": {
+    "mode": "subprocess",
+    "bubblewrap_binary": "bwrap",
+    "map_docker_socket": false
   },
   "channels": [
     {

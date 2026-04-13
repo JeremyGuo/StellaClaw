@@ -682,6 +682,10 @@ fn build_bubblewrap_command(
     if Path::new("/run").exists() {
         command.args(["--ro-bind", "/run", "/run"]);
     }
+    let docker_socket = Path::new("/run/docker.sock");
+    if cfg!(target_os = "linux") && sandbox.map_docker_socket && docker_socket.exists() {
+        command.args(["--bind", "/run/docker.sock", "/run/docker.sock"]);
+    }
     command.args(["--dev", "/dev"]);
     command.args(["--proc", "/proc"]);
     command.args(["--tmpfs", "/tmp"]);
@@ -859,6 +863,7 @@ mod tests {
             &SandboxConfig {
                 mode: SandboxMode::Bubblewrap,
                 bubblewrap_binary: "bwrap".to_string(),
+                map_docker_socket: false,
             },
             &current_exe,
             &workspace_root,
@@ -905,6 +910,7 @@ mod tests {
             &SandboxConfig {
                 mode: SandboxMode::Bubblewrap,
                 bubblewrap_binary: "bwrap".to_string(),
+                map_docker_socket: false,
             },
             &current_exe,
             &workspace_root,

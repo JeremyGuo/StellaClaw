@@ -17,6 +17,7 @@ mod v0_11;
 mod v0_12;
 mod v0_13;
 mod v0_14;
+mod v0_15;
 mod v0_2;
 mod v0_3;
 mod v0_4;
@@ -27,7 +28,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.14";
+pub const LATEST_CONFIG_VERSION: &str = "0.15";
 pub const VERSION_0_2: &str = "0.2";
 pub const VERSION_0_3: &str = "0.3";
 pub const VERSION_0_4: &str = "0.4";
@@ -40,6 +41,7 @@ pub const VERSION_0_10: &str = "0.10";
 pub const VERSION_0_11: &str = "0.11";
 pub const VERSION_0_12: &str = "0.12";
 pub const VERSION_0_13: &str = "0.13";
+pub const VERSION_0_14: &str = "0.14";
 
 trait ConfigLoader {
     fn version(&self) -> &'static str;
@@ -509,6 +511,8 @@ pub struct SandboxConfig {
     pub mode: SandboxMode,
     #[serde(default = "default_bubblewrap_binary")]
     pub bubblewrap_binary: String,
+    #[serde(default)]
+    pub map_docker_socket: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -826,7 +830,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let loaders: [&dyn ConfigLoader; 14] = [
+    let loaders: [&dyn ConfigLoader; 15] = [
         &v0_1::LegacyConfigLoader,
         &v0_2::VersionedConfigLoader,
         &v0_3::VersionedConfigLoader,
@@ -841,6 +845,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         &v0_12::LatestConfigLoader,
         &v0_13::LatestConfigLoader,
         &v0_14::LatestConfigLoader,
+        &v0_15::LatestConfigLoader,
     ];
     let loader = loaders
         .into_iter()
@@ -942,7 +947,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
     let config = {
-        let loaders: [&dyn ConfigLoader; 14] = [
+        let loaders: [&dyn ConfigLoader; 15] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
             &v0_3::VersionedConfigLoader,
@@ -957,6 +962,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
             &v0_12::LatestConfigLoader,
             &v0_13::LatestConfigLoader,
             &v0_14::LatestConfigLoader,
+            &v0_15::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()

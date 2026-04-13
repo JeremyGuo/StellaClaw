@@ -114,8 +114,19 @@ TELEGRAM_BOT_TOKEN=...
 - `Models`: 模型 alias、上游模型名、API key 环境变量
 - `Tooling`: `web_search`、`image`、`image_gen` 指向哪个模型 alias
 - `Main Agent`: 默认语言、memory、compaction
-- `Sandbox`: Linux 可选 `bubblewrap` 或 `subprocess`
+- `Sandbox`: Linux 可选 `bubblewrap` 或 `subprocess`；需要让 bubblewrap 沙盒内命令访问宿主 Docker 时，显式打开 `map_docker_socket`
 - `Channels`: Telegram 的 `bot_token_env` 是否是 `TELEGRAM_BOT_TOKEN`
+
+`sandbox.map_docker_socket` 默认是 `false`。只有在 Linux + `sandbox.mode = "bubblewrap"` + 宿主存在 `/run/docker.sock` 时才会把 Docker socket 映射进沙盒；macOS、Windows 和 `subprocess` 沙盒会直接跳过这个功能。
+
+如果开启 Docker socket 映射，请确保运行服务的 Linux 用户本身已经属于 `docker` 组：
+
+```bash
+groups
+sudo usermod -aG docker "$USER"
+```
+
+加入组后需要重新登录，或重启 user manager/session，才能让 systemd user service 拿到新的组成员身份。
 
 ### 4. 前台试运行
 
@@ -134,6 +145,15 @@ systemctl --user restart mybot.service
 systemctl --user enable mybot.service
 systemctl --user status mybot.service --no-pager
 ```
+
+`partyclaw setup` 生成的是 systemd user service，不会写入 `SupplementaryGroups=docker`。不要手工给 user service 加类似下面的 drop-in：
+
+```ini
+[Service]
+SupplementaryGroups=docker
+```
+
+用户级 systemd 在不少环境里不能这样切换组，可能导致服务启动前失败并报 `status=216/GROUP` / `Changing group credentials failed: Operation not permitted`。正确做法是让当前用户加入 `docker` 组，然后按上面的 `sandbox.map_docker_socket` 配置决定是否映射 `/run/docker.sock`。
 
 如果希望机器重启后，即使该用户没有登录也自动拉起服务：
 
@@ -302,6 +322,7 @@ Windows 可以原生编译运行。请在配置里使用 `subprocess` 沙盒；`
 - PTY 只在 Unix 平台启用；Windows 上请求 TTY 时会退化为普通管道执行
 - 后台任务进程用 Windows 的 `tasklist` / `taskkill` 检查和终止
 - `partyclaw setup` 仍然只支持 Linux，不会生成 Windows Service
+- `sandbox.map_docker_socket` 是 Linux bubblewrap 专用能力，Windows 会跳过；Windows 上请直接使用 Docker Desktop / 原生命令，不需要映射 `/run/docker.sock`
 
 ### 1. 安装依赖
 
@@ -559,6 +580,32 @@ Linux 服务状态：
 systemctl --user status mybot.service --no-pager
 journalctl --user -u mybot.service -n 200 --no-pager
 ```
+
+如果 Linux user service 反复 auto-restart，并且日志出现：
+
+```text
+Changing group credentials failed: Operation not permitted
+status=216/GROUP
+```
+
+检查是否有旧的 docker group drop-in：
+
+```bash
+systemctl --user cat mybot.service
+ls ~/.config/systemd/user/mybot.service.d
+```
+
+如果看到 `SupplementaryGroups=docker`，请移走该 drop-in 并重载：
+
+```bash
+mv ~/.config/systemd/user/mybot.service.d/docker.conf \
+  ~/.config/systemd/user/mybot.service.d/docker.conf.disabled
+systemctl --user daemon-reload
+systemctl --user reset-failed mybot.service
+systemctl --user restart mybot.service
+```
+
+如果该 drop-in 目录是 root 创建的，`mv` 可能需要加 `sudo`。
 
 macOS 服务状态：
 
