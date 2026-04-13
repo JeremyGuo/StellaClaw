@@ -1000,6 +1000,7 @@ fn build_remote_shell_command(host: &str, command: &str, cwd: &Path, tty: bool) 
         shell_quote(command),
         shell_quote(&cwd.display().to_string())
     );
+    let remote_command = format!("sh -lc {}", shell_quote(&remote_script));
     let mut command_builder = Command::new(resolve_ssh_executable());
     command_builder
         .arg("-o")
@@ -1011,12 +1012,7 @@ fn build_remote_shell_command(host: &str, command: &str, cwd: &Path, tty: bool) 
     } else {
         command_builder.arg("-T");
     }
-    command_builder
-        .arg(host)
-        .arg("--")
-        .arg("sh")
-        .arg("-lc")
-        .arg(remote_script);
+    command_builder.arg(host).arg(remote_command);
     Ok(command_builder)
 }
 

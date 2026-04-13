@@ -87,10 +87,8 @@ if [ "$1" = "-T" ] || [ "$1" = "-tt" ]; then
   shift
 fi
 shift
-if [ "$1" = "--" ]; then
-  shift
-fi
-exec "$@"
+remote_command="$*"
+exec sh -c "$remote_command"
 "#,
     )
     .unwrap();
@@ -2130,13 +2128,13 @@ fn controlled_run_emits_execution_progress_snapshots() -> Result<()> {
                 .iter()
                 .any(|tool| tool.status == ToolExecutionStatus::Running)
     }));
-    assert!(progress.iter().any(|item| {
-        item.phase == ExecutionProgressPhase::Tools
-            && item
-                .tools
-                .iter()
-                .any(|tool| tool.status == ToolExecutionStatus::Completed)
-    }));
+    assert_eq!(
+        progress
+            .iter()
+            .filter(|item| item.phase == ExecutionProgressPhase::Tools)
+            .count(),
+        1
+    );
     Ok(())
 }
 

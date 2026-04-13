@@ -630,7 +630,7 @@ fn ssh_command(host: &str, tty: bool) -> Command {
     } else {
         command.arg("-T");
     }
-    command.arg(host).arg("--");
+    command.arg(host);
     command
 }
 
@@ -658,10 +658,9 @@ fn run_remote_command(
         script.push_str(&shell_quote(arg));
     }
     let mut command = ssh_command(host, false);
+    let remote_command = format!("sh -lc {}", shell_quote(&script));
     command
-        .arg("sh")
-        .arg("-lc")
-        .arg(script)
+        .arg(remote_command)
         .stdin(if stdin.is_some() {
             Stdio::piped()
         } else {
@@ -4622,7 +4621,7 @@ mod tests {
 
     #[cfg(unix)]
     fn write_fake_ssh(temp_dir: &TempDir) -> PathBuf {
-        write_fake_ssh_with_path(temp_dir, "exec \"$@\"")
+        write_fake_ssh_with_path(temp_dir, "exec sh -c \"$remote_command\"")
     }
 
     #[cfg(unix)]
@@ -4639,9 +4638,7 @@ if [ "$1" = "-T" ] || [ "$1" = "-tt" ]; then
   shift
 fi
 shift
-if [ "$1" = "--" ]; then
-  shift
-fi
+remote_command="$*"
 {path_line}
 "#
             ),
@@ -5049,7 +5046,10 @@ fi
         std::os::unix::fs::symlink(python3_path, bin_dir.join("python")).unwrap();
         let fake_ssh = write_fake_ssh_with_path(
             &temp_dir,
-            &format!("PATH='{}' exec \"$@\"", bin_dir.display()),
+            &format!(
+                "PATH='{}' exec sh -c \"$remote_command\"",
+                bin_dir.display()
+            ),
         );
         let _ssh_guard = EnvVarGuard::set("AGENT_FRAME_SSH_BIN", fake_ssh.as_os_str());
         let workspace_root = temp_dir.path().join("workspace");
@@ -5094,7 +5094,10 @@ fi
         std::os::unix::fs::symlink("/bin/sh", bin_dir.join("sh")).unwrap();
         let fake_ssh = write_fake_ssh_with_path(
             &temp_dir,
-            &format!("PATH='{}' exec \"$@\"", bin_dir.display()),
+            &format!(
+                "PATH='{}' exec sh -c \"$remote_command\"",
+                bin_dir.display()
+            ),
         );
         let _ssh_guard = EnvVarGuard::set("AGENT_FRAME_SSH_BIN", fake_ssh.as_os_str());
         let workspace_root = temp_dir.path().join("workspace");

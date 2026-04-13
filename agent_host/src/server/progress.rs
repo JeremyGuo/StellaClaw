@@ -1,6 +1,6 @@
 use super::*;
 use crate::channel::{ProgressFeedback, ProgressFeedbackFinalState, ProgressFeedbackUpdate};
-use agent_frame::{ExecutionProgressPhase, ToolExecutionStatus};
+use agent_frame::ExecutionProgressPhase;
 
 impl ServerRuntime {
     pub(super) async fn cleanup_stale_progress_messages_once(&self) -> Result<()> {
@@ -117,7 +117,7 @@ impl ServerRuntime {
         let feedback = ProgressFeedback {
             turn_id: session.id.to_string(),
             text: progress_text_for_execution(model_key, progress),
-            important: matches!(progress.phase, ExecutionProgressPhase::Thinking),
+            important: true,
             final_state: None,
             message_id: self.current_progress_message_id(session),
         };
@@ -175,53 +175,21 @@ fn progress_feedback_for_event(
     event: &SessionEvent,
 ) -> Option<ProgressFeedback> {
     let (activity, important, final_state) = match event {
-        SessionEvent::SessionStarted { .. } => ("开始处理".to_string(), true, None),
-        SessionEvent::CompactionStarted { phase, .. } => {
-            (format!("压缩上下文：{phase}"), true, None)
+        SessionEvent::CompactionStarted { .. } => ("压缩中...".to_string(), true, None),
+        SessionEvent::SessionStarted { .. } | SessionEvent::CompactionCompleted { .. } => {
+            return None;
         }
-        SessionEvent::CompactionCompleted { compacted, .. } => (
-            if *compacted {
-                "上下文压缩完成".to_string()
-            } else {
-                "跳过上下文压缩".to_string()
-            },
-            true,
-            None,
-        ),
         SessionEvent::RoundStarted { .. }
         | SessionEvent::ModelCallStarted { .. }
         | SessionEvent::ModelCallCompleted { .. } => return None,
-        SessionEvent::ToolWaitCompactionScheduled { tool_name, .. } => (
-            format!("等待工具 `{}` 时准备压缩上下文", tool_name),
-            false,
-            None,
-        ),
-        SessionEvent::ToolWaitCompactionStarted { tool_name, .. } => (
-            format!("等待工具 `{}`，正在压缩上下文", tool_name),
-            true,
-            None,
-        ),
-        SessionEvent::ToolWaitCompactionCompleted {
-            tool_name,
-            compacted,
-            ..
-        } => (
-            format!(
-                "工具 `{}` 等待期间上下文压缩{}",
-                tool_name,
-                if *compacted { "完成" } else { "跳过" }
-            ),
-            true,
-            None,
-        ),
+        SessionEvent::ToolWaitCompactionStarted { .. } => ("压缩中...".to_string(), true, None),
+        SessionEvent::ToolWaitCompactionScheduled { .. }
+        | SessionEvent::ToolWaitCompactionCompleted { .. } => return None,
         SessionEvent::ToolCallStarted { .. } | SessionEvent::ToolCallCompleted { .. } => {
             return None;
         }
-        SessionEvent::SessionYielded { phase, .. } => {
-            (format!("已到安全边界：{phase}，等待继续"), true, None)
-        }
-        SessionEvent::PrefixRewriteApplied { .. } => {
-            ("已更新压缩后的上下文前缀".to_string(), false, None)
+        SessionEvent::SessionYielded { .. } | SessionEvent::PrefixRewriteApplied { .. } => {
+            return None;
         }
         SessionEvent::SessionCompleted { .. } => (
             "完成".to_string(),
@@ -257,21 +225,13 @@ fn progress_text_for_execution(model_key: &str, progress: &ExecutionProgress) ->
             model_key
         ),
         ExecutionProgressPhase::Tools => {
-            let mut lines = vec![
-                "正在执行".to_string(),
-                format!("模型：{model_key}"),
-                "工具：".to_string(),
-            ];
+            let mut lines = vec!["正在执行".to_string(), format!("模型：{model_key}")];
+            lines.push("状态：工具执行中".to_string());
             for tool in &progress.tools {
-                let status = match tool.status {
-                    ToolExecutionStatus::Running => "执行中",
-                    ToolExecutionStatus::Completed => "已完成",
-                    ToolExecutionStatus::Failed => "失败",
-                };
                 lines.push(format!(
                     "- {}：{}",
-                    status,
-                    render_tool_activity(&tool.tool_name, tool.arguments.as_deref())
+                    tool.tool_name,
+                    render_tool_brief_arguments(&tool.tool_name, tool.arguments.as_deref())
                 ));
             }
             lines.push(String::new());
@@ -281,120 +241,31 @@ fn progress_text_for_execution(model_key: &str, progress: &ExecutionProgress) ->
     }
 }
 
-fn render_tool_activity(tool_name: &str, arguments: Option<&str>) -> String {
+fn render_tool_brief_arguments(tool_name: &str, arguments: Option<&str>) -> String {
     let args = arguments
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
         .unwrap_or(Value::Null);
     let object = args.as_object();
-    match tool_name {
-        "exec_start" | "exec_command" => {
-            let command = first_string(object, &["cmd", "command"])
-                .map(|value| truncate_single_line(value, 160))
-                .unwrap_or_else(|| "命令".to_string());
-            with_remote(object, format!("执行 `{command}`"))
+    let detail = match tool_name {
+        "exec_start" | "exec_command" => first_string(object, &["cmd", "command"]),
+        "exec_wait" | "exec_write" | "exec_kill" => first_string(object, &["exec_id", "id"]),
+        "file_read" | "read_file" | "file_write" | "file_edit" | "ls" | "image_load"
+        | "pdf_read" | "audio_transcribe" => first_string(object, &["path", "file_path"]),
+        "glob" | "grep" | "web_search" => first_string(object, &["pattern", "query", "q"]),
+        "web_fetch" => first_string(object, &["url"]),
+        "image_generate" | "subagent_start" | "spawn_agent" => {
+            first_string(object, &["prompt", "message", "task"])
         }
-        "exec_wait" => {
-            let exec_id = first_string(object, &["exec_id", "id"]).unwrap_or("进程");
-            with_remote(
-                object,
-                format!("等待 `{}`", truncate_single_line(exec_id, 80)),
-            )
-        }
-        "exec_write" => {
-            let exec_id = first_string(object, &["exec_id", "id"]).unwrap_or("进程");
-            with_remote(
-                object,
-                format!("写入 `{}`", truncate_single_line(exec_id, 80)),
-            )
-        }
-        "exec_kill" => {
-            let exec_id = first_string(object, &["exec_id", "id"]).unwrap_or("进程");
-            with_remote(
-                object,
-                format!("终止 `{}`", truncate_single_line(exec_id, 80)),
-            )
-        }
-        "file_read" | "read_file" => with_remote(object, path_activity("读取文件", object)),
-        "file_write" => with_remote(object, path_activity("写入文件", object)),
-        "file_edit" => with_remote(object, path_activity("编辑文件", object)),
-        "apply_patch" => with_remote(object, "应用补丁".to_string()),
-        "ls" => with_remote(object, path_activity("列目录", object)),
-        "glob" => with_remote(object, pattern_activity("查找文件", object)),
-        "grep" => with_remote(object, pattern_activity("搜索文本", object)),
-        "web_search" => first_string(object, &["query", "q"])
-            .map(|query| format!("网页搜索 `{}`", truncate_single_line(query, 120)))
-            .unwrap_or_else(|| "网页搜索".to_string()),
-        "web_fetch" => first_string(object, &["url"])
-            .map(|url| format!("读取网页 `{}`", truncate_single_line(url, 120)))
-            .unwrap_or_else(|| "读取网页".to_string()),
-        "image_load" => path_activity("读取图片", object),
-        "image_generate" => first_string(object, &["prompt"])
-            .map(|prompt| format!("生成图片 `{}`", truncate_single_line(prompt, 120)))
-            .unwrap_or_else(|| "生成图片".to_string()),
-        "pdf_read" => path_activity("读取 PDF", object),
-        "audio_transcribe" => path_activity("转写音频", object),
-        "user_tell" => "发送中间消息".to_string(),
-        "subagent_start" | "spawn_agent" => first_string(object, &["prompt", "message", "task"])
-            .map(|prompt| format!("启动子代理 `{}`", truncate_single_line(prompt, 120)))
-            .unwrap_or_else(|| "启动子代理".to_string()),
-        "wait_agent" => "等待子代理".to_string(),
-        "close_agent" => "关闭子代理".to_string(),
-        other => generic_tool_activity(other, object),
-    }
-}
-
-fn path_activity(prefix: &str, object: Option<&serde_json::Map<String, Value>>) -> String {
-    let path = first_string(object, &["path", "file_path", "notebook_path"])
-        .map(|value| truncate_single_line(value, 120))
-        .unwrap_or_else(|| "目标".to_string());
-    format!("{prefix} `{path}`")
-}
-
-fn pattern_activity(prefix: &str, object: Option<&serde_json::Map<String, Value>>) -> String {
-    let pattern = first_string(object, &["pattern", "query", "q"])
-        .map(|value| truncate_single_line(value, 120))
-        .unwrap_or_else(|| "模式".to_string());
-    let path = first_string(object, &["path"])
-        .filter(|value| !value.trim().is_empty())
-        .map(|value| format!(" in `{}`", truncate_single_line(value, 80)))
-        .unwrap_or_default();
-    format!("{prefix} `{pattern}`{path}")
-}
-
-fn generic_tool_activity(
-    tool_name: &str,
-    object: Option<&serde_json::Map<String, Value>>,
-) -> String {
-    let details = object
-        .map(|object| {
+        _ => object.and_then(|object| {
             object
-                .iter()
-                .take(2)
-                .map(|(key, value)| {
-                    let value = value
-                        .as_str()
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| value.to_string());
-                    format!("{key}: {}", truncate_single_line(&value, 80))
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .filter(|value| !value.is_empty());
-    match details {
-        Some(details) => format!("{} ({})", tool_name, details),
-        None => tool_name.to_string(),
-    }
-}
-
-fn with_remote(object: Option<&serde_json::Map<String, Value>>, activity: String) -> String {
-    let Some(remote) = first_string(object, &["remote"])
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && *value != "local")
-    else {
-        return activity;
+                .values()
+                .find_map(|value| value.as_str().filter(|value| !value.trim().is_empty()))
+        }),
     };
-    format!("{activity} @ {remote}")
+    detail
+        .map(|value| truncate_single_line_strict(value, 20))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "-".to_string())
 }
 
 fn first_string<'a>(
@@ -416,42 +287,25 @@ fn truncate_single_line(input: &str, max_chars: usize) -> String {
     out
 }
 
+fn truncate_single_line_strict(input: &str, max_chars: usize) -> String {
+    let compact = input.split_whitespace().collect::<Vec<_>>().join(" ");
+    if compact.chars().count() <= max_chars {
+        return compact;
+    }
+    if max_chars <= 3 {
+        return compact.chars().take(max_chars).collect();
+    }
+    let mut out = compact.chars().take(max_chars - 3).collect::<String>();
+    out.push_str("...");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn renders_exec_start_as_human_progress() {
-        let text = render_tool_activity(
-            "exec_start",
-            Some(
-                r#"{"cmd":"cargo test --manifest-path agent_host/Cargo.toml","remote":"wuwen-dev6"}"#,
-            ),
-        );
-
-        assert_eq!(
-            text,
-            "执行 `cargo test --manifest-path agent_host/Cargo.toml` @ wuwen-dev6"
-        );
-    }
-
-    #[test]
-    fn renders_file_tools_as_human_progress() {
-        assert_eq!(
-            render_tool_activity("file_read", Some(r#"{"path":"src/main.rs"}"#)),
-            "读取文件 `src/main.rs`"
-        );
-        assert_eq!(
-            render_tool_activity(
-                "grep",
-                Some(r#"{"pattern":"ToolCallStarted","path":"agent_host/src"}"#)
-            ),
-            "搜索文本 `ToolCallStarted` in `agent_host/src`"
-        );
-    }
-
-    #[test]
-    fn renders_execution_progress_as_tool_status_list() {
+    fn renders_execution_progress_as_compact_tool_list() {
         let text = progress_text_for_execution(
             "gpt54",
             &ExecutionProgress {
@@ -461,22 +315,26 @@ mod tests {
                     agent_frame::ToolExecutionProgress {
                         tool_call_id: "call-1".to_string(),
                         tool_name: "exec_start".to_string(),
-                        arguments: Some(r#"{"cmd":"cargo test"}"#.to_string()),
-                        status: ToolExecutionStatus::Running,
+                        arguments: Some(
+                            r#"{"cmd":"cargo test --manifest-path agent_host/Cargo.toml"}"#
+                                .to_string(),
+                        ),
+                        status: agent_frame::ToolExecutionStatus::Running,
                     },
                     agent_frame::ToolExecutionProgress {
                         tool_call_id: "call-2".to_string(),
                         tool_name: "file_read".to_string(),
                         arguments: Some(r#"{"path":"src/main.rs"}"#.to_string()),
-                        status: ToolExecutionStatus::Completed,
+                        status: agent_frame::ToolExecutionStatus::Completed,
                     },
                 ],
             },
         );
 
-        assert!(text.contains("工具："));
-        assert!(text.contains("- 执行中：执行 `cargo test`"));
-        assert!(text.contains("- 已完成：读取文件 `src/main.rs`"));
+        assert!(text.contains("状态：工具执行中"));
+        assert!(text.contains("- exec_start：cargo test --mani..."));
+        assert!(text.contains("- file_read：src/main.rs"));
+        assert!(!text.contains("已完成"));
     }
 
     #[test]

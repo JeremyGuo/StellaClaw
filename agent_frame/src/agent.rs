@@ -1102,36 +1102,10 @@ fn run_session_state_controlled_internal(
         drop(completed_sender);
 
         let mut completed = Vec::with_capacity(handles.len());
-        let mut tool_progress = tool_calls
-            .iter()
-            .map(|tool_call| ToolExecutionProgress {
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.function.name.clone(),
-                arguments: tool_call.function.arguments.clone(),
-                status: ToolExecutionStatus::Running,
-            })
-            .collect::<Vec<_>>();
         while completed.len() < handles.len() {
             let completed_tool = completed_receiver
                 .recv()
                 .map_err(|_| anyhow!("tool worker channel closed unexpectedly"))?;
-            if let Some(progress) = tool_progress
-                .iter_mut()
-                .find(|item| item.tool_call_id == completed_tool.tool_call_id)
-            {
-                progress.status = if tool_result_looks_like_error(&completed_tool.result) {
-                    ToolExecutionStatus::Failed
-                } else {
-                    ToolExecutionStatus::Completed
-                };
-            }
-            if let Some(control) = &control {
-                control.emit_progress(ExecutionProgress {
-                    round_index,
-                    phase: ExecutionProgressPhase::Tools,
-                    tools: tool_progress.clone(),
-                });
-            }
             completed.push(completed_tool);
         }
         for handle in handles {
