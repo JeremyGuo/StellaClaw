@@ -1,5 +1,18 @@
-version: 0.15.4
+version: 0.15.5
 ---
+
+# 0.15.5
+
+- 新增 conversation 级别的 `remote_workpaths`：
+  foreground/background 等同一 conversation 下的 agent 共享远端 SSH 工作目录登记；`workpath_add` 会保存 host/path/description，并立即尝试读取远端 `AGENTS.md`，后续重建 system prompt 时会自动拼接登记信息并重新加载远端规则。
+- 调整 compaction 提示：
+  context compaction 不再要求摘要重复保存 remote workpath 的 host/path/description 或远端 `AGENTS.md` 内容，这些信息会由 conversation settings 重建。
+- 改进 context token 估算：
+  `agent_frame` 改用开源 `tiktoken-rs` 的 `o200k_base` BPE tokenizer 估算文本与工具 schema token 数，不再使用字符/字节比例粗估；内联图片、文件和音频 payload 仍按固定占位成本估算，避免大块 base64 被完整 tokenize。
+- 升级 `workdir` 结构版本到 `0.22`：
+  `0.21 -> 0.22` upgrade step 会为旧 conversation 的 `settings` 回填 `remote_workpaths: []`；本次不影响 `config` schema。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  新增 workdir upgrade step；按 workdir-only 变更策略将仓库版本从 `0.15.4` 提升到 `0.15.5`。
 
 # 0.15.4
 

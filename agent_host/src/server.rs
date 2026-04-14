@@ -43,6 +43,7 @@ use crate::sink::{SinkRouter, SinkTarget};
 use crate::snapshot::{SnapshotBundle, SnapshotManager};
 use crate::subagent::{HostedSubagent, HostedSubagentInner, SubagentState};
 use crate::upgrade::upgrade_workdir;
+use crate::workpath::{load_remote_agents_md_for_workpath, load_result_to_json};
 use crate::workspace::{WorkspaceManager, WorkspaceMountMaterialization};
 use crate::zgent::kernel::{
     PersistentZgentKernelSession, ZgentKernelRuntimeSpec, zgent_native_kernel_runtime_available,
@@ -858,6 +859,81 @@ impl ServerRuntime {
         }))
     }
 
+    fn add_remote_workpath(
+        &self,
+        session: &SessionSnapshot,
+        host: String,
+        path: String,
+        description: String,
+    ) -> Result<Value> {
+        let snapshot = self.with_conversations(|conversations| {
+            conversations.add_remote_workpath(&session.address, &host, &path, &description)
+        })?;
+        let workpath = snapshot
+            .settings
+            .remote_workpaths
+            .iter()
+            .find(|item| item.host == host.trim() && item.path == path.trim())
+            .cloned()
+            .ok_or_else(|| anyhow!("remote workpath was not persisted"))?;
+        let agents_md = load_remote_agents_md_for_workpath(&workpath);
+        Ok(json!({
+            "ok": true,
+            "host": workpath.host,
+            "path": workpath.path,
+            "description": workpath.description,
+            "agents_md": load_result_to_json(&agents_md),
+            "chat_version_rotated": true,
+            "note": "The remote workpath is stored at the conversation level and shared by foreground/background agents. The current turn's system prompt does not hot-reload; the next turn or rebuilt agent prompt will include it.",
+        }))
+    }
+
+    fn modify_remote_workpath(
+        &self,
+        session: &SessionSnapshot,
+        host: String,
+        path: String,
+        description: String,
+    ) -> Result<Value> {
+        let snapshot = self.with_conversations(|conversations| {
+            conversations.modify_remote_workpath(&session.address, &host, &path, &description)
+        })?;
+        let workpath = snapshot
+            .settings
+            .remote_workpaths
+            .iter()
+            .find(|item| item.host == host.trim() && item.path == path.trim())
+            .cloned()
+            .ok_or_else(|| anyhow!("remote workpath was not found after modification"))?;
+        Ok(json!({
+            "ok": true,
+            "host": workpath.host,
+            "path": workpath.path,
+            "description": workpath.description,
+            "chat_version_rotated": true,
+        }))
+    }
+
+    fn remove_remote_workpath(
+        &self,
+        session: &SessionSnapshot,
+        host: String,
+        path: String,
+    ) -> Result<Value> {
+        self.with_conversations(|conversations| {
+            conversations
+                .remove_remote_workpath(&session.address, &host, &path)
+                .map(|_| ())
+        })?;
+        Ok(json!({
+            "ok": true,
+            "removed": true,
+            "host": host.trim(),
+            "path": path.trim(),
+            "chat_version_rotated": true,
+        }))
+    }
+
     fn upload_shared_profile_files(&self, session: &SessionSnapshot) -> Result<Value> {
         let report =
             upload_workspace_shared_profile_files(&self.agent_workspace, &session.workspace_root)?;
@@ -1294,6 +1370,12 @@ impl ServerRuntime {
             .or_else(|| self.inferred_agent_backend_for_model(model_key))
             .unwrap_or(AgentBackendKind::AgentFrame);
         let prompt_available_models = self.available_agent_models(prompt_agent_backend);
+        let remote_workpaths = self.with_conversations(|conversations| {
+            Ok(conversations
+                .get_snapshot(&session.address)
+                .map(|snapshot| snapshot.settings.remote_workpaths)
+                .unwrap_or_default())
+        })?;
 
         Ok(FrameAgentConfig {
             enabled_tools: self.main_agent.enabled_tools.clone(),
@@ -1325,6 +1407,7 @@ impl ServerRuntime {
                 &self.agent_workspace,
                 session,
                 &workspace_summary,
+                &remote_workpaths,
                 kind,
                 model_key,
                 model,
@@ -1498,6 +1581,88 @@ impl ServerRuntime {
                         optional_string_arg(object, "target_dir")?,
                         optional_string_arg(object, "source_summary_update")?,
                         optional_string_arg(object, "target_summary_update")?,
+                    )
+                },
+            ));
+
+            let runtime = self.clone();
+            let workpath_session = session.clone();
+            tools.push(Tool::new(
+                "workpath_add",
+                "Register a remote SSH workpath for this whole conversation. Use this when a remote directory should become durable shared context for foreground/background agents. The host must be an SSH alias, path is the remote directory, and description must explain what the directory is for. On success, the tool immediately tries to load path/AGENTS.md and future rebuilt prompts will include the host/path/description and reload AGENTS.md automatically.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "host": {"type": "string"},
+                        "path": {"type": "string"},
+                        "description": {"type": "string"}
+                    },
+                    "required": ["host", "path", "description"],
+                    "additionalProperties": false
+                }),
+                move |arguments| {
+                    let object = arguments
+                        .as_object()
+                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                    runtime.add_remote_workpath(
+                        &workpath_session,
+                        string_arg_required(object, "host")?,
+                        string_arg_required(object, "path")?,
+                        string_arg_required(object, "description")?,
+                    )
+                },
+            ));
+
+            let runtime = self.clone();
+            let workpath_session = session.clone();
+            tools.push(Tool::new(
+                "workpath_modify",
+                "Modify the description for an existing conversation-level remote workpath. The host and path identify the existing remote workpath; only description is changed.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "host": {"type": "string"},
+                        "path": {"type": "string"},
+                        "description": {"type": "string"}
+                    },
+                    "required": ["host", "path", "description"],
+                    "additionalProperties": false
+                }),
+                move |arguments| {
+                    let object = arguments
+                        .as_object()
+                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                    runtime.modify_remote_workpath(
+                        &workpath_session,
+                        string_arg_required(object, "host")?,
+                        string_arg_required(object, "path")?,
+                        string_arg_required(object, "description")?,
+                    )
+                },
+            ));
+
+            let runtime = self.clone();
+            let workpath_session = session.clone();
+            tools.push(Tool::new(
+                "workpath_remove",
+                "Remove an existing conversation-level remote workpath. The host and path identify the remote workpath to remove.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "host": {"type": "string"},
+                        "path": {"type": "string"}
+                    },
+                    "required": ["host", "path"],
+                    "additionalProperties": false
+                }),
+                move |arguments| {
+                    let object = arguments
+                        .as_object()
+                        .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+                    runtime.remove_remote_workpath(
+                        &workpath_session,
+                        string_arg_required(object, "host")?,
+                        string_arg_required(object, "path")?,
                     )
                 },
             ));
@@ -4511,6 +4676,17 @@ impl Server {
             .get(&session.address.channel_id)
             .cloned()
             .unwrap_or_else(default_bot_commands);
+        let workspace_summary = self
+            .workspace_manager
+            .ensure_workspace_exists(&session.workspace_id)
+            .map(|workspace| workspace.summary)
+            .unwrap_or_default();
+        let remote_workpaths = self.with_conversations(|conversations| {
+            Ok(conversations
+                .get_snapshot(&session.address)
+                .map(|snapshot| snapshot.settings.remote_workpaths)
+                .unwrap_or_default())
+        })?;
         Ok(ForegroundAgent {
             id: session.agent_id,
             session_id: session.id,
@@ -4518,11 +4694,8 @@ impl Server {
             system_prompt: build_agent_system_prompt(
                 &self.agent_workspace,
                 session,
-                &self
-                    .workspace_manager
-                    .ensure_workspace_exists(&session.workspace_id)
-                    .map(|workspace| workspace.summary)
-                    .unwrap_or_default(),
+                &workspace_summary,
+                &remote_workpaths,
                 AgentPromptKind::MainForeground,
                 model_key,
                 model,

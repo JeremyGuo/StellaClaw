@@ -6,6 +6,7 @@ use crate::tooling::active_runtime_state_summary;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use tiktoken_rs::o200k_base_singleton;
 
 pub const COMPACTION_MARKER: &str = "[AgentFrame Context Compression]";
 
@@ -275,9 +276,10 @@ fn estimate_text_tokens(text: &str) -> usize {
     if text.is_empty() {
         return 0;
     }
-    let char_estimate = (text.chars().count() as f64 * 0.75).ceil() as usize;
-    let byte_estimate = text.len().div_ceil(4);
-    char_estimate.max(byte_estimate).max(1)
+    o200k_base_singleton()
+        .encode_with_special_tokens(text)
+        .len()
+        .max(1)
 }
 
 // Mirrors Codex's approach: do not estimate inline base64 image payloads as
@@ -313,139 +315,107 @@ fn parse_base64_image_data_url(url: &str) -> Option<&str> {
     Some(payload)
 }
 
-fn image_data_url_estimate_adjustment(content: &Option<Value>) -> (usize, usize) {
-    let Some(Value::Array(items)) = content else {
-        return (0, 0);
-    };
-
-    let mut payload_bytes = 0usize;
-    let mut replacement_bytes = 0usize;
-
-    for item in items {
-        let Some(object) = item.as_object() else {
-            continue;
-        };
-        let Some(kind) = object.get("type").and_then(Value::as_str) else {
-            continue;
-        };
-        if kind != "input_image" && kind != "image_url" {
-            continue;
-        }
-        let image_url = object.get("image_url").and_then(|value| match value {
-            Value::String(url) => Some(url.as_str()),
-            Value::Object(map) => map.get("url").and_then(Value::as_str),
-            _ => None,
-        });
-        let Some(image_url) = image_url else {
-            continue;
-        };
-        let Some(payload) = parse_base64_image_data_url(image_url) else {
-            continue;
-        };
-        payload_bytes = payload_bytes.saturating_add(payload.len());
-        replacement_bytes = replacement_bytes.saturating_add(RESIZED_IMAGE_BYTES_ESTIMATE);
-    }
-
-    (payload_bytes, replacement_bytes)
+fn estimate_payload_bytes_as_tokens(bytes: usize) -> usize {
+    bytes.div_ceil(4).max(1)
 }
 
-fn inline_file_estimate_adjustment(content: &Option<Value>) -> (usize, usize) {
+fn replace_inline_payloads_for_token_estimate(content: Option<&mut Value>) -> usize {
     let Some(Value::Array(items)) = content else {
-        return (0, 0);
+        return 0;
     };
 
-    let mut payload_bytes = 0usize;
-    let mut replacement_bytes = 0usize;
-
+    let mut extra_tokens = 0usize;
     for item in items {
-        let Some(object) = item.as_object() else {
+        let Some(object) = item.as_object_mut() else {
             continue;
         };
-        let Some(kind) = object.get("type").and_then(Value::as_str) else {
-            continue;
-        };
-        let file_value = match kind {
-            "file" => object.get("file"),
-            "input_file" => Some(item),
-            _ => None,
-        };
-        let Some(file_value) = file_value else {
-            continue;
-        };
-        let Some(file_data) = file_value.get("file_data").and_then(Value::as_str) else {
-            continue;
-        };
-        payload_bytes = payload_bytes.saturating_add(file_data.len());
-        replacement_bytes = replacement_bytes.saturating_add(INLINE_FILE_BYTES_ESTIMATE);
-    }
-
-    (payload_bytes, replacement_bytes)
-}
-
-fn inline_audio_estimate_adjustment(content: &Option<Value>) -> (usize, usize) {
-    let Some(Value::Array(items)) = content else {
-        return (0, 0);
-    };
-
-    let mut payload_bytes = 0usize;
-    let mut replacement_bytes = 0usize;
-
-    for item in items {
-        let Some(object) = item.as_object() else {
-            continue;
-        };
-        if object.get("type").and_then(Value::as_str) != Some("input_audio") {
-            continue;
-        }
-        let Some(data) = object
-            .get("input_audio")
-            .and_then(Value::as_object)
-            .and_then(|audio| audio.get("data"))
+        let kind = object
+            .get("type")
             .and_then(Value::as_str)
-        else {
+            .unwrap_or_default()
+            .to_string();
+        if (kind.as_str() == "input_image" || kind.as_str() == "image_url")
+            && let Some(image_url) = object.get_mut("image_url")
+        {
+            let url = match image_url {
+                Value::String(url) => Some(url.as_str()),
+                Value::Object(map) => map.get("url").and_then(Value::as_str),
+                _ => None,
+            };
+            if url.and_then(parse_base64_image_data_url).is_some() {
+                match image_url {
+                    Value::String(url) => {
+                        *url = "[inline image payload omitted for token estimate]".to_string();
+                    }
+                    Value::Object(map) => {
+                        map.insert(
+                            "url".to_string(),
+                            Value::String(
+                                "[inline image payload omitted for token estimate]".to_string(),
+                            ),
+                        );
+                    }
+                    _ => {}
+                }
+                extra_tokens = extra_tokens.saturating_add(estimate_payload_bytes_as_tokens(
+                    RESIZED_IMAGE_BYTES_ESTIMATE,
+                ));
+            }
             continue;
-        };
-        payload_bytes = payload_bytes.saturating_add(data.len());
-        replacement_bytes = replacement_bytes.saturating_add(INLINE_AUDIO_BYTES_ESTIMATE);
+        }
+
+        if kind == "file"
+            && let Some(file_object) = object.get_mut("file").and_then(Value::as_object_mut)
+            && file_object
+                .get("file_data")
+                .and_then(Value::as_str)
+                .is_some()
+        {
+            file_object.insert(
+                "file_data".to_string(),
+                Value::String("[inline file payload omitted for token estimate]".to_string()),
+            );
+            extra_tokens = extra_tokens
+                .saturating_add(estimate_payload_bytes_as_tokens(INLINE_FILE_BYTES_ESTIMATE));
+            continue;
+        }
+
+        if kind == "input_file" && object.get("file_data").and_then(Value::as_str).is_some() {
+            object.insert(
+                "file_data".to_string(),
+                Value::String("[inline file payload omitted for token estimate]".to_string()),
+            );
+            extra_tokens = extra_tokens
+                .saturating_add(estimate_payload_bytes_as_tokens(INLINE_FILE_BYTES_ESTIMATE));
+            continue;
+        }
+
+        if kind == "input_audio"
+            && let Some(audio) = object.get_mut("input_audio").and_then(Value::as_object_mut)
+            && audio.get("data").and_then(Value::as_str).is_some()
+        {
+            audio.insert(
+                "data".to_string(),
+                Value::String("[inline audio payload omitted for token estimate]".to_string()),
+            );
+            extra_tokens = extra_tokens.saturating_add(estimate_payload_bytes_as_tokens(
+                INLINE_AUDIO_BYTES_ESTIMATE,
+            ));
+        }
     }
 
-    (payload_bytes, replacement_bytes)
+    extra_tokens
 }
 
 fn estimate_message_tokens(message: &ChatMessage) -> usize {
-    let serialized = serde_json::to_string(message).unwrap_or_default();
-    let serialized_bytes = serialized.len();
-    let serialized_chars = serialized.chars().count();
-    let adjustments = [
-        image_data_url_estimate_adjustment(&message.content),
-        inline_file_estimate_adjustment(&message.content),
-        inline_audio_estimate_adjustment(&message.content),
-    ];
-    let payload_bytes = adjustments
-        .iter()
-        .map(|(payload, _)| *payload)
-        .sum::<usize>();
-    let replacement_bytes = adjustments
-        .iter()
-        .map(|(_, replacement)| *replacement)
-        .sum::<usize>();
-    let adjusted_bytes = if payload_bytes == 0 || replacement_bytes == 0 {
-        serialized_bytes
-    } else {
-        serialized_bytes
-            .saturating_sub(payload_bytes)
-            .saturating_add(replacement_bytes)
-    };
-    let adjusted_chars = if payload_bytes == 0 || replacement_bytes == 0 {
-        serialized_chars
-    } else {
-        serialized_chars
-            .saturating_sub(payload_bytes)
-            .saturating_add(replacement_bytes)
-    };
-    let char_estimate = (adjusted_chars as f64 * 0.75).ceil() as usize;
-    let byte_estimate = adjusted_bytes.div_ceil(4);
-    char_estimate.max(byte_estimate).max(1) + 6
+    let mut value = serde_json::to_value(message).unwrap_or_default();
+    let inline_payload_tokens = replace_inline_payloads_for_token_estimate(
+        value
+            .as_object_mut()
+            .and_then(|object| object.get_mut("content")),
+    );
+    let serialized = serde_json::to_string(&value).unwrap_or_default();
+    estimate_text_tokens(&serialized) + inline_payload_tokens + 6
 }
 
 pub fn estimate_session_tokens(
@@ -538,7 +508,7 @@ fn build_summary_request(
     request_messages.push(ChatMessage::text(
         "user",
         format!(
-            "Compress the older conversation history in this same transcript.\n\nReturn a JSON object with exactly these top-level keys:\n- old_summary\n- new_summary\n- keywords\n- important_refs\n- memory_hints\n- next_step\n\nMeaning:\n- old_summary: further compress the previously compacted old history. If there is no previous compacted old history, return an empty string.\n- new_summary: summarize only the older conversation history that appears before the most recent {preserved_recent_count} message(s) immediately preceding this request.\n- keywords: short retrieval keywords.\n- important_refs: object with arrays paths, commands, errors, urls, ids.\n- memory_hints: array of {{ group, conclusions }} for higher-level memory grouping.\n- next_step: one short recommended next step.\n\nRules:\n- keep summaries concise and factual\n- redact long secrets; mention that a secret or cookie was provided without copying the full value\n- do not invent details\n- do not restate or summarize shared context content from the system prompt, skills metadata, USER, or IDENTITY\n- ignore transient runtime system messages that only announce refreshed shared profiles, runtime skill updates, or available model catalog changes; those are reconstructed separately and should not be preserved in the compaction summary\n- the most recent {preserved_recent_count} message(s) immediately preceding this request are preserved separately as the recent high-fidelity zone; do not summarize them except for a tiny pointer when continuity absolutely requires it\n- if an earlier assistant message beginning with {COMPACTION_MARKER} exists in the older history, further compress its Old Summary into old_summary\n- if an older start-type task is still active, preserve the continuation-critical identifier needed to resume it safely, especially exec_id, download_id, or subagent id, plus any path, cwd, or url needed to continue unfinished work\n- if that start-type task has already finished or is no longer active, you do not need to preserve its identifier just because it appeared earlier\n- intermediate tool calls and tool results do not need to be reproduced step by step; summarize their outcome compactly unless a still-active task needs a specific identifier or reference to continue safely\n- old_summary and new_summary should each be markdown bullet summaries\n- if a field has no content, use an empty string or empty array\n- return JSON only"
+            "Compress the older conversation history in this same transcript.\n\nReturn a JSON object with exactly these top-level keys:\n- old_summary\n- new_summary\n- keywords\n- important_refs\n- memory_hints\n- next_step\n\nMeaning:\n- old_summary: further compress the previously compacted old history. If there is no previous compacted old history, return an empty string.\n- new_summary: summarize only the older conversation history that appears before the most recent {preserved_recent_count} message(s) immediately preceding this request.\n- keywords: short retrieval keywords.\n- important_refs: object with arrays paths, commands, errors, urls, ids.\n- memory_hints: array of {{ group, conclusions }} for higher-level memory grouping.\n- next_step: one short recommended next step.\n\nRules:\n- keep summaries concise and factual\n- redact long secrets; mention that a secret or cookie was provided without copying the full value\n- do not invent details\n- do not restate or summarize shared context content from the system prompt, skills metadata, USER, IDENTITY, remote workpath host/path/description entries, or remote AGENTS.md content\n- ignore transient runtime system messages that only announce refreshed shared profiles, runtime skill updates, or available model catalog changes; those are reconstructed separately and should not be preserved in the compaction summary\n- the most recent {preserved_recent_count} message(s) immediately preceding this request are preserved separately as the recent high-fidelity zone; do not summarize them except for a tiny pointer when continuity absolutely requires it\n- if an earlier assistant message beginning with {COMPACTION_MARKER} exists in the older history, further compress its Old Summary into old_summary\n- if an older start-type task is still active, preserve the continuation-critical identifier needed to resume it safely, especially exec_id, download_id, or subagent id, plus any path, cwd, or url needed to continue unfinished work\n- if that start-type task has already finished or is no longer active, you do not need to preserve its identifier just because it appeared earlier\n- intermediate tool calls and tool results do not need to be reproduced step by step; summarize their outcome compactly unless a still-active task needs a specific identifier or reference to continue safely\n- old_summary and new_summary should each be markdown bullet summaries\n- if a field has no content, use an empty string or empty array\n- return JSON only"
         ),
     ));
     request_messages
@@ -552,7 +522,7 @@ fn build_claude_code_summary_request(
     request_messages.push(ChatMessage::text(
         "user",
         format!(
-            "Provide a detailed but concise summary of our conversation above.\n\nFocus on information that would be helpful for continuing the conversation, including what we did, what we're doing, which files we're working on, and what we're going to do next.\n\nRules:\n- keep the summary factual, compact, and continuation-oriented\n- redact long secrets; mention that a secret or cookie was provided without copying the full value\n- do not invent details\n- do not restate shared context content from the system prompt, skills metadata, USER, IDENTITY, or PARTCLAW\n- ignore transient runtime system messages that only announce refreshed shared profiles, runtime skill updates, or available model catalog changes; those are reconstructed separately and should not be preserved in the summary\n- the most recent {preserved_recent_count} message(s) immediately preceding this request are preserved separately as the recent high-fidelity zone; do not summarize them except for a tiny pointer when continuity absolutely requires it\n- if an unfinished long-running task still matters, preserve the continuation-critical identifier needed to resume or write back safely, especially exec_id, download_id, file_download id, subagent id, plus any path, cwd, url, or pending destination needed to finish the task\n- never drop the identifiers for background work that is still running or waiting to be observed; losing those ids can prevent safe completion\n- if a task is already finished or no longer relevant, you do not need to preserve its identifier just because it appeared earlier\n- intermediate tool calls and tool results do not need to be reproduced step by step; summarize the outcome compactly unless an unfinished task needs exact references\n- return plain text only"
+            "Provide a detailed but concise summary of our conversation above.\n\nFocus on information that would be helpful for continuing the conversation, including what we did, what we're doing, which files we're working on, and what we're going to do next.\n\nRules:\n- keep the summary factual, compact, and continuation-oriented\n- redact long secrets; mention that a secret or cookie was provided without copying the full value\n- do not invent details\n- do not restate shared context content from the system prompt, skills metadata, USER, IDENTITY, PARTCLAW, remote workpath host/path/description entries, or remote AGENTS.md content\n- ignore transient runtime system messages that only announce refreshed shared profiles, runtime skill updates, or available model catalog changes; those are reconstructed separately and should not be preserved in the summary\n- the most recent {preserved_recent_count} message(s) immediately preceding this request are preserved separately as the recent high-fidelity zone; do not summarize them except for a tiny pointer when continuity absolutely requires it\n- if an unfinished long-running task still matters, preserve the continuation-critical identifier needed to resume or write back safely, especially exec_id, download_id, file_download id, subagent id, plus any path, cwd, url, or pending destination needed to finish the task\n- never drop the identifiers for background work that is still running or waiting to be observed; losing those ids can prevent safe completion\n- if a task is already finished or no longer relevant, you do not need to preserve its identifier just because it appeared earlier\n- intermediate tool calls and tool results do not need to be reproduced step by step; summarize the outcome compactly unless an unfinished task needs exact references\n- return plain text only"
         ),
     ));
     request_messages
@@ -864,6 +834,13 @@ mod tests {
     use crate::message::{ChatMessage, ToolCall};
     use serde_json::json;
 
+    fn synthetic_base64_payload(len: usize) -> String {
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        (0..len)
+            .map(|index| alphabet[(index * 37 + index / 7) % alphabet.len()] as char)
+            .collect()
+    }
+
     #[test]
     fn content_to_text_reads_image_url_objects() {
         let content = Some(json!([
@@ -886,7 +863,7 @@ mod tests {
 
     #[test]
     fn estimate_message_tokens_discounts_inline_image_data_urls() {
-        let base64_payload = "A".repeat(20_000);
+        let base64_payload = synthetic_base64_payload(20_000);
         let message = ChatMessage {
             role: "user".to_string(),
             content: Some(json!([
@@ -914,7 +891,7 @@ mod tests {
 
     #[test]
     fn estimate_message_tokens_discounts_inline_file_payloads() {
-        let base64_payload = "A".repeat(32_000);
+        let base64_payload = synthetic_base64_payload(32_000);
         let message = ChatMessage {
             role: "user".to_string(),
             content: Some(json!([
@@ -945,7 +922,7 @@ mod tests {
 
     #[test]
     fn estimate_message_tokens_discounts_inline_audio_payloads() {
-        let base64_payload = "A".repeat(32_000);
+        let base64_payload = synthetic_base64_payload(32_000);
         let message = ChatMessage {
             role: "user".to_string(),
             content: Some(json!([

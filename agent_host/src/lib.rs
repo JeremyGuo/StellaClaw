@@ -20,6 +20,7 @@ pub mod sink;
 pub mod snapshot;
 pub mod subagent;
 pub mod upgrade;
+pub mod workpath;
 pub mod workspace;
 pub mod zgent;
 

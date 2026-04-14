@@ -1,6 +1,7 @@
 use crate::bootstrap::AgentWorkspace;
 use crate::config::{BotCommandConfig, MainAgentConfig, ModelConfig};
 use crate::session::SessionSnapshot;
+use crate::workpath::{RemoteWorkpath, render_remote_workpaths_for_prompt};
 use agent_frame::config::MemorySystem;
 use std::collections::BTreeMap;
 use std::fs;
@@ -35,6 +36,7 @@ pub fn build_agent_system_prompt(
     workspace: &AgentWorkspace,
     session: &SessionSnapshot,
     workspace_summary: &str,
+    remote_workpaths: &[RemoteWorkpath],
     kind: AgentPromptKind,
     model_name: &str,
     model: &ModelConfig,
@@ -102,6 +104,7 @@ pub fn build_agent_system_prompt(
         "For repository exploration, prefer the dedicated tools over shell commands: use glob to find files by path pattern and grep to find files by content pattern first. Use ls only after you have narrowed the search to a specific directory, and use file_read to read file contents. Only fall back to shell search commands when those tools are insufficient.".to_string(),
         "Some filesystem and exec tools support an optional remote=\"<host>|local\" argument for one-off SSH execution. For local work, omit remote entirely; remote=\"\" and remote=\"local\" are treated as local but waste tokens. For remote work, use an actual SSH alias such as remote=\"wuwen-dev6\". Never pass the literal placeholder remote=\"host\".".to_string(),
         "When you need to run supported tools on a remote SSH host, prefer the tool's remote argument with the actual host alias instead of manually wrapping commands with ssh host. Manual ssh commands should be a fallback only when the dedicated tool remote option cannot express the operation.".to_string(),
+        "When a remote directory should become durable shared context for this whole conversation, use workpath_add(host, path, description). Later agents in this conversation will see the registered remote workpath and its remote AGENTS.md automatically after prompt rebuild or compaction.".to_string(),
         "When you do use exec_start, prefer the default wait-until-complete mode for short, non-interactive commands so one tool call returns the result. Set return_immediate=true only for long-running servers, watchers, daemons, interactive commands, or work you intentionally want to leave in the background.".to_string(),
         "When multiple exec commands have no causal dependency on one another, issue them in the same tool-call batch instead of serializing them across model rounds. Keep dependent commands ordered when one command needs another command's output or side effects.".to_string(),
         "Prefer non-interactive exec commands. Use flags such as --yes, --no-pager, CI=1, explicit timeouts, and batch-mode SSH where appropriate so commands do not wait for prompts.".to_string(),
@@ -190,6 +193,10 @@ pub fn build_agent_system_prompt(
     if !current_agents_markdown.trim().is_empty() {
         parts.push("Runtime notes:".to_string());
         parts.push(current_agents_markdown.trim().to_string());
+    }
+
+    if let Some(remote_workpaths) = render_remote_workpaths_for_prompt(remote_workpaths) {
+        parts.push(remote_workpaths);
     }
 
     if main_agent.memory_system == MemorySystem::ClaudeCode {
@@ -373,6 +380,7 @@ mod tests {
             &workspace,
             &session,
             "Current workspace summary.",
+            &[],
             AgentPromptKind::MainForeground,
             "main",
             &model,
@@ -546,6 +554,7 @@ mod tests {
             &workspace,
             &session,
             "",
+            &[],
             AgentPromptKind::MainForeground,
             "main",
             &model,
@@ -682,6 +691,7 @@ mod tests {
             &workspace,
             &session,
             "",
+            &[],
             AgentPromptKind::MainForeground,
             "main",
             &model,

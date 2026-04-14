@@ -14,6 +14,7 @@ mod v0_18;
 mod v0_19;
 mod v0_20;
 mod v0_21;
+mod v0_22;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -21,7 +22,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.21";
+pub const LATEST_WORKDIR_VERSION: &str = "0.22";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -37,7 +38,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 17] = [
+    let upgraders: [&dyn WorkdirUpgrader; 18] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
@@ -55,6 +56,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
         &v0_19::Upgrade,
         &v0_20::Upgrade,
         &v0_21::Upgrade,
+        &v0_22::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -100,6 +102,7 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.18" => Ok("0.18"),
         "0.19" => Ok("0.19"),
         "0.20" => Ok("0.20"),
+        "0.21" => Ok("0.21"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -864,6 +867,88 @@ mod tests {
         assert_eq!(
             session["session_state"]["errinfo"].as_str(),
             Some("old retry marker")
+        );
+    }
+
+    #[test]
+    fn v0_22_workdir_upgrade_backfills_conversation_remote_workpaths() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.21\n").unwrap();
+
+        let conversation_dir = temp_dir
+            .path()
+            .join("conversations")
+            .join(Uuid::new_v4().to_string());
+        let snapshot_dir = temp_dir.path().join("snapshots").join("snap-1");
+        fs::create_dir_all(&conversation_dir).unwrap();
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        fs::write(
+            conversation_dir.join("conversation.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": Uuid::new_v4(),
+                "address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "123",
+                    "user_id": "user-1",
+                    "display_name": "User"
+                },
+                "settings": {
+                    "main_model": "main"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            snapshot_dir.join("snapshot.json"),
+            serde_json::to_string_pretty(&json!({
+                "saved_at": "2026-04-14T00:00:00Z",
+                "source_address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "123",
+                    "user_id": "user-1",
+                    "display_name": "User"
+                },
+                "settings": {
+                    "main_model": "main"
+                },
+                "session": {
+                    "id": Uuid::new_v4()
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("VERSION"))
+                .unwrap()
+                .trim(),
+            LATEST_WORKDIR_VERSION
+        );
+        let conversation: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(conversation_dir.join("conversation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            conversation["settings"]["remote_workpaths"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(snapshot_dir.join("snapshot.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            snapshot["settings"]["remote_workpaths"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
         );
     }
 }
