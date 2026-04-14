@@ -495,6 +495,9 @@ impl ServerRuntime {
             session_state: crate::session::DurableSessionState {
                 messages: previous_messages.clone(),
                 pending_messages: Vec::new(),
+                system_prompt_static_hash: None,
+                system_prompt_component_hashes: Default::default(),
+                pending_system_prompt_component_notices: Default::default(),
                 phase: crate::session::SessionPhase::End,
                 errno: None,
                 errinfo: None,

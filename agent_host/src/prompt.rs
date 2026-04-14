@@ -5,12 +5,21 @@ use crate::workpath::{RemoteWorkpath, render_remote_workpaths_for_prompt};
 use agent_frame::config::MemorySystem;
 use std::collections::BTreeMap;
 use std::fs;
+use std::hash::{Hash, Hasher};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentPromptKind {
     MainForeground,
     MainBackground,
     SubAgent,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentSystemPromptState {
+    pub system_prompt: String,
+    pub static_hash: String,
+    pub dynamic_hashes: BTreeMap<String, String>,
+    pub dynamic_notices: BTreeMap<String, String>,
 }
 
 pub fn render_available_models_catalog(
@@ -30,6 +39,162 @@ pub fn render_available_models_catalog(
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+pub fn build_agent_system_prompt_state(
+    workspace: &AgentWorkspace,
+    session: &SessionSnapshot,
+    workspace_summary: &str,
+    remote_workpaths: &[RemoteWorkpath],
+    kind: AgentPromptKind,
+    model_name: &str,
+    model: &ModelConfig,
+    models: &BTreeMap<String, ModelConfig>,
+    chat_model_keys: &[String],
+    main_agent: &MainAgentConfig,
+    commands: &[BotCommandConfig],
+) -> AgentSystemPromptState {
+    let system_prompt = build_agent_system_prompt(
+        workspace,
+        session,
+        workspace_summary,
+        remote_workpaths,
+        kind,
+        model_name,
+        model,
+        models,
+        chat_model_keys,
+        main_agent,
+        commands,
+    );
+    let dynamic_components = build_dynamic_system_context_components(
+        workspace,
+        session,
+        workspace_summary,
+        kind,
+        model_name,
+        model,
+        models,
+        chat_model_keys,
+    );
+    let dynamic_hashes = dynamic_components
+        .iter()
+        .map(|(key, value)| (key.clone(), stable_prompt_hash(value)))
+        .collect::<BTreeMap<_, _>>();
+    let dynamic_notices = dynamic_components
+        .iter()
+        .map(|(key, value)| {
+            (
+                key.clone(),
+                render_dynamic_context_notice(key, value.as_str()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    AgentSystemPromptState {
+        system_prompt,
+        static_hash: stable_prompt_hash(&format!("{kind:?}")),
+        dynamic_hashes,
+        dynamic_notices,
+    }
+}
+
+fn stable_prompt_hash(content: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    content.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn render_dynamic_context_notice(key: &str, value: &str) -> String {
+    let title = match key {
+        "available_models" => "Available models",
+        "current_model_profile" => "Current model profile",
+        "identity" => "Identity",
+        "memory_mode" => "Memory mode",
+        "runtime_context" => "Runtime context",
+        "runtime_notes" => "Runtime notes",
+        "user_meta" => "User meta",
+        "workspace_summary" => "Current workspace summary",
+        _ => "Runtime context",
+    };
+    if value.trim().is_empty() {
+        format!("[System Message: {title} was removed from the dynamic runtime context.]")
+    } else {
+        format!(
+            "[System Message: {title} changed in the dynamic runtime context. Treat this as authoritative for this turn.\n{}]",
+            value.trim()
+        )
+    }
+}
+
+fn build_dynamic_system_context_components(
+    workspace: &AgentWorkspace,
+    session: &SessionSnapshot,
+    workspace_summary: &str,
+    _kind: AgentPromptKind,
+    model_name: &str,
+    model: &ModelConfig,
+    models: &BTreeMap<String, ModelConfig>,
+    chat_model_keys: &[String],
+) -> BTreeMap<String, String> {
+    let current_identity_prompt = fs::read_to_string(&workspace.identity_md_path)
+        .ok()
+        .map(|markdown| crate::bootstrap::render_identity_prompt_for_runtime(&markdown))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| workspace.identity_prompt.clone());
+    let current_user_profile_markdown = fs::read_to_string(&workspace.user_md_path)
+        .ok()
+        .unwrap_or_else(|| workspace.user_profile_markdown.clone());
+    let current_agents_markdown = fs::read_to_string(&workspace.agents_md_path)
+        .ok()
+        .unwrap_or_else(|| workspace.agents_markdown.clone());
+
+    let mut components = BTreeMap::new();
+    components.insert(
+        "current_model_profile".to_string(),
+        format!(
+            "Current model profile: {} - {}",
+            model_name,
+            if model.description.trim().is_empty() {
+                "No description provided."
+            } else {
+                model.description.trim()
+            }
+        ),
+    );
+
+    let model_catalog = render_available_models_catalog(models, chat_model_keys);
+    components.insert("available_models".to_string(), model_catalog);
+
+    let identity = current_identity_prompt.trim();
+    components.insert("identity".to_string(), identity.to_string());
+
+    components.insert(
+        "user_meta".to_string(),
+        extract_frontmatter(&current_user_profile_markdown)
+            .map(|value| value.trim().to_string())
+            .unwrap_or_default(),
+    );
+
+    let workspace_summary = workspace_summary.trim();
+    components.insert(
+        "workspace_summary".to_string(),
+        workspace_summary.to_string(),
+    );
+
+    components.insert(
+        "runtime_notes".to_string(),
+        current_agents_markdown.trim().to_string(),
+    );
+
+    components.insert(
+        "runtime_context".to_string(),
+        format!(
+            "Runtime context: channel_id={}, session_id={}, agent_id={}, workspace_id={}",
+            session.address.channel_id, session.id, session.agent_id, session.workspace_id,
+        ),
+    );
+
+    components
 }
 
 pub fn build_agent_system_prompt(
@@ -102,8 +267,6 @@ pub fn build_agent_system_prompt(
         "If a user message starts with [Queued User Updates], it means multiple follow-up messages arrived while you were still working. Treat newer items as newer steering, but do not assume they cancel the current task unless they clearly do so. Before making any further tool calls or continuing substantial work, you MUST give immediate visible feedback to the user. If you are not ready to give the final answer right now, you MUST call user_tell first. If the newest update is only a progress check or lightweight coordination, acknowledge it with user_tell and continue working. Silent continuation after queued follow-up messages is a failure. Only convert the turn into a direct final reply when the user explicitly changes the objective or asks for an immediate answer instead of continued execution.".to_string(),
         "USER.md and IDENTITY.md are copied into the workspace root. A running foreground turn keeps its current system prompt until that turn finishes, so mid-run shared-profile updates still arrive as system messages. On later user turns the runtime may rebuild the canonical system prompt when durable prompt inputs changed. If a system message says one of those files changed, use file_read to inspect that workspace file: always reread IDENTITY.md immediately so your current behavior follows the updated persona, and read USER.md when you need refreshed user info. If you edit either file, call shared_profile_upload right away, then use file_read on ./IDENTITY.md after changing it.".to_string(),
         "For repository exploration, prefer the dedicated tools over shell commands: use glob to find files by path pattern and grep to find files by content pattern first. Use ls only after you have narrowed the search to a specific directory, and use file_read to read file contents. Only fall back to shell search commands when those tools are insufficient.".to_string(),
-        "Some filesystem and exec tools support an optional remote=\"<host>|local\" argument for one-off SSH execution. For local work, omit remote entirely; remote=\"\" and remote=\"local\" are treated as local but waste tokens. For remote work, use an actual SSH alias such as remote=\"wuwen-dev6\". Never pass the literal placeholder remote=\"host\".".to_string(),
-        "When you need to run supported tools on a remote SSH host, prefer the tool's remote argument with the actual host alias instead of manually wrapping commands with ssh host. Manual ssh commands should be a fallback only when the dedicated tool remote option cannot express the operation.".to_string(),
         "When a remote directory should become durable shared context for this whole conversation, use workpath_add(host, path, description). Later agents in this conversation will see the registered remote workpath and its remote AGENTS.md automatically after prompt rebuild or compaction.".to_string(),
         "When you do use exec_start, prefer the default wait-until-complete mode for short, non-interactive commands so one tool call returns the result. Set return_immediate=true only for long-running servers, watchers, daemons, interactive commands, or work you intentionally want to leave in the background.".to_string(),
         "When multiple exec commands have no causal dependency on one another, issue them in the same tool-call batch instead of serializing them across model rounds. Keep dependent commands ordered when one command needs another command's output or side effects.".to_string(),
@@ -214,12 +377,8 @@ pub fn build_agent_system_prompt(
     let _ = commands;
 
     parts.push(format!(
-        "Runtime context: channel_id={}, session_id={}, agent_id={}, workspace_id={}, workspace_root={}",
-        session.address.channel_id,
-        session.id,
-        session.agent_id,
-        session.workspace_id,
-        session.workspace_root.display(),
+        "Runtime context: channel_id={}, session_id={}, agent_id={}, workspace_id={}",
+        session.address.channel_id, session.id, session.agent_id, session.workspace_id,
     ));
 
     parts.join("\n")

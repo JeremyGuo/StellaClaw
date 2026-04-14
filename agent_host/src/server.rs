@@ -27,8 +27,8 @@ use crate::domain::{
     ShowOption, StoredAttachment,
 };
 use crate::prompt::{
-    AgentPromptKind, build_agent_system_prompt, greeting_for_language,
-    render_available_models_catalog,
+    AgentPromptKind, AgentSystemPromptState, build_agent_system_prompt_state,
+    greeting_for_language, render_available_models_catalog,
 };
 use crate::sandbox::{
     PersistentChildRuntime, bubblewrap_is_available, is_child_run_turn_request_send_error,
@@ -239,6 +239,14 @@ fn infer_single_agent_backend(agent: &AgentConfig, model_key: &str) -> Option<Ag
         [backend] => Some(*backend),
         _ => None,
     }
+}
+
+fn leading_system_prompt(messages: &[ChatMessage]) -> Option<String> {
+    let first = messages.first()?;
+    if first.role != "system" {
+        return None;
+    }
+    first.content.as_ref()?.as_str().map(ToOwned::to_owned)
 }
 
 #[derive(Clone)]
@@ -1541,7 +1549,7 @@ impl ServerRuntime {
             } else {
                 vec![self.agent_workspace.skills_dir.clone()]
             },
-            system_prompt: build_agent_system_prompt(
+            system_prompt: build_agent_system_prompt_state(
                 &self.agent_workspace,
                 session,
                 &workspace_summary,
@@ -1553,7 +1561,8 @@ impl ServerRuntime {
                 &prompt_available_models,
                 &self.main_agent,
                 &commands,
-            ),
+            )
+            .system_prompt,
             max_tool_roundtrips: self.main_agent.max_tool_roundtrips,
             workspace_root: workspace_root.to_path_buf(),
             runtime_state_root: self
@@ -2346,13 +2355,16 @@ impl ServerRuntime {
                 .workspace_manager
                 .prepare_bubblewrap_view(&session.workspace_id)?;
         }
-        let config = self.build_agent_frame_config(
+        let mut config = self.build_agent_frame_config(
             &session,
             &workspace_root,
             kind,
             &model_key,
             upstream_timeout_seconds,
         )?;
+        if let Some(system_prompt) = leading_system_prompt(&previous_messages) {
+            config.system_prompt = system_prompt;
+        }
         std::fs::create_dir_all(&config.runtime_state_root).with_context(|| {
             format!(
                 "failed to create runtime state root {}",
@@ -3899,6 +3911,14 @@ impl Server {
             )
         })
         .with_context(|| format!("failed to persist idle compaction for {}", session.id))?;
+        let prompt_state = self.build_foreground_prompt_state(session, &model_key)?;
+        self.with_sessions(|sessions| {
+            sessions.mark_system_prompt_state_current(
+                &session.address,
+                prompt_state.static_hash,
+                prompt_state.dynamic_hashes,
+            )
+        })?;
         self.rotate_chat_version_after_external_compaction(&session.address)?;
         info!(
             log_stream = "session",
@@ -4346,6 +4366,14 @@ impl Server {
                 &session.address,
                 normalized_messages,
                 &compaction_stats,
+            )
+        })?;
+        let prompt_state = self.build_foreground_prompt_state(session, model_key)?;
+        self.with_sessions(|sessions| {
+            sessions.mark_system_prompt_state_current(
+                &session.address,
+                prompt_state.static_hash,
+                prompt_state.dynamic_hashes,
             )
         })?;
         self.rotate_chat_version_after_external_compaction(&session.address)?;
@@ -4809,6 +4837,20 @@ impl Server {
         session: &SessionSnapshot,
         model_key: &str,
     ) -> Result<ForegroundAgent> {
+        let prompt_state = self.build_foreground_prompt_state(session, model_key)?;
+        Ok(ForegroundAgent {
+            id: session.agent_id,
+            session_id: session.id,
+            channel_id: session.address.channel_id.clone(),
+            system_prompt: prompt_state.system_prompt,
+        })
+    }
+
+    fn build_foreground_prompt_state(
+        &self,
+        session: &SessionSnapshot,
+        model_key: &str,
+    ) -> Result<AgentSystemPromptState> {
         let model = self.model_config_or_main(model_key)?;
         let commands = self
             .command_catalog
@@ -4826,24 +4868,19 @@ impl Server {
                 .map(|snapshot| snapshot.settings.remote_workpaths)
                 .unwrap_or_default())
         })?;
-        Ok(ForegroundAgent {
-            id: session.agent_id,
-            session_id: session.id,
-            channel_id: session.address.channel_id.clone(),
-            system_prompt: build_agent_system_prompt(
-                &self.agent_workspace,
-                session,
-                &workspace_summary,
-                &remote_workpaths,
-                AgentPromptKind::MainForeground,
-                model_key,
-                model,
-                &self.models,
-                &self.chat_model_keys,
-                &self.main_agent,
-                &commands,
-            ),
-        })
+        Ok(build_agent_system_prompt_state(
+            &self.agent_workspace,
+            session,
+            &workspace_summary,
+            &remote_workpaths,
+            AgentPromptKind::MainForeground,
+            model_key,
+            model,
+            &self.models,
+            &self.chat_model_keys,
+            &self.main_agent,
+            &commands,
+        ))
     }
 
     fn current_runtime_skill_observations(&self) -> Result<Vec<SessionSkillObservation>> {
@@ -5762,6 +5799,7 @@ mod tests {
         let injected = build_synthetic_system_messages(
             None,
             None,
+            &[],
             None,
             Some("[Runtime Skill Updates]\nSkill \"search\" updated to version 3."),
             &[],
@@ -5786,6 +5824,7 @@ mod tests {
         let injected = build_synthetic_system_messages(
             Some(SYSTEM_RESTART_NOTICE),
             Some("[System Tip: 2.0 hours since the last user message.]"),
+            &[],
             None,
             None,
             &[],
@@ -5825,6 +5864,7 @@ mod tests {
         let injected = build_synthetic_system_messages(
             None,
             None,
+            &[],
             Some("[System Message: models changed]"),
             None,
             &[],
@@ -5859,7 +5899,7 @@ mod tests {
             "- gpt54: primary\n- opus-4.6: large-context",
         )
         .unwrap();
-        let injected = build_synthetic_system_messages(None, None, Some(&notice), None, &[]);
+        let injected = build_synthetic_system_messages(None, None, &[], Some(&notice), None, &[]);
         assert_eq!(injected.len(), 1);
         assert_eq!(injected[0].role, "system");
         assert!(

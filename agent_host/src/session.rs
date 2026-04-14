@@ -5,7 +5,7 @@ pub use agent_frame::{SessionErrno, SessionPhase};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -88,6 +88,12 @@ pub struct SessionCheckpointData {
     pub seen_model_catalog_version: Option<String>,
     #[serde(default)]
     pub pending_model_catalog_notice: bool,
+    #[serde(default)]
+    pub system_prompt_static_hash: Option<String>,
+    #[serde(default)]
+    pub system_prompt_component_hashes: BTreeMap<String, String>,
+    #[serde(default)]
+    pub pending_system_prompt_component_notices: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +120,12 @@ pub struct DurableSessionState {
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
     pub pending_messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub system_prompt_static_hash: Option<String>,
+    #[serde(default)]
+    pub system_prompt_component_hashes: BTreeMap<String, String>,
+    #[serde(default)]
+    pub pending_system_prompt_component_notices: BTreeSet<String>,
     #[serde(default)]
     pub phase: SessionPhase,
     #[serde(default)]
@@ -149,6 +161,12 @@ pub struct SessionSnapshot {
     pub pending_workspace_summary: bool,
     pub close_after_summary: bool,
     pub session_state: DurableSessionState,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SystemPromptStateObservation {
+    pub static_changed: bool,
+    pub dynamic_notice_keys: BTreeSet<String>,
 }
 
 impl SessionSnapshot {
@@ -317,6 +335,9 @@ impl Session {
             .unwrap_or_else(|| DurableSessionState {
                 messages: legacy_agent_messages.clone(),
                 pending_messages: Vec::new(),
+                system_prompt_static_hash: None,
+                system_prompt_component_hashes: BTreeMap::new(),
+                pending_system_prompt_component_notices: BTreeSet::new(),
                 phase: SessionPhase::End,
                 errno: None,
                 errinfo: None,
@@ -756,6 +777,15 @@ impl SessionManager {
             pending_identity_profile_notice: session.pending_identity_profile_notice,
             seen_model_catalog_version: session.seen_model_catalog_version.clone(),
             pending_model_catalog_notice: session.pending_model_catalog_notice,
+            system_prompt_static_hash: session.session_state.system_prompt_static_hash.clone(),
+            system_prompt_component_hashes: session
+                .session_state
+                .system_prompt_component_hashes
+                .clone(),
+            pending_system_prompt_component_notices: session
+                .session_state
+                .pending_system_prompt_component_notices
+                .clone(),
         })
     }
 
@@ -805,6 +835,10 @@ impl SessionManager {
             session_state: DurableSessionState {
                 messages: checkpoint_messages,
                 pending_messages: Vec::new(),
+                system_prompt_static_hash: checkpoint.system_prompt_static_hash,
+                system_prompt_component_hashes: checkpoint.system_prompt_component_hashes,
+                pending_system_prompt_component_notices: checkpoint
+                    .pending_system_prompt_component_notices,
                 phase: SessionPhase::End,
                 errno: None,
                 errinfo: None,
@@ -1124,6 +1158,110 @@ impl SessionManager {
         }
         session.persist()?;
         Ok(notices)
+    }
+
+    pub fn observe_system_prompt_state(
+        &mut self,
+        address: &ChannelAddress,
+        static_hash: String,
+        component_hashes: BTreeMap<String, String>,
+    ) -> Result<SystemPromptStateObservation> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        let mut static_changed = false;
+        match session.session_state.system_prompt_static_hash.as_deref() {
+            None => {
+                session.session_state.system_prompt_static_hash = Some(static_hash);
+            }
+            Some(previous) if previous != static_hash => {
+                session.session_state.system_prompt_static_hash = Some(static_hash);
+                static_changed = true;
+            }
+            Some(_) => {}
+        }
+
+        for (key, hash) in &component_hashes {
+            match session
+                .session_state
+                .system_prompt_component_hashes
+                .get(key)
+            {
+                None => {}
+                Some(previous) if previous != hash => {
+                    session
+                        .session_state
+                        .pending_system_prompt_component_notices
+                        .insert(key.clone());
+                }
+                Some(_) => {}
+            }
+        }
+        let removed_keys = session
+            .session_state
+            .system_prompt_component_hashes
+            .keys()
+            .filter(|key| !component_hashes.contains_key(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in removed_keys {
+            session
+                .session_state
+                .pending_system_prompt_component_notices
+                .insert(key);
+        }
+        session.session_state.system_prompt_component_hashes = component_hashes;
+
+        let observation = SystemPromptStateObservation {
+            static_changed,
+            dynamic_notice_keys: session
+                .session_state
+                .pending_system_prompt_component_notices
+                .clone(),
+        };
+        session.persist()?;
+        Ok(observation)
+    }
+
+    pub fn mark_system_prompt_state_current(
+        &mut self,
+        address: &ChannelAddress,
+        static_hash: String,
+        component_hashes: BTreeMap<String, String>,
+    ) -> Result<()> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        session.session_state.system_prompt_static_hash = Some(static_hash);
+        session.session_state.system_prompt_component_hashes = component_hashes;
+        session
+            .session_state
+            .pending_system_prompt_component_notices
+            .clear();
+        session.persist()?;
+        Ok(())
+    }
+
+    pub fn take_system_prompt_dynamic_notices(
+        &mut self,
+        address: &ChannelAddress,
+    ) -> Result<BTreeSet<String>> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        let pending = std::mem::take(
+            &mut session
+                .session_state
+                .pending_system_prompt_component_notices,
+        );
+        session.persist()?;
+        Ok(pending)
     }
 
     pub fn mark_skills_loaded_current_turn(
@@ -1545,6 +1683,7 @@ mod tests {
     use crate::domain::{ChannelAddress, MessageRole, StoredAttachment};
     use crate::workspace::WorkspaceManager;
     use agent_frame::{ChatMessage, SessionCompactionStats, TokenUsage};
+    use std::collections::BTreeMap;
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -1579,6 +1718,52 @@ mod tests {
         assert_eq!(
             sanitized[2].content.as_ref().and_then(|v| v.as_str()),
             Some("runtime state")
+        );
+    }
+
+    #[test]
+    fn system_prompt_state_tracks_changed_components_independently() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        sessions.ensure_foreground(&address).unwrap();
+
+        let baseline = BTreeMap::from([
+            ("identity".to_string(), "hash-a".to_string()),
+            ("runtime_notes".to_string(), "hash-b".to_string()),
+        ]);
+        let observed = sessions
+            .observe_system_prompt_state(&address, "static-a".to_string(), baseline)
+            .unwrap();
+        assert!(!observed.static_changed);
+        assert!(observed.dynamic_notice_keys.is_empty());
+
+        let changed = BTreeMap::from([
+            ("identity".to_string(), "hash-a2".to_string()),
+            ("runtime_notes".to_string(), "hash-b".to_string()),
+        ]);
+        let observed = sessions
+            .observe_system_prompt_state(&address, "static-a".to_string(), changed)
+            .unwrap();
+        assert!(!observed.static_changed);
+        assert_eq!(
+            observed.dynamic_notice_keys.into_iter().collect::<Vec<_>>(),
+            vec!["identity".to_string()]
+        );
+        assert_eq!(
+            sessions
+                .take_system_prompt_dynamic_notices(&address)
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["identity".to_string()]
+        );
+        assert!(
+            sessions
+                .take_system_prompt_dynamic_notices(&address)
+                .unwrap()
+                .is_empty()
         );
     }
 

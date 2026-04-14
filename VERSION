@@ -1,5 +1,16 @@
-version: 0.18.0
+version: 0.18.1
 ---
+
+# 0.18.1
+
+- 优化前台会话 system prompt 缓存策略：
+  普通新 turn 不再因为动态上下文变化直接替换历史开头的 canonical system prompt，而是按动态组件分别保存 hash，只对实际变化的组件注入最小 transient system message。
+- 保留压缩后的完整重组语义：
+  当上下文压缩真正发生后，持久化 transcript 会重新写入当前完整 system prompt；`PARTCLAW.md` 与 remote workpaths 这类内部可见更新不触发动态通知，等待压缩后的完整重组进入 system prompt。
+- 升级 `workdir` 结构版本到 `0.23`：
+  `sessions/*/session.json` 的 `session_state` 以及 snapshot checkpoint 新增 system prompt 静态 hash、动态组件 hash、待通知组件集合；`0.22 -> 0.23` upgrade step 会为旧文件回填默认值。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  新增 workdir upgrade step；按 workdir-only 变更策略将仓库版本从 `0.18.0` 提升到 `0.18.1`。
 
 # 0.18.0
 

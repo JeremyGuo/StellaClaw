@@ -15,6 +15,7 @@ mod v0_19;
 mod v0_20;
 mod v0_21;
 mod v0_22;
+mod v0_23;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -22,7 +23,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.22";
+pub const LATEST_WORKDIR_VERSION: &str = "0.23";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -38,7 +39,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 18] = [
+    let upgraders: [&dyn WorkdirUpgrader; 19] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
@@ -57,6 +58,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
         &v0_20::Upgrade,
         &v0_21::Upgrade,
         &v0_22::Upgrade,
+        &v0_23::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -103,6 +105,7 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.19" => Ok("0.19"),
         "0.20" => Ok("0.20"),
         "0.21" => Ok("0.21"),
+        "0.22" => Ok("0.22"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -949,6 +952,89 @@ mod tests {
                 .unwrap()
                 .len(),
             0
+        );
+    }
+
+    #[test]
+    fn v0_23_workdir_upgrade_backfills_system_prompt_prompt_state() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.22\n").unwrap();
+
+        let session_dir = temp_dir
+            .path()
+            .join("sessions")
+            .join(Uuid::new_v4().to_string());
+        let snapshot_dir = temp_dir.path().join("snapshots").join("snap-1");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": Uuid::new_v4(),
+                "agent_id": Uuid::new_v4(),
+                "address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "123"
+                },
+                "session_state": {
+                    "messages": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            snapshot_dir.join("snapshot.json"),
+            serde_json::to_string_pretty(&json!({
+                "saved_at": "2026-04-14T00:00:00Z",
+                "source_address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "123"
+                },
+                "settings": {},
+                "session": {
+                    "turn_count": 1
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        let session: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
+                .unwrap();
+        assert!(session["session_state"]["system_prompt_static_hash"].is_null());
+        assert!(
+            session["session_state"]["system_prompt_component_hashes"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            session["session_state"]["pending_system_prompt_component_notices"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(snapshot_dir.join("snapshot.json")).unwrap())
+                .unwrap();
+        assert!(snapshot["session"]["system_prompt_static_hash"].is_null());
+        assert!(
+            snapshot["session"]["system_prompt_component_hashes"]
+                .as_object()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            snapshot["session"]["pending_system_prompt_component_notices"]
+                .as_array()
+                .unwrap()
+                .is_empty()
         );
     }
 }

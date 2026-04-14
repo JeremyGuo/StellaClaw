@@ -1,5 +1,23 @@
 use super::*;
 
+#[derive(Clone, Debug)]
+struct TurnSystemPromptState {
+    active: String,
+    full: String,
+    static_hash: String,
+    component_hashes: BTreeMap<String, String>,
+}
+
+impl TurnSystemPromptState {
+    fn for_persistence(&self, compaction: &SessionCompactionStats) -> &str {
+        if compaction.compacted_run_count > 0 {
+            &self.full
+        } else {
+            &self.active
+        }
+    }
+}
+
 pub(super) fn register_active_foreground_control(
     active_controls: &Arc<Mutex<HashMap<String, SessionExecutionControl>>>,
     pending_interrupts: &Arc<Mutex<HashSet<String>>>,
@@ -62,9 +80,15 @@ impl Server {
             incoming.address.clone(),
             ProcessingState::Typing,
         );
-        let persistence_system_prompt = self
-            .build_foreground_agent(&session, &continue_model_key)?
-            .system_prompt;
+        let persistence_system_prompt =
+            self.build_foreground_prompt_state(&session, &continue_model_key)?;
+        let prompt_observation = self.with_sessions(|sessions| {
+            sessions.observe_system_prompt_state(
+                &incoming.address,
+                persistence_system_prompt.static_hash.clone(),
+                persistence_system_prompt.dynamic_hashes.clone(),
+            )
+        })?;
         self.log_current_tools_for_user_message(
             &session,
             &continue_model_key,
@@ -72,23 +96,39 @@ impl Server {
             "continue",
         );
         let mut active_session = session;
-        let mut next_previous_messages = {
-            let (resume_messages, rebuilt_system_prompt) = rebuild_canonical_system_prompt(
-                &active_session.request_messages(),
-                &persistence_system_prompt,
-            );
+        let (mut next_previous_messages, active_system_prompt) = {
+            let (resume_messages, active_system_prompt, rebuilt_system_prompt) =
+                prepare_system_prompt_for_turn(
+                    &active_session.request_messages(),
+                    &persistence_system_prompt.system_prompt,
+                    prompt_observation.static_changed,
+                );
             if rebuilt_system_prompt {
                 self.with_conversations(|conversations| {
                     conversations
                         .rotate_chat_version_id(&incoming.address)
                         .map(|_| ())
                 })?;
+                self.with_sessions(|sessions| {
+                    sessions.mark_system_prompt_state_current(
+                        &incoming.address,
+                        persistence_system_prompt.static_hash.clone(),
+                        persistence_system_prompt.dynamic_hashes.clone(),
+                    )
+                })?;
             }
-            resume_messages
+            (resume_messages, active_system_prompt)
+        };
+        let turn_system_prompt = TurnSystemPromptState {
+            active: active_system_prompt,
+            full: persistence_system_prompt.system_prompt.clone(),
+            static_hash: persistence_system_prompt.static_hash.clone(),
+            component_hashes: persistence_system_prompt.dynamic_hashes.clone(),
         };
         let synthetic_system_messages = build_synthetic_system_messages(
             self.take_process_restart_notice(&incoming.address),
             None,
+            &[],
             None,
             None,
             &[],
@@ -100,7 +140,7 @@ impl Server {
                 &mut active_session,
                 &continue_model_key,
                 &mut next_previous_messages,
-                &persistence_system_prompt,
+                &turn_system_prompt,
                 &mut ephemeral_system_messages,
                 "failed to continue interrupted foreground turn",
             )
@@ -128,7 +168,7 @@ impl Server {
                     &active_session.session_state.pending_messages,
                     &state.usage,
                     &state.compaction,
-                    &persistence_system_prompt,
+                    &turn_system_prompt,
                     &synthetic_system_messages,
                     Some(&outgoing),
                 )
@@ -152,7 +192,7 @@ impl Server {
                         &incoming.address,
                         &active_session,
                         outcome,
-                        &persistence_system_prompt,
+                        &turn_system_prompt,
                         &synthetic_system_messages,
                     )
                     .await?
@@ -207,12 +247,12 @@ impl Server {
         self.stage_runtime_profile_change_notices(&session, &workspace_profile_notices)?;
         let should_emit_runtime_change_notice =
             should_emit_runtime_change_prompt(incoming.text.as_deref());
-        let profile_change_notices = if should_emit_runtime_change_notice {
+        let mut profile_change_notices = if should_emit_runtime_change_notice {
             self.take_runtime_profile_change_notices(&session)?
         } else {
             Vec::new()
         };
-        let model_catalog_change_notice = if should_emit_runtime_change_notice {
+        let mut model_catalog_change_notice = if should_emit_runtime_change_notice {
             render_model_catalog_change_notice(
                 &self.take_runtime_model_catalog_change_notices(&session)?,
                 &self.current_runtime_model_catalog(),
@@ -260,19 +300,57 @@ impl Server {
         let session = self
             .with_sessions(|sessions| Ok(sessions.get_snapshot(&incoming.address)))?
             .expect("session should exist after staging pending user message");
+        let prompt_state = self.build_foreground_prompt_state(&session, &effective_model_key)?;
+        let prompt_observation = self.with_sessions(|sessions| {
+            sessions.observe_system_prompt_state(
+                &incoming.address,
+                prompt_state.static_hash.clone(),
+                prompt_state.dynamic_hashes.clone(),
+            )
+        })?;
+        let dynamic_notice_keys = if should_emit_runtime_change_notice
+            && !prompt_observation.static_changed
+            && !prompt_observation.dynamic_notice_keys.is_empty()
+        {
+            self.with_sessions(|sessions| {
+                sessions.take_system_prompt_dynamic_notices(&incoming.address)
+            })?
+        } else {
+            Default::default()
+        };
+        let dynamic_system_prompt_notices = dynamic_notice_keys
+            .iter()
+            .filter_map(|key| prompt_state.dynamic_notices.get(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if dynamic_notice_keys.contains("identity") {
+            profile_change_notices
+                .retain(|notice| !matches!(notice, SharedProfileChangeNotice::IdentityUpdated));
+        }
+        if dynamic_notice_keys.contains("user_meta") {
+            profile_change_notices
+                .retain(|notice| !matches!(notice, SharedProfileChangeNotice::UserUpdated));
+        }
+        if dynamic_notice_keys.contains("available_models")
+            || dynamic_notice_keys.contains("current_model_profile")
+        {
+            model_catalog_change_notice = None;
+        }
         let synthetic_system_messages = build_synthetic_system_messages(
             self.take_process_restart_notice(&incoming.address),
             user_time_tip.as_deref(),
+            &dynamic_system_prompt_notices,
             model_catalog_change_notice.as_deref(),
             skill_updates_prefix.as_deref(),
             &profile_change_notices,
         );
-        let persistence_system_prompt = self
-            .build_foreground_agent(&session, &effective_model_key)?
-            .system_prompt;
         let base_messages = session.request_messages();
-        let (mut previous_messages, rebuilt_system_prompt) =
-            rebuild_canonical_system_prompt(&base_messages, &persistence_system_prompt);
+        let (mut previous_messages, active_system_prompt, rebuilt_system_prompt) =
+            prepare_system_prompt_for_turn(
+                &base_messages,
+                &prompt_state.system_prompt,
+                prompt_observation.static_changed,
+            );
         previous_messages.extend(synthetic_system_messages.iter().cloned());
         if rebuilt_system_prompt {
             self.with_conversations(|conversations| {
@@ -280,7 +358,20 @@ impl Server {
                     .rotate_chat_version_id(&incoming.address)
                     .map(|_| ())
             })?;
+            self.with_sessions(|sessions| {
+                sessions.mark_system_prompt_state_current(
+                    &incoming.address,
+                    prompt_state.static_hash.clone(),
+                    prompt_state.dynamic_hashes.clone(),
+                )
+            })?;
         }
+        let turn_system_prompt = TurnSystemPromptState {
+            active: active_system_prompt,
+            full: prompt_state.system_prompt.clone(),
+            static_hash: prompt_state.static_hash.clone(),
+            component_hashes: prompt_state.dynamic_hashes.clone(),
+        };
         let mut active_session = session;
         let mut next_previous_messages = previous_messages;
         let mut ephemeral_system_messages = synthetic_system_messages.clone();
@@ -300,7 +391,7 @@ impl Server {
                 &mut active_session,
                 &effective_model_key,
                 &mut next_previous_messages,
-                &persistence_system_prompt,
+                &turn_system_prompt,
                 &mut ephemeral_system_messages,
                 "foreground agent turn failed",
             )
@@ -332,7 +423,7 @@ impl Server {
                         &incoming.address,
                         &active_session,
                         outcome,
-                        &persistence_system_prompt,
+                        &turn_system_prompt,
                         &synthetic_system_messages,
                     )
                     .await?
@@ -350,7 +441,7 @@ impl Server {
             &active_session.session_state.pending_messages,
             &state.usage,
             &state.compaction,
-            &persistence_system_prompt,
+            &turn_system_prompt,
             &synthetic_system_messages,
             Some(&outgoing),
         )
@@ -395,9 +486,10 @@ impl Server {
         progress_summary: String,
         compaction: &SessionCompactionStats,
         error: &anyhow::Error,
-        persistence_system_prompt: &str,
+        system_prompt: &TurnSystemPromptState,
         ephemeral_system_messages: &[ChatMessage],
     ) -> Result<String> {
+        let persistence_system_prompt = system_prompt.for_persistence(compaction);
         let resume_messages = normalize_messages_for_persistence(
             resume_messages,
             persistence_system_prompt,
@@ -413,6 +505,7 @@ impl Server {
             )
         })?;
         self.rotate_chat_version_if_compacted(address, compaction)?;
+        self.mark_system_prompt_state_after_compaction(address, system_prompt, compaction)?;
         Ok(user_facing_continue_error_text(
             &self.main_agent.language,
             error,
@@ -428,10 +521,11 @@ impl Server {
         consumed_pending_messages: &[ChatMessage],
         usage: &TokenUsage,
         compaction: &SessionCompactionStats,
-        persistence_system_prompt: &str,
+        system_prompt: &TurnSystemPromptState,
         ephemeral_system_messages: &[ChatMessage],
         append_assistant_history: Option<&OutgoingMessage>,
     ) -> Result<()> {
+        let persistence_system_prompt = system_prompt.for_persistence(compaction);
         let messages = normalize_messages_for_persistence(
             messages,
             persistence_system_prompt,
@@ -448,6 +542,7 @@ impl Server {
             )
         })?;
         self.rotate_chat_version_if_compacted(address, compaction)?;
+        self.mark_system_prompt_state_after_compaction(address, system_prompt, compaction)?;
         self.with_sessions(|sessions| {
             sessions.mark_skills_loaded_current_turn(address, &loaded_skills)
         })?;
@@ -455,6 +550,24 @@ impl Server {
             self.append_completed_foreground_assistant_history(address, outgoing)?;
         }
         Ok(())
+    }
+
+    fn mark_system_prompt_state_after_compaction(
+        &self,
+        address: &ChannelAddress,
+        system_prompt: &TurnSystemPromptState,
+        compaction: &SessionCompactionStats,
+    ) -> Result<()> {
+        if compaction.compacted_run_count == 0 {
+            return Ok(());
+        }
+        self.with_sessions(|sessions| {
+            sessions.mark_system_prompt_state_current(
+                address,
+                system_prompt.static_hash.clone(),
+                system_prompt.component_hashes.clone(),
+            )
+        })
     }
 
     pub(super) fn append_completed_foreground_assistant_history(
@@ -474,7 +587,7 @@ impl Server {
         address: &ChannelAddress,
         active_session: &SessionSnapshot,
         outcome: ForegroundTurnOutcome,
-        persistence_system_prompt: &str,
+        system_prompt: &TurnSystemPromptState,
         ephemeral_system_messages: &[ChatMessage],
     ) -> Result<bool> {
         match outcome {
@@ -519,7 +632,7 @@ impl Server {
                     progress_summary,
                     &compaction,
                     &error,
-                    persistence_system_prompt,
+                    system_prompt,
                     ephemeral_system_messages,
                 )?;
                 channel
@@ -575,9 +688,10 @@ impl Server {
         consumed_pending_messages: &[ChatMessage],
         usage: &TokenUsage,
         compaction: &SessionCompactionStats,
-        persistence_system_prompt: &str,
+        system_prompt: &TurnSystemPromptState,
         ephemeral_system_messages: &[ChatMessage],
     ) -> Result<PersistedYieldedForegroundTurn> {
+        let persistence_system_prompt = system_prompt.for_persistence(compaction);
         let messages = normalize_messages_for_persistence(
             messages,
             persistence_system_prompt,
@@ -594,6 +708,7 @@ impl Server {
             )
         })?;
         self.rotate_chat_version_if_compacted(address, compaction)?;
+        self.mark_system_prompt_state_after_compaction(address, system_prompt, compaction)?;
         self.with_sessions(|sessions| {
             sessions.mark_skills_loaded_current_turn(address, &loaded_skills)
         })?;
@@ -612,7 +727,7 @@ impl Server {
         active_session: &mut SessionSnapshot,
         model_key: &str,
         next_previous_messages: &mut Vec<ChatMessage>,
-        persistence_system_prompt: &str,
+        system_prompt: &TurnSystemPromptState,
         ephemeral_system_messages: &mut Vec<ChatMessage>,
         error_context: &str,
     ) -> Result<ForegroundTurnOutcome> {
@@ -644,7 +759,7 @@ impl Server {
                             progress_summary,
                             &state.compaction,
                             &error,
-                            persistence_system_prompt,
+                            system_prompt,
                             ephemeral_system_messages,
                         )
                         .context("failed to persist error yielded agent_frame state")?;
@@ -673,7 +788,7 @@ impl Server {
                             &consumed_pending_messages,
                             &state.usage,
                             &state.compaction,
-                            persistence_system_prompt,
+                            system_prompt,
                             ephemeral_system_messages,
                         )
                         .context("failed to persist yielded agent_frame messages")?;
@@ -713,9 +828,20 @@ impl Server {
         }
         let greeting = ChatMessage::text("user", greeting_for_language(&self.main_agent.language));
         let effective_model_key = self.effective_main_model_key(&session.address)?;
-        let persistence_system_prompt = self
-            .build_foreground_agent(session, &effective_model_key)?
-            .system_prompt;
+        let prompt_state = self.build_foreground_prompt_state(session, &effective_model_key)?;
+        self.with_sessions(|sessions| {
+            sessions.mark_system_prompt_state_current(
+                &session.address,
+                prompt_state.static_hash.clone(),
+                prompt_state.dynamic_hashes.clone(),
+            )
+        })?;
+        let turn_system_prompt = TurnSystemPromptState {
+            active: prompt_state.system_prompt.clone(),
+            full: prompt_state.system_prompt.clone(),
+            static_hash: prompt_state.static_hash.clone(),
+            component_hashes: prompt_state.dynamic_hashes.clone(),
+        };
         let mut active_session = session.clone();
         let mut next_previous_messages = {
             let mut messages = active_session.request_messages();
@@ -728,7 +854,7 @@ impl Server {
                 &mut active_session,
                 &effective_model_key,
                 &mut next_previous_messages,
-                &persistence_system_prompt,
+                &turn_system_prompt,
                 &mut ephemeral_system_messages,
                 "failed to initialize foreground session",
             )
@@ -752,7 +878,7 @@ impl Server {
             &[],
             &state.usage,
             &state.compaction,
-            &persistence_system_prompt,
+            &turn_system_prompt,
             &[],
             show_reply.then_some(&outgoing),
         )?;

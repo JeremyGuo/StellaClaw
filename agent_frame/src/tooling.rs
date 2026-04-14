@@ -2406,7 +2406,10 @@ fn exec_start_tool(
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
-                "cwd": {"type": "string"},
+                "cwd": {
+                    "type": "string",
+                    "description": "Working directory for the command. Prefer relative paths for normal workspace work. When remote is set to an SSH host, cwd is resolved as a directory on that target host."
+                },
                 "tty": {"type": "boolean"},
                 "include_stdout": {"type": "boolean"},
                 "start": {"type": "integer"},
@@ -2506,15 +2509,14 @@ fn exec_observe_tool(
 ) -> Tool {
     Tool::new(
         "exec_observe",
-        "Observe the latest output of a previously started exec process by exec_id. start=0 and limit=2 means the last two lines. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths. Remote host is inferred from exec_id; do not repeat remote unless a future tool version asks for it.",
+        "Observe the latest output of a previously started exec process by exec_id. start=0 and limit=2 means the last two lines. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths. Remote host is inferred from exec_id.",
         json!({
             "type": "object",
             "properties": {
                 "exec_id": {"type": "string"},
                 "start": {"type": "integer"},
                 "limit": {"type": "integer"},
-                "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000},
-                "remote": remote_schema_property()
+                "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000}
             },
             "required": ["exec_id"],
             "additionalProperties": false
@@ -2547,7 +2549,7 @@ fn exec_wait_tool(
 ) -> Tool {
     Tool::new_interruptible(
         "exec_wait",
-        "Wait on a previously started exec process by exec_id. Optionally write input to stdin before waiting. If interrupted by a newer user message or timeout observation, return immediately and leave the process running. If the process does not finish before wait_timeout_seconds, on_timeout=continue leaves it running while on_timeout=kill terminates it. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths. Remote host is inferred from exec_id; do not repeat remote unless a future tool version asks for it.",
+        "Wait on a previously started exec process by exec_id. Optionally write input to stdin before waiting. If interrupted by a newer user message or timeout observation, return immediately and leave the process running. If the process does not finish before wait_timeout_seconds, on_timeout=continue leaves it running while on_timeout=kill terminates it. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths. Remote host is inferred from exec_id.",
         json!({
             "type": "object",
             "properties": {
@@ -2558,8 +2560,7 @@ fn exec_wait_tool(
                 "start": {"type": "integer"},
                 "limit": {"type": "integer"},
                 "on_timeout": {"type": "string", "enum": ["continue", "kill", "CONTINUE", "KILL"]},
-                "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000},
-                "remote": remote_schema_property()
+                "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000}
             },
             "required": ["exec_id", "wait_timeout_seconds"],
             "additionalProperties": false
@@ -2615,8 +2616,7 @@ fn exec_kill_tool(runtime_state_root: PathBuf, _cancel_flag: Option<Arc<Interrup
         json!({
             "type": "object",
             "properties": {
-                "exec_id": {"type": "string"},
-                "remote": remote_schema_property()
+                "exec_id": {"type": "string"}
             },
             "required": ["exec_id"],
             "additionalProperties": false
@@ -4891,9 +4891,6 @@ remote_command="$*"
             "ls",
             "edit",
             "exec_start",
-            "exec_observe",
-            "exec_wait",
-            "exec_kill",
             "apply_patch",
         ] {
             let tool = registry.get(name).expect("tool should be registered");
@@ -4909,6 +4906,39 @@ remote_command="$*"
             assert!(
                 !required.iter().any(|item| item.as_str() == Some("remote")),
                 "remote must stay optional for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_followup_tools_do_not_expose_remote_parameter() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = test_upstream();
+        let registry = build_tool_registry_with_cancel(
+            &[],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        for name in ["exec_observe", "exec_wait", "exec_kill"] {
+            let tool = registry.get(name).expect("tool should be registered");
+            assert!(
+                tool.parameters["properties"].get("remote").is_none(),
+                "{name} should infer remote from exec_id instead of exposing a remote argument"
             );
         }
     }

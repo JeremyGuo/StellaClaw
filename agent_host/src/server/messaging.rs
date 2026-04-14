@@ -400,6 +400,7 @@ pub(super) fn build_user_turn_message(
 pub(super) fn build_synthetic_system_messages(
     process_restart_notice: Option<&str>,
     user_time_tip: Option<&str>,
+    dynamic_system_prompt_notices: &[String],
     model_catalog_change_notice: Option<&str>,
     skill_updates_prefix: Option<&str>,
     profile_change_notices: &[SharedProfileChangeNotice],
@@ -416,6 +417,14 @@ pub(super) fn build_synthetic_system_messages(
         .filter(|value| !value.is_empty())
     {
         messages.push(ChatMessage::text("system", user_time_tip));
+    }
+    for notice in dynamic_system_prompt_notices
+        .iter()
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        messages.push(ChatMessage::text("system", notice));
     }
     for notice in profile_change_notices {
         let text = match notice {
@@ -643,6 +652,30 @@ pub(super) fn rebuild_canonical_system_prompt(
     rebuilt.push(ChatMessage::text("system", canonical_system_prompt));
     rebuilt.extend(messages.iter().skip(leading_system_count).cloned());
     (rebuilt, true)
+}
+
+pub(super) fn prepare_system_prompt_for_turn(
+    messages: &[ChatMessage],
+    current_full_system_prompt: &str,
+    force_rebuild: bool,
+) -> (Vec<ChatMessage>, String, bool) {
+    let mut leading_system_count = 0usize;
+    while leading_system_count < messages.len()
+        && system_message_text(&messages[leading_system_count]).is_some()
+    {
+        leading_system_count += 1;
+    }
+
+    if force_rebuild || leading_system_count == 0 || leading_system_count > 1 {
+        let (rebuilt, changed) =
+            rebuild_canonical_system_prompt(messages, current_full_system_prompt);
+        return (rebuilt, current_full_system_prompt.to_string(), changed);
+    }
+
+    let cached = system_message_text(&messages[0])
+        .unwrap_or(current_full_system_prompt)
+        .to_string();
+    (messages.to_vec(), cached, false)
 }
 
 pub(super) fn normalize_messages_for_persistence(
