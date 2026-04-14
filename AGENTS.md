@@ -2,6 +2,10 @@
 
 This file defines project-specific rules for LLM-assisted development in this repository.
 
+## Development History Awareness
+
+Before making non-trivial project changes, read the root `VERSION` file for recent changelog entries that may explain important bug fixes, compatibility work, and feature invariants. Use that history to avoid reintroducing previously fixed bugs or accidentally disabling important behavior that earlier versions added.
+
 ## Versioning Responsibilities
 
 There are two independent version tracks in this project:

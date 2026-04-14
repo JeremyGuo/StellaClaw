@@ -92,7 +92,7 @@ pub fn build_agent_system_prompt_state(
         .collect::<BTreeMap<_, _>>();
     AgentSystemPromptState {
         system_prompt,
-        static_hash: stable_prompt_hash(&format!("{kind:?}")),
+        static_hash: stable_prompt_hash(&build_static_system_prompt(kind, main_agent)),
         dynamic_hashes,
         dynamic_notices,
     }
@@ -197,38 +197,17 @@ fn build_dynamic_system_context_components(
     components
 }
 
-pub fn build_agent_system_prompt(
-    workspace: &AgentWorkspace,
-    session: &SessionSnapshot,
-    workspace_summary: &str,
-    remote_workpaths: &[RemoteWorkpath],
-    kind: AgentPromptKind,
-    model_name: &str,
-    model: &ModelConfig,
-    models: &BTreeMap<String, ModelConfig>,
-    chat_model_keys: &[String],
-    main_agent: &MainAgentConfig,
-    commands: &[BotCommandConfig],
-) -> String {
-    let current_identity_prompt = fs::read_to_string(&workspace.identity_md_path)
-        .ok()
-        .map(|markdown| crate::bootstrap::render_identity_prompt_for_runtime(&markdown))
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| workspace.identity_prompt.clone());
-    let current_user_profile_markdown = fs::read_to_string(&workspace.user_md_path)
-        .ok()
-        .unwrap_or_else(|| workspace.user_profile_markdown.clone());
-    let current_agents_markdown = fs::read_to_string(&workspace.agents_md_path)
-        .ok()
-        .unwrap_or_else(|| workspace.agents_markdown.clone());
-    let current_partclaw_markdown = if main_agent.memory_system == MemorySystem::ClaudeCode {
-        fs::read_to_string(session.workspace_root.join("PARTCLAW.md"))
-            .ok()
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+fn build_static_system_prompt(kind: AgentPromptKind, main_agent: &MainAgentConfig) -> String {
+    let mut parts = build_static_intro_prompt_parts(kind, main_agent);
+    parts.extend(build_kind_static_prompt_parts(kind));
+    parts.extend(build_memory_static_prompt_parts(main_agent));
+    parts.join("\n")
+}
 
+fn build_static_intro_prompt_parts(
+    kind: AgentPromptKind,
+    main_agent: &MainAgentConfig,
+) -> Vec<String> {
     let header = match kind {
         AgentPromptKind::MainForeground => "[AgentHost Main Foreground Agent]",
         AgentPromptKind::MainBackground => "[AgentHost Main Background Agent]",
@@ -251,7 +230,7 @@ pub fn build_agent_system_prompt(
             "Skills are available. If a skill seems relevant, inspect the preloaded skill metadata and load the relevant skill before relying on its detailed instructions."
         }
     };
-    let mut parts = vec![
+    vec![
         header.to_string(),
         role_line.to_string(),
         "Your primary writable workspace is the current workspace root for this session.".to_string(),
@@ -284,23 +263,11 @@ pub fn build_agent_system_prompt(
             "Reply to the user in {} unless the user clearly asks for another language.",
             main_agent.language
         ),
-        format!(
-            "Current model profile: {} - {}",
-            model_name,
-            if model.description.trim().is_empty() {
-                "No description provided."
-            } else {
-                model.description.trim()
-            }
-        ),
-    ];
+    ]
+}
 
-    let model_catalog = render_available_models_catalog(models, chat_model_keys);
-    if !model_catalog.is_empty() {
-        parts.push("Available models:".to_string());
-        parts.extend(model_catalog.lines().map(ToOwned::to_owned));
-    }
-
+fn build_kind_static_prompt_parts(kind: AgentPromptKind) -> Vec<String> {
+    let mut parts = Vec::new();
     match kind {
         AgentPromptKind::MainForeground => {
             parts.push("You are the primary agent for this user-facing conversation.".to_string());
@@ -335,6 +302,71 @@ pub fn build_agent_system_prompt(
             parts.push("Return one concise final summary for the caller. Do not ask the caller to continue an extended back-and-forth with you.".to_string());
         }
     }
+    parts
+}
+
+fn build_memory_static_prompt_parts(main_agent: &MainAgentConfig) -> Vec<String> {
+    if main_agent.memory_system == MemorySystem::ClaudeCode {
+        vec![
+            "Memory mode: claude_code.".to_string(),
+            "In this mode, PARTCLAW.md in the workspace root is the durable project memory file. Keep it concise and factual. Update it when long-lived project facts, conventions, plans, or handoff notes change in ways future turns should remember after compaction. Do not use PARTCLAW.md for transient per-turn chatter.".to_string(),
+            "When you confirm durable project facts such as build, test, lint, or typecheck commands, stable code style rules, important architecture facts, or handoff-critical decisions, record those confirmed facts in PARTCLAW.md instead of leaving future turns to rediscover or guess them.".to_string(),
+        ]
+    } else {
+        vec!["Memory mode: layered.".to_string()]
+    }
+}
+
+pub fn build_agent_system_prompt(
+    workspace: &AgentWorkspace,
+    session: &SessionSnapshot,
+    workspace_summary: &str,
+    remote_workpaths: &[RemoteWorkpath],
+    kind: AgentPromptKind,
+    model_name: &str,
+    model: &ModelConfig,
+    models: &BTreeMap<String, ModelConfig>,
+    chat_model_keys: &[String],
+    main_agent: &MainAgentConfig,
+    commands: &[BotCommandConfig],
+) -> String {
+    let current_identity_prompt = fs::read_to_string(&workspace.identity_md_path)
+        .ok()
+        .map(|markdown| crate::bootstrap::render_identity_prompt_for_runtime(&markdown))
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| workspace.identity_prompt.clone());
+    let current_user_profile_markdown = fs::read_to_string(&workspace.user_md_path)
+        .ok()
+        .unwrap_or_else(|| workspace.user_profile_markdown.clone());
+    let current_agents_markdown = fs::read_to_string(&workspace.agents_md_path)
+        .ok()
+        .unwrap_or_else(|| workspace.agents_markdown.clone());
+    let current_partclaw_markdown = if main_agent.memory_system == MemorySystem::ClaudeCode {
+        fs::read_to_string(session.workspace_root.join("PARTCLAW.md"))
+            .ok()
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    let mut parts = build_static_intro_prompt_parts(kind, main_agent);
+    parts.push(format!(
+        "Current model profile: {} - {}",
+        model_name,
+        if model.description.trim().is_empty() {
+            "No description provided."
+        } else {
+            model.description.trim()
+        }
+    ));
+
+    let model_catalog = render_available_models_catalog(models, chat_model_keys);
+    if !model_catalog.is_empty() {
+        parts.push("Available models:".to_string());
+        parts.extend(model_catalog.lines().map(ToOwned::to_owned));
+    }
+
+    parts.extend(build_kind_static_prompt_parts(kind));
 
     let identity = current_identity_prompt.trim();
     if !identity.is_empty() {
@@ -362,16 +394,12 @@ pub fn build_agent_system_prompt(
         parts.push(remote_workpaths);
     }
 
-    if main_agent.memory_system == MemorySystem::ClaudeCode {
-        parts.push("Memory mode: claude_code.".to_string());
-        parts.push("In this mode, PARTCLAW.md in the workspace root is the durable project memory file. Keep it concise and factual. Update it when long-lived project facts, conventions, plans, or handoff notes change in ways future turns should remember after compaction. Do not use PARTCLAW.md for transient per-turn chatter.".to_string());
-        parts.push("When you confirm durable project facts such as build, test, lint, or typecheck commands, stable code style rules, important architecture facts, or handoff-critical decisions, record those confirmed facts in PARTCLAW.md instead of leaving future turns to rediscover or guess them.".to_string());
-        if !current_partclaw_markdown.trim().is_empty() {
-            parts.push("PARTCLAW.md:".to_string());
-            parts.push(current_partclaw_markdown.trim().to_string());
-        }
-    } else {
-        parts.push("Memory mode: layered.".to_string());
+    parts.extend(build_memory_static_prompt_parts(main_agent));
+    if main_agent.memory_system == MemorySystem::ClaudeCode
+        && !current_partclaw_markdown.trim().is_empty()
+    {
+        parts.push("PARTCLAW.md:".to_string());
+        parts.push(current_partclaw_markdown.trim().to_string());
     }
 
     let _ = commands;
@@ -420,7 +448,10 @@ fn extract_frontmatter(markdown: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentPromptKind, build_agent_system_prompt};
+    use super::{
+        AgentPromptKind, build_agent_system_prompt, build_agent_system_prompt_state,
+        build_static_system_prompt, stable_prompt_hash,
+    };
     use crate::backend::AgentBackendKind;
     use crate::bootstrap::AgentWorkspace;
     use crate::config::{
@@ -600,6 +631,31 @@ mod tests {
         assert!(!prompt.contains("Use only tools that are actually available to this agent"));
         assert!(!prompt.contains("available commands:"));
         assert!(!prompt.contains("delivery channel may translate rich text"));
+
+        let prompt_state = build_agent_system_prompt_state(
+            &workspace,
+            &session,
+            "Current workspace summary.",
+            &[],
+            AgentPromptKind::MainForeground,
+            "main",
+            &model,
+            &models,
+            &["main".to_string()],
+            &main_agent,
+            &[],
+        );
+        assert_eq!(
+            prompt_state.static_hash,
+            stable_prompt_hash(&build_static_system_prompt(
+                AgentPromptKind::MainForeground,
+                &main_agent
+            ))
+        );
+        assert_ne!(
+            prompt_state.static_hash,
+            stable_prompt_hash(&format!("{:?}", AgentPromptKind::MainForeground))
+        );
     }
 
     #[test]
