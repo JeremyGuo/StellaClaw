@@ -68,6 +68,17 @@ impl Server {
             self.handle_continue_command(channel, incoming).await?;
             return Ok(true);
         }
+        if is_command_like_text(incoming.text.as_deref()) {
+            self.send_channel_message(
+                channel,
+                &incoming.address,
+                OutgoingMessage::text(
+                    "Unknown command. Use `/help` to see available commands.".to_string(),
+                ),
+            )
+            .await?;
+            return Ok(true);
+        }
 
         Ok(false)
     }
@@ -92,7 +103,7 @@ impl Server {
                 &incoming.address,
                 self.agent_selection_message(
                     &incoming.address,
-                    "Choose an agent backend and model for this conversation before using `/status`.",
+                    "Choose a model for this conversation before using `/status`.",
                 )?,
             )
             .await?;
@@ -129,7 +140,7 @@ impl Server {
                 &incoming.address,
                 self.agent_selection_message(
                     &incoming.address,
-                    "Choose an agent backend and model for this conversation before using `/compact`.",
+                    "Choose a model for this conversation before using `/compact`.",
                 )?,
             )
             .await?;
@@ -213,36 +224,21 @@ impl Server {
                 self.send_channel_message(
                     channel,
                     &incoming.address,
-                    self.agent_backend_selection_message(
-                        &incoming.address,
-                        "Choose an agent backend for this conversation.",
-                    )?,
-                )
-                .await?;
-            }
-            AgentCommand::SelectBackend(backend) => {
-                self.send_channel_message(
-                    channel,
-                    &incoming.address,
                     self.agent_model_selection_message(
                         &incoming.address,
-                        backend,
-                        "Choose a model for this agent backend.",
+                        "Choose a model for this conversation.",
                     )?,
                 )
                 .await?;
             }
-            AgentCommand::SelectModel { backend, model_key } => {
+            AgentCommand::SelectModel { model_key } => {
                 if !self.models.contains_key(&model_key) {
                     let error = anyhow!("unknown model {}", model_key);
                     self.send_user_error_message(channel, &incoming.address, &error)
                         .await;
                     return Err(error);
                 }
-                let selected_backend = backend
-                    .or(self.selected_agent_backend(&incoming.address)?)
-                    .or_else(|| self.inferred_agent_backend_for_model(&model_key))
-                    .ok_or_else(|| anyhow!("please choose an agent backend first with `/agent`"))?;
+                let selected_backend = AgentBackendKind::AgentFrame;
                 self.ensure_model_available_for_backend(selected_backend, &model_key)?;
                 let stored_settings = self.effective_conversation_settings(&incoming.address)?;
                 let current_backend = self.selected_agent_backend(&incoming.address)?;
@@ -262,8 +258,7 @@ impl Server {
                             channel,
                             &incoming.address,
                             OutgoingMessage::text(format!(
-                                "Conversation agent updated to `{}` with model `{}`.",
-                                Self::render_agent_backend_value(selected_backend),
+                                "Conversation model updated to `{}`.",
                                 model_key
                             )),
                         )
@@ -274,8 +269,7 @@ impl Server {
                         channel,
                         &incoming.address,
                         OutgoingMessage::text(format!(
-                            "Conversation agent is already `{}` with model `{}`. No change was made.",
-                            Self::render_agent_backend_value(selected_backend),
+                            "Conversation model is already `{}`. No change was made.",
                             model_key
                         )),
                     )
@@ -307,8 +301,7 @@ impl Server {
                     channel,
                     &incoming.address,
                     OutgoingMessage::text(format!(
-                        "Conversation agent updated to `{}` with model `{}`.{}",
-                        Self::render_agent_backend_value(selected_backend),
+                        "Conversation model updated to `{}`.{}",
                         effective_model_key,
                         if compacted {
                             " Existing context was compacted before the switch."

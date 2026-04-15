@@ -1,5 +1,4 @@
 use crate::backend::AgentBackendKind;
-use crate::zgent::zgent_runtime_available;
 use agent_frame::config::{
     AuthCredentialsStoreMode, ExternalWebSearchConfig, MemorySystem, NativeWebSearchConfig,
     ReasoningConfig, RetryModeConfig, TokenEstimationConfig, UpstreamApiKind, UpstreamAuthKind,
@@ -22,6 +21,7 @@ mod v0_15;
 mod v0_16;
 mod v0_17;
 mod v0_18;
+mod v0_19;
 mod v0_2;
 mod v0_3;
 mod v0_4;
@@ -32,7 +32,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.18";
+pub const LATEST_CONFIG_VERSION: &str = "0.19";
 pub const VERSION_0_2: &str = "0.2";
 pub const VERSION_0_3: &str = "0.3";
 pub const VERSION_0_4: &str = "0.4";
@@ -49,6 +49,7 @@ pub const VERSION_0_14: &str = "0.14";
 pub const VERSION_0_15: &str = "0.15";
 pub const VERSION_0_16: &str = "0.16";
 pub const VERSION_0_17: &str = "0.17";
+pub const VERSION_0_18: &str = "0.18";
 
 trait ConfigLoader {
     fn version(&self) -> &'static str;
@@ -213,22 +214,18 @@ pub struct AgentBackendConfig {
 pub struct AgentConfig {
     #[serde(default)]
     pub agent_frame: AgentBackendConfig,
-    #[serde(default)]
-    pub zgent: AgentBackendConfig,
 }
 
 impl AgentConfig {
     pub fn backend_config(&self, backend: AgentBackendKind) -> &AgentBackendConfig {
         match backend {
             AgentBackendKind::AgentFrame => &self.agent_frame,
-            AgentBackendKind::Zgent => &self.zgent,
         }
     }
 
     pub fn backend_config_mut(&mut self, backend: AgentBackendKind) -> &mut AgentBackendConfig {
         match backend {
             AgentBackendKind::AgentFrame => &mut self.agent_frame,
-            AgentBackendKind::Zgent => &mut self.zgent,
         }
     }
 
@@ -243,19 +240,19 @@ impl AgentConfig {
     }
 
     pub fn backends_for_model(&self, model_key: &str) -> Vec<AgentBackendKind> {
-        [AgentBackendKind::AgentFrame, AgentBackendKind::Zgent]
+        [AgentBackendKind::AgentFrame]
             .into_iter()
             .filter(|backend| self.is_model_available(*backend, model_key))
             .collect()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.agent_frame.available_models.is_empty() && self.zgent.available_models.is_empty()
+        self.agent_frame.available_models.is_empty()
     }
 
     pub fn all_available_models(&self) -> Vec<String> {
         let mut result = Vec::new();
-        for backend in [AgentBackendKind::AgentFrame, AgentBackendKind::Zgent] {
+        for backend in [AgentBackendKind::AgentFrame] {
             for model_key in self.available_models(backend) {
                 if !result.iter().any(|value| value == model_key) {
                     result.push(model_key.clone());
@@ -810,7 +807,7 @@ pub fn default_bot_commands() -> Vec<BotCommandConfig> {
         },
         BotCommandConfig {
             command: "agent".to_string(),
-            description: "Show or set the conversation agent backend and model".to_string(),
+            description: "Show or set the conversation model".to_string(),
         },
         BotCommandConfig {
             command: "sandbox".to_string(),
@@ -899,7 +896,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let loaders: [&dyn ConfigLoader; 18] = [
+    let loaders: [&dyn ConfigLoader; 19] = [
         &v0_1::LegacyConfigLoader,
         &v0_2::VersionedConfigLoader,
         &v0_3::VersionedConfigLoader,
@@ -918,6 +915,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         &v0_16::LatestConfigLoader,
         &v0_17::LatestConfigLoader,
         &v0_18::LatestConfigLoader,
+        &v0_19::LatestConfigLoader,
     ];
     let loader = loaders
         .into_iter()
@@ -979,7 +977,7 @@ pub(crate) fn build_server_config(
             }
         }
     }
-    for backend in [AgentBackendKind::AgentFrame, AgentBackendKind::Zgent] {
+    for backend in [AgentBackendKind::AgentFrame] {
         let mut normalized = Vec::new();
         for model_key in agent.available_models(backend) {
             if !normalized.iter().any(|value| value == model_key) {
@@ -1031,7 +1029,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
     let mut config = {
-        let loaders: [&dyn ConfigLoader; 18] = [
+        let loaders: [&dyn ConfigLoader; 19] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
             &v0_3::VersionedConfigLoader,
@@ -1050,6 +1048,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
             &v0_16::LatestConfigLoader,
             &v0_17::LatestConfigLoader,
             &v0_18::LatestConfigLoader,
+            &v0_19::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()
@@ -1128,7 +1127,6 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
     #[derive(Serialize)]
     struct PersistedAgentConfig<'a> {
         agent_frame: &'a AgentBackendConfig,
-        zgent: &'a AgentBackendConfig,
     }
 
     #[derive(Serialize)]
@@ -1186,7 +1184,6 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
         models: persisted_models,
         agent: PersistedAgentConfig {
             agent_frame: &config.agent.agent_frame,
-            zgent: &config.agent.zgent,
         },
         tooling: &config.tooling,
         main_agent: PersistedMainAgentConfig {
@@ -1285,16 +1282,8 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
             ));
         }
     }
-    for backend in [AgentBackendKind::AgentFrame, AgentBackendKind::Zgent] {
+    for backend in [AgentBackendKind::AgentFrame] {
         let available_models = config.agent.available_models(backend);
-        if backend == AgentBackendKind::Zgent
-            && !available_models.is_empty()
-            && !zgent_runtime_available()
-        {
-            return Err(anyhow!(
-                "agent.zgent.available_models is configured but the local ./zgent runtime directory is unavailable"
-            ));
-        }
         for model_key in available_models {
             let Some(model) = config.models.get(model_key) else {
                 return Err(anyhow!(
@@ -1308,15 +1297,6 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
                     "agent.{}.available_models references model '{}' which is not an enabled agent chat model",
                     agent_backend_field_name(backend),
                     model_key
-                ));
-            }
-            if backend == AgentBackendKind::Zgent
-                && model.chat_completions_path != default_chat_completions_path()
-            {
-                return Err(anyhow!(
-                    "agent.zgent.available_models references model '{}' but chat_completions_path must be '{}'",
-                    model_key,
-                    default_chat_completions_path()
                 ));
             }
         }
@@ -1357,7 +1337,6 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
 fn agent_backend_field_name(backend: AgentBackendKind) -> &'static str {
     match backend {
         AgentBackendKind::AgentFrame => "agent_frame",
-        AgentBackendKind::Zgent => "zgent",
     }
 }
 
@@ -1554,7 +1533,6 @@ mod tests {
         load_server_config_file, load_server_config_file_and_upgrade, resolve_model_api_keys,
     };
     use crate::backend::AgentBackendKind;
-    use crate::zgent::zgent_runtime_available;
     use agent_frame::config::{
         TokenEstimationSource, TokenEstimationTemplateConfig, TokenEstimationTokenizerConfig,
     };
@@ -1629,8 +1607,7 @@ mod tests {
                 }
               },
               "agent": {
-                "agent_frame": {"available_models": ["main"]},
-                "zgent": {"available_models": []}
+                "agent_frame": {"available_models": ["main"]}
               },
               "main_agent": {
                 "model": "main"
@@ -1687,8 +1664,7 @@ mod tests {
                 }
               },
               "agent": {
-                "agent_frame": {"available_models": ["main"]},
-                "zgent": {"available_models": []}
+                "agent_frame": {"available_models": ["main"]}
               },
               "main_agent": {
                 "model": "main"
@@ -1740,8 +1716,7 @@ mod tests {
                 }
               },
               "agent": {
-                "agent_frame": {"available_models": ["main"]},
-                "zgent": {"available_models": []}
+                "agent_frame": {"available_models": ["main"]}
               },
               "main_agent": {
                 "model": "main"
@@ -1769,7 +1744,7 @@ mod tests {
         );
 
         let written = fs::read_to_string(&config_path).unwrap();
-        assert!(written.contains("\"version\": \"0.18\""));
+        assert!(written.contains("\"version\": \"0.19\""));
         assert!(written.contains("\"token_estimation_cache\""));
         assert!(written.contains("\"template-cache/hf\""));
         assert!(written.contains("\"tokenizer-cache/hf\""));
@@ -2003,49 +1978,6 @@ mod tests {
 
         let config = load_server_config_file(&config_path).unwrap();
         assert_eq!(config.models["main"].backend, AgentBackendKind::AgentFrame);
-    }
-
-    #[test]
-    fn zgent_backend_rejects_custom_chat_completions_path() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"
-            {
-              "models": {
-                "main": {
-                  "api_endpoint": "https://example.com/v1",
-                  "model": "demo-model",
-                  "backend": "zgent",
-                  "chat_completions_path": "/custom/chat",
-                  "description": "demo"
-                }
-              },
-              "main_agent": {
-                "model": "main"
-              },
-              "channels": [
-                {
-                  "kind": "command_line",
-                  "id": "local-cli"
-                }
-              ]
-            }
-            "#,
-        )
-        .unwrap();
-
-        let error = load_server_config_file(&config_path).unwrap_err();
-        if zgent_runtime_available() {
-            assert!(error.to_string().contains("chat_completions_path"));
-        } else {
-            assert!(
-                error
-                    .to_string()
-                    .contains("local ./zgent runtime directory is unavailable")
-            );
-        }
     }
 
     #[test]
@@ -2497,9 +2429,6 @@ mod tests {
               "agent": {
                 "agent_frame": {
                   "available_models": ["gpt54"]
-                },
-                "zgent": {
-                  "available_models": []
                 }
               },
               "tooling": {

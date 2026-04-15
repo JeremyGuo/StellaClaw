@@ -986,6 +986,13 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
+fn remote_cd_prefix(remote_cwd: &str) -> String {
+    format!(
+        "AGENT_FRAME_REMOTE_CWD={}; case \"$AGENT_FRAME_REMOTE_CWD\" in '~') AGENT_FRAME_REMOTE_CWD=\"$HOME\" ;; '~/'*) AGENT_FRAME_REMOTE_CWD=\"$HOME/${{AGENT_FRAME_REMOTE_CWD#~/}}\" ;; esac; cd \"$AGENT_FRAME_REMOTE_CWD\" &&",
+        shell_quote(remote_cwd)
+    )
+}
+
 fn resolve_ssh_executable() -> String {
     std::env::var("AGENT_FRAME_SSH_BIN").unwrap_or_else(|_| "ssh".to_string())
 }
@@ -996,9 +1003,9 @@ fn build_remote_shell_command(host: &str, command: &str, cwd: &Path, tty: bool) 
         return Ok(build_shell_command(command));
     }
     let remote_script = format!(
-        "AGENT_FRAME_EXEC_COMMAND={}; cd {} && eval \"$AGENT_FRAME_EXEC_COMMAND\"",
+        "AGENT_FRAME_EXEC_COMMAND={}; {} eval \"$AGENT_FRAME_EXEC_COMMAND\"",
         shell_quote(command),
-        shell_quote(&cwd.display().to_string())
+        remote_cd_prefix(&cwd.display().to_string())
     );
     let remote_command = format!("sh -lc {}", shell_quote(&remote_script));
     let mut command_builder = Command::new(resolve_ssh_executable());

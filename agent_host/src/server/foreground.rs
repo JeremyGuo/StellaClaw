@@ -36,6 +36,281 @@ pub(super) fn register_active_foreground_control(
     }
 }
 
+struct TurnCoordinator<'a> {
+    server: &'a Server,
+    channel: &'a Arc<dyn Channel>,
+    incoming: IncomingMessage,
+}
+
+impl<'a> TurnCoordinator<'a> {
+    fn new(server: &'a Server, channel: &'a Arc<dyn Channel>, incoming: IncomingMessage) -> Self {
+        Self {
+            server,
+            channel,
+            incoming,
+        }
+    }
+
+    async fn run(self) -> Result<()> {
+        let server = self.server;
+        let channel = self.channel;
+        let incoming = self.incoming;
+
+        if !server.has_complete_agent_selection(&incoming.address)? {
+            server
+                .send_channel_message(
+                    channel,
+                    &incoming.address,
+                    server.agent_selection_message(
+                        &incoming.address,
+                        "Choose a model for this conversation before sending messages.",
+                    )?,
+                )
+                .await?;
+            return Ok(());
+        }
+
+        let session = server.ensure_foreground_session(&incoming.address)?;
+        if session.stable_message_count() == 0 {
+            if let Err(error) = server.initialize_foreground_session(&session, false).await {
+                server
+                    .send_user_error_message(channel, &incoming.address, &error)
+                    .await;
+                return Err(error);
+            }
+        }
+        let session = server
+            .with_sessions(|sessions| Ok(sessions.get_snapshot(&incoming.address)))?
+            .expect("session should exist after initialization");
+
+        let stored_attachments = if incoming.stored_attachments.is_empty() {
+            server
+                .materialize_attachments(&session.attachments_dir, incoming.attachments)
+                .await?
+        } else {
+            incoming.stored_attachments.clone()
+        };
+        let skill_updates_prefix = server.observe_runtime_skill_changes(&session)?;
+        let workspace_profile_notices = server.sync_runtime_profile_files(&session)?;
+        server.observe_runtime_profile_changes(&session)?;
+        server.observe_runtime_model_catalog_changes(&session)?;
+        server.stage_runtime_profile_change_notices(&session, &workspace_profile_notices)?;
+        let should_emit_runtime_change_notice =
+            should_emit_runtime_change_prompt(incoming.text.as_deref());
+        let mut profile_change_notices = if should_emit_runtime_change_notice {
+            server.take_runtime_profile_change_notices(&session)?
+        } else {
+            Vec::new()
+        };
+        let mut model_catalog_change_notice = if should_emit_runtime_change_notice {
+            render_model_catalog_change_notice(
+                &server.take_runtime_model_catalog_change_notices(&session)?,
+                &server.current_runtime_model_catalog(),
+            )
+        } else {
+            None
+        };
+        let now = Utc::now();
+        let user_time_tip = server
+            .main_agent
+            .time_awareness
+            .emit_idle_time_gap_hint
+            .then(|| render_last_user_message_time_tip(&session, now))
+            .flatten();
+        let system_date = server
+            .main_agent
+            .time_awareness
+            .emit_system_date_on_user_message
+            .then(|| render_system_date_on_user_message(now));
+        let effective_model_key = server.effective_main_model_key(&incoming.address)?;
+        server.log_current_tools_for_user_message(
+            &session,
+            &effective_model_key,
+            &incoming.remote_message_id,
+            "user_message",
+        );
+        let effective_model = server.model_config_or_main(&effective_model_key)?.clone();
+        let user_message = build_user_turn_message(
+            incoming.text.as_deref(),
+            &stored_attachments,
+            &effective_model,
+            backend_supports_native_multimodal_input(AgentBackendKind::AgentFrame),
+            system_date.as_deref(),
+        )?;
+        server.with_sessions(|sessions| {
+            sessions.stage_foreground_user_turn(
+                &incoming.address,
+                user_message.clone(),
+                incoming.text.clone(),
+                stored_attachments.clone(),
+            )
+        })?;
+        let session = server
+            .with_sessions(|sessions| Ok(sessions.get_snapshot(&incoming.address)))?
+            .expect("session should exist after staging pending user message");
+        let prompt_state = server.build_foreground_prompt_state(&session, &effective_model_key)?;
+        let prompt_observation = server.with_sessions(|sessions| {
+            sessions.observe_system_prompt_state(
+                &incoming.address,
+                prompt_state.static_hash.clone(),
+                prompt_state.dynamic_hashes.clone(),
+            )
+        })?;
+        let dynamic_notice_keys = if should_emit_runtime_change_notice
+            && !prompt_observation.static_changed
+            && !prompt_observation.dynamic_notice_keys.is_empty()
+        {
+            server.with_sessions(|sessions| {
+                sessions.take_system_prompt_dynamic_notices(&incoming.address)
+            })?
+        } else {
+            Default::default()
+        };
+        let dynamic_system_prompt_notices = dynamic_notice_keys
+            .iter()
+            .filter_map(|key| prompt_state.dynamic_notices.get(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        if dynamic_notice_keys.contains("identity") {
+            profile_change_notices
+                .retain(|notice| !matches!(notice, SharedProfileChangeNotice::IdentityUpdated));
+        }
+        if dynamic_notice_keys.contains("user_meta") {
+            profile_change_notices
+                .retain(|notice| !matches!(notice, SharedProfileChangeNotice::UserUpdated));
+        }
+        if dynamic_notice_keys.contains("available_models")
+            || dynamic_notice_keys.contains("current_model_profile")
+        {
+            model_catalog_change_notice = None;
+        }
+        let synthetic_system_messages = build_synthetic_system_messages(
+            server.take_process_restart_notice(&incoming.address),
+            user_time_tip.as_deref(),
+            &dynamic_system_prompt_notices,
+            model_catalog_change_notice.as_deref(),
+            skill_updates_prefix.as_deref(),
+            &profile_change_notices,
+        );
+        let base_messages = session.request_messages();
+        let (mut previous_messages, active_system_prompt, rebuilt_system_prompt) =
+            prepare_system_prompt_for_turn(
+                &base_messages,
+                &prompt_state.system_prompt,
+                prompt_observation.static_changed,
+            );
+        previous_messages.extend(synthetic_system_messages.iter().cloned());
+        if rebuilt_system_prompt {
+            server.with_conversations(|conversations| {
+                conversations
+                    .rotate_chat_version_id(&incoming.address)
+                    .map(|_| ())
+            })?;
+            server.with_sessions(|sessions| {
+                sessions.mark_system_prompt_state_current(
+                    &incoming.address,
+                    prompt_state.static_hash.clone(),
+                    prompt_state.dynamic_hashes.clone(),
+                )
+            })?;
+        }
+        let turn_system_prompt = TurnSystemPromptState {
+            active: active_system_prompt,
+            full: prompt_state.system_prompt.clone(),
+            static_hash: prompt_state.static_hash.clone(),
+            component_hashes: prompt_state.dynamic_hashes.clone(),
+        };
+        let mut active_session = session;
+        let mut next_previous_messages = previous_messages;
+        let mut ephemeral_system_messages = synthetic_system_messages.clone();
+
+        channel
+            .set_processing(&incoming.address, ProcessingState::Typing)
+            .await
+            .ok();
+        let typing_guard = spawn_processing_keepalive(
+            channel.clone(),
+            incoming.address.clone(),
+            ProcessingState::Typing,
+        );
+
+        let turn_result = server
+            .run_foreground_turn_until_settled(
+                &mut active_session,
+                &effective_model_key,
+                &mut next_previous_messages,
+                &turn_system_prompt,
+                &mut ephemeral_system_messages,
+                "foreground agent turn failed",
+            )
+            .await;
+        // Clear the pending-interrupt flag for this session so future turns
+        // resume normally. The flag was set by the main event loop when a user
+        // message arrived during this turn.
+        if let Ok(mut interrupts) = server.pending_foreground_interrupts.lock() {
+            interrupts.remove(&incoming.address.session_key());
+        }
+        if let Some(stop_sender) = typing_guard {
+            let _ = stop_sender.send(());
+        }
+        if let Err(error) = &turn_result {
+            channel
+                .set_processing(&incoming.address, ProcessingState::Idle)
+                .await
+                .ok();
+            server
+                .send_user_error_message(channel, &incoming.address, error)
+                .await;
+        }
+        let outcome = turn_result?;
+        let (state, outgoing) = match outcome {
+            ForegroundTurnOutcome::Replied { state, outgoing } => (state, outgoing),
+            outcome => {
+                if server
+                    .finish_non_reply_foreground_outcome_for_channel(
+                        channel,
+                        &incoming.address,
+                        &active_session,
+                        outcome,
+                        &turn_system_prompt,
+                        &synthetic_system_messages,
+                    )
+                    .await?
+                {
+                    return Ok(());
+                }
+                unreachable!("replied branch should have matched above");
+            }
+        };
+
+        server
+            .persist_completed_foreground_turn(
+                &incoming.address,
+                active_session.stable_message_count(),
+                state.messages,
+                &active_session.session_state.pending_messages,
+                &state.usage,
+                &state.compaction,
+                &turn_system_prompt,
+                &synthetic_system_messages,
+                Some(&outgoing),
+            )
+            .context("failed to persist agent_frame messages")?;
+        server
+            .finish_replied_foreground_outcome_for_channel(
+                channel,
+                &active_session,
+                &incoming.address,
+                &effective_model_key,
+                &state.usage,
+                outgoing,
+                "user message reply",
+            )
+            .await?;
+        Ok(())
+    }
+}
+
 impl Server {
     fn take_process_restart_notice(&self, address: &ChannelAddress) -> Option<&'static str> {
         let session_key = address.session_key();
@@ -209,254 +484,7 @@ impl Server {
         channel: &Arc<dyn Channel>,
         incoming: IncomingMessage,
     ) -> Result<()> {
-        if !self.has_complete_agent_selection(&incoming.address)? {
-            self.send_channel_message(
-                channel,
-                &incoming.address,
-                self.agent_selection_message(
-                    &incoming.address,
-                    "Choose an agent backend and model for this conversation before sending messages.",
-                )?,
-            )
-            .await?;
-            return Ok(());
-        }
-
-        let session = self.ensure_foreground_session(&incoming.address)?;
-        if session.stable_message_count() == 0 {
-            if let Err(error) = self.initialize_foreground_session(&session, false).await {
-                self.send_user_error_message(channel, &incoming.address, &error)
-                    .await;
-                return Err(error);
-            }
-        }
-        let session = self
-            .with_sessions(|sessions| Ok(sessions.get_snapshot(&incoming.address)))?
-            .expect("session should exist after initialization");
-
-        let stored_attachments = if incoming.stored_attachments.is_empty() {
-            self.materialize_attachments(&session.attachments_dir, incoming.attachments)
-                .await?
-        } else {
-            incoming.stored_attachments.clone()
-        };
-        let skill_updates_prefix = self.observe_runtime_skill_changes(&session)?;
-        let workspace_profile_notices = self.sync_runtime_profile_files(&session)?;
-        self.observe_runtime_profile_changes(&session)?;
-        self.observe_runtime_model_catalog_changes(&session)?;
-        self.stage_runtime_profile_change_notices(&session, &workspace_profile_notices)?;
-        let should_emit_runtime_change_notice =
-            should_emit_runtime_change_prompt(incoming.text.as_deref());
-        let mut profile_change_notices = if should_emit_runtime_change_notice {
-            self.take_runtime_profile_change_notices(&session)?
-        } else {
-            Vec::new()
-        };
-        let mut model_catalog_change_notice = if should_emit_runtime_change_notice {
-            render_model_catalog_change_notice(
-                &self.take_runtime_model_catalog_change_notices(&session)?,
-                &self.current_runtime_model_catalog(),
-            )
-        } else {
-            None
-        };
-        let now = Utc::now();
-        let user_time_tip = self
-            .main_agent
-            .time_awareness
-            .emit_idle_time_gap_hint
-            .then(|| render_last_user_message_time_tip(&session, now))
-            .flatten();
-        let system_date = self
-            .main_agent
-            .time_awareness
-            .emit_system_date_on_user_message
-            .then(|| render_system_date_on_user_message(now));
-        let effective_model_key = self.effective_main_model_key(&incoming.address)?;
-        self.log_current_tools_for_user_message(
-            &session,
-            &effective_model_key,
-            &incoming.remote_message_id,
-            "user_message",
-        );
-        let effective_model = self.model_config_or_main(&effective_model_key)?.clone();
-        let user_message = build_user_turn_message(
-            incoming.text.as_deref(),
-            &stored_attachments,
-            &effective_model,
-            backend_supports_native_multimodal_input(
-                self.effective_agent_backend(&incoming.address)?,
-            ),
-            system_date.as_deref(),
-        )?;
-        self.with_sessions(|sessions| {
-            sessions.stage_foreground_user_turn(
-                &incoming.address,
-                user_message.clone(),
-                incoming.text.clone(),
-                stored_attachments.clone(),
-            )
-        })?;
-        let session = self
-            .with_sessions(|sessions| Ok(sessions.get_snapshot(&incoming.address)))?
-            .expect("session should exist after staging pending user message");
-        let prompt_state = self.build_foreground_prompt_state(&session, &effective_model_key)?;
-        let prompt_observation = self.with_sessions(|sessions| {
-            sessions.observe_system_prompt_state(
-                &incoming.address,
-                prompt_state.static_hash.clone(),
-                prompt_state.dynamic_hashes.clone(),
-            )
-        })?;
-        let dynamic_notice_keys = if should_emit_runtime_change_notice
-            && !prompt_observation.static_changed
-            && !prompt_observation.dynamic_notice_keys.is_empty()
-        {
-            self.with_sessions(|sessions| {
-                sessions.take_system_prompt_dynamic_notices(&incoming.address)
-            })?
-        } else {
-            Default::default()
-        };
-        let dynamic_system_prompt_notices = dynamic_notice_keys
-            .iter()
-            .filter_map(|key| prompt_state.dynamic_notices.get(key))
-            .cloned()
-            .collect::<Vec<_>>();
-        if dynamic_notice_keys.contains("identity") {
-            profile_change_notices
-                .retain(|notice| !matches!(notice, SharedProfileChangeNotice::IdentityUpdated));
-        }
-        if dynamic_notice_keys.contains("user_meta") {
-            profile_change_notices
-                .retain(|notice| !matches!(notice, SharedProfileChangeNotice::UserUpdated));
-        }
-        if dynamic_notice_keys.contains("available_models")
-            || dynamic_notice_keys.contains("current_model_profile")
-        {
-            model_catalog_change_notice = None;
-        }
-        let synthetic_system_messages = build_synthetic_system_messages(
-            self.take_process_restart_notice(&incoming.address),
-            user_time_tip.as_deref(),
-            &dynamic_system_prompt_notices,
-            model_catalog_change_notice.as_deref(),
-            skill_updates_prefix.as_deref(),
-            &profile_change_notices,
-        );
-        let base_messages = session.request_messages();
-        let (mut previous_messages, active_system_prompt, rebuilt_system_prompt) =
-            prepare_system_prompt_for_turn(
-                &base_messages,
-                &prompt_state.system_prompt,
-                prompt_observation.static_changed,
-            );
-        previous_messages.extend(synthetic_system_messages.iter().cloned());
-        if rebuilt_system_prompt {
-            self.with_conversations(|conversations| {
-                conversations
-                    .rotate_chat_version_id(&incoming.address)
-                    .map(|_| ())
-            })?;
-            self.with_sessions(|sessions| {
-                sessions.mark_system_prompt_state_current(
-                    &incoming.address,
-                    prompt_state.static_hash.clone(),
-                    prompt_state.dynamic_hashes.clone(),
-                )
-            })?;
-        }
-        let turn_system_prompt = TurnSystemPromptState {
-            active: active_system_prompt,
-            full: prompt_state.system_prompt.clone(),
-            static_hash: prompt_state.static_hash.clone(),
-            component_hashes: prompt_state.dynamic_hashes.clone(),
-        };
-        let mut active_session = session;
-        let mut next_previous_messages = previous_messages;
-        let mut ephemeral_system_messages = synthetic_system_messages.clone();
-
-        channel
-            .set_processing(&incoming.address, ProcessingState::Typing)
-            .await
-            .ok();
-        let typing_guard = spawn_processing_keepalive(
-            channel.clone(),
-            incoming.address.clone(),
-            ProcessingState::Typing,
-        );
-
-        let turn_result = self
-            .run_foreground_turn_until_settled(
-                &mut active_session,
-                &effective_model_key,
-                &mut next_previous_messages,
-                &turn_system_prompt,
-                &mut ephemeral_system_messages,
-                "foreground agent turn failed",
-            )
-            .await;
-        // Clear the pending-interrupt flag for this session so future turns
-        // resume normally. The flag was set by the main event loop when a user
-        // message arrived during this turn.
-        if let Ok(mut interrupts) = self.pending_foreground_interrupts.lock() {
-            interrupts.remove(&incoming.address.session_key());
-        }
-        if let Some(stop_sender) = typing_guard {
-            let _ = stop_sender.send(());
-        }
-        if let Err(error) = &turn_result {
-            channel
-                .set_processing(&incoming.address, ProcessingState::Idle)
-                .await
-                .ok();
-            self.send_user_error_message(channel, &incoming.address, error)
-                .await;
-        }
-        let outcome = turn_result?;
-        let (state, outgoing) = match outcome {
-            ForegroundTurnOutcome::Replied { state, outgoing } => (state, outgoing),
-            outcome => {
-                if self
-                    .finish_non_reply_foreground_outcome_for_channel(
-                        channel,
-                        &incoming.address,
-                        &active_session,
-                        outcome,
-                        &turn_system_prompt,
-                        &synthetic_system_messages,
-                    )
-                    .await?
-                {
-                    return Ok(());
-                }
-                unreachable!("replied branch should have matched above");
-            }
-        };
-
-        self.persist_completed_foreground_turn(
-            &incoming.address,
-            active_session.stable_message_count(),
-            state.messages,
-            &active_session.session_state.pending_messages,
-            &state.usage,
-            &state.compaction,
-            &turn_system_prompt,
-            &synthetic_system_messages,
-            Some(&outgoing),
-        )
-        .context("failed to persist agent_frame messages")?;
-        self.finish_replied_foreground_outcome_for_channel(
-            channel,
-            &active_session,
-            &incoming.address,
-            &effective_model_key,
-            &state.usage,
-            outgoing,
-            "user message reply",
-        )
-        .await?;
-        Ok(())
+        TurnCoordinator::new(self, channel, incoming).run().await
     }
 
     fn should_auto_resume_yielded_session(&self, session: &SessionSnapshot) -> bool {
@@ -892,63 +920,6 @@ impl Server {
         model_key: &str,
         previous_messages: Vec<ChatMessage>,
     ) -> Result<ForegroundTurnOutcome> {
-        let effective_backend = self.effective_agent_backend(&session.address)?;
-        let model = self.model_config_or_main(model_key)?.clone();
-        let previous_messages = if effective_backend == AgentBackendKind::AgentFrame {
-            previous_messages
-        } else {
-            sanitize_messages_for_model_capabilities(
-                &previous_messages,
-                &model,
-                backend_supports_native_multimodal_input(effective_backend),
-            )
-        };
-        if self.foreground_uses_native_zgent(&session.address, model_key)? {
-            let active = self.ensure_native_zgent_session(session, model_key)?;
-            active.busy.store(true, Ordering::SeqCst);
-            let kernel = Arc::clone(&active.kernel);
-            let previous_messages_clone = previous_messages.clone();
-            let run_result = tokio::task::spawn_blocking(move || {
-                kernel.run_immediate_turn(&previous_messages_clone, "")
-            })
-            .await
-            .context("native zgent foreground task join failed");
-            active.busy.store(false, Ordering::SeqCst);
-            let messages = run_result??;
-            let session_summary = active.kernel.fetch_session_summary().ok();
-            self.with_sessions(|sessions| {
-                sessions.set_zgent_native_state(
-                    &session.address,
-                    Some(ZgentNativeSessionState {
-                        remote_session_id: Some(active.kernel.remote_session_id().to_string()),
-                        model_key: Some(model_key.to_string()),
-                        context_window_current: session_summary
-                            .as_ref()
-                            .and_then(|summary| summary.context_window_current),
-                        context_window_size: session_summary
-                            .as_ref()
-                            .and_then(|summary| summary.context_window_size),
-                    }),
-                )
-            })?;
-            let workspace_root = session.workspace_root.clone();
-            let state = SessionState {
-                messages,
-                pending_messages: Vec::new(),
-                phase: SessionPhase::End,
-                errno: None,
-                errinfo: None,
-                usage: TokenUsage::default(),
-                compaction: SessionCompactionStats::default(),
-            };
-            return foreground_reply_from_completed_state(
-                session,
-                state,
-                &workspace_root,
-                &self.main_agent.language,
-            );
-        }
-
         let workspace_root = session.workspace_root.clone();
         let upstream_timeout_seconds = session
             .api_timeout_override_seconds
@@ -971,7 +942,7 @@ impl Server {
                 session.clone(),
                 AgentPromptKind::MainForeground,
                 session.agent_id,
-                effective_backend,
+                AgentBackendKind::AgentFrame,
                 model_key.to_string(),
                 previous_messages.clone(),
                 String::new(),

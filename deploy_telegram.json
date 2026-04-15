@@ -1,5 +1,5 @@
 {
-  "version": "0.18",
+  "version": "0.19",
   "models": {
     "gemini3.1-flash-image": {
       "type": "openrouter-resp",
@@ -37,12 +37,14 @@
         "mode": "no"
       },
       "context_window_tokens": 200000,
+      "description": "Don't use this model as subagent, unless you are this model, or with the permission of user.",
       "token_estimation": {
         "template": {
           "source": "huggingface",
           "repo": "zai-org/GLM-5.1",
           "revision": "main",
-          "file": "chat_template.jinja"
+          "file": "chat_template.jinja",
+          "field": "chat_template"
         },
         "tokenizer": {
           "source": "huggingface",
@@ -50,8 +52,7 @@
           "revision": "main",
           "file": "tokenizer.json"
         }
-      },
-      "description": "Don't use this model as subagent, unless you are this model, or with the permission of user."
+      }
     },
     "gpt54": {
       "type": "codex-subscription",
@@ -123,11 +124,6 @@
         "opus-4.6",
         "glm-5.1",
         "gpt54"
-      ]
-    },
-    "zgent": {
-      "available_models": [
-        "opus-4.6"
       ]
     }
   },
@@ -220,7 +216,7 @@
         },
         {
           "command": "agent",
-          "description": "Show or set the conversation agent backend and model"
+          "description": "Show or set the conversation model"
         },
         {
           "command": "sandbox",

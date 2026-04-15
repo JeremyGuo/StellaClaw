@@ -3,7 +3,7 @@ use crate::config::SandboxMode;
 use crate::domain::ChannelAddress;
 use crate::workpath::{
     RemoteWorkpath, replace_workpath_description, validate_remote_workpath,
-    validate_remote_workpath_key,
+    validate_remote_workpath_host,
 };
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -187,24 +187,6 @@ impl ConversationManager {
         Ok(state.snapshot())
     }
 
-    pub fn set_agent_backend(
-        &mut self,
-        address: &ChannelAddress,
-        backend: Option<AgentBackendKind>,
-    ) -> Result<ConversationSnapshot> {
-        let key = address.session_key();
-        if !self.conversations.contains_key(&key) {
-            self.ensure_conversation(address)?;
-        }
-        let state = self
-            .conversations
-            .get_mut(&key)
-            .ok_or_else(|| anyhow!("missing conversation {}", key))?;
-        state.settings.agent_backend = backend;
-        state.persist()?;
-        Ok(state.snapshot())
-    }
-
     pub fn set_agent_selection(
         &mut self,
         address: &ChannelAddress,
@@ -330,16 +312,12 @@ impl ConversationManager {
             .conversations
             .get_mut(&key)
             .ok_or_else(|| anyhow!("missing conversation {}", key))?;
-        if let Some(existing) = state
+        let host_key = workpath.host.clone();
+        state
             .settings
             .remote_workpaths
-            .iter_mut()
-            .find(|item| item.host == workpath.host && item.path == workpath.path)
-        {
-            existing.description = workpath.description;
-        } else {
-            state.settings.remote_workpaths.push(workpath);
-        }
+            .retain(|item| item.host != host_key);
+        state.settings.remote_workpaths.push(workpath);
         state.settings.chat_version_id = Uuid::new_v4();
         state.persist()?;
         Ok(state.snapshot())
@@ -349,10 +327,10 @@ impl ConversationManager {
         &mut self,
         address: &ChannelAddress,
         host: &str,
-        path: &str,
+        _path: &str,
         description: &str,
     ) -> Result<ConversationSnapshot> {
-        let (host, path) = validate_remote_workpath_key(host, path)?;
+        let host = validate_remote_workpath_host(host)?;
         let key = address.session_key();
         if !self.conversations.contains_key(&key) {
             self.ensure_conversation(address)?;
@@ -361,12 +339,7 @@ impl ConversationManager {
             .conversations
             .get_mut(&key)
             .ok_or_else(|| anyhow!("missing conversation {}", key))?;
-        replace_workpath_description(
-            &mut state.settings.remote_workpaths,
-            &host,
-            &path,
-            description,
-        )?;
+        replace_workpath_description(&mut state.settings.remote_workpaths, &host, description)?;
         state.settings.chat_version_id = Uuid::new_v4();
         state.persist()?;
         Ok(state.snapshot())
@@ -376,9 +349,9 @@ impl ConversationManager {
         &mut self,
         address: &ChannelAddress,
         host: &str,
-        path: &str,
+        _path: &str,
     ) -> Result<ConversationSnapshot> {
-        let (host, path) = validate_remote_workpath_key(host, path)?;
+        let host = validate_remote_workpath_host(host)?;
         let key = address.session_key();
         if !self.conversations.contains_key(&key) {
             self.ensure_conversation(address)?;
@@ -391,9 +364,9 @@ impl ConversationManager {
         state
             .settings
             .remote_workpaths
-            .retain(|item| !(item.host == host && item.path == path));
+            .retain(|item| item.host != host);
         if state.settings.remote_workpaths.len() == before {
-            return Err(anyhow!("remote workpath not found for {}:{}", host, path));
+            return Err(anyhow!("remote workpath not found for {}", host));
         }
         state.settings.chat_version_id = Uuid::new_v4();
         state.persist()?;
@@ -523,6 +496,28 @@ mod tests {
             .unwrap();
 
         assert!(snapshot.settings.remote_workpaths.is_empty());
+    }
+
+    #[test]
+    fn add_remote_workpath_replaces_existing_host() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = test_address();
+        let mut manager = ConversationManager::new(temp_dir.path()).unwrap();
+
+        manager
+            .add_remote_workpath(&address, "wuwen-dev6", "/srv/old", "old checkout")
+            .unwrap();
+        let snapshot = manager
+            .add_remote_workpath(&address, "wuwen-dev6", "/srv/new", "new checkout")
+            .unwrap();
+
+        assert_eq!(snapshot.settings.remote_workpaths.len(), 1);
+        assert_eq!(snapshot.settings.remote_workpaths[0].host, "wuwen-dev6");
+        assert_eq!(snapshot.settings.remote_workpaths[0].path, "/srv/new");
+        assert_eq!(
+            snapshot.settings.remote_workpaths[0].description,
+            "new checkout"
+        );
     }
 
     #[test]

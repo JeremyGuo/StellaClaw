@@ -829,6 +829,7 @@ fn run_session_state_controlled_internal(
         &config.skills_dirs,
         &discovered_skills,
         &extra_tools,
+        &config.remote_workpaths,
         control
             .as_ref()
             .map(SessionExecutionControl::tool_interrupt_flag),
@@ -1467,6 +1468,7 @@ mod tests {
             image_generation_tool_upstream: None,
             skills_dirs: Vec::new(),
             system_prompt: "Test system prompt.".to_string(),
+            remote_workpaths: Vec::new(),
             max_tool_roundtrips: 4,
             workspace_root: PathBuf::from("."),
             runtime_state_root: std::env::temp_dir().join("agent_frame_tests"),
@@ -1664,6 +1666,7 @@ pub fn compact_session_messages_with_report(
         &config.skills_dirs,
         &discovered_skills,
         &extra_tools,
+        &config.remote_workpaths,
     )?;
     let tool_definitions = registry.values().cloned().collect::<Vec<_>>();
     let compaction_source = materialize_messages_for_upstream(&messages, &config)?;
@@ -1696,6 +1699,7 @@ pub fn estimate_configured_session_tokens(
         &config.skills_dirs,
         &discovered_skills,
         &extra_tools,
+        &config.remote_workpaths,
     )?;
     let tool_definitions = registry.values().cloned().collect::<Vec<_>>();
     let request_messages = materialize_messages_for_upstream(&messages, &config)?;

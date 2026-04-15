@@ -1,5 +1,16 @@
-version: 0.18.1
+version: 0.19.0
 ---
+
+# 0.19.0
+
+- 移除主分支的 ZGent backend 支持：
+  `agent_host` 现在只暴露并运行 `agent_frame` backend；删除 ZGent native kernel、app bridge、compat adapter、subagent bridge、smoke test、构建脚本以及根目录 ZGent gitlink。
+- 更新配置版本到 `0.19`：
+  最新 config schema、TUI 配置编辑器、配置骨架和部署配置都不再包含 `agent.zgent`；旧配置中残留的 `agent.zgent` 会在加载并保存升级后被丢弃，历史 `"backend": "zgent"` 值会兼容解析为 `agent_frame`。
+- 升级 `workdir` 结构版本到 `0.24`：
+  `0.23 -> 0.24` upgrade step 会移除旧 `sessions/*/session.json`、snapshot 等 JSON 中的 `zgent_native` 状态，并把持久化的 `agent_backend: "zgent"` 规范化为 `agent_backend: "agent_frame"`。
+- 本次同时影响 `config` 与 `workdir` schema：
+  新增 config loader 与 workdir upgrade step；按配置变更策略将仓库版本从 `0.18.1` 提升到 `0.19.0`。
 
 # 0.18.1
 

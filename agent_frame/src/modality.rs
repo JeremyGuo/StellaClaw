@@ -327,6 +327,7 @@ mod tests {
             image_generation_tool_upstream: None,
             skills_dirs: Vec::new(),
             system_prompt: String::new(),
+            remote_workpaths: Vec::new(),
             max_tool_roundtrips: 4,
             workspace_root: workspace_root.to_path_buf(),
             runtime_state_root: workspace_root.join(".runtime"),

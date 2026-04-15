@@ -526,34 +526,6 @@ schtasks /Run /TN "ClawParty\mybot"
 
 修改 `.env` 后也需要重启服务。`.env` 的路径变了，则需要重新执行 Linux `setup`、重新生成 macOS plist，或重新生成 Windows 启动脚本。
 
-## 可选：构建 zgent-server
-
-只有启用 zgent 原生 kernel 路径时才需要额外构建 `./zgent` 里的 `zgent-server`。
-
-Linux：
-
-```bash
-./scripts/build_zgent_server.sh
-```
-
-如果依赖已经装好，只编译：
-
-```bash
-./scripts/build_zgent_server.sh --skip-install
-```
-
-macOS：
-
-```bash
-cargo build --manifest-path zgent/Cargo.toml --bin zgent-server
-```
-
-Windows：
-
-```powershell
-cargo build --manifest-path zgent\Cargo.toml --bin zgent-server
-```
-
 ## 故障排查
 
 检查配置能否打开：

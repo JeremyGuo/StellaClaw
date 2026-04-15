@@ -99,7 +99,7 @@ Together, these turn a one-shot request-response pattern into a **continuous, co
 
 Each Telegram group chat with the bot creates an **independent conversation** with its own:
 - Workspace (isolated filesystem)
-- Model & agent backend selection
+- Model selection
 - Session history & memory
 - Sandbox mode
 
@@ -290,7 +290,7 @@ systemctl --user enable --now partyclaw
 
 | Command | Description |
 |:--------|:------------|
-| `/agent` | Select agent backend & model |
+| `/agent` | Select conversation model |
 | `/status` | Token usage, cache stats, cost estimation |
 | `/compact` | One-off context compaction |
 | `/compact_mode` | Toggle automatic compaction |

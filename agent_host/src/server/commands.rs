@@ -2,12 +2,36 @@ use super::*;
 
 pub(super) enum AgentCommand {
     ShowSelection,
-    SelectBackend(AgentBackendKind),
-    SelectModel {
-        backend: Option<AgentBackendKind>,
-        model_key: String,
-    },
+    SelectModel { model_key: String },
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum IncomingCommandLane {
+    Immediate,
+    ConversationWorker,
+}
+
+const IMMEDIATE_COMMANDS: &[&str] = &["/help", "/status"];
+const KNOWN_COMMANDS: &[&str] = &[
+    "/admin_authorize",
+    "/admin_chat_approve",
+    "/admin_chat_list",
+    "/admin_chat_reject",
+    "/agent",
+    "/authorize",
+    "/compact",
+    "/compact_mode",
+    "/continue",
+    "/help",
+    "/model",
+    "/sandbox",
+    "/set_api_timeout",
+    "/snaplist",
+    "/snapload",
+    "/snapsave",
+    "/status",
+    "/think",
+];
 
 pub(super) fn format_api_timeout_update(
     session: &SessionSnapshot,
@@ -43,42 +67,33 @@ pub(super) fn format_api_timeout_update(
 }
 
 pub(super) fn parse_set_api_timeout_command(text: Option<&str>) -> Option<String> {
-    let text = normalized_command_text(text?)?;
-    let suffix = text.strip_prefix("/set_api_timeout")?.trim();
-    if suffix.is_empty() {
-        None
-    } else {
-        Some(suffix.to_string())
-    }
+    parse_required_command_argument(text, "/set_api_timeout")
 }
 
 pub(super) fn parse_agent_command(text: Option<&str>) -> Option<AgentCommand> {
-    let text = normalized_command_text(text?)?;
-    let suffix = text
-        .strip_prefix("/agent")
-        .or_else(|| text.strip_prefix("/model"))?
-        .trim();
+    let (_, suffix) = split_any_command_argument(text?, &["/agent", "/model"])?;
     if suffix.is_empty() {
         return Some(AgentCommand::ShowSelection);
     }
 
     let parts = suffix.split_whitespace().collect::<Vec<_>>();
     match parts.as_slice() {
-        [backend] => parse_agent_backend_value(backend)
-            .map(AgentCommand::SelectBackend)
-            .or_else(|| {
+        ["agent_frame"] => Some(AgentCommand::ShowSelection),
+        [model_key] => Some(AgentCommand::SelectModel {
+            model_key: (*model_key).to_string(),
+        }),
+        ["agent_frame", model_key] => Some(AgentCommand::SelectModel {
+            model_key: (*model_key).to_string(),
+        }),
+        _ => {
+            if parse_agent_backend_value(parts[0]).is_some() {
+                None
+            } else {
                 Some(AgentCommand::SelectModel {
-                    backend: None,
-                    model_key: (*backend).to_string(),
+                    model_key: suffix.to_string(),
                 })
-            }),
-        [backend, model_key] => {
-            parse_agent_backend_value(backend).map(|backend| AgentCommand::SelectModel {
-                backend: Some(backend),
-                model_key: (*model_key).to_string(),
-            })
+            }
         }
-        _ => None,
     }
 }
 
@@ -140,29 +155,16 @@ pub(super) fn parse_optional_command_argument(
     text: Option<&str>,
     command: &str,
 ) -> Option<Option<String>> {
-    let text = normalized_command_text(text?)?;
-    if text == command {
-        return Some(None);
-    }
-    let suffix = text.strip_prefix(command)?.trim();
-    if suffix.is_empty() {
-        Some(None)
-    } else {
-        Some(Some(suffix.to_string()))
-    }
+    let (_, suffix) = split_command_argument(text?, command)?;
+    Some((!suffix.is_empty()).then(|| suffix.to_string()))
 }
 
 fn parse_required_command_argument(text: Option<&str>, command: &str) -> Option<String> {
-    let text = normalized_command_text(text?)?;
-    let suffix = text.strip_prefix(command)?.trim();
-    if suffix.is_empty() {
-        None
-    } else {
-        Some(suffix.to_string())
-    }
+    let (_, suffix) = split_command_argument(text?, command)?;
+    (!suffix.is_empty()).then(|| suffix.to_string())
 }
 
-fn normalized_command_text(text: &str) -> Option<String> {
+fn normalized_command_parts(text: &str) -> Option<(String, String)> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;
@@ -171,32 +173,66 @@ fn normalized_command_text(text: &str) -> Option<String> {
     let first = parts.next()?;
     let normalized_first = first_token_without_mention(first);
     let rest = parts.next().map(str::trim_start).unwrap_or("");
-    if rest.is_empty() {
-        Some(normalized_first.to_string())
-    } else {
-        Some(format!("{normalized_first} {rest}"))
-    }
+    Some((normalized_first.to_string(), rest.to_string()))
 }
 
 fn first_token_without_mention(token: &str) -> &str {
     token.split_once('@').map_or(token, |(base, _)| base)
 }
 
-pub(super) fn command_matches(text: &str, command: &str) -> bool {
-    normalized_command_text(text).as_deref() == Some(command)
+fn split_command_argument(text: &str, command: &str) -> Option<(String, String)> {
+    let (normalized_command, suffix) = normalized_command_parts(text)?;
+    (normalized_command == command).then_some((normalized_command, suffix.trim().to_string()))
 }
 
+fn split_any_command_argument(text: &str, commands: &[&str]) -> Option<(String, String)> {
+    let (normalized_command, suffix) = normalized_command_parts(text)?;
+    commands
+        .contains(&normalized_command.as_str())
+        .then_some((normalized_command, suffix.trim().to_string()))
+}
+
+pub(super) fn command_matches(text: &str, command: &str) -> bool {
+    normalized_command_parts(text).is_some_and(|(normalized_command, suffix)| {
+        normalized_command == command && suffix.is_empty()
+    })
+}
+
+#[cfg(test)]
 pub(super) fn is_out_of_band_command(text: Option<&str>) -> bool {
-    let Some(text) = text else {
-        return false;
-    };
-    command_matches(text, "/help") || command_matches(text, "/status")
+    command_name(text).is_some_and(|name| IMMEDIATE_COMMANDS.contains(&name.as_str()))
 }
 
 pub(super) fn command_starts_with(text: &str, command: &str) -> bool {
-    normalized_command_text(text)
-        .as_deref()
-        .is_some_and(|normalized| normalized.starts_with(command))
+    normalized_command_parts(text)
+        .is_some_and(|(normalized_command, _)| normalized_command == command)
+}
+
+pub(super) fn incoming_command_lane(text: Option<&str>) -> Option<IncomingCommandLane> {
+    let command_name = command_name(text)?;
+    if IMMEDIATE_COMMANDS.contains(&command_name.as_str()) {
+        return Some(IncomingCommandLane::Immediate);
+    }
+    if KNOWN_COMMANDS.contains(&command_name.as_str()) {
+        return Some(IncomingCommandLane::ConversationWorker);
+    }
+    is_slash_command_name(&command_name).then_some(IncomingCommandLane::Immediate)
+}
+
+pub(super) fn is_command_like_text(text: Option<&str>) -> bool {
+    command_name(text).is_some_and(|name| is_slash_command_name(&name))
+}
+
+fn command_name(text: Option<&str>) -> Option<String> {
+    let (command_name, _) = normalized_command_parts(text?)?;
+    Some(command_name)
+}
+
+fn is_slash_command_name(command_name: &str) -> bool {
+    let Some(name) = command_name.strip_prefix('/') else {
+        return false;
+    };
+    !name.trim().is_empty()
 }
 
 pub(super) fn sandbox_mode_label(mode: SandboxMode) -> &'static str {
@@ -231,7 +267,6 @@ pub(super) fn parse_reasoning_effort_value(value: &str) -> Option<&'static str> 
 pub(super) fn parse_agent_backend_value(value: &str) -> Option<AgentBackendKind> {
     match value.trim() {
         "agent_frame" => Some(AgentBackendKind::AgentFrame),
-        "zgent" => Some(AgentBackendKind::Zgent),
         _ => None,
     }
 }

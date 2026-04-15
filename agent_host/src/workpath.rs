@@ -52,8 +52,16 @@ pub fn validate_remote_workpath(
 }
 
 pub fn validate_remote_workpath_key(host: &str, path: &str) -> Result<(String, String)> {
-    let host = host.trim();
+    let host = validate_remote_workpath_host(host)?;
     let path = path.trim();
+    if path.is_empty() {
+        return Err(anyhow!("path must be a non-empty remote directory path"));
+    }
+    Ok((host, path.to_string()))
+}
+
+pub fn validate_remote_workpath_host(host: &str) -> Result<String> {
+    let host = host.trim();
     if host.is_empty() {
         return Err(anyhow!("host must be a non-empty SSH alias"));
     }
@@ -62,10 +70,7 @@ pub fn validate_remote_workpath_key(host: &str, path: &str) -> Result<(String, S
             "remote workpath host must be a remote SSH alias, not local"
         ));
     }
-    if path.is_empty() {
-        return Err(anyhow!("path must be a non-empty remote directory path"));
-    }
-    Ok((host.to_string(), path.to_string()))
+    Ok(host.to_string())
 }
 
 pub fn load_remote_agents_md(host: &str, path: &str) -> RemoteAgentsMdLoad {
@@ -210,7 +215,6 @@ pub fn load_remote_agents_md_for_workpath(workpath: &RemoteWorkpath) -> RemoteAg
 pub fn replace_workpath_description(
     workpaths: &mut [RemoteWorkpath],
     host: &str,
-    path: &str,
     description: &str,
 ) -> Result<()> {
     let description = description.trim();
@@ -219,11 +223,8 @@ pub fn replace_workpath_description(
             "description must explain what this remote path is for"
         ));
     }
-    let Some(workpath) = workpaths
-        .iter_mut()
-        .find(|item| item.host == host && item.path == path)
-    else {
-        return Err(anyhow!("remote workpath not found for {}:{}", host, path));
+    let Some(workpath) = workpaths.iter_mut().find(|item| item.host == host) else {
+        return Err(anyhow!("remote workpath not found for {}", host));
     };
     workpath.description = description.to_string();
     Ok(())
@@ -251,9 +252,9 @@ mod tests {
             description: "old".to_string(),
         }];
 
-        replace_workpath_description(&mut workpaths, "wuwen-dev6", "/srv/app", "new").unwrap();
+        replace_workpath_description(&mut workpaths, "wuwen-dev6", "new").unwrap();
 
         assert_eq!(workpaths[0].description, "new");
-        assert!(replace_workpath_description(&mut workpaths, "other", "/srv/app", "new").is_err());
+        assert!(replace_workpath_description(&mut workpaths, "other", "new").is_err());
     }
 }

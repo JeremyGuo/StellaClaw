@@ -522,16 +522,7 @@ pub(super) fn format_session_status(
     } else {
         (current_context_estimate as f64 / current_context_limit as f64) * 100.0
     };
-    let context_source_label = if session
-        .zgent_native
-        .as_ref()
-        .and_then(|state| state.context_window_current)
-        .is_some()
-    {
-        "native actual".to_string()
-    } else {
-        format!("local estimate, {}", token_estimation_status_label(model))
-    };
+    let context_source_label = format!("local estimate, {}", token_estimation_status_label(model));
     let language = language.to_ascii_lowercase();
     if language.starts_with("zh") {
         let mut lines = vec![
@@ -932,13 +923,6 @@ pub(super) fn estimate_current_context_tokens_for_session(
     session: &SessionSnapshot,
     model_key: &str,
 ) -> Result<usize> {
-    if let Some(actual) = session
-        .zgent_native
-        .as_ref()
-        .and_then(|state| state.context_window_current)
-    {
-        return Ok(actual as usize);
-    }
     let frame_config = runtime.build_agent_frame_config(
         session,
         &session.workspace_root,
@@ -952,58 +936,15 @@ pub(super) fn estimate_current_context_tokens_for_session(
         session.agent_id,
         None,
     );
-    let model = runtime.model_config(model_key)?;
-    let effective_backend = runtime
-        .selected_agent_backend()
-        .or_else(|| runtime.inferred_agent_backend_for_model(model_key))
-        .unwrap_or(AgentBackendKind::AgentFrame);
-    if effective_backend == AgentBackendKind::AgentFrame {
-        return estimate_configured_session_tokens(
-            session.request_messages(),
-            "",
-            frame_config,
-            extra_tools,
-        );
-    }
-    let skills = discover_skills(&frame_config.skills_dirs)?;
-    let registry = build_tool_registry(
-        &frame_config.enabled_tools,
-        &frame_config.workspace_root,
-        &frame_config.runtime_state_root,
-        &frame_config.upstream,
-        frame_config.image_tool_upstream.as_ref(),
-        frame_config.pdf_tool_upstream.as_ref(),
-        frame_config.audio_tool_upstream.as_ref(),
-        frame_config.image_generation_tool_upstream.as_ref(),
-        &frame_config.skills_dirs,
-        &skills,
-        &extra_tools,
-    )?;
-    let tools = registry.into_values().collect::<Vec<_>>();
-    let sanitized_messages = sanitize_messages_for_model_capabilities(
-        &session.request_messages(),
-        model,
-        backend_supports_native_multimodal_input(effective_backend),
-    );
-    Ok(estimate_session_tokens_for_model_with_config(
-        &sanitized_messages,
-        &tools,
-        "",
-        &model.model,
-        model.token_estimation.as_ref(),
-    ))
+    estimate_configured_session_tokens(session.request_messages(), "", frame_config, extra_tools)
 }
 
 pub(super) fn effective_context_window_limit_for_session(
     session: &SessionSnapshot,
     model: &ModelConfig,
 ) -> usize {
-    session
-        .zgent_native
-        .as_ref()
-        .and_then(|state| state.context_window_size)
-        .map(|value| value as usize)
-        .unwrap_or(model.context_window_tokens)
+    let _ = session;
+    model.context_window_tokens
 }
 
 pub(super) fn replace_directory_contents(target: &Path, source: &Path) -> Result<()> {

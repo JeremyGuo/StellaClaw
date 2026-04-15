@@ -440,6 +440,7 @@ fn builtin_tools_work() -> Result<()> {
         &[],
         &[],
         &[],
+        &[],
     )?;
 
     let write_result = execute_tool_call(
@@ -713,6 +714,7 @@ fn exec_processes_report_clear_error_after_runtime_shutdown() -> Result<()> {
         &[],
         &[],
         &[],
+        &[],
     )?;
 
     let started = execute_tool_call(
@@ -763,6 +765,7 @@ fn exec_wait_accepts_input_from_a_fresh_registry_instance() -> Result<()> {
         &[],
         &[],
         &[],
+        &[],
     )?;
 
     let started = execute_tool_call(
@@ -784,6 +787,7 @@ fn exec_wait_accepts_input_from_a_fresh_registry_instance() -> Result<()> {
         None,
         None,
         None,
+        &[],
         &[],
         &[],
         &[],
@@ -834,6 +838,7 @@ fn exec_start_supports_per_tool_remote_ssh() -> Result<()> {
         None,
         None,
         None,
+        &[],
         &[],
         &[],
         &[],
@@ -899,6 +904,7 @@ fn load_skill_tool_hides_paths_but_can_read_skill_content() -> Result<()> {
         &[skill_root.clone()],
         &skills,
         &[],
+        &[],
     )?;
     let result = execute_tool_call(
         &registry,
@@ -934,6 +940,7 @@ fn skill_create_persists_staged_skill_directory() -> Result<()> {
         None,
         None,
         &[skill_root.clone()],
+        &[],
         &[],
         &[],
     )?;
@@ -986,6 +993,7 @@ fn skill_update_validates_and_replaces_existing_skill_directory() -> Result<()> 
         &[skill_root.clone()],
         &skills,
         &[],
+        &[],
     )?;
     let result = execute_tool_call(
         &registry,
@@ -1017,6 +1025,7 @@ fn native_web_search_disables_external_web_search_tool() -> Result<()> {
         None,
         None,
         None,
+        &[],
         &[],
         &[],
         &[],
@@ -2176,6 +2185,7 @@ fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -
         None,
         None,
         None,
+        &[],
         &[],
         &[],
         &[],

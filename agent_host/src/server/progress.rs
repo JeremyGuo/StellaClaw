@@ -364,7 +364,6 @@ mod tests {
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
             seen_model_catalog_version: None,
-            zgent_native: None,
             pending_workspace_summary: false,
             close_after_summary: false,
             session_state: crate::session::DurableSessionState::default(),

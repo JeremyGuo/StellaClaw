@@ -2240,13 +2240,6 @@ impl ConfigEditorApp {
             "agent_frame",
             form.agent_frame_enabled,
         );
-        update_backend_membership(
-            &mut self.value,
-            existing_alias,
-            &alias,
-            "zgent",
-            form.zgent_enabled,
-        );
 
         self.dirty = true;
         Ok(alias)
@@ -2322,7 +2315,6 @@ impl ConfigEditorApp {
             bail!("model `{alias}` does not exist");
         }
         remove_backend_alias(&mut self.value, "agent_frame", alias);
-        remove_backend_alias(&mut self.value, "zgent", alias);
         self.dirty = true;
         Ok(())
     }
@@ -3025,7 +3017,6 @@ enum ModelFormField {
     NativeWebSearchEnabled,
     Description,
     AgentFrameEnabled,
-    ZgentEnabled,
 }
 
 impl ModelFormField {
@@ -3066,7 +3057,6 @@ impl ModelFormField {
             Self::NativeWebSearchEnabled => "native_web_search.enabled",
             Self::Description => "description",
             Self::AgentFrameEnabled => "agent.agent_frame.available_models",
-            Self::ZgentEnabled => "agent.zgent.available_models",
         }
     }
 
@@ -3111,7 +3101,6 @@ impl ModelFormField {
             Self::AgentFrameEnabled => {
                 "Include this alias under agent.agent_frame.available_models"
             }
-            Self::ZgentEnabled => "Include this alias under agent.zgent.available_models",
         }
     }
 
@@ -3122,7 +3111,6 @@ impl ModelFormField {
                 | Self::AgentModelEnabled
                 | Self::NativeWebSearchEnabled
                 | Self::AgentFrameEnabled
-                | Self::ZgentEnabled
         )
     }
 }
@@ -3218,7 +3206,6 @@ struct ModelFormState {
     native_web_search_enabled: bool,
     description: String,
     agent_frame_enabled: bool,
-    zgent_enabled: bool,
 }
 
 impl ModelFormState {
@@ -3263,7 +3250,6 @@ impl ModelFormState {
             native_web_search_enabled: false,
             description: String::new(),
             agent_frame_enabled: true,
-            zgent_enabled: false,
         }
     }
 
@@ -3272,7 +3258,6 @@ impl ModelFormState {
             .cloned()
             .unwrap_or_default();
         let agent_frame_enabled = backend_has_alias(value, "agent_frame", alias);
-        let zgent_enabled = backend_has_alias(value, "zgent", alias);
         Self {
             existing_alias: Some(alias.to_string()),
             raw: raw.clone(),
@@ -3447,7 +3432,6 @@ impl ModelFormState {
                 .unwrap_or("")
                 .to_string(),
             agent_frame_enabled,
-            zgent_enabled,
         }
     }
 
@@ -3479,7 +3463,6 @@ impl ModelFormState {
             ModelFormField::NativeWebSearchEnabled,
             ModelFormField::Description,
             ModelFormField::AgentFrameEnabled,
-            ModelFormField::ZgentEnabled,
         ];
         if self.model_type == "codex-subscription" {
             fields.insert(6, ModelFormField::CodexHome);
@@ -3565,9 +3548,6 @@ impl ModelFormState {
             ModelFormField::AgentFrameEnabled => {
                 self.agent_frame_enabled = !self.agent_frame_enabled;
             }
-            ModelFormField::ZgentEnabled => {
-                self.zgent_enabled = !self.zgent_enabled;
-            }
             _ => {}
         }
     }
@@ -3609,7 +3589,6 @@ impl ModelFormState {
             ModelFormField::NativeWebSearchEnabled => bool_string(self.native_web_search_enabled),
             ModelFormField::Description => self.description.clone(),
             ModelFormField::AgentFrameEnabled => bool_string(self.agent_frame_enabled),
-            ModelFormField::ZgentEnabled => bool_string(self.zgent_enabled),
         }
     }
 
@@ -4225,11 +4204,6 @@ fn model_field_guide_text(form: &ModelFormState, field: ModelFormField) -> Strin
             "true / false",
             "Turn this on when foreground sessions may run through agent_frame.",
         ),
-        ModelFormField::ZgentEnabled => (
-            "Whether this alias should be selectable by the zgent backend.",
-            "true / false",
-            "Turn this on only for models compatible with the zgent runtime.",
-        ),
     };
     format!(
         "Field: {}\n\nWhat to write\n{}\n\nExample\n{}\n\nNotes\n{}",
@@ -4467,9 +4441,8 @@ fn model_summary_text(value: &Value, alias: &str) -> String {
         .filter(|text| !text.is_empty())
         .unwrap_or_else(|| "none".to_string());
     format!(
-        "当前模型: {alias}\n类型: {model_type}\n上游模型: {upstream}\n能力: {capabilities}\nagent_frame 可用: {}\nzgent 可用: {}",
-        bool_string(backend_has_alias(value, "agent_frame", alias)),
-        bool_string(backend_has_alias(value, "zgent", alias))
+        "当前模型: {alias}\n类型: {model_type}\n上游模型: {upstream}\n能力: {capabilities}\nagent_frame 可用: {}",
+        bool_string(backend_has_alias(value, "agent_frame", alias))
     )
 }
 
@@ -4698,9 +4671,6 @@ fn latest_server_config_skeleton() -> Value {
         "models": {},
         "agent": {
             "agent_frame": {
-                "available_models": []
-            },
-            "zgent": {
                 "available_models": []
             }
         },
@@ -5110,7 +5080,6 @@ mod tests {
 
     fn apply_backend_membership(value: &mut serde_json::Value, alias: &str) {
         super::update_backend_membership(value, None, alias, "agent_frame", true);
-        super::update_backend_membership(value, None, alias, "zgent", false);
     }
 
     #[test]
@@ -5174,9 +5143,6 @@ mod tests {
             "agent": {
                 "agent_frame": {
                     "available_models": ["main"]
-                },
-                "zgent": {
-                    "available_models": []
                 }
             },
             "main_agent": {

@@ -97,18 +97,6 @@ pub struct SessionCheckpointData {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ZgentNativeSessionState {
-    #[serde(default)]
-    pub remote_session_id: Option<String>,
-    #[serde(default)]
-    pub model_key: Option<String>,
-    #[serde(default)]
-    pub context_window_current: Option<u32>,
-    #[serde(default)]
-    pub context_window_size: Option<u32>,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionProgressMessageState {
     pub turn_id: String,
     pub message_id: String,
@@ -157,7 +145,6 @@ pub struct SessionSnapshot {
     pub seen_user_profile_version: Option<String>,
     pub seen_identity_profile_version: Option<String>,
     pub seen_model_catalog_version: Option<String>,
-    pub zgent_native: Option<ZgentNativeSessionState>,
     pub pending_workspace_summary: bool,
     pub close_after_summary: bool,
     pub session_state: DurableSessionState,
@@ -219,7 +206,6 @@ struct Session {
     pending_user_profile_notice: bool,
     pending_identity_profile_notice: bool,
     pending_model_catalog_notice: bool,
-    zgent_native: Option<ZgentNativeSessionState>,
     session_state: DurableSessionState,
     pending_workspace_summary: bool,
     close_after_summary: bool,
@@ -252,7 +238,6 @@ impl Session {
             seen_user_profile_version: self.seen_user_profile_version.clone(),
             seen_identity_profile_version: self.seen_identity_profile_version.clone(),
             seen_model_catalog_version: self.seen_model_catalog_version.clone(),
-            zgent_native: self.zgent_native.clone(),
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
             session_state: self.session_state.clone(),
@@ -299,7 +284,6 @@ impl Session {
             pending_identity_profile_notice: self.pending_identity_profile_notice,
             seen_model_catalog_version: self.seen_model_catalog_version.clone(),
             pending_model_catalog_notice: self.pending_model_catalog_notice,
-            zgent_native: self.zgent_native.clone(),
             session_state: Some(self.session_state.clone()),
             pending_workspace_summary: self.pending_workspace_summary,
             close_after_summary: self.close_after_summary,
@@ -368,7 +352,6 @@ impl Session {
             pending_user_profile_notice: persisted.pending_user_profile_notice,
             pending_identity_profile_notice: persisted.pending_identity_profile_notice,
             pending_model_catalog_notice: persisted.pending_model_catalog_notice,
-            zgent_native: persisted.zgent_native,
             session_state,
             pending_workspace_summary: persisted.pending_workspace_summary,
             close_after_summary: persisted.close_after_summary,
@@ -517,8 +500,6 @@ struct PersistedSession {
     pending_identity_profile_notice: bool,
     #[serde(default)]
     pending_model_catalog_notice: bool,
-    #[serde(default)]
-    zgent_native: Option<ZgentNativeSessionState>,
     #[serde(default)]
     session_state: Option<DurableSessionState>,
     #[serde(default)]
@@ -831,7 +812,6 @@ impl SessionManager {
             pending_identity_profile_notice: checkpoint.pending_identity_profile_notice,
             seen_model_catalog_version: checkpoint.seen_model_catalog_version,
             pending_model_catalog_notice: checkpoint.pending_model_catalog_notice,
-            zgent_native: None,
             session_state: DurableSessionState {
                 messages: checkpoint_messages,
                 pending_messages: Vec::new(),
@@ -869,33 +849,6 @@ impl SessionManager {
             .get_mut(&key)
             .with_context(|| format!("no active session for {}", key))?;
         session.api_timeout_override_seconds = timeout_seconds;
-        session.persist()?;
-        Ok(())
-    }
-
-    pub fn zgent_native_state(
-        &self,
-        address: &ChannelAddress,
-    ) -> Result<Option<ZgentNativeSessionState>> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        Ok(session.zgent_native.clone())
-    }
-
-    pub fn set_zgent_native_state(
-        &mut self,
-        address: &ChannelAddress,
-        zgent_native: Option<ZgentNativeSessionState>,
-    ) -> Result<()> {
-        let key = address.session_key();
-        let session = self
-            .foreground_sessions
-            .get_mut(&key)
-            .with_context(|| format!("no active session for {}", key))?;
-        session.zgent_native = zgent_native;
         session.persist()?;
         Ok(())
     }
@@ -1594,7 +1547,6 @@ impl SessionManager {
             pending_user_profile_notice: false,
             pending_identity_profile_notice: false,
             pending_model_catalog_notice: false,
-            zgent_native: None,
             session_state: DurableSessionState::default(),
             pending_workspace_summary: false,
             close_after_summary: false,

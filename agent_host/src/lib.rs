@@ -22,6 +22,5 @@ pub mod subagent;
 pub mod upgrade;
 pub mod workpath;
 pub mod workspace;
-pub mod zgent;
 
 pub use server::Server;

@@ -331,22 +331,6 @@ pub fn run_child_stdio() -> Result<()> {
                         Some(control),
                         &mut agent_frame_runtime,
                     ),
-                    AgentBackendKind::Zgent => {
-                        if !crate::zgent::zgent_runtime_available() {
-                            Err(anyhow!(
-                                "the zgent backend is unavailable because the local ./zgent runtime directory is unavailable"
-                            ))
-                        } else {
-                            crate::zgent::kernel::run_session_state_controlled(
-                                payload.previous_messages,
-                                payload.prompt,
-                                payload.config,
-                                extra_tools,
-                                Some(control),
-                                payload.execution_options,
-                            )
-                        }
-                    }
                 };
 
                 {

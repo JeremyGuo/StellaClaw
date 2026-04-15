@@ -5,27 +5,36 @@ use agent_frame::{
     Tool, compact_session_messages_with_report as frame_compact_session_messages_with_report,
 };
 use anyhow::{Result, anyhow};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::zgent::subagent::ZgentSubagentModel;
-use crate::zgent::zgent_runtime_available;
-
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentBackendKind {
     #[default]
     AgentFrame,
-    Zgent,
+}
+
+impl<'de> Deserialize<'de> for AgentBackendKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "agent_frame" | "zgent" => Ok(Self::AgentFrame),
+            other => Err(serde::de::Error::custom(format!(
+                "unsupported agent backend '{}'",
+                other
+            ))),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub struct BackendExecutionOptions {
-    #[serde(default)]
-    pub zgent_allowed_subagent_models: Vec<ZgentSubagentModel>,
-}
+pub struct BackendExecutionOptions {}
 
-pub fn backend_supports_native_multimodal_input(kind: AgentBackendKind) -> bool {
-    matches!(kind, AgentBackendKind::AgentFrame)
+pub fn backend_supports_native_multimodal_input(_kind: AgentBackendKind) -> bool {
+    true
 }
 
 pub fn compact_session_messages_with_report(
@@ -38,19 +47,33 @@ pub fn compact_session_messages_with_report(
         AgentBackendKind::AgentFrame => {
             frame_compact_session_messages_with_report(previous_messages, config, extra_tools)
         }
-        AgentBackendKind::Zgent => {
-            if !zgent_runtime_available() {
-                return Err(anyhow!(
-                    "the zgent backend is unavailable because the local ./zgent runtime directory is unavailable"
-                ));
-            }
-            crate::zgent::compaction::compact_session_messages_with_report(
-                previous_messages,
-                &config,
-                &extra_tools,
-            )
-        }
     }
+}
+
+pub fn ensure_supported_backend(backend: AgentBackendKind) -> Result<()> {
+    match backend {
+        AgentBackendKind::AgentFrame => Ok(()),
+    }
+}
+
+pub fn parse_agent_backend_value(value: &str) -> Option<AgentBackendKind> {
+    match value.trim() {
+        "agent_frame" => Some(AgentBackendKind::AgentFrame),
+        _ => None,
+    }
+}
+
+pub fn render_agent_backend_value(backend: AgentBackendKind) -> &'static str {
+    match backend {
+        AgentBackendKind::AgentFrame => "agent_frame",
+    }
+}
+
+pub fn unsupported_backend_error(value: &str) -> anyhow::Error {
+    anyhow!(
+        "unsupported agent backend '{}'; this branch only supports agent_frame",
+        value
+    )
 }
 
 #[cfg(test)]
@@ -58,12 +81,15 @@ mod tests {
     use super::{AgentBackendKind, backend_supports_native_multimodal_input};
 
     #[test]
-    fn only_agent_frame_backend_supports_native_multimodal_input() {
+    fn only_agent_frame_backend_exists_and_supports_native_multimodal_input() {
         assert!(backend_supports_native_multimodal_input(
             AgentBackendKind::AgentFrame
         ));
-        assert!(!backend_supports_native_multimodal_input(
-            AgentBackendKind::Zgent
-        ));
+    }
+
+    #[test]
+    fn legacy_zgent_backend_deserializes_to_agent_frame() {
+        let backend: AgentBackendKind = serde_json::from_str("\"zgent\"").unwrap();
+        assert_eq!(backend, AgentBackendKind::AgentFrame);
     }
 }

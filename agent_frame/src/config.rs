@@ -307,6 +307,14 @@ pub enum MemorySystem {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RemoteWorkpathConfig {
+    pub host: String,
+    pub path: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentConfig {
     #[serde(default)]
     pub enabled_tools: Vec<String>,
@@ -323,6 +331,8 @@ pub struct AgentConfig {
     pub skills_dirs: Vec<PathBuf>,
     #[serde(default)]
     pub system_prompt: String,
+    #[serde(default)]
+    pub remote_workpaths: Vec<RemoteWorkpathConfig>,
     #[serde(default = "default_max_tool_roundtrips")]
     pub max_tool_roundtrips: usize,
     pub workspace_root: PathBuf,
@@ -354,6 +364,8 @@ struct AgentConfigRaw {
     skills_dirs: Vec<String>,
     #[serde(default)]
     system_prompt: String,
+    #[serde(default)]
+    remote_workpaths: Vec<RemoteWorkpathConfig>,
     #[serde(default = "default_max_tool_roundtrips")]
     max_tool_roundtrips: usize,
     #[serde(default)]
@@ -700,6 +712,7 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
             .map(|path| resolve_path(path, base_dir))
             .collect(),
         system_prompt: raw.system_prompt,
+        remote_workpaths: raw.remote_workpaths,
         max_tool_roundtrips: raw.max_tool_roundtrips,
         workspace_root,
         runtime_state_root,

@@ -1,4 +1,4 @@
-use crate::config::{ExternalWebSearchConfig, UpstreamConfig};
+use crate::config::{ExternalWebSearchConfig, RemoteWorkpathConfig, UpstreamConfig};
 use crate::skills::{
     SkillMetadata, build_skill_index, load_skill_by_name, validate_skill_markdown,
 };
@@ -23,6 +23,7 @@ use uuid::Uuid;
 use walkdir::{DirEntry, WalkDir};
 
 type ToolHandler = dyn Fn(Value) -> Result<Value> + Send + Sync + 'static;
+type RemoteWorkpathMap = Arc<BTreeMap<String, String>>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolExecutionMode {
@@ -634,8 +635,105 @@ fn ssh_command(host: &str, tty: bool) -> Command {
     command
 }
 
-fn remote_workspace_root(workspace_root: &Path) -> String {
-    workspace_root.to_string_lossy().to_string()
+fn remote_workpath_map(remote_workpaths: &[RemoteWorkpathConfig]) -> RemoteWorkpathMap {
+    let mut map = BTreeMap::new();
+    for workpath in remote_workpaths {
+        let host = workpath.host.trim();
+        let path = workpath.path.trim();
+        if !host.is_empty() && !path.is_empty() && host != "local" {
+            map.insert(host.to_string(), path.to_string());
+        }
+    }
+    Arc::new(map)
+}
+
+fn remote_cd_prefix(remote_cwd: &str) -> String {
+    format!(
+        "AGENT_FRAME_REMOTE_CWD={}; case \"$AGENT_FRAME_REMOTE_CWD\" in '~') AGENT_FRAME_REMOTE_CWD=\"$HOME\" ;; '~/'*) AGENT_FRAME_REMOTE_CWD=\"$HOME/${{AGENT_FRAME_REMOTE_CWD#~/}}\" ;; esac; cd \"$AGENT_FRAME_REMOTE_CWD\" &&",
+        shell_quote(remote_cwd)
+    )
+}
+
+fn is_remote_absolute_path(path: &str) -> bool {
+    path.starts_with('/')
+}
+
+fn join_remote_path(base: &str, relative: &str) -> String {
+    let relative = relative.trim();
+    if relative.is_empty() || relative == "." {
+        return base.to_string();
+    }
+    let relative = relative.strip_prefix("./").unwrap_or(relative);
+    if base.ends_with('/') {
+        format!("{base}{relative}")
+    } else {
+        format!("{base}/{relative}")
+    }
+}
+
+fn resolve_remote_cwd(
+    host: &str,
+    cwd: Option<&str>,
+    remote_workpaths: &BTreeMap<String, String>,
+) -> Result<String> {
+    let workpath = remote_workpaths.get(host).map(String::as_str);
+    match (
+        cwd.map(str::trim).filter(|value| !value.is_empty()),
+        workpath,
+    ) {
+        (Some(cwd), _) if is_remote_absolute_path(cwd) || cwd == "~" || cwd.starts_with("~/") => {
+            Ok(cwd.to_string())
+        }
+        (Some(cwd), Some(workpath)) => Ok(join_remote_path(workpath, cwd)),
+        (Some(cwd), None) => Err(anyhow!(
+            "remote cwd '{}' is relative but remote host '{}' has no registered workpath; pass an absolute remote cwd or add one with workpath_add",
+            cwd,
+            host
+        )),
+        (None, Some(workpath)) => Ok(workpath.to_string()),
+        (None, None) => Err(anyhow!(
+            "remote host '{}' has no registered workpath; pass an absolute remote cwd/path or add one with workpath_add",
+            host
+        )),
+    }
+}
+
+fn remote_file_path_arg<'a>(operation: &str, arguments: &'a Map<String, Value>) -> Option<&'a str> {
+    match operation {
+        "file_read" | "file_write" => arguments
+            .get("file_path")
+            .or_else(|| arguments.get("path"))
+            .and_then(Value::as_str),
+        "glob" | "grep" | "ls" | "edit" => arguments.get("path").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+fn remote_file_root(
+    host: &str,
+    operation: &str,
+    arguments: &Map<String, Value>,
+    remote_workpaths: &BTreeMap<String, String>,
+) -> Result<(String, String)> {
+    if let Some(workpath) = remote_workpaths.get(host) {
+        return Ok((workpath.clone(), ".".to_string()));
+    }
+    let path = remote_file_path_arg(operation, arguments).ok_or_else(|| {
+        anyhow!(
+            "remote {} tool on '{}' has no registered workpath; pass an absolute remote path or add one with workpath_add",
+            operation,
+            host
+        )
+    })?;
+    if !is_remote_absolute_path(path) {
+        return Err(anyhow!(
+            "remote {} path '{}' is relative but remote host '{}' has no registered workpath; pass an absolute remote path or add one with workpath_add",
+            operation,
+            path,
+            host
+        ));
+    }
+    Ok(("/".to_string(), "/".to_string()))
 }
 
 fn remote_python_command(script: &str) -> String {
@@ -652,7 +750,7 @@ fn run_remote_command(
     command_args: &[String],
     stdin: Option<&[u8]>,
 ) -> Result<std::process::Output> {
-    let mut script = format!("cd {} &&", shell_quote(remote_cwd));
+    let mut script = remote_cd_prefix(remote_cwd);
     for arg in command_args {
         script.push(' ');
         script.push_str(&shell_quote(arg));
@@ -975,11 +1073,11 @@ except Exception as error:
 
 fn run_remote_file_tool(
     host: &str,
-    workspace_root: &Path,
     operation: &str,
     arguments: &Map<String, Value>,
+    remote_workpaths: &BTreeMap<String, String>,
 ) -> Result<Value> {
-    let remote_root = remote_workspace_root(workspace_root);
+    let (remote_cwd, remote_root) = remote_file_root(host, operation, arguments, remote_workpaths)?;
     let payload = json!({
         "operation": operation,
         "workspace_root": remote_root,
@@ -988,7 +1086,7 @@ fn run_remote_file_tool(
     let stdin = serde_json::to_vec(&payload).context("failed to serialize remote tool payload")?;
     let output = run_remote_command(
         host,
-        &remote_workspace_root(workspace_root),
+        &remote_cwd,
         &[
             "sh".to_string(),
             "-lc".to_string(),
@@ -1038,12 +1136,18 @@ fn run_remote_file_tool(
 
 fn run_remote_apply_patch(
     host: &str,
-    workspace_root: &Path,
+    remote_workpaths: &BTreeMap<String, String>,
     patch: &str,
     strip: usize,
     reverse: bool,
     check: bool,
 ) -> Result<Value> {
+    let remote_cwd = remote_workpaths.get(host).ok_or_else(|| {
+        anyhow!(
+            "remote apply_patch on '{}' requires a registered workpath; add one with workpath_add first",
+            host
+        )
+    })?;
     let mut args = vec![
         "git".to_string(),
         "apply".to_string(),
@@ -1057,12 +1161,7 @@ fn run_remote_apply_patch(
     if check {
         args.push("--check".to_string());
     }
-    let output = run_remote_command(
-        host,
-        &remote_workspace_root(workspace_root),
-        &args,
-        Some(patch.as_bytes()),
-    )?;
+    let output = run_remote_command(host, remote_cwd, &args, Some(patch.as_bytes()))?;
     Ok(json!({
         "remote": host,
         "applied": output.status.success(),
@@ -1108,7 +1207,11 @@ impl InterruptSignal {
     }
 }
 
-fn file_read_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+fn file_read_tool(
+    workspace_root: PathBuf,
+    remote_workpaths: RemoteWorkpathMap,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
     Tool::new(
         "file_read",
         "Read a UTF-8 text file. Supports file_path plus optional offset and limit for large files. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local reads.",
@@ -1128,7 +1231,7 @@ fn file_read_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSig
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
-                return run_remote_file_tool(&host, &workspace_root, "file_read", arguments);
+                return run_remote_file_tool(&host, "file_read", arguments, &remote_workpaths);
             }
             let file_path = string_arg_with_alias(arguments, "file_path", "path")?;
             let path = resolve_path(&file_path, &workspace_root);
@@ -1223,7 +1326,11 @@ fn file_read_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSig
     )
 }
 
-fn file_write_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+fn file_write_tool(
+    workspace_root: PathBuf,
+    remote_workpaths: RemoteWorkpathMap,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
     Tool::new(
         "file_write",
         "Write a UTF-8 text file. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local writes.",
@@ -1244,7 +1351,7 @@ fn file_write_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSi
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
-                return run_remote_file_tool(&host, &workspace_root, "file_write", arguments);
+                return run_remote_file_tool(&host, "file_write", arguments, &remote_workpaths);
             }
             let file_path = string_arg_with_alias(arguments, "file_path", "path")?;
             let path = resolve_path(&file_path, &workspace_root);
@@ -1281,7 +1388,11 @@ fn file_write_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSi
     )
 }
 
-fn glob_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+fn glob_tool(
+    workspace_root: PathBuf,
+    remote_workpaths: RemoteWorkpathMap,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
     Tool::new(
         "glob",
         "Fast file pattern matching tool. Supports glob patterns like **/*.rs and src/**/*.ts. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local matching.",
@@ -1300,7 +1411,7 @@ fn glob_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
-                return run_remote_file_tool(&host, &workspace_root, "glob", arguments);
+                return run_remote_file_tool(&host, "glob", arguments, &remote_workpaths);
             }
             let pattern = string_arg(arguments, "pattern")?;
             let base_path = resolve_path(
@@ -1342,7 +1453,11 @@ fn glob_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>
     )
 }
 
-fn grep_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+fn grep_tool(
+    workspace_root: PathBuf,
+    remote_workpaths: RemoteWorkpathMap,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
     Tool::new(
         "grep",
         "Fast content search tool. Searches file contents with a regex pattern and returns matching file paths. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local search.",
@@ -1362,7 +1477,7 @@ fn grep_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
-                return run_remote_file_tool(&host, &workspace_root, "grep", arguments);
+                return run_remote_file_tool(&host, "grep", arguments, &remote_workpaths);
             }
             let pattern = string_arg(arguments, "pattern")?;
             let base_path = resolve_path(
@@ -1415,7 +1530,11 @@ fn grep_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>
     )
 }
 
-fn ls_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+fn ls_tool(
+    workspace_root: PathBuf,
+    remote_workpaths: RemoteWorkpathMap,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
     Tool::new(
         "ls",
         "List a recursive directory tree for non-hidden files and directories under a path. Skips common cache/build directories by default. Large trees are truncated to the first 1000 files and directories; pass a more specific path or use glob/grep when you know what to search for. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local listing.",
@@ -1433,7 +1552,7 @@ fn ls_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) 
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
-                return run_remote_file_tool(&host, &workspace_root, "ls", arguments);
+                return run_remote_file_tool(&host, "ls", arguments, &remote_workpaths);
             }
             let base_path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
             if !base_path.exists() {
@@ -1458,7 +1577,11 @@ fn ls_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) 
     )
 }
 
-fn edit_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+fn edit_tool(
+    workspace_root: PathBuf,
+    remote_workpaths: RemoteWorkpathMap,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
     Tool::new(
         "edit",
         "Edit a UTF-8 text file by replacing old_text with new_text. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local edits.",
@@ -1481,7 +1604,7 @@ fn edit_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
-                return run_remote_file_tool(&host, &workspace_root, "edit", arguments);
+                return run_remote_file_tool(&host, "edit", arguments, &remote_workpaths);
             }
             let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
             let old_text = string_arg(arguments, "old_text")?;
@@ -2397,6 +2520,7 @@ fn wait_for_managed_process(
 fn exec_start_tool(
     workspace_root: PathBuf,
     runtime_state_root: PathBuf,
+    remote_workpaths: RemoteWorkpathMap,
     cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
     Tool::new_interruptible(
@@ -2451,11 +2575,18 @@ fn exec_start_tool(
             let max_output_chars = max_output_chars_arg(arguments)?;
             let start = usize_arg_with_default(arguments, "start", 0)?;
             let limit = usize_arg_with_default(arguments, "limit", 20)?;
-            let cwd = arguments
-                .get("cwd")
-                .and_then(Value::as_str)
-                .map(|value| resolve_path(value, &workspace_root))
-                .unwrap_or_else(|| workspace_root.clone());
+            let cwd = match &target {
+                ExecutionTarget::Local => arguments
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(|value| resolve_path(value, &workspace_root))
+                    .unwrap_or_else(|| workspace_root.clone()),
+                ExecutionTarget::RemoteSsh { host } => PathBuf::from(resolve_remote_cwd(
+                    host,
+                    arguments.get("cwd").and_then(Value::as_str),
+                    &remote_workpaths,
+                )?),
+            };
             let state_dir = ensure_process_state_dir(&runtime_state_root)?;
             let metadata = spawn_managed_process(
                 &runtime_state_root,
@@ -2659,7 +2790,11 @@ fn exec_kill_tool(runtime_state_root: PathBuf, _cancel_flag: Option<Arc<Interrup
     )
 }
 
-fn apply_patch_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptSignal>>) -> Tool {
+fn apply_patch_tool(
+    workspace_root: PathBuf,
+    remote_workpaths: RemoteWorkpathMap,
+    _cancel_flag: Option<Arc<InterruptSignal>>,
+) -> Tool {
     Tool::new(
         "apply_patch",
         "Apply a unified diff patch inside the workspace using git apply. The patch must be a valid unified diff. Optional remote=\"<host>|local\" applies this single patch over SSH when set to an actual host alias; omit remote or set remote=\"\" for local patches.",
@@ -2692,7 +2827,7 @@ fn apply_patch_tool(workspace_root: PathBuf, _cancel_flag: Option<Arc<InterruptS
             if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
                 return run_remote_apply_patch(
                     &host,
-                    &workspace_root,
+                    &remote_workpaths,
                     &patch,
                     strip,
                     reverse,
@@ -4205,6 +4340,7 @@ pub fn build_tool_registry(
     skill_roots: &[PathBuf],
     skills: &[SkillMetadata],
     extra_tools: &[Tool],
+    remote_workpaths: &[RemoteWorkpathConfig],
 ) -> Result<BTreeMap<String, Tool>> {
     build_tool_registry_with_cancel(
         enabled_tools,
@@ -4218,6 +4354,7 @@ pub fn build_tool_registry(
         skill_roots,
         skills,
         extra_tools,
+        remote_workpaths,
         None,
     )
 }
@@ -4234,38 +4371,65 @@ pub fn build_tool_registry_with_cancel(
     skill_roots: &[PathBuf],
     skills: &[SkillMetadata],
     extra_tools: &[Tool],
+    remote_workpaths: &[RemoteWorkpathConfig],
     cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Result<BTreeMap<String, Tool>> {
+    let remote_workpaths = remote_workpath_map(remote_workpaths);
     let mut registry = BTreeMap::from([
         (
             "file_read".to_string(),
-            file_read_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            file_read_tool(
+                workspace_root.to_path_buf(),
+                remote_workpaths.clone(),
+                cancel_flag.clone(),
+            ),
         ),
         (
             "file_write".to_string(),
-            file_write_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            file_write_tool(
+                workspace_root.to_path_buf(),
+                remote_workpaths.clone(),
+                cancel_flag.clone(),
+            ),
         ),
         (
             "glob".to_string(),
-            glob_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            glob_tool(
+                workspace_root.to_path_buf(),
+                remote_workpaths.clone(),
+                cancel_flag.clone(),
+            ),
         ),
         (
             "grep".to_string(),
-            grep_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            grep_tool(
+                workspace_root.to_path_buf(),
+                remote_workpaths.clone(),
+                cancel_flag.clone(),
+            ),
         ),
         (
             "ls".to_string(),
-            ls_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            ls_tool(
+                workspace_root.to_path_buf(),
+                remote_workpaths.clone(),
+                cancel_flag.clone(),
+            ),
         ),
         (
             "edit".to_string(),
-            edit_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            edit_tool(
+                workspace_root.to_path_buf(),
+                remote_workpaths.clone(),
+                cancel_flag.clone(),
+            ),
         ),
         (
             "exec_start".to_string(),
             exec_start_tool(
                 workspace_root.to_path_buf(),
                 runtime_state_root.to_path_buf(),
+                remote_workpaths.clone(),
                 cancel_flag.clone(),
             ),
         ),
@@ -4291,7 +4455,11 @@ pub fn build_tool_registry_with_cancel(
         ),
         (
             "apply_patch".to_string(),
-            apply_patch_tool(workspace_root.to_path_buf(), cancel_flag.clone()),
+            apply_patch_tool(
+                workspace_root.to_path_buf(),
+                remote_workpaths.clone(),
+                cancel_flag.clone(),
+            ),
         ),
         (
             "file_download_start".to_string(),
@@ -4538,12 +4706,15 @@ mod tests {
         BackgroundTaskMetadata, ExecutionTarget, FILE_READ_MAX_OUTPUT_BYTES, LS_MAX_ENTRIES,
         ProcessMetadata, Tool, active_runtime_state_summary, build_tool_registry_with_cancel,
         execute_tool_call, execution_target_arg, process_is_running, process_meta_path,
-        terminate_runtime_state_tasks, write_background_task_metadata,
+        remote_file_root, resolve_remote_cwd, terminate_runtime_state_tasks,
+        write_background_task_metadata,
     };
     use crate::config::{
-        AuthCredentialsStoreMode, UpstreamApiKind, UpstreamAuthKind, UpstreamConfig,
+        AuthCredentialsStoreMode, RemoteWorkpathConfig, UpstreamApiKind, UpstreamAuthKind,
+        UpstreamConfig,
     };
     use serde_json::json;
+    use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::fs;
     #[cfg(unix)]
@@ -4755,6 +4926,7 @@ remote_command="$*"
             &Vec::<PathBuf>::new(),
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -4772,6 +4944,55 @@ remote_command="$*"
             Some(r#"{"path":"legacy.txt","offset_lines":0,"limit_lines":10}"#),
         );
         assert!(read_result.contains("1: hello"));
+    }
+
+    #[test]
+    fn remote_file_root_uses_registered_workpath() {
+        let mut workpaths = BTreeMap::new();
+        workpaths.insert("wuwen-dev3".to_string(), "/srv/project".to_string());
+        let arguments = json!({"path": "src/main.rs"}).as_object().cloned().unwrap();
+
+        let (remote_cwd, workspace_root) =
+            remote_file_root("wuwen-dev3", "edit", &arguments, &workpaths).unwrap();
+
+        assert_eq!(remote_cwd, "/srv/project");
+        assert_eq!(workspace_root, ".");
+    }
+
+    #[test]
+    fn remote_file_root_without_workpath_requires_absolute_path() {
+        let workpaths = BTreeMap::new();
+        let relative_args = json!({"path": "src/main.rs"}).as_object().cloned().unwrap();
+        assert!(remote_file_root("wuwen-dev3", "edit", &relative_args, &workpaths).is_err());
+
+        let absolute_args = json!({"path": "/srv/project/src/main.rs"})
+            .as_object()
+            .cloned()
+            .unwrap();
+        let (remote_cwd, workspace_root) =
+            remote_file_root("wuwen-dev3", "edit", &absolute_args, &workpaths).unwrap();
+        assert_eq!(remote_cwd, "/");
+        assert_eq!(workspace_root, "/");
+    }
+
+    #[test]
+    fn remote_cwd_uses_workpath_for_relative_paths() {
+        let mut workpaths = BTreeMap::new();
+        workpaths.insert("wuwen-dev3".to_string(), "/srv/project".to_string());
+
+        assert_eq!(
+            resolve_remote_cwd("wuwen-dev3", None, &workpaths).unwrap(),
+            "/srv/project"
+        );
+        assert_eq!(
+            resolve_remote_cwd("wuwen-dev3", Some("scripts"), &workpaths).unwrap(),
+            "/srv/project/scripts"
+        );
+        assert_eq!(
+            resolve_remote_cwd("wuwen-dev3", Some("/tmp"), &workpaths).unwrap(),
+            "/tmp"
+        );
+        assert!(resolve_remote_cwd("wuwen-dev6", Some("scripts"), &workpaths).is_err());
     }
 
     #[test]
@@ -4830,6 +5051,7 @@ remote_command="$*"
             &Vec::<PathBuf>::new(),
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -4867,6 +5089,11 @@ remote_command="$*"
         let runtime_state_root = temp_dir.path().join("runtime");
         fs::create_dir_all(&runtime_state_root).unwrap();
         let upstream = test_upstream();
+        let remote_workpaths = vec![RemoteWorkpathConfig {
+            host: "fake-host".to_string(),
+            path: workspace_root.display().to_string(),
+            description: "test remote workspace".to_string(),
+        }];
         let registry = build_tool_registry_with_cancel(
             &[],
             &workspace_root,
@@ -4879,6 +5106,7 @@ remote_command="$*"
             &Vec::<PathBuf>::new(),
             &[],
             &[],
+            &remote_workpaths,
             None,
         )
         .unwrap();
@@ -4918,6 +5146,11 @@ remote_command="$*"
         let runtime_state_root = temp_dir.path().join("runtime");
         fs::create_dir_all(&runtime_state_root).unwrap();
         let upstream = test_upstream();
+        let remote_workpaths = vec![RemoteWorkpathConfig {
+            host: "fake-host".to_string(),
+            path: workspace_root.display().to_string(),
+            description: "test remote workspace".to_string(),
+        }];
         let registry = build_tool_registry_with_cancel(
             &[],
             &workspace_root,
@@ -4930,6 +5163,7 @@ remote_command="$*"
             &Vec::<PathBuf>::new(),
             &[],
             &[],
+            &remote_workpaths,
             None,
         )
         .unwrap();
@@ -4971,6 +5205,11 @@ remote_command="$*"
         let runtime_state_root = temp_dir.path().join("runtime");
         fs::create_dir_all(&runtime_state_root).unwrap();
         let upstream = test_upstream();
+        let remote_workpaths = vec![RemoteWorkpathConfig {
+            host: "fake-host".to_string(),
+            path: workspace_root.display().to_string(),
+            description: "test remote workspace".to_string(),
+        }];
         let registry = build_tool_registry_with_cancel(
             &[],
             &workspace_root,
@@ -4983,6 +5222,7 @@ remote_command="$*"
             &Vec::<PathBuf>::new(),
             &[],
             &[],
+            &remote_workpaths,
             None,
         )
         .unwrap();
@@ -5091,6 +5331,11 @@ remote_command="$*"
         let runtime_state_root = temp_dir.path().join("runtime");
         fs::create_dir_all(&runtime_state_root).unwrap();
         let upstream = test_upstream();
+        let remote_workpaths = vec![RemoteWorkpathConfig {
+            host: "fake-host".to_string(),
+            path: workspace_root.display().to_string(),
+            description: "test remote workspace".to_string(),
+        }];
         let registry = build_tool_registry_with_cancel(
             &[],
             &workspace_root,
@@ -5103,6 +5348,7 @@ remote_command="$*"
             &Vec::<PathBuf>::new(),
             &[],
             &[],
+            &remote_workpaths,
             None,
         )
         .unwrap();
@@ -5138,6 +5384,11 @@ remote_command="$*"
         let runtime_state_root = temp_dir.path().join("runtime");
         fs::create_dir_all(&runtime_state_root).unwrap();
         let upstream = test_upstream();
+        let remote_workpaths = vec![RemoteWorkpathConfig {
+            host: "fake-host".to_string(),
+            path: workspace_root.display().to_string(),
+            description: "test remote workspace".to_string(),
+        }];
         let registry = build_tool_registry_with_cancel(
             &[],
             &workspace_root,
@@ -5150,6 +5401,7 @@ remote_command="$*"
             &Vec::<PathBuf>::new(),
             &[],
             &[],
+            &remote_workpaths,
             None,
         )
         .unwrap();
@@ -5218,6 +5470,7 @@ remote_command="$*"
             &Vec::<PathBuf>::new(),
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -5283,6 +5536,7 @@ remote_command="$*"
             None,
             None,
             &Vec::<PathBuf>::new(),
+            &[],
             &[],
             &[],
             None,
@@ -5354,6 +5608,7 @@ remote_command="$*"
             &Vec::<PathBuf>::new(),
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -5421,6 +5676,7 @@ remote_command="$*"
             &Vec::<PathBuf>::new(),
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -5486,6 +5742,7 @@ remote_command="$*"
             &Vec::<PathBuf>::new(),
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -5549,6 +5806,7 @@ remote_command="$*"
             &Vec::<PathBuf>::new(),
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -5608,6 +5866,7 @@ remote_command="$*"
             &Vec::<PathBuf>::new(),
             &[],
             &[],
+            &[],
             None,
         )
         .unwrap();
@@ -5663,6 +5922,7 @@ remote_command="$*"
             None,
             None,
             &Vec::<PathBuf>::new(),
+            &[],
             &[],
             &[],
             None,

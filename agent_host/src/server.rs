@@ -37,7 +37,7 @@ use crate::sandbox::{
 use crate::session::{
     ModelCatalogChangeNotice, SessionErrno, SessionManager, SessionPhase,
     SessionProgressMessageState, SessionSkillObservation, SessionSnapshot,
-    SharedProfileChangeNotice, SkillChangeNotice, ZgentNativeSessionState,
+    SharedProfileChangeNotice, SkillChangeNotice,
 };
 use crate::sink::{SinkRouter, SinkTarget};
 use crate::snapshot::{SnapshotBundle, SnapshotManager};
@@ -45,10 +45,6 @@ use crate::subagent::{HostedSubagent, HostedSubagentInner, SubagentState};
 use crate::upgrade::upgrade_workdir;
 use crate::workpath::{load_remote_agents_md_for_workpath, load_result_to_json};
 use crate::workspace::{WorkspaceManager, WorkspaceMountMaterialization};
-use crate::zgent::kernel::{
-    PersistentZgentKernelSession, ZgentKernelRuntimeSpec, zgent_native_kernel_runtime_available,
-};
-use crate::zgent::subagent::ZgentSubagentModel;
 use agent_frame::config::{
     AgentConfig as FrameAgentConfig, CodexAuthConfig, ExternalWebSearchConfig,
     NativeWebSearchConfig, ReasoningConfig, TokenEstimationSource, TokenEstimationTemplateConfig,
@@ -59,8 +55,8 @@ use agent_frame::tooling::{build_tool_registry, terminate_runtime_state_tasks};
 use agent_frame::{
     ChatMessage, ContextCompactionReport, ExecutionProgress, SessionCompactionStats, SessionEvent,
     SessionExecutionControl, SessionState, StructuredCompactionOutput, TokenUsage, Tool,
-    estimate_configured_session_tokens, estimate_session_tokens_for_model_with_config,
-    extract_assistant_text, prompt_token_calibration_for_model, token_estimator_label_for_model,
+    estimate_configured_session_tokens, extract_assistant_text, prompt_token_calibration_for_model,
+    token_estimator_label_for_model,
 };
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
@@ -73,7 +69,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use tokio::select;
@@ -86,6 +82,7 @@ mod background;
 mod command_routing;
 mod commands;
 mod foreground;
+mod incoming;
 mod messaging;
 mod persistence;
 mod progress;
@@ -94,6 +91,7 @@ mod security;
 mod subagents;
 
 use self::commands::*;
+use self::incoming::*;
 use self::messaging::*;
 use self::persistence::*;
 use self::runtime_helpers::*;
@@ -123,13 +121,6 @@ struct BackgroundJobRequest {
 enum ForegroundRuntimePhase {
     Running,
     Compacting,
-}
-
-#[derive(Clone)]
-struct ActiveNativeZgentSession {
-    kernel: Arc<PersistentZgentKernelSession>,
-    model_key: String,
-    busy: Arc<AtomicBool>,
 }
 
 struct ActiveForegroundAgentFrameRuntime {
@@ -234,6 +225,7 @@ fn select_image_generation_routing(
     }
 }
 
+#[cfg(test)]
 fn infer_single_agent_backend(agent: &AgentConfig, model_key: &str) -> Option<AgentBackendKind> {
     match agent.backends_for_model(model_key).as_slice() {
         [backend] => Some(*backend),
@@ -371,21 +363,17 @@ impl ServerRuntime {
             .collect()
     }
 
-    fn inferred_agent_backend_for_model(&self, model_key: &str) -> Option<AgentBackendKind> {
-        infer_single_agent_backend(&self.agent, model_key)
-    }
-
     fn selected_agent_backend(&self) -> Option<AgentBackendKind> {
         self.selected_agent_backend.or_else(|| {
             self.selected_main_model_key
-                .as_deref()
-                .and_then(|model_key| self.inferred_agent_backend_for_model(model_key))
+                .as_ref()
+                .map(|_| AgentBackendKind::AgentFrame)
         })
     }
 
     fn effective_agent_backend(&self) -> Result<AgentBackendKind> {
         self.selected_agent_backend().ok_or_else(|| {
-            anyhow!("this conversation does not have an agent backend yet; choose one with /agent")
+            anyhow!("this conversation does not have a model yet; choose one with /agent")
         })
     }
 
@@ -421,8 +409,7 @@ impl ServerRuntime {
         let model_key = self.selected_main_model_key.clone().ok_or_else(|| {
             anyhow!("this conversation does not have a main model yet; choose one with /agent")
         })?;
-        let backend = self.effective_agent_backend()?;
-        self.ensure_model_available_for_backend(backend, &model_key)?;
+        self.ensure_model_available_for_backend(AgentBackendKind::AgentFrame, &model_key)?;
         Ok(model_key)
     }
 
@@ -1018,7 +1005,7 @@ impl ServerRuntime {
             .settings
             .remote_workpaths
             .iter()
-            .find(|item| item.host == host.trim() && item.path == path.trim())
+            .find(|item| item.host == host.trim())
             .cloned()
             .ok_or_else(|| anyhow!("remote workpath was not persisted"))?;
         let agents_md = load_remote_agents_md_for_workpath(&workpath);
@@ -1037,17 +1024,16 @@ impl ServerRuntime {
         &self,
         session: &SessionSnapshot,
         host: String,
-        path: String,
         description: String,
     ) -> Result<Value> {
         let snapshot = self.with_conversations(|conversations| {
-            conversations.modify_remote_workpath(&session.address, &host, &path, &description)
+            conversations.modify_remote_workpath(&session.address, &host, "", &description)
         })?;
         let workpath = snapshot
             .settings
             .remote_workpaths
             .iter()
-            .find(|item| item.host == host.trim() && item.path == path.trim())
+            .find(|item| item.host == host.trim())
             .cloned()
             .ok_or_else(|| anyhow!("remote workpath was not found after modification"))?;
         Ok(json!({
@@ -1059,22 +1045,16 @@ impl ServerRuntime {
         }))
     }
 
-    fn remove_remote_workpath(
-        &self,
-        session: &SessionSnapshot,
-        host: String,
-        path: String,
-    ) -> Result<Value> {
+    fn remove_remote_workpath(&self, session: &SessionSnapshot, host: String) -> Result<Value> {
         self.with_conversations(|conversations| {
             conversations
-                .remove_remote_workpath(&session.address, &host, &path)
+                .remove_remote_workpath(&session.address, &host, "")
                 .map(|_| ())
         })?;
         Ok(json!({
             "ok": true,
             "removed": true,
             "host": host.trim(),
-            "path": path.trim(),
             "chat_version_rotated": true,
         }))
     }
@@ -1510,11 +1490,7 @@ impl ServerRuntime {
             self.resolve_web_search_configs(model_key, model);
         let (native_image_generation, image_generation_tool_upstream) =
             self.resolve_native_image_generation(model_key, model);
-        let prompt_agent_backend = self
-            .selected_agent_backend()
-            .or_else(|| self.inferred_agent_backend_for_model(model_key))
-            .unwrap_or(AgentBackendKind::AgentFrame);
-        let prompt_available_models = self.available_agent_models(prompt_agent_backend);
+        let prompt_available_models = self.available_agent_models(AgentBackendKind::AgentFrame);
         let remote_workpaths = self.with_conversations(|conversations| {
             Ok(conversations
                 .get_snapshot(&session.address)
@@ -1563,6 +1539,14 @@ impl ServerRuntime {
                 &commands,
             )
             .system_prompt,
+            remote_workpaths: remote_workpaths
+                .iter()
+                .map(|workpath| agent_frame::config::RemoteWorkpathConfig {
+                    host: workpath.host.clone(),
+                    path: workpath.path.clone(),
+                    description: workpath.description.clone(),
+                })
+                .collect(),
             max_tool_roundtrips: self.main_agent.max_tool_roundtrips,
             workspace_root: workspace_root.to_path_buf(),
             runtime_state_root: self
@@ -1736,7 +1720,7 @@ impl ServerRuntime {
             let workpath_session = session.clone();
             tools.push(Tool::new(
                 "workpath_add",
-                "Register a remote SSH workpath for this whole conversation. Use this when a remote directory should become durable shared context for foreground/background agents. The host must be an SSH alias, path is the remote directory, and description must explain what the directory is for. On success, the tool immediately tries to load path/AGENTS.md and future rebuilt prompts will include the host/path/description and reload AGENTS.md automatically.",
+                "Register the remote SSH workpath for a host in this whole conversation. Each host can have only one workpath; adding the same host replaces the previous path and description. Use this when a remote directory should become durable shared context for foreground/background agents. The host must be an SSH alias, path is the remote directory, and description must explain what the directory is for. On success, the tool immediately tries to load path/AGENTS.md and future rebuilt prompts will include the host/path/description and reload AGENTS.md automatically.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -1764,15 +1748,14 @@ impl ServerRuntime {
             let workpath_session = session.clone();
             tools.push(Tool::new(
                 "workpath_modify",
-                "Modify the description for an existing conversation-level remote workpath. The host and path identify the existing remote workpath; only description is changed.",
+                "Modify the description for an existing conversation-level remote workpath. The host identifies the existing remote workpath because each host can have only one.",
                 json!({
                     "type": "object",
                     "properties": {
                         "host": {"type": "string"},
-                        "path": {"type": "string"},
                         "description": {"type": "string"}
                     },
-                    "required": ["host", "path", "description"],
+                    "required": ["host", "description"],
                     "additionalProperties": false
                 }),
                 move |arguments| {
@@ -1782,7 +1765,6 @@ impl ServerRuntime {
                     runtime.modify_remote_workpath(
                         &workpath_session,
                         string_arg_required(object, "host")?,
-                        string_arg_required(object, "path")?,
                         string_arg_required(object, "description")?,
                     )
                 },
@@ -1792,14 +1774,13 @@ impl ServerRuntime {
             let workpath_session = session.clone();
             tools.push(Tool::new(
                 "workpath_remove",
-                "Remove an existing conversation-level remote workpath. The host and path identify the remote workpath to remove.",
+                "Remove an existing conversation-level remote workpath by host.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "host": {"type": "string"},
-                        "path": {"type": "string"}
+                        "host": {"type": "string"}
                     },
-                    "required": ["host", "path"],
+                    "required": ["host"],
                     "additionalProperties": false
                 }),
                 move |arguments| {
@@ -1809,7 +1790,6 @@ impl ServerRuntime {
                     runtime.remove_remote_workpath(
                         &workpath_session,
                         string_arg_required(object, "host")?,
-                        string_arg_required(object, "path")?,
                     )
                 },
             ));
@@ -2310,24 +2290,9 @@ impl ServerRuntime {
 
     fn build_backend_execution_options(
         &self,
-        backend: AgentBackendKind,
+        _backend: AgentBackendKind,
     ) -> BackendExecutionOptions {
-        BackendExecutionOptions {
-            zgent_allowed_subagent_models: self
-                .available_agent_models(backend)
-                .into_iter()
-                .filter_map(|alias| {
-                    self.models.get(&alias).map(|model| ZgentSubagentModel {
-                        alias: alias.clone(),
-                        description: if model.description.trim().is_empty() {
-                            model.model.clone()
-                        } else {
-                            model.description.clone()
-                        },
-                    })
-                })
-                .collect(),
-        }
+        BackendExecutionOptions {}
     }
 
     fn run_agent_turn_sync(
@@ -3023,7 +2988,6 @@ pub struct Server {
     pending_process_restart_notices: Arc<Mutex<HashSet<String>>>,
     active_foreground_agent_frame_runtimes:
         Arc<Mutex<HashMap<String, Arc<Mutex<ActiveForegroundAgentFrameRuntime>>>>>,
-    active_native_zgent_sessions: Arc<Mutex<HashMap<String, Arc<ActiveNativeZgentSession>>>>,
     subagents: Arc<Mutex<HashMap<uuid::Uuid, Arc<HostedSubagent>>>>,
     channel_auth: Arc<Mutex<ChannelAuthorizationManager>>,
 }
@@ -3049,95 +3013,6 @@ impl Server {
                 .map(|_| ())
         })?;
         Ok(Some(model_key))
-    }
-
-    fn foreground_uses_native_zgent(
-        &self,
-        address: &ChannelAddress,
-        model_key: &str,
-    ) -> Result<bool> {
-        self.ensure_model_available_for_backend(self.effective_agent_backend(address)?, model_key)?;
-        if self.effective_agent_backend(address)? != AgentBackendKind::Zgent {
-            return Ok(false);
-        }
-        if !zgent_native_kernel_runtime_available() {
-            return Ok(false);
-        }
-        Ok(true)
-    }
-
-    fn ensure_native_zgent_session(
-        &self,
-        session: &SessionSnapshot,
-        model_key: &str,
-    ) -> Result<Arc<ActiveNativeZgentSession>> {
-        let session_key = session.address.session_key();
-        if let Some(existing) = self
-            .active_native_zgent_sessions
-            .lock()
-            .ok()
-            .and_then(|sessions| sessions.get(&session_key).cloned())
-            .filter(|active| active.model_key == model_key)
-        {
-            return Ok(existing);
-        }
-
-        let runtime = self.tool_runtime_for_address(&session.address)?;
-        let config = runtime.build_agent_frame_config(
-            session,
-            &session.workspace_root,
-            AgentPromptKind::MainForeground,
-            model_key,
-            None,
-        )?;
-        let extra_tools = runtime.build_extra_tools(
-            session,
-            AgentPromptKind::MainForeground,
-            session.agent_id,
-            None,
-        );
-        let options = runtime.build_backend_execution_options(AgentBackendKind::Zgent);
-        let existing_remote_session_id = self
-            .with_sessions(|sessions| sessions.zgent_native_state(&session.address))?
-            .filter(|state| state.model_key.as_deref() == Some(model_key))
-            .and_then(|state| state.remote_session_id);
-        let kernel = PersistentZgentKernelSession::spawn_or_attach(
-            &ZgentKernelRuntimeSpec::from_frame_config(&config),
-            &extra_tools,
-            &options,
-            existing_remote_session_id.as_deref(),
-        )?;
-        let session_summary = kernel.fetch_session_summary().ok();
-        crate::zgent::kernel::require_workspace_binding(
-            kernel.remote_workspace_path(),
-            &config.workspace_root,
-        )?;
-        let active = Arc::new(ActiveNativeZgentSession {
-            kernel: Arc::new(kernel),
-            model_key: model_key.to_string(),
-            busy: Arc::new(AtomicBool::new(false)),
-        });
-        self.with_sessions(|sessions| {
-            sessions.set_zgent_native_state(
-                &session.address,
-                Some(ZgentNativeSessionState {
-                    remote_session_id: Some(active.kernel.remote_session_id().to_string()),
-                    model_key: Some(model_key.to_string()),
-                    context_window_current: session_summary
-                        .as_ref()
-                        .and_then(|summary| summary.context_window_current),
-                    context_window_size: session_summary
-                        .as_ref()
-                        .and_then(|summary| summary.context_window_size),
-                }),
-            )
-        })?;
-        let mut sessions = self
-            .active_native_zgent_sessions
-            .lock()
-            .map_err(|_| anyhow!("active native zgent sessions lock poisoned"))?;
-        sessions.insert(session_key, Arc::clone(&active));
-        Ok(active)
     }
 
     fn current_tool_names_for_foreground_turn(
@@ -3172,6 +3047,7 @@ impl Server {
             &frame_config.skills_dirs,
             &skills,
             &extra_tools,
+            &frame_config.remote_workpaths,
         )?;
         Ok(registry.into_keys().collect())
     }
@@ -3185,9 +3061,6 @@ impl Server {
     ) {
         match self.current_tool_names_for_foreground_turn(session, model_key) {
             Ok(tool_names) => {
-                let using_native_zgent = self
-                    .foreground_uses_native_zgent(&session.address, model_key)
-                    .unwrap_or(false);
                 info!(
                     log_stream = "agent",
                     log_key = %session.agent_id,
@@ -3198,7 +3071,6 @@ impl Server {
                     remote_message_id = remote_message_id,
                     model = model_key,
                     trigger,
-                    native_zgent = using_native_zgent,
                     tool_count = tool_names.len() as u64,
                     tool_names = %tool_names.join(","),
                     "resolved foreground tool catalog for user message"
@@ -3222,59 +3094,6 @@ impl Server {
         }
     }
 
-    async fn try_forward_to_active_native_zgent_turn(
-        &self,
-        message: IncomingMessage,
-    ) -> Result<Option<IncomingMessage>> {
-        if message.control.is_some() {
-            return Ok(Some(message));
-        }
-        let Some(model_key) = self.selected_main_model_key(&message.address)? else {
-            return Ok(Some(message));
-        };
-        if !self.foreground_uses_native_zgent(&message.address, &model_key)? {
-            return Ok(Some(message));
-        }
-        let session_key = message.address.session_key();
-        let Some(active) = self
-            .active_native_zgent_sessions
-            .lock()
-            .ok()
-            .and_then(|sessions| sessions.get(&session_key).cloned())
-            .filter(|active| active.model_key == model_key)
-        else {
-            return Ok(Some(message));
-        };
-        if !active.busy.load(Ordering::SeqCst) {
-            return Ok(Some(message));
-        }
-
-        let Some(session) =
-            self.with_sessions(|sessions| Ok(sessions.get_snapshot(&message.address)))?
-        else {
-            return Ok(Some(message));
-        };
-        self.log_current_tools_for_user_message(
-            &session,
-            &model_key,
-            &message.remote_message_id,
-            "native_busy_steer",
-        );
-        let stored_attachments = self
-            .materialize_attachments(&session.attachments_dir, message.attachments)
-            .await?;
-        let steer_prompt = tag_interrupted_followup_text(Some(compose_user_prompt(
-            message.text.as_deref(),
-            &stored_attachments,
-        )))
-        .unwrap_or_else(|| INTERRUPTED_FOLLOWUP_MARKER.to_string());
-        let kernel = Arc::clone(&active.kernel);
-        tokio::task::spawn_blocking(move || kernel.send_steer(&steer_prompt))
-            .await
-            .context("native zgent steer task join failed")??;
-        Ok(None)
-    }
-
     async fn prompt_missing_conversation_model(
         &self,
         channel: &Arc<dyn Channel>,
@@ -3284,10 +3103,10 @@ impl Server {
         self.send_channel_message(
             channel,
             address,
-            self.agent_backend_selection_message(
+            self.agent_model_selection_message(
                 address,
                 &format!(
-                    "The previously selected model `{}` is no longer available for the current agent setup. `/agent` has been opened automatically below so you can choose again.",
+                    "The previously selected model `{}` is no longer available. `/agent` has been opened automatically below so you can choose again.",
                     missing_model_key
                 ),
             )?,
@@ -3313,10 +3132,10 @@ impl Server {
             );
             return Ok(());
         };
-        let message = self.agent_backend_selection_message(
+        let message = self.agent_model_selection_message(
             &session.address,
             &format!(
-                "The previously selected model `{}` is no longer available for the current agent setup. Idle compaction has been paused for this conversation, and `/agent` has been opened automatically below so you can choose again.",
+                "The previously selected model `{}` is no longer available. Idle compaction has been paused for this conversation, and `/agent` has been opened automatically below so you can choose again.",
                 missing_model_key
             ),
         )?;
@@ -3496,7 +3315,6 @@ impl Server {
             pending_foreground_interrupts: Arc::new(Mutex::new(HashSet::new())),
             pending_process_restart_notices: Arc::new(Mutex::new(pending_process_restart_notices)),
             active_foreground_agent_frame_runtimes: Arc::new(Mutex::new(HashMap::new())),
-            active_native_zgent_sessions: Arc::new(Mutex::new(HashMap::new())),
             subagents: Arc::new(Mutex::new(HashMap::new())),
             channel_auth: Arc::new(Mutex::new(ChannelAuthorizationManager::new(&workdir)?)),
         })
@@ -3585,15 +3403,11 @@ impl Server {
             server.main_agent.idle_compaction.poll_interval_seconds,
         ));
         idle_compaction_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let conversation_workers: Arc<
-            Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<IncomingMessage>>>,
-        > = Arc::new(Mutex::new(HashMap::new()));
-        let active_worker_count = Arc::new(AtomicUsize::new(0));
-        let active_worker_notify = Arc::new(Notify::new());
+        let incoming_dispatcher = IncomingDispatcher::new(Arc::clone(&server));
         let mut receiver_closed = false;
 
         loop {
-            if receiver_closed && active_worker_count.load(Ordering::SeqCst) == 0 {
+            if receiver_closed && !incoming_dispatcher.has_active_workers() {
                 break;
             }
 
@@ -3601,150 +3415,7 @@ impl Server {
                 maybe_message = receiver.recv(), if !receiver_closed => {
                     match maybe_message {
                         Some(message) => {
-                            if server.allows_fast_path_agent_selection(&message.address)?
-                                && let Some(outgoing) =
-                                    fast_path_agent_selection_message(&server.workdir, &server.models, &server.agent, &message)
-                            {
-                                if let Some(channel) = server.channels.get(&message.address.channel_id) {
-                                    if let Err(error) = channel.send(&message.address, outgoing).await {
-                                        error!(
-                                            log_stream = "channel",
-                                            log_key = %message.address.channel_id,
-                                            kind = "fast_path_send_failed",
-                                            conversation_id = %message.address.conversation_id,
-                                            error = %format!("{error:#}"),
-                                            "failed to send fast-path model selection message"
-                                        );
-                                    }
-                                }
-                                continue;
-                            }
-                            if is_out_of_band_command(message.text.as_deref()) {
-                                let server = Arc::clone(&server);
-                                tokio::spawn(async move {
-                                    if let Err(error) = server.handle_incoming(message).await {
-                                        error!(
-                                            log_stream = "server",
-                                            kind = "handle_out_of_band_command_failed",
-                                            error = %format!("{error:#}"),
-                                            "failed to handle out-of-band command"
-                                        );
-                                    }
-                                });
-                                continue;
-                            }
-                            let Some(message) = server
-                                .try_forward_to_active_native_zgent_turn(message)
-                                .await?
-                            else {
-                                continue;
-                            };
-                            let interrupted_followup = request_yield_for_incoming(
-                                &server.active_foreground_controls,
-                                &server.active_foreground_phases,
-                                &message,
-                            );
-                            if interrupted_followup.compaction_in_progress
-                                && let Some(channel) =
-                                    server.channels.get(&message.address.channel_id)
-                                && let Err(error) = channel
-                                    .send(
-                                        &message.address,
-                                        OutgoingMessage::text(
-                                            "正在压缩上下文，可能要等待压缩完毕后才能回复。"
-                                                .to_string(),
-                                        ),
-                                    )
-                                    .await
-                            {
-                                error!(
-                                    log_stream = "channel",
-                                    log_key = %message.address.channel_id,
-                                    kind = "compaction_wait_notice_send_failed",
-                                    conversation_id = %message.address.conversation_id,
-                                    error = %format!("{error:#}"),
-                                    "failed to send compaction wait notice"
-                                );
-                            }
-                            let message = if interrupted_followup.interrupted {
-                                let mut message = message;
-                                message.text = tag_interrupted_followup_text(message.text);
-                                if let Ok(mut interrupts) =
-                                    server.pending_foreground_interrupts.lock()
-                                {
-                                    interrupts.insert(message.address.session_key());
-                                }
-                                message
-                            } else {
-                                message
-                            };
-                            let session_key = message.address.session_key();
-                            let mut pending_message = Some(message);
-                            loop {
-                                let worker_sender = conversation_workers
-                                    .lock()
-                                    .map_err(|_| anyhow!("conversation workers lock poisoned"))?
-                                    .get(&session_key)
-                                    .cloned();
-                                let worker_sender = match worker_sender {
-                                    Some(worker_sender) => worker_sender,
-                                    None => {
-                                        let (worker_tx, mut worker_rx) = tokio::sync::mpsc::unbounded_channel();
-                                        conversation_workers
-                                            .lock()
-                                            .map_err(|_| anyhow!("conversation workers lock poisoned"))?
-                                            .insert(session_key.clone(), worker_tx.clone());
-                                        active_worker_count.fetch_add(1, Ordering::SeqCst);
-                                        let server = Arc::clone(&server);
-                                        let conversation_workers = Arc::clone(&conversation_workers);
-                                        let active_worker_count = Arc::clone(&active_worker_count);
-                                        let active_worker_notify = Arc::clone(&active_worker_notify);
-                                        let worker_session_key = session_key.clone();
-                                        tokio::spawn(async move {
-                                            let mut local_queue = VecDeque::new();
-                                            while let Some(message) = worker_rx.recv().await {
-                                                local_queue.push_back(message);
-                                                while let Ok(message) = worker_rx.try_recv() {
-                                                    local_queue.push_back(message);
-                                                }
-                                                while let Some(message) = local_queue.pop_front() {
-                                                    let merged =
-                                                        coalesce_buffered_conversation_messages(message, &mut local_queue);
-                                                    if let Err(error) = server.handle_incoming(merged).await {
-                                                        error!(
-                                                            log_stream = "server",
-                                                            kind = "handle_incoming_failed",
-                                                            error = %format!("{error:#}"),
-                                                            "failed to handle incoming message"
-                                                        );
-                                                    }
-                                                    while let Ok(message) = worker_rx.try_recv() {
-                                                        local_queue.push_back(message);
-                                                    }
-                                                }
-                                            }
-                                            if let Ok(mut workers) = conversation_workers.lock() {
-                                                workers.remove(&worker_session_key);
-                                            }
-                                            active_worker_count.fetch_sub(1, Ordering::SeqCst);
-                                            active_worker_notify.notify_waiters();
-                                        });
-                                        worker_tx
-                                    }
-                                };
-                                let message = pending_message
-                                    .take()
-                                    .expect("pending message should exist while dispatching");
-                                match worker_sender.send(message) {
-                                    Ok(()) => break,
-                                    Err(error) => {
-                                        if let Ok(mut workers) = conversation_workers.lock() {
-                                            workers.remove(&session_key);
-                                        }
-                                        pending_message = Some(error.0);
-                                    }
-                                }
-                            }
+                            incoming_dispatcher.dispatch(message).await?;
                         }
                         None => receiver_closed = true,
                     }
@@ -3761,7 +3432,7 @@ impl Server {
                         );
                     }
                 }
-                _ = active_worker_notify.notified(), if receiver_closed => {}
+                _ = incoming_dispatcher.wait_for_worker_change(), if receiver_closed => {}
             }
         }
 
@@ -3874,19 +3545,18 @@ impl Server {
         }
 
         let persistence_system_prompt = config.system_prompt.clone();
-        let effective_backend = self.effective_agent_backend(&session.address)?;
-        let source_messages = if effective_backend == AgentBackendKind::AgentFrame {
-            source_messages
-        } else {
-            sanitize_messages_for_model_capabilities(
-                &source_messages,
-                &model,
-                backend_supports_native_multimodal_input(effective_backend),
-            )
-        };
-        let report =
-            run_backend_compaction(effective_backend, source_messages, config, extra_tools)
-                .with_context(|| format!("failed to compact idle session {}", session.id))?;
+        let source_messages = sanitize_messages_for_model_capabilities(
+            &source_messages,
+            &model,
+            backend_supports_native_multimodal_input(AgentBackendKind::AgentFrame),
+        );
+        let report = run_backend_compaction(
+            AgentBackendKind::AgentFrame,
+            source_messages,
+            config,
+            extra_tools,
+        )
+        .with_context(|| format!("failed to compact idle session {}", session.id))?;
         if !report.compacted {
             self.with_sessions(|sessions| {
                 sessions.clear_idle_compaction_failure(&session.address)
@@ -4065,9 +3735,6 @@ impl Server {
 
     fn destroy_foreground_session(&self, address: &ChannelAddress) -> Result<()> {
         let snapshot = self.with_sessions(|sessions| Ok(sessions.get_snapshot(address)))?;
-        if let Ok(mut sessions) = self.active_native_zgent_sessions.lock() {
-            sessions.remove(&address.session_key());
-        }
         self.invalidate_foreground_agent_frame_runtime(address)?;
         if let Some(control) = self
             .active_foreground_controls
@@ -4338,19 +4005,18 @@ impl Server {
             config.context_compaction.token_limit_override = Some(manual_compact_min_tokens);
         }
         let persistence_system_prompt = config.system_prompt.clone();
-        let effective_backend = self.effective_agent_backend(&session.address)?;
         let model = self.model_config_or_main(model_key)?;
-        let compaction_messages = if effective_backend == AgentBackendKind::AgentFrame {
-            session.request_messages()
-        } else {
-            sanitize_messages_for_model_capabilities(
-                &session.request_messages(),
-                model,
-                backend_supports_native_multimodal_input(effective_backend),
-            )
-        };
-        let report =
-            run_backend_compaction(effective_backend, compaction_messages, config, extra_tools)?;
+        let compaction_messages = sanitize_messages_for_model_capabilities(
+            &session.request_messages(),
+            model,
+            backend_supports_native_multimodal_input(AgentBackendKind::AgentFrame),
+        );
+        let report = run_backend_compaction(
+            AgentBackendKind::AgentFrame,
+            compaction_messages,
+            config,
+            extra_tools,
+        )?;
         if !report.compacted {
             return Ok(false);
         }
@@ -4447,18 +4113,13 @@ impl Server {
                 session.agent_id,
                 None,
             );
-            let effective_backend = self.effective_agent_backend(&session.address)?;
-            let compaction_messages = if effective_backend == AgentBackendKind::AgentFrame {
-                previous_messages.clone()
-            } else {
-                sanitize_messages_for_model_capabilities(
-                    &previous_messages,
-                    self.model_config_or_main(&effective_model_key)?,
-                    backend_supports_native_multimodal_input(effective_backend),
-                )
-            };
+            let compaction_messages = sanitize_messages_for_model_capabilities(
+                &previous_messages,
+                self.model_config_or_main(&effective_model_key)?,
+                backend_supports_native_multimodal_input(AgentBackendKind::AgentFrame),
+            );
             let compaction = run_backend_compaction(
-                effective_backend,
+                AgentBackendKind::AgentFrame,
                 compaction_messages,
                 config,
                 extra_tools,
@@ -4492,7 +4153,7 @@ impl Server {
                 session.clone(),
                 AgentPromptKind::MainForeground,
                 session.agent_id,
-                self.effective_agent_backend(&session.address)?,
+                AgentBackendKind::AgentFrame,
                 effective_model_key.clone(),
                 previous_messages,
                 prompt,
@@ -4579,29 +4240,18 @@ impl Server {
         Ok(self.effective_conversation_settings(address)?.main_model)
     }
 
-    fn inferred_agent_backend_for_model(&self, model_key: &str) -> Option<AgentBackendKind> {
-        infer_single_agent_backend(&self.agent, model_key)
-    }
-
     fn selected_agent_backend(&self, address: &ChannelAddress) -> Result<Option<AgentBackendKind>> {
         let settings = self.effective_conversation_settings(address)?;
         Ok(settings.agent_backend.or_else(|| {
             settings
                 .main_model
-                .as_deref()
-                .and_then(|model_key| self.inferred_agent_backend_for_model(model_key))
+                .as_ref()
+                .map(|_| AgentBackendKind::AgentFrame)
         }))
     }
 
-    fn effective_agent_backend(&self, address: &ChannelAddress) -> Result<AgentBackendKind> {
-        self.selected_agent_backend(address)?.ok_or_else(|| {
-            anyhow!("this conversation does not have an agent backend yet; choose one with /agent")
-        })
-    }
-
     fn has_complete_agent_selection(&self, address: &ChannelAddress) -> Result<bool> {
-        Ok(self.selected_agent_backend(address)?.is_some()
-            && self.selected_main_model_key(address)?.is_some())
+        Ok(self.selected_main_model_key(address)?.is_some())
     }
 
     fn ensure_model_available_for_backend(
@@ -4625,8 +4275,7 @@ impl Server {
         let model_key = self.selected_main_model_key(address)?.ok_or_else(|| {
             anyhow!("this conversation does not have a main model yet; choose one with /agent")
         })?;
-        let backend = self.effective_agent_backend(address)?;
-        self.ensure_model_available_for_backend(backend, &model_key)?;
+        self.ensure_model_available_for_backend(AgentBackendKind::AgentFrame, &model_key)?;
         Ok(model_key)
     }
 
@@ -4664,13 +4313,6 @@ impl Server {
         })
     }
 
-    fn render_agent_backend_value(backend: AgentBackendKind) -> &'static str {
-        match backend {
-            AgentBackendKind::AgentFrame => "agent_frame",
-            AgentBackendKind::Zgent => "zgent",
-        }
-    }
-
     fn available_agent_models(&self, backend: AgentBackendKind) -> Vec<String> {
         self.agent
             .available_models(backend)
@@ -4680,67 +4322,28 @@ impl Server {
             .collect()
     }
 
-    fn agent_backend_selection_message(
-        &self,
-        address: &ChannelAddress,
-        intro: &str,
-    ) -> Result<OutgoingMessage> {
-        let current_backend = self.selected_agent_backend(address)?;
-        let current_model = self.selected_main_model_key(address)?;
-        let mut options = [AgentBackendKind::AgentFrame, AgentBackendKind::Zgent]
-            .into_iter()
-            .filter(|backend| !self.available_agent_models(*backend).is_empty())
-            .map(|backend| ShowOption {
-                label: Self::render_agent_backend_value(backend).to_string(),
-                value: format!("/agent {}", Self::render_agent_backend_value(backend)),
-            })
-            .collect::<Vec<_>>();
-        options.sort_by(|left, right| left.label.cmp(&right.label));
-        Ok(OutgoingMessage::with_options(
-            format!(
-                "{}\nCurrent agent backend: {}\nCurrent conversation model: {}\nChoose a backend below or send `/agent <agent_frame|zgent>`.",
-                intro,
-                current_backend
-                    .map(|value| format!("`{}`", Self::render_agent_backend_value(value)))
-                    .unwrap_or_else(|| "`<not selected>`".to_string()),
-                current_model
-                    .map(|value| format!("`{}`", value))
-                    .unwrap_or_else(|| "`<not selected>`".to_string())
-            ),
-            "Choose a backend",
-            options,
-        ))
-    }
-
     fn agent_model_selection_message(
         &self,
         address: &ChannelAddress,
-        backend: AgentBackendKind,
         intro: &str,
     ) -> Result<OutgoingMessage> {
         let current_model = self.selected_main_model_key(address)?;
         let mut options = self
-            .available_agent_models(backend)
+            .available_agent_models(AgentBackendKind::AgentFrame)
             .into_iter()
             .map(|model_key| ShowOption {
                 label: model_key.clone(),
-                value: format!(
-                    "/agent {} {}",
-                    Self::render_agent_backend_value(backend),
-                    model_key
-                ),
+                value: format!("/agent {}", model_key),
             })
             .collect::<Vec<_>>();
         options.sort_by(|left, right| left.label.cmp(&right.label));
         Ok(OutgoingMessage::with_options(
             format!(
-                "{}\nCurrent agent backend: `{}`\nCurrent conversation model: {}\nChoose a model below or send `/agent {} <model>`.",
+                "{}\nCurrent conversation model: {}\nChoose a model below or send `/agent <model>`.",
                 intro,
-                Self::render_agent_backend_value(backend),
                 current_model
                     .map(|value| format!("`{}`", value))
                     .unwrap_or_else(|| "`<not selected>`".to_string()),
-                Self::render_agent_backend_value(backend),
             ),
             "Choose a model",
             options,
@@ -4752,10 +4355,7 @@ impl Server {
         address: &ChannelAddress,
         intro: &str,
     ) -> Result<OutgoingMessage> {
-        if let Some(backend) = self.selected_agent_backend(address)? {
-            return self.agent_model_selection_message(address, backend, intro);
-        }
-        self.agent_backend_selection_message(address, intro)
+        self.agent_model_selection_message(address, intro)
     }
 
     fn reasoning_effort_message(&self, address: &ChannelAddress) -> Result<OutgoingMessage> {
@@ -5051,23 +4651,24 @@ fn spawn_channel_supervisor(channel: Arc<dyn Channel>, sender: mpsc::Sender<Inco
 mod tests {
     use super::foreground::register_active_foreground_control;
     use super::{
-        AgentCommand, ForegroundRuntimePhase, ImageGenerationRouting, SYSTEM_RESTART_NOTICE,
-        Server, SinkTarget, SummaryTracker, TokenUsage,
+        AgentCommand, ForegroundRuntimePhase, ImageGenerationRouting, IncomingCommandLane,
+        SYSTEM_RESTART_NOTICE, Server, SinkTarget, SummaryTracker, TokenUsage,
         background_timeout_with_active_children_text, build_synthetic_system_messages,
         build_user_turn_message, channel_restart_backoff_seconds,
         coalesce_buffered_conversation_messages, conversation_memory_root,
         estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
-        fast_path_agent_selection_message, format_session_status, infer_single_agent_backend,
-        is_out_of_band_command, is_timeout_like, memory_search_files,
-        normalize_messages_for_persistence, openrouter_automatic_cache_control,
-        openrouter_automatic_cache_ttl, parse_agent_command, parse_model_command,
-        parse_sandbox_command, parse_set_api_timeout_command, parse_sink_target,
-        parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
-        parse_think_command, persist_compaction_artifacts, rebuild_canonical_system_prompt,
-        render_last_user_message_time_tip, render_model_catalog_change_notice,
-        render_system_date_on_user_message, request_yield_for_incoming, rollout_read_file,
-        rollout_search_files, sanitize_messages_for_model_capabilities,
-        select_image_generation_routing, send_outgoing_message_now, session_errno_for_turn_error,
+        fast_path_agent_selection_message, format_session_status, incoming_command_lane,
+        infer_single_agent_backend, is_command_like_text, is_out_of_band_command, is_timeout_like,
+        memory_search_files, normalize_messages_for_persistence,
+        openrouter_automatic_cache_control, openrouter_automatic_cache_ttl, parse_agent_command,
+        parse_model_command, parse_sandbox_command, parse_set_api_timeout_command,
+        parse_sink_target, parse_snap_list_command, parse_snap_load_command,
+        parse_snap_save_command, parse_think_command, persist_compaction_artifacts,
+        rebuild_canonical_system_prompt, render_last_user_message_time_tip,
+        render_model_catalog_change_notice, render_system_date_on_user_message,
+        request_yield_for_incoming, rollout_read_file, rollout_search_files,
+        sanitize_messages_for_model_capabilities, select_image_generation_routing,
+        send_outgoing_message_now, session_errno_for_turn_error,
         should_attempt_idle_context_compaction, should_emit_runtime_change_prompt,
         summarize_resume_progress, sync_workspace_shared_profile_files,
         tag_interrupted_followup_text, update_active_foreground_phase,
@@ -5150,7 +4751,6 @@ mod tests {
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
             seen_model_catalog_version: None,
-            zgent_native: None,
             pending_workspace_summary: false,
             close_after_summary: false,
             session_state: crate::session::DurableSessionState::default(),
@@ -5211,7 +4811,6 @@ mod tests {
                 agent_frame: AgentBackendConfig {
                     available_models: vec!["demo-model".to_string()],
                 },
-                zgent: AgentBackendConfig::default(),
             },
             tooling: ToolingConfig::default(),
             chat_model_keys: vec!["demo-model".to_string()],
@@ -5249,7 +4848,6 @@ mod tests {
             pending_foreground_interrupts: Arc::new(Mutex::new(HashSet::new())),
             pending_process_restart_notices: Arc::new(Mutex::new(HashSet::new())),
             active_foreground_agent_frame_runtimes: Arc::new(Mutex::new(HashMap::new())),
-            active_native_zgent_sessions: Arc::new(Mutex::new(HashMap::new())),
             subagents: Arc::new(Mutex::new(HashMap::new())),
             channel_auth: Arc::new(Mutex::new(channel_auth)),
         }
@@ -5701,6 +5299,30 @@ mod tests {
     }
 
     #[test]
+    fn slash_commands_have_an_explicit_transport_lane() {
+        assert_eq!(
+            incoming_command_lane(Some("/status@party_claw_bot")),
+            Some(IncomingCommandLane::Immediate)
+        );
+        assert_eq!(
+            incoming_command_lane(Some("/compact@party_claw_bot")),
+            Some(IncomingCommandLane::ConversationWorker)
+        );
+        assert_eq!(
+            incoming_command_lane(Some("/unknown_command@party_claw_bot arg")),
+            Some(IncomingCommandLane::Immediate)
+        );
+        assert_eq!(
+            incoming_command_lane(Some("/home/jeremy/project")),
+            Some(IncomingCommandLane::Immediate)
+        );
+        assert!(is_command_like_text(Some(
+            "/unknown_command@party_claw_bot arg"
+        )));
+        assert!(is_command_like_text(Some("/home/jeremy/project")));
+    }
+
+    #[test]
     fn yield_request_detects_compaction_in_progress() {
         let address = ChannelAddress {
             channel_id: "telegram".to_string(),
@@ -5792,6 +5414,71 @@ mod tests {
         let text = returned.text.expect("merged follow-up text should exist");
         assert!(text.contains("Follow-up 1"));
         assert!(text.contains("Follow-up 2"));
+    }
+
+    #[test]
+    fn buffered_slash_commands_are_not_coalesced_into_user_context() {
+        let address = ChannelAddress {
+            channel_id: "telegram".to_string(),
+            conversation_id: "conversation-1".to_string(),
+            user_id: None,
+            display_name: None,
+        };
+        let initial = IncomingMessage {
+            remote_message_id: "msg-1".to_string(),
+            address: address.clone(),
+            text: Some("[Interrupted Follow-up]\n进度如何？".to_string()),
+            attachments: Vec::new(),
+            stored_attachments: Vec::new(),
+            control: None,
+        };
+        let command = IncomingMessage {
+            remote_message_id: "msg-2".to_string(),
+            address: address.clone(),
+            text: Some("/status@party_claw_bot".to_string()),
+            attachments: Vec::new(),
+            stored_attachments: Vec::new(),
+            control: None,
+        };
+        let later = IncomingMessage {
+            remote_message_id: "msg-3".to_string(),
+            address,
+            text: Some("[Interrupted Follow-up]\n继续".to_string()),
+            attachments: Vec::new(),
+            stored_attachments: Vec::new(),
+            control: None,
+        };
+        let mut queue = std::collections::VecDeque::from([command, later]);
+
+        let returned = coalesce_buffered_conversation_messages(initial, &mut queue);
+
+        assert_eq!(returned.remote_message_id, "msg-1");
+        assert_eq!(
+            returned.text.as_deref(),
+            Some("[Interrupted Follow-up]\n进度如何？")
+        );
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].text.as_deref(), Some("/status@party_claw_bot"));
+        assert_eq!(
+            queue[1].text.as_deref(),
+            Some("[Interrupted Follow-up]\n继续")
+        );
+    }
+
+    #[test]
+    fn unknown_slash_commands_are_control_messages_not_user_context() {
+        assert!(is_command_like_text(Some(
+            "/unknown-command@party_claw_bot arg"
+        )));
+        assert!(matches!(
+            incoming_command_lane(Some("/unknown-command@party_claw_bot arg")),
+            Some(IncomingCommandLane::Immediate)
+        ));
+        assert!(is_command_like_text(Some("/some/path")));
+        assert!(matches!(
+            incoming_command_lane(Some("/some/path")),
+            Some(IncomingCommandLane::Immediate)
+        ));
     }
 
     #[test]
@@ -6285,7 +5972,6 @@ mod tests {
             seen_user_profile_version: None,
             seen_identity_profile_version: None,
             seen_model_catalog_version: None,
-            zgent_native: None,
             pending_workspace_summary: false,
             close_after_summary: false,
             session_state: crate::session::DurableSessionState::default(),
@@ -6586,12 +6272,12 @@ mod tests {
                 .contains("Idle compaction has been paused")
         );
         let options = sent_messages[0].1.options.as_ref().expect("show options");
-        assert_eq!(options.prompt, "Choose a backend");
+        assert_eq!(options.prompt, "Choose a model");
         assert!(
             options
                 .options
                 .iter()
-                .any(|option| option.value == "/agent agent_frame")
+                .any(|option| option.value == "/agent demo-model")
         );
     }
 
@@ -6620,14 +6306,15 @@ mod tests {
         ));
         assert!(matches!(
             parse_agent_command(Some("/agent agent_frame")),
-            Some(AgentCommand::SelectBackend(AgentBackendKind::AgentFrame))
+            Some(AgentCommand::ShowSelection)
         ));
         assert!(matches!(
-            parse_agent_command(Some("/agent zgent demo-model")),
-            Some(AgentCommand::SelectModel {
-                backend: Some(AgentBackendKind::Zgent),
-                model_key
-            }) if model_key == "demo-model"
+            parse_agent_command(Some("/agent demo-model")),
+            Some(AgentCommand::SelectModel { model_key }) if model_key == "demo-model"
+        ));
+        assert!(matches!(
+            parse_agent_command(Some("/agent agent_frame demo-model")),
+            Some(AgentCommand::SelectModel { model_key }) if model_key == "demo-model"
         ));
         assert_eq!(parse_model_command(Some("/model")), Some(None));
         assert_eq!(
@@ -6658,6 +6345,8 @@ mod tests {
             parse_think_command(Some("/think@party_claw_bot medium")),
             Some(Some("medium".to_string()))
         );
+        assert_eq!(parse_sandbox_command(Some("/sandboxed bubblewrap")), None);
+        assert_eq!(parse_think_command(Some("/thinking high")), None);
     }
 
     #[test]
@@ -6690,7 +6379,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_path_skips_prompt_and_backfills_unique_backend_selection() {
+    fn fast_path_skips_prompt_when_model_is_already_selected() {
         let temp_dir = TempDir::new().unwrap();
         let address = ChannelAddress {
             channel_id: "telegram-main".to_string(),
@@ -6737,7 +6426,6 @@ mod tests {
             agent_frame: crate::config::AgentBackendConfig {
                 available_models: vec!["gpt54".to_string()],
             },
-            zgent: crate::config::AgentBackendConfig::default(),
         };
         let message = IncomingMessage {
             remote_message_id: "msg-1".to_string(),
@@ -6755,10 +6443,7 @@ mod tests {
         let reloaded = ConversationManager::new(temp_dir.path()).unwrap();
         let snapshot = reloaded.get_snapshot(&address).unwrap();
         assert_eq!(snapshot.settings.main_model.as_deref(), Some("gpt54"));
-        assert_eq!(
-            snapshot.settings.agent_backend,
-            Some(AgentBackendKind::AgentFrame)
-        );
+        assert_eq!(snapshot.settings.agent_backend, None);
     }
 
     #[test]
@@ -6774,27 +6459,12 @@ mod tests {
             agent_frame: AgentBackendConfig {
                 available_models: vec!["gpt54".to_string()],
             },
-            zgent: AgentBackendConfig::default(),
         };
 
         assert_eq!(
             infer_single_agent_backend(&agent, "gpt54"),
             Some(AgentBackendKind::AgentFrame)
         );
-    }
-
-    #[test]
-    fn infer_single_agent_backend_returns_none_when_model_has_multiple_backends() {
-        let agent = AgentConfig {
-            agent_frame: AgentBackendConfig {
-                available_models: vec!["gpt54".to_string()],
-            },
-            zgent: AgentBackendConfig {
-                available_models: vec!["gpt54".to_string()],
-            },
-        };
-
-        assert_eq!(infer_single_agent_backend(&agent, "gpt54"), None);
     }
 
     #[test]
