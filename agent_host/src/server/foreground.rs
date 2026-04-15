@@ -1064,3 +1064,35 @@ fn assistant_message_has_content_or_tool_calls(message: &ChatMessage) -> bool {
         Some(_) => true,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_prompt_components_persist_only_after_compaction() {
+        let state = TurnSystemPromptState {
+            active: "static prompt plus dynamic change notifications".to_string(),
+            full: "static prompt plus latest dynamic components".to_string(),
+            static_hash: "static-hash".to_string(),
+            component_hashes: BTreeMap::from([(
+                "agent_frame_dynamic_prompt".to_string(),
+                "dynamic-hash".to_string(),
+            )]),
+        };
+
+        assert_eq!(
+            state.for_persistence(&SessionCompactionStats::default()),
+            "static prompt plus dynamic change notifications"
+        );
+
+        let compacted = SessionCompactionStats {
+            compacted_run_count: 1,
+            ..SessionCompactionStats::default()
+        };
+        assert_eq!(
+            state.for_persistence(&compacted),
+            "static prompt plus latest dynamic components"
+        );
+    }
+}

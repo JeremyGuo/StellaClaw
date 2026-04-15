@@ -800,10 +800,10 @@ pub mod macro_support {
 mod tests {
     use super::{
         BackgroundTaskMetadata, ExecutionTarget, FILE_READ_MAX_OUTPUT_BYTES, LS_MAX_ENTRIES,
-        ProcessMetadata, Tool, active_runtime_state_summary, build_tool_registry_with_cancel,
-        execute_tool_call, execution_target_arg, process_is_running, process_meta_path,
-        remote_file_root, resolve_remote_cwd, terminate_runtime_state_tasks,
-        write_background_task_metadata,
+        ProcessMetadata, Tool, ToolExecutionMode, active_runtime_state_summary,
+        build_tool_registry_with_cancel, execute_tool_call, execution_target_arg,
+        process_is_running, process_meta_path, remote_file_root, resolve_remote_cwd,
+        terminate_runtime_state_tasks, write_background_task_metadata,
     };
     use crate::config::{
         AuthCredentialsStoreMode, RemoteWorkpathConfig, UpstreamApiKind, UpstreamAuthKind,
@@ -1271,6 +1271,119 @@ remote_command="$*"
                 "{name} should infer remote from exec_id instead of exposing a remote argument"
             );
         }
+    }
+
+    #[test]
+    fn long_running_tool_families_use_start_wait_and_terminate_lifecycle() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = test_upstream();
+        let registry = build_tool_registry_with_cancel(
+            &[],
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            Some(&upstream),
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let exec_start = registry.get("exec_start").expect("exec_start registered");
+        assert_eq!(exec_start.execution_mode, ToolExecutionMode::Interruptible);
+        assert!(
+            exec_start.parameters["properties"]
+                .get("return_immediate")
+                .is_some()
+        );
+        assert!(
+            exec_start.parameters["properties"]
+                .get("wait_timeout_seconds")
+                .is_some()
+        );
+        assert!(
+            exec_start.parameters["properties"]
+                .get("on_timeout")
+                .is_some()
+        );
+
+        let exec_wait = registry.get("exec_wait").expect("exec_wait registered");
+        assert_eq!(exec_wait.execution_mode, ToolExecutionMode::Interruptible);
+        assert!(exec_wait.parameters["properties"].get("exec_id").is_some());
+        assert!(
+            exec_wait.parameters["properties"]
+                .get("wait_timeout_seconds")
+                .is_some()
+        );
+        assert!(
+            exec_wait.parameters["properties"]
+                .get("on_timeout")
+                .is_some()
+        );
+
+        let exec_kill = registry.get("exec_kill").expect("exec_kill registered");
+        assert_eq!(exec_kill.execution_mode, ToolExecutionMode::Immediate);
+        assert!(exec_kill.parameters["properties"].get("exec_id").is_some());
+
+        let download_start = registry
+            .get("file_download_start")
+            .expect("file_download_start registered");
+        assert_eq!(download_start.execution_mode, ToolExecutionMode::Immediate);
+        assert!(download_start.parameters["properties"].get("url").is_some());
+
+        let download_wait = registry
+            .get("file_download_wait")
+            .expect("file_download_wait registered");
+        assert_eq!(
+            download_wait.execution_mode,
+            ToolExecutionMode::Interruptible
+        );
+        assert!(
+            download_wait.parameters["properties"]
+                .get("download_id")
+                .is_some()
+        );
+
+        let download_cancel = registry
+            .get("file_download_cancel")
+            .expect("file_download_cancel registered");
+        assert_eq!(download_cancel.execution_mode, ToolExecutionMode::Immediate);
+        assert!(
+            download_cancel.parameters["properties"]
+                .get("download_id")
+                .is_some()
+        );
+
+        let image_start = registry.get("image_start").expect("image_start registered");
+        assert_eq!(image_start.execution_mode, ToolExecutionMode::Immediate);
+        assert!(image_start.parameters["properties"].get("path").is_some());
+
+        let image_wait = registry.get("image_wait").expect("image_wait registered");
+        assert_eq!(image_wait.execution_mode, ToolExecutionMode::Interruptible);
+        assert!(
+            image_wait.parameters["properties"]
+                .get("image_id")
+                .is_some()
+        );
+
+        let image_cancel = registry
+            .get("image_cancel")
+            .expect("image_cancel registered");
+        assert_eq!(image_cancel.execution_mode, ToolExecutionMode::Immediate);
+        assert!(
+            image_cancel.parameters["properties"]
+                .get("image_id")
+                .is_some()
+        );
     }
 
     #[test]

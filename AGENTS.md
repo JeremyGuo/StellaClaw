@@ -6,6 +6,19 @@ This file defines project-specific rules for LLM-assisted development in this re
 
 Before making non-trivial project changes, read the root `VERSION` file for recent changelog entries that may explain important bug fixes, compatibility work, and feature invariants. Use that history to avoid reintroducing previously fixed bugs or accidentally disabling important behavior that earlier versions added.
 
+Before making non-trivial project changes, also read the root `FEATURES.md` file. It records core user-facing and architecture-level features that should remain protected during future development.
+
+## Feature Tracking And Tests
+
+When the user asks for a change that is not only a bug fix:
+
+- decide whether the change adds, removes, or meaningfully changes a project feature
+- if it is a feature change, update `FEATURES.md` in the same change so the feature list stays current
+- add or update focused tests that protect the new or changed feature from future regressions
+- if a listed feature is intentionally removed or weakened, call that out explicitly and update `FEATURES.md` rather than silently deleting coverage
+
+Bug fixes do not need a new `FEATURES.md` entry unless they introduce or redefine a durable feature. However, bug fixes should still add regression tests when practical.
+
 ## Versioning Responsibilities
 
 There are two independent version tracks in this project:
