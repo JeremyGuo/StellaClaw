@@ -1,6 +1,6 @@
 use super::*;
 
-impl ServerRuntime {
+impl AgentRuntimeView {
     fn subagent_prompt(description: &str) -> String {
         format!(
             "{description}\n\nThis is a delegated subtask for the caller. Keep the work narrowly scoped, prefer the fastest path to a correct result, and avoid exploring unrelated directions. Return a concise summary when you finish, including any files you changed and anything the caller must know before continuing."

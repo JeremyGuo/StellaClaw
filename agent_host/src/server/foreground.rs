@@ -18,6 +18,20 @@ impl TurnSystemPromptState {
     }
 }
 
+enum ForegroundTurnOutcome {
+    Replied {
+        state: SessionState,
+        outgoing: OutgoingMessage,
+    },
+    Yielded(SessionState),
+    Failed {
+        resume_messages: Vec<ChatMessage>,
+        progress_summary: String,
+        compaction: SessionCompactionStats,
+        error: anyhow::Error,
+    },
+}
+
 pub(super) fn register_active_foreground_control(
     active_controls: &Arc<Mutex<HashMap<String, SessionExecutionControl>>>,
     pending_interrupts: &Arc<Mutex<HashSet<String>>>,
@@ -924,7 +938,7 @@ impl Server {
         let upstream_timeout_seconds = session
             .api_timeout_override_seconds
             .unwrap_or(self.model_upstream_timeout_seconds(model_key)?);
-        let runtime = self.tool_runtime_for_address(&session.address)?;
+        let runtime = self.agent_runtime_view_for_address(&session.address)?;
         let active_controls = Arc::clone(&self.active_foreground_controls);
         let pending_interrupts = Arc::clone(&self.pending_foreground_interrupts);
         let session_key = session.address.session_key();

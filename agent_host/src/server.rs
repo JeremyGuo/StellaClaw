@@ -14,8 +14,8 @@ use crate::channels::command_line::CommandLineChannel;
 use crate::channels::dingtalk::DingtalkChannel;
 use crate::channels::telegram::TelegramChannel;
 use crate::config::{
-    AgentConfig, BotCommandConfig, ChannelConfig, MainAgentConfig, ModelCapability, ModelConfig,
-    SandboxConfig, SandboxMode, ServerConfig, ToolingConfig, ToolingTarget, default_bot_commands,
+    AgentConfig, BotCommandConfig, ChannelConfig, ModelCapability, ModelConfig, SandboxConfig,
+    SandboxMode, ServerConfig, ToolingConfig, ToolingTarget, default_bot_commands,
     default_dingtalk_commands, default_telegram_commands,
 };
 use crate::conversation::{ConversationManager, ConversationSettings};
@@ -67,6 +67,7 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -78,9 +79,11 @@ use tokio::time::{Duration, MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+mod agent_runtime;
 mod background;
 mod command_routing;
 mod commands;
+mod context;
 mod extra_tools;
 mod foreground;
 mod frame_config;
@@ -91,8 +94,13 @@ mod progress;
 mod runtime_helpers;
 mod security;
 mod subagents;
+mod workspace_summary;
 
+use self::agent_runtime::{
+    AgentRuntimeView, SubAgentSlot, SummaryInProgressGuard, SummaryTracker, TimedRunOutcome,
+};
 use self::commands::*;
+use self::context::RuntimeContext;
 use self::incoming::*;
 use self::messaging::*;
 use self::persistence::*;
@@ -243,124 +251,12 @@ fn leading_system_prompt(messages: &[ChatMessage]) -> Option<String> {
     first.content.as_ref()?.as_str().map(ToOwned::to_owned)
 }
 
-#[derive(Clone)]
-struct ServerRuntime {
-    agent_workspace: AgentWorkspace,
-    sessions: Arc<Mutex<SessionManager>>,
-    workspace_manager: WorkspaceManager,
-    active_workspace_ids: Vec<String>,
-    selected_agent_backend: Option<AgentBackendKind>,
-    selected_main_model_key: Option<String>,
-    selected_reasoning_effort: Option<String>,
-    selected_context_compaction_enabled: Option<bool>,
-    selected_chat_version_id: Option<Uuid>,
-    channels: Arc<HashMap<String, Arc<dyn Channel>>>,
-    command_catalog: HashMap<String, Vec<BotCommandConfig>>,
-    models: BTreeMap<String, ModelConfig>,
-    agent: AgentConfig,
-    tooling: ToolingConfig,
-    main_agent: MainAgentConfig,
-    sandbox: SandboxConfig,
-    sink_router: Arc<RwLock<SinkRouter>>,
-    cron_manager: Arc<Mutex<CronManager>>,
-    agent_registry: Arc<Mutex<AgentRegistry>>,
-    agent_registry_notify: Arc<Notify>,
-    max_global_sub_agents: usize,
-    subagent_count: Arc<AtomicUsize>,
-    cron_poll_interval_seconds: u64,
-    background_job_sender: mpsc::Sender<BackgroundJobRequest>,
-    summary_tracker: Arc<SummaryTracker>,
-    active_foreground_phases: Arc<Mutex<HashMap<String, ForegroundRuntimePhase>>>,
-    active_foreground_agent_frame_runtimes:
-        Arc<Mutex<HashMap<String, Arc<Mutex<ActiveForegroundAgentFrameRuntime>>>>>,
-    subagents: Arc<Mutex<HashMap<uuid::Uuid, Arc<HostedSubagent>>>>,
-    conversations: Arc<Mutex<ConversationManager>>,
-}
-
-struct SubAgentSlot {
-    counter: Arc<AtomicUsize>,
-}
-
-struct SummaryInProgressGuard {
-    tracker: Arc<SummaryTracker>,
-}
-
-struct SummaryTracker {
-    count: Mutex<usize>,
-    condvar: Condvar,
-}
-
-enum TimedRunOutcome {
-    Completed(SessionState),
-    Yielded(SessionState),
-    TimedOut {
-        state: Option<SessionState>,
-        error: anyhow::Error,
-    },
-    Failed(anyhow::Error),
-}
-
-enum ForegroundTurnOutcome {
-    Replied {
-        state: SessionState,
-        outgoing: OutgoingMessage,
-    },
-    Yielded(SessionState),
-    Failed {
-        resume_messages: Vec<ChatMessage>,
-        progress_summary: String,
-        compaction: SessionCompactionStats,
-        error: anyhow::Error,
-    },
-}
-
-impl Drop for SubAgentSlot {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-impl Drop for SummaryInProgressGuard {
-    fn drop(&mut self) {
-        let mut count = self.tracker.count.lock().unwrap();
-        *count = count.saturating_sub(1);
-        if *count == 0 {
-            self.tracker.condvar.notify_all();
-        }
-    }
-}
-
-impl SummaryInProgressGuard {
-    fn new(tracker: Arc<SummaryTracker>) -> Self {
-        let mut count = tracker.count.lock().unwrap();
-        *count += 1;
-        drop(count);
-        Self { tracker }
-    }
-}
-
-impl SummaryTracker {
-    fn new() -> Self {
-        Self {
-            count: Mutex::new(0),
-            condvar: Condvar::new(),
-        }
-    }
-
-    fn wait_for_zero(&self) {
-        let mut count = self.count.lock().unwrap();
-        while *count > 0 {
-            count = self.condvar.wait(count).unwrap();
-        }
-    }
-}
-
-impl ServerRuntime {
+impl AgentRuntimeView {
     fn available_agent_models(&self, backend: AgentBackendKind) -> Vec<String> {
         self.agent
             .available_models(backend)
             .iter()
-            .filter(|model_key| self.models.contains_key(model_key.as_str()))
+            .filter(|model_key: &&String| self.models.contains_key(model_key.as_str()))
             .cloned()
             .collect()
     }
@@ -757,36 +653,6 @@ impl ServerRuntime {
                 .with_context(|| format!("unknown model {}", model_key))?
                 .timeout_seconds,
         ))
-    }
-
-    fn with_subagents<T>(
-        &self,
-        f: impl FnOnce(&mut HashMap<uuid::Uuid, Arc<HostedSubagent>>) -> Result<T>,
-    ) -> Result<T> {
-        let mut subagents = self
-            .subagents
-            .lock()
-            .map_err(|_| anyhow!("subagent manager lock poisoned"))?;
-        f(&mut subagents)
-    }
-
-    fn with_conversations<T>(
-        &self,
-        f: impl FnOnce(&mut ConversationManager) -> Result<T>,
-    ) -> Result<T> {
-        let mut conversations = self
-            .conversations
-            .lock()
-            .map_err(|_| anyhow!("conversation manager lock poisoned"))?;
-        f(&mut conversations)
-    }
-
-    fn with_sessions<T>(&self, f: impl FnOnce(&mut SessionManager) -> Result<T>) -> Result<T> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| anyhow!("session manager lock poisoned"))?;
-        f(&mut sessions)
     }
 
     fn create_background_session_for_conversation(
@@ -1779,42 +1645,25 @@ impl ServerRuntime {
 }
 
 pub struct Server {
-    workdir: PathBuf,
-    agent_workspace: AgentWorkspace,
-    workspace_manager: WorkspaceManager,
-    channels: Arc<HashMap<String, Arc<dyn Channel>>>,
+    context: Arc<RuntimeContext>,
     telegram_channel_ids: Arc<HashSet<String>>,
-    command_catalog: HashMap<String, Vec<BotCommandConfig>>,
-    models: BTreeMap<String, ModelConfig>,
-    agent: AgentConfig,
-    tooling: ToolingConfig,
-    chat_model_keys: Vec<String>,
-    main_agent: MainAgentConfig,
     sandbox: SandboxConfig,
-    conversations: Arc<Mutex<ConversationManager>>,
-    snapshots: Arc<Mutex<SnapshotManager>>,
-    sessions: Arc<Mutex<SessionManager>>,
-    sink_router: Arc<RwLock<SinkRouter>>,
-    cron_manager: Arc<Mutex<CronManager>>,
-    agent_registry: Arc<Mutex<AgentRegistry>>,
-    agent_registry_notify: Arc<Notify>,
-    max_global_sub_agents: usize,
-    subagent_count: Arc<AtomicUsize>,
-    cron_poll_interval_seconds: u64,
-    background_job_sender: mpsc::Sender<BackgroundJobRequest>,
     background_job_receiver: Option<mpsc::Receiver<BackgroundJobRequest>>,
-    summary_tracker: Arc<SummaryTracker>,
     active_foreground_controls: Arc<Mutex<HashMap<String, SessionExecutionControl>>>,
-    active_foreground_phases: Arc<Mutex<HashMap<String, ForegroundRuntimePhase>>>,
     /// Session keys with pending user interrupts — when a new user message arrives while a
     /// foreground turn is running, the session key is inserted here so that
     /// `should_auto_resume_yielded_session` knows not to auto-resume.
     pending_foreground_interrupts: Arc<Mutex<HashSet<String>>>,
     pending_process_restart_notices: Arc<Mutex<HashSet<String>>>,
-    active_foreground_agent_frame_runtimes:
-        Arc<Mutex<HashMap<String, Arc<Mutex<ActiveForegroundAgentFrameRuntime>>>>>,
-    subagents: Arc<Mutex<HashMap<uuid::Uuid, Arc<HostedSubagent>>>>,
     channel_auth: Arc<Mutex<ChannelAuthorizationManager>>,
+}
+
+impl Deref for Server {
+    type Target = RuntimeContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
 }
 
 impl Server {
@@ -1845,7 +1694,7 @@ impl Server {
         session: &SessionSnapshot,
         model_key: &str,
     ) -> Result<Vec<String>> {
-        let runtime = self.tool_runtime_for_address(&session.address)?;
+        let runtime = self.agent_runtime_view_for_address(&session.address)?;
         let frame_config = runtime.build_agent_frame_config(
             session,
             &session.workspace_root,
@@ -1992,33 +1841,6 @@ impl Server {
         Ok(())
     }
 
-    fn with_sessions<T>(&self, f: impl FnOnce(&mut SessionManager) -> Result<T>) -> Result<T> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| anyhow!("session manager lock poisoned"))?;
-        f(&mut sessions)
-    }
-
-    fn with_conversations<T>(
-        &self,
-        f: impl FnOnce(&mut ConversationManager) -> Result<T>,
-    ) -> Result<T> {
-        let mut conversations = self
-            .conversations
-            .lock()
-            .map_err(|_| anyhow!("conversation manager lock poisoned"))?;
-        f(&mut conversations)
-    }
-
-    fn with_snapshots<T>(&self, f: impl FnOnce(&mut SnapshotManager) -> Result<T>) -> Result<T> {
-        let mut snapshots = self
-            .snapshots
-            .lock()
-            .map_err(|_| anyhow!("snapshot manager lock poisoned"))?;
-        f(&mut snapshots)
-    }
-
     fn with_channel_auth<T>(
         &self,
         f: impl FnOnce(&mut ChannelAuthorizationManager) -> Result<T>,
@@ -2109,23 +1931,27 @@ impl Server {
             );
         }
 
-        Ok(Self {
-            sessions: Arc::new(Mutex::new(session_manager)),
-            workdir: workdir.clone(),
+        let sessions = Arc::new(Mutex::new(session_manager));
+        let conversations = Arc::new(Mutex::new(ConversationManager::new(&workdir)?));
+        let snapshots = Arc::new(Mutex::new(SnapshotManager::new(&workdir)?));
+        let sink_router = Arc::new(RwLock::new(SinkRouter::new()));
+        let summary_tracker = Arc::new(SummaryTracker::new());
+        let active_foreground_phases = Arc::new(Mutex::new(HashMap::new()));
+        let active_foreground_agent_frame_runtimes = Arc::new(Mutex::new(HashMap::new()));
+        let subagents = Arc::new(Mutex::new(HashMap::new()));
+        let context = Arc::new(RuntimeContext {
+            workdir,
             agent_workspace,
             workspace_manager,
+            sessions,
             channels: Arc::new(channels),
-            telegram_channel_ids: Arc::new(telegram_channel_ids),
             command_catalog,
             models: config.models,
             agent: config.agent,
             tooling,
             chat_model_keys: config.chat_model_keys,
             main_agent: config.main_agent,
-            sandbox: config.sandbox,
-            conversations: Arc::new(Mutex::new(ConversationManager::new(&workdir)?)),
-            snapshots: Arc::new(Mutex::new(SnapshotManager::new(&workdir)?)),
-            sink_router: Arc::new(RwLock::new(SinkRouter::new())),
+            sink_router,
             cron_manager,
             agent_registry,
             agent_registry_notify,
@@ -2133,15 +1959,25 @@ impl Server {
             subagent_count: Arc::new(AtomicUsize::new(0)),
             cron_poll_interval_seconds: config.cron_poll_interval_seconds,
             background_job_sender,
+            summary_tracker,
+            active_foreground_phases,
+            active_foreground_agent_frame_runtimes,
+            subagents,
+            conversations,
+            snapshots,
+        });
+
+        Ok(Self {
+            context: Arc::clone(&context),
+            telegram_channel_ids: Arc::new(telegram_channel_ids),
+            sandbox: config.sandbox,
             background_job_receiver: Some(background_job_receiver),
-            summary_tracker: Arc::new(SummaryTracker::new()),
             active_foreground_controls: Arc::new(Mutex::new(HashMap::new())),
-            active_foreground_phases: Arc::new(Mutex::new(HashMap::new())),
             pending_foreground_interrupts: Arc::new(Mutex::new(HashSet::new())),
             pending_process_restart_notices: Arc::new(Mutex::new(pending_process_restart_notices)),
-            active_foreground_agent_frame_runtimes: Arc::new(Mutex::new(HashMap::new())),
-            subagents: Arc::new(Mutex::new(HashMap::new())),
-            channel_auth: Arc::new(Mutex::new(ChannelAuthorizationManager::new(&workdir)?)),
+            channel_auth: Arc::new(Mutex::new(ChannelAuthorizationManager::new(
+                &context.workdir,
+            )?)),
         })
     }
 
@@ -2151,7 +1987,7 @@ impl Server {
         let background_receiver = self.background_job_receiver.take();
         let server = Arc::new(self);
         {
-            let runtime = server.tool_runtime();
+            let runtime = server.agent_runtime_view();
             tokio::spawn(async move {
                 let mut ticker = interval(Duration::from_secs(runtime.cron_poll_interval_seconds));
                 ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -2187,7 +2023,7 @@ impl Server {
             });
         }
         if let Some(mut background_receiver) = background_receiver {
-            let runtime = server.tool_runtime();
+            let runtime = server.agent_runtime_view();
             tokio::spawn(async move {
                 while let Some(job) = background_receiver.recv().await {
                     let runtime = runtime.clone();
@@ -2210,7 +2046,7 @@ impl Server {
         }
         drop(sender);
         {
-            let runtime = server.tool_runtime();
+            let runtime = server.agent_runtime_view();
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 if let Err(error) = runtime.cleanup_stale_progress_messages_once().await {
@@ -2319,7 +2155,7 @@ impl Server {
         }
         let model_key = self.effective_main_model_key(&session.address)?;
         let model = self.model_config_or_main(&model_key)?.clone();
-        let runtime = self.tool_runtime_for_address(&session.address)?;
+        let runtime = self.agent_runtime_view_for_address(&session.address)?;
         let source_messages = session.request_messages();
         if source_messages.is_empty() {
             return Ok(false);
@@ -2443,11 +2279,9 @@ impl Server {
         Ok(true)
     }
 
-    fn tool_runtime(&self) -> ServerRuntime {
-        ServerRuntime {
-            agent_workspace: self.agent_workspace.clone(),
-            sessions: Arc::clone(&self.sessions),
-            workspace_manager: self.workspace_manager.clone(),
+    fn agent_runtime_view(&self) -> AgentRuntimeView {
+        AgentRuntimeView {
+            context: Arc::clone(&self.context),
             active_workspace_ids: self
                 .with_sessions(|sessions| Ok(sessions.list_foreground_snapshots()))
                 .unwrap_or_default()
@@ -2459,40 +2293,19 @@ impl Server {
             selected_reasoning_effort: None,
             selected_context_compaction_enabled: None,
             selected_chat_version_id: None,
-            channels: Arc::clone(&self.channels),
-            command_catalog: self.command_catalog.clone(),
-            models: self.models.clone(),
-            agent: self.agent.clone(),
-            tooling: self.tooling.clone(),
-            main_agent: self.main_agent.clone(),
             sandbox: self.sandbox.clone(),
-            sink_router: Arc::clone(&self.sink_router),
-            cron_manager: Arc::clone(&self.cron_manager),
-            agent_registry: Arc::clone(&self.agent_registry),
-            agent_registry_notify: Arc::clone(&self.agent_registry_notify),
-            max_global_sub_agents: self.max_global_sub_agents,
-            subagent_count: Arc::clone(&self.subagent_count),
-            cron_poll_interval_seconds: self.cron_poll_interval_seconds,
-            background_job_sender: self.background_job_sender.clone(),
-            summary_tracker: Arc::clone(&self.summary_tracker),
-            active_foreground_phases: Arc::clone(&self.active_foreground_phases),
-            active_foreground_agent_frame_runtimes: Arc::clone(
-                &self.active_foreground_agent_frame_runtimes,
-            ),
-            subagents: Arc::clone(&self.subagents),
-            conversations: Arc::clone(&self.conversations),
         }
     }
 
-    fn tool_runtime_for_sandbox_mode(&self, sandbox_mode: SandboxMode) -> ServerRuntime {
-        let mut runtime = self.tool_runtime();
+    fn agent_runtime_view_for_sandbox_mode(&self, sandbox_mode: SandboxMode) -> AgentRuntimeView {
+        let mut runtime = self.agent_runtime_view();
         runtime.sandbox.mode = sandbox_mode;
         runtime
     }
 
-    fn tool_runtime_for_address(&self, address: &ChannelAddress) -> Result<ServerRuntime> {
+    fn agent_runtime_view_for_address(&self, address: &ChannelAddress) -> Result<AgentRuntimeView> {
         let sandbox_mode = self.effective_sandbox_mode(address)?;
-        let mut runtime = self.tool_runtime_for_sandbox_mode(sandbox_mode);
+        let mut runtime = self.agent_runtime_view_for_sandbox_mode(sandbox_mode);
         let settings = self.with_conversations(|conversations| {
             conversations
                 .ensure_conversation(address)
@@ -2572,7 +2385,7 @@ impl Server {
         self.unregister_active_foreground_control(address)?;
         if let Some(session) = snapshot {
             let destroyed_subagents = self
-                .tool_runtime()
+                .agent_runtime_view()
                 .destroy_subagents_for_session(session.id)?;
             let runtime_state_root = self
                 .agent_workspace
@@ -2734,7 +2547,7 @@ impl Server {
         } else {
             "model default"
         };
-        let runtime = self.tool_runtime_for_address(&session.address)?;
+        let runtime = self.agent_runtime_view_for_address(&session.address)?;
         let current_context_estimate =
             estimate_current_context_tokens_for_session(&runtime, session, model_key)?;
         let current_context_limit = self
@@ -2802,7 +2615,7 @@ impl Server {
         {
             return Ok(false);
         }
-        let runtime = self.tool_runtime_for_address(&session.address)?;
+        let runtime = self.agent_runtime_view_for_address(&session.address)?;
         let mut config = runtime.build_agent_frame_config(
             session,
             &session.workspace_root,
@@ -2877,178 +2690,6 @@ impl Server {
             modes.push(SandboxMode::Bubblewrap);
         }
         modes
-    }
-
-    async fn summarize_active_workspaces_on_shutdown(&self) -> Result<()> {
-        let snapshots = self.with_sessions(|sessions| Ok(sessions.list_foreground_snapshots()))?;
-        let mut first_error = None;
-        for session in snapshots {
-            let _ = self.with_sessions(|sessions| {
-                sessions.mark_workspace_summary_state(&session.address, true, false)
-            });
-            if let Err(error) = self.summarize_workspace_before_destroy(&session).await {
-                warn!(
-                    log_stream = "session",
-                    log_key = %session.id,
-                    kind = "workspace_summary_on_shutdown_failed",
-                    workspace_id = %session.workspace_id,
-                    error = %format!("{error:#}"),
-                    "failed to summarize workspace on shutdown"
-                );
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    async fn summarize_workspace_before_destroy(&self, session: &SessionSnapshot) -> Result<()> {
-        let _summary_guard = SummaryInProgressGuard::new(Arc::clone(&self.summary_tracker));
-        let entries =
-            self.workspace_manager
-                .list_workspace_contents(&session.workspace_id, None, 3, 200)?;
-        let request_messages = session.request_messages();
-        let request_message_count = request_messages.len();
-        if request_message_count == 0 && entries.is_empty() {
-            self.with_sessions(|sessions| {
-                sessions.mark_workspace_summary_state(&session.address, false, false)
-            })?;
-            return Ok(());
-        }
-
-        let mut previous_messages = request_messages;
-        let effective_model_key = self.effective_main_model_key(&session.address)?;
-        if self.effective_context_compaction_enabled(&session.address)? && request_message_count > 1
-        {
-            let runtime = self.tool_runtime();
-            let config = runtime.build_agent_frame_config(
-                session,
-                &session.workspace_root,
-                AgentPromptKind::MainForeground,
-                &effective_model_key,
-                None,
-            )?;
-            let extra_tools = runtime.build_extra_tools(
-                session,
-                AgentPromptKind::MainForeground,
-                session.agent_id,
-                None,
-            );
-            let compaction_messages = sanitize_messages_for_model_capabilities(
-                &previous_messages,
-                self.model_config_or_main(&effective_model_key)?,
-                backend_supports_native_multimodal_input(AgentBackendKind::AgentFrame),
-            );
-            let compaction = run_backend_compaction(
-                AgentBackendKind::AgentFrame,
-                compaction_messages,
-                config,
-                extra_tools,
-            )?;
-            if compaction.compacted {
-                previous_messages = compaction.messages;
-            }
-        }
-
-        let workspace = self
-            .workspace_manager
-            .ensure_workspace_exists(&session.workspace_id)?;
-        let tree = entries
-            .iter()
-            .map(|entry| format!("- {} ({})", entry.path, entry.entry_type))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let prompt = format!(
-            "You are about to stop working in the current workspace.\n\nSummarize the work that has been done here for future agents.\nWrite a concise durable summary in plain text.\nFocus on:\n1. what work this workspace is mainly about\n2. what kinds of changes or outputs now exist in the workspace at a high level\n3. recent progress and current status\n4. any important unfinished direction a future agent should know\n\nKeep the summary at the level of work content and broad impact on the workspace.\nDo not explain files or directories one by one, and avoid file-level detail unless a path is truly the single most important entry point.\n\nCurrent stored summary:\n{}\n\nWorkspace file tree snapshot:\n{}\n\nReturn only the summary text. Do not use attachment tags.",
-            workspace.summary,
-            if tree.trim().is_empty() {
-                "(workspace currently has no files)"
-            } else {
-                &tree
-            }
-        );
-        let upstream_timeout_seconds = self.model_upstream_timeout_seconds(&effective_model_key)?;
-        let runtime = self.tool_runtime_for_address(&session.address)?;
-        let outcome = runtime
-            .run_agent_turn_with_timeout(
-                session.clone(),
-                AgentPromptKind::MainForeground,
-                session.agent_id,
-                AgentBackendKind::AgentFrame,
-                effective_model_key.clone(),
-                previous_messages,
-                prompt,
-                Some(upstream_timeout_seconds),
-                None,
-                "workspace summary task join failed",
-            )
-            .await?;
-        let state = match outcome {
-            TimedRunOutcome::Completed(state) => state,
-            TimedRunOutcome::Yielded(state) => state,
-            TimedRunOutcome::TimedOut {
-                state: Some(state), ..
-            } => state,
-            TimedRunOutcome::TimedOut { state: None, error } => return Err(error),
-            TimedRunOutcome::Failed(error) => return Err(error),
-        };
-        let summary_text = extract_assistant_text(&state.messages);
-        let (clean_summary, _) =
-            extract_attachment_references(&summary_text, &session.workspace_root)?;
-        let clean_summary = clean_summary.trim();
-        if clean_summary.is_empty() {
-            self.with_sessions(|sessions| {
-                sessions.mark_workspace_summary_state(&session.address, false, false)
-            })?;
-            return Ok(());
-        }
-        let updated = self.workspace_manager.update_summary(
-            &session.workspace_id,
-            clean_summary.to_string(),
-            None,
-        )?;
-        self.with_sessions(|sessions| {
-            sessions.mark_workspace_summary_state(&session.address, false, false)
-        })?;
-        info!(
-            log_stream = "session",
-            log_key = %session.id,
-            kind = "workspace_summary_updated",
-            workspace_id = %session.workspace_id,
-            summary_path = %updated.summary_path.display(),
-            summary_len = clean_summary.len() as u64,
-            "updated workspace summary before destroy"
-        );
-        Ok(())
-    }
-
-    async fn retry_pending_workspace_summaries(&self) -> Result<()> {
-        let pending =
-            self.with_sessions(|sessions| Ok(sessions.pending_workspace_summary_snapshots()))?;
-        for session in pending {
-            if let Err(error) = self.summarize_workspace_before_destroy(&session).await {
-                warn!(
-                    log_stream = "session",
-                    log_key = %session.id,
-                    kind = "workspace_summary_retry_failed",
-                    workspace_id = %session.workspace_id,
-                    error = %format!("{error:#}"),
-                    "failed to retry pending workspace summary on startup"
-                );
-                continue;
-            }
-            self.with_sessions(|sessions| {
-                sessions.mark_workspace_summary_state(&session.address, false, false)
-            })?;
-            if session.close_after_summary {
-                self.destroy_foreground_session(&session.address)?;
-            }
-        }
-        Ok(())
     }
 
     fn effective_conversation_settings(
@@ -3142,7 +2783,7 @@ impl Server {
         self.agent
             .available_models(backend)
             .iter()
-            .filter(|model_key| self.models.contains_key(model_key.as_str()))
+            .filter(|model_key: &&String| self.models.contains_key(model_key.as_str()))
             .cloned()
             .collect()
     }
@@ -3477,7 +3118,7 @@ mod tests {
     use super::foreground::register_active_foreground_control;
     use super::{
         AgentCommand, ForegroundRuntimePhase, ImageGenerationRouting, IncomingCommandLane,
-        SYSTEM_RESTART_NOTICE, Server, SinkTarget, SummaryTracker, TokenUsage,
+        RuntimeContext, SYSTEM_RESTART_NOTICE, Server, SinkTarget, SummaryTracker, TokenUsage,
         background_timeout_with_active_children_text, build_synthetic_system_messages,
         build_user_turn_message, channel_restart_backoff_seconds,
         coalesce_buffered_conversation_messages, conversation_memory_root,
@@ -3624,12 +3265,12 @@ mod tests {
             },
         );
 
-        Server {
+        let context = Arc::new(RuntimeContext {
             workdir: temp_dir.path().to_path_buf(),
             agent_workspace,
             workspace_manager,
+            sessions: Arc::new(Mutex::new(sessions)),
             channels: Arc::new(HashMap::from([("telegram-main".to_string(), channel)])),
-            telegram_channel_ids: Arc::new(HashSet::new()),
             command_catalog: HashMap::new(),
             models,
             agent: AgentConfig {
@@ -3654,10 +3295,6 @@ mod tests {
                 token_estimation_cache: Default::default(),
                 memory_system: MemorySystem::default(),
             },
-            sandbox: SandboxConfig::default(),
-            conversations: Arc::new(Mutex::new(conversations)),
-            snapshots: Arc::new(Mutex::new(snapshots)),
-            sessions: Arc::new(Mutex::new(sessions)),
             sink_router: Arc::new(RwLock::new(SinkRouter::new())),
             cron_manager: Arc::new(Mutex::new(cron_manager)),
             agent_registry: Arc::new(Mutex::new(agent_registry)),
@@ -3666,14 +3303,22 @@ mod tests {
             subagent_count: Arc::new(AtomicUsize::new(0)),
             cron_poll_interval_seconds: 60,
             background_job_sender,
-            background_job_receiver: Some(background_job_receiver),
             summary_tracker: Arc::new(SummaryTracker::new()),
-            active_foreground_controls: Arc::new(Mutex::new(HashMap::new())),
             active_foreground_phases: Arc::new(Mutex::new(HashMap::new())),
-            pending_foreground_interrupts: Arc::new(Mutex::new(HashSet::new())),
-            pending_process_restart_notices: Arc::new(Mutex::new(HashSet::new())),
             active_foreground_agent_frame_runtimes: Arc::new(Mutex::new(HashMap::new())),
             subagents: Arc::new(Mutex::new(HashMap::new())),
+            conversations: Arc::new(Mutex::new(conversations)),
+            snapshots: Arc::new(Mutex::new(snapshots)),
+        });
+
+        Server {
+            context,
+            telegram_channel_ids: Arc::new(HashSet::new()),
+            sandbox: SandboxConfig::default(),
+            background_job_receiver: Some(background_job_receiver),
+            active_foreground_controls: Arc::new(Mutex::new(HashMap::new())),
+            pending_foreground_interrupts: Arc::new(Mutex::new(HashSet::new())),
+            pending_process_restart_notices: Arc::new(Mutex::new(HashSet::new())),
             channel_auth: Arc::new(Mutex::new(channel_auth)),
         }
     }

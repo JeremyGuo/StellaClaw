@@ -919,7 +919,7 @@ pub(super) fn effective_reasoning_config(
 }
 
 pub(super) fn estimate_current_context_tokens_for_session(
-    runtime: &ServerRuntime,
+    runtime: &AgentRuntimeView,
     session: &SessionSnapshot,
     model_key: &str,
 ) -> Result<usize> {

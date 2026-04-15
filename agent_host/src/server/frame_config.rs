@@ -1,6 +1,6 @@
 use super::*;
 
-impl ServerRuntime {
+impl AgentRuntimeView {
     fn build_upstream_config(
         &self,
         model_key: &str,

@@ -1,6 +1,6 @@
 use super::*;
 
-impl ServerRuntime {
+impl AgentRuntimeView {
     pub(super) fn start_background_agent(
         &self,
         parent_agent_id: uuid::Uuid,

@@ -2,7 +2,7 @@ use super::*;
 use crate::channel::{ProgressFeedback, ProgressFeedbackFinalState, ProgressFeedbackUpdate};
 use agent_frame::ExecutionProgressPhase;
 
-impl ServerRuntime {
+impl AgentRuntimeView {
     pub(super) async fn cleanup_stale_progress_messages_once(&self) -> Result<()> {
         let sessions = self.with_sessions(|sessions| Ok(sessions.list_foreground_snapshots()))?;
         for session in sessions {

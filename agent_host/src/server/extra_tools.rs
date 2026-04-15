@@ -1,6 +1,6 @@
 use super::*;
 
-impl ServerRuntime {
+impl AgentRuntimeView {
     pub(super) fn build_extra_tools(
         &self,
         session: &SessionSnapshot,
