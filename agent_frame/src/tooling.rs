@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 
 mod args;
 mod download;
+pub(crate) mod dsl;
 mod exec;
 #[path = "tooling/fs.rs"]
 mod file_tools;
@@ -27,6 +28,7 @@ use download::{
     file_download_cancel_tool, file_download_progress_tool, file_download_start_tool,
     file_download_wait_tool,
 };
+use dsl::{dsl_kill_tool, dsl_start_tool, dsl_wait_tool};
 pub use exec::terminate_all_managed_processes;
 #[cfg(test)]
 use exec::{ProcessMetadata, process_is_running, process_meta_path};
@@ -486,6 +488,7 @@ pub fn build_tool_registry(
     workspace_root: &Path,
     runtime_state_root: &Path,
     upstream: &UpstreamConfig,
+    available_upstreams: &BTreeMap<String, UpstreamConfig>,
     image_tool_upstream: Option<&UpstreamConfig>,
     pdf_tool_upstream: Option<&UpstreamConfig>,
     audio_tool_upstream: Option<&UpstreamConfig>,
@@ -500,6 +503,7 @@ pub fn build_tool_registry(
         workspace_root,
         runtime_state_root,
         upstream,
+        available_upstreams,
         image_tool_upstream,
         pdf_tool_upstream,
         audio_tool_upstream,
@@ -517,6 +521,7 @@ pub fn build_tool_registry_with_cancel(
     workspace_root: &Path,
     runtime_state_root: &Path,
     upstream: &UpstreamConfig,
+    available_upstreams: &BTreeMap<String, UpstreamConfig>,
     image_tool_upstream: Option<&UpstreamConfig>,
     pdf_tool_upstream: Option<&UpstreamConfig>,
     audio_tool_upstream: Option<&UpstreamConfig>,
@@ -527,6 +532,7 @@ pub fn build_tool_registry_with_cancel(
     remote_workpaths: &[RemoteWorkpathConfig],
     cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Result<BTreeMap<String, Tool>> {
+    let remote_workpath_configs = remote_workpaths.to_vec();
     let remote_workpaths = remote_workpath_map(remote_workpaths);
     let mut registry = ToolRegistryBuilder::new();
     registry.add(file_read_tool(
@@ -576,6 +582,24 @@ pub fn build_tool_registry_with_cancel(
         cancel_flag.clone(),
     ))?;
     registry.add(exec_kill_tool(
+        runtime_state_root.to_path_buf(),
+        cancel_flag.clone(),
+    ))?;
+    registry.add(dsl_start_tool(
+        workspace_root.to_path_buf(),
+        runtime_state_root.to_path_buf(),
+        upstream.clone(),
+        available_upstreams.clone(),
+        remote_workpath_configs,
+        cancel_flag.clone(),
+    ))?;
+    registry.add(dsl_wait_tool(
+        workspace_root.to_path_buf(),
+        runtime_state_root.to_path_buf(),
+        cancel_flag.clone(),
+    ))?;
+    registry.add(dsl_kill_tool(
+        workspace_root.to_path_buf(),
         runtime_state_root.to_path_buf(),
         cancel_flag.clone(),
     ))?;
@@ -1015,6 +1039,7 @@ remote_command="$*"
             &workspace_root,
             &runtime_state_root,
             &upstream,
+            &BTreeMap::new(),
             None,
             None,
             None,
@@ -1140,6 +1165,7 @@ remote_command="$*"
             &workspace_root,
             &runtime_state_root,
             &upstream,
+            &BTreeMap::new(),
             None,
             None,
             None,
@@ -1195,6 +1221,7 @@ remote_command="$*"
             &workspace_root,
             &runtime_state_root,
             &upstream,
+            &BTreeMap::new(),
             None,
             None,
             None,
@@ -1252,6 +1279,7 @@ remote_command="$*"
             &workspace_root,
             &runtime_state_root,
             &upstream,
+            &BTreeMap::new(),
             None,
             None,
             None,
@@ -1286,6 +1314,7 @@ remote_command="$*"
             &workspace_root,
             &runtime_state_root,
             &upstream,
+            &BTreeMap::new(),
             Some(&upstream),
             None,
             None,
@@ -1384,6 +1413,38 @@ remote_command="$*"
                 .get("image_id")
                 .is_some()
         );
+
+        let dsl_start = registry.get("dsl_start").expect("dsl_start registered");
+        assert_eq!(dsl_start.execution_mode, ToolExecutionMode::Interruptible);
+        assert!(dsl_start.parameters["properties"].get("code").is_some());
+        assert!(
+            dsl_start.parameters["properties"]
+                .get("return_immediate")
+                .is_some()
+        );
+        assert!(
+            dsl_start.parameters["properties"]
+                .get("wait_timeout_seconds")
+                .is_some()
+        );
+        assert!(
+            dsl_start.parameters["properties"]
+                .get("on_timeout")
+                .is_some()
+        );
+
+        let dsl_wait = registry.get("dsl_wait").expect("dsl_wait registered");
+        assert_eq!(dsl_wait.execution_mode, ToolExecutionMode::Interruptible);
+        assert!(dsl_wait.parameters["properties"].get("dsl_id").is_some());
+
+        let dsl_kill = registry.get("dsl_kill").expect("dsl_kill registered");
+        assert_eq!(dsl_kill.execution_mode, ToolExecutionMode::Immediate);
+        assert!(dsl_kill.parameters["properties"].get("dsl_id").is_some());
+        assert!(
+            dsl_kill.parameters["properties"]
+                .get("kill_children")
+                .is_some()
+        );
     }
 
     #[test]
@@ -1424,6 +1485,7 @@ remote_command="$*"
             &workspace_root,
             &runtime_state_root,
             &upstream,
+            &BTreeMap::new(),
             None,
             None,
             None,
@@ -1550,6 +1612,7 @@ remote_command="$*"
             &workspace_root,
             &runtime_state_root,
             &upstream,
+            &BTreeMap::new(),
             None,
             None,
             None,
@@ -1603,6 +1666,7 @@ remote_command="$*"
             &workspace_root,
             &runtime_state_root,
             &upstream,
+            &BTreeMap::new(),
             None,
             None,
             None,
@@ -1672,6 +1736,7 @@ remote_command="$*"
             &workspace_root,
             &runtime_state_root,
             &upstream,
+            &BTreeMap::new(),
             None,
             None,
             None,
@@ -1740,6 +1805,7 @@ remote_command="$*"
             &workspace_root,
             &runtime_state_root,
             &upstream,
+            &BTreeMap::new(),
             None,
             None,
             None,
@@ -1810,6 +1876,7 @@ remote_command="$*"
             &workspace_root,
             &runtime_state_root,
             &upstream,
+            &BTreeMap::new(),
             None,
             None,
             None,
@@ -1878,6 +1945,7 @@ remote_command="$*"
             &workspace_root,
             &runtime_state_root,
             &upstream,
+            &BTreeMap::new(),
             None,
             None,
             None,
@@ -1944,6 +2012,7 @@ remote_command="$*"
             &workspace_root,
             &runtime_state_root,
             &upstream,
+            &BTreeMap::new(),
             None,
             None,
             None,
@@ -2008,6 +2077,7 @@ remote_command="$*"
             &workspace_root,
             &runtime_state_root,
             &upstream,
+            &BTreeMap::new(),
             Some(&image_helper),
             None,
             None,
@@ -2068,6 +2138,7 @@ remote_command="$*"
             &workspace_root,
             &runtime_state_root,
             &upstream,
+            &BTreeMap::new(),
             None,
             None,
             None,
@@ -2126,6 +2197,7 @@ remote_command="$*"
             &workspace_root,
             &runtime_state_root,
             &upstream,
+            &BTreeMap::new(),
             None,
             None,
             None,

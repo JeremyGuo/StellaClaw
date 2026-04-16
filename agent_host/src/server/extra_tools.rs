@@ -455,13 +455,12 @@ impl AgentRuntimeView {
             let session = session.clone();
             tools.push(Tool::new(
                 "start_background_agent",
-                "Start a main background agent. Arguments: task (string), optional model (string), optional sink object. If sink is omitted, results go back to the current user conversation. Usually omit sink unless you really need custom routing. Never use session_id as conversation_id. Sink forms: {kind:\"current_session\"}, {kind:\"direct\", channel_id, conversation_id, user_id?, display_name?}, {kind:\"broadcast\", topic}, or {kind:\"multi\", targets:[...]}",
+                "Start a main background agent. Arguments: task (string), optional model (string). The final user-facing reply is delivered to the current foreground conversation and inserted into the main foreground context.",
                 json!({
                     "type": "object",
                     "properties": {
                         "task": {"type": "string"},
-                        "model": {"type": "string"},
-                        "sink": {"type": "object"}
+                        "model": {"type": "string"}
                     },
                     "required": ["task"],
                     "additionalProperties": false
@@ -480,21 +479,36 @@ impl AgentRuntimeView {
                         .get("model")
                         .and_then(Value::as_str)
                         .map(ToOwned::to_owned);
-                    let sink = match object.get("sink") {
-                        Some(value) => parse_sink_target(
-                            value,
-                            Some(SinkTarget::Direct(session.address.clone())),
-                        )?,
-                        None => SinkTarget::Direct(session.address.clone()),
-                    };
-                    let sink = normalize_sink_target(sink, &session);
                     runtime.start_background_agent(
                         agent_id,
                         session.clone(),
                         model_key,
                         task.to_string(),
-                        sink,
                     )
+                },
+            ));
+        }
+
+        if matches!(kind, AgentPromptKind::MainBackground) {
+            let runtime = self.clone();
+            let terminate_control = control.clone();
+            tools.push(Tool::new(
+                "terminate",
+                "Terminate this main background agent silently. Use this when the task should stop without sending any user-facing reply or inserting anything into the main foreground context.",
+                json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }),
+                move |_| {
+                    runtime.request_background_terminate(agent_id)?;
+                    if let Some(control) = &terminate_control {
+                        control.request_yield();
+                    }
+                    Ok(json!({
+                        "terminated": true,
+                        "instruction": "Stop now without sending a final answer."
+                    }))
                 },
             ));
         }
@@ -548,9 +562,8 @@ impl AgentRuntimeView {
                         "description": {"type": "string"},
                         "schedule": {"type": "string"},
                         "task": {"type": "string"},
-                                "enabled": {"type": "boolean"},
-                                "sink": {"type": "object"},
-                                "checker_command": {"type": "string"},
+                        "enabled": {"type": "boolean"},
+                        "checker_command": {"type": "string"},
                         "checker_timeout_seconds": {"type": "number"},
                         "checker_cwd": {"type": "string"}
                     },
@@ -561,14 +574,6 @@ impl AgentRuntimeView {
                     let object = arguments
                         .as_object()
                         .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
-                    let sink = match object.get("sink") {
-                        Some(value) => parse_sink_target(
-                            value,
-                            Some(SinkTarget::Direct(create_session.address.clone())),
-                        )?,
-                        None => SinkTarget::Direct(create_session.address.clone()),
-                    };
-                    let sink = normalize_sink_target(sink, &create_session);
                     let checker = parse_checker_from_tool_args(object)?;
                     runtime.create_cron_task(
                         create_session.clone(),
@@ -579,7 +584,7 @@ impl AgentRuntimeView {
                             agent_backend: runtime.effective_agent_backend()?,
                             model_key: runtime.effective_main_model_key()?,
                             prompt: string_arg_required(object, "task")?,
-                            sink,
+                            sink: SinkTarget::Direct(create_session.address.clone()),
                             address: create_session.address.clone(),
                             enabled: object
                                 .get("enabled")
@@ -592,7 +597,6 @@ impl AgentRuntimeView {
             ));
 
             let runtime = self.clone();
-            let update_session = session.clone();
             tools.push(Tool::new(
                 "update_cron_task",
                 "Update a cron task. Use enabled to pause or resume it. Set clear_checker=true to remove the checker.",
@@ -606,7 +610,6 @@ impl AgentRuntimeView {
                         "task": {"type": "string"},
                         "model": {"type": "string"},
                         "enabled": {"type": "boolean"},
-                        "sink": {"type": "object"},
                         "checker_command": {"type": "string"},
                         "checker_timeout_seconds": {"type": "number"},
                         "checker_cwd": {"type": "string"},
@@ -634,13 +637,6 @@ impl AgentRuntimeView {
                     } else {
                         None
                     };
-                    let sink = match object.get("sink") {
-                        Some(value) => Some(normalize_sink_target(
-                            parse_sink_target(value, Some(SinkTarget::Direct(update_session.address.clone())))?,
-                            &update_session,
-                        )),
-                        None => None,
-                    };
                     runtime.update_cron_task(
                         id,
                         CronUpdateRequest {
@@ -650,7 +646,7 @@ impl AgentRuntimeView {
                             agent_backend: None,
                             model_key: optional_string_arg(object, "model")?,
                             prompt: optional_string_arg(object, "task")?,
-                            sink,
+                            sink: None,
                             enabled: object.get("enabled").and_then(Value::as_bool),
                             checker,
                         },

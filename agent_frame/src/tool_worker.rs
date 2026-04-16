@@ -1,4 +1,4 @@
-use crate::config::{ExternalWebSearchConfig, UpstreamConfig};
+use crate::config::{ExternalWebSearchConfig, RemoteWorkpathConfig, UpstreamConfig};
 use crate::llm::create_chat_completion;
 use crate::message::ChatMessage;
 use anyhow::{Context, Result, anyhow};
@@ -79,6 +79,24 @@ pub enum ToolWorkerJob {
         stdout_path: String,
         stderr_path: String,
         requests_dir: String,
+    },
+    Dsl {
+        dsl_id: String,
+        #[serde(default)]
+        label: Option<String>,
+        code: String,
+        upstream: UpstreamConfig,
+        #[serde(default)]
+        available_upstreams: std::collections::BTreeMap<String, UpstreamConfig>,
+        workspace_root: String,
+        runtime_state_root: String,
+        remote_workpaths: Vec<RemoteWorkpathConfig>,
+        status_path: String,
+        result_path: String,
+        max_runtime_seconds: u64,
+        max_llm_calls: u64,
+        max_tool_calls: u64,
+        max_emit_calls: u64,
     },
 }
 
@@ -185,6 +203,37 @@ fn run_job(job: ToolWorkerJob) -> Result<()> {
             Path::new(&stdout_path),
             Path::new(&stderr_path),
             Path::new(&requests_dir),
+        ),
+        ToolWorkerJob::Dsl {
+            dsl_id,
+            label,
+            code,
+            upstream,
+            available_upstreams,
+            workspace_root,
+            runtime_state_root,
+            remote_workpaths,
+            status_path,
+            result_path,
+            max_runtime_seconds,
+            max_llm_calls,
+            max_tool_calls,
+            max_emit_calls,
+        } => crate::tooling::dsl::run_dsl_worker_job(
+            &dsl_id,
+            label,
+            &code,
+            upstream,
+            available_upstreams,
+            Path::new(&workspace_root),
+            Path::new(&runtime_state_root),
+            &remote_workpaths,
+            Path::new(&status_path),
+            Path::new(&result_path),
+            max_runtime_seconds,
+            max_llm_calls,
+            max_tool_calls,
+            max_emit_calls,
         ),
     }
 }

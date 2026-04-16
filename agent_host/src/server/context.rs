@@ -13,7 +13,7 @@ use crate::sink::SinkRouter;
 use crate::snapshot::SnapshotManager;
 use crate::workspace::WorkspaceManager;
 use anyhow::{Result, anyhow};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
@@ -40,6 +40,7 @@ pub struct RuntimeContext {
     pub(super) subagent_count: Arc<AtomicUsize>,
     pub(super) cron_poll_interval_seconds: u64,
     pub(super) background_job_sender: mpsc::Sender<BackgroundJobRequest>,
+    pub(super) background_terminate_flags: Arc<Mutex<HashSet<Uuid>>>,
     pub(super) summary_tracker: Arc<SummaryTracker>,
     pub(super) active_foreground_phases: Arc<Mutex<HashMap<String, ForegroundRuntimePhase>>>,
     pub(super) active_foreground_agent_frame_runtimes:

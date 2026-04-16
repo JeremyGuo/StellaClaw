@@ -70,7 +70,7 @@ use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use tokio::select;
@@ -113,7 +113,7 @@ const QUEUED_USER_UPDATES_MARKER: &str = "[Queued User Updates]";
 const CHANNEL_RESTART_MAX_BACKOFF_SECONDS: u64 = 30;
 const CONVERSATION_CLEANUP_POLL_SECONDS: u64 = 300;
 const SYSTEM_RESTART_NOTICE: &str =
-    "[System Restarted: All previous long run execution tools with IDs are all ended]";
+    "[System Restarted: All previous long run execution tools and DSL jobs with IDs are all ended]";
 
 #[derive(Clone, Debug)]
 struct BackgroundJobRequest {
@@ -124,7 +124,6 @@ struct BackgroundJobRequest {
     agent_backend: AgentBackendKind,
     model_key: String,
     prompt: String,
-    sink: SinkTarget,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1620,7 +1619,6 @@ impl AgentRuntimeView {
                 agent_backend: task.agent_backend,
                 model_key: task.model_key.clone(),
                 prompt: task.prompt.clone(),
-                sink: task.sink.clone(),
             })
             .await
             .context("failed to enqueue cron background agent")?;
@@ -1714,6 +1712,7 @@ impl Server {
             &frame_config.workspace_root,
             &frame_config.runtime_state_root,
             &frame_config.upstream,
+            &frame_config.available_upstreams,
             frame_config.image_tool_upstream.as_ref(),
             frame_config.pdf_tool_upstream.as_ref(),
             frame_config.audio_tool_upstream.as_ref(),
@@ -1939,6 +1938,7 @@ impl Server {
         let active_foreground_phases = Arc::new(Mutex::new(HashMap::new()));
         let active_foreground_agent_frame_runtimes = Arc::new(Mutex::new(HashMap::new()));
         let subagents = Arc::new(Mutex::new(HashMap::new()));
+        let background_terminate_flags = Arc::new(Mutex::new(HashSet::new()));
         let context = Arc::new(RuntimeContext {
             workdir,
             agent_workspace,
@@ -1959,6 +1959,7 @@ impl Server {
             subagent_count: Arc::new(AtomicUsize::new(0)),
             cron_poll_interval_seconds: config.cron_poll_interval_seconds,
             background_job_sender,
+            background_terminate_flags,
             summary_tracker,
             active_foreground_phases,
             active_foreground_agent_frame_runtimes,
@@ -2064,6 +2065,7 @@ impl Server {
             server.main_agent.idle_compaction.poll_interval_seconds,
         ));
         idle_compaction_ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let idle_compaction_running = Arc::new(AtomicBool::new(false));
         let incoming_dispatcher = IncomingDispatcher::new(Arc::clone(&server));
         let mut receiver_closed = false;
 
@@ -2083,14 +2085,21 @@ impl Server {
                 }
                 _ = idle_compaction_ticker.tick() => {
                     if server.main_agent.idle_compaction.enabled
-                        && let Err(error) = server.run_idle_context_compaction_once().await
+                        && !idle_compaction_running.swap(true, Ordering::SeqCst)
                     {
-                        error!(
-                            log_stream = "server",
-                            kind = "idle_context_compaction_failed",
-                            error = %format!("{error:#}"),
-                            "idle context compaction pass failed"
-                        );
+                        let server = Arc::clone(&server);
+                        let idle_compaction_running = Arc::clone(&idle_compaction_running);
+                        tokio::spawn(async move {
+                            if let Err(error) = server.run_idle_context_compaction_once().await {
+                                error!(
+                                    log_stream = "server",
+                                    kind = "idle_context_compaction_failed",
+                                    error = %format!("{error:#}"),
+                                    "idle context compaction pass failed"
+                                );
+                            }
+                            idle_compaction_running.store(false, Ordering::SeqCst);
+                        });
                     }
                 }
                 _ = incoming_dispatcher.wait_for_worker_change(), if receiver_closed => {}
@@ -2397,6 +2406,7 @@ impl Server {
                 || report.exec_processes_killed > 0
                 || report.file_downloads_cancelled > 0
                 || report.image_tasks_cancelled > 0
+                || report.dsl_tasks_killed > 0
             {
                 info!(
                     log_stream = "session",
@@ -2407,6 +2417,7 @@ impl Server {
                     exec_processes_killed = report.exec_processes_killed as u64,
                     file_downloads_cancelled = report.file_downloads_cancelled as u64,
                     image_tasks_cancelled = report.image_tasks_cancelled as u64,
+                    dsl_tasks_killed = report.dsl_tasks_killed as u64,
                     "destroyed background runtime tasks for session"
                 );
             }
@@ -3117,9 +3128,9 @@ fn spawn_channel_supervisor(channel: Arc<dyn Channel>, sender: mpsc::Sender<Inco
 mod tests {
     use super::foreground::register_active_foreground_control;
     use super::{
-        AgentCommand, ForegroundRuntimePhase, ImageGenerationRouting, IncomingCommandLane,
-        RuntimeContext, SYSTEM_RESTART_NOTICE, Server, SinkTarget, SummaryTracker, TokenUsage,
-        background_timeout_with_active_children_text, build_synthetic_system_messages,
+        AgentCommand, AgentPromptKind, ForegroundRuntimePhase, ImageGenerationRouting,
+        IncomingCommandLane, RuntimeContext, SYSTEM_RESTART_NOTICE, Server, SummaryTracker,
+        TokenUsage, background_timeout_with_active_children_text, build_synthetic_system_messages,
         build_user_turn_message, channel_restart_backoff_seconds,
         coalesce_buffered_conversation_messages, conversation_memory_root,
         estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
@@ -3128,13 +3139,12 @@ mod tests {
         memory_search_files, normalize_messages_for_persistence,
         openrouter_automatic_cache_control, openrouter_automatic_cache_ttl, parse_agent_command,
         parse_model_command, parse_sandbox_command, parse_set_api_timeout_command,
-        parse_sink_target, parse_snap_list_command, parse_snap_load_command,
-        parse_snap_save_command, parse_think_command, persist_compaction_artifacts,
-        rebuild_canonical_system_prompt, render_last_user_message_time_tip,
-        render_model_catalog_change_notice, render_system_date_on_user_message,
-        request_yield_for_incoming, rollout_read_file, rollout_search_files,
-        sanitize_messages_for_model_capabilities, select_image_generation_routing,
-        send_outgoing_message_now, session_errno_for_turn_error,
+        parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
+        parse_think_command, persist_compaction_artifacts, rebuild_canonical_system_prompt,
+        render_last_user_message_time_tip, render_model_catalog_change_notice,
+        render_system_date_on_user_message, request_yield_for_incoming, rollout_read_file,
+        rollout_search_files, sanitize_messages_for_model_capabilities,
+        select_image_generation_routing, send_outgoing_message_now, session_errno_for_turn_error,
         should_attempt_idle_context_compaction, should_emit_runtime_change_prompt,
         summarize_resume_progress, sync_workspace_shared_profile_files,
         tag_interrupted_followup_text, update_active_foreground_phase,
@@ -3303,6 +3313,7 @@ mod tests {
             subagent_count: Arc::new(AtomicUsize::new(0)),
             cron_poll_interval_seconds: 60,
             background_job_sender,
+            background_terminate_flags: Arc::new(Mutex::new(HashSet::new())),
             summary_tracker: Arc::new(SummaryTracker::new()),
             active_foreground_phases: Arc::new(Mutex::new(HashMap::new())),
             active_foreground_agent_frame_runtimes: Arc::new(Mutex::new(HashMap::new())),
@@ -3831,6 +3842,46 @@ mod tests {
         assert!(control.take_yield_requested());
         let phase = active_phases.lock().unwrap().get(&session_key).copied();
         assert_eq!(phase, Some(ForegroundRuntimePhase::Compacting));
+    }
+
+    #[test]
+    fn yield_request_is_scoped_to_matching_conversation() {
+        let active_address = ChannelAddress {
+            channel_id: "telegram".to_string(),
+            conversation_id: "conversation-active".to_string(),
+            user_id: None,
+            display_name: None,
+        };
+        let other_address = ChannelAddress {
+            channel_id: "telegram".to_string(),
+            conversation_id: "conversation-other".to_string(),
+            user_id: None,
+            display_name: None,
+        };
+        let active_session_key = active_address.session_key();
+        let active_control = SessionExecutionControl::new();
+        let active_controls = Arc::new(Mutex::new(HashMap::from([(
+            active_session_key.clone(),
+            active_control.clone(),
+        )])));
+        let active_phases = Arc::new(Mutex::new(HashMap::from([(
+            active_session_key,
+            ForegroundRuntimePhase::Compacting,
+        )])));
+        let incoming = IncomingMessage {
+            remote_message_id: "msg-1".to_string(),
+            address: other_address,
+            text: Some("另一个会话的新消息".to_string()),
+            attachments: Vec::new(),
+            stored_attachments: Vec::new(),
+            control: None,
+        };
+
+        let disposition = request_yield_for_incoming(&active_controls, &active_phases, &incoming);
+
+        assert!(!disposition.interrupted);
+        assert!(!disposition.compaction_in_progress);
+        assert!(!active_control.take_yield_requested());
     }
 
     #[test]
@@ -4388,30 +4439,44 @@ mod tests {
     }
 
     #[test]
-    fn parses_multi_sink_structure() {
-        let sink = parse_sink_target(
-            &json!({
-                "kind": "multi",
-                "targets": [
-                    {
-                        "kind": "direct",
-                        "channel_id": "telegram-main",
-                        "conversation_id": "123"
-                    },
-                    {
-                        "kind": "broadcast",
-                        "topic": "ops"
-                    }
-                ]
-            }),
-            None,
-        )
-        .unwrap();
+    fn background_agent_tools_use_current_conversation_delivery_and_silent_terminate() {
+        let temp_dir = TempDir::new().unwrap();
+        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        let server = build_test_server(&temp_dir, channel);
+        let runtime = server.agent_runtime_view();
+        let session = build_test_session(&temp_dir);
 
-        match sink {
-            SinkTarget::Multi(targets) => assert_eq!(targets.len(), 2),
-            other => panic!("expected multi sink, got {:?}", other),
-        }
+        let foreground_tools = runtime.build_extra_tools(
+            &session,
+            AgentPromptKind::MainForeground,
+            session.agent_id,
+            None,
+        );
+        let start_background = foreground_tools
+            .iter()
+            .find(|tool| tool.name == "start_background_agent")
+            .expect("foreground should expose start_background_agent");
+        assert!(
+            start_background
+                .parameters
+                .get("properties")
+                .and_then(Value::as_object)
+                .is_some_and(|properties| !properties.contains_key("sink"))
+        );
+        assert!(!foreground_tools.iter().any(|tool| tool.name == "terminate"));
+
+        let background_tools = runtime.build_extra_tools(
+            &session,
+            AgentPromptKind::MainBackground,
+            session.agent_id,
+            Some(SessionExecutionControl::new()),
+        );
+        assert!(background_tools.iter().any(|tool| tool.name == "terminate"));
+        assert!(
+            !background_tools
+                .iter()
+                .any(|tool| tool.name == "start_background_agent")
+        );
     }
 
     #[test]

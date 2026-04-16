@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -320,6 +321,8 @@ pub struct AgentConfig {
     pub enabled_tools: Vec<String>,
     pub upstream: UpstreamConfig,
     #[serde(default)]
+    pub available_upstreams: BTreeMap<String, UpstreamConfig>,
+    #[serde(default)]
     pub image_tool_upstream: Option<UpstreamConfig>,
     #[serde(default)]
     pub pdf_tool_upstream: Option<UpstreamConfig>,
@@ -352,6 +355,8 @@ struct AgentConfigRaw {
     #[serde(default)]
     enabled_tools: Vec<String>,
     upstream: UpstreamConfigRaw,
+    #[serde(default)]
+    available_upstreams: BTreeMap<String, UpstreamConfigRaw>,
     #[serde(default)]
     image_tool_upstream: Option<UpstreamConfigRaw>,
     #[serde(default)]
@@ -694,6 +699,11 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
     Ok(AgentConfig {
         enabled_tools: normalize_enabled_tools(raw.enabled_tools),
         upstream: resolve_upstream(raw.upstream, base_dir),
+        available_upstreams: raw
+            .available_upstreams
+            .into_iter()
+            .map(|(key, upstream)| (key, resolve_upstream(upstream, base_dir)))
+            .collect(),
         image_tool_upstream: raw
             .image_tool_upstream
             .map(|upstream| resolve_upstream(upstream, base_dir)),

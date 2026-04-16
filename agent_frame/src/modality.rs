@@ -321,6 +321,7 @@ mod tests {
                 native_image_generation: false,
                 token_estimation: None,
             },
+            available_upstreams: Default::default(),
             image_tool_upstream: None,
             pdf_tool_upstream: None,
             audio_tool_upstream: None,

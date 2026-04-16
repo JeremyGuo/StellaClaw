@@ -630,6 +630,43 @@ impl SessionManager {
         self.append_message(address, MessageRole::Assistant, text, attachments)
     }
 
+    pub fn append_background_result_to_foreground(
+        &mut self,
+        address: &ChannelAddress,
+        text: Option<String>,
+        attachments: Vec<StoredAttachment>,
+    ) -> Result<SessionSnapshot> {
+        let key = address.session_key();
+        let session = self
+            .foreground_sessions
+            .get_mut(&key)
+            .with_context(|| format!("no active session for {}", key))?;
+        let stable_text = text
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+        if let Some(stable_text) = stable_text {
+            session
+                .session_state
+                .messages
+                .push(ChatMessage::text("assistant", stable_text));
+        }
+        let attachment_count = attachments.len();
+        session.push_message(MessageRole::Assistant, text, attachments);
+        info!(
+            log_stream = "session",
+            log_key = %session.id,
+            kind = "background_result_inserted",
+            message_count = session.history.len() as u64,
+            agent_message_count = session.session_state.messages.len() as u64,
+            attachment_count = attachment_count as u64,
+            "inserted background result into foreground session"
+        );
+        session.persist()?;
+        Ok(session.snapshot())
+    }
+
     pub fn get_snapshot(&self, address: &ChannelAddress) -> Option<SessionSnapshot> {
         self.foreground_sessions
             .get(&address.session_key())
@@ -2274,6 +2311,35 @@ mod tests {
                 .as_ref()
                 .and_then(serde_json::Value::as_str),
             Some("background memory")
+        );
+    }
+
+    #[test]
+    fn background_result_is_inserted_into_foreground_stable_context() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        sessions.ensure_foreground(&address).unwrap();
+
+        let snapshot = sessions
+            .append_background_result_to_foreground(
+                &address,
+                Some("background finished".to_string()),
+                Vec::new(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            snapshot.stable_messages(),
+            &[ChatMessage::text("assistant", "background finished")]
+        );
+        let checkpoint = sessions.export_checkpoint(&address).unwrap();
+        assert_eq!(checkpoint.history.len(), 1);
+        assert_eq!(checkpoint.history[0].role, MessageRole::Assistant);
+        assert_eq!(
+            checkpoint.history[0].text.as_deref(),
+            Some("background finished")
         );
     }
 }

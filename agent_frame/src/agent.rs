@@ -34,6 +34,7 @@ fn compose_system_prompt(config: &AgentConfig, skills: &[SkillMetadata]) -> Stri
         AGENT_FRAME_MARKER.to_string(),
         "You are running inside AgentFrame. Use tools when they materially help.".to_string(),
         "When a supported tool has remote=\"<host>|local\" and the task is on an SSH host, you MUST set remote to the actual SSH alias instead of manually running ssh <host> inside a shell command; this avoids brittle quoting and escaping retries. Omit remote for local work.".to_string(),
+        "DSL tool guidance: use dsl_start/dsl_wait/dsl_kill only for finite multi-step orchestration that reduces multiple dependent LLM/tool rounds. DSL code runs in a restricted CPython worker, so normal Python expressions, assignments, if statements, f-strings, list/dict operations, slices, string methods, and type() work. Available globals are emit(text), quit(), quit(value), handle = LLM(), handle.system(text), handle.config(key=value), handle.fork(), await handle.gen(prompt, **format_vars), await handle.json(prompt, **format_vars), await handle.select(prompt, [\"A\", \"B\", \"C\"]), and await tool({\"name\": \"tool_name\", \"args\": {\"arg\": value}}). tool(...) only accepts that single dict request shape; do not call tool(\"tool_name\", arg=value). DSL LLM calls always use the same model as the dsl_start caller; call LLM() without arguments and do not use LLM(model=...) or handle.config(model=...). LLM is only a callable handle factory; do not call LLM.llm(), LLM.tool(), LLM.gen(), LLM.json(), or LLM.select(). Use emit(text) for DSL output; emitted text is joined into the default result, while quit(value) returns an explicit result. Assign tool(...) results to variables and access returned JSON with normal Python dict/list syntax. DSL jobs are exec-like long-running jobs: interrupting dsl_start or dsl_wait only interrupts the outer wait, while the DSL job continues in the background regardless of what it is doing internally. User interrupts do not cancel DSL code, DSL LLM calls, DSL tool calls, or child long-running tools; use dsl_kill to stop the DSL job and kill child tools explicitly when needed. DSL code must not use loops, comprehensions, generators, imports, functions, classes, lambdas, private '_' names/attributes, or recursive DSL calls. DSL cannot directly mutate canonical system prompts; dynamic prompt changes still arrive through system notifications and are folded into the canonical system prompt after compaction.".to_string(),
     ];
     if config
         .upstream
@@ -822,6 +823,7 @@ fn run_session_state_controlled_internal(
         &config.workspace_root,
         &config.runtime_state_root,
         &config.upstream,
+        &config.available_upstreams,
         config.image_tool_upstream.as_ref(),
         config.pdf_tool_upstream.as_ref(),
         config.audio_tool_upstream.as_ref(),
@@ -1462,6 +1464,7 @@ mod tests {
                 native_image_generation: false,
                 token_estimation: None,
             },
+            available_upstreams: Default::default(),
             image_tool_upstream: None,
             pdf_tool_upstream: None,
             audio_tool_upstream: None,
@@ -1659,6 +1662,7 @@ pub fn compact_session_messages_with_report(
         &config.workspace_root,
         &config.runtime_state_root,
         &config.upstream,
+        &config.available_upstreams,
         config.image_tool_upstream.as_ref(),
         config.pdf_tool_upstream.as_ref(),
         config.audio_tool_upstream.as_ref(),
@@ -1692,6 +1696,7 @@ pub fn estimate_configured_session_tokens(
         &config.workspace_root,
         &config.runtime_state_root,
         &config.upstream,
+        &config.available_upstreams,
         config.image_tool_upstream.as_ref(),
         config.pdf_tool_upstream.as_ref(),
         config.audio_tool_upstream.as_ref(),

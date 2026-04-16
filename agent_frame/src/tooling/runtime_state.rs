@@ -1,5 +1,6 @@
 use super::InterruptSignal;
 use super::download::{cleanup_file_downloads, list_active_file_download_summaries};
+use super::dsl::{cleanup_dsl_tasks, list_active_dsl_summaries};
 #[cfg(windows)]
 use super::exec::record_exit_code;
 use super::exec::{
@@ -35,6 +36,7 @@ pub struct RuntimeTaskCleanupReport {
     pub exec_processes_killed: usize,
     pub file_downloads_cancelled: usize,
     pub image_tasks_cancelled: usize,
+    pub dsl_tasks_killed: usize,
 }
 
 fn tool_worker_state_dir(runtime_state_root: &Path) -> Result<PathBuf> {
@@ -287,6 +289,7 @@ pub(super) fn spawn_background_worker_process(
         status_path: match job {
             ToolWorkerJob::Image { status_path, .. } => status_path.clone(),
             ToolWorkerJob::FileDownload { status_path, .. } => status_path.clone(),
+            ToolWorkerJob::Dsl { status_path, .. } => status_path.clone(),
             _ => String::new(),
         },
         stdout_path: stdout_path.display().to_string(),
@@ -304,8 +307,13 @@ pub(super) fn read_status_json(path: &Path) -> Result<Value> {
 pub(crate) fn active_runtime_state_summary(runtime_state_root: &Path) -> Result<Option<String>> {
     let active_execs = list_active_exec_summaries(runtime_state_root)?;
     let active_downloads = list_active_file_download_summaries(runtime_state_root)?;
+    let active_dsls = list_active_dsl_summaries(runtime_state_root)?;
     let active_subagents = list_active_subagent_summaries(runtime_state_root)?;
-    if active_execs.is_empty() && active_downloads.is_empty() && active_subagents.is_empty() {
+    if active_execs.is_empty()
+        && active_downloads.is_empty()
+        && active_dsls.is_empty()
+        && active_subagents.is_empty()
+    {
         return Ok(None);
     }
     let mut sections = vec![
@@ -319,6 +327,10 @@ pub(crate) fn active_runtime_state_summary(runtime_state_root: &Path) -> Result<
     if !active_downloads.is_empty() {
         sections.push("Active file downloads:".to_string());
         sections.extend(active_downloads);
+    }
+    if !active_dsls.is_empty() {
+        sections.push("Active DSL jobs:".to_string());
+        sections.extend(active_dsls);
     }
     if !active_subagents.is_empty() {
         sections.push("Active subagents:".to_string());
@@ -397,5 +409,6 @@ pub fn terminate_runtime_state_tasks(
         exec_processes_killed: cleanup_exec_processes(runtime_state_root)?,
         file_downloads_cancelled: cleanup_file_downloads(runtime_state_root)?,
         image_tasks_cancelled: cleanup_image_tasks(runtime_state_root)?,
+        dsl_tasks_killed: cleanup_dsl_tasks(runtime_state_root)?,
     })
 }

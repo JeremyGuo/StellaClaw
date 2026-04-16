@@ -7,7 +7,6 @@ impl AgentRuntimeView {
         session: SessionSnapshot,
         model_key: Option<String>,
         prompt: String,
-        sink: SinkTarget,
     ) -> Result<Value> {
         let background_agent_id = uuid::Uuid::new_v4();
         let agent_backend = self.effective_agent_backend()?;
@@ -36,7 +35,6 @@ impl AgentRuntimeView {
                 agent_backend,
                 model_key: model_key.clone(),
                 prompt,
-                sink: sink.clone(),
             })
             .context("failed to enqueue background agent")?;
         info!(
@@ -53,8 +51,24 @@ impl AgentRuntimeView {
             "agent_id": background_agent_id,
             "parent_agent_id": parent_agent_id,
             "model": model_key,
-            "sink": sink_target_to_value(&sink)
+            "delivery": "current_foreground_conversation"
         }))
+    }
+
+    pub(super) fn request_background_terminate(&self, agent_id: uuid::Uuid) -> Result<()> {
+        let mut flags = self
+            .background_terminate_flags
+            .lock()
+            .map_err(|_| anyhow!("background terminate flags lock poisoned"))?;
+        flags.insert(agent_id);
+        Ok(())
+    }
+
+    fn take_background_terminate_requested(&self, agent_id: uuid::Uuid) -> bool {
+        self.background_terminate_flags
+            .lock()
+            .map(|mut flags| flags.remove(&agent_id))
+            .unwrap_or(false)
     }
 
     fn background_session_snapshot(&self, session_id: uuid::Uuid) -> Result<SessionSnapshot> {
@@ -101,6 +115,230 @@ impl AgentRuntimeView {
         })
     }
 
+    fn foreground_runtime_for_address(&self, address: &ChannelAddress) -> Result<AgentRuntimeView> {
+        let mut runtime = self.clone();
+        let settings = self.with_conversations(|conversations| {
+            conversations
+                .ensure_conversation(address)
+                .map(|snapshot| snapshot.settings)
+        })?;
+        runtime.selected_agent_backend = settings.agent_backend;
+        runtime.selected_main_model_key = settings.main_model.clone();
+        runtime.selected_reasoning_effort = settings.reasoning_effort.clone();
+        runtime.selected_context_compaction_enabled = settings.context_compaction_enabled;
+        runtime.selected_chat_version_id = Some(settings.chat_version_id);
+        runtime.sandbox.mode = settings.sandbox_mode.unwrap_or(runtime.sandbox.mode);
+        Ok(runtime)
+    }
+
+    fn ensure_foreground_session_for_background(
+        &self,
+        address: &ChannelAddress,
+    ) -> Result<SessionSnapshot> {
+        let preferred_workspace_id = self.with_conversations(|conversations| {
+            Ok(conversations
+                .ensure_conversation(address)?
+                .settings
+                .workspace_id)
+        })?;
+        let session = self.with_sessions(|sessions| match preferred_workspace_id.as_deref() {
+            Some(workspace_id) => sessions.ensure_foreground_in_workspace(address, workspace_id),
+            None => sessions.ensure_foreground(address),
+        })?;
+        self.with_conversations(|conversations| {
+            conversations.set_workspace_id(address, Some(session.workspace_id.clone()))?;
+            Ok(())
+        })?;
+        Ok(session)
+    }
+
+    fn build_foreground_prompt_state_for_runtime(
+        &self,
+        session: &SessionSnapshot,
+        model_key: &str,
+    ) -> Result<AgentSystemPromptState> {
+        let model = self.model_config(model_key)?;
+        let commands = self
+            .command_catalog
+            .get(&session.address.channel_id)
+            .cloned()
+            .unwrap_or_else(default_bot_commands);
+        let workspace_summary = self
+            .workspace_manager
+            .ensure_workspace_exists(&session.workspace_id)
+            .map(|workspace| workspace.summary)
+            .unwrap_or_default();
+        let remote_workpaths = self.with_conversations(|conversations| {
+            Ok(conversations
+                .get_snapshot(&session.address)
+                .map(|snapshot| snapshot.settings.remote_workpaths)
+                .unwrap_or_default())
+        })?;
+        Ok(build_agent_system_prompt_state(
+            &self.agent_workspace,
+            session,
+            &workspace_summary,
+            &remote_workpaths,
+            AgentPromptKind::MainForeground,
+            model_key,
+            model,
+            &self.models,
+            &self.available_agent_models(AgentBackendKind::AgentFrame),
+            &self.main_agent,
+            &commands,
+        ))
+    }
+
+    async fn wait_for_foreground_turn_to_finish(&self, address: &ChannelAddress) {
+        let session_key = address.session_key();
+        loop {
+            let active = self
+                .active_foreground_phases
+                .lock()
+                .ok()
+                .is_some_and(|phases| phases.contains_key(&session_key));
+            if !active {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    async fn maybe_compact_foreground_after_background_insert(
+        &self,
+        session: &SessionSnapshot,
+        fallback_model_key: &str,
+    ) -> Result<()> {
+        let runtime = self.foreground_runtime_for_address(&session.address)?;
+        let model_key = runtime
+            .selected_main_model_key
+            .clone()
+            .unwrap_or_else(|| fallback_model_key.to_string());
+        if !runtime
+            .selected_context_compaction_enabled
+            .unwrap_or(runtime.main_agent.enable_context_compression)
+            || session.stable_message_count() == 0
+        {
+            return Ok(());
+        }
+        let model = runtime.model_config(&model_key)?.clone();
+        let estimated_tokens =
+            estimate_current_context_tokens_for_session(&runtime, session, &model_key)?;
+        let trigger_tokens = (effective_context_window_limit_for_session(session, &model) as f64
+            * runtime.main_agent.context_compaction.trigger_ratio)
+            .floor() as usize;
+        if estimated_tokens < trigger_tokens {
+            return Ok(());
+        }
+
+        let config = runtime.build_agent_frame_config(
+            session,
+            &session.workspace_root,
+            AgentPromptKind::MainForeground,
+            &model_key,
+            None,
+        )?;
+        let extra_tools = runtime.build_extra_tools(
+            session,
+            AgentPromptKind::MainForeground,
+            session.agent_id,
+            None,
+        );
+        let persistence_system_prompt = config.system_prompt.clone();
+        let compaction_messages = sanitize_messages_for_model_capabilities(
+            &session.request_messages(),
+            &model,
+            backend_supports_native_multimodal_input(AgentBackendKind::AgentFrame),
+        );
+        let report = run_backend_compaction(
+            AgentBackendKind::AgentFrame,
+            compaction_messages,
+            config,
+            extra_tools,
+        )
+        .with_context(|| format!("failed to compact foreground session {}", session.id))?;
+        if !report.compacted {
+            return Ok(());
+        }
+        let normalized_messages = normalize_messages_for_persistence(
+            report.messages.clone(),
+            &persistence_system_prompt,
+            &[],
+        );
+        persist_compaction_artifacts(session, &report)?;
+        let compaction_stats = compaction_stats_from_report(&report);
+        self.with_sessions(|sessions| {
+            sessions.record_idle_compaction(
+                &session.address,
+                normalized_messages,
+                &compaction_stats,
+            )
+        })?;
+        let prompt_state =
+            runtime.build_foreground_prompt_state_for_runtime(session, &model_key)?;
+        self.with_sessions(|sessions| {
+            sessions.mark_system_prompt_state_current(
+                &session.address,
+                prompt_state.static_hash,
+                prompt_state.dynamic_hashes,
+            )
+        })?;
+        self.with_conversations(|conversations| {
+            conversations
+                .rotate_chat_version_id(&session.address)
+                .map(|_| ())
+        })?;
+        info!(
+            log_stream = "session",
+            log_key = %session.id,
+            kind = "background_insert_context_compacted",
+            estimated_tokens,
+            trigger_tokens,
+            "compacted foreground context after background result insertion"
+        );
+        Ok(())
+    }
+
+    async fn deliver_background_outgoing_to_foreground(
+        &self,
+        session: &SessionSnapshot,
+        model_key: &str,
+        outgoing: OutgoingMessage,
+    ) -> Result<()> {
+        self.wait_for_foreground_turn_to_finish(&session.address)
+            .await;
+        let _ = self.ensure_foreground_session_for_background(&session.address)?;
+        let foreground_session = self.with_sessions(|sessions| {
+            sessions.append_background_result_to_foreground(
+                &session.address,
+                outgoing.text.clone(),
+                Vec::new(),
+            )
+        })?;
+        let channel = self
+            .channels
+            .get(&session.address.channel_id)
+            .cloned()
+            .with_context(|| format!("unknown channel {}", session.address.channel_id))?;
+        channel
+            .send(&session.address, outgoing)
+            .await
+            .context("failed to deliver background agent reply to foreground conversation")?;
+        if let Err(error) = self
+            .maybe_compact_foreground_after_background_insert(&foreground_session, model_key)
+            .await
+        {
+            warn!(
+                log_stream = "session",
+                log_key = %foreground_session.id,
+                kind = "background_insert_context_compaction_failed",
+                error = %format!("{error:#}"),
+                "failed to compact foreground context after background result insertion"
+            );
+        }
+        Ok(())
+    }
+
     pub(super) async fn run_background_job(&self, job: BackgroundJobRequest) -> Result<()> {
         let session = self.background_session_snapshot(job.session.id)?;
         self.mark_managed_agent_running(job.agent_id);
@@ -125,6 +363,37 @@ impl AgentRuntimeView {
                 "background agent task join failed",
             )
             .await;
+
+        if self.take_background_terminate_requested(job.agent_id) {
+            let usage = match &run_result {
+                Ok(TimedRunOutcome::Completed(report)) | Ok(TimedRunOutcome::Yielded(report)) => {
+                    self.persist_background_report(session.id, report)?;
+                    report.usage.clone()
+                }
+                Ok(TimedRunOutcome::TimedOut { state, .. }) => {
+                    if let Some(state) = state {
+                        self.persist_background_report(session.id, state)?;
+                        state.usage.clone()
+                    } else {
+                        TokenUsage::default()
+                    }
+                }
+                Ok(TimedRunOutcome::Failed(_)) | Err(_) => TokenUsage::default(),
+            };
+            self.mark_managed_agent_completed(job.agent_id, &usage);
+            info!(
+                log_stream = "agent",
+                log_key = %job.agent_id,
+                kind = "background_agent_terminated_silently",
+                parent_agent_id = job.parent_agent_id.map(|value| value.to_string()),
+                cron_task_id = job.cron_task_id.map(|value| value.to_string()),
+                session_id = %session.id,
+                channel_id = %session.address.channel_id,
+                "background agent terminated without user-facing reply"
+            );
+            let _ = self.with_sessions(|sessions| sessions.close_background(session.id));
+            return Ok(());
+        }
 
         let outcome = match run_result {
             Ok(TimedRunOutcome::Completed(report)) => {
@@ -176,11 +445,10 @@ impl AgentRuntimeView {
                     attachment_count = outgoing.attachments.len() as u64 + outgoing.images.len() as u64,
                     "background agent produced reply"
                 );
-                let sink_router = self.sink_router.read().await;
-                if let Err(error) = sink_router
-                    .dispatch(&self.channels, &job.sink, outgoing)
+                if let Err(error) = self
+                    .deliver_background_outgoing_to_foreground(&session, &job.model_key, outgoing)
                     .await
-                    .context("failed to dispatch background agent reply")
+                    .context("failed to deliver background agent reply")
                 {
                     self.mark_managed_agent_failed(job.agent_id, &report.usage, &error);
                     let recovery = self
@@ -230,11 +498,9 @@ impl AgentRuntimeView {
                     "main_background",
                     job.parent_agent_id,
                 );
-                let sink_router = self.sink_router.read().await;
-                sink_router
-                    .dispatch(&self.channels, &job.sink, outgoing)
+                self.deliver_background_outgoing_to_foreground(&session, &job.model_key, outgoing)
                     .await
-                    .context("failed to dispatch yielded background agent reply")?;
+                    .context("failed to deliver yielded background agent reply")?;
                 self.mark_managed_agent_completed(job.agent_id, &report.usage);
                 Ok(())
             }
@@ -274,13 +540,13 @@ impl AgentRuntimeView {
         let session = self.background_session_snapshot(session.id)?;
         if error
             .to_string()
-            .contains("failed to dispatch background agent reply")
+            .contains("failed to deliver background agent reply")
             || error
                 .to_string()
-                .contains("background agent error dispatch failed")
+                .contains("background agent error delivery failed")
         {
             return Err(anyhow!(
-                "background job failed and frontend dispatch is unavailable"
+                "background job failed and frontend delivery failed"
             ));
         }
 
@@ -295,11 +561,13 @@ impl AgentRuntimeView {
             );
             self.wait_for_child_agents_to_finish(job.agent_id).await;
             let text = background_timeout_with_active_children_text(&self.main_agent.language);
-            let sink_router = self.sink_router.read().await;
-            sink_router
-                .dispatch(&self.channels, &job.sink, OutgoingMessage::text(text))
-                .await
-                .context("failed to dispatch background timeout notification")?;
+            self.deliver_background_outgoing_to_foreground(
+                &session,
+                &job.model_key,
+                OutgoingMessage::text(text),
+            )
+            .await
+            .context("failed to deliver background timeout notification")?;
             return Ok(());
         }
 
@@ -370,11 +638,9 @@ impl AgentRuntimeView {
                         Vec::new(),
                     )
                 })?;
-                let sink_router = self.sink_router.read().await;
-                sink_router
-                    .dispatch(&self.channels, &job.sink, outgoing)
+                self.deliver_background_outgoing_to_foreground(&session, &job.model_key, outgoing)
                     .await
-                    .context("failed to dispatch recovered background agent reply")?;
+                    .context("failed to deliver recovered background agent reply")?;
                 self.mark_managed_agent_completed(recovery_agent_id, &report.usage);
                 info!(
                     log_stream = "agent",
@@ -414,11 +680,9 @@ impl AgentRuntimeView {
                         Vec::new(),
                     )
                 })?;
-                let sink_router = self.sink_router.read().await;
-                sink_router
-                    .dispatch(&self.channels, &job.sink, outgoing)
+                self.deliver_background_outgoing_to_foreground(&session, &job.model_key, outgoing)
                     .await
-                    .context("failed to dispatch yielded recovered background agent reply")?;
+                    .context("failed to deliver yielded recovered background agent reply")?;
                 self.mark_managed_agent_completed(recovery_agent_id, &report.usage);
                 Ok(())
             }
@@ -435,11 +699,13 @@ impl AgentRuntimeView {
                     .unwrap_or_default();
                 self.mark_managed_agent_timed_out(recovery_agent_id, &usage, &recovery_error);
                 let text = user_facing_error_text(&self.main_agent.language, error);
-                let sink_router = self.sink_router.read().await;
-                sink_router
-                    .dispatch(&self.channels, &job.sink, OutgoingMessage::text(text))
-                    .await
-                    .context("failed to dispatch background failure notification")?;
+                self.deliver_background_outgoing_to_foreground(
+                    &session,
+                    &job.model_key,
+                    OutgoingMessage::text(text),
+                )
+                .await
+                .context("failed to deliver background failure notification")?;
                 warn!(
                     log_stream = "agent",
                     log_key = %recovery_agent_id,
@@ -457,11 +723,13 @@ impl AgentRuntimeView {
                     &recovery_error,
                 );
                 let text = user_facing_error_text(&self.main_agent.language, error);
-                let sink_router = self.sink_router.read().await;
-                sink_router
-                    .dispatch(&self.channels, &job.sink, OutgoingMessage::text(text))
-                    .await
-                    .context("failed to dispatch background failure notification")?;
+                self.deliver_background_outgoing_to_foreground(
+                    &session,
+                    &job.model_key,
+                    OutgoingMessage::text(text),
+                )
+                .await
+                .context("failed to deliver background failure notification")?;
                 warn!(
                     log_stream = "agent",
                     log_key = %recovery_agent_id,
@@ -479,11 +747,13 @@ impl AgentRuntimeView {
                     &recovery_error,
                 );
                 let text = user_facing_error_text(&self.main_agent.language, error);
-                let sink_router = self.sink_router.read().await;
-                sink_router
-                    .dispatch(&self.channels, &job.sink, OutgoingMessage::text(text))
-                    .await
-                    .context("failed to dispatch background failure notification")?;
+                self.deliver_background_outgoing_to_foreground(
+                    &session,
+                    &job.model_key,
+                    OutgoingMessage::text(text),
+                )
+                .await
+                .context("failed to deliver background failure notification")?;
                 warn!(
                     log_stream = "agent",
                     log_key = %recovery_agent_id,

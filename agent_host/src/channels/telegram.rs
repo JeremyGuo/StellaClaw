@@ -17,7 +17,7 @@ use serde_json::json;
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
@@ -56,6 +56,10 @@ impl TelegramChannel {
     const MAX_MESSAGE_CHARS: usize = 4096;
     const MAX_CAPTION_CHARS: usize = 1024;
     const MIN_PROGRESS_EDIT_INTERVAL: Duration = Duration::from_secs(3);
+    const GET_UPDATES_TIMEOUT_GRACE_SECONDS: u64 = 15;
+    const DEFAULT_JSON_API_TIMEOUT_SECONDS: u64 = 60;
+    const SEND_CHAT_ACTION_TIMEOUT_SECONDS: u64 = 10;
+    const MULTIPART_API_TIMEOUT_SECONDS: u64 = 600;
 
     pub fn from_config(config: TelegramChannelConfig) -> Result<Self> {
         let bot_token = match config.bot_token {
@@ -99,20 +103,52 @@ impl TelegramChannel {
     ) -> Result<T> {
         let max_attempts = self.max_send_attempts(method);
         for attempt in 1..=max_attempts {
-            let response = match self
-                .client
-                .post(self.method_url(method))
-                .json(&payload)
-                .send()
-                .await
-            {
-                Ok(response) => response,
-                Err(error) => {
+            let call = async {
+                let response = self
+                    .client
+                    .post(self.method_url(method))
+                    .json(&payload)
+                    .send()
+                    .await
+                    .map_err(|error| {
+                        anyhow!(
+                            "{}",
+                            self.redact_sensitive_text(&format!(
+                                "telegram API call {} failed: {error:#}",
+                                method
+                            ))
+                        )
+                    })?;
+                response
+                    .json::<TelegramEnvelope<T>>()
+                    .await
+                    .map_err(|error| {
+                        anyhow!(
+                            "{}",
+                            self.redact_sensitive_text(&format!(
+                                "telegram API {} returned invalid JSON: {error:#}",
+                                method
+                            ))
+                        )
+                    })
+            };
+            let envelope = match tokio::time::timeout(self.api_call_timeout(method), call).await {
+                Ok(Ok(envelope)) => envelope,
+                Ok(Err(error)) => {
+                    if attempt < max_attempts && self.should_retry_transport_error(method) {
+                        self.log_send_retry(method, attempt, max_attempts, &error);
+                        tokio::time::sleep(Duration::from_secs(u64::from(attempt))).await;
+                        continue;
+                    }
+                    return Err(error);
+                }
+                Err(_) => {
+                    let timeout_seconds = self.api_call_timeout(method).as_secs();
                     let error = anyhow!(
                         "{}",
                         self.redact_sensitive_text(&format!(
-                            "telegram API call {} failed: {error:#}",
-                            method
+                            "telegram API call {} timed out after {}s",
+                            method, timeout_seconds
                         ))
                     );
                     if attempt < max_attempts && self.should_retry_transport_error(method) {
@@ -123,15 +159,6 @@ impl TelegramChannel {
                     return Err(error);
                 }
             };
-            let envelope: TelegramEnvelope<T> = response.json().await.map_err(|error| {
-                anyhow!(
-                    "{}",
-                    self.redact_sensitive_text(&format!(
-                        "telegram API {} returned invalid JSON: {error:#}",
-                        method
-                    ))
-                )
-            })?;
             if !envelope.ok {
                 let error = anyhow!(
                     "telegram API {} failed: {}",
@@ -156,32 +183,66 @@ impl TelegramChannel {
         unreachable!("telegram API retry loop exhausted without returning")
     }
 
+    fn api_call_timeout(&self, method: &str) -> Duration {
+        match method {
+            "getUpdates" => Duration::from_secs(
+                self.poll_timeout_seconds
+                    .saturating_add(Self::GET_UPDATES_TIMEOUT_GRACE_SECONDS)
+                    .max(1),
+            ),
+            "sendChatAction" => Duration::from_secs(Self::SEND_CHAT_ACTION_TIMEOUT_SECONDS),
+            _ => Duration::from_secs(Self::DEFAULT_JSON_API_TIMEOUT_SECONDS),
+        }
+    }
+
     async fn call_multipart(&self, method: &str, form: Form) -> Result<serde_json::Value> {
-        let response = self
-            .client
-            .post(self.method_url(method))
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|error| {
-                anyhow!(
+        let call = async {
+            let response = self
+                .client
+                .post(self.method_url(method))
+                .multipart(form)
+                .send()
+                .await
+                .map_err(|error| {
+                    anyhow!(
+                        "{}",
+                        self.redact_sensitive_text(&format!(
+                            "telegram multipart API call {} failed: {error:#}",
+                            method
+                        ))
+                    )
+                })?;
+            response
+                .json::<TelegramEnvelope<serde_json::Value>>()
+                .await
+                .map_err(|error| {
+                    anyhow!(
+                        "{}",
+                        self.redact_sensitive_text(&format!(
+                            "telegram API {} returned invalid JSON: {error:#}",
+                            method
+                        ))
+                    )
+                })
+        };
+        let envelope = match tokio::time::timeout(
+            Duration::from_secs(Self::MULTIPART_API_TIMEOUT_SECONDS),
+            call,
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(anyhow!(
                     "{}",
                     self.redact_sensitive_text(&format!(
-                        "telegram multipart API call {} failed: {error:#}",
-                        method
+                        "telegram multipart API call {} timed out after {}s",
+                        method,
+                        Self::MULTIPART_API_TIMEOUT_SECONDS
                     ))
-                )
-            })?;
-        let envelope: TelegramEnvelope<serde_json::Value> =
-            response.json().await.map_err(|error| {
-                anyhow!(
-                    "{}",
-                    self.redact_sensitive_text(&format!(
-                        "telegram API {} returned invalid JSON: {error:#}",
-                        method
-                    ))
-                )
-            })?;
+                ));
+            }
+        };
         if !envelope.ok {
             return Err(anyhow!(
                 "telegram API {} failed: {}",
@@ -1146,6 +1207,19 @@ impl Channel for TelegramChannel {
                     );
                     continue;
                 }
+                let receive_lag_seconds = telegram_message_receive_lag_seconds(message.date);
+                info!(
+                    log_stream = "channel",
+                    log_key = %self.id,
+                    kind = "telegram_update_accepted",
+                    conversation_id = message.chat.id.to_string(),
+                    remote_message_id = message.message_id.to_string(),
+                    telegram_message_date = ?message.date,
+                    telegram_receive_lag_seconds = ?receive_lag_seconds,
+                    text_preview = text.as_deref().map(summarize_for_log),
+                    attachment_count = attachments.len() as u64,
+                    "accepted telegram update"
+                );
                 let incoming = IncomingMessage {
                     remote_message_id: message.message_id.to_string(),
                     address: self.build_address(&message),
@@ -1419,6 +1493,17 @@ fn summarize_for_log(text: &str) -> String {
     } else {
         summary
     }
+}
+
+fn telegram_message_receive_lag_seconds(message_date: Option<i64>) -> Option<i64> {
+    let sent_at = message_date?;
+    let now: i64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_secs()
+        .try_into()
+        .ok()?;
+    Some(now - sent_at)
 }
 
 fn build_inline_keyboard_markup(options: &ShowOptions) -> serde_json::Value {
@@ -3260,7 +3345,7 @@ mod tests {
     use anyhow::anyhow;
     use reqwest::Client;
     use std::collections::{HashMap, VecDeque};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
     use tokio::sync::Mutex;
 
     #[test]
@@ -3690,6 +3775,37 @@ mod tests {
     }
 
     #[test]
+    fn telegram_json_api_timeouts_are_bounded() {
+        let channel = TelegramChannel {
+            id: "telegram-main".to_string(),
+            bot_token: "secret-token".to_string(),
+            api_base_url: "https://api.telegram.org".to_string(),
+            poll_timeout_seconds: 30,
+            poll_interval_ms: 250,
+            commands: Vec::new(),
+            client: Client::new(),
+            bot_username: Mutex::new(None),
+            bot_user_id: Mutex::new(None),
+            chat_member_counts: Mutex::new(HashMap::new()),
+            pending_outbound: Mutex::new(VecDeque::new()),
+            progress_messages: Mutex::new(HashMap::new()),
+        };
+
+        assert_eq!(
+            channel.api_call_timeout("getUpdates"),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            channel.api_call_timeout("sendChatAction"),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            channel.api_call_timeout("sendMessage"),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
     fn defers_retryable_send_failures() {
         let channel = TelegramChannel {
             id: "telegram-main".to_string(),
@@ -3781,6 +3897,7 @@ mod tests {
         };
         let message = TelegramMessage {
             message_id: 1,
+            date: None,
             chat: TelegramChat {
                 id: 1,
                 kind: "private".to_string(),
@@ -3819,6 +3936,7 @@ mod tests {
         };
         let message = TelegramMessage {
             message_id: 1,
+            date: None,
             chat: TelegramChat {
                 id: -1,
                 kind: "group".to_string(),
@@ -3857,6 +3975,7 @@ mod tests {
         };
         let message = TelegramMessage {
             message_id: 1,
+            date: None,
             chat: TelegramChat {
                 id: -1,
                 kind: "supergroup".to_string(),
@@ -3895,6 +4014,7 @@ mod tests {
         };
         let message = TelegramMessage {
             message_id: 1,
+            date: None,
             chat: TelegramChat {
                 id: -5158767783,
                 kind: "group".to_string(),
@@ -4008,6 +4128,7 @@ struct TelegramCallbackQuery {
 #[derive(Deserialize)]
 struct TelegramMessage {
     message_id: i64,
+    date: Option<i64>,
     chat: TelegramChat,
     from: Option<TelegramUser>,
     left_chat_member: Option<TelegramUser>,

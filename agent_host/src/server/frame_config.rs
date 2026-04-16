@@ -381,6 +381,52 @@ impl AgentRuntimeView {
         let (native_image_generation, image_generation_tool_upstream) =
             self.resolve_native_image_generation(model_key, model);
         let prompt_available_models = self.available_agent_models(AgentBackendKind::AgentFrame);
+        let mut available_upstreams = BTreeMap::new();
+        for available_model_key in &prompt_available_models {
+            let Some(available_model) = self.models.get(available_model_key) else {
+                continue;
+            };
+            let (available_native_image_input, _) =
+                self.resolve_image_tool_upstream(available_model_key, available_model)?;
+            let (available_native_pdf_input, _) = self.resolve_native_or_tool_upstream(
+                ToolingFamily::Pdf,
+                available_model_key,
+                available_model,
+            );
+            let (available_native_audio_input, _) = self.resolve_native_or_tool_upstream(
+                ToolingFamily::AudioInput,
+                available_model_key,
+                available_model,
+            );
+            let (available_native_web_search, available_external_web_search) =
+                self.resolve_web_search_configs(available_model_key, available_model);
+            let (available_native_image_generation, _) =
+                self.resolve_native_image_generation(available_model_key, available_model);
+            let available_reasoning = effective_reasoning_config(
+                available_model,
+                self.selected_reasoning_effort.as_deref(),
+            );
+            available_upstreams.insert(
+                available_model_key.clone(),
+                self.build_upstream_config(
+                    available_model_key,
+                    available_model,
+                    available_model.timeout_seconds,
+                    None,
+                    default_prompt_cache_retention(
+                        available_model.cache_ttl.as_deref(),
+                        available_model,
+                    ),
+                    available_reasoning,
+                    available_native_web_search,
+                    available_external_web_search,
+                    available_native_image_input,
+                    available_native_pdf_input,
+                    available_native_audio_input,
+                    available_native_image_generation,
+                )?,
+            );
+        }
         let remote_workpaths = self.with_conversations(|conversations| {
             Ok(conversations
                 .get_snapshot(&session.address)
@@ -406,6 +452,7 @@ impl AgentRuntimeView {
                 native_audio_input,
                 native_image_generation,
             )?,
+            available_upstreams,
             image_tool_upstream,
             pdf_tool_upstream,
             audio_tool_upstream,
