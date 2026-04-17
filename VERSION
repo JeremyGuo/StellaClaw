@@ -1,5 +1,18 @@
-version: 0.19.3
+version: 0.20.0
 ---
+
+# 0.20.0
+
+- 新增 `dingtalk_robot` channel 类型：
+  支持通过钉钉自定义/企业机器人 webhook 向群内发送文本消息；webhook URL 通过 `DINGTALK_ROBOT_WEBHOOK_URL` 等环境变量注入，避免把 access token 写入 JSON 配置。
+- 支持 DingTalk robot HTTP 回调收消息：
+  当配置 `DINGTALK_ROBOT_APP_SECRET` 后，channel 会启动本地 HTTP callback receiver，校验钉钉 `timestamp`/`sign` HMAC-SHA256 签名并解析回调消息；未配置 AppSecret 时保持 send-only。
+- 支持 DingTalk robot 入站附件：
+  当配置 `DINGTALK_ROBOT_APP_KEY` 与 `DINGTALK_ROBOT_APP_SECRET` 后，图片、文件、视频、语音和富文本中的 `downloadCode` 会换取临时下载链接，并通过统一 `PendingAttachment` 路径落盘到 conversation workspace。
+- 更新配置版本到 `0.20`：
+  新增 config loader，TUI 配置编辑器、示例配置、本地部署配置和 `.env.example` 均补齐 `dingtalk_robot` webhook、AppKey、AppSecret、OpenAPI endpoint 与 HTTP callback 配置。
+- 本次影响 `config` schema，不影响 `workdir` schema：
+  没有新增 workdir upgrade step；按配置变更策略将仓库版本从 `0.19.3` 提升到 `0.20.0`。
 
 # 0.19.3
 

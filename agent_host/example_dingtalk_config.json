@@ -1,5 +1,5 @@
 {
-  "version": "0.18",
+  "version": "0.20",
   "models": {
     "main": {
       "backend": "agent_frame",
@@ -64,6 +64,16 @@
       "id": "dingtalk-main",
       "client_id_env": "DINGTALK_CLIENT_ID",
       "client_secret_env": "DINGTALK_CLIENT_SECRET",
+      "api_base_url": "https://api.dingtalk.com"
+    },
+    {
+      "kind": "dingtalk_robot",
+      "id": "dingtalk-robot-main",
+      "webhook_url_env": "DINGTALK_ROBOT_WEBHOOK_URL",
+      "app_key_env": "DINGTALK_ROBOT_APP_KEY",
+      "app_secret_env": "DINGTALK_ROBOT_APP_SECRET",
+      "http_listen_addr": "127.0.0.1:35888",
+      "http_callback_path": "/dingtalk/robot",
       "api_base_url": "https://api.dingtalk.com"
     }
   ]

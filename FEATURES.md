@@ -59,6 +59,14 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - A cron task must not enqueue overlapping background jobs for the same task; if a previous trigger is still running, the due time is skipped rather than queued for catch-up.
 - Regression coverage should protect named-field schedule compilation, rejection of partial cron-field updates, local-time exact schedules, and non-overlapping trigger behavior.
 
+### Channel Integrations
+
+- DingTalk Stream channels support bidirectional bot conversations through DingTalk app `client_id`/`client_secret` credentials.
+- DingTalk robot channels support custom/enterprise robot webhook delivery through `DINGTALK_ROBOT_WEBHOOK_URL`; webhook access tokens should live in `.env`, not JSON config.
+- DingTalk robot channels can receive HTTP callback messages when `DINGTALK_ROBOT_APP_SECRET` is configured; callbacks must validate DingTalk `timestamp`/`sign` headers with HMAC-SHA256 and reject stale or invalid requests before parsing message bodies.
+- DingTalk robot channels materialize inbound non-text messages as conversation attachments when `DINGTALK_ROBOT_APP_KEY` and `DINGTALK_ROBOT_APP_SECRET` are configured; `downloadCode` is exchanged for a temporary file URL and persisted through the same `PendingAttachment` path used by Telegram.
+- Without an AppSecret, DingTalk robot channels must remain send-only and must not pretend to receive user messages.
+
 ### Session Actor Architecture
 
 ```mermaid

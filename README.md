@@ -235,7 +235,14 @@ cp .env.example .env
 # Fill in:
 #   OPENROUTER_API_KEY=sk-or-...
 #   TELEGRAM_BOT_TOKEN=...        (for Telegram channel)
+#   DINGTALK_ROBOT_WEBHOOK_URL=... (for DingTalk robot replies)
+#   DINGTALK_ROBOT_APP_KEY=...     (optional: enables DingTalk attachment downloads)
+#   DINGTALK_ROBOT_APP_SECRET=...  (optional: enables DingTalk robot HTTP callbacks)
 ```
+
+For DingTalk enterprise/outgoing robot receive mode, expose the configured local
+callback listener through HTTPS and set the DingTalk callback URL to the same
+path, for example `/dingtalk/robot`.
 
 ### 2. Build & Run
 

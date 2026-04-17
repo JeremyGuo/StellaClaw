@@ -1557,10 +1557,12 @@ impl ConfigEditorApp {
                                 "command_line".to_string(),
                                 "telegram".to_string(),
                                 "dingtalk".to_string(),
+                                "dingtalk_robot".to_string(),
                             ],
                             selected: match kind.as_str() {
                                 "telegram" => 1,
                                 "dingtalk" => 2,
+                                "dingtalk_robot" => 3,
                                 _ => 0,
                             },
                             target: SelectTarget::ChannelKind,
@@ -1875,7 +1877,7 @@ impl ConfigEditorApp {
                 Ok(())
             }
             SelectTarget::ChannelKind => {
-                let kinds = ["command_line", "telegram", "dingtalk"];
+                let kinds = ["command_line", "telegram", "dingtalk", "dingtalk_robot"];
                 let value = kinds
                     .get(selected)
                     .ok_or_else(|| anyhow!("invalid channel kind selection"))?;
@@ -2259,11 +2261,49 @@ impl ConfigEditorApp {
             channel.remove("client_id_env");
             channel.remove("client_secret");
             channel.remove("client_secret_env");
+            channel.remove("webhook_url");
+            channel.remove("webhook_url_env");
+            channel.remove("app_key");
+            channel.remove("app_key_env");
+            channel.remove("app_secret");
+            channel.remove("app_secret_env");
+            channel.remove("http_listen_addr");
+            channel.remove("http_callback_path");
             channel.remove("api_base_url");
             channel.remove("commands");
         } else if form.kind == "telegram" {
             set_optional_trimmed_string(&mut channel, "bot_token_env", &form.bot_token_env);
             channel.remove("bot_token");
+            channel.remove("client_id");
+            channel.remove("client_id_env");
+            channel.remove("client_secret");
+            channel.remove("client_secret_env");
+            channel.remove("webhook_url");
+            channel.remove("webhook_url_env");
+            channel.remove("app_key");
+            channel.remove("app_key_env");
+            channel.remove("app_secret");
+            channel.remove("app_secret_env");
+            channel.remove("http_listen_addr");
+            channel.remove("http_callback_path");
+            channel.remove("commands");
+            channel.remove("prompt");
+        } else if form.kind == "dingtalk_robot" {
+            set_optional_trimmed_string(&mut channel, "webhook_url_env", &form.webhook_url_env);
+            set_optional_trimmed_string(&mut channel, "app_key_env", &form.app_key_env);
+            set_optional_trimmed_string(&mut channel, "app_secret_env", &form.app_secret_env);
+            set_optional_trimmed_string(&mut channel, "http_listen_addr", &form.http_listen_addr);
+            set_optional_trimmed_string(
+                &mut channel,
+                "http_callback_path",
+                &form.http_callback_path,
+            );
+            set_optional_trimmed_string(&mut channel, "api_base_url", &form.api_base_url);
+            channel.remove("webhook_url");
+            channel.remove("app_key");
+            channel.remove("app_secret");
+            channel.remove("bot_token");
+            channel.remove("bot_token_env");
             channel.remove("client_id");
             channel.remove("client_id_env");
             channel.remove("client_secret");
@@ -2278,6 +2318,14 @@ impl ConfigEditorApp {
             channel.remove("client_secret");
             channel.remove("bot_token");
             channel.remove("bot_token_env");
+            channel.remove("webhook_url");
+            channel.remove("webhook_url_env");
+            channel.remove("app_key");
+            channel.remove("app_key_env");
+            channel.remove("app_secret");
+            channel.remove("app_secret_env");
+            channel.remove("http_listen_addr");
+            channel.remove("http_callback_path");
             channel.remove("commands");
             channel.remove("prompt");
         }
@@ -2653,7 +2701,7 @@ struct ChannelKindWizardState {
 }
 
 impl ChannelKindWizardState {
-    const OPTIONS: [&str; 3] = ["telegram", "dingtalk", "command_line"];
+    const OPTIONS: [&str; 4] = ["telegram", "dingtalk", "dingtalk_robot", "command_line"];
 
     fn selected_kind(&self) -> &'static str {
         Self::OPTIONS
@@ -3731,6 +3779,11 @@ enum ChannelFormField {
     BotTokenEnv,
     ClientIdEnv,
     ClientSecretEnv,
+    WebhookUrlEnv,
+    AppKeyEnv,
+    AppSecretEnv,
+    HttpListenAddr,
+    HttpCallbackPath,
     ApiBaseUrl,
 }
 
@@ -3743,18 +3796,28 @@ impl ChannelFormField {
             Self::BotTokenEnv => "bot_token_env",
             Self::ClientIdEnv => "client_id_env",
             Self::ClientSecretEnv => "client_secret_env",
+            Self::WebhookUrlEnv => "webhook_url_env",
+            Self::AppKeyEnv => "app_key_env",
+            Self::AppSecretEnv => "app_secret_env",
+            Self::HttpListenAddr => "http_listen_addr",
+            Self::HttpCallbackPath => "http_callback_path",
             Self::ApiBaseUrl => "api_base_url",
         }
     }
 
     fn help(self) -> &'static str {
         match self {
-            Self::Kind => "Choose command_line, telegram, or dingtalk",
+            Self::Kind => "Choose command_line, telegram, dingtalk, or dingtalk_robot",
             Self::Id => "Stable channel identifier",
             Self::Prompt => "CLI prompt text such as you> ",
             Self::BotTokenEnv => "Environment variable for Telegram bot token",
             Self::ClientIdEnv => "Environment variable for DingTalk client id",
             Self::ClientSecretEnv => "Environment variable for DingTalk client secret",
+            Self::WebhookUrlEnv => "Environment variable for DingTalk robot webhook URL",
+            Self::AppKeyEnv => "Environment variable for DingTalk robot AppKey",
+            Self::AppSecretEnv => "Environment variable for DingTalk robot AppSecret",
+            Self::HttpListenAddr => "Local listen address for DingTalk robot HTTP callbacks",
+            Self::HttpCallbackPath => "HTTP callback path configured in DingTalk",
             Self::ApiBaseUrl => "DingTalk API base URL",
         }
     }
@@ -3771,6 +3834,11 @@ struct ChannelFormState {
     bot_token_env: String,
     client_id_env: String,
     client_secret_env: String,
+    webhook_url_env: String,
+    app_key_env: String,
+    app_secret_env: String,
+    http_listen_addr: String,
+    http_callback_path: String,
     api_base_url: String,
 }
 
@@ -3786,6 +3854,11 @@ impl ChannelFormState {
             bot_token_env: "TELEGRAM_BOT_TOKEN".to_string(),
             client_id_env: "DINGTALK_CLIENT_ID".to_string(),
             client_secret_env: "DINGTALK_CLIENT_SECRET".to_string(),
+            webhook_url_env: "DINGTALK_ROBOT_WEBHOOK_URL".to_string(),
+            app_key_env: "DINGTALK_ROBOT_APP_KEY".to_string(),
+            app_secret_env: "DINGTALK_ROBOT_APP_SECRET".to_string(),
+            http_listen_addr: "127.0.0.1:35888".to_string(),
+            http_callback_path: "/dingtalk/robot".to_string(),
             api_base_url: "https://api.dingtalk.com".to_string(),
         }
     }
@@ -3818,6 +3891,31 @@ impl ChannelFormState {
                 .and_then(Value::as_str)
                 .unwrap_or("DINGTALK_CLIENT_SECRET")
                 .to_string(),
+            webhook_url_env: raw
+                .get("webhook_url_env")
+                .and_then(Value::as_str)
+                .unwrap_or("DINGTALK_ROBOT_WEBHOOK_URL")
+                .to_string(),
+            app_key_env: raw
+                .get("app_key_env")
+                .and_then(Value::as_str)
+                .unwrap_or("DINGTALK_ROBOT_APP_KEY")
+                .to_string(),
+            app_secret_env: raw
+                .get("app_secret_env")
+                .and_then(Value::as_str)
+                .unwrap_or("DINGTALK_ROBOT_APP_SECRET")
+                .to_string(),
+            http_listen_addr: raw
+                .get("http_listen_addr")
+                .and_then(Value::as_str)
+                .unwrap_or("127.0.0.1:35888")
+                .to_string(),
+            http_callback_path: raw
+                .get("http_callback_path")
+                .and_then(Value::as_str)
+                .unwrap_or("/dingtalk/robot")
+                .to_string(),
             api_base_url: raw
                 .get("api_base_url")
                 .and_then(Value::as_str)
@@ -3838,6 +3936,17 @@ impl ChannelFormState {
                 ("kind", self.kind.clone()),
                 ("id", self.id.clone()),
                 ("bot_token_env", self.bot_token_env.clone()),
+            ]
+        } else if self.kind == "dingtalk_robot" {
+            vec![
+                ("kind", self.kind.clone()),
+                ("id", self.id.clone()),
+                ("webhook_url_env", self.webhook_url_env.clone()),
+                ("app_key_env", self.app_key_env.clone()),
+                ("app_secret_env", self.app_secret_env.clone()),
+                ("http_listen_addr", self.http_listen_addr.clone()),
+                ("http_callback_path", self.http_callback_path.clone()),
+                ("api_base_url", self.api_base_url.clone()),
             ]
         } else {
             vec![
@@ -3863,6 +3972,17 @@ impl ChannelFormState {
                 1 => ChannelFormField::Id,
                 _ => ChannelFormField::BotTokenEnv,
             }
+        } else if self.kind == "dingtalk_robot" {
+            match self.selected {
+                0 => ChannelFormField::Kind,
+                1 => ChannelFormField::Id,
+                2 => ChannelFormField::WebhookUrlEnv,
+                3 => ChannelFormField::AppKeyEnv,
+                4 => ChannelFormField::AppSecretEnv,
+                5 => ChannelFormField::HttpListenAddr,
+                6 => ChannelFormField::HttpCallbackPath,
+                _ => ChannelFormField::ApiBaseUrl,
+            }
         } else {
             match self.selected {
                 0 => ChannelFormField::Kind,
@@ -3882,6 +4002,11 @@ impl ChannelFormState {
             ChannelFormField::BotTokenEnv => self.bot_token_env.clone(),
             ChannelFormField::ClientIdEnv => self.client_id_env.clone(),
             ChannelFormField::ClientSecretEnv => self.client_secret_env.clone(),
+            ChannelFormField::WebhookUrlEnv => self.webhook_url_env.clone(),
+            ChannelFormField::AppKeyEnv => self.app_key_env.clone(),
+            ChannelFormField::AppSecretEnv => self.app_secret_env.clone(),
+            ChannelFormField::HttpListenAddr => self.http_listen_addr.clone(),
+            ChannelFormField::HttpCallbackPath => self.http_callback_path.clone(),
             ChannelFormField::ApiBaseUrl => self.api_base_url.clone(),
         }
     }
@@ -3894,6 +4019,11 @@ impl ChannelFormState {
             ChannelFormField::BotTokenEnv => self.bot_token_env = value,
             ChannelFormField::ClientIdEnv => self.client_id_env = value,
             ChannelFormField::ClientSecretEnv => self.client_secret_env = value,
+            ChannelFormField::WebhookUrlEnv => self.webhook_url_env = value,
+            ChannelFormField::AppKeyEnv => self.app_key_env = value,
+            ChannelFormField::AppSecretEnv => self.app_secret_env = value,
+            ChannelFormField::HttpListenAddr => self.http_listen_addr = value,
+            ChannelFormField::HttpCallbackPath => self.http_callback_path = value,
             ChannelFormField::ApiBaseUrl => self.api_base_url = value,
         }
     }
@@ -4010,6 +4140,18 @@ fn channel_kind_wizard_text(kind: &str) -> String {
             "  Stream websocket subscriptions",
             "  sessionWebhook-based replies",
             "  default api.dingtalk.com endpoint",
+        ]
+        .join("\n"),
+        "dingtalk_robot" => [
+            "DingTalk Robot Channel",
+            "",
+            "Adds a DingTalk enterprise/outgoing robot channel.",
+            "You need a webhook URL for replies, AppSecret for HTTP callbacks, and AppKey for attachment downloads.",
+            "",
+            "Built in automatically",
+            "  text webhook sends and sessionWebhook replies",
+            "  HTTP callback signature verification",
+            "  downloadCode attachment materialization when AppKey is configured",
         ]
         .join("\n"),
         _ => [
@@ -4219,7 +4361,7 @@ fn channel_field_guide_text(form: &ChannelFormState, field: ChannelFormField) ->
         ChannelFormField::Kind => (
             "Which integration should be created for this channel.",
             form.kind.as_str(),
-            "Telegram manages bot commands internally. DingTalk uses Stream mode credentials. Command-line only needs a prompt.",
+            "Telegram manages bot commands internally. DingTalk uses Stream mode credentials. DingTalk robot can receive HTTP callbacks when AppSecret is configured. Command-line only needs a prompt.",
         ),
         ChannelFormField::Id => (
             "A stable unique channel id.",
@@ -4245,6 +4387,31 @@ fn channel_field_guide_text(form: &ChannelFormState, field: ChannelFormField) ->
             "The environment variable that holds the DingTalk client secret.",
             "DINGTALK_CLIENT_SECRET",
             "Only used by dingtalk channels. Keep the secret out of the JSON config.",
+        ),
+        ChannelFormField::WebhookUrlEnv => (
+            "The environment variable that holds the full DingTalk robot webhook URL.",
+            "DINGTALK_ROBOT_WEBHOOK_URL",
+            "Only used by dingtalk_robot channels. The URL contains an access token, so keep it in .env rather than JSON.",
+        ),
+        ChannelFormField::AppKeyEnv => (
+            "The environment variable that holds the DingTalk robot appKey.",
+            "DINGTALK_ROBOT_APP_KEY",
+            "Only used by dingtalk_robot attachment downloads. DingTalk requires appKey + AppSecret to exchange downloadCode for a temporary file URL.",
+        ),
+        ChannelFormField::AppSecretEnv => (
+            "The environment variable that holds the DingTalk robot AppSecret.",
+            "DINGTALK_ROBOT_APP_SECRET",
+            "Used by dingtalk_robot HTTP callback signatures and attachment downloads. When this env var is absent, the channel remains send-only.",
+        ),
+        ChannelFormField::HttpListenAddr => (
+            "The local address where PartyClaw listens for DingTalk robot HTTP callbacks.",
+            "127.0.0.1:35888",
+            "Expose this address through your HTTPS reverse proxy and configure that public URL in DingTalk.",
+        ),
+        ChannelFormField::HttpCallbackPath => (
+            "The HTTP path for DingTalk robot callbacks.",
+            "/dingtalk/robot",
+            "The same path must be used in the public HTTPS callback URL configured in DingTalk.",
         ),
         ChannelFormField::ApiBaseUrl => (
             "The DingTalk API base URL.",
@@ -4581,6 +4748,31 @@ fn channel_summary_text(channel: &ChannelSummary) -> String {
         .get("client_secret_env")
         .and_then(Value::as_str)
         .unwrap_or("DINGTALK_CLIENT_SECRET");
+    let webhook_url_env = channel
+        .raw
+        .get("webhook_url_env")
+        .and_then(Value::as_str)
+        .unwrap_or("DINGTALK_ROBOT_WEBHOOK_URL");
+    let app_key_env = channel
+        .raw
+        .get("app_key_env")
+        .and_then(Value::as_str)
+        .unwrap_or("DINGTALK_ROBOT_APP_KEY");
+    let app_secret_env = channel
+        .raw
+        .get("app_secret_env")
+        .and_then(Value::as_str)
+        .unwrap_or("DINGTALK_ROBOT_APP_SECRET");
+    let http_listen_addr = channel
+        .raw
+        .get("http_listen_addr")
+        .and_then(Value::as_str)
+        .unwrap_or("127.0.0.1:35888");
+    let http_callback_path = channel
+        .raw
+        .get("http_callback_path")
+        .and_then(Value::as_str)
+        .unwrap_or("/dingtalk/robot");
     let api_base_url = channel
         .raw
         .get("api_base_url")
@@ -4599,6 +4791,16 @@ fn channel_summary_text(channel: &ChannelSummary) -> String {
         "dingtalk" => format!(
             "当前频道: {}\n类型: dingtalk\nclient_id_env: {}\nclient_secret_env: {}\napi_base_url: {}\n使用 Stream 模式收消息，并通过 sessionWebhook 回复当前会话。",
             channel.id, client_id_env, client_secret_env, api_base_url
+        ),
+        "dingtalk_robot" => format!(
+            "当前频道: {}\n类型: dingtalk_robot\nwebhook_url_env: {}\napp_key_env: {}\napp_secret_env: {}\nhttp: {}{}\napi_base_url: {}\n支持 webhook 发送；当 AppSecret 环境变量存在时启用 HTTP 回调收消息；当 AppKey + AppSecret 存在时下载入站附件。",
+            channel.id,
+            webhook_url_env,
+            app_key_env,
+            app_secret_env,
+            http_listen_addr,
+            http_callback_path,
+            api_base_url
         ),
         "command_line" => format!(
             "当前频道: {}\n类型: command_line\nprompt: {}",

@@ -1,5 +1,5 @@
 {
-  "version": "0.19",
+  "version": "0.20",
   "models": {
     "gemini3.1-flash-image": {
       "type": "openrouter-resp",
@@ -247,6 +247,16 @@
           "description": "Continue the latest interrupted turn"
         }
       ]
+    },
+    {
+      "kind": "dingtalk_robot",
+      "id": "dingtalk-robot-main",
+      "webhook_url_env": "DINGTALK_ROBOT_WEBHOOK_URL",
+      "app_key_env": "DINGTALK_ROBOT_APP_KEY",
+      "app_secret_env": "DINGTALK_ROBOT_APP_SECRET",
+      "http_listen_addr": "127.0.0.1:35888",
+      "http_callback_path": "/dingtalk/robot",
+      "api_base_url": "https://api.dingtalk.com"
     }
   ]
 }

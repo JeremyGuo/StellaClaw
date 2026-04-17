@@ -23,6 +23,7 @@ mod v0_17;
 mod v0_18;
 mod v0_19;
 mod v0_2;
+mod v0_20;
 mod v0_3;
 mod v0_4;
 mod v0_5;
@@ -32,7 +33,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.19";
+pub const LATEST_CONFIG_VERSION: &str = "0.20";
 pub const VERSION_0_2: &str = "0.2";
 pub const VERSION_0_3: &str = "0.3";
 pub const VERSION_0_4: &str = "0.4";
@@ -50,6 +51,7 @@ pub const VERSION_0_15: &str = "0.15";
 pub const VERSION_0_16: &str = "0.16";
 pub const VERSION_0_17: &str = "0.17";
 pub const VERSION_0_18: &str = "0.18";
+pub const VERSION_0_19: &str = "0.19";
 
 trait ConfigLoader {
     fn version(&self) -> &'static str;
@@ -97,6 +99,29 @@ pub struct DingtalkChannelConfig {
     pub client_secret: Option<String>,
     #[serde(default = "default_dingtalk_client_secret_env")]
     pub client_secret_env: String,
+    #[serde(default = "default_dingtalk_api_base_url")]
+    pub api_base_url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DingtalkRobotChannelConfig {
+    pub id: String,
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    #[serde(default = "default_dingtalk_robot_webhook_url_env")]
+    pub webhook_url_env: String,
+    #[serde(default)]
+    pub app_key: Option<String>,
+    #[serde(default = "default_dingtalk_robot_app_key_env")]
+    pub app_key_env: String,
+    #[serde(default)]
+    pub app_secret: Option<String>,
+    #[serde(default = "default_dingtalk_robot_app_secret_env")]
+    pub app_secret_env: String,
+    #[serde(default = "default_dingtalk_robot_http_listen_addr")]
+    pub http_listen_addr: String,
+    #[serde(default = "default_dingtalk_robot_http_callback_path")]
+    pub http_callback_path: String,
     #[serde(default = "default_dingtalk_api_base_url")]
     pub api_base_url: String,
 }
@@ -567,6 +592,7 @@ pub enum ChannelConfig {
     CommandLine(CommandLineChannelConfig),
     Telegram(TelegramChannelConfig),
     Dingtalk(DingtalkChannelConfig),
+    DingtalkRobot(DingtalkRobotChannelConfig),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -771,6 +797,26 @@ fn default_dingtalk_client_secret_env() -> String {
     "DINGTALK_CLIENT_SECRET".to_string()
 }
 
+fn default_dingtalk_robot_webhook_url_env() -> String {
+    "DINGTALK_ROBOT_WEBHOOK_URL".to_string()
+}
+
+fn default_dingtalk_robot_app_key_env() -> String {
+    "DINGTALK_ROBOT_APP_KEY".to_string()
+}
+
+fn default_dingtalk_robot_app_secret_env() -> String {
+    "DINGTALK_ROBOT_APP_SECRET".to_string()
+}
+
+fn default_dingtalk_robot_http_listen_addr() -> String {
+    "127.0.0.1:35888".to_string()
+}
+
+fn default_dingtalk_robot_http_callback_path() -> String {
+    "/dingtalk/robot".to_string()
+}
+
 fn default_telegram_api_base_url() -> String {
     "https://api.telegram.org".to_string()
 }
@@ -896,7 +942,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let loaders: [&dyn ConfigLoader; 19] = [
+    let loaders: [&dyn ConfigLoader; 20] = [
         &v0_1::LegacyConfigLoader,
         &v0_2::VersionedConfigLoader,
         &v0_3::VersionedConfigLoader,
@@ -916,6 +962,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         &v0_17::LatestConfigLoader,
         &v0_18::LatestConfigLoader,
         &v0_19::LatestConfigLoader,
+        &v0_20::LatestConfigLoader,
     ];
     let loader = loaders
         .into_iter()
@@ -1029,7 +1076,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
     let mut config = {
-        let loaders: [&dyn ConfigLoader; 19] = [
+        let loaders: [&dyn ConfigLoader; 20] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
             &v0_3::VersionedConfigLoader,
@@ -1049,6 +1096,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
             &v0_17::LatestConfigLoader,
             &v0_18::LatestConfigLoader,
             &v0_19::LatestConfigLoader,
+            &v0_20::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()
@@ -1549,10 +1597,15 @@ mod tests {
             {
               "models": {
                 "main": {
+                  "type": "openrouter",
                   "api_endpoint": "https://example.com/v1",
                   "model": "demo-model",
-                  "description": "demo"
+                  "description": "demo",
+                  "capabilities": ["chat"]
                 }
+              },
+              "agent": {
+                "agent_frame": {"available_models": ["main"]}
               },
               "main_agent": {
                 "model": "main"
@@ -1744,7 +1797,7 @@ mod tests {
         );
 
         let written = fs::read_to_string(&config_path).unwrap();
-        assert!(written.contains("\"version\": \"0.19\""));
+        assert!(written.contains("\"version\": \"0.20\""));
         assert!(written.contains("\"token_estimation_cache\""));
         assert!(written.contains("\"template-cache/hf\""));
         assert!(written.contains("\"tokenizer-cache/hf\""));
@@ -1760,10 +1813,15 @@ mod tests {
             {
               "models": {
                 "main": {
+                  "type": "openrouter",
                   "api_endpoint": "https://example.com/v1",
                   "model": "demo-model",
-                  "description": "demo"
+                  "description": "demo",
+                  "capabilities": ["chat"]
                 }
+              },
+              "agent": {
+                "agent_frame": {"available_models": ["main"]}
               },
               "main_agent": {
                 "model": "main"
@@ -1787,6 +1845,58 @@ mod tests {
                 assert_eq!(dingtalk.api_base_url, "https://api.dingtalk.com");
             }
             _ => panic!("expected dingtalk channel"),
+        }
+    }
+
+    #[test]
+    fn dingtalk_robot_channel_defaults_to_env_based_webhook() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.20",
+              "models": {
+                "main": {
+                  "type": "openrouter",
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-model",
+                  "description": "demo",
+                  "capabilities": ["chat"]
+                }
+              },
+              "agent": {
+                "agent_frame": {"available_models": ["main"]}
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "dingtalk_robot",
+                  "id": "dingtalk-robot-main"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = load_server_config_file(&config_path).unwrap();
+        match &config.channels[0] {
+            ChannelConfig::DingtalkRobot(dingtalk) => {
+                assert_eq!(dingtalk.webhook_url_env, "DINGTALK_ROBOT_WEBHOOK_URL");
+                assert!(dingtalk.webhook_url.is_none());
+                assert_eq!(dingtalk.app_key_env, "DINGTALK_ROBOT_APP_KEY");
+                assert!(dingtalk.app_key.is_none());
+                assert_eq!(dingtalk.app_secret_env, "DINGTALK_ROBOT_APP_SECRET");
+                assert!(dingtalk.app_secret.is_none());
+                assert_eq!(dingtalk.http_listen_addr, "127.0.0.1:35888");
+                assert_eq!(dingtalk.http_callback_path, "/dingtalk/robot");
+                assert_eq!(dingtalk.api_base_url, "https://api.dingtalk.com");
+            }
+            _ => panic!("expected dingtalk robot channel"),
         }
     }
 

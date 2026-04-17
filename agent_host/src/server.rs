@@ -12,6 +12,7 @@ use crate::channel_auth::{
 };
 use crate::channels::command_line::CommandLineChannel;
 use crate::channels::dingtalk::DingtalkChannel;
+use crate::channels::dingtalk_robot::DingtalkRobotChannel;
 use crate::channels::telegram::TelegramChannel;
 use crate::config::{
     AgentConfig, BotCommandConfig, ChannelConfig, ModelCapability, ModelConfig, SandboxConfig,
@@ -1883,6 +1884,14 @@ impl Server {
                     let id = dingtalk.id.clone();
                     command_catalog.insert(id.clone(), default_dingtalk_commands());
                     channels.insert(id, Arc::new(DingtalkChannel::from_config(dingtalk)?));
+                }
+                ChannelConfig::DingtalkRobot(dingtalk_robot) => {
+                    let id = dingtalk_robot.id.clone();
+                    command_catalog.insert(id.clone(), default_dingtalk_commands());
+                    channels.insert(
+                        id,
+                        Arc::new(DingtalkRobotChannel::from_config(dingtalk_robot)?),
+                    );
                 }
             }
         }

@@ -101,6 +101,9 @@ ${EDITOR:-nano} .env
 ```dotenv
 OPENROUTER_API_KEY=...
 TELEGRAM_BOT_TOKEN=...
+DINGTALK_ROBOT_WEBHOOK_URL=...
+DINGTALK_ROBOT_APP_KEY=...
+DINGTALK_ROBOT_APP_SECRET=...
 ```
 
 然后打开配置 TUI：
@@ -115,7 +118,9 @@ TELEGRAM_BOT_TOKEN=...
 - `Tooling`: `web_search`、`image`、`image_gen` 指向哪个模型 alias
 - `Main Agent`: 默认语言、memory、compaction
 - `Sandbox`: Linux 可选 `bubblewrap` 或 `subprocess`；需要让 bubblewrap 沙盒内命令访问宿主 Docker 时，显式打开 `map_docker_socket`
-- `Channels`: Telegram 的 `bot_token_env` 是否是 `TELEGRAM_BOT_TOKEN`
+- `Channels`: Telegram 的 `bot_token_env` 是否是 `TELEGRAM_BOT_TOKEN`；DingTalk robot 的 `webhook_url_env` 是否是 `DINGTALK_ROBOT_WEBHOOK_URL`，`app_key_env` 是否是 `DINGTALK_ROBOT_APP_KEY`，`app_secret_env` 是否是 `DINGTALK_ROBOT_APP_SECRET`
+
+DingTalk robot 的 HTTP 回调默认监听 `127.0.0.1:35888/dingtalk/robot`。生产环境需要通过 HTTPS 反向代理暴露这个路径，并在钉钉开发者后台配置为机器人回调地址；如果没有设置 `DINGTALK_ROBOT_APP_SECRET`，该 channel 只会发送，不会启动接收入口。入站图片/文件下载需要同时设置 `DINGTALK_ROBOT_APP_KEY` 和 `DINGTALK_ROBOT_APP_SECRET`，用于换取 `accessToken` 并通过 `downloadCode` 获取临时下载链接。
 
 `sandbox.map_docker_socket` 默认是 `false`。只有在 Linux + `sandbox.mode = "bubblewrap"` + 宿主存在 `/run/docker.sock` 时才会把 Docker socket 映射进沙盒；macOS、Windows 和 `subprocess` 沙盒会直接跳过这个功能。bubblewrap 沙盒不会整体映射 `/run`，只会额外保留 `/run/systemd/resolve` 以兼容常见 DNS 配置。
 
