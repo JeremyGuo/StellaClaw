@@ -77,7 +77,9 @@ impl<'a> TurnCoordinator<'a> {
             return Ok(());
         }
 
-        let session = server.ensure_foreground_session(&incoming.address)?;
+        let session = server
+            .ensure_foreground_actor(&incoming.address)?
+            .snapshot()?;
         if session.stable_message_count() == 0 {
             if let Err(error) = server.initialize_foreground_session(&session, false).await {
                 server
@@ -301,7 +303,9 @@ impl Server {
         mut incoming: IncomingMessage,
     ) -> Result<IncomingMessage> {
         if !incoming.attachments.is_empty() {
-            let session = self.ensure_foreground_session(&incoming.address)?;
+            let session = self
+                .ensure_foreground_actor(&incoming.address)?
+                .snapshot()?;
             let mut stored_attachments = materialize_conversation_attachments(
                 &session.attachments_dir,
                 std::mem::take(&mut incoming.attachments),
@@ -376,7 +380,9 @@ impl Server {
         channel: &Arc<dyn Channel>,
         incoming: &IncomingMessage,
     ) -> Result<()> {
-        let preflight_session = self.ensure_foreground_session(&incoming.address)?;
+        let preflight_session = self
+            .ensure_foreground_actor(&incoming.address)?
+            .snapshot()?;
         if preflight_session.session_state.phase != SessionPhase::Yielded {
             self.send_channel_message(
                 channel,

@@ -2,7 +2,7 @@ use crate::backend::AgentBackendKind;
 use crate::channel::PendingAttachment;
 use crate::config::SandboxMode;
 use crate::domain::{ChannelAddress, StoredAttachment};
-use crate::session::{SessionActorRef, SessionManager, SessionSnapshot};
+use crate::session::{SessionActorRef, SessionManager};
 use crate::workpath::{
     RemoteWorkpath, replace_workpath_description, validate_remote_workpath,
     validate_remote_workpath_host,
@@ -190,15 +190,6 @@ impl ConversationManager {
         }
         state.foreground_actor = Some(actor.clone());
         Ok(actor)
-    }
-
-    pub fn ensure_foreground_session(
-        &mut self,
-        address: &ChannelAddress,
-        sessions: &mut SessionManager,
-    ) -> Result<SessionSnapshot> {
-        let actor = self.ensure_foreground_actor(address, sessions)?;
-        actor.snapshot()
     }
 
     pub fn resolve_foreground_actor(

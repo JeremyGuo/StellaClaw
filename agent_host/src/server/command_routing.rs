@@ -109,7 +109,9 @@ impl Server {
             .await?;
             return Ok(true);
         };
-        let session = self.ensure_foreground_session(&incoming.address)?;
+        let session = self
+            .ensure_foreground_actor(&incoming.address)?
+            .snapshot()?;
         let status_text = self.status_text_for_session(&session, &effective_model_key)?;
         self.send_channel_message(
             channel,
@@ -146,7 +148,9 @@ impl Server {
             .await?;
             return Ok(true);
         };
-        let session = self.ensure_foreground_session(&incoming.address)?;
+        let session = self
+            .ensure_foreground_actor(&incoming.address)?
+            .snapshot()?;
         self.send_channel_message(
             channel,
             &incoming.address,
@@ -277,7 +281,9 @@ impl Server {
                     return Ok(true);
                 }
                 let compacted = if let Some(previous_model_key) = current_model_key {
-                    let session = self.ensure_foreground_session(&incoming.address)?;
+                    let session = self
+                        .ensure_foreground_actor(&incoming.address)?
+                        .snapshot()?;
                     self.compact_session_now(&session, &previous_model_key, false)
                         .await
                         .unwrap_or(false)
@@ -486,7 +492,9 @@ impl Server {
         }
 
         if let Some(checkpoint_name) = parse_snap_save_command(incoming.text.as_deref()) {
-            let session = self.ensure_foreground_session(&incoming.address)?;
+            let session = self
+                .ensure_foreground_actor(&incoming.address)?
+                .snapshot()?;
             let checkpoint =
                 self.with_sessions(|sessions| sessions.export_checkpoint(&incoming.address))?;
             let bundle = SnapshotBundle {
@@ -661,7 +669,9 @@ impl Server {
             return Ok(false);
         };
 
-        let session = self.ensure_foreground_session(&incoming.address)?;
+        let session = self
+            .ensure_foreground_actor(&incoming.address)?
+            .snapshot()?;
         let effective_model_key = self.effective_main_model_key(&incoming.address)?;
         let model_timeout_seconds = self.model_upstream_timeout_seconds(&effective_model_key)?;
         let (override_timeout, status_text) =

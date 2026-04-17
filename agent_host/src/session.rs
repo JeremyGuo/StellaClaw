@@ -331,10 +331,6 @@ impl SessionActorRef {
         self.read(|actor| Ok(actor.snapshot()))
     }
 
-    pub(crate) fn workspace_id(&self) -> Result<String> {
-        self.read(|actor| Ok(actor.session.workspace_id.clone()))
-    }
-
     pub(crate) fn export_checkpoint(&self) -> Result<SessionCheckpointData> {
         self.read(|actor| Ok(actor.export_checkpoint()))
     }
@@ -2235,13 +2231,6 @@ impl SessionManager {
             .collect()
     }
 
-    pub fn has_active_workspace(&self, workspace_id: &str) -> bool {
-        self.foreground_actors
-            .values()
-            .chain(self.background_actors.values())
-            .any(|actor| actor.workspace_id().is_ok_and(|id| id == workspace_id))
-    }
-
     pub fn create_background_actor(
         &mut self,
         address: &ChannelAddress,
@@ -2516,7 +2505,7 @@ mod tests {
         ModelCatalogChangeNotice, SessionActorMessage, SessionActorOutbound, SessionEffect,
         SessionErrno, SessionKind, SessionManager, SessionPhase, SessionRuntimePhase,
         SessionRuntimeTurnCommit, SessionRuntimeTurnFailure, SessionSkillObservation,
-        SharedProfileChangeNotice, SkillChangeNotice, SystemPromptStateObservation,
+        SharedProfileChangeNotice, SkillChangeNotice,
     };
     use crate::channel::ProgressFeedbackFinalState;
     use crate::domain::{ChannelAddress, MessageRole, StoredAttachment};
@@ -2525,7 +2514,7 @@ mod tests {
         ChatMessage, ExecutionProgress, ExecutionProgressPhase, SessionCompactionStats,
         SessionEvent, SessionExecutionControl, TokenUsage,
     };
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     use std::fs;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -2547,215 +2536,11 @@ mod tests {
         actor.snapshot().unwrap()
     }
 
-    trait SessionManagerTestExt {
-        fn append_user_message(
-            &self,
-            address: &ChannelAddress,
-            text: Option<String>,
-            attachments: Vec<StoredAttachment>,
-        ) -> anyhow::Result<()>;
-        fn append_background_result_to_foreground(
-            &self,
-            address: &ChannelAddress,
-            text: Option<String>,
-            attachments: Vec<StoredAttachment>,
-        ) -> anyhow::Result<super::SessionSnapshot>;
-        fn append_pending_request_message(
-            &self,
-            address: &ChannelAddress,
-            message: ChatMessage,
-        ) -> anyhow::Result<()>;
-        fn stage_foreground_user_turn(
-            &self,
-            address: &ChannelAddress,
-            pending_message: ChatMessage,
-            text: Option<String>,
-            attachments: Vec<StoredAttachment>,
-        ) -> anyhow::Result<()>;
-        fn observe_skill_changes(
-            &self,
-            address: &ChannelAddress,
-            observed_skills: &[SessionSkillObservation],
-        ) -> anyhow::Result<Vec<SkillChangeNotice>>;
-        fn observe_shared_profile_changes(
-            &self,
-            address: &ChannelAddress,
-            user_profile_version: String,
-            identity_profile_version: String,
-        ) -> anyhow::Result<Vec<SharedProfileChangeNotice>>;
-        fn observe_model_catalog_changes(
-            &self,
-            address: &ChannelAddress,
-            model_catalog_version: String,
-        ) -> anyhow::Result<Vec<ModelCatalogChangeNotice>>;
-        fn stage_shared_profile_change_notices(
-            &self,
-            address: &ChannelAddress,
-            notices: &[SharedProfileChangeNotice],
-        ) -> anyhow::Result<()>;
-        fn take_shared_profile_change_notices(
-            &self,
-            address: &ChannelAddress,
-        ) -> anyhow::Result<Vec<SharedProfileChangeNotice>>;
-        fn take_model_catalog_change_notices(
-            &self,
-            address: &ChannelAddress,
-        ) -> anyhow::Result<Vec<ModelCatalogChangeNotice>>;
-        fn observe_system_prompt_state(
-            &self,
-            address: &ChannelAddress,
-            static_hash: String,
-            component_hashes: BTreeMap<String, String>,
-        ) -> anyhow::Result<SystemPromptStateObservation>;
-        fn take_system_prompt_dynamic_notices(
-            &self,
-            address: &ChannelAddress,
-        ) -> anyhow::Result<BTreeSet<String>>;
-        fn mark_idle_compaction_failed(
-            &self,
-            address: &ChannelAddress,
-            error_summary: String,
-        ) -> anyhow::Result<()>;
-        fn clear_idle_compaction_failure(&self, address: &ChannelAddress) -> anyhow::Result<()>;
-    }
-
-    impl SessionManagerTestExt for SessionManager {
-        fn append_user_message(
-            &self,
-            address: &ChannelAddress,
-            text: Option<String>,
-            attachments: Vec<StoredAttachment>,
-        ) -> anyhow::Result<()> {
-            let actor = self.resolve_foreground_by_address(address)?;
-            actor.debug_append_visible_message(MessageRole::User, text, attachments)
-        }
-
-        fn append_background_result_to_foreground(
-            &self,
-            address: &ChannelAddress,
-            text: Option<String>,
-            attachments: Vec<StoredAttachment>,
-        ) -> anyhow::Result<super::SessionSnapshot> {
-            let actor = self.resolve_foreground_by_address(address)?;
-            actor.tell_actor_message(SessionActorMessage {
-                from_session_id: Uuid::new_v4(),
-                role: MessageRole::Assistant,
-                text,
-                attachments,
-            })?;
-            actor.snapshot()
-        }
-
-        fn append_pending_request_message(
-            &self,
-            address: &ChannelAddress,
-            message: ChatMessage,
-        ) -> anyhow::Result<()> {
-            let actor = self.resolve_foreground_by_address(address)?;
-            actor.debug_append_pending_request_message(message)
-        }
-
-        fn stage_foreground_user_turn(
-            &self,
-            address: &ChannelAddress,
-            pending_message: ChatMessage,
-            text: Option<String>,
-            attachments: Vec<StoredAttachment>,
-        ) -> anyhow::Result<()> {
-            let actor = self.resolve_foreground_by_address(address)?;
-            actor
-                .tell_user_message(super::SessionUserMessage {
-                    pending_message,
-                    text,
-                    attachments,
-                })
-                .map(|_| ())
-        }
-
-        fn observe_skill_changes(
-            &self,
-            address: &ChannelAddress,
-            observed_skills: &[SessionSkillObservation],
-        ) -> anyhow::Result<Vec<SkillChangeNotice>> {
-            let actor = self.resolve_foreground_by_address(address)?;
-            actor.observe_skill_changes(observed_skills)
-        }
-
-        fn observe_shared_profile_changes(
-            &self,
-            address: &ChannelAddress,
-            user_profile_version: String,
-            identity_profile_version: String,
-        ) -> anyhow::Result<Vec<SharedProfileChangeNotice>> {
-            let actor = self.resolve_foreground_by_address(address)?;
-            actor.observe_shared_profile_changes(user_profile_version, identity_profile_version)
-        }
-
-        fn observe_model_catalog_changes(
-            &self,
-            address: &ChannelAddress,
-            model_catalog_version: String,
-        ) -> anyhow::Result<Vec<ModelCatalogChangeNotice>> {
-            let actor = self.resolve_foreground_by_address(address)?;
-            actor.observe_model_catalog_changes(model_catalog_version)
-        }
-
-        fn stage_shared_profile_change_notices(
-            &self,
-            address: &ChannelAddress,
-            notices: &[SharedProfileChangeNotice],
-        ) -> anyhow::Result<()> {
-            let actor = self.resolve_foreground_by_address(address)?;
-            actor.stage_shared_profile_change_notices(notices)
-        }
-
-        fn take_shared_profile_change_notices(
-            &self,
-            address: &ChannelAddress,
-        ) -> anyhow::Result<Vec<SharedProfileChangeNotice>> {
-            let actor = self.resolve_foreground_by_address(address)?;
-            actor.take_shared_profile_change_notices()
-        }
-
-        fn take_model_catalog_change_notices(
-            &self,
-            address: &ChannelAddress,
-        ) -> anyhow::Result<Vec<ModelCatalogChangeNotice>> {
-            let actor = self.resolve_foreground_by_address(address)?;
-            actor.take_model_catalog_change_notices()
-        }
-
-        fn observe_system_prompt_state(
-            &self,
-            address: &ChannelAddress,
-            static_hash: String,
-            component_hashes: BTreeMap<String, String>,
-        ) -> anyhow::Result<SystemPromptStateObservation> {
-            let actor = self.resolve_foreground_by_address(address)?;
-            actor.observe_system_prompt_state(static_hash, component_hashes)
-        }
-
-        fn take_system_prompt_dynamic_notices(
-            &self,
-            address: &ChannelAddress,
-        ) -> anyhow::Result<BTreeSet<String>> {
-            let actor = self.resolve_foreground_by_address(address)?;
-            actor.take_system_prompt_dynamic_notices()
-        }
-
-        fn mark_idle_compaction_failed(
-            &self,
-            address: &ChannelAddress,
-            error_summary: String,
-        ) -> anyhow::Result<()> {
-            let actor = self.resolve_foreground_by_address(address)?;
-            actor.mark_idle_compaction_failed(error_summary)
-        }
-
-        fn clear_idle_compaction_failure(&self, address: &ChannelAddress) -> anyhow::Result<()> {
-            let actor = self.resolve_foreground_by_address(address)?;
-            actor.clear_idle_compaction_failure()
-        }
+    fn foreground_actor(
+        sessions: &SessionManager,
+        address: &ChannelAddress,
+    ) -> super::SessionActorRef {
+        sessions.resolve_foreground_by_address(address).unwrap()
     }
 
     fn commit_foreground_turn(
@@ -2844,13 +2629,14 @@ mod tests {
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
         sessions.ensure_foreground_actor(&address).unwrap();
+        let actor = foreground_actor(&sessions, &address);
 
         let baseline = BTreeMap::from([
             ("identity".to_string(), "hash-a".to_string()),
             ("runtime_notes".to_string(), "hash-b".to_string()),
         ]);
-        let observed = sessions
-            .observe_system_prompt_state(&address, "static-a".to_string(), baseline)
+        let observed = actor
+            .observe_system_prompt_state("static-a".to_string(), baseline)
             .unwrap();
         assert!(!observed.static_changed);
         assert!(observed.dynamic_notice_keys.is_empty());
@@ -2859,8 +2645,8 @@ mod tests {
             ("identity".to_string(), "hash-a2".to_string()),
             ("runtime_notes".to_string(), "hash-b".to_string()),
         ]);
-        let observed = sessions
-            .observe_system_prompt_state(&address, "static-a".to_string(), changed)
+        let observed = actor
+            .observe_system_prompt_state("static-a".to_string(), changed)
             .unwrap();
         assert!(!observed.static_changed);
         assert_eq!(
@@ -2868,16 +2654,16 @@ mod tests {
             vec!["identity".to_string()]
         );
         assert_eq!(
-            sessions
-                .take_system_prompt_dynamic_notices(&address)
+            actor
+                .take_system_prompt_dynamic_notices()
                 .unwrap()
                 .into_iter()
                 .collect::<Vec<_>>(),
             vec!["identity".to_string()]
         );
         assert!(
-            sessions
-                .take_system_prompt_dynamic_notices(&address)
+            actor
+                .take_system_prompt_dynamic_notices()
                 .unwrap()
                 .is_empty()
         );
@@ -2890,16 +2676,14 @@ mod tests {
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
         sessions.ensure_foreground_actor(&address).unwrap();
+        let actor = foreground_actor(&sessions, &address);
 
-        sessions
-            .observe_skill_changes(
-                &address,
-                &[SessionSkillObservation {
-                    name: "skill-a".to_string(),
-                    description: "old desc".to_string(),
-                    content: "old content".to_string(),
-                }],
-            )
+        actor
+            .observe_skill_changes(&[SessionSkillObservation {
+                name: "skill-a".to_string(),
+                description: "old desc".to_string(),
+                content: "old content".to_string(),
+            }])
             .unwrap();
 
         commit_foreground_turn_with_loaded_skills(
@@ -2912,15 +2696,12 @@ mod tests {
         )
         .unwrap();
 
-        let notices = sessions
-            .observe_skill_changes(
-                &address,
-                &[SessionSkillObservation {
-                    name: "skill-a".to_string(),
-                    description: "new desc".to_string(),
-                    content: "new content".to_string(),
-                }],
-            )
+        let notices = actor
+            .observe_skill_changes(&[SessionSkillObservation {
+                name: "skill-a".to_string(),
+                description: "new desc".to_string(),
+                content: "new content".to_string(),
+            }])
             .unwrap();
 
         assert!(matches!(
@@ -2947,27 +2728,22 @@ mod tests {
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
         sessions.ensure_foreground_actor(&address).unwrap();
+        let actor = foreground_actor(&sessions, &address);
 
-        sessions
-            .observe_skill_changes(
-                &address,
-                &[SessionSkillObservation {
-                    name: "skill-b".to_string(),
-                    description: "old desc".to_string(),
-                    content: "same content".to_string(),
-                }],
-            )
+        actor
+            .observe_skill_changes(&[SessionSkillObservation {
+                name: "skill-b".to_string(),
+                description: "old desc".to_string(),
+                content: "same content".to_string(),
+            }])
             .unwrap();
 
-        let notices = sessions
-            .observe_skill_changes(
-                &address,
-                &[SessionSkillObservation {
-                    name: "skill-b".to_string(),
-                    description: "new desc".to_string(),
-                    content: "same content".to_string(),
-                }],
-            )
+        let notices = actor
+            .observe_skill_changes(&[SessionSkillObservation {
+                name: "skill-b".to_string(),
+                description: "new desc".to_string(),
+                content: "same content".to_string(),
+            }])
             .unwrap();
 
         assert!(matches!(
@@ -2984,16 +2760,14 @@ mod tests {
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
         sessions.ensure_foreground_actor(&address).unwrap();
+        let actor = foreground_actor(&sessions, &address);
 
-        sessions
-            .observe_skill_changes(
-                &address,
-                &[SessionSkillObservation {
-                    name: "skill-c".to_string(),
-                    description: "old desc".to_string(),
-                    content: "old content".to_string(),
-                }],
-            )
+        actor
+            .observe_skill_changes(&[SessionSkillObservation {
+                name: "skill-c".to_string(),
+                description: "old desc".to_string(),
+                content: "old content".to_string(),
+            }])
             .unwrap();
 
         commit_foreground_turn_with_loaded_skills(
@@ -3006,15 +2780,12 @@ mod tests {
         )
         .unwrap();
 
-        let notices = sessions
-            .observe_skill_changes(
-                &address,
-                &[SessionSkillObservation {
-                    name: "skill-c".to_string(),
-                    description: "new desc".to_string(),
-                    content: "new content".to_string(),
-                }],
-            )
+        let notices = actor
+            .observe_skill_changes(&[SessionSkillObservation {
+                name: "skill-c".to_string(),
+                description: "new desc".to_string(),
+                content: "new content".to_string(),
+            }])
             .unwrap();
 
         assert!(matches!(
@@ -3041,52 +2812,34 @@ mod tests {
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
         sessions.ensure_foreground_actor(&address).unwrap();
+        let actor = foreground_actor(&sessions, &address);
 
-        let first = sessions
-            .observe_shared_profile_changes(
-                &address,
-                "user-v1".to_string(),
-                "identity-v1".to_string(),
-            )
+        let first = actor
+            .observe_shared_profile_changes("user-v1".to_string(), "identity-v1".to_string())
             .unwrap();
         assert!(first.is_empty());
 
-        let second = sessions
-            .observe_shared_profile_changes(
-                &address,
-                "user-v2".to_string(),
-                "identity-v1".to_string(),
-            )
+        let second = actor
+            .observe_shared_profile_changes("user-v2".to_string(), "identity-v1".to_string())
             .unwrap();
         assert_eq!(second, vec![SharedProfileChangeNotice::UserUpdated]);
-        let queued = sessions
-            .take_shared_profile_change_notices(&address)
-            .unwrap();
+        let queued = actor.take_shared_profile_change_notices().unwrap();
         assert_eq!(queued, vec![SharedProfileChangeNotice::UserUpdated]);
         assert!(
-            sessions
-                .take_shared_profile_change_notices(&address)
+            actor
+                .take_shared_profile_change_notices()
                 .unwrap()
                 .is_empty()
         );
 
-        let third = sessions
-            .observe_shared_profile_changes(
-                &address,
-                "user-v2".to_string(),
-                "identity-v2".to_string(),
-            )
+        let third = actor
+            .observe_shared_profile_changes("user-v2".to_string(), "identity-v2".to_string())
             .unwrap();
         assert_eq!(third, vec![SharedProfileChangeNotice::IdentityUpdated]);
-        sessions
-            .stage_shared_profile_change_notices(
-                &address,
-                &[SharedProfileChangeNotice::UserUpdated],
-            )
+        actor
+            .stage_shared_profile_change_notices(&[SharedProfileChangeNotice::UserUpdated])
             .unwrap();
-        let delivered = sessions
-            .take_shared_profile_change_notices(&address)
-            .unwrap();
+        let delivered = actor.take_shared_profile_change_notices().unwrap();
         assert_eq!(
             delivered,
             vec![
@@ -3103,24 +2856,23 @@ mod tests {
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
         sessions.ensure_foreground_actor(&address).unwrap();
+        let actor = foreground_actor(&sessions, &address);
 
-        let first = sessions
-            .observe_model_catalog_changes(&address, "models-v1".to_string())
+        let first = actor
+            .observe_model_catalog_changes("models-v1".to_string())
             .unwrap();
         assert!(first.is_empty());
 
-        let second = sessions
-            .observe_model_catalog_changes(&address, "models-v2".to_string())
+        let second = actor
+            .observe_model_catalog_changes("models-v2".to_string())
             .unwrap();
         assert_eq!(second, vec![ModelCatalogChangeNotice::Updated]);
 
-        let queued = sessions
-            .take_model_catalog_change_notices(&address)
-            .unwrap();
+        let queued = actor.take_model_catalog_change_notices().unwrap();
         assert_eq!(queued, vec![ModelCatalogChangeNotice::Updated]);
         assert!(
-            sessions
-                .take_model_catalog_change_notices(&address)
+            actor
+                .take_model_catalog_change_notices()
                 .unwrap()
                 .is_empty()
         );
@@ -3133,9 +2885,10 @@ mod tests {
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
         sessions.ensure_foreground_actor(&address).unwrap();
+        let actor = foreground_actor(&sessions, &address);
 
-        sessions
-            .mark_idle_compaction_failed(&address, "idle compaction failed".to_string())
+        actor
+            .mark_idle_compaction_failed("idle compaction failed".to_string())
             .unwrap();
         let snapshot = sessions.get_snapshot(&address).unwrap();
         assert_eq!(
@@ -3147,7 +2900,7 @@ mod tests {
             Some("idle compaction failed")
         );
 
-        sessions.clear_idle_compaction_failure(&address).unwrap();
+        actor.clear_idle_compaction_failure().unwrap();
         let snapshot = sessions.get_snapshot(&address).unwrap();
         assert_eq!(snapshot.session_state.errno, None);
         assert_eq!(snapshot.session_state.errinfo, None);
@@ -3160,14 +2913,14 @@ mod tests {
         let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
         let address = test_address();
         sessions.ensure_foreground_actor(&address).unwrap();
+        let actor = foreground_actor(&sessions, &address);
 
-        sessions
-            .stage_foreground_user_turn(
-                &address,
-                ChatMessage::text("user", "queued"),
-                Some("queued".to_string()),
-                Vec::new(),
-            )
+        actor
+            .tell_user_message(super::SessionUserMessage {
+                pending_message: ChatMessage::text("user", "queued"),
+                text: Some("queued".to_string()),
+                attachments: Vec::new(),
+            })
             .unwrap();
 
         let snapshot = sessions.get_snapshot(&address).unwrap();
@@ -3226,8 +2979,8 @@ mod tests {
             SessionPhase::End,
         )
         .unwrap();
-        sessions
-            .append_pending_request_message(&address, ChatMessage::text("user", "queued"))
+        foreground_actor(&sessions, &address)
+            .debug_append_pending_request_message(ChatMessage::text("user", "queued"))
             .unwrap();
 
         let snapshot = sessions.get_snapshot(&address).unwrap();
@@ -3271,8 +3024,8 @@ mod tests {
             SessionPhase::End,
         )
         .unwrap();
-        sessions
-            .append_pending_request_message(&address, ChatMessage::text("user", "queued"))
+        foreground_actor(&sessions, &address)
+            .debug_append_pending_request_message(ChatMessage::text("user", "queued"))
             .unwrap();
 
         fail_foreground_turn(
@@ -3317,11 +3070,11 @@ mod tests {
             SessionPhase::End,
         )
         .unwrap();
-        sessions
-            .append_pending_request_message(&address, ChatMessage::text("user", "consumed"))
+        foreground_actor(&sessions, &address)
+            .debug_append_pending_request_message(ChatMessage::text("user", "consumed"))
             .unwrap();
-        sessions
-            .append_pending_request_message(&address, ChatMessage::text("user", "new-tail"))
+        foreground_actor(&sessions, &address)
+            .debug_append_pending_request_message(ChatMessage::text("user", "new-tail"))
             .unwrap();
 
         commit_foreground_turn(
@@ -3361,9 +3114,9 @@ mod tests {
         let address = test_address();
         sessions.ensure_foreground_actor(&address).unwrap();
 
-        sessions
-            .append_user_message(
-                &address,
+        foreground_actor(&sessions, &address)
+            .debug_append_visible_message(
+                MessageRole::User,
                 Some("hello".to_string()),
                 Vec::<StoredAttachment>::new(),
             )
@@ -3951,13 +3704,16 @@ mod tests {
         let address = test_address();
         sessions.ensure_foreground_actor(&address).unwrap();
 
-        let snapshot = sessions
-            .append_background_result_to_foreground(
-                &address,
-                Some("background finished".to_string()),
-                Vec::new(),
-            )
+        let actor = foreground_actor(&sessions, &address);
+        actor
+            .tell_actor_message(SessionActorMessage {
+                from_session_id: Uuid::new_v4(),
+                role: MessageRole::Assistant,
+                text: Some("background finished".to_string()),
+                attachments: Vec::new(),
+            })
             .unwrap();
+        let snapshot = actor.snapshot().unwrap();
 
         assert_eq!(
             snapshot.stable_messages(),

@@ -10,7 +10,7 @@ use crate::config::{
 use crate::conversation::ConversationManager;
 use crate::cron::CronManager;
 use crate::domain::ChannelAddress;
-use crate::session::{SessionActorRef, SessionManager, SessionSnapshot};
+use crate::session::{SessionActorRef, SessionManager};
 use crate::sink::SinkRouter;
 use crate::snapshot::SnapshotManager;
 use crate::workspace::WorkspaceManager;
@@ -98,15 +98,6 @@ impl RuntimeContext {
             .lock()
             .map_err(|_| anyhow!("snapshot manager lock poisoned"))?;
         f(&mut snapshots)
-    }
-
-    pub(super) fn ensure_foreground_session(
-        &self,
-        address: &ChannelAddress,
-    ) -> Result<SessionSnapshot> {
-        self.with_conversations_and_sessions(|conversations, sessions| {
-            conversations.ensure_foreground_session(address, sessions)
-        })
     }
 
     pub(super) fn ensure_foreground_actor(
