@@ -3052,11 +3052,10 @@ mod tests {
     use crate::domain::ChannelAddress;
     use crate::domain::{AttachmentKind, OutgoingMessage, ProcessingState, StoredAttachment};
     use crate::session::tag_interrupted_followup_text;
-    use crate::session::{ModelCatalogChangeNotice, SessionErrno, SessionSnapshot};
     use crate::session::{
-        SessionManager, SessionPhase, SessionRuntimePhase, SessionRuntimeTurnCommit,
-        session_runtime_phase_for_event,
+        ModelCatalogChangeNotice, SessionErrno, SessionSnapshot, SessionUserMessage,
     };
+    use crate::session::{SessionManager, SessionPhase, SessionRuntimeTurnCommit};
     use crate::sink::SinkRouter;
     use crate::snapshot::SnapshotManager;
     use crate::workspace::WorkspaceManager;
@@ -3278,6 +3277,14 @@ mod tests {
         persist_compaction_artifacts(session, &report)
             .unwrap()
             .expect("rollout id should be created")
+    }
+
+    fn test_user_message(text: &str) -> SessionUserMessage {
+        SessionUserMessage {
+            pending_message: ChatMessage::text("user", text),
+            text: Some(text.to_string()),
+            attachments: Vec::new(),
+        }
     }
 
     #[async_trait]
@@ -3703,15 +3710,15 @@ mod tests {
         let actor = sessions.ensure_foreground_actor(&address).unwrap();
         let control = SessionExecutionControl::new();
         actor.register_control(control.clone()).unwrap();
-        let phase = session_runtime_phase_for_event(&SessionEvent::CompactionStarted {
-            phase: "initial".to_string(),
-            message_count: 3,
-        })
-        .unwrap();
-        actor.debug_set_runtime_phase(phase).unwrap();
+        actor
+            .receive_runtime_event(&SessionEvent::CompactionStarted {
+                phase: "initial".to_string(),
+                message_count: 3,
+            })
+            .unwrap();
 
         let disposition = actor
-            .debug_receive_user_message(Some("进度如何？".to_string()))
+            .tell_user_message(test_user_message("进度如何？"))
             .unwrap();
 
         assert!(disposition.interrupted);
@@ -3746,17 +3753,16 @@ mod tests {
             .register_control(active_control.clone())
             .unwrap();
         active_actor
-            .debug_set_runtime_phase(SessionRuntimePhase::Compacting)
+            .receive_runtime_event(&SessionEvent::CompactionStarted {
+                phase: "initial".to_string(),
+                message_count: 3,
+            })
             .unwrap();
 
         let disposition = sessions
             .resolve_foreground_by_address(&other_address)
             .ok()
-            .and_then(|actor| {
-                actor
-                    .debug_receive_user_message(Some("hello".to_string()))
-                    .ok()
-            })
+            .and_then(|actor| actor.tell_user_message(test_user_message("hello")).ok())
             .unwrap_or_default();
 
         assert!(!disposition.interrupted);
@@ -3778,9 +3784,7 @@ mod tests {
         let actor = sessions.ensure_foreground_actor(&address).unwrap();
         let first_control = SessionExecutionControl::new();
         actor.register_control(first_control.clone()).unwrap();
-        let disposition = actor
-            .debug_receive_user_message(Some("继续".to_string()))
-            .unwrap();
+        let disposition = actor.tell_user_message(test_user_message("继续")).unwrap();
         assert!(disposition.interrupted);
         actor.unregister_control().unwrap();
         let next_control = SessionExecutionControl::new();

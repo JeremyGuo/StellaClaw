@@ -445,52 +445,6 @@ impl SessionActorRef {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn debug_set_runtime_phase(&self, phase: SessionRuntimePhase) -> Result<()> {
-        self.update(move |actor| {
-            actor.set_runtime_phase(phase);
-            Ok(())
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn debug_receive_user_message(
-        &self,
-        text: Option<String>,
-    ) -> Result<SessionUserMessageReceipt> {
-        self.update(move |actor| Ok(actor.receive_user_message(text)))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn debug_is_running(&self) -> Result<bool> {
-        self.read(|actor| Ok(actor.is_running()))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn debug_stage_user_turn(
-        &self,
-        pending_message: ChatMessage,
-        text: Option<String>,
-        attachments: Vec<StoredAttachment>,
-    ) -> Result<SessionUserMessageReceipt> {
-        self.update(move |actor| actor.stage_user_turn(pending_message, text, attachments))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn debug_append_visible_message(
-        &self,
-        role: MessageRole,
-        text: Option<String>,
-        attachments: Vec<StoredAttachment>,
-    ) -> Result<()> {
-        self.update(move |actor| actor.append_visible_message(role, text, attachments))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn debug_append_pending_request_message(&self, message: ChatMessage) -> Result<()> {
-        self.update(move |actor| actor.append_pending_request_message(message))
-    }
-
     pub(crate) fn has_pending_interrupt(&self) -> Result<bool> {
         self.read(|actor| Ok(actor.has_pending_interrupt()))
     }
@@ -886,13 +840,6 @@ impl SessionActor {
         true
     }
 
-    #[cfg(test)]
-    fn set_runtime_phase(&mut self, phase: SessionRuntimePhase) {
-        if self.runtime.active_control.is_some() {
-            self.runtime.active_phase = Some(phase);
-        }
-    }
-
     fn clear_pending_interrupt(&mut self) {
         self.runtime.pending_interrupt = false;
     }
@@ -940,26 +887,6 @@ impl SessionActor {
     fn set_api_timeout_override(&mut self, timeout_seconds: Option<f64>) -> Result<()> {
         self.session.api_timeout_override_seconds = timeout_seconds;
         self.session.persist()
-    }
-
-    #[cfg(test)]
-    fn append_pending_request_message(&mut self, message: ChatMessage) -> Result<()> {
-        self.session.session_state.pending_messages.push(message);
-        self.session.persist()
-    }
-
-    #[cfg(test)]
-    fn stage_user_turn(
-        &mut self,
-        pending_message: ChatMessage,
-        text: Option<String>,
-        attachments: Vec<StoredAttachment>,
-    ) -> Result<SessionUserMessageReceipt> {
-        self.tell_user_message(SessionUserMessage {
-            pending_message,
-            text,
-            attachments,
-        })
     }
 
     fn set_failed_turn(
@@ -1922,7 +1849,7 @@ fn tag_interrupted_user_chat_message(message: &mut ChatMessage) {
     }
 }
 
-pub fn session_runtime_phase_for_event(event: &SessionEvent) -> Option<SessionRuntimePhase> {
+fn session_runtime_phase_for_event(event: &SessionEvent) -> Option<SessionRuntimePhase> {
     match event {
         SessionEvent::CompactionStarted { .. } | SessionEvent::ToolWaitCompactionStarted { .. } => {
             Some(SessionRuntimePhase::Compacting)
@@ -2503,12 +2430,12 @@ fn load_persisted_sessions(
 mod tests {
     use super::{
         ModelCatalogChangeNotice, SessionActorMessage, SessionActorOutbound, SessionEffect,
-        SessionErrno, SessionKind, SessionManager, SessionPhase, SessionRuntimePhase,
-        SessionRuntimeTurnCommit, SessionRuntimeTurnFailure, SessionSkillObservation,
-        SharedProfileChangeNotice, SkillChangeNotice,
+        SessionErrno, SessionKind, SessionManager, SessionPhase, SessionRuntimeTurnCommit,
+        SessionRuntimeTurnFailure, SessionSkillObservation, SharedProfileChangeNotice,
+        SkillChangeNotice,
     };
     use crate::channel::ProgressFeedbackFinalState;
-    use crate::domain::{ChannelAddress, MessageRole, StoredAttachment};
+    use crate::domain::{ChannelAddress, MessageRole};
     use crate::workspace::WorkspaceManager;
     use agent_frame::{
         ChatMessage, ExecutionProgress, ExecutionProgressPhase, SessionCompactionStats,
@@ -2541,6 +2468,14 @@ mod tests {
         address: &ChannelAddress,
     ) -> super::SessionActorRef {
         sessions.resolve_foreground_by_address(address).unwrap()
+    }
+
+    fn user_message(text: &str) -> super::SessionUserMessage {
+        super::SessionUserMessage {
+            pending_message: ChatMessage::text("user", text),
+            text: Some(text.to_string()),
+            attachments: Vec::new(),
+        }
     }
 
     fn commit_foreground_turn(
@@ -2980,7 +2915,7 @@ mod tests {
         )
         .unwrap();
         foreground_actor(&sessions, &address)
-            .debug_append_pending_request_message(ChatMessage::text("user", "queued"))
+            .tell_user_message(user_message("queued"))
             .unwrap();
 
         let snapshot = sessions.get_snapshot(&address).unwrap();
@@ -3025,7 +2960,7 @@ mod tests {
         )
         .unwrap();
         foreground_actor(&sessions, &address)
-            .debug_append_pending_request_message(ChatMessage::text("user", "queued"))
+            .tell_user_message(user_message("queued"))
             .unwrap();
 
         fail_foreground_turn(
@@ -3071,10 +3006,10 @@ mod tests {
         )
         .unwrap();
         foreground_actor(&sessions, &address)
-            .debug_append_pending_request_message(ChatMessage::text("user", "consumed"))
+            .tell_user_message(user_message("consumed"))
             .unwrap();
         foreground_actor(&sessions, &address)
-            .debug_append_pending_request_message(ChatMessage::text("user", "new-tail"))
+            .tell_user_message(user_message("new-tail"))
             .unwrap();
 
         commit_foreground_turn(
@@ -3115,17 +3050,13 @@ mod tests {
         sessions.ensure_foreground_actor(&address).unwrap();
 
         foreground_actor(&sessions, &address)
-            .debug_append_visible_message(
-                MessageRole::User,
-                Some("hello".to_string()),
-                Vec::<StoredAttachment>::new(),
-            )
+            .tell_user_message(user_message("hello"))
             .unwrap();
         commit_foreground_turn(
             &sessions,
             &address,
             vec![ChatMessage::text("assistant", "hi")],
-            &[],
+            &[ChatMessage::text("user", "hello")],
             SessionPhase::End,
         )
         .unwrap();
@@ -3358,10 +3289,9 @@ mod tests {
         let address = test_address();
         let actor = sessions.ensure_foreground_actor(&address).unwrap();
 
-        assert!(!actor.debug_is_running().unwrap());
         assert!(
             !actor
-                .debug_receive_user_message(Some("hello".to_string()))
+                .tell_user_message(user_message("hello"))
                 .unwrap()
                 .interrupted
         );
@@ -3369,13 +3299,13 @@ mod tests {
         let control = SessionExecutionControl::new();
         actor.register_control(control.clone()).unwrap();
         actor
-            .debug_set_runtime_phase(SessionRuntimePhase::Compacting)
+            .receive_runtime_event(&SessionEvent::CompactionStarted {
+                phase: "initial".to_string(),
+                message_count: 3,
+            })
             .unwrap();
 
-        let disposition = actor
-            .debug_receive_user_message(Some("进度如何？".to_string()))
-            .unwrap();
-        assert!(actor.debug_is_running().unwrap());
+        let disposition = actor.tell_user_message(user_message("进度如何？")).unwrap();
         assert!(disposition.interrupted);
         assert!(disposition.compaction_in_progress);
         assert_eq!(
@@ -3401,7 +3331,6 @@ mod tests {
         assert!(actor.request_cancel().unwrap());
 
         actor.unregister_control().unwrap();
-        assert!(!actor.debug_is_running().unwrap());
         assert!(!actor.request_cancel().unwrap());
     }
 
@@ -3414,17 +3343,13 @@ mod tests {
         let actor = sessions.ensure_foreground_actor(&address).unwrap();
 
         assert!(actor.try_claim_turn_runner().unwrap());
-        assert!(actor.debug_is_running().unwrap());
         assert!(!actor.try_claim_turn_runner().unwrap());
 
-        let disposition = actor
-            .debug_receive_user_message(Some("next".to_string()))
-            .unwrap();
+        let disposition = actor.tell_user_message(user_message("next")).unwrap();
         assert!(disposition.interrupted);
         assert!(actor.has_pending_interrupt().unwrap());
 
         actor.unregister_control().unwrap();
-        assert!(!actor.debug_is_running().unwrap());
         assert!(actor.try_claim_turn_runner().unwrap());
     }
 
@@ -3438,16 +3363,13 @@ mod tests {
         let control = SessionExecutionControl::new();
         actor.register_control(control.clone()).unwrap();
         actor
-            .debug_set_runtime_phase(SessionRuntimePhase::Compacting)
+            .receive_runtime_event(&SessionEvent::CompactionStarted {
+                phase: "initial".to_string(),
+                message_count: 3,
+            })
             .unwrap();
 
-        let receipt = actor
-            .debug_stage_user_turn(
-                ChatMessage::text("user", "status?"),
-                Some("status?".to_string()),
-                Vec::new(),
-            )
-            .unwrap();
+        let receipt = actor.tell_user_message(user_message("status?")).unwrap();
 
         assert!(receipt.interrupted);
         assert!(receipt.compaction_in_progress);
@@ -3499,11 +3421,7 @@ mod tests {
                 .register_control(SessionExecutionControl::new())
                 .unwrap();
             actor
-                .debug_stage_user_turn(
-                    ChatMessage::text("user", "survived restart"),
-                    Some("survived restart".to_string()),
-                    Vec::new(),
-                )
+                .tell_user_message(user_message("survived restart"))
                 .unwrap();
 
             let snapshot = actor.snapshot().unwrap();
