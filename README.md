@@ -34,10 +34,36 @@ ClawParty is a **production-grade agent hosting framework** that turns LLM agent
 </tr></table>
 </div>
 
+```mermaid
+flowchart TD
+    Channel["Channel Actors<br/>Telegram / DingTalk / CLI<br/>Normalize updates<br/>Send user-visible effects"]
+    Dispatcher["Incoming Dispatcher<br/>Fast-path commands<br/>Model / sandbox routing<br/>Non-blocking handoff"]
+    Conversation["Conversation Actor<br/>Conversation config<br/>Workspace selection<br/>Attachment materialization<br/>Foreground actor reference"]
+    SessionManager["SessionManager<br/>Factory + registry<br/>Load/create SessionActor refs<br/>No message or turn ownership"]
+    Session["SessionActor<br/>Foreground / background sessions<br/>Durable user + actor mailboxes<br/>Interrupt / yield / progress<br/>Turn commit and failure state"]
+    Runtime["Agent Runtime Adapter<br/>AgentFrame execution<br/>Tool events and progress<br/>Completed / yielded / failed reports"]
+    Tools["Tool Runtime<br/>File / shell / web / media<br/>Subagents / downloads / DSL<br/>Interruptible job lifecycle"]
+    Scheduler["Cron Scheduler<br/>Local-time schedules<br/>Checker commands<br/>Background SessionActor jobs"]
+    Background["Other SessionActors<br/>Background agents<br/>Actor-to-actor messages<br/>Durable tell delivery"]
+
+    Channel --> Dispatcher
+    Dispatcher --> Conversation
+    Conversation --> SessionManager
+    SessionManager --> Session
+    Conversation --> Session
+    Scheduler --> SessionManager
+    Scheduler --> Session
+    Session --> Runtime
+    Runtime --> Session
+    Runtime --> Tools
+    Tools --> Runtime
+    Background --> Conversation
+    Background --> Session
+    Session --> Channel
+```
+
 <div align="center">
-  <img src="docs/imgs/architecture_svg.svg" alt="System Architecture" width="780" />
-  <br />
-  <sub>Layered architecture: Channels → Session → Agent Topology → Cron / Sink</sub>
+  <sub>Actor architecture: Conversation prepares and routes; SessionActor owns session state, mailboxes, interruption, progress, and persistence.</sub>
 </div>
 
 ---
@@ -148,18 +174,31 @@ Tools are classified as **immediate** (return promptly) or **interruptible** (ca
 
 ## Agent Topology
 
-Each conversation supports a three-tier agent hierarchy:
+Each conversation owns routing and workspace context, while each foreground or background session runs as an independent `SessionActor`:
 
-```
-Conversation
-  └─ Main Foreground Agent (user-facing, one active turn at a time)
-       ├─ Sub-Agents (session-bound helpers, delegated tasks)
-       └─ Background Agents (independent async work, report back via sinks)
+```mermaid
+flowchart TD
+    Conversation["Conversation<br/>workspace + config<br/>attachment preparation<br/>foreground actor ref"]
+    Foreground["Main Foreground SessionActor<br/>user-facing turns<br/>durable user mailbox<br/>interrupt + progress state"]
+    Background["Main Background SessionActor<br/>async independent work<br/>same actor lifecycle<br/>different prompt and tools"]
+    Subagents["Sub-Agents<br/>bounded helper work<br/>joined by owning agent"]
+    Runtime["AgentFrame Runtime<br/>model calls<br/>tool execution<br/>runtime events"]
+
+    Conversation --> Foreground
+    Conversation --> Background
+    Foreground --> Runtime
+    Background --> Runtime
+    Foreground --> Subagents
+    Background --> Subagents
+    Background --> Conversation
+    Background --> Foreground
 ```
 
-- **Main agent** handles user messages, runs tools, manages workspace
-- **Sub-agents** run bounded tasks in parallel (e.g., search, fact gathering)
-- **Background agents** run independently and deliver results later via configurable sinks (direct message, broadcast topic, multi-target fan-out)
+- **Conversation** owns conversation-level config, workspace selection, attachment materialization, and the current foreground actor reference.
+- **SessionActor** owns all per-session durable and runtime state: stable context, pending context, visible history, user mailbox, actor mailbox, active phase, interrupt state, progress state, and turn commit/failure state.
+- **Foreground and background agents** share the same session actor lifecycle; they differ through session policy such as system prompt kind, enabled tools, and delivery behavior.
+- **Sub-agents** run bounded helper tasks and return results to their owning foreground or background agent.
+- **Actor-to-actor delivery** uses durable tell-style messages, so background results can be inserted into the foreground actor without blocking and survive restarts.
 
 ---
 
