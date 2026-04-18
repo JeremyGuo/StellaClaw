@@ -145,7 +145,7 @@ fn retry_after_auth_failure(
     payload: Map<String, Value>,
     auth: Option<&crate::config::CodexAuthConfig>,
     original_error: anyhow::Error,
-) -> Result<(Value, WebSocket<MaybeTlsStream<TcpStream>>)> {
+) -> Result<(Value, String, WebSocket<MaybeTlsStream<TcpStream>>)> {
     if !is_probable_auth_error(&original_error) {
         return Err(original_error);
     }
@@ -220,16 +220,16 @@ fn send_responses_websocket_request(
     upstream: &UpstreamConfig,
     payload: Map<String, Value>,
     auth: Option<&crate::config::CodexAuthConfig>,
-) -> Result<(Value, WebSocket<MaybeTlsStream<TcpStream>>)> {
+) -> Result<(Value, String, WebSocket<MaybeTlsStream<TcpStream>>)> {
     let mut socket = connect_codex_websocket(upstream, auth)?;
-    let response = send_response_create(&mut socket, payload)?;
-    Ok((response, socket))
+    let (response, api_request_id) = send_response_create(upstream, &mut socket, payload)?;
+    Ok((response, api_request_id, socket))
 }
 
 fn send_responses_websocket_request_once(
     upstream: &UpstreamConfig,
     payload: Map<String, Value>,
-) -> Result<(Value, WebSocket<MaybeTlsStream<TcpStream>>)> {
+) -> Result<(Value, String, WebSocket<MaybeTlsStream<TcpStream>>)> {
     let auth = load_codex_auth(upstream)?;
     match send_responses_websocket_request(upstream, payload.clone(), auth.as_ref()) {
         Ok(response) => Ok(response),
@@ -240,7 +240,7 @@ fn send_responses_websocket_request_once(
 fn send_responses_websocket_request_with_retries(
     upstream: &UpstreamConfig,
     payload: Map<String, Value>,
-) -> Result<(Value, WebSocket<MaybeTlsStream<TcpStream>>)> {
+) -> Result<(Value, String, WebSocket<MaybeTlsStream<TcpStream>>)> {
     let mut last_error = None;
 
     for attempt in 0..=DEFAULT_STREAM_RECONNECT_ATTEMPTS {
@@ -390,9 +390,10 @@ fn set_tcp_stream_timeout(stream: &TcpStream, timeout: Option<Duration>) -> Resu
 }
 
 fn send_response_create(
+    upstream: &UpstreamConfig,
     socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
     payload: Map<String, Value>,
-) -> Result<Value> {
+) -> Result<(Value, String)> {
     let create_request = Value::Object(Map::from_iter([(
         "type".to_string(),
         Value::String("response.create".to_string()),
@@ -403,22 +404,74 @@ fn send_response_create(
     .into_iter()
     .chain(payload)
     .collect::<Map<_, _>>();
-    socket
-        .send(Message::Text(
-            Value::Object(create_request).to_string().into(),
-        ))
-        .context("failed to send codex websocket request")?;
+    let request_body = Value::Object(create_request);
+    let api_request_id = next_api_request_id();
+    let websocket_url = build_websocket_url(&build_chat_completions_url(upstream))
+        .map(|url| url.to_string())
+        .unwrap_or_else(|_| build_chat_completions_url(upstream));
+    log_upstream_api_request_started(
+        &api_request_id,
+        upstream,
+        "codex_subscription_responses_websocket",
+        "WEBSOCKET",
+        &websocket_url,
+        "{}",
+        &request_body,
+    );
+
+    let started = Instant::now();
+    if let Err(error) = socket.send(Message::Text(request_body.to_string().into())) {
+        log_upstream_api_request_failed(
+            &api_request_id,
+            upstream,
+            "codex_subscription_responses_websocket",
+            None,
+            started.elapsed().as_millis() as u64,
+            "{}",
+            None,
+            &format!("{error:#}"),
+        );
+        return Err(error).context("failed to send codex websocket request");
+    }
 
     let mut accumulator = WebsocketResponseAccumulator::default();
 
     loop {
-        match socket
-            .read()
-            .context("failed to read codex websocket event")?
-        {
+        let message = match socket.read() {
+            Ok(message) => message,
+            Err(error) => {
+                log_upstream_api_request_failed(
+                    &api_request_id,
+                    upstream,
+                    "codex_subscription_responses_websocket",
+                    None,
+                    started.elapsed().as_millis() as u64,
+                    "{}",
+                    None,
+                    &format!("{error:#}"),
+                );
+                return Err(error).context("failed to read codex websocket event");
+            }
+        };
+        match message {
             Message::Text(text) => {
-                let value: Value =
-                    serde_json::from_str(&text).context("failed to parse codex websocket event")?;
+                let value: Value = match serde_json::from_str(&text) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let response_body = Value::String(text.to_string());
+                        log_upstream_api_request_failed(
+                            &api_request_id,
+                            upstream,
+                            "codex_subscription_responses_websocket",
+                            None,
+                            started.elapsed().as_millis() as u64,
+                            "{}",
+                            Some(&response_body),
+                            &format!("{error:#}"),
+                        );
+                        return Err(error).context("failed to parse codex websocket event");
+                    }
+                };
                 match value.get("type").and_then(Value::as_str) {
                     Some("response.completed") => {
                         let mut response = value
@@ -426,14 +479,35 @@ fn send_response_create(
                             .cloned()
                             .ok_or_else(|| anyhow!("codex websocket completed without response"))?;
                         merge_streamed_response_output(&mut response, accumulator);
-                        return Ok(response);
+                        let usage = crate::llm::parse_usage(&response);
+                        let response_id = response_id_from_value(&response);
+                        log_upstream_api_request_completed(
+                            &api_request_id,
+                            upstream,
+                            "codex_subscription_responses_websocket",
+                            200,
+                            started.elapsed().as_millis() as u64,
+                            "{}",
+                            &response,
+                            &usage,
+                            response_id.as_deref(),
+                        );
+                        return Ok((response, api_request_id));
                     }
                     Some("response.failed") | Some("error") => {
-                        return Err(anyhow!(
-                            "codex websocket request failed: {}",
-                            crate::llm::upstream_error_from_value(&value)
-                                .unwrap_or_else(|| value.to_string())
-                        ));
+                        let error_message = crate::llm::upstream_error_from_value(&value)
+                            .unwrap_or_else(|| value.to_string());
+                        log_upstream_api_request_failed(
+                            &api_request_id,
+                            upstream,
+                            "codex_subscription_responses_websocket",
+                            None,
+                            started.elapsed().as_millis() as u64,
+                            "{}",
+                            Some(&value),
+                            &error_message,
+                        );
+                        return Err(anyhow!("codex websocket request failed: {}", error_message));
                     }
                     Some("response.output_item.done") => {
                         accumulator.record_output_item_done(&value);
@@ -450,12 +524,23 @@ fn send_response_create(
                     .context("failed to send codex websocket pong")?;
             }
             Message::Close(frame) => {
-                return Err(anyhow!(
+                let error = format!(
                     "codex websocket closed before response.completed: {}",
                     frame
                         .map(|value| value.reason.to_string())
                         .unwrap_or_else(|| "connection closed".to_string())
-                ));
+                );
+                log_upstream_api_request_failed(
+                    &api_request_id,
+                    upstream,
+                    "codex_subscription_responses_websocket",
+                    None,
+                    started.elapsed().as_millis() as u64,
+                    "{}",
+                    None,
+                    &error,
+                );
+                return Err(anyhow!("{error}"));
             }
             _ => {}
         }
