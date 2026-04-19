@@ -28,7 +28,7 @@ use crate::cron::{
 };
 use crate::domain::{
     AttachmentKind, ChannelAddress, MessageRole, OutgoingAttachment, OutgoingMessage,
-    ProcessingState, ShowOption, StoredAttachment,
+    ProcessingState, ShowOption, StoredAttachment, UsageChart, UsageChartDay,
 };
 use crate::prompt::{
     AgentPromptKind, AgentSystemPromptState, build_agent_system_prompt_state,
@@ -1266,7 +1266,19 @@ impl AgentRuntimeView {
                             "failed to persist compaction artifacts from runtime event"
                         );
                     }
-                    log_agent_frame_event(agent_id, &event_session, kind, &event_model_key, &event);
+                    let event_model_id = self
+                        .models
+                        .get(&event_model_key)
+                        .map(|model| model.model.as_str())
+                        .unwrap_or(event_model_key.as_str());
+                    log_agent_frame_event(
+                        agent_id,
+                        &event_session,
+                        kind,
+                        &event_model_key,
+                        event_model_id,
+                        &event,
+                    );
                 }
                 DriverEvent::Progress(progress) => {
                     if matches!(kind, AgentPromptKind::MainForeground) {
@@ -1447,7 +1459,19 @@ impl AgentRuntimeView {
                             "failed to persist compaction artifacts from runtime event"
                         );
                     }
-                    log_agent_frame_event(agent_id, &event_session, kind, &event_model_key, &event)
+                    let event_model_id = self
+                        .models
+                        .get(&event_model_key)
+                        .map(|model| model.model.as_str())
+                        .unwrap_or(event_model_key.as_str());
+                    log_agent_frame_event(
+                        agent_id,
+                        &event_session,
+                        kind,
+                        &event_model_key,
+                        event_model_id,
+                        &event,
+                    )
                 }
                 DriverEvent::Completed(result) => {
                     let state = match result {
@@ -2539,11 +2563,11 @@ impl Server {
         lines.join("\n")
     }
 
-    fn status_text_for_session(
+    async fn status_message_for_session(
         &self,
         session: &SessionSnapshot,
         model_key: &str,
-    ) -> Result<String> {
+    ) -> Result<OutgoingMessage> {
         let model = self.model_config_or_main(model_key)?;
         let effective_api_timeout = session
             .api_timeout_override_seconds
@@ -2576,13 +2600,17 @@ impl Server {
             });
         let context_compaction_enabled =
             self.effective_context_compaction_enabled(&session.address)?;
-        let conversation_usage_24h = collect_conversation_usage_window(
-            &self.workdir,
-            &session.address,
-            Utc::now(),
-            chrono::Duration::hours(24),
+        let conversation_usage_report =
+            collect_conversation_usage_report(&self.workdir, &session.address, Utc::now(), 6);
+        let (pricing_by_model, pricing_fetch_errors) = self
+            .resolve_pricing_for_usage_report(&conversation_usage_report)
+            .await;
+        let conversation_pricing = price_conversation_usage_report(
+            &conversation_usage_report,
+            &pricing_by_model,
+            pricing_fetch_errors,
         );
-        Ok(format_session_status(
+        let status_text = format_session_status(
             &self.main_agent.language,
             model_key,
             model,
@@ -2593,8 +2621,125 @@ impl Server {
             current_context_limit,
             current_reasoning_effort.as_deref(),
             context_compaction_enabled,
-            &conversation_usage_24h,
-        ))
+            &conversation_usage_report,
+            &conversation_pricing,
+        );
+        let usage_chart = build_status_usage_chart(
+            &self.main_agent.language,
+            &conversation_usage_report,
+            &conversation_pricing,
+        );
+        Ok(OutgoingMessage {
+            text: Some(status_text),
+            images: Vec::new(),
+            attachments: Vec::new(),
+            options: None,
+            usage_chart: Some(usage_chart),
+        })
+    }
+
+    async fn resolve_pricing_for_usage_report(
+        &self,
+        report: &ConversationUsageReport,
+    ) -> (HashMap<String, ModelPricing>, Vec<String>) {
+        let model_ids = report.model_usages.keys().cloned().collect::<HashSet<_>>();
+        let mut pricing_by_model = HashMap::new();
+        let canonical_by_logged_model = model_ids
+            .iter()
+            .map(|logged_model| {
+                let canonical = self
+                    .models
+                    .get(logged_model)
+                    .map(|model| model.model.clone())
+                    .unwrap_or_else(|| logged_model.clone());
+                (logged_model.clone(), canonical)
+            })
+            .collect::<HashMap<_, _>>();
+        let openrouter_candidates = canonical_by_logged_model
+            .values()
+            .filter(|model| model.contains('/'))
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut pricing_fetch_errors = Vec::new();
+        let mut fetched_pricing = HashMap::new();
+        if !openrouter_candidates.is_empty() {
+            match self
+                .fetch_openrouter_pricing_for_models(&openrouter_candidates)
+                .await
+            {
+                Ok(fetched) => {
+                    fetched_pricing = fetched;
+                }
+                Err(error) => {
+                    pricing_fetch_errors
+                        .push(format!("OpenRouter pricing lookup failed: {error:#}"));
+                }
+            }
+        }
+        for (logged_model, canonical_model) in &canonical_by_logged_model {
+            if let Some(pricing) = fetched_pricing.get(canonical_model) {
+                pricing_by_model.insert(logged_model.clone(), pricing.clone());
+                continue;
+            }
+            if let Some(mut pricing) = model_pricing_by_id(canonical_model) {
+                if logged_model != canonical_model {
+                    pricing.source = format!("{} via model_key:{logged_model}", pricing.source);
+                }
+                pricing_by_model.insert(logged_model.clone(), pricing);
+                continue;
+            }
+            if let Some(pricing) = model_pricing_by_id(logged_model) {
+                pricing_by_model.insert(logged_model.clone(), pricing);
+            }
+        }
+        merge_builtin_pricing(model_ids, &mut pricing_by_model);
+        (pricing_by_model, pricing_fetch_errors)
+    }
+
+    async fn fetch_openrouter_pricing_for_models(
+        &self,
+        model_ids: &HashSet<String>,
+    ) -> Result<HashMap<String, ModelPricing>> {
+        let response = reqwest::Client::new()
+            .get("https://openrouter.ai/api/v1/models")
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+            .context("failed to fetch OpenRouter model catalog")?
+            .error_for_status()
+            .context("OpenRouter model catalog returned an error status")?;
+        let value = response
+            .json::<Value>()
+            .await
+            .context("failed to parse OpenRouter model catalog")?;
+        let mut pricing = HashMap::new();
+        let Some(data) = value.get("data").and_then(Value::as_array) else {
+            return Ok(pricing);
+        };
+        for item in data {
+            let Some(model_id) = item.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !model_ids.contains(model_id) {
+                continue;
+            }
+            let Some(price) = item.get("pricing") else {
+                continue;
+            };
+            let Some(prompt) = json_number_or_string(price.get("prompt")) else {
+                continue;
+            };
+            let Some(completion) = json_number_or_string(price.get("completion")) else {
+                continue;
+            };
+            let cache_read = json_number_or_string(price.get("input_cache_read"));
+            let cache_write = json_number_or_string(price.get("input_cache_write"));
+            pricing.insert(
+                model_id.to_string(),
+                model_pricing_from_openrouter(prompt, completion, cache_read, cache_write),
+            );
+        }
+        Ok(pricing)
     }
 
     fn archive_stale_workspaces_if_needed(&self) -> Result<()> {
@@ -3023,6 +3168,51 @@ impl Server {
     }
 }
 
+fn build_status_usage_chart(
+    language: &str,
+    report: &ConversationUsageReport,
+    pricing: &ConversationPricingBreakdown,
+) -> UsageChart {
+    let title = if language.to_ascii_lowercase().starts_with("zh") {
+        format!(
+            "Conversation estimated spend, last {} days",
+            report.days.len()
+        )
+    } else {
+        format!(
+            "Conversation estimated spend, last {} days",
+            report.days.len()
+        )
+    };
+    UsageChart {
+        title,
+        y_label: "USD".to_string(),
+        days: report
+            .days
+            .iter()
+            .map(|day| UsageChartDay {
+                label: day.date.format("%m-%d").to_string(),
+                total_usd: pricing
+                    .daily_costs
+                    .get(&day.date)
+                    .copied()
+                    .unwrap_or_default(),
+                input_tokens: day.usage.input_total_tokens(),
+                output_tokens: day.usage.output_total_tokens(),
+                llm_calls: day.usage.llm_calls,
+            })
+            .collect(),
+    }
+}
+
+fn json_number_or_string(value: Option<&Value>) -> Option<f64> {
+    match value? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
 fn channel_restart_backoff_seconds(consecutive_failures: u32) -> u64 {
     let exponent = consecutive_failures.saturating_sub(1).min(5);
     2_u64
@@ -3076,24 +3266,26 @@ fn spawn_channel_supervisor(channel: Arc<dyn Channel>, sender: mpsc::Sender<Inco
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentCommand, AgentPromptKind, ConversationUsageWindow, ImageGenerationRouting,
-        IncomingCommandLane, RuntimeContext, SYSTEM_RESTART_NOTICE, Server, SummaryTracker,
-        TokenUsage, background_timeout_with_active_children_text, build_synthetic_system_messages,
+        AgentCommand, AgentPromptKind, ConversationPricingBreakdown, ConversationUsageReport,
+        ImageGenerationRouting, IncomingCommandLane, ModelPricing, RuntimeContext,
+        SYSTEM_RESTART_NOTICE, Server, SummaryTracker, TokenUsage,
+        background_timeout_with_active_children_text, build_synthetic_system_messages,
         build_user_turn_message, channel_restart_backoff_seconds,
-        coalesce_buffered_conversation_messages, collect_conversation_usage_window,
-        conversation_memory_root, estimate_compaction_savings_usd, estimate_cost_usd,
-        extract_attachment_references, fast_path_agent_selection_message, format_session_status,
-        idle_compaction_token_limit, incoming_command_lane, infer_single_agent_backend,
-        is_command_like_text, is_out_of_band_command, is_timeout_like, leading_system_prompt,
-        memory_search_files, normalize_messages_for_persistence,
-        openrouter_automatic_cache_control, openrouter_automatic_cache_ttl, parse_agent_command,
-        parse_model_command, parse_sandbox_command, parse_set_api_timeout_command,
-        parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
-        parse_think_command, persist_compaction_artifacts, prepare_system_prompt_for_turn,
-        rebuild_canonical_system_prompt, render_last_user_message_time_tip,
-        render_system_date_on_user_message, rollout_read_file, rollout_search_files,
-        sanitize_messages_for_model_capabilities, select_image_generation_routing,
-        send_outgoing_message_now, session_errno_for_turn_error,
+        coalesce_buffered_conversation_messages, collect_conversation_usage_report,
+        collect_conversation_usage_window, conversation_memory_root,
+        estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
+        fast_path_agent_selection_message, format_session_status, idle_compaction_token_limit,
+        incoming_command_lane, infer_single_agent_backend, is_command_like_text,
+        is_out_of_band_command, is_timeout_like, leading_system_prompt, memory_search_files,
+        normalize_messages_for_persistence, openrouter_automatic_cache_control,
+        openrouter_automatic_cache_ttl, parse_agent_command, parse_model_command,
+        parse_sandbox_command, parse_set_api_timeout_command, parse_snap_list_command,
+        parse_snap_load_command, parse_snap_save_command, parse_think_command,
+        persist_compaction_artifacts, prepare_system_prompt_for_turn,
+        price_conversation_usage_report, rebuild_canonical_system_prompt,
+        render_last_user_message_time_tip, render_system_date_on_user_message, rollout_read_file,
+        rollout_search_files, sanitize_messages_for_model_capabilities,
+        select_image_generation_routing, send_outgoing_message_now, session_errno_for_turn_error,
         should_attempt_idle_context_compaction, summarize_resume_progress,
         sync_workspace_shared_profile_files, upload_workspace_shared_profile_files,
         user_facing_continue_error_text, workspace_visible_in_list,
@@ -4741,7 +4933,8 @@ mod tests {
             115_200,
             None,
             true,
-            &ConversationUsageWindow::default(),
+            &ConversationUsageReport::default(),
+            &ConversationPricingBreakdown::default(),
         );
 
         assert!(
@@ -4868,6 +5061,146 @@ mod tests {
         assert_eq!(usage.usage.cache_read_input_tokens(), 40);
         assert_eq!(usage.usage.cache_write_input_tokens(), 5);
         assert_eq!(usage.usage.normal_billed_input_tokens(), 255);
+    }
+
+    #[test]
+    fn conversation_usage_report_prices_per_model_and_marks_unknown_models() {
+        let temp_dir = TempDir::new().unwrap();
+        let workdir = temp_dir.path();
+        let sessions_dir = workdir.join("sessions");
+        let logs_dir = workdir.join("logs").join("agents");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        fs::create_dir_all(&logs_dir).unwrap();
+        let address = ChannelAddress {
+            channel_id: "telegram-main".to_string(),
+            conversation_id: "-100".to_string(),
+            user_id: Some("user-a".to_string()),
+            display_name: None,
+        };
+        let session_id = Uuid::new_v4();
+        let root = sessions_dir.join(session_id.to_string());
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join("session.json"),
+            serde_json::to_vec(&json!({
+                "id": session_id,
+                "address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "-100",
+                    "user_id": "user-a",
+                    "display_name": null
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let now = Utc::now();
+        let recent = now.timestamp_millis();
+        let log_path = logs_dir.join("agent.jsonl");
+        let lines = [
+            json!({
+                "kind": "turn_token_usage",
+                "ts": recent,
+                "channel_id": "telegram-main",
+                "session_id": session_id,
+                "llm_calls": 3,
+                "input_total_tokens": 350,
+                "output_total_tokens": 35,
+                "context_total_tokens": 385,
+                "cache_read_input_tokens": 40,
+                "cache_write_input_tokens": 5,
+                "cache_uncached_input_tokens": 310
+            }),
+            json!({
+                "kind": "agent_frame_model_call_completed",
+                "ts": recent,
+                "channel_id": "telegram-main",
+                "session_id": session_id,
+                "model": "z-ai/glm-5.1:nitro",
+                "input_total_tokens": 100,
+                "output_total_tokens": 10,
+                "context_total_tokens": 110,
+                "cache_read_input_tokens": 40,
+                "cache_write_input_tokens": 5,
+                "cache_uncached_input_tokens": 60
+            }),
+            json!({
+                "kind": "agent_frame_model_call_completed",
+                "ts": recent,
+                "channel_id": "telegram-main",
+                "session_id": session_id,
+                "model": "anthropic/claude-opus-4.6",
+                "prompt_tokens": 50,
+                "completion_tokens": 5,
+                "total_tokens": 55
+            }),
+            json!({
+                "kind": "agent_frame_model_call_completed",
+                "ts": recent,
+                "channel_id": "telegram-main",
+                "session_id": session_id,
+                "model": "custom/unknown",
+                "input_total_tokens": 200,
+                "output_total_tokens": 20,
+                "context_total_tokens": 220,
+                "cache_read_input_tokens": 0,
+                "cache_write_input_tokens": 0,
+                "cache_uncached_input_tokens": 200
+            }),
+        ]
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(log_path, lines).unwrap();
+
+        let report = collect_conversation_usage_report(workdir, &address, now, 6);
+        let mut pricing = HashMap::new();
+        pricing.insert(
+            "z-ai/glm-5.1:nitro".to_string(),
+            ModelPricing {
+                input_per_million: 1.0,
+                output_per_million: 3.20,
+                cache_read_per_million: None,
+                cache_write_per_million: None,
+                source: "test".to_string(),
+            },
+        );
+        pricing.insert(
+            "anthropic/claude-opus-4.6".to_string(),
+            ModelPricing {
+                input_per_million: 15.0,
+                output_per_million: 75.0,
+                cache_read_per_million: None,
+                cache_write_per_million: None,
+                source: "test".to_string(),
+            },
+        );
+        let priced = price_conversation_usage_report(&report, &pricing, Vec::new());
+        assert_eq!(report.days.len(), 6);
+        assert_eq!(report.total.usage.input_total_tokens(), 350);
+        assert_eq!(report.model_call_event_count, 3);
+        assert!(
+            priced
+                .correctly_priced_models
+                .iter()
+                .any(|model| model.model == "z-ai/glm-5.1:nitro")
+        );
+        assert!(
+            priced
+                .risky_priced_models
+                .iter()
+                .any(|model| model.model == "anthropic/claude-opus-4.6")
+        );
+        assert!(
+            priced
+                .unknown_priced_models
+                .iter()
+                .any(|model| model.model == "custom/unknown")
+        );
+        assert!(priced.total_usd > 0.0);
+        assert!(priced.daily_costs.values().any(|cost| *cost > 0.0));
     }
 
     #[tokio::test]

@@ -5,7 +5,7 @@ use crate::channel::{
 use crate::config::{BotCommandConfig, TelegramChannelConfig, default_telegram_commands};
 use crate::domain::{
     AttachmentKind, ChannelAddress, OutgoingAttachment, OutgoingMessage, ProcessingState,
-    ShowOptions,
+    ShowOptions, UsageChart,
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -15,10 +15,13 @@ use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command as TokioCommand;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{info, warn};
 
@@ -784,6 +787,126 @@ impl TelegramChannel {
         Ok(())
     }
 
+    async fn render_usage_chart_image(&self, chart: &UsageChart) -> Result<PathBuf> {
+        self.ensure_matplotlib_available().await?;
+        let output_dir = std::env::temp_dir().join("clawparty-usage-charts");
+        fs::create_dir_all(&output_dir)
+            .await
+            .with_context(|| format!("failed to create {}", output_dir.display()))?;
+        let output_path = output_dir.join(format!("usage-{}.png", uuid::Uuid::new_v4()));
+        let payload = serde_json::to_vec(chart).context("failed to serialize usage chart")?;
+        let script = r##"
+import json
+import sys
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+output_path = sys.argv[1]
+chart = json.loads(sys.stdin.read())
+days = chart.get("days", [])
+labels = [str(day.get("label", "")) for day in days]
+costs = [float(day.get("total_usd", 0.0) or 0.0) for day in days]
+tokens = [int(day.get("input_tokens", 0) or 0) + int(day.get("output_tokens", 0) or 0) for day in days]
+
+fig, ax_cost = plt.subplots(figsize=(9, 4.8), dpi=160)
+bars = ax_cost.bar(labels, costs, color="#2563eb", label="Estimated cost")
+ax_cost.set_title(chart.get("title", "Conversation usage"))
+ax_cost.set_ylabel(chart.get("y_label", "USD"))
+ax_cost.grid(axis="y", linestyle="--", linewidth=0.6, alpha=0.35)
+for bar, cost in zip(bars, costs):
+    ax_cost.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"${cost:.4f}", ha="center", va="bottom", fontsize=8)
+
+ax_tokens = ax_cost.twinx()
+ax_tokens.plot(labels, tokens, color="#16a34a", marker="o", linewidth=2, label="Tokens")
+ax_tokens.set_ylabel("Input + output tokens")
+
+lines_1, labels_1 = ax_cost.get_legend_handles_labels()
+lines_2, labels_2 = ax_tokens.get_legend_handles_labels()
+ax_cost.legend(lines_1 + lines_2, labels_1 + labels_2, loc="upper left")
+fig.autofmt_xdate(rotation=0)
+fig.tight_layout()
+fig.savefig(output_path, format="png")
+"##;
+        let mut child = TokioCommand::new("python3")
+            .arg("-c")
+            .arg(script)
+            .arg(&output_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to start python3 for usage chart rendering")?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .context("failed to open python3 stdin for usage chart rendering")?;
+        stdin
+            .write_all(&payload)
+            .await
+            .context("failed to write usage chart payload to python3")?;
+        drop(stdin);
+        let output = tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+            .await
+            .context("usage chart rendering timed out")?
+            .context("failed to wait for usage chart renderer")?;
+        if !output.status.success() {
+            return Err(anyhow!(
+                "usage chart renderer failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        Ok(output_path)
+    }
+
+    async fn ensure_matplotlib_available(&self) -> Result<()> {
+        if self
+            .run_python_command(&["-c", "import matplotlib"], Duration::from_secs(10))
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        warn!(
+            log_stream = "channel",
+            log_key = %self.id,
+            kind = "telegram_usage_chart_matplotlib_missing",
+            "matplotlib is not available; attempting user-level installation"
+        );
+        self.run_python_command(
+            &["-m", "pip", "install", "--user", "matplotlib"],
+            Duration::from_secs(180),
+        )
+        .await
+        .context("failed to install matplotlib for Telegram usage chart rendering")?;
+        self.run_python_command(&["-c", "import matplotlib"], Duration::from_secs(10))
+            .await
+            .context("matplotlib is still unavailable after installation")
+    }
+
+    async fn run_python_command(&self, args: &[&str], timeout: Duration) -> Result<()> {
+        let output = tokio::time::timeout(
+            timeout,
+            TokioCommand::new("python3")
+                .args(args)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .output(),
+        )
+        .await
+        .context("python3 command timed out")?
+        .context("failed to run python3 command")?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "python3 command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            ))
+        }
+    }
+
     async fn send_photo_group(
         &self,
         chat_id: &str,
@@ -994,16 +1117,41 @@ impl TelegramChannel {
         message: OutgoingMessage,
     ) -> Result<()> {
         let OutgoingMessage {
-            text,
-            images,
+            mut text,
+            mut images,
             attachments,
             options,
+            usage_chart,
         } = message;
+        let mut generated_chart_path = None;
+        if let Some(chart) = usage_chart {
+            match self.render_usage_chart_image(&chart).await {
+                Ok(path) => {
+                    generated_chart_path = Some(path.clone());
+                    images.insert(
+                        0,
+                        OutgoingAttachment {
+                            kind: AttachmentKind::Image,
+                            path,
+                            caption: text.take(),
+                        },
+                    );
+                }
+                Err(error) => {
+                    let fallback_note = format!(
+                        "\n\nUsage chart rendering failed, falling back to text only: {error:#}"
+                    );
+                    text = Some(match text.take() {
+                        Some(existing) if !existing.is_empty() => existing + &fallback_note,
+                        _ => fallback_note.trim().to_string(),
+                    });
+                }
+            }
+        }
         if images.len() >= 2 {
             self.send_media_group_with_caption(address, images, text)
                 .await?;
         } else {
-            let mut images = images;
             let has_images = !images.is_empty();
             if let Some(text) = text.as_deref()
                 && has_images
@@ -1026,6 +1174,18 @@ impl TelegramChannel {
         for attachment in attachments {
             self.send_document(&address.conversation_id, attachment)
                 .await?;
+        }
+        if let Some(path) = generated_chart_path
+            && let Err(error) = fs::remove_file(&path).await
+        {
+            warn!(
+                log_stream = "channel",
+                log_key = %self.id,
+                kind = "telegram_usage_chart_cleanup_failed",
+                path = %path.display(),
+                error = %format!("{error:#}"),
+                "failed to remove temporary usage chart"
+            );
         }
 
         Ok(())
@@ -1260,6 +1420,7 @@ impl Channel for TelegramChannel {
             images,
             attachments,
             options,
+            usage_chart,
         } = message;
         info!(
             log_stream = "channel",
@@ -1271,6 +1432,7 @@ impl Channel for TelegramChannel {
             image_count = images.len() as u64,
             attachment_count = attachments.len() as u64,
             has_options = options.is_some(),
+            has_usage_chart = usage_chart.is_some(),
             attachment_names = ?attachments
                 .iter()
                 .filter_map(|item| item.path.file_name().map(|name| name.to_string_lossy().to_string()))
@@ -1305,6 +1467,7 @@ impl Channel for TelegramChannel {
                     images,
                     attachments,
                     options,
+                    usage_chart,
                 },
             )
             .await

@@ -510,9 +510,11 @@ pub(super) fn format_session_status(
     current_context_limit: usize,
     current_reasoning_effort: Option<&str>,
     context_compaction_enabled: bool,
-    conversation_usage_24h: &ConversationUsageWindow,
+    conversation_usage_report: &ConversationUsageReport,
+    conversation_pricing: &ConversationPricingBreakdown,
 ) -> String {
-    let usage = &conversation_usage_24h.usage;
+    let conversation_usage = &conversation_usage_report.total;
+    let usage = &conversation_usage.usage;
     let legacy_usage = &session.cumulative_usage;
     let compaction = &session.cumulative_compaction;
     let cache_read_rate = if usage.input_total_tokens() == 0 {
@@ -568,10 +570,18 @@ pub(super) fn format_session_status(
                 context_source_label.as_str()
             ),
             String::new(),
-            "最近 24 小时 Conversation 总用量（所有 Agent）：".to_string(),
-            "- source: agent turn usage logs; legacy session cumulative_usage is not used for this 24h total".to_string(),
-            format!("- sessions: {}", conversation_usage_24h.session_count),
-            format!("- usage_events: {}", conversation_usage_24h.event_count),
+            format!(
+                "最近 {} 天 Conversation 总用量（所有 Agent）：",
+                conversation_usage_report.days.len()
+            ),
+            "- source: token totals use agent turn usage logs; model costs use per-model model-call logs".to_string(),
+            format!("- 当前已消费金额: ${:.6}", conversation_pricing.total_usd),
+            format!("- sessions: {}", conversation_usage.session_count),
+            format!("- usage_events: {}", conversation_usage.event_count),
+            format!(
+                "- model_call_events: {}",
+                conversation_usage_report.model_call_event_count
+            ),
             format!("- llm_calls: {}", usage.llm_calls),
             format!("- input_total_tokens: {}", usage.input_total_tokens()),
             format!("- output_total_tokens: {}", usage.output_total_tokens()),
@@ -594,10 +604,33 @@ pub(super) fn format_session_status(
             ),
             format!("- cache_read_rate: {:.2}%", cache_read_rate),
         ];
-        if conversation_usage_24h.missing_cache_breakdown_events > 0 {
+        if conversation_usage.missing_cache_breakdown_events > 0 {
             lines.push(format!(
                 "- cache_breakdown_note: {} old events did not include cache fields, so token totals are correct but billed-cache split is best-effort.",
-                conversation_usage_24h.missing_cache_breakdown_events
+                conversation_usage.missing_cache_breakdown_events
+            ));
+        }
+        lines.push(String::new());
+        lines.push("金额计算模型分类：".to_string());
+        append_model_cost_lines(
+            &mut lines,
+            "正确计算的模型",
+            &conversation_pricing.correctly_priced_models,
+        );
+        append_model_cost_lines(
+            &mut lines,
+            "错误计算风险模型（已用 best-effort）",
+            &conversation_pricing.risky_priced_models,
+        );
+        append_model_cost_lines(
+            &mut lines,
+            "未知模型（已按 GLM 5.1 默认价格估算）",
+            &conversation_pricing.unknown_priced_models,
+        );
+        if !conversation_pricing.pricing_fetch_errors.is_empty() {
+            lines.push(format!(
+                "- pricing_fetch_errors: {}",
+                conversation_pricing.pricing_fetch_errors.join(" | ")
             ));
         }
         lines.push(String::new());
@@ -630,7 +663,7 @@ pub(super) fn format_session_status(
         ));
         lines.push(format!("- cache_read_rate: {:.2}%", legacy_cache_read_rate));
         lines.push(String::new());
-        lines.push("价格估算：最近 24 小时 Conversation 总用量目前按日志 token 精确统计，但不再用当前模型价格粗估总价；历史多模型、多 Agent 和旧日志 cache 字段缺失会让这种粗估误导。".to_string());
+        lines.push("价格估算：总 token 使用 turn 日志避免历史 cumulative_usage 污染；金额按带 model 字段的 model-call 日志分模型计算，未知模型会明确列出并按 GLM 5.1 默认价格估算。".to_string());
         lines.push(String::new());
         lines.push("累计上下文压缩统计：".to_string());
         lines.push(format!("- compaction_runs: {}", compaction.run_count));
@@ -703,10 +736,18 @@ pub(super) fn format_session_status(
                 context_source_label.as_str()
             ),
             String::new(),
-            "Last 24h conversation usage (all agents):".to_string(),
-            "- source: agent turn usage logs; legacy session cumulative_usage is not used for this 24h total".to_string(),
-            format!("- sessions: {}", conversation_usage_24h.session_count),
-            format!("- usage_events: {}", conversation_usage_24h.event_count),
+            format!(
+                "Last {} days conversation usage (all agents):",
+                conversation_usage_report.days.len()
+            ),
+            "- source: token totals use agent turn usage logs; model costs use per-model model-call logs".to_string(),
+            format!("- current_spend_usd: ${:.6}", conversation_pricing.total_usd),
+            format!("- sessions: {}", conversation_usage.session_count),
+            format!("- usage_events: {}", conversation_usage.event_count),
+            format!(
+                "- model_call_events: {}",
+                conversation_usage_report.model_call_event_count
+            ),
             format!("- llm_calls: {}", usage.llm_calls),
             format!("- input_total_tokens: {}", usage.input_total_tokens()),
             format!("- output_total_tokens: {}", usage.output_total_tokens()),
@@ -729,10 +770,33 @@ pub(super) fn format_session_status(
             ),
             format!("- cache_read_rate: {:.2}%", cache_read_rate),
         ];
-        if conversation_usage_24h.missing_cache_breakdown_events > 0 {
+        if conversation_usage.missing_cache_breakdown_events > 0 {
             lines.push(format!(
                 "- cache_breakdown_note: {} old events did not include cache fields, so token totals are correct but billed-cache split is best-effort.",
-                conversation_usage_24h.missing_cache_breakdown_events
+                conversation_usage.missing_cache_breakdown_events
+            ));
+        }
+        lines.push(String::new());
+        lines.push("Model pricing classification:".to_string());
+        append_model_cost_lines(
+            &mut lines,
+            "Correctly priced models",
+            &conversation_pricing.correctly_priced_models,
+        );
+        append_model_cost_lines(
+            &mut lines,
+            "Risky/best-effort models",
+            &conversation_pricing.risky_priced_models,
+        );
+        append_model_cost_lines(
+            &mut lines,
+            "Unknown models (GLM 5.1 fallback used)",
+            &conversation_pricing.unknown_priced_models,
+        );
+        if !conversation_pricing.pricing_fetch_errors.is_empty() {
+            lines.push(format!(
+                "- pricing_fetch_errors: {}",
+                conversation_pricing.pricing_fetch_errors.join(" | ")
             ));
         }
         lines.push(String::new());
@@ -765,7 +829,7 @@ pub(super) fn format_session_status(
         ));
         lines.push(format!("- cache_read_rate: {:.2}%", legacy_cache_read_rate));
         lines.push(String::new());
-        lines.push("Estimated cost: disabled for the 24h conversation total because using the current model price for mixed historical models, subagents, and old cache logs would be misleading.".to_string());
+        lines.push("Estimated cost: token totals avoid legacy cumulative_usage pollution; spend is priced per model-call log, and unknown models are explicitly listed with the GLM 5.1 fallback price.".to_string());
         lines.push(String::new());
         lines.push("Cumulative context compaction stats:".to_string());
         lines.push(format!("- compaction_runs: {}", compaction.run_count));
@@ -807,6 +871,30 @@ pub(super) fn format_session_status(
     }
 }
 
+fn append_model_cost_lines(lines: &mut Vec<String>, label: &str, models: &[ModelCostSummary]) {
+    if models.is_empty() {
+        lines.push(format!("- {}: none", label));
+        return;
+    }
+    let rendered = models
+        .iter()
+        .map(|model| {
+            format!(
+                "{} ${:.6} (input={}, output={}, calls={}, source={}, note={})",
+                model.model,
+                model.total_usd,
+                model.input_tokens,
+                model.output_tokens,
+                model.event_count,
+                model.pricing_source,
+                model.note
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    lines.push(format!("- {}: {}", label, rendered));
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct ConversationUsageWindow {
     pub usage: TokenUsage,
@@ -815,6 +903,291 @@ pub(super) struct ConversationUsageWindow {
     pub missing_cache_breakdown_events: u64,
 }
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct ConversationUsageReport {
+    pub days: Vec<ConversationDailyUsage>,
+    pub total: ConversationUsageWindow,
+    pub model_usages: BTreeMap<String, ConversationModelUsage>,
+    pub model_call_event_count: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ConversationDailyUsage {
+    pub date: chrono::NaiveDate,
+    pub usage: TokenUsage,
+    pub event_count: u64,
+    pub missing_cache_breakdown_events: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ConversationModelUsage {
+    pub usage: TokenUsage,
+    pub daily_usage: BTreeMap<chrono::NaiveDate, TokenUsage>,
+    pub event_count: u64,
+    pub missing_cache_breakdown_events: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct ConversationPricingBreakdown {
+    pub total_usd: f64,
+    pub daily_costs: BTreeMap<chrono::NaiveDate, f64>,
+    pub correctly_priced_models: Vec<ModelCostSummary>,
+    pub risky_priced_models: Vec<ModelCostSummary>,
+    pub unknown_priced_models: Vec<ModelCostSummary>,
+    pub pricing_fetch_errors: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ModelCostSummary {
+    pub model: String,
+    pub total_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub event_count: u64,
+    pub pricing_source: String,
+    pub note: String,
+}
+
+pub(super) fn collect_conversation_usage_report(
+    workdir: &Path,
+    address: &ChannelAddress,
+    now: chrono::DateTime<Utc>,
+    day_count: usize,
+) -> ConversationUsageReport {
+    let day_count = day_count.max(1);
+    let session_ids = conversation_session_ids_from_workdir(workdir, address);
+    let today = now.with_timezone(&chrono_tz::Asia::Shanghai).date_naive();
+    let first_day = today
+        .checked_sub_days(chrono::Days::new(day_count.saturating_sub(1) as u64))
+        .unwrap_or(today);
+    let days = (0..day_count)
+        .filter_map(|offset| first_day.checked_add_days(chrono::Days::new(offset as u64)))
+        .map(|date| ConversationDailyUsage {
+            date,
+            usage: TokenUsage::default(),
+            event_count: 0,
+            missing_cache_breakdown_events: 0,
+        })
+        .collect::<Vec<_>>();
+    let mut report = ConversationUsageReport {
+        total: ConversationUsageWindow {
+            session_count: session_ids.len(),
+            ..ConversationUsageWindow::default()
+        },
+        days,
+        ..ConversationUsageReport::default()
+    };
+    if session_ids.is_empty() {
+        return report;
+    }
+    let Some(start_local) = first_day.and_hms_opt(0, 0, 0) else {
+        return report;
+    };
+    let Some(start_ms) = start_local
+        .and_local_timezone(chrono_tz::Asia::Shanghai)
+        .single()
+        .map(|value| value.with_timezone(&Utc).timestamp_millis())
+    else {
+        return report;
+    };
+    let logs_dir = workdir.join("logs").join("agents");
+    let Ok(entries) = fs::read_dir(&logs_dir) else {
+        return report;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(file) = fs::File::open(&path) else {
+            continue;
+        };
+        let reader = std::io::BufReader::new(file);
+        for line in std::io::BufRead::lines(reader).map_while(std::result::Result::ok) {
+            let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                continue;
+            };
+            let Some(ts_ms) = event_timestamp_ms(&value) else {
+                continue;
+            };
+            if ts_ms < start_ms {
+                continue;
+            }
+            if value.get("channel_id").and_then(Value::as_str) != Some(address.channel_id.as_str())
+            {
+                continue;
+            }
+            let Some(session_id) = value.get("session_id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !session_ids.contains(session_id) {
+                continue;
+            }
+            let Some(date) = chrono::DateTime::<Utc>::from_timestamp_millis(ts_ms)
+                .map(|value| value.with_timezone(&chrono_tz::Asia::Shanghai).date_naive())
+            else {
+                continue;
+            };
+            if date < first_day || date > today {
+                continue;
+            }
+            match value.get("kind").and_then(Value::as_str) {
+                Some("turn_token_usage") => {
+                    let event_usage = token_usage_from_log_event(&value);
+                    let has_cache_breakdown = event_has_cache_breakdown(&value);
+                    if let Some(day) = report.days.iter_mut().find(|day| day.date == date) {
+                        day.usage.add_assign(&event_usage);
+                        day.event_count = day.event_count.saturating_add(1);
+                        if !has_cache_breakdown {
+                            day.missing_cache_breakdown_events =
+                                day.missing_cache_breakdown_events.saturating_add(1);
+                        }
+                    }
+                    report.total.usage.add_assign(&event_usage);
+                    report.total.event_count = report.total.event_count.saturating_add(1);
+                    if !has_cache_breakdown {
+                        report.total.missing_cache_breakdown_events = report
+                            .total
+                            .missing_cache_breakdown_events
+                            .saturating_add(1);
+                    }
+                }
+                Some("agent_frame_model_call_completed") => {
+                    let model = value
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let event_usage = token_usage_from_log_event(&value);
+                    let entry = report.model_usages.entry(model).or_default();
+                    entry.usage.add_assign(&event_usage);
+                    entry
+                        .daily_usage
+                        .entry(date)
+                        .or_insert_with(TokenUsage::default)
+                        .add_assign(&event_usage);
+                    entry.event_count = entry.event_count.saturating_add(1);
+                    if !event_has_cache_breakdown(&value) {
+                        entry.missing_cache_breakdown_events =
+                            entry.missing_cache_breakdown_events.saturating_add(1);
+                    }
+                    report.model_call_event_count = report.model_call_event_count.saturating_add(1);
+                }
+                _ => {}
+            }
+        }
+    }
+    report.days.sort_by_key(|day| day.date);
+    report
+}
+
+pub(super) fn price_conversation_usage_report(
+    report: &ConversationUsageReport,
+    pricing_by_model: &HashMap<String, ModelPricing>,
+    pricing_fetch_errors: Vec<String>,
+) -> ConversationPricingBreakdown {
+    let fallback_pricing = glm_5_1_fallback_pricing();
+    let mut breakdown = ConversationPricingBreakdown {
+        pricing_fetch_errors,
+        ..ConversationPricingBreakdown::default()
+    };
+    for day in &report.days {
+        breakdown.daily_costs.insert(day.date, 0.0);
+    }
+    for (model, usage) in &report.model_usages {
+        let (pricing, unknown_pricing) = match pricing_by_model.get(model) {
+            Some(pricing) => (pricing.clone(), false),
+            None => (fallback_pricing.clone(), true),
+        };
+        let total_usd = cost_usd_for_usage(&pricing, &usage.usage);
+        breakdown.total_usd += total_usd;
+        for (date, daily_usage) in &usage.daily_usage {
+            *breakdown.daily_costs.entry(*date).or_insert(0.0) +=
+                cost_usd_for_usage(&pricing, daily_usage);
+        }
+        let summary = ModelCostSummary {
+            model: model.clone(),
+            total_usd,
+            input_tokens: usage.usage.input_total_tokens(),
+            output_tokens: usage.usage.output_total_tokens(),
+            event_count: usage.event_count,
+            pricing_source: pricing.source.clone(),
+            note: if unknown_pricing {
+                "pricing unknown; GLM 5.1 fallback pricing used".to_string()
+            } else if usage.missing_cache_breakdown_events > 0 {
+                format!(
+                    "{} model-call events missed cache fields; cost is best-effort",
+                    usage.missing_cache_breakdown_events
+                )
+            } else {
+                "priced from per-model model-call logs".to_string()
+            },
+        };
+        if unknown_pricing {
+            breakdown.unknown_priced_models.push(summary);
+        } else if usage.missing_cache_breakdown_events > 0 {
+            breakdown.risky_priced_models.push(summary);
+        } else {
+            breakdown.correctly_priced_models.push(summary);
+        }
+    }
+    let mut unattributed_usage = TokenUsage::default();
+    for day in &report.days {
+        let mut attributed = TokenUsage::default();
+        for usage in report.model_usages.values() {
+            if let Some(daily_usage) = usage.daily_usage.get(&day.date) {
+                attributed.add_assign(daily_usage);
+            }
+        }
+        let unattributed = subtract_token_usage_floor(&day.usage, &attributed);
+        if token_usage_has_billable_tokens(&unattributed) {
+            let daily_cost = cost_usd_for_usage(&fallback_pricing, &unattributed);
+            *breakdown.daily_costs.entry(day.date).or_insert(0.0) += daily_cost;
+            breakdown.total_usd += daily_cost;
+            unattributed_usage.add_assign(&unattributed);
+        }
+    }
+    if token_usage_has_billable_tokens(&unattributed_usage) {
+        breakdown.unknown_priced_models.push(ModelCostSummary {
+            model: "unattributed_turn_usage".to_string(),
+            total_usd: cost_usd_for_usage(&fallback_pricing, &unattributed_usage),
+            input_tokens: unattributed_usage.input_total_tokens(),
+            output_tokens: unattributed_usage.output_total_tokens(),
+            event_count: report.total.event_count,
+            pricing_source: fallback_pricing.source,
+            note: "turn usage had no matching per-model model-call logs; GLM 5.1 fallback pricing used".to_string(),
+        });
+    }
+    breakdown
+}
+
+fn token_usage_has_billable_tokens(usage: &TokenUsage) -> bool {
+    usage.input_total_tokens() > 0 || usage.output_total_tokens() > 0
+}
+
+fn subtract_token_usage_floor(left: &TokenUsage, right: &TokenUsage) -> TokenUsage {
+    TokenUsage {
+        llm_calls: left.llm_calls.saturating_sub(right.llm_calls),
+        prompt_tokens: left.prompt_tokens.saturating_sub(right.prompt_tokens),
+        completion_tokens: left
+            .completion_tokens
+            .saturating_sub(right.completion_tokens),
+        total_tokens: left.total_tokens.saturating_sub(right.total_tokens),
+        cache_hit_tokens: left.cache_hit_tokens.saturating_sub(right.cache_hit_tokens),
+        cache_miss_tokens: left
+            .cache_miss_tokens
+            .saturating_sub(right.cache_miss_tokens),
+        cache_read_tokens: left
+            .cache_read_tokens
+            .saturating_sub(right.cache_read_tokens),
+        cache_write_tokens: left
+            .cache_write_tokens
+            .saturating_sub(right.cache_write_tokens),
+    }
+}
+
+#[cfg(test)]
 pub(super) fn collect_conversation_usage_window(
     workdir: &Path,
     address: &ChannelAddress,
@@ -1077,29 +1450,96 @@ fn summarize_idle_compaction_error(error_summary: Option<&str>) -> String {
     normalized.chars().take(MAX_CHARS).collect::<String>() + "..."
 }
 
-struct ModelPricing {
-    input_per_million: f64,
-    output_per_million: f64,
+#[derive(Clone, Debug)]
+pub(super) struct ModelPricing {
+    pub input_per_million: f64,
+    pub output_per_million: f64,
+    pub cache_read_per_million: Option<f64>,
+    pub cache_write_per_million: Option<f64>,
+    pub source: String,
 }
 
 fn model_pricing(model: &ModelConfig) -> Option<ModelPricing> {
-    match (
-        model.api_endpoint.contains("openrouter.ai"),
-        model.model.as_str(),
-    ) {
-        (true, "anthropic/claude-opus-4.6") => Some(ModelPricing {
-            input_per_million: 15.0,
-            output_per_million: 75.0,
+    model_pricing_by_id(&model.model)
+}
+
+pub(super) fn model_pricing_by_id(model_id: &str) -> Option<ModelPricing> {
+    match (model_id, model_id.trim_end_matches(":nitro")) {
+        ("anthropic/claude-opus-4.6", _) => Some(ModelPricing {
+            input_per_million: 5.0,
+            output_per_million: 25.0,
+            cache_read_per_million: Some(0.5),
+            cache_write_per_million: Some(6.25),
+            source: "builtin".to_string(),
         }),
-        (true, "anthropic/claude-sonnet-4.6") => Some(ModelPricing {
+        ("anthropic/claude-sonnet-4.6", _) => Some(ModelPricing {
             input_per_million: 3.0,
             output_per_million: 15.0,
+            cache_read_per_million: Some(0.3),
+            cache_write_per_million: Some(3.75),
+            source: "builtin".to_string(),
         }),
-        (true, "qwen/qwen3.5-27b") => Some(ModelPricing {
+        ("qwen/qwen3.5-27b", _) => Some(ModelPricing {
             input_per_million: 0.195,
             output_per_million: 1.56,
+            cache_read_per_million: None,
+            cache_write_per_million: None,
+            source: "builtin".to_string(),
         }),
+        (_, "z-ai/glm-5.1") => Some(glm_5_1_fallback_pricing()),
         _ => None,
+    }
+}
+
+pub(super) fn glm_5_1_fallback_pricing() -> ModelPricing {
+    ModelPricing {
+        input_per_million: 0.95,
+        output_per_million: 3.15,
+        cache_read_per_million: Some(0.475),
+        cache_write_per_million: None,
+        source: "fallback_glm_5_1_openrouter".to_string(),
+    }
+}
+
+pub(super) fn cost_usd_for_usage(pricing: &ModelPricing, usage: &TokenUsage) -> f64 {
+    let cache_read_per_million = pricing
+        .cache_read_per_million
+        .unwrap_or(pricing.input_per_million * 0.1);
+    let cache_write_per_million = pricing
+        .cache_write_per_million
+        .unwrap_or(pricing.input_per_million * 1.25);
+    (usage.cache_read_input_tokens() as f64 / 1_000_000.0) * cache_read_per_million
+        + (usage.cache_write_input_tokens() as f64 / 1_000_000.0) * cache_write_per_million
+        + (usage.normal_billed_input_tokens() as f64 / 1_000_000.0) * pricing.input_per_million
+        + (usage.output_total_tokens() as f64 / 1_000_000.0) * pricing.output_per_million
+}
+
+pub(super) fn model_pricing_from_openrouter(
+    input_per_token: f64,
+    output_per_token: f64,
+    cache_read_per_token: Option<f64>,
+    cache_write_per_token: Option<f64>,
+) -> ModelPricing {
+    ModelPricing {
+        input_per_million: input_per_token * 1_000_000.0,
+        output_per_million: output_per_token * 1_000_000.0,
+        cache_read_per_million: cache_read_per_token.map(|value| value * 1_000_000.0),
+        cache_write_per_million: cache_write_per_token.map(|value| value * 1_000_000.0),
+        source: "openrouter_models_api".to_string(),
+    }
+}
+
+pub(super) fn merge_builtin_pricing(
+    model_ids: impl IntoIterator<Item = String>,
+    fetched: &mut HashMap<String, ModelPricing>,
+) {
+    for model_id in model_ids {
+        if fetched.contains_key(&model_id) {
+            continue;
+        }
+        if let Some(pricing) = model_pricing_by_id(&model_id) {
+            fetched.insert(model_id, pricing);
+        }
     }
 }
 
@@ -1344,6 +1784,7 @@ pub(super) fn log_agent_frame_event(
     session: &SessionSnapshot,
     kind: AgentPromptKind,
     model_key: &str,
+    model_id: &str,
     event: &SessionEvent,
 ) {
     let agent_kind = match kind {
@@ -1364,7 +1805,8 @@ pub(super) fn log_agent_frame_event(
             session_id = %session.id,
             channel_id = %session.address.channel_id,
             agent_kind,
-            model = model_key,
+            model_key,
+            model = model_id,
             previous_message_count = *previous_message_count as u64,
             prompt_len = *prompt_len as u64,
             tool_definition_count = *tool_definition_count as u64,
@@ -1381,7 +1823,8 @@ pub(super) fn log_agent_frame_event(
             session_id = %session.id,
             channel_id = %session.address.channel_id,
             agent_kind,
-            model = model_key,
+            model_key,
+            model = model_id,
             phase,
             message_count = *message_count as u64,
             "agent_frame compaction started"
@@ -1401,7 +1844,8 @@ pub(super) fn log_agent_frame_event(
             session_id = %session.id,
             channel_id = %session.address.channel_id,
             agent_kind,
-            model = model_key,
+            model_key,
+            model = model_id,
             phase,
             compacted = *compacted,
             estimated_tokens_before = *estimated_tokens_before as u64,
@@ -1424,7 +1868,8 @@ pub(super) fn log_agent_frame_event(
             session_id = %session.id,
             channel_id = %session.address.channel_id,
             agent_kind,
-            model = model_key,
+            model_key,
+            model = model_id,
             round_index = *round_index as u64,
             message_count = *message_count as u64,
             "agent_frame round started"
@@ -1439,7 +1884,8 @@ pub(super) fn log_agent_frame_event(
             session_id = %session.id,
             channel_id = %session.address.channel_id,
             agent_kind,
-            model = model_key,
+            model_key,
+            model = model_id,
             round_index = *round_index as u64,
             message_count = *message_count as u64,
             "agent_frame model call started"
@@ -1462,7 +1908,8 @@ pub(super) fn log_agent_frame_event(
             session_id = %session.id,
             channel_id = %session.address.channel_id,
             agent_kind,
-            model = model_key,
+            model_key,
+            model = model_id,
             round_index = *round_index as u64,
             tool_call_count = *tool_call_count as u64,
             api_request_id = api_request_id.as_deref().unwrap_or(""),
@@ -1493,7 +1940,8 @@ pub(super) fn log_agent_frame_event(
             session_id = %session.id,
             channel_id = %session.address.channel_id,
             agent_kind,
-            model = model_key,
+            model_key,
+            model = model_id,
             tool_name,
             stable_prefix_message_count = *stable_prefix_message_count as u64,
             delay_ms = *delay_ms,
@@ -1509,7 +1957,8 @@ pub(super) fn log_agent_frame_event(
             session_id = %session.id,
             channel_id = %session.address.channel_id,
             agent_kind,
-            model = model_key,
+            model_key,
+            model = model_id,
             tool_name,
             stable_prefix_message_count = *stable_prefix_message_count as u64,
             "agent_frame tool-wait compaction started"
@@ -1529,7 +1978,8 @@ pub(super) fn log_agent_frame_event(
             session_id = %session.id,
             channel_id = %session.address.channel_id,
             agent_kind,
-            model = model_key,
+            model_key,
+            model = model_id,
             tool_name,
             compacted = *compacted,
             estimated_tokens_before = *estimated_tokens_before as u64,
@@ -1554,7 +2004,8 @@ pub(super) fn log_agent_frame_event(
             session_id = %session.id,
             channel_id = %session.address.channel_id,
             agent_kind,
-            model = model_key,
+            model_key,
+            model = model_id,
             round_index = *round_index as u64,
             tool_name,
             tool_call_id,
@@ -1573,7 +2024,8 @@ pub(super) fn log_agent_frame_event(
             session_id = %session.id,
             channel_id = %session.address.channel_id,
             agent_kind,
-            model = model_key,
+            model_key,
+            model = model_id,
             round_index = *round_index as u64,
             tool_name,
             tool_call_id,
@@ -1592,7 +2044,8 @@ pub(super) fn log_agent_frame_event(
             session_id = %session.id,
             channel_id = %session.address.channel_id,
             agent_kind,
-            model = model_key,
+            model_key,
+            model = model_id,
             phase,
             message_count = *message_count as u64,
             total_tokens = *total_tokens,
@@ -1608,7 +2061,8 @@ pub(super) fn log_agent_frame_event(
             session_id = %session.id,
             channel_id = %session.address.channel_id,
             agent_kind,
-            model = model_key,
+            model_key,
+            model = model_id,
             previous_prefix_message_count = *previous_prefix_message_count as u64,
             replacement_prefix_message_count = *replacement_prefix_message_count as u64,
             "agent_frame prefix rewrite applied"
@@ -1623,7 +2077,8 @@ pub(super) fn log_agent_frame_event(
             session_id = %session.id,
             channel_id = %session.address.channel_id,
             agent_kind,
-            model = model_key,
+            model_key,
+            model = model_id,
             message_count = *message_count as u64,
             total_tokens = *total_tokens,
             "agent_frame session completed"

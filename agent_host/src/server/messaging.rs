@@ -825,6 +825,7 @@ pub(super) fn build_outgoing_message_for_session(
         images: Vec::new(),
         attachments: Vec::new(),
         options: None,
+        usage_chart: None,
     };
     for attachment in attachments {
         let attachment = persist_outgoing_attachment(session, attachment)?;

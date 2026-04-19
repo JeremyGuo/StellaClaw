@@ -112,13 +112,11 @@ impl Server {
         let session = self
             .ensure_foreground_actor(&incoming.address)?
             .snapshot()?;
-        let status_text = self.status_text_for_session(&session, &effective_model_key)?;
-        self.send_channel_message(
-            channel,
-            &incoming.address,
-            OutgoingMessage::text(status_text),
-        )
-        .await?;
+        let status_message = self
+            .status_message_for_session(&session, &effective_model_key)
+            .await?;
+        self.send_channel_message(channel, &incoming.address, status_message)
+            .await?;
         Ok(true)
     }
 

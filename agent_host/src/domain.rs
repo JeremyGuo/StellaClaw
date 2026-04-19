@@ -71,6 +71,8 @@ pub struct OutgoingMessage {
     pub attachments: Vec<OutgoingAttachment>,
     #[serde(default)]
     pub options: Option<ShowOptions>,
+    #[serde(default)]
+    pub usage_chart: Option<UsageChart>,
 }
 
 impl OutgoingMessage {
@@ -80,6 +82,7 @@ impl OutgoingMessage {
             images: Vec::new(),
             attachments: Vec::new(),
             options: None,
+            usage_chart: None,
         }
     }
 
@@ -97,8 +100,25 @@ impl OutgoingMessage {
                 options,
                 one_time: true,
             }),
+            usage_chart: None,
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UsageChart {
+    pub title: String,
+    pub y_label: String,
+    pub days: Vec<UsageChartDay>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UsageChartDay {
+    pub label: String,
+    pub total_usd: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub llm_calls: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
