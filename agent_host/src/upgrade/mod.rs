@@ -23,6 +23,7 @@ mod v0_27;
 mod v0_28;
 mod v0_29;
 mod v0_30;
+mod v0_31;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -30,7 +31,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.30";
+pub const LATEST_WORKDIR_VERSION: &str = "0.31";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -46,7 +47,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 26] = [
+    let upgraders: [&dyn WorkdirUpgrader; 27] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
@@ -73,6 +74,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
         &v0_28::Upgrade,
         &v0_29::Upgrade,
         &v0_30::Upgrade,
+        &v0_31::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -127,6 +129,7 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.27" => Ok("0.27"),
         "0.28" => Ok("0.28"),
         "0.29" => Ok("0.29"),
+        "0.30" => Ok("0.30"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -1386,5 +1389,43 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(snapshot_dir.join("snapshot.json")).unwrap())
                 .unwrap();
         assert!(snapshot["session"]["current_plan"].is_null());
+    }
+
+    #[test]
+    fn v0_31_workdir_upgrade_creates_session_transcripts() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.30\n").unwrap();
+
+        let session_dir = temp_dir
+            .path()
+            .join("sessions")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": Uuid::new_v4(),
+                "agent_id": Uuid::new_v4(),
+                "address": {
+                    "channel_id": "web-main",
+                    "conversation_id": "web-default"
+                },
+                "session_state": {
+                    "messages": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("VERSION"))
+                .unwrap()
+                .trim(),
+            LATEST_WORKDIR_VERSION
+        );
+        assert!(session_dir.join("transcript.jsonl").is_file());
     }
 }

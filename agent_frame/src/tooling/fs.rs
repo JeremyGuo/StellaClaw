@@ -559,7 +559,7 @@ pub(super) fn file_read_tool(
 ) -> Tool {
     Tool::new(
         "file_read",
-        "Read a UTF-8 text file. Supports file_path plus optional offset and limit for large files. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local reads.",
+        "Read a UTF-8 text file. Supports file_path plus optional offset and limit for large files.",
         json!({
             "type": "object",
             "properties": {
@@ -689,7 +689,7 @@ pub(super) fn file_write_tool(
 ) -> Tool {
     Tool::new(
         "file_write",
-        "Write a UTF-8 text file. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local writes.",
+        "Write a UTF-8 text file.",
         json!({
             "type": "object",
             "properties": {
@@ -751,7 +751,7 @@ pub(super) fn glob_tool(
 ) -> Tool {
     Tool::new(
         "glob",
-        "Fast file pattern matching tool. Supports glob patterns like **/*.rs and src/**/*.ts. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local matching.",
+        "Fast file pattern matching tool. Supports glob patterns like **/*.rs and src/**/*.ts.",
         json!({
             "type": "object",
             "properties": {
@@ -821,7 +821,7 @@ pub(super) fn grep_tool(
 ) -> Tool {
     Tool::new(
         "grep",
-        "Fast content search tool. Searches file contents with a regex pattern and returns matching file paths. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local search.",
+        "Fast content search tool. Searches file contents with a regex pattern and returns matching file paths.",
         json!({
             "type": "object",
             "properties": {
@@ -905,7 +905,7 @@ pub(super) fn ls_tool(
 ) -> Tool {
     Tool::new(
         "ls",
-        "List a recursive directory tree for non-hidden files and directories under a path. Skips common cache/build directories by default. Large trees are truncated to the first 1000 files and directories; pass a more specific path or use glob/grep when you know what to search for. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local listing.",
+        "List a recursive directory tree for non-hidden files and directories under a path. Skips common cache/build directories by default. Large trees are truncated to the first 1000 files and directories; pass a more specific path or use glob/grep when you know what to search for.",
         json!({
             "type": "object",
             "properties": {
@@ -952,7 +952,7 @@ pub(super) fn edit_tool(
 ) -> Tool {
     Tool::new(
         "edit",
-        "Edit a UTF-8 text file by replacing old_text with new_text. When replace_all=false, old_text must match exactly one location; if it matches multiple locations, include more surrounding context. Optional remote=\"<host>|local\" runs this single tool call over SSH when set to an actual host alias; omit remote or set remote=\"\" for local edits.",
+        "Edit a UTF-8 text file by replacing old_text with new_text. When replace_all=false, old_text must match exactly one location; if it matches multiple locations, include more surrounding context.",
         json!({
             "type": "object",
             "properties": {

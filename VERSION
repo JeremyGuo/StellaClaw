@@ -1,5 +1,24 @@
-version: 0.20.4
+version: 0.21.0
 ---
+
+# 0.21.0
+
+- 新增 `web` channel 类型：
+  支持内嵌浏览器页面、assistant Markdown 渲染、`/api/send` HTTP 入站消息、`/ws` 实时 WebSocket 推送、`ShowOptions` 按钮选择，以及可选 `auth_token` / `auth_token_env` Bearer token 认证；TUI config editor、示例配置和 `.env.example` 已补齐 Web channel 字段。
+- 新增 Session Transcript 持久化：
+  每个 session root 会维护 append-only `transcript.jsonl`，记录用户消息、assistant response、模型调用（含完整 assistant message）、工具结果（含完整输出）和 compaction 事件；Web channel 通过 Host bridge 读取 session transcript 并接收 transcript append 通知，前端刷新后按 conversation 分页恢复 skeleton，并在点击 API/tool 摘要时通过 WebSocket 拉取 detail。
+- 改进 Web 历史前端：
+  首次加载默认滚动到最新消息；滚动到顶部会自动加载上一页 transcript 并保持视口位置；历史 `user_tell` 会按 assistant 消息渲染并隐藏配套 ok-only 工具结果；assistant Markdown 中的 `<attachment>...</attachment>` 与 Web outgoing attachments 会通过认证附件端点渲染图片或文件链接。
+- 增加 Web conversation 管理：
+  浏览器前端左侧显示 conversation 列表，并通过认证接口支持新建和删除 Web conversation；删除时会移除对应 conversation 持久化目录，并尽量清理同 key 的 foreground session 目录，避免旧 transcript 被同名 conversation 懒回填回来。
+- 扩展 `agent_frame::SessionEvent`：
+  `ModelCallCompleted` 携带完整 assistant message，`ToolCallCompleted` 携带工具输出；Web 实时历史更新由 Host 写入 transcript 后发布稳定 skeleton，不让 channel trait 依赖 raw runtime event。
+- 更新配置版本到 `0.21`：
+  新增 `ChannelConfig::Web`，旧 `0.20` 配置会自动升级到最新版本；本次影响 `config` schema。
+- 升级 `workdir` 结构版本到 `0.31`：
+  `0.30 -> 0.31` upgrade step 会为旧 `sessions/*/session.json` 所在目录补齐空的 `transcript.jsonl`；历史 transcript 不会凭空重建。
+- 本次同时影响 `config` 与 `workdir` schema：
+  新增 config loader 与 workdir upgrade step；按配置变更策略将仓库版本从 `0.20.4` 提升到 `0.21.0`。
 
 # 0.20.4
 

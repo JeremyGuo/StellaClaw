@@ -1,5 +1,6 @@
 use crate::channel::{ProgressFeedback, ProgressFeedbackFinalState, ProgressFeedbackUpdate};
 use crate::domain::{ChannelAddress, MessageRole, SessionMessage, StoredAttachment};
+use crate::transcript::{SessionTranscript, TranscriptEntrySkeleton};
 use crate::workspace::WorkspaceManager;
 use agent_frame::{
     ChatMessage, ExecutionProgress, ExecutionProgressPhase, SessionCompactionStats, SessionEvent,
@@ -221,12 +222,13 @@ struct SessionYieldDisposition {
     compaction_in_progress: bool,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct SessionUserMessageReceipt {
     pub(crate) text: Option<String>,
     pub(crate) interrupted: bool,
     pub(crate) compaction_in_progress: bool,
     pub(crate) outbound: Vec<SessionActorOutbound>,
+    pub(crate) transcript_entry: Option<TranscriptEntrySkeleton>,
 }
 
 #[derive(Clone, Debug)]
@@ -682,6 +684,7 @@ impl SessionActor {
             interrupted: disposition.interrupted,
             compaction_in_progress: disposition.compaction_in_progress,
             outbound,
+            transcript_entry: None,
         }
     }
 
@@ -1009,7 +1012,9 @@ impl SessionActor {
         &mut self,
         mut message: SessionUserMessage,
     ) -> Result<SessionUserMessageReceipt> {
-        let receipt = self.receive_user_message(message.text);
+        let transcript_text = message.text.clone();
+        let transcript_attachment_count = message.attachments.len();
+        let mut receipt = self.receive_user_message(message.text);
         if receipt.interrupted {
             tag_interrupted_user_chat_message(&mut message.pending_message);
         }
@@ -1030,6 +1035,24 @@ impl SessionActor {
         );
         self.session.session_state.user_mailbox.push(queued);
         self.session.persist()?;
+        match SessionTranscript::open(&self.session.root_dir).and_then(|mut transcript| {
+            transcript
+                .record_user_message(transcript_text, transcript_attachment_count)
+                .map(|entry| entry.to_skeleton())
+        }) {
+            Ok(entry) => {
+                receipt.transcript_entry = Some(entry);
+            }
+            Err(error) => {
+                warn!(
+                    log_stream = "session",
+                    log_key = %self.session.id,
+                    kind = "transcript_record_failed",
+                    error = %format!("{error:#}"),
+                    "failed to record user message transcript entry"
+                );
+            }
+        }
         self.drain_mailboxes_if_idle()?;
         Ok(receipt)
     }
@@ -2090,6 +2113,27 @@ impl SessionManager {
             );
         }
         Ok(())
+    }
+
+    pub fn remove_foreground(&mut self, address: &ChannelAddress) -> Result<bool> {
+        let key = address.session_key();
+        let Some(actor) = self.foreground_actors.remove(&key) else {
+            return Ok(false);
+        };
+        let snapshot = actor.snapshot()?;
+        info!(
+            log_stream = "session",
+            log_key = %snapshot.id,
+            kind = "session_removing",
+            root_dir = %snapshot.root_dir.display(),
+            "removing foreground session"
+        );
+        actor.close_and_shutdown()?;
+        if snapshot.root_dir.exists() {
+            fs::remove_dir_all(&snapshot.root_dir)
+                .with_context(|| format!("failed to remove {}", snapshot.root_dir.display()))?;
+        }
+        Ok(true)
     }
 
     pub fn get_snapshot(&self, address: &ChannelAddress) -> Option<SessionSnapshot> {

@@ -70,6 +70,37 @@ pub fn validate_remote_workpath_host(host: &str) -> Result<String> {
             "remote workpath host must be a remote SSH alias, not local"
         ));
     }
+    if matches!(host, "host" | "<host>" | "<host>|local") {
+        return Err(anyhow!(
+            "remote workpath host must be an actual SSH alias, not a placeholder"
+        ));
+    }
+    if host.starts_with('-') {
+        return Err(anyhow!("remote workpath host must not start with '-'"));
+    }
+    if host.chars().any(char::is_whitespace) {
+        return Err(anyhow!("remote workpath host must not contain whitespace"));
+    }
+    if host.chars().any(|ch| ch.is_control()) {
+        return Err(anyhow!(
+            "remote workpath host must not contain control characters"
+        ));
+    }
+    if host.chars().any(|ch| {
+        matches!(
+            ch,
+            '\'' | '"' | '`' | '$' | ';' | '&' | '|' | '<' | '>' | '(' | ')'
+        )
+    }) {
+        return Err(anyhow!(
+            "remote workpath host must not contain shell metacharacters"
+        ));
+    }
+    if host.contains('/') || host.contains('\\') {
+        return Err(anyhow!(
+            "remote workpath host must not contain path separators"
+        ));
+    }
     Ok(host.to_string())
 }
 
@@ -232,7 +263,10 @@ pub fn replace_workpath_description(
 
 #[cfg(test)]
 mod tests {
-    use super::{RemoteWorkpath, replace_workpath_description, validate_remote_workpath};
+    use super::{
+        RemoteWorkpath, replace_workpath_description, validate_remote_workpath,
+        validate_remote_workpath_host,
+    };
 
     #[test]
     fn validate_remote_workpath_trims_values() {
@@ -242,6 +276,24 @@ mod tests {
         assert_eq!(workpath.host, "wuwen-dev6");
         assert_eq!(workpath.path, "~/repo");
         assert_eq!(workpath.description, "remote checkout");
+    }
+
+    #[test]
+    fn validate_remote_workpath_rejects_placeholder_and_unsafe_hosts() {
+        for host in [
+            "host",
+            "<host>",
+            "<host>|local",
+            "-oProxyCommand=bad",
+            "dev host",
+            "dev;rm",
+            "dev/repo",
+        ] {
+            assert!(
+                validate_remote_workpath_host(host).is_err(),
+                "{host} should be rejected"
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,5 @@
 {
-  "version": "0.20",
+  "version": "0.21",
   "models": {
     "main": {
       "backend": "agent_frame",
@@ -83,6 +83,12 @@
       "kind": "command_line",
       "id": "local-cli",
       "prompt": "you> "
+    },
+    {
+      "kind": "web",
+      "id": "web-main",
+      "listen_addr": "127.0.0.1:8080",
+      "auth_token_env": "CLAWPARTY_WEB_AUTH_TOKEN"
     }
   ]
 }

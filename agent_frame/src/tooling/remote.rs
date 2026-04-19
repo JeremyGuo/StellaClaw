@@ -62,7 +62,7 @@ fn validate_remote_host(host: &str) -> Result<String> {
 pub(super) fn remote_schema_property() -> Value {
     json!({
         "type": "string",
-        "description": "Optional execution target. Format: \"<host>|local\". Omit remote, set remote=\"\", or set remote=\"local\" for local execution. For SSH execution, use an actual SSH alias such as \"wuwen-dev6\"; do not pass the literal placeholder \"host\". Remote path resolution is unified: when a tool supports cwd and cwd is non-empty, cwd determines the remote working directory; otherwise a registered workpath is used as the root, falling back to the remote user's home directory."
+        "description": "Execution target."
     })
 }
 
@@ -196,7 +196,7 @@ pub(super) fn remote_file_root(
 
 pub(super) fn remote_python_command(script: &str) -> String {
     format!(
-        "if command -v python3 >/dev/null 2>&1; then exec python3 -c {}; elif command -v python >/dev/null 2>&1; then exec python -c {}; else echo 'remote file tools require Python 3 on this host; install python3/python or use exec_start remote=\"<host>\" for shell-only commands' >&2; exit 127; fi",
+        "if command -v python3 >/dev/null 2>&1; then exec python3 -c {}; elif command -v python >/dev/null 2>&1; then exec python -c {}; else echo 'remote file tools require Python 3 on this host; install python3/python or use a remote shell command for shell-only commands' >&2; exit 127; fi",
         shell_quote(script),
         shell_quote(script)
     )

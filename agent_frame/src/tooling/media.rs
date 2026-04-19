@@ -1,4 +1,4 @@
-use super::args::{string_arg, string_arg_with_default, string_array_arg};
+use super::args::{f64_arg, string_arg, string_arg_with_default, string_array_arg};
 use super::exec::{process_is_running, read_exit_code, record_exit_code, terminate_process_pid};
 use super::runtime_state::{
     BackgroundTaskMetadata, background_task_dir, background_task_dir_if_exists,
@@ -15,7 +15,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 fn read_image_task_snapshot(runtime_state_root: &Path, image_id: &str) -> Result<Value> {
@@ -43,6 +43,43 @@ fn read_image_task_snapshot(runtime_state_root: &Path, image_id: &str) -> Result
         });
     }
     Ok(snapshot)
+}
+
+const IMAGE_START_DEFAULT_WAIT_TIMEOUT_SECONDS: f64 = 270.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageTimeoutAction {
+    Continue,
+    Kill,
+}
+
+impl ImageTimeoutAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Kill => "kill",
+        }
+    }
+}
+
+fn image_timeout_action_arg(
+    arguments: &serde_json::Map<String, Value>,
+    key: &str,
+    default: ImageTimeoutAction,
+) -> Result<ImageTimeoutAction> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(default);
+    };
+    let text = value
+        .as_str()
+        .ok_or_else(|| anyhow!("argument {} must be a string", key))?
+        .trim()
+        .to_ascii_lowercase();
+    match text.as_str() {
+        "continue" => Ok(ImageTimeoutAction::Continue),
+        "kill" => Ok(ImageTimeoutAction::Kill),
+        _ => Err(anyhow!("argument {} must be one of: continue, kill", key)),
+    }
 }
 
 pub(super) fn cleanup_image_tasks(runtime_state_root: &Path) -> Result<usize> {
@@ -82,21 +119,126 @@ pub(super) fn cleanup_image_tasks(runtime_state_root: &Path) -> Result<usize> {
     Ok(cancelled)
 }
 
+fn cancel_image_task(runtime_state_root: &Path, image_id: &str) -> Result<Value> {
+    let task_dir = background_task_dir(runtime_state_root, "image_tasks")?;
+    let metadata = read_background_task_metadata(&task_dir, image_id)?;
+    terminate_process_pid(metadata.pid);
+    let _ = record_exit_code(Path::new(&metadata.exit_code_path), -9);
+    let previous = read_image_task_snapshot(runtime_state_root, image_id).ok();
+    let snapshot = json!({
+        "image_id": image_id,
+        "path": previous
+            .as_ref()
+            .and_then(|value| value.get("path").cloned())
+            .unwrap_or(Value::String(String::new())),
+        "question": previous
+            .as_ref()
+            .and_then(|value| value.get("question").cloned())
+            .unwrap_or(Value::String(String::new())),
+        "running": false,
+        "completed": false,
+        "cancelled": true,
+        "failed": false,
+    });
+    fs::write(
+        Path::new(&metadata.status_path),
+        serde_json::to_vec_pretty(&snapshot)
+            .context("failed to serialize image cancel snapshot")?,
+    )
+    .with_context(|| format!("failed to write {}", metadata.status_path))?;
+    Ok(snapshot)
+}
+
+fn wait_for_image_task(
+    runtime_state_root: &Path,
+    image_id: &str,
+    wait_timeout_seconds: f64,
+    on_timeout: ImageTimeoutAction,
+    cancel_flag: Option<&Arc<InterruptSignal>>,
+) -> Result<Value> {
+    if !wait_timeout_seconds.is_finite() || wait_timeout_seconds < 0.0 {
+        return Err(anyhow!(
+            "argument wait_timeout_seconds must be a finite non-negative number"
+        ));
+    }
+    let deadline = Instant::now() + Duration::from_secs_f64(wait_timeout_seconds);
+    let cancel_receiver = cancel_flag.map(|signal| signal.subscribe());
+    loop {
+        let snapshot = read_image_task_snapshot(runtime_state_root, image_id)?;
+        let finished = snapshot
+            .get("running")
+            .and_then(Value::as_bool)
+            .is_some_and(|running| !running);
+        if finished {
+            return Ok(snapshot);
+        }
+        if let Some(cancel_receiver) = &cancel_receiver
+            && cancel_receiver.try_recv().is_ok()
+        {
+            return Ok(json!({
+                "interrupted": true,
+                "image": snapshot,
+            }));
+        }
+        if Instant::now() >= deadline {
+            if on_timeout == ImageTimeoutAction::Kill {
+                let mut cancelled = cancel_image_task(runtime_state_root, image_id)?;
+                if let Some(object) = cancelled.as_object_mut() {
+                    object.insert("wait_timed_out".to_string(), Value::Bool(true));
+                    object.insert(
+                        "on_timeout".to_string(),
+                        Value::String(on_timeout.as_str().to_string()),
+                    );
+                }
+                return Ok(cancelled);
+            }
+            let mut object = snapshot
+                .as_object()
+                .cloned()
+                .ok_or_else(|| anyhow!("image snapshot must be a JSON object"))?;
+            object.insert("wait_timed_out".to_string(), Value::Bool(true));
+            object.insert(
+                "on_timeout".to_string(),
+                Value::String(on_timeout.as_str().to_string()),
+            );
+            object.insert("running".to_string(), Value::Bool(true));
+            object.insert("completed".to_string(), Value::Bool(false));
+            return Ok(Value::Object(object));
+        }
+        if let Some(cancel_receiver) = &cancel_receiver {
+            crossbeam_channel::select! {
+                recv(cancel_receiver) -> _ => {
+                    return Ok(json!({
+                        "interrupted": true,
+                        "image": snapshot,
+                    }));
+                }
+                recv(crossbeam_channel::after(Duration::from_millis(200))) -> _ => {}
+            }
+        } else {
+            thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
 pub(super) fn image_start_tool(
     workspace_root: PathBuf,
     runtime_state_root: PathBuf,
     upstream: UpstreamConfig,
     image_tool_upstream: Option<UpstreamConfig>,
-    _cancel_flag: Option<Arc<InterruptSignal>>,
+    cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
-    Tool::new(
+    Tool::new_interruptible(
         "image_start",
-        "Start inspecting a local image file with the model's multimodal capability and return immediately with an image_id.",
+        "Start inspecting a local image file with the model's multimodal capability.",
         json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "question": {"type": "string"}
+                "question": {"type": "string"},
+                "return_immediate": {"type": "boolean"},
+                "wait_timeout_seconds": {"type": "number"},
+                "on_timeout": {"type": "string", "enum": ["continue", "kill", "CONTINUE", "KILL"]}
             },
             "required": ["path", "question"],
             "additionalProperties": false
@@ -107,6 +249,17 @@ pub(super) fn image_start_tool(
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
             let question = string_arg(arguments, "question")?;
+            let return_immediate = arguments
+                .get("return_immediate")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let wait_timeout_seconds = arguments
+                .get("wait_timeout_seconds")
+                .map(|_| f64_arg(arguments, "wait_timeout_seconds"))
+                .transpose()?
+                .unwrap_or(IMAGE_START_DEFAULT_WAIT_TIMEOUT_SECONDS);
+            let on_timeout =
+                image_timeout_action_arg(arguments, "on_timeout", ImageTimeoutAction::Continue)?;
             let upstream = image_tool_upstream
                 .clone()
                 .unwrap_or_else(|| upstream.clone());
@@ -137,7 +290,17 @@ pub(super) fn image_start_tool(
             let metadata =
                 spawn_background_worker_process(&runtime_state_root, "image", &image_id, &job)?;
             write_background_task_metadata(&task_dir, &metadata)?;
-            read_image_task_snapshot(&runtime_state_root, &image_id)
+            if return_immediate {
+                read_image_task_snapshot(&runtime_state_root, &image_id)
+            } else {
+                wait_for_image_task(
+                    &runtime_state_root,
+                    &image_id,
+                    wait_timeout_seconds,
+                    on_timeout,
+                    cancel_flag.as_ref(),
+                )
+            }
         },
     )
 }
@@ -428,11 +591,13 @@ pub(super) fn image_wait_tool(
 ) -> Tool {
     Tool::new_interruptible(
         "image_wait",
-        "Wait for a previously started image task by image_id. If interrupted by a newer user message or timeout observation, return immediately without cancelling the image task.",
+        "Wait for or observe a previously started image task by image_id.",
         json!({
             "type": "object",
             "properties": {
-                "image_id": {"type": "string"}
+                "image_id": {"type": "string"},
+                "wait_timeout_seconds": {"type": "number"},
+                "on_timeout": {"type": "string", "enum": ["continue", "kill", "CONTINUE", "KILL"]}
             },
             "required": ["image_id"],
             "additionalProperties": false
@@ -442,30 +607,20 @@ pub(super) fn image_wait_tool(
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let image_id = string_arg(arguments, "image_id")?;
-            let cancel_receiver = cancel_flag.as_ref().map(|signal| signal.subscribe());
-            loop {
-                let snapshot = read_image_task_snapshot(&runtime_state_root, &image_id)?;
-                let finished = snapshot
-                    .get("running")
-                    .and_then(Value::as_bool)
-                    .is_some_and(|running| !running);
-                if finished {
-                    return Ok(snapshot);
-                }
-                if let Some(cancel_receiver) = &cancel_receiver {
-                    crossbeam_channel::select! {
-                        recv(cancel_receiver) -> _ => {
-                            return Ok(json!({
-                                "interrupted": true,
-                                "image": snapshot,
-                            }));
-                        }
-                        recv(crossbeam_channel::after(Duration::from_millis(200))) -> _ => {}
-                    }
-                } else {
-                    thread::sleep(Duration::from_millis(200));
-                }
-            }
+            let wait_timeout_seconds = arguments
+                .get("wait_timeout_seconds")
+                .map(|_| f64_arg(arguments, "wait_timeout_seconds"))
+                .transpose()?
+                .unwrap_or(IMAGE_START_DEFAULT_WAIT_TIMEOUT_SECONDS);
+            let on_timeout =
+                image_timeout_action_arg(arguments, "on_timeout", ImageTimeoutAction::Continue)?;
+            wait_for_image_task(
+                &runtime_state_root,
+                &image_id,
+                wait_timeout_seconds,
+                on_timeout,
+                cancel_flag.as_ref(),
+            )
         },
     )
 }
@@ -490,32 +645,7 @@ pub(super) fn image_cancel_tool(
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let image_id = string_arg(arguments, "image_id")?;
-            let task_dir = background_task_dir(&runtime_state_root, "image_tasks")?;
-            let metadata = read_background_task_metadata(&task_dir, &image_id)?;
-            terminate_process_pid(metadata.pid);
-            let _ = record_exit_code(Path::new(&metadata.exit_code_path), -9);
-            let snapshot = json!({
-                "image_id": image_id,
-                "path": read_image_task_snapshot(&runtime_state_root, &image_id)
-                    .ok()
-                    .and_then(|value| value.get("path").cloned())
-                    .unwrap_or(Value::String(String::new())),
-                "question": read_image_task_snapshot(&runtime_state_root, &image_id)
-                    .ok()
-                    .and_then(|value| value.get("question").cloned())
-                    .unwrap_or(Value::String(String::new())),
-                "running": false,
-                "completed": false,
-                "cancelled": true,
-                "failed": false,
-            });
-            fs::write(
-                Path::new(&metadata.status_path),
-                serde_json::to_vec_pretty(&snapshot)
-                    .context("failed to serialize image cancel snapshot")?,
-            )
-            .with_context(|| format!("failed to write {}", metadata.status_path))?;
-            Ok(snapshot)
+            cancel_image_task(&runtime_state_root, &image_id)
         },
     )
 }

@@ -1901,6 +1901,7 @@ pub(super) fn log_agent_frame_event(
             cache_miss_tokens,
             cache_read_tokens,
             cache_write_tokens,
+            ..
         } => info!(
             log_stream = "agent",
             log_key = %agent_id,
@@ -2017,6 +2018,7 @@ pub(super) fn log_agent_frame_event(
             tool_call_id,
             output_len,
             errored,
+            ..
         } => info!(
             log_stream = "agent",
             log_key = %agent_id,

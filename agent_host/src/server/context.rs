@@ -4,6 +4,7 @@ use super::{
 use crate::agent_status::AgentRegistry;
 use crate::bootstrap::AgentWorkspace;
 use crate::channel::Channel;
+use crate::channels::web::WebChannel;
 use crate::config::{
     AgentConfig, BotCommandConfig, MainAgentConfig, ModelConfig, SandboxMode, ToolingConfig,
 };
@@ -28,6 +29,7 @@ pub struct RuntimeContext {
     pub(super) sessions: Arc<Mutex<SessionManager>>,
     pub(super) workspace_manager: WorkspaceManager,
     pub(super) channels: Arc<HashMap<String, Arc<dyn Channel>>>,
+    pub(super) web_channels: Arc<HashMap<String, Arc<WebChannel>>>,
     pub(super) command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     pub(super) models: BTreeMap<String, ModelConfig>,
     pub(super) agent: AgentConfig,

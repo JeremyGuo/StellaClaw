@@ -12,6 +12,7 @@ path = "src/main.rs"
 agent_frame = { path = "../agent_frame" }
 anyhow = "1.0"
 async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 chrono-tz = "0.10"

@@ -37,7 +37,8 @@ fn compose_system_prompt(config: &AgentConfig, skills: &[SkillMetadata]) -> Stri
     let mut parts = vec![
         AGENT_FRAME_MARKER.to_string(),
         "You are running inside AgentFrame. Use tools when they materially help.".to_string(),
-        "When a supported tool has remote=\"<host>|local\" and the task is on an SSH host, you MUST set remote to the actual SSH alias instead of manually running ssh <host> inside a shell command; this avoids brittle quoting and escaping retries. Omit remote for local work. Remote path resolution is unified: if a tool supports cwd and cwd is non-empty, cwd determines the remote working directory; otherwise the registered workpath is used as the root, falling back to the remote user's home directory when no workpath is registered.".to_string(),
+        "Remote execution policy: when a tool exposes a remote parameter and the task is on an SSH host, you MUST use that tool with remote set to the actual SSH alias instead of manually running ssh <host> inside a shell command. Manual SSH through exec_start is rejected when a remote-capable tool can perform the work. Omit remote, set remote=\"\", or set remote=\"local\" for local work. Remote path resolution is unified: if a remote-capable tool supports cwd and cwd is non-empty, cwd determines the remote working directory; otherwise the registered workpath is used as the root, falling back to the remote user's home directory when no workpath is registered.".to_string(),
+        "Runtime-ID start tools create background state and can also wait for short jobs in the same call. For exec_start, dsl_start, file_download_start, and image_start, prefer the default wait-until-complete behavior for short bounded work; set return_immediate=true only for long-running jobs; use wait_timeout_seconds and on_timeout when you need explicit timeout behavior.".to_string(),
         "DSL tool guidance: use dsl_start/dsl_wait/dsl_kill only for finite multi-step orchestration that reduces multiple dependent LLM/tool rounds. DSL code runs in a restricted CPython worker, so normal Python expressions, assignments, if statements, f-strings, list/dict operations, slices, string methods, and type() work. Available globals are emit(text), quit(), quit(value), handle = LLM(), handle.system(text), handle.config(key=value), handle.fork(), await handle.gen(prompt, **format_vars), await handle.json(prompt, **format_vars), await handle.select(prompt, [\"A\", \"B\", \"C\"]), and await tool({\"name\": \"tool_name\", \"args\": {\"arg\": value}}). tool(...) only accepts that single dict request shape; do not call tool(\"tool_name\", arg=value). DSL LLM calls always use the same model as the dsl_start caller; call LLM() without arguments and do not use LLM(model=...) or handle.config(model=...). LLM is only a callable handle factory; do not call LLM.llm(), LLM.tool(), LLM.gen(), LLM.json(), or LLM.select(). Use emit(text) for DSL output; emitted text is joined into the default result, while quit(value) returns an explicit result. Assign tool(...) results to variables and access returned JSON with normal Python dict/list syntax. DSL jobs are exec-like long-running jobs: interrupting dsl_start or dsl_wait only interrupts the outer wait, while the DSL job continues in the background regardless of what it is doing internally. User interrupts do not cancel DSL code, DSL LLM calls, DSL tool calls, or child long-running tools; use dsl_kill to stop the DSL job and kill child tools explicitly when needed. DSL code must not use loops, comprehensions, generators, imports, functions, classes, lambdas, private '_' names/attributes, or recursive DSL calls. DSL cannot directly mutate canonical system prompts or Session prompt components; request-time prompt state is owned by AgentHost/AgentFrame, and skills metadata changes flow through Session prompt component snapshots at user-message turn boundaries.".to_string(),
     ];
     if config
@@ -465,6 +466,7 @@ pub enum SessionEvent {
         cache_miss_tokens: u64,
         cache_read_tokens: u64,
         cache_write_tokens: u64,
+        assistant_message: Option<ChatMessage>,
     },
     ToolWaitCompactionScheduled {
         tool_name: String,
@@ -496,6 +498,7 @@ pub enum SessionEvent {
         tool_call_id: String,
         output_len: usize,
         errored: bool,
+        output: Option<String>,
     },
     SessionYielded {
         phase: String,
@@ -1016,6 +1019,7 @@ fn run_session_state_controlled_internal(
                 cache_miss_tokens: outcome.usage.cache_miss_tokens,
                 cache_read_tokens: outcome.usage.cache_read_tokens,
                 cache_write_tokens: outcome.usage.cache_write_tokens,
+                assistant_message: Some(outcome.message.clone()),
             });
         }
         if tool_calls.is_empty() && !assistant_message_has_content_or_tool_calls(&outcome.message) {
@@ -1186,6 +1190,7 @@ fn run_session_state_controlled_internal(
                     tool_call_id: completed_tool.tool_call_id,
                     output_len: result.len(),
                     errored: tool_result_looks_like_error(&result),
+                    output: Some(result),
                 });
             }
         }
@@ -1608,6 +1613,10 @@ mod tests {
         let prompt = compose_system_prompt(&config, &latest);
 
         assert!(prompt.contains("[AgentFrame Skills]\nsnapshot"));
+        assert!(prompt.contains("Remote execution policy"));
+        assert!(prompt.contains("Manual SSH through exec_start is rejected"));
+        assert!(prompt.contains("Runtime-ID start tools"));
+        assert!(prompt.contains("return_immediate=true only for long-running jobs"));
         assert!(!prompt.contains("new-skill"));
     }
 

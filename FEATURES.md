@@ -31,14 +31,16 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
   - start: create the job/process/task, and optionally wait for completion when that reduces API round trips.
   - wait/observe/progress: check or wait for completion; waits must be interruptible and must not kill the underlying job merely because the user interrupted the agent turn.
   - kill/cancel: explicitly terminate the job/process/task.
-- `exec_start` follows the start shape while supporting default wait-until-complete; `exec_wait` is interruptible; `exec_kill` terminates explicitly.
+- `exec_start`, `dsl_start`, `file_download_start`, and `image_start` follow the start shape while supporting default wait-until-complete, `return_immediate`, `wait_timeout_seconds`, and timeout continue/kill behavior so short jobs can complete in one model round trip.
+- Shared runtime-id start guidance belongs in the AgentFrame system prompt; individual start tool descriptions should expose the tool effect and schema without repeating the same wait/timeout usage policy.
 - Tool results should omit empty, null, or false diagnostic fields on ordinary success paths; absence means the normal/false case, while truncation, stderr, and errors remain explicit when present.
 - Tool errors are normalized at the global tool layer before they are returned to the model; oversized error strings are truncated with head/tail preservation rather than letting individual tools flood the assistant context.
-- Direct shell read/search commands such as `cat`, `grep`, `find`, `head`, `tail`, and `ls` are rejected by `exec_start` on the simple-command path. Agents should use the dedicated `file_read`, `grep`, `glob`, and `ls` tools, including their `remote` parameter for remote work.
+- Direct shell read/search commands such as `cat`, `grep`, `find`, `head`, `tail`, and `ls` are rejected by `exec_start` on the simple-command path. Agents should use the dedicated `file_read`, `grep`, `glob`, and `ls` tools; remote behavior is governed by the centralized remote policy.
 - Timeout observation compaction is controlled by the main agent global setting and is not gated on a particular model provider or per-model prompt-cache TTL.
-- Remote-capable tools should use `remote="<host>"` instead of shelling out to `ssh <host>` manually. If the tool has `cwd` and `cwd` is non-empty, that `cwd` controls the remote working directory. If `cwd` is omitted or empty, the remote root is the registered workpath, falling back to the remote user's home directory when no workpath is registered.
-- Download/image-style background jobs follow start + wait/progress + cancel where applicable.
-- Regression coverage should protect tool execution mode annotations and the start/wait/terminate schemas for long-running tool families.
+- Remote-capable tools should use their `remote` argument instead of shelling out to `ssh <host>` manually. This guidance belongs in the system prompt and shared remote context, not repeated in every individual tool description. If the tool has `cwd` and `cwd` is non-empty, that `cwd` controls the remote working directory. If `cwd` is omitted or empty, the remote root is the registered workpath, falling back to the remote user's home directory when no workpath is registered.
+- `exec_start` rejects manual `ssh ...` command strings so models use remote-capable tools rather than bypassing the remote policy.
+- Download/image-style background jobs follow start + wait/progress + cancel where applicable, and their wait tools support explicit wait timeouts without cancelling on normal interruption.
+- Regression coverage should protect tool execution mode annotations, centralized remote guidance, centralized runtime-id start guidance, manual SSH rejection, and the start/wait/terminate schemas for long-running tool families.
 
 ### Agent Plan Progress
 
@@ -93,6 +95,23 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - DingTalk robot channels can receive HTTP callback messages when `DINGTALK_ROBOT_APP_SECRET` is configured; callbacks must validate DingTalk `timestamp`/`sign` headers with HMAC-SHA256 and reject stale or invalid requests before parsing message bodies.
 - DingTalk robot channels materialize inbound non-text messages as conversation attachments when `DINGTALK_ROBOT_APP_KEY` and `DINGTALK_ROBOT_APP_SECRET` are configured; `downloadCode` is exchanged for a temporary file URL and persisted through the same `PendingAttachment` path used by Telegram.
 - Without an AppSecret, DingTalk robot channels must remain send-only and must not pretend to receive user messages.
+- Web channels serve the embedded browser client over HTTP, accept user messages through `/api/send`, push live outgoing/progress/session events through `/ws`, and support optional bearer-token authentication from `auth_token` or `auth_token_env`.
+- Web browser clients expose a left-side conversation list and authenticated create/delete controls for Web conversations.
+- Web browser clients render assistant messages with safe local Markdown support for headings, lists, blockquotes, code blocks, inline code, emphasis, and links.
+- Web browser clients render assistant `<attachment>...</attachment>` references and outgoing Web attachments through an authenticated attachment endpoint so images and files remain visible after refresh.
+- Web browser clients render `ShowOptions` response prompts as clickable buttons and send the selected option value back through the normal `/api/send` path.
+- Web channel transcript APIs expose newest-first session transcript skeletons and bounded detail ranges through the Host bridge so browser clients can recover reliable history after refresh without depending only on live WebSocket events.
+- Web browser clients load transcript skeletons by page, render API calls and tool responses as clickable summary rows, and request full transcript details over WebSocket only when a user expands an entry.
+- Web browser clients scroll to the newest history on initial load and automatically request the previous transcript page when the user scrolls to the top, preserving the viewport while older entries are inserted.
+- Web transcript history renders `user_tell` model calls as normal assistant messages and suppresses the matching ok-only tool result row.
+- Regression coverage should protect Web channel auth, config/TUI visibility for Web fields, and session transcript append/list/detail behavior.
+
+### Session Transcript
+
+- Each session root owns an append-only `transcript.jsonl` that records user messages, assistant messages, model calls, tool results, and compaction events in stable sequence order. Channel adapters must not write transcript files directly; Web history is served from the Host/session transcript path.
+- Model-call transcript entries include token accounting and the full assistant `ChatMessage`; tool-result entries include the tool name, call id, output length, error flag, and full tool output when available.
+- Existing workdirs are upgraded by creating missing `transcript.jsonl` files for persisted sessions.
+- Regression coverage should protect transcript reopening sequence continuity, newest-first list pagination, detail reads, and workdir upgrade creation of missing transcript files.
 
 ### Session Actor Architecture
 

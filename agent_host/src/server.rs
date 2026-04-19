@@ -14,6 +14,9 @@ use crate::channels::command_line::CommandLineChannel;
 use crate::channels::dingtalk::DingtalkChannel;
 use crate::channels::dingtalk_robot::DingtalkRobotChannel;
 use crate::channels::telegram::TelegramChannel;
+use crate::channels::web::{
+    WebChannel, WebChannelHost, WebConversationSummary, summarize_skeleton,
+};
 use crate::config::{
     AgentConfig, BotCommandConfig, ChannelConfig, ModelCapability, ModelConfig, SandboxConfig,
     SandboxMode, ServerConfig, ToolingConfig, ToolingTarget, default_bot_commands,
@@ -49,6 +52,7 @@ use crate::session::{
 use crate::sink::{SinkRouter, SinkTarget};
 use crate::snapshot::{SnapshotBundle, SnapshotManager};
 use crate::subagent::{HostedSubagent, HostedSubagentInner, SubagentState};
+use crate::transcript::SessionTranscript;
 use crate::upgrade::upgrade_workdir;
 use crate::workpath::{load_remote_agents_md_for_workpath, load_result_to_json};
 use crate::workspace::{WorkspaceManager, WorkspaceMountMaterialization};
@@ -66,6 +70,7 @@ use agent_frame::{
     token_estimator_label_for_model,
 };
 use anyhow::{Context, Result, anyhow};
+use async_trait::async_trait;
 use base64::Engine;
 use chrono::Utc;
 use humantime::parse_duration;
@@ -589,7 +594,7 @@ impl AgentRuntimeView {
             "description": workpath.description,
             "agents_md": load_result_to_json(&agents_md),
             "chat_version_rotated": true,
-            "note": "The remote workpath is stored at the conversation level and shared by foreground/background agents. The current turn's system prompt does not hot-reload; the next turn or rebuilt agent prompt will include it.",
+            "note": "The remote workpath is stored at the conversation level and shared by foreground/background agents. The current turn's system prompt and AgentFrame remote default-root map do not hot-reload; until the next turn or rebuilt agent prompt, use absolute remote paths or pass cwd=path explicitly when calling remote-capable tools.",
         }))
     }
 
@@ -1237,6 +1242,33 @@ impl AgentRuntimeView {
                         )
                         .await;
                     }
+                    match SessionTranscript::open(&event_session.root_dir)
+                        .and_then(|mut transcript| transcript.record_event(&event))
+                    {
+                        Ok(Some(entry)) => {
+                            if matches!(kind, AgentPromptKind::MainForeground)
+                                && let Some(web_channel) =
+                                    self.web_channels.get(&event_session.address.channel_id)
+                            {
+                                web_channel.publish_transcript_append(
+                                    &event_session.address,
+                                    entry.to_skeleton(),
+                                );
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            warn!(
+                                log_stream = "agent",
+                                log_key = %agent_id,
+                                kind = "transcript_record_failed",
+                                session_id = %event_session.id,
+                                channel_id = %event_session.address.channel_id,
+                                error = %format!("{error:#}"),
+                                "failed to record transcript event"
+                            );
+                        }
+                    }
                     if matches!(kind, AgentPromptKind::MainForeground)
                         && let SessionEvent::CompactionCompleted {
                             compacted: true,
@@ -1430,6 +1462,19 @@ impl AgentRuntimeView {
         while let Ok(driver_event) = driver_receiver.recv() {
             match driver_event {
                 DriverEvent::Runtime(event) => {
+                    if let Err(error) = SessionTranscript::open(&event_session.root_dir)
+                        .and_then(|mut transcript| transcript.record_event(&event).map(|_| ()))
+                    {
+                        warn!(
+                            log_stream = "agent",
+                            log_key = %agent_id,
+                            kind = "transcript_record_failed",
+                            session_id = %event_session.id,
+                            channel_id = %event_session.address.channel_id,
+                            error = %format!("{error:#}"),
+                            "failed to record transcript event in blocking context"
+                        );
+                    }
                     if matches!(kind, AgentPromptKind::MainForeground)
                         && let SessionEvent::CompactionCompleted {
                             compacted: true,
@@ -1742,6 +1787,92 @@ impl Deref for Server {
     }
 }
 
+#[async_trait]
+impl WebChannelHost for RuntimeContext {
+    async fn list_web_conversations(
+        &self,
+        channel_id: &str,
+    ) -> Result<Vec<WebConversationSummary>> {
+        let conversations = self.with_conversations(|conversations| {
+            Ok(conversations
+                .list_snapshots()
+                .into_iter()
+                .filter(|conversation| conversation.address.channel_id == channel_id)
+                .collect::<Vec<_>>())
+        })?;
+        conversations
+            .into_iter()
+            .map(|conversation| self.web_conversation_summary(&conversation.address))
+            .collect()
+    }
+
+    async fn create_web_conversation(
+        &self,
+        address: &ChannelAddress,
+    ) -> Result<WebConversationSummary> {
+        self.with_conversations(|conversations| conversations.ensure_conversation(address))?;
+        self.web_conversation_summary(address)
+    }
+
+    async fn delete_web_conversation(&self, address: &ChannelAddress) -> Result<bool> {
+        self.with_conversations_and_sessions(|conversations, sessions| {
+            let removed_conversation = conversations.remove_conversation(address)?.is_some();
+            let removed_session = sessions.remove_foreground(address)?;
+            Ok(removed_conversation || removed_session)
+        })
+    }
+
+    async fn list_web_transcript(
+        &self,
+        address: &ChannelAddress,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<crate::transcript::TranscriptEntrySkeleton>> {
+        let Some(session) = self.with_sessions(|sessions| Ok(sessions.get_snapshot(address)))?
+        else {
+            return Ok(Vec::new());
+        };
+        SessionTranscript::open(&session.root_dir)?.list(offset, limit)
+    }
+
+    async fn get_web_transcript_detail(
+        &self,
+        address: &ChannelAddress,
+        seq_start: usize,
+        seq_end: usize,
+    ) -> Result<Option<Vec<crate::transcript::TranscriptEntry>>> {
+        if seq_end < seq_start || seq_end.saturating_sub(seq_start) > 200 {
+            anyhow::bail!("invalid transcript detail range");
+        }
+        let Some(session) = self.with_sessions(|sessions| Ok(sessions.get_snapshot(address)))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            SessionTranscript::open(&session.root_dir)?.get_detail(seq_start, seq_end)?,
+        ))
+    }
+}
+
+impl RuntimeContext {
+    fn web_conversation_summary(&self, address: &ChannelAddress) -> Result<WebConversationSummary> {
+        let session = self.with_sessions(|sessions| Ok(sessions.get_snapshot(address)))?;
+        let (entry_count, latest) = if let Some(session) = session {
+            let transcript = SessionTranscript::open(&session.root_dir)?;
+            (transcript.len(), transcript.list(0, 1)?.into_iter().next())
+        } else {
+            (0, None)
+        };
+        Ok(WebConversationSummary {
+            conversation_key: address.conversation_id.clone(),
+            entry_count,
+            latest_ts: latest.as_ref().map(|entry| entry.ts.clone()),
+            latest_type: latest.as_ref().map(|entry| entry.entry_type.clone()),
+            latest_summary: latest.as_ref().and_then(summarize_skeleton),
+        })
+    }
+}
+
 impl Server {
     fn clear_missing_selected_main_model(
         &self,
@@ -1940,6 +2071,7 @@ impl Server {
         let tooling = config.tooling.clone();
 
         let mut channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+        let mut web_channels: HashMap<String, Arc<WebChannel>> = HashMap::new();
         let mut telegram_channel_ids: HashSet<String> = HashSet::new();
         let mut command_catalog: HashMap<String, Vec<BotCommandConfig>> = HashMap::new();
         for channel_config in config.channels {
@@ -1967,6 +2099,13 @@ impl Server {
                         id,
                         Arc::new(DingtalkRobotChannel::from_config(dingtalk_robot)?),
                     );
+                }
+                ChannelConfig::Web(web) => {
+                    let id = web.id.clone();
+                    command_catalog.insert(id.clone(), default_bot_commands());
+                    let channel = Arc::new(WebChannel::from_config(web, &workdir)?);
+                    web_channels.insert(id.clone(), Arc::clone(&channel));
+                    channels.insert(id, channel);
                 }
             }
         }
@@ -2031,6 +2170,7 @@ impl Server {
             workspace_manager,
             sessions,
             channels: Arc::new(channels),
+            web_channels: Arc::new(web_channels),
             command_catalog,
             models: config.models,
             agent: config.agent,
@@ -2052,6 +2192,9 @@ impl Server {
             conversations,
             snapshots,
         });
+        for channel in context.web_channels.values() {
+            channel.set_host(Arc::clone(&context) as Arc<dyn WebChannelHost>)?;
+        }
 
         Ok(Self {
             context: Arc::clone(&context),
@@ -3436,6 +3579,7 @@ mod tests {
             workspace_manager,
             sessions: Arc::new(Mutex::new(sessions)),
             channels: Arc::new(HashMap::from([("telegram-main".to_string(), channel)])),
+            web_channels: Arc::new(HashMap::new()),
             command_catalog: HashMap::new(),
             models,
             agent: AgentConfig {

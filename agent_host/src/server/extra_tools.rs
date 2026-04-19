@@ -338,7 +338,7 @@ impl AgentRuntimeView {
             let tell_session = session.clone();
             tools.push(Tool::new(
                 "shared_profile_upload",
-                "Upload the workspace copies of USER.md and IDENTITY.md back to the shared profile files. Call this right after you edit either file. The current foreground run keeps its existing system prompt after upload, so use file_read on the workspace copy to inspect the refreshed content directly. If you changed IDENTITY.md, reread ./IDENTITY.md immediately after uploading so your current turn follows the updated persona.",
+                "Upload the workspace copies of USER.md and IDENTITY.md back to the shared profile files.",
                 json!({
                     "type": "object",
                     "properties": {},
@@ -356,10 +356,10 @@ impl AgentRuntimeView {
             let tell_session = session.clone();
             let user_tell_description = match kind {
                 AgentPromptKind::MainBackground => {
-                    "Immediately send a short progress or coordination message to the current user conversation without waiting for the current background turn to finish. Use this only for genuine mid-task progress updates while work is still ongoing. A main background agent's final answer is automatically delivered to the owning foreground conversation and inserted into foreground context, so do not use user_tell for the primary result of a reminder, cron, scheduled notification, or 'send this message' task. Put that primary user-facing message in your final answer instead, and do not add a separate 'sent' confirmation unless the user explicitly asked for a receipt. To include files or images, append one or more <attachment>relative/path/from/workspace_root</attachment> tags inside text."
+                    "Immediately send a short progress or coordination message to the current user conversation without waiting for the current background turn to finish. To include files or images, append one or more <attachment>relative/path/from/workspace_root</attachment> tags inside text."
                 }
                 AgentPromptKind::MainForeground | AgentPromptKind::SubAgent => {
-                    "Immediately send a short progress or coordination message to the current user conversation without waiting for the current turn to finish. Use this only for genuine mid-task user-facing updates that should appear as their own chat bubbles while work is still ongoing. Do not use user_tell as a substitute for the final answer; return final answers normally. To include files or images, append one or more <attachment>relative/path/from/workspace_root</attachment> tags inside text."
+                    "Immediately send a short progress or coordination message to the current user conversation without waiting for the current turn to finish. To include files or images, append one or more <attachment>relative/path/from/workspace_root</attachment> tags inside text."
                 }
             };
             tools.push(Tool::new(
@@ -385,7 +385,7 @@ impl AgentRuntimeView {
             let plan_session = session.clone();
             tools.push(Tool::new(
                 "update_plan",
-                "Update the current task plan shown to the user. Use this for non-trivial, multi-step, or long-running work. Keep steps short and concrete. Status must be one of pending, in_progress, completed, and at most one step may be in_progress. Do not use this for simple one-step work.",
+                "Replace the current task plan shown to the user.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -414,7 +414,8 @@ impl AgentRuntimeView {
                         .as_object()
                         .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
                     let plan = parse_session_plan_tool_args(object)?;
-                    let actor = runtime.with_sessions(|sessions| sessions.resolve_snapshot(&plan_session))?;
+                    let actor = runtime
+                        .with_sessions(|sessions| sessions.resolve_snapshot(&plan_session))?;
                     actor.update_plan(plan)?;
                     Ok(json!({"updated": true}))
                 },

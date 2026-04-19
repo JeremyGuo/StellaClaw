@@ -158,6 +158,13 @@ impl ConversationManager {
             .map(ConversationState::snapshot)
     }
 
+    pub fn list_snapshots(&self) -> Vec<ConversationSnapshot> {
+        self.conversations
+            .values()
+            .map(ConversationState::snapshot)
+            .collect()
+    }
+
     fn ensure_state_mut(&mut self, address: &ChannelAddress) -> Result<&mut ConversationState> {
         let key = address.session_key();
         if !self.conversations.contains_key(&key) {

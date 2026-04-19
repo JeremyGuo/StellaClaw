@@ -308,7 +308,7 @@ fn apply_patch_tool(
 ) -> Tool {
     Tool::new(
         "apply_patch",
-        "Apply a unified diff patch inside the workspace using git apply. The patch must be a valid unified diff. Optional remote=\"<host>|local\" applies this single patch over SSH when set to an actual host alias; omit remote or set remote=\"\" for local patches. If the remote host has no registered workpath, the patch is applied from the remote user's home directory.",
+        "Apply a unified diff patch inside the workspace using git apply. The patch must be a valid unified diff.",
         json!({
             "type": "object",
             "properties": {
@@ -1330,11 +1330,12 @@ remote_command="$*"
             let tool = registry.get(name).expect("tool should be registered");
             let remote = &tool.parameters["properties"]["remote"];
             assert_eq!(remote["type"], "string");
+            assert_eq!(remote["description"], "Execution target.");
             assert!(
-                remote["description"]
-                    .as_str()
-                    .is_some_and(|description| description.contains("<host>|local")),
-                "remote schema should document the accepted target format for {name}"
+                !tool.description.contains("remote=")
+                    && !tool.description.contains("Optional remote")
+                    && !tool.description.contains("SSH"),
+                "remote guidance should stay in system prompt, not {name} description"
             );
             let required = tool.parameters["required"].as_array().unwrap();
             assert!(
@@ -1427,6 +1428,7 @@ remote_command="$*"
                 .get("on_timeout")
                 .is_some()
         );
+        assert_start_description_keeps_wait_policy_centralized(exec_start);
 
         let exec_wait = registry.get("exec_wait").expect("exec_wait registered");
         assert_eq!(exec_wait.execution_mode, ToolExecutionMode::Interruptible);
@@ -1449,8 +1451,27 @@ remote_command="$*"
         let download_start = registry
             .get("file_download_start")
             .expect("file_download_start registered");
-        assert_eq!(download_start.execution_mode, ToolExecutionMode::Immediate);
+        assert_eq!(
+            download_start.execution_mode,
+            ToolExecutionMode::Interruptible
+        );
         assert!(download_start.parameters["properties"].get("url").is_some());
+        assert!(
+            download_start.parameters["properties"]
+                .get("return_immediate")
+                .is_some()
+        );
+        assert!(
+            download_start.parameters["properties"]
+                .get("wait_timeout_seconds")
+                .is_some()
+        );
+        assert!(
+            download_start.parameters["properties"]
+                .get("on_timeout")
+                .is_some()
+        );
+        assert_start_description_keeps_wait_policy_centralized(download_start);
 
         let download_wait = registry
             .get("file_download_wait")
@@ -1462,6 +1483,16 @@ remote_command="$*"
         assert!(
             download_wait.parameters["properties"]
                 .get("download_id")
+                .is_some()
+        );
+        assert!(
+            download_wait.parameters["properties"]
+                .get("wait_timeout_seconds")
+                .is_some()
+        );
+        assert!(
+            download_wait.parameters["properties"]
+                .get("on_timeout")
                 .is_some()
         );
 
@@ -1476,14 +1507,40 @@ remote_command="$*"
         );
 
         let image_start = registry.get("image_start").expect("image_start registered");
-        assert_eq!(image_start.execution_mode, ToolExecutionMode::Immediate);
+        assert_eq!(image_start.execution_mode, ToolExecutionMode::Interruptible);
         assert!(image_start.parameters["properties"].get("path").is_some());
+        assert!(
+            image_start.parameters["properties"]
+                .get("return_immediate")
+                .is_some()
+        );
+        assert!(
+            image_start.parameters["properties"]
+                .get("wait_timeout_seconds")
+                .is_some()
+        );
+        assert!(
+            image_start.parameters["properties"]
+                .get("on_timeout")
+                .is_some()
+        );
+        assert_start_description_keeps_wait_policy_centralized(image_start);
 
         let image_wait = registry.get("image_wait").expect("image_wait registered");
         assert_eq!(image_wait.execution_mode, ToolExecutionMode::Interruptible);
         assert!(
             image_wait.parameters["properties"]
                 .get("image_id")
+                .is_some()
+        );
+        assert!(
+            image_wait.parameters["properties"]
+                .get("wait_timeout_seconds")
+                .is_some()
+        );
+        assert!(
+            image_wait.parameters["properties"]
+                .get("on_timeout")
                 .is_some()
         );
 
@@ -1515,6 +1572,7 @@ remote_command="$*"
                 .get("on_timeout")
                 .is_some()
         );
+        assert_start_description_keeps_wait_policy_centralized(dsl_start);
 
         let dsl_wait = registry.get("dsl_wait").expect("dsl_wait registered");
         assert_eq!(dsl_wait.execution_mode, ToolExecutionMode::Interruptible);
@@ -1528,6 +1586,21 @@ remote_command="$*"
                 .get("kill_children")
                 .is_some()
         );
+    }
+
+    fn assert_start_description_keeps_wait_policy_centralized(tool: &Tool) {
+        for phrase in [
+            "By default",
+            "return_immediate",
+            "wait_timeout_seconds",
+            "on_timeout",
+        ] {
+            assert!(
+                !tool.description.contains(phrase),
+                "start tool {} should leave shared wait policy in the system prompt",
+                tool.name
+            );
+        }
     }
 
     #[test]

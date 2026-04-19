@@ -1115,11 +1115,11 @@ pub(super) fn dsl_start_tool(
 ) -> Tool {
     Tool::new_interruptible(
         "dsl_start",
-        "Start an exec-like DSL orchestration job backed by an isolated CPython worker. Code uses normal Python expression/assignment/branching syntax but is statically restricted: no loops, comprehensions, generators, imports, function/class/lambda definitions, return/delete/global/nonlocal/yield, private '_' names/attributes, or recursive DSL lifecycle tool calls. Supported globals are emit(text), quit(), quit(value), handle = LLM(), handle.system(text), handle.config(key=value), handle.fork(), await handle.gen(prompt, **format_vars), await handle.json(prompt, **format_vars), await handle.select(prompt, [\"A\", \"B\", \"C\"]), and await tool({\"name\": \"tool_name\", \"args\": {\"arg\": value}}). DSL LLM calls always use the same caller model as the dsl_start caller; call LLM() without arguments and do not use LLM(model=...) or handle.config(model=...). Use emit output as the default result; quit(value) returns an explicit result. Interrupting dsl_start only interrupts the outer wait and returns running; the CPython worker continues until completion, failure, timeout, or dsl_kill. Output is capped by max_output_chars 0..1000 with complete files saved at returned paths.",
+        "Start an exec-like DSL orchestration job backed by an isolated CPython worker. See the system prompt for DSL syntax and lifecycle rules. Output is capped by max_output_chars 0..1000 with complete files saved at returned paths.",
         json!({
             "type": "object",
             "properties": {
-                "code": {"type": "string", "description": "Python DSL code executed inside a restricted CPython worker. Use emit(text), quit(value), LLM() handles, await handle.gen/json/select, and await tool({\"name\": \"tool_name\", \"args\": {\"arg\": value}}). tool(...) only accepts that single dict request shape. DSL LLM calls always use the dsl_start caller model; call LLM() without arguments and do not use LLM(model=...) or handle.config(model=...). Normal Python assignment, if statements, f-strings, list/dict operations, string methods, type(), and expressions work. Loops, comprehensions, imports, function/class/lambda definitions, private '_' names/attributes, and recursive dsl_* tool calls are rejected."},
+                "code": {"type": "string", "description": "DSL code executed inside a restricted CPython worker. See the system prompt for supported syntax and restrictions."},
                 "label": {"type": "string"},
                 "return_immediate": {"type": "boolean"},
                 "wait_timeout_seconds": {"type": "number", "minimum": 0},
@@ -1461,9 +1461,16 @@ mod tests {
             super::super::ToolExecutionMode::Interruptible
         );
         assert!(start.description.contains("CPython worker"));
-        assert!(start.description.contains("tool({\"name\""));
-        assert!(start.description.contains("same caller model"));
+        assert!(start.description.contains("See the system prompt"));
+        assert!(!start.description.contains("tool({\"name\""));
+        assert!(!start.description.contains("same caller model"));
         assert!(start.parameters["properties"].get("code").is_some());
+        let code_description = start.parameters["properties"]["code"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(code_description.contains("See the system prompt"));
+        assert!(!code_description.contains("LLM()"));
+        assert!(!code_description.contains("tool({\"name\""));
         assert!(
             start.parameters["properties"]
                 .get("return_immediate")

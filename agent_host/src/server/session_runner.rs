@@ -129,6 +129,11 @@ impl<'a> TurnCoordinator<'a> {
         server
             .send_session_actor_outputs(channel, &incoming.address, user_receipt.outbound)
             .await;
+        if let Some(entry) = user_receipt.transcript_entry
+            && let Some(web_channel) = server.web_channels.get(&incoming.address.channel_id)
+        {
+            web_channel.publish_transcript_append(&incoming.address, entry);
+        }
         let session = server
             .claim_foreground_turn_runner_when_ready(&incoming.address)
             .await?;

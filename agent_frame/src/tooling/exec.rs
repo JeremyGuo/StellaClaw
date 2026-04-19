@@ -98,20 +98,17 @@ fn direct_read_command_guidance(command: &str) -> Option<&'static str> {
         .and_then(|value| value.to_str())
         .unwrap_or(head);
     match head {
-        "cat" => {
-            Some("Use file_read with file_path and optional remote instead of exec_start cat.")
-        }
-        "grep" => {
-            Some("Use grep with pattern/path and optional remote instead of exec_start grep.")
-        }
-        "find" => Some("Use glob or ls with optional remote instead of exec_start find."),
-        "head" | "tail" => Some(
-            "Use file_read with offset/limit and optional remote instead of exec_start head/tail.",
+        "cat" => Some("Use file_read with file_path instead of exec_start cat."),
+        "grep" => Some("Use grep with pattern/path instead of exec_start grep."),
+        "find" => Some("Use glob or ls instead of exec_start find."),
+        "head" | "tail" => Some("Use file_read with offset/limit instead of exec_start head/tail."),
+        "ls" => Some("Use ls with path instead of exec_start ls."),
+        "ssh" => Some(
+            "Manual ssh through exec_start is rejected. Follow the remote execution policy in the system prompt.",
         ),
-        "ls" => Some("Use ls with path and optional remote instead of exec_start ls."),
-        _ if DIRECT_READ_COMMANDS.contains(&head) => Some(
-            "Use the dedicated filesystem/search tool with optional remote instead of exec_start.",
-        ),
+        _ if DIRECT_READ_COMMANDS.contains(&head) => {
+            Some("Use the dedicated filesystem/search tool instead of exec_start.")
+        }
         _ => None,
     }
 }
@@ -994,14 +991,14 @@ pub(super) fn exec_start_tool(
 ) -> Tool {
     Tool::new_interruptible(
         "exec_start",
-        "Start a shell command or executable. By default this waits up to wait_timeout_seconds for completion and returns the final status. Set return_immediate=true for long-running, server, daemon, watch, or interactive commands. If the default wait times out, on_timeout=continue leaves the process running while on_timeout=kill terminates it. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths. Optional remote=\"<host>|local\" runs this single command over SSH when set to an actual host alias; omit remote or set remote=\"\" for local commands. Remote cwd resolution is unified: non-empty cwd controls the remote working directory; empty or omitted cwd uses the registered workpath, or the remote user's home directory if no workpath is registered.",
+        "Start a shell command or executable. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths.",
         json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
                 "cwd": {
                     "type": "string",
-                    "description": "Working directory for the command. Prefer relative paths for normal workspace work. When remote is set to an SSH host, a non-empty cwd controls the remote working directory; empty or omitted cwd uses the registered workpath, or the remote user's home directory if no workpath is registered."
+                    "description": "Working directory for the command. Prefer relative paths for normal workspace work."
                 },
                 "tty": {"type": "boolean"},
                 "include_stdout": {"type": "boolean"},
@@ -1276,6 +1273,7 @@ mod tests {
         assert!(direct_read_command_guidance("cat src/main.rs").is_some());
         assert!(direct_read_command_guidance("/usr/bin/grep foo src/main.rs").is_some());
         assert!(direct_read_command_guidance("find . -name '*.rs'").is_some());
+        assert!(direct_read_command_guidance("ssh dev 'cat src/main.rs'").is_some());
         assert!(direct_read_command_guidance("cargo test").is_none());
         assert!(direct_read_command_guidance("git grep foo").is_none());
     }
