@@ -5,7 +5,7 @@ use super::runtime_state::{
     background_task_is_running, iter_metadata_json_files, read_background_task_metadata,
     read_status_json, spawn_background_worker_process, write_background_task_metadata,
 };
-use super::{InterruptSignal, Tool, resolve_path};
+use super::{InterruptSignal, Tool, compact_tool_status_fields_for_model, resolve_path};
 use crate::tool_worker::ToolWorkerJob;
 use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
@@ -30,6 +30,11 @@ const DOWNLOAD_START_DEFAULT_WAIT_TIMEOUT_SECONDS: f64 = 270.0;
 enum DownloadTimeoutAction {
     Continue,
     Kill,
+}
+
+fn compact_download_status_for_model(mut value: Value) -> Value {
+    compact_tool_status_fields_for_model(&mut value);
+    value
 }
 
 impl DownloadTimeoutAction {
@@ -234,15 +239,15 @@ fn wait_for_file_download(
             .and_then(Value::as_bool)
             .is_some_and(|running| !running);
         if finished {
-            return Ok(snapshot);
+            return Ok(compact_download_status_for_model(snapshot));
         }
         if let Some(cancel_receiver) = &cancel_receiver
             && cancel_receiver.try_recv().is_ok()
         {
-            return Ok(json!({
+            return Ok(compact_download_status_for_model(json!({
                 "interrupted": true,
                 "download": snapshot,
-            }));
+            })));
         }
         if Instant::now() >= deadline {
             if on_timeout == DownloadTimeoutAction::Kill {
@@ -254,7 +259,7 @@ fn wait_for_file_download(
                         Value::String(on_timeout.as_str().to_string()),
                     );
                 }
-                return Ok(cancelled);
+                return Ok(compact_download_status_for_model(cancelled));
             }
             let mut object = snapshot
                 .as_object()
@@ -267,15 +272,15 @@ fn wait_for_file_download(
             );
             object.insert("running".to_string(), Value::Bool(true));
             object.insert("completed".to_string(), Value::Bool(false));
-            return Ok(Value::Object(object));
+            return Ok(compact_download_status_for_model(Value::Object(object)));
         }
         if let Some(cancel_receiver) = &cancel_receiver {
             crossbeam_channel::select! {
                 recv(cancel_receiver) -> _ => {
-                    return Ok(json!({
+                    return Ok(compact_download_status_for_model(json!({
                         "interrupted": true,
                         "download": snapshot,
-                    }));
+                    })));
                 }
                 recv(crossbeam_channel::after(Duration::from_millis(200))) -> _ => {}
             }
@@ -388,6 +393,7 @@ pub(super) fn file_download_start_tool(
             write_background_task_metadata(&task_dir, &metadata)?;
             if return_immediate {
                 read_file_download_snapshot(&runtime_state_root, &download_id)
+                    .map(compact_download_status_for_model)
             } else {
                 wait_for_file_download(
                     &runtime_state_root,
@@ -422,6 +428,7 @@ pub(super) fn file_download_progress_tool(
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let download_id = string_arg(arguments, "download_id")?;
             read_file_download_snapshot(&runtime_state_root, &download_id)
+                .map(compact_download_status_for_model)
         },
     )
 }
@@ -490,6 +497,7 @@ pub(super) fn file_download_cancel_tool(
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let download_id = string_arg(arguments, "download_id")?;
             cancel_file_download(&runtime_state_root, &download_id)
+                .map(compact_download_status_for_model)
         },
     )
 }

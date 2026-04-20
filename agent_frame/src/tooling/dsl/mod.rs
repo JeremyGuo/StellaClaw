@@ -8,7 +8,8 @@ use super::runtime_state::{
     write_background_task_metadata,
 };
 use super::{
-    InterruptSignal, Tool, build_tool_registry_with_cancel, exec_kill_tool, execute_tool_call,
+    InterruptSignal, Tool, build_tool_registry_with_cancel, compact_tool_status_fields_for_model,
+    exec_kill_tool, execute_tool_call,
 };
 use crate::config::{RemoteWorkpathConfig, UpstreamConfig};
 use crate::llm::create_chat_completion;
@@ -1391,12 +1392,14 @@ fn kill_child_task(runtime_state_root: &Path, child: &Value) -> Value {
             .invoke(json!({"image_id": id})),
         _ => Err(anyhow!("unknown child id field")),
     };
-    json!({
+    let mut output = json!({
         "tool": tool,
         "id": id,
         "status": if result.is_ok() { "killed" } else { "failed_to_kill" },
         "error": result.err().map(|error| error.to_string()),
-    })
+    });
+    compact_tool_status_fields_for_model(&mut output);
+    output
 }
 
 #[cfg(test)]

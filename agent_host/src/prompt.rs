@@ -1,7 +1,10 @@
 use crate::bootstrap::AgentWorkspace;
 use crate::config::{MainAgentConfig, ModelConfig};
 use crate::conversation::LocalMount;
-use crate::session::{IDENTITY_PROMPT_COMPONENT, SessionSnapshot, USER_META_PROMPT_COMPONENT};
+use crate::session::{
+    IDENTITY_PROMPT_COMPONENT, REMOTE_ALIASES_PROMPT_COMPONENT, SessionSnapshot,
+    USER_META_PROMPT_COMPONENT,
+};
 use crate::workpath::{RemoteWorkpath, render_remote_workpaths_for_prompt};
 use agent_frame::config::MemorySystem;
 use std::collections::BTreeMap;
@@ -338,6 +341,14 @@ pub fn build_agent_system_prompt(
         parts.push(workspace_summary.to_string());
     }
 
+    if let Some(remote_aliases) = session
+        .prompt_component_system_value(REMOTE_ALIASES_PROMPT_COMPONENT)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(remote_aliases.to_string());
+    }
+
     if !current_agents_markdown.trim().is_empty() {
         parts.push("Runtime notes:".to_string());
         parts.push(current_agents_markdown.trim().to_string());
@@ -410,8 +421,8 @@ mod tests {
     use crate::conversation::LocalMount;
     use crate::domain::ChannelAddress;
     use crate::session::{
-        DurableSessionState, IDENTITY_PROMPT_COMPONENT, SessionPromptComponentState,
-        SessionSnapshot, USER_META_PROMPT_COMPONENT,
+        DurableSessionState, IDENTITY_PROMPT_COMPONENT, REMOTE_ALIASES_PROMPT_COMPONENT,
+        SessionPromptComponentState, SessionSnapshot, USER_META_PROMPT_COMPONENT,
     };
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
@@ -796,6 +807,15 @@ mod tests {
                         notified_hash: "fresh-user-meta-hash".to_string(),
                     },
                 ),
+                (
+                    REMOTE_ALIASES_PROMPT_COMPONENT.to_string(),
+                    SessionPromptComponentState {
+                        system_prompt_value: "Available SSH remote aliases detected from this host's SSH config:\n- `wuwen-dev3`".to_string(),
+                        system_prompt_hash: "remote-aliases-hash".to_string(),
+                        notified_value: "Available SSH remote aliases detected from this host's SSH config:\n- `wuwen-roce-check`".to_string(),
+                        notified_hash: "fresh-remote-aliases-hash".to_string(),
+                    },
+                ),
             ]),
             ..DurableSessionState::default()
         };
@@ -814,6 +834,8 @@ mod tests {
         );
         assert!(snapshot_prompt.contains("Snapshot Identity"));
         assert!(snapshot_prompt.contains("name: Snapshot User"));
+        assert!(snapshot_prompt.contains("`wuwen-dev3`"));
+        assert!(!snapshot_prompt.contains("`wuwen-roce-check`"));
         assert!(!snapshot_prompt.contains("Fresh Identity"));
         assert!(!snapshot_prompt.contains("name: Fresh User"));
 

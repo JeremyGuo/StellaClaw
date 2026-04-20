@@ -1,5 +1,16 @@
-version: 0.21.4
+version: 0.21.5
 ---
+
+# 0.21.5
+
+- 新增 SSH remote alias 上下文：
+  AgentHost 会从本机 SSH config 中读取可用 Host alias，作为 `ssh_remote_aliases` prompt component 放入 canonical system prompt；模型侧 `remote` 参数现在明确要求使用这些本机 alias 或已注册 remote workpath host，不应凭语义猜测 remote 名称。
+- 避免 remote 上下文中途热变更：
+  SSH alias 列表只在用户消息 turn 边界重新检查；如果列表变化，会通过持久化的 `[Runtime Prompt Updates]` system notice 注入本轮上下文，后续 compaction/rebuild 再折叠进 canonical system prompt，继续保护 prompt-cache 前缀稳定性。
+- 精简生命周期工具返回：
+  `exec_*`、`file_download_*`、`image_*` 与 DSL child kill 的状态返回会省略 `error: null`、`returncode: null`、默认 false 状态、本地 `remote` 和空 stdout/stderr 等无信息字段；真实错误、true 状态、路径、id 和实际退出码仍然保留，减少无意义上下文 token。
+- 本次不影响 `config` 或 `workdir` schema：
+  没有新增配置字段或 workdir migration；按普通 patch 将仓库版本从 `0.21.4` 提升到 `0.21.5`。
 
 # 0.21.4
 

@@ -205,6 +205,48 @@ fn normalize_error_fields(value: &mut Value) {
     }
 }
 
+pub(super) fn compact_tool_status_fields_for_model(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                compact_tool_status_fields_for_model(value);
+            }
+            object.retain(|key, value| !is_redundant_status_field_for_model(key, value));
+        }
+        Value::Array(items) => {
+            for item in items {
+                compact_tool_status_fields_for_model(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_redundant_status_field_for_model(key: &str, value: &Value) -> bool {
+    match value {
+        Value::Null => matches!(
+            key,
+            "error"
+                | "returncode"
+                | "pid"
+                | "total_bytes"
+                | "http_status"
+                | "final_url"
+                | "content_type"
+        ),
+        Value::Bool(false) => matches!(
+            key,
+            "running" | "completed" | "cancelled" | "failed" | "stdin_closed" | "tty"
+        ),
+        Value::String(text) if text.is_empty() => matches!(
+            key,
+            "error" | "stdout" | "stderr" | "final_url" | "content_type"
+        ),
+        Value::String(text) if key == "remote" && text == "local" => true,
+        _ => false,
+    }
+}
+
 fn normalize_tool_result(mut result: Value) -> String {
     normalize_error_fields(&mut result);
     match result {
@@ -869,9 +911,10 @@ mod tests {
     use super::{
         BackgroundTaskMetadata, ExecutionTarget, FILE_READ_MAX_OUTPUT_BYTES, LS_MAX_ENTRIES,
         ProcessMetadata, Tool, ToolExecutionMode, active_runtime_state_summary,
-        build_tool_registry_with_cancel, execute_tool_call, execution_target_arg,
-        normalize_tool_result, process_is_running, process_meta_path, remote_file_root,
-        resolve_remote_cwd, terminate_runtime_state_tasks, write_background_task_metadata,
+        build_tool_registry_with_cancel, compact_tool_status_fields_for_model, execute_tool_call,
+        execution_target_arg, normalize_tool_result, process_is_running, process_meta_path,
+        remote_file_root, resolve_remote_cwd, terminate_runtime_state_tasks,
+        write_background_task_metadata,
     };
     use crate::config::{
         AuthCredentialsStoreMode, RemoteWorkpathConfig, UpstreamApiKind, UpstreamAuthKind,
@@ -937,6 +980,40 @@ mod tests {
         assert!(result.contains("tool error truncated"));
         assert!(result.contains("\"stdout\": \"ok\""));
         assert!(result.len() < 11_000);
+    }
+
+    #[test]
+    fn compact_tool_status_fields_removes_default_status_noise() {
+        let mut value = json!({
+            "exec_id": "abc",
+            "remote": "local",
+            "running": false,
+            "completed": true,
+            "cancelled": false,
+            "failed": false,
+            "returncode": null,
+            "error": null,
+            "stdout": "",
+            "process": {
+                "running": true,
+                "completed": false,
+                "error": null
+            }
+        });
+
+        compact_tool_status_fields_for_model(&mut value);
+
+        assert_eq!(value["completed"], json!(true));
+        assert_eq!(value["process"]["running"], json!(true));
+        assert!(value.get("remote").is_none());
+        assert!(value.get("running").is_none());
+        assert!(value.get("cancelled").is_none());
+        assert!(value.get("failed").is_none());
+        assert!(value.get("returncode").is_none());
+        assert!(value.get("error").is_none());
+        assert!(value.get("stdout").is_none());
+        assert!(value["process"].get("completed").is_none());
+        assert!(value["process"].get("error").is_none());
     }
 
     struct EnvVarGuard {
@@ -1330,7 +1407,12 @@ remote_command="$*"
             let tool = registry.get(name).expect("tool should be registered");
             let remote = &tool.parameters["properties"]["remote"];
             assert_eq!(remote["type"], "string");
-            assert_eq!(remote["description"], "Execution target.");
+            assert!(
+                remote["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("local SSH alias")
+            );
             assert!(
                 !tool.description.contains("remote=")
                     && !tool.description.contains("Optional remote")

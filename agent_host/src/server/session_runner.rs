@@ -525,6 +525,10 @@ impl Server {
             USER_META_PROMPT_COMPONENT,
             current_user_meta_prompt_for_workspace(&self.agent_workspace),
         )?;
+        actor.initialize_prompt_component_if_missing(
+            REMOTE_ALIASES_PROMPT_COMPONENT,
+            current_ssh_remote_aliases_prompt(),
+        )?;
         let discovered = discover_skills(std::slice::from_ref(&self.agent_workspace.skills_dir))?;
         actor.initialize_prompt_component_if_missing(
             crate::session::SKILLS_METADATA_PROMPT_COMPONENT,

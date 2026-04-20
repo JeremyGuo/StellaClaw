@@ -194,6 +194,7 @@ pub const INTERRUPTED_FOLLOWUP_MARKER: &str = "[Interrupted Follow-up]";
 pub const QUEUED_USER_UPDATES_MARKER: &str = "[Queued User Updates]";
 const COMPACTION_WAIT_NOTICE_TEXT: &str = "正在压缩上下文，可能要等待压缩完毕后才能回复。";
 pub(crate) const IDENTITY_PROMPT_COMPONENT: &str = "identity";
+pub(crate) const REMOTE_ALIASES_PROMPT_COMPONENT: &str = "ssh_remote_aliases";
 pub(crate) const SKILLS_METADATA_PROMPT_COMPONENT: &str = "skills_metadata";
 pub(crate) const USER_META_PROMPT_COMPONENT: &str = "user_meta";
 

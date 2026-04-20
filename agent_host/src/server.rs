@@ -44,18 +44,20 @@ use crate::sandbox::{
     is_child_transport_error, run_one_shot_child_turn,
 };
 use crate::session::{
-    IDENTITY_PROMPT_COMPONENT, PromptComponentChangeNotice, SessionActorMessage,
-    SessionActorOutbound, SessionEffect, SessionErrno, SessionKind, SessionManager, SessionPhase,
-    SessionPlan, SessionPlanStep, SessionPlanStepStatus, SessionRuntimeTurnCommit,
-    SessionRuntimeTurnFailure, SessionSkillObservation, SessionSnapshot, SessionTurnTimeHintConfig,
-    SessionUserMessage, SkillChangeNotice, USER_META_PROMPT_COMPONENT,
+    IDENTITY_PROMPT_COMPONENT, PromptComponentChangeNotice, REMOTE_ALIASES_PROMPT_COMPONENT,
+    SessionActorMessage, SessionActorOutbound, SessionEffect, SessionErrno, SessionKind,
+    SessionManager, SessionPhase, SessionPlan, SessionPlanStep, SessionPlanStepStatus,
+    SessionRuntimeTurnCommit, SessionRuntimeTurnFailure, SessionSkillObservation, SessionSnapshot,
+    SessionTurnTimeHintConfig, SessionUserMessage, SkillChangeNotice, USER_META_PROMPT_COMPONENT,
 };
 use crate::sink::{SinkRouter, SinkTarget};
 use crate::snapshot::{SnapshotBundle, SnapshotManager};
 use crate::subagent::{HostedSubagent, HostedSubagentInner, SubagentState};
 use crate::transcript::SessionTranscript;
 use crate::upgrade::upgrade_workdir;
-use crate::workpath::{load_remote_agents_md_for_workpath, load_result_to_json};
+use crate::workpath::{
+    current_ssh_remote_aliases_prompt, load_remote_agents_md_for_workpath, load_result_to_json,
+};
 use crate::workspace::{WorkspaceManager, WorkspaceMountMaterialization};
 use agent_frame::config::{
     AgentConfig as FrameAgentConfig, CodexAuthConfig, ExternalWebSearchConfig,
@@ -288,6 +290,10 @@ impl AgentRuntimeView {
         actor.initialize_prompt_component_if_missing(
             USER_META_PROMPT_COMPONENT,
             current_user_meta_prompt_for_workspace(&self.agent_workspace),
+        )?;
+        actor.initialize_prompt_component_if_missing(
+            REMOTE_ALIASES_PROMPT_COMPONENT,
+            current_ssh_remote_aliases_prompt(),
         )
     }
 
@@ -3348,6 +3354,9 @@ impl Server {
     ) -> Result<Option<String>> {
         let actor = self.ensure_foreground_actor(&session.address)?;
         let mut notices = Vec::new();
+        let had_remote_aliases_component = session
+            .prompt_component_system_value(REMOTE_ALIASES_PROMPT_COMPONENT)
+            .is_some();
         if let Some(notice) = actor.observe_prompt_component_change(
             IDENTITY_PROMPT_COMPONENT,
             current_identity_prompt_for_workspace(&self.agent_workspace),
@@ -3359,6 +3368,18 @@ impl Server {
             current_user_meta_prompt_for_workspace(&self.agent_workspace),
         )? {
             notices.push(notice);
+        }
+        let remote_aliases_prompt = current_ssh_remote_aliases_prompt();
+        if let Some(notice) = actor.observe_prompt_component_change(
+            REMOTE_ALIASES_PROMPT_COMPONENT,
+            remote_aliases_prompt.clone(),
+        )? {
+            notices.push(notice);
+        } else if !had_remote_aliases_component && !remote_aliases_prompt.trim().is_empty() {
+            notices.push(PromptComponentChangeNotice {
+                key: REMOTE_ALIASES_PROMPT_COMPONENT.to_string(),
+                value: remote_aliases_prompt,
+            });
         }
         let rendered = render_prompt_component_change_notices(&notices);
         Ok((!rendered.is_empty()).then_some(rendered))
@@ -3499,9 +3520,10 @@ mod tests {
         parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
         parse_think_command, persist_compaction_artifacts, prepare_system_prompt_for_turn,
         price_conversation_usage_report, rebuild_canonical_system_prompt,
-        render_last_user_message_time_tip, render_system_date_on_user_message, rollout_read_file,
-        rollout_search_files, sanitize_messages_for_model_capabilities,
-        select_image_generation_routing, send_outgoing_message_now, session_errno_for_turn_error,
+        render_last_user_message_time_tip, render_prompt_component_change_notices,
+        render_system_date_on_user_message, rollout_read_file, rollout_search_files,
+        sanitize_messages_for_model_capabilities, select_image_generation_routing,
+        send_outgoing_message_now, session_errno_for_turn_error,
         should_attempt_idle_context_compaction, summarize_resume_progress,
         sync_workspace_shared_profile_files, upload_workspace_shared_profile_files,
         user_facing_continue_error_text, workspace_visible_in_list,
@@ -3522,7 +3544,9 @@ mod tests {
     use crate::cron::CronManager;
     use crate::domain::ChannelAddress;
     use crate::domain::{AttachmentKind, OutgoingMessage, ProcessingState, StoredAttachment};
-    use crate::session::tag_interrupted_followup_text;
+    use crate::session::{
+        PromptComponentChangeNotice, REMOTE_ALIASES_PROMPT_COMPONENT, tag_interrupted_followup_text,
+    };
     use crate::session::{SessionErrno, SessionSnapshot, SessionUserMessage};
     use crate::session::{SessionManager, SessionPhase, SessionRuntimeTurnCommit};
     use crate::sink::SinkRouter;
@@ -4399,6 +4423,20 @@ mod tests {
             Some(SYSTEM_RESTART_NOTICE)
         );
         assert_eq!(injected[1].role, "system");
+    }
+
+    #[test]
+    fn remote_alias_prompt_updates_render_as_runtime_prompt_notice() {
+        let rendered = render_prompt_component_change_notices(&[PromptComponentChangeNotice {
+            key: REMOTE_ALIASES_PROMPT_COMPONENT.to_string(),
+            value:
+                "Available SSH remote aliases detected from this host's SSH config:\n- `wuwen-dev3`"
+                    .to_string(),
+        }]);
+
+        assert!(rendered.contains("[Runtime Prompt Updates]"));
+        assert!(rendered.contains("available SSH remote alias list changed"));
+        assert!(rendered.contains("`wuwen-dev3`"));
     }
 
     #[test]

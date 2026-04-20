@@ -6,7 +6,7 @@ use super::runtime_state::{
     read_status_json, run_interruptible_worker_job, spawn_background_worker_process,
     write_background_task_metadata,
 };
-use super::{InterruptSignal, Tool, resolve_path};
+use super::{InterruptSignal, Tool, compact_tool_status_fields_for_model, resolve_path};
 use crate::config::UpstreamConfig;
 use crate::tool_worker::ToolWorkerJob;
 use anyhow::{Context, Result, anyhow};
@@ -51,6 +51,11 @@ const IMAGE_START_DEFAULT_WAIT_TIMEOUT_SECONDS: f64 = 270.0;
 enum ImageTimeoutAction {
     Continue,
     Kill,
+}
+
+fn compact_image_status_for_model(mut value: Value) -> Value {
+    compact_tool_status_fields_for_model(&mut value);
+    value
 }
 
 impl ImageTimeoutAction {
@@ -170,15 +175,15 @@ fn wait_for_image_task(
             .and_then(Value::as_bool)
             .is_some_and(|running| !running);
         if finished {
-            return Ok(snapshot);
+            return Ok(compact_image_status_for_model(snapshot));
         }
         if let Some(cancel_receiver) = &cancel_receiver
             && cancel_receiver.try_recv().is_ok()
         {
-            return Ok(json!({
+            return Ok(compact_image_status_for_model(json!({
                 "interrupted": true,
                 "image": snapshot,
-            }));
+            })));
         }
         if Instant::now() >= deadline {
             if on_timeout == ImageTimeoutAction::Kill {
@@ -190,7 +195,7 @@ fn wait_for_image_task(
                         Value::String(on_timeout.as_str().to_string()),
                     );
                 }
-                return Ok(cancelled);
+                return Ok(compact_image_status_for_model(cancelled));
             }
             let mut object = snapshot
                 .as_object()
@@ -203,15 +208,15 @@ fn wait_for_image_task(
             );
             object.insert("running".to_string(), Value::Bool(true));
             object.insert("completed".to_string(), Value::Bool(false));
-            return Ok(Value::Object(object));
+            return Ok(compact_image_status_for_model(Value::Object(object)));
         }
         if let Some(cancel_receiver) = &cancel_receiver {
             crossbeam_channel::select! {
                 recv(cancel_receiver) -> _ => {
-                    return Ok(json!({
+                    return Ok(compact_image_status_for_model(json!({
                         "interrupted": true,
                         "image": snapshot,
-                    }));
+                    })));
                 }
                 recv(crossbeam_channel::after(Duration::from_millis(200))) -> _ => {}
             }
@@ -292,6 +297,7 @@ pub(super) fn image_start_tool(
             write_background_task_metadata(&task_dir, &metadata)?;
             if return_immediate {
                 read_image_task_snapshot(&runtime_state_root, &image_id)
+                    .map(compact_image_status_for_model)
             } else {
                 wait_for_image_task(
                     &runtime_state_root,
@@ -645,7 +651,7 @@ pub(super) fn image_cancel_tool(
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
             let image_id = string_arg(arguments, "image_id")?;
-            cancel_image_task(&runtime_state_root, &image_id)
+            cancel_image_task(&runtime_state_root, &image_id).map(compact_image_status_for_model)
         },
     )
 }

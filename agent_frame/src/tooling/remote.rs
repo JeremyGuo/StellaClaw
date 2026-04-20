@@ -62,7 +62,7 @@ fn validate_remote_host(host: &str) -> Result<String> {
 pub(super) fn remote_schema_property() -> Value {
     json!({
         "type": "string",
-        "description": "Execution target."
+        "description": "Execution target: local SSH alias from the system prompt's available remote aliases or a registered workpath host. Omit for local work."
     })
 }
 

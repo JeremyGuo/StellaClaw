@@ -4,7 +4,7 @@ use super::remote::{
     resolve_remote_cwd,
 };
 use super::runtime_state::{read_status_json, spawn_background_worker_process};
-use super::{InterruptSignal, Tool, resolve_path};
+use super::{InterruptSignal, Tool, compact_tool_status_fields_for_model, resolve_path};
 use crate::tool_worker::ToolWorkerJob;
 use anyhow::{Context, Result, anyhow};
 use serde::Serialize;
@@ -1091,6 +1091,7 @@ pub(super) fn exec_start_tool(
                     cancel_flag.as_ref(),
                 )?
             };
+            compact_tool_status_fields_for_model(&mut result);
             if !include_stdout && let Some(object) = result.as_object_mut() {
                 object.remove("stdout");
                 object.remove("stderr");
@@ -1132,14 +1133,16 @@ pub(super) fn exec_observe_tool(
             let limit = usize_arg_with_default(arguments, "limit", 20)?;
             let max_output_chars = max_output_chars_arg(arguments)?;
             let state_dir = ensure_process_state_dir(&runtime_state_root)?;
-            read_process_snapshot(
+            let mut result = read_process_snapshot(
                 &state_dir,
                 &exec_id,
                 start,
                 limit,
                 max_output_chars,
                 Some(&workspace_root),
-            )
+            )?;
+            compact_tool_status_fields_for_model(&mut result);
+            Ok(result)
         },
     )
 }
@@ -1198,6 +1201,7 @@ pub(super) fn exec_wait_tool(
                 on_timeout,
                 cancel_flag.as_ref(),
             )?;
+            compact_tool_status_fields_for_model(&mut result);
             if !include_stdout && let Some(object) = result.as_object_mut() {
                 object.remove("stdout");
                 object.remove("stderr");
@@ -1245,7 +1249,7 @@ pub(super) fn exec_kill_tool(
             extra.insert("error".to_string(), Value::Null);
             write_exec_snapshot(&metadata, false, true, Value::from(-9), Some(extra))?;
             live_processes().lock().unwrap().remove(&exec_id);
-            Ok(json!({
+            let mut result = json!({
                 "exec_id": metadata.exec_id,
                 "pid": previous
                     .as_ref()
@@ -1259,7 +1263,9 @@ pub(super) fn exec_kill_tool(
                 "completed": true,
                 "killed": true,
                 "returncode": -9,
-            }))
+            });
+            compact_tool_status_fields_for_model(&mut result);
+            Ok(result)
         },
     )
 }

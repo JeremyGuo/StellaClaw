@@ -501,7 +501,7 @@ fn builtin_tools_work() -> Result<()> {
     let timeout_json: Value = serde_json::from_str(&timeout_process)?;
     assert_eq!(timeout_json["wait_timed_out"], json!(true));
     assert_eq!(timeout_json["running"], json!(true));
-    assert_eq!(timeout_json["stdout"], json!(""));
+    assert!(timeout_json.get("stdout").is_none());
     assert!(
         timeout_json["stdout_path"]
             .as_str()

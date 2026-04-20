@@ -659,6 +659,12 @@ pub(super) fn render_prompt_component_change_notices(
                     ));
                 }
             }
+            REMOTE_ALIASES_PROMPT_COMPONENT => {
+                sections.push(format!(
+                    "The available SSH remote alias list changed. Treat this refreshed list as authoritative for remote tool calls in this turn:\n{}",
+                    notice.value.trim()
+                ));
+            }
             key => {
                 sections.push(format!(
                     "Prompt component `{key}` changed. Treat this refreshed value as authoritative for this turn:\n{}",
