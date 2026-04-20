@@ -954,6 +954,7 @@ fn run_session_state_controlled_internal(
                 messages = round_compaction.messages;
             }
         }
+        append_plan_update_reminder_if_due(&mut messages);
         if let Some(control) = &control {
             control.ensure_not_cancelled()?;
             control.emit_event(SessionEvent::ModelCallStarted {
@@ -966,10 +967,7 @@ fn run_session_state_controlled_internal(
                 tools: Vec::new(),
             });
         }
-        let mut model_input_messages = messages.clone();
-        if let Some(plan_reminder) = transient_plan_update_reminder(&messages) {
-            model_input_messages.push(ChatMessage::text("system", plan_reminder));
-        }
+        let model_input_messages = messages.clone();
         let request_messages = materialize_messages_for_upstream(&model_input_messages, &config)?;
         let continuation_messages = runtime
             .continuation
@@ -1351,7 +1349,17 @@ fn apply_pending_prefix_rewrite(
     control.set_stable_prefix_messages(&rewrite.replacement_prefix);
 }
 
-fn transient_plan_update_reminder(messages: &[ChatMessage]) -> Option<String> {
+const PLAN_UPDATE_REMINDER: &str = "[System Reminder: use tool to update plan progress.]";
+
+fn append_plan_update_reminder_if_due(messages: &mut Vec<ChatMessage>) -> bool {
+    let Some(plan_reminder) = plan_update_reminder(messages) else {
+        return false;
+    };
+    messages.push(ChatMessage::text("system", plan_reminder));
+    true
+}
+
+fn plan_update_reminder(messages: &[ChatMessage]) -> Option<String> {
     let tool_batch_count = messages
         .iter()
         .filter(|message| {
@@ -1365,26 +1373,39 @@ fn transient_plan_update_reminder(messages: &[ChatMessage]) -> Option<String> {
     if tool_batch_count == 0 || tool_batch_count % 10 != 0 {
         return None;
     }
-    let last_tool_batch_has_plan_update = messages
-        .iter()
-        .rev()
-        .find(|message| {
-            message.role == "assistant"
-                && message
-                    .tool_calls
-                    .as_ref()
-                    .is_some_and(|tool_calls| !tool_calls.is_empty())
-        })
-        .and_then(|message| message.tool_calls.as_ref())
-        .is_some_and(|tool_calls| {
-            tool_calls
-                .iter()
-                .any(|tool_call| tool_call.function.name == "update_plan")
-        });
+    let last_tool_batch = messages.iter().enumerate().rev().find(|(_, message)| {
+        message.role == "assistant"
+            && message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|tool_calls| !tool_calls.is_empty())
+    });
+    let Some((last_tool_batch_index, last_tool_batch)) = last_tool_batch else {
+        return None;
+    };
+    let last_tool_batch_has_plan_update =
+        last_tool_batch
+            .tool_calls
+            .as_ref()
+            .is_some_and(|tool_calls| {
+                tool_calls
+                    .iter()
+                    .any(|tool_call| tool_call.function.name == "update_plan")
+            });
     if last_tool_batch_has_plan_update {
         return None;
     }
-    Some("[System Reminder: use tool to update plan progress.]".to_string())
+    let reminder_already_added = messages
+        .iter()
+        .skip(last_tool_batch_index + 1)
+        .any(|message| {
+            message.role == "system"
+                && message.content.as_ref().and_then(Value::as_str) == Some(PLAN_UPDATE_REMINDER)
+        });
+    if reminder_already_added {
+        return None;
+    }
+    Some(PLAN_UPDATE_REMINDER.to_string())
 }
 
 fn tool_result_looks_like_error(result: &str) -> bool {
@@ -1425,10 +1446,11 @@ fn synthesize_tool_timeout_observation(
 #[cfg(test)]
 mod tests {
     use super::{
-        CompletedToolCall, ExecutionSignal, ResponseContinuation, SessionExecutionControl,
-        compose_system_prompt, enforce_image_load_batch_limit, finish_pending_tool_wait_compaction,
+        CompletedToolCall, ExecutionSignal, PLAN_UPDATE_REMINDER, ResponseContinuation,
+        SessionExecutionControl, append_plan_update_reminder_if_due, compose_system_prompt,
+        enforce_image_load_batch_limit, finish_pending_tool_wait_compaction, plan_update_reminder,
         start_pending_tool_wait_compaction, synthetic_user_message_from_tool_result,
-        tool_result_looks_like_error, transient_plan_update_reminder,
+        tool_result_looks_like_error,
     };
     use crate::config::{AgentConfig, MemorySystem, UpstreamConfig};
     use crate::message::{ChatMessage, FunctionCall, ToolCall};
@@ -1486,7 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn transient_plan_reminder_triggers_every_ten_tool_batches() {
+    fn durable_plan_reminder_triggers_every_ten_tool_batches() {
         let mut messages = Vec::new();
         for index in 0..9 {
             messages.push(ChatMessage {
@@ -1504,7 +1526,7 @@ mod tests {
                 }]),
             });
         }
-        assert!(transient_plan_update_reminder(&messages).is_none());
+        assert!(plan_update_reminder(&messages).is_none());
 
         messages.push(ChatMessage {
             role: "assistant".to_string(),
@@ -1521,13 +1543,19 @@ mod tests {
             }]),
         });
         assert_eq!(
-            transient_plan_update_reminder(&messages).as_deref(),
-            Some("[System Reminder: use tool to update plan progress.]")
+            plan_update_reminder(&messages).as_deref(),
+            Some(PLAN_UPDATE_REMINDER)
         );
+        assert!(append_plan_update_reminder_if_due(&mut messages));
+        assert_eq!(
+            messages.last().and_then(|message| message.content.as_ref()),
+            Some(&Value::String(PLAN_UPDATE_REMINDER.to_string()))
+        );
+        assert!(plan_update_reminder(&messages).is_none());
     }
 
     #[test]
-    fn transient_plan_reminder_skips_when_last_batch_updated_plan() {
+    fn durable_plan_reminder_skips_when_last_batch_updated_plan() {
         let mut messages = Vec::new();
         for index in 0..10 {
             messages.push(ChatMessage {
@@ -1549,7 +1577,7 @@ mod tests {
                 }]),
             });
         }
-        assert!(transient_plan_update_reminder(&messages).is_none());
+        assert!(plan_update_reminder(&messages).is_none());
     }
 
     #[test]

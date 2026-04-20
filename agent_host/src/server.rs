@@ -4484,6 +4484,27 @@ mod tests {
     }
 
     #[test]
+    fn normalize_messages_for_persistence_preserves_runtime_system_notices() {
+        let canonical = "[AgentHost Main Foreground Agent]\ncanonical prompt";
+        let restart_notice = SYSTEM_RESTART_NOTICE;
+        let runtime_notice = "[Runtime Skill Updates]\nSkill \"search\" updated to version 3.";
+        let messages = vec![
+            ChatMessage::text("system", "[AgentFrame Runtime]\nold prompt"),
+            ChatMessage::text("assistant", "existing context"),
+            ChatMessage::text("system", restart_notice),
+            ChatMessage::text("system", runtime_notice),
+            ChatMessage::text("user", "继续"),
+        ];
+
+        let normalized = normalize_messages_for_persistence(messages, canonical, &[]);
+
+        assert_eq!(normalized[0], ChatMessage::text("system", canonical));
+        assert_eq!(normalized[2], ChatMessage::text("system", restart_notice));
+        assert_eq!(normalized[3], ChatMessage::text("system", runtime_notice));
+        assert_eq!(normalized.len(), 5);
+    }
+
+    #[test]
     fn system_prompt_prefix_survives_normal_turns_and_updates_after_compaction() {
         let prompt_v1 = "[AgentHost Main Foreground Agent]\nIdentity: v1";
         let prompt_v2 = "[AgentHost Main Foreground Agent]\nIdentity: v2";
@@ -5159,6 +5180,7 @@ mod tests {
                 "Idle compaction error: upstream timeout while compacting older messages"
             )
         );
+        assert!(text.contains("Conversation: 1717801091"));
         assert!(text.contains("upstream timeout while compacting older messages"));
     }
 

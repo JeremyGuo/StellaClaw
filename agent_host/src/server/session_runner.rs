@@ -171,7 +171,8 @@ impl<'a> TurnCoordinator<'a> {
             };
             let mut active_session = session;
             let mut next_previous_messages = previous_messages;
-            let mut ephemeral_system_messages = synthetic_system_messages.clone();
+            // Runtime system notices are durable once sent; do not strip them at commit.
+            let mut ephemeral_system_messages = Vec::new();
 
             channel
                 .set_processing(&incoming.address, ProcessingState::Typing)
@@ -217,7 +218,7 @@ impl<'a> TurnCoordinator<'a> {
                             state,
                             outgoing,
                             &turn_system_prompt,
-                            &synthetic_system_messages,
+                            &ephemeral_system_messages,
                             "user message reply",
                             "failed to persist agent_frame messages",
                         )
@@ -231,7 +232,7 @@ impl<'a> TurnCoordinator<'a> {
                             &active_session,
                             outcome,
                             &turn_system_prompt,
-                            &synthetic_system_messages,
+                            &ephemeral_system_messages,
                         )
                         .await?
                     {
@@ -358,7 +359,7 @@ impl Server {
                     &base_messages,
                     &prompt_state.system_prompt,
                     prompt_observation.static_changed,
-                );
+            );
             next_previous_messages.extend(synthetic_system_messages.iter().cloned());
             if rebuilt_system_prompt {
                 self.mark_conversation_context_changed(&address)?;
@@ -369,7 +370,8 @@ impl Server {
                 full: prompt_state.system_prompt.clone(),
                 static_hash: prompt_state.static_hash.clone(),
             };
-            let mut ephemeral_system_messages = synthetic_system_messages.clone();
+            // Runtime system notices are durable once sent; do not strip them at commit.
+            let mut ephemeral_system_messages = Vec::new();
 
             channel
                 .set_processing(&address, ProcessingState::Typing)
@@ -410,7 +412,7 @@ impl Server {
                         state,
                         outgoing,
                         &turn_system_prompt,
-                        &synthetic_system_messages,
+                        &ephemeral_system_messages,
                         "startup pending message recovery",
                         "failed to persist recovered pending foreground turn",
                     )
@@ -424,7 +426,7 @@ impl Server {
                             &active_session,
                             outcome,
                             &turn_system_prompt,
-                            &synthetic_system_messages,
+                            &ephemeral_system_messages,
                         )
                         .await?;
                 }
@@ -631,7 +633,8 @@ impl Server {
                 None,
             );
             next_previous_messages.extend(synthetic_system_messages.iter().cloned());
-            let mut ephemeral_system_messages = synthetic_system_messages.clone();
+            // Runtime system notices are durable once sent; do not strip them at commit.
+            let mut ephemeral_system_messages = Vec::new();
             let outcome = self
                 .run_main_session_turn_until_settled(
                     &mut active_session,
@@ -665,7 +668,7 @@ impl Server {
                         state,
                         outgoing,
                         &turn_system_prompt,
-                        &synthetic_system_messages,
+                        &ephemeral_system_messages,
                         "continued interrupted turn",
                         "failed to persist continued agent_frame messages",
                     )
@@ -680,7 +683,7 @@ impl Server {
                             &active_session,
                             outcome,
                             &turn_system_prompt,
-                            &synthetic_system_messages,
+                            &ephemeral_system_messages,
                         )
                         .await?
                     {

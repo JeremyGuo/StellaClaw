@@ -1,5 +1,32 @@
-version: 0.21.1
+version: 0.21.4
 ---
+
+# 0.21.4
+
+- 改进 prompt-cache 稳定性：
+  运行期 system notices（进程重启提示、长静默时间提示、runtime prompt/skill updates）一旦进入本轮模型请求，就会作为 durable session messages 持久化，不再在 turn commit 时按 ephemeral system message 剥离，避免 provider 看到的 prompt 形状与下一轮恢复的 messages 形状不一致。
+- 调整计划更新提醒语义：
+  每 10 个 tool batch 的 `update_plan` 提醒现在会追加到 AgentFrame `messages` 中并随 turn state 持久化；同一个 tool-batch 边界不会重复插入，减少隐藏 request-only system message 对 prompt cache 前缀复用的破坏。
+- 本次不影响 `config` 或 `workdir` schema：
+  没有新增配置字段或 workdir migration；按普通 patch 将仓库版本从 `0.21.3` 提升到 `0.21.4`。
+
+# 0.21.3
+
+- 改进 `/status` 调试信息：
+  状态文本顶部现在显示当前 `conversation_id`，方便把 Telegram/Web conversation 与 `sessions/<conversation_id>/...` 目录、agent 日志和 transcript 对齐排查。
+- 本次不影响 `config` 或 `workdir` schema：
+  没有新增配置字段或 workdir migration；按普通 patch 将仓库版本从 `0.21.2` 提升到 `0.21.3`。
+
+# 0.21.2
+
+- 调整 session workdir 布局：
+  新建 session 会写入 `sessions/<conversation_id>/foreground/<session_id>` 或 `sessions/<conversation_id>/background/<session_id>`，方便按 conversation 同时查看前台与后台 agent 的 transcript、session state 和调试文件。
+- 保持旧 session 读取兼容：
+  session 恢复、Web transcript 查找与 `/status` conversation 用量统计改为递归发现 `session.json`，避免新旧目录混用时漏算 foreground/background session。
+- 升级 `workdir` 结构版本到 `0.33`：
+  `0.32 -> 0.33` upgrade step 会把旧的平铺 `sessions/<session_id>` 目录迁移到 conversation/kind 分层目录，保留原 `session_id`、`session.json` 与 `transcript.jsonl` 内容。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  新增 workdir upgrade step；按 workdir-only 变更策略将仓库版本从 `0.21.1` 提升到 `0.21.2`。
 
 # 0.21.1
 

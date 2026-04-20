@@ -1497,6 +1497,67 @@ pub enum SessionKind {
     Background,
 }
 
+pub(crate) fn session_conversation_dir_name(conversation_id: &str) -> String {
+    let mut encoded = String::new();
+    for byte in conversation_id.as_bytes() {
+        let character = *byte as char;
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '@') {
+            encoded.push(character);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    if encoded.is_empty() {
+        "_".to_string()
+    } else {
+        encoded
+    }
+}
+
+pub(crate) fn session_kind_dir_name(kind: SessionKind) -> &'static str {
+    match kind {
+        SessionKind::Foreground => "foreground",
+        SessionKind::Background => "background",
+    }
+}
+
+pub(crate) fn session_root_dir(
+    sessions_root: &Path,
+    address: &ChannelAddress,
+    kind: SessionKind,
+    session_id: Uuid,
+) -> PathBuf {
+    sessions_root
+        .join(session_conversation_dir_name(&address.conversation_id))
+        .join(session_kind_dir_name(kind))
+        .join(session_id.to_string())
+}
+
+pub(crate) fn find_session_roots(sessions_root: &Path) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    collect_session_roots(sessions_root, &mut roots)?;
+    roots.sort();
+    Ok(roots)
+}
+
+fn collect_session_roots(root: &Path, roots: &mut Vec<PathBuf>) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(root).with_context(|| format!("failed to read {}", root.display()))? {
+        let path = entry?.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path.join("session.json").is_file() {
+            roots.push(path);
+        } else {
+            collect_session_roots(&path, roots)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct Session {
     kind: SessionKind,
@@ -2258,7 +2319,12 @@ impl SessionManager {
         let checkpoint_messages = checkpoint.messages.clone();
         let session_id = Uuid::new_v4();
         let agent_id = Uuid::new_v4();
-        let root_dir = self.sessions_root.join(session_id.to_string());
+        let root_dir = session_root_dir(
+            &self.sessions_root,
+            address,
+            SessionKind::Foreground,
+            session_id,
+        );
         fs::create_dir_all(&root_dir)
             .with_context(|| format!("failed to create session root {}", root_dir.display()))?;
         let attachments_dir = workspace_root.join("upload");
@@ -2337,7 +2403,7 @@ impl SessionManager {
                 .workspace_manager
                 .create_workspace(agent_id, session_id, None)?,
         };
-        let root_dir = self.sessions_root.join(session_id.to_string());
+        let root_dir = session_root_dir(&self.sessions_root, address, kind, session_id);
         fs::create_dir_all(&root_dir)
             .with_context(|| format!("failed to create session root {}", root_dir.display()))?;
         let attachments_dir = workspace.files_dir.join("upload");
@@ -2381,18 +2447,8 @@ fn load_persisted_sessions(
     workspace_manager: &WorkspaceManager,
 ) -> Result<HashMap<String, SessionActorRef>> {
     let mut sessions = HashMap::new();
-    for entry in fs::read_dir(sessions_root)
-        .with_context(|| format!("failed to read {}", sessions_root.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
+    for path in find_session_roots(sessions_root)? {
         let state_path = path.join("session.json");
-        if !state_path.exists() {
-            continue;
-        }
         match load_single_session(&path, &state_path, workspace_manager) {
             Ok(Some(session)) => {
                 if session.kind != SessionKind::Foreground {
@@ -2446,7 +2502,7 @@ mod tests {
         IDENTITY_PROMPT_COMPONENT, SKILLS_METADATA_PROMPT_COMPONENT, SessionActorMessage,
         SessionActorOutbound, SessionEffect, SessionErrno, SessionKind, SessionManager,
         SessionPhase, SessionRuntimeTurnCommit, SessionRuntimeTurnFailure, SessionSkillObservation,
-        SkillChangeNotice,
+        SkillChangeNotice, session_conversation_dir_name,
     };
     use crate::channel::ProgressFeedbackFinalState;
     use crate::domain::{ChannelAddress, MessageRole};
@@ -3165,6 +3221,40 @@ mod tests {
                 .as_ref()
                 .and_then(serde_json::Value::as_str),
             Some("background memory")
+        );
+    }
+
+    #[test]
+    fn foreground_and_background_session_roots_are_nested_by_conversation_and_kind() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let foreground = ensure_foreground_snapshot(&mut sessions, &address);
+        let background = sessions
+            .create_background_actor(&address, Uuid::new_v4())
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        let conversation_dir = session_conversation_dir_name(&address.conversation_id);
+
+        assert_eq!(
+            foreground.root_dir,
+            temp_dir
+                .path()
+                .join("sessions")
+                .join(&conversation_dir)
+                .join("foreground")
+                .join(foreground.id.to_string())
+        );
+        assert_eq!(
+            background.root_dir,
+            temp_dir
+                .path()
+                .join("sessions")
+                .join(conversation_dir)
+                .join("background")
+                .join(background.id.to_string())
         );
     }
 

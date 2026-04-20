@@ -55,8 +55,8 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Main agents can call `update_plan` to publish a short structured checklist for non-trivial, multi-step, ambiguous, or long-running work.
 - The current plan is owned and persisted by the receiving SessionActor as `session_state.current_plan`, so progress survives normal actor reloads and does not live in Conversation routing state.
 - Plan updates are rendered through the channel progress feedback path while the model only receives a compact tool result, avoiding repeated long plan text in the assistant context.
-- During long tool-driven turns, AgentFrame injects a transient reminder every 10 tool batches to update the plan when progress changed. The reminder is request-time only and must not be persisted into durable session messages.
-- Regression coverage should protect plan schema validation, at-most-one in-progress step, persisted current-plan upgrades, progress rendering, and transient reminder timing.
+- During long tool-driven turns, AgentFrame injects a plan-update reminder every 10 tool batches when progress may have changed. If the reminder is sent to the model, it must be appended to durable session messages and preserved like any other context message so the next request sees the same prompt history shape.
+- Regression coverage should protect plan schema validation, at-most-one in-progress step, persisted current-plan upgrades, progress rendering, and durable reminder timing.
 
 ### System Prompt Refresh Semantics
 
@@ -67,6 +67,7 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - AgentFrame always assembles latest runtime/tool guidance and tool schemas at request time, while skills metadata is tracked as a session prompt component with separate canonical and notified snapshots.
 - Profile and skill metadata change notifications are emitted only on user-message turn boundaries. Assistant resume, background auto-resume, and tool-progress loops must not advance prompt notification state.
 - After context compaction, notified prompt component snapshots are promoted into canonical prompt snapshots.
+- Runtime system notices must not be hidden request-only mutations. If restart notices, idle-time tips, runtime prompt updates, runtime skill updates, or plan reminders are included in an upstream model request, they must also be persisted into `session_state.messages` in the same relative position instead of being stripped during turn commit. The durable messages are the cache-stability contract: AgentHost/AgentFrame must not send one prompt shape to the provider and then resume from a different message shape, because that destroys prompt-cache prefix reuse and makes token efficiency unpredictable.
 - Regression coverage should protect prompt recursion prevention, RuntimeContext removal, skill metadata snapshot/notified behavior, and user-boundary-only skill notifications.
 
 ### API Request Observability
@@ -76,6 +77,7 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Request and response bodies are logged with secret-key redaction. By default, logs include bounded body previews for debugging; setting `AGENT_FRAME_LOG_API_BODIES=full` includes full redacted JSON bodies, and `off` disables body content while preserving sizes and metadata.
 - Agent runtime model-call events include the final `api_request_id` and cache token fields so session/agent logs can be joined to low-level API request logs without inferring from timestamps.
 - `/status` should show a rolling multi-day total usage and current estimated spend for the current conversation across foreground, background, and subagents by aggregating per-turn agent usage logs for sessions with the same channel/conversation address. It must not use legacy `session.cumulative_usage` as the primary status total because older session state may contain polluted cumulative accounting.
+- `/status` should include the current `conversation_id` near the top of the response so session transcripts and agent logs can be matched back to the channel conversation quickly.
 - `/status` spend accounting should price per-model `agent_frame_model_call_completed` logs instead of multiplying all tokens by the current model. Unknown model pricing may fall back to GLM 5.1 pricing, but the response must separately list correctly priced models, risky/best-effort models, and unknown models.
 - Telegram `/status` renders the rolling spend trend as a channel-owned matplotlib chart when available, attempts a user-level matplotlib install if missing, and falls back to the text status when chart rendering is unavailable.
 - Regression coverage should protect header/body redaction, clear token accounting names, and the model-call/API-request join fields.
@@ -123,8 +125,10 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 ### Session Transcript
 
 - Each session root owns an append-only `transcript.jsonl` that records user messages, assistant messages, model calls, tool results, and compaction events in stable sequence order. Channel adapters must not write transcript files directly; Web history is served from the Host/session transcript path.
+- Session roots are grouped under `sessions/<conversation_id>/foreground/<session_id>` and `sessions/<conversation_id>/background/<session_id>` so foreground and background transcripts for the same conversation are easy to inspect together.
 - Model-call transcript entries include token accounting and the full assistant `ChatMessage`; tool-result entries include the tool name, call id, output length, error flag, and full tool output when available.
 - Existing workdirs are upgraded by creating missing `transcript.jsonl` files for persisted sessions.
+- Existing flat `sessions/<session_id>` workdirs are upgraded into the conversation/kind hierarchy without changing the session ids or transcript contents.
 - Regression coverage should protect transcript reopening sequence continuity, newest-first list pagination, detail reads, and workdir upgrade creation of missing transcript files.
 
 ### Session Actor Architecture

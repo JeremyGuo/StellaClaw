@@ -539,6 +539,7 @@ pub(super) fn format_session_status(
     if language.starts_with("zh") {
         let mut lines = vec![
             format!("Session: {}", session.id),
+            format!("Conversation: {}", session.address.conversation_id),
             format!("Workspace: {}", session.workspace_id),
             format!("Model: {} ({})", model_key, model.model),
             format!(
@@ -705,6 +706,7 @@ pub(super) fn format_session_status(
     } else {
         let mut lines = vec![
             format!("Session: {}", session.id),
+            format!("Conversation: {}", session.address.conversation_id),
             format!("Workspace: {}", session.workspace_id),
             format!("Model: {} ({})", model_key, model.model),
             format!(
@@ -1255,13 +1257,13 @@ fn conversation_session_ids_from_workdir(
     address: &ChannelAddress,
 ) -> HashSet<String> {
     let sessions_dir = workdir.join("sessions");
-    let Ok(entries) = fs::read_dir(sessions_dir) else {
+    let Ok(session_roots) = crate::session::find_session_roots(&sessions_dir) else {
         return HashSet::new();
     };
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path().join("session.json");
+    session_roots
+        .into_iter()
+        .filter_map(|root| {
+            let path = root.join("session.json");
             let raw = fs::read_to_string(path).ok()?;
             let value = serde_json::from_str::<Value>(&raw).ok()?;
             let object_address = value.get("address")?.as_object()?;

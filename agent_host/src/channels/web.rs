@@ -1014,14 +1014,8 @@ fn find_session_root(
     if !sessions_root.is_dir() {
         return Ok(None);
     }
-    for entry in std::fs::read_dir(&sessions_root)
-        .with_context(|| format!("failed to read {}", sessions_root.display()))?
-    {
-        let session_root = entry?.path();
+    for session_root in crate::session::find_session_roots(&sessions_root)? {
         let session_path = session_root.join("session.json");
-        if !session_path.is_file() {
-            continue;
-        }
         let raw = std::fs::read_to_string(&session_path)
             .with_context(|| format!("failed to read {}", session_path.display()))?;
         let value: Value = serde_json::from_str(&raw)

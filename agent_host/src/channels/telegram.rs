@@ -2816,12 +2816,7 @@ fn render_blocks_to_telegram_entities(
                 builder.push_text(code);
                 builder.push_entity_trimmed(start, "pre", None, language.clone());
                 if collapse {
-                    builder.push_entity_trimmed(
-                        outer_start,
-                        "expandable_blockquote",
-                        None,
-                        None,
-                    );
+                    builder.push_entity_trimmed(outer_start, "expandable_blockquote", None, None);
                 }
                 *need_paragraph_break = true;
             }
@@ -2836,12 +2831,7 @@ fn render_blocks_to_telegram_entities(
                 builder.push_text(&table_text);
                 builder.push_entity_trimmed(start, "pre", None, None);
                 if collapse {
-                    builder.push_entity_trimmed(
-                        outer_start,
-                        "expandable_blockquote",
-                        None,
-                        None,
-                    );
+                    builder.push_entity_trimmed(outer_start, "expandable_blockquote", None, None);
                 }
                 *need_paragraph_break = true;
             }
@@ -4914,10 +4904,7 @@ mod tests {
         let rendered = render_rich_document_to_telegram_entities(&document);
 
         assert!(
-            rendered
-                .entities
-                .iter()
-                .any(|entity| entity.kind == "pre"),
+            rendered.entities.iter().any(|entity| entity.kind == "pre"),
             "should have a pre entity for the code block"
         );
         assert!(
@@ -4936,10 +4923,7 @@ mod tests {
         let rendered = render_rich_document_to_telegram_entities(&document);
 
         assert!(
-            rendered
-                .entities
-                .iter()
-                .any(|entity| entity.kind == "pre"),
+            rendered.entities.iter().any(|entity| entity.kind == "pre"),
             "should have a pre entity for the code block"
         );
         assert!(

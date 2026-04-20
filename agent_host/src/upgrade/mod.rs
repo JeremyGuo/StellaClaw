@@ -25,6 +25,7 @@ mod v0_29;
 mod v0_30;
 mod v0_31;
 mod v0_32;
+mod v0_33;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -32,7 +33,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.32";
+pub const LATEST_WORKDIR_VERSION: &str = "0.33";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -48,7 +49,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 28] = [
+    let upgraders: [&dyn WorkdirUpgrader; 29] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
@@ -77,6 +78,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
         &v0_30::Upgrade,
         &v0_31::Upgrade,
         &v0_32::Upgrade,
+        &v0_33::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -133,6 +135,7 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.29" => Ok("0.29"),
         "0.30" => Ok("0.30"),
         "0.31" => Ok("0.31"),
+        "0.32" => Ok("0.32"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -148,8 +151,29 @@ mod tests {
     use super::{LATEST_WORKDIR_VERSION, upgrade_workdir};
     use serde_json::json;
     use std::fs;
+    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
     use uuid::Uuid;
+
+    fn upgraded_session_json_path(workdir: &Path, original_session_dir: &Path) -> PathBuf {
+        let original_path = original_session_dir.join("session.json");
+        if original_path.is_file() {
+            return original_path;
+        }
+        let session_id = original_session_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("session dir should be named by session id");
+        let roots = crate::session::find_session_roots(&workdir.join("sessions")).unwrap();
+        if roots.len() == 1 {
+            return roots[0].join("session.json");
+        }
+        roots
+            .into_iter()
+            .find(|root| root.file_name().and_then(|name| name.to_str()) == Some(session_id))
+            .expect("upgraded session root should exist")
+            .join("session.json")
+    }
 
     #[test]
     fn missing_version_file_upgrades_workdir_and_backfills_conversation_workspace() {
@@ -389,9 +413,10 @@ mod tests {
             Some("agent_frame")
         );
 
-        let session: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
-                .unwrap();
+        let session: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(upgraded_session_json_path(temp_dir.path(), &session_dir)).unwrap(),
+        )
+        .unwrap();
         assert!(session.get("pending_continue").is_none());
 
         let subagent: serde_json::Value =
@@ -581,9 +606,10 @@ mod tests {
         let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
 
         assert!(upgraded);
-        let session: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
-                .unwrap();
+        let session: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(upgraded_session_json_path(temp_dir.path(), &session_dir)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             session["last_user_message_at"].as_str(),
             Some("2026-04-09T00:00:00Z")
@@ -649,9 +675,10 @@ mod tests {
                 .trim(),
             LATEST_WORKDIR_VERSION
         );
-        let session: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
-                .unwrap();
+        let session: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(upgraded_session_json_path(temp_dir.path(), &session_dir)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             session["session_state"]["messages"][0]["content"].as_str(),
             Some("resume-here")
@@ -701,9 +728,10 @@ mod tests {
         let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
 
         assert!(upgraded);
-        let session: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
-                .unwrap();
+        let session: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(upgraded_session_json_path(temp_dir.path(), &session_dir)).unwrap(),
+        )
+        .unwrap();
         assert!(session["session_state"].get("progress_message").is_some());
         assert!(session["session_state"]["progress_message"].is_null());
     }
@@ -750,9 +778,10 @@ mod tests {
 
         let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
         assert!(upgraded);
-        let session: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
-                .unwrap();
+        let session: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(upgraded_session_json_path(temp_dir.path(), &session_dir)).unwrap(),
+        )
+        .unwrap();
         assert!(session.get("pending_continue").is_none());
         assert_eq!(session["session_state"]["phase"].as_str(), Some("yielded"));
     }
@@ -792,9 +821,10 @@ mod tests {
 
         let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
         assert!(upgraded);
-        let session: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
-                .unwrap();
+        let session: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(upgraded_session_json_path(temp_dir.path(), &session_dir)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             session["session_state"]["errno"].as_str(),
             Some("runtime_failure")
@@ -837,9 +867,10 @@ mod tests {
 
         let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
         assert!(upgraded);
-        let session: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
-                .unwrap();
+        let session: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(upgraded_session_json_path(temp_dir.path(), &session_dir)).unwrap(),
+        )
+        .unwrap();
         assert!(session.get("agent_messages").is_none());
         assert_eq!(
             session["session_state"]["messages"][0]["content"].as_str(),
@@ -886,9 +917,10 @@ mod tests {
 
         let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
         assert!(upgraded);
-        let session: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
-                .unwrap();
+        let session: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(upgraded_session_json_path(temp_dir.path(), &session_dir)).unwrap(),
+        )
+        .unwrap();
         assert!(session.get("idle_compaction_retry").is_none());
         assert_eq!(
             session["session_state"]["errno"].as_str(),
@@ -1030,9 +1062,10 @@ mod tests {
         let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
 
         assert!(upgraded);
-        let session: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
-                .unwrap();
+        let session: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(upgraded_session_json_path(temp_dir.path(), &session_dir)).unwrap(),
+        )
+        .unwrap();
         assert!(session["session_state"]["system_prompt_static_hash"].is_null());
         assert!(session["session_state"]["system_prompt_component_hashes"].is_null());
         assert!(session["session_state"]["pending_system_prompt_component_notices"].is_null());
@@ -1093,9 +1126,10 @@ mod tests {
         let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
 
         assert!(upgraded);
-        let session: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
-                .unwrap();
+        let session: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(upgraded_session_json_path(temp_dir.path(), &session_dir)).unwrap(),
+        )
+        .unwrap();
         assert!(
             session["session_state"]["actor_mailbox"]
                 .as_array()
@@ -1164,9 +1198,10 @@ mod tests {
         let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
 
         assert!(upgraded);
-        let session: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
-                .unwrap();
+        let session: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(upgraded_session_json_path(temp_dir.path(), &session_dir)).unwrap(),
+        )
+        .unwrap();
         assert!(
             session["session_state"]["user_mailbox"]
                 .as_array()
@@ -1259,9 +1294,10 @@ mod tests {
         let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
 
         assert!(upgraded);
-        let session: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
-                .unwrap();
+        let session: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(upgraded_session_json_path(temp_dir.path(), &session_dir)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(session["session_state"]["prompt_components"], json!({}));
         assert!(session["seen_user_profile_version"].is_null());
         assert!(session["seen_identity_profile_version"].is_null());
@@ -1383,9 +1419,10 @@ mod tests {
         let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
 
         assert!(upgraded);
-        let session: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
-                .unwrap();
+        let session: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(upgraded_session_json_path(temp_dir.path(), &session_dir)).unwrap(),
+        )
+        .unwrap();
         assert!(session["session_state"]["current_plan"].is_null());
 
         let snapshot: serde_json::Value =
@@ -1399,15 +1436,16 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         fs::write(temp_dir.path().join("VERSION"), "0.30\n").unwrap();
 
+        let session_id = Uuid::new_v4();
         let session_dir = temp_dir
             .path()
             .join("sessions")
-            .join(Uuid::new_v4().to_string());
+            .join(session_id.to_string());
         fs::create_dir_all(&session_dir).unwrap();
         fs::write(
             session_dir.join("session.json"),
             serde_json::to_string_pretty(&json!({
-                "id": Uuid::new_v4(),
+                "id": session_id,
                 "agent_id": Uuid::new_v4(),
                 "address": {
                     "channel_id": "web-main",
@@ -1429,7 +1467,16 @@ mod tests {
                 .trim(),
             LATEST_WORKDIR_VERSION
         );
-        assert!(session_dir.join("transcript.jsonl").is_file());
+        assert!(
+            temp_dir
+                .path()
+                .join("sessions")
+                .join("web-default")
+                .join("foreground")
+                .join(session_id.to_string())
+                .join("transcript.jsonl")
+                .is_file()
+        );
     }
 
     #[test]
@@ -1509,5 +1556,65 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[test]
+    fn v0_33_workdir_upgrade_moves_sessions_under_conversation_and_kind() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.32\n").unwrap();
+
+        let foreground_id = Uuid::new_v4();
+        let background_id = Uuid::new_v4();
+        let sessions_root = temp_dir.path().join("sessions");
+        for (session_id, kind) in [(foreground_id, "foreground"), (background_id, "background")] {
+            let session_dir = sessions_root.join(session_id.to_string());
+            fs::create_dir_all(&session_dir).unwrap();
+            fs::write(
+                session_dir.join("session.json"),
+                serde_json::to_string_pretty(&json!({
+                    "kind": kind,
+                    "id": session_id,
+                    "agent_id": Uuid::new_v4(),
+                    "address": {
+                        "channel_id": "telegram-main",
+                        "conversation_id": "-100/test"
+                    },
+                    "session_state": {
+                        "messages": []
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fs::write(session_dir.join("transcript.jsonl"), "").unwrap();
+        }
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("VERSION"))
+                .unwrap()
+                .trim(),
+            LATEST_WORKDIR_VERSION
+        );
+        assert!(
+            sessions_root
+                .join("-100%2Ftest")
+                .join("foreground")
+                .join(foreground_id.to_string())
+                .join("session.json")
+                .is_file()
+        );
+        assert!(
+            sessions_root
+                .join("-100%2Ftest")
+                .join("background")
+                .join(background_id.to_string())
+                .join("transcript.jsonl")
+                .is_file()
+        );
+        assert!(!sessions_root.join(foreground_id.to_string()).exists());
+        assert!(!sessions_root.join(background_id.to_string()).exists());
     }
 }
