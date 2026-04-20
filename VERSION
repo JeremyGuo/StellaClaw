@@ -1,5 +1,18 @@
-version: 0.21.0
+version: 0.21.1
 ---
+
+# 0.21.1
+
+- 新增 conversation 级本地目录挂载：
+  用户可发送 `/mount <folder>` 将一个已存在的本地目录加入当前 conversation 的 durable local mounts；bubblewrap 模式会把这些目录以同样的绝对路径可写 bind mount 到 AgentFrame 沙盒中，subprocess 模式会保留设置以便之后切换到 bubblewrap 时生效。
+- 改进 AgentFrame runtime 刷新：
+  新增本地挂载后会让当前 foreground AgentFrame runtime 失效，下一次 turn 会重新启动子进程并带上新的 bubblewrap mount 参数；system prompt 重建时也会列出当前 conversation 的本地挂载路径。
+- `/mount` 已加入默认 bot command 列表：
+  CLI、Web、DingTalk 与 Telegram 默认命令表都会包含该命令，Telegram 启动注册命令时会同步到 bot 菜单。
+- 升级 `workdir` 结构版本到 `0.32`：
+  `0.31 -> 0.32` upgrade step 会为旧 `conversations/*/conversation.json` 与 `snapshots/*/snapshot.json` 的 `settings` 回填 `local_mounts: []`。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  新增 workdir upgrade step；按 workdir-only 变更策略将仓库版本从 `0.21.0` 提升到 `0.21.1`。
 
 # 0.21.0
 

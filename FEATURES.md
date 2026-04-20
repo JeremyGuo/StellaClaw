@@ -42,6 +42,14 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Download/image-style background jobs follow start + wait/progress + cancel where applicable, and their wait tools support explicit wait timeouts without cancelling on normal interruption.
 - Regression coverage should protect tool execution mode annotations, centralized remote guidance, centralized runtime-id start guidance, manual SSH rejection, and the start/wait/terminate schemas for long-running tool families.
 
+### Conversation Local Mounts
+
+- Users can send `/mount <folder>` to add an existing local directory to the current conversation's durable local mount list.
+- In bubblewrap sandbox mode, conversation local mounts are exposed to AgentFrame at the same absolute host paths as writable bind mounts, while subprocess mode keeps the setting for later bubblewrap use.
+- Adding a local mount invalidates the foreground AgentFrame runtime so an idle conversation uses a freshly spawned bubblewrap process with the new mount on the next turn.
+- Conversation local mounts are included in the rebuilt system prompt so future turns can identify the mounted local paths without treating them as remote SSH workpaths.
+- Regression coverage should protect `/mount` parsing, conversation persistence, workdir upgrade backfill, prompt rendering, and bubblewrap bind arguments for local mounts.
+
 ### Agent Plan Progress
 
 - Main agents can call `update_plan` to publish a short structured checklist for non-trivial, multi-step, ambiguous, or long-running work.

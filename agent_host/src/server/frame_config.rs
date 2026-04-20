@@ -428,6 +428,12 @@ impl AgentRuntimeView {
                 .map(|snapshot| snapshot.settings.remote_workpaths)
                 .unwrap_or_default())
         })?;
+        let local_mounts = self.with_conversations(|conversations| {
+            Ok(conversations
+                .get_snapshot(&session.address)
+                .map(|snapshot| snapshot.settings.local_mounts)
+                .unwrap_or_default())
+        })?;
 
         Ok(FrameAgentConfig {
             enabled_tools: self.main_agent.enabled_tools.clone(),
@@ -465,6 +471,7 @@ impl AgentRuntimeView {
                 session,
                 &workspace_summary,
                 &remote_workpaths,
+                &local_mounts,
                 kind,
                 model_key,
                 model,

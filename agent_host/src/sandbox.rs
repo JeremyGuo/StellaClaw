@@ -369,6 +369,7 @@ impl PersistentChildRuntime {
         runtime_state_root: &Path,
         global_install_root: PathBuf,
         token_estimation_cache_roots: Vec<PathBuf>,
+        local_mounts: Vec<PathBuf>,
         skill_memory_source: PathBuf,
         skills_source_root: PathBuf,
         skills_dirs: &[std::path::PathBuf],
@@ -389,6 +390,7 @@ impl PersistentChildRuntime {
                 runtime_state_root,
                 &global_install_root,
                 &token_estimation_cache_roots,
+                &local_mounts,
                 &workspace_root.join(".skill_memory"),
                 &skill_memory_source,
                 &skills_source_root,
@@ -616,6 +618,7 @@ pub fn run_one_shot_child_turn(
     execution_options: BackendExecutionOptions,
     global_install_root: PathBuf,
     token_estimation_cache_roots: Vec<PathBuf>,
+    local_mounts: Vec<PathBuf>,
     skill_memory_source: PathBuf,
     skills_source_root: PathBuf,
     extra_tools: Vec<Tool>,
@@ -627,6 +630,7 @@ pub fn run_one_shot_child_turn(
         &config.runtime_state_root,
         global_install_root,
         token_estimation_cache_roots,
+        local_mounts,
         skill_memory_source,
         skills_source_root,
         &config.skills_dirs,
@@ -655,6 +659,7 @@ fn build_bubblewrap_command(
     runtime_state_root: &Path,
     global_install_root: &Path,
     token_estimation_cache_roots: &[PathBuf],
+    local_mounts: &[PathBuf],
     skill_memory_target: &Path,
     skill_memory_source: &Path,
     skills_source_root: &Path,
@@ -715,10 +720,20 @@ fn build_bubblewrap_command(
         for cache_root in token_estimation_cache_roots {
             ensure_home_skeleton_parent_for_target(&home_skeleton, &home_dir, cache_root)?;
         }
+        for local_mount in local_mounts {
+            ensure_home_skeleton_parent_for_target(&home_skeleton, &home_dir, local_mount)?;
+        }
         bind_path_to(&mut command, &home_skeleton, &home_dir, true)?;
     }
     bind_path(&mut command, workspace_root, false)?;
     bind_path(&mut command, runtime_state_root, false)?;
+    for local_mount in local_mounts {
+        if local_mount.as_os_str().is_empty() {
+            continue;
+        }
+        ensure_bubblewrap_target_parent_dirs(&mut command, local_mount)?;
+        bind_path(&mut command, local_mount, false)?;
+    }
     if !global_install_root.as_os_str().is_empty() {
         fs::create_dir_all(global_install_root).with_context(|| {
             format!(
@@ -833,6 +848,47 @@ fn ensure_home_skeleton_parent_for_target(
     Ok(())
 }
 
+fn ensure_bubblewrap_target_parent_dirs(command: &mut Command, target: &Path) -> Result<()> {
+    if let Some(home_dir) = discover_home_dir()
+        && target.starts_with(home_dir)
+    {
+        return Ok(());
+    }
+    let Some(parent) = target.parent() else {
+        return Ok(());
+    };
+    let mut dirs = parent
+        .ancestors()
+        .filter(|path| {
+            path.has_root()
+                && !matches!(
+                    path.to_str(),
+                    Some(
+                        "/" | "/tmp"
+                            | "/var/tmp"
+                            | "/usr"
+                            | "/bin"
+                            | "/sbin"
+                            | "/lib"
+                            | "/lib64"
+                            | "/etc"
+                            | "/run"
+                            | "/dev"
+                            | "/proc"
+                    )
+                )
+        })
+        .collect::<Vec<_>>();
+    dirs.reverse();
+    for dir in dirs {
+        let dir_str = dir
+            .to_str()
+            .ok_or_else(|| anyhow!("path is not valid UTF-8: {}", dir.display()))?;
+        command.args(["--dir", dir_str]);
+    }
+    Ok(())
+}
+
 fn bind_path(command: &mut Command, path: &Path, read_only: bool) -> Result<()> {
     bind_path_to(command, path, path, read_only)
 }
@@ -895,6 +951,7 @@ mod tests {
             &runtime_state_root,
             &global_install_root,
             &[],
+            &[],
             &workspace_root.join(".skill_memory"),
             &skill_memory_source,
             &skills_source_root,
@@ -943,6 +1000,7 @@ mod tests {
             &runtime_state_root,
             &missing_global_install_root,
             &[],
+            &[],
             &workspace_root.join(".skill_memory"),
             &temp_dir.path().join("skill_memory"),
             &temp_dir.path().join("skills-source"),
@@ -990,6 +1048,7 @@ mod tests {
             &runtime_state_root,
             &global_install_root,
             &[template_cache_root.clone(), tokenizer_cache_root.clone()],
+            &[],
             &workspace_root.join(".skill_memory"),
             &temp_dir.path().join("skill_memory"),
             &temp_dir.path().join("skills-source"),
@@ -1019,6 +1078,57 @@ mod tests {
     }
 
     #[test]
+    fn bubblewrap_mounts_conversation_local_mounts_as_writable_binds() {
+        let temp_dir = TempDir::new().unwrap();
+        let current_exe = temp_dir.path().join("partyclaw");
+        let workspace_root = temp_dir.path().join("workspace");
+        let runtime_state_root = temp_dir.path().join("runtime");
+        let global_install_root = temp_dir.path().join("global");
+        let local_mount = temp_dir.path().join("shared-data");
+
+        fs::write(&current_exe, b"binary").unwrap();
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        fs::create_dir_all(&global_install_root).unwrap();
+        fs::create_dir_all(&local_mount).unwrap();
+
+        let command = build_bubblewrap_command(
+            &SandboxConfig {
+                mode: SandboxMode::Bubblewrap,
+                bubblewrap_binary: "bwrap".to_string(),
+                map_docker_socket: false,
+            },
+            &current_exe,
+            &workspace_root,
+            &runtime_state_root,
+            &global_install_root,
+            &[],
+            std::slice::from_ref(&local_mount),
+            &workspace_root.join(".skill_memory"),
+            &temp_dir.path().join("skill_memory"),
+            &temp_dir.path().join("skills-source"),
+            &[],
+        )
+        .unwrap();
+
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let expected = vec![
+            "--bind".to_string(),
+            local_mount.to_string_lossy().into_owned(),
+            local_mount.to_string_lossy().into_owned(),
+        ];
+        assert!(
+            args.windows(expected.len())
+                .any(|window| window == expected),
+            "bubblewrap args did not include writable local mount bind: {:?}",
+            args
+        );
+    }
+
+    #[test]
     fn bubblewrap_does_not_bind_entire_run_by_default() {
         let temp_dir = TempDir::new().unwrap();
         let current_exe = temp_dir.path().join("partyclaw");
@@ -1041,6 +1151,7 @@ mod tests {
             &workspace_root,
             &runtime_state_root,
             &global_install_root,
+            &[],
             &[],
             &workspace_root.join(".skill_memory"),
             &temp_dir.path().join("skill_memory"),

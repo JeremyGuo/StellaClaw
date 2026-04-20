@@ -882,6 +882,10 @@ pub fn default_bot_commands() -> Vec<BotCommandConfig> {
             description: "Show or set the conversation sandbox mode".to_string(),
         },
         BotCommandConfig {
+            command: "mount".to_string(),
+            description: "Mount a local folder into bubblewrap for this conversation".to_string(),
+        },
+        BotCommandConfig {
             command: "think".to_string(),
             description: "Show or set the conversation reasoning effort".to_string(),
         },
@@ -1609,6 +1613,7 @@ mod tests {
         TokenEstimationSource, TokenEstimationTemplateConfig, TokenEstimationTokenizerConfig,
     };
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
 
     #[test]
@@ -1983,6 +1988,49 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(!commands.iter().any(|command| command == "new"));
         assert!(!commands.iter().any(|command| command == "oldspace"));
+        assert!(commands.iter().any(|command| command == "mount"));
+    }
+
+    #[test]
+    fn repository_telegram_templates_include_mount_command() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let template_paths = [
+            manifest_dir.join("../deploy_telegram.json"),
+            manifest_dir.join("../test_telegram.json"),
+            manifest_dir.join("example_telegram_config.json"),
+        ];
+
+        for path in template_paths {
+            let content = fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+            let value: serde_json::Value = serde_json::from_str(&content)
+                .unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()));
+            let channels = value
+                .get("channels")
+                .and_then(|channels| channels.as_array())
+                .unwrap_or_else(|| panic!("{} has no channels array", path.display()));
+            let telegram = channels
+                .iter()
+                .find(|channel| {
+                    channel.get("kind").and_then(|kind| kind.as_str()) == Some("telegram")
+                })
+                .unwrap_or_else(|| panic!("{} has no telegram channel", path.display()));
+            let commands = telegram
+                .get("commands")
+                .and_then(|commands| commands.as_array())
+                .unwrap_or_else(|| {
+                    panic!("{} telegram channel has no commands array", path.display())
+                });
+
+            assert!(
+                commands.iter().any(|command| command
+                    .get("command")
+                    .and_then(|command| command.as_str())
+                    == Some("mount")),
+                "{} telegram command list should include /mount",
+                path.display()
+            );
+        }
     }
 
     #[test]

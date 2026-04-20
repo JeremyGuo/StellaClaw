@@ -24,6 +24,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "/continue",
     "/help",
     "/model",
+    "/mount",
     "/sandbox",
     "/set_api_timeout",
     "/snaplist",
@@ -108,6 +109,10 @@ pub(super) fn parse_compact_mode_command(text: Option<&str>) -> Option<Option<St
 
 pub(super) fn parse_sandbox_command(text: Option<&str>) -> Option<Option<String>> {
     parse_optional_command_argument(text, "/sandbox")
+}
+
+pub(super) fn parse_mount_command(text: Option<&str>) -> Option<Option<String>> {
+    parse_optional_command_argument(text, "/mount")
 }
 
 pub(super) fn parse_think_command(text: Option<&str>) -> Option<Option<String>> {

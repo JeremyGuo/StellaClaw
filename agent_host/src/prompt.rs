@@ -1,5 +1,6 @@
 use crate::bootstrap::AgentWorkspace;
 use crate::config::{MainAgentConfig, ModelConfig};
+use crate::conversation::LocalMount;
 use crate::session::{IDENTITY_PROMPT_COMPONENT, SessionSnapshot, USER_META_PROMPT_COMPONENT};
 use crate::workpath::{RemoteWorkpath, render_remote_workpaths_for_prompt};
 use agent_frame::config::MemorySystem;
@@ -44,6 +45,7 @@ pub fn build_agent_system_prompt_state(
     session: &SessionSnapshot,
     workspace_summary: &str,
     remote_workpaths: &[RemoteWorkpath],
+    local_mounts: &[LocalMount],
     kind: AgentPromptKind,
     model_name: &str,
     model: &ModelConfig,
@@ -56,6 +58,7 @@ pub fn build_agent_system_prompt_state(
         session,
         workspace_summary,
         remote_workpaths,
+        local_mounts,
         kind,
         model_name,
         model,
@@ -70,6 +73,7 @@ pub fn build_agent_system_prompt_state(
         models,
         chat_model_keys,
         main_agent,
+        local_mounts,
     );
     AgentSystemPromptState {
         system_prompt,
@@ -90,6 +94,7 @@ fn build_system_prompt_rebuild_trigger(
     models: &BTreeMap<String, ModelConfig>,
     chat_model_keys: &[String],
     main_agent: &MainAgentConfig,
+    local_mounts: &[LocalMount],
 ) -> String {
     let mut trigger = build_static_system_prompt(kind, main_agent);
     trigger.push('\n');
@@ -105,7 +110,25 @@ fn build_system_prompt_rebuild_trigger(
     let model_catalog = render_available_models_catalog(models, chat_model_keys);
     trigger.push('\n');
     trigger.push_str(&model_catalog);
+    if let Some(local_mounts) = render_local_mounts_for_prompt(local_mounts) {
+        trigger.push('\n');
+        trigger.push_str(&local_mounts);
+    }
     trigger
+}
+
+pub fn render_local_mounts_for_prompt(local_mounts: &[LocalMount]) -> Option<String> {
+    if local_mounts.is_empty() {
+        return None;
+    }
+    let mut lines = vec![
+        "Local folders mounted for this conversation:".to_string(),
+        "When sandbox mode is bubblewrap, these host directories are visible at the same absolute paths inside the sandbox. Treat them as local paths; do not use remote tooling for them.".to_string(),
+    ];
+    for mount in local_mounts {
+        lines.push(format!("- `{}`", mount.path.display()));
+    }
+    Some(lines.join("\n"))
 }
 
 pub fn current_identity_prompt_for_workspace(workspace: &AgentWorkspace) -> String {
@@ -252,6 +275,7 @@ pub fn build_agent_system_prompt(
     session: &SessionSnapshot,
     workspace_summary: &str,
     remote_workpaths: &[RemoteWorkpath],
+    local_mounts: &[LocalMount],
     kind: AgentPromptKind,
     model_name: &str,
     model: &ModelConfig,
@@ -322,6 +346,9 @@ pub fn build_agent_system_prompt(
     if let Some(remote_workpaths) = render_remote_workpaths_for_prompt(remote_workpaths) {
         parts.push(remote_workpaths);
     }
+    if let Some(local_mounts) = render_local_mounts_for_prompt(local_mounts) {
+        parts.push(local_mounts);
+    }
 
     parts.extend(build_memory_static_prompt_parts(main_agent));
     if main_agent.memory_system == MemorySystem::ClaudeCode
@@ -380,6 +407,7 @@ mod tests {
         ContextCompactionConfig, IdleCompactionConfig, MainAgentConfig, ModelConfig,
         TimeAwarenessConfig, TimeoutObservationCompactionConfig, TokenEstimationCacheConfig,
     };
+    use crate::conversation::LocalMount;
     use crate::domain::ChannelAddress;
     use crate::session::{
         DurableSessionState, IDENTITY_PROMPT_COMPONENT, SessionPromptComponentState,
@@ -495,6 +523,7 @@ mod tests {
             &session,
             "Current workspace summary.",
             &[],
+            &[],
             AgentPromptKind::MainForeground,
             "main",
             &model,
@@ -506,6 +535,23 @@ mod tests {
         assert!(prompt.contains("append one or more tags in your final reply"));
         assert!(prompt.contains("Some system-wide software packages are installed under /opt."));
         assert!(prompt.contains("Current workspace summary."));
+        let local_mount_prompt = build_agent_system_prompt(
+            &workspace,
+            &session,
+            "Current workspace summary.",
+            &[],
+            &[LocalMount {
+                path: PathBuf::from("/srv/shared"),
+            }],
+            AgentPromptKind::MainForeground,
+            "main",
+            &model,
+            &models,
+            &["main".to_string()],
+            &main_agent,
+        );
+        assert!(local_mount_prompt.contains("Local folders mounted for this conversation:"));
+        assert!(local_mount_prompt.contains("`/srv/shared`"));
         assert!(!prompt.contains("workspace_id=workspace-1"));
         assert!(prompt.contains("use the available workspace history tools"));
         assert!(!prompt.contains("do not issue more than 3 image_load calls"));
@@ -557,6 +603,7 @@ mod tests {
             &session,
             "Current workspace summary.",
             &[],
+            &[],
             AgentPromptKind::MainBackground,
             "main",
             &model,
@@ -573,6 +620,7 @@ mod tests {
             &session,
             "Current workspace summary.",
             &[],
+            &[],
             AgentPromptKind::MainForeground,
             "main",
             &model,
@@ -587,6 +635,7 @@ mod tests {
             &models,
             &["main".to_string()],
             &main_agent,
+            &[],
         );
         assert_eq!(
             prompt_state.static_hash,
@@ -711,6 +760,7 @@ mod tests {
             &session,
             "",
             &[],
+            &[],
             AgentPromptKind::MainForeground,
             "main",
             &model,
@@ -754,6 +804,7 @@ mod tests {
             &component_session,
             "",
             &[],
+            &[],
             AgentPromptKind::MainForeground,
             "main",
             &model,
@@ -771,6 +822,7 @@ mod tests {
             &component_session,
             "",
             &[],
+            &[],
             AgentPromptKind::MainForeground,
             "main",
             &model,
@@ -784,6 +836,7 @@ mod tests {
             &workspace,
             &component_session,
             "",
+            &[],
             &[],
             AgentPromptKind::MainForeground,
             "main",
@@ -927,6 +980,7 @@ mod tests {
             &workspace,
             &session,
             "",
+            &[],
             &[],
             AgentPromptKind::MainForeground,
             "main",

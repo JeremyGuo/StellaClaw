@@ -24,6 +24,7 @@ mod v0_28;
 mod v0_29;
 mod v0_30;
 mod v0_31;
+mod v0_32;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -31,7 +32,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.31";
+pub const LATEST_WORKDIR_VERSION: &str = "0.32";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -47,7 +48,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 27] = [
+    let upgraders: [&dyn WorkdirUpgrader; 28] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
@@ -75,6 +76,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
         &v0_29::Upgrade,
         &v0_30::Upgrade,
         &v0_31::Upgrade,
+        &v0_32::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -130,6 +132,7 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.28" => Ok("0.28"),
         "0.29" => Ok("0.29"),
         "0.30" => Ok("0.30"),
+        "0.31" => Ok("0.31"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -1427,5 +1430,84 @@ mod tests {
             LATEST_WORKDIR_VERSION
         );
         assert!(session_dir.join("transcript.jsonl").is_file());
+    }
+
+    #[test]
+    fn v0_32_workdir_upgrade_backfills_local_mounts() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.31\n").unwrap();
+
+        let conversation_dir = temp_dir
+            .path()
+            .join("conversations")
+            .join(Uuid::new_v4().to_string());
+        let snapshot_dir = temp_dir
+            .path()
+            .join("snapshots")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&conversation_dir).unwrap();
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        fs::write(
+            conversation_dir.join("conversation.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": Uuid::new_v4(),
+                "address": {
+                    "channel_id": "web-main",
+                    "conversation_id": "web-default"
+                },
+                "settings": {
+                    "remote_workpaths": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            snapshot_dir.join("snapshot.json"),
+            serde_json::to_string_pretty(&json!({
+                "saved_at": "2026-04-20T00:00:00Z",
+                "source_address": {
+                    "channel_id": "web-main",
+                    "conversation_id": "web-default"
+                },
+                "settings": {},
+                "session": {
+                    "messages": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("VERSION"))
+                .unwrap()
+                .trim(),
+            LATEST_WORKDIR_VERSION
+        );
+        let conversation: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(conversation_dir.join("conversation.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            conversation["settings"]["local_mounts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(snapshot_dir.join("snapshot.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            snapshot["settings"]["local_mounts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
     }
 }

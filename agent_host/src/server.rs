@@ -24,6 +24,7 @@ use crate::config::{
 };
 use crate::conversation::{
     ConversationManager, ConversationSettings, materialize_conversation_attachments,
+    resolve_local_mount_path,
 };
 use crate::cron::{
     ClaimedCronTask, CronCheckerConfig, CronCreateRequest, CronManager, CronUpdateRequest,
@@ -138,6 +139,7 @@ struct ActiveForegroundAgentFrameRuntime {
     model_key: String,
     workspace_id: String,
     sandbox_mode: SandboxMode,
+    local_mounts: Vec<PathBuf>,
     runtime: PersistentChildRuntime,
 }
 
@@ -365,6 +367,22 @@ impl AgentRuntimeView {
         Ok(settings.sandbox_mode.unwrap_or(self.sandbox.mode))
     }
 
+    fn local_mount_paths_for_address(&self, address: &ChannelAddress) -> Result<Vec<PathBuf>> {
+        self.with_conversations(|conversations| {
+            Ok(conversations
+                .get_snapshot(address)
+                .map(|snapshot| {
+                    snapshot
+                        .settings
+                        .local_mounts
+                        .into_iter()
+                        .map(|mount| mount.path)
+                        .collect()
+                })
+                .unwrap_or_default())
+        })
+    }
+
     fn ensure_foreground_agent_frame_runtime(
         &self,
         session: &SessionSnapshot,
@@ -373,6 +391,7 @@ impl AgentRuntimeView {
     ) -> Result<Arc<Mutex<ActiveForegroundAgentFrameRuntime>>> {
         let session_key = session.address.session_key();
         let effective_sandbox_mode = self.effective_sandbox_mode(&session.address)?;
+        let local_mounts = self.local_mount_paths_for_address(&session.address)?;
         if let Some(existing) = self
             .active_foreground_agent_frame_runtimes
             .lock()
@@ -383,6 +402,7 @@ impl AgentRuntimeView {
                 runtime.model_key == model_key
                     && runtime.workspace_id == session.workspace_id
                     && runtime.sandbox_mode == effective_sandbox_mode
+                    && runtime.local_mounts == local_mounts
             });
             if matches_current {
                 return Ok(existing);
@@ -413,6 +433,7 @@ impl AgentRuntimeView {
             &config.runtime_state_root,
             PathBuf::from(&self.main_agent.global_install_root),
             self.token_estimation_cache_roots(),
+            local_mounts.clone(),
             self.agent_workspace.rundir.join("skill_memory"),
             self.agent_workspace.skills_dir.clone(),
             &config.skills_dirs,
@@ -421,6 +442,7 @@ impl AgentRuntimeView {
             model_key: model_key.to_string(),
             workspace_id: session.workspace_id.clone(),
             sandbox_mode: effective_sandbox_mode,
+            local_mounts,
             runtime,
         }));
         self.active_foreground_agent_frame_runtimes
@@ -1123,6 +1145,7 @@ impl AgentRuntimeView {
                 backend_execution_options,
                 PathBuf::from(&self.main_agent.global_install_root),
                 self.token_estimation_cache_roots(),
+                self.local_mount_paths_for_address(&session.address)?,
                 self.agent_workspace.rundir.join("skill_memory"),
                 self.agent_workspace.skills_dir.clone(),
                 extra_tools,
@@ -3067,6 +3090,22 @@ impl Server {
         Ok(settings.sandbox_mode.unwrap_or(self.sandbox.mode))
     }
 
+    fn local_mount_paths_for_address(&self, address: &ChannelAddress) -> Result<Vec<PathBuf>> {
+        self.with_conversations(|conversations| {
+            Ok(conversations
+                .get_snapshot(address)
+                .map(|snapshot| {
+                    snapshot
+                        .settings
+                        .local_mounts
+                        .into_iter()
+                        .map(|mount| mount.path)
+                        .collect()
+                })
+                .unwrap_or_default())
+        })
+    }
+
     fn effective_context_compaction_enabled(&self, address: &ChannelAddress) -> Result<bool> {
         Ok(self
             .effective_conversation_settings(address)?
@@ -3248,11 +3287,18 @@ impl Server {
                 .map(|snapshot| snapshot.settings.remote_workpaths)
                 .unwrap_or_default())
         })?;
+        let local_mounts = self.with_conversations(|conversations| {
+            Ok(conversations
+                .get_snapshot(&session.address)
+                .map(|snapshot| snapshot.settings.local_mounts)
+                .unwrap_or_default())
+        })?;
         Ok(build_agent_system_prompt_state(
             &self.agent_workspace,
             session,
             &workspace_summary,
             &remote_workpaths,
+            &local_mounts,
             AgentPromptKind::MainForeground,
             model_key,
             model,
@@ -3449,9 +3495,9 @@ mod tests {
         is_out_of_band_command, is_timeout_like, leading_system_prompt, memory_search_files,
         normalize_messages_for_persistence, openrouter_automatic_cache_control,
         openrouter_automatic_cache_ttl, parse_agent_command, parse_model_command,
-        parse_sandbox_command, parse_set_api_timeout_command, parse_snap_list_command,
-        parse_snap_load_command, parse_snap_save_command, parse_think_command,
-        persist_compaction_artifacts, prepare_system_prompt_for_turn,
+        parse_mount_command, parse_sandbox_command, parse_set_api_timeout_command,
+        parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
+        parse_think_command, persist_compaction_artifacts, prepare_system_prompt_for_turn,
         price_conversation_usage_report, rebuild_canonical_system_prompt,
         render_last_user_message_time_tip, render_system_date_on_user_message, rollout_read_file,
         rollout_search_files, sanitize_messages_for_model_capabilities,
@@ -5500,6 +5546,15 @@ mod tests {
         assert_eq!(
             parse_sandbox_command(Some("/sandbox@party_claw_bot bubblewrap")),
             Some(Some("bubblewrap".to_string()))
+        );
+        assert_eq!(parse_mount_command(Some("/mount")), Some(None));
+        assert_eq!(
+            parse_mount_command(Some("/mount /srv/shared data")),
+            Some(Some("/srv/shared data".to_string()))
+        );
+        assert_eq!(
+            parse_mount_command(Some("/mount@party_claw_bot ./shared")),
+            Some(Some("./shared".to_string()))
         );
 
         assert_eq!(parse_think_command(Some("/think")), Some(None));

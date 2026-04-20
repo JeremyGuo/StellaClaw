@@ -223,6 +223,10 @@
           "description": "Show or set the conversation sandbox mode"
         },
         {
+          "command": "mount",
+          "description": "Mount a local folder into bubblewrap for this conversation"
+        },
+        {
           "command": "think",
           "description": "Show or set the conversation reasoning effort"
         },
@@ -247,12 +251,6 @@
           "description": "Continue the latest interrupted turn"
         }
       ]
-    },
-    {
-      "kind": "web",
-      "id": "web-main",
-      "listen_addr": "0.0.0.0:8080",
-      "auth_token_env": "CLAWPARTY_WEB_AUTH_TOKEN"
     }
   ]
 }

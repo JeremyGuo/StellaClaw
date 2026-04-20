@@ -1676,11 +1676,18 @@ impl AgentRuntimeView {
                 .map(|snapshot| snapshot.settings.remote_workpaths)
                 .unwrap_or_default())
         })?;
+        let local_mounts = self.with_conversations(|conversations| {
+            Ok(conversations
+                .get_snapshot(&session.address)
+                .map(|snapshot| snapshot.settings.local_mounts)
+                .unwrap_or_default())
+        })?;
         Ok(build_agent_system_prompt_state(
             &self.agent_workspace,
             session,
             &workspace_summary,
             &remote_workpaths,
+            &local_mounts,
             AgentPromptKind::MainForeground,
             model_key,
             model,

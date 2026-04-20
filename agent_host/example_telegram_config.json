@@ -81,6 +81,10 @@
         {
           "command": "help",
           "description": "Show available commands"
+        },
+        {
+          "command": "mount",
+          "description": "Mount a local folder into bubblewrap for this conversation"
         }
       ]
     }

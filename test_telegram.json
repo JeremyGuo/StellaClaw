@@ -175,6 +175,10 @@
           "description": "Show or set the conversation sandbox mode"
         },
         {
+          "command": "mount",
+          "description": "Mount a local folder into bubblewrap for this conversation"
+        },
+        {
           "command": "think",
           "description": "Show or set the conversation reasoning effort"
         },

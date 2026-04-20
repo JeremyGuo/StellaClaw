@@ -19,6 +19,11 @@ fn default_chat_version_id() -> Uuid {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalMount {
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationSettings {
     #[serde(default)]
     pub agent_backend: Option<AgentBackendKind>,
@@ -34,6 +39,8 @@ pub struct ConversationSettings {
     pub workspace_id: Option<String>,
     #[serde(default)]
     pub remote_workpaths: Vec<RemoteWorkpath>,
+    #[serde(default)]
+    pub local_mounts: Vec<LocalMount>,
     #[serde(default = "default_chat_version_id")]
     pub chat_version_id: Uuid,
 }
@@ -48,6 +55,7 @@ impl Default for ConversationSettings {
             context_compaction_enabled: None,
             workspace_id: None,
             remote_workpaths: Vec::new(),
+            local_mounts: Vec::new(),
             chat_version_id: default_chat_version_id(),
         }
     }
@@ -375,6 +383,58 @@ impl ConversationManager {
         state.persist()?;
         Ok(state.snapshot())
     }
+
+    pub fn add_local_mount(
+        &mut self,
+        address: &ChannelAddress,
+        path: PathBuf,
+    ) -> Result<ConversationSnapshot> {
+        let state = self.ensure_state_mut(address)?;
+        state.settings.local_mounts.retain(|item| item.path != path);
+        state.settings.local_mounts.push(LocalMount { path });
+        state.settings.chat_version_id = Uuid::new_v4();
+        state.persist()?;
+        Ok(state.snapshot())
+    }
+}
+
+pub fn resolve_local_mount_path(raw: &str, base_dir: &Path) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("mount path must be a non-empty local directory"));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(anyhow!("mount path must not contain control characters"));
+    }
+    let expanded = expand_home_path(trimmed);
+    let candidate = if expanded.is_absolute() {
+        expanded
+    } else {
+        base_dir.join(expanded)
+    };
+    let canonical = fs::canonicalize(&candidate)
+        .with_context(|| format!("failed to resolve mount path {}", candidate.display()))?;
+    if !canonical.is_dir() {
+        return Err(anyhow!(
+            "mount path must be an existing local directory: {}",
+            canonical.display()
+        ));
+    }
+    Ok(canonical)
+}
+
+fn expand_home_path(path: &str) -> PathBuf {
+    if path == "~" {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(path));
+    }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(path)
 }
 
 fn load_persisted_conversations(root: &Path) -> Result<HashMap<String, ConversationState>> {
@@ -515,6 +575,11 @@ mod tests {
                 "remote build and test checkout",
             )
             .unwrap();
+        let mount_dir = temp_dir.path().join("mounted");
+        std::fs::create_dir_all(&mount_dir).unwrap();
+        manager
+            .add_local_mount(&address, mount_dir.clone())
+            .unwrap();
 
         let reloaded = ConversationManager::new(temp_dir.path()).unwrap();
         let snapshot = reloaded.get_snapshot(&address).unwrap();
@@ -536,6 +601,8 @@ mod tests {
             snapshot.settings.remote_workpaths[0].description,
             "remote build and test checkout"
         );
+        assert_eq!(snapshot.settings.local_mounts.len(), 1);
+        assert_eq!(snapshot.settings.local_mounts[0].path, mount_dir);
         assert_ne!(snapshot.settings.chat_version_id, Uuid::nil());
     }
 
@@ -575,6 +642,18 @@ mod tests {
             snapshot.settings.remote_workpaths[0].description,
             "new checkout"
         );
+    }
+
+    #[test]
+    fn resolves_local_mount_paths_against_workspace_root() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = temp_dir.path().join("workspace");
+        let mount = workspace.join("data");
+        std::fs::create_dir_all(&mount).unwrap();
+
+        let resolved = super::resolve_local_mount_path("data", &workspace).unwrap();
+
+        assert_eq!(resolved, mount.canonicalize().unwrap());
     }
 
     #[test]

@@ -356,7 +356,7 @@ impl AgentRuntimeView {
             let tell_session = session.clone();
             let user_tell_description = match kind {
                 AgentPromptKind::MainBackground => {
-                    "Immediately send a short progress or coordination message to the current user conversation without waiting for the current background turn to finish. To include files or images, append one or more <attachment>relative/path/from/workspace_root</attachment> tags inside text."
+                    "Immediately send a short progress or coordination message to the current user conversation without waiting for the current background turn to finish; do not use user_tell for the primary result. Put that primary user-facing message in your final answer instead. To include files or images, append one or more <attachment>relative/path/from/workspace_root</attachment> tags inside text."
                 }
                 AgentPromptKind::MainForeground | AgentPromptKind::SubAgent => {
                     "Immediately send a short progress or coordination message to the current user conversation without waiting for the current turn to finish. To include files or images, append one or more <attachment>relative/path/from/workspace_root</attachment> tags inside text."

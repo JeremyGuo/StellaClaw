@@ -49,6 +49,9 @@ impl Server {
         if self.try_handle_agent_command(channel, incoming).await? {
             return Ok(true);
         }
+        if self.try_handle_mount_command(channel, incoming).await? {
+            return Ok(true);
+        }
         if self.try_handle_sandbox_command(channel, incoming).await? {
             return Ok(true);
         }
@@ -397,6 +400,67 @@ impl Server {
                 "Choose a sandbox mode",
                 options,
             ),
+        )
+        .await?;
+        Ok(true)
+    }
+
+    async fn try_handle_mount_command(
+        &self,
+        channel: &Arc<dyn Channel>,
+        incoming: &IncomingMessage,
+    ) -> Result<bool> {
+        let Some(argument) = parse_mount_command(incoming.text.as_deref()) else {
+            return Ok(false);
+        };
+
+        let Some(folder) = argument else {
+            let mounts = self.local_mount_paths_for_address(&incoming.address)?;
+            let usage = if mounts.is_empty() {
+                "Usage: `/mount <folder>`\nExample: `/mount /srv/shared`".to_string()
+            } else {
+                format!(
+                    "Usage: `/mount <folder>`\nCurrent local mounts:\n{}",
+                    mounts
+                        .iter()
+                        .map(|path| format!("- `{}`", path.display()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
+            self.send_channel_message(channel, &incoming.address, OutgoingMessage::text(usage))
+                .await?;
+            return Ok(true);
+        };
+
+        let session = self
+            .ensure_foreground_actor(&incoming.address)?
+            .snapshot()?;
+        let mount_path = match resolve_local_mount_path(&folder, &session.workspace_root) {
+            Ok(path) => path,
+            Err(error) => {
+                self.send_user_error_message(channel, &incoming.address, &error)
+                    .await;
+                return Err(error);
+            }
+        };
+        self.with_conversations(|conversations| {
+            conversations.add_local_mount(&incoming.address, mount_path.clone())
+        })?;
+        self.invalidate_foreground_agent_frame_runtime(&incoming.address)?;
+        let effective_mode = self.effective_sandbox_mode(&incoming.address)?;
+        self.send_channel_message(
+            channel,
+            &incoming.address,
+            OutgoingMessage::text(format!(
+                "Mounted `{}` for this conversation.{}",
+                mount_path.display(),
+                if effective_mode == SandboxMode::Bubblewrap {
+                    " The AgentFrame bubblewrap runtime was refreshed so the path is available on the next turn."
+                } else {
+                    " The current sandbox mode is `subprocess`; the mount is stored and will apply when this conversation uses bubblewrap."
+                }
+            )),
         )
         .await?;
         Ok(true)
