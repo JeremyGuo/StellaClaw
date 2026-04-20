@@ -299,9 +299,27 @@ pub(super) fn spawn_background_worker_process(
 }
 
 pub(super) fn read_status_json(path: &Path) -> Result<Value> {
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&raw).context("failed to parse status json")
+    let mut last_error = None;
+    for attempt in 0..10 {
+        match fs::read_to_string(path) {
+            Ok(raw) => match serde_json::from_str(&raw) {
+                Ok(value) => return Ok(value),
+                Err(error) => {
+                    last_error = Some(format!("failed to parse status json: {error}"));
+                }
+            },
+            Err(error) => {
+                last_error = Some(format!("failed to read {}: {error}", path.display()));
+            }
+        }
+        if attempt < 9 {
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    Err(anyhow!(
+        "{} after retries",
+        last_error.unwrap_or_else(|| format!("failed to read {}", path.display()))
+    ))
 }
 
 pub(crate) fn active_runtime_state_summary(runtime_state_root: &Path) -> Result<Option<String>> {
@@ -337,6 +355,34 @@ pub(crate) fn active_runtime_state_summary(runtime_state_root: &Path) -> Result<
         sections.extend(active_subagents);
     }
     Ok(Some(sections.join("\n")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::TempDir;
+
+    #[test]
+    fn read_status_json_retries_transient_partial_writes() {
+        let temp_dir = TempDir::new().unwrap();
+        let status_path = temp_dir.path().join("status.json");
+        fs::write(&status_path, "{").unwrap();
+
+        let writer_path = status_path.clone();
+        let writer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            fs::write(
+                &writer_path,
+                serde_json::to_vec(&json!({"ok": true})).unwrap(),
+            )
+            .unwrap();
+        });
+
+        let value = read_status_json(&status_path).unwrap();
+        writer.join().unwrap();
+        assert_eq!(value["ok"], json!(true));
+    }
 }
 
 fn list_active_subagent_summaries(runtime_state_root: &Path) -> Result<Vec<String>> {

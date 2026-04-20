@@ -524,7 +524,11 @@ fn builtin_tools_work() -> Result<()> {
         ),
     );
     let killed_on_timeout_json: Value = serde_json::from_str(&killed_on_timeout)?;
-    assert_eq!(killed_on_timeout_json["wait_timed_out"], json!(true));
+    assert_eq!(
+        killed_on_timeout_json["wait_timed_out"],
+        json!(true),
+        "{killed_on_timeout}"
+    );
     assert_eq!(killed_on_timeout_json["killed"], json!(true));
     assert_eq!(killed_on_timeout_json["completed"], json!(true));
 
@@ -536,7 +540,11 @@ fn builtin_tools_work() -> Result<()> {
         ),
     );
     let large_output_json: Value = serde_json::from_str(&large_output)?;
-    assert_eq!(large_output_json["completed"], json!(true));
+    assert_eq!(
+        large_output_json["completed"],
+        json!(true),
+        "{large_output}"
+    );
     assert_eq!(large_output_json["stdout_chars"], json!(1400));
     assert_eq!(large_output_json["stdout_truncated"], json!(true));
     assert!(

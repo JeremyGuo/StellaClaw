@@ -942,14 +942,23 @@ fn wait_for_managed_process(
                 extra.insert("error".to_string(), Value::Null);
                 write_exec_snapshot(&metadata, false, true, Value::from(-9), Some(extra))?;
                 live_processes().lock().unwrap().remove(exec_id);
-                return read_process_snapshot(
-                    state_dir,
-                    exec_id,
-                    start,
-                    limit,
-                    max_output_chars,
-                    workspace_root,
+                let mut object = snapshot
+                    .as_object()
+                    .cloned()
+                    .ok_or_else(|| anyhow!("exec snapshot must be a JSON object"))?;
+                object.insert("running".to_string(), Value::Bool(false));
+                object.insert("completed".to_string(), Value::Bool(true));
+                object.insert("returncode".to_string(), Value::from(-9));
+                object.insert("wait_timed_out".to_string(), Value::Bool(true));
+                object.insert(
+                    "on_timeout".to_string(),
+                    Value::String(on_timeout.as_str().to_string()),
                 );
+                object.insert("killed".to_string(), Value::Bool(true));
+                object.insert("stdin_closed".to_string(), Value::Bool(true));
+                object.insert("failed".to_string(), Value::Bool(false));
+                object.insert("error".to_string(), Value::Null);
+                return Ok(Value::Object(object));
             }
 
             let mut object = snapshot
