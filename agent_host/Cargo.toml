@@ -23,6 +23,7 @@ dotenvy = "0.15"
 futures-util = "0.3"
 hmac = "0.12"
 humantime = "2.1"
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp", "tiff"] }
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls"] }
 pulldown-cmark = "0.13"

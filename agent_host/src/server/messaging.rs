@@ -1,8 +1,10 @@
 use super::*;
 #[cfg(test)]
 use crate::session::QUEUED_USER_UPDATES_MARKER;
+use image::{ImageFormat, ImageReader};
 #[cfg(test)]
 use std::collections::VecDeque;
+use std::io::Cursor;
 
 pub(super) fn send_outgoing_message_now(
     channel: Arc<dyn Channel>,
@@ -210,9 +212,14 @@ pub(super) fn build_user_turn_message(
         backend_supports_native_multimodal && model.has_capability(ModelCapability::Pdf);
     let allow_audio =
         backend_supports_native_multimodal && model.has_capability(ModelCapability::AudioIn);
-    let image_attachments = attachments
+    let direct_images = attachments
         .iter()
         .filter(|attachment| attachment.kind.is_image() && allow_images)
+        .filter_map(|attachment| {
+            build_image_data_url(attachment)
+                .ok()
+                .map(|url| (attachment, url))
+        })
         .collect::<Vec<_>>();
     let pdf_attachments = attachments
         .iter()
@@ -223,7 +230,7 @@ pub(super) fn build_user_turn_message(
         .filter(|attachment| attachment.kind.is_audio() && allow_audio)
         .filter(|attachment| infer_audio_format_for_attachment(attachment).is_some())
         .collect::<Vec<_>>();
-    if image_attachments.is_empty() && pdf_attachments.is_empty() && audio_attachments.is_empty() {
+    if direct_images.is_empty() && pdf_attachments.is_empty() && audio_attachments.is_empty() {
         return Ok(ChatMessage::text(
             "user",
             prepend_system_date_section(vec![compose_user_prompt(text, attachments)], system_date)
@@ -239,9 +246,9 @@ pub(super) fn build_user_turn_message(
     let file_attachments = attachments
         .iter()
         .filter(|attachment| {
-            !image_attachments
+            !direct_images
                 .iter()
-                .any(|direct| direct.id == attachment.id)
+                .any(|(direct, _)| direct.id == attachment.id)
                 && !pdf_attachments
                     .iter()
                     .any(|direct| direct.id == attachment.id)
@@ -271,7 +278,7 @@ pub(super) fn build_user_turn_message(
 
     if text_sections.is_empty() {
         text_sections.push(direct_multimodal_summary(
-            image_attachments.len(),
+            direct_images.len(),
             pdf_attachments.len(),
             audio_attachments.len(),
         ));
@@ -279,7 +286,7 @@ pub(super) fn build_user_turn_message(
         text_sections.push(format!(
             "{} Inspect directly visible current-turn attachments here instead of calling load/query tools for the same files.",
             direct_multimodal_summary(
-                image_attachments.len(),
+                direct_images.len(),
                 pdf_attachments.len(),
                 audio_attachments.len()
             )
@@ -291,11 +298,11 @@ pub(super) fn build_user_turn_message(
         "type": "text",
         "text": text_sections.join("\n\n")
     })];
-    for image in image_attachments {
+    for (_, image_url) in direct_images {
         content.push(json!({
             "type": "image_url",
             "image_url": {
-                "url": build_image_data_url(image)?,
+                "url": image_url,
             }
         }));
     }
@@ -377,6 +384,13 @@ pub(super) fn render_system_date_on_user_message(now: chrono::DateTime<chrono::U
     )
 }
 
+const SUPPORTED_INLINE_IMAGE_FORMATS_TEXT: &str = "JPEG, PNG, GIF, or WebP";
+
+enum InlineImageUrlNormalization {
+    Unchanged,
+    Rewritten(String),
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn placeholder_text_item(text: String) -> Value {
     json!({
@@ -440,6 +454,12 @@ fn sanitize_message_content_for_model_capabilities(
                     sanitized.push(placeholder_text_item(text));
                 }
             }
+            "image_url" | "input_image" => match sanitize_inline_image_item(item_type, item) {
+                Ok(value) => sanitized.push(value),
+                Err(_) => {
+                    sanitized.push(placeholder_text_item(unsupported_inline_image_placeholder()))
+                }
+            },
             "file" | "input_file" if !allow_files => {
                 if let Some(text) =
                     downgraded_multimodal_placeholder(item_type, item, capability_text)
@@ -714,14 +734,16 @@ fn build_image_data_url(attachment: &StoredAttachment) -> Result<String> {
             attachment.path.display()
         )
     })?;
-    let mime_type = attachment
-        .media_type
-        .as_deref()
-        .filter(|value| value.starts_with("image/"))
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| infer_image_media_type(&attachment.path));
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    Ok(format!("data:{};base64,{}", mime_type, encoded))
+    if let Some(media_type) = image_media_type_hint(attachment) {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let original_url = format!("data:{media_type};base64,{encoded}");
+        return match normalize_inline_image_url(&original_url)? {
+            InlineImageUrlNormalization::Unchanged => Ok(original_url),
+            InlineImageUrlNormalization::Rewritten(url) => Ok(url),
+        };
+    }
+
+    transcode_inline_image_bytes_to_png_data_url(&bytes, &attachment.path.display().to_string())
 }
 
 fn direct_multimodal_summary(image_count: usize, pdf_count: usize, audio_count: usize) -> String {
@@ -820,7 +842,112 @@ fn infer_audio_format_for_attachment(attachment: &StoredAttachment) -> Option<&'
     }
 }
 
-fn infer_image_media_type(path: &Path) -> String {
+fn unsupported_inline_image_placeholder() -> String {
+    format!(
+        "[Earlier image omitted because it could not be converted into a supported inline image format ({SUPPORTED_INLINE_IMAGE_FORMATS_TEXT}).]"
+    )
+}
+
+fn sanitize_inline_image_item(item_type: &str, item: &Value) -> Result<Value> {
+    let Some(url) = inline_image_url_from_item(item_type, item) else {
+        return Ok(item.clone());
+    };
+    match normalize_inline_image_url(url)? {
+        InlineImageUrlNormalization::Unchanged => Ok(item.clone()),
+        InlineImageUrlNormalization::Rewritten(url) => {
+            Ok(rebuild_inline_image_item(item_type, item, url))
+        }
+    }
+}
+
+fn normalize_inline_image_url(url: &str) -> Result<InlineImageUrlNormalization> {
+    let Some((media_type, encoded)) = parse_inline_image_data_url(url) else {
+        return Ok(InlineImageUrlNormalization::Unchanged);
+    };
+    if let Some(canonical) = canonical_inline_image_media_type(media_type) {
+        if media_type.eq_ignore_ascii_case(canonical) {
+            return Ok(InlineImageUrlNormalization::Unchanged);
+        }
+        return Ok(InlineImageUrlNormalization::Rewritten(format!(
+            "data:{canonical};base64,{encoded}"
+        )));
+    }
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .context("failed to decode unsupported inline image data")?;
+    let rewritten = transcode_inline_image_bytes_to_png_data_url(&bytes, media_type)?;
+    Ok(InlineImageUrlNormalization::Rewritten(rewritten))
+}
+
+fn transcode_inline_image_bytes_to_png_data_url(bytes: &[u8], label: &str) -> Result<String> {
+    let image = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .with_context(|| format!("failed to guess image format for {label}"))?
+        .decode()
+        .with_context(|| format!("failed to decode image data for {label}"))?;
+    let mut output = Vec::new();
+    image
+        .write_to(&mut Cursor::new(&mut output), ImageFormat::Png)
+        .with_context(|| format!("failed to transcode image data for {label} to PNG"))?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(output);
+    Ok(format!("data:image/png;base64,{encoded}"))
+}
+
+fn inline_image_url_from_item<'a>(item_type: &str, item: &'a Value) -> Option<&'a str> {
+    if item_type == "image_url" {
+        return item.get("image_url").and_then(|value| match value {
+            Value::String(url) => Some(url.as_str()),
+            Value::Object(object) => object.get("url").and_then(Value::as_str),
+            _ => None,
+        });
+    }
+    item.get("image_url").and_then(Value::as_str)
+}
+
+fn rebuild_inline_image_item(item_type: &str, item: &Value, url: String) -> Value {
+    let mut rebuilt = item.clone();
+    let Some(object) = rebuilt.as_object_mut() else {
+        return item.clone();
+    };
+    if item_type == "image_url" {
+        object.insert("image_url".to_string(), json!({ "url": url }));
+    } else {
+        object.insert("image_url".to_string(), Value::String(url));
+    }
+    rebuilt
+}
+
+fn parse_inline_image_data_url(url: &str) -> Option<(&str, &str)> {
+    let (metadata, encoded) = url.strip_prefix("data:")?.split_once(',')?;
+    let mut parts = metadata.split(';');
+    let media_type = parts.next()?.trim();
+    if !media_type.starts_with("image/") || !parts.any(|part| part.eq_ignore_ascii_case("base64")) {
+        return None;
+    }
+    Some((media_type, encoded))
+}
+
+fn canonical_inline_image_media_type(media_type: &str) -> Option<&'static str> {
+    match media_type.to_ascii_lowercase().as_str() {
+        "image/png" => Some("image/png"),
+        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
+        "image/gif" => Some("image/gif"),
+        "image/webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn image_media_type_hint(attachment: &StoredAttachment) -> Option<String> {
+    attachment
+        .media_type
+        .as_deref()
+        .filter(|value| value.starts_with("image/"))
+        .map(ToOwned::to_owned)
+        .or_else(|| infer_image_media_type(&attachment.path).map(ToOwned::to_owned))
+}
+
+fn infer_image_media_type(path: &Path) -> Option<&'static str> {
     match path
         .extension()
         .and_then(|value| value.to_str())
@@ -828,14 +955,15 @@ fn infer_image_media_type(path: &Path) -> String {
         .to_ascii_lowercase()
         .as_str()
     {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        _ => "image/png",
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "tif" | "tiff" => Some("image/tiff"),
+        "svg" => Some("image/svg+xml"),
+        _ => None,
     }
-    .to_string()
 }
 
 pub(super) fn spawn_processing_keepalive(

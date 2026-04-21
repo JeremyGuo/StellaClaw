@@ -3566,6 +3566,7 @@ mod tests {
     };
     use anyhow::anyhow;
     use async_trait::async_trait;
+    use base64::Engine;
     use chrono::{Duration as ChronoDuration, Utc};
     use serde_json::{Value, json};
     use std::collections::{BTreeMap, HashMap, HashSet};
@@ -3889,6 +3890,18 @@ mod tests {
         assert_eq!(attachments[0].path, file_path.canonicalize().unwrap());
     }
 
+    fn tiny_tiff_bytes() -> Vec<u8> {
+        let image = image::ImageBuffer::from_pixel(1, 1, image::Rgba([12, 34, 56, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Tiff,
+            )
+            .unwrap();
+        bytes
+    }
+
     #[test]
     fn builds_multimodal_user_message_for_vision_models() {
         let temp_dir = TempDir::new().unwrap();
@@ -3947,6 +3960,102 @@ mod tests {
         assert_eq!(items[1]["type"], "image_url");
         let url = items[1]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn builds_multimodal_user_message_transcodes_tiff_attachments_to_png() {
+        let temp_dir = TempDir::new().unwrap();
+        let image_path = temp_dir.path().join("photo.tiff");
+        fs::write(&image_path, tiny_tiff_bytes()).unwrap();
+        let attachment = StoredAttachment {
+            id: Uuid::new_v4(),
+            kind: AttachmentKind::Image,
+            original_name: Some("photo.tiff".to_string()),
+            media_type: Some("image/tiff".to_string()),
+            path: image_path,
+            size_bytes: 4,
+        };
+        let model = ModelConfig {
+            model_type: crate::config::ModelType::Openrouter,
+            api_endpoint: "https://example.com/v1".to_string(),
+            model: "demo-vision".to_string(),
+            backend: AgentBackendKind::AgentFrame,
+            supports_vision_input: false,
+            image_tool_model: None,
+            web_search_model: None,
+            api_key: None,
+            api_key_env: "TEST_API_KEY".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            retry_mode: Default::default(),
+            context_window_tokens: 128_000,
+            cache_ttl: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            description: "vision".to_string(),
+            agent_model_enabled: true,
+            native_web_search: None,
+            token_estimation: None,
+            capabilities: vec![ModelCapability::ImageIn],
+        };
+
+        let message =
+            build_user_turn_message(Some("看看这张 tiff"), &[attachment], &model, true, None)
+                .unwrap();
+
+        let items = message.content.unwrap().as_array().unwrap().clone();
+        assert_eq!(items[1]["type"], "image_url");
+        let url = items[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn builds_multimodal_user_message_downgrades_unconvertible_images_to_file_context() {
+        let temp_dir = TempDir::new().unwrap();
+        let image_path = temp_dir.path().join("broken.tiff");
+        fs::write(&image_path, b"not actually an image").unwrap();
+        let attachment = StoredAttachment {
+            id: Uuid::new_v4(),
+            kind: AttachmentKind::Image,
+            original_name: Some("broken.tiff".to_string()),
+            media_type: Some("image/tiff".to_string()),
+            path: image_path,
+            size_bytes: 19,
+        };
+        let model = ModelConfig {
+            model_type: crate::config::ModelType::Openrouter,
+            api_endpoint: "https://example.com/v1".to_string(),
+            model: "demo-vision".to_string(),
+            backend: AgentBackendKind::AgentFrame,
+            supports_vision_input: false,
+            image_tool_model: None,
+            web_search_model: None,
+            api_key: None,
+            api_key_env: "TEST_API_KEY".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            retry_mode: Default::default(),
+            context_window_tokens: 128_000,
+            cache_ttl: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            description: "vision".to_string(),
+            agent_model_enabled: true,
+            native_web_search: None,
+            token_estimation: None,
+            capabilities: vec![ModelCapability::ImageIn],
+        };
+
+        let message =
+            build_user_turn_message(Some("看看这张图"), &[attachment], &model, true, None).unwrap();
+
+        let text = message.content.as_ref().and_then(Value::as_str).unwrap();
+        assert!(text.contains("Attachments available for this turn"));
+        assert!(text.contains("image/tiff"));
     }
 
     #[test]
@@ -4009,6 +4118,124 @@ mod tests {
             items[1]["text"]
                 .as_str()
                 .is_some_and(|text| text.contains("does not accept image input"))
+        );
+    }
+
+    #[test]
+    fn sanitizes_historical_multimodal_messages_transcoding_unsupported_inline_images() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(tiny_tiff_bytes());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(Value::Array(vec![
+                json!({
+                    "type": "text",
+                    "text": "先看这张 tiff"
+                }),
+                json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": format!("data:image/tiff;base64,{encoded}")
+                    }
+                }),
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+        let model = ModelConfig {
+            model_type: crate::config::ModelType::Openrouter,
+            api_endpoint: "https://example.com/v1".to_string(),
+            model: "demo-chat".to_string(),
+            backend: AgentBackendKind::AgentFrame,
+            supports_vision_input: false,
+            image_tool_model: None,
+            web_search_model: None,
+            api_key: None,
+            api_key_env: "TEST_API_KEY".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            retry_mode: Default::default(),
+            context_window_tokens: 128_000,
+            cache_ttl: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            description: "vision".to_string(),
+            agent_model_enabled: true,
+            native_web_search: None,
+            token_estimation: None,
+            capabilities: vec![ModelCapability::ImageIn],
+        };
+
+        let sanitized = sanitize_messages_for_model_capabilities(&messages, &model, true);
+        let items = sanitized[0]
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(items[1]["type"], "image_url");
+        let url = items[1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn sanitizes_historical_multimodal_messages_dropping_unconvertible_inline_images() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(Value::Array(vec![
+                json!({
+                    "type": "text",
+                    "text": "先看这张坏图"
+                }),
+                json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "data:image/tiff;base64,AAAA"
+                    }
+                }),
+            ])),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+        let model = ModelConfig {
+            model_type: crate::config::ModelType::Openrouter,
+            api_endpoint: "https://example.com/v1".to_string(),
+            model: "demo-chat".to_string(),
+            backend: AgentBackendKind::AgentFrame,
+            supports_vision_input: false,
+            image_tool_model: None,
+            web_search_model: None,
+            api_key: None,
+            api_key_env: "TEST_API_KEY".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            retry_mode: Default::default(),
+            context_window_tokens: 128_000,
+            cache_ttl: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            description: "vision".to_string(),
+            agent_model_enabled: true,
+            native_web_search: None,
+            token_estimation: None,
+            capabilities: vec![ModelCapability::ImageIn],
+        };
+
+        let sanitized = sanitize_messages_for_model_capabilities(&messages, &model, true);
+        let items = sanitized[0]
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .unwrap();
+        assert_eq!(items[1]["type"], "text");
+        assert!(
+            items[1]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("could not be converted"))
         );
     }
 

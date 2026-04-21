@@ -1237,6 +1237,11 @@ impl AgentRuntimeView {
         join_label: &str,
     ) -> Result<TimedRunOutcome> {
         let prompt_kind = prompt_kind_for_main_session(&session);
+        let previous_messages = sanitize_messages_for_model_capabilities(
+            &previous_messages,
+            self.model_config(&model_key)?,
+            backend_supports_native_multimodal_input(agent_backend),
+        );
         let control_observer = {
             let session_registry = Arc::clone(&self.sessions);
             let control_session = session.clone();
