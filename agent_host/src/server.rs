@@ -4504,7 +4504,7 @@ mod tests {
                 "[System Message: USER.md changed. It stores user info. If you need refreshed user info in this run, use file_read on ./USER.md.]",
             ),
             ChatMessage::text("assistant", "summary"),
-            ChatMessage::text("system", "[Active Runtime Tasks]\nexec_id=123"),
+            ChatMessage::text("system", "[Active Runtime Tasks]\nsession_id=123"),
             ChatMessage::text("user", "继续"),
         ];
 
@@ -4513,7 +4513,7 @@ mod tests {
         assert_eq!(normalized[1], ChatMessage::text("assistant", "summary"));
         assert_eq!(
             normalized[2],
-            ChatMessage::text("system", "[Active Runtime Tasks]\nexec_id=123")
+            ChatMessage::text("system", "[Active Runtime Tasks]\nsession_id=123")
         );
         assert_eq!(normalized[3], ChatMessage::text("user", "继续"));
         assert_eq!(normalized.len(), 4);
@@ -5138,8 +5138,8 @@ mod tests {
                     id: "call_1".to_string(),
                     kind: "function".to_string(),
                     function: FunctionCall {
-                        name: "exec_wait".to_string(),
-                        arguments: Some("{}".to_string()),
+                        name: "shell".to_string(),
+                        arguments: Some("{\"session_id\":\"abc\"}".to_string()),
                     },
                 }]),
             },
@@ -5147,7 +5147,7 @@ mod tests {
 
         let summary = summarize_resume_progress("zh-CN", &messages);
         assert!(summary.contains("工具阶段"));
-        assert!(summary.contains("exec_wait"));
+        assert!(summary.contains("shell"));
     }
 
     #[test]

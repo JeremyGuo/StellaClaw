@@ -31,8 +31,8 @@ use download::{
 use dsl::{dsl_kill_tool, dsl_start_tool, dsl_wait_tool};
 pub use exec::terminate_all_managed_processes;
 #[cfg(test)]
-use exec::{ProcessMetadata, process_is_running, process_meta_path};
-use exec::{exec_kill_tool, exec_observe_tool, exec_start_tool, exec_wait_tool};
+use exec::{ShellSessionMetadata, process_is_running, process_meta_path};
+use exec::{shell_close_tool, shell_tool};
 #[cfg(test)]
 use file_tools::{FILE_READ_MAX_OUTPUT_BYTES, LS_MAX_ENTRIES};
 use file_tools::{edit_tool, file_read_tool, file_write_tool, glob_tool, grep_tool, ls_tool};
@@ -648,23 +648,13 @@ pub fn build_tool_registry_with_cancel(
         remote_workpaths.clone(),
         cancel_flag.clone(),
     ))?;
-    registry.add(exec_start_tool(
+    registry.add(shell_tool(
         workspace_root.to_path_buf(),
         runtime_state_root.to_path_buf(),
         remote_workpaths.clone(),
         cancel_flag.clone(),
     ))?;
-    registry.add(exec_observe_tool(
-        workspace_root.to_path_buf(),
-        runtime_state_root.to_path_buf(),
-        cancel_flag.clone(),
-    ))?;
-    registry.add(exec_wait_tool(
-        workspace_root.to_path_buf(),
-        runtime_state_root.to_path_buf(),
-        cancel_flag.clone(),
-    ))?;
-    registry.add(exec_kill_tool(
+    registry.add(shell_close_tool(
         runtime_state_root.to_path_buf(),
         cancel_flag.clone(),
     ))?;
@@ -907,7 +897,7 @@ pub mod macro_support {
 mod tests {
     use super::{
         BackgroundTaskMetadata, ExecutionTarget, FILE_READ_MAX_OUTPUT_BYTES, LS_MAX_ENTRIES,
-        ProcessMetadata, Tool, ToolExecutionMode, active_runtime_state_summary,
+        ShellSessionMetadata, Tool, ToolExecutionMode, active_runtime_state_summary,
         build_tool_registry_with_cancel, compact_tool_status_fields_for_model, execute_tool_call,
         execution_target_arg, normalize_tool_result, process_is_running, process_meta_path,
         remote_file_root, resolve_remote_cwd, terminate_runtime_state_tasks,
@@ -1395,7 +1385,7 @@ remote_command="$*"
             "grep",
             "ls",
             "edit",
-            "exec_start",
+            "shell",
             "apply_patch",
         ] {
             let tool = registry.get(name).expect("tool should be registered");
@@ -1413,7 +1403,12 @@ remote_command="$*"
                     && !tool.description.contains("SSH"),
                 "remote guidance should stay in system prompt, not {name} description"
             );
-            let required = tool.parameters["required"].as_array().unwrap();
+            let required = tool
+                .parameters
+                .get("required")
+                .and_then(|value| value.as_array())
+                .cloned()
+                .unwrap_or_default();
             assert!(
                 !required.iter().any(|item| item.as_str() == Some("remote")),
                 "remote must stay optional for {name}"
@@ -1422,7 +1417,7 @@ remote_command="$*"
     }
 
     #[test]
-    fn exec_followup_tools_do_not_expose_remote_parameter() {
+    fn shell_close_does_not_expose_remote_parameter() {
         let temp_dir = TempDir::new().unwrap();
         let workspace_root = temp_dir.path().join("workspace");
         fs::create_dir_all(&workspace_root).unwrap();
@@ -1451,13 +1446,10 @@ remote_command="$*"
         )
         .unwrap();
 
-        for name in ["exec_observe", "exec_wait", "exec_kill"] {
-            let tool = registry.get(name).expect("tool should be registered");
-            assert!(
-                tool.parameters["properties"].get("remote").is_none(),
-                "{name} should infer remote from exec_id instead of exposing a remote argument"
-            );
-        }
+        let tool = registry
+            .get("shell_close")
+            .expect("shell_close should be registered");
+        assert!(tool.parameters["properties"].get("remote").is_none());
     }
 
     #[test]
@@ -1485,42 +1477,21 @@ remote_command="$*"
         )
         .unwrap();
 
-        let exec_start = registry.get("exec_start").expect("exec_start registered");
-        assert_eq!(exec_start.execution_mode, ToolExecutionMode::Interruptible);
-        assert!(
-            exec_start.parameters["properties"]
-                .get("return_immediate")
-                .is_some()
-        );
-        assert!(
-            exec_start.parameters["properties"]
-                .get("wait_timeout_seconds")
-                .is_some()
-        );
-        assert!(
-            exec_start.parameters["properties"]
-                .get("on_timeout")
-                .is_some()
-        );
-        assert_start_description_keeps_wait_policy_centralized(exec_start);
+        let shell = registry.get("shell").expect("shell registered");
+        assert_eq!(shell.execution_mode, ToolExecutionMode::Interruptible);
+        assert!(shell.parameters["properties"].get("session_id").is_some());
+        assert!(shell.parameters["properties"].get("command").is_some());
+        assert!(shell.parameters["properties"].get("input").is_some());
+        assert!(shell.parameters["properties"].get("wait_ms").is_some());
+        assert!(shell.parameters["properties"].get("remote").is_some());
 
-        let exec_wait = registry.get("exec_wait").expect("exec_wait registered");
-        assert_eq!(exec_wait.execution_mode, ToolExecutionMode::Interruptible);
-        assert!(exec_wait.parameters["properties"].get("exec_id").is_some());
+        let shell_close = registry.get("shell_close").expect("shell_close registered");
+        assert_eq!(shell_close.execution_mode, ToolExecutionMode::Immediate);
         assert!(
-            exec_wait.parameters["properties"]
-                .get("wait_timeout_seconds")
+            shell_close.parameters["properties"]
+                .get("session_id")
                 .is_some()
         );
-        assert!(
-            exec_wait.parameters["properties"]
-                .get("on_timeout")
-                .is_some()
-        );
-
-        let exec_kill = registry.get("exec_kill").expect("exec_kill registered");
-        assert_eq!(exec_kill.execution_mode, ToolExecutionMode::Immediate);
-        assert!(exec_kill.parameters["properties"].get("exec_id").is_some());
 
         let download_start = registry
             .get("file_download_start")
@@ -2499,98 +2470,112 @@ exec sh -c "$remote_command""#,
         fs::create_dir_all(&downloads_dir).unwrap();
         fs::create_dir_all(&subagents_dir).unwrap();
 
-        let exec_status_path = processes_dir.join("exec-1.status.json");
+        let exec_status_path = processes_dir.join("shell-1.status.json");
         fs::write(
             &exec_status_path,
             serde_json::to_vec_pretty(&json!({
-                "exec_id": "exec-1",
+                "session_id": "shell-1",
                 "pid": std::process::id(),
+                "interactive": false,
+                "remote": "local",
+                "process_id": "proc-1",
                 "command": "sleep 10",
-                "cwd": "/tmp/demo",
                 "running": true,
-                "completed": false,
-                "returncode": json!(null),
-                "stdin_closed": false,
-                "failed": false,
+                "exit_code": json!(null),
+                "stdout_path": processes_dir.join("shell-1").join("proc-1").join("stdout").display().to_string(),
+                "stderr_path": processes_dir.join("shell-1").join("proc-1").join("stderr").display().to_string(),
                 "error": json!(null),
             }))
             .unwrap(),
         )
         .unwrap();
-        let exec_metadata = ProcessMetadata {
-            exec_id: "exec-1".to_string(),
+        let exec_metadata = ShellSessionMetadata {
+            session_id: "shell-1".to_string(),
             worker_pid: std::process::id(),
-            tty: false,
+            interactive: false,
             remote: "local".to_string(),
-            command: "sleep 10".to_string(),
-            cwd: "/tmp/demo".to_string(),
-            stdout_path: processes_dir.join("exec-1.stdout").display().to_string(),
-            stderr_path: processes_dir.join("exec-1.stderr").display().to_string(),
             status_path: exec_status_path.display().to_string(),
             worker_exit_code_path: processes_dir
-                .join("exec-1.worker.exit")
+                .join("shell-1.worker.exit")
                 .display()
                 .to_string(),
-            requests_dir: processes_dir.join("exec-1.requests").display().to_string(),
+            requests_dir: processes_dir.join("shell-1.requests").display().to_string(),
+            output_root: processes_dir.join("shell-1").display().to_string(),
+            delivered_process_id: None,
         };
         fs::write(
-            process_meta_path(&processes_dir, "exec-1"),
+            process_meta_path(&processes_dir, "shell-1"),
             serde_json::to_vec_pretty(&exec_metadata).unwrap(),
         )
         .unwrap();
+        fs::create_dir_all(processes_dir.join("shell-1").join("proc-1")).unwrap();
         fs::write(
-            processes_dir.join("exec-1.stdout"),
+            processes_dir.join("shell-1").join("proc-1").join("stdout"),
             b"hello\nnon-utf8:\x9f\nstill visible\n",
         )
         .unwrap();
-        fs::write(processes_dir.join("exec-1.stderr"), b"").unwrap();
+        fs::write(
+            processes_dir.join("shell-1").join("proc-1").join("stderr"),
+            b"",
+        )
+        .unwrap();
 
-        let finished_status_path = processes_dir.join("exec-finished.status.json");
+        let finished_status_path = processes_dir.join("shell-finished.status.json");
         fs::write(
             &finished_status_path,
             serde_json::to_vec_pretty(&json!({
-                "exec_id": "exec-finished",
+                "session_id": "shell-finished",
                 "pid": std::process::id(),
+                "interactive": false,
+                "remote": "local",
+                "process_id": "proc-finished",
                 "command": "echo done",
-                "cwd": "/tmp/finished",
                 "running": false,
-                "completed": true,
-                "returncode": 0,
-                "stdin_closed": true,
-                "failed": false,
+                "exit_code": 0,
+                "stdout_path": processes_dir.join("shell-finished").join("proc-finished").join("stdout").display().to_string(),
+                "stderr_path": processes_dir.join("shell-finished").join("proc-finished").join("stderr").display().to_string(),
                 "error": json!(null),
             }))
             .unwrap(),
         )
         .unwrap();
-        let finished_metadata = ProcessMetadata {
-            exec_id: "exec-finished".to_string(),
+        let finished_metadata = ShellSessionMetadata {
+            session_id: "shell-finished".to_string(),
             worker_pid: std::process::id(),
-            tty: false,
+            interactive: false,
             remote: "local".to_string(),
-            command: "echo done".to_string(),
-            cwd: "/tmp/finished".to_string(),
-            stdout_path: processes_dir
-                .join("exec-finished.stdout")
-                .display()
-                .to_string(),
-            stderr_path: processes_dir
-                .join("exec-finished.stderr")
-                .display()
-                .to_string(),
             status_path: finished_status_path.display().to_string(),
             worker_exit_code_path: processes_dir
-                .join("exec-finished.worker.exit")
+                .join("shell-finished.worker.exit")
                 .display()
                 .to_string(),
             requests_dir: processes_dir
-                .join("exec-finished.requests")
+                .join("shell-finished.requests")
                 .display()
                 .to_string(),
+            output_root: processes_dir.join("shell-finished").display().to_string(),
+            delivered_process_id: None,
         };
         fs::write(
-            process_meta_path(&processes_dir, "exec-finished"),
+            process_meta_path(&processes_dir, "shell-finished"),
             serde_json::to_vec_pretty(&finished_metadata).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(processes_dir.join("shell-finished").join("proc-finished")).unwrap();
+        fs::write(
+            processes_dir
+                .join("shell-finished")
+                .join("proc-finished")
+                .join("stdout"),
+            b"done\n",
+        )
+        .unwrap();
+        fs::write(
+            processes_dir
+                .join("shell-finished")
+                .join("proc-finished")
+                .join("stderr"),
+            b"",
         )
         .unwrap();
 
@@ -2645,9 +2630,9 @@ exec sh -c "$remote_command""#,
         let summary = active_runtime_state_summary(runtime_state_root)
             .unwrap()
             .expect("expected active runtime summary");
-        assert!(summary.contains("Active exec processes:"));
-        assert!(summary.contains("exec_id=`exec-1`"));
-        assert!(!summary.contains("exec-finished"));
+        assert!(summary.contains("Active shell sessions:"));
+        assert!(summary.contains("session_id=`shell-1`"));
+        assert!(!summary.contains("shell-finished"));
         assert!(summary.contains("Active file downloads:"));
         assert!(summary.contains("download_id=`download-1`"));
         assert!(summary.contains("Active subagents:"));
@@ -2655,7 +2640,7 @@ exec sh -c "$remote_command""#,
     }
 
     #[test]
-    fn active_runtime_state_summary_ignores_legacy_exec_metadata_files() {
+    fn active_runtime_state_summary_ignores_unknown_process_metadata_files() {
         let temp_dir = TempDir::new().unwrap();
         let runtime_state_root = temp_dir.path();
         let processes_dir = runtime_state_root.join("agent_frame").join("processes");
@@ -2677,40 +2662,31 @@ exec sh -c "$remote_command""#,
         )
         .unwrap();
 
-        let current_exec_id = "current-exec";
+        let current_exec_id = "current-shell";
         let current_status_path = processes_dir.join(format!("{current_exec_id}.status.json"));
         fs::write(
             &current_status_path,
             serde_json::to_vec_pretty(&json!({
-                "exec_id": current_exec_id,
+                "session_id": current_exec_id,
                 "pid": std::process::id(),
+                "interactive": false,
+                "remote": "local",
+                "process_id": "proc-current",
                 "command": "sleep 10",
-                "cwd": "/tmp/current",
                 "running": true,
-                "completed": false,
-                "returncode": json!(null),
-                "stdin_closed": false,
-                "failed": false,
+                "exit_code": json!(null),
+                "stdout_path": processes_dir.join(current_exec_id).join("proc-current").join("stdout").display().to_string(),
+                "stderr_path": processes_dir.join(current_exec_id).join("proc-current").join("stderr").display().to_string(),
                 "error": json!(null),
             }))
             .unwrap(),
         )
         .unwrap();
-        let current_metadata = ProcessMetadata {
-            exec_id: current_exec_id.to_string(),
+        let current_metadata = ShellSessionMetadata {
+            session_id: current_exec_id.to_string(),
             worker_pid: std::process::id(),
-            tty: false,
+            interactive: false,
             remote: "local".to_string(),
-            command: "sleep 10".to_string(),
-            cwd: "/tmp/current".to_string(),
-            stdout_path: processes_dir
-                .join(format!("{current_exec_id}.stdout"))
-                .display()
-                .to_string(),
-            stderr_path: processes_dir
-                .join(format!("{current_exec_id}.stderr"))
-                .display()
-                .to_string(),
             status_path: current_status_path.display().to_string(),
             worker_exit_code_path: processes_dir
                 .join(format!("{current_exec_id}.worker.exit"))
@@ -2720,17 +2696,36 @@ exec sh -c "$remote_command""#,
                 .join(format!("{current_exec_id}.requests"))
                 .display()
                 .to_string(),
+            output_root: processes_dir.join(current_exec_id).display().to_string(),
+            delivered_process_id: None,
         };
         fs::write(
             process_meta_path(&processes_dir, current_exec_id),
             serde_json::to_vec_pretty(&current_metadata).unwrap(),
         )
         .unwrap();
+        fs::create_dir_all(processes_dir.join(current_exec_id).join("proc-current")).unwrap();
+        fs::write(
+            processes_dir
+                .join(current_exec_id)
+                .join("proc-current")
+                .join("stdout"),
+            b"running\n",
+        )
+        .unwrap();
+        fs::write(
+            processes_dir
+                .join(current_exec_id)
+                .join("proc-current")
+                .join("stderr"),
+            b"",
+        )
+        .unwrap();
 
         let summary = active_runtime_state_summary(runtime_state_root)
             .unwrap()
             .expect("expected active runtime summary");
-        assert!(summary.contains("current-exec"));
+        assert!(summary.contains("current-shell"));
         assert!(!summary.contains("legacy-exec"));
     }
 
@@ -2755,52 +2750,62 @@ exec sh -c "$remote_command""#,
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let exec_status_path = processes_dir.join("exec-cleanup.status.json");
+        let exec_status_path = processes_dir.join("shell-cleanup.status.json");
         fs::write(
             &exec_status_path,
             serde_json::to_vec_pretty(&json!({
-                "exec_id": "exec-cleanup",
+                "session_id": "shell-cleanup",
                 "pid": exec_child.id(),
+                "interactive": false,
+                "remote": "local",
+                "process_id": "proc-cleanup",
                 "command": "sleep 30",
-                "cwd": "/tmp",
                 "running": true,
-                "completed": false,
-                "returncode": json!(null),
-                "stdin_closed": false,
-                "failed": false,
+                "exit_code": json!(null),
+                "stdout_path": processes_dir.join("shell-cleanup").join("proc-cleanup").join("stdout").display().to_string(),
+                "stderr_path": processes_dir.join("shell-cleanup").join("proc-cleanup").join("stderr").display().to_string(),
                 "error": json!(null),
             }))
             .unwrap(),
         )
         .unwrap();
-        let exec_metadata = ProcessMetadata {
-            exec_id: "exec-cleanup".to_string(),
+        let exec_metadata = ShellSessionMetadata {
+            session_id: "shell-cleanup".to_string(),
             worker_pid: exec_child.id(),
-            tty: false,
+            interactive: false,
             remote: "local".to_string(),
-            command: "sleep 30".to_string(),
-            cwd: "/tmp".to_string(),
-            stdout_path: processes_dir
-                .join("exec-cleanup.stdout")
-                .display()
-                .to_string(),
-            stderr_path: processes_dir
-                .join("exec-cleanup.stderr")
-                .display()
-                .to_string(),
             status_path: exec_status_path.display().to_string(),
             worker_exit_code_path: processes_dir
-                .join("exec-cleanup.worker.exit")
+                .join("shell-cleanup.worker.exit")
                 .display()
                 .to_string(),
             requests_dir: processes_dir
-                .join("exec-cleanup.requests")
+                .join("shell-cleanup.requests")
                 .display()
                 .to_string(),
+            output_root: processes_dir.join("shell-cleanup").display().to_string(),
+            delivered_process_id: None,
         };
         fs::write(
-            process_meta_path(&processes_dir, "exec-cleanup"),
+            process_meta_path(&processes_dir, "shell-cleanup"),
             serde_json::to_vec_pretty(&exec_metadata).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(processes_dir.join("shell-cleanup").join("proc-cleanup")).unwrap();
+        fs::write(
+            processes_dir
+                .join("shell-cleanup")
+                .join("proc-cleanup")
+                .join("stdout"),
+            b"",
+        )
+        .unwrap();
+        fs::write(
+            processes_dir
+                .join("shell-cleanup")
+                .join("proc-cleanup")
+                .join("stderr"),
+            b"",
         )
         .unwrap();
 

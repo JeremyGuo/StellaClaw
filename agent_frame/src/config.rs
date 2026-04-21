@@ -758,7 +758,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.max_tool_roundtrips, super::default_max_tool_roundtrips());
+        assert_eq!(
+            config.max_tool_roundtrips,
+            super::default_max_tool_roundtrips()
+        );
     }
 
     #[test]

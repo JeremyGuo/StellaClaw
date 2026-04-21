@@ -454,15 +454,19 @@ fn builtin_tools_work() -> Result<()> {
     );
     assert!(read_after_edit.contains("1: gamma"));
 
-    let shell_result =
-        execute_tool_call(&registry, "exec_start", Some(r#"{"command":"printf 123"}"#));
+    let shell_result = execute_tool_call(&registry, "shell", Some(r#"{"command":"printf 123"}"#));
     let shell_json: Value = serde_json::from_str(&shell_result)?;
-    assert!(shell_json.get("exec_id").is_some());
-    assert_eq!(shell_json["completed"], json!(true));
+    assert!(shell_json.get("session_id").is_some());
+    assert!(shell_json.get("process_id").is_some());
+    assert_eq!(shell_json["running"], json!(false));
+    assert_eq!(shell_json["interactive"], json!(false));
     assert_eq!(shell_json["stdout"], json!("123"));
-    assert!(shell_json.get("stdout_truncated").is_none());
-    assert!(shell_json.get("stderr").is_none());
-    assert!(shell_json.get("stderr_truncated").is_none());
+    assert_eq!(shell_json["stderr"], json!(""));
+    assert_eq!(shell_json["exit_code"], json!(0));
+    let out_path = temp_dir
+        .path()
+        .join(shell_json["out_path"].as_str().unwrap());
+    assert_eq!(fs::read_to_string(out_path.join("stdout"))?, "123");
 
     let duplicate_edit = execute_tool_call(
         &registry,
@@ -474,59 +478,26 @@ fn builtin_tools_work() -> Result<()> {
 
     let timeout_process = execute_tool_call(
         &registry,
-        "exec_start",
-        Some(
-            r#"{"command":"sleep 1; printf late","wait_timeout_seconds":0.05,"max_output_chars":0}"#,
-        ),
+        "shell",
+        Some(r#"{"command":"sleep 1; printf late","wait_ms":0}"#),
     );
     let timeout_json: Value = serde_json::from_str(&timeout_process)?;
-    assert_eq!(timeout_json["wait_timed_out"], json!(true));
     assert_eq!(timeout_json["running"], json!(true));
-    assert!(timeout_json.get("stdout").is_none());
-    assert!(
-        timeout_json["stdout_path"]
-            .as_str()
-            .unwrap_or_default()
-            .ends_with(".stdout")
-    );
-    let timeout_exec_id = timeout_json["exec_id"].as_str().unwrap();
+    let timeout_session_id = timeout_json["session_id"].as_str().unwrap();
     let timeout_kill = execute_tool_call(
         &registry,
-        "exec_kill",
-        Some(&format!(r#"{{"exec_id":"{}"}}"#, timeout_exec_id)),
+        "shell_close",
+        Some(&format!(r#"{{"session_id":"{}"}}"#, timeout_session_id)),
     );
-    assert!(timeout_kill.contains("\"killed\": true"));
-
-    let killed_on_timeout = execute_tool_call(
-        &registry,
-        "exec_start",
-        Some(
-            r#"{"command":"sleep 1","wait_timeout_seconds":0.05,"on_timeout":"kill","include_stdout":false}"#,
-        ),
-    );
-    let killed_on_timeout_json: Value = serde_json::from_str(&killed_on_timeout)?;
-    assert_eq!(
-        killed_on_timeout_json["wait_timed_out"],
-        json!(true),
-        "{killed_on_timeout}"
-    );
-    assert_eq!(killed_on_timeout_json["killed"], json!(true));
-    assert_eq!(killed_on_timeout_json["completed"], json!(true));
+    assert!(timeout_kill.contains("\"closed\": true"));
 
     let large_output = execute_tool_call(
         &registry,
-        "exec_start",
-        Some(
-            r#"{"command":"python3 -c \"print('a'*700 + 'b'*700, end='')\"","max_output_chars":1000,"limit":100}"#,
-        ),
+        "shell",
+        Some(r#"{"command":"python3 -c \"print('a'*700 + 'b'*700, end='')\""}"#),
     );
     let large_output_json: Value = serde_json::from_str(&large_output)?;
-    assert_eq!(
-        large_output_json["completed"],
-        json!(true),
-        "{large_output}"
-    );
-    assert_eq!(large_output_json["stdout_chars"], json!(1400));
+    assert_eq!(large_output_json["running"], json!(false), "{large_output}");
     assert_eq!(large_output_json["stdout_truncated"], json!(true));
     assert!(
         large_output_json["stdout"]
@@ -538,82 +509,49 @@ fn builtin_tools_work() -> Result<()> {
     );
     let stdout_path = temp_dir
         .path()
-        .join(large_output_json["stdout_path"].as_str().unwrap());
-    assert_eq!(fs::read_to_string(stdout_path)?.chars().count(), 1400);
-
-    let max_output_too_large = execute_tool_call(
-        &registry,
-        "exec_start",
-        Some(r#"{"command":"printf no","max_output_chars":1001}"#),
+        .join(large_output_json["out_path"].as_str().unwrap());
+    assert_eq!(
+        fs::read_to_string(stdout_path.join("stdout"))?
+            .chars()
+            .count(),
+        1400
     );
-    assert!(max_output_too_large.contains("max_output_chars"));
 
     let background_process = execute_tool_call(
         &registry,
-        "exec_start",
-        Some(r#"{"command":"sleep 0.2; printf bg","return_immediate":true}"#),
+        "shell",
+        Some(r#"{"command":"sleep 0.2; printf bg","wait_ms":0}"#),
     );
     let background_json: Value = serde_json::from_str(&background_process)?;
-    let background_exec_id = background_json
-        .get("exec_id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            background_json
-                .get("process")
-                .and_then(Value::as_object)
-                .and_then(|process| process.get("exec_id"))
-                .and_then(Value::as_str)
-        })
-        .expect("background exec id");
+    let background_session_id = background_json["session_id"].as_str().unwrap();
     let process_result = execute_tool_call(
         &registry,
-        "exec_wait",
+        "shell",
         Some(&format!(
-            r#"{{"exec_id":"{}","wait_timeout_seconds":1,"start":0,"limit":10}}"#,
-            background_exec_id
+            r#"{{"session_id":"{}","wait_ms":1000}}"#,
+            background_session_id
         )),
     );
-    assert!(process_result.contains("\"exec_id\""));
+    assert!(process_result.contains("\"process_id\""));
     assert!(process_result.contains("\"stdout\": \"bg\""));
 
     let stdin_process = execute_tool_call(
         &registry,
-        "exec_start",
+        "shell",
         Some(
-            r#"{"command":"python3 -c \"import sys; print(sys.stdin.readline(), end='')\"","include_stdout":false,"return_immediate":true}"#,
+            r#"{"command":"read line; printf 'got:%s\n' \"$line\"","interactive":true,"wait_ms":0}"#,
         ),
     );
     let stdin_json: Value = serde_json::from_str(&stdin_process)?;
     let stdin_wait = execute_tool_call(
         &registry,
-        "exec_wait",
+        "shell",
         Some(&format!(
-            r#"{{"exec_id":"{}","wait_timeout_seconds":0.2,"input":"hello\n","start":0,"limit":10}}"#,
-            stdin_json["exec_id"].as_str().unwrap()
+            r#"{{"session_id":"{}","input":"hello\n","wait_ms":5000}}"#,
+            stdin_json["session_id"].as_str().unwrap()
         )),
     );
-    assert!(
-        stdin_wait.contains("\"wait_timed_out\": true")
-            || stdin_wait.contains("\"stdout\": \"hello\"")
-    );
-    let stdin_observe = execute_tool_call(
-        &registry,
-        "exec_observe",
-        Some(&format!(
-            r#"{{"exec_id":"{}","start":0,"limit":10}}"#,
-            stdin_json["exec_id"].as_str().unwrap()
-        )),
-    );
-    assert!(stdin_observe.contains("hello"));
-    let stdin_kill = execute_tool_call(
-        &registry,
-        "exec_kill",
-        Some(&format!(
-            r#"{{"exec_id":"{}"}}"#,
-            stdin_json["exec_id"].as_str().unwrap()
-        )),
-    );
-    assert!(stdin_kill.contains("\"killed\": true"));
+    assert!(stdin_wait.contains("got:hello"));
 
     let patch_path = temp_dir.path().join("patch.txt");
     fs::write(&patch_path, "before\n")?;
@@ -681,23 +619,11 @@ fn builtin_tools_work() -> Result<()> {
     assert!(image_load.contains("\"kind\": \"synthetic_user_multimodal\""));
     assert!(image_load.contains("\"path\":"));
 
-    let timeout_target = temp_dir.path().join("timeout-side-effect.txt");
-    let timeout_result = execute_tool_call(
-        &registry,
-        "exec_start",
-        Some(&format!(
-            r#"{{"command":"sleep 1; printf late > {}","return_immediate":true}}"#,
-            timeout_target.display()
-        )),
-    );
-    assert!(timeout_result.contains("\"exec_id\""));
-    thread::sleep(std::time::Duration::from_millis(1200));
-    assert!(timeout_target.exists());
     Ok(())
 }
 
 #[test]
-fn exec_processes_report_clear_error_after_runtime_shutdown() -> Result<()> {
+fn shell_sessions_report_clear_error_after_runtime_shutdown() -> Result<()> {
     let _guard = acquire_process_test_lock();
     let temp_dir = TempDir::new()?;
     let registry = build_tool_registry(
@@ -717,38 +643,25 @@ fn exec_processes_report_clear_error_after_runtime_shutdown() -> Result<()> {
 
     let started = execute_tool_call(
         &registry,
-        "exec_start",
-        Some(r#"{"command":"sleep 10","include_stdout":false,"return_immediate":true}"#),
+        "shell",
+        Some(r#"{"command":"sleep 10","wait_ms":0}"#),
     );
     let started_json: Value = serde_json::from_str(&started)?;
-    let exec_id = started_json["exec_id"].as_str().unwrap();
+    let session_id = started_json["session_id"].as_str().unwrap();
 
     terminate_all_managed_processes()?;
 
     let observe = execute_tool_call(
         &registry,
-        "exec_observe",
-        Some(&format!(
-            r#"{{"exec_id":"{}","start":0,"limit":5}}"#,
-            exec_id
-        )),
+        "shell",
+        Some(&format!(r#"{{"session_id":"{}","wait_ms":0}}"#, session_id)),
     );
     assert!(observe.contains("no longer exists"));
-
-    let wait = execute_tool_call(
-        &registry,
-        "exec_wait",
-        Some(&format!(
-            r#"{{"exec_id":"{}","wait_timeout_seconds":0.1}}"#,
-            exec_id
-        )),
-    );
-    assert!(wait.contains("no longer exists"));
     Ok(())
 }
 
 #[test]
-fn exec_wait_accepts_input_from_a_fresh_registry_instance() -> Result<()> {
+fn shell_accepts_input_from_a_fresh_registry_instance() -> Result<()> {
     let _guard = acquire_process_test_lock();
     let temp_dir = TempDir::new()?;
     let starter = build_tool_registry(
@@ -768,13 +681,13 @@ fn exec_wait_accepts_input_from_a_fresh_registry_instance() -> Result<()> {
 
     let started = execute_tool_call(
         &starter,
-        "exec_start",
+        "shell",
         Some(
-            r#"{"command":"read line; printf 'got:%s\n' \"$line\"","include_stdout":false,"return_immediate":true}"#,
+            r#"{"command":"read line; printf 'got:%s\n' \"$line\"","interactive":true,"wait_ms":0}"#,
         ),
     );
     let started_json: Value = serde_json::from_str(&started)?;
-    let exec_id = started_json["exec_id"].as_str().unwrap();
+    let session_id = started_json["session_id"].as_str().unwrap();
 
     let waiter = build_tool_registry(
         temp_dir.path(),
@@ -792,15 +705,15 @@ fn exec_wait_accepts_input_from_a_fresh_registry_instance() -> Result<()> {
     )?;
     let waited = execute_tool_call(
         &waiter,
-        "exec_wait",
+        "shell",
         Some(&format!(
-            r#"{{"exec_id":"{}","input":"hello\n","wait_timeout_seconds":5.0}}"#,
-            exec_id
+            r#"{{"session_id":"{}","input":"hello\n","wait_ms":5000}}"#,
+            session_id
         )),
     );
     let waited_json: Value = serde_json::from_str(&waited)?;
-    assert_eq!(waited_json["completed"], json!(true));
-    assert_eq!(waited_json["returncode"], json!(0));
+    assert_eq!(waited_json["running"], json!(false));
+    assert_eq!(waited_json["exit_code"], json!(0));
     assert!(
         waited_json["stdout"]
             .as_str()
@@ -810,9 +723,169 @@ fn exec_wait_accepts_input_from_a_fresh_registry_instance() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn shell_discards_unreturned_finished_result_when_starting_next_command() -> Result<()> {
+    let _guard = acquire_process_test_lock();
+    let temp_dir = TempDir::new()?;
+    let registry = build_tool_registry(
+        temp_dir.path(),
+        temp_dir.path(),
+        &test_upstream("http://127.0.0.1:1"),
+        &BTreeMap::new(),
+        None,
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+    )?;
+
+    let started = execute_tool_call(
+        &registry,
+        "shell",
+        Some(r#"{"command":"sleep 0.2; printf first","wait_ms":0}"#),
+    );
+    let started_json: Value = serde_json::from_str(&started)?;
+    let session_id = started_json["session_id"].as_str().unwrap();
+
+    thread::sleep(Duration::from_millis(350));
+
+    let next = execute_tool_call(
+        &registry,
+        "shell",
+        Some(&format!(
+            r#"{{"session_id":"{}","command":"printf second"}}"#,
+            session_id
+        )),
+    );
+    let next_json: Value = serde_json::from_str(&next)?;
+    assert_eq!(next_json["running"], json!(false));
+    assert_eq!(next_json["stdout"], json!("second"));
+    assert_eq!(next_json["exit_code"], json!(0));
+
+    let observe = execute_tool_call(
+        &registry,
+        "shell",
+        Some(&format!(r#"{{"session_id":"{}","wait_ms":0}}"#, session_id)),
+    );
+    let observe_json: Value = serde_json::from_str(&observe)?;
+    assert_eq!(observe_json["running"], json!(false));
+    assert!(observe_json.get("process_id").is_none(), "{observe_json}");
+    assert!(observe_json.get("stdout").is_none(), "{observe_json}");
+
+    Ok(())
+}
+
+#[test]
+fn shell_treats_empty_command_as_observe() -> Result<()> {
+    let _guard = acquire_process_test_lock();
+    let temp_dir = TempDir::new()?;
+    let registry = build_tool_registry(
+        temp_dir.path(),
+        temp_dir.path(),
+        &test_upstream("http://127.0.0.1:1"),
+        &BTreeMap::new(),
+        None,
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+    )?;
+
+    let started = execute_tool_call(
+        &registry,
+        "shell",
+        Some(r#"{"command":"sleep 0.2; printf empty-ok","wait_ms":0}"#),
+    );
+    let started_json: Value = serde_json::from_str(&started)?;
+    let session_id = started_json["session_id"].as_str().unwrap();
+
+    let observed = execute_tool_call(
+        &registry,
+        "shell",
+        Some(&format!(
+            r#"{{"session_id":"{}","command":"","wait_ms":1000}}"#,
+            session_id
+        )),
+    );
+    let observed_json: Value = serde_json::from_str(&observed)?;
+    assert_eq!(observed_json["running"], json!(false));
+    assert_eq!(observed_json["stdout"], json!("empty-ok"));
+    assert_eq!(observed_json["exit_code"], json!(0));
+
+    Ok(())
+}
+
+#[test]
+fn shell_rejects_unknown_session_id_even_with_command() -> Result<()> {
+    let _guard = acquire_process_test_lock();
+    let temp_dir = TempDir::new()?;
+    let registry = build_tool_registry(
+        temp_dir.path(),
+        temp_dir.path(),
+        &test_upstream("http://127.0.0.1:1"),
+        &BTreeMap::new(),
+        None,
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+    )?;
+
+    let result = execute_tool_call(
+        &registry,
+        "shell",
+        Some(&format!(
+            r#"{{"session_id":"{}","command":"printf custom-ok"}}"#,
+            "custom-shell-001"
+        )),
+    );
+    assert!(result.contains("no longer exists"), "{result}");
+    Ok(())
+}
+
+#[test]
+fn shell_rejects_invalid_session_id() -> Result<()> {
+    let _guard = acquire_process_test_lock();
+    let temp_dir = TempDir::new()?;
+    let registry = build_tool_registry(
+        temp_dir.path(),
+        temp_dir.path(),
+        &test_upstream("http://127.0.0.1:1"),
+        &BTreeMap::new(),
+        None,
+        None,
+        None,
+        None,
+        &[],
+        &[],
+        &[],
+        &[],
+    )?;
+
+    let result = execute_tool_call(
+        &registry,
+        "shell",
+        Some(r#"{"session_id":"../bad","command":"printf nope"}"#),
+    );
+    assert!(
+        result.contains("ASCII letters, digits, '_' and '-'"),
+        "{result}"
+    );
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
-fn exec_start_supports_per_tool_remote_ssh() -> Result<()> {
+fn shell_supports_per_tool_remote_ssh() -> Result<()> {
     let _guard = acquire_process_test_lock();
     let temp_dir = TempDir::new()?;
     let fake_ssh = write_fake_ssh(&temp_dir);
@@ -839,36 +912,31 @@ fn exec_start_supports_per_tool_remote_ssh() -> Result<()> {
 
     let completed = execute_tool_call(
         &registry,
-        "exec_start",
-        Some(r#"{"command":"printf remote-ok","remote":"fake-host","cwd":"/"}"#),
+        "shell",
+        Some(r#"{"command":"printf remote-ok","remote":"fake-host"}"#),
     );
     let completed_json: Value = serde_json::from_str(&completed)?;
-    assert_eq!(completed_json["completed"], json!(true));
-    assert_eq!(completed_json["remote"], json!("fake-host"));
+    assert_eq!(completed_json["running"], json!(false));
     assert_eq!(completed_json["stdout"], json!("remote-ok"));
 
     let started = execute_tool_call(
         &registry,
-        "exec_start",
-        Some(
-            r#"{"command":"sleep 0.2; printf remote-bg","remote":"fake-host","cwd":"/","return_immediate":true}"#,
-        ),
+        "shell",
+        Some(r#"{"command":"sleep 0.2; printf remote-bg","remote":"fake-host","wait_ms":0}"#),
     );
     let started_json: Value = serde_json::from_str(&started)?;
-    let exec_id = started_json["exec_id"].as_str().unwrap();
-    assert_eq!(started_json["remote"], json!("fake-host"));
+    let session_id = started_json["session_id"].as_str().unwrap();
 
     let waited = execute_tool_call(
         &registry,
-        "exec_wait",
+        "shell",
         Some(&format!(
-            r#"{{"exec_id":"{}","wait_timeout_seconds":2.0}}"#,
-            exec_id
+            r#"{{"session_id":"{}","wait_ms":2000}}"#,
+            session_id
         )),
     );
     let waited_json: Value = serde_json::from_str(&waited)?;
-    assert_eq!(waited_json["completed"], json!(true));
-    assert_eq!(waited_json["remote"], json!("fake-host"));
+    assert_eq!(waited_json["running"], json!(false));
     assert_eq!(waited_json["stdout"], json!("remote-bg"));
     Ok(())
 }
@@ -2175,15 +2243,15 @@ fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -
         &[],
         &[],
     )?;
-    let exec_start = execute_tool_call(
+    let shell_start = execute_tool_call(
         &registry,
-        "exec_start",
-        Some(r#"{"command":"sleep 10","include_stdout":false,"return_immediate":true}"#),
+        "shell",
+        Some(r#"{"command":"sleep 10","wait_ms":0}"#),
     );
-    let exec_start_json: Value = serde_json::from_str(&exec_start)?;
-    let exec_id = exec_start_json["exec_id"]
+    let shell_start_json: Value = serde_json::from_str(&shell_start)?;
+    let session_id = shell_start_json["session_id"]
         .as_str()
-        .expect("exec_start should return exec_id")
+        .expect("shell should return session_id")
         .to_string();
     server.push_response(json!({
         "choices": [{
@@ -2194,11 +2262,10 @@ fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -
                     "id": "call-1",
                     "type": "function",
                     "function": {
-                        "name": "exec_wait",
+                        "name": "shell",
                         "arguments": serde_json::to_string(&json!({
-                            "exec_id": exec_id,
-                            "wait_timeout_seconds": 30,
-                            "include_stdout": false
+                            "session_id": session_id,
+                            "wait_ms": 30000
                         })).unwrap()
                     }
                 }]
@@ -2260,8 +2327,8 @@ fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -
     )?;
     let _ = execute_tool_call(
         &registry,
-        "exec_kill",
-        Some(&format!(r#"{{"exec_id":"{}"}}"#, exec_id)),
+        "shell_close",
+        Some(&format!(r#"{{"session_id":"{}"}}"#, session_id)),
     );
     let assistant_text = extract_assistant_text(&report.messages);
     assert!(assistant_text.contains("tool timed out"));
@@ -2278,7 +2345,7 @@ fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -
         .unwrap();
     let tool_json: Value = serde_json::from_str(tool_content)?;
     assert_eq!(tool_json["timed_out"], json!(true));
-    assert_eq!(tool_json["tool"], json!("exec_wait"));
+    assert_eq!(tool_json["tool"], json!("shell"));
     Ok(())
 }
 

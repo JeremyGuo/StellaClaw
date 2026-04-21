@@ -3,20 +3,14 @@ use crate::llm::create_chat_completion;
 use crate::message::ChatMessage;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
-#[cfg(unix)]
-use nix::pty::{Winsize, openpty};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::fs;
-use std::fs::File;
 use std::io::{Read, Write};
 use std::net::IpAddr;
-#[cfg(unix)]
-use std::os::fd::AsRawFd;
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -67,18 +61,16 @@ pub enum ToolWorkerJob {
         headers: Map<String, Value>,
         status_path: String,
     },
-    Exec {
-        exec_id: String,
+    ShellSession {
+        session_id: String,
         #[serde(default)]
-        tty: bool,
+        interactive: bool,
         #[serde(default)]
         remote: Option<String>,
-        command: String,
-        cwd: String,
+        initial_cwd: String,
         status_path: String,
-        stdout_path: String,
-        stderr_path: String,
         requests_dir: String,
+        output_root: String,
     },
     Dsl {
         dsl_id: String,
@@ -183,26 +175,22 @@ fn run_job(job: ToolWorkerJob) -> Result<()> {
             headers,
             Path::new(&status_path),
         ),
-        ToolWorkerJob::Exec {
-            exec_id,
-            tty,
+        ToolWorkerJob::ShellSession {
+            session_id,
+            interactive,
             remote,
-            command,
-            cwd,
+            initial_cwd,
             status_path,
-            stdout_path,
-            stderr_path,
             requests_dir,
-        } => run_exec_job(
-            &exec_id,
-            tty,
+            output_root,
+        } => run_shell_session_job(
+            &session_id,
+            interactive,
             remote.as_deref(),
-            &command,
-            Path::new(&cwd),
+            &initial_cwd,
             Path::new(&status_path),
-            Path::new(&stdout_path),
-            Path::new(&stderr_path),
             Path::new(&requests_dir),
+            Path::new(&output_root),
         ),
         ToolWorkerJob::Dsl {
             dsl_id,
@@ -259,172 +247,6 @@ fn write_json_file(path: &Path, value: &Value) -> Result<()> {
         serde_json::to_vec_pretty(value).context("failed to serialize worker status")?,
     )
     .with_context(|| format!("failed to write {}", path.display()))
-}
-
-fn exec_status_json(
-    exec_id: &str,
-    tty: bool,
-    remote: Option<&str>,
-    command: &str,
-    cwd: &Path,
-    pid: Option<u32>,
-    running: bool,
-    completed: bool,
-    returncode: Option<i32>,
-    stdin_closed: bool,
-    failed: bool,
-    error: Option<String>,
-) -> Value {
-    json!({
-        "exec_id": exec_id,
-        "tty": tty,
-        "pid": pid,
-        "command": command,
-        "remote": remote.unwrap_or("local"),
-        "cwd": cwd.display().to_string(),
-        "running": running,
-        "completed": completed,
-        "returncode": returncode,
-        "stdin_closed": stdin_closed,
-        "failed": failed,
-        "error": error,
-    })
-}
-
-fn write_exec_status(
-    status_path: &Path,
-    exec_id: &str,
-    tty: bool,
-    remote: Option<&str>,
-    command: &str,
-    cwd: &Path,
-    pid: Option<u32>,
-    running: bool,
-    completed: bool,
-    returncode: Option<i32>,
-    stdin_closed: bool,
-    failed: bool,
-    error: Option<String>,
-) -> Result<()> {
-    write_json_file(
-        status_path,
-        &exec_status_json(
-            exec_id,
-            tty,
-            remote,
-            command,
-            cwd,
-            pid,
-            running,
-            completed,
-            returncode,
-            stdin_closed,
-            failed,
-            error,
-        ),
-    )
-}
-
-enum ExecInputWriter {
-    Pipe(ChildStdin),
-    #[cfg(unix)]
-    Pty(File),
-}
-
-impl ExecInputWriter {
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        match self {
-            ExecInputWriter::Pipe(stdin) => stdin.write_all(buf),
-            #[cfg(unix)]
-            ExecInputWriter::Pty(writer) => writer.write_all(buf),
-        }
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        match self {
-            ExecInputWriter::Pipe(stdin) => stdin.flush(),
-            #[cfg(unix)]
-            ExecInputWriter::Pty(writer) => writer.flush(),
-        }
-    }
-}
-
-#[derive(Deserialize)]
-struct ExecInputRequest {
-    input: String,
-}
-
-fn process_exec_requests(
-    requests_dir: &Path,
-    stdin: &mut Option<ExecInputWriter>,
-    exec_id: &str,
-) -> Result<bool> {
-    let mut request_paths = fs::read_dir(requests_dir)
-        .with_context(|| format!("failed to read {}", requests_dir.display()))?
-        .filter_map(|entry| entry.ok().map(|item| item.path()))
-        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
-        .filter(|path| {
-            path.file_name()
-                .and_then(|value| value.to_str())
-                .is_some_and(|name| name.starts_with("request-") && !name.ends_with(".result.json"))
-        })
-        .collect::<Vec<_>>();
-    request_paths.sort();
-
-    let mut stdin_closed = stdin.is_none();
-    for path in request_paths {
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let request: ExecInputRequest =
-            serde_json::from_str(&raw).context("failed to parse exec input request")?;
-        let stem = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| anyhow!("invalid exec input request name"))?;
-        let result_path = requests_dir.join(format!("{stem}.result.json"));
-        let mut close_stdin_after_request = false;
-
-        let result = match stdin.as_mut() {
-            Some(stdin) => match stdin.write_all(request.input.as_bytes()) {
-                Ok(()) => match stdin.flush() {
-                    Ok(()) => json!({
-                        "ok": true,
-                    }),
-                    Err(error) => {
-                        close_stdin_after_request = true;
-                        stdin_closed = true;
-                        json!({
-                            "ok": false,
-                            "error": format!("failed to flush stdin for exec process {}: {}", exec_id, error),
-                        })
-                    }
-                },
-                Err(error) => {
-                    close_stdin_after_request = true;
-                    stdin_closed = true;
-                    json!({
-                        "ok": false,
-                        "error": format!("stdin is closed for exec process {}: {}", exec_id, error),
-                    })
-                }
-            },
-            None => {
-                stdin_closed = true;
-                json!({
-                    "ok": false,
-                    "error": format!("stdin is closed for exec process {}", exec_id),
-                })
-            }
-        };
-
-        write_json_file(&result_path, &result)?;
-        fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
-        if close_stdin_after_request {
-            *stdin = None;
-        }
-    }
-
-    Ok(stdin_closed)
 }
 
 fn should_bypass_proxy(url: &str) -> bool {
@@ -969,25 +791,6 @@ fn run_file_download_job(
     )
 }
 
-fn build_shell_command(command: &str) -> Command {
-    #[cfg(windows)]
-    {
-        let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
-        let mut command_builder = Command::new(shell);
-        command_builder.arg("/C").arg(command);
-        command_builder
-    }
-    #[cfg(not(windows))]
-    {
-        let mut command_builder = Command::new("sh");
-        command_builder
-            .arg("-c")
-            .arg("eval \"$AGENT_FRAME_EXEC_COMMAND\"")
-            .env("AGENT_FRAME_EXEC_COMMAND", command);
-        command_builder
-    }
-}
-
 fn validate_remote_host(host: &str) -> Result<String> {
     let trimmed = host.trim();
     if trimmed.is_empty() {
@@ -1035,338 +838,643 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn remote_cd_prefix(remote_cwd: &str) -> String {
-    format!(
-        "AGENT_FRAME_REMOTE_CWD={}; case \"$AGENT_FRAME_REMOTE_CWD\" in '~') AGENT_FRAME_REMOTE_CWD=\"$HOME\" ;; '~/'*) AGENT_FRAME_REMOTE_CWD=\"$HOME/${{AGENT_FRAME_REMOTE_CWD#~/}}\" ;; esac; cd \"$AGENT_FRAME_REMOTE_CWD\" &&",
-        shell_quote(remote_cwd)
-    )
-}
-
 fn resolve_ssh_executable() -> String {
     std::env::var("AGENT_FRAME_SSH_BIN").unwrap_or_else(|_| "ssh".to_string())
 }
 
-fn build_remote_shell_command(host: &str, command: &str, cwd: &Path, tty: bool) -> Result<Command> {
+#[derive(Debug, Clone)]
+enum ShellRequest {
+    Run { process_id: String, command: String },
+    Input { input: String },
+    Close,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ShellWriterState {
+    stdout_path: Option<PathBuf>,
+    stderr_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+enum ShellEvent {
+    ProcessDone { process_id: String, exit_code: i32 },
+    ReaderFailed { stream: &'static str, error: String },
+}
+
+fn shell_request_result_path(request_path: &Path) -> PathBuf {
+    let Some(file_name) = request_path.file_name().and_then(|value| value.to_str()) else {
+        return request_path.with_extension("result.json");
+    };
+    let result_name = if let Some(stripped) = file_name.strip_suffix(".json") {
+        format!("{stripped}.result.json")
+    } else {
+        format!("{file_name}.result.json")
+    };
+    request_path.with_file_name(result_name)
+}
+
+fn append_output(path: &Path, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open {}", path.display()))?;
+    file.write_all(bytes)
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("failed to flush {}", path.display()))?;
+    Ok(())
+}
+
+fn write_shell_session_status(
+    status_path: &Path,
+    session_id: &str,
+    interactive: bool,
+    remote: Option<&str>,
+    pid: Option<u32>,
+    running: bool,
+    process_id: Option<&str>,
+    exit_code: Option<i32>,
+    command: Option<&str>,
+    stdout_path: Option<&Path>,
+    stderr_path: Option<&Path>,
+    error: Option<&str>,
+) -> Result<()> {
+    write_json_file(
+        status_path,
+        &json!({
+            "session_id": session_id,
+            "interactive": interactive,
+            "remote": remote.unwrap_or("local"),
+            "pid": pid,
+            "running": running,
+            "process_id": process_id,
+            "exit_code": exit_code,
+            "command": command,
+            "stdout_path": stdout_path.map(|value| value.display().to_string()),
+            "stderr_path": stderr_path.map(|value| value.display().to_string()),
+            "error": error,
+        }),
+    )
+}
+
+fn file_size_if_exists(path: Option<&Path>) -> u64 {
+    path.and_then(|value| fs::metadata(value).ok())
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn wait_for_shell_output_settle(stdout_path: Option<&Path>, stderr_path: Option<&Path>) {
+    let mut last_sizes = (
+        file_size_if_exists(stdout_path),
+        file_size_if_exists(stderr_path),
+    );
+    for _ in 0..4 {
+        thread::sleep(Duration::from_millis(10));
+        let current_sizes = (
+            file_size_if_exists(stdout_path),
+            file_size_if_exists(stderr_path),
+        );
+        if current_sizes == last_sizes {
+            return;
+        }
+        last_sizes = current_sizes;
+    }
+}
+
+fn build_persistent_shell_command() -> Command {
+    #[cfg(windows)]
+    {
+        let shell = std::env::var_os("COMSPEC").unwrap_or_else(|| "cmd.exe".into());
+        let mut command_builder = Command::new(shell);
+        command_builder.arg("/Q");
+        command_builder
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("sh")
+    }
+}
+
+fn build_remote_persistent_shell_command(host: &str) -> Result<Command> {
     let host = validate_remote_host(host)?;
     if host == "local" {
-        return Ok(build_shell_command(command));
+        return Ok(build_persistent_shell_command());
     }
-    let remote_script = format!(
-        "AGENT_FRAME_EXEC_COMMAND={}; {} eval \"$AGENT_FRAME_EXEC_COMMAND\"",
-        shell_quote(command),
-        remote_cd_prefix(&cwd.display().to_string())
-    );
-    let remote_command = format!("sh -c {}", shell_quote(&remote_script));
     let mut command_builder = Command::new(resolve_ssh_executable());
     command_builder
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
-        .arg("ConnectTimeout=10");
-    if tty {
-        command_builder.arg("-tt");
-    } else {
-        command_builder.arg("-T");
-    }
-    command_builder.arg(host).arg(remote_command);
+        .arg("ConnectTimeout=10")
+        .arg("-T")
+        .arg(host)
+        .arg("sh");
     Ok(command_builder)
 }
 
-#[cfg(unix)]
-fn spawn_pty_output_reader(
-    reader: File,
-    stdout_path: &Path,
-) -> Result<thread::JoinHandle<Result<()>>> {
-    let output_path = stdout_path.to_path_buf();
-    Ok(thread::spawn(move || -> Result<()> {
+fn spawn_persistent_shell(
+    remote: Option<&str>,
+    initial_cwd: &Path,
+) -> Result<(
+    Child,
+    ChildStdin,
+    std::process::ChildStdout,
+    std::process::ChildStderr,
+)> {
+    let mut command_builder = match remote {
+        Some(host) if host != "local" => build_remote_persistent_shell_command(host)?,
+        _ => build_persistent_shell_command(),
+    };
+    if remote.is_none() || remote == Some("local") {
+        command_builder.current_dir(initial_cwd);
+    }
+    let mut child = command_builder
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed to spawn persistent shell in {}",
+                initial_cwd.display()
+            )
+        })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow!("persistent shell stdin unavailable"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("persistent shell stdout unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("persistent shell stderr unavailable"))?;
+    Ok((child, stdin, stdout, stderr))
+}
+
+fn shell_request_paths(requests_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for entry in fs::read_dir(requests_dir)
+        .with_context(|| format!("failed to read {}", requests_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if file_name.starts_with("request-")
+            && file_name.ends_with(".json")
+            && !file_name.ends_with(".result.json")
+        {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn read_shell_request(path: &Path) -> Result<ShellRequest> {
+    let raw =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let value: Value = serde_json::from_str(&raw).context("failed to parse shell request")?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| anyhow!("shell request must be an object"))?;
+    let action = object
+        .get("action")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("shell request missing action"))?;
+    match action {
+        "run" => Ok(ShellRequest::Run {
+            process_id: object
+                .get("process_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("shell run request missing process_id"))?
+                .to_string(),
+            command: object
+                .get("command")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("shell run request missing command"))?
+                .to_string(),
+        }),
+        "input" => Ok(ShellRequest::Input {
+            input: object
+                .get("input")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("shell input request missing input"))?
+                .to_string(),
+        }),
+        "close" => Ok(ShellRequest::Close),
+        other => Err(anyhow!("unknown shell request action {}", other)),
+    }
+}
+
+fn write_shell_request_result(path: &Path, value: &Value) -> Result<()> {
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(value).context("failed to serialize shell request result")?,
+    )
+    .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn spawn_stdout_forwarder(
+    reader: std::process::ChildStdout,
+    writer_state: Arc<Mutex<ShellWriterState>>,
+    event_sender: mpsc::Sender<ShellEvent>,
+) -> thread::JoinHandle<Result<()>> {
+    thread::spawn(move || -> Result<()> {
         let mut reader = reader;
-        let mut output = fs::OpenOptions::new()
-            .append(true)
-            .open(&output_path)
-            .with_context(|| format!("failed to open {} for PTY output", output_path.display()))?;
         let mut buffer = [0_u8; 8192];
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => return Ok(()),
                 Ok(read_len) => {
-                    output
-                        .write_all(&buffer[..read_len])
-                        .with_context(|| format!("failed to write {}", output_path.display()))?;
-                    output
-                        .flush()
-                        .with_context(|| format!("failed to flush {}", output_path.display()))?;
+                    let path = writer_state
+                        .lock()
+                        .map_err(|_| anyhow!("stdout writer state poisoned"))?
+                        .stdout_path
+                        .clone();
+                    if let Some(path) = path {
+                        append_output(&path, &buffer[..read_len])?;
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) if error.raw_os_error() == Some(libc::EIO) => return Ok(()),
                 Err(error) => {
-                    return Err(error).with_context(|| {
-                        format!("failed to read PTY output for {}", output_path.display())
+                    let _ = event_sender.send(ShellEvent::ReaderFailed {
+                        stream: "stdout",
+                        error: error.to_string(),
                     });
+                    return Err(error).context("failed to read persistent shell stdout");
                 }
             }
         }
-    }))
+    })
 }
 
-#[cfg(unix)]
-fn join_pty_output_reader(handle: thread::JoinHandle<Result<()>>) -> Result<()> {
-    handle
-        .join()
-        .map_err(|_| anyhow!("PTY output reader thread panicked"))?
+fn parse_shell_done_marker(line: &[u8]) -> Option<(String, i32)> {
+    let text = std::str::from_utf8(line)
+        .ok()?
+        .trim_matches(|ch| ch == '\r' || ch == '\n');
+    let rest = text.strip_prefix("__AGENT_FRAME_SHELL_DONE__:")?;
+    let (process_id, exit_code) = rest.rsplit_once(':')?;
+    let exit_code = exit_code.parse::<i32>().ok()?;
+    Some((process_id.to_string(), exit_code))
 }
 
-#[cfg(not(unix))]
-fn join_pty_output_reader(handle: thread::JoinHandle<Result<()>>) -> Result<()> {
-    handle
-        .join()
-        .map_err(|_| anyhow!("exec output reader thread panicked"))?
-}
-
-#[cfg(unix)]
-fn spawn_exec_child(
-    tty: bool,
-    remote: Option<&str>,
-    command: &str,
-    cwd: &Path,
-    stdout_file: File,
-    stderr_file: File,
-    stdout_path: &Path,
-) -> Result<(
-    Child,
-    Option<ExecInputWriter>,
-    Option<thread::JoinHandle<Result<()>>>,
-)> {
-    if tty {
-        let pty = openpty(
-            Some(&Winsize {
-                ws_row: 24,
-                ws_col: 80,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            }),
-            None,
-        )
-        .context("failed to allocate pty for exec process")?;
-        let master_fd = pty.master.as_raw_fd();
-        let slave_fd = pty.slave.as_raw_fd();
-
-        let mut command_builder = match remote {
-            Some(host) if host != "local" => build_remote_shell_command(host, command, cwd, true)?,
-            _ => build_shell_command(command),
-        };
-        command_builder
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit());
-        if remote.is_none() || remote == Some("local") {
-            command_builder.current_dir(cwd);
+fn spawn_stderr_forwarder(
+    reader: std::process::ChildStderr,
+    writer_state: Arc<Mutex<ShellWriterState>>,
+    event_sender: mpsc::Sender<ShellEvent>,
+) -> thread::JoinHandle<Result<()>> {
+    thread::spawn(move || -> Result<()> {
+        let mut reader = reader;
+        let mut pending = Vec::<u8>::new();
+        let mut buffer = [0_u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    if !pending.is_empty() {
+                        let path = writer_state
+                            .lock()
+                            .map_err(|_| anyhow!("stderr writer state poisoned"))?
+                            .stderr_path
+                            .clone();
+                        if let Some(path) = path {
+                            append_output(&path, &pending)?;
+                        }
+                    }
+                    return Ok(());
+                }
+                Ok(read_len) => {
+                    pending.extend_from_slice(&buffer[..read_len]);
+                    while let Some(pos) = pending.iter().position(|byte| *byte == b'\n') {
+                        let line = pending.drain(..=pos).collect::<Vec<_>>();
+                        if let Some((process_id, exit_code)) = parse_shell_done_marker(&line) {
+                            let _ = event_sender.send(ShellEvent::ProcessDone {
+                                process_id,
+                                exit_code,
+                            });
+                            continue;
+                        }
+                        let path = writer_state
+                            .lock()
+                            .map_err(|_| anyhow!("stderr writer state poisoned"))?
+                            .stderr_path
+                            .clone();
+                        if let Some(path) = path {
+                            append_output(&path, &line)?;
+                        }
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    let _ = event_sender.send(ShellEvent::ReaderFailed {
+                        stream: "stderr",
+                        error: error.to_string(),
+                    });
+                    return Err(error).context("failed to read persistent shell stderr");
+                }
+            }
         }
-        // PTY-backed commands need a controlling terminal and their own process group.
-        unsafe {
-            command_builder.pre_exec(move || {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0) == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::dup2(slave_fd, libc::STDIN_FILENO) == -1
-                    || libc::dup2(slave_fd, libc::STDOUT_FILENO) == -1
-                    || libc::dup2(slave_fd, libc::STDERR_FILENO) == -1
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                libc::close(master_fd);
-                if slave_fd > libc::STDERR_FILENO {
-                    libc::close(slave_fd);
-                }
-                Ok(())
-            });
-        }
-        let child = command_builder
-            .spawn()
-            .with_context(|| format!("failed to spawn PTY shell in {}", cwd.display()))?;
-        drop(pty.slave);
-        let reader_master = File::from(pty.master);
-        let writer_master = reader_master
-            .try_clone()
-            .context("failed to clone PTY master for stdin writes")?;
-        let stdin = Some(ExecInputWriter::Pty(writer_master));
-        drop(stdout_file);
-        drop(stderr_file);
-        let reader_handle = Some(spawn_pty_output_reader(reader_master, stdout_path)?);
-        Ok((child, stdin, reader_handle))
-    } else {
-        let mut command_builder = match remote {
-            Some(host) if host != "local" => build_remote_shell_command(host, command, cwd, false)?,
-            _ => build_shell_command(command),
-        };
-        if remote.is_none() || remote == Some("local") {
-            command_builder.current_dir(cwd);
-        }
-        let mut child = command_builder
-            .stdin(Stdio::piped())
-            .stdout(Stdio::from(stdout_file))
-            .stderr(Stdio::from(stderr_file))
-            .spawn()
-            .with_context(|| format!("failed to spawn shell in {}", cwd.display()))?;
-        let stdin = child.stdin.take().map(ExecInputWriter::Pipe);
-        Ok((child, stdin, None))
-    }
+    })
 }
 
-#[cfg(not(unix))]
-fn spawn_exec_child(
-    _tty: bool,
-    remote: Option<&str>,
+fn start_shell_process(
+    stdin: &mut ChildStdin,
+    process_id: &str,
     command: &str,
-    cwd: &Path,
-    stdout_file: File,
-    stderr_file: File,
-    _stdout_path: &Path,
-) -> Result<(
-    Child,
-    Option<ExecInputWriter>,
-    Option<thread::JoinHandle<Result<()>>>,
-)> {
-    let mut command_builder = match remote {
-        Some(host) if host != "local" => build_remote_shell_command(host, command, cwd, false)?,
-        _ => build_shell_command(command),
-    };
-    if remote.is_none() || remote == Some("local") {
-        command_builder.current_dir(cwd);
-    }
-    let mut child = command_builder
-        .stdin(Stdio::piped())
-        .stdout(Stdio::from(stdout_file))
-        .stderr(Stdio::from(stderr_file))
-        .spawn()
-        .with_context(|| format!("failed to spawn shell in {}", cwd.display()))?;
-    let stdin = child.stdin.take().map(ExecInputWriter::Pipe);
-    Ok((child, stdin, None))
-}
-
-fn run_exec_job(
-    exec_id: &str,
-    tty: bool,
-    remote: Option<&str>,
-    command: &str,
-    cwd: &Path,
-    status_path: &Path,
+    interactive: bool,
     stdout_path: &Path,
     stderr_path: &Path,
-    requests_dir: &Path,
 ) -> Result<()> {
-    let effective_tty = tty && cfg!(unix);
+    #[cfg(windows)]
+    let script = if interactive {
+        format!(
+            "{command}\r\nset AGENT_FRAME_SHELL_EXIT=%ERRORLEVEL%\r\necho __AGENT_FRAME_SHELL_DONE__:{process_id}:%AGENT_FRAME_SHELL_EXIT% 1>&2\r\n"
+        )
+    } else {
+        format!(
+            "({command}) 1> \"{}\" 2> \"{}\"\r\nset AGENT_FRAME_SHELL_EXIT=%ERRORLEVEL%\r\necho __AGENT_FRAME_SHELL_DONE__:{process_id}:%AGENT_FRAME_SHELL_EXIT% 1>&2\r\n",
+            stdout_path.display(),
+            stderr_path.display()
+        )
+    };
+    #[cfg(not(windows))]
+    let script = if interactive {
+        format!(
+            "{command}\n__agent_frame_shell_exit=$?\nprintf '__AGENT_FRAME_SHELL_DONE__:{process_id}:%s\\n' \"$__agent_frame_shell_exit\" >&2\n"
+        )
+    } else {
+        format!(
+            "{{ {command}; }} >{} 2>{}\n__agent_frame_shell_exit=$?\nprintf '__AGENT_FRAME_SHELL_DONE__:{process_id}:%s\\n' \"$__agent_frame_shell_exit\" >&2\n",
+            shell_quote(&stdout_path.display().to_string()),
+            shell_quote(&stderr_path.display().to_string())
+        )
+    };
+    stdin
+        .write_all(script.as_bytes())
+        .context("failed to send shell command to persistent shell")?;
+    stdin
+        .flush()
+        .context("failed to flush persistent shell stdin")
+}
+
+fn send_shell_input(stdin: &mut ChildStdin, input: &str) -> Result<()> {
+    stdin
+        .write_all(input.as_bytes())
+        .context("failed to write shell input")?;
+    stdin.flush().context("failed to flush shell input")
+}
+
+fn initialize_shell_session(
+    stdin: &mut ChildStdin,
+    remote: Option<&str>,
+    initial_cwd: &str,
+) -> Result<()> {
+    if remote.is_some_and(|host| host != "local") {
+        #[cfg(windows)]
+        let command = format!("cd /d {}\r\n", initial_cwd);
+        #[cfg(not(windows))]
+        let command = format!("cd {}\n", shell_quote(initial_cwd));
+        stdin
+            .write_all(command.as_bytes())
+            .context("failed to initialize remote shell cwd")?;
+        stdin
+            .flush()
+            .context("failed to flush remote shell initialization")?;
+    }
+    Ok(())
+}
+
+fn run_shell_session_job(
+    session_id: &str,
+    interactive: bool,
+    remote: Option<&str>,
+    initial_cwd: &str,
+    status_path: &Path,
+    requests_dir: &Path,
+    output_root: &Path,
+) -> Result<()> {
+    fs::create_dir_all(requests_dir)
+        .with_context(|| format!("failed to create {}", requests_dir.display()))?;
+    fs::create_dir_all(output_root)
+        .with_context(|| format!("failed to create {}", output_root.display()))?;
+
+    let initial_cwd_path = Path::new(initial_cwd);
+    let (mut shell, mut stdin, stdout, stderr) = spawn_persistent_shell(remote, initial_cwd_path)?;
+    initialize_shell_session(&mut stdin, remote, initial_cwd)?;
+    let shell_pid = shell.id();
+    write_shell_session_status(
+        status_path,
+        session_id,
+        interactive,
+        remote,
+        Some(shell_pid),
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )?;
+
+    let writer_state = Arc::new(Mutex::new(ShellWriterState::default()));
+    let (event_sender, event_receiver) = mpsc::channel();
+    let stdout_handle = spawn_stdout_forwarder(stdout, writer_state.clone(), event_sender.clone());
+    let stderr_handle = spawn_stderr_forwarder(stderr, writer_state.clone(), event_sender);
+
+    let mut current_process_id: Option<String> = None;
+    let mut current_command: Option<String> = None;
+    let mut current_stdout_path: Option<PathBuf> = None;
+    let mut current_stderr_path: Option<PathBuf> = None;
+    let mut running = false;
+    let mut current_exit_code: Option<i32> = None;
+
     let run_result = (|| -> Result<()> {
-        if let Some(parent) = stdout_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        if let Some(parent) = stderr_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
-        fs::create_dir_all(requests_dir)
-            .with_context(|| format!("failed to create {}", requests_dir.display()))?;
-
-        let stdout_file = File::create(stdout_path)
-            .with_context(|| format!("failed to create {}", stdout_path.display()))?;
-        let stderr_file = File::create(stderr_path)
-            .with_context(|| format!("failed to create {}", stderr_path.display()))?;
-
-        let (mut child, mut stdin, reader_handle) = spawn_exec_child(
-            effective_tty,
-            remote,
-            command,
-            cwd,
-            stdout_file,
-            stderr_file,
-            stdout_path,
-        )?;
-        let pid = child.id();
-        let mut stdin_closed = stdin.is_none();
-        let mut last_stdin_closed = stdin_closed;
-
-        write_exec_status(
-            status_path,
-            exec_id,
-            effective_tty,
-            remote,
-            command,
-            cwd,
-            Some(pid),
-            true,
-            false,
-            None,
-            stdin_closed,
-            false,
-            None,
-        )?;
-
         loop {
-            stdin_closed = process_exec_requests(requests_dir, &mut stdin, exec_id)?;
-            if stdin_closed != last_stdin_closed {
-                write_exec_status(
-                    status_path,
-                    exec_id,
-                    effective_tty,
-                    remote,
-                    command,
-                    cwd,
-                    Some(pid),
-                    true,
-                    false,
-                    None,
-                    stdin_closed,
-                    false,
-                    None,
-                )?;
-                last_stdin_closed = stdin_closed;
-            }
-            if let Some(status) = child
-                .try_wait()
-                .context("failed to poll exec child process")?
-            {
-                if let Some(handle) = reader_handle {
-                    join_pty_output_reader(handle)?;
+            while let Ok(event) = event_receiver.try_recv() {
+                match event {
+                    ShellEvent::ProcessDone {
+                        process_id,
+                        exit_code,
+                    } if current_process_id.as_deref() == Some(process_id.as_str()) => {
+                        running = false;
+                        current_exit_code = Some(exit_code);
+                        wait_for_shell_output_settle(
+                            current_stdout_path.as_deref(),
+                            current_stderr_path.as_deref(),
+                        );
+                        write_shell_session_status(
+                            status_path,
+                            session_id,
+                            interactive,
+                            remote,
+                            Some(shell_pid),
+                            false,
+                            current_process_id.as_deref(),
+                            current_exit_code,
+                            current_command.as_deref(),
+                            current_stdout_path.as_deref(),
+                            current_stderr_path.as_deref(),
+                            None,
+                        )?;
+                    }
+                    ShellEvent::ReaderFailed { stream, error } => {
+                        return Err(anyhow!(
+                            "persistent shell {} reader failed: {}",
+                            stream,
+                            error
+                        ));
+                    }
+                    _ => {}
                 }
-                write_exec_status(
-                    status_path,
-                    exec_id,
-                    effective_tty,
-                    remote,
-                    command,
-                    cwd,
-                    Some(pid),
-                    false,
-                    true,
-                    status.code().or(Some(-1)),
-                    stdin_closed,
-                    false,
-                    None,
-                )?;
-                return Ok(());
             }
-            thread::sleep(Duration::from_millis(100));
+
+            if let Some(status) = shell
+                .try_wait()
+                .context("failed to poll persistent shell process")?
+            {
+                let code = status.code().unwrap_or(-1);
+                write_shell_session_status(
+                    status_path,
+                    session_id,
+                    interactive,
+                    remote,
+                    Some(shell_pid),
+                    false,
+                    current_process_id.as_deref(),
+                    current_exit_code.or(Some(code)),
+                    current_command.as_deref(),
+                    current_stdout_path.as_deref(),
+                    current_stderr_path.as_deref(),
+                    if current_process_id.is_some() {
+                        Some("persistent shell exited unexpectedly")
+                    } else {
+                        None
+                    },
+                )?;
+                break;
+            }
+
+            for request_path in shell_request_paths(requests_dir)? {
+                let result_path = shell_request_result_path(&request_path);
+                let request = read_shell_request(&request_path);
+                let response = match request {
+                    Ok(ShellRequest::Run {
+                        process_id,
+                        command,
+                    }) => {
+                        if running {
+                            json!({"ok": false, "error": "session already has a running command"})
+                        } else {
+                            let process_dir = output_root.join(&process_id);
+                            fs::create_dir_all(&process_dir).with_context(|| {
+                                format!("failed to create {}", process_dir.display())
+                            })?;
+                            let stdout_path = process_dir.join("stdout");
+                            let stderr_path = process_dir.join("stderr");
+                            fs::write(&stdout_path, b"").with_context(|| {
+                                format!("failed to create {}", stdout_path.display())
+                            })?;
+                            fs::write(&stderr_path, b"").with_context(|| {
+                                format!("failed to create {}", stderr_path.display())
+                            })?;
+                            {
+                                let mut writer_state = writer_state
+                                    .lock()
+                                    .map_err(|_| anyhow!("shell writer state poisoned"))?;
+                                writer_state.stdout_path = Some(stdout_path.clone());
+                                writer_state.stderr_path = Some(stderr_path.clone());
+                            }
+                            current_process_id = Some(process_id.clone());
+                            current_command = Some(command.clone());
+                            current_stdout_path = Some(stdout_path);
+                            current_stderr_path = Some(stderr_path);
+                            running = true;
+                            current_exit_code = None;
+                            start_shell_process(
+                                &mut stdin,
+                                &process_id,
+                                &command,
+                                interactive,
+                                current_stdout_path.as_deref().unwrap(),
+                                current_stderr_path.as_deref().unwrap(),
+                            )?;
+                            write_shell_session_status(
+                                status_path,
+                                session_id,
+                                interactive,
+                                remote,
+                                Some(shell_pid),
+                                true,
+                                current_process_id.as_deref(),
+                                None,
+                                current_command.as_deref(),
+                                current_stdout_path.as_deref(),
+                                current_stderr_path.as_deref(),
+                                None,
+                            )?;
+                            json!({"ok": true, "process_id": process_id})
+                        }
+                    }
+                    Ok(ShellRequest::Input { input }) => {
+                        if !interactive {
+                            json!({"ok": false, "error": "session is not interactive"})
+                        } else if !running {
+                            json!({"ok": false, "error": "session does not have a running command"})
+                        } else {
+                            send_shell_input(&mut stdin, &input)?;
+                            json!({"ok": true})
+                        }
+                    }
+                    Ok(ShellRequest::Close) => {
+                        let _ = shell.kill();
+                        let _ = shell.wait();
+                        write_shell_request_result(&result_path, &json!({"ok": true}))?;
+                        let _ = fs::remove_file(&request_path);
+                        return Ok(());
+                    }
+                    Err(error) => json!({"ok": false, "error": format!("{:#}", error)}),
+                };
+                write_shell_request_result(&result_path, &response)?;
+                let _ = fs::remove_file(&request_path);
+            }
+
+            thread::sleep(Duration::from_millis(50));
         }
+        Ok(())
     })();
 
+    let _ = shell.kill();
+    let _ = shell.wait();
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
+
     if let Err(error) = run_result {
-        write_exec_status(
+        write_shell_session_status(
             status_path,
-            exec_id,
-            effective_tty,
+            session_id,
+            interactive,
             remote,
-            command,
-            cwd,
-            None,
+            Some(shell_pid),
             false,
-            false,
-            None,
-            true,
-            true,
-            Some(format!("{error:#}")),
+            current_process_id.as_deref(),
+            current_exit_code,
+            current_command.as_deref(),
+            current_stdout_path.as_deref(),
+            current_stderr_path.as_deref(),
+            Some(&format!("{error:#}")),
         )?;
     }
 

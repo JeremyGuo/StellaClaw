@@ -1998,8 +1998,8 @@ fn render_tool_brief_arguments(tool_name: &str, arguments: Option<&str>) -> Stri
         .unwrap_or(serde_json::Value::Null);
     let object = args.as_object();
     let detail = match tool_name {
-        "exec_start" | "exec_command" => first_string(object, &["cmd", "command"]),
-        "exec_wait" | "exec_write" | "exec_kill" => first_string(object, &["exec_id", "id"]),
+        "shell" => first_string(object, &["cmd", "command"]),
+        "shell_close" => first_string(object, &["session_id", "id"]),
         "file_read" | "read_file" | "file_write" | "file_edit" | "ls" | "image_load"
         | "pdf_read" | "audio_transcribe" => first_string(object, &["path", "file_path"]),
         "glob" | "grep" | "web_search" => first_string(object, &["pattern", "query", "q"]),
@@ -3711,9 +3711,9 @@ mod tests {
                     tools: vec![
                         agent_frame::ToolExecutionProgress {
                             tool_call_id: "call-1".to_string(),
-                            tool_name: "exec_start".to_string(),
+                            tool_name: "shell".to_string(),
                             arguments: Some(
-                                r#"{"cmd":"cargo test --manifest-path agent_host/Cargo.toml"}"#
+                                r#"{"command":"cargo test --manifest-path agent_host/Cargo.toml"}"#
                                     .to_string(),
                             ),
                             status: agent_frame::ToolExecutionStatus::Running,
@@ -3731,7 +3731,7 @@ mod tests {
 
         let SessionEffect::UpdateProgress(feedback) = &effects[0];
         assert!(feedback.text.contains("状态：工具执行中"));
-        assert!(feedback.text.contains("exec_start：cargo test --mani..."));
+        assert!(feedback.text.contains("shell：cargo test --mani..."));
         assert!(feedback.text.contains("file_read：src/main.rs"));
         assert!(!feedback.text.contains("已完成"));
     }

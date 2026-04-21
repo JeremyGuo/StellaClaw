@@ -1,12 +1,14 @@
-use super::args::{f64_arg, string_arg, usize_arg_with_default};
+use super::args::{string_arg, usize_arg_with_default};
 use super::remote::{
     ExecutionTarget, RemoteWorkpathMap, execution_target_arg, remote_schema_property,
     resolve_remote_cwd,
 };
 use super::runtime_state::{read_status_json, spawn_background_worker_process};
-use super::{InterruptSignal, Tool, compact_tool_status_fields_for_model, resolve_path};
+use super::{InterruptSignal, Tool, compact_tool_status_fields_for_model};
 use crate::tool_worker::ToolWorkerJob;
 use anyhow::{Context, Result, anyhow};
+use base64::Engine;
+use chrono::Local;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -17,6 +19,12 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
+
+const SHELL_DEFAULT_WAIT_MS: usize = 10_000;
+const SHELL_OUTPUT_TAIL_LINES: usize = 20;
+const SHELL_OUTPUT_MAX_CHARS: usize = 1000;
+const SHELL_SESSION_ID_MAX_LEN: usize = 128;
+const DIRECT_READ_COMMANDS: &[&str] = &["cat", "grep", "find", "head", "tail", "ls"];
 
 fn process_state_dir(runtime_state_root: &Path) -> PathBuf {
     runtime_state_root.join("agent_frame").join("processes")
@@ -33,54 +41,32 @@ fn ensure_process_state_dir(runtime_state_root: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-const EXEC_START_DEFAULT_WAIT_TIMEOUT_SECONDS: f64 = 270.0;
-const EXEC_OUTPUT_MAX_CHARS: usize = 1000;
-const DIRECT_READ_COMMANDS: &[&str] = &["cat", "grep", "find", "head", "tail", "ls"];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ExecTimeoutAction {
-    Continue,
-    Kill,
-}
-
-impl ExecTimeoutAction {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Continue => "continue",
-            Self::Kill => "kill",
-        }
+fn validate_shell_session_id(session_id: &str) -> Result<()> {
+    if session_id.is_empty() {
+        return Err(anyhow!("session_id must not be empty"));
     }
-}
-
-fn exec_timeout_action_arg(
-    arguments: &Map<String, Value>,
-    key: &str,
-    default: ExecTimeoutAction,
-) -> Result<ExecTimeoutAction> {
-    let Some(value) = arguments.get(key) else {
-        return Ok(default);
-    };
-    let text = value
-        .as_str()
-        .ok_or_else(|| anyhow!("argument {} must be a string", key))?
-        .trim()
-        .to_ascii_lowercase();
-    match text.as_str() {
-        "continue" => Ok(ExecTimeoutAction::Continue),
-        "kill" => Ok(ExecTimeoutAction::Kill),
-        _ => Err(anyhow!("argument {} must be one of: continue, kill", key)),
-    }
-}
-
-fn max_output_chars_arg(arguments: &Map<String, Value>) -> Result<usize> {
-    let value = usize_arg_with_default(arguments, "max_output_chars", EXEC_OUTPUT_MAX_CHARS)?;
-    if value > EXEC_OUTPUT_MAX_CHARS {
+    if session_id.len() > SHELL_SESSION_ID_MAX_LEN {
         return Err(anyhow!(
-            "argument max_output_chars must be less than or equal to {}",
-            EXEC_OUTPUT_MAX_CHARS
+            "session_id must be at most {} characters",
+            SHELL_SESSION_ID_MAX_LEN
         ));
     }
-    Ok(value)
+    if !session_id
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(anyhow!(
+            "session_id may contain only ASCII letters, digits, '_' and '-'"
+        ));
+    }
+    Ok(())
+}
+
+fn generate_shell_session_id() -> String {
+    let date = Local::now().format("%Y%m%d").to_string();
+    let random =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&Uuid::new_v4().into_bytes()[..5]);
+    format!("sh_{}_{:6}", date, &random[..6])
 }
 
 fn shell_command_head(command: &str) -> Option<&str> {
@@ -98,128 +84,71 @@ fn direct_read_command_guidance(command: &str) -> Option<&'static str> {
         .and_then(|value| value.to_str())
         .unwrap_or(head);
     match head {
-        "cat" => Some("Use file_read with file_path instead of exec_start cat."),
-        "grep" => Some("Use grep with pattern/path instead of exec_start grep."),
-        "find" => Some("Use glob or ls instead of exec_start find."),
-        "head" | "tail" => Some("Use file_read with offset/limit instead of exec_start head/tail."),
-        "ls" => Some("Use ls with path instead of exec_start ls."),
+        "cat" => Some("Use file_read with file_path instead of shell cat."),
+        "grep" => Some("Use grep with pattern/path instead of shell grep."),
+        "find" => Some("Use glob or ls instead of shell find."),
+        "head" | "tail" => Some("Use file_read with offset/limit instead of shell head/tail."),
+        "ls" => Some("Use ls with path instead of shell ls."),
         "ssh" => Some(
-            "Manual ssh through exec_start is rejected. Follow the remote execution policy in the system prompt.",
+            "Manual ssh through shell is rejected. Follow the remote execution policy in the system prompt.",
         ),
         _ if DIRECT_READ_COMMANDS.contains(&head) => {
-            Some("Use the dedicated filesystem/search tool instead of exec_start.")
+            Some("Use the dedicated filesystem/search tool instead of shell.")
         }
         _ => None,
     }
 }
 
 #[derive(Clone, Serialize, serde::Deserialize)]
-pub(super) struct ProcessMetadata {
-    pub(super) exec_id: String,
+pub(super) struct ShellSessionMetadata {
+    pub(super) session_id: String,
     pub(super) worker_pid: u32,
-    #[serde(default)]
-    pub(super) tty: bool,
+    pub(super) interactive: bool,
     #[serde(default = "default_remote_local")]
     pub(super) remote: String,
-    pub(super) command: String,
-    pub(super) cwd: String,
-    pub(super) stdout_path: String,
-    pub(super) stderr_path: String,
     pub(super) status_path: String,
     pub(super) worker_exit_code_path: String,
     pub(super) requests_dir: String,
+    pub(super) output_root: String,
+    #[serde(default)]
+    pub(super) delivered_process_id: Option<String>,
 }
 
 fn default_remote_local() -> String {
     "local".to_string()
 }
 
-#[derive(serde::Deserialize)]
-struct LegacyProcessMetadata {
-    exec_id: String,
-    pid: u32,
-    command: String,
-    cwd: String,
-    stdout_path: String,
-    stderr_path: String,
-    exit_code_path: String,
-}
-
-enum ProcessMetadataRecord {
-    Current(ProcessMetadata),
-    Legacy(LegacyProcessMetadata),
-}
-
-static LIVE_PROCESSES: std::sync::OnceLock<Mutex<BTreeMap<String, ProcessMetadata>>> =
+static LIVE_SESSIONS: std::sync::OnceLock<Mutex<BTreeMap<String, ShellSessionMetadata>>> =
     std::sync::OnceLock::new();
 
-fn live_processes() -> &'static Mutex<BTreeMap<String, ProcessMetadata>> {
-    LIVE_PROCESSES.get_or_init(|| Mutex::new(BTreeMap::new()))
+fn live_sessions() -> &'static Mutex<BTreeMap<String, ShellSessionMetadata>> {
+    LIVE_SESSIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-pub(super) fn process_meta_path(dir: &Path, exec_id: &str) -> PathBuf {
-    dir.join(format!("{}.json", exec_id))
+pub(super) fn process_meta_path(dir: &Path, session_id: &str) -> PathBuf {
+    dir.join(format!("{}.json", session_id))
 }
 
-fn parse_process_metadata_record(raw: &str) -> Result<ProcessMetadataRecord> {
-    match serde_json::from_str::<ProcessMetadata>(raw) {
-        Ok(metadata) => Ok(ProcessMetadataRecord::Current(metadata)),
-        Err(current_err) => match serde_json::from_str::<LegacyProcessMetadata>(raw) {
-            Ok(metadata) => Ok(ProcessMetadataRecord::Legacy(metadata)),
-            Err(_) => Err(current_err).context("failed to parse process metadata"),
-        },
-    }
-}
-
-fn legacy_process_metadata_to_current(
-    dir: &Path,
-    metadata: LegacyProcessMetadata,
-) -> ProcessMetadata {
-    ProcessMetadata {
-        exec_id: metadata.exec_id.clone(),
-        worker_pid: metadata.pid,
-        tty: false,
-        remote: default_remote_local(),
-        command: metadata.command,
-        cwd: metadata.cwd,
-        stdout_path: metadata.stdout_path,
-        stderr_path: metadata.stderr_path,
-        status_path: dir
-            .join(format!("{}.status.json", metadata.exec_id))
-            .display()
-            .to_string(),
-        worker_exit_code_path: metadata.exit_code_path,
-        requests_dir: dir
-            .join(format!("{}.requests", metadata.exec_id))
-            .display()
-            .to_string(),
-    }
-}
-
-fn read_process_metadata(dir: &Path, exec_id: &str) -> Result<ProcessMetadata> {
-    let path = process_meta_path(dir, exec_id);
+fn read_session_metadata(dir: &Path, session_id: &str) -> Result<ShellSessionMetadata> {
+    validate_shell_session_id(session_id)?;
+    let path = process_meta_path(dir, session_id);
     let raw =
         fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    match parse_process_metadata_record(&raw)? {
-        ProcessMetadataRecord::Current(metadata) => Ok(metadata),
-        ProcessMetadataRecord::Legacy(metadata) => {
-            Ok(legacy_process_metadata_to_current(dir, metadata))
-        }
-    }
+    serde_json::from_str(&raw).context("failed to parse shell session metadata")
 }
 
-fn write_process_metadata(dir: &Path, metadata: &ProcessMetadata) -> Result<()> {
-    let raw =
-        serde_json::to_string_pretty(metadata).context("failed to serialize process metadata")?;
-    fs::write(process_meta_path(dir, &metadata.exec_id), raw)
-        .with_context(|| format!("failed to write process metadata for {}", metadata.exec_id))
+fn write_session_metadata(dir: &Path, metadata: &ShellSessionMetadata) -> Result<()> {
+    let raw = serde_json::to_string_pretty(metadata)
+        .context("failed to serialize shell session metadata")?;
+    fs::write(process_meta_path(dir, &metadata.session_id), raw).with_context(|| {
+        format!(
+            "failed to write shell session metadata for {}",
+            metadata.session_id
+        )
+    })
 }
 
-fn read_file_lines_window(
-    path: &Path,
-    start: usize,
-    limit: usize,
-) -> Result<(String, usize, bool)> {
+fn read_file_lines_window(path: &Path, limit: usize) -> Result<(String, usize, bool)> {
     if !path.exists() {
         return Ok((String::new(), 0, false));
     }
@@ -230,11 +159,10 @@ fn read_file_lines_window(
         return Ok((String::new(), total_chars, total_chars > 0));
     }
     let lines = text.lines().map(ToOwned::to_owned).collect::<Vec<_>>();
-    let end = lines.len().saturating_sub(start);
-    let begin = end.saturating_sub(limit);
-    let line_window_truncated = begin > 0 || start > 0;
+    let begin = lines.len().saturating_sub(limit);
+    let line_window_truncated = begin > 0;
     Ok((
-        lines[begin..end].join("\n"),
+        lines[begin..].join("\n"),
         total_chars,
         line_window_truncated,
     ))
@@ -263,12 +191,6 @@ fn truncate_exec_output(text: &str, max_chars: usize) -> (String, bool) {
     (format!("{head}{tail}"), true)
 }
 
-fn workspace_output_relative_path(exec_id: &str, stream: &str) -> PathBuf {
-    PathBuf::from(".agent_frame")
-        .join("exec")
-        .join(format!("{exec_id}.{stream}"))
-}
-
 fn format_relative_path(path: &Path) -> String {
     path.components()
         .map(|component| component.as_os_str().to_string_lossy())
@@ -276,86 +198,49 @@ fn format_relative_path(path: &Path) -> String {
         .join("/")
 }
 
-fn sync_workspace_output_file(
-    workspace_root: Option<&Path>,
-    metadata: &ProcessMetadata,
-    source: &Path,
-    stream: &str,
-) -> Result<Option<String>> {
-    let Some(workspace_root) = workspace_root else {
-        return Ok(None);
-    };
-    let relative_path = workspace_output_relative_path(&metadata.exec_id, stream);
-    let destination = workspace_root.join(&relative_path);
-    if source != destination {
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("failed to create {}", parent.display()))?;
-        }
+fn sync_workspace_output_dir(
+    workspace_root: &Path,
+    session_id: &str,
+    process_id: &str,
+    source_root: &Path,
+) -> Result<String> {
+    let relative_root = PathBuf::from(".agent_frame")
+        .join("shell")
+        .join(session_id)
+        .join(process_id);
+    let destination_root = workspace_root.join(&relative_root);
+    fs::create_dir_all(&destination_root)
+        .with_context(|| format!("failed to create {}", destination_root.display()))?;
+    for name in ["stdout", "stderr"] {
+        let source = source_root.join(name);
+        let destination = destination_root.join(name);
         if source.exists() {
-            fs::copy(source, &destination).with_context(|| {
-                format!(
-                    "failed to copy {} to {}",
-                    source.display(),
-                    destination.display()
-                )
-            })?;
+            if source != destination {
+                fs::copy(&source, &destination).with_context(|| {
+                    format!(
+                        "failed to copy {} to {}",
+                        source.display(),
+                        destination.display()
+                    )
+                })?;
+            }
         } else {
             fs::write(&destination, b"")
                 .with_context(|| format!("failed to write {}", destination.display()))?;
         }
     }
-    Ok(Some(format_relative_path(&relative_path)))
-}
-
-fn insert_exec_output_fields(
-    object: &mut Map<String, Value>,
-    metadata: &ProcessMetadata,
-    workspace_root: Option<&Path>,
-    start: usize,
-    limit: usize,
-    max_output_chars: usize,
-) -> Result<()> {
-    let stdout_path = Path::new(&metadata.stdout_path);
-    let stderr_path = Path::new(&metadata.stderr_path);
-    let (stdout_window, stdout_chars, stdout_line_truncated) =
-        read_file_lines_window(stdout_path, start, limit)?;
-    let (stderr_window, stderr_chars, stderr_line_truncated) =
-        read_file_lines_window(stderr_path, start, limit)?;
-    let (stdout, stdout_truncated) = truncate_exec_output(&stdout_window, max_output_chars);
-    let (stderr, stderr_truncated) = truncate_exec_output(&stderr_window, max_output_chars);
-    let stdout_truncated = stdout_truncated || stdout_line_truncated;
-    let stderr_truncated = stderr_truncated || stderr_line_truncated;
-
-    object.insert("stdout".to_string(), Value::String(stdout));
-    if stdout_truncated {
-        object.insert("stdout_truncated".to_string(), Value::Bool(true));
-    }
-    if stderr_truncated || !stderr.is_empty() {
-        object.insert("stderr".to_string(), Value::String(stderr));
-    }
-    if stderr_truncated {
-        object.insert("stderr_truncated".to_string(), Value::Bool(true));
-    }
-    object.insert("stdout_chars".to_string(), Value::from(stdout_chars));
-    if stderr_chars > 0 || stderr_truncated {
-        object.insert("stderr_chars".to_string(), Value::from(stderr_chars));
-    }
-    if let Some(path) = sync_workspace_output_file(workspace_root, metadata, stdout_path, "stdout")?
-    {
-        object.insert("stdout_path".to_string(), Value::String(path));
-    }
-    if let Some(path) = sync_workspace_output_file(workspace_root, metadata, stderr_path, "stderr")?
-    {
-        object.insert("stderr_path".to_string(), Value::String(path));
-    }
-    Ok(())
+    Ok(format_relative_path(&relative_root))
 }
 
 pub(super) fn read_exit_code(path: &Path) -> Option<i32> {
     fs::read_to_string(path)
         .ok()
         .and_then(|value| value.trim().parse::<i32>().ok())
+}
+
+pub(super) fn record_exit_code(path: &Path, code: i32) -> Result<()> {
+    fs::write(path, code.to_string())
+        .with_context(|| format!("failed to write exit code to {}", path.display()))
 }
 
 #[cfg(not(windows))]
@@ -400,33 +285,15 @@ pub(super) fn terminate_process_pid(pid: u32) {
         .status();
 }
 
-#[cfg(not(windows))]
-fn terminate_process_group(pid: u32) {
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        .arg(format!("-{}", pid))
-        .status();
-}
-
-#[cfg(windows)]
-fn terminate_process_group(pid: u32) {
-    terminate_process_pid(pid);
-}
-
-pub(super) fn record_exit_code(path: &Path, code: i32) -> Result<()> {
-    fs::write(path, code.to_string())
-        .with_context(|| format!("failed to write exit code to {}", path.display()))
-}
-
-fn process_request_path(requests_dir: &Path, request_id: &str) -> PathBuf {
+fn shell_request_path(requests_dir: &Path, request_id: &str) -> PathBuf {
     requests_dir.join(format!("request-{request_id}.json"))
 }
 
-fn process_request_result_path(requests_dir: &Path, request_id: &str) -> PathBuf {
+fn shell_request_result_path(requests_dir: &Path, request_id: &str) -> PathBuf {
     requests_dir.join(format!("request-{request_id}.result.json"))
 }
 
-fn queue_exec_input_request(metadata: &ProcessMetadata, input: &str) -> Result<PathBuf> {
+fn queue_shell_request(metadata: &ShellSessionMetadata, payload: &Value) -> Result<PathBuf> {
     let requests_dir = Path::new(&metadata.requests_dir);
     fs::create_dir_all(requests_dir)
         .with_context(|| format!("failed to create {}", requests_dir.display()))?;
@@ -435,12 +302,12 @@ fn queue_exec_input_request(metadata: &ProcessMetadata, input: &str) -> Result<P
         .unwrap_or_default()
         .as_millis();
     let request_id = format!("{timestamp:020}-{}", Uuid::new_v4());
-    let request_path = process_request_path(requests_dir, &request_id);
+    let request_path = shell_request_path(requests_dir, &request_id);
+    let result_path = shell_request_result_path(requests_dir, &request_id);
     let temp_path = requests_dir.join(format!("request-{request_id}.tmp"));
     fs::write(
         &temp_path,
-        serde_json::to_vec_pretty(&json!({ "input": input }))
-            .context("failed to serialize exec input request")?,
+        serde_json::to_vec_pretty(payload).context("failed to serialize shell request")?,
     )
     .with_context(|| format!("failed to write {}", temp_path.display()))?;
     fs::rename(&temp_path, &request_path).with_context(|| {
@@ -450,315 +317,273 @@ fn queue_exec_input_request(metadata: &ProcessMetadata, input: &str) -> Result<P
             request_path.display()
         )
     })?;
-    Ok(process_request_result_path(requests_dir, &request_id))
+    Ok(result_path)
 }
 
-fn read_exec_input_result(result_path: &Path) -> Result<Option<Value>> {
+fn read_shell_request_result(result_path: &Path) -> Result<Option<Value>> {
     if !result_path.exists() {
         return Ok(None);
     }
     let raw = fs::read_to_string(result_path)
         .with_context(|| format!("failed to read {}", result_path.display()))?;
-    let value = serde_json::from_str(&raw).context("failed to parse exec input result")?;
+    let value = serde_json::from_str(&raw).context("failed to parse shell request result")?;
     Ok(Some(value))
 }
 
-fn exec_pid_from_snapshot(snapshot: &Value) -> Option<u32> {
-    snapshot
-        .get("pid")
-        .and_then(Value::as_u64)
-        .and_then(|pid| u32::try_from(pid).ok())
-}
-
-fn kill_exec_processes(metadata: &ProcessMetadata, snapshot: Option<&Value>) {
-    if let Some(exec_pid) = snapshot.and_then(exec_pid_from_snapshot)
-        && exec_pid != metadata.worker_pid
-    {
-        if metadata.tty {
-            terminate_process_group(exec_pid);
-        } else {
-            terminate_process_pid(exec_pid);
+fn wait_for_shell_request_ack(
+    result_path: &Path,
+    wait_timeout_ms: usize,
+    cancel_flag: Option<&Arc<InterruptSignal>>,
+) -> Result<Value> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(wait_timeout_ms as u64);
+    loop {
+        if let Some(result) = read_shell_request_result(result_path)? {
+            let _ = fs::remove_file(result_path);
+            return Ok(result);
         }
+        if cancel_flag.is_some_and(|signal| signal.is_requested()) {
+            return Err(anyhow!("operation cancelled"));
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!("shell request acknowledgement timed out"));
+        }
+        thread::sleep(Duration::from_millis(25));
     }
-    terminate_process_pid(metadata.worker_pid);
 }
 
-fn write_exec_snapshot(
-    metadata: &ProcessMetadata,
-    running: bool,
-    completed: bool,
-    returncode: Value,
-    extra: Option<Map<String, Value>>,
-) -> Result<()> {
-    let pid = read_status_json(Path::new(&metadata.status_path))
-        .ok()
-        .and_then(|value| value.get("pid").cloned())
-        .unwrap_or(Value::Null);
-    let stdin_closed = read_status_json(Path::new(&metadata.status_path))
-        .ok()
-        .and_then(|value| value.get("stdin_closed").cloned())
-        .unwrap_or(Value::Bool(true));
-    let failed = read_status_json(Path::new(&metadata.status_path))
-        .ok()
-        .and_then(|value| value.get("failed").cloned())
-        .unwrap_or(Value::Bool(false));
+fn session_missing_error(session_id: &str) -> anyhow::Error {
+    anyhow!(
+        "shell session {} no longer exists; it may have been closed or terminated when the main runtime shut down",
+        session_id
+    )
+}
 
+fn read_session_status(metadata: &ShellSessionMetadata) -> Result<Value> {
+    read_status_json(Path::new(&metadata.status_path))
+        .map_err(|_| session_missing_error(&metadata.session_id))
+}
+
+fn current_process_id(status: &Value) -> Option<&str> {
+    status.get("process_id").and_then(Value::as_str)
+}
+
+fn current_process_output_root(status: &Value) -> Option<PathBuf> {
+    let stdout = status.get("stdout_path").and_then(Value::as_str)?;
+    Path::new(stdout).parent().map(Path::to_path_buf)
+}
+
+fn build_current_process_fields(
+    object: &mut Map<String, Value>,
+    status: &Value,
+    workspace_root: &Path,
+    session_id: &str,
+) -> Result<()> {
+    let Some(process_id) = current_process_id(status) else {
+        return Ok(());
+    };
+    let Some(output_root) = current_process_output_root(status) else {
+        return Ok(());
+    };
+    let stdout_path = output_root.join("stdout");
+    let stderr_path = output_root.join("stderr");
+    let (stdout_window, _, stdout_line_truncated) =
+        read_file_lines_window(&stdout_path, SHELL_OUTPUT_TAIL_LINES)?;
+    let (stderr_window, _, stderr_line_truncated) =
+        read_file_lines_window(&stderr_path, SHELL_OUTPUT_TAIL_LINES)?;
+    let (stdout, stdout_truncated) = truncate_exec_output(&stdout_window, SHELL_OUTPUT_MAX_CHARS);
+    let (stderr, stderr_truncated) = truncate_exec_output(&stderr_window, SHELL_OUTPUT_MAX_CHARS);
+    object.insert(
+        "process_id".to_string(),
+        Value::String(process_id.to_string()),
+    );
+    object.insert("stdout".to_string(), Value::String(stdout));
+    object.insert("stderr".to_string(), Value::String(stderr));
+    if stdout_truncated || stdout_line_truncated {
+        object.insert("stdout_truncated".to_string(), Value::Bool(true));
+    }
+    if stderr_truncated || stderr_line_truncated {
+        object.insert("stderr_truncated".to_string(), Value::Bool(true));
+    }
+    let out_path = sync_workspace_output_dir(workspace_root, session_id, process_id, &output_root)?;
+    object.insert("out_path".to_string(), Value::String(out_path));
+    Ok(())
+}
+
+fn format_shell_response(
+    metadata: &ShellSessionMetadata,
+    status: &Value,
+    workspace_root: &Path,
+    include_finished_process: bool,
+) -> Result<Value> {
+    let running = status
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let interactive = status
+        .get("interactive")
+        .and_then(Value::as_bool)
+        .unwrap_or(metadata.interactive);
     let mut object = Map::from_iter([
         (
-            "exec_id".to_string(),
-            Value::String(metadata.exec_id.clone()),
+            "session_id".to_string(),
+            Value::String(metadata.session_id.clone()),
         ),
-        ("tty".to_string(), Value::Bool(metadata.tty)),
-        ("pid".to_string(), pid),
-        (
-            "command".to_string(),
-            Value::String(metadata.command.clone()),
-        ),
-        ("remote".to_string(), Value::String(metadata.remote.clone())),
-        ("cwd".to_string(), Value::String(metadata.cwd.clone())),
         ("running".to_string(), Value::Bool(running)),
-        ("completed".to_string(), Value::Bool(completed)),
-        ("returncode".to_string(), returncode),
-        ("stdin_closed".to_string(), stdin_closed),
-        ("failed".to_string(), failed),
+        ("interactive".to_string(), Value::Bool(interactive)),
     ]);
-    if let Some(extra) = extra {
-        object.extend(extra);
+    let include_process = running || include_finished_process;
+    if include_process {
+        build_current_process_fields(&mut object, status, workspace_root, &metadata.session_id)?;
     }
-    fs::write(
-        &metadata.status_path,
-        serde_json::to_vec_pretty(&Value::Object(object))
-            .context("failed to serialize exec status snapshot")?,
-    )
-    .with_context(|| format!("failed to write {}", metadata.status_path))
+    if !running
+        && include_finished_process
+        && let Some(exit_code) = status.get("exit_code").and_then(Value::as_i64)
+    {
+        object.insert("exit_code".to_string(), Value::from(exit_code));
+    }
+    if status
+        .get("needs_input")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        object.insert("needs_input".to_string(), Value::Bool(true));
+    }
+    if let Some(error) = status.get("error").and_then(Value::as_str)
+        && !error.trim().is_empty()
+    {
+        object.insert("error".to_string(), Value::String(error.to_string()));
+    }
+    Ok(Value::Object(object))
 }
 
-fn spawn_managed_process(
+fn spawn_shell_session(
     runtime_state_root: &Path,
     state_dir: &Path,
     workspace_root: &Path,
-    command: &str,
-    cwd: &Path,
-    tty: bool,
+    interactive: bool,
     target: &ExecutionTarget,
-) -> Result<ProcessMetadata> {
-    let exec_id = Uuid::new_v4().to_string();
-    let output_dir = workspace_root.join(".agent_frame").join("exec");
-    fs::create_dir_all(&output_dir)
-        .with_context(|| format!("failed to create {}", output_dir.display()))?;
-    let stdout_path = output_dir.join(format!("{}.stdout", exec_id));
-    let stderr_path = output_dir.join(format!("{}.stderr", exec_id));
-    let status_path = state_dir.join(format!("{}.status.json", exec_id));
-    let requests_dir = state_dir.join(format!("{}.requests", exec_id));
+    initial_cwd: &Path,
+) -> Result<ShellSessionMetadata> {
+    let session_id = generate_shell_session_id();
+    validate_shell_session_id(&session_id)?;
+    let output_root = workspace_root
+        .join(".agent_frame")
+        .join("shell")
+        .join(&session_id);
+    fs::create_dir_all(&output_root)
+        .with_context(|| format!("failed to create {}", output_root.display()))?;
+    let status_path = state_dir.join(format!("{}.status.json", session_id));
+    let requests_dir = state_dir.join(format!("{}.requests", session_id));
     fs::create_dir_all(&requests_dir)
         .with_context(|| format!("failed to create {}", requests_dir.display()))?;
     fs::write(
         &status_path,
         serde_json::to_vec_pretty(&json!({
-            "exec_id": exec_id,
-            "tty": tty,
-            "pid": Value::Null,
-            "command": command,
+            "session_id": session_id,
+            "interactive": interactive,
             "remote": target.remote_name(),
-            "cwd": cwd.display().to_string(),
-            "running": true,
-            "completed": false,
-            "returncode": Value::Null,
-            "stdin_closed": false,
-            "failed": false,
+            "pid": Value::Null,
+            "running": false,
+            "process_id": Value::Null,
+            "exit_code": Value::Null,
+            "command": Value::Null,
+            "stdout_path": Value::Null,
+            "stderr_path": Value::Null,
             "error": Value::Null,
         }))
-        .context("failed to serialize initial exec status")?,
+        .context("failed to serialize initial shell session status")?,
     )
     .with_context(|| format!("failed to write {}", status_path.display()))?;
     let worker = spawn_background_worker_process(
         runtime_state_root,
-        "exec",
-        &exec_id,
-        &ToolWorkerJob::Exec {
-            exec_id: exec_id.clone(),
-            tty,
+        "shell-session",
+        &session_id,
+        &ToolWorkerJob::ShellSession {
+            session_id: session_id.clone(),
+            interactive,
             remote: match target {
                 ExecutionTarget::Local => None,
                 ExecutionTarget::RemoteSsh { host } => Some(host.clone()),
             },
-            command: command.to_string(),
-            cwd: cwd.display().to_string(),
+            initial_cwd: initial_cwd.display().to_string(),
             status_path: status_path.display().to_string(),
-            stdout_path: stdout_path.display().to_string(),
-            stderr_path: stderr_path.display().to_string(),
             requests_dir: requests_dir.display().to_string(),
+            output_root: output_root.display().to_string(),
         },
     )?;
-    let metadata = ProcessMetadata {
-        exec_id: exec_id.clone(),
+    let metadata = ShellSessionMetadata {
+        session_id: session_id.clone(),
         worker_pid: worker.pid,
-        tty,
+        interactive,
         remote: target.remote_name().to_string(),
-        command: command.to_string(),
-        cwd: cwd.display().to_string(),
-        stdout_path: stdout_path.display().to_string(),
-        stderr_path: stderr_path.display().to_string(),
         status_path: status_path.display().to_string(),
         worker_exit_code_path: worker.exit_code_path,
         requests_dir: requests_dir.display().to_string(),
+        output_root: output_root.display().to_string(),
+        delivered_process_id: None,
     };
-    write_process_metadata(state_dir, &metadata)?;
-    live_processes()
+    write_session_metadata(state_dir, &metadata)?;
+    live_sessions()
         .lock()
         .unwrap()
-        .insert(exec_id, metadata.clone());
+        .insert(session_id, metadata.clone());
     Ok(metadata)
 }
 
-fn process_missing_error(exec_id: &str) -> anyhow::Error {
-    anyhow!(
-        "exec process {} no longer exists; it may have already finished, been killed, or been terminated when the main runtime shut down",
-        exec_id
-    )
+fn current_process_was_delivered(metadata: &ShellSessionMetadata, status: &Value) -> bool {
+    metadata.delivered_process_id.as_deref() == current_process_id(status)
 }
 
-fn read_process_snapshot(
+fn mark_process_delivered(
     state_dir: &Path,
-    exec_id: &str,
-    start: usize,
-    limit: usize,
-    max_output_chars: usize,
-    workspace_root: Option<&Path>,
-) -> Result<Value> {
-    let metadata = match read_process_metadata(state_dir, exec_id) {
-        Ok(metadata) => metadata,
-        Err(_) => return Err(process_missing_error(exec_id)),
-    };
-    let mut snapshot = read_status_json(Path::new(&metadata.status_path))
-        .map_err(|_| process_missing_error(exec_id))?;
-    let worker_alive = read_exit_code(Path::new(&metadata.worker_exit_code_path)).is_none()
-        && process_is_running(metadata.worker_pid);
-    let running = snapshot
-        .get("running")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    if running && !worker_alive {
-        let pid = snapshot.get("pid").cloned().unwrap_or(Value::Null);
-        snapshot = json!({
-            "exec_id": metadata.exec_id,
-            "tty": metadata.tty,
-            "pid": pid,
-            "command": metadata.command,
-            "remote": metadata.remote,
-            "cwd": metadata.cwd,
-            "running": false,
-            "completed": false,
-            "returncode": Value::Null,
-            "stdin_closed": true,
-            "failed": true,
-            "error": "exec worker exited unexpectedly",
-        });
-    }
-    let mut object = snapshot
-        .as_object()
-        .cloned()
-        .ok_or_else(|| anyhow!("exec snapshot must be a JSON object"))?;
-    object
-        .entry("tty".to_string())
-        .or_insert_with(|| Value::Bool(metadata.tty));
-    insert_exec_output_fields(
-        &mut object,
-        &metadata,
-        workspace_root,
-        start,
-        limit,
-        max_output_chars,
-    )?;
-    Ok(Value::Object(object))
+    metadata: &mut ShellSessionMetadata,
+    process_id: &str,
+) -> Result<()> {
+    metadata.delivered_process_id = Some(process_id.to_string());
+    write_session_metadata(state_dir, metadata)
 }
 
-pub(super) fn list_active_exec_summaries(runtime_state_root: &Path) -> Result<Vec<String>> {
-    let Some(state_dir) = process_state_dir_if_exists(runtime_state_root) else {
-        return Ok(Vec::new());
-    };
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(&state_dir)
-        .with_context(|| format!("failed to read {}", state_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if !file_name.ends_with(".json") || file_name.ends_with(".status.json") {
-            continue;
-        }
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let (metadata, allow_missing_snapshot) = match parse_process_metadata_record(&raw)? {
-            ProcessMetadataRecord::Current(metadata) => (metadata, false),
-            // Older workdirs can still contain pre-worker exec metadata files.
-            // Skip them for runtime summaries so compaction stays best-effort.
-            ProcessMetadataRecord::Legacy(metadata) => (
-                legacy_process_metadata_to_current(&state_dir, metadata),
-                true,
-            ),
-        };
-        let snapshot = match read_process_snapshot(
-            &state_dir,
-            &metadata.exec_id,
-            0,
-            0,
-            EXEC_OUTPUT_MAX_CHARS,
-            None,
-        ) {
-            Ok(snapshot) => snapshot,
-            Err(_) if allow_missing_snapshot => continue,
-            Err(err) => return Err(err),
-        };
-        if !snapshot
+fn wait_for_shell_session(
+    state_dir: &Path,
+    metadata: &mut ShellSessionMetadata,
+    wait_ms: usize,
+    workspace_root: &Path,
+    cancel_flag: Option<&Arc<InterruptSignal>>,
+    allow_finished_result: bool,
+) -> Result<Value> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms as u64);
+    loop {
+        let status = read_session_status(metadata)?;
+        let running = status
             .get("running")
             .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            continue;
+            .unwrap_or(false);
+        if !running {
+            let finished_undelivered = current_process_id(&status).is_some()
+                && !current_process_was_delivered(metadata, &status);
+            if allow_finished_result && finished_undelivered {
+                let process_id = current_process_id(&status).unwrap();
+                let response = format_shell_response(metadata, &status, workspace_root, true)?;
+                mark_process_delivered(state_dir, metadata, process_id)?;
+                return Ok(response);
+            }
+            let response = format_shell_response(metadata, &status, workspace_root, false)?;
+            return Ok(response);
         }
-        let pid = snapshot
-            .get("pid")
-            .and_then(Value::as_u64)
-            .unwrap_or(metadata.worker_pid as u64);
-        entries.push(format!(
-            "- exec_id=`{}` pid={} remote=`{}` tty={} cwd=`{}` command=`{}`",
-            metadata.exec_id, pid, metadata.remote, metadata.tty, metadata.cwd, metadata.command
-        ));
+        if wait_ms == 0 {
+            let response = format_shell_response(metadata, &status, workspace_root, true)?;
+            return Ok(response);
+        }
+        if cancel_flag.is_some_and(|signal| signal.is_requested()) {
+            let response = format_shell_response(metadata, &status, workspace_root, true)?;
+            return Ok(response);
+        }
+        if std::time::Instant::now() >= deadline {
+            let response = format_shell_response(metadata, &status, workspace_root, true)?;
+            return Ok(response);
+        }
+        thread::sleep(Duration::from_millis(100));
     }
-    entries.sort();
-    Ok(entries)
-}
-
-pub fn terminate_all_managed_processes() -> Result<()> {
-    let mut registry = live_processes().lock().unwrap();
-    let processes = std::mem::take(&mut *registry)
-        .into_values()
-        .collect::<Vec<_>>();
-    drop(registry);
-    for process in processes {
-        let state_dir = Path::new(&process.status_path)
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
-        let snapshot = read_process_snapshot(
-            state_dir,
-            &process.exec_id,
-            0,
-            0,
-            EXEC_OUTPUT_MAX_CHARS,
-            None,
-        )
-        .ok();
-        let meta_path = process_meta_path(state_dir, &process.exec_id);
-        let _ = fs::remove_file(meta_path);
-        let _ = fs::remove_file(&process.worker_exit_code_path);
-        let _ = fs::remove_file(&process.status_path);
-        let _ = fs::remove_dir_all(&process.requests_dir);
-        kill_exec_processes(&process, snapshot.as_ref());
-    }
-    Ok(())
 }
 
 fn iter_process_metadata_json_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -778,6 +603,17 @@ fn iter_process_metadata_json_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+fn kill_shell_session_processes(metadata: &ShellSessionMetadata, status: Option<&Value>) {
+    if let Some(shell_pid) = status
+        .and_then(|value| value.get("pid"))
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+    {
+        terminate_process_pid(shell_pid);
+    }
+    terminate_process_pid(metadata.worker_pid);
+}
+
 pub(super) fn cleanup_exec_processes(runtime_state_root: &Path) -> Result<usize> {
     let Some(state_dir) = process_state_dir_if_exists(runtime_state_root) else {
         return Ok(0);
@@ -786,492 +622,331 @@ pub(super) fn cleanup_exec_processes(runtime_state_root: &Path) -> Result<usize>
     for path in iter_process_metadata_json_files(&state_dir)? {
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let (metadata, allow_missing_snapshot) = match parse_process_metadata_record(&raw)? {
-            ProcessMetadataRecord::Current(metadata) => (metadata, false),
-            ProcessMetadataRecord::Legacy(metadata) => (
-                legacy_process_metadata_to_current(&state_dir, metadata),
-                true,
-            ),
+        let Ok(metadata) = serde_json::from_str::<ShellSessionMetadata>(&raw) else {
+            continue;
         };
-        let snapshot = match read_process_snapshot(
-            &state_dir,
-            &metadata.exec_id,
-            0,
-            0,
-            EXEC_OUTPUT_MAX_CHARS,
-            None,
-        ) {
-            Ok(snapshot) => Some(snapshot),
-            Err(_) if allow_missing_snapshot => None,
-            Err(err) => return Err(err),
-        };
-        let running = snapshot
-            .as_ref()
-            .and_then(|value| value.get("running"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        live_processes().lock().unwrap().remove(&metadata.exec_id);
-        if running
-            || (read_exit_code(Path::new(&metadata.worker_exit_code_path)).is_none()
-                && process_is_running(metadata.worker_pid))
+        let status = read_session_status(&metadata).ok();
+        live_sessions().lock().unwrap().remove(&metadata.session_id);
+        if read_exit_code(Path::new(&metadata.worker_exit_code_path)).is_none()
+            || process_is_running(metadata.worker_pid)
         {
-            kill_exec_processes(&metadata, snapshot.as_ref());
-            let _ = record_exit_code(Path::new(&metadata.worker_exit_code_path), -9);
-            let mut extra = Map::new();
-            extra.insert("cancelled".to_string(), Value::Bool(true));
-            extra.insert(
-                "reason".to_string(),
-                Value::String("session_destroyed".to_string()),
-            );
-            extra.insert("stdin_closed".to_string(), Value::Bool(true));
-            extra.insert("failed".to_string(), Value::Bool(false));
-            extra.insert("error".to_string(), Value::Null);
-            let _ = write_exec_snapshot(&metadata, false, false, Value::from(-9), Some(extra));
+            kill_shell_session_processes(&metadata, status.as_ref());
             killed = killed.saturating_add(1);
         }
     }
     Ok(killed)
 }
 
-fn wait_for_managed_process(
-    state_dir: &Path,
-    exec_id: &str,
-    wait_timeout_seconds: f64,
-    input: Option<&str>,
-    start: usize,
-    limit: usize,
-    max_output_chars: usize,
-    workspace_root: Option<&Path>,
-    on_timeout: ExecTimeoutAction,
-    cancel_flag: Option<&Arc<InterruptSignal>>,
-) -> Result<Value> {
-    if !wait_timeout_seconds.is_finite() || wait_timeout_seconds < 0.0 {
-        return Err(anyhow!(
-            "argument wait_timeout_seconds must be a finite non-negative number"
+pub(super) fn list_active_exec_summaries(runtime_state_root: &Path) -> Result<Vec<String>> {
+    let Some(state_dir) = process_state_dir_if_exists(runtime_state_root) else {
+        return Ok(Vec::new());
+    };
+    let mut entries = Vec::new();
+    for path in iter_process_metadata_json_files(&state_dir)? {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let Ok(metadata) = serde_json::from_str::<ShellSessionMetadata>(&raw) else {
+            continue;
+        };
+        let Ok(status) = read_session_status(&metadata) else {
+            continue;
+        };
+        if !status
+            .get("running")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let pid = status
+            .get("pid")
+            .and_then(Value::as_u64)
+            .unwrap_or(metadata.worker_pid as u64);
+        let process_id = current_process_id(&status).unwrap_or("-");
+        let command = status.get("command").and_then(Value::as_str).unwrap_or("-");
+        entries.push(format!(
+            "- shell session_id=`{}` process_id=`{}` pid={} remote=`{}` interactive={} command=`{}`",
+            metadata.session_id, process_id, pid, metadata.remote, metadata.interactive, command
         ));
     }
-    let pending_input_result = if let Some(input) = input {
-        let metadata = read_process_metadata(state_dir, exec_id)
-            .map_err(|_| process_missing_error(exec_id))?;
-        Some(queue_exec_input_request(&metadata, input)?)
-    } else {
-        None
-    };
-    let deadline = std::time::Instant::now() + Duration::from_secs_f64(wait_timeout_seconds);
-    let cancel_receiver = cancel_flag.map(|signal| signal.subscribe());
-    let mut input_acknowledged = pending_input_result.is_none();
-    loop {
-        let snapshot = read_process_snapshot(
-            state_dir,
-            exec_id,
-            start,
-            limit,
-            max_output_chars,
-            workspace_root,
-        )?;
-        if !input_acknowledged && let Some(result_path) = pending_input_result.as_ref() {
-            if let Some(result) = read_exec_input_result(result_path)? {
-                let _ = fs::remove_file(result_path);
-                let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
-                if !ok {
-                    let error = result
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .unwrap_or("stdin is closed for exec process");
-                    return Err(anyhow!(error.to_string()));
-                }
-                input_acknowledged = true;
-            } else {
-                let running = snapshot
-                    .get("running")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let stdin_closed = snapshot
-                    .get("stdin_closed")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let failed = snapshot
-                    .get("failed")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                if stdin_closed || failed || !running {
-                    let error = snapshot
-                        .get("error")
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
-                        .unwrap_or_else(|| format!("stdin is closed for exec process {}", exec_id));
-                    return Err(anyhow!(error));
-                }
-                thread::sleep(Duration::from_millis(50));
-                continue;
-            }
-        }
-
-        let completed = snapshot
-            .get("completed")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if completed {
-            live_processes().lock().unwrap().remove(exec_id);
-            return Ok(snapshot);
-        }
-        if let Some(signal) = cancel_flag
-            && signal.is_requested()
-        {
-            return Ok(json!({
-                "interrupted": true,
-                "reason": "agent_turn_interrupted",
-                "process": snapshot
-            }));
-        }
-        if std::time::Instant::now() >= deadline {
-            if on_timeout == ExecTimeoutAction::Kill {
-                let metadata = read_process_metadata(state_dir, exec_id)
-                    .map_err(|_| process_missing_error(exec_id))?;
-                kill_exec_processes(&metadata, Some(&snapshot));
-                let _ = record_exit_code(Path::new(&metadata.worker_exit_code_path), -9);
-                let mut extra = Map::new();
-                extra.insert("killed".to_string(), Value::Bool(true));
-                extra.insert("wait_timed_out".to_string(), Value::Bool(true));
-                extra.insert(
-                    "on_timeout".to_string(),
-                    Value::String(on_timeout.as_str().to_string()),
-                );
-                extra.insert("stdin_closed".to_string(), Value::Bool(true));
-                extra.insert("failed".to_string(), Value::Bool(false));
-                extra.insert("error".to_string(), Value::Null);
-                write_exec_snapshot(&metadata, false, true, Value::from(-9), Some(extra))?;
-                live_processes().lock().unwrap().remove(exec_id);
-                let mut object = snapshot
-                    .as_object()
-                    .cloned()
-                    .ok_or_else(|| anyhow!("exec snapshot must be a JSON object"))?;
-                object.insert("running".to_string(), Value::Bool(false));
-                object.insert("completed".to_string(), Value::Bool(true));
-                object.insert("returncode".to_string(), Value::from(-9));
-                object.insert("wait_timed_out".to_string(), Value::Bool(true));
-                object.insert(
-                    "on_timeout".to_string(),
-                    Value::String(on_timeout.as_str().to_string()),
-                );
-                object.insert("killed".to_string(), Value::Bool(true));
-                object.insert("stdin_closed".to_string(), Value::Bool(true));
-                object.insert("failed".to_string(), Value::Bool(false));
-                object.insert("error".to_string(), Value::Null);
-                return Ok(Value::Object(object));
-            }
-
-            let mut object = snapshot
-                .as_object()
-                .cloned()
-                .ok_or_else(|| anyhow!("exec snapshot must be a JSON object"))?;
-            object.insert("wait_timed_out".to_string(), Value::Bool(true));
-            object.insert(
-                "on_timeout".to_string(),
-                Value::String(on_timeout.as_str().to_string()),
-            );
-            object.insert("running".to_string(), Value::Bool(true));
-            object.insert("completed".to_string(), Value::Bool(false));
-            object.insert("returncode".to_string(), Value::Null);
-            return Ok(Value::Object(object));
-        }
-        if let Some(cancel_receiver) = &cancel_receiver {
-            crossbeam_channel::select! {
-                recv(cancel_receiver) -> _ => {
-                    return Ok(json!({
-                        "interrupted": true,
-                        "reason": "agent_turn_interrupted",
-                        "process": snapshot
-                    }));
-                }
-                recv(crossbeam_channel::after(Duration::from_millis(200))) -> _ => {}
-            }
-        } else {
-            thread::sleep(Duration::from_millis(200));
-        }
-    }
+    entries.sort();
+    Ok(entries)
 }
 
-pub(super) fn exec_start_tool(
+pub fn terminate_all_managed_processes() -> Result<()> {
+    let mut registry = live_sessions().lock().unwrap();
+    let sessions = std::mem::take(&mut *registry)
+        .into_values()
+        .collect::<Vec<_>>();
+    drop(registry);
+    for session in sessions {
+        let status = read_session_status(&session).ok();
+        let state_dir = Path::new(&session.status_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        let _ = fs::remove_file(process_meta_path(state_dir, &session.session_id));
+        let _ = fs::remove_file(&session.worker_exit_code_path);
+        let _ = fs::remove_file(&session.status_path);
+        let _ = fs::remove_dir_all(&session.requests_dir);
+        kill_shell_session_processes(&session, status.as_ref());
+    }
+    Ok(())
+}
+
+fn shell_wait_ms_arg(arguments: &Map<String, Value>) -> Result<usize> {
+    let wait_ms = usize_arg_with_default(arguments, "wait_ms", SHELL_DEFAULT_WAIT_MS)?;
+    Ok(wait_ms)
+}
+
+fn optional_command_arg(arguments: &Map<String, Value>) -> Result<Option<String>> {
+    let Some(value) = arguments.get("command") else {
+        return Ok(None);
+    };
+    let command = value
+        .as_str()
+        .ok_or_else(|| anyhow!("argument command must be a string"))?
+        .trim()
+        .to_string();
+    if command.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(command))
+}
+
+fn current_status_running(status: &Value) -> bool {
+    status
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+pub(super) fn shell_tool(
     workspace_root: PathBuf,
     runtime_state_root: PathBuf,
     remote_workpaths: RemoteWorkpathMap,
     cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
     Tool::new_interruptible(
-        "exec_start",
-        "Start a shell command or executable. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths.",
+        "shell",
+        "Run or continue a persistent shell session. Pass command to start the next command in a session. Pass no command to only observe or collect the current command result. Pass input to write to the current interactive command. command=\"\" is treated the same as omitting command. session_id only reuses an existing session; omit it when creating a new one. If a finished command result has not been returned yet and you start a new command in the same session, the older unreturned result is discarded. Returned stdout/stderr describe only the current process. Full stdout/stderr are saved under out_path/stdout and out_path/stderr.",
         json!({
             "type": "object",
             "properties": {
+                "session_id": {"type": "string"},
                 "command": {"type": "string"},
-                "cwd": {
-                    "type": "string",
-                    "description": "Working directory for the command. Prefer relative paths for normal workspace work."
-                },
-                "tty": {"type": "boolean"},
-                "include_stdout": {"type": "boolean"},
-                "start": {"type": "integer"},
-                "limit": {"type": "integer"},
-                "return_immediate": {"type": "boolean"},
-                "wait_timeout_seconds": {"type": "number"},
-                "on_timeout": {"type": "string", "enum": ["continue", "kill", "CONTINUE", "KILL"]},
-                "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000},
+                "input": {"type": "string"},
+                "interactive": {"type": "boolean"},
+                "wait_ms": {"type": "integer"},
                 "remote": remote_schema_property()
             },
-            "required": ["command"],
             "additionalProperties": false
         }),
         move |arguments| {
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
-            let target = execution_target_arg(arguments)?;
-            let command = string_arg(arguments, "command")?;
-            if let Some(guidance) = direct_read_command_guidance(&command) {
+            let command = optional_command_arg(arguments)?;
+            if let Some(command) = command.as_deref()
+                && let Some(guidance) = direct_read_command_guidance(command)
+            {
                 return Err(anyhow!(
                     "direct read/search shell command rejected by tool policy: {guidance}"
                 ));
             }
-            let include_stdout = arguments
-                .get("include_stdout")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            let tty = arguments
-                .get("tty")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let return_immediate = arguments
-                .get("return_immediate")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let wait_timeout_seconds = arguments
-                .get("wait_timeout_seconds")
-                .map(|_| f64_arg(arguments, "wait_timeout_seconds"))
-                .transpose()?
-                .unwrap_or(EXEC_START_DEFAULT_WAIT_TIMEOUT_SECONDS);
-            let on_timeout =
-                exec_timeout_action_arg(arguments, "on_timeout", ExecTimeoutAction::Continue)?;
-            let max_output_chars = max_output_chars_arg(arguments)?;
-            let start = usize_arg_with_default(arguments, "start", 0)?;
-            let limit = usize_arg_with_default(arguments, "limit", 20)?;
-            let cwd = match &target {
-                ExecutionTarget::Local => arguments
-                    .get("cwd")
-                    .and_then(Value::as_str)
-                    .map(|value| resolve_path(value, &workspace_root))
-                    .unwrap_or_else(|| workspace_root.clone()),
-                ExecutionTarget::RemoteSsh { host } => PathBuf::from(resolve_remote_cwd(
-                    host,
-                    arguments.get("cwd").and_then(Value::as_str),
-                    &remote_workpaths,
-                )?),
-            };
-            let state_dir = ensure_process_state_dir(&runtime_state_root)?;
-            let metadata = spawn_managed_process(
-                &runtime_state_root,
-                &state_dir,
-                &workspace_root,
-                &command,
-                &cwd,
-                tty,
-                &target,
-            )?;
-            let mut result = if return_immediate {
-                read_process_snapshot(
-                    &state_dir,
-                    &metadata.exec_id,
-                    start,
-                    limit,
-                    max_output_chars,
-                    Some(&workspace_root),
-                )?
-            } else {
-                wait_for_managed_process(
-                    &state_dir,
-                    &metadata.exec_id,
-                    wait_timeout_seconds,
-                    None,
-                    start,
-                    limit,
-                    max_output_chars,
-                    Some(&workspace_root),
-                    on_timeout,
-                    cancel_flag.as_ref(),
-                )?
-            };
-            compact_tool_status_fields_for_model(&mut result);
-            if !include_stdout && let Some(object) = result.as_object_mut() {
-                object.remove("stdout");
-                object.remove("stderr");
-                if let Some(process) = object.get_mut("process").and_then(Value::as_object_mut) {
-                    process.remove("stdout");
-                    process.remove("stderr");
-                }
-            }
-            Ok(result)
-        },
-    )
-}
-
-pub(super) fn exec_observe_tool(
-    workspace_root: PathBuf,
-    runtime_state_root: PathBuf,
-    _cancel_flag: Option<Arc<InterruptSignal>>,
-) -> Tool {
-    Tool::new(
-        "exec_observe",
-        "Observe the latest output of a previously started exec process by exec_id. start=0 and limit=2 means the last two lines. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths. Remote host is inferred from exec_id.",
-        json!({
-            "type": "object",
-            "properties": {
-                "exec_id": {"type": "string"},
-                "start": {"type": "integer"},
-                "limit": {"type": "integer"},
-                "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000}
-            },
-            "required": ["exec_id"],
-            "additionalProperties": false
-        }),
-        move |arguments| {
-            let arguments = arguments
-                .as_object()
-                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
-            let exec_id = string_arg(arguments, "exec_id")?;
-            let start = usize_arg_with_default(arguments, "start", 0)?;
-            let limit = usize_arg_with_default(arguments, "limit", 20)?;
-            let max_output_chars = max_output_chars_arg(arguments)?;
-            let state_dir = ensure_process_state_dir(&runtime_state_root)?;
-            let mut result = read_process_snapshot(
-                &state_dir,
-                &exec_id,
-                start,
-                limit,
-                max_output_chars,
-                Some(&workspace_root),
-            )?;
-            compact_tool_status_fields_for_model(&mut result);
-            Ok(result)
-        },
-    )
-}
-
-pub(super) fn exec_wait_tool(
-    workspace_root: PathBuf,
-    runtime_state_root: PathBuf,
-    cancel_flag: Option<Arc<InterruptSignal>>,
-) -> Tool {
-    Tool::new_interruptible(
-        "exec_wait",
-        "Wait on a previously started exec process by exec_id. Optionally write input to stdin before waiting. If interrupted by a newer user message or timeout observation, return immediately and leave the process running. If the process does not finish before wait_timeout_seconds, on_timeout=continue leaves it running while on_timeout=kill terminates it. Output returned to the model is capped by max_output_chars, which must be 0..1000; complete stdout/stderr are saved at the returned workspace-relative paths. Remote host is inferred from exec_id.",
-        json!({
-            "type": "object",
-            "properties": {
-                "exec_id": {"type": "string"},
-                "wait_timeout_seconds": {"type": "number"},
-                "input": {"type": "string"},
-                "include_stdout": {"type": "boolean"},
-                "start": {"type": "integer"},
-                "limit": {"type": "integer"},
-                "on_timeout": {"type": "string", "enum": ["continue", "kill", "CONTINUE", "KILL"]},
-                "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000}
-            },
-            "required": ["exec_id", "wait_timeout_seconds"],
-            "additionalProperties": false
-        }),
-        move |arguments| {
-            let arguments = arguments
-                .as_object()
-                .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
-            let exec_id = string_arg(arguments, "exec_id")?;
-            let wait_timeout_seconds = f64_arg(arguments, "wait_timeout_seconds")?;
-            let include_stdout = arguments
-                .get("include_stdout")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            let on_timeout =
-                exec_timeout_action_arg(arguments, "on_timeout", ExecTimeoutAction::Continue)?;
-            let max_output_chars = max_output_chars_arg(arguments)?;
-            let start = usize_arg_with_default(arguments, "start", 0)?;
-            let limit = usize_arg_with_default(arguments, "limit", 20)?;
             let input = arguments
                 .get("input")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned);
-            let mut result = wait_for_managed_process(
-                &ensure_process_state_dir(&runtime_state_root)?,
-                &exec_id,
-                wait_timeout_seconds,
-                input.as_deref(),
-                start,
-                limit,
-                max_output_chars,
-                Some(&workspace_root),
-                on_timeout,
-                cancel_flag.as_ref(),
-            )?;
-            compact_tool_status_fields_for_model(&mut result);
-            if !include_stdout && let Some(object) = result.as_object_mut() {
-                object.remove("stdout");
-                object.remove("stderr");
-                if let Some(process) = object.get_mut("process").and_then(Value::as_object_mut) {
-                    process.remove("stdout");
-                    process.remove("stderr");
-                }
+            if command.is_some() && input.is_some() {
+                return Err(anyhow!(
+                    "arguments command and input are mutually exclusive"
+                ));
             }
-            Ok(result)
+            let wait_ms = shell_wait_ms_arg(arguments)?;
+            let state_dir = ensure_process_state_dir(&runtime_state_root)?;
+            let session_id = arguments
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned);
+            if let Some(session_id) = session_id.as_deref() {
+                validate_shell_session_id(session_id)?;
+            }
+
+            let mut metadata = if let Some(session_id) = session_id {
+                if process_meta_path(&state_dir, &session_id).exists() {
+                    let metadata = read_session_metadata(&state_dir, &session_id)
+                        .map_err(|_| session_missing_error(&session_id))?;
+                    if arguments.get("interactive").is_some() {
+                        return Err(anyhow!(
+                            "argument interactive is only allowed when creating a new shell session"
+                        ));
+                    }
+                    if arguments.get("remote").is_some() {
+                        return Err(anyhow!(
+                            "argument remote is only allowed when creating a new shell session"
+                        ));
+                    }
+                    metadata
+                } else {
+                    return Err(session_missing_error(&session_id));
+                }
+            } else {
+                let Some(command) = command.as_deref() else {
+                    return Err(anyhow!(
+                        "command is required when creating a new shell session"
+                    ));
+                };
+                let _ = command;
+                let target = execution_target_arg(arguments)?;
+                let interactive = arguments
+                    .get("interactive")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let initial_cwd = match &target {
+                    ExecutionTarget::Local => workspace_root.clone(),
+                    ExecutionTarget::RemoteSsh { host } => {
+                        PathBuf::from(resolve_remote_cwd(host, None, &remote_workpaths)?)
+                    }
+                };
+                spawn_shell_session(
+                    &runtime_state_root,
+                    &state_dir,
+                    &workspace_root,
+                    interactive,
+                    &target,
+                    &initial_cwd,
+                )?
+            };
+
+            if let Some(input) = input {
+                let result_path = queue_shell_request(
+                    &metadata,
+                    &json!({
+                        "action": "input",
+                        "input": input,
+                    }),
+                )?;
+                let ack = wait_for_shell_request_ack(
+                    &result_path,
+                    wait_ms.max(500),
+                    cancel_flag.as_ref(),
+                )?;
+                if !ack.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                    let error = ack
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("shell input failed");
+                    return Err(anyhow!(error.to_string()));
+                }
+                return wait_for_shell_session(
+                    &state_dir,
+                    &mut metadata,
+                    wait_ms,
+                    &workspace_root,
+                    cancel_flag.as_ref(),
+                    true,
+                );
+            }
+
+            if let Some(command) = command {
+                let status = read_session_status(&metadata)?;
+                if current_status_running(&status) {
+                    return Err(anyhow!(
+                        "shell session {} already has a running command; call shell without command to observe it first",
+                        metadata.session_id
+                    ));
+                }
+                if let Some(process_id) = current_process_id(&status)
+                    && !current_process_was_delivered(&metadata, &status)
+                {
+                    mark_process_delivered(&state_dir, &mut metadata, process_id)?;
+                }
+                let process_id = Uuid::new_v4().to_string();
+                let result_path = queue_shell_request(
+                    &metadata,
+                    &json!({
+                        "action": "run",
+                        "process_id": process_id,
+                        "command": command,
+                    }),
+                )?;
+                let ack = wait_for_shell_request_ack(
+                    &result_path,
+                    wait_ms.max(500),
+                    cancel_flag.as_ref(),
+                )?;
+                if !ack.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+                    let error = ack
+                        .get("error")
+                        .and_then(Value::as_str)
+                        .unwrap_or("shell command failed to start");
+                    return Err(anyhow!(error.to_string()));
+                }
+                metadata.delivered_process_id = None;
+                write_session_metadata(&state_dir, &metadata)?;
+                return wait_for_shell_session(
+                    &state_dir,
+                    &mut metadata,
+                    wait_ms,
+                    &workspace_root,
+                    cancel_flag.as_ref(),
+                    true,
+                );
+            }
+
+            wait_for_shell_session(
+                &state_dir,
+                &mut metadata,
+                wait_ms,
+                &workspace_root,
+                cancel_flag.as_ref(),
+                true,
+            )
         },
     )
 }
 
-pub(super) fn exec_kill_tool(
+pub(super) fn shell_close_tool(
     runtime_state_root: PathBuf,
     _cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
     Tool::new(
-        "exec_kill",
-        "Immediately stop a previously started exec process by exec_id. Remote host is inferred from exec_id.",
+        "shell_close",
+        "Close a shell session and stop its background worker. If the session has a running command, that command is stopped too.",
         json!({
             "type": "object",
             "properties": {
-                "exec_id": {"type": "string"}
+                "session_id": {"type": "string"}
             },
-            "required": ["exec_id"],
+            "required": ["session_id"],
             "additionalProperties": false
         }),
         move |arguments| {
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
-            let exec_id = string_arg(arguments, "exec_id")?;
+            let session_id = string_arg(arguments, "session_id")?;
             let state_dir = ensure_process_state_dir(&runtime_state_root)?;
-            let metadata = read_process_metadata(&state_dir, &exec_id)
-                .map_err(|_| process_missing_error(&exec_id))?;
-            let previous =
-                read_process_snapshot(&state_dir, &exec_id, 0, 0, EXEC_OUTPUT_MAX_CHARS, None).ok();
-            kill_exec_processes(&metadata, previous.as_ref());
-            let _ = record_exit_code(Path::new(&metadata.worker_exit_code_path), -9);
-            let mut extra = Map::new();
-            extra.insert("killed".to_string(), Value::Bool(true));
-            extra.insert("failed".to_string(), Value::Bool(false));
-            extra.insert("stdin_closed".to_string(), Value::Bool(true));
-            extra.insert("error".to_string(), Value::Null);
-            write_exec_snapshot(&metadata, false, true, Value::from(-9), Some(extra))?;
-            live_processes().lock().unwrap().remove(&exec_id);
+            let metadata = read_session_metadata(&state_dir, &session_id)
+                .map_err(|_| session_missing_error(&session_id))?;
+            let status = read_session_status(&metadata).ok();
+            let killed_running_process = status
+                .as_ref()
+                .and_then(|value| value.get("running"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let close_result_path = queue_shell_request(&metadata, &json!({"action": "close"}))?;
+            let _ = wait_for_shell_request_ack(&close_result_path, 500, None);
+            kill_shell_session_processes(&metadata, status.as_ref());
+            let _ = fs::remove_file(process_meta_path(&state_dir, &metadata.session_id));
+            let _ = fs::remove_file(&metadata.worker_exit_code_path);
+            let _ = fs::remove_file(&metadata.status_path);
+            let _ = fs::remove_dir_all(&metadata.requests_dir);
+            live_sessions().lock().unwrap().remove(&metadata.session_id);
             let mut result = json!({
-                "exec_id": metadata.exec_id,
-                "pid": previous
-                    .as_ref()
-                    .and_then(exec_pid_from_snapshot)
-                    .map(Value::from)
-                    .unwrap_or(Value::Null),
-                "command": metadata.command,
-                "remote": metadata.remote,
-                "cwd": metadata.cwd,
-                "running": false,
-                "completed": true,
-                "killed": true,
-                "returncode": -9,
+                "session_id": metadata.session_id,
+                "closed": true,
+                "killed_running_process": killed_running_process,
             });
             compact_tool_status_fields_for_model(&mut result);
             Ok(result)
@@ -1281,15 +956,40 @@ pub(super) fn exec_kill_tool(
 
 #[cfg(test)]
 mod tests {
-    use super::direct_read_command_guidance;
+    use super::{
+        direct_read_command_guidance, generate_shell_session_id, validate_shell_session_id,
+    };
 
     #[test]
     fn direct_read_command_guard_catches_simple_shell_reads() {
-        assert!(direct_read_command_guidance("cat src/main.rs").is_some());
-        assert!(direct_read_command_guidance("/usr/bin/grep foo src/main.rs").is_some());
-        assert!(direct_read_command_guidance("find . -name '*.rs'").is_some());
-        assert!(direct_read_command_guidance("ssh dev 'cat src/main.rs'").is_some());
-        assert!(direct_read_command_guidance("cargo test").is_none());
-        assert!(direct_read_command_guidance("git grep foo").is_none());
+        assert!(direct_read_command_guidance("cat README.md").is_some());
+        assert!(direct_read_command_guidance("grep -n foo src/lib.rs").is_some());
+        assert!(direct_read_command_guidance("ls src").is_some());
+        assert!(direct_read_command_guidance("ssh dev uptime").is_some());
+        assert!(direct_read_command_guidance("printf 123").is_none());
+    }
+
+    #[test]
+    fn shell_session_id_validation_accepts_safe_names() {
+        assert!(validate_shell_session_id("shell_123-test").is_ok());
+    }
+
+    #[test]
+    fn shell_session_id_validation_rejects_special_characters() {
+        assert!(validate_shell_session_id("../oops").is_err());
+        assert!(validate_shell_session_id("bad space").is_err());
+    }
+
+    #[test]
+    fn generated_shell_session_id_uses_short_dated_format() {
+        let session_id = generate_shell_session_id();
+        assert!(session_id.starts_with("sh_"));
+        assert_eq!(session_id.len(), 18, "{session_id}");
+        assert_eq!(&session_id[11..12], "_");
+        assert!(
+            validate_shell_session_id(&session_id).is_ok(),
+            "{session_id}"
+        );
+        assert!(session_id[3..11].bytes().all(|byte| byte.is_ascii_digit()));
     }
 }

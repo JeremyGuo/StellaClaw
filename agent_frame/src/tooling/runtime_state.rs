@@ -339,7 +339,7 @@ pub(crate) fn active_runtime_state_summary(runtime_state_root: &Path) -> Result<
         "These tasks are still in progress across turns. Reuse their ids with observe/wait/cancel tools instead of starting duplicates.".to_string(),
     ];
     if !active_execs.is_empty() {
-        sections.push("Active exec processes:".to_string());
+        sections.push("Active shell sessions:".to_string());
         sections.extend(active_execs);
     }
     if !active_downloads.is_empty() {

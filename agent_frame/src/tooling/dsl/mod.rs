@@ -9,7 +9,7 @@ use super::runtime_state::{
 };
 use super::{
     InterruptSignal, Tool, build_tool_registry_with_cancel, compact_tool_status_fields_for_model,
-    exec_kill_tool, execute_tool_call,
+    execute_tool_call, shell_close_tool,
 };
 use crate::config::{RemoteWorkpathConfig, UpstreamConfig};
 use crate::llm::create_chat_completion;
@@ -963,7 +963,7 @@ impl DslRuntime {
     }
 
     fn record_child_task(&mut self, tool_name: &str, value: &Value) {
-        for id_field in ["exec_id", "download_id", "image_id"] {
+        for id_field in ["session_id", "download_id", "image_id"] {
             if let Some(id) = value.get(id_field).and_then(Value::as_str) {
                 self.status.children.push(DslChildTask {
                     tool: tool_name.to_string(),
@@ -1382,9 +1382,8 @@ fn kill_child_task(runtime_state_root: &Path, child: &Value) -> Value {
     let id_field = child.get("id_field").and_then(Value::as_str).unwrap_or("");
     let id = child.get("id").and_then(Value::as_str).unwrap_or("");
     let result = match id_field {
-        "exec_id" => {
-            exec_kill_tool(runtime_state_root.to_path_buf(), None).invoke(json!({"exec_id": id}))
-        }
+        "session_id" => shell_close_tool(runtime_state_root.to_path_buf(), None)
+            .invoke(json!({"session_id": id})),
         "download_id" => file_download_cancel_tool(runtime_state_root.to_path_buf(), None)
             .invoke(json!({"download_id": id})),
         "image_id" => image_cancel_tool(runtime_state_root.to_path_buf(), None)

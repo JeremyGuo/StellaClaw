@@ -35,21 +35,25 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Tools have only two execution modes:
   - immediate: the tool returns promptly and does not require turn-level waiting semantics.
   - interruptible: the tool may wait, but must return promptly when a newer user message interrupts the turn or timeout observation asks it to yield.
-- Long-running stateful work should use an explicit lifecycle:
-  - start: create the job/process/task, and optionally wait for completion when that reduces API round trips.
-  - wait/observe/progress: check or wait for completion; waits must be interruptible and must not kill the underlying job merely because the user interrupted the agent turn.
-  - kill/cancel: explicitly terminate the job/process/task.
-- `exec_start`, `dsl_start`, `file_download_start`, and `image_start` follow the start shape while supporting default wait-until-complete, `return_immediate`, `wait_timeout_seconds`, and timeout continue/kill behavior so short jobs can complete in one model round trip.
-- Shared runtime-id start guidance belongs in the AgentFrame system prompt; individual start tool descriptions should expose the tool effect and schema without repeating the same wait/timeout usage policy.
+- Long-running stateful work should use an explicit lifecycle. Some families keep separate start/wait/kill tools, while shell execution now uses a session-oriented pair: `shell` and `shell_close`.
+- `shell` owns persistent shell sessions. It can create a session and start the next command, wait for or observe the current command when called without `command`, or send stdin with `input`.
+- `shell` creates new sessions only when `session_id` is omitted. Passing `session_id` means "reuse this existing session"; unknown ids must be rejected instead of creating caller-chosen session names.
+- Auto-generated shell session ids use the short `sh_<YYYYMMDD>_<6-char>` format instead of UUIDs so they stay easier to quote in tool args, compaction summaries, and transcripts.
+- `shell` treats `command=""` the same as omitting `command`.
+- Shell results expose `running` and `interactive` on every response. `stdout`, `stderr`, `out_path`, and optional `exit_code` describe only the current process in that session and must not leak output from older commands.
+- Full shell output is persisted under `out_path/stdout` and `out_path/stderr`, while the returned `stdout` and `stderr` keep the existing tail-window plus character-cap truncation behavior. Truncation flags and `needs_input` are omitted unless they are true.
+- If a shell command finishes and its result has not yet been returned, starting another command in the same session discards that older unreturned result and immediately replaces it with the new current process.
+- `shell_close` closes the session and stops any running current command.
+- Shared runtime-id guidance belongs in the AgentFrame system prompt; individual tool descriptions should expose the tool effect and schema without restating the same lifecycle rules at length.
 - Tool results should omit empty, null, or false diagnostic fields on ordinary success paths; absence means the normal/false case, while truncation, stderr, and errors remain explicit when present.
 - Lifecycle tool status results should also omit redundant default-state noise such as `error: null`, `returncode: null`, `completed: false`, `cancelled: false`, `failed: false`, local `remote`, and empty stdout/stderr while preserving meaningful true states, errors, ids, paths, and actual exit codes.
 - Tool errors are normalized at the global tool layer before they are returned to the model; oversized error strings are truncated with head/tail preservation rather than letting individual tools flood the assistant context.
-- Direct shell read/search commands such as `cat`, `grep`, `find`, `head`, `tail`, and `ls` are rejected by `exec_start` on the simple-command path. Agents should use the dedicated `file_read`, `grep`, `glob`, and `ls` tools; remote behavior is governed by the centralized remote policy.
+- Direct shell read/search commands such as `cat`, `grep`, `find`, `head`, `tail`, and `ls` are rejected on the simple-command path. Agents should use the dedicated `file_read`, `grep`, `glob`, and `ls` tools; remote behavior is governed by the centralized remote policy.
 - Timeout observation compaction is controlled by the main agent global setting and is not gated on a particular model provider or per-model prompt-cache TTL.
-- Remote-capable tools should use their `remote` argument instead of shelling out to `ssh <host>` manually. The `remote` value must be an actual local SSH alias, normally one detected from `~/.ssh/config` and listed in the system prompt, or a registered remote workpath host; agents must not invent host labels. If the tool has `cwd` and `cwd` is non-empty, that `cwd` controls the remote working directory. If `cwd` is omitted or empty, the remote root is the registered workpath, falling back to the remote user's home directory when no workpath is registered.
-- `exec_start` rejects manual `ssh ...` command strings so models use remote-capable tools rather than bypassing the remote policy.
+- Remote-capable tools should use their `remote` argument instead of shelling out to `ssh <host>` manually. The `remote` value must be an actual local SSH alias, normally one detected from `~/.ssh/config` and listed in the system prompt, or a registered remote workpath host; agents must not invent host labels.
+- `shell` rejects manual `ssh ...` command strings so models use remote-capable tools rather than bypassing the remote policy.
 - Download/image-style background jobs follow start + wait/progress + cancel where applicable, and their wait tools support explicit wait timeouts without cancelling on normal interruption.
-- Regression coverage should protect tool execution mode annotations, centralized remote guidance, centralized runtime-id start guidance, manual SSH rejection, and the start/wait/terminate schemas for long-running tool families.
+- Regression coverage should protect tool execution mode annotations, shell session lifecycle semantics, centralized remote guidance, manual SSH rejection, and the start/wait/terminate schemas for long-running tool families.
 
 ### Conversation Local Mounts
 
