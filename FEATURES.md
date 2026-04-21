@@ -8,11 +8,19 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 
 ### Config Schema Invariants
 
+- Latest AgentHost config files support a `models.<alias>.type = "claude-code"` provider for Anthropic Messages compatible endpoints, with default endpoint/path semantics that resolve to `/v1/messages` style routing instead of OpenAI chat or responses routes.
 - Latest AgentHost config files do not use `main_agent.model` as a global default-model knob; user-facing model selection remains conversation-owned state.
 - Latest AgentHost config files do not use `main_agent.timeout_seconds` as a global subagent-timeout knob; subagent timeout policy is derived from the selected model/runtime flow instead of a second main-agent override field.
 - Latest AgentHost config files do not allow inline model-level `external_web_search` blocks; external search routing must flow through normal model/tooling configuration instead of a second per-model search config shape.
 - Older configs may still load with those legacy fields present, but the latest config writer must not emit them again.
 - Regression coverage should protect legacy-field ignore-on-load behavior and latest-template omission.
+
+### Claude Messages Provider
+
+- The `claude-code` model type uses Anthropic Messages compatible payloads with `x-api-key` authentication and a default `/messages` request path.
+- Automatic Anthropic prompt caching is enabled for Claude-compatible `claude-code` models and is translated into an explicit block-level `cache_control` marker on the last cacheable request block so Claude-style prompt caching works on Anthropic Messages / NewAPI style gateways.
+- Assistant tool use and tool result history are translated losslessly between internal `ChatMessage` state and Claude Messages `tool_use` / `tool_result` blocks, so tool-driven multi-round sessions keep working when a conversation runs on `claude-code`.
+- Regression coverage should protect config upgrade defaults for `claude-code`, request payload cache markers, and tool roundtrips through the Claude Messages provider.
 
 ### Interruptible Conversations
 

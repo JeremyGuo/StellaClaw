@@ -161,12 +161,14 @@ fn upgrade_versioned_model(
             "https://openrouter.ai/api/v1".to_string()
         }
         ModelType::CodexSubscription => default_codex_subscription_endpoint(),
+        ModelType::ClaudeCode => "https://api.anthropic.com/v1".to_string(),
     });
     let chat_completions_path = raw
         .chat_completions_path
         .unwrap_or_else(|| match raw.model_type {
             ModelType::Openrouter => default_chat_completions_path(),
             ModelType::OpenrouterResp | ModelType::CodexSubscription => default_responses_path(),
+            ModelType::ClaudeCode => "/messages".to_string(),
         });
     Ok(ModelConfig {
         model_type: raw.model_type,

@@ -1,8 +1,8 @@
 mod providers;
 
 use crate::config::{
-    AuthCredentialsStoreMode, CodexAuthConfig, RetryModeConfig, UpstreamApiKind, UpstreamAuthKind,
-    UpstreamConfig,
+    AuthCredentialsStoreMode, CacheControlConfig, CodexAuthConfig, RetryModeConfig,
+    UpstreamApiKind, UpstreamAuthKind, UpstreamConfig,
 };
 use crate::message::ChatMessage;
 use crate::token_estimation::observe_prompt_tokens_for_upstream;
@@ -1083,19 +1083,23 @@ fn is_sensitive_name(name: &str) -> bool {
         || lower.contains("credential")
 }
 
-pub(super) fn redacted_upstream_request_headers_json(
+pub(super) fn redacted_upstream_request_headers_json_with_auth(
     upstream: &UpstreamConfig,
-    has_authorization: bool,
+    auth_header_name: Option<&str>,
 ) -> String {
     let mut object = Map::new();
     object.insert(
         "content-type".to_string(),
         Value::String("application/json".to_string()),
     );
-    if has_authorization {
+    if let Some(header_name) = auth_header_name {
         object.insert(
-            "authorization".to_string(),
-            Value::String("Bearer [REDACTED]".to_string()),
+            header_name.to_string(),
+            if header_name.eq_ignore_ascii_case("authorization") {
+                Value::String("Bearer [REDACTED]".to_string())
+            } else {
+                Value::String("[REDACTED]".to_string())
+            },
         );
     }
     for (key, value) in &upstream.headers {
@@ -1113,6 +1117,264 @@ pub(super) fn redacted_upstream_request_headers_json(
         );
     }
     serde_json::to_string(&Value::Object(object)).unwrap_or_else(|_| "{}".to_string())
+}
+
+pub(super) fn redacted_upstream_request_headers_json(
+    upstream: &UpstreamConfig,
+    has_authorization: bool,
+) -> String {
+    redacted_upstream_request_headers_json_with_auth(
+        upstream,
+        has_authorization.then_some("authorization"),
+    )
+}
+
+fn parse_data_url(value: &str) -> Option<(&str, &str)> {
+    let (metadata, encoded) = value.strip_prefix("data:")?.split_once(',')?;
+    let mut parts = metadata.split(';');
+    let media_type = parts.next()?;
+    parts
+        .any(|part| part.eq_ignore_ascii_case("base64"))
+        .then_some((media_type, encoded))
+}
+
+fn content_item_to_claude_block(item: &Value) -> Result<Option<Value>> {
+    let Some(kind) = item.get("type").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    Ok(match kind {
+        "text" | "input_text" | "output_text" => item
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| json!({ "type": "text", "text": text })),
+        "image_url" => {
+            let image_url = item
+                .get("image_url")
+                .and_then(|value| {
+                    value
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .or_else(|| value.as_str())
+                })
+                .ok_or_else(|| anyhow!("image_url content item is missing a url"))?;
+            Some(claude_image_block_from_url(image_url))
+        }
+        "input_image" => item
+            .get("image_url")
+            .and_then(Value::as_str)
+            .map(claude_image_block_from_url),
+        _ => None,
+    })
+}
+
+fn claude_image_block_from_url(image_url: &str) -> Value {
+    if let Some((media_type, data)) = parse_data_url(image_url) {
+        json!({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": media_type,
+                "data": data,
+            }
+        })
+    } else {
+        json!({
+            "type": "image",
+            "source": {
+                "type": "url",
+                "url": image_url,
+            }
+        })
+    }
+}
+
+fn message_content_to_claude_blocks(content: Option<&Value>) -> Result<Vec<Value>> {
+    match content {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(text)) if text.is_empty() => Ok(Vec::new()),
+        Some(Value::String(text)) => Ok(vec![json!({ "type": "text", "text": text })]),
+        Some(Value::Array(items)) => {
+            let mut converted = Vec::new();
+            for item in items {
+                if let Some(block) = content_item_to_claude_block(item)? {
+                    converted.push(block);
+                }
+            }
+            if converted.is_empty() {
+                Ok(vec![json!({
+                    "type": "text",
+                    "text": Value::Array(items.clone()).to_string(),
+                })])
+            } else {
+                Ok(converted)
+            }
+        }
+        Some(other) => Ok(vec![json!({
+            "type": "text",
+            "text": other.to_string(),
+        })]),
+    }
+}
+
+fn parse_tool_arguments_for_claude(arguments: Option<&String>) -> Value {
+    let Some(arguments) = arguments else {
+        return json!({});
+    };
+    serde_json::from_str::<Value>(arguments).unwrap_or_else(|_| json!({}))
+}
+
+fn append_claude_message(messages: &mut Vec<Value>, role: &str, content: Vec<Value>) {
+    if content.is_empty() {
+        return;
+    }
+    if let Some(last) = messages.last_mut()
+        && last.get("role").and_then(Value::as_str) == Some(role)
+        && let Some(last_content) = last.get_mut("content").and_then(Value::as_array_mut)
+    {
+        last_content.extend(content);
+        return;
+    }
+    messages.push(json!({
+        "role": role,
+        "content": content,
+    }));
+}
+
+fn add_cache_control_to_last_claude_block(
+    system: &mut [Value],
+    messages: &mut [Value],
+    cache_control: &CacheControlConfig,
+) {
+    for message in messages.iter_mut().rev() {
+        if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut)
+            && let Some(last_block) = content.last_mut()
+            && let Some(object) = last_block.as_object_mut()
+        {
+            object.insert(
+                "cache_control".to_string(),
+                serde_json::to_value(cache_control)
+                    .unwrap_or_else(|_| json!({ "type": "ephemeral" })),
+            );
+            return;
+        }
+    }
+
+    if let Some(last_block) = system.last_mut()
+        && let Some(object) = last_block.as_object_mut()
+    {
+        object.insert(
+            "cache_control".to_string(),
+            serde_json::to_value(cache_control).unwrap_or_else(|_| json!({ "type": "ephemeral" })),
+        );
+    }
+}
+
+pub(super) fn build_claude_messages_input(
+    messages: &[ChatMessage],
+    cache_control: Option<&CacheControlConfig>,
+) -> Result<(Vec<Value>, Vec<Value>)> {
+    let mut system = Vec::new();
+    let mut converted_messages = Vec::new();
+
+    for message in messages {
+        match message.role.as_str() {
+            "system" => {
+                system.extend(message_content_to_claude_blocks(message.content.as_ref())?);
+            }
+            "user" => append_claude_message(
+                &mut converted_messages,
+                "user",
+                message_content_to_claude_blocks(message.content.as_ref())?,
+            ),
+            "assistant" => {
+                let mut content = message_content_to_claude_blocks(message.content.as_ref())?;
+                if let Some(tool_calls) = &message.tool_calls {
+                    content.extend(tool_calls.iter().map(|tool_call| {
+                        json!({
+                            "type": "tool_use",
+                            "id": tool_call.id,
+                            "name": tool_call.function.name,
+                            "input": parse_tool_arguments_for_claude(
+                                tool_call.function.arguments.as_ref()
+                            ),
+                        })
+                    }));
+                }
+                append_claude_message(&mut converted_messages, "assistant", content);
+            }
+            "tool" => append_claude_message(
+                &mut converted_messages,
+                "user",
+                vec![json!({
+                    "type": "tool_result",
+                    "tool_use_id": message.tool_call_id.clone().unwrap_or_default(),
+                    "content": message_text_content(message.content.as_ref()).unwrap_or_default(),
+                })],
+            ),
+            other => append_claude_message(
+                &mut converted_messages,
+                other,
+                message_content_to_claude_blocks(message.content.as_ref())?,
+            ),
+        }
+    }
+
+    if let Some(cache_control) = cache_control {
+        add_cache_control_to_last_claude_block(&mut system, &mut converted_messages, cache_control);
+    }
+
+    Ok((system, converted_messages))
+}
+
+pub(super) fn claude_messages_value_to_chat_message(value: &Value) -> Result<ChatMessage> {
+    let content = value
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("invalid claude messages response: missing content array"))?;
+    let mut text_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+
+    for item in content {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    text_parts.push(text.to_string());
+                }
+            }
+            Some("tool_use") => {
+                let call_id = item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("invalid claude tool_use block: missing id"))?;
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("invalid claude tool_use block: missing name"))?;
+                let arguments = item
+                    .get("input")
+                    .map(Value::to_string)
+                    .unwrap_or_else(|| "{}".to_string());
+                tool_calls.push(crate::message::ToolCall {
+                    id: call_id.to_string(),
+                    kind: "function".to_string(),
+                    function: crate::message::FunctionCall {
+                        name: name.to_string(),
+                        arguments: Some(arguments),
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+
+    Ok(ChatMessage {
+        role: "assistant".to_string(),
+        content: (!text_parts.is_empty()).then(|| Value::String(text_parts.join("\n\n"))),
+        name: None,
+        tool_call_id: None,
+        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+    })
 }
 
 pub(super) fn redacted_response_headers_json(headers: &reqwest::header::HeaderMap) -> String {
@@ -1267,15 +1529,16 @@ fn nested_u64(object: &Map<String, Value>, path: &[&str]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TokenUsage, UpstreamAuthKind, build_responses_input, build_responses_tools_payload,
-        chat_completions_messages_payload, normalize_inline_image_url,
+        TokenUsage, UpstreamAuthKind, build_claude_messages_input, build_responses_input,
+        build_responses_tools_payload, chat_completions_messages_payload,
+        claude_messages_value_to_chat_message, normalize_inline_image_url,
         parse_streamed_responses_body, parse_usage, redact_sensitive_json,
-        redacted_upstream_request_headers_json, responses_value_to_chat_message,
-        upstream_error_from_value,
+        redacted_upstream_request_headers_json, redacted_upstream_request_headers_json_with_auth,
+        responses_value_to_chat_message, upstream_error_from_value,
     };
     use crate::config::{
-        AuthCredentialsStoreMode, NativeWebSearchConfig, ReasoningConfig, UpstreamApiKind,
-        UpstreamConfig,
+        AuthCredentialsStoreMode, CacheControlConfig, NativeWebSearchConfig, ReasoningConfig,
+        UpstreamApiKind, UpstreamConfig,
     };
     use crate::message::{ChatMessage, FunctionCall, ToolCall};
     use crate::tooling::Tool;
@@ -1343,6 +1606,16 @@ mod tests {
         assert_eq!(value["X-Api-Key"], "[REDACTED]");
         assert_eq!(value["X-Trace"], "trace-value");
         assert!(!headers.contains("secret-value"));
+    }
+
+    #[test]
+    fn api_log_can_redact_x_api_key_headers() {
+        let upstream = test_upstream_config();
+        let headers =
+            redacted_upstream_request_headers_json_with_auth(&upstream, Some("x-api-key"));
+        let value: serde_json::Value = serde_json::from_str(&headers).unwrap();
+        assert_eq!(value["x-api-key"], "[REDACTED]");
+        assert!(value.get("authorization").is_none());
     }
 
     #[test]
@@ -1541,6 +1814,111 @@ mod tests {
         assert_eq!(input[2]["name"], "file_read");
         assert_eq!(input[3]["type"], "function_call_output");
         assert_eq!(input[3]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn build_claude_messages_input_converts_history_and_applies_cache_breakpoint() {
+        let messages = vec![
+            ChatMessage::text("system", "System prefix"),
+            ChatMessage::text("user", "First question"),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(json!("Calling tool")),
+                name: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tool-1".to_string(),
+                    kind: "function".to_string(),
+                    function: FunctionCall {
+                        name: "lookup".to_string(),
+                        arguments: Some("{\"topic\":\"cache\"}".to_string()),
+                    },
+                }]),
+            },
+            ChatMessage::tool_output("tool-1", "lookup", "tool result"),
+            ChatMessage::text("user", "Final question"),
+        ];
+
+        let (system, input) = build_claude_messages_input(
+            &messages,
+            Some(&CacheControlConfig {
+                cache_type: "ephemeral".to_string(),
+                ttl: Some("5m".to_string()),
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(system[0]["type"], "text");
+        assert_eq!(system[0]["text"], "System prefix");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["role"], "assistant");
+        assert_eq!(input[1]["content"][1]["type"], "tool_use");
+        assert_eq!(input[2]["role"], "user");
+        assert_eq!(input[2]["content"][0]["type"], "tool_result");
+        assert_eq!(input[2]["content"][1]["type"], "text");
+        assert_eq!(input[2]["content"][1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(input[2]["content"][1]["cache_control"]["ttl"], "5m");
+    }
+
+    #[test]
+    fn build_claude_messages_input_omits_empty_text_blocks() {
+        let messages = vec![
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: Some(json!("")),
+                name: None,
+                tool_call_id: None,
+                tool_calls: Some(vec![ToolCall {
+                    id: "tool-1".to_string(),
+                    kind: "function".to_string(),
+                    function: FunctionCall {
+                        name: "lookup".to_string(),
+                        arguments: Some("{\"topic\":\"cache\"}".to_string()),
+                    },
+                }]),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(json!("")),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            },
+        ];
+
+        let (_system, input) = build_claude_messages_input(&messages, None).unwrap();
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "assistant");
+        assert_eq!(input[0]["content"].as_array().unwrap().len(), 1);
+        assert_eq!(input[0]["content"][0]["type"], "tool_use");
+    }
+
+    #[test]
+    fn claude_messages_value_to_chat_message_reads_text_and_tool_use() {
+        let response = json!({
+            "content": [
+                { "type": "text", "text": "Need a tool" },
+                {
+                    "type": "tool_use",
+                    "id": "call_1",
+                    "name": "lookup",
+                    "input": { "topic": "cache" }
+                }
+            ]
+        });
+
+        let message = claude_messages_value_to_chat_message(&response).unwrap();
+        assert_eq!(message.role, "assistant");
+        assert_eq!(message.content, Some(json!("Need a tool")));
+        assert_eq!(message.tool_calls.as_ref().unwrap()[0].id, "call_1");
+        assert_eq!(
+            message.tool_calls.as_ref().unwrap()[0]
+                .function
+                .arguments
+                .as_deref(),
+            Some("{\"topic\":\"cache\"}")
+        );
     }
 
     #[test]

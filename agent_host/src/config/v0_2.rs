@@ -199,12 +199,14 @@ fn upgrade_base_model(raw: VersionedModelConfigRaw) -> ModelConfig {
             "https://openrouter.ai/api/v1".to_string()
         }
         ModelType::CodexSubscription => default_codex_subscription_endpoint(),
+        ModelType::ClaudeCode => "https://api.anthropic.com/v1".to_string(),
     });
     let chat_completions_path = raw
         .chat_completions_path
         .unwrap_or_else(|| match raw.model_type {
             ModelType::Openrouter => default_chat_completions_path(),
             ModelType::OpenrouterResp | ModelType::CodexSubscription => default_responses_path(),
+            ModelType::ClaudeCode => "/messages".to_string(),
         });
     ModelConfig {
         model_type: raw.model_type,
@@ -251,6 +253,7 @@ fn upgrade_external_web_search_model(
                 ModelType::OpenrouterResp | ModelType::CodexSubscription => {
                     default_responses_path()
                 }
+                ModelType::ClaudeCode => "/messages".to_string(),
             }),
         timeout_seconds: raw.timeout_seconds,
         headers: raw.headers,

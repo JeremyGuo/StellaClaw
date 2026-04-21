@@ -11,6 +11,7 @@ pub enum UpstreamApiKind {
     #[default]
     ChatCompletions,
     Responses,
+    ClaudeMessages,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]

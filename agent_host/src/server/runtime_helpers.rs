@@ -1545,31 +1545,34 @@ pub(super) fn merge_builtin_pricing(
     }
 }
 
-pub(super) fn openrouter_automatic_cache_ttl(model: &ModelConfig) -> Option<String> {
-    if !supports_openrouter_anthropic_automatic_cache(model) {
+pub(super) fn automatic_anthropic_cache_ttl(model: &ModelConfig) -> Option<String> {
+    if !supports_automatic_anthropic_cache(model) {
         return None;
     }
     Some(model.cache_ttl.clone().unwrap_or_else(|| "5m".to_string()))
 }
 
-pub(super) fn openrouter_automatic_cache_control(
+pub(super) fn automatic_anthropic_cache_control(
     model: &ModelConfig,
 ) -> Option<agent_frame::config::CacheControlConfig> {
-    if !supports_openrouter_anthropic_automatic_cache(model) {
+    if !supports_automatic_anthropic_cache(model) {
         return None;
     }
-    openrouter_automatic_cache_ttl(model).map(|ttl| agent_frame::config::CacheControlConfig {
+    automatic_anthropic_cache_ttl(model).map(|ttl| agent_frame::config::CacheControlConfig {
         cache_type: "ephemeral".to_string(),
         ttl: Some(ttl),
     })
 }
 
-fn supports_openrouter_anthropic_automatic_cache(model: &ModelConfig) -> bool {
-    matches!(
-        model.model_type,
-        crate::config::ModelType::Openrouter | crate::config::ModelType::OpenrouterResp
-    ) && model.api_endpoint.contains("openrouter.ai")
-        && model.model.starts_with("anthropic/claude-")
+fn supports_automatic_anthropic_cache(model: &ModelConfig) -> bool {
+    match model.model_type {
+        crate::config::ModelType::Openrouter | crate::config::ModelType::OpenrouterResp => {
+            model.api_endpoint.contains("openrouter.ai")
+                && model.model.starts_with("anthropic/claude-")
+        }
+        crate::config::ModelType::ClaudeCode => model.model.starts_with("claude-"),
+        crate::config::ModelType::CodexSubscription => false,
+    }
 }
 
 pub(super) fn estimate_cost_usd(model: &ModelConfig, usage: &TokenUsage) -> Option<(String, f64)> {

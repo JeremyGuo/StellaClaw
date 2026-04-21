@@ -29,6 +29,7 @@ mod v0_22;
 mod v0_23;
 mod v0_24;
 mod v0_25;
+mod v0_26;
 mod v0_3;
 mod v0_4;
 mod v0_5;
@@ -38,7 +39,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.25";
+pub const LATEST_CONFIG_VERSION: &str = "0.26";
 pub const VERSION_0_2: &str = "0.2";
 pub const VERSION_0_3: &str = "0.3";
 pub const VERSION_0_4: &str = "0.4";
@@ -63,6 +64,7 @@ pub const VERSION_0_22: &str = "0.22";
 pub const VERSION_0_23: &str = "0.23";
 pub const VERSION_0_24: &str = "0.24";
 pub const VERSION_0_25: &str = "0.25";
+pub const VERSION_0_26: &str = "0.26";
 
 trait ConfigLoader {
     fn version(&self) -> &'static str;
@@ -200,13 +202,16 @@ impl ModelConfig {
         match self.model_type {
             ModelType::Openrouter => UpstreamApiKind::ChatCompletions,
             ModelType::OpenrouterResp | ModelType::CodexSubscription => UpstreamApiKind::Responses,
+            ModelType::ClaudeCode => UpstreamApiKind::ClaudeMessages,
         }
     }
 
     pub fn upstream_auth_kind(&self) -> UpstreamAuthKind {
         match self.model_type {
             ModelType::CodexSubscription => UpstreamAuthKind::CodexSubscription,
-            ModelType::Openrouter | ModelType::OpenrouterResp => UpstreamAuthKind::ApiKey,
+            ModelType::Openrouter | ModelType::OpenrouterResp | ModelType::ClaudeCode => {
+                UpstreamAuthKind::ApiKey
+            }
         }
     }
 
@@ -233,6 +238,7 @@ pub enum ModelType {
     Openrouter,
     OpenrouterResp,
     CodexSubscription,
+    ClaudeCode,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -652,6 +658,10 @@ pub(crate) fn default_api_key_env() -> String {
     "OPENAI_API_KEY".to_string()
 }
 
+pub(crate) fn default_anthropic_api_key_env() -> String {
+    "ANTHROPIC_API_KEY".to_string()
+}
+
 pub(crate) fn default_chat_completions_path() -> String {
     "/chat/completions".to_string()
 }
@@ -660,8 +670,16 @@ pub(crate) fn default_responses_path() -> String {
     "/responses".to_string()
 }
 
+pub(crate) fn default_claude_messages_path() -> String {
+    "/messages".to_string()
+}
+
 pub(crate) fn default_codex_subscription_endpoint() -> String {
     "https://chatgpt.com/backend-api/codex".to_string()
+}
+
+pub(crate) fn default_claude_messages_endpoint() -> String {
+    "https://api.anthropic.com/v1".to_string()
 }
 
 pub(crate) fn default_model_timeout_seconds() -> f64 {
@@ -1052,7 +1070,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
     let mut config = {
-        let loaders: [&dyn ConfigLoader; 25] = [
+        let loaders: [&dyn ConfigLoader; 26] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
             &v0_3::VersionedConfigLoader,
@@ -1078,6 +1096,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
             &v0_23::LatestConfigLoader,
             &v0_24::LatestConfigLoader,
             &v0_25::LatestConfigLoader,
+            &v0_26::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()
@@ -2409,6 +2428,54 @@ mod tests {
 
         let config = load_server_config_file(&config_path).unwrap();
         assert_eq!(config.models["main"].chat_completions_path, "/responses");
+    }
+
+    #[test]
+    fn claude_code_upgrade_defaults_to_messages_path_and_anthropic_endpoint() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.25",
+              "models": {
+                "main": {
+                  "type": "claude-code",
+                  "model": "claude-opus-4-6",
+                  "capabilities": ["chat"],
+                  "description": "demo"
+                }
+              },
+              "agent": {
+                "agent_frame": {
+                  "available_models": ["main"]
+                }
+              },
+              "main_agent": {
+                "language": "zh-CN"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let (config, upgraded) = load_server_config_file_and_upgrade(&config_path).unwrap();
+        assert!(upgraded);
+        assert_eq!(config.version, LATEST_CONFIG_VERSION);
+        assert_eq!(config.models["main"].model_type, ModelType::ClaudeCode);
+        assert_eq!(
+            config.models["main"].api_endpoint,
+            "https://api.anthropic.com/v1"
+        );
+        assert_eq!(config.models["main"].chat_completions_path, "/messages");
+        assert_eq!(config.models["main"].api_key_env, "ANTHROPIC_API_KEY");
     }
 
     #[test]

@@ -37,7 +37,7 @@ impl AgentRuntimeView {
             timeout_seconds,
             retry_mode: model.retry_mode.clone(),
             context_window_tokens: model.context_window_tokens,
-            cache_control: openrouter_automatic_cache_control(model),
+            cache_control: automatic_anthropic_cache_control(model),
             prompt_cache_retention,
             prompt_cache_key,
             reasoning,

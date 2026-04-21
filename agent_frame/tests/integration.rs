@@ -1676,6 +1676,111 @@ fn responses_upstream_cache_fields_are_forwarded() -> Result<()> {
 }
 
 #[test]
+fn claude_messages_provider_roundtrips_tools_and_block_cache_control() -> Result<()> {
+    let server = TestServer::start();
+    server.push_response(json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            { "type": "text", "text": "checking" },
+            {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "multiply",
+                "input": { "a": 6, "b": 7 }
+            }
+        ],
+        "usage": {
+            "input_tokens": 5000,
+            "cache_creation_input_tokens": 4990,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 5
+        }
+    }));
+    server.push_response(json!({
+        "type": "message",
+        "role": "assistant",
+        "content": [
+            { "type": "text", "text": "42" }
+        ],
+        "usage": {
+            "input_tokens": 20,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 4990,
+            "output_tokens": 3
+        }
+    }));
+
+    let config = load_config_value(
+        json!({
+            "upstream": {
+                "base_url": server.address,
+                "model": "claude-opus-4-6",
+                "api_kind": "claude_messages",
+                "chat_completions_path": "/messages",
+                "cache_control": {
+                    "type": "ephemeral",
+                    "ttl": "5m"
+                }
+            },
+            "system_prompt": "Stable cacheable prefix."
+        }),
+        ".",
+    )?;
+
+    let multiply = Tool::new(
+        "multiply",
+        "Multiply two numbers.",
+        json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "integer" },
+                "b": { "type": "integer" }
+            },
+            "required": ["a", "b"]
+        }),
+        |args| {
+            let a = args["a"].as_i64().unwrap_or_default();
+            let b = args["b"].as_i64().unwrap_or_default();
+            Ok(json!({ "product": a * b }))
+        },
+    );
+
+    let report = run_session_state_until_end(Vec::new(), "hello", config, vec![multiply], None)?;
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        2,
+        "requests={requests:?} messages={:?}",
+        report.messages
+    );
+    assert!(
+        requests[0]["system"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Stable cacheable prefix."))
+    );
+    assert_eq!(requests[0]["messages"][0]["role"], "user");
+    assert_eq!(
+        requests[0]["messages"][0]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert_eq!(requests[1]["messages"][1]["role"], "assistant");
+    assert_eq!(requests[1]["messages"][1]["content"][1]["type"], "tool_use");
+    assert_eq!(requests[1]["messages"][2]["role"], "user");
+    assert_eq!(
+        requests[1]["messages"][2]["content"][0]["type"],
+        "tool_result"
+    );
+    assert_eq!(
+        extract_assistant_text(&report.messages),
+        "42",
+        "requests={requests:?} messages={:?}",
+        report.messages
+    );
+    Ok(())
+}
+
+#[test]
 fn run_session_state_aggregates_usage_across_tool_roundtrips() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let server = TestServer::start();

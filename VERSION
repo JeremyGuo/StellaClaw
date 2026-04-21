@@ -1,5 +1,16 @@
-version: 0.25.0
+version: 0.26.0
 ---
+
+# 0.26.0
+
+- 新增 `claude-code` 模型类型：
+  AgentHost 最新 config schema 现在支持 `models.<alias>.type = "claude-code"`，用于 Anthropic Messages 兼容上游；默认 endpoint/path 会落到 `https://api.anthropic.com/v1` 与 `/messages`，TUI config editor 也已补齐新 provider 选项与默认值。
+- 新增 Claude Messages provider 与显式 block-level prompt cache 适配：
+  AgentFrame 现在会把 `claude-code` 请求组装成 Claude Messages payload，使用 `x-api-key` 认证，并把自动 Anthropic prompt cache 语义转成最后一个可缓存内容块上的显式 `cache_control`，兼容需要 block-level cache marker 的 NewAPI/Claude 兼容网关；tool use / tool result 往返也已接通。
+- 新增本地 Telegram 部署配置：
+  当前运行中的 Telegram 配置已拆分到 `deploy_telegram_local.json`，对应 workdir 改为 `deploy_telegram_local/`，便于保留本地运行态同时把仓库里的 `deploy_telegram.json` 继续作为通用模板维护。
+- 本次影响 `config` schema，不影响 `workdir` schema：
+  新增 `0.26` config loader，并按配置变更策略将仓库版本从 `0.25.0` 提升到 `0.26.0`。
 
 # 0.25.0
 

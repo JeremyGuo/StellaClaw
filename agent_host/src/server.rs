@@ -2470,7 +2470,7 @@ impl Server {
         if !force_retry {
             let lead_time = Duration::from_secs(30);
             let now = Utc::now();
-            let Some(ttl) = openrouter_automatic_cache_ttl(&model) else {
+            let Some(ttl) = automatic_anthropic_cache_ttl(&model) else {
                 return Ok(false);
             };
             let ttl = parse_duration(&ttl)
@@ -3508,7 +3508,8 @@ mod tests {
     use super::{
         AgentCommand, AgentPromptKind, ConversationPricingBreakdown, ConversationUsageReport,
         ImageGenerationRouting, IncomingCommandLane, ModelPricing, RuntimeContext, Server,
-        SummaryTracker, TokenUsage, background_timeout_with_active_children_text,
+        SummaryTracker, TokenUsage, automatic_anthropic_cache_control,
+        automatic_anthropic_cache_ttl, background_timeout_with_active_children_text,
         build_synthetic_runtime_messages, build_user_turn_message, channel_restart_backoff_seconds,
         coalesce_buffered_conversation_messages, collect_conversation_usage_report,
         collect_conversation_usage_window, conversation_memory_root,
@@ -3516,8 +3517,7 @@ mod tests {
         fast_path_agent_selection_message, format_session_status, idle_compaction_token_limit,
         incoming_command_lane, infer_single_agent_backend, is_command_like_text,
         is_out_of_band_command, is_timeout_like, leading_system_prompt, memory_search_files,
-        normalize_messages_for_persistence, openrouter_automatic_cache_control,
-        openrouter_automatic_cache_ttl, parse_agent_command, parse_model_command,
+        normalize_messages_for_persistence, parse_agent_command, parse_model_command,
         parse_mount_command, parse_sandbox_command, parse_set_api_timeout_command,
         parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
         parse_think_command, persist_compaction_artifacts, prepare_system_prompt_for_turn,
@@ -6071,10 +6071,15 @@ mod tests {
         );
     }
 
-    fn openrouter_test_model(model: &str, cache_ttl: Option<&str>) -> ModelConfig {
+    fn anthropic_cache_test_model(
+        model_type: crate::config::ModelType,
+        api_endpoint: &str,
+        model: &str,
+        cache_ttl: Option<&str>,
+    ) -> ModelConfig {
         ModelConfig {
-            model_type: crate::config::ModelType::Openrouter,
-            api_endpoint: "https://openrouter.ai/api/v1".to_string(),
+            model_type,
+            api_endpoint: api_endpoint.to_string(),
             model: model.to_string(),
             backend: AgentBackendKind::AgentFrame,
             supports_vision_input: true,
@@ -6101,44 +6106,73 @@ mod tests {
 
     #[test]
     fn openrouter_claude_defaults_to_five_minute_automatic_cache() {
-        let model = openrouter_test_model("anthropic/claude-opus-4.6", None);
-        let cache_control = openrouter_automatic_cache_control(&model).unwrap();
-
-        assert_eq!(
-            openrouter_automatic_cache_ttl(&model).as_deref(),
-            Some("5m")
+        let model = anthropic_cache_test_model(
+            crate::config::ModelType::Openrouter,
+            "https://openrouter.ai/api/v1",
+            "anthropic/claude-opus-4.6",
+            None,
         );
+        let cache_control = automatic_anthropic_cache_control(&model).unwrap();
+
+        assert_eq!(automatic_anthropic_cache_ttl(&model).as_deref(), Some("5m"));
         assert_eq!(cache_control.cache_type, "ephemeral");
         assert_eq!(cache_control.ttl.as_deref(), Some("5m"));
     }
 
     #[test]
     fn openrouter_responses_claude_defaults_to_five_minute_automatic_cache() {
-        let mut model = openrouter_test_model("anthropic/claude-opus-4.6", None);
+        let mut model = anthropic_cache_test_model(
+            crate::config::ModelType::Openrouter,
+            "https://openrouter.ai/api/v1",
+            "anthropic/claude-opus-4.6",
+            None,
+        );
         model.model_type = crate::config::ModelType::OpenrouterResp;
         model.chat_completions_path = "/responses".to_string();
 
-        let cache_control = openrouter_automatic_cache_control(&model).unwrap();
+        let cache_control = automatic_anthropic_cache_control(&model).unwrap();
 
-        assert_eq!(
-            openrouter_automatic_cache_ttl(&model).as_deref(),
-            Some("5m")
-        );
+        assert_eq!(automatic_anthropic_cache_ttl(&model).as_deref(), Some("5m"));
         assert_eq!(cache_control.cache_type, "ephemeral");
         assert_eq!(cache_control.ttl.as_deref(), Some("5m"));
     }
 
     #[test]
-    fn openrouter_non_claude_does_not_get_anthropic_cache_control() {
-        let model = openrouter_test_model("z-ai/glm-5.1", None);
+    fn claude_code_defaults_to_five_minute_automatic_cache() {
+        let model = anthropic_cache_test_model(
+            crate::config::ModelType::ClaudeCode,
+            "https://api.anthropic.com/v1",
+            "claude-opus-4-6",
+            None,
+        );
+        let cache_control = automatic_anthropic_cache_control(&model).unwrap();
 
-        assert!(openrouter_automatic_cache_ttl(&model).is_none());
-        assert!(openrouter_automatic_cache_control(&model).is_none());
+        assert_eq!(automatic_anthropic_cache_ttl(&model).as_deref(), Some("5m"));
+        assert_eq!(cache_control.cache_type, "ephemeral");
+        assert_eq!(cache_control.ttl.as_deref(), Some("5m"));
+    }
+
+    #[test]
+    fn non_claude_models_do_not_get_anthropic_cache_control() {
+        let model = anthropic_cache_test_model(
+            crate::config::ModelType::Openrouter,
+            "https://openrouter.ai/api/v1",
+            "z-ai/glm-5.1",
+            None,
+        );
+
+        assert!(automatic_anthropic_cache_ttl(&model).is_none());
+        assert!(automatic_anthropic_cache_control(&model).is_none());
     }
 
     #[test]
     fn estimates_openrouter_opus_cost_with_cache_formula() {
-        let model = openrouter_test_model("anthropic/claude-opus-4.6", Some("5m"));
+        let model = anthropic_cache_test_model(
+            crate::config::ModelType::Openrouter,
+            "https://openrouter.ai/api/v1",
+            "anthropic/claude-opus-4.6",
+            Some("5m"),
+        );
         let usage = TokenUsage {
             llm_calls: 1,
             prompt_tokens: 10_000,
@@ -6158,7 +6192,12 @@ mod tests {
 
     #[test]
     fn estimates_compaction_savings_from_token_delta_and_compaction_cost() {
-        let model = openrouter_test_model("anthropic/claude-sonnet-4.6", Some("5m"));
+        let model = anthropic_cache_test_model(
+            crate::config::ModelType::Openrouter,
+            "https://openrouter.ai/api/v1",
+            "anthropic/claude-sonnet-4.6",
+            Some("5m"),
+        );
         let compaction = SessionCompactionStats {
             run_count: 2,
             compacted_run_count: 2,

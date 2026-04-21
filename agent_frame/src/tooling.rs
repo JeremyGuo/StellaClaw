@@ -155,6 +155,22 @@ impl Tool {
         })
     }
 
+    pub fn as_claude_tool(&self) -> Value {
+        let execution_guidance = match self.execution_mode {
+            ToolExecutionMode::Immediate => {
+                "Execution mode: immediate. This tool returns promptly and does not use a top-level timeout parameter."
+            }
+            ToolExecutionMode::Interruptible => {
+                "Execution mode: interruptible. This tool may wait, but the runtime can interrupt it when a newer user message arrives or the turn hits its timeout observation boundary."
+            }
+        };
+        json!({
+            "name": self.name,
+            "description": format!("{} {}", execution_guidance, self.description),
+            "input_schema": self.parameters,
+        })
+    }
+
     pub fn invoke(&self, arguments: Value) -> Result<Value> {
         (self.handler)(arguments)
     }

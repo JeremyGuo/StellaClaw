@@ -2,9 +2,11 @@ use super::{
     AgentConfig, ChannelConfig, ConfigLoader, LATEST_CONFIG_VERSION, MainAgentConfig,
     ModelCapability, ModelCatalogConfig, ModelConfig, ModelType, SandboxConfig, ServerConfig,
     ToolingConfig, VERSION_0_14, build_server_config, default_agent_model_enabled,
-    default_api_key_env, default_chat_completions_path, default_codex_subscription_endpoint,
-    default_context_window_tokens, default_cron_poll_interval_seconds,
-    default_max_global_sub_agents, default_model_timeout_seconds, default_responses_path,
+    default_anthropic_api_key_env, default_api_key_env, default_chat_completions_path,
+    default_claude_messages_endpoint, default_claude_messages_path,
+    default_codex_subscription_endpoint, default_context_window_tokens,
+    default_cron_poll_interval_seconds, default_max_global_sub_agents,
+    default_model_timeout_seconds, default_responses_path,
 };
 use crate::backend::AgentBackendKind;
 use agent_frame::config::{
@@ -55,7 +57,7 @@ struct VersionedModelConfigRaw {
     pub web_search: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
-    #[serde(default = "default_api_key_env")]
+    #[serde(default)]
     pub api_key_env: String,
     #[serde(default)]
     pub chat_completions_path: Option<String>,
@@ -133,12 +135,22 @@ fn upgrade_versioned_model(raw: VersionedModelConfigRaw) -> ModelConfig {
             "https://openrouter.ai/api/v1".to_string()
         }
         ModelType::CodexSubscription => default_codex_subscription_endpoint(),
+        ModelType::ClaudeCode => default_claude_messages_endpoint(),
     });
+    let api_key_env = if raw.api_key_env.trim().is_empty() {
+        match raw.model_type {
+            ModelType::ClaudeCode => default_anthropic_api_key_env(),
+            _ => default_api_key_env(),
+        }
+    } else {
+        raw.api_key_env
+    };
     let chat_completions_path = raw
         .chat_completions_path
         .unwrap_or_else(|| match raw.model_type {
             ModelType::Openrouter => default_chat_completions_path(),
             ModelType::OpenrouterResp | ModelType::CodexSubscription => default_responses_path(),
+            ModelType::ClaudeCode => default_claude_messages_path(),
         });
 
     ModelConfig {
@@ -150,7 +162,7 @@ fn upgrade_versioned_model(raw: VersionedModelConfigRaw) -> ModelConfig {
         image_tool_model: raw.image_tool_model,
         web_search_model: raw.web_search,
         api_key: raw.api_key,
-        api_key_env: raw.api_key_env,
+        api_key_env,
         chat_completions_path,
         codex_home: raw.codex_home,
         auth_credentials_store_mode: raw.auth_credentials_store_mode,

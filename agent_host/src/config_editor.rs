@@ -1427,6 +1427,7 @@ impl ConfigEditorApp {
                             options: vec![
                                 "openrouter".to_string(),
                                 "openrouter-resp".to_string(),
+                                "claude-code".to_string(),
                                 "codex-subscription".to_string(),
                             ],
                             selected: model_type_index(&model_type),
@@ -1820,7 +1821,12 @@ impl ConfigEditorApp {
                 self.set_main_agent_value(MainAgentField::MemorySystem, value)
             }
             SelectTarget::ModelForm(ModelFormField::ModelType) => {
-                let types = ["openrouter", "openrouter-resp", "codex-subscription"];
+                let types = [
+                    "openrouter",
+                    "openrouter-resp",
+                    "claude-code",
+                    "codex-subscription",
+                ];
                 let value = types
                     .get(selected)
                     .ok_or_else(|| anyhow!("invalid model type selection"))?;
@@ -2726,7 +2732,12 @@ struct ModelTypeWizardState {
 }
 
 impl ModelTypeWizardState {
-    const OPTIONS: [&str; 3] = ["openrouter", "openrouter-resp", "codex-subscription"];
+    const OPTIONS: [&str; 4] = [
+        "openrouter",
+        "openrouter-resp",
+        "claude-code",
+        "codex-subscription",
+    ];
 
     fn selected_type(&self) -> &'static str {
         Self::OPTIONS
@@ -3158,7 +3169,9 @@ impl ModelFormField {
     fn help(self) -> &'static str {
         match self {
             Self::Alias => "Unique key under models",
-            Self::ModelType => "Select openrouter, openrouter-resp, or codex-subscription",
+            Self::ModelType => {
+                "Select openrouter, openrouter-resp, claude-code, or codex-subscription"
+            }
             Self::ModelName => "Upstream model name",
             Self::ApiEndpoint => "Base upstream endpoint URL",
             Self::ApiKeyEnv => "Environment variable name for API auth",
@@ -4153,6 +4166,17 @@ fn default_model_type_profile(model_type: &str) -> ModelTypeProfile {
             supports_vision_input: true,
             agent_model_enabled: true,
         },
+        "claude-code" => ModelTypeProfile {
+            model_type: "claude-code",
+            api_endpoint: "https://api.anthropic.com/v1",
+            api_key_env: "ANTHROPIC_API_KEY",
+            chat_completions_path: "/messages",
+            codex_home: "",
+            auth_credentials_store_mode: "",
+            capabilities: "chat",
+            supports_vision_input: true,
+            agent_model_enabled: true,
+        },
         "codex-subscription" => ModelTypeProfile {
             model_type: "codex-subscription",
             api_endpoint: "https://chatgpt.com/backend-api/codex",
@@ -4190,6 +4214,18 @@ fn model_type_wizard_text(model_type: &str) -> String {
             "  api_endpoint: https://openrouter.ai/api/v1",
             "  chat_completions_path: /responses",
             "  api_key_env: OPENROUTER_API_KEY",
+        ]
+        .join("\n"),
+        "claude-code" => [
+            "Claude Messages",
+            "",
+            "Use this for Anthropic Messages compatible endpoints, including NewAPI Claude routes.",
+            "The adapter sends x-api-key auth and a Claude /messages payload.",
+            "",
+            "Defaults",
+            "  api_endpoint: https://api.anthropic.com/v1",
+            "  chat_completions_path: /messages",
+            "  api_key_env: ANTHROPIC_API_KEY",
         ]
         .join("\n"),
         "codex-subscription" => [
@@ -4291,7 +4327,7 @@ fn model_field_guide_text(form: &ModelFormState, field: ModelFormField) -> Strin
         ModelFormField::ModelType => (
             "Pick the upstream adapter shape for this model.",
             form.model_type.as_str(),
-            "OpenRouter uses /chat/completions, Responses models use /responses, and Codex subscription uses the ChatGPT backend.",
+            "OpenRouter uses /chat/completions, Claude Messages uses /messages, Responses models use /responses, and Codex subscription uses the ChatGPT backend.",
         ),
         ModelFormField::ModelName => (
             "The real upstream model identifier sent to the provider.",
@@ -4301,7 +4337,7 @@ fn model_field_guide_text(form: &ModelFormState, field: ModelFormField) -> Strin
         ModelFormField::ApiEndpoint => (
             "The base URL of the provider endpoint.",
             "https://openrouter.ai/api/v1",
-            "Do not include the final /chat/completions or /responses path here.",
+            "Do not include the final /chat/completions, /messages, or /responses path here.",
         ),
         ModelFormField::ApiKeyEnv => (
             "The env var name that stores the API key.",
@@ -4310,8 +4346,8 @@ fn model_field_guide_text(form: &ModelFormState, field: ModelFormField) -> Strin
         ),
         ModelFormField::ChatCompletionsPath => (
             "The request path appended to api_endpoint.",
-            "/chat/completions or /responses",
-            "Match this to the provider adapter. ZGent models require the default chat completions path.",
+            "/chat/completions, /messages, or /responses",
+            "Match this to the provider adapter.",
         ),
         ModelFormField::CodexHome => (
             "The Codex home directory used by subscription-backed models.",
@@ -4774,7 +4810,8 @@ fn model_type_index(model_type: &str) -> usize {
     match model_type {
         "openrouter" => 0,
         "openrouter-resp" => 1,
-        "codex-subscription" => 2,
+        "claude-code" => 2,
+        "codex-subscription" => 3,
         _ => 0,
     }
 }
