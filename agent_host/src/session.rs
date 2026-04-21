@@ -295,7 +295,6 @@ pub(crate) struct SessionTurnTimeHintConfig {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SessionTurnTimeHints {
-    pub(crate) user_time_tip: Option<String>,
     pub(crate) system_date: Option<String>,
 }
 
@@ -697,10 +696,6 @@ impl SessionActor {
         now: DateTime<Utc>,
     ) -> SessionTurnTimeHints {
         SessionTurnTimeHints {
-            user_time_tip: config
-                .emit_idle_time_gap_hint
-                .then(|| render_last_user_message_time_tip(&self.session, now))
-                .flatten(),
             system_date: config
                 .emit_system_date_on_user_message
                 .then(|| render_system_date_on_user_message(now)),
@@ -1880,21 +1875,6 @@ fn session_runtime_phase_for_event(event: &SessionEvent) -> Option<SessionRuntim
         | SessionEvent::PrefixRewriteApplied { .. }
         | SessionEvent::SessionCompleted { .. } => Some(SessionRuntimePhase::Running),
     }
-}
-
-fn render_last_user_message_time_tip(session: &Session, now: DateTime<Utc>) -> Option<String> {
-    let last_user_message_at = session.last_user_message_at?;
-    let last_agent_returned_at = session.last_agent_returned_at?;
-    let idle_seconds = (now - last_agent_returned_at).num_seconds().max(0);
-    if idle_seconds < 5 * 60 {
-        return None;
-    }
-    let elapsed_seconds = (now - last_user_message_at).num_seconds().max(0);
-    let elapsed_hours = elapsed_seconds as f64 / 3600.0;
-    Some(format!(
-        "[System Tip: {:.1} hours since the last user message.]",
-        elapsed_hours
-    ))
 }
 
 fn render_system_date_on_user_message(now: DateTime<Utc>) -> String {

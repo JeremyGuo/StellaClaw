@@ -645,19 +645,18 @@ async fn handle_ws_client_text(
             seq_start,
             seq_end,
         } => {
-            let conversation_key = match normalize_or_default_conversation_key(
-                conversation_key.as_deref(),
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    let event = WebSocketEvent::TranscriptError {
-                        request_id,
-                        conversation_key: conversation_key.map(|value| value.to_string()),
-                        message: format!("{error:#}"),
-                    };
-                    return send_ws_event(socket, &event).await;
-                }
-            };
+            let conversation_key =
+                match normalize_or_default_conversation_key(conversation_key.as_deref()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let event = WebSocketEvent::TranscriptError {
+                            request_id,
+                            conversation_key: conversation_key.map(|value| value.to_string()),
+                            message: format!("{error:#}"),
+                        };
+                        return send_ws_event(socket, &event).await;
+                    }
+                };
             let address = web_channel_address(state, &conversation_key);
             let event = match host_for_state(state) {
                 Ok(host) => match host
@@ -814,7 +813,8 @@ fn normalize_conversation_key(value: &str) -> Result<String> {
     if trimmed.is_empty() {
         anyhow::bail!("conversation_key is empty");
     }
-    validate_conversation_id(trimmed).map_err(|error| anyhow::anyhow!("invalid conversation_key: {error}"))?;
+    validate_conversation_id(trimmed)
+        .map_err(|error| anyhow::anyhow!("invalid conversation_key: {error}"))?;
     Ok(trimmed.to_string())
 }
 
@@ -1174,7 +1174,10 @@ mod tests {
     #[test]
     fn normalize_conversation_key_rejects_special_characters() {
         for value in ["..", ".", "web/default", "web default", "abc@def"] {
-            assert!(normalize_conversation_key(value).is_err(), "{value} should be rejected");
+            assert!(
+                normalize_conversation_key(value).is_err(),
+                "{value} should be rejected"
+            );
         }
         assert_eq!(
             normalize_conversation_key("web-default_123").unwrap(),

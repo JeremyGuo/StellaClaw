@@ -1547,8 +1547,8 @@ pub fn resolve_model_api_keys(config: &ServerConfig) -> Vec<ResolvedModelApiKey>
 mod tests {
     use super::{
         ChannelConfig, LATEST_CONFIG_VERSION, MainAgentConfig, ModelType, SandboxMode,
-        default_dingtalk_commands, expand_home_path,
-        load_server_config_file, load_server_config_file_and_upgrade, resolve_model_api_keys,
+        default_dingtalk_commands, expand_home_path, load_server_config_file,
+        load_server_config_file_and_upgrade, resolve_model_api_keys,
     };
     use crate::backend::AgentBackendKind;
     use agent_frame::config::{
@@ -1983,12 +1983,9 @@ mod tests {
                 .unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()));
 
             assert!(
-                value["main_agent"]
-                    .as_object()
-                    .is_some_and(|main_agent| {
-                        !main_agent.contains_key("model")
-                            && !main_agent.contains_key("timeout_seconds")
-                    }),
+                value["main_agent"].as_object().is_some_and(|main_agent| {
+                    !main_agent.contains_key("model") && !main_agent.contains_key("timeout_seconds")
+                }),
                 "{} should not emit legacy main_agent fields",
                 path.display()
             );
@@ -1998,7 +1995,8 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} has no models object", path.display()));
             for (alias, model) in models {
                 assert!(
-                    model.as_object()
+                    model
+                        .as_object()
                         .is_some_and(|object| !object.contains_key("external_web_search")),
                     "{} model '{}' should not emit external_web_search",
                     path.display(),
@@ -2079,7 +2077,10 @@ mod tests {
         .unwrap();
 
         let config = load_server_config_file(&config_path).unwrap();
-        assert_eq!(config.main_agent.language, super::default_main_agent_language());
+        assert_eq!(
+            config.main_agent.language,
+            super::default_main_agent_language()
+        );
         assert_eq!(
             config.main_agent.max_tool_roundtrips,
             super::default_max_tool_roundtrips()

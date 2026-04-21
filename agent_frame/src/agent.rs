@@ -1354,7 +1354,7 @@ fn append_plan_update_reminder_if_due(messages: &mut Vec<ChatMessage>) -> bool {
     let Some(plan_reminder) = plan_update_reminder(messages) else {
         return false;
     };
-    messages.push(ChatMessage::text("system", plan_reminder));
+    messages.push(ChatMessage::text("user", plan_reminder));
     true
 }
 
@@ -1398,7 +1398,7 @@ fn plan_update_reminder(messages: &[ChatMessage]) -> Option<String> {
         .iter()
         .skip(last_tool_batch_index + 1)
         .any(|message| {
-            message.role == "system"
+            message.role == "user"
                 && message.content.as_ref().and_then(Value::as_str) == Some(PLAN_UPDATE_REMINDER)
         });
     if reminder_already_added {
@@ -1546,6 +1546,10 @@ mod tests {
             Some(PLAN_UPDATE_REMINDER)
         );
         assert!(append_plan_update_reminder_if_due(&mut messages));
+        assert_eq!(
+            messages.last().map(|message| message.role.as_str()),
+            Some("user")
+        );
         assert_eq!(
             messages.last().and_then(|message| message.content.as_ref()),
             Some(&Value::String(PLAN_UPDATE_REMINDER.to_string()))

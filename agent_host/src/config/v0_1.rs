@@ -6,7 +6,9 @@ use super::{
     default_max_global_sub_agents, default_model_timeout_seconds,
 };
 use crate::backend::AgentBackendKind;
-use agent_frame::config::{AuthCredentialsStoreMode, ExternalWebSearchConfig, NativeWebSearchConfig, ReasoningConfig};
+use agent_frame::config::{
+    AuthCredentialsStoreMode, ExternalWebSearchConfig, NativeWebSearchConfig, ReasoningConfig,
+};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Map, Value};

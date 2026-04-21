@@ -322,57 +322,24 @@ pub(super) fn build_user_turn_message(
     })
 }
 
-pub(super) fn build_synthetic_system_messages(
-    process_restart_notice: Option<&str>,
-    user_time_tip: Option<&str>,
+pub(super) fn build_synthetic_runtime_messages(
     prompt_updates_prefix: Option<&str>,
     skill_updates_prefix: Option<&str>,
 ) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
-    if let Some(process_restart_notice) = process_restart_notice
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        messages.push(ChatMessage::text("system", process_restart_notice));
-    }
-    if let Some(user_time_tip) = user_time_tip
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        messages.push(ChatMessage::text("system", user_time_tip));
-    }
     if let Some(prompt_updates_prefix) = prompt_updates_prefix
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        messages.push(ChatMessage::text("system", prompt_updates_prefix));
+        messages.push(ChatMessage::text("user", prompt_updates_prefix));
     }
     if let Some(skill_updates_prefix) = skill_updates_prefix
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        messages.push(ChatMessage::text("system", skill_updates_prefix));
+        messages.push(ChatMessage::text("user", skill_updates_prefix));
     }
     messages
-}
-
-#[cfg(test)]
-pub(super) fn render_last_user_message_time_tip(
-    session: &SessionSnapshot,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Option<String> {
-    let last_user_message_at = session.last_user_message_at?;
-    let last_agent_returned_at = session.last_agent_returned_at?;
-    let idle_seconds = (now - last_agent_returned_at).num_seconds().max(0);
-    if idle_seconds < 5 * 60 {
-        return None;
-    }
-    let elapsed_seconds = (now - last_user_message_at).num_seconds().max(0);
-    let elapsed_hours = elapsed_seconds as f64 / 3600.0;
-    Some(format!(
-        "[System Tip: {:.1} hours since the last user message.]",
-        elapsed_hours
-    ))
 }
 
 #[cfg(test)]

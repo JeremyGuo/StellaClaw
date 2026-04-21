@@ -32,9 +32,7 @@ pub fn validate_conversation_id(conversation_id: &str) -> Result<()> {
         .chars()
         .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
     {
-        anyhow::bail!(
-            "conversation_id must contain only ASCII letters, digits, '_' or '-'"
-        );
+        anyhow::bail!("conversation_id must contain only ASCII letters, digits, '_' or '-'");
     }
     Ok(())
 }
@@ -114,7 +112,10 @@ mod tests {
     #[test]
     fn rejects_special_character_conversation_ids() {
         for value in ["..", ".", "abc/def", "abc def", "abc@def", "中文"] {
-            assert!(validate_conversation_id(value).is_err(), "{value} should be rejected");
+            assert!(
+                validate_conversation_id(value).is_err(),
+                "{value} should be rejected"
+            );
         }
     }
 }

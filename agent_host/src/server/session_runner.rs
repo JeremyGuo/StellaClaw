@@ -146,9 +146,8 @@ impl<'a> TurnCoordinator<'a> {
                 server.build_foreground_prompt_state(&session, &effective_model_key)?;
             let prompt_observation =
                 session_actor.observe_system_prompt_state(prompt_state.static_hash.clone())?;
-            let synthetic_system_messages = build_synthetic_system_messages(
-                server.take_process_restart_notice(&incoming.address),
-                time_hints.user_time_tip.as_deref(),
+            server.clear_process_restart_notice(&incoming.address);
+            let synthetic_runtime_messages = build_synthetic_runtime_messages(
                 prompt_updates_prefix.as_deref(),
                 skill_updates_prefix.as_deref(),
             );
@@ -159,7 +158,7 @@ impl<'a> TurnCoordinator<'a> {
                     &prompt_state.system_prompt,
                     prompt_observation.static_changed,
                 );
-            previous_messages.extend(synthetic_system_messages.iter().cloned());
+            previous_messages.extend(synthetic_runtime_messages.iter().cloned());
             if rebuilt_system_prompt {
                 server.mark_conversation_context_changed(&incoming.address)?;
                 session_actor.mark_system_prompt_state_current(prompt_state.static_hash.clone())?;
@@ -171,7 +170,7 @@ impl<'a> TurnCoordinator<'a> {
             };
             let mut active_session = session;
             let mut next_previous_messages = previous_messages;
-            // Runtime system notices are durable once sent; do not strip them at commit.
+            // Runtime notices are durable once sent; do not strip them at commit.
             let mut ephemeral_system_messages = Vec::new();
 
             channel
@@ -347,9 +346,8 @@ impl Server {
             let actor = self.ensure_foreground_actor(&address)?;
             let prompt_observation =
                 actor.observe_system_prompt_state(prompt_state.static_hash.clone())?;
-            let synthetic_system_messages = build_synthetic_system_messages(
-                self.take_process_restart_notice(&address),
-                None,
+            self.clear_process_restart_notice(&address);
+            let synthetic_runtime_messages = build_synthetic_runtime_messages(
                 prompt_updates_prefix.as_deref(),
                 skill_updates_prefix.as_deref(),
             );
@@ -360,7 +358,7 @@ impl Server {
                     &prompt_state.system_prompt,
                     prompt_observation.static_changed,
             );
-            next_previous_messages.extend(synthetic_system_messages.iter().cloned());
+            next_previous_messages.extend(synthetic_runtime_messages.iter().cloned());
             if rebuilt_system_prompt {
                 self.mark_conversation_context_changed(&address)?;
                 actor.mark_system_prompt_state_current(prompt_state.static_hash.clone())?;
@@ -370,7 +368,7 @@ impl Server {
                 full: prompt_state.system_prompt.clone(),
                 static_hash: prompt_state.static_hash.clone(),
             };
-            // Runtime system notices are durable once sent; do not strip them at commit.
+            // Runtime notices are durable once sent; do not strip them at commit.
             let mut ephemeral_system_messages = Vec::new();
 
             channel
@@ -536,19 +534,18 @@ impl Server {
         )
     }
 
-    fn take_process_restart_notice(&self, address: &ChannelAddress) -> Option<&'static str> {
+    fn clear_process_restart_notice(&self, address: &ChannelAddress) {
         let session_key = address.session_key();
-        let mut pending = self.pending_process_restart_notices.lock().ok()?;
+        let Some(mut pending) = self.pending_process_restart_notices.lock().ok() else {
+            return;
+        };
         if pending.remove(&session_key) {
             info!(
                 log_stream = "session",
                 log_key = %session_key,
-                kind = "process_restart_notice_emitted",
-                "emitted one-shot process restart notice for foreground session"
+                kind = "process_restart_notice_cleared",
+                "cleared one-shot process restart notice without injecting a model message"
             );
-            Some(SYSTEM_RESTART_NOTICE)
-        } else {
-            None
         }
     }
 
@@ -630,14 +627,8 @@ impl Server {
                 full: persistence_system_prompt.system_prompt.clone(),
                 static_hash: persistence_system_prompt.static_hash.clone(),
             };
-            let synthetic_system_messages = build_synthetic_system_messages(
-                self.take_process_restart_notice(&incoming.address),
-                None,
-                None,
-                None,
-            );
-            next_previous_messages.extend(synthetic_system_messages.iter().cloned());
-            // Runtime system notices are durable once sent; do not strip them at commit.
+            self.clear_process_restart_notice(&incoming.address);
+            // Runtime notices are durable once sent; do not strip them at commit.
             let mut ephemeral_system_messages = Vec::new();
             let outcome = self
                 .run_main_session_turn_until_settled(

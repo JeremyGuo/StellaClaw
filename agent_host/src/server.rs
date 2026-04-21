@@ -124,8 +124,6 @@ const ATTACHMENT_OPEN_TAG: &str = "<attachment>";
 const ATTACHMENT_CLOSE_TAG: &str = "</attachment>";
 const CHANNEL_RESTART_MAX_BACKOFF_SECONDS: u64 = 30;
 const CONVERSATION_CLEANUP_POLL_SECONDS: u64 = 300;
-const SYSTEM_RESTART_NOTICE: &str =
-    "[System Restarted: All previous long run execution tools and DSL jobs with IDs are all ended]";
 
 #[derive(Clone, Debug)]
 struct BackgroundJobRequest {
@@ -3509,10 +3507,9 @@ fn spawn_channel_supervisor(channel: Arc<dyn Channel>, sender: mpsc::Sender<Inco
 mod tests {
     use super::{
         AgentCommand, AgentPromptKind, ConversationPricingBreakdown, ConversationUsageReport,
-        ImageGenerationRouting, IncomingCommandLane, ModelPricing, RuntimeContext,
-        SYSTEM_RESTART_NOTICE, Server, SummaryTracker, TokenUsage,
-        background_timeout_with_active_children_text, build_synthetic_system_messages,
-        build_user_turn_message, channel_restart_backoff_seconds,
+        ImageGenerationRouting, IncomingCommandLane, ModelPricing, RuntimeContext, Server,
+        SummaryTracker, TokenUsage, background_timeout_with_active_children_text,
+        build_synthetic_runtime_messages, build_user_turn_message, channel_restart_backoff_seconds,
         coalesce_buffered_conversation_messages, collect_conversation_usage_report,
         collect_conversation_usage_window, conversation_memory_root,
         estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
@@ -3525,10 +3522,9 @@ mod tests {
         parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
         parse_think_command, persist_compaction_artifacts, prepare_system_prompt_for_turn,
         price_conversation_usage_report, rebuild_canonical_system_prompt,
-        render_last_user_message_time_tip, render_prompt_component_change_notices,
-        render_system_date_on_user_message, rollout_read_file, rollout_search_files,
-        sanitize_messages_for_model_capabilities, select_image_generation_routing,
-        send_outgoing_message_now, session_errno_for_turn_error,
+        render_prompt_component_change_notices, render_system_date_on_user_message,
+        rollout_read_file, rollout_search_files, sanitize_messages_for_model_capabilities,
+        select_image_generation_routing, send_outgoing_message_now, session_errno_for_turn_error,
         should_attempt_idle_context_compaction, summarize_resume_progress,
         sync_workspace_shared_profile_files, upload_workspace_shared_profile_files,
         user_facing_continue_error_text, workspace_visible_in_list,
@@ -4611,15 +4607,13 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_skill_updates_are_system_messages_not_user_prefixes() {
-        let injected = build_synthetic_system_messages(
-            None,
-            None,
+    fn synthetic_skill_updates_are_user_messages_not_system_prefixes() {
+        let injected = build_synthetic_runtime_messages(
             None,
             Some("[Runtime Skill Updates]\nSkill \"search\" updated to version 3."),
         );
         assert_eq!(injected.len(), 1);
-        assert_eq!(injected[0].role, "system");
+        assert_eq!(injected[0].role, "user");
         assert_eq!(
             injected[0].content.as_ref().and_then(Value::as_str),
             Some("[Runtime Skill Updates]\nSkill \"search\" updated to version 3.")
@@ -4629,25 +4623,15 @@ mod tests {
         previous.extend(injected);
         previous.push(ChatMessage::text("user", "继续"));
         assert_eq!(previous.len(), 3);
-        assert_eq!(previous[1].role, "system");
+        assert_eq!(previous[1].role, "user");
         assert_eq!(previous[2].role, "user");
     }
 
     #[test]
-    fn synthetic_process_restart_notice_is_first_system_message() {
-        let injected = build_synthetic_system_messages(
-            Some(SYSTEM_RESTART_NOTICE),
-            Some("[System Tip: 2.0 hours since the last user message.]"),
-            None,
-            None,
-        );
+    fn synthetic_runtime_messages_skip_restart_and_idle_time_notices() {
+        let injected = build_synthetic_runtime_messages(None, None);
 
-        assert_eq!(injected.len(), 2);
-        assert_eq!(
-            injected[0].content.as_ref().and_then(Value::as_str),
-            Some(SYSTEM_RESTART_NOTICE)
-        );
-        assert_eq!(injected[1].role, "system");
+        assert!(injected.is_empty());
     }
 
     #[test]
@@ -4687,9 +4671,7 @@ mod tests {
 
     #[test]
     fn previous_messages_builder_rewrites_only_canonical_prefix() {
-        let injected = build_synthetic_system_messages(
-            None,
-            None,
+        let injected = build_synthetic_runtime_messages(
             None,
             Some("[Runtime Skill Updates]\nSkill \"search\" updated to version 3."),
         );
@@ -4712,7 +4694,7 @@ mod tests {
             previous[1].content.as_ref().and_then(Value::as_str),
             Some("existing context")
         );
-        assert_eq!(previous[2].role, "system");
+        assert_eq!(previous[2].role, "user");
         assert_eq!(previous[3].role, "user");
     }
 
@@ -4731,7 +4713,7 @@ mod tests {
                 "[System Message: USER.md changed. It stores user info. If you need refreshed user info in this run, use file_read on ./USER.md.]",
             ),
             ChatMessage::text("assistant", "summary"),
-            ChatMessage::text("system", "[Active Runtime Tasks]\nsession_id=123"),
+            ChatMessage::text("user", "[Active Runtime Tasks]\nsession_id=123"),
             ChatMessage::text("user", "继续"),
         ];
 
@@ -4740,31 +4722,28 @@ mod tests {
         assert_eq!(normalized[1], ChatMessage::text("assistant", "summary"));
         assert_eq!(
             normalized[2],
-            ChatMessage::text("system", "[Active Runtime Tasks]\nsession_id=123")
+            ChatMessage::text("user", "[Active Runtime Tasks]\nsession_id=123")
         );
         assert_eq!(normalized[3], ChatMessage::text("user", "继续"));
         assert_eq!(normalized.len(), 4);
     }
 
     #[test]
-    fn normalize_messages_for_persistence_preserves_runtime_system_notices() {
+    fn normalize_messages_for_persistence_preserves_runtime_user_notices() {
         let canonical = "[AgentHost Main Foreground Agent]\ncanonical prompt";
-        let restart_notice = SYSTEM_RESTART_NOTICE;
         let runtime_notice = "[Runtime Skill Updates]\nSkill \"search\" updated to version 3.";
         let messages = vec![
             ChatMessage::text("system", "[AgentFrame Runtime]\nold prompt"),
             ChatMessage::text("assistant", "existing context"),
-            ChatMessage::text("system", restart_notice),
-            ChatMessage::text("system", runtime_notice),
+            ChatMessage::text("user", runtime_notice),
             ChatMessage::text("user", "继续"),
         ];
 
         let normalized = normalize_messages_for_persistence(messages, canonical, &[]);
 
         assert_eq!(normalized[0], ChatMessage::text("system", canonical));
-        assert_eq!(normalized[2], ChatMessage::text("system", restart_notice));
-        assert_eq!(normalized[3], ChatMessage::text("system", runtime_notice));
-        assert_eq!(normalized.len(), 5);
+        assert_eq!(normalized[2], ChatMessage::text("user", runtime_notice));
+        assert_eq!(normalized.len(), 4);
     }
 
     #[test]
@@ -4806,34 +4785,6 @@ mod tests {
         )];
 
         assert!(leading_system_prompt(&messages).is_none());
-    }
-
-    #[test]
-    fn user_time_tip_is_emitted_after_five_minutes_of_idle_time() {
-        let now = Utc::now();
-        let session = SessionSnapshot {
-            kind: crate::session::SessionKind::Foreground,
-            last_user_message_at: Some(now - ChronoDuration::minutes(6)),
-            last_agent_returned_at: Some(now - ChronoDuration::minutes(5)),
-            ..build_test_session(&TempDir::new().unwrap())
-        };
-
-        let tip = render_last_user_message_time_tip(&session, now).expect("tip should exist");
-        assert!(tip.starts_with("[System Tip: "));
-        assert!(tip.contains("hours since the last user message"));
-    }
-
-    #[test]
-    fn user_time_tip_is_not_emitted_before_five_minutes_of_idle_time() {
-        let now = Utc::now();
-        let session = SessionSnapshot {
-            kind: crate::session::SessionKind::Foreground,
-            last_user_message_at: Some(now - ChronoDuration::minutes(10)),
-            last_agent_returned_at: Some(now - ChronoDuration::minutes(4)),
-            ..build_test_session(&TempDir::new().unwrap())
-        };
-
-        assert!(render_last_user_message_time_tip(&session, now).is_none());
     }
 
     #[test]
