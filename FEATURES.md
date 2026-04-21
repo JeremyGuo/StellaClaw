@@ -6,6 +6,14 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 
 ## Features
 
+### Config Schema Invariants
+
+- Latest AgentHost config files do not use `main_agent.model` as a global default-model knob; user-facing model selection remains conversation-owned state.
+- Latest AgentHost config files do not use `main_agent.timeout_seconds` as a global subagent-timeout knob; subagent timeout policy is derived from the selected model/runtime flow instead of a second main-agent override field.
+- Latest AgentHost config files do not allow inline model-level `external_web_search` blocks; external search routing must flow through normal model/tooling configuration instead of a second per-model search config shape.
+- Older configs may still load with those legacy fields present, but the latest config writer must not emit them again.
+- Regression coverage should protect legacy-field ignore-on-load behavior and latest-template omission.
+
 ### Interruptible Conversations
 
 - A foreground conversation can be interrupted by a newer user message while the current agent turn is still running.
@@ -102,6 +110,7 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 
 ### Channel Integrations
 
+- Telegram bot command registration is channel-owned runtime behavior. Telegram config/templates must not expose a per-channel `commands` array as the source of truth for which slash commands get registered.
 - DingTalk Stream channels support bidirectional bot conversations through DingTalk app `client_id`/`client_secret` credentials.
 - DingTalk robot channels support custom/enterprise robot webhook delivery through `DINGTALK_ROBOT_WEBHOOK_URL`; webhook access tokens should live in `.env`, not JSON config.
 - DingTalk robot channels can receive HTTP callback messages when `DINGTALK_ROBOT_APP_SECRET` is configured; callbacks must validate DingTalk `timestamp`/`sign` headers with HMAC-SHA256 and reject stale or invalid requests before parsing message bodies.
@@ -155,7 +164,7 @@ flowchart TD
 ```
 
 - Session actors are the only owner of per-session durable state and runtime state, including pending/stable messages, visible history, active runtime phase, pending interrupts, progress state, prompt/profile/model/skill observations, usage, compaction stats, and turn completion/yield/failure state.
-- Foreground and background main agents share one session actor lifecycle; differences should be expressed through session policy such as system prompt kind, enabled tools, delivery behavior, and whether final output is told to a foreground actor.
+- Foreground and background main agents share one session actor lifecycle; differences should be expressed through session policy such as system prompt kind, runtime/model-driven tool availability, delivery behavior, and whether final output is told to a foreground actor.
 - Conversation state owns conversation-level routing and configuration: current workspace, remote workpaths, selected model/backend/sandbox settings, chat version, current foreground actor reference, and user attachment materialization for that conversation. It should hand prepared messages to session actors rather than maintaining long-running turn serialization.
 - SessionManager acts as a factory and registry for `SessionId -> SessionActorRef` style actor loading/creation. It must not decide user-message handling, turn commit semantics, interrupt behavior, progress behavior, or background-to-foreground delivery semantics.
 - `SessionActorRef` is the external production boundary for session operations. Production code should call explicit actor methods such as `tell_user_message`, `tell_actor_message`, runtime commit/failure, progress, interrupt, and observation APIs instead of locking or mutating actor internals directly.

@@ -290,7 +290,6 @@ mod tests {
 
     fn test_config(workspace_root: &Path, supports_vision_input: bool) -> AgentConfig {
         AgentConfig {
-            enabled_tools: Vec::new(),
             upstream: UpstreamConfig {
                 base_url: "https://example.com/v1".to_string(),
                 model: "demo".to_string(),

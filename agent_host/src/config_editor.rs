@@ -4488,7 +4488,7 @@ fn channel_field_guide_text(form: &ChannelFormState, field: ChannelFormField) ->
         ChannelFormField::BotTokenEnv => (
             "The environment variable that holds the Telegram bot token.",
             "TELEGRAM_BOT_TOKEN",
-            "Telegram commands, polling defaults, and API base URL are handled automatically unless an older config already overrides them.",
+            "Telegram commands, polling defaults, and API base URL are handled automatically by the channel runtime.",
         ),
         ChannelFormField::ClientIdEnv => (
             "The environment variable that holds the DingTalk client id.",

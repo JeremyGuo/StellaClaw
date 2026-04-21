@@ -28,15 +28,14 @@ fn require_openrouter_api_key() -> Result<()> {
         .map_err(|_| anyhow!("OPENROUTER_API_KEY is not set; source .env before running this test"))
 }
 
-fn live_config(workspace_root: &str, enabled_tools: Vec<&str>) -> Result<agent_frame::AgentConfig> {
-    let system_prompt = if enabled_tools.is_empty() {
-        "Reply with exactly the requested token."
-    } else {
+fn live_config(workspace_root: &str, tool_friendly: bool) -> Result<agent_frame::AgentConfig> {
+    let system_prompt = if tool_friendly {
         "Use tools when needed. Keep the final answer short."
+    } else {
+        "Reply with exactly the requested token."
     };
     load_config_value(
         json!({
-            "enabled_tools": enabled_tools,
             "upstream": {
                 "base_url": "https://openrouter.ai/api/v1",
                 "model": live_model(),
@@ -59,7 +58,7 @@ fn live_config(workspace_root: &str, enabled_tools: Vec<&str>) -> Result<agent_f
 fn live_openrouter_kimi_roundtrip_and_tool_call() -> Result<()> {
     require_openrouter_api_key()?;
 
-    let plain_config = live_config(".", Vec::new())?;
+    let plain_config = live_config(".", false)?;
     let plain_messages = run_session(
         Vec::new(),
         "Reply with exactly: KIMI_OK",
@@ -75,7 +74,7 @@ fn live_openrouter_kimi_roundtrip_and_tool_call() -> Result<()> {
         format!("{file_content}\n"),
     )?;
 
-    let tool_config = live_config(&temp_dir.path().display().to_string(), vec!["file_read"])?;
+    let tool_config = live_config(&temp_dir.path().display().to_string(), true)?;
     let tool_messages = run_session(
         Vec::new(),
         "Read hello.txt and reply with only its content.",

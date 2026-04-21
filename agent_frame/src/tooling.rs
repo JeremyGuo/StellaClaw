@@ -570,7 +570,6 @@ impl ToolRegistryBuilder {
 }
 
 pub fn build_tool_registry(
-    enabled_tools: &[String],
     workspace_root: &Path,
     runtime_state_root: &Path,
     upstream: &UpstreamConfig,
@@ -585,7 +584,6 @@ pub fn build_tool_registry(
     remote_workpaths: &[RemoteWorkpathConfig],
 ) -> Result<BTreeMap<String, Tool>> {
     build_tool_registry_with_cancel(
-        enabled_tools,
         workspace_root,
         runtime_state_root,
         upstream,
@@ -603,7 +601,6 @@ pub fn build_tool_registry(
 }
 
 pub fn build_tool_registry_with_cancel(
-    _enabled_tools: &[String],
     workspace_root: &Path,
     runtime_state_root: &Path,
     upstream: &UpstreamConfig,
@@ -1167,7 +1164,6 @@ remote_command="$*"
             token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
-            &[],
             &workspace_root,
             &runtime_state_root,
             &upstream,
@@ -1321,7 +1317,6 @@ remote_command="$*"
             token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
-            &[],
             &workspace_root,
             &runtime_state_root,
             &upstream,
@@ -1377,7 +1372,6 @@ remote_command="$*"
             description: "test remote workspace".to_string(),
         }];
         let registry = build_tool_registry_with_cancel(
-            &[],
             &workspace_root,
             &runtime_state_root,
             &upstream,
@@ -1441,7 +1435,6 @@ remote_command="$*"
             description: "test remote workspace".to_string(),
         }];
         let registry = build_tool_registry_with_cancel(
-            &[],
             &workspace_root,
             &runtime_state_root,
             &upstream,
@@ -1476,7 +1469,6 @@ remote_command="$*"
         fs::create_dir_all(&runtime_state_root).unwrap();
         let upstream = test_upstream();
         let registry = build_tool_registry_with_cancel(
-            &[],
             &workspace_root,
             &runtime_state_root,
             &upstream,
@@ -1719,7 +1711,6 @@ remote_command="$*"
             description: "test remote workspace".to_string(),
         }];
         let registry = build_tool_registry_with_cancel(
-            &[],
             &workspace_root,
             &runtime_state_root,
             &upstream,
@@ -1836,7 +1827,6 @@ exec sh -c "$remote_command""#,
             description: "test remote workspace".to_string(),
         }];
         let registry = build_tool_registry_with_cancel(
-            &[],
             &workspace_root,
             &runtime_state_root,
             &upstream,
@@ -1900,7 +1890,6 @@ exec sh -c "$remote_command""#,
             description: "test remote workspace".to_string(),
         }];
         let registry = build_tool_registry_with_cancel(
-            &[],
             &workspace_root,
             &runtime_state_root,
             &upstream,
@@ -1954,7 +1943,6 @@ exec sh -c "$remote_command""#,
             description: "test remote workspace".to_string(),
         }];
         let registry = build_tool_registry_with_cancel(
-            &[],
             &workspace_root,
             &runtime_state_root,
             &upstream,
@@ -2024,7 +2012,6 @@ exec sh -c "$remote_command""#,
             token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
-            &[],
             &workspace_root,
             &runtime_state_root,
             &upstream,
@@ -2093,7 +2080,6 @@ exec sh -c "$remote_command""#,
             token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
-            &[],
             &workspace_root,
             &runtime_state_root,
             &upstream,
@@ -2164,7 +2150,6 @@ exec sh -c "$remote_command""#,
             token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
-            &[],
             &workspace_root,
             &runtime_state_root,
             &upstream,
@@ -2233,7 +2218,6 @@ exec sh -c "$remote_command""#,
             token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
-            &["image_load".to_string()],
             &workspace_root,
             &runtime_state_root,
             &upstream,
@@ -2300,7 +2284,6 @@ exec sh -c "$remote_command""#,
             token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
-            &[],
             &workspace_root,
             &runtime_state_root,
             &upstream,
@@ -2365,7 +2348,6 @@ exec sh -c "$remote_command""#,
             ..upstream.clone()
         };
         let registry = build_tool_registry_with_cancel(
-            &[],
             &workspace_root,
             &runtime_state_root,
             &upstream,
@@ -2426,7 +2408,6 @@ exec sh -c "$remote_command""#,
             token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
-            &[],
             &workspace_root,
             &runtime_state_root,
             &upstream,
@@ -2485,7 +2466,6 @@ exec sh -c "$remote_command""#,
             token_estimation: None,
         };
         let registry = build_tool_registry_with_cancel(
-            &[],
             &workspace_root,
             &runtime_state_root,
             &upstream,

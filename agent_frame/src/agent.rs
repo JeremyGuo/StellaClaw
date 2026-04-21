@@ -831,7 +831,6 @@ fn run_session_state_controlled_internal(
     }
 
     let registry = build_tool_registry_with_cancel(
-        &config.enabled_tools,
         &config.workspace_root,
         &config.runtime_state_root,
         &config.upstream,
@@ -1583,7 +1582,6 @@ mod tests {
     #[test]
     fn compose_system_prompt_uses_configured_skills_metadata_snapshot() {
         let config = AgentConfig {
-            enabled_tools: Vec::new(),
             upstream: UpstreamConfig {
                 base_url: "http://127.0.0.1:1".to_string(),
                 model: "fake-model".to_string(),
@@ -1651,7 +1649,6 @@ mod tests {
     #[test]
     fn pending_tool_wait_compaction_requests_timeout_observation_after_deadline() {
         let config = AgentConfig {
-            enabled_tools: Vec::new(),
             upstream: UpstreamConfig {
                 base_url: "http://127.0.0.1:1".to_string(),
                 model: "fake-model".to_string(),
@@ -1877,7 +1874,6 @@ pub fn compact_session_messages_with_report(
     let system_prompt = compose_system_prompt(&config, &discovered_skills);
     let messages = ensure_system_message(&previous_messages, &system_prompt);
     let registry = build_tool_registry(
-        &config.enabled_tools,
         &config.workspace_root,
         &config.runtime_state_root,
         &config.upstream,
@@ -1911,7 +1907,6 @@ pub fn estimate_configured_session_tokens(
     let system_prompt = compose_system_prompt(&config, &discovered_skills);
     let messages = ensure_system_message(&previous_messages, &system_prompt);
     let registry = build_tool_registry(
-        &config.enabled_tools,
         &config.workspace_root,
         &config.runtime_state_root,
         &config.upstream,

@@ -6,7 +6,8 @@ use crate::bootstrap::AgentWorkspace;
 use crate::channel::Channel;
 use crate::channels::web::WebChannel;
 use crate::config::{
-    AgentConfig, BotCommandConfig, MainAgentConfig, ModelConfig, SandboxMode, ToolingConfig,
+    AgentConfig, BotCommandConfig, MainAgentConfig, ModelCatalogConfig, ModelConfig, SandboxMode,
+    ToolingConfig,
 };
 use crate::conversation::ConversationManager;
 use crate::cron::CronManager;
@@ -32,6 +33,7 @@ pub struct RuntimeContext {
     pub(super) web_channels: Arc<HashMap<String, Arc<WebChannel>>>,
     pub(super) command_catalog: HashMap<String, Vec<BotCommandConfig>>,
     pub(super) models: BTreeMap<String, ModelConfig>,
+    pub(super) model_catalog: ModelCatalogConfig,
     pub(super) agent: AgentConfig,
     pub(super) tooling: ToolingConfig,
     pub(super) chat_model_keys: Vec<String>,

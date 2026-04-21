@@ -497,7 +497,6 @@ mod tests {
             reasoning: None,
             native_web_search: None,
             token_estimation: None,
-            external_web_search: None,
             capabilities: Vec::new(),
         };
         let mut models = BTreeMap::new();
@@ -506,11 +505,8 @@ mod tests {
         vision_model.description = "vision only".to_string();
         models.insert("vision-only".to_string(), vision_model);
         let main_agent = MainAgentConfig {
-            model: Some("main".to_string()),
             global_install_root: "/opt".to_string(),
             language: "zh-CN".to_string(),
-            timeout_seconds: Some(60.0),
-            enabled_tools: vec!["file_read".to_string()],
             max_tool_roundtrips: 8,
             enable_context_compression: true,
             context_compaction: ContextCompactionConfig {
@@ -737,17 +733,13 @@ mod tests {
             reasoning: None,
             native_web_search: None,
             token_estimation: None,
-            external_web_search: None,
             capabilities: Vec::new(),
         };
         let mut models = BTreeMap::new();
         models.insert("main".to_string(), model.clone());
         let main_agent = MainAgentConfig {
-            model: Some("main".to_string()),
             global_install_root: "/opt".to_string(),
             language: "zh-CN".to_string(),
-            timeout_seconds: Some(60.0),
-            enabled_tools: vec!["file_read".to_string()],
             max_tool_roundtrips: 8,
             enable_context_compression: true,
             context_compaction: ContextCompactionConfig {
@@ -969,17 +961,13 @@ mod tests {
             reasoning: None,
             native_web_search: None,
             token_estimation: None,
-            external_web_search: None,
             capabilities: Vec::new(),
         };
         let mut models = BTreeMap::new();
         models.insert("main".to_string(), model.clone());
         let main_agent = MainAgentConfig {
-            model: Some("main".to_string()),
             global_install_root: "/opt".to_string(),
             language: "zh-CN".to_string(),
-            timeout_seconds: Some(60.0),
-            enabled_tools: vec!["file_read".to_string()],
             max_tool_roundtrips: 8,
             enable_context_compression: true,
             context_compaction: ContextCompactionConfig {

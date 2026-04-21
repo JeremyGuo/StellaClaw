@@ -1,5 +1,49 @@
-version: 0.21.5
+version: 0.25.0
 ---
+
+# 0.25.0
+
+- 移除冗余的 `main_agent.timeout_seconds` 配置字段：
+  最新 AgentHost config schema 不再接受这个容易误解的主代理级超时覆盖项；subagent 默认超时继续按所选模型与运行时逻辑推导，而不是再读第二个全局字段。
+- 保持旧配置向后兼容：
+  老配置里残留的 `main_agent.timeout_seconds` 仍可被 loader 读取但会被忽略，最新 `0.25` 配置文件不会再写出这个字段。
+- 清理最新模板与回归测试：
+  最新模板继续不生成该字段，并新增针对 legacy timeout 字段忽略行为的测试，避免它以后悄悄回到 schema 里。
+- 本次影响 `config` schema，不影响 `workdir` schema：
+  新增 `0.25` config loader，并按配置变更策略将仓库版本从 `0.24.0` 提升到 `0.25.0`。
+
+# 0.24.0
+
+- 移除冗余的 `main_agent.model` 配置字段：
+  最新 AgentHost config schema 不再把它当作全局默认模型入口；前台会话继续只使用 conversation 自己的模型选择状态，老配置里残留的 `main_agent.model` 会被兼容读取并忽略。
+- 移除旧式 inline `external_web_search` 配置字段：
+  最新 AgentHost config schema 不再接受 `models.<alias>.external_web_search`；外部搜索能力改为只保留正常的 `web_search`/tooling 路由与共享 catalog 语义，老配置里的 inline 字段会在升级时被丢弃而不会重新写回。
+- 清理最新模板与示例配置：
+  `deploy_telegram.json`、`agent_host/example_config.json` 与 `agent_host/example_telegram_config.json` 不再示例这两个过时字段，避免继续把冗余配置当成有效入口。
+- 本次影响 `config` schema，不影响 `workdir` schema：
+  新增 `0.24` config loader，并按配置变更策略将仓库版本从 `0.23.0` 提升到 `0.24.0`。
+
+# 0.23.0
+
+- 移除 Telegram `commands` 配置字段：
+  最新 AgentHost config schema 不再接受 `channels[].commands` 作为 Telegram bot 命令来源；Telegram 预注册命令现在明确属于 channel/runtime 内部行为，而不是用户配置项。
+- 清理 Telegram 配置模板残留：
+  `deploy_telegram.json`、`agent_host/example_telegram_config.json` 和仓库内测试模板不再示例 `commands` 数组，避免把运行时内建命令误写成可配置项。
+- 保持旧配置向后兼容：
+  旧版配置里残留的 Telegram `commands` 数组仍可被 serde 忽略并正常加载，但最新 `0.23` 配置文件不会再写出这个字段。
+- 本次影响 `config` schema，不影响 `workdir` schema：
+  新增 `0.23` config loader，并按配置变更策略将仓库版本从 `0.22.0` 提升到 `0.23.0`。
+
+# 0.22.0
+
+- 删除冗余的 `main_agent.enabled_tools` 配置字段：
+  AgentHost 最新 config schema 不再暴露这一层工具白名单；工具可用性只保留运行时按 agent kind、模型能力与 tooling 配置自动选择这一套逻辑，避免配置值与真实注册结果漂移。
+- 对齐 token 估计与真实工具注册：
+  AgentFrame 的 session token 估计、context compaction 与实际运行现在共用同一条工具注册路径，不再携带或读取独立的 `enabled_tools` 配置输入。
+- 保持旧配置向后兼容：
+  `0.21` 及更早版本里残留的 `main_agent.enabled_tools` 仍可被 loader 读取并自动升级写回，但最新 `0.22` 配置文件不会再生成这个字段。
+- 本次影响 `config` schema，不影响 `workdir` schema：
+  新增 `0.22` config loader，并按配置变更策略将仓库版本从 `0.21.5` 提升到 `0.22.0`。
 
 # 0.21.5
 

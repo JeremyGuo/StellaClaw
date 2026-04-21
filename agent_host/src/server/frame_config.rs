@@ -128,7 +128,7 @@ impl AgentRuntimeView {
             default_prompt_cache_retention(image_model.cache_ttl.as_deref(), image_model),
             image_model.reasoning.clone(),
             image_model.native_web_search.clone(),
-            image_model.external_web_search.clone(),
+            None,
             false,
             false,
             false,
@@ -180,7 +180,7 @@ impl AgentRuntimeView {
             default_prompt_cache_retention(tool_model.cache_ttl.as_deref(), tool_model),
             tool_model.reasoning.clone(),
             tool_model.native_web_search.clone(),
-            tool_model.external_web_search.clone(),
+            None,
             false,
             false,
             false,
@@ -313,9 +313,7 @@ impl AgentRuntimeView {
                 );
                 return (None, None);
             };
-            let external = search_model.external_web_search.clone().or_else(|| {
-                self.synthesize_external_web_search_config(&target.alias, search_model)
-            });
+            let external = self.synthesize_external_web_search_config(&target.alias, search_model);
             if external.is_none() {
                 warn!(
                     log_stream = "server",
@@ -336,12 +334,17 @@ impl AgentRuntimeView {
         } else {
             None
         };
-        let external = model.external_web_search.clone().or_else(|| {
-            model.web_search_model.as_ref().and_then(|alias| {
-                self.models.get(alias).and_then(|search_model| {
-                    self.synthesize_external_web_search_config(alias, search_model)
+        let external = model.web_search_model.as_ref().and_then(|alias| {
+            self.context
+                .model_catalog
+                .web_search
+                .get(alias)
+                .cloned()
+                .or_else(|| {
+                    self.models.get(alias).and_then(|search_model| {
+                        self.synthesize_external_web_search_config(alias, search_model)
+                    })
                 })
-            })
         });
         (native, external)
     }
@@ -436,7 +439,6 @@ impl AgentRuntimeView {
         })?;
 
         Ok(FrameAgentConfig {
-            enabled_tools: self.main_agent.enabled_tools.clone(),
             upstream: self.build_upstream_config(
                 model_key,
                 model,

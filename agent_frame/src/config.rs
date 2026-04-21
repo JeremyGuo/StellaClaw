@@ -317,8 +317,6 @@ pub struct RemoteWorkpathConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AgentConfig {
-    #[serde(default)]
-    pub enabled_tools: Vec<String>,
     pub upstream: UpstreamConfig,
     #[serde(default)]
     pub available_upstreams: BTreeMap<String, UpstreamConfig>,
@@ -354,8 +352,6 @@ pub struct AgentConfig {
 
 #[derive(Deserialize)]
 struct AgentConfigRaw {
-    #[serde(default)]
-    enabled_tools: Vec<String>,
     upstream: UpstreamConfigRaw,
     #[serde(default)]
     available_upstreams: BTreeMap<String, UpstreamConfigRaw>,
@@ -580,25 +576,6 @@ fn resolve_upstream(raw: UpstreamConfigRaw, base_dir: &Path) -> UpstreamConfig {
     }
 }
 
-fn canonical_enabled_tool_name(tool_name: &str) -> &str {
-    match tool_name {
-        "read_file" => "file_read",
-        "write_file" => "file_write",
-        _ => tool_name,
-    }
-}
-
-fn normalize_enabled_tools(enabled_tools: Vec<String>) -> Vec<String> {
-    let mut normalized = Vec::new();
-    for tool_name in enabled_tools {
-        let canonical = canonical_enabled_tool_name(&tool_name).to_string();
-        if !normalized.iter().any(|existing| existing == &canonical) {
-            normalized.push(canonical);
-        }
-    }
-    normalized
-}
-
 fn validate_retry_mode(label: &str, retry_mode: &RetryModeConfig) -> Result<()> {
     match retry_mode {
         RetryModeConfig::No => Ok(()),
@@ -701,7 +678,6 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
         });
 
     Ok(AgentConfig {
-        enabled_tools: normalize_enabled_tools(raw.enabled_tools),
         upstream: resolve_upstream(raw.upstream, base_dir),
         available_upstreams: raw
             .available_upstreams
@@ -768,7 +744,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn load_config_value_normalizes_legacy_file_tool_names() {
+    fn load_config_value_ignores_legacy_enabled_tools_field() {
         let temp_dir = TempDir::new().unwrap();
         let config = load_config_value(
             json!({
@@ -782,7 +758,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(config.enabled_tools, vec!["file_read", "file_write"]);
+        assert_eq!(config.max_tool_roundtrips, super::default_max_tool_roundtrips());
     }
 
     #[test]

@@ -932,7 +932,6 @@ impl DslRuntime {
             .cloned()
             .unwrap_or_default();
         let mut registry = build_tool_registry_with_cancel(
-            &[],
             &self.workspace_root,
             &self.runtime_state_root,
             &self.upstream,

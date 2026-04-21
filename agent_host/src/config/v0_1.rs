@@ -6,9 +6,7 @@ use super::{
     default_max_global_sub_agents, default_model_timeout_seconds,
 };
 use crate::backend::AgentBackendKind;
-use agent_frame::config::{
-    AuthCredentialsStoreMode, ExternalWebSearchConfig, NativeWebSearchConfig, ReasoningConfig,
-};
+use agent_frame::config::{AuthCredentialsStoreMode, ExternalWebSearchConfig, NativeWebSearchConfig, ReasoningConfig};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -46,6 +44,7 @@ struct LegacyModelConfigRaw {
     pub description: String,
     #[serde(default)]
     pub native_web_search: Option<NativeWebSearchConfig>,
+    #[allow(dead_code)]
     #[serde(default)]
     pub external_web_search: Option<ExternalWebSearchConfig>,
 }
@@ -72,22 +71,10 @@ impl ConfigLoader for LegacyConfigLoader {
         let raw: LegacyServerConfigRaw =
             serde_json::from_value(value).context("failed to parse legacy server config")?;
         let chat_model_keys = raw.models.keys().cloned().collect::<Vec<_>>();
-        let mut web_search_catalog = BTreeMap::new();
-        let mut dedup_index = BTreeMap::new();
         let models = raw
             .models
             .into_iter()
             .map(|(name, model)| {
-                let search_alias = if let Some(search) = model.external_web_search.clone() {
-                    Some(register_web_search_config(
-                        format!("{name}_web_search"),
-                        search,
-                        &mut web_search_catalog,
-                        &mut dedup_index,
-                    )?)
-                } else {
-                    None
-                };
                 let upgraded = ModelConfig {
                     model_type: ModelType::Openrouter,
                     api_endpoint: model.api_endpoint,
@@ -95,7 +82,7 @@ impl ConfigLoader for LegacyConfigLoader {
                     backend: model.backend,
                     supports_vision_input: model.supports_vision_input,
                     image_tool_model: model.image_tool_model,
-                    web_search_model: search_alias.clone(),
+                    web_search_model: None,
                     api_key: model.api_key,
                     api_key_env: model.api_key_env,
                     chat_completions_path: model.chat_completions_path,
@@ -112,10 +99,6 @@ impl ConfigLoader for LegacyConfigLoader {
                     capabilities: Vec::new(),
                     native_web_search: model.native_web_search,
                     token_estimation: None,
-                    external_web_search: search_alias
-                        .as_ref()
-                        .and_then(|alias| web_search_catalog.get(alias))
-                        .cloned(),
                 };
                 Ok((name, upgraded))
             })
@@ -123,7 +106,7 @@ impl ConfigLoader for LegacyConfigLoader {
         let model_catalog = ModelCatalogConfig {
             chat: models.clone(),
             vision: BTreeMap::new(),
-            web_search: web_search_catalog,
+            web_search: BTreeMap::new(),
         };
         Ok(build_server_config(
             LATEST_CONFIG_VERSION.to_string(),
@@ -139,33 +122,4 @@ impl ConfigLoader for LegacyConfigLoader {
             raw.channels,
         ))
     }
-}
-
-fn register_web_search_config(
-    preferred_alias: String,
-    config: ExternalWebSearchConfig,
-    web_search_catalog: &mut BTreeMap<String, ExternalWebSearchConfig>,
-    dedup_index: &mut BTreeMap<String, String>,
-) -> Result<String> {
-    let fingerprint = search_fingerprint(&config)?;
-    if let Some(existing_alias) = dedup_index.get(&fingerprint) {
-        return Ok(existing_alias.clone());
-    }
-    if let Some(existing) = web_search_catalog.get(&preferred_alias) {
-        if search_fingerprint(existing)? != fingerprint {
-            return Err(anyhow::anyhow!(
-                "web_search alias '{}' is already defined with different settings",
-                preferred_alias
-            ));
-        }
-        dedup_index.insert(fingerprint, preferred_alias.clone());
-        return Ok(preferred_alias);
-    }
-    web_search_catalog.insert(preferred_alias.clone(), config);
-    dedup_index.insert(fingerprint, preferred_alias.clone());
-    Ok(preferred_alias)
-}
-
-fn search_fingerprint(config: &ExternalWebSearchConfig) -> Result<String> {
-    serde_json::to_string(config).context("failed to fingerprint web_search config")
 }

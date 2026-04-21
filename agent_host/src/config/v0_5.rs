@@ -154,7 +154,7 @@ impl ConfigLoader for LatestConfigLoader {
 
 fn upgrade_versioned_model(
     raw: VersionedModelConfigRaw,
-    web_search_catalog: &BTreeMap<String, ExternalWebSearchConfig>,
+    _web_search_catalog: &BTreeMap<String, ExternalWebSearchConfig>,
 ) -> Result<ModelConfig> {
     let api_endpoint = raw.api_endpoint.unwrap_or_else(|| match raw.model_type {
         ModelType::Openrouter | ModelType::OpenrouterResp => {
@@ -168,12 +168,6 @@ fn upgrade_versioned_model(
             ModelType::Openrouter => default_chat_completions_path(),
             ModelType::OpenrouterResp | ModelType::CodexSubscription => default_responses_path(),
         });
-    let external_web_search = raw
-        .web_search
-        .as_ref()
-        .and_then(|alias| web_search_catalog.get(alias))
-        .cloned();
-
     Ok(ModelConfig {
         model_type: raw.model_type,
         api_endpoint,
@@ -198,6 +192,5 @@ fn upgrade_versioned_model(
         capabilities: Vec::new(),
         native_web_search: raw.native_web_search,
         token_estimation: None,
-        external_web_search,
     })
 }

@@ -1,6 +1,9 @@
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
+
+pub const MAX_CONVERSATION_ID_LENGTH: usize = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChannelAddress {
@@ -16,6 +19,24 @@ impl ChannelAddress {
     pub fn session_key(&self) -> String {
         format!("{}::{}", self.channel_id, self.conversation_id)
     }
+}
+
+pub fn validate_conversation_id(conversation_id: &str) -> Result<()> {
+    if conversation_id.is_empty() {
+        anyhow::bail!("conversation_id is empty");
+    }
+    if conversation_id.len() > MAX_CONVERSATION_ID_LENGTH {
+        anyhow::bail!("conversation_id is too long");
+    }
+    if !conversation_id
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
+    {
+        anyhow::bail!(
+            "conversation_id must contain only ASCII letters, digits, '_' or '-'"
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +100,23 @@ pub struct ShowOptions {
     pub options: Vec<ShowOption>,
     #[serde(default = "default_show_options_one_time")]
     pub one_time: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_conversation_id;
+
+    #[test]
+    fn validates_whitelisted_conversation_ids() {
+        assert!(validate_conversation_id("abc-123_DEF").is_ok());
+    }
+
+    #[test]
+    fn rejects_special_character_conversation_ids() {
+        for value in ["..", ".", "abc/def", "abc def", "abc@def", "中文"] {
+            assert!(validate_conversation_id(value).is_err(), "{value} should be rejected");
+        }
+    }
 }
 
 fn default_show_options_one_time() -> bool {

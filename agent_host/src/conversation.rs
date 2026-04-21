@@ -1,7 +1,7 @@
 use crate::backend::AgentBackendKind;
 use crate::channel::PendingAttachment;
 use crate::config::SandboxMode;
-use crate::domain::{ChannelAddress, StoredAttachment};
+use crate::domain::{ChannelAddress, StoredAttachment, validate_conversation_id};
 use crate::session::{SessionActorRef, SessionManager};
 use crate::workpath::{
     RemoteWorkpath, replace_workpath_description, validate_remote_workpath,
@@ -137,6 +137,7 @@ impl ConversationManager {
         &mut self,
         address: &ChannelAddress,
     ) -> Result<ConversationSnapshot> {
+        validate_conversation_id(&address.conversation_id)?;
         let key = address.session_key();
         if !self.conversations.contains_key(&key) {
             let id = Uuid::new_v4();
@@ -685,5 +686,24 @@ mod tests {
         assert!(!snapshot.root_dir.exists());
         let reloaded = ConversationManager::new(temp_dir.path()).unwrap();
         assert!(reloaded.get_snapshot(&address).is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_conversation_id() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = ConversationManager::new(temp_dir.path()).unwrap();
+        let address = ChannelAddress {
+            channel_id: "web".to_string(),
+            conversation_id: "..".to_string(),
+            user_id: Some("web-user".to_string()),
+            display_name: Some("Web User".to_string()),
+        };
+
+        let error = manager.ensure_conversation(&address).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("conversation_id must contain only ASCII letters")
+        );
     }
 }

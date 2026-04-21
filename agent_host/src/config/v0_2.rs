@@ -79,6 +79,7 @@ struct VersionedModelConfigRaw {
     pub description: String,
     #[serde(default)]
     pub native_web_search: Option<NativeWebSearchConfig>,
+    #[allow(dead_code)]
     #[serde(default)]
     pub external_web_search: Option<ExternalWebSearchConfig>,
 }
@@ -177,28 +178,15 @@ impl ConfigLoader for VersionedConfigLoader {
 }
 
 fn upgrade_chat_or_vision_model(
-    model_name: &str,
+    _model_name: &str,
     raw: VersionedModelConfigRaw,
-    web_search_catalog: &mut BTreeMap<String, ExternalWebSearchConfig>,
-    dedup_index: &mut BTreeMap<String, String>,
+    _web_search_catalog: &mut BTreeMap<String, ExternalWebSearchConfig>,
+    _dedup_index: &mut BTreeMap<String, String>,
 ) -> Result<ModelConfig> {
-    let inline_external = raw.external_web_search.clone();
     let preferred_alias = raw.web_search_model.clone();
     let mut model = upgrade_base_model(raw);
 
-    if let Some(inline_external) = inline_external {
-        let alias = register_web_search_config(
-            preferred_alias
-                .clone()
-                .unwrap_or_else(|| format!("{model_name}_web_search")),
-            inline_external,
-            web_search_catalog,
-            dedup_index,
-        )?;
-        model.web_search_model = Some(alias.clone());
-        model.external_web_search = web_search_catalog.get(&alias).cloned();
-    } else if let Some(alias) = preferred_alias {
-        model.external_web_search = web_search_catalog.get(&alias).cloned();
+    if let Some(alias) = preferred_alias {
         model.web_search_model = Some(alias);
     }
 
@@ -242,7 +230,6 @@ fn upgrade_base_model(raw: VersionedModelConfigRaw) -> ModelConfig {
         capabilities: Vec::new(),
         native_web_search: raw.native_web_search,
         token_estimation: None,
-        external_web_search: None,
     }
 }
 
@@ -268,33 +255,6 @@ fn upgrade_external_web_search_model(
         timeout_seconds: raw.timeout_seconds,
         headers: raw.headers,
     })
-}
-
-fn register_web_search_config(
-    preferred_alias: String,
-    config: ExternalWebSearchConfig,
-    web_search_catalog: &mut BTreeMap<String, ExternalWebSearchConfig>,
-    dedup_index: &mut BTreeMap<String, String>,
-) -> Result<String> {
-    let fingerprint = search_fingerprint(&config)?;
-    if let Some(existing_alias) = dedup_index.get(&fingerprint) {
-        return Ok(existing_alias.clone());
-    }
-
-    if let Some(existing) = web_search_catalog.get(&preferred_alias) {
-        if search_fingerprint(existing)? != fingerprint {
-            return Err(anyhow!(
-                "web_search alias '{}' is already defined with different settings",
-                preferred_alias
-            ));
-        }
-        dedup_index.insert(fingerprint, preferred_alias.clone());
-        return Ok(preferred_alias);
-    }
-
-    web_search_catalog.insert(preferred_alias.clone(), config);
-    dedup_index.insert(fingerprint, preferred_alias.clone());
-    Ok(preferred_alias)
 }
 
 fn search_fingerprint(config: &ExternalWebSearchConfig) -> Result<String> {

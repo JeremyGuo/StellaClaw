@@ -411,25 +411,6 @@ fn builtin_tools_work() -> Result<()> {
         headers: serde_json::Map::new(),
     });
     let registry = build_tool_registry(
-        &[
-            "file_read".to_string(),
-            "file_write".to_string(),
-            "edit".to_string(),
-            "apply_patch".to_string(),
-            "exec_start".to_string(),
-            "exec_observe".to_string(),
-            "exec_wait".to_string(),
-            "exec_kill".to_string(),
-            "file_download_start".to_string(),
-            "file_download_progress".to_string(),
-            "file_download_wait".to_string(),
-            "file_download_cancel".to_string(),
-            "glob".to_string(),
-            "grep".to_string(),
-            "ls".to_string(),
-            "web_fetch".to_string(),
-            "web_search".to_string(),
-        ],
         temp_dir.path(),
         temp_dir.path(),
         &upstream,
@@ -720,11 +701,6 @@ fn exec_processes_report_clear_error_after_runtime_shutdown() -> Result<()> {
     let _guard = acquire_process_test_lock();
     let temp_dir = TempDir::new()?;
     let registry = build_tool_registry(
-        &[
-            "exec_start".to_string(),
-            "exec_observe".to_string(),
-            "exec_wait".to_string(),
-        ],
         temp_dir.path(),
         temp_dir.path(),
         &test_upstream("http://127.0.0.1:1"),
@@ -776,7 +752,6 @@ fn exec_wait_accepts_input_from_a_fresh_registry_instance() -> Result<()> {
     let _guard = acquire_process_test_lock();
     let temp_dir = TempDir::new()?;
     let starter = build_tool_registry(
-        &["exec_start".to_string()],
         temp_dir.path(),
         temp_dir.path(),
         &test_upstream("http://127.0.0.1:1"),
@@ -802,7 +777,6 @@ fn exec_wait_accepts_input_from_a_fresh_registry_instance() -> Result<()> {
     let exec_id = started_json["exec_id"].as_str().unwrap();
 
     let waiter = build_tool_registry(
-        &["exec_wait".to_string()],
         temp_dir.path(),
         temp_dir.path(),
         &test_upstream("http://127.0.0.1:1"),
@@ -849,12 +823,6 @@ fn exec_start_supports_per_tool_remote_ssh() -> Result<()> {
     fs::create_dir_all(&runtime_state_root)?;
 
     let registry = build_tool_registry(
-        &[
-            "exec_start".to_string(),
-            "exec_wait".to_string(),
-            "exec_observe".to_string(),
-            "exec_kill".to_string(),
-        ],
         &workspace_root,
         &runtime_state_root,
         &test_upstream("http://127.0.0.1:1"),
@@ -918,7 +886,6 @@ fn load_skill_tool_hides_paths_but_can_read_skill_content() -> Result<()> {
 
     let skills = discover_skills(&[skill_root.clone()])?;
     let registry = build_tool_registry(
-        &[],
         temp_dir.path(),
         temp_dir.path(),
         &test_upstream("http://127.0.0.1:1"),
@@ -957,7 +924,6 @@ fn skill_create_persists_staged_skill_directory() -> Result<()> {
     fs::write(staged_dir.join("references").join("note.txt"), "hello")?;
 
     let registry = build_tool_registry(
-        &[],
         temp_dir.path(),
         temp_dir.path(),
         &test_upstream("http://127.0.0.1:1"),
@@ -1009,7 +975,6 @@ fn skill_update_validates_and_replaces_existing_skill_directory() -> Result<()> 
 
     let skills = discover_skills(&[skill_root.clone()])?;
     let registry = build_tool_registry(
-        &[],
         temp_dir.path(),
         temp_dir.path(),
         &test_upstream("http://127.0.0.1:1"),
@@ -1045,7 +1010,6 @@ fn native_web_search_disables_external_web_search_tool() -> Result<()> {
         payload: serde_json::Map::new(),
     });
     let registry = build_tool_registry(
-        &["web_search".to_string(), "web_fetch".to_string()],
         temp_dir.path(),
         temp_dir.path(),
         &upstream,
@@ -1087,7 +1051,6 @@ fn run_session_registers_load_skill_without_exposing_skill_paths() -> Result<()>
 
     let config = load_config_value(
         json!({
-            "enabled_tools": [],
             "upstream": {"base_url": server.address, "model": "fake-model"},
             "skills_dirs": [skill_root]
         }),
@@ -1117,7 +1080,6 @@ fn run_session_registers_load_skill_without_exposing_skill_paths() -> Result<()>
 fn load_config_prefers_reasoning_object_over_reasoning_effort_shorthand() -> Result<()> {
     let config = load_config_value(
         json!({
-            "enabled_tools": [],
             "upstream": {
                 "base_url": "https://openrouter.ai/api/v1",
                 "model": "openai/gpt-5-mini",
@@ -1194,7 +1156,6 @@ fn run_session_with_extra_tool() -> Result<()> {
 
     let config = load_config_value(
         json!({
-            "enabled_tools": [],
             "upstream": {"base_url": server.address, "model": "fake-model"},
             "system_prompt": "Test system prompt."
         }),
@@ -1286,7 +1247,6 @@ fn run_session_auto_compacts_before_next_turn() -> Result<()> {
 
     let config = load_config_value(
         json!({
-            "enabled_tools": [],
             "upstream": {
                 "base_url": server.address,
                 "model": "fake-model",
@@ -1406,7 +1366,6 @@ fn pending_prefix_rewrite_is_applied_before_next_model_call() -> Result<()> {
 
     let config = load_config_value(
         json!({
-            "enabled_tools": [],
             "upstream": {"base_url": server.address, "model": "fake-model"},
             "system_prompt": "Test system prompt."
         }),
@@ -1490,7 +1449,6 @@ fn compact_session_messages_with_report_compacts_and_reports_usage() -> Result<(
 
     let config = load_config_value(
         json!({
-            "enabled_tools": [],
             "upstream": {
                 "base_url": server.address,
                 "model": "fake-model",
@@ -1529,7 +1487,6 @@ fn compact_session_messages_with_report_skips_when_below_threshold() -> Result<(
 
     let config = load_config_value(
         json!({
-            "enabled_tools": [],
             "upstream": {
                 "base_url": "http://127.0.0.1:1",
                 "model": "fake-model",
@@ -1574,7 +1531,6 @@ fn upstream_cache_control_and_reasoning_are_forwarded() -> Result<()> {
 
     let config = load_config_value(
         json!({
-            "enabled_tools": [],
             "upstream": {
                 "base_url": server.address,
                 "model": "anthropic/claude-sonnet-4.6",
@@ -1624,7 +1580,6 @@ fn responses_upstream_cache_fields_are_forwarded() -> Result<()> {
 
     let config = load_config_value(
         json!({
-            "enabled_tools": [],
             "upstream": {
                 "base_url": server.address,
                 "model": "anthropic/claude-opus-4.6",
@@ -1704,7 +1659,6 @@ fn run_session_state_aggregates_usage_across_tool_roundtrips() -> Result<()> {
     };
     let config = load_config_value(
         json!({
-            "enabled_tools": [],
             "upstream": {
                 "base_url": server.address,
                 "model": "demo-model"
@@ -1763,7 +1717,6 @@ fn empty_final_assistant_response_yields_api_failure_state() -> Result<()> {
     let temp_dir = TempDir::new()?;
     let config = load_config_value(
         json!({
-            "enabled_tools": [],
             "upstream": {
                 "base_url": server.address,
                 "model": "demo-model"
@@ -1825,7 +1778,6 @@ fn controlled_run_emits_checkpoint_and_honors_cancellation() -> Result<()> {
 
     let config = load_config_value(
         json!({
-            "enabled_tools": [],
             "upstream": {"base_url": server.address, "model": "fake-model"},
             "system_prompt": "Test system prompt."
         }),
@@ -1911,7 +1863,6 @@ fn controlled_run_emits_process_events() -> Result<()> {
 
     let config = load_config_value(
         json!({
-            "enabled_tools": [],
             "upstream": {"base_url": server.address, "model": "fake-model"},
             "system_prompt": "Test system prompt."
         }),
@@ -2001,7 +1952,6 @@ fn controlled_run_does_not_emit_checkpoint_for_assistant_messages_with_tool_call
 
     let config = load_config_value(
         json!({
-            "enabled_tools": [],
             "upstream": {"base_url": server.address, "model": "fake-model"},
             "system_prompt": "Test system prompt."
         }),
@@ -2099,7 +2049,6 @@ fn tool_calls_in_one_round_execute_in_parallel() -> Result<()> {
 
     let config = load_config_value(
         json!({
-            "enabled_tools": [],
             "upstream": {"base_url": server.address, "model": "fake-model"},
             "system_prompt": "Test system prompt."
         }),
@@ -2164,7 +2113,6 @@ fn controlled_run_emits_execution_progress_snapshots() -> Result<()> {
     };
     let config = load_config_value(
         json!({
-            "enabled_tools": [],
             "upstream": {"base_url": server.address, "model": "fake-model"},
             "system_prompt": "Test system prompt."
         }),
@@ -2214,11 +2162,6 @@ fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -
     let temp_dir = TempDir::new()?;
     let server = TestServer::start();
     let registry = build_tool_registry(
-        &[
-            "exec_start".to_string(),
-            "exec_wait".to_string(),
-            "exec_kill".to_string(),
-        ],
         temp_dir.path(),
         temp_dir.path(),
         &test_upstream(&server.address),
@@ -2283,7 +2226,6 @@ fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -
 
     let config = load_config_value(
         json!({
-            "enabled_tools": ["exec_wait"],
             "upstream": {"base_url": server.address, "model": "fake-model"},
             "system_prompt": "Test system prompt.",
             "timeout_observation_compaction": {"enabled": true},
@@ -2385,7 +2327,6 @@ fn controlled_run_starts_tools_and_yields_after_tool_batch() -> Result<()> {
 
     let config = load_config_value(
         json!({
-            "enabled_tools": ["file_read"],
             "enable_context_compression": false,
             "upstream": {"base_url": server.address, "model": "fake-model"},
             "system_prompt": "Test system prompt.",
@@ -2472,7 +2413,6 @@ fn cli_reads_prompt_argument() -> Result<()> {
     write_config(
         &config_path,
         json!({
-            "enabled_tools": [],
             "upstream": {"base_url": server.address, "model": "fake-model"}
         }),
     );

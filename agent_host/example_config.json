@@ -1,5 +1,5 @@
 {
-  "version": "0.21",
+  "version": "0.25",
   "models": {
     "main": {
       "backend": "agent_frame",
@@ -29,22 +29,10 @@
           }
         }
       },
-      "external_web_search": {
-        "base_url": "https://openrouter.ai/api/v1",
-        "model": "perplexity/sonar",
-        "api_key_env": "OPENROUTER_API_KEY",
-        "chat_completions_path": "/chat/completions",
-        "timeout_seconds": 60,
-        "headers": {
-          "HTTP-Referer": "https://example.com",
-          "X-Title": "AgentHost External Search"
-        }
-      },
       "description": "Fast general-purpose chat model for the foreground agent."
     }
   },
   "main_agent": {
-    "model": "main",
     "language": "zh-CN",
     "memory_system": "layered",
     "token_estimation_cache": {

@@ -33,6 +33,7 @@ use crate::cron::{
 use crate::domain::{
     AttachmentKind, ChannelAddress, MessageRole, OutgoingAttachment, OutgoingMessage,
     ProcessingState, ShowOption, StoredAttachment, UsageChart, UsageChartDay,
+    validate_conversation_id,
 };
 use crate::prompt::{
     AgentPromptKind, AgentSystemPromptState, build_agent_system_prompt_state,
@@ -693,13 +694,6 @@ impl AgentRuntimeView {
     }
 
     fn default_subagent_timeout_seconds(&self, model_key: &str) -> Result<f64> {
-        if let Some(timeout_seconds) = self.main_agent.timeout_seconds {
-            return Ok(if timeout_seconds > 0.0 {
-                timeout_seconds
-            } else {
-                300.0
-            });
-        }
         Ok(background_agent_timeout_seconds(
             self.models
                 .get(model_key)
@@ -1946,7 +1940,6 @@ impl Server {
             None,
         );
         let registry = build_tool_registry(
-            &frame_config.enabled_tools,
             &frame_config.workspace_root,
             &frame_config.runtime_state_root,
             &frame_config.upstream,
@@ -2158,7 +2151,6 @@ impl Server {
             user_profile_path = %agent_workspace.user_md_path.display(),
             agents_md_path = %agent_workspace.agents_md_path.display(),
             skills_dir = %agent_workspace.skills_dir.display(),
-            configured_main_model = ?config.main_agent.model,
             sandbox_mode = ?config.sandbox.mode,
             "server initialized"
         );
@@ -2212,6 +2204,7 @@ impl Server {
             web_channels: Arc::new(web_channels),
             command_catalog,
             models: config.models,
+            model_catalog: config.model_catalog,
             agent: config.agent,
             tooling,
             chat_model_keys: config.chat_model_keys,
@@ -2677,6 +2670,18 @@ impl Server {
     }
 
     async fn handle_incoming(&self, incoming: IncomingMessage) -> Result<()> {
+        if let Err(error) = validate_conversation_id(&incoming.address.conversation_id) {
+            warn!(
+                log_stream = "channel",
+                log_key = %incoming.address.channel_id,
+                kind = "incoming_message_invalid_conversation_id",
+                conversation_id = %incoming.address.conversation_id,
+                error = %format!("{error:#}"),
+                "dropping incoming message with invalid conversation id"
+            );
+            return Ok(());
+        }
+
         let channel = self
             .channels
             .get(&incoming.address.channel_id)
@@ -3537,8 +3542,8 @@ mod tests {
         ChannelAdminSnapshot, ConversationApprovalSnapshot, ConversationApprovalState,
     };
     use crate::config::{
-        AgentBackendConfig, AgentConfig, MainAgentConfig, ModelCapability, ModelConfig,
-        SandboxConfig, ToolingConfig, ToolingTarget,
+        AgentBackendConfig, AgentConfig, MainAgentConfig, ModelCapability, ModelCatalogConfig,
+        ModelConfig, SandboxConfig, ToolingConfig, ToolingTarget,
     };
     use crate::conversation::ConversationManager;
     use crate::cron::CronManager;
@@ -3648,7 +3653,6 @@ mod tests {
                 agent_model_enabled: true,
                 native_web_search: None,
                 token_estimation: None,
-                external_web_search: None,
                 capabilities: vec![ModelCapability::Chat],
             },
         );
@@ -3662,6 +3666,7 @@ mod tests {
             web_channels: Arc::new(HashMap::new()),
             command_catalog: HashMap::new(),
             models,
+            model_catalog: ModelCatalogConfig::default(),
             agent: AgentConfig {
                 agent_frame: AgentBackendConfig {
                     available_models: vec!["demo-model".to_string()],
@@ -3670,11 +3675,8 @@ mod tests {
             tooling: ToolingConfig::default(),
             chat_model_keys: vec!["demo-model".to_string()],
             main_agent: MainAgentConfig {
-                model: None,
-                timeout_seconds: None,
                 global_install_root: "/opt".to_string(),
                 language: "zh-CN".to_string(),
-                enabled_tools: Vec::new(),
                 max_tool_roundtrips: 4,
                 enable_context_compression: true,
                 context_compaction: Default::default(),
@@ -3923,7 +3925,6 @@ mod tests {
             agent_model_enabled: true,
             native_web_search: None,
             token_estimation: None,
-            external_web_search: None,
             capabilities: vec![ModelCapability::ImageIn],
         };
 
@@ -3991,7 +3992,6 @@ mod tests {
             agent_model_enabled: true,
             native_web_search: None,
             token_estimation: None,
-            external_web_search: None,
             capabilities: vec![ModelCapability::Chat],
         };
 
@@ -4060,7 +4060,6 @@ mod tests {
             agent_model_enabled: true,
             native_web_search: None,
             token_estimation: None,
-            external_web_search: None,
             capabilities: vec![ModelCapability::Chat, ModelCapability::ImageOut],
         };
 
@@ -4115,7 +4114,6 @@ mod tests {
             agent_model_enabled: true,
             native_web_search: None,
             token_estimation: None,
-            external_web_search: None,
             capabilities: vec![ModelCapability::Chat, ModelCapability::ImageOut],
         };
         let non_image_model = ModelConfig {
@@ -5194,7 +5192,6 @@ mod tests {
             agent_model_enabled: true,
             native_web_search: None,
             token_estimation: None,
-            external_web_search: None,
             capabilities: Vec::new(),
         };
 
@@ -5700,7 +5697,6 @@ mod tests {
                 capabilities: vec![ModelCapability::Chat],
                 native_web_search: None,
                 token_estimation: None,
-                external_web_search: None,
             },
         );
         let agent = crate::config::AgentConfig {
@@ -5921,7 +5917,6 @@ mod tests {
             agent_model_enabled: true,
             native_web_search: None,
             token_estimation: None,
-            external_web_search: None,
             capabilities: Vec::new(),
         }
     }

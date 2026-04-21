@@ -132,77 +132,7 @@
       "bot_token_env": "TELEGRAM_BOT_TOKEN",
       "api_base_url": "https://api.telegram.org",
       "poll_timeout_seconds": 30,
-      "poll_interval_ms": 250,
-      "commands": [
-        {
-          "command": "admin_authorize",
-          "description": "Authorize yourself as this channel's admin from a private chat"
-        },
-        {
-          "command": "admin_chat_list",
-          "description": "List approval state for this channel's chats"
-        },
-        {
-          "command": "admin_chat_approve",
-          "description": "Approve a chat id for this channel"
-        },
-        {
-          "command": "admin_chat_reject",
-          "description": "Reject a chat id for this channel"
-        },
-        {
-          "command": "help",
-          "description": "Show available commands"
-        },
-        {
-          "command": "status",
-          "description": "Show current session usage and timeout settings"
-        },
-        {
-          "command": "compact",
-          "description": "Compact the current conversation context now"
-        },
-        {
-          "command": "compact_mode",
-          "description": "Show or set automatic context compaction"
-        },
-        {
-          "command": "model",
-          "description": "Show or set the conversation model"
-        },
-        {
-          "command": "sandbox",
-          "description": "Show or set the conversation sandbox mode"
-        },
-        {
-          "command": "mount",
-          "description": "Mount a local folder into bubblewrap for this conversation"
-        },
-        {
-          "command": "think",
-          "description": "Show or set the conversation reasoning effort"
-        },
-        {
-          "command": "set_api_timeout",
-          "description": "Set session API timeout in seconds"
-        },
-        {
-          "command": "snapsave",
-          "description": "Save a named global snapshot"
-        },
-        {
-          "command": "snapload",
-          "description": "Load a named global snapshot"
-        },
-        {
-          "command": "snaplist",
-          "description": "List saved global snapshots"
-        },
-        {
-          "command": "continue",
-          "description": "Continue the latest interrupted turn"
-        }
-      ]
+      "poll_interval_ms": 250
     }
   ]
 }

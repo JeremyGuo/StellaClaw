@@ -1,5 +1,7 @@
 use crate::channel::{ProgressFeedback, ProgressFeedbackFinalState, ProgressFeedbackUpdate};
-use crate::domain::{ChannelAddress, MessageRole, SessionMessage, StoredAttachment};
+use crate::domain::{
+    ChannelAddress, MessageRole, SessionMessage, StoredAttachment, validate_conversation_id,
+};
 use crate::transcript::{SessionTranscript, TranscriptEntrySkeleton};
 use crate::workspace::WorkspaceManager;
 use agent_frame::{
@@ -1502,7 +1504,7 @@ pub(crate) fn session_conversation_dir_name(conversation_id: &str) -> String {
     let mut encoded = String::new();
     for byte in conversation_id.as_bytes() {
         let character = *byte as char;
-        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '@') {
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
             encoded.push(character);
         } else {
             encoded.push_str(&format!("%{byte:02X}"));
@@ -2316,6 +2318,7 @@ impl SessionManager {
         workspace_id: String,
         workspace_root: PathBuf,
     ) -> Result<SessionSnapshot> {
+        validate_conversation_id(&address.conversation_id)?;
         self.destroy_foreground(address)?;
         let checkpoint_messages = checkpoint.messages.clone();
         let session_id = Uuid::new_v4();
@@ -2395,6 +2398,7 @@ impl SessionManager {
         workspace_id: Option<&str>,
         kind: SessionKind,
     ) -> Result<Session> {
+        validate_conversation_id(&address.conversation_id)?;
         let session_id = Uuid::new_v4();
         let workspace = match workspace_id {
             Some(workspace_id) => self
@@ -3257,6 +3261,13 @@ mod tests {
                 .join("background")
                 .join(background.id.to_string())
         );
+    }
+
+    #[test]
+    fn session_conversation_dir_name_encodes_disallowed_path_segments() {
+        assert_eq!(session_conversation_dir_name("."), "%2E");
+        assert_eq!(session_conversation_dir_name(".."), "%2E%2E");
+        assert_eq!(session_conversation_dir_name("room@1"), "room%401");
     }
 
     #[test]

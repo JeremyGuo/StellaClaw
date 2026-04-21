@@ -25,6 +25,10 @@ mod v0_19;
 mod v0_2;
 mod v0_20;
 mod v0_21;
+mod v0_22;
+mod v0_23;
+mod v0_24;
+mod v0_25;
 mod v0_3;
 mod v0_4;
 mod v0_5;
@@ -34,7 +38,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.21";
+pub const LATEST_CONFIG_VERSION: &str = "0.25";
 pub const VERSION_0_2: &str = "0.2";
 pub const VERSION_0_3: &str = "0.3";
 pub const VERSION_0_4: &str = "0.4";
@@ -54,6 +58,11 @@ pub const VERSION_0_17: &str = "0.17";
 pub const VERSION_0_18: &str = "0.18";
 pub const VERSION_0_19: &str = "0.19";
 pub const VERSION_0_20: &str = "0.20";
+pub const VERSION_0_21: &str = "0.21";
+pub const VERSION_0_22: &str = "0.22";
+pub const VERSION_0_23: &str = "0.23";
+pub const VERSION_0_24: &str = "0.24";
+pub const VERSION_0_25: &str = "0.25";
 
 trait ConfigLoader {
     fn version(&self) -> &'static str;
@@ -86,8 +95,6 @@ pub struct TelegramChannelConfig {
     pub poll_timeout_seconds: u64,
     #[serde(default = "default_poll_interval_ms")]
     pub poll_interval_ms: u64,
-    #[serde(default = "default_telegram_commands")]
-    pub commands: Vec<BotCommandConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -186,9 +193,6 @@ pub struct ModelConfig {
     pub native_web_search: Option<NativeWebSearchConfig>,
     #[serde(default)]
     pub token_estimation: Option<TokenEstimationConfig>,
-    #[serde(default)]
-    #[serde(skip_serializing)]
-    pub external_web_search: Option<ExternalWebSearchConfig>,
 }
 
 impl ModelConfig {
@@ -467,16 +471,10 @@ impl TokenEstimationCacheConfig {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct MainAgentConfig {
-    #[serde(default)]
-    pub model: Option<String>,
-    #[serde(default)]
-    pub timeout_seconds: Option<f64>,
     #[serde(default = "default_global_install_root")]
     pub global_install_root: String,
     #[serde(default = "default_main_agent_language")]
     pub language: String,
-    #[serde(default = "default_enabled_tools")]
-    pub enabled_tools: Vec<String>,
     #[serde(default = "default_max_tool_roundtrips")]
     pub max_tool_roundtrips: usize,
     #[serde(default = "default_enable_context_compression")]
@@ -497,16 +495,10 @@ pub struct MainAgentConfig {
 
 #[derive(Debug, Deserialize)]
 struct MainAgentConfigRaw {
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    timeout_seconds: Option<f64>,
     #[serde(default = "default_global_install_root")]
     global_install_root: String,
     #[serde(default = "default_main_agent_language")]
     language: String,
-    #[serde(default = "default_enabled_tools")]
-    enabled_tools: Vec<String>,
     #[serde(default = "default_max_tool_roundtrips")]
     max_tool_roundtrips: usize,
     #[serde(default = "default_enable_context_compression")]
@@ -555,11 +547,8 @@ impl<'de> Deserialize<'de> for MainAgentConfig {
             raw.compact_trigger_ratio
         };
         Ok(Self {
-            model: raw.model,
-            timeout_seconds: raw.timeout_seconds,
             global_install_root: raw.global_install_root,
             language: raw.language,
-            enabled_tools: normalize_enabled_tools(raw.enabled_tools),
             max_tool_roundtrips: raw.max_tool_roundtrips,
             enable_context_compression: raw.enable_context_compression,
             context_compaction: raw.context_compaction.unwrap_or(ContextCompactionConfig {
@@ -693,50 +682,6 @@ fn default_global_install_root() -> String {
     } else {
         "/opt".to_string()
     }
-}
-
-fn canonical_enabled_tool_name(tool_name: &str) -> &str {
-    match tool_name {
-        "read_file" => "file_read",
-        "write_file" => "file_write",
-        _ => tool_name,
-    }
-}
-
-fn normalize_enabled_tools(enabled_tools: Vec<String>) -> Vec<String> {
-    let mut normalized = Vec::new();
-    for tool_name in enabled_tools {
-        let canonical = canonical_enabled_tool_name(&tool_name).to_string();
-        if !normalized.iter().any(|existing| existing == &canonical) {
-            normalized.push(canonical);
-        }
-    }
-    normalized
-}
-
-pub fn default_enabled_tools() -> Vec<String> {
-    vec![
-        "file_read".to_string(),
-        "file_write".to_string(),
-        "glob".to_string(),
-        "grep".to_string(),
-        "ls".to_string(),
-        "edit".to_string(),
-        "apply_patch".to_string(),
-        "exec_start".to_string(),
-        "exec_observe".to_string(),
-        "exec_wait".to_string(),
-        "exec_kill".to_string(),
-        "file_download_start".to_string(),
-        "file_download_progress".to_string(),
-        "file_download_wait".to_string(),
-        "file_download_cancel".to_string(),
-        "web_fetch".to_string(),
-        "web_search".to_string(),
-        "image_start".to_string(),
-        "image_wait".to_string(),
-        "image_cancel".to_string(),
-    ]
 }
 
 fn default_max_tool_roundtrips() -> usize {
@@ -968,7 +913,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let loaders: [&dyn ConfigLoader; 21] = [
+    let loaders: [&dyn ConfigLoader; 25] = [
         &v0_1::LegacyConfigLoader,
         &v0_2::VersionedConfigLoader,
         &v0_3::VersionedConfigLoader,
@@ -990,6 +935,10 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         &v0_19::LatestConfigLoader,
         &v0_20::LatestConfigLoader,
         &v0_21::LatestConfigLoader,
+        &v0_22::LatestConfigLoader,
+        &v0_23::LatestConfigLoader,
+        &v0_24::LatestConfigLoader,
+        &v0_25::LatestConfigLoader,
     ];
     let loader = loaders
         .into_iter()
@@ -1103,7 +1052,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
     let mut config = {
-        let loaders: [&dyn ConfigLoader; 21] = [
+        let loaders: [&dyn ConfigLoader; 25] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
             &v0_3::VersionedConfigLoader,
@@ -1125,6 +1074,10 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
             &v0_19::LatestConfigLoader,
             &v0_20::LatestConfigLoader,
             &v0_21::LatestConfigLoader,
+            &v0_22::LatestConfigLoader,
+            &v0_23::LatestConfigLoader,
+            &v0_24::LatestConfigLoader,
+            &v0_25::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()
@@ -1147,7 +1100,6 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
 pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -> Result<()> {
     #[derive(Serialize)]
     struct PersistedMainAgentConfig<'a> {
-        model: &'a Option<String>,
         global_install_root: &'a str,
         language: &'a str,
         max_tool_roundtrips: usize,
@@ -1263,7 +1215,6 @@ pub fn write_server_config_file(path: impl AsRef<Path>, config: &ServerConfig) -
         },
         tooling: &config.tooling,
         main_agent: PersistedMainAgentConfig {
-            model: &config.main_agent.model,
             global_install_root: &config.main_agent.global_install_root,
             language: &config.main_agent.language,
             max_tool_roundtrips: config.main_agent.max_tool_roundtrips,
@@ -1309,15 +1260,6 @@ fn validate_server_config(config: &ServerConfig) -> Result<()> {
     {
         return Err(anyhow!(
             "main_agent.idle_compaction.poll_interval_seconds must be at least 1"
-        ));
-    }
-    if config
-        .main_agent
-        .timeout_seconds
-        .is_some_and(|value| value < 0.0)
-    {
-        return Err(anyhow!(
-            "main_agent.timeout_seconds must be greater than or equal to 0"
         ));
     }
     for (model_name, model) in &config.models {
@@ -1605,7 +1547,7 @@ pub fn resolve_model_api_keys(config: &ServerConfig) -> Vec<ResolvedModelApiKey>
 mod tests {
     use super::{
         ChannelConfig, LATEST_CONFIG_VERSION, MainAgentConfig, ModelType, SandboxMode,
-        default_dingtalk_commands, default_telegram_commands, expand_home_path,
+        default_dingtalk_commands, expand_home_path,
         load_server_config_file, load_server_config_file_and_upgrade, resolve_model_api_keys,
     };
     use crate::backend::AgentBackendKind;
@@ -1617,7 +1559,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn telegram_commands_default_to_builtin_list() {
+    fn telegram_channel_config_loads_without_commands_field() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.json");
         fs::write(
@@ -1654,7 +1596,9 @@ mod tests {
         let config = load_server_config_file(&config_path).unwrap();
         match &config.channels[0] {
             ChannelConfig::Telegram(telegram) => {
-                assert_eq!(telegram.commands, default_telegram_commands());
+                assert_eq!(telegram.bot_token.as_deref(), Some("token"));
+                assert_eq!(telegram.poll_timeout_seconds, 30);
+                assert_eq!(telegram.poll_interval_ms, 250);
             }
             _ => panic!("expected telegram channel"),
         }
@@ -1992,7 +1936,7 @@ mod tests {
     }
 
     #[test]
-    fn repository_telegram_templates_include_mount_command() {
+    fn repository_telegram_templates_omit_commands_array() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let template_paths = [
             manifest_dir.join("../deploy_telegram.json"),
@@ -2015,21 +1959,52 @@ mod tests {
                     channel.get("kind").and_then(|kind| kind.as_str()) == Some("telegram")
                 })
                 .unwrap_or_else(|| panic!("{} has no telegram channel", path.display()));
-            let commands = telegram
-                .get("commands")
-                .and_then(|commands| commands.as_array())
-                .unwrap_or_else(|| {
-                    panic!("{} telegram channel has no commands array", path.display())
-                });
-
             assert!(
-                commands.iter().any(|command| command
-                    .get("command")
-                    .and_then(|command| command.as_str())
-                    == Some("mount")),
-                "{} telegram command list should include /mount",
+                telegram.get("commands").is_none(),
+                "{} telegram channel should not configure commands explicitly",
                 path.display()
             );
+        }
+    }
+
+    #[test]
+    fn latest_templates_omit_legacy_model_and_external_search_fields() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let template_paths = [
+            manifest_dir.join("../deploy_telegram.json"),
+            manifest_dir.join("example_telegram_config.json"),
+            manifest_dir.join("example_config.json"),
+        ];
+
+        for path in template_paths {
+            let content = fs::read_to_string(&path)
+                .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+            let value: serde_json::Value = serde_json::from_str(&content)
+                .unwrap_or_else(|err| panic!("failed to parse {}: {err}", path.display()));
+
+            assert!(
+                value["main_agent"]
+                    .as_object()
+                    .is_some_and(|main_agent| {
+                        !main_agent.contains_key("model")
+                            && !main_agent.contains_key("timeout_seconds")
+                    }),
+                "{} should not emit legacy main_agent fields",
+                path.display()
+            );
+
+            let models = value["models"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{} has no models object", path.display()));
+            for (alias, model) in models {
+                assert!(
+                    model.as_object()
+                        .is_some_and(|object| !object.contains_key("external_web_search")),
+                    "{} model '{}' should not emit external_web_search",
+                    path.display(),
+                    alias
+                );
+            }
         }
     }
 
@@ -2074,7 +2049,7 @@ mod tests {
     }
 
     #[test]
-    fn main_agent_timeout_allows_zero_to_disable_external_timeout() {
+    fn main_agent_config_ignores_legacy_timeout_seconds_field() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.json");
         fs::write(
@@ -2104,41 +2079,11 @@ mod tests {
         .unwrap();
 
         let config = load_server_config_file(&config_path).unwrap();
-        assert_eq!(config.main_agent.timeout_seconds, Some(0.0));
-    }
-
-    #[test]
-    fn main_agent_timeout_rejects_negative_values() {
-        let temp_dir = TempDir::new().unwrap();
-        let config_path = temp_dir.path().join("config.json");
-        fs::write(
-            &config_path,
-            r#"
-            {
-              "models": {
-                "main": {
-                  "api_endpoint": "https://example.com/v1",
-                  "model": "demo-model",
-                  "description": "demo"
-                }
-              },
-              "main_agent": {
-                "model": "main",
-                "timeout_seconds": -1
-              },
-              "channels": [
-                {
-                  "kind": "command_line",
-                  "id": "local-cli"
-                }
-              ]
-            }
-            "#,
-        )
-        .unwrap();
-
-        let error = load_server_config_file(&config_path).unwrap_err();
-        assert!(error.to_string().contains("main_agent.timeout_seconds"));
+        assert_eq!(config.main_agent.language, super::default_main_agent_language());
+        assert_eq!(
+            config.main_agent.max_tool_roundtrips,
+            super::default_max_tool_roundtrips()
+        );
     }
 
     #[test]
@@ -2504,7 +2449,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_external_web_search_is_promoted_into_shared_web_search_catalog() {
+    fn legacy_external_web_search_is_ignored_during_upgrade() {
         let temp_dir = TempDir::new().unwrap();
         let config_path = temp_dir.path().join("config.json");
         fs::write(
@@ -2541,24 +2486,23 @@ mod tests {
 
         let (config, upgraded) = load_server_config_file_and_upgrade(&config_path).unwrap();
         assert!(upgraded);
-        assert_eq!(
-            config.models["main"].web_search_model.as_deref(),
-            Some("main_web_search")
-        );
-        assert!(
-            config
-                .model_catalog
-                .web_search
-                .contains_key("main_web_search")
-        );
+        assert!(config.models["main"].web_search_model.is_none());
+        assert!(config.model_catalog.web_search.is_empty());
 
         let written = fs::read_to_string(&config_path).unwrap();
         let written_json: serde_json::Value = serde_json::from_str(&written).unwrap();
         assert!(written.contains(&format!("\"version\": \"{LATEST_CONFIG_VERSION}\"")));
-        assert!(written.contains("\"web_search\": \"main_web_search\""));
         assert!(written.contains("\"models\": {"));
         assert!(!written.contains("\"tooling\": {"));
         assert!(!written.contains("\"enabled_tools\""));
+        assert!(!written.contains("\"external_web_search\""));
+        assert!(
+            written_json["models"]["main"]
+                .as_object()
+                .unwrap()
+                .get("web_search")
+                .is_none()
+        );
         assert!(written.contains("\"context_compaction\": {"));
         assert!(
             written_json["main_agent"]
@@ -2618,7 +2562,6 @@ mod tests {
             config.models["main"].web_search_model.as_deref(),
             Some("default_search")
         );
-        assert!(config.models["main"].external_web_search.is_some());
         assert!(
             config
                 .model_catalog
@@ -2896,17 +2839,48 @@ mod tests {
         .unwrap();
 
         let config = load_server_config_file(&config_path).unwrap();
-        assert_eq!(config.main_agent.model.as_deref(), Some("helper"));
         assert!(!config.models["helper"].agent_model_enabled);
     }
 
     #[test]
-    fn main_agent_config_normalizes_legacy_file_tool_names() {
+    fn main_agent_config_ignores_legacy_model_field() {
+        let config: MainAgentConfig = serde_json::from_value(serde_json::json!({
+            "model": "helper"
+        }))
+        .unwrap();
+
+        assert_eq!(config.language, super::default_main_agent_language());
+        assert_eq!(
+            config.max_tool_roundtrips,
+            super::default_max_tool_roundtrips()
+        );
+    }
+
+    #[test]
+    fn main_agent_config_ignores_legacy_timeout_field() {
+        let config: MainAgentConfig = serde_json::from_value(serde_json::json!({
+            "timeout_seconds": 0
+        }))
+        .unwrap();
+
+        assert_eq!(config.language, super::default_main_agent_language());
+        assert_eq!(
+            config.max_tool_roundtrips,
+            super::default_max_tool_roundtrips()
+        );
+    }
+
+    #[test]
+    fn main_agent_config_ignores_legacy_enabled_tools_field() {
         let config: MainAgentConfig = serde_json::from_value(serde_json::json!({
             "enabled_tools": ["read_file", "write_file", "file_read"]
         }))
         .unwrap();
 
-        assert_eq!(config.enabled_tools, vec!["file_read", "file_write"]);
+        assert_eq!(config.language, super::default_main_agent_language());
+        assert_eq!(
+            config.max_tool_roundtrips,
+            super::default_max_tool_roundtrips()
+        );
     }
 }

@@ -150,6 +150,5 @@ fn upgrade_versioned_model(raw: VersionedModelConfigRaw) -> ModelConfig {
         capabilities: raw.capabilities,
         native_web_search: raw.native_web_search,
         token_estimation: None,
-        external_web_search: None,
     }
 }

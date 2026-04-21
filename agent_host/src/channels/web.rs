@@ -4,6 +4,7 @@ use crate::channel::{
 use crate::config::WebChannelConfig;
 use crate::domain::{
     ChannelAddress, OutgoingAttachment, OutgoingMessage, ProcessingState, ShowOptions,
+    validate_conversation_id,
 };
 use crate::transcript::{TranscriptEntry, TranscriptEntrySkeleton, TranscriptEntryType};
 use anyhow::{Context, Result};
@@ -468,10 +469,8 @@ async fn send_message(
     let sender = incoming_sender
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let conversation_key = body
-        .conversation_key
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "web-default".to_string());
+    let conversation_key = normalize_or_default_conversation_key(body.conversation_key.as_deref())
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
     let address = ChannelAddress {
         channel_id: state.id.clone(),
         conversation_id: conversation_key.clone(),
@@ -646,7 +645,19 @@ async fn handle_ws_client_text(
             seq_start,
             seq_end,
         } => {
-            let conversation_key = conversation_key.unwrap_or_else(|| "web-default".to_string());
+            let conversation_key = match normalize_or_default_conversation_key(
+                conversation_key.as_deref(),
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    let event = WebSocketEvent::TranscriptError {
+                        request_id,
+                        conversation_key: conversation_key.map(|value| value.to_string()),
+                        message: format!("{error:#}"),
+                    };
+                    return send_ws_event(socket, &event).await;
+                }
+            };
             let address = web_channel_address(state, &conversation_key);
             let event = match host_for_state(state) {
                 Ok(host) => match host
@@ -717,14 +728,9 @@ async fn list_transcript(
     headers: HeaderMap,
 ) -> Result<Json<Vec<TranscriptEntrySkeleton>>, StatusCode> {
     check_auth(&state, &headers, query_token(&query.conversation_key))?;
-    let address = web_channel_address(
-        &state,
-        query
-            .conversation_key
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("web-default"),
-    );
+    let conversation_key = normalize_or_default_conversation_key(query.conversation_key.as_deref())
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let address = web_channel_address(&state, &conversation_key);
     let entries = host_for_state(&state)?
         .list_web_transcript(
             &address,
@@ -749,14 +755,9 @@ async fn get_transcript_detail(
     headers: HeaderMap,
 ) -> Result<Json<Vec<TranscriptEntry>>, StatusCode> {
     check_auth(&state, &headers, query_token(&query.conversation_key))?;
-    let address = web_channel_address(
-        &state,
-        query
-            .conversation_key
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("web-default"),
-    );
+    let conversation_key = normalize_or_default_conversation_key(query.conversation_key.as_deref())
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let address = web_channel_address(&state, &conversation_key);
     let entries = host_for_state(&state)?
         .get_web_transcript_detail(&address, query.seq_start, query.seq_end)
         .await
@@ -801,17 +802,19 @@ fn normalize_required_conversation_key(value: Option<String>) -> Result<String> 
     normalize_conversation_key(&value)
 }
 
+fn normalize_or_default_conversation_key(value: Option<&str>) -> Result<String> {
+    match value {
+        Some(value) if !value.trim().is_empty() => normalize_conversation_key(value),
+        _ => Ok("web-default".to_string()),
+    }
+}
+
 fn normalize_conversation_key(value: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         anyhow::bail!("conversation_key is empty");
     }
-    if trimmed.len() > 128 {
-        anyhow::bail!("conversation_key is too long");
-    }
-    if trimmed.chars().any(char::is_control) {
-        anyhow::bail!("conversation_key contains control characters");
-    }
+    validate_conversation_id(trimmed).map_err(|error| anyhow::anyhow!("invalid conversation_key: {error}"))?;
     Ok(trimmed.to_string())
 }
 
@@ -965,10 +968,7 @@ fn find_conversation_root(
     channel_id: &str,
     conversation_key: &Option<String>,
 ) -> Result<Option<PathBuf>> {
-    let conversation_key = conversation_key
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("web-default");
+    let conversation_key = normalize_or_default_conversation_key(conversation_key.as_deref())?;
     let conversations_root = workdir.join("conversations");
     if !conversations_root.is_dir() {
         return Ok(None);
@@ -993,7 +993,7 @@ fn find_conversation_root(
         let matches_conversation = address
             .and_then(|address| address.get("conversation_id"))
             .and_then(Value::as_str)
-            == Some(conversation_key);
+            == Some(conversation_key.as_str());
         if matches_channel && matches_conversation {
             return Ok(Some(root));
         }
@@ -1006,10 +1006,7 @@ fn find_session_root(
     channel_id: &str,
     conversation_key: &Option<String>,
 ) -> Result<Option<PathBuf>> {
-    let conversation_key = conversation_key
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("web-default");
+    let conversation_key = normalize_or_default_conversation_key(conversation_key.as_deref())?;
     let sessions_root = workdir.join("sessions");
     if !sessions_root.is_dir() {
         return Ok(None);
@@ -1028,7 +1025,7 @@ fn find_session_root(
         let matches_conversation = address
             .and_then(|address| address.get("conversation_id"))
             .and_then(Value::as_str)
-            == Some(conversation_key);
+            == Some(conversation_key.as_str());
         if matches_channel && matches_conversation {
             return Ok(Some(session_root));
         }
@@ -1172,5 +1169,16 @@ mod tests {
         let result = host_for_state(&state);
         assert!(result.is_err());
         assert_eq!(result.err(), Some(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn normalize_conversation_key_rejects_special_characters() {
+        for value in ["..", ".", "web/default", "web default", "abc@def"] {
+            assert!(normalize_conversation_key(value).is_err(), "{value} should be rejected");
+        }
+        assert_eq!(
+            normalize_conversation_key("web-default_123").unwrap(),
+            "web-default_123"
+        );
     }
 }

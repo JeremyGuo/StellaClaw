@@ -1,4 +1,4 @@
-use super::{ConfigLoader, ServerConfig, VERSION_0_21};
+use super::{ConfigLoader, ServerConfig, VERSION_0_22};
 use anyhow::Result;
 use serde_json::Value;
 
@@ -6,10 +6,10 @@ pub(super) struct LatestConfigLoader;
 
 impl ConfigLoader for LatestConfigLoader {
     fn version(&self) -> &'static str {
-        VERSION_0_21
+        VERSION_0_22
     }
 
     fn load_and_upgrade(&self, value: Value) -> Result<ServerConfig> {
-        super::v0_14::load_versioned_config(value, VERSION_0_21)
+        super::v0_14::load_versioned_config(value, VERSION_0_22)
     }
 }
