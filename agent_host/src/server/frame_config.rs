@@ -446,18 +446,35 @@ impl AgentRuntimeView {
                 )?,
             );
         }
-        let remote_workpaths = self.with_conversations(|conversations| {
-            Ok(conversations
-                .get_snapshot(&session.address)
-                .map(|snapshot| snapshot.settings.remote_workpaths)
-                .unwrap_or_default())
-        })?;
-        let local_mounts = self.with_conversations(|conversations| {
-            Ok(conversations
-                .get_snapshot(&session.address)
-                .map(|snapshot| snapshot.settings.local_mounts)
-                .unwrap_or_default())
-        })?;
+        let conversation_snapshot = self
+            .with_conversations(|conversations| Ok(conversations.get_snapshot(&session.address)))?;
+        let remote_execution = conversation_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.settings.remote_execution.clone());
+        let remote_workpaths = if remote_execution.is_some() {
+            Vec::new()
+        } else {
+            conversation_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.settings.remote_workpaths.clone())
+                .unwrap_or_default()
+        };
+        let local_mounts = if remote_execution.is_some() {
+            Vec::new()
+        } else {
+            conversation_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.settings.local_mounts.clone())
+                .unwrap_or_default()
+        };
+        let runtime_state_root = if remote_execution.is_some() {
+            self.runtime_state_root_for_session(session)?
+        } else {
+            self.agent_workspace
+                .root_dir
+                .join("runtime")
+                .join(&session.workspace_id)
+        };
 
         Ok(FrameAgentConfig {
             upstream: self.build_upstream_config(
@@ -495,6 +512,7 @@ impl AgentRuntimeView {
                 &workspace_summary,
                 &remote_workpaths,
                 &local_mounts,
+                remote_execution.as_ref(),
                 kind,
                 model_key,
                 model,
@@ -511,13 +529,10 @@ impl AgentRuntimeView {
                     description: workpath.description.clone(),
                 })
                 .collect(),
+            enable_remote_tools: remote_execution.is_none(),
             max_tool_roundtrips: self.main_agent.max_tool_roundtrips,
             workspace_root: workspace_root.to_path_buf(),
-            runtime_state_root: self
-                .agent_workspace
-                .root_dir
-                .join("runtime")
-                .join(&session.workspace_id),
+            runtime_state_root,
             enable_context_compression: self
                 .selected_context_compaction_enabled
                 .unwrap_or(self.main_agent.enable_context_compression),

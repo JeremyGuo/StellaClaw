@@ -14,6 +14,7 @@ pub mod domain;
 pub mod env;
 pub mod logging;
 pub mod prompt;
+pub mod remote_execution;
 pub mod sandbox;
 pub mod server;
 pub mod session;

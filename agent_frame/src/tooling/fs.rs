@@ -552,29 +552,71 @@ fn run_remote_file_tool(
     Ok(result)
 }
 
+fn ensure_remote_argument_allowed(
+    arguments: &Map<String, Value>,
+    enable_remote_tools: bool,
+) -> Result<()> {
+    if !enable_remote_tools && arguments.get("remote").is_some() {
+        return Err(anyhow!(
+            "argument remote is disabled in the current execution mode"
+        ));
+    }
+    Ok(())
+}
+
+fn file_tool_schema(
+    mut properties: Map<String, Value>,
+    required: &[&str],
+    enable_remote_tools: bool,
+) -> Value {
+    if enable_remote_tools {
+        properties.insert("remote".to_string(), remote_schema_property());
+    }
+    Value::Object(
+        [
+            ("type".to_string(), Value::String("object".to_string())),
+            ("properties".to_string(), Value::Object(properties)),
+            (
+                "required".to_string(),
+                Value::Array(
+                    required
+                        .iter()
+                        .map(|value| Value::String((*value).to_string()))
+                        .collect(),
+                ),
+            ),
+            ("additionalProperties".to_string(), Value::Bool(false)),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
 pub(super) fn file_read_tool(
     workspace_root: PathBuf,
     remote_workpaths: RemoteWorkpathMap,
+    enable_remote_tools: bool,
     _cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
     Tool::new(
         "file_read",
         "Read a UTF-8 text file. Supports file_path plus optional offset and limit for large files.",
-        json!({
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string"},
-                "offset": {"type": "integer"},
-                "limit": {"type": "integer"},
-                "remote": remote_schema_property()
-            },
-            "required": ["file_path"],
-            "additionalProperties": false
-        }),
+        file_tool_schema(
+            [
+                ("file_path".to_string(), json!({"type": "string"})),
+                ("offset".to_string(), json!({"type": "integer"})),
+                ("limit".to_string(), json!({"type": "integer"})),
+            ]
+            .into_iter()
+            .collect(),
+            &["file_path"],
+            enable_remote_tools,
+        ),
         move |arguments| {
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            ensure_remote_argument_allowed(arguments, enable_remote_tools)?;
             if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
                 return run_remote_file_tool(&host, "file_read", arguments, &remote_workpaths);
             }
@@ -685,27 +727,32 @@ pub(super) fn file_read_tool(
 pub(super) fn file_write_tool(
     workspace_root: PathBuf,
     remote_workpaths: RemoteWorkpathMap,
+    enable_remote_tools: bool,
     _cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
     Tool::new(
         "file_write",
         "Write a UTF-8 text file.",
-        json!({
-            "type": "object",
-            "properties": {
-                "file_path": {"type": "string"},
-                "content": {"type": "string"},
-                "mode": {"type": "string", "enum": ["overwrite", "append"]},
-                "encoding": {"type": "string"},
-                "remote": remote_schema_property()
-            },
-            "required": ["file_path", "content"],
-            "additionalProperties": false
-        }),
+        file_tool_schema(
+            [
+                ("file_path".to_string(), json!({"type": "string"})),
+                ("content".to_string(), json!({"type": "string"})),
+                (
+                    "mode".to_string(),
+                    json!({"type": "string", "enum": ["overwrite", "append"]}),
+                ),
+                ("encoding".to_string(), json!({"type": "string"})),
+            ]
+            .into_iter()
+            .collect(),
+            &["file_path", "content"],
+            enable_remote_tools,
+        ),
         move |arguments| {
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            ensure_remote_argument_allowed(arguments, enable_remote_tools)?;
             if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
                 return run_remote_file_tool(&host, "file_write", arguments, &remote_workpaths);
             }
@@ -747,25 +794,27 @@ pub(super) fn file_write_tool(
 pub(super) fn glob_tool(
     workspace_root: PathBuf,
     remote_workpaths: RemoteWorkpathMap,
+    enable_remote_tools: bool,
     _cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
     Tool::new(
         "glob",
         "Fast file pattern matching tool. Supports glob patterns like **/*.rs and src/**/*.ts.",
-        json!({
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string"},
-                "path": {"type": "string"},
-                "remote": remote_schema_property()
-            },
-            "required": ["pattern"],
-            "additionalProperties": false
-        }),
+        file_tool_schema(
+            [
+                ("pattern".to_string(), json!({"type": "string"})),
+                ("path".to_string(), json!({"type": "string"})),
+            ]
+            .into_iter()
+            .collect(),
+            &["pattern"],
+            enable_remote_tools,
+        ),
         move |arguments| {
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            ensure_remote_argument_allowed(arguments, enable_remote_tools)?;
             if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
                 return run_remote_file_tool(&host, "glob", arguments, &remote_workpaths);
             }
@@ -817,26 +866,28 @@ pub(super) fn glob_tool(
 pub(super) fn grep_tool(
     workspace_root: PathBuf,
     remote_workpaths: RemoteWorkpathMap,
+    enable_remote_tools: bool,
     _cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
     Tool::new(
         "grep",
         "Fast content search tool. Searches file contents with a regex pattern and returns matching file paths.",
-        json!({
-            "type": "object",
-            "properties": {
-                "pattern": {"type": "string"},
-                "path": {"type": "string"},
-                "include": {"type": "string"},
-                "remote": remote_schema_property()
-            },
-            "required": ["pattern"],
-            "additionalProperties": false
-        }),
+        file_tool_schema(
+            [
+                ("pattern".to_string(), json!({"type": "string"})),
+                ("path".to_string(), json!({"type": "string"})),
+                ("include".to_string(), json!({"type": "string"})),
+            ]
+            .into_iter()
+            .collect(),
+            &["pattern"],
+            enable_remote_tools,
+        ),
         move |arguments| {
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            ensure_remote_argument_allowed(arguments, enable_remote_tools)?;
             if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
                 return run_remote_file_tool(&host, "grep", arguments, &remote_workpaths);
             }
@@ -901,24 +952,24 @@ pub(super) fn grep_tool(
 pub(super) fn ls_tool(
     workspace_root: PathBuf,
     remote_workpaths: RemoteWorkpathMap,
+    enable_remote_tools: bool,
     _cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
     Tool::new(
         "ls",
         "List a recursive directory tree for non-hidden files and directories under a path. Skips common cache/build directories by default. Large trees are truncated to the first 1000 files and directories; pass a more specific path or use glob/grep when you know what to search for.",
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "remote": remote_schema_property()
-            },
-            "required": ["path"],
-            "additionalProperties": false
-        }),
+        file_tool_schema(
+            [("path".to_string(), json!({"type": "string"}))]
+                .into_iter()
+                .collect(),
+            &["path"],
+            enable_remote_tools,
+        ),
         move |arguments| {
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            ensure_remote_argument_allowed(arguments, enable_remote_tools)?;
             if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
                 return run_remote_file_tool(&host, "ls", arguments, &remote_workpaths);
             }
@@ -948,29 +999,31 @@ pub(super) fn ls_tool(
 pub(super) fn edit_tool(
     workspace_root: PathBuf,
     remote_workpaths: RemoteWorkpathMap,
+    enable_remote_tools: bool,
     _cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
     Tool::new(
         "edit",
         "Edit a UTF-8 text file by replacing old_text with new_text. When replace_all=false, old_text must match exactly one location; if it matches multiple locations, include more surrounding context.",
-        json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string"},
-                "old_text": {"type": "string"},
-                "new_text": {"type": "string"},
-                "replace_all": {"type": "boolean"},
-                "create_if_missing": {"type": "boolean"},
-                "encoding": {"type": "string"},
-                "remote": remote_schema_property()
-            },
-            "required": ["path", "old_text", "new_text"],
-            "additionalProperties": false
-        }),
+        file_tool_schema(
+            [
+                ("path".to_string(), json!({"type": "string"})),
+                ("old_text".to_string(), json!({"type": "string"})),
+                ("new_text".to_string(), json!({"type": "string"})),
+                ("replace_all".to_string(), json!({"type": "boolean"})),
+                ("create_if_missing".to_string(), json!({"type": "boolean"})),
+                ("encoding".to_string(), json!({"type": "string"})),
+            ]
+            .into_iter()
+            .collect(),
+            &["path", "old_text", "new_text"],
+            enable_remote_tools,
+        ),
         move |arguments| {
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            ensure_remote_argument_allowed(arguments, enable_remote_tools)?;
             if let ExecutionTarget::RemoteSsh { host } = execution_target_arg(arguments)? {
                 return run_remote_file_tool(&host, "edit", arguments, &remote_workpaths);
             }

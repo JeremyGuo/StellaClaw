@@ -359,30 +359,50 @@ fn run_remote_apply_patch(
     }))
 }
 
+fn ensure_remote_argument_allowed(
+    arguments: &Map<String, Value>,
+    enable_remote_tools: bool,
+) -> Result<()> {
+    if !enable_remote_tools && arguments.get("remote").is_some() {
+        return Err(anyhow!(
+            "argument remote is disabled in the current execution mode"
+        ));
+    }
+    Ok(())
+}
+
 fn apply_patch_tool(
     workspace_root: PathBuf,
     remote_workpaths: RemoteWorkpathMap,
+    enable_remote_tools: bool,
     _cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
+    let mut properties = Map::new();
+    properties.insert("patch".to_string(), json!({"type": "string"}));
+    properties.insert("strip".to_string(), json!({"type": "integer"}));
+    properties.insert("reverse".to_string(), json!({"type": "boolean"}));
+    properties.insert("check".to_string(), json!({"type": "boolean"}));
+    if enable_remote_tools {
+        properties.insert("remote".to_string(), remote_schema_property());
+    }
     Tool::new(
         "apply_patch",
         "Apply a unified diff patch inside the workspace using git apply. The patch must be a valid unified diff.",
-        json!({
-            "type": "object",
-            "properties": {
-                "patch": {"type": "string"},
-                "strip": {"type": "integer"},
-                "reverse": {"type": "boolean"},
-                "check": {"type": "boolean"},
-                "remote": remote_schema_property()
-            },
-            "required": ["patch"],
-            "additionalProperties": false
-        }),
+        Value::Object(
+            [
+                ("type".to_string(), Value::String("object".to_string())),
+                ("properties".to_string(), Value::Object(properties)),
+                ("required".to_string(), json!(["patch"])),
+                ("additionalProperties".to_string(), Value::Bool(false)),
+            ]
+            .into_iter()
+            .collect(),
+        ),
         move |arguments| {
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            ensure_remote_argument_allowed(arguments, enable_remote_tools)?;
             let patch = string_arg(arguments, "patch")?;
             let strip = usize_arg_with_default(arguments, "strip", 0)?;
             let reverse = arguments
@@ -598,6 +618,7 @@ pub fn build_tool_registry(
     skills: &[SkillMetadata],
     extra_tools: &[Tool],
     remote_workpaths: &[RemoteWorkpathConfig],
+    enable_remote_tools: bool,
 ) -> Result<BTreeMap<String, Tool>> {
     build_tool_registry_with_cancel(
         workspace_root,
@@ -612,6 +633,7 @@ pub fn build_tool_registry(
         skills,
         extra_tools,
         remote_workpaths,
+        enable_remote_tools,
         None,
     )
 }
@@ -629,6 +651,7 @@ pub fn build_tool_registry_with_cancel(
     skills: &[SkillMetadata],
     extra_tools: &[Tool],
     remote_workpaths: &[RemoteWorkpathConfig],
+    enable_remote_tools: bool,
     cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Result<BTreeMap<String, Tool>> {
     let remote_workpath_configs = remote_workpaths.to_vec();
@@ -637,37 +660,44 @@ pub fn build_tool_registry_with_cancel(
     registry.add(file_read_tool(
         workspace_root.to_path_buf(),
         remote_workpaths.clone(),
+        enable_remote_tools,
         cancel_flag.clone(),
     ))?;
     registry.add(file_write_tool(
         workspace_root.to_path_buf(),
         remote_workpaths.clone(),
+        enable_remote_tools,
         cancel_flag.clone(),
     ))?;
     registry.add(glob_tool(
         workspace_root.to_path_buf(),
         remote_workpaths.clone(),
+        enable_remote_tools,
         cancel_flag.clone(),
     ))?;
     registry.add(grep_tool(
         workspace_root.to_path_buf(),
         remote_workpaths.clone(),
+        enable_remote_tools,
         cancel_flag.clone(),
     ))?;
     registry.add(ls_tool(
         workspace_root.to_path_buf(),
         remote_workpaths.clone(),
+        enable_remote_tools,
         cancel_flag.clone(),
     ))?;
     registry.add(edit_tool(
         workspace_root.to_path_buf(),
         remote_workpaths.clone(),
+        enable_remote_tools,
         cancel_flag.clone(),
     ))?;
     registry.add(shell_tool(
         workspace_root.to_path_buf(),
         runtime_state_root.to_path_buf(),
         remote_workpaths.clone(),
+        enable_remote_tools,
         cancel_flag.clone(),
     ))?;
     registry.add(shell_close_tool(
@@ -680,6 +710,7 @@ pub fn build_tool_registry_with_cancel(
         upstream.clone(),
         available_upstreams.clone(),
         remote_workpath_configs,
+        enable_remote_tools,
         cancel_flag.clone(),
     ))?;
     registry.add(dsl_wait_tool(
@@ -695,6 +726,7 @@ pub fn build_tool_registry_with_cancel(
     registry.add(apply_patch_tool(
         workspace_root.to_path_buf(),
         remote_workpaths.clone(),
+        enable_remote_tools,
         cancel_flag.clone(),
     ))?;
     registry.add(file_download_start_tool(
@@ -1193,6 +1225,7 @@ remote_command="$*"
             &[],
             &[],
             &[],
+            true,
             None,
         )
         .unwrap();
@@ -1346,6 +1379,7 @@ remote_command="$*"
             &[],
             &[],
             &[],
+            true,
             None,
         )
         .unwrap();
@@ -1401,6 +1435,7 @@ remote_command="$*"
             &[],
             &[],
             &remote_workpaths,
+            true,
             None,
         )
         .unwrap();
@@ -1444,6 +1479,55 @@ remote_command="$*"
     }
 
     #[test]
+    fn remote_mode_tool_registry_hides_remote_parameters() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let upstream = test_upstream();
+        let remote_workpaths = vec![RemoteWorkpathConfig {
+            host: "fake-host".to_string(),
+            path: workspace_root.display().to_string(),
+            description: "test remote workspace".to_string(),
+        }];
+        let registry = build_tool_registry_with_cancel(
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            &BTreeMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            &remote_workpaths,
+            false,
+            None,
+        )
+        .unwrap();
+
+        for name in [
+            "file_read",
+            "file_write",
+            "glob",
+            "grep",
+            "ls",
+            "edit",
+            "shell",
+            "apply_patch",
+        ] {
+            let tool = registry.get(name).expect("tool should be registered");
+            assert!(
+                tool.parameters["properties"].get("remote").is_none(),
+                "remote should be hidden for {name}"
+            );
+        }
+    }
+
+    #[test]
     fn shell_close_does_not_expose_remote_parameter() {
         let temp_dir = TempDir::new().unwrap();
         let workspace_root = temp_dir.path().join("workspace");
@@ -1469,6 +1553,7 @@ remote_command="$*"
             &[],
             &[],
             &remote_workpaths,
+            true,
             None,
         )
         .unwrap();
@@ -1500,6 +1585,7 @@ remote_command="$*"
             &[],
             &[],
             &[],
+            true,
             None,
         )
         .unwrap();
@@ -1721,6 +1807,7 @@ remote_command="$*"
             &[],
             &[],
             &remote_workpaths,
+            true,
             None,
         )
         .unwrap();
@@ -1837,6 +1924,7 @@ exec sh -c "$remote_command""#,
             &[],
             &[],
             &remote_workpaths,
+            true,
             None,
         )
         .unwrap();
@@ -1900,6 +1988,7 @@ exec sh -c "$remote_command""#,
             &[],
             &[],
             &remote_workpaths,
+            true,
             None,
         )
         .unwrap();
@@ -1953,6 +2042,7 @@ exec sh -c "$remote_command""#,
             &[],
             &[],
             &remote_workpaths,
+            true,
             None,
         )
         .unwrap();
@@ -2022,6 +2112,7 @@ exec sh -c "$remote_command""#,
             &[],
             &[],
             &[],
+            true,
             None,
         )
         .unwrap();
@@ -2090,6 +2181,7 @@ exec sh -c "$remote_command""#,
             &[],
             &[],
             &[],
+            true,
             None,
         )
         .unwrap();
@@ -2160,6 +2252,7 @@ exec sh -c "$remote_command""#,
             &[],
             &[],
             &[],
+            true,
             None,
         )
         .unwrap();
@@ -2228,6 +2321,7 @@ exec sh -c "$remote_command""#,
             &[],
             &[],
             &[],
+            true,
             None,
         )
         .unwrap();
@@ -2270,6 +2364,7 @@ exec sh -c "$remote_command""#,
             &[],
             &[],
             &[],
+            true,
             None,
         )
         .unwrap();
@@ -2334,6 +2429,7 @@ exec sh -c "$remote_command""#,
             &[],
             &[],
             &[],
+            true,
             None,
         )
         .unwrap();
@@ -2398,6 +2494,7 @@ exec sh -c "$remote_command""#,
             &[],
             &[],
             &[],
+            true,
             None,
         )
         .unwrap();
@@ -2458,6 +2555,7 @@ exec sh -c "$remote_command""#,
             &[],
             &[],
             &[],
+            true,
             None,
         )
         .unwrap();
@@ -2516,6 +2614,7 @@ exec sh -c "$remote_command""#,
             &[],
             &[],
             &[],
+            true,
             None,
         )
         .unwrap();

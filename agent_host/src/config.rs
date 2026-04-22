@@ -1040,6 +1040,10 @@ pub fn default_bot_commands() -> Vec<BotCommandConfig> {
             description: "Mount a local folder into bubblewrap for this conversation".to_string(),
         },
         BotCommandConfig {
+            command: "remote".to_string(),
+            description: "Bind this conversation to one execution root".to_string(),
+        },
+        BotCommandConfig {
             command: "think".to_string(),
             description: "Show or set the conversation reasoning effort".to_string(),
         },

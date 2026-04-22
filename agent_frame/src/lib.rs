@@ -38,9 +38,8 @@ pub use message::{
 };
 pub use modality::{
     CanonicalMessageScope, ModalityItemContext, ModalityItemRewrite, UpstreamModalityPolicy,
-    canonicalize_message_multimodal_for_storage,
-    downgraded_multimodal_placeholder_text, placeholder_text_item,
-    rewrite_message_content_with_modality_policy,
+    canonicalize_message_multimodal_for_storage, downgraded_multimodal_placeholder_text,
+    placeholder_text_item, rewrite_message_content_with_modality_policy,
 };
 pub use token_estimation::{
     RenderedTokenEstimatePrompt, TokenEstimateInput, TokenEstimateModel, TokenEstimator,

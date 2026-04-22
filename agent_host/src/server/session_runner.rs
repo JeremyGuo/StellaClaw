@@ -1632,29 +1632,42 @@ impl AgentRuntimeView {
         model_key: &str,
     ) -> Result<AgentSystemPromptState> {
         let model = self.model_config(model_key)?;
-        let workspace_summary = self
-            .workspace_manager
-            .ensure_workspace_exists(&session.workspace_id)
-            .map(|workspace| workspace.summary)
-            .unwrap_or_default();
-        let remote_workpaths = self.with_conversations(|conversations| {
-            Ok(conversations
-                .get_snapshot(&session.address)
-                .map(|snapshot| snapshot.settings.remote_workpaths)
-                .unwrap_or_default())
-        })?;
-        let local_mounts = self.with_conversations(|conversations| {
-            Ok(conversations
-                .get_snapshot(&session.address)
-                .map(|snapshot| snapshot.settings.local_mounts)
-                .unwrap_or_default())
-        })?;
+        let conversation_snapshot = self
+            .with_conversations(|conversations| Ok(conversations.get_snapshot(&session.address)))?;
+        let remote_execution = conversation_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.settings.remote_execution.clone());
+        let workspace_summary = if remote_execution.is_some() {
+            String::new()
+        } else {
+            self.workspace_manager
+                .ensure_workspace_exists(&session.workspace_id)
+                .map(|workspace| workspace.summary)
+                .unwrap_or_default()
+        };
+        let remote_workpaths = if remote_execution.is_some() {
+            Vec::new()
+        } else {
+            conversation_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.settings.remote_workpaths.clone())
+                .unwrap_or_default()
+        };
+        let local_mounts = if remote_execution.is_some() {
+            Vec::new()
+        } else {
+            conversation_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.settings.local_mounts.clone())
+                .unwrap_or_default()
+        };
         Ok(build_agent_system_prompt_state(
             &self.agent_workspace,
             session,
             &workspace_summary,
             &remote_workpaths,
             &local_mounts,
+            remote_execution.as_ref(),
             AgentPromptKind::MainForeground,
             model_key,
             model,

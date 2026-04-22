@@ -9,10 +9,14 @@ impl AgentRuntimeView {
         control: Option<SessionExecutionControl>,
     ) -> Vec<Tool> {
         let mut tools = Vec::new();
+        let remote_execution_active = self
+            .remote_execution_active(&session.address)
+            .unwrap_or(false);
         if matches!(
             kind,
             AgentPromptKind::MainForeground | AgentPromptKind::MainBackground
-        ) {
+        ) && !remote_execution_active
+        {
             let runtime = self.clone();
             tools.push(Tool::new(
                 "workspaces_list",

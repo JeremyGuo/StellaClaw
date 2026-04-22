@@ -30,6 +30,13 @@ impl Server {
 
     async fn summarize_workspace_before_destroy(&self, session: &SessionSnapshot) -> Result<()> {
         let _summary_guard = SummaryInProgressGuard::new(Arc::clone(&self.summary_tracker));
+        if self.remote_execution_active(&session.address)? {
+            let actor = self.with_sessions(|sessions| {
+                sessions.resolve_foreground_by_address(&session.address)
+            })?;
+            actor.mark_workspace_summary_state(false, false)?;
+            return Ok(());
+        }
         let entries =
             self.workspace_manager
                 .list_workspace_contents(&session.workspace_id, None, 3, 200)?;

@@ -1,5 +1,20 @@
-version: 0.27.2
+version: 0.27.3
 ---
+
+# 0.27.3
+
+- 新增 conversation 级 `/remote` 唯一 execution root 模式：
+  conversation settings 现在可持久化 `remote_execution` 绑定，支持 `/remote <absolute-local-path>`、`/remote <host> <path>` 和 `/remote off`。SSH 模式通过 `sshfs` 把远端目录挂到本地 `workdir/remote_mounts/<conversation>/workspace`，然后把它当普通 workspace root 使用。
+- Remote mode 改写运行期存储根与工具暴露：
+  绑定 execution root 后，session/runtime/snapshots 持久化默认写入 `<execution_root>/.cache/partyclaw`；foreground/background session 恢复、snapshot save/load、Web 附件定位和运行时状态清理都会跟随这个根切换。remote mode 下会清空 conversation `remote_workpaths`，禁用 `/mount` 与 `workpath_*`，并让 AgentFrame 文件/patch/shell 工具不再暴露 `remote` 参数。
+- Remote mode prompt 与恢复行为更新：
+  system prompt 在 remote mode 下会把当前 execution root 作为唯一文件根，自动读取绑定根目录的 `AGENTS.md`，并隐藏 workspace-history / remote-alias / workpath 指导。切换 `/remote` 会写入 durable system notice；snapshot 现在会按 conversation 当前存储根保存，并在加载时恢复对应的 remote/local execution binding。
+- 新增 `0.38 -> 0.39` workdir upgrade：
+  upgrade 会为历史 `conversations/*/conversation.json` 和 `snapshots/*/snapshot.json` 的 `settings` 回填 `remote_execution: null`，保持旧 workdir 可顺序升级到新 schema。
+- 补充回归测试：
+  新增针对 `0.39` upgrade backfill、remote-mode prompt 渲染，以及 snapshot/运行时根切换相关编译回归的覆盖。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  workdir 版本从 `0.38` 提升到 `0.39`；仓库版本按 workdir-only 变更策略从 `0.27.2` 提升到 `0.27.3`。
 
 # 0.27.2
 

@@ -337,6 +337,8 @@ pub struct AgentConfig {
     pub system_prompt: String,
     #[serde(default)]
     pub remote_workpaths: Vec<RemoteWorkpathConfig>,
+    #[serde(default = "default_enable_remote_tools")]
+    pub enable_remote_tools: bool,
     #[serde(default = "default_max_tool_roundtrips")]
     pub max_tool_roundtrips: usize,
     pub workspace_root: PathBuf,
@@ -372,6 +374,8 @@ struct AgentConfigRaw {
     system_prompt: String,
     #[serde(default)]
     remote_workpaths: Vec<RemoteWorkpathConfig>,
+    #[serde(default = "default_enable_remote_tools")]
+    enable_remote_tools: bool,
     #[serde(default = "default_max_tool_roundtrips")]
     max_tool_roundtrips: usize,
     #[serde(default)]
@@ -482,6 +486,10 @@ fn default_context_window_tokens() -> usize {
 
 fn default_max_tool_roundtrips() -> usize {
     12
+}
+
+fn default_enable_remote_tools() -> bool {
+    true
 }
 
 fn default_enable_context_compression() -> bool {
@@ -694,6 +702,7 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
         skills_metadata_prompt: raw.skills_metadata_prompt,
         system_prompt: raw.system_prompt,
         remote_workpaths: raw.remote_workpaths,
+        enable_remote_tools: raw.enable_remote_tools,
         max_tool_roundtrips: raw.max_tool_roundtrips,
         workspace_root,
         runtime_state_root,

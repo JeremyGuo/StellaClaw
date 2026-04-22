@@ -720,31 +720,51 @@ fn current_status_running(status: &Value) -> bool {
         .unwrap_or(false)
 }
 
+fn ensure_remote_argument_allowed(
+    arguments: &Map<String, Value>,
+    enable_remote_tools: bool,
+) -> Result<()> {
+    if !enable_remote_tools && arguments.get("remote").is_some() {
+        return Err(anyhow!(
+            "argument remote is disabled in the current execution mode"
+        ));
+    }
+    Ok(())
+}
+
 pub(super) fn shell_tool(
     workspace_root: PathBuf,
     runtime_state_root: PathBuf,
     remote_workpaths: RemoteWorkpathMap,
+    enable_remote_tools: bool,
     cancel_flag: Option<Arc<InterruptSignal>>,
 ) -> Tool {
+    let mut properties = Map::new();
+    properties.insert("session_id".to_string(), json!({"type": "string"}));
+    properties.insert("command".to_string(), json!({"type": "string"}));
+    properties.insert("input".to_string(), json!({"type": "string"}));
+    properties.insert("interactive".to_string(), json!({"type": "boolean"}));
+    properties.insert("wait_ms".to_string(), json!({"type": "integer"}));
+    if enable_remote_tools {
+        properties.insert("remote".to_string(), remote_schema_property());
+    }
     Tool::new_interruptible(
         "shell",
         "Run or continue a persistent shell session. Pass command to start the next command in a session. Pass no command to only observe or collect the current command result. Pass input to write to the current interactive command. command=\"\" is treated the same as omitting command. session_id only reuses an existing session; omit it when creating a new one. If a finished command result has not been returned yet and you start a new command in the same session, the older unreturned result is discarded. Returned stdout/stderr describe only the current process. Full stdout/stderr are saved under out_path/stdout and out_path/stderr.",
-        json!({
-            "type": "object",
-            "properties": {
-                "session_id": {"type": "string"},
-                "command": {"type": "string"},
-                "input": {"type": "string"},
-                "interactive": {"type": "boolean"},
-                "wait_ms": {"type": "integer"},
-                "remote": remote_schema_property()
-            },
-            "additionalProperties": false
-        }),
+        Value::Object(
+            [
+                ("type".to_string(), Value::String("object".to_string())),
+                ("properties".to_string(), Value::Object(properties)),
+                ("additionalProperties".to_string(), Value::Bool(false)),
+            ]
+            .into_iter()
+            .collect(),
+        ),
         move |arguments| {
             let arguments = arguments
                 .as_object()
                 .ok_or_else(|| anyhow!("tool arguments must be an object"))?;
+            ensure_remote_argument_allowed(arguments, enable_remote_tools)?;
             let command = optional_command_arg(arguments)?;
             if let Some(command) = command.as_deref()
                 && let Some(guidance) = direct_read_command_guidance(command)

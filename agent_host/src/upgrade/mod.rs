@@ -31,6 +31,7 @@ mod v0_35;
 mod v0_36;
 mod v0_37;
 mod v0_38;
+mod v0_39;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -38,7 +39,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.38";
+pub const LATEST_WORKDIR_VERSION: &str = "0.39";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -54,7 +55,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 34] = [
+    let upgraders: [&dyn WorkdirUpgrader; 35] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
@@ -89,6 +90,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
         &v0_36::Upgrade,
         &v0_37::Upgrade,
         &v0_38::Upgrade,
+        &v0_39::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -151,6 +153,7 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.35" => Ok("0.35"),
         "0.36" => Ok("0.36"),
         "0.37" => Ok("0.37"),
+        "0.38" => Ok("0.38"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -2139,5 +2142,68 @@ mod tests {
             fs::read_to_string(session_dir.join("session.json")).unwrap(),
             broken
         );
+    }
+
+    #[test]
+    fn v0_39_workdir_upgrade_backfills_remote_execution() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.38\n").unwrap();
+
+        let conversation_dir = temp_dir.path().join("conversations").join("conv-1");
+        let snapshot_dir = temp_dir.path().join("snapshots").join("snap-1");
+        fs::create_dir_all(&conversation_dir).unwrap();
+        fs::create_dir_all(&snapshot_dir).unwrap();
+        fs::write(
+            conversation_dir.join("conversation.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": Uuid::new_v4(),
+                "address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "conversation-1"
+                },
+                "settings": {
+                    "workspace_id": "workspace-1",
+                    "remote_workpaths": [],
+                    "local_mounts": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            snapshot_dir.join("snapshot.json"),
+            serde_json::to_string_pretty(&json!({
+                "saved_at": "2026-04-22T00:00:00Z",
+                "source_address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "conversation-1"
+                },
+                "settings": {
+                    "workspace_id": "workspace-1",
+                    "remote_workpaths": [],
+                    "local_mounts": []
+                },
+                "session": {
+                    "messages": [],
+                    "pending_messages": [],
+                    "user_mailbox": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        let conversation: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(conversation_dir.join("conversation.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(conversation["settings"]["remote_execution"].is_null());
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(snapshot_dir.join("snapshot.json")).unwrap())
+                .unwrap();
+        assert!(snapshot["settings"]["remote_execution"].is_null());
     }
 }

@@ -427,6 +427,7 @@ fn builtin_tools_work() -> Result<()> {
         &[],
         &[],
         &[],
+        true,
     )?;
 
     let write_result = execute_tool_call(
@@ -646,6 +647,7 @@ fn shell_sessions_report_clear_error_after_runtime_shutdown() -> Result<()> {
         &[],
         &[],
         &[],
+        true,
     )?;
 
     let started = execute_tool_call(
@@ -684,6 +686,7 @@ fn shell_accepts_input_from_a_fresh_registry_instance() -> Result<()> {
         &[],
         &[],
         &[],
+        true,
     )?;
 
     let started = execute_tool_call(
@@ -709,6 +712,7 @@ fn shell_accepts_input_from_a_fresh_registry_instance() -> Result<()> {
         &[],
         &[],
         &[],
+        true,
     )?;
     let waited = execute_tool_call(
         &waiter,
@@ -747,6 +751,7 @@ fn shell_discards_unreturned_finished_result_when_starting_next_command() -> Res
         &[],
         &[],
         &[],
+        true,
     )?;
 
     let started = execute_tool_call(
@@ -802,6 +807,7 @@ fn shell_treats_empty_command_as_observe() -> Result<()> {
         &[],
         &[],
         &[],
+        true,
     )?;
 
     let started = execute_tool_call(
@@ -845,6 +851,7 @@ fn shell_rejects_unknown_session_id_even_with_command() -> Result<()> {
         &[],
         &[],
         &[],
+        true,
     )?;
 
     let result = execute_tool_call(
@@ -876,6 +883,7 @@ fn shell_rejects_invalid_session_id() -> Result<()> {
         &[],
         &[],
         &[],
+        true,
     )?;
 
     let result = execute_tool_call(
@@ -915,6 +923,7 @@ fn shell_supports_per_tool_remote_ssh() -> Result<()> {
         &[],
         &[],
         &[],
+        true,
     )?;
 
     let completed = execute_tool_call(
@@ -973,6 +982,7 @@ fn load_skill_tool_hides_paths_but_can_read_skill_content() -> Result<()> {
         &skills,
         &[],
         &[],
+        true,
     )?;
     let result = execute_tool_call(
         &registry,
@@ -1011,6 +1021,7 @@ fn skill_create_persists_staged_skill_directory() -> Result<()> {
         &[],
         &[],
         &[],
+        true,
     )?;
     let result = execute_tool_call(
         &registry,
@@ -1062,6 +1073,7 @@ fn skill_update_validates_and_replaces_existing_skill_directory() -> Result<()> 
         &skills,
         &[],
         &[],
+        true,
     )?;
     let result = execute_tool_call(
         &registry,
@@ -1097,6 +1109,7 @@ fn native_web_search_disables_external_web_search_tool() -> Result<()> {
         &[],
         &[],
         &[],
+        true,
     )?;
     assert!(!registry.contains_key("web_search"));
     assert!(registry.contains_key("web_fetch"));
@@ -2354,6 +2367,7 @@ fn controlled_run_converts_tool_phase_timeout_into_observation_and_continues() -
         &[],
         &[],
         &[],
+        true,
     )?;
     let shell_start = execute_tool_call(
         &registry,

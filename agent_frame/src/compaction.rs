@@ -115,10 +115,7 @@ fn content_to_text(content: &Option<Value>) -> String {
                                     .and_then(Value::as_str)
                             })
                             .unwrap_or("audio");
-                        Some(format!(
-                            "[audio] {}",
-                            path.unwrap_or(format)
-                        ))
+                        Some(format!("[audio] {}", path.unwrap_or(format)))
                     }
                     _ => content_item_text(item),
                 }
@@ -205,9 +202,9 @@ fn sanitize_content_item_for_compaction_request(item: &Value) -> Value {
         return item.clone();
     };
     match item_type {
-        "input_image" | "output_image" | "image_url" => compaction_text_item(image_placeholder_for_compaction(
-            image_url_from_content_item(object),
-        )),
+        "input_image" | "output_image" | "image_url" => compaction_text_item(
+            image_placeholder_for_compaction(image_url_from_content_item(object)),
+        ),
         "file" | "input_file" | "output_file" => {
             compaction_text_item(file_placeholder_for_compaction(item_type, item))
         }

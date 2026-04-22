@@ -111,6 +111,7 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Timeout observation compaction is controlled by the main agent global setting and is not gated on a particular model provider or per-model prompt-cache TTL.
 - Remote-capable tools should use their `remote` argument instead of shelling out to `ssh <host>` manually. The `remote` value must be an actual local SSH alias, normally one detected from `~/.ssh/config` and listed in the system prompt, or a registered remote workpath host; agents must not invent host labels.
 - `shell` rejects manual `ssh ...` command strings so models use remote-capable tools rather than bypassing the remote policy.
+- When a conversation is in `/remote` execution mode, AgentFrame filesystem/patch/shell tool schemas must stop exposing per-tool `remote` arguments entirely; the bound execution root becomes the only filesystem target for those tools.
 - Download/image-style background jobs follow start + wait/progress + cancel where applicable, and their wait tools support explicit wait timeouts without cancelling on normal interruption.
 - Regression coverage should protect tool execution mode annotations, shell session lifecycle semantics, centralized remote guidance, manual SSH rejection, and the start/wait/terminate schemas for long-running tool families.
 
@@ -120,7 +121,18 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - In bubblewrap sandbox mode, conversation local mounts are exposed to AgentFrame at the same absolute host paths as writable bind mounts, while subprocess mode keeps the setting for later bubblewrap use.
 - Adding a local mount invalidates the foreground AgentFrame runtime so an idle conversation uses a freshly spawned bubblewrap process with the new mount on the next turn.
 - Conversation local mounts are included in the rebuilt system prompt so future turns can identify the mounted local paths without treating them as remote SSH workpaths.
+- `/mount` is unavailable while the conversation is in `/remote` execution mode because that mode replaces the normal workspace/workpath model with one bound execution root.
 - Regression coverage should protect `/mount` parsing, conversation persistence, workdir upgrade backfill, prompt rendering, and bubblewrap bind arguments for local mounts.
+
+### Conversation Remote Execution Root
+
+- Users can bind a conversation to one durable execution root with `/remote <absolute-local-path>`, `/remote <host> <path>`, and `/remote off`.
+- SSH `/remote` bindings are implemented through `sshfs`; the host mounts the remote directory under `workdir/remote_mounts/<conversation-id>/workspace` and then reuses the existing local-path file, attachment, bubblewrap, and channel pipelines against that mountpoint.
+- A bound `/remote` execution root becomes the conversation's only filesystem root. Entering this mode clears conversation `remote_workpaths`, disables workpath tools and workspace-history tools, and removes per-tool `remote` arguments from AgentFrame schemas.
+- Runtime-owned persistent data such as sessions, runtime state, and snapshots move under `<execution_root>/.cache/partyclaw`, while conversation settings remain locally durable and preserve the remote binding across service restarts until the next conversation access remounts it.
+- In remote mode, snapshots save/list/load against the bound execution root's `.cache/partyclaw/snapshots` store, and loading a snapshot restores the snapshot's saved remote/local execution binding before restoring the session.
+- Remote-mode prompts must explicitly treat the current execution root as the only workspace root, load `AGENTS.md` from that root, and hide remote-alias/workpath/workspace-history guidance that only applies to normal multi-workspace mode.
+- Web and outgoing attachment resolution should continue using plain local `PathBuf` handling by resolving paths against either the bound local path or the `sshfs` mountpoint rather than introducing a separate remote attachment type.
 
 ### Workspace Shared Directory
 
@@ -247,6 +259,7 @@ flowchart TD
 - Session actors are the only owner of per-session durable state and runtime state, including pending/stable messages, visible history, active runtime phase, pending interrupts, progress state, prompt/profile/model/skill observations, usage, compaction stats, and turn completion/yield/failure state.
 - Foreground and background main agents share one session actor lifecycle; differences should be expressed through session policy such as system prompt kind, runtime/model-driven tool availability, delivery behavior, and whether final output is told to a foreground actor.
 - Conversation state owns conversation-level routing and configuration: current workspace, remote workpaths, selected model/backend/sandbox settings, chat version, current foreground actor reference, and user attachment materialization for that conversation. It should hand prepared messages to session actors rather than maintaining long-running turn serialization.
+- Conversation state also owns any bound `remote_execution` mode for that conversation; session actors inherit the chosen execution/storage roots from conversation settings rather than becoming the source of truth for remote bindings.
 - SessionManager acts as a factory and registry for `SessionId -> SessionActorRef` style actor loading/creation. It must not decide user-message handling, turn commit semantics, interrupt behavior, progress behavior, or background-to-foreground delivery semantics.
 - `SessionActorRef` is the external production boundary for session operations. Production code should call explicit actor methods such as `tell_user_message`, `tell_actor_message`, runtime commit/failure, progress, interrupt, and observation APIs instead of locking or mutating actor internals directly.
 - `SessionActorRef` dispatches production operations through a mailbox-backed actor loop so each session serializes its own state transitions independently of Conversation routing.

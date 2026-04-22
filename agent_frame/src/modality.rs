@@ -169,8 +169,12 @@ pub fn canonicalize_message_multimodal_for_storage(
     message: &ChatMessage,
     scope: CanonicalMessageScope,
 ) -> Result<ChatMessage> {
-    let rewritten_content =
-        canonicalize_message_content_for_storage(workspace_root, &message.role, &message.content, scope)?;
+    let rewritten_content = canonicalize_message_content_for_storage(
+        workspace_root,
+        &message.role,
+        &message.content,
+        scope,
+    )?;
     if rewritten_content == message.content {
         return Ok(message.clone());
     }
@@ -192,7 +196,8 @@ fn canonicalize_message_content_for_storage(
     let mut rewritten = Vec::with_capacity(items.len());
     let mut changed = false;
     for item in items {
-        let next = canonicalize_message_content_item_for_storage(workspace_root, role, item, scope)?;
+        let next =
+            canonicalize_message_content_item_for_storage(workspace_root, role, item, scope)?;
         changed |= next != *item;
         rewritten.push(next);
     }
@@ -355,24 +360,34 @@ fn canonicalize_image_path_item_for_storage(
     resolved_path: &Path,
     scope: CanonicalMessageScope,
 ) -> Result<Value> {
-    let bytes =
-        fs::read(resolved_path).with_context(|| format!("failed to read {}", resolved_path.display()))?;
+    let bytes = fs::read(resolved_path)
+        .with_context(|| format!("failed to read {}", resolved_path.display()))?;
     let reader = ImageReader::new(Cursor::new(&bytes))
         .with_guessed_format()
-        .with_context(|| format!("failed to guess image format for {}", resolved_path.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to guess image format for {}",
+                resolved_path.display()
+            )
+        })?;
     let format = reader
         .format()
         .ok_or_else(|| anyhow!("unsupported image format: {}", resolved_path.display()))?;
     let canonical_extension = canonical_image_extension(format);
-    let relative_path = if is_path_under_root(workspace_root, resolved_path)
-        && canonical_extension.is_some()
-    {
-        relative_path(workspace_root, resolved_path)?
-    } else {
-        let extension = canonical_extension.unwrap_or("png");
-        let output_bytes = canonicalize_image_bytes(&bytes, format)?;
-        persist_canonical_media_bytes(workspace_root, scope, canonical_type, &output_bytes, extension)?
-    };
+    let relative_path =
+        if is_path_under_root(workspace_root, resolved_path) && canonical_extension.is_some() {
+            relative_path(workspace_root, resolved_path)?
+        } else {
+            let extension = canonical_extension.unwrap_or("png");
+            let output_bytes = canonicalize_image_bytes(&bytes, format)?;
+            persist_canonical_media_bytes(
+                workspace_root,
+                scope,
+                canonical_type,
+                &output_bytes,
+                extension,
+            )?
+        };
     Ok(build_path_media_item(
         canonical_type,
         &relative_path,
@@ -389,9 +404,16 @@ fn canonicalize_file_path_item_for_storage(
     resolved_path: &Path,
     scope: CanonicalMessageScope,
 ) -> Result<Value> {
-    let filename = item_filename(item)
-        .or_else(|| resolved_path.file_name().and_then(|value| value.to_str()).map(ToOwned::to_owned));
-    let media_type = item.get("media_type").and_then(Value::as_str).map(ToOwned::to_owned);
+    let filename = item_filename(item).or_else(|| {
+        resolved_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(ToOwned::to_owned)
+    });
+    let media_type = item
+        .get("media_type")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     let relative_path = if is_path_under_root(workspace_root, resolved_path) {
         relative_path(workspace_root, resolved_path)?
     } else {
@@ -400,7 +422,10 @@ fn canonicalize_file_path_item_for_storage(
         let extension = preferred_extension(
             filename.as_deref(),
             media_type.as_deref(),
-            resolved_path.extension().and_then(|value| value.to_str()).unwrap_or("bin"),
+            resolved_path
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("bin"),
         );
         persist_canonical_media_bytes(workspace_root, scope, canonical_type, &bytes, &extension)?
     };
@@ -425,7 +450,10 @@ fn canonicalize_audio_path_item_for_storage(
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .or_else(|| infer_audio_format_from_path(resolved_path).map(ToOwned::to_owned));
-    let media_type = item.get("media_type").and_then(Value::as_str).map(ToOwned::to_owned);
+    let media_type = item
+        .get("media_type")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     let relative_path = if is_path_under_root(workspace_root, resolved_path) {
         relative_path(workspace_root, resolved_path)?
     } else {
@@ -898,7 +926,12 @@ fn materialize_user_item_from_path(
                 return Ok(None);
             }
             let filename = item_filename(item)
-                .or_else(|| resolved.file_name().and_then(|value| value.to_str()).map(ToOwned::to_owned))
+                .or_else(|| {
+                    resolved
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .map(ToOwned::to_owned)
+                })
                 .unwrap_or_else(|| "document.pdf".to_string());
             Ok(Some(json!({
                 "type": "file",
@@ -1057,10 +1090,7 @@ fn persist_canonical_media_bytes(
     relative_path(workspace_root, &target_path)
 }
 
-fn load_image_item_bytes(
-    item_type: &str,
-    item: &Value,
-) -> Result<Option<(Vec<u8>, String)>> {
+fn load_image_item_bytes(item_type: &str, item: &Value) -> Result<Option<(Vec<u8>, String)>> {
     if let Some((bytes, extension)) = extract_image_bytes(item_type, item) {
         return Ok(Some((bytes, extension)));
     }
@@ -1080,16 +1110,22 @@ fn load_file_item_bytes(
 ) -> Result<Option<(Vec<u8>, String, Option<String>, Option<String>)>> {
     if let Some(path) = path_from_item(item) {
         let resolved = Path::new(path);
-        let bytes = fs::read(resolved).with_context(|| format!("failed to read {}", resolved.display()))?;
+        let bytes =
+            fs::read(resolved).with_context(|| format!("failed to read {}", resolved.display()))?;
         return Ok(Some((
             bytes,
             preferred_extension(
                 item_filename(item).as_deref(),
                 item.get("media_type").and_then(Value::as_str),
-                resolved.extension().and_then(|value| value.to_str()).unwrap_or("bin"),
+                resolved
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("bin"),
             ),
             item_filename(item),
-            item.get("media_type").and_then(Value::as_str).map(ToOwned::to_owned),
+            item.get("media_type")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
         )));
     }
     let file_value = if item_type == "file" {
@@ -1100,7 +1136,10 @@ fn load_file_item_bytes(
     let Some(file_value) = file_value else {
         return Ok(None);
     };
-    let filename = file_value.get("filename").and_then(Value::as_str).map(ToOwned::to_owned);
+    let filename = file_value
+        .get("filename")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     if let Some(file_data) = file_value.get("file_data").and_then(Value::as_str) {
         if let Some((bytes, media_type)) = decode_data_url_payload(file_data) {
             let extension = preferred_extension(filename.as_deref(), media_type.as_deref(), "bin");
@@ -1125,7 +1164,8 @@ fn load_audio_item_bytes(
 ) -> Result<Option<(Vec<u8>, String, Option<String>, Option<String>)>> {
     if let Some(path) = path_from_item(item) {
         let resolved = Path::new(path);
-        let bytes = fs::read(resolved).with_context(|| format!("failed to read {}", resolved.display()))?;
+        let bytes =
+            fs::read(resolved).with_context(|| format!("failed to read {}", resolved.display()))?;
         let format = item
             .get("format")
             .and_then(Value::as_str)
@@ -1143,7 +1183,9 @@ fn load_audio_item_bytes(
             bytes,
             extension,
             format,
-            item.get("media_type").and_then(Value::as_str).map(ToOwned::to_owned),
+            item.get("media_type")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
         )));
     }
     let audio = item.get("input_audio").and_then(Value::as_object);
@@ -1151,12 +1193,15 @@ fn load_audio_item_bytes(
         return Ok(None);
     };
     let data = audio.get("data").and_then(Value::as_str);
-    let format = audio.get("format").and_then(Value::as_str).map(ToOwned::to_owned);
+    let format = audio
+        .get("format")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
     let Some(data) = data else {
         return Ok(None);
     };
-    let bytes =
-        decode_base64_payload(data).ok_or_else(|| anyhow!("failed to decode inline audio payload"))?;
+    let bytes = decode_base64_payload(data)
+        .ok_or_else(|| anyhow!("failed to decode inline audio payload"))?;
     let extension = sanitize_extension(format.as_deref().unwrap_or("bin"))
         .unwrap_or("bin")
         .to_string();
@@ -1199,7 +1244,10 @@ fn download_url_bytes(url: &str) -> Result<(Vec<u8>, Option<String>, Option<Stri
         .map(|value| value.split(';').next().unwrap_or(value).trim().to_string())
         .filter(|value| !value.is_empty());
     let final_url = response.url().clone();
-    let bytes = response.bytes().context("failed to read downloaded body")?.to_vec();
+    let bytes = response
+        .bytes()
+        .context("failed to read downloaded body")?
+        .to_vec();
     let file_name = final_url
         .path_segments()
         .and_then(|mut segments| segments.next_back())
@@ -1274,6 +1322,7 @@ mod tests {
             skills_metadata_prompt: None,
             system_prompt: String::new(),
             remote_workpaths: Vec::new(),
+            enable_remote_tools: true,
             max_tool_roundtrips: 4,
             workspace_root: workspace_root.to_path_buf(),
             runtime_state_root: workspace_root.join(".runtime"),

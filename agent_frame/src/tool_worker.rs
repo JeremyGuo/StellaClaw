@@ -84,6 +84,8 @@ pub enum ToolWorkerJob {
         workspace_root: String,
         runtime_state_root: String,
         remote_workpaths: Vec<RemoteWorkpathConfig>,
+        #[serde(default = "default_enable_remote_tools")]
+        enable_remote_tools: bool,
         status_path: String,
         result_path: String,
         max_runtime_seconds: u64,
@@ -202,6 +204,7 @@ fn run_job(job: ToolWorkerJob) -> Result<()> {
             workspace_root,
             runtime_state_root,
             remote_workpaths,
+            enable_remote_tools,
             status_path,
             result_path,
             max_runtime_seconds,
@@ -217,6 +220,7 @@ fn run_job(job: ToolWorkerJob) -> Result<()> {
             Path::new(&workspace_root),
             Path::new(&runtime_state_root),
             &remote_workpaths,
+            enable_remote_tools,
             Path::new(&status_path),
             Path::new(&result_path),
             max_runtime_seconds,
@@ -225,6 +229,10 @@ fn run_job(job: ToolWorkerJob) -> Result<()> {
             max_emit_calls,
         ),
     }
+}
+
+fn default_enable_remote_tools() -> bool {
+    true
 }
 
 fn write_json_stdout(value: &Value) -> Result<()> {

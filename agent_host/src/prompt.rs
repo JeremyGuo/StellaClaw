@@ -1,6 +1,7 @@
 use crate::bootstrap::AgentWorkspace;
 use crate::config::{MainAgentConfig, ModelConfig};
 use crate::conversation::LocalMount;
+use crate::remote_execution::RemoteExecutionBinding;
 use crate::session::{
     IDENTITY_PROMPT_COMPONENT, REMOTE_ALIASES_PROMPT_COMPONENT, SessionSnapshot,
     USER_META_PROMPT_COMPONENT,
@@ -49,6 +50,7 @@ pub fn build_agent_system_prompt_state(
     workspace_summary: &str,
     remote_workpaths: &[RemoteWorkpath],
     local_mounts: &[LocalMount],
+    remote_execution: Option<&RemoteExecutionBinding>,
     kind: AgentPromptKind,
     model_name: &str,
     model: &ModelConfig,
@@ -62,6 +64,7 @@ pub fn build_agent_system_prompt_state(
         workspace_summary,
         remote_workpaths,
         local_mounts,
+        remote_execution,
         kind,
         model_name,
         model,
@@ -77,6 +80,7 @@ pub fn build_agent_system_prompt_state(
         chat_model_keys,
         main_agent,
         local_mounts,
+        remote_execution.is_some(),
     );
     AgentSystemPromptState {
         system_prompt,
@@ -98,8 +102,9 @@ fn build_system_prompt_rebuild_trigger(
     chat_model_keys: &[String],
     main_agent: &MainAgentConfig,
     local_mounts: &[LocalMount],
+    remote_execution_active: bool,
 ) -> String {
-    let mut trigger = build_static_system_prompt(kind, main_agent);
+    let mut trigger = build_static_system_prompt(kind, main_agent, remote_execution_active);
     trigger.push('\n');
     trigger.push_str(&format!(
         "Current model profile: {} - {}",
@@ -113,7 +118,9 @@ fn build_system_prompt_rebuild_trigger(
     let model_catalog = render_available_models_catalog(models, chat_model_keys);
     trigger.push('\n');
     trigger.push_str(&model_catalog);
-    if let Some(local_mounts) = render_local_mounts_for_prompt(local_mounts) {
+    if !remote_execution_active
+        && let Some(local_mounts) = render_local_mounts_for_prompt(local_mounts)
+    {
         trigger.push('\n');
         trigger.push_str(&local_mounts);
     }
@@ -152,9 +159,16 @@ pub fn current_user_meta_prompt_for_workspace(workspace: &AgentWorkspace) -> Str
         .to_string()
 }
 
-fn build_static_system_prompt(kind: AgentPromptKind, main_agent: &MainAgentConfig) -> String {
-    let mut parts = build_static_intro_prompt_parts(kind, main_agent);
-    parts.extend(build_kind_static_prompt_parts(kind));
+fn build_static_system_prompt(
+    kind: AgentPromptKind,
+    main_agent: &MainAgentConfig,
+    remote_execution_active: bool,
+) -> String {
+    let mut parts = build_static_intro_prompt_parts(kind, main_agent, remote_execution_active);
+    parts.extend(build_kind_static_prompt_parts(
+        kind,
+        remote_execution_active,
+    ));
     parts.extend(build_memory_static_prompt_parts(main_agent));
     parts.join("\n")
 }
@@ -162,6 +176,7 @@ fn build_static_system_prompt(kind: AgentPromptKind, main_agent: &MainAgentConfi
 fn build_static_intro_prompt_parts(
     kind: AgentPromptKind,
     main_agent: &MainAgentConfig,
+    remote_execution_active: bool,
 ) -> Vec<String> {
     let header = match kind {
         AgentPromptKind::MainForeground => "[AgentHost Main Foreground Agent]",
@@ -185,11 +200,10 @@ fn build_static_intro_prompt_parts(
             "Skills are available. If a skill seems relevant, inspect the preloaded skill metadata and load the relevant skill before relying on its detailed instructions."
         }
     };
-    vec![
+    let mut parts = vec![
         header.to_string(),
         role_line.to_string(),
         "Your primary writable workspace is the current workspace root for this session.".to_string(),
-        "The path ./shared is a writable directory shared by every workspace in this workdir. It is backed by rundir/shared, so files written there are visible across workspaces.".to_string(),
         "Anti-fabrication rules: if you are unsure, do not answer from memory. Inspect the codebase, search history, or run a narrow verification step first. Do not guess.".to_string(),
         "Before using any library, framework, command, flag, file path, or project capability, verify that it exists in this repository or local environment instead of assuming it exists.".to_string(),
         "Default workflow: explore the relevant code and config, understand local conventions, implement the root cause, run focused verification, then run lint, typecheck, or other project checks if they exist and are relevant.".to_string(),
@@ -203,7 +217,6 @@ fn build_static_intro_prompt_parts(
         "If a user message starts with [Queued User Updates], it means multiple follow-up messages arrived while you were still working. Treat newer items as newer steering, but do not assume they cancel the current task unless they clearly do so. Before making any further tool calls or continuing substantial work, you MUST give immediate visible feedback to the user. If you are not ready to give the final answer right now, you MUST call user_tell first. If the newest update is only a progress check or lightweight coordination, acknowledge it with user_tell and continue working. Silent continuation after queued follow-up messages is a failure. Only convert the turn into a direct final reply when the user explicitly changes the objective or asks for an immediate answer instead of continued execution.".to_string(),
         "USER.md and IDENTITY.md are copied into the workspace root. A running foreground turn keeps its current system prompt until that turn finishes, so mid-run shared-profile updates still arrive as runtime update messages. On later user turns the runtime may rebuild the canonical system prompt when durable prompt inputs changed. If a runtime prompt update says one of those files changed, use file_read to inspect that workspace file: always reread IDENTITY.md immediately so your current behavior follows the updated persona, and read USER.md when you need refreshed user info. If you edit either file, call shared_profile_upload right away, then use file_read on ./IDENTITY.md after changing it.".to_string(),
         "For repository exploration, use the dedicated tools instead of shell read/search commands: use glob to find files by path pattern, grep to find files by content pattern, ls for narrowed directory listings, and file_read for file contents. Do not call shell with direct grep, find, cat, head, tail, or ls; the runtime rejects those direct read/search commands.".to_string(),
-        "When a remote directory should become durable shared context for this whole conversation, use workpath_add(host, path, description). Each remote host has one active workpath; adding the same host replaces the previous one. Later agents in this conversation will see the registered remote workpath and its remote AGENTS.md automatically after prompt rebuild or compaction.".to_string(),
         "When multiple shell commands have no causal dependency on one another, issue them in the same tool-call batch instead of serializing them across model rounds. Keep dependent commands ordered when one command needs another command's output or side effects.".to_string(),
         "Prefer non-interactive shell commands. Use flags such as --yes, --no-pager, CI=1, explicit timeouts, and batch-mode SSH where appropriate so commands do not wait for prompts.".to_string(),
         format!(
@@ -217,15 +230,37 @@ fn build_static_intro_prompt_parts(
             "Reply to the user in {} unless the user clearly asks for another language.",
             main_agent.language
         ),
-    ]
+    ];
+    if remote_execution_active {
+        parts.insert(
+            3,
+            "This conversation is bound to one execution root. Treat the current workspace root as the only filesystem root for tools; do not rely on workpath tools or per-tool remote parameters."
+                .to_string(),
+        );
+    } else {
+        parts.insert(
+            3,
+            "The path ./shared is a writable directory shared by every workspace in this workdir. It is backed by rundir/shared, so files written there are visible across workspaces.".to_string(),
+        );
+        parts.insert(
+            parts.len().saturating_sub(5),
+            "When a remote directory should become durable shared context for this whole conversation, use workpath_add(host, path, description). Each remote host has one active workpath; adding the same host replaces the previous one. Later agents in this conversation will see the registered remote workpath and its remote AGENTS.md automatically after prompt rebuild or compaction.".to_string(),
+        );
+    }
+    parts
 }
 
-fn build_kind_static_prompt_parts(kind: AgentPromptKind) -> Vec<String> {
+fn build_kind_static_prompt_parts(
+    kind: AgentPromptKind,
+    remote_execution_active: bool,
+) -> Vec<String> {
     let mut parts = Vec::new();
     match kind {
         AgentPromptKind::MainForeground => {
             parts.push("You are the primary agent for this user-facing conversation.".to_string());
-            parts.push("If the user asks about earlier chat content, a previous session, something you sent before, or historical work, use the available workspace history tools before saying you cannot remember.".to_string());
+            if !remote_execution_active {
+                parts.push("If the user asks about earlier chat content, a previous session, something you sent before, or historical work, use the available workspace history tools before saying you cannot remember.".to_string());
+            }
             parts.push("When a small, bounded task would consume context without needing your full attention, delegate it to a subagent early instead of carrying that work in your own context.".to_string());
             parts.push("Use subagents aggressively for open-ended search, multi-file locating, fact gathering, and other side tasks that can run in parallel while you keep the main thread moving.".to_string());
             parts.push("Choose between subagent and background agent based on who owns the final user-facing result. Use a subagent for internal support work that you still plan to review, integrate, or selectively adopt before replying yourself. Use a background agent only for truly independent asynchronous work that is allowed to finish later, report back to the user on its own, and become part of the main foreground context.".to_string());
@@ -249,7 +284,9 @@ fn build_kind_static_prompt_parts(kind: AgentPromptKind) -> Vec<String> {
             parts.push("Negative examples: do not start a background agent just to draft text that you will personally integrate; do not reply 'I already finished it' while an earlier background agent is still allowed to send its own completion later; do not use a background agent when you still need to inspect, filter, or merge its output before replying.".to_string());
             parts.push("When a later subagent will continue from files written by an earlier subagent, prefer not to reread large generated content unless it is actually necessary. Instead, rely on the earlier subagent's concise summary of what it created and inspect the files only when needed.".to_string());
             parts.push("When you ask a subagent to write substantial content, require it to summarize what it created so downstream work can continue without rereading everything.".to_string());
-            parts.push("If you need historical information from earlier workspaces, use the available workspace history tools instead of assuming the information is unavailable.".to_string());
+            if !remote_execution_active {
+                parts.push("If you need historical information from earlier workspaces, use the available workspace history tools instead of assuming the information is unavailable.".to_string());
+            }
         }
         AgentPromptKind::SubAgent => {
             parts.push("Focus only on the delegated task. Do not broaden scope unless the caller explicitly needs it.".to_string());
@@ -279,6 +316,7 @@ pub fn build_agent_system_prompt(
     workspace_summary: &str,
     remote_workpaths: &[RemoteWorkpath],
     local_mounts: &[LocalMount],
+    remote_execution: Option<&RemoteExecutionBinding>,
     kind: AgentPromptKind,
     model_name: &str,
     model: &ModelConfig,
@@ -286,9 +324,16 @@ pub fn build_agent_system_prompt(
     chat_model_keys: &[String],
     main_agent: &MainAgentConfig,
 ) -> String {
-    let current_agents_markdown = fs::read_to_string(&workspace.agents_md_path)
-        .ok()
-        .unwrap_or_else(|| workspace.agents_markdown.clone());
+    let remote_execution_active = remote_execution.is_some();
+    let current_agents_markdown = if remote_execution_active {
+        fs::read_to_string(session.workspace_root.join("AGENTS.md"))
+            .ok()
+            .unwrap_or_default()
+    } else {
+        fs::read_to_string(&workspace.agents_md_path)
+            .ok()
+            .unwrap_or_else(|| workspace.agents_markdown.clone())
+    };
     let current_partclaw_markdown = if main_agent.memory_system == MemorySystem::ClaudeCode {
         fs::read_to_string(session.workspace_root.join("PARTCLAW.md"))
             .ok()
@@ -297,7 +342,7 @@ pub fn build_agent_system_prompt(
         String::new()
     };
 
-    let mut parts = build_static_intro_prompt_parts(kind, main_agent);
+    let mut parts = build_static_intro_prompt_parts(kind, main_agent, remote_execution_active);
     parts.push(format!(
         "Current model profile: {} - {}",
         model_name,
@@ -314,7 +359,10 @@ pub fn build_agent_system_prompt(
         parts.extend(model_catalog.lines().map(ToOwned::to_owned));
     }
 
-    parts.extend(build_kind_static_prompt_parts(kind));
+    parts.extend(build_kind_static_prompt_parts(
+        kind,
+        remote_execution_active,
+    ));
 
     let identity_prompt = session
         .prompt_component_system_value(IDENTITY_PROMPT_COMPONENT)
@@ -341,10 +389,18 @@ pub fn build_agent_system_prompt(
         parts.push(workspace_summary.to_string());
     }
 
-    if let Some(remote_aliases) = session
-        .prompt_component_system_value(REMOTE_ALIASES_PROMPT_COMPONENT)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
+    if remote_execution_active {
+        parts.push(format!(
+            "Current execution root: `{}`",
+            session.workspace_root.display()
+        ));
+    }
+
+    if !remote_execution_active
+        && let Some(remote_aliases) = session
+            .prompt_component_system_value(REMOTE_ALIASES_PROMPT_COMPONENT)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
     {
         parts.push(remote_aliases.to_string());
     }
@@ -354,10 +410,14 @@ pub fn build_agent_system_prompt(
         parts.push(current_agents_markdown.trim().to_string());
     }
 
-    if let Some(remote_workpaths) = render_remote_workpaths_for_prompt(remote_workpaths) {
+    if !remote_execution_active
+        && let Some(remote_workpaths) = render_remote_workpaths_for_prompt(remote_workpaths)
+    {
         parts.push(remote_workpaths);
     }
-    if let Some(local_mounts) = render_local_mounts_for_prompt(local_mounts) {
+    if !remote_execution_active
+        && let Some(local_mounts) = render_local_mounts_for_prompt(local_mounts)
+    {
         parts.push(local_mounts);
     }
 
@@ -420,6 +480,7 @@ mod tests {
     };
     use crate::conversation::LocalMount;
     use crate::domain::ChannelAddress;
+    use crate::remote_execution::RemoteExecutionBinding;
     use crate::session::{
         DurableSessionState, IDENTITY_PROMPT_COMPONENT, REMOTE_ALIASES_PROMPT_COMPONENT,
         SessionPromptComponentState, SessionSnapshot, USER_META_PROMPT_COMPONENT,
@@ -531,6 +592,7 @@ mod tests {
             "Current workspace summary.",
             &[],
             &[],
+            None,
             AgentPromptKind::MainForeground,
             "main",
             &model,
@@ -553,6 +615,7 @@ mod tests {
             &[LocalMount {
                 path: PathBuf::from("/srv/shared"),
             }],
+            None,
             AgentPromptKind::MainForeground,
             "main",
             &model,
@@ -562,6 +625,37 @@ mod tests {
         );
         assert!(local_mount_prompt.contains("Local folders mounted for this conversation:"));
         assert!(local_mount_prompt.contains("`/srv/shared`"));
+        let remote_execution = RemoteExecutionBinding::Local {
+            path: PathBuf::from("/srv/remote-bound"),
+        };
+        let remote_prompt = build_agent_system_prompt(
+            &workspace,
+            &session,
+            "Current workspace summary.",
+            &[],
+            &[],
+            Some(&remote_execution),
+            AgentPromptKind::MainForeground,
+            "main",
+            &model,
+            &models,
+            &["main".to_string()],
+            &main_agent,
+        );
+        assert!(remote_prompt.contains("This conversation is bound to one execution root."));
+        assert!(
+            remote_prompt
+                .contains("Current execution root: `/tmp/work/workspaces/workspace-1/files`")
+        );
+        assert!(!remote_prompt.contains(
+            "The path ./shared is a writable directory shared by every workspace in this workdir."
+        ));
+        assert!(!remote_prompt.contains("workpath_add("));
+        assert!(!remote_prompt.contains("workspace history tools"));
+        assert!(
+            !remote_prompt
+                .contains("Available SSH remote aliases detected from this host's SSH config")
+        );
         assert!(!prompt.contains("workspace_id=workspace-1"));
         assert!(prompt.contains("use the available workspace history tools"));
         assert!(!prompt.contains("do not issue more than 3 image_load calls"));
@@ -614,6 +708,7 @@ mod tests {
             "Current workspace summary.",
             &[],
             &[],
+            None,
             AgentPromptKind::MainBackground,
             "main",
             &model,
@@ -631,6 +726,7 @@ mod tests {
             "Current workspace summary.",
             &[],
             &[],
+            None,
             AgentPromptKind::MainForeground,
             "main",
             &model,
@@ -646,6 +742,7 @@ mod tests {
             &["main".to_string()],
             &main_agent,
             &[],
+            false,
         );
         assert_eq!(
             prompt_state.static_hash,
@@ -767,6 +864,7 @@ mod tests {
             "",
             &[],
             &[],
+            None,
             AgentPromptKind::MainForeground,
             "main",
             &model,
@@ -820,6 +918,7 @@ mod tests {
             "",
             &[],
             &[],
+            None,
             AgentPromptKind::MainForeground,
             "main",
             &model,
@@ -840,6 +939,7 @@ mod tests {
             "",
             &[],
             &[],
+            None,
             AgentPromptKind::MainForeground,
             "main",
             &model,
@@ -855,6 +955,7 @@ mod tests {
             "",
             &[],
             &[],
+            None,
             AgentPromptKind::MainForeground,
             "main",
             &model,
@@ -995,6 +1096,7 @@ mod tests {
             "",
             &[],
             &[],
+            None,
             AgentPromptKind::MainForeground,
             "main",
             &model,

@@ -40,6 +40,10 @@ use crate::prompt::{
     current_identity_prompt_for_workspace, current_user_meta_prompt_for_workspace,
     greeting_for_language,
 };
+use crate::remote_execution::{
+    RemoteExecutionBinding, storage_root_for_execution_root, validate_local_execution_path,
+    validate_ssh_execution_binding,
+};
 use crate::sandbox::{
     PersistentChildRuntime, bubblewrap_is_available, is_child_run_turn_request_send_error,
     is_child_transport_error, run_one_shot_child_turn,
@@ -103,6 +107,7 @@ mod incoming;
 mod messaging;
 mod persistence;
 mod progress;
+mod remote_execution;
 mod runtime_helpers;
 mod security;
 mod session_runner;
@@ -698,31 +703,6 @@ impl AgentRuntimeView {
                 .with_context(|| format!("unknown model {}", model_key))?
                 .timeout_seconds,
         ))
-    }
-
-    fn create_background_session_for_conversation(
-        &self,
-        address: &ChannelAddress,
-        agent_id: uuid::Uuid,
-    ) -> Result<SessionSnapshot> {
-        let preferred_workspace_id = self.with_conversations(|conversations| {
-            Ok(conversations
-                .ensure_conversation(address)?
-                .settings
-                .workspace_id)
-        })?;
-        let actor = self.with_sessions(|sessions| match preferred_workspace_id.as_deref() {
-            Some(workspace_id) => {
-                sessions.create_background_in_workspace_actor(address, agent_id, workspace_id)
-            }
-            None => sessions.create_background_actor(address, agent_id),
-        })?;
-        let session = actor.snapshot()?;
-        self.with_conversations(|conversations| {
-            conversations.set_workspace_id(address, Some(session.workspace_id.clone()))?;
-            Ok(())
-        })?;
-        Ok(session)
     }
 
     fn register_managed_agent(
@@ -1961,6 +1941,7 @@ impl Server {
             &skills,
             &extra_tools,
             &frame_config.remote_workpaths,
+            frame_config.enable_remote_tools,
         )?;
         Ok(registry.into_keys().collect())
     }
@@ -2629,10 +2610,8 @@ impl Server {
                 .agent_runtime_view()
                 .destroy_subagents_for_session(session.id)?;
             let runtime_state_root = self
-                .agent_workspace
-                .root_dir
-                .join("runtime")
-                .join(&session.workspace_id);
+                .agent_runtime_view_for_address(address)?
+                .runtime_state_root_for_session(&session)?;
             let report = terminate_runtime_state_tasks(&runtime_state_root)?;
             if destroyed_subagents > 0
                 || report.exec_processes_killed > 0
@@ -3302,29 +3281,42 @@ impl Server {
         model_key: &str,
     ) -> Result<AgentSystemPromptState> {
         let model = self.model_config_or_main(model_key)?;
-        let workspace_summary = self
-            .workspace_manager
-            .ensure_workspace_exists(&session.workspace_id)
-            .map(|workspace| workspace.summary)
-            .unwrap_or_default();
-        let remote_workpaths = self.with_conversations(|conversations| {
-            Ok(conversations
-                .get_snapshot(&session.address)
-                .map(|snapshot| snapshot.settings.remote_workpaths)
-                .unwrap_or_default())
-        })?;
-        let local_mounts = self.with_conversations(|conversations| {
-            Ok(conversations
-                .get_snapshot(&session.address)
-                .map(|snapshot| snapshot.settings.local_mounts)
-                .unwrap_or_default())
-        })?;
+        let conversation_snapshot = self
+            .with_conversations(|conversations| Ok(conversations.get_snapshot(&session.address)))?;
+        let remote_execution = conversation_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.settings.remote_execution.clone());
+        let workspace_summary = if remote_execution.is_some() {
+            String::new()
+        } else {
+            self.workspace_manager
+                .ensure_workspace_exists(&session.workspace_id)
+                .map(|workspace| workspace.summary)
+                .unwrap_or_default()
+        };
+        let remote_workpaths = if remote_execution.is_some() {
+            Vec::new()
+        } else {
+            conversation_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.settings.remote_workpaths.clone())
+                .unwrap_or_default()
+        };
+        let local_mounts = if remote_execution.is_some() {
+            Vec::new()
+        } else {
+            conversation_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.settings.local_mounts.clone())
+                .unwrap_or_default()
+        };
         Ok(build_agent_system_prompt_state(
             &self.agent_workspace,
             session,
             &workspace_summary,
             &remote_workpaths,
             &local_mounts,
+            remote_execution.as_ref(),
             AgentPromptKind::MainForeground,
             model_key,
             model,
@@ -3550,14 +3542,14 @@ mod tests {
         incoming_command_lane, infer_single_agent_backend, is_command_like_text,
         is_out_of_band_command, is_timeout_like, leading_system_prompt, memory_search_files,
         normalize_messages_for_persistence, parse_agent_command, parse_model_command,
-        parse_mount_command, parse_sandbox_command, parse_set_api_timeout_command,
-        parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
-        parse_think_command, persist_compaction_artifacts, prepare_system_prompt_for_turn,
-        prepare_user_turn_attachments, price_conversation_usage_report,
-        rebuild_canonical_system_prompt, render_prompt_component_change_notices,
-        render_system_date_on_user_message, rollout_read_file, rollout_search_files,
-        sanitize_messages_for_model_capabilities, select_image_generation_routing,
-        send_outgoing_message_now, session_errno_for_turn_error,
+        parse_mount_command, parse_remote_command, parse_sandbox_command,
+        parse_set_api_timeout_command, parse_snap_list_command, parse_snap_load_command,
+        parse_snap_save_command, parse_think_command, persist_compaction_artifacts,
+        prepare_system_prompt_for_turn, prepare_user_turn_attachments,
+        price_conversation_usage_report, rebuild_canonical_system_prompt,
+        render_prompt_component_change_notices, render_system_date_on_user_message,
+        rollout_read_file, rollout_search_files, sanitize_messages_for_model_capabilities,
+        select_image_generation_routing, send_outgoing_message_now, session_errno_for_turn_error,
         should_attempt_idle_context_compaction, summarize_resume_progress,
         sync_workspace_shared_profile_files, upload_workspace_shared_profile_files,
         user_facing_continue_error_text, workspace_visible_in_list,
@@ -6084,6 +6076,19 @@ mod tests {
         assert_eq!(
             parse_mount_command(Some("/mount@party_claw_bot ./shared")),
             Some(Some("./shared".to_string()))
+        );
+        assert_eq!(parse_remote_command(Some("/remote")), Some(None));
+        assert_eq!(
+            parse_remote_command(Some("/remote /srv/project")),
+            Some(Some("/srv/project".to_string()))
+        );
+        assert_eq!(
+            parse_remote_command(Some("/remote@party_claw_bot demo-host ~/repo")),
+            Some(Some("demo-host ~/repo".to_string()))
+        );
+        assert_eq!(
+            parse_remote_command(Some("/remote off")),
+            Some(Some("off".to_string()))
         );
 
         assert_eq!(parse_think_command(Some("/think")), Some(None));

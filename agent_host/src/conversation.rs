@@ -3,6 +3,7 @@ use crate::backend::AgentBackendKind;
 use crate::channel::{IncomingMessage, PendingAttachment};
 use crate::config::SandboxMode;
 use crate::domain::{ChannelAddress, StoredAttachment, validate_conversation_id};
+use crate::remote_execution::RemoteExecutionBinding;
 use crate::session::{SessionActorRef, SessionManager};
 use crate::workpath::{
     RemoteWorkpath, replace_workpath_description, validate_remote_workpath,
@@ -42,6 +43,8 @@ pub struct ConversationSettings {
     pub remote_workpaths: Vec<RemoteWorkpath>,
     #[serde(default)]
     pub local_mounts: Vec<LocalMount>,
+    #[serde(default)]
+    pub remote_execution: Option<RemoteExecutionBinding>,
     #[serde(default = "default_chat_version_id")]
     pub chat_version_id: Uuid,
 }
@@ -57,6 +60,7 @@ impl Default for ConversationSettings {
             workspace_id: None,
             remote_workpaths: Vec::new(),
             local_mounts: Vec::new(),
+            remote_execution: None,
             chat_version_id: default_chat_version_id(),
         }
     }
@@ -429,6 +433,19 @@ impl ConversationManager {
         let state = self.ensure_state_mut(address)?;
         state.settings.local_mounts.retain(|item| item.path != path);
         state.settings.local_mounts.push(LocalMount { path });
+        state.settings.chat_version_id = Uuid::new_v4();
+        state.persist()?;
+        Ok(state.snapshot())
+    }
+
+    pub fn set_remote_execution(
+        &mut self,
+        address: &ChannelAddress,
+        binding: Option<RemoteExecutionBinding>,
+    ) -> Result<ConversationSnapshot> {
+        let state = self.ensure_state_mut(address)?;
+        state.settings.remote_execution = binding;
+        state.settings.remote_workpaths.clear();
         state.settings.chat_version_id = Uuid::new_v4();
         state.persist()?;
         Ok(state.snapshot())

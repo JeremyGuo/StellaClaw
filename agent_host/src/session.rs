@@ -2298,6 +2298,37 @@ impl SessionManager {
         self.resolve_foreground(&key)
     }
 
+    pub fn ensure_foreground_actor_in_root(
+        &mut self,
+        address: &ChannelAddress,
+        workspace_id: &str,
+        workspace_root: &Path,
+        sessions_root: &Path,
+    ) -> Result<SessionActorRef> {
+        let key = address.session_key();
+        if !self.foreground_actors.contains_key(&key) {
+            if let Some(actor) = self.load_foreground_actor_from_root(
+                address,
+                workspace_id,
+                workspace_root,
+                sessions_root,
+            )? {
+                self.foreground_actors.insert(key.clone(), actor);
+            } else {
+                let session = self.create_session_with_kind_in_root(
+                    address,
+                    Uuid::new_v4(),
+                    workspace_id.to_string(),
+                    workspace_root.to_path_buf(),
+                    SessionKind::Foreground,
+                    sessions_root,
+                )?;
+                self.insert_foreground_actor(key.clone(), session);
+            }
+        }
+        self.resolve_foreground(&key)
+    }
+
     fn insert_foreground_actor(&mut self, key: String, session: Session) {
         info!(
             log_stream = "session",
@@ -2414,6 +2445,28 @@ impl SessionManager {
         self.create_background_actor_with_optional_workspace(address, agent_id, Some(workspace_id))
     }
 
+    pub fn create_background_actor_in_root(
+        &mut self,
+        address: &ChannelAddress,
+        agent_id: Uuid,
+        workspace_id: &str,
+        workspace_root: &Path,
+        sessions_root: &Path,
+    ) -> Result<SessionActorRef> {
+        let session = self.create_session_with_kind_in_root(
+            address,
+            agent_id,
+            workspace_id.to_string(),
+            workspace_root.to_path_buf(),
+            SessionKind::Background,
+            sessions_root,
+        )?;
+        let session_id = session.id;
+        self.background_actors
+            .insert(session_id, actor_ref(session));
+        self.resolve_background(session_id)
+    }
+
     fn create_background_actor_with_optional_workspace(
         &mut self,
         address: &ChannelAddress,
@@ -2466,17 +2519,30 @@ impl SessionManager {
         workspace_id: String,
         workspace_root: PathBuf,
     ) -> Result<SessionSnapshot> {
+        self.restore_foreground_from_checkpoint_in_root(
+            address,
+            checkpoint,
+            workspace_id,
+            workspace_root,
+            &self.sessions_root.clone(),
+        )
+    }
+
+    pub fn restore_foreground_from_checkpoint_in_root(
+        &mut self,
+        address: &ChannelAddress,
+        checkpoint: SessionCheckpointData,
+        workspace_id: String,
+        workspace_root: PathBuf,
+        sessions_root: &Path,
+    ) -> Result<SessionSnapshot> {
         validate_conversation_id(&address.conversation_id)?;
         self.destroy_foreground(address)?;
         let checkpoint_messages = checkpoint.messages.clone();
         let session_id = Uuid::new_v4();
         let agent_id = Uuid::new_v4();
-        let root_dir = session_root_dir(
-            &self.sessions_root,
-            address,
-            SessionKind::Foreground,
-            session_id,
-        );
+        let root_dir =
+            session_root_dir(sessions_root, address, SessionKind::Foreground, session_id);
         fs::create_dir_all(&root_dir)
             .with_context(|| format!("failed to create session root {}", root_dir.display()))?;
         let attachments_dir = workspace_root.join("upload");
@@ -2556,10 +2622,31 @@ impl SessionManager {
                 .workspace_manager
                 .create_workspace(agent_id, session_id, None)?,
         };
-        let root_dir = session_root_dir(&self.sessions_root, address, kind, session_id);
+        self.create_session_with_kind_in_root(
+            address,
+            agent_id,
+            workspace.id,
+            workspace.files_dir,
+            kind,
+            &self.sessions_root,
+        )
+    }
+
+    fn create_session_with_kind_in_root(
+        &self,
+        address: &ChannelAddress,
+        agent_id: Uuid,
+        workspace_id: String,
+        workspace_root: PathBuf,
+        kind: SessionKind,
+        sessions_root: &Path,
+    ) -> Result<Session> {
+        validate_conversation_id(&address.conversation_id)?;
+        let session_id = Uuid::new_v4();
+        let root_dir = session_root_dir(sessions_root, address, kind, session_id);
         fs::create_dir_all(&root_dir)
             .with_context(|| format!("failed to create session root {}", root_dir.display()))?;
-        let attachments_dir = workspace.files_dir.join("upload");
+        let attachments_dir = workspace_root.join("upload");
         fs::create_dir_all(&attachments_dir).with_context(|| {
             format!(
                 "failed to create workspace upload directory {}",
@@ -2573,8 +2660,8 @@ impl SessionManager {
             address: address.clone(),
             root_dir,
             attachments_dir,
-            workspace_id: workspace.id,
-            workspace_root: workspace.files_dir,
+            workspace_id,
+            workspace_root,
             history: Vec::new(),
             last_user_message_at: None,
             last_agent_returned_at: None,
@@ -2592,6 +2679,36 @@ impl SessionManager {
         };
         session.persist()?;
         Ok(session)
+    }
+
+    fn load_foreground_actor_from_root(
+        &self,
+        address: &ChannelAddress,
+        workspace_id: &str,
+        workspace_root: &Path,
+        sessions_root: &Path,
+    ) -> Result<Option<SessionActorRef>> {
+        let foreground_root = sessions_root
+            .join(session_conversation_dir_name(&address.conversation_id))
+            .join(session_kind_dir_name(SessionKind::Foreground));
+        let mut loaded = None;
+        for root in find_session_roots(&foreground_root)? {
+            let state_path = root.join("session.json");
+            let Some(session) = load_single_session_with_workspace_override(
+                &root,
+                &state_path,
+                workspace_id.to_string(),
+                workspace_root.to_path_buf(),
+            )?
+            else {
+                continue;
+            };
+            if session.address.session_key() != address.session_key() {
+                continue;
+            }
+            loaded = Some(actor_ref(session));
+        }
+        Ok(loaded)
     }
 }
 
@@ -4186,6 +4303,29 @@ fn load_single_session(
             (workspace.id, workspace.files_dir)
         }
     };
+    let session = Session::from_persisted(
+        root_dir.to_path_buf(),
+        persisted,
+        workspace_id,
+        workspace_root,
+    )?;
+    session.persist()?;
+    Ok(Some(session))
+}
+
+fn load_single_session_with_workspace_override(
+    root_dir: &Path,
+    state_path: &Path,
+    workspace_id: String,
+    workspace_root: PathBuf,
+) -> Result<Option<Session>> {
+    let raw = fs::read_to_string(state_path)
+        .with_context(|| format!("failed to read {}", state_path.display()))?;
+    let persisted: PersistedSession =
+        serde_json::from_str(&raw).context("failed to parse session state")?;
+    if persisted.closed_at.is_some() {
+        return Ok(None);
+    }
     let session = Session::from_persisted(
         root_dir.to_path_buf(),
         persisted,

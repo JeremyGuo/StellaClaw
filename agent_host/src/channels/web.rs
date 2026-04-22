@@ -6,6 +6,7 @@ use crate::domain::{
     ChannelAddress, OutgoingAttachment, OutgoingMessage, ProcessingState, ShowOptions,
     validate_conversation_id,
 };
+use crate::remote_execution::storage_root_for_execution_root;
 use crate::transcript::{TranscriptEntry, TranscriptEntrySkeleton, TranscriptEntryType};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -906,11 +907,37 @@ fn conversation_workspace_root(
     workdir: &Path,
     conversation_root: &Path,
 ) -> Result<Option<PathBuf>> {
-    let state_path = conversation_root.join("conversation.json");
-    let raw = std::fs::read_to_string(&state_path)
-        .with_context(|| format!("failed to read {}", state_path.display()))?;
-    let value: Value = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse {}", state_path.display()))?;
+    let value = read_conversation_state(conversation_root)?;
+    if let Some(remote_execution) = value
+        .get("settings")
+        .and_then(|settings| settings.get("remote_execution"))
+        .and_then(Value::as_object)
+    {
+        let conversation_id = conversation_root
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .context("conversation root is missing a directory name")?;
+        let kind = remote_execution
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match kind {
+            "local" => {
+                if let Some(path) = remote_execution.get("path").and_then(Value::as_str) {
+                    return Ok(Some(PathBuf::from(path)));
+                }
+            }
+            "ssh" => {
+                return Ok(Some(
+                    workdir
+                        .join("remote_mounts")
+                        .join(conversation_id)
+                        .join("workspace"),
+                ));
+            }
+            _ => {}
+        }
+    }
     let workspace_id = value
         .get("settings")
         .and_then(|settings| settings.get("workspace_id"))
@@ -920,6 +947,30 @@ fn conversation_workspace_root(
         workspace_id
             .map(|workspace_id| workdir.join("workspaces").join(workspace_id).join("files")),
     )
+}
+
+fn conversation_sessions_root(workdir: &Path, conversation_root: &Path) -> Result<Option<PathBuf>> {
+    let value = read_conversation_state(conversation_root)?;
+    let remote_execution_active = value
+        .get("settings")
+        .and_then(|settings| settings.get("remote_execution"))
+        .is_some_and(|value| !value.is_null());
+    if !remote_execution_active {
+        return Ok(Some(workdir.join("sessions")));
+    }
+    let Some(workspace_root) = conversation_workspace_root(workdir, conversation_root)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        storage_root_for_execution_root(&workspace_root).join("sessions"),
+    ))
+}
+
+fn read_conversation_state(conversation_root: &Path) -> Result<Value> {
+    let state_path = conversation_root.join("conversation.json");
+    let raw = std::fs::read_to_string(&state_path)
+        .with_context(|| format!("failed to read {}", state_path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", state_path.display()))
 }
 
 fn infer_static_content_type(path: &Path) -> &'static str {
@@ -1007,7 +1058,14 @@ fn find_session_root(
     conversation_key: &Option<String>,
 ) -> Result<Option<PathBuf>> {
     let conversation_key = normalize_or_default_conversation_key(conversation_key.as_deref())?;
-    let sessions_root = workdir.join("sessions");
+    let sessions_root = if let Some(conversation_root) =
+        find_conversation_root(workdir, channel_id, &Some(conversation_key.clone()))?
+    {
+        conversation_sessions_root(workdir, &conversation_root)?
+            .unwrap_or_else(|| workdir.join("sessions"))
+    } else {
+        workdir.join("sessions")
+    };
     if !sessions_root.is_dir() {
         return Ok(None);
     }

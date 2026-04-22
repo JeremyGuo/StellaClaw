@@ -49,6 +49,9 @@ impl Server {
         if self.try_handle_agent_command(channel, incoming).await? {
             return Ok(true);
         }
+        if self.try_handle_remote_command(channel, incoming).await? {
+            return Ok(true);
+        }
         if self.try_handle_mount_command(channel, incoming).await? {
             return Ok(true);
         }
@@ -414,6 +417,19 @@ impl Server {
             return Ok(false);
         };
 
+        if self.remote_execution_active(&incoming.address)? {
+            self.send_channel_message(
+                channel,
+                &incoming.address,
+                OutgoingMessage::text(
+                    "The current conversation is using `/remote`. `/mount` is unavailable until you run `/remote off`."
+                        .to_string(),
+                ),
+            )
+            .await?;
+            return Ok(true);
+        }
+
         let Some(folder) = argument else {
             let mounts = self.local_mount_paths_for_address(&incoming.address)?;
             let usage = if mounts.is_empty() {
@@ -464,6 +480,74 @@ impl Server {
         )
         .await?;
         Ok(true)
+    }
+
+    async fn try_handle_remote_command(
+        &self,
+        channel: &Arc<dyn Channel>,
+        incoming: &IncomingMessage,
+    ) -> Result<bool> {
+        let Some(argument) = parse_remote_command(incoming.text.as_deref()) else {
+            return Ok(false);
+        };
+
+        let current = self.remote_execution_binding(&incoming.address)?;
+        let Some(argument) = argument else {
+            let text = match current {
+                Some(binding) => format!(
+                    "Current remote execution mode: `{}`\nUsage:\n`/remote /absolute/local/path`\n`/remote <host> <path>`\n`/remote off`",
+                    binding.describe()
+                ),
+                None => "Remote execution mode is off.\nUsage:\n`/remote /absolute/local/path`\n`/remote <host> <path>`\n`/remote off`".to_string(),
+            };
+            self.send_channel_message(channel, &incoming.address, OutgoingMessage::text(text))
+                .await?;
+            return Ok(true);
+        };
+
+        let trimmed = argument.trim();
+        let result = if trimmed.eq_ignore_ascii_case("off") {
+            self.deactivate_remote_execution(&incoming.address)
+        } else if trimmed.starts_with('/') || trimmed.starts_with("~/") {
+            let path = validate_local_execution_path(trimmed)?;
+            self.activate_remote_execution(
+                &incoming.address,
+                RemoteExecutionBinding::Local { path },
+            )
+        } else {
+            let mut parts = trimmed.splitn(2, char::is_whitespace);
+            let host = parts.next().unwrap_or_default();
+            let path = parts.next().map(str::trim).unwrap_or("");
+            let (host, path) = validate_ssh_execution_binding(host, path)?;
+            self.activate_remote_execution(
+                &incoming.address,
+                RemoteExecutionBinding::Ssh { host, path },
+            )
+        };
+
+        match result {
+            Ok(snapshot) => {
+                let text = match snapshot.settings.remote_execution {
+                    Some(binding) => format!(
+                        "Remote execution is now bound to `{}`. Conversation-level workpaths were cleared, and future turns will use this execution root by default.",
+                        binding.describe()
+                    ),
+                    None => {
+                        "Remote execution is now off. Future turns will use the normal local workspace flow."
+                            .to_string()
+                    }
+                };
+                self.invalidate_foreground_agent_frame_runtime(&incoming.address)?;
+                self.send_channel_message(channel, &incoming.address, OutgoingMessage::text(text))
+                    .await?;
+                Ok(true)
+            }
+            Err(error) => {
+                self.send_user_error_message(channel, &incoming.address, &error)
+                    .await;
+                Err(error)
+            }
+        }
     }
 
     async fn try_handle_think_command(
@@ -566,20 +650,21 @@ impl Server {
                 session: checkpoint,
             };
             let conversation_memory_root = conversation_memory_root(&session);
-            let record = self.with_snapshots(|snapshots| {
-                snapshots.save_snapshot(
-                    &incoming.address,
-                    &checkpoint_name,
-                    bundle,
-                    &session.workspace_root,
-                    Some(&conversation_memory_root),
-                )
-            })?;
+            let record =
+                self.with_snapshot_manager_for_address(&incoming.address, |snapshots| {
+                    snapshots.save_snapshot(
+                        &incoming.address,
+                        &checkpoint_name,
+                        bundle,
+                        &session.workspace_root,
+                        Some(&conversation_memory_root),
+                    )
+                })?;
             self.send_channel_message(
                 channel,
                 &incoming.address,
                 OutgoingMessage::text(format!(
-                    "Saved global snapshot `{}` at {}.",
+                    "Saved snapshot `{}` at {}.",
                     record.name, record.saved_at
                 )),
             )
@@ -593,7 +678,10 @@ impl Server {
                 Some(None)
             )
         {
-            let snapshots = self.with_snapshots(|snapshots| Ok(snapshots.list_snapshots()))?;
+            let snapshots = self
+                .with_snapshot_manager_for_address(&incoming.address, |snapshots| {
+                    Ok(snapshots.list_snapshots())
+                })?;
             if snapshots.is_empty() {
                 self.send_channel_message(
                     channel,
@@ -627,7 +715,7 @@ impl Server {
                 &incoming.address,
                 OutgoingMessage::with_options(
                     format!(
-                        "Saved global snapshots:\n{}\n\nChoose one below or send `/snapload <name>`.",
+                        "Saved snapshots:\n{}\n\nChoose one below or send `/snapload <name>`.",
                         lines.join("\n")
                     ),
                     "Choose a snapshot to load",
@@ -639,15 +727,17 @@ impl Server {
         }
 
         if let Some(checkpoint_name) = parse_snap_load_command(incoming.text.as_deref()) {
-            let loaded =
-                match self.with_snapshots(|snapshots| snapshots.load_snapshot(&checkpoint_name)) {
-                    Ok(loaded) => loaded,
-                    Err(error) => {
-                        self.send_user_error_message(channel, &incoming.address, &error)
-                            .await;
-                        return Err(error);
-                    }
-                };
+            let loaded = match self
+                .with_snapshot_manager_for_address(&incoming.address, |snapshots| {
+                    snapshots.load_snapshot(&checkpoint_name)
+                }) {
+                Ok(loaded) => loaded,
+                Err(error) => {
+                    self.send_user_error_message(channel, &incoming.address, &error)
+                        .await;
+                    return Err(error);
+                }
+            };
             self.with_conversations(|conversations| {
                 conversations.set_agent_selection(
                     &incoming.address,
@@ -675,21 +765,53 @@ impl Server {
             let loaded_workspace_dir = loaded.workspace_dir.clone();
             let loaded_conversation_memory_dir = loaded.conversation_memory_dir.clone();
             let loaded_session = loaded.bundle.session.clone();
-            self.destroy_foreground_session(&incoming.address)?;
-            let workspace = self.workspace_manager.create_workspace(
-                uuid::Uuid::new_v4(),
-                uuid::Uuid::new_v4(),
-                Some(&format!("snapshot-{}", loaded_record.name)),
-            )?;
-            replace_directory_contents(&workspace.files_dir, &loaded_workspace_dir)?;
-            let restored = self.with_sessions(|sessions| {
-                sessions.restore_foreground_from_checkpoint(
-                    &incoming.address,
-                    loaded_session,
-                    workspace.id.clone(),
-                    workspace.files_dir.clone(),
-                )
-            })?;
+            let loaded_remote_execution = loaded.bundle.settings.remote_execution.clone();
+            let restored = if let Some(binding) = loaded_remote_execution {
+                self.activate_remote_execution(&incoming.address, binding)?;
+                let context = self
+                    .remote_execution_context(&incoming.address)?
+                    .ok_or_else(|| {
+                        anyhow!("remote execution context is missing after activation")
+                    })?;
+                self.destroy_foreground_session(&incoming.address)?;
+                replace_directory_contents(&context.workspace_root, &loaded_workspace_dir)?;
+                let restored = self.with_sessions(|sessions| {
+                    sessions.restore_foreground_from_checkpoint_in_root(
+                        &incoming.address,
+                        loaded_session,
+                        context.workspace_id.clone(),
+                        context.workspace_root.clone(),
+                        &context.sessions_root,
+                    )
+                })?;
+                self.with_conversations(|conversations| {
+                    conversations.set_workspace_id(&incoming.address, None)
+                })?;
+                restored
+            } else {
+                if self.remote_execution_active(&incoming.address)? {
+                    self.deactivate_remote_execution(&incoming.address)?;
+                }
+                self.destroy_foreground_session(&incoming.address)?;
+                let workspace = self.workspace_manager.create_workspace(
+                    uuid::Uuid::new_v4(),
+                    uuid::Uuid::new_v4(),
+                    Some(&format!("snapshot-{}", loaded_record.name)),
+                )?;
+                replace_directory_contents(&workspace.files_dir, &loaded_workspace_dir)?;
+                let restored = self.with_sessions(|sessions| {
+                    sessions.restore_foreground_from_checkpoint(
+                        &incoming.address,
+                        loaded_session,
+                        workspace.id.clone(),
+                        workspace.files_dir.clone(),
+                    )
+                })?;
+                self.with_conversations(|conversations| {
+                    conversations.set_workspace_id(&incoming.address, Some(workspace.id.clone()))
+                })?;
+                restored
+            };
             if let Some(memory_dir) = loaded_conversation_memory_dir.as_ref() {
                 let restored_memory_root = conversation_memory_root(&restored);
                 replace_directory_contents(&restored_memory_root, memory_dir)?;
@@ -698,8 +820,9 @@ impl Server {
                 channel,
                 &incoming.address,
                 OutgoingMessage::text(format!(
-                    "Loaded snapshot `{}` into a new session with workspace `{}`.",
-                    loaded_record.name, restored.workspace_id
+                    "Loaded snapshot `{}` into a new session with execution root `{}`.",
+                    loaded_record.name,
+                    restored.workspace_root.display()
                 )),
             )
             .await?;

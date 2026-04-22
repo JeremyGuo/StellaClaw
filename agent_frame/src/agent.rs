@@ -306,7 +306,12 @@ fn synthetic_user_message_from_tool_result(
         tool_call_id: None,
         tool_calls: None,
     };
-    canonicalize_message_multimodal_for_storage(workspace_root, &message, CanonicalMessageScope::Tool).ok()
+    canonicalize_message_multimodal_for_storage(
+        workspace_root,
+        &message,
+        CanonicalMessageScope::Tool,
+    )
+    .ok()
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -842,6 +847,7 @@ fn run_session_state_controlled_internal(
         &discovered_skills,
         &extra_tools,
         &config.remote_workpaths,
+        config.enable_remote_tools,
         control
             .as_ref()
             .map(SessionExecutionControl::tool_interrupt_flag),
@@ -1673,6 +1679,7 @@ mod tests {
             skills_metadata_prompt: Some("[AgentFrame Skills]\nsnapshot".to_string()),
             system_prompt: "host prompt".to_string(),
             remote_workpaths: Vec::new(),
+            enable_remote_tools: true,
             max_tool_roundtrips: 4,
             workspace_root: PathBuf::from("."),
             runtime_state_root: std::env::temp_dir().join("agent_frame_tests"),
@@ -1744,6 +1751,7 @@ mod tests {
             skills_metadata_prompt: None,
             system_prompt: "Test system prompt.".to_string(),
             remote_workpaths: Vec::new(),
+            enable_remote_tools: true,
             max_tool_roundtrips: 4,
             workspace_root: PathBuf::from("."),
             runtime_state_root: std::env::temp_dir().join("agent_frame_tests"),
@@ -1979,6 +1987,7 @@ pub fn compact_session_messages_with_report(
         &discovered_skills,
         &extra_tools,
         &config.remote_workpaths,
+        config.enable_remote_tools,
     )?;
     let tool_definitions = registry.values().cloned().collect::<Vec<_>>();
     let compaction_source = materialize_messages_for_upstream(&messages, &config)?;
@@ -2012,6 +2021,7 @@ pub fn estimate_configured_session_tokens(
         &discovered_skills,
         &extra_tools,
         &config.remote_workpaths,
+        config.enable_remote_tools,
     )?;
     let tool_definitions = registry.values().cloned().collect::<Vec<_>>();
     let request_messages = materialize_messages_for_upstream(&messages, &config)?;
