@@ -1800,7 +1800,7 @@ impl Deref for Server {
 }
 
 #[async_trait]
-impl WebChannelHost for RuntimeContext {
+impl WebChannelHost for Server {
     async fn list_web_conversations(
         &self,
         channel_id: &str,
@@ -1814,16 +1814,38 @@ impl WebChannelHost for RuntimeContext {
         })?;
         conversations
             .into_iter()
-            .map(|conversation| self.web_conversation_summary(&conversation.address))
+            .map(|conversation| self.web_conversation_summary(&conversation))
             .collect()
+    }
+
+    async fn get_web_conversation(
+        &self,
+        address: &ChannelAddress,
+    ) -> Result<Option<WebConversationSummary>> {
+        let conversation = self.with_conversations(|conversations| Ok(conversations.get_snapshot(address)))?;
+        conversation
+            .map(|conversation| self.web_conversation_summary(&conversation))
+            .transpose()
     }
 
     async fn create_web_conversation(
         &self,
         address: &ChannelAddress,
+        remote_execution: RemoteExecutionBinding,
     ) -> Result<WebConversationSummary> {
         self.with_conversations(|conversations| conversations.ensure_conversation(address))?;
-        self.web_conversation_summary(address)
+        let conversation = self.activate_remote_execution(address, remote_execution)?;
+        self.web_conversation_summary(&conversation)
+    }
+
+    async fn update_web_conversation_remote_execution(
+        &self,
+        address: &ChannelAddress,
+        remote_execution: RemoteExecutionBinding,
+    ) -> Result<WebConversationSummary> {
+        self.with_conversations(|conversations| conversations.ensure_conversation(address))?;
+        let conversation = self.activate_remote_execution(address, remote_execution)?;
+        self.web_conversation_summary(&conversation)
     }
 
     async fn delete_web_conversation(&self, address: &ChannelAddress) -> Result<bool> {
@@ -1866,21 +1888,30 @@ impl WebChannelHost for RuntimeContext {
     }
 }
 
-impl RuntimeContext {
-    fn web_conversation_summary(&self, address: &ChannelAddress) -> Result<WebConversationSummary> {
-        let session = self.with_sessions(|sessions| Ok(sessions.get_snapshot(address)))?;
+impl Server {
+    fn web_conversation_summary(
+        &self,
+        conversation: &crate::conversation::ConversationSnapshot,
+    ) -> Result<WebConversationSummary> {
+        let session = self.with_sessions(|sessions| Ok(sessions.get_snapshot(&conversation.address)))?;
         let (entry_count, latest) = if let Some(session) = session {
             let transcript = SessionTranscript::open(&session.root_dir)?;
             (transcript.len(), transcript.list(0, 1)?.into_iter().next())
         } else {
             (0, None)
         };
+        let remote_execution = conversation.settings.remote_execution.clone();
+        let remote_execution_label = remote_execution
+            .as_ref()
+            .map(RemoteExecutionBinding::describe);
         Ok(WebConversationSummary {
-            conversation_key: address.conversation_id.clone(),
+            conversation_key: conversation.address.conversation_id.clone(),
             entry_count,
             latest_ts: latest.as_ref().map(|entry| entry.ts.clone()),
             latest_type: latest.as_ref().map(|entry| entry.entry_type.clone()),
             latest_summary: latest.as_ref().and_then(summarize_skeleton),
+            remote_execution,
+            remote_execution_label,
         })
     }
 }
@@ -2217,10 +2248,6 @@ impl Server {
             conversations,
             snapshots,
         });
-        for channel in context.web_channels.values() {
-            channel.set_host(Arc::clone(&context) as Arc<dyn WebChannelHost>)?;
-        }
-
         Ok(Self {
             context: Arc::clone(&context),
             telegram_channel_ids: Arc::new(telegram_channel_ids),
@@ -2238,6 +2265,9 @@ impl Server {
         let (sender, mut receiver) = mpsc::channel::<IncomingMessage>(128);
         let background_receiver = self.background_job_receiver.take();
         let server = Arc::new(self);
+        for channel in server.context.web_channels.values() {
+            channel.set_host(Arc::clone(&server) as Arc<dyn WebChannelHost>)?;
+        }
         {
             let runtime = server.agent_runtime_view();
             tokio::spawn(async move {
@@ -3554,6 +3584,7 @@ mod tests {
         sync_workspace_shared_profile_files, upload_workspace_shared_profile_files,
         user_facing_continue_error_text, workspace_visible_in_list,
     };
+    use super::command_routing::web_channel_disallows_remote_deactivation;
     use crate::agent_status::AgentRegistry;
     use crate::backend::AgentBackendKind;
     use crate::bootstrap::AgentWorkspace;
@@ -6090,6 +6121,10 @@ mod tests {
             parse_remote_command(Some("/remote off")),
             Some(Some("off".to_string()))
         );
+        assert!(web_channel_disallows_remote_deactivation(true, "off"));
+        assert!(web_channel_disallows_remote_deactivation(true, " OFF "));
+        assert!(!web_channel_disallows_remote_deactivation(false, "off"));
+        assert!(!web_channel_disallows_remote_deactivation(true, "/srv/project"));
 
         assert_eq!(parse_think_command(Some("/think")), Some(None));
         assert_eq!(

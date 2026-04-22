@@ -498,6 +498,7 @@ impl Server {
                     "Current remote execution mode: `{}`\nUsage:\n`/remote /absolute/local/path`\n`/remote <host> <path>`\n`/remote off`",
                     binding.describe()
                 ),
+                None if self.web_channels.contains_key(&incoming.address.channel_id) => "This web conversation requires remote execution before chatting.\nUsage:\n`/remote /absolute/local/path`\n`/remote <host> <path>`".to_string(),
                 None => "Remote execution mode is off.\nUsage:\n`/remote /absolute/local/path`\n`/remote <host> <path>`\n`/remote off`".to_string(),
             };
             self.send_channel_message(channel, &incoming.address, OutgoingMessage::text(text))
@@ -507,6 +508,17 @@ impl Server {
 
         let trimmed = argument.trim();
         let result = if trimmed.eq_ignore_ascii_case("off") {
+            if web_channel_disallows_remote_deactivation(
+                self.web_channels.contains_key(&incoming.address.channel_id),
+                trimmed,
+            ) {
+                let error = anyhow!(
+                    "Web conversations must stay in remote execution mode. Rebind with `/remote /absolute/local/path` or `/remote <host> <path>` instead of turning it off."
+                );
+                self.send_user_error_message(channel, &incoming.address, &error)
+                    .await;
+                return Err(error);
+            }
             self.deactivate_remote_execution(&incoming.address)
         } else if trimmed.starts_with('/') || trimmed.starts_with("~/") {
             let path = validate_local_execution_path(trimmed)?;
@@ -879,4 +891,11 @@ impl Server {
         .await?;
         Ok(true)
     }
+}
+
+pub(super) fn web_channel_disallows_remote_deactivation(
+    is_web_channel: bool,
+    argument: &str,
+) -> bool {
+    is_web_channel && argument.trim().eq_ignore_ascii_case("off")
 }

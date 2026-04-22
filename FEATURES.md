@@ -212,6 +212,8 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Web channels serve the embedded browser client over HTTP, accept user messages through `/api/send`, push live outgoing/progress/session events through `/ws`, and require bearer-token authentication from `auth_token` or `auth_token_env`.
 - Web channels without a configured token must log a warning and stay disabled rather than exposing an unauthenticated browser/API surface.
 - Web browser clients expose a left-side conversation list and authenticated create/delete controls for Web conversations.
+- Web browser clients expose server/token settings plus a remote-workspace binding flow; conversations are created or rebound through authenticated `/api/conversation` calls that carry a required `remote_execution` payload.
+- Web conversations are remote-only: sending the first message requires a bound local absolute path or SSH host/path execution root, and `/remote off` is rejected for conversations that originate from the Web channel.
 - Web browser clients render assistant messages with safe local Markdown support for headings, lists, tables, horizontal rules, blockquotes, code blocks, inline code, emphasis, and links.
 - Web browser clients render assistant `<attachment>...</attachment>` references and outgoing Web attachments through an authenticated attachment endpoint so images and files remain visible after refresh.
 - Web browser clients render `ShowOptions` response prompts as clickable buttons and send the selected option value back through the normal `/api/send` path.
@@ -220,6 +222,7 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Web browser clients load transcript skeletons by page, render API calls and tool responses as clickable summary rows, and request full transcript details over WebSocket only when a user expands an entry.
 - Web browser clients scroll to the newest history on initial load and automatically request the previous transcript page when the user scrolls to the top, preserving the viewport while older entries are inserted.
 - Web transcript history renders `user_tell` model calls as normal assistant messages and suppresses the matching ok-only tool result row.
+- The repository also contains an Electron client scaffold under `apps/partx` that reuses the Web channel renderer and protocol surface instead of inventing a second chat transport.
 - Regression coverage should protect Web channel auth, config/TUI visibility for Web fields, and session transcript append/list/detail behavior.
 - Telegram progress messages use emoji-decorated status indicators: phase icons (🧠 thinking, 🔧 tools, 🗜️ compaction), per-tool status markers (⏳ running, ✅ completed, ❌ failed), and plan step markers (✅ completed, ▶️ in-progress, ⬜ pending).
 - Telegram progress messages are edited to a one-line completion summary with elapsed time on success instead of being deleted, so users can see that the turn finished and how long it took.

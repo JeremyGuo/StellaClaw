@@ -6,6 +6,9 @@ use crate::domain::{
     ChannelAddress, OutgoingAttachment, OutgoingMessage, ProcessingState, ShowOptions,
     validate_conversation_id,
 };
+use crate::remote_execution::{
+    RemoteExecutionBinding, validate_local_execution_path, validate_ssh_execution_binding,
+};
 use crate::remote_execution::storage_root_for_execution_root;
 use crate::transcript::{TranscriptEntry, TranscriptEntrySkeleton, TranscriptEntryType};
 use anyhow::{Context, Result};
@@ -13,7 +16,7 @@ use async_trait::async_trait;
 use axum::{
     Router,
     extract::{Query, State, WebSocketUpgrade, ws},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, Method, StatusCode, header},
     response::{Html, IntoResponse, Json, Response},
     routing::{get, post},
 };
@@ -24,6 +27,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock as StdRwLock};
 use tokio::sync::{RwLock, broadcast, mpsc};
+use tower_http::cors::{Any, CorsLayer};
 
 struct WebChannelInner {
     id: String,
@@ -44,9 +48,19 @@ pub struct WebChannel {
 pub trait WebChannelHost: Send + Sync {
     async fn list_web_conversations(&self, channel_id: &str)
     -> Result<Vec<WebConversationSummary>>;
+    async fn get_web_conversation(
+        &self,
+        address: &ChannelAddress,
+    ) -> Result<Option<WebConversationSummary>>;
     async fn create_web_conversation(
         &self,
         address: &ChannelAddress,
+        remote_execution: RemoteExecutionBinding,
+    ) -> Result<WebConversationSummary>;
+    async fn update_web_conversation_remote_execution(
+        &self,
+        address: &ChannelAddress,
+        remote_execution: RemoteExecutionBinding,
     ) -> Result<WebConversationSummary>;
     async fn delete_web_conversation(&self, address: &ChannelAddress) -> Result<bool>;
     async fn list_web_transcript(
@@ -318,7 +332,10 @@ fn build_router(state: Arc<WebChannelInner>) -> Router {
         .route("/api/conversations", get(list_conversations))
         .route(
             "/api/conversation",
-            post(create_conversation).delete(delete_conversation),
+            get(get_conversation)
+                .post(create_conversation)
+                .put(update_conversation)
+                .delete(delete_conversation),
         )
         .route("/api/attachment", get(get_attachment))
         .route("/api/send", post(send_message))
@@ -327,6 +344,18 @@ fn build_router(state: Arc<WebChannelInner>) -> Router {
         .route("/ws", get(ws_handler))
         .route("/assets/app.js", get(serve_app_js))
         .route("/assets/style.css", get(serve_style_css))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]),
+        )
         .with_state(state)
 }
 
@@ -361,10 +390,18 @@ pub struct WebConversationSummary {
     pub latest_ts: Option<String>,
     pub latest_type: Option<TranscriptEntryType>,
     pub latest_summary: Option<String>,
+    pub remote_execution: Option<RemoteExecutionBinding>,
+    pub remote_execution_label: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct ConversationMutationRequest {
+    conversation_key: Option<String>,
+    remote_execution: Option<RemoteExecutionBinding>,
+}
+
+#[derive(Deserialize)]
+struct ConversationLookupQuery {
     conversation_key: Option<String>,
 }
 
@@ -388,19 +425,58 @@ async fn list_conversations(
     Ok(Json(conversations))
 }
 
+async fn get_conversation(
+    State(state): State<Arc<WebChannelInner>>,
+    Query(query): Query<ConversationLookupQuery>,
+    headers: HeaderMap,
+) -> Result<Json<WebConversationSummary>, StatusCode> {
+    check_auth(&state, &headers, None)?;
+    let conversation_key = normalize_required_conversation_key(query.conversation_key)
+        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let address = web_channel_address(&state, &conversation_key);
+    let summary = host_for_state(&state)?
+        .get_web_conversation(&address)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(summary))
+}
+
 async fn create_conversation(
     State(state): State<Arc<WebChannelInner>>,
     headers: HeaderMap,
     Json(body): Json<ConversationMutationRequest>,
-) -> Result<Json<WebConversationSummary>, StatusCode> {
-    check_auth(&state, &headers, None)?;
+) -> Result<Json<WebConversationSummary>, (StatusCode, String)> {
+    check_auth(&state, &headers, None).map_err(status_text)?;
     let conversation_key = normalize_or_generate_conversation_key(body.conversation_key)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(error_text(StatusCode::BAD_REQUEST))?;
+    let remote_execution = validate_requested_remote_execution(body.remote_execution)
+        .map_err(error_text(StatusCode::BAD_REQUEST))?;
     let address = web_channel_address(&state, &conversation_key);
-    let summary = host_for_state(&state)?
-        .create_web_conversation(&address)
+    let summary = host_for_state(&state)
+        .map_err(status_text)?
+        .create_web_conversation(&address, remote_execution)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(error_text(StatusCode::INTERNAL_SERVER_ERROR))?;
+    Ok(Json(summary))
+}
+
+async fn update_conversation(
+    State(state): State<Arc<WebChannelInner>>,
+    headers: HeaderMap,
+    Json(body): Json<ConversationMutationRequest>,
+) -> Result<Json<WebConversationSummary>, (StatusCode, String)> {
+    check_auth(&state, &headers, None).map_err(status_text)?;
+    let conversation_key = normalize_required_conversation_key(body.conversation_key)
+        .map_err(error_text(StatusCode::BAD_REQUEST))?;
+    let remote_execution = validate_requested_remote_execution(body.remote_execution)
+        .map_err(error_text(StatusCode::BAD_REQUEST))?;
+    let address = web_channel_address(&state, &conversation_key);
+    let summary = host_for_state(&state)
+        .map_err(status_text)?
+        .update_web_conversation_remote_execution(&address, remote_execution)
+        .await
+        .map_err(error_text(StatusCode::INTERNAL_SERVER_ERROR))?;
     Ok(Json(summary))
 }
 
@@ -408,15 +484,16 @@ async fn delete_conversation(
     State(state): State<Arc<WebChannelInner>>,
     headers: HeaderMap,
     Json(body): Json<ConversationMutationRequest>,
-) -> Result<Json<DeleteConversationResponse>, StatusCode> {
-    check_auth(&state, &headers, None)?;
+) -> Result<Json<DeleteConversationResponse>, (StatusCode, String)> {
+    check_auth(&state, &headers, None).map_err(status_text)?;
     let conversation_key = normalize_required_conversation_key(body.conversation_key)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(error_text(StatusCode::BAD_REQUEST))?;
     let address = web_channel_address(&state, &conversation_key);
-    let deleted = host_for_state(&state)?
+    let deleted = host_for_state(&state)
+        .map_err(status_text)?
         .delete_web_conversation(&address)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(error_text(StatusCode::INTERNAL_SERVER_ERROR))?;
     Ok(Json(DeleteConversationResponse {
         conversation_key,
         deleted,
@@ -459,30 +536,47 @@ async fn send_message(
     State(state): State<Arc<WebChannelInner>>,
     headers: HeaderMap,
     Json(body): Json<SendMessageRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    check_auth(&state, &headers, None)?;
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    check_auth(&state, &headers, None).map_err(status_text)?;
     let text = body.text.trim();
     if text.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err((StatusCode::BAD_REQUEST, "text must not be empty".to_string()));
     }
 
     let incoming_sender = state.incoming_sender.read().await;
     let sender = incoming_sender
         .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        .ok_or((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "web channel is not ready to accept incoming messages".to_string(),
+        ))?;
     let conversation_key = normalize_or_default_conversation_key(body.conversation_key.as_deref())
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+        .map_err(error_text(StatusCode::BAD_REQUEST))?;
     let address = ChannelAddress {
         channel_id: state.id.clone(),
         conversation_id: conversation_key.clone(),
         user_id: Some("web-user".to_string()),
         display_name: Some("Web User".to_string()),
     };
-
-    host_for_state(&state)?
-        .create_web_conversation(&address)
+    let conversation = host_for_state(&state)
+        .map_err(status_text)?
+        .get_web_conversation(&address)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(error_text(StatusCode::INTERNAL_SERVER_ERROR))?;
+    let Some(conversation) = conversation else {
+        return Err((
+            StatusCode::PRECONDITION_FAILED,
+            "conversation is not configured yet; create it and bind a remote workspace first"
+                .to_string(),
+        ));
+    };
+    if conversation.remote_execution.is_none() {
+        return Err((
+            StatusCode::PRECONDITION_FAILED,
+            "conversation is missing remote execution; bind a workspace before sending messages"
+                .to_string(),
+        ));
+    }
 
     sender
         .send(IncomingMessage {
@@ -494,7 +588,12 @@ async fn send_message(
             control: None,
         })
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to enqueue incoming message: {error}"),
+            )
+        })?;
 
     Ok(Json(serde_json::json!({
         "status": "sent",
@@ -793,6 +892,39 @@ fn normalize_or_generate_conversation_key(value: Option<String>) -> Result<Strin
         Some(value) if !value.trim().is_empty() => normalize_conversation_key(&value),
         _ => Ok(format!("web-{}", uuid::Uuid::new_v4().simple())),
     }
+}
+
+fn validate_requested_remote_execution(
+    remote_execution: Option<RemoteExecutionBinding>,
+) -> Result<RemoteExecutionBinding> {
+    let remote_execution =
+        remote_execution.ok_or_else(|| anyhow::anyhow!("remote_execution is required"))?;
+    match remote_execution {
+        RemoteExecutionBinding::Local { path } => {
+            let validated = validate_local_execution_path(&path.to_string_lossy())?;
+            Ok(RemoteExecutionBinding::Local { path: validated })
+        }
+        RemoteExecutionBinding::Ssh { host, path } => {
+            let (host, path) = validate_ssh_execution_binding(&host, &path)?;
+            Ok(RemoteExecutionBinding::Ssh { host, path })
+        }
+    }
+}
+
+fn error_text(
+    status: StatusCode,
+) -> impl FnOnce(anyhow::Error) -> (StatusCode, String) + Copy + Send + Sync + 'static {
+    move |error| (status, format!("{error:#}"))
+}
+
+fn status_text(status: StatusCode) -> (StatusCode, String) {
+    (
+        status,
+        status
+            .canonical_reason()
+            .unwrap_or("request failed")
+            .to_string(),
+    )
 }
 
 fn normalize_required_conversation_key(value: Option<String>) -> Result<String> {
@@ -1094,6 +1226,8 @@ fn find_session_root(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
     fn state_with_token(token: Option<&str>) -> WebChannelInner {
         state_with_workdir(token, PathBuf::new())
     }
@@ -1202,7 +1336,8 @@ mod tests {
         assert!(APP_JS.contains("function isMarkdownTableStart"));
         assert!(APP_JS.contains("markdown-table-wrap"));
         assert!(STYLE_CSS.contains(".markdown table"));
-        assert!(STYLE_CSS.contains(".markdown th, .markdown td"));
+        assert!(STYLE_CSS.contains(".markdown th"));
+        assert!(STYLE_CSS.contains(".markdown td"));
     }
 
     #[test]
@@ -1241,5 +1376,76 @@ mod tests {
             normalize_conversation_key("web-default_123").unwrap(),
             "web-default_123"
         );
+    }
+
+    #[test]
+    fn requested_remote_execution_validates_local_and_ssh_bindings() {
+        let local = validate_requested_remote_execution(Some(RemoteExecutionBinding::Local {
+            path: PathBuf::from("/srv/project"),
+        }))
+        .unwrap();
+        assert_eq!(
+            local,
+            RemoteExecutionBinding::Local {
+                path: PathBuf::from("/srv/project"),
+            }
+        );
+
+        let ssh = validate_requested_remote_execution(Some(RemoteExecutionBinding::Ssh {
+            host: "demo-host".to_string(),
+            path: "~/repo".to_string(),
+        }))
+        .unwrap();
+        assert_eq!(
+            ssh,
+            RemoteExecutionBinding::Ssh {
+                host: "demo-host".to_string(),
+                path: "~/repo".to_string(),
+            }
+        );
+
+        assert!(validate_requested_remote_execution(None).is_err());
+        assert!(validate_requested_remote_execution(Some(RemoteExecutionBinding::Local {
+            path: PathBuf::from("relative/path"),
+        }))
+        .is_err());
+        assert!(validate_requested_remote_execution(Some(RemoteExecutionBinding::Ssh {
+            host: "".to_string(),
+            path: "".to_string(),
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn bundled_web_client_exposes_remote_workspace_controls() {
+        assert!(INDEX_HTML.contains("workspace-kind-input"));
+        assert!(INDEX_HTML.contains("bind-workspace-btn"));
+        assert!(APP_JS.contains("bindCurrentConversation"));
+        assert!(APP_JS.contains("/api/conversation"));
+        assert!(APP_JS.contains("remote_execution"));
+        assert!(APP_JS.contains("http://127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn partx_electron_shell_is_scaffolded() {
+        let package = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../apps/partx/package.json"
+        ))
+        .unwrap();
+        let main = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../apps/partx/main.js"
+        ))
+        .unwrap();
+        let renderer = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../apps/partx/renderer/index.html"
+        ))
+        .unwrap();
+
+        assert!(package.contains("\"electron\""));
+        assert!(main.contains("BrowserWindow"));
+        assert!(renderer.contains("agent_host/src/channels/web_static/app.js"));
     }
 }
