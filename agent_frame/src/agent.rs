@@ -243,6 +243,41 @@ fn is_previous_response_id_error(error: &anyhow::Error) -> bool {
         || (message.contains("response") && message.contains("invalid"))
 }
 
+fn is_payload_too_large_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    message.contains("payload too large")
+        || message.contains("request_too_large")
+        || message.contains("request exceeds the maximum size")
+        || message.contains("request too large")
+        || (message.contains("413") && message.contains("upstream"))
+}
+
+fn payload_too_large_rescue_token_limit(estimated_tokens: usize, attempt: usize) -> usize {
+    let aggressive_limit = match attempt {
+        0 => estimated_tokens.saturating_mul(3) / 4,
+        1 => estimated_tokens / 2,
+        _ => estimated_tokens / 3,
+    };
+    aggressive_limit.max(1)
+}
+
+fn force_payload_too_large_compaction(
+    config: &AgentConfig,
+    messages: &[ChatMessage],
+    tools: &[Tool],
+    attempt: usize,
+    session: Option<&mut ChatCompletionSession>,
+) -> Result<ContextCompactionReport> {
+    let estimated_tokens =
+        estimate_session_tokens_for_upstream(messages, tools, "", &config.upstream);
+    let mut forced_config = config.clone();
+    forced_config.enable_context_compression = true;
+    forced_config.context_compaction.token_limit_override = Some(
+        payload_too_large_rescue_token_limit(estimated_tokens, attempt),
+    );
+    maybe_compact_messages_with_report_with_session(&forced_config, messages, tools, "", session)
+}
+
 fn synthetic_user_message_from_tool_result(
     workspace_root: &std::path::Path,
     result: &str,
@@ -900,6 +935,7 @@ fn run_session_state_controlled_internal(
 
     let round_index = 0usize;
     let mut empty_final_assistant_retries = 0usize;
+    let mut payload_too_large_rescue_attempts = 0usize;
     loop {
         if let Some(control) = &control {
             control.ensure_not_cancelled()?;
@@ -1004,8 +1040,56 @@ fn run_session_state_controlled_internal(
                     llm_session.as_mut(),
                 )?
             }
+            Err(error)
+                if config.enable_context_compression
+                    && payload_too_large_rescue_attempts < 3
+                    && is_payload_too_large_error(&error) =>
+            {
+                let rescue_attempt = payload_too_large_rescue_attempts;
+                let rescue_phase = format!("payload_rescue_{}", rescue_attempt + 1);
+                if let Some(control) = &control {
+                    control.emit_event(SessionEvent::CompactionStarted {
+                        phase: rescue_phase.clone(),
+                        message_count: messages.len(),
+                    });
+                }
+                let rescue_compaction = force_payload_too_large_compaction(
+                    &config,
+                    &request_messages,
+                    &tool_definitions,
+                    rescue_attempt,
+                    llm_session.as_mut(),
+                )
+                .context("payload-too-large rescue compaction failed")?;
+                if let Some(control) = &control {
+                    control.emit_event(SessionEvent::CompactionCompleted {
+                        phase: rescue_phase,
+                        compacted: rescue_compaction.compacted,
+                        estimated_tokens_before: rescue_compaction.estimated_tokens_before,
+                        estimated_tokens_after: rescue_compaction.estimated_tokens_after,
+                        token_limit: rescue_compaction.token_limit,
+                        structured_output: rescue_compaction.structured_output.clone(),
+                        compacted_messages: rescue_compaction.compacted_messages.clone(),
+                    });
+                }
+                usage.add_assign(&rescue_compaction.usage);
+                compaction_stats.record_report(&rescue_compaction);
+                payload_too_large_rescue_attempts += 1;
+                if rescue_compaction.compacted {
+                    messages = rescue_compaction.messages;
+                    runtime.continuation = None;
+                    if let Some(control) = &control {
+                        control.set_stable_prefix_messages(&messages);
+                    }
+                    continue;
+                }
+                return Err(error.context(
+                    "payload-too-large rescue compaction made no progress; request still exceeds upstream size limits",
+                ));
+            }
             Err(error) => return Err(error),
         };
+        payload_too_large_rescue_attempts = 0;
         let outcome = crate::llm::ChatCompletionOutcome {
             message: canonicalize_message_multimodal_for_storage(
                 &config.workspace_root,
@@ -1477,13 +1561,15 @@ mod tests {
     use super::{
         CompletedToolCall, ExecutionSignal, PLAN_UPDATE_REMINDER, ResponseContinuation,
         SessionExecutionControl, append_plan_update_reminder_if_due, compose_system_prompt,
-        enforce_image_load_batch_limit, finish_pending_tool_wait_compaction, plan_update_reminder,
+        enforce_image_load_batch_limit, finish_pending_tool_wait_compaction,
+        is_payload_too_large_error, payload_too_large_rescue_token_limit, plan_update_reminder,
         start_pending_tool_wait_compaction, synthetic_user_message_from_tool_result,
         tool_result_looks_like_error,
     };
     use crate::config::{AgentConfig, MemorySystem, UpstreamConfig};
     use crate::message::{ChatMessage, FunctionCall, ToolCall};
     use crate::skills::SkillMetadata;
+    use anyhow::anyhow;
     use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
     use serde_json::Value;
     use std::io::Cursor;
@@ -1522,6 +1608,28 @@ mod tests {
         assert!(tool_result_looks_like_error(
             r#"{"error": null, "failed": true}"#
         ));
+    }
+
+    #[test]
+    fn payload_too_large_error_detection_matches_provider_shapes() {
+        assert!(is_payload_too_large_error(&anyhow!(
+            "upstream chat completion failed with 413 Payload Too Large"
+        )));
+        assert!(is_payload_too_large_error(&anyhow!(
+            "Provider returned error: request_too_large"
+        )));
+        assert!(is_payload_too_large_error(&anyhow!(
+            "Request exceeds the maximum size"
+        )));
+        assert!(!is_payload_too_large_error(&anyhow!("401 Unauthorized")));
+    }
+
+    #[test]
+    fn payload_too_large_rescue_limit_becomes_more_aggressive() {
+        assert_eq!(payload_too_large_rescue_token_limit(1200, 0), 900);
+        assert_eq!(payload_too_large_rescue_token_limit(1200, 1), 600);
+        assert_eq!(payload_too_large_rescue_token_limit(1200, 2), 400);
+        assert_eq!(payload_too_large_rescue_token_limit(1, 0), 1);
     }
 
     #[test]
