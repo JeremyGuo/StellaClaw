@@ -1,5 +1,16 @@
-version: 0.26.0
+version: 0.26.1
 ---
+
+# 0.26.1
+
+- 前移多模态图片格式规范化边界：
+  channel 入站附件在落盘到 conversation/session workdir 后，会立刻把 TIFF 这类不适合作为原生图片输入持久化的已知图片格式规范化成 PNG；后续 turn 拼装直接复用规范化后的持久化附件，不再每轮临时重复转码同一上传文件。
+- 新增历史多模态内容 workdir 升级：
+  `0.33 -> 0.34` upgrade step 会重写 `session.json` / `snapshot.json` 中残留的旧 inline 图片内容；可转码的旧 `data:image/tiff` 等内容会写回成 canonical PNG data URL，已经损坏或不可解码的旧 payload 会写回稳定占位文本，避免历史恢复时继续携带不受支持的格式。
+- 补充回归测试与持久化覆盖：
+  新增针对附件 materialize 规范化和 workdir 历史消息升级的测试，保护新上传附件与旧 workdir 恢复路径的一致性。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  workdir 结构版本提升到 `0.34`，新增 upgrade step；按 workdir-only 变更策略将仓库版本从 `0.26.0` 提升到 `0.26.1`。
 
 # 0.26.0
 

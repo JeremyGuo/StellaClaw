@@ -1,3 +1,4 @@
+use crate::attachment_prep::normalize_stored_attachment_for_persistence;
 use crate::backend::AgentBackendKind;
 use crate::channel::PendingAttachment;
 use crate::config::SandboxMode;
@@ -476,15 +477,16 @@ pub async fn materialize_conversation_attachments(
     let mut stored = Vec::with_capacity(attachments.len());
     for attachment in attachments {
         let item = attachment.materialize(attachments_dir).await?;
+        let normalized = normalize_stored_attachment_for_persistence(item)?;
         tracing::info!(
             log_stream = "conversation",
             kind = "attachment_materialized",
-            attachment_id = %item.id,
-            path = %item.path.display(),
-            size_bytes = item.size_bytes,
+            attachment_id = %normalized.id,
+            path = %normalized.path.display(),
+            size_bytes = normalized.size_bytes,
             "attachment persisted to conversation session storage"
         );
-        stored.push(item);
+        stored.push(normalized);
     }
     Ok(stored)
 }
@@ -492,10 +494,12 @@ pub async fn materialize_conversation_attachments(
 #[cfg(test)]
 mod tests {
     use super::ConversationManager;
+    use crate::channel::{LocalFileAttachmentSource, PendingAttachment};
     use crate::config::SandboxMode;
-    use crate::domain::ChannelAddress;
+    use crate::domain::{AttachmentKind, ChannelAddress};
     use crate::session::SessionManager;
     use crate::workspace::WorkspaceManager;
+    use std::sync::Arc;
     use tempfile::TempDir;
     use uuid::Uuid;
 
@@ -705,5 +709,46 @@ mod tests {
                 .to_string()
                 .contains("conversation_id must contain only ASCII letters")
         );
+    }
+
+    fn tiny_tiff_bytes() -> Vec<u8> {
+        let image = image::ImageBuffer::from_pixel(1, 1, image::Rgba([12, 34, 56, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Tiff,
+            )
+            .unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn materialized_attachments_normalize_unsupported_images_for_persistence() {
+        let temp_dir = TempDir::new().unwrap();
+        let source = temp_dir.path().join("photo.tiff");
+        std::fs::write(&source, tiny_tiff_bytes()).unwrap();
+        let attachments_dir = temp_dir.path().join("upload");
+
+        let stored = super::materialize_conversation_attachments(
+            &attachments_dir,
+            vec![PendingAttachment::new(
+                AttachmentKind::Image,
+                Some("photo.tiff".to_string()),
+                Some("image/tiff".to_string()),
+                None,
+                Arc::new(LocalFileAttachmentSource::new(&source)),
+            )],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].media_type.as_deref(), Some("image/png"));
+        assert_eq!(
+            stored[0].path.extension().and_then(|value| value.to_str()),
+            Some("png")
+        );
+        assert!(stored[0].path.is_file());
     }
 }

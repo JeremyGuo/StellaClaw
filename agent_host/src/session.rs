@@ -12,7 +12,7 @@ pub use agent_frame::{SessionErrno, SessionPhase};
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -321,6 +321,7 @@ pub(crate) struct SessionRuntimeTurnFailure {
 #[derive(Clone, Debug)]
 pub(crate) enum SessionEffect {
     UpdateProgress(ProgressFeedback),
+    UserVisibleText(String),
 }
 
 #[derive(Default)]
@@ -329,6 +330,113 @@ struct SessionRuntimeState {
     active_phase: Option<SessionRuntimePhase>,
     pending_interrupt: bool,
     turn_runner_claimed: bool,
+    cache_health: SessionCacheHealthState,
+}
+
+const CACHE_WARNING_RECENT_CALL_LIMIT: usize = 10;
+const CACHE_WARNING_REQUIRED_CONSECUTIVE_ZERO_READS: usize = 3;
+const CACHE_WARNING_REQUIRED_RECENT_ZERO_READS: usize = 2;
+const CACHE_WARNING_MAX_GAP_SECONDS: i64 = 5 * 60;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CacheWarningKind {
+    ConsecutiveZeroReads,
+    BurstyZeroReads,
+}
+
+#[derive(Clone, Debug)]
+struct CacheReadObservation {
+    at: DateTime<Utc>,
+    cache_read_tokens: u64,
+}
+
+#[derive(Default)]
+struct SessionCacheHealthState {
+    recent_model_calls: VecDeque<CacheReadObservation>,
+    warning_active: bool,
+}
+
+impl SessionCacheHealthState {
+    fn record_compaction_boundary(&mut self) {
+        self.recent_model_calls.clear();
+        self.warning_active = false;
+    }
+
+    fn record_model_call(
+        &mut self,
+        now: DateTime<Utc>,
+        cache_read_tokens: u64,
+    ) -> Option<CacheWarningKind> {
+        self.recent_model_calls.push_back(CacheReadObservation {
+            at: now,
+            cache_read_tokens,
+        });
+        while self.recent_model_calls.len() > CACHE_WARNING_RECENT_CALL_LIMIT {
+            self.recent_model_calls.pop_front();
+        }
+
+        if cache_read_tokens > 0 {
+            self.warning_active = false;
+            return None;
+        }
+        if self.warning_active {
+            return None;
+        }
+        if self.last_n_are_zero_with_recent_gap(CACHE_WARNING_REQUIRED_CONSECUTIVE_ZERO_READS) {
+            self.warning_active = true;
+            return Some(CacheWarningKind::ConsecutiveZeroReads);
+        }
+        if self.has_recent_bursty_zero_reads() {
+            self.warning_active = true;
+            return Some(CacheWarningKind::BurstyZeroReads);
+        }
+        None
+    }
+
+    fn last_n_are_zero_with_recent_gap(&self, n: usize) -> bool {
+        if self.recent_model_calls.len() < n {
+            return false;
+        }
+        let tail = self
+            .recent_model_calls
+            .iter()
+            .rev()
+            .take(n)
+            .collect::<Vec<_>>();
+        tail.len() == n
+            && tail.iter().all(|call| call.cache_read_tokens == 0)
+            && self.zero_call_slice_within_gap(&tail)
+    }
+
+    fn has_recent_bursty_zero_reads(&self) -> bool {
+        let zero_calls = self
+            .recent_model_calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| call.cache_read_tokens == 0)
+            .collect::<Vec<_>>();
+        if zero_calls.len() < CACHE_WARNING_REQUIRED_RECENT_ZERO_READS {
+            return false;
+        }
+        let tail = &zero_calls[zero_calls.len() - CACHE_WARNING_REQUIRED_RECENT_ZERO_READS..];
+        let separated_by_model_call = tail
+            .windows(2)
+            .all(|pair| pair[1].0.saturating_sub(pair[0].0) > 1);
+        separated_by_model_call
+            && self
+                .zero_call_slice_within_gap(&tail.iter().map(|(_, call)| *call).collect::<Vec<_>>())
+    }
+
+    fn zero_call_slice_within_gap(&self, calls: &[&CacheReadObservation]) -> bool {
+        calls.windows(2).all(|pair| {
+            pair[0]
+                .at
+                .signed_duration_since(pair[1].at)
+                .num_seconds()
+                .abs()
+                <= CACHE_WARNING_MAX_GAP_SECONDS
+        })
+    }
 }
 
 type SessionActorCommandFn = Box<dyn FnOnce(&mut SessionActor) + Send + 'static>;
@@ -703,6 +811,12 @@ impl SessionActor {
     }
 
     fn receive_runtime_event(&mut self, event: &SessionEvent) {
+        if matches!(
+            event,
+            SessionEvent::CompactionStarted { .. } | SessionEvent::ToolWaitCompactionStarted { .. }
+        ) {
+            self.runtime.cache_health.record_compaction_boundary();
+        }
         if let Some(phase) = session_runtime_phase_for_event(event)
             && self.runtime.active_control.is_some()
         {
@@ -716,10 +830,15 @@ impl SessionActor {
         event: &SessionEvent,
     ) -> Vec<SessionEffect> {
         self.receive_runtime_event(event);
-        self.progress_feedback_for_event(model_key, event)
+        let mut effects = self
+            .progress_feedback_for_event(model_key, event)
             .map(SessionEffect::UpdateProgress)
             .into_iter()
-            .collect()
+            .collect::<Vec<_>>();
+        if let Some(text) = self.cache_warning_text_for_event(event) {
+            effects.push(SessionEffect::UserVisibleText(text));
+        }
+        effects
     }
 
     fn receive_runtime_progress(
@@ -765,6 +884,20 @@ impl SessionActor {
                 .as_ref()
                 .map(|state| state.message_id.clone()),
         })]
+    }
+
+    fn cache_warning_text_for_event(&mut self, event: &SessionEvent) -> Option<String> {
+        let SessionEvent::ModelCallCompleted {
+            cache_read_tokens, ..
+        } = event
+        else {
+            return None;
+        };
+        let warning = self
+            .runtime
+            .cache_health
+            .record_model_call(Utc::now(), *cache_read_tokens)?;
+        Some(render_cache_warning_text(&self.session.address, warning))
     }
 
     fn apply_progress_feedback_update(&mut self, update: ProgressFeedbackUpdate) -> Result<()> {
@@ -1939,6 +2072,20 @@ fn progress_text_for_execution(
     text
 }
 
+fn render_cache_warning_text(_address: &ChannelAddress, warning: CacheWarningKind) -> String {
+    let trigger = match warning {
+        CacheWarningKind::ConsecutiveZeroReads => {
+            "连续 3 次模型调用的 cache read 都是 0，且它们之间的间隔都不超过 5 分钟"
+        }
+        CacheWarningKind::BurstyZeroReads => {
+            "最近 10 次模型调用里已有 2 次 cache read 为 0，且它们之间的间隔都不超过 5 分钟，且中间没有发生压缩"
+        }
+    };
+    format!(
+        "缓存告警：检测到 prompt cache 可能没有正常命中。\n触发条件：{trigger}。\n建议检查最近的 system/runtime notice、provider 路由、历史消息形状或 cache_control 是否发生变化。"
+    )
+}
+
 fn render_plan_progress(plan: Option<&SessionPlan>) -> Option<String> {
     let plan = plan?;
     if plan.steps.is_empty() {
@@ -2485,9 +2632,9 @@ fn load_persisted_sessions(
 mod tests {
     use super::{
         IDENTITY_PROMPT_COMPONENT, SKILLS_METADATA_PROMPT_COMPONENT, SessionActorMessage,
-        SessionActorOutbound, SessionEffect, SessionErrno, SessionKind, SessionManager,
-        SessionPhase, SessionRuntimeTurnCommit, SessionRuntimeTurnFailure, SessionSkillObservation,
-        SkillChangeNotice, session_conversation_dir_name,
+        SessionActorOutbound, SessionCacheHealthState, SessionEffect, SessionErrno, SessionKind,
+        SessionManager, SessionPhase, SessionRuntimeTurnCommit, SessionRuntimeTurnFailure,
+        SessionSkillObservation, SkillChangeNotice, session_conversation_dir_name,
     };
     use crate::channel::ProgressFeedbackFinalState;
     use crate::domain::{ChannelAddress, MessageRole};
@@ -2496,6 +2643,7 @@ mod tests {
         ChatMessage, ExecutionProgress, ExecutionProgressPhase, SessionCompactionStats,
         SessionEvent, SessionExecutionControl, TokenUsage,
     };
+    use chrono::Utc;
     use std::fs;
     use tempfile::TempDir;
     use uuid::Uuid;
@@ -2529,6 +2677,22 @@ mod tests {
             pending_message: ChatMessage::text("user", text),
             text: Some(text.to_string()),
             attachments: Vec::new(),
+        }
+    }
+
+    fn model_call_completed_event(cache_read_tokens: u64) -> SessionEvent {
+        SessionEvent::ModelCallCompleted {
+            round_index: 0,
+            tool_call_count: 0,
+            api_request_id: None,
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cache_hit_tokens: cache_read_tokens,
+            cache_miss_tokens: 10,
+            cache_read_tokens,
+            cache_write_tokens: 0,
+            assistant_message: Some(ChatMessage::text("assistant", "ok")),
         }
     }
 
@@ -3541,6 +3705,161 @@ mod tests {
     }
 
     #[test]
+    fn cache_warning_triggers_after_three_consecutive_zero_reads() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
+
+        assert!(
+            actor
+                .receive_runtime_event_with_effects("opus-4.6", &model_call_completed_event(0))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            actor
+                .receive_runtime_event_with_effects("opus-4.6", &model_call_completed_event(0))
+                .unwrap()
+                .is_empty()
+        );
+
+        let effects = actor
+            .receive_runtime_event_with_effects("opus-4.6", &model_call_completed_event(0))
+            .unwrap();
+        assert!(matches!(
+            effects.as_slice(),
+            [SessionEffect::UserVisibleText(text)] if text.contains("cache read 都是 0") && text.contains("不超过 5 分钟")
+        ));
+    }
+
+    #[test]
+    fn consecutive_zero_read_warning_requires_recent_gaps() {
+        let mut cache_health = SessionCacheHealthState::default();
+        let start = Utc::now();
+
+        assert_eq!(cache_health.record_model_call(start, 0), None);
+        assert_eq!(
+            cache_health.record_model_call(start + chrono::Duration::minutes(6), 0),
+            None
+        );
+        assert_eq!(
+            cache_health.record_model_call(start + chrono::Duration::minutes(12), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn cache_warning_deduplicates_until_cache_read_recovers() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
+
+        for _ in 0..3 {
+            let _ = actor
+                .receive_runtime_event_with_effects("opus-4.6", &model_call_completed_event(0))
+                .unwrap();
+        }
+        assert!(
+            actor
+                .receive_runtime_event_with_effects("opus-4.6", &model_call_completed_event(0))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            actor
+                .receive_runtime_event_with_effects("opus-4.6", &model_call_completed_event(64))
+                .unwrap()
+                .is_empty()
+        );
+        let effects = actor
+            .receive_runtime_event_with_effects("opus-4.6", &model_call_completed_event(0))
+            .unwrap();
+        assert!(matches!(
+            effects.as_slice(),
+            [SessionEffect::UserVisibleText(text)] if text.contains("最近 10 次模型调用里已有 2 次")
+        ));
+    }
+
+    #[test]
+    fn cache_warning_triggers_for_two_zero_reads_within_ten_calls() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
+
+        assert!(
+            actor
+                .receive_runtime_event_with_effects("opus-4.6", &model_call_completed_event(0))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            actor
+                .receive_runtime_event_with_effects("opus-4.6", &model_call_completed_event(12))
+                .unwrap()
+                .is_empty()
+        );
+
+        let effects = actor
+            .receive_runtime_event_with_effects("opus-4.6", &model_call_completed_event(0))
+            .unwrap();
+        assert!(matches!(
+            effects.as_slice(),
+            [SessionEffect::UserVisibleText(text)]
+                if text.contains("最近 10 次模型调用里已有 2 次")
+        ));
+    }
+
+    #[test]
+    fn cache_warning_recent_zero_reads_ignore_calls_across_compaction() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
+
+        assert!(
+            actor
+                .receive_runtime_event_with_effects("opus-4.6", &model_call_completed_event(0))
+                .unwrap()
+                .is_empty()
+        );
+        actor
+            .receive_runtime_event(&SessionEvent::CompactionStarted {
+                phase: "threshold".to_string(),
+                message_count: 8,
+            })
+            .unwrap();
+        assert!(
+            actor
+                .receive_runtime_event_with_effects("opus-4.6", &model_call_completed_event(0))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            actor
+                .receive_runtime_event_with_effects("opus-4.6", &model_call_completed_event(7))
+                .unwrap()
+                .is_empty()
+        );
+
+        let effects = actor
+            .receive_runtime_event_with_effects("opus-4.6", &model_call_completed_event(0))
+            .unwrap();
+        assert!(matches!(
+            effects.as_slice(),
+            [SessionEffect::UserVisibleText(text)]
+                if text.contains("最近 10 次模型调用里已有 2 次")
+                    && text.contains("中间没有发生压缩")
+        ));
+    }
+
+    #[test]
     fn persisted_user_mailbox_drains_after_restart() {
         let temp_dir = TempDir::new().unwrap();
         let address = test_address();
@@ -3709,7 +4028,12 @@ mod tests {
             )
             .unwrap();
 
-        let SessionEffect::UpdateProgress(feedback) = &effects[0];
+        let feedback = match &effects[0] {
+            SessionEffect::UpdateProgress(feedback) => feedback,
+            SessionEffect::UserVisibleText(text) => {
+                panic!("expected progress feedback, got user-visible text: {text}")
+            }
+        };
         assert!(feedback.text.contains("状态：工具执行中"));
         assert!(feedback.text.contains("shell：cargo test --mani..."));
         assert!(feedback.text.contains("file_read：src/main.rs"));
@@ -3734,7 +4058,12 @@ mod tests {
             )
             .unwrap();
 
-        let SessionEffect::UpdateProgress(feedback) = &effects[0];
+        let feedback = match &effects[0] {
+            SessionEffect::UpdateProgress(feedback) => feedback,
+            SessionEffect::UserVisibleText(text) => {
+                panic!("expected progress feedback, got user-visible text: {text}")
+            }
+        };
         assert_eq!(feedback.final_state, Some(ProgressFeedbackFinalState::Done));
     }
 

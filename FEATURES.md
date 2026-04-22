@@ -22,6 +22,35 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Assistant tool use and tool result history are translated losslessly between internal `ChatMessage` state and Claude Messages `tool_use` / `tool_result` blocks, so tool-driven multi-round sessions keep working when a conversation runs on `claude-code`.
 - Regression coverage should protect config upgrade defaults for `claude-code`, request payload cache markers, and tool roundtrips through the Claude Messages provider.
 
+### Chat Message Fidelity
+
+- Internal `ChatMessage` state can retain multiple tool calls on a single assistant message, structured array content, and optional reasoning payloads instead of flattening everything to plain text too early.
+- Structured `ChatMessage.content` arrays may also carry multiple multimodal items plus internal rich blocks such as `tool_result` and `context`, so one durable message can preserve richer assistant/runtime state than any single upstream provider schema.
+- Provider adapters may still degrade or omit unsupported fields at the last upstream boundary, but internal persistence/transcript-friendly message state should keep rich assistant content whenever the source provider exposed it.
+- When a provider cannot natively represent `tool_result` or `context` content blocks inline, adapters should degrade them only at request-build time by splitting tool-result blocks into provider-native tool outputs where possible and rendering context blocks into textual fallback blocks otherwise.
+- OpenAI Responses output should preserve assistant content blocks plus reasoning blocks in internal `ChatMessage` form, while OpenAI chat-completions payloads must omit the internal-only `reasoning` field before sending upstream.
+- Regression coverage should protect mixed assistant content + multi-tool-call parsing, context/tool-result block degradation, and internal-only reasoning not leaking into incompatible upstream payloads.
+
+### Runtime Recovery Notices
+
+- Foreground startup-recovery notices should only arm for sessions that actually still have pending messages to recover, rather than every restored foreground session.
+- User-facing recovery copy should describe this as a ClawParty service restart, not a generic system restart, so restart semantics stay accurate when only the host/service process was restarted.
+- Regression coverage should protect the “pending messages only” arming rule.
+
+### Cache Health Warnings
+
+- Foreground sessions should emit a user-visible cache warning when prompt-cache reads look unhealthy: either 3 consecutive model calls with `cache_read_input_tokens == 0` and no gap longer than 5 minutes between those consecutive zero-read calls, or 2 zero-read model calls within the most recent 10 calls with no gap longer than 5 minutes between those zero-read calls and no compaction boundary in between.
+- Cache warnings should deduplicate during a continuous failure streak and only reopen after a subsequent non-zero cache read changes the health state again.
+- Regression coverage should protect the consecutive-zero trigger, the rolling-10-call trigger, the compaction-boundary reset, and the deduplication behavior.
+
+### Attachment Prompt Preparation
+
+- Current-turn attachment handling should stay split into an attachment-preparation phase and a message-assembly phase instead of mixing attachment capability checks, prompt-ready multimodal conversion, and final `ChatMessage` assembly in one function.
+- Prompt-ready attachment derivation for images, PDFs, audio clips, and historical inline-image normalization should live behind reusable attachment-prep helpers rather than being duplicated across message-building and history-sanitization code paths.
+- Newly materialized conversation attachments should normalize unsupported but transcodable image formats such as TIFF into canonical persisted PNG files at the channel/workdir boundary, so later prompt assembly can reuse stable stored artifacts instead of re-transcoding the same upload every turn.
+- Existing workdirs should be upgraded by rewriting persisted `ChatMessage.content` inline images in unsupported formats into canonical supported inline image payloads when possible, or durable placeholder text when the old payload is no longer decodable.
+- Regression coverage should protect direct-vs-fallback attachment separation, prompt-ready TIFF-to-PNG image conversion, attachment materialization normalization, and historical inline-image sanitization/upgrade behavior.
+
 ### Interruptible Conversations
 
 - A foreground conversation can be interrupted by a newer user message while the current agent turn is still running.

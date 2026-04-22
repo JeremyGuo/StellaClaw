@@ -26,6 +26,7 @@ mod v0_30;
 mod v0_31;
 mod v0_32;
 mod v0_33;
+mod v0_34;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -33,7 +34,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.33";
+pub const LATEST_WORKDIR_VERSION: &str = "0.34";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -49,7 +50,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 29] = [
+    let upgraders: [&dyn WorkdirUpgrader; 30] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
@@ -79,6 +80,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
         &v0_31::Upgrade,
         &v0_32::Upgrade,
         &v0_33::Upgrade,
+        &v0_34::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -136,6 +138,7 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.30" => Ok("0.30"),
         "0.31" => Ok("0.31"),
         "0.32" => Ok("0.32"),
+        "0.33" => Ok("0.33"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -149,6 +152,7 @@ fn write_workdir_version(version_path: &Path, version: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{LATEST_WORKDIR_VERSION, upgrade_workdir};
+    use base64::Engine;
     use serde_json::json;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -1616,5 +1620,118 @@ mod tests {
         );
         assert!(!sessions_root.join(foreground_id.to_string()).exists());
         assert!(!sessions_root.join(background_id.to_string()).exists());
+    }
+
+    #[test]
+    fn v0_34_workdir_upgrade_normalizes_persisted_inline_images() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.33\n").unwrap();
+
+        let session_dir = temp_dir
+            .path()
+            .join("sessions")
+            .join("conversation-1")
+            .join("foreground")
+            .join(Uuid::new_v4().to_string());
+        let snapshot_dir = temp_dir.path().join("snapshots").join("snap-1");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::create_dir_all(&snapshot_dir).unwrap();
+
+        let image = image::ImageBuffer::from_pixel(1, 1, image::Rgba([12, 34, 56, 255]));
+        let mut tiff = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut tiff),
+                image::ImageFormat::Tiff,
+            )
+            .unwrap();
+        let encoded_tiff = base64::engine::general_purpose::STANDARD.encode(tiff);
+
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": Uuid::new_v4(),
+                "agent_id": Uuid::new_v4(),
+                "address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "conversation-1"
+                },
+                "session_state": {
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "look"},
+                            {"type": "image_url", "image_url": {"url": format!("data:image/tiff;base64,{encoded_tiff}")}}
+                        ]
+                    }],
+                    "pending_messages": [],
+                    "user_mailbox": [{
+                        "pending_message": {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "bad"},
+                                {"type": "image_url", "image_url": {"url": "data:image/tiff;base64,AAAA"}}
+                            ]
+                        }
+                    }]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        fs::write(
+            snapshot_dir.join("snapshot.json"),
+            serde_json::to_string_pretty(&json!({
+                "saved_at": "2026-04-22T00:00:00Z",
+                "session": {
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "snapshot"},
+                            {"type": "image_url", "image_url": {"url": format!("data:image/tiff;base64,{encoded_tiff}")}}
+                        ]
+                    }],
+                    "pending_messages": [],
+                    "user_mailbox": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("VERSION"))
+                .unwrap()
+                .trim(),
+            LATEST_WORKDIR_VERSION
+        );
+
+        let session: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
+                .unwrap();
+        let session_url = session["session_state"]["messages"][0]["content"][1]["image_url"]["url"]
+            .as_str()
+            .unwrap();
+        assert!(session_url.starts_with("data:image/png;base64,"));
+        let user_mailbox_item =
+            &session["session_state"]["user_mailbox"][0]["pending_message"]["content"][1];
+        assert_eq!(user_mailbox_item["type"], "text");
+        assert!(
+            user_mailbox_item["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("could not be converted"))
+        );
+
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(snapshot_dir.join("snapshot.json")).unwrap())
+                .unwrap();
+        let snapshot_url = snapshot["session"]["messages"][0]["content"][1]["image_url"]["url"]
+            .as_str()
+            .unwrap();
+        assert!(snapshot_url.starts_with("data:image/png;base64,"));
     }
 }
