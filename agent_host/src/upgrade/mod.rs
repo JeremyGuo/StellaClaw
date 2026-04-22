@@ -2110,4 +2110,34 @@ mod tests {
         assert!(snapshot_path.starts_with("media/legacy/by-hash/image-"));
         assert!(snapshot_dir.join("workspace").join(snapshot_path).is_file());
     }
+
+    #[test]
+    fn v0_38_workdir_upgrade_skips_malformed_session_json() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.37\n").unwrap();
+
+        let session_dir = temp_dir
+            .path()
+            .join("sessions")
+            .join("conversation-1")
+            .join("foreground")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&session_dir).unwrap();
+        let broken = r#"{"id":"broken","workspace_id":"workspace-1","session_state":{"messages":["#;
+        fs::write(session_dir.join("session.json"), broken).unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("VERSION"))
+                .unwrap()
+                .trim(),
+            LATEST_WORKDIR_VERSION
+        );
+        assert_eq!(
+            fs::read_to_string(session_dir.join("session.json")).unwrap(),
+            broken
+        );
+    }
 }

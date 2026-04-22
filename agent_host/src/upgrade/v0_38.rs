@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 pub(super) struct Upgrade;
 
@@ -52,8 +53,19 @@ fn rewrite_json_files_recursive(
 
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        let mut value: Value = serde_json::from_str(&raw)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
+        let mut value: Value = match serde_json::from_str(&raw) {
+            Ok(value) => value,
+            Err(error) => {
+                warn!(
+                    log_stream = "upgrade",
+                    kind = "workdir_upgrade_json_skipped",
+                    path = %path.display(),
+                    error = %error,
+                    "skipping malformed JSON file during v0.38 workdir upgrade"
+                );
+                continue;
+            }
+        };
         if !rewrite(&path, &mut value)? {
             continue;
         }

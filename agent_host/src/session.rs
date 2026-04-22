@@ -1785,8 +1785,7 @@ impl Session {
         };
         let raw =
             serde_json::to_string_pretty(&state).context("failed to serialize session state")?;
-        fs::write(self.state_path(), raw)
-            .with_context(|| format!("failed to write {}", self.state_path().display()))
+        write_file_atomically(&self.state_path(), raw.as_bytes())
     }
 
     fn from_persisted(
@@ -1825,6 +1824,28 @@ impl Session {
             closed_at: persisted.closed_at,
         })
     }
+}
+
+fn write_file_atomically(path: &Path, contents: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path {} has no parent", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("state");
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4().simple()));
+    fs::write(&temp_path, contents)
+        .with_context(|| format!("failed to write {}", temp_path.display()))?;
+    fs::rename(&temp_path, path).with_context(|| {
+        format!(
+            "failed to move {} into place at {}",
+            temp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
 }
 
 fn record_turn(
@@ -4101,6 +4122,31 @@ mod tests {
             checkpoint.history[0].text.as_deref(),
             Some("background finished")
         );
+    }
+
+    #[test]
+    fn session_manager_skips_malformed_persisted_session() {
+        let temp_dir = TempDir::new().unwrap();
+        let bad_session_root = temp_dir
+            .path()
+            .join("sessions")
+            .join(session_conversation_dir_name("123"))
+            .join("foreground")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&bad_session_root).unwrap();
+        fs::write(
+            bad_session_root.join("session.json"),
+            r#"{"id":"broken","address":{"channel_id":"telegram-main","conversation_id":"123"},"history":["#,
+        )
+        .unwrap();
+
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let address = test_address();
+
+        let actor = sessions.ensure_foreground_actor(&address).unwrap();
+        let snapshot = actor.snapshot().unwrap();
+        assert_eq!(snapshot.address.conversation_id, "123");
     }
 }
 
