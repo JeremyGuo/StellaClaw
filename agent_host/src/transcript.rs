@@ -1,5 +1,5 @@
 use crate::domain::ShowOptions;
-use agent_frame::{ChatMessage, SessionEvent};
+use agent_frame::{ChatMessage, SessionEvent, content_item_text};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -323,11 +323,11 @@ fn extract_text_preview(message: &ChatMessage, limit: usize) -> Option<String> {
         Value::Array(parts) => {
             let mut combined = String::new();
             for part in parts {
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                if let Some(text) = content_item_text(part) {
                     if !combined.is_empty() {
                         combined.push(' ');
                     }
-                    combined.push_str(text);
+                    combined.push_str(&text);
                 }
             }
             combined
@@ -644,6 +644,7 @@ mod tests {
                 assistant_message: Some(ChatMessage {
                     role: "assistant".to_string(),
                     content: None,
+                    reasoning: None,
                     tool_calls: Some(vec![ToolCall {
                         id: "call-1".to_string(),
                         kind: "function".to_string(),

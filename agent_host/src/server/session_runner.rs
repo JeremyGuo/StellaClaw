@@ -314,7 +314,7 @@ impl Server {
                 &address,
                 self.agent_selection_message(
                     &address,
-                    "A pending message survived a service restart. Choose a model for this conversation to resume it.",
+                    "A pending message survived a ClawParty service restart. Choose a model for this conversation to resume it.",
                 )?,
             )
             .await?;
@@ -1301,23 +1301,7 @@ fn assistant_message_has_content_or_tool_calls(message: &ChatMessage) -> bool {
     {
         return true;
     }
-    match &message.content {
-        None | Some(Value::Null) => false,
-        Some(Value::String(text)) => !text.trim().is_empty(),
-        Some(Value::Array(items)) => items.iter().any(|item| match item {
-            Value::String(text) => !text.trim().is_empty(),
-            Value::Object(object) => match object.get("type").and_then(Value::as_str) {
-                Some("text" | "input_text" | "output_text") => object
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.trim().is_empty()),
-                _ => true,
-            },
-            Value::Null => false,
-            _ => true,
-        }),
-        Some(_) => true,
-    }
+    agent_frame::content_has_nonempty_visible_parts(message.content.as_ref())
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ use crate::config::AgentConfig;
 use crate::llm::{
     ChatCompletionSession, TokenUsage, create_chat_completion, start_chat_completion_session,
 };
-use crate::message::ChatMessage;
+use crate::message::{ChatMessage, content_has_nonempty_visible_parts};
 use crate::modality::materialize_messages_for_upstream;
 use crate::skills::{SkillMetadata, build_skills_meta_prompt, discover_skills};
 use crate::token_estimation::estimate_session_tokens_for_upstream;
@@ -126,23 +126,7 @@ fn assistant_message_has_content_or_tool_calls(message: &ChatMessage) -> bool {
     {
         return true;
     }
-    match &message.content {
-        None | Some(Value::Null) => false,
-        Some(Value::String(text)) => !text.trim().is_empty(),
-        Some(Value::Array(items)) => items.iter().any(|item| match item {
-            Value::String(text) => !text.trim().is_empty(),
-            Value::Object(object) => match object.get("type").and_then(Value::as_str) {
-                Some("text" | "input_text" | "output_text") => object
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .is_some_and(|text| !text.trim().is_empty()),
-                _ => true,
-            },
-            Value::Null => false,
-            _ => true,
-        }),
-        Some(_) => true,
-    }
+    content_has_nonempty_visible_parts(message.content.as_ref())
 }
 
 pub fn run_session(
@@ -362,6 +346,7 @@ fn synthetic_user_message_from_tool_result(result: &str) -> Option<ChatMessage> 
     Some(ChatMessage {
         role: "user".to_string(),
         content: Some(Value::Array(content)),
+        reasoning: None,
         name: None,
         tool_call_id: None,
         tool_calls: None,
@@ -1195,6 +1180,7 @@ fn run_session_state_controlled_internal(
             messages.push(ChatMessage {
                 role: "user".to_string(),
                 content: Some(Value::Array(synthetic_user_content)),
+                reasoning: None,
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -1513,6 +1499,7 @@ mod tests {
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: None,
+                reasoning: None,
                 name: None,
                 tool_call_id: None,
                 tool_calls: Some(vec![ToolCall {
@@ -1530,6 +1517,7 @@ mod tests {
         messages.push(ChatMessage {
             role: "assistant".to_string(),
             content: None,
+            reasoning: None,
             name: None,
             tool_call_id: None,
             tool_calls: Some(vec![ToolCall {
@@ -1564,6 +1552,7 @@ mod tests {
             messages.push(ChatMessage {
                 role: "assistant".to_string(),
                 content: None,
+                reasoning: None,
                 name: None,
                 tool_call_id: None,
                 tool_calls: Some(vec![ToolCall {
@@ -1718,6 +1707,7 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: None,
+                reasoning: None,
                 name: None,
                 tool_call_id: None,
                 tool_calls: Some(Vec::new()),

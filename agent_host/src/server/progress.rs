@@ -165,6 +165,21 @@ impl AgentRuntimeView {
                     );
                 }
             }
+            SessionEffect::UserVisibleText(text) => {
+                if let Err(error) = channel
+                    .send(&session.address, OutgoingMessage::text(text))
+                    .await
+                {
+                    warn!(
+                        log_stream = "channel",
+                        kind = "session_effect_user_visible_send_failed",
+                        channel_id = %session.address.channel_id,
+                        conversation_id = %session.address.conversation_id,
+                        error = %format!("{error:#}"),
+                        "failed to deliver session effect message"
+                    );
+                }
+            }
         }
     }
 

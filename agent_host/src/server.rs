@@ -75,7 +75,6 @@ use agent_frame::{
 };
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use base64::Engine;
 use chrono::Utc;
 use humantime::parse_duration;
 use serde::{Deserialize, Serialize};
@@ -2174,6 +2173,7 @@ impl Server {
         let pending_process_restart_notices = session_manager
             .list_foreground_snapshots()
             .into_iter()
+            .filter(should_arm_process_restart_notice)
             .map(|session| session.address.session_key())
             .collect::<HashSet<_>>();
         if !pending_process_restart_notices.is_empty() {
@@ -2181,7 +2181,7 @@ impl Server {
                 log_stream = "server",
                 kind = "process_restart_notice_armed",
                 session_count = pending_process_restart_notices.len() as u64,
-                "armed one-shot process restart notices for existing foreground sessions"
+                "armed one-shot process restart notices for foreground sessions with pending messages"
             );
         }
 
@@ -3461,6 +3461,10 @@ fn channel_restart_backoff_seconds(consecutive_failures: u32) -> u64 {
         .max(1)
 }
 
+fn should_arm_process_restart_notice(session: &SessionSnapshot) -> bool {
+    !session.session_state.pending_messages.is_empty()
+}
+
 fn spawn_channel_supervisor(channel: Arc<dyn Channel>, sender: mpsc::Sender<IncomingMessage>) {
     info!(
         log_stream = "channel",
@@ -3521,10 +3525,11 @@ mod tests {
         parse_mount_command, parse_sandbox_command, parse_set_api_timeout_command,
         parse_snap_list_command, parse_snap_load_command, parse_snap_save_command,
         parse_think_command, persist_compaction_artifacts, prepare_system_prompt_for_turn,
-        price_conversation_usage_report, rebuild_canonical_system_prompt,
-        render_prompt_component_change_notices, render_system_date_on_user_message,
-        rollout_read_file, rollout_search_files, sanitize_messages_for_model_capabilities,
-        select_image_generation_routing, send_outgoing_message_now, session_errno_for_turn_error,
+        prepare_user_turn_attachments, price_conversation_usage_report,
+        rebuild_canonical_system_prompt, render_prompt_component_change_notices,
+        render_system_date_on_user_message, rollout_read_file, rollout_search_files,
+        sanitize_messages_for_model_capabilities, select_image_generation_routing,
+        send_outgoing_message_now, session_errno_for_turn_error,
         should_attempt_idle_context_compaction, summarize_resume_progress,
         sync_workspace_shared_profile_files, upload_workspace_shared_profile_files,
         user_facing_continue_error_text, workspace_visible_in_list,
@@ -3719,6 +3724,7 @@ mod tests {
                 ChatMessage {
                     role: "assistant".to_string(),
                     content: Some(Value::String("调用搜索工具".to_string())),
+                    reasoning: None,
                     name: None,
                     tool_call_id: None,
                     tool_calls: Some(vec![ToolCall {
@@ -4055,6 +4061,71 @@ mod tests {
     }
 
     #[test]
+    fn prepares_user_turn_attachments_separating_direct_and_fallback_items() {
+        let temp_dir = TempDir::new().unwrap();
+        let image_path = temp_dir.path().join("photo.png");
+        let file_path = temp_dir.path().join("notes.txt");
+        fs::write(&image_path, [0_u8, 1, 2, 3]).unwrap();
+        fs::write(&file_path, b"hello").unwrap();
+        let image_attachment = StoredAttachment {
+            id: Uuid::new_v4(),
+            kind: AttachmentKind::Image,
+            original_name: Some("photo.png".to_string()),
+            media_type: Some("image/png".to_string()),
+            path: image_path,
+            size_bytes: 4,
+        };
+        let file_attachment = StoredAttachment {
+            id: Uuid::new_v4(),
+            kind: AttachmentKind::File,
+            original_name: Some("notes.txt".to_string()),
+            media_type: Some("text/plain".to_string()),
+            path: file_path,
+            size_bytes: 5,
+        };
+        let model = ModelConfig {
+            model_type: crate::config::ModelType::Openrouter,
+            api_endpoint: "https://example.com/v1".to_string(),
+            model: "demo-vision".to_string(),
+            backend: AgentBackendKind::AgentFrame,
+            supports_vision_input: false,
+            image_tool_model: None,
+            web_search_model: None,
+            api_key: None,
+            api_key_env: "TEST_API_KEY".to_string(),
+            chat_completions_path: "/chat/completions".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            retry_mode: Default::default(),
+            context_window_tokens: 128_000,
+            cache_ttl: None,
+            reasoning: None,
+            headers: serde_json::Map::new(),
+            description: "vision".to_string(),
+            agent_model_enabled: true,
+            native_web_search: None,
+            token_estimation: None,
+            capabilities: vec![ModelCapability::ImageIn],
+        };
+
+        let prepared =
+            prepare_user_turn_attachments(&[image_attachment, file_attachment], &model, true)
+                .unwrap();
+
+        assert_eq!(prepared.direct_image_count, 1);
+        assert_eq!(prepared.direct_pdf_count, 0);
+        assert_eq!(prepared.direct_audio_count, 0);
+        assert_eq!(prepared.direct_content_items.len(), 1);
+        assert_eq!(prepared.direct_content_items[0]["type"], "image_url");
+        assert_eq!(prepared.fallback_attachments.len(), 1);
+        assert_eq!(
+            prepared.fallback_attachments[0].original_name.as_deref(),
+            Some("notes.txt")
+        );
+    }
+
+    #[test]
     fn sanitizes_historical_multimodal_messages_for_non_vision_models() {
         let messages = vec![ChatMessage {
             role: "user".to_string(),
@@ -4070,6 +4141,7 @@ mod tests {
                     }
                 }),
             ])),
+            reasoning: None,
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -4134,6 +4206,7 @@ mod tests {
                     }
                 }),
             ])),
+            reasoning: None,
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -4191,6 +4264,7 @@ mod tests {
                     }
                 }),
             ])),
+            reasoning: None,
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -5028,6 +5102,21 @@ mod tests {
     }
 
     #[test]
+    fn process_restart_notice_only_arms_sessions_with_pending_messages() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut idle = build_test_session(&temp_dir);
+        idle.session_state.phase = SessionPhase::End;
+        assert!(!super::should_arm_process_restart_notice(&idle));
+
+        let mut pending = build_test_session(&temp_dir);
+        pending
+            .session_state
+            .pending_messages
+            .push(ChatMessage::text("user", "resume me"));
+        assert!(super::should_arm_process_restart_notice(&pending));
+    }
+
+    #[test]
     fn background_agent_tools_use_current_conversation_delivery_and_silent_terminate() {
         let temp_dir = TempDir::new().unwrap();
         let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
@@ -5310,6 +5399,7 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: None,
+                reasoning: None,
                 name: None,
                 tool_call_id: None,
                 tool_calls: Some(vec![ToolCall {

@@ -1,6 +1,6 @@
 use crate::config::{AgentConfig, MemorySystem};
 use crate::llm::{ChatCompletionSession, TokenUsage, create_chat_completion};
-use crate::message::{ChatMessage, ToolCall};
+use crate::message::{ChatMessage, ToolCall, content_item_text};
 use crate::token_estimation::estimate_session_tokens_for_upstream;
 use crate::tooling::Tool;
 use crate::tooling::active_runtime_state_summary;
@@ -104,7 +104,7 @@ fn content_to_text(content: &Option<Value>) -> String {
                             .unwrap_or("audio");
                         Some(format!("[audio] {}", format))
                     }
-                    _ => None,
+                    _ => content_item_text(item),
                 }
             })
             .collect::<Vec<_>>()
@@ -264,6 +264,7 @@ fn sanitize_messages_for_compaction_request(messages: &[ChatMessage]) -> Vec<Cha
             ChatMessage {
                 role,
                 content: Some(Value::String(content)),
+                reasoning: None,
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -744,6 +745,7 @@ mod tests {
                     "image_url": format!("data:image/png;base64,{base64_payload}")
                 }
             ])),
+            reasoning: None,
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -775,6 +777,7 @@ mod tests {
                     }
                 }
             ])),
+            reasoning: None,
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -806,6 +809,7 @@ mod tests {
                     }
                 }
             ])),
+            reasoning: None,
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -856,6 +860,7 @@ mod tests {
                     }
                 }
             ])),
+            reasoning: None,
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -885,6 +890,7 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: Some(json!("I will inspect the file.")),
+                reasoning: None,
                 name: None,
                 tool_call_id: None,
                 tool_calls: Some(vec![ToolCall {
@@ -928,6 +934,7 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: None,
+                reasoning: None,
                 name: None,
                 tool_call_id: None,
                 tool_calls: Some(vec![ToolCall {
@@ -956,6 +963,7 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: None,
+                reasoning: None,
                 name: None,
                 tool_call_id: None,
                 tool_calls: Some(vec![ToolCall {
@@ -982,6 +990,7 @@ mod tests {
             ChatMessage {
                 role: "assistant".to_string(),
                 content: None,
+                reasoning: None,
                 name: None,
                 tool_call_id: None,
                 tool_calls: Some(vec![ToolCall {

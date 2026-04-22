@@ -440,6 +440,7 @@ fn run_image_job(
                         }
                     }),
                 ])),
+                reasoning: None,
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -503,6 +504,7 @@ fn run_pdf_job(
             ChatMessage {
                 role: "user".to_string(),
                 content: Some(Value::Array(user_content)),
+                reasoning: None,
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,
@@ -555,6 +557,7 @@ fn run_audio_job(
             ChatMessage {
                 role: "user".to_string(),
                 content: Some(Value::Array(user_content)),
+                reasoning: None,
                 name: None,
                 tool_call_id: None,
                 tool_calls: None,

@@ -1,5 +1,6 @@
 pub mod agent_status;
 pub mod agents;
+pub mod attachment_prep;
 pub mod backend;
 pub mod bootstrap;
 pub mod channel;

@@ -2,7 +2,7 @@ use crate::config::{
     TokenEstimationConfig, TokenEstimationSource, TokenEstimationTemplateConfig,
     TokenEstimationTiktokenEncoding, TokenEstimationTokenizerConfig, UpstreamConfig,
 };
-use crate::message::{ChatMessage, ToolCall};
+use crate::message::{ChatMessage, ToolCall, content_item_text};
 use crate::tooling::Tool;
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Repo, RepoType};
@@ -51,6 +51,19 @@ pub struct RenderedTokenEstimatePrompt {
     pub text: String,
     pub inline_payload_tokens: usize,
     pub template_label: String,
+}
+
+#[derive(Clone, Copy)]
+pub struct TokenEstimateInput<'a> {
+    pub messages: &'a [ChatMessage],
+    pub tools: &'a [Tool],
+    pub pending_user_prompt: &'a str,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TokenEstimateModel<'a> {
+    pub model: &'a str,
+    pub token_estimation: Option<&'a TokenEstimationConfig>,
 }
 
 pub fn token_estimator_for_model(model: &str) -> TokenEstimator {
@@ -266,7 +279,7 @@ fn render_content_item(item: &Value, extra_tokens: &mut usize) -> String {
                 format!("[audio: {format}]")
             }
         }
-        _ => value_text(item),
+        _ => content_item_text(item).unwrap_or_else(|| value_text(item)),
     }
 }
 
@@ -640,10 +653,8 @@ fn render_local_template_prompt_for_estimate(
     })
 }
 
-fn render_prompt_for_config(
-    messages: &[ChatMessage],
-    tools: &[Tool],
-    pending_user_prompt: &str,
+pub fn render_prompt_for_token_estimate(
+    input: TokenEstimateInput<'_>,
     token_estimation: Option<&TokenEstimationConfig>,
 ) -> RenderedTokenEstimatePrompt {
     if let Some(config) = token_estimation {
@@ -653,9 +664,9 @@ fn render_prompt_for_config(
                 if let Some(template) = read_local_template(path, field)
                     && let Some(rendered) = render_local_template_prompt_for_estimate(
                         &template,
-                        messages,
-                        tools,
-                        pending_user_prompt,
+                        input.messages,
+                        input.tools,
+                        input.pending_user_prompt,
                         format!("local:{}", path.display()),
                     )
                 {
@@ -674,9 +685,9 @@ fn render_prompt_for_config(
                     && let Some(template) = read_local_template(&path, field)
                     && let Some(rendered) = render_local_template_prompt_for_estimate(
                         &template,
-                        messages,
-                        tools,
-                        pending_user_prompt,
+                        input.messages,
+                        input.tools,
+                        input.pending_user_prompt,
                         format!("huggingface:{repo}@{revision}:{file}"),
                     )
                 {
@@ -697,9 +708,9 @@ fn render_prompt_for_config(
                     ) && let Some(template) = read_local_template(&path, "chat_template")
                         && let Some(rendered) = render_local_template_prompt_for_estimate(
                             &template,
-                            messages,
-                            tools,
-                            pending_user_prompt,
+                            input.messages,
+                            input.tools,
+                            input.pending_user_prompt,
                             format!("huggingface:{repo}@{revision}:{file}"),
                         )
                     {
@@ -709,15 +720,14 @@ fn render_prompt_for_config(
             }
         }
     }
-    render_builtin_prompt_for_estimate(messages, tools, pending_user_prompt)
+    render_builtin_prompt_for_estimate(input.messages, input.tools, input.pending_user_prompt)
 }
 
-fn estimate_rendered_tokens_for_config(
+pub fn estimate_rendered_tokens_for_model(
     rendered: &RenderedTokenEstimatePrompt,
-    model: &str,
-    token_estimation: Option<&TokenEstimationConfig>,
+    model: TokenEstimateModel<'_>,
 ) -> usize {
-    if let Some(config) = token_estimation {
+    if let Some(config) = model.token_estimation {
         let local_tokenizer_path = match config.tokenizer.as_ref() {
             Some(TokenEstimationTokenizerConfig::Local { path }) => Some(path.clone()),
             Some(TokenEstimationTokenizerConfig::Huggingface {
@@ -749,14 +759,35 @@ fn estimate_rendered_tokens_for_config(
         }
     }
 
-    let estimator = match token_estimation.and_then(|config| config.tokenizer.as_ref()) {
+    let estimator = match model
+        .token_estimation
+        .and_then(|config| config.tokenizer.as_ref())
+    {
         Some(TokenEstimationTokenizerConfig::Tiktoken { encoding }) => {
-            tiktoken_encoding_to_estimator(*encoding, model)
+            tiktoken_encoding_to_estimator(*encoding, model.model)
         }
-        _ => token_estimator_for_model(model),
+        _ => token_estimator_for_model(model.model),
     };
     estimate_text_tokens_for_estimator(&rendered.text, estimator)
         .saturating_add(rendered.inline_payload_tokens)
+}
+
+pub fn estimate_session_tokens_for_request(
+    input: TokenEstimateInput<'_>,
+    model: TokenEstimateModel<'_>,
+) -> usize {
+    apply_prompt_token_calibration(
+        model.model,
+        estimate_session_tokens_for_request_uncalibrated(input, model),
+    )
+}
+
+pub fn estimate_session_tokens_for_request_uncalibrated(
+    input: TokenEstimateInput<'_>,
+    model: TokenEstimateModel<'_>,
+) -> usize {
+    let rendered = render_prompt_for_token_estimate(input, model.token_estimation);
+    estimate_rendered_tokens_for_model(&rendered, model)
 }
 
 pub fn estimate_session_tokens_for_estimator(
@@ -793,15 +824,16 @@ pub fn estimate_session_tokens_for_model_with_config(
     model: &str,
     token_estimation: Option<&TokenEstimationConfig>,
 ) -> usize {
-    apply_prompt_token_calibration(
-        model,
-        estimate_session_tokens_for_model_with_config_uncalibrated(
+    estimate_session_tokens_for_request(
+        TokenEstimateInput {
             messages,
             tools,
             pending_user_prompt,
+        },
+        TokenEstimateModel {
             model,
             token_estimation,
-        ),
+        },
     )
 }
 
@@ -812,8 +844,17 @@ pub fn estimate_session_tokens_for_model_with_config_uncalibrated(
     model: &str,
     token_estimation: Option<&TokenEstimationConfig>,
 ) -> usize {
-    let rendered = render_prompt_for_config(messages, tools, pending_user_prompt, token_estimation);
-    estimate_rendered_tokens_for_config(&rendered, model, token_estimation)
+    estimate_session_tokens_for_request_uncalibrated(
+        TokenEstimateInput {
+            messages,
+            tools,
+            pending_user_prompt,
+        },
+        TokenEstimateModel {
+            model,
+            token_estimation,
+        },
+    )
 }
 
 pub fn estimate_session_tokens_for_upstream(
@@ -878,17 +919,21 @@ pub fn estimate_session_tokens(
 #[cfg(test)]
 mod tests {
     use super::{
-        TokenEstimator, estimate_session_tokens_for_estimator,
-        estimate_session_tokens_for_model_with_config, estimate_session_tokens_for_upstream,
-        observe_prompt_token_estimate, prompt_token_calibration_for_model,
-        render_builtin_prompt_for_estimate, token_estimator_for_model,
+        TokenEstimateInput, TokenEstimateModel, TokenEstimator, estimate_rendered_tokens_for_model,
+        estimate_session_tokens_for_estimator, estimate_session_tokens_for_model_with_config,
+        estimate_session_tokens_for_request, estimate_session_tokens_for_request_uncalibrated,
+        estimate_session_tokens_for_upstream, observe_prompt_token_estimate,
+        prompt_token_calibration_for_model, render_builtin_prompt_for_estimate,
+        render_prompt_for_token_estimate, token_estimator_for_model,
     };
     use crate::config::{
         AuthCredentialsStoreMode, RetryModeConfig, TokenEstimationConfig,
         TokenEstimationTemplateConfig, TokenEstimationTokenizerConfig, UpstreamApiKind,
         UpstreamAuthKind, UpstreamConfig,
     };
-    use crate::message::{ChatMessage, FunctionCall, ToolCall};
+    use crate::message::{
+        ChatMessage, FunctionCall, ToolCall, context_content_block, tool_result_content_block,
+    };
     use crate::tooling::Tool;
     use serde_json::json;
     use std::fs;
@@ -962,6 +1007,7 @@ mod tests {
                 {"type": "input_image", "image_url": format!("data:image/png;base64,{image_payload}")},
                 {"type": "input_file", "filename": "notes.txt", "file_data": file_payload}
             ])),
+            reasoning: None,
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -973,6 +1019,33 @@ mod tests {
         assert!(!rendered.text.contains(&file_payload));
         assert!(rendered.text.contains("inline image payload omitted"));
         assert!(rendered.text.contains("inline file payload omitted"));
+    }
+
+    #[test]
+    fn builtin_template_renders_context_and_tool_result_blocks() {
+        let message = ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(json!([
+                {"type": "output_text", "text": "Need two preserved observations."},
+                context_content_block(
+                    Some("cache"),
+                    Some("prefix was restored"),
+                    Some(json!({"ttl": "5m"}))
+                ),
+                tool_result_content_block("call_1", "fetch", json!("first result"))
+            ])),
+            reasoning: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        };
+
+        let rendered = render_builtin_prompt_for_estimate(&[message], &[], "");
+        assert!(rendered.text.contains("Need two preserved observations."));
+        assert!(rendered.text.contains("[context: cache]"));
+        assert!(rendered.text.contains("\"ttl\":\"5m\""));
+        assert!(rendered.text.contains("[tool result: fetch id=call_1]"));
+        assert!(rendered.text.contains("first result"));
     }
 
     #[test]
@@ -1085,6 +1158,22 @@ mod tests {
     }
 
     #[test]
+    fn explicit_request_render_matches_legacy_builtin_rendering() {
+        let message = ChatMessage::text("user", "Hello template");
+        let legacy = render_builtin_prompt_for_estimate(std::slice::from_ref(&message), &[], "");
+        let explicit = render_prompt_for_token_estimate(
+            TokenEstimateInput {
+                messages: std::slice::from_ref(&message),
+                tools: &[],
+                pending_user_prompt: "",
+            },
+            None,
+        );
+
+        assert_eq!(explicit, legacy);
+    }
+
+    #[test]
     fn local_tokenizer_config_uses_tokenizer_json() {
         let temp_dir = TempDir::new().unwrap();
         let tokenizer_path = temp_dir.path().join("tokenizer.json");
@@ -1130,6 +1219,66 @@ mod tests {
             estimated < 10,
             "local tokenizer should produce a tiny count, got {estimated}"
         );
+    }
+
+    #[test]
+    fn explicit_request_estimator_matches_legacy_wrapper() {
+        let upstream = test_upstream("anthropic/claude-opus-4.6", None);
+        let message = ChatMessage::text("user", "count me");
+
+        let legacy = estimate_session_tokens_for_model_with_config(
+            std::slice::from_ref(&message),
+            &[],
+            "",
+            &upstream.model,
+            upstream.token_estimation.as_ref(),
+        );
+        let explicit = estimate_session_tokens_for_request(
+            TokenEstimateInput {
+                messages: std::slice::from_ref(&message),
+                tools: &[],
+                pending_user_prompt: "",
+            },
+            TokenEstimateModel {
+                model: &upstream.model,
+                token_estimation: upstream.token_estimation.as_ref(),
+            },
+        );
+
+        assert_eq!(explicit, legacy);
+    }
+
+    #[test]
+    fn rendered_prompt_estimate_respects_explicit_tiktoken_override() {
+        let rendered =
+            render_builtin_prompt_for_estimate(&[ChatMessage::text("user", "hello")], &[], "");
+        let config = TokenEstimationConfig {
+            tokenizer: Some(TokenEstimationTokenizerConfig::Tiktoken {
+                encoding: crate::config::TokenEstimationTiktokenEncoding::Cl100kBase,
+            }),
+            ..TokenEstimationConfig::default()
+        };
+
+        let explicit = estimate_rendered_tokens_for_model(
+            &rendered,
+            TokenEstimateModel {
+                model: "any-model",
+                token_estimation: Some(&config),
+            },
+        );
+        let wrapped = estimate_session_tokens_for_request_uncalibrated(
+            TokenEstimateInput {
+                messages: &[ChatMessage::text("user", "hello")],
+                tools: &[],
+                pending_user_prompt: "",
+            },
+            TokenEstimateModel {
+                model: "any-model",
+                token_estimation: Some(&config),
+            },
+        );
+
+        assert_eq!(explicit, wrapped);
     }
 
     #[test]

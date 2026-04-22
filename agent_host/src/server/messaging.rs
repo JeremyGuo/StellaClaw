@@ -1,10 +1,17 @@
 use super::*;
+use crate::attachment_prep::{
+    build_audio_content_item, build_image_data_url, build_pdf_content_item,
+    infer_audio_format_for_attachment, sanitize_inline_image_item,
+    unsupported_inline_image_placeholder_text,
+};
 #[cfg(test)]
 use crate::session::QUEUED_USER_UPDATES_MARKER;
-use image::{ImageFormat, ImageReader};
+use agent_frame::{
+    ModalityItemRewrite, UpstreamModalityPolicy, downgraded_multimodal_placeholder_text,
+    placeholder_text_item, rewrite_message_content_with_modality_policy,
+};
 #[cfg(test)]
 use std::collections::VecDeque;
-use std::io::Cursor;
 
 pub(super) fn send_outgoing_message_now(
     channel: Arc<dyn Channel>,
@@ -200,6 +207,79 @@ pub(super) fn fast_path_agent_selection_message(
     ))
 }
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct PreparedUserTurnAttachments {
+    pub direct_content_items: Vec<Value>,
+    pub fallback_attachments: Vec<StoredAttachment>,
+    pub direct_image_count: usize,
+    pub direct_pdf_count: usize,
+    pub direct_audio_count: usize,
+}
+
+impl PreparedUserTurnAttachments {
+    fn has_direct_content(&self) -> bool {
+        !self.direct_content_items.is_empty()
+    }
+
+    fn visible_summary(&self) -> String {
+        direct_multimodal_summary(
+            self.direct_image_count,
+            self.direct_pdf_count,
+            self.direct_audio_count,
+        )
+    }
+}
+
+pub(super) fn prepare_user_turn_attachments(
+    attachments: &[StoredAttachment],
+    model: &ModelConfig,
+    backend_supports_native_multimodal: bool,
+) -> Result<PreparedUserTurnAttachments> {
+    let allow_images = backend_supports_native_multimodal && model.supports_image_input();
+    let allow_pdfs =
+        backend_supports_native_multimodal && model.has_capability(ModelCapability::Pdf);
+    let allow_audio =
+        backend_supports_native_multimodal && model.has_capability(ModelCapability::AudioIn);
+
+    let mut prepared = PreparedUserTurnAttachments::default();
+    for attachment in attachments {
+        if attachment.kind.is_image() && allow_images {
+            if let Ok(url) = build_image_data_url(attachment) {
+                prepared.direct_content_items.push(json!({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": url,
+                    }
+                }));
+                prepared.direct_image_count += 1;
+                continue;
+            }
+        }
+
+        if attachment.kind.is_pdf() && allow_pdfs {
+            prepared
+                .direct_content_items
+                .push(build_pdf_content_item(attachment)?);
+            prepared.direct_pdf_count += 1;
+            continue;
+        }
+
+        if attachment.kind.is_audio() && allow_audio {
+            if infer_audio_format_for_attachment(attachment).is_some() {
+                prepared
+                    .direct_content_items
+                    .push(build_audio_content_item(attachment)?);
+                prepared.direct_audio_count += 1;
+                continue;
+            }
+        }
+
+        prepared.fallback_attachments.push(attachment.clone());
+    }
+
+    Ok(prepared)
+}
+
 pub(super) fn build_user_turn_message(
     text: Option<&str>,
     attachments: &[StoredAttachment],
@@ -207,30 +287,9 @@ pub(super) fn build_user_turn_message(
     backend_supports_native_multimodal: bool,
     system_date: Option<&str>,
 ) -> Result<ChatMessage> {
-    let allow_images = backend_supports_native_multimodal && model.supports_image_input();
-    let allow_pdfs =
-        backend_supports_native_multimodal && model.has_capability(ModelCapability::Pdf);
-    let allow_audio =
-        backend_supports_native_multimodal && model.has_capability(ModelCapability::AudioIn);
-    let direct_images = attachments
-        .iter()
-        .filter(|attachment| attachment.kind.is_image() && allow_images)
-        .filter_map(|attachment| {
-            build_image_data_url(attachment)
-                .ok()
-                .map(|url| (attachment, url))
-        })
-        .collect::<Vec<_>>();
-    let pdf_attachments = attachments
-        .iter()
-        .filter(|attachment| attachment.kind.is_pdf() && allow_pdfs)
-        .collect::<Vec<_>>();
-    let audio_attachments = attachments
-        .iter()
-        .filter(|attachment| attachment.kind.is_audio() && allow_audio)
-        .filter(|attachment| infer_audio_format_for_attachment(attachment).is_some())
-        .collect::<Vec<_>>();
-    if direct_images.is_empty() && pdf_attachments.is_empty() && audio_attachments.is_empty() {
+    let prepared =
+        prepare_user_turn_attachments(attachments, model, backend_supports_native_multimodal)?;
+    if !prepared.has_direct_content() {
         return Ok(ChatMessage::text(
             "user",
             prepend_system_date_section(vec![compose_user_prompt(text, attachments)], system_date)
@@ -243,24 +302,10 @@ pub(super) fn build_user_turn_message(
         text_sections.push(text.to_string());
     }
 
-    let file_attachments = attachments
-        .iter()
-        .filter(|attachment| {
-            !direct_images
-                .iter()
-                .any(|(direct, _)| direct.id == attachment.id)
-                && !pdf_attachments
-                    .iter()
-                    .any(|direct| direct.id == attachment.id)
-                && !audio_attachments
-                    .iter()
-                    .any(|direct| direct.id == attachment.id)
-        })
-        .collect::<Vec<_>>();
-    if !file_attachments.is_empty() {
+    if !prepared.fallback_attachments.is_empty() {
         let mut attachment_lines =
             vec!["Additional attachments available for this turn:".to_string()];
-        for attachment in file_attachments {
+        for attachment in &prepared.fallback_attachments {
             attachment_lines.push(format!(
                 "- kind={:?}, path={}, original_name={}, media_type={}",
                 attachment.kind,
@@ -277,19 +322,11 @@ pub(super) fn build_user_turn_message(
     }
 
     if text_sections.is_empty() {
-        text_sections.push(direct_multimodal_summary(
-            direct_images.len(),
-            pdf_attachments.len(),
-            audio_attachments.len(),
-        ));
+        text_sections.push(prepared.visible_summary());
     } else {
         text_sections.push(format!(
             "{} Inspect directly visible current-turn attachments here instead of calling load/query tools for the same files.",
-            direct_multimodal_summary(
-                direct_images.len(),
-                pdf_attachments.len(),
-                audio_attachments.len()
-            )
+            prepared.visible_summary()
         ));
     }
     let text_sections = prepend_system_date_section(text_sections, system_date);
@@ -298,24 +335,12 @@ pub(super) fn build_user_turn_message(
         "type": "text",
         "text": text_sections.join("\n\n")
     })];
-    for (_, image_url) in direct_images {
-        content.push(json!({
-            "type": "image_url",
-            "image_url": {
-                "url": image_url,
-            }
-        }));
-    }
-    for pdf in pdf_attachments {
-        content.push(build_pdf_content_item(pdf)?);
-    }
-    for audio in audio_attachments {
-        content.push(build_audio_content_item(audio)?);
-    }
+    content.extend(prepared.direct_content_items);
 
     Ok(ChatMessage {
         role: "user".to_string(),
         content: Some(Value::Array(content)),
+        reasoning: None,
         name: None,
         tool_call_id: None,
         tool_calls: None,
@@ -351,51 +376,6 @@ pub(super) fn render_system_date_on_user_message(now: chrono::DateTime<chrono::U
     )
 }
 
-const SUPPORTED_INLINE_IMAGE_FORMATS_TEXT: &str = "JPEG, PNG, GIF, or WebP";
-
-enum InlineImageUrlNormalization {
-    Unchanged,
-    Rewritten(String),
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-fn placeholder_text_item(text: String) -> Value {
-    json!({
-        "type": "text",
-        "text": text,
-    })
-}
-
-fn downgraded_multimodal_placeholder(
-    item_type: &str,
-    item: &Value,
-    capability_text: &str,
-) -> Option<String> {
-    match item_type {
-        "image_url" | "input_image" => Some(format!(
-            "[Earlier image omitted because the current {capability_text} does not accept image input.]"
-        )),
-        "file" | "input_file" => {
-            let file_value = if item_type == "file" {
-                item.get("file")
-            } else {
-                Some(item)
-            }?;
-            let filename = file_value
-                .get("filename")
-                .and_then(Value::as_str)
-                .unwrap_or("document");
-            Some(format!(
-                "[Earlier file omitted because the current {capability_text} does not accept file input: {filename}]"
-            ))
-        }
-        "input_audio" => Some(format!(
-            "[Earlier audio omitted because the current {capability_text} does not accept audio input.]"
-        )),
-        _ => None,
-    }
-}
-
 fn sanitize_message_content_for_model_capabilities(
     content: &Option<Value>,
     allow_images: bool,
@@ -403,49 +383,39 @@ fn sanitize_message_content_for_model_capabilities(
     allow_audio: bool,
     capability_text: &str,
 ) -> Option<Value> {
-    let Some(Value::Array(items)) = content else {
-        return content.clone();
-    };
+    rewrite_message_content_with_modality_policy(
+        content,
+        UpstreamModalityPolicy {
+            allow_images,
+            allow_files,
+            allow_audio,
+            capability_text: capability_text.to_string(),
+        },
+        |ctx| {
+            if ctx.is_downgraded {
+                return Ok(downgraded_multimodal_placeholder_text(
+                    ctx.item_type,
+                    ctx.item,
+                    capability_text,
+                )
+                .map(|text| ModalityItemRewrite::Replace(placeholder_text_item(text)))
+                .unwrap_or(ModalityItemRewrite::Drop));
+            }
 
-    let mut sanitized = Vec::with_capacity(items.len());
-    for item in items {
-        let Some(item_type) = item.get("type").and_then(Value::as_str) else {
-            sanitized.push(item.clone());
-            continue;
-        };
-        match item_type {
-            "image_url" | "input_image" if !allow_images => {
-                if let Some(text) =
-                    downgraded_multimodal_placeholder(item_type, item, capability_text)
-                {
-                    sanitized.push(placeholder_text_item(text));
+            match ctx.item_type {
+                "image_url" | "input_image" => {
+                    match sanitize_inline_image_item(ctx.item_type, ctx.item) {
+                        Ok(value) => Ok(ModalityItemRewrite::Replace(value)),
+                        Err(_) => Ok(ModalityItemRewrite::Replace(placeholder_text_item(
+                            unsupported_inline_image_placeholder_text().to_string(),
+                        ))),
+                    }
                 }
+                _ => Ok(ModalityItemRewrite::KeepOriginal),
             }
-            "image_url" | "input_image" => match sanitize_inline_image_item(item_type, item) {
-                Ok(value) => sanitized.push(value),
-                Err(_) => {
-                    sanitized.push(placeholder_text_item(unsupported_inline_image_placeholder()))
-                }
-            },
-            "file" | "input_file" if !allow_files => {
-                if let Some(text) =
-                    downgraded_multimodal_placeholder(item_type, item, capability_text)
-                {
-                    sanitized.push(placeholder_text_item(text));
-                }
-            }
-            "input_audio" if !allow_audio => {
-                if let Some(text) =
-                    downgraded_multimodal_placeholder(item_type, item, capability_text)
-                {
-                    sanitized.push(placeholder_text_item(text));
-                }
-            }
-            _ => sanitized.push(item.clone()),
-        }
-    }
-
-    Some(Value::Array(sanitized))
+        },
+    )
+    .unwrap_or_else(|_| content.clone())
 }
 
 pub(super) fn sanitize_messages_for_model_capabilities(
@@ -694,25 +664,6 @@ pub(super) fn extract_loaded_skill_names(
     skill_names
 }
 
-fn build_image_data_url(attachment: &StoredAttachment) -> Result<String> {
-    let bytes = std::fs::read(&attachment.path).with_context(|| {
-        format!(
-            "failed to read image attachment {}",
-            attachment.path.display()
-        )
-    })?;
-    if let Some(media_type) = image_media_type_hint(attachment) {
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        let original_url = format!("data:{media_type};base64,{encoded}");
-        return match normalize_inline_image_url(&original_url)? {
-            InlineImageUrlNormalization::Unchanged => Ok(original_url),
-            InlineImageUrlNormalization::Rewritten(url) => Ok(url),
-        };
-    }
-
-    transcode_inline_image_bytes_to_png_data_url(&bytes, &attachment.path.display().to_string())
-}
-
 fn direct_multimodal_summary(image_count: usize, pdf_count: usize, audio_count: usize) -> String {
     let mut parts = Vec::new();
     if image_count > 0 {
@@ -728,209 +679,6 @@ fn direct_multimodal_summary(image_count: usize, pdf_count: usize, audio_count: 
         "The user attached {}, and they are already directly visible in this request.",
         parts.join(", ")
     )
-}
-
-fn build_pdf_content_item(attachment: &StoredAttachment) -> Result<Value> {
-    let encoded = file_to_base64(attachment)?;
-    Ok(json!({
-        "type": "file",
-        "file": {
-            "file_data": encoded,
-            "filename": attachment_filename(attachment, "document.pdf"),
-        }
-    }))
-}
-
-fn build_audio_content_item(attachment: &StoredAttachment) -> Result<Value> {
-    let encoded = file_to_base64(attachment)?;
-    let format = infer_audio_format_for_attachment(attachment).ok_or_else(|| {
-        anyhow!(
-            "unsupported audio attachment format for {}",
-            attachment.path.display()
-        )
-    })?;
-    Ok(json!({
-        "type": "input_audio",
-        "input_audio": {
-            "data": encoded,
-            "format": format,
-        }
-    }))
-}
-
-fn file_to_base64(attachment: &StoredAttachment) -> Result<String> {
-    let bytes = std::fs::read(&attachment.path)
-        .with_context(|| format!("failed to read attachment {}", attachment.path.display()))?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
-}
-
-fn attachment_filename(attachment: &StoredAttachment, fallback: &str) -> String {
-    attachment
-        .original_name
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            attachment
-                .path
-                .file_name()
-                .map(|value| value.to_string_lossy().to_string())
-        })
-        .unwrap_or_else(|| fallback.to_string())
-}
-
-fn infer_audio_format_for_attachment(attachment: &StoredAttachment) -> Option<&'static str> {
-    if let Some(media_type) = attachment.media_type.as_deref() {
-        match media_type.to_ascii_lowercase().as_str() {
-            "audio/wav" | "audio/wave" | "audio/x-wav" => return Some("wav"),
-            "audio/mpeg" | "audio/mp3" | "audio/mpga" => return Some("mp3"),
-            "audio/ogg" | "audio/opus" => return Some("ogg"),
-            "audio/webm" => return Some("webm"),
-            "audio/mp4" | "audio/aac" | "audio/m4a" => return Some("m4a"),
-            "audio/flac" => return Some("flac"),
-            _ => {}
-        }
-    }
-    match attachment
-        .path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "wav" => Some("wav"),
-        "mp3" | "mpeg" | "mpga" => Some("mp3"),
-        "ogg" | "opus" => Some("ogg"),
-        "webm" => Some("webm"),
-        "m4a" | "mp4" | "aac" => Some("m4a"),
-        "flac" => Some("flac"),
-        _ => None,
-    }
-}
-
-fn unsupported_inline_image_placeholder() -> String {
-    format!(
-        "[Earlier image omitted because it could not be converted into a supported inline image format ({SUPPORTED_INLINE_IMAGE_FORMATS_TEXT}).]"
-    )
-}
-
-fn sanitize_inline_image_item(item_type: &str, item: &Value) -> Result<Value> {
-    let Some(url) = inline_image_url_from_item(item_type, item) else {
-        return Ok(item.clone());
-    };
-    match normalize_inline_image_url(url)? {
-        InlineImageUrlNormalization::Unchanged => Ok(item.clone()),
-        InlineImageUrlNormalization::Rewritten(url) => {
-            Ok(rebuild_inline_image_item(item_type, item, url))
-        }
-    }
-}
-
-fn normalize_inline_image_url(url: &str) -> Result<InlineImageUrlNormalization> {
-    let Some((media_type, encoded)) = parse_inline_image_data_url(url) else {
-        return Ok(InlineImageUrlNormalization::Unchanged);
-    };
-    if let Some(canonical) = canonical_inline_image_media_type(media_type) {
-        if media_type.eq_ignore_ascii_case(canonical) {
-            return Ok(InlineImageUrlNormalization::Unchanged);
-        }
-        return Ok(InlineImageUrlNormalization::Rewritten(format!(
-            "data:{canonical};base64,{encoded}"
-        )));
-    }
-
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .context("failed to decode unsupported inline image data")?;
-    let rewritten = transcode_inline_image_bytes_to_png_data_url(&bytes, media_type)?;
-    Ok(InlineImageUrlNormalization::Rewritten(rewritten))
-}
-
-fn transcode_inline_image_bytes_to_png_data_url(bytes: &[u8], label: &str) -> Result<String> {
-    let image = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .with_context(|| format!("failed to guess image format for {label}"))?
-        .decode()
-        .with_context(|| format!("failed to decode image data for {label}"))?;
-    let mut output = Vec::new();
-    image
-        .write_to(&mut Cursor::new(&mut output), ImageFormat::Png)
-        .with_context(|| format!("failed to transcode image data for {label} to PNG"))?;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(output);
-    Ok(format!("data:image/png;base64,{encoded}"))
-}
-
-fn inline_image_url_from_item<'a>(item_type: &str, item: &'a Value) -> Option<&'a str> {
-    if item_type == "image_url" {
-        return item.get("image_url").and_then(|value| match value {
-            Value::String(url) => Some(url.as_str()),
-            Value::Object(object) => object.get("url").and_then(Value::as_str),
-            _ => None,
-        });
-    }
-    item.get("image_url").and_then(Value::as_str)
-}
-
-fn rebuild_inline_image_item(item_type: &str, item: &Value, url: String) -> Value {
-    let mut rebuilt = item.clone();
-    let Some(object) = rebuilt.as_object_mut() else {
-        return item.clone();
-    };
-    if item_type == "image_url" {
-        object.insert("image_url".to_string(), json!({ "url": url }));
-    } else {
-        object.insert("image_url".to_string(), Value::String(url));
-    }
-    rebuilt
-}
-
-fn parse_inline_image_data_url(url: &str) -> Option<(&str, &str)> {
-    let (metadata, encoded) = url.strip_prefix("data:")?.split_once(',')?;
-    let mut parts = metadata.split(';');
-    let media_type = parts.next()?.trim();
-    if !media_type.starts_with("image/") || !parts.any(|part| part.eq_ignore_ascii_case("base64")) {
-        return None;
-    }
-    Some((media_type, encoded))
-}
-
-fn canonical_inline_image_media_type(media_type: &str) -> Option<&'static str> {
-    match media_type.to_ascii_lowercase().as_str() {
-        "image/png" => Some("image/png"),
-        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
-        "image/gif" => Some("image/gif"),
-        "image/webp" => Some("image/webp"),
-        _ => None,
-    }
-}
-
-fn image_media_type_hint(attachment: &StoredAttachment) -> Option<String> {
-    attachment
-        .media_type
-        .as_deref()
-        .filter(|value| value.starts_with("image/"))
-        .map(ToOwned::to_owned)
-        .or_else(|| infer_image_media_type(&attachment.path).map(ToOwned::to_owned))
-}
-
-fn infer_image_media_type(path: &Path) -> Option<&'static str> {
-    match path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "bmp" => Some("image/bmp"),
-        "tif" | "tiff" => Some("image/tiff"),
-        "svg" => Some("image/svg+xml"),
-        _ => None,
-    }
 }
 
 pub(super) fn spawn_processing_keepalive(

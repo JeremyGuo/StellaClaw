@@ -11,49 +11,110 @@ use std::path::Path;
 const CONTEXT_ATTACHMENT_STORE_DIR_NAME: &str = ".context_attachments";
 const CONTEXT_ATTACHMENT_HASH_DIR_NAME: &str = "by-hash";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpstreamModalityPolicy {
+    pub allow_images: bool,
+    pub allow_files: bool,
+    pub allow_audio: bool,
+    pub capability_text: String,
+}
+
+impl UpstreamModalityPolicy {
+    pub fn for_agent_config(config: &AgentConfig) -> Self {
+        Self {
+            allow_images: config.upstream.supports_vision_input,
+            allow_files: config.upstream.supports_pdf_input,
+            allow_audio: config.upstream.supports_audio_input,
+            capability_text: "current model/backend combination".to_string(),
+        }
+    }
+
+    fn should_downgrade(&self, item_type: &str) -> bool {
+        match item_type {
+            "image_url" | "input_image" => !self.allow_images,
+            "file" | "input_file" => !self.allow_files,
+            "input_audio" => !self.allow_audio,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ModalityItemContext<'a> {
+    pub item_type: &'a str,
+    pub item: &'a Value,
+    pub policy: UpstreamModalityPolicy,
+    pub is_downgraded: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ModalityItemRewrite {
+    KeepOriginal,
+    Replace(Value),
+    Drop,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RequestViewArtifactStore<'a> {
+    workspace_root: &'a Path,
+}
+
+impl<'a> RequestViewArtifactStore<'a> {
+    pub fn new(workspace_root: &'a Path) -> Self {
+        Self { workspace_root }
+    }
+
+    fn persist_item(self, item_type: &str, item: &Value) -> Result<String> {
+        persist_request_view_artifact(self.workspace_root, item_type, item)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct UpstreamMaterializationRequest<'a> {
+    pub messages: &'a [ChatMessage],
+    pub policy: UpstreamModalityPolicy,
+    pub artifact_store: RequestViewArtifactStore<'a>,
+}
+
 pub(crate) fn materialize_messages_for_upstream(
     messages: &[ChatMessage],
     config: &AgentConfig,
 ) -> Result<Vec<ChatMessage>> {
-    let allow_images = config.upstream.supports_vision_input;
-    let allow_files = config.upstream.supports_pdf_input;
-    let allow_audio = config.upstream.supports_audio_input;
-    let capability_text = "current model/backend combination";
+    materialize_messages_for_request(UpstreamMaterializationRequest {
+        messages,
+        policy: UpstreamModalityPolicy::for_agent_config(config),
+        artifact_store: RequestViewArtifactStore::new(&config.workspace_root),
+    })
+}
 
-    let mut rewritten_messages = Vec::with_capacity(messages.len());
-    for message in messages {
-        let Some(Value::Array(items)) = &message.content else {
-            rewritten_messages.push(message.clone());
-            continue;
-        };
-        let mut rewritten_items = Vec::with_capacity(items.len());
-        let mut changed = false;
-        for item in items {
-            let Some(item_type) = item.get("type").and_then(Value::as_str) else {
-                rewritten_items.push(item.clone());
-                continue;
-            };
-            let should_downgrade = match item_type {
-                "image_url" | "input_image" => !allow_images,
-                "file" | "input_file" => !allow_files,
-                "input_audio" => !allow_audio,
-                _ => false,
-            };
-            if !should_downgrade {
-                rewritten_items.push(item.clone());
-                continue;
-            }
-            let relative_path =
-                persist_request_view_artifact(&config.workspace_root, item_type, item)?;
-            rewritten_items.push(json!({
-                "type": "text",
-                "text": request_view_placeholder_text(item_type, capability_text, &relative_path),
-            }));
-            changed = true;
-        }
-        if changed {
+pub(crate) fn materialize_messages_for_request(
+    request: UpstreamMaterializationRequest<'_>,
+) -> Result<Vec<ChatMessage>> {
+    let mut rewritten_messages = Vec::with_capacity(request.messages.len());
+    for message in request.messages {
+        let policy = request.policy.clone();
+        let rewritten_content = rewrite_message_content_with_modality_policy(
+            &message.content,
+            policy.clone(),
+            |ctx| {
+                if !ctx.is_downgraded {
+                    return Ok(ModalityItemRewrite::KeepOriginal);
+                }
+                let relative_path = request
+                    .artifact_store
+                    .persist_item(ctx.item_type, ctx.item)?;
+                Ok(ModalityItemRewrite::Replace(placeholder_text_item(
+                    request_view_placeholder_text(
+                        ctx.item_type,
+                        policy.capability_text.as_str(),
+                        &relative_path,
+                    ),
+                )))
+            },
+        )?;
+        if rewritten_content != message.content {
             let mut rewritten = message.clone();
-            rewritten.content = Some(Value::Array(rewritten_items));
+            rewritten.content = rewritten_content;
             rewritten_messages.push(rewritten);
         } else {
             rewritten_messages.push(message.clone());
@@ -81,6 +142,85 @@ fn request_view_placeholder_text(
         _ => format!(
             "[Earlier multimodal content is referenced at {relative_path}. Inspect it with tools if needed.]"
         ),
+    }
+}
+
+pub fn placeholder_text_item(text: String) -> Value {
+    json!({
+        "type": "text",
+        "text": text,
+    })
+}
+
+pub fn downgraded_multimodal_placeholder_text(
+    item_type: &str,
+    item: &Value,
+    capability_text: &str,
+) -> Option<String> {
+    match item_type {
+        "image_url" | "input_image" => Some(format!(
+            "[Earlier image omitted because the current {capability_text} does not accept image input.]"
+        )),
+        "file" | "input_file" => {
+            let file_value = if item_type == "file" {
+                item.get("file")
+            } else {
+                Some(item)
+            }?;
+            let filename = file_value
+                .get("filename")
+                .and_then(Value::as_str)
+                .unwrap_or("document");
+            Some(format!(
+                "[Earlier file omitted because the current {capability_text} does not accept file input: {filename}]"
+            ))
+        }
+        "input_audio" => Some(format!(
+            "[Earlier audio omitted because the current {capability_text} does not accept audio input.]"
+        )),
+        _ => None,
+    }
+}
+
+pub fn rewrite_message_content_with_modality_policy<F>(
+    content: &Option<Value>,
+    policy: UpstreamModalityPolicy,
+    mut rewrite_item: F,
+) -> Result<Option<Value>>
+where
+    F: FnMut(ModalityItemContext<'_>) -> Result<ModalityItemRewrite>,
+{
+    let Some(Value::Array(items)) = content else {
+        return Ok(content.clone());
+    };
+
+    let mut rewritten_items = Vec::with_capacity(items.len());
+    let mut changed = false;
+    for item in items {
+        let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+            rewritten_items.push(item.clone());
+            continue;
+        };
+        let rewrite = rewrite_item(ModalityItemContext {
+            item_type,
+            item,
+            policy: policy.clone(),
+            is_downgraded: policy.should_downgrade(item_type),
+        })?;
+        match rewrite {
+            ModalityItemRewrite::KeepOriginal => rewritten_items.push(item.clone()),
+            ModalityItemRewrite::Replace(value) => {
+                changed = true;
+                rewritten_items.push(value);
+            }
+            ModalityItemRewrite::Drop => changed = true,
+        }
+    }
+
+    if changed {
+        Ok(Some(Value::Array(rewritten_items)))
+    } else {
+        Ok(content.clone())
     }
 }
 
@@ -277,7 +417,12 @@ fn extension_from_media_type(media_type: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::materialize_messages_for_upstream;
+    use super::{
+        ModalityItemRewrite, RequestViewArtifactStore, UpstreamMaterializationRequest,
+        UpstreamModalityPolicy, materialize_messages_for_request,
+        materialize_messages_for_upstream, placeholder_text_item,
+        rewrite_message_content_with_modality_policy,
+    };
     use crate::config::{
         AgentConfig, ContextCompactionConfig, MemorySystem, TimeoutObservationCompactionConfig,
         UpstreamApiKind, UpstreamAuthKind, UpstreamConfig,
@@ -350,6 +495,7 @@ mod tests {
                 "type": "input_image",
                 "image_url": format!("data:image/png;base64,{payload}")
             }])),
+            reasoning: None,
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -373,6 +519,7 @@ mod tests {
                 "type": "input_image",
                 "image_url": format!("data:image/png;base64,{payload}")
             }])),
+            reasoning: None,
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -380,5 +527,77 @@ mod tests {
 
         let rewritten = materialize_messages_for_upstream(&messages, &config).unwrap();
         assert_eq!(rewritten, messages);
+    }
+
+    #[test]
+    fn explicit_policy_materialization_matches_legacy_wrapper() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = test_config(temp_dir.path(), false);
+        let payload = base64::engine::general_purpose::STANDARD.encode([0_u8, 1, 2, 3]);
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(json!([{
+                "type": "input_image",
+                "image_url": format!("data:image/png;base64,{payload}")
+            }])),
+            reasoning: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let legacy = materialize_messages_for_upstream(&messages, &config).unwrap();
+        let explicit = materialize_messages_for_request(UpstreamMaterializationRequest {
+            messages: &messages,
+            policy: UpstreamModalityPolicy {
+                allow_images: false,
+                allow_files: false,
+                allow_audio: false,
+                capability_text: "current model/backend combination".to_string(),
+            },
+            artifact_store: RequestViewArtifactStore::new(temp_dir.path()),
+        })
+        .unwrap();
+
+        assert_eq!(explicit, legacy);
+    }
+
+    #[test]
+    fn shared_modality_rewriter_supports_replace_and_drop() {
+        let content = Some(json!([
+            {"type": "text", "text": "hello"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+            {"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}}
+        ]));
+
+        let rewritten = rewrite_message_content_with_modality_policy(
+            &content,
+            UpstreamModalityPolicy {
+                allow_images: false,
+                allow_files: true,
+                allow_audio: false,
+                capability_text: "test model".to_string(),
+            },
+            |ctx| {
+                if ctx.is_downgraded && ctx.item_type == "input_image" {
+                    return Ok(ModalityItemRewrite::Replace(placeholder_text_item(
+                        "image downgraded".to_string(),
+                    )));
+                }
+                if ctx.is_downgraded && ctx.item_type == "input_audio" {
+                    return Ok(ModalityItemRewrite::Drop);
+                }
+                Ok(ModalityItemRewrite::KeepOriginal)
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            rewritten,
+            Some(json!([
+                {"type": "text", "text": "hello"},
+                {"type": "text", "text": "image downgraded"}
+            ]))
+        );
     }
 }
