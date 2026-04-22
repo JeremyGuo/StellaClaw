@@ -27,6 +27,7 @@ mod v0_31;
 mod v0_32;
 mod v0_33;
 mod v0_34;
+mod v0_35;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -34,7 +35,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.34";
+pub const LATEST_WORKDIR_VERSION: &str = "0.35";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -50,7 +51,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 30] = [
+    let upgraders: [&dyn WorkdirUpgrader; 31] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
@@ -81,6 +82,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
         &v0_32::Upgrade,
         &v0_33::Upgrade,
         &v0_34::Upgrade,
+        &v0_35::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -139,6 +141,7 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.31" => Ok("0.31"),
         "0.32" => Ok("0.32"),
         "0.33" => Ok("0.33"),
+        "0.34" => Ok("0.34"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -1730,6 +1733,114 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(snapshot_dir.join("snapshot.json")).unwrap())
                 .unwrap();
         let snapshot_url = snapshot["session"]["messages"][0]["content"][1]["image_url"]["url"]
+            .as_str()
+            .unwrap();
+        assert!(snapshot_url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn v0_35_workdir_upgrade_repairs_non_image_media_types_in_image_slots() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.34\n").unwrap();
+
+        let session_dir = temp_dir
+            .path()
+            .join("sessions")
+            .join("conversation-1")
+            .join("foreground")
+            .join(Uuid::new_v4().to_string());
+        let snapshot_dir = temp_dir.path().join("snapshots").join("snap-1");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::create_dir_all(&snapshot_dir).unwrap();
+
+        let image = image::ImageBuffer::from_pixel(1, 1, image::Rgba([12, 34, 56, 255]));
+        let mut tiff = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut tiff),
+                image::ImageFormat::Tiff,
+            )
+            .unwrap();
+        let encoded_tiff = base64::engine::general_purpose::STANDARD.encode(tiff);
+        let encoded_pdf = base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.4\n");
+
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": Uuid::new_v4(),
+                "agent_id": Uuid::new_v4(),
+                "address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "conversation-1"
+                },
+                "session_state": {
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "input_image", "image_url": format!("data:application/octet-stream;base64,{encoded_tiff}")},
+                            {"type": "input_image", "image_url": format!("data:application/octet-stream;base64,{encoded_pdf}")}
+                        ]
+                    }],
+                    "pending_messages": [],
+                    "user_mailbox": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        fs::write(
+            snapshot_dir.join("snapshot.json"),
+            serde_json::to_string_pretty(&json!({
+                "saved_at": "2026-04-22T00:00:00Z",
+                "session": {
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "input_image", "image_url": format!("data:application/octet-stream;base64,{encoded_tiff}")}
+                        ]
+                    }],
+                    "pending_messages": [],
+                    "user_mailbox": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("VERSION"))
+                .unwrap()
+                .trim(),
+            LATEST_WORKDIR_VERSION
+        );
+
+        let session: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
+                .unwrap();
+        let session_items = session["session_state"]["messages"][0]["content"]
+            .as_array()
+            .unwrap();
+        assert_eq!(session_items[0]["type"], "input_image");
+        assert!(
+            session_items[0]["image_url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("data:image/png;base64,"))
+        );
+        assert_eq!(session_items[1]["type"], "text");
+        assert!(
+            session_items[1]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("could not be converted"))
+        );
+
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(snapshot_dir.join("snapshot.json")).unwrap())
+                .unwrap();
+        let snapshot_url = snapshot["session"]["messages"][0]["content"][0]["image_url"]
             .as_str()
             .unwrap();
         assert!(snapshot_url.starts_with("data:image/png;base64,"));

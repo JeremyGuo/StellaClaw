@@ -923,10 +923,12 @@ mod tests {
         AuthCredentialsStoreMode, RemoteWorkpathConfig, UpstreamApiKind, UpstreamAuthKind,
         UpstreamConfig,
     };
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
     use std::fs;
+    use std::io::Cursor;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -935,6 +937,15 @@ mod tests {
     use std::thread;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    fn tiny_png_bytes() -> Vec<u8> {
+        let image = ImageBuffer::from_pixel(1, 1, Rgba([12, 34, 56, 255]));
+        let mut bytes = Vec::new();
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .unwrap();
+        bytes
+    }
 
     fn test_upstream() -> UpstreamConfig {
         UpstreamConfig {
@@ -2171,7 +2182,7 @@ exec sh -c "$remote_command""#,
         let workspace_root = temp_dir.path().join("workspace");
         fs::create_dir_all(&workspace_root).unwrap();
         let image_path = workspace_root.join("demo.png");
-        fs::write(&image_path, b"png-bytes").unwrap();
+        fs::write(&image_path, tiny_png_bytes()).unwrap();
         let runtime_state_root = temp_dir.path().join("runtime");
         fs::create_dir_all(&runtime_state_root).unwrap();
         let upstream = UpstreamConfig {
@@ -2231,6 +2242,46 @@ exec sh -c "$remote_command""#,
         assert_eq!(result["media"][0]["type"], "input_image");
         assert_eq!(result["media"][0]["path"], image_path.display().to_string());
         assert!(result["media"][0].get("image_url").is_none());
+    }
+
+    #[test]
+    fn image_load_rejects_non_image_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let pdf_path = workspace_root.join("demo.pdf");
+        fs::write(&pdf_path, b"%PDF-1.4\n").unwrap();
+        let runtime_state_root = temp_dir.path().join("runtime");
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        let mut upstream = test_upstream();
+        upstream.supports_vision_input = true;
+        upstream.native_image_input = true;
+
+        let registry = build_tool_registry_with_cancel(
+            &workspace_root,
+            &runtime_state_root,
+            &upstream,
+            &BTreeMap::new(),
+            None,
+            None,
+            None,
+            None,
+            &Vec::<PathBuf>::new(),
+            &[],
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        let error = registry["image_load"]
+            .invoke(json!({
+                "path": "demo.pdf"
+            }))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("image_load only accepts image files"));
     }
 
     #[test]
@@ -2743,6 +2794,45 @@ exec sh -c "$remote_command""#,
             .expect("expected active runtime summary");
         assert!(summary.contains("current-shell"));
         assert!(!summary.contains("legacy-exec"));
+    }
+
+    #[test]
+    fn active_runtime_state_summary_tolerates_missing_download_status_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let runtime_state_root = temp_dir.path();
+        let downloads_dir = runtime_state_root
+            .join("agent_frame")
+            .join("file_downloads");
+        fs::create_dir_all(&downloads_dir).unwrap();
+
+        let missing_status_path = downloads_dir.join("download-missing.status.json");
+        let download_exit_path = downloads_dir.join("download-missing.exit");
+        write_background_task_metadata(
+            &downloads_dir,
+            &BackgroundTaskMetadata {
+                task_id: "download-missing".to_string(),
+                pid: std::process::id(),
+                label: "file-download".to_string(),
+                status_path: missing_status_path.display().to_string(),
+                stdout_path: downloads_dir
+                    .join("download-missing.stdout")
+                    .display()
+                    .to_string(),
+                stderr_path: downloads_dir
+                    .join("download-missing.stderr")
+                    .display()
+                    .to_string(),
+                exit_code_path: download_exit_path.display().to_string(),
+            },
+        )
+        .unwrap();
+
+        let summary = active_runtime_state_summary(runtime_state_root)
+            .unwrap()
+            .expect("expected active runtime summary");
+        assert!(summary.contains("Active file downloads:"));
+        assert!(summary.contains("download_id=`download-missing`"));
+        assert!(summary.contains("progress unavailable"));
     }
 
     #[test]

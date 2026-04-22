@@ -16,7 +16,7 @@ pub fn build_image_data_url(attachment: &StoredAttachment) -> Result<String> {
     if let Some(media_type) = image_media_type_hint(attachment) {
         let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
         let original_url = format!("data:{media_type};base64,{encoded}");
-        return match normalize_inline_image_url(&original_url)? {
+        return match normalize_inline_image_url("image_url", &original_url)? {
             InlineImageUrlNormalization::Unchanged => Ok(original_url),
             InlineImageUrlNormalization::Rewritten(url) => Ok(url),
         };
@@ -139,7 +139,7 @@ pub fn sanitize_inline_image_item(item_type: &str, item: &Value) -> Result<Value
     let Some(url) = inline_image_url_from_item(item_type, item) else {
         return Ok(item.clone());
     };
-    match normalize_inline_image_url(url)? {
+    match normalize_inline_image_url(item_type, url)? {
         InlineImageUrlNormalization::Unchanged => Ok(item.clone()),
         InlineImageUrlNormalization::Rewritten(url) => {
             Ok(rebuild_inline_image_item(item_type, item, url))
@@ -238,17 +238,22 @@ fn rebuild_inline_image_item(item_type: &str, item: &Value, url: String) -> Valu
     rebuilt
 }
 
-fn normalize_inline_image_url(url: &str) -> Result<InlineImageUrlNormalization> {
-    let Some((media_type, encoded)) = parse_inline_image_data_url(url) else {
+fn normalize_inline_image_url(item_type: &str, url: &str) -> Result<InlineImageUrlNormalization> {
+    let Some((media_type, encoded)) = parse_inline_data_url(url) else {
         return Ok(InlineImageUrlNormalization::Unchanged);
     };
-    if let Some(canonical) = canonical_inline_image_media_type(media_type) {
+    let media_type = media_type.trim();
+    let is_image_data_url = media_type.starts_with("image/");
+    if is_image_data_url && let Some(canonical) = canonical_inline_image_media_type(media_type) {
         if media_type.eq_ignore_ascii_case(canonical) {
             return Ok(InlineImageUrlNormalization::Unchanged);
         }
         return Ok(InlineImageUrlNormalization::Rewritten(format!(
             "data:{canonical};base64,{encoded}"
         )));
+    }
+    if !matches!(item_type, "image_url" | "input_image") && !is_image_data_url {
+        return Ok(InlineImageUrlNormalization::Unchanged);
     }
 
     let bytes = base64::engine::general_purpose::STANDARD
@@ -258,11 +263,11 @@ fn normalize_inline_image_url(url: &str) -> Result<InlineImageUrlNormalization> 
     Ok(InlineImageUrlNormalization::Rewritten(rewritten))
 }
 
-fn parse_inline_image_data_url(url: &str) -> Option<(&str, &str)> {
+fn parse_inline_data_url(url: &str) -> Option<(&str, &str)> {
     let (metadata, encoded) = url.strip_prefix("data:")?.split_once(',')?;
     let mut parts = metadata.split(';');
     let media_type = parts.next()?.trim();
-    if !media_type.starts_with("image/") || !parts.any(|part| part.eq_ignore_ascii_case("base64")) {
+    if !parts.any(|part| part.eq_ignore_ascii_case("base64")) {
         return None;
     }
     Some((media_type, encoded))
@@ -426,6 +431,46 @@ mod tests {
         assert_eq!(items[2]["type"], "text");
         assert!(
             items[2]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("could not be converted"))
+        );
+    }
+
+    #[test]
+    fn normalize_inline_image_content_for_persistence_rewrites_octet_stream_images() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(tiny_tiff_bytes());
+        let content = Some(json!([
+            {
+                "type": "input_image",
+                "image_url": format!("data:application/octet-stream;base64,{encoded}")
+            }
+        ]));
+
+        let normalized = normalize_inline_image_content_for_persistence(&content).unwrap();
+        let items = normalized.unwrap().as_array().unwrap().clone();
+        assert_eq!(items[0]["type"], "input_image");
+        assert!(
+            items[0]["image_url"]
+                .as_str()
+                .is_some_and(|url| url.starts_with("data:image/png;base64,"))
+        );
+    }
+
+    #[test]
+    fn normalize_inline_image_content_for_persistence_replaces_non_image_octet_stream_payloads() {
+        let pdf_header = base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.4\n");
+        let content = Some(json!([
+            {
+                "type": "input_image",
+                "image_url": format!("data:application/octet-stream;base64,{pdf_header}")
+            }
+        ]));
+
+        let normalized = normalize_inline_image_content_for_persistence(&content).unwrap();
+        let items = normalized.unwrap().as_array().unwrap().clone();
+        assert_eq!(items[0]["type"], "text");
+        assert!(
+            items[0]["text"]
                 .as_str()
                 .is_some_and(|text| text.contains("could not be converted"))
         );

@@ -10,8 +10,10 @@ use super::{InterruptSignal, Tool, compact_tool_status_fields_for_model, resolve
 use crate::config::UpstreamConfig;
 use crate::tool_worker::ToolWorkerJob;
 use anyhow::{Context, Result, anyhow};
+use image::ImageReader;
 use serde_json::{Map, Value, json};
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
@@ -56,6 +58,23 @@ enum ImageTimeoutAction {
 fn compact_image_status_for_model(mut value: Value) -> Value {
     compact_tool_status_fields_for_model(&mut value);
     value
+}
+
+fn ensure_image_loadable(path: &Path) -> Result<()> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let reader = ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .with_context(|| format!("failed to guess image format for {}", path.display()))?;
+    let Some(_) = reader.format() else {
+        return Err(anyhow!(
+            "image_load only accepts image files or transcodable image formats: {}",
+            path.display()
+        ));
+    };
+    reader
+        .decode()
+        .with_context(|| format!("failed to decode image {}", path.display()))?;
+    Ok(())
 }
 
 impl ImageTimeoutAction {
@@ -337,6 +356,7 @@ pub(super) fn image_load_tool(
                 ));
             }
             let path = resolve_path(&string_arg(arguments, "path")?, &workspace_root);
+            ensure_image_loadable(&path)?;
             Ok(json!({
                 "loaded": true,
                 "kind": "synthetic_user_multimodal",

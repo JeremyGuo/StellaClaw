@@ -15,8 +15,10 @@ use crate::tooling::{
 };
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use image::{ImageFormat, ImageReader};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -244,22 +246,33 @@ fn is_previous_response_id_error(error: &anyhow::Error) -> bool {
 fn image_path_to_data_url(path: &Path) -> Result<String> {
     let bytes =
         std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let media_type = match path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("bmp") => "image/bmp",
-        Some("svg") => "image/svg+xml",
-        _ => "application/octet-stream",
+    let guessed = ImageReader::new(Cursor::new(&bytes))
+        .with_guessed_format()
+        .with_context(|| format!("failed to guess image format for {}", path.display()))?;
+    let Some(format) = guessed.format() else {
+        return Err(anyhow!(
+            "image_load only accepts image files; could not detect an image format for {}",
+            path.display()
+        ));
+    };
+    let (media_type, output_bytes) = match format {
+        ImageFormat::Png => ("image/png", bytes),
+        ImageFormat::Jpeg => ("image/jpeg", bytes),
+        ImageFormat::Gif => ("image/gif", bytes),
+        ImageFormat::WebP => ("image/webp", bytes),
+        _ => {
+            let image = guessed
+                .decode()
+                .with_context(|| format!("failed to decode image {}", path.display()))?;
+            let mut output = Vec::new();
+            image
+                .write_to(&mut Cursor::new(&mut output), ImageFormat::Png)
+                .with_context(|| format!("failed to transcode image {} to PNG", path.display()))?;
+            ("image/png", output)
+        }
     };
     use base64::Engine as _;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let encoded = base64::engine::general_purpose::STANDARD.encode(output_bytes);
     Ok(format!("data:{};base64,{}", media_type, encoded))
 }
 
@@ -1440,11 +1453,31 @@ mod tests {
     use crate::config::{AgentConfig, MemorySystem, UpstreamConfig};
     use crate::message::{ChatMessage, FunctionCall, ToolCall};
     use crate::skills::SkillMetadata;
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgba};
     use serde_json::Value;
+    use std::io::Cursor;
     use std::path::PathBuf;
     use std::thread;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
+
+    fn tiny_png_bytes() -> Vec<u8> {
+        let image = ImageBuffer::from_pixel(1, 1, Rgba([12, 34, 56, 255]));
+        let mut bytes = Vec::new();
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .unwrap();
+        bytes
+    }
+
+    fn tiny_bmp_bytes() -> Vec<u8> {
+        let image = ImageBuffer::from_pixel(1, 1, Rgba([12, 34, 56, 255]));
+        let mut bytes = Vec::new();
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Bmp)
+            .unwrap();
+        bytes
+    }
 
     #[test]
     fn tool_result_error_detection_ignores_null_error_fields() {
@@ -1737,7 +1770,7 @@ mod tests {
     fn synthetic_multimodal_tool_result_becomes_user_image_message() {
         let temp_dir = TempDir::new().unwrap();
         let image_path = temp_dir.path().join("sample.png");
-        std::fs::write(&image_path, b"png-bytes").unwrap();
+        std::fs::write(&image_path, tiny_png_bytes()).unwrap();
 
         let message = synthetic_user_message_from_tool_result(
             &serde_json::json!({
@@ -1763,6 +1796,55 @@ mod tests {
                 .starts_with("data:image/png;base64,")
         );
         assert!(matches!(content, Value::Array(_)));
+    }
+
+    #[test]
+    fn synthetic_multimodal_tool_result_transcodes_unsupported_images_to_png() {
+        let temp_dir = TempDir::new().unwrap();
+        let image_path = temp_dir.path().join("sample.bmp");
+        std::fs::write(&image_path, tiny_bmp_bytes()).unwrap();
+
+        let message = synthetic_user_message_from_tool_result(
+            &serde_json::json!({
+                "kind": "synthetic_user_multimodal",
+                "media": [{
+                    "type": "input_image",
+                    "path": image_path.display().to_string(),
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let content = message.content.unwrap();
+        let items = content.as_array().unwrap();
+        assert_eq!(items[0]["type"], "input_image");
+        assert!(
+            items[0]["image_url"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("data:image/png;base64,")
+        );
+    }
+
+    #[test]
+    fn synthetic_multimodal_tool_result_drops_non_image_image_load_payloads() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("sample.pdf");
+        std::fs::write(&file_path, b"%PDF-demo").unwrap();
+
+        let message = synthetic_user_message_from_tool_result(
+            &serde_json::json!({
+                "kind": "synthetic_user_multimodal",
+                "media": [{
+                    "type": "input_image",
+                    "path": file_path.display().to_string(),
+                }]
+            })
+            .to_string(),
+        );
+
+        assert!(message.is_none());
     }
 
     #[test]

@@ -1,5 +1,16 @@
-version: 0.26.1
+version: 0.26.2
 ---
+
+# 0.26.2
+
+- 修复 `image_load` 历史多模态污染与当前回合格式泄漏：
+  `image_load` 现在会先验证本地文件确实可解码为图片，再在 synthetic user multimodal 注入阶段按真实格式生成 base64 内容；JPEG/PNG/GIF/WebP 会保留 canonical media type，TIFF/BMP 等可转码图片会自动转成 PNG，像误传入 PDF 这类非图片文件会在本地直接拒绝，不再把 `application/octet-stream` 之类非法 image media type 送到 Claude。
+- 新增一次性历史修复升级：
+  `0.34 -> 0.35` upgrade step 会重新扫描 `session.json` / `snapshot.json` 里的 `input_image` / `image_url` data URL，即使旧 payload 被错误写成 `application/octet-stream` 也会尝试转写成 canonical PNG；不可解码的旧伪图片 payload 会稳定替换成占位文本，避免恢复旧会话时再次触发上游 400。
+- 补充回归测试覆盖：
+  新增针对 `image_load` 非图片拒绝、TIFF 自动转 PNG，以及 `0.35` workdir upgrade 修复旧 octet-stream 图片槽位的测试，保护当前回合和历史恢复两条路径。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  workdir 结构版本提升到 `0.35`，新增 upgrade step；按 workdir-only 变更策略将仓库版本从 `0.26.1` 提升到 `0.26.2`。
 
 # 0.26.1
 

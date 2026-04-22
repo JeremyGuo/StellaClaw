@@ -103,21 +103,26 @@ pub(super) fn list_active_file_download_summaries(
         return Ok(Vec::new());
     };
     let mut entries = Vec::new();
-    for entry in
-        fs::read_dir(&task_dir).with_context(|| format!("failed to read {}", task_dir.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+    for path in iter_metadata_json_files(&task_dir)? {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let Ok(metadata) = serde_json::from_str::<BackgroundTaskMetadata>(&raw) else {
             continue;
         };
-        if !file_name.ends_with(".json") || file_name.ends_with(".status.json") {
+        if !background_task_is_running(&metadata) {
             continue;
         }
-        let Some(download_id) = path.file_stem().and_then(|value| value.to_str()) else {
-            continue;
+        let download_id = metadata.task_id.as_str();
+        let snapshot = match read_file_download_snapshot(runtime_state_root, download_id) {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                entries.push(format!(
+                    "- download_id=`{}` status=`progress unavailable`",
+                    download_id
+                ));
+                continue;
+            }
         };
-        let snapshot = read_file_download_snapshot(runtime_state_root, download_id)?;
         if !snapshot
             .get("running")
             .and_then(Value::as_bool)
