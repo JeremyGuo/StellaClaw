@@ -4,12 +4,15 @@ use crate::config::{
 };
 use crate::message::{ChatMessage, ToolCall, content_item_text};
 use crate::tooling::Tool;
+use base64::Engine;
 use hf_hub::api::sync::ApiBuilder;
 use hf_hub::{Repo, RepoType};
+use image::ImageReader;
 use minijinja::{Environment, context};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use tiktoken_rs::{cl100k_base_singleton, o200k_base_singleton, o200k_harmony_singleton};
@@ -147,11 +150,33 @@ pub fn estimate_text_tokens_for_estimator(text: &str, estimator: TokenEstimator)
 }
 
 // Mirrors Codex's approach: do not estimate inline base64 media payloads as
-// raw text. Replace them with a fixed per-item estimate before tokenizing the
-// rendered prompt.
-const RESIZED_IMAGE_BYTES_ESTIMATE: usize = 7_373;
+// raw text. Replace them with a conservative side estimate before tokenizing
+// the rendered prompt. Image estimates are model-aware: GPT-family models use
+// OpenAI's documented image-token sizing rules, while other models use the
+// Anthropic-style vision-area approximation. Invalid payloads still fall back
+// to a coarse bytes/4 estimate so malformed inline media never collapses to 0.
 const INLINE_FILE_BYTES_ESTIMATE: usize = 12_000;
 const INLINE_AUDIO_BYTES_ESTIMATE: usize = 16_000;
+const CLAUDE_IMAGE_MAX_EDGE_PX: f64 = 1_568.0;
+const CLAUDE_IMAGE_MAX_TOKENS: usize = 1_568;
+const OPENAI_IMAGE_MAX_DIMENSION_PX: f64 = 2_048.0;
+const OPENAI_IMAGE_TILE_SIZE_PX: f64 = 512.0;
+const OPENAI_IMAGE_HIGH_DETAIL_SHORT_SIDE_PX: f64 = 768.0;
+const OPENAI_IMAGE_PATCH_SIZE_PX: f64 = 32.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ImageTokenEstimatorKind {
+    OpenAiTiles {
+        base_tokens: usize,
+        tile_tokens: usize,
+    },
+    OpenAiPatches {
+        patch_budget: usize,
+        max_dimension_px: f64,
+        multiplier: f64,
+    },
+    Anthropic,
+}
 
 fn estimate_payload_bytes_as_tokens(bytes: usize) -> usize {
     bytes.div_ceil(4).max(1)
@@ -181,6 +206,217 @@ fn parse_base64_image_data_url(url: &str) -> Option<&str> {
         return None;
     }
     Some(payload)
+}
+
+fn image_dimensions_from_data_url(image_url: &str) -> Option<(u32, u32)> {
+    let payload = parse_base64_image_data_url(image_url)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(payload)
+        .ok()?;
+    ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
+}
+
+fn image_token_estimator_kind_for_model(model_id: Option<&str>) -> ImageTokenEstimatorKind {
+    let normalized = model_id.unwrap_or_default().trim().to_ascii_lowercase();
+    if !normalized.contains("gpt") {
+        return ImageTokenEstimatorKind::Anthropic;
+    }
+
+    if normalized.contains("gpt-5.4-mini")
+        || normalized.contains("gpt-5-mini")
+        || normalized.contains("gpt-4.1-mini")
+    {
+        return ImageTokenEstimatorKind::OpenAiPatches {
+            patch_budget: 1_536,
+            max_dimension_px: OPENAI_IMAGE_MAX_DIMENSION_PX,
+            multiplier: 1.62,
+        };
+    }
+
+    if normalized.contains("gpt-5.4-nano")
+        || normalized.contains("gpt-5-nano")
+        || normalized.contains("gpt-4.1-nano")
+    {
+        return ImageTokenEstimatorKind::OpenAiPatches {
+            patch_budget: 1_536,
+            max_dimension_px: OPENAI_IMAGE_MAX_DIMENSION_PX,
+            multiplier: 2.46,
+        };
+    }
+
+    if normalized.contains("gpt-5.4") {
+        return ImageTokenEstimatorKind::OpenAiPatches {
+            patch_budget: 2_500,
+            max_dimension_px: OPENAI_IMAGE_MAX_DIMENSION_PX,
+            multiplier: 1.0,
+        };
+    }
+
+    if normalized.contains("gpt-5.3-codex")
+        || normalized.contains("gpt-5-codex")
+        || normalized.contains("gpt-5.1-codex-mini")
+        || normalized.contains("gpt-5.2-codex")
+        || normalized.contains("gpt-5.2-chat-latest")
+        || normalized.contains("gpt-5.2")
+    {
+        return ImageTokenEstimatorKind::OpenAiPatches {
+            patch_budget: 1_536,
+            max_dimension_px: OPENAI_IMAGE_MAX_DIMENSION_PX,
+            multiplier: 1.0,
+        };
+    }
+
+    if normalized.contains("gpt-4o-mini") {
+        return ImageTokenEstimatorKind::OpenAiTiles {
+            base_tokens: 2_833,
+            tile_tokens: 5_667,
+        };
+    }
+
+    if normalized.contains("gpt-5") {
+        return ImageTokenEstimatorKind::OpenAiTiles {
+            base_tokens: 70,
+            tile_tokens: 140,
+        };
+    }
+
+    if normalized.contains("gpt-4o")
+        || normalized.contains("gpt-4.1")
+        || normalized.contains("gpt-4.5")
+    {
+        return ImageTokenEstimatorKind::OpenAiTiles {
+            base_tokens: 85,
+            tile_tokens: 170,
+        };
+    }
+
+    ImageTokenEstimatorKind::OpenAiTiles {
+        base_tokens: 70,
+        tile_tokens: 140,
+    }
+}
+
+fn estimate_inline_image_tokens_for_model(model_id: Option<&str>, image_url: &str) -> usize {
+    let Some((width, height)) = image_dimensions_from_data_url(image_url) else {
+        return estimate_payload_bytes_as_tokens(image_url.len());
+    };
+    match image_token_estimator_kind_for_model(model_id) {
+        ImageTokenEstimatorKind::OpenAiTiles {
+            base_tokens,
+            tile_tokens,
+        } => estimate_openai_tiled_image_tokens(width, height, base_tokens, tile_tokens),
+        ImageTokenEstimatorKind::OpenAiPatches {
+            patch_budget,
+            max_dimension_px,
+            multiplier,
+        } => estimate_openai_patch_image_tokens(
+            width,
+            height,
+            patch_budget,
+            max_dimension_px,
+            multiplier,
+        ),
+        ImageTokenEstimatorKind::Anthropic => {
+            estimate_claude_image_tokens_from_dimensions(width, height)
+        }
+    }
+}
+
+fn estimate_openai_tiled_image_tokens(
+    width: u32,
+    height: u32,
+    base_tokens: usize,
+    tile_tokens: usize,
+) -> usize {
+    if width == 0 || height == 0 {
+        return base_tokens.max(1);
+    }
+
+    let mut width = width as f64;
+    let mut height = height as f64;
+    let fit_scale = (OPENAI_IMAGE_MAX_DIMENSION_PX / width.max(height)).min(1.0);
+    width *= fit_scale;
+    height *= fit_scale;
+
+    let shortest_side = width.min(height);
+    if shortest_side > 0.0 {
+        let detail_scale = OPENAI_IMAGE_HIGH_DETAIL_SHORT_SIDE_PX / shortest_side;
+        width *= detail_scale;
+        height *= detail_scale;
+    }
+
+    let tiles_w = (width / OPENAI_IMAGE_TILE_SIZE_PX).ceil().max(1.0) as usize;
+    let tiles_h = (height / OPENAI_IMAGE_TILE_SIZE_PX).ceil().max(1.0) as usize;
+    base_tokens.saturating_add(tile_tokens.saturating_mul(tiles_w.saturating_mul(tiles_h)))
+}
+
+fn estimate_openai_patch_image_tokens(
+    width: u32,
+    height: u32,
+    patch_budget: usize,
+    max_dimension_px: f64,
+    multiplier: f64,
+) -> usize {
+    if width == 0 || height == 0 {
+        return 1;
+    }
+
+    let width = width as f64;
+    let height = height as f64;
+    let original_patch_count =
+        (width / OPENAI_IMAGE_PATCH_SIZE_PX).ceil() * (height / OPENAI_IMAGE_PATCH_SIZE_PX).ceil();
+    let dimension_scale = (max_dimension_px / width.max(height)).min(1.0);
+    let budget_scale =
+        ((OPENAI_IMAGE_PATCH_SIZE_PX.powi(2) * patch_budget as f64) / (width * height)).sqrt();
+    let shrink_factor = dimension_scale.min(budget_scale).min(1.0);
+
+    let resized_patch_count = if original_patch_count <= patch_budget as f64
+        && width.max(height) <= max_dimension_px
+    {
+        original_patch_count
+    } else {
+        let scaled_width_in_patches = (width * shrink_factor) / OPENAI_IMAGE_PATCH_SIZE_PX;
+        let scaled_height_in_patches = (height * shrink_factor) / OPENAI_IMAGE_PATCH_SIZE_PX;
+        let width_adjust = if scaled_width_in_patches > 0.0 {
+            scaled_width_in_patches.floor().max(1.0) / scaled_width_in_patches
+        } else {
+            1.0
+        };
+        let height_adjust = if scaled_height_in_patches > 0.0 {
+            scaled_height_in_patches.floor().max(1.0) / scaled_height_in_patches
+        } else {
+            1.0
+        };
+        let adjusted_shrink_factor = shrink_factor * width_adjust.min(height_adjust);
+        let resized_patches_w = ((width * adjusted_shrink_factor) / OPENAI_IMAGE_PATCH_SIZE_PX)
+            .ceil()
+            .max(1.0);
+        let resized_patches_h = ((height * adjusted_shrink_factor) / OPENAI_IMAGE_PATCH_SIZE_PX)
+            .ceil()
+            .max(1.0);
+        (resized_patches_w * resized_patches_h).min(patch_budget as f64)
+    };
+
+    ((resized_patch_count * multiplier).ceil() as usize).max(1)
+}
+
+fn estimate_claude_image_tokens_from_dimensions(width: u32, height: u32) -> usize {
+    if width == 0 || height == 0 {
+        return 1;
+    }
+
+    let width = width as f64;
+    let height = height as f64;
+    let scale = (CLAUDE_IMAGE_MAX_EDGE_PX / width.max(height)).min(1.0);
+    let scaled_width = (width * scale).round().max(1.0);
+    let scaled_height = (height * scale).round().max(1.0);
+    let area = scaled_width * scaled_height;
+    let estimate = (area / 750.0).ceil() as usize;
+    estimate.clamp(1, CLAUDE_IMAGE_MAX_TOKENS)
 }
 
 fn value_text(value: &Value) -> String {
@@ -236,7 +472,7 @@ fn render_file_item(item_type: &str, item: &Value, extra_tokens: &mut usize) -> 
     }
 }
 
-fn render_content_item(item: &Value, extra_tokens: &mut usize) -> String {
+fn render_content_item(item: &Value, extra_tokens: &mut usize, model_id: Option<&str>) -> String {
     let Some(object) = item.as_object() else {
         return value_text(item);
     };
@@ -252,9 +488,8 @@ fn render_content_item(item: &Value, extra_tokens: &mut usize) -> String {
         "image_url" | "input_image" | "output_image" => {
             let image_url = image_url_value(item_type, item).unwrap_or_default();
             if parse_base64_image_data_url(&image_url).is_some() {
-                *extra_tokens = extra_tokens.saturating_add(estimate_payload_bytes_as_tokens(
-                    RESIZED_IMAGE_BYTES_ESTIMATE,
-                ));
+                *extra_tokens = extra_tokens
+                    .saturating_add(estimate_inline_image_tokens_for_model(model_id, &image_url));
                 "[inline image payload omitted for token estimate]".to_string()
             } else if image_url.is_empty() {
                 "[image]".to_string()
@@ -296,12 +531,16 @@ fn render_content_item(item: &Value, extra_tokens: &mut usize) -> String {
     }
 }
 
-fn render_message_content(content: &Option<Value>, extra_tokens: &mut usize) -> String {
+fn render_message_content(
+    content: &Option<Value>,
+    extra_tokens: &mut usize,
+    model_id: Option<&str>,
+) -> String {
     match content {
         Some(Value::String(text)) => text.clone(),
         Some(Value::Array(items)) => items
             .iter()
-            .map(|item| render_content_item(item, extra_tokens))
+            .map(|item| render_content_item(item, extra_tokens, model_id))
             .filter(|text| !text.is_empty())
             .collect::<Vec<_>>()
             .join("\n"),
@@ -337,7 +576,11 @@ fn render_tool_call(tool_call: &ToolCall) -> String {
     }
 }
 
-fn render_message(message: &ChatMessage, extra_tokens: &mut usize) -> String {
+fn render_message(
+    message: &ChatMessage,
+    extra_tokens: &mut usize,
+    model_id: Option<&str>,
+) -> String {
     let mut attrs = String::new();
     if let Some(name) = message.name.as_deref() {
         attrs.push_str(" name=\"");
@@ -351,7 +594,7 @@ fn render_message(message: &ChatMessage, extra_tokens: &mut usize) -> String {
     }
 
     let mut parts = vec![format!("<|{}{}|>", message.role, attrs)];
-    let content = render_message_content(&message.content, extra_tokens);
+    let content = render_message_content(&message.content, extra_tokens, model_id);
     if !content.trim().is_empty() {
         parts.push(content);
     }
@@ -361,10 +604,11 @@ fn render_message(message: &ChatMessage, extra_tokens: &mut usize) -> String {
     parts.join("\n")
 }
 
-pub fn render_builtin_prompt_for_estimate(
+fn render_builtin_prompt_for_estimate_with_model(
     messages: &[ChatMessage],
     tools: &[Tool],
     pending_user_prompt: &str,
+    model_id: Option<&str>,
 ) -> RenderedTokenEstimatePrompt {
     let mut inline_payload_tokens = 0usize;
     let mut sections = Vec::new();
@@ -377,7 +621,7 @@ pub fn render_builtin_prompt_for_estimate(
     sections.extend(
         messages
             .iter()
-            .map(|message| render_message(message, &mut inline_payload_tokens)),
+            .map(|message| render_message(message, &mut inline_payload_tokens, model_id)),
     );
     if !pending_user_prompt.is_empty() {
         sections.push(format!("<|user|>\n{pending_user_prompt}"));
@@ -388,6 +632,14 @@ pub fn render_builtin_prompt_for_estimate(
         inline_payload_tokens,
         template_label: "builtin".to_string(),
     }
+}
+
+pub fn render_builtin_prompt_for_estimate(
+    messages: &[ChatMessage],
+    tools: &[Tool],
+    pending_user_prompt: &str,
+) -> RenderedTokenEstimatePrompt {
+    render_builtin_prompt_for_estimate_with_model(messages, tools, pending_user_prompt, None)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -583,12 +835,20 @@ fn load_local_tokenizer(path: &Path) -> Option<Tokenizer> {
     Some(tokenizer)
 }
 
-fn message_to_template_value(message: &ChatMessage, extra_tokens: &mut usize) -> Value {
+fn message_to_template_value(
+    message: &ChatMessage,
+    extra_tokens: &mut usize,
+    model_id: Option<&str>,
+) -> Value {
     let mut object = serde_json::Map::new();
     object.insert("role".to_string(), Value::String(message.role.clone()));
     object.insert(
         "content".to_string(),
-        Value::String(render_message_content(&message.content, extra_tokens)),
+        Value::String(render_message_content(
+            &message.content,
+            extra_tokens,
+            model_id,
+        )),
     );
     if let Some(name) = &message.name {
         object.insert("name".to_string(), Value::String(name.clone()));
@@ -624,11 +884,12 @@ fn render_local_template_prompt_for_estimate(
     tools: &[Tool],
     pending_user_prompt: &str,
     label: String,
+    model_id: Option<&str>,
 ) -> Option<RenderedTokenEstimatePrompt> {
     let mut inline_payload_tokens = 0usize;
     let mut template_messages = messages
         .iter()
-        .map(|message| message_to_template_value(message, &mut inline_payload_tokens))
+        .map(|message| message_to_template_value(message, &mut inline_payload_tokens, model_id))
         .collect::<Vec<_>>();
     if !pending_user_prompt.is_empty() {
         template_messages.push(serde_json::json!({
@@ -666,9 +927,10 @@ fn render_local_template_prompt_for_estimate(
     })
 }
 
-pub fn render_prompt_for_token_estimate(
+fn render_prompt_for_token_estimate_with_model(
     input: TokenEstimateInput<'_>,
     token_estimation: Option<&TokenEstimationConfig>,
+    model_id: Option<&str>,
 ) -> RenderedTokenEstimatePrompt {
     if let Some(config) = token_estimation {
         match config.template.as_ref() {
@@ -681,6 +943,7 @@ pub fn render_prompt_for_token_estimate(
                         input.tools,
                         input.pending_user_prompt,
                         format!("local:{}", path.display()),
+                        model_id,
                     )
                 {
                     return rendered;
@@ -702,6 +965,7 @@ pub fn render_prompt_for_token_estimate(
                         input.tools,
                         input.pending_user_prompt,
                         format!("huggingface:{repo}@{revision}:{file}"),
+                        model_id,
                     )
                 {
                     return rendered;
@@ -725,6 +989,7 @@ pub fn render_prompt_for_token_estimate(
                             input.tools,
                             input.pending_user_prompt,
                             format!("huggingface:{repo}@{revision}:{file}"),
+                            model_id,
                         )
                     {
                         return rendered;
@@ -733,7 +998,19 @@ pub fn render_prompt_for_token_estimate(
             }
         }
     }
-    render_builtin_prompt_for_estimate(input.messages, input.tools, input.pending_user_prompt)
+    render_builtin_prompt_for_estimate_with_model(
+        input.messages,
+        input.tools,
+        input.pending_user_prompt,
+        model_id,
+    )
+}
+
+pub fn render_prompt_for_token_estimate(
+    input: TokenEstimateInput<'_>,
+    token_estimation: Option<&TokenEstimationConfig>,
+) -> RenderedTokenEstimatePrompt {
+    render_prompt_for_token_estimate_with_model(input, token_estimation, None)
 }
 
 pub fn estimate_rendered_tokens_for_model(
@@ -799,7 +1076,11 @@ pub fn estimate_session_tokens_for_request_uncalibrated(
     input: TokenEstimateInput<'_>,
     model: TokenEstimateModel<'_>,
 ) -> usize {
-    let rendered = render_prompt_for_token_estimate(input, model.token_estimation);
+    let rendered = render_prompt_for_token_estimate_with_model(
+        input,
+        model.token_estimation,
+        Some(model.model),
+    );
     estimate_rendered_tokens_for_model(&rendered, model)
 }
 
@@ -932,11 +1213,13 @@ pub fn estimate_session_tokens(
 #[cfg(test)]
 mod tests {
     use super::{
-        TokenEstimateInput, TokenEstimateModel, TokenEstimator, estimate_rendered_tokens_for_model,
-        estimate_session_tokens_for_estimator, estimate_session_tokens_for_model_with_config,
-        estimate_session_tokens_for_request, estimate_session_tokens_for_request_uncalibrated,
-        estimate_session_tokens_for_upstream, observe_prompt_token_estimate,
-        prompt_token_calibration_for_model, render_builtin_prompt_for_estimate,
+        TokenEstimateInput, TokenEstimateModel, TokenEstimator,
+        estimate_claude_image_tokens_from_dimensions, estimate_inline_image_tokens_for_model,
+        estimate_rendered_tokens_for_model, estimate_session_tokens_for_estimator,
+        estimate_session_tokens_for_model_with_config, estimate_session_tokens_for_request,
+        estimate_session_tokens_for_request_uncalibrated, estimate_session_tokens_for_upstream,
+        observe_prompt_token_estimate, prompt_token_calibration_for_model,
+        render_builtin_prompt_for_estimate, render_builtin_prompt_for_estimate_with_model,
         render_prompt_for_token_estimate, token_estimator_for_model,
     };
     use crate::config::{
@@ -948,8 +1231,11 @@ mod tests {
         ChatMessage, FunctionCall, ToolCall, context_content_block, tool_result_content_block,
     };
     use crate::tooling::Tool;
+    use base64::Engine as _;
+    use image::{ImageBuffer, ImageFormat, Rgba};
     use serde_json::json;
     use std::fs;
+    use std::io::Cursor;
     use tempfile::TempDir;
 
     fn synthetic_base64_payload(len: usize) -> String {
@@ -957,6 +1243,16 @@ mod tests {
         (0..len)
             .map(|index| alphabet[(index * 37 + index / 7) % alphabet.len()] as char)
             .collect()
+    }
+
+    fn png_data_url(width: u32, height: u32) -> String {
+        let image = ImageBuffer::from_pixel(width, height, Rgba([12, 34, 56, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image)
+            .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+            .unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        format!("data:image/png;base64,{encoded}")
     }
 
     #[test]
@@ -1032,6 +1328,61 @@ mod tests {
         assert!(!rendered.text.contains(&file_payload));
         assert!(rendered.text.contains("inline image payload omitted"));
         assert!(rendered.text.contains("inline file payload omitted"));
+    }
+
+    #[test]
+    fn gpt_models_use_openai_tile_estimator() {
+        let image_url = png_data_url(1_000, 1_000);
+        assert_eq!(
+            estimate_inline_image_tokens_for_model(Some("openai/gpt-5"), &image_url),
+            630
+        );
+
+        let message = ChatMessage {
+            role: "user".to_string(),
+            content: Some(json!([
+                {"type": "input_image", "image_url": image_url}
+            ])),
+            reasoning: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        };
+        let rendered =
+            render_builtin_prompt_for_estimate_with_model(&[message], &[], "", Some("gpt-5"));
+
+        assert_eq!(rendered.inline_payload_tokens, 630);
+        assert!(rendered.text.contains("inline image payload omitted"));
+    }
+
+    #[test]
+    fn gpt_patch_models_use_openai_patch_estimator() {
+        let image_url = png_data_url(1_024, 1_024);
+        assert_eq!(
+            estimate_inline_image_tokens_for_model(Some("gpt-5.3-codex"), &image_url),
+            1_024
+        );
+    }
+
+    #[test]
+    fn non_gpt_models_use_anthropic_estimator() {
+        let image_url = png_data_url(1_000, 1_000);
+        assert_eq!(
+            estimate_inline_image_tokens_for_model(Some("anthropic/claude-opus-4.6"), &image_url),
+            1_334
+        );
+    }
+
+    #[test]
+    fn anthropic_image_estimate_scales_large_dimensions_before_capping() {
+        assert_eq!(
+            estimate_claude_image_tokens_from_dimensions(3_136, 1_568),
+            1_568
+        );
+        assert_eq!(
+            estimate_claude_image_tokens_from_dimensions(10_000, 100),
+            34
+        );
     }
 
     #[test]
