@@ -181,6 +181,10 @@ pub struct UsageChartDay {
     pub total_usd: f64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
+    #[serde(default)]
+    pub cache_write_input_tokens: u64,
     pub llm_calls: u64,
 }
 

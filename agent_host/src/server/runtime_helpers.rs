@@ -513,12 +513,19 @@ pub(super) fn format_session_status(
     conversation_usage_report: &ConversationUsageReport,
     conversation_pricing: &ConversationPricingBreakdown,
 ) -> String {
+    let spend_aligned_usage = spend_aligned_conversation_usage(conversation_usage_report);
     let conversation_usage = &conversation_usage_report.total;
-    let usage = &conversation_usage.usage;
-    let today_usage = conversation_usage_report
-        .days
-        .last()
-        .map(|day| (&day.date, &day.usage));
+    let usage = &spend_aligned_usage.total;
+    let today_usage = conversation_usage_report.days.last().map(|day| {
+        (
+            &day.date,
+            spend_aligned_usage
+                .daily_usage
+                .get(&day.date)
+                .cloned()
+                .unwrap_or_default(),
+        )
+    });
     let today_spend_usd = conversation_usage_report
         .days
         .last()
@@ -581,7 +588,7 @@ pub(super) fn format_session_status(
                 context_source_label.as_str()
             ),
             String::new(),
-            match today_usage {
+            match today_usage.as_ref() {
                 Some((date, _usage)) => format!(
                     "今日 Conversation 用量（{}，Asia/Shanghai）：",
                     date.format("%Y-%m-%d")
@@ -592,31 +599,37 @@ pub(super) fn format_session_status(
             format!(
                 "- today_input_total_tokens: {}",
                 today_usage
+                    .as_ref()
                     .map(|(_, usage)| usage.input_total_tokens())
                     .unwrap_or_default()
             ),
             format!(
                 "- today_output_total_tokens: {}",
                 today_usage
+                    .as_ref()
                     .map(|(_, usage)| usage.output_total_tokens())
                     .unwrap_or_default()
             ),
             format!(
                 "- today_context_total_tokens: {}",
                 today_usage
+                    .as_ref()
                     .map(|(_, usage)| usage.context_total_tokens())
                     .unwrap_or_default()
             ),
             format!(
                 "- today_llm_calls: {}",
-                today_usage.map(|(_, usage)| usage.llm_calls).unwrap_or_default()
+                today_usage
+                    .as_ref()
+                    .map(|(_, usage)| usage.llm_calls)
+                    .unwrap_or_default()
             ),
             String::new(),
             format!(
                 "最近 {} 天 Conversation 总用量（所有 Agent）：",
                 conversation_usage_report.days.len()
             ),
-            "- source: token totals use agent turn usage logs; model costs use per-model model-call logs".to_string(),
+            "- source: usage is aligned to spend using model-call logs plus any turn usage not attributable to model-call events".to_string(),
             format!("- window_spend_usd: ${:.6}", conversation_pricing.total_usd),
             format!("- sessions: {}", conversation_usage.session_count),
             format!("- usage_events: {}", conversation_usage.event_count),
@@ -705,7 +718,7 @@ pub(super) fn format_session_status(
         ));
         lines.push(format!("- cache_read_rate: {:.2}%", legacy_cache_read_rate));
         lines.push(String::new());
-        lines.push("价格估算：总 token 使用 turn 日志避免历史 cumulative_usage 污染；金额按带 model 字段的 model-call 日志分模型计算，未知模型会明确列出并按 GLM 5.1 默认价格估算。".to_string());
+        lines.push("价格估算：usage 会优先对齐 model-call 日志以反映进行中的开销，再补上无法归因到 model-call 的 turn usage；未知模型会明确列出并按 GLM 5.1 默认价格估算。".to_string());
         lines.push(String::new());
         lines.push("累计上下文压缩统计：".to_string());
         lines.push(format!("- compaction_runs: {}", compaction.run_count));
@@ -779,7 +792,7 @@ pub(super) fn format_session_status(
                 context_source_label.as_str()
             ),
             String::new(),
-            match today_usage {
+            match today_usage.as_ref() {
                 Some((date, _usage)) => format!(
                     "Today conversation usage ({}, Asia/Shanghai):",
                     date.format("%Y-%m-%d")
@@ -790,31 +803,37 @@ pub(super) fn format_session_status(
             format!(
                 "- today_input_total_tokens: {}",
                 today_usage
+                    .as_ref()
                     .map(|(_, usage)| usage.input_total_tokens())
                     .unwrap_or_default()
             ),
             format!(
                 "- today_output_total_tokens: {}",
                 today_usage
+                    .as_ref()
                     .map(|(_, usage)| usage.output_total_tokens())
                     .unwrap_or_default()
             ),
             format!(
                 "- today_context_total_tokens: {}",
                 today_usage
+                    .as_ref()
                     .map(|(_, usage)| usage.context_total_tokens())
                     .unwrap_or_default()
             ),
             format!(
                 "- today_llm_calls: {}",
-                today_usage.map(|(_, usage)| usage.llm_calls).unwrap_or_default()
+                today_usage
+                    .as_ref()
+                    .map(|(_, usage)| usage.llm_calls)
+                    .unwrap_or_default()
             ),
             String::new(),
             format!(
                 "Last {} days conversation usage (all agents):",
                 conversation_usage_report.days.len()
             ),
-            "- source: token totals use agent turn usage logs; model costs use per-model model-call logs".to_string(),
+            "- source: usage is aligned to spend using model-call logs plus any turn usage not attributable to model-call events".to_string(),
             format!("- window_spend_usd: ${:.6}", conversation_pricing.total_usd),
             format!("- sessions: {}", conversation_usage.session_count),
             format!("- usage_events: {}", conversation_usage.event_count),
@@ -903,7 +922,7 @@ pub(super) fn format_session_status(
         ));
         lines.push(format!("- cache_read_rate: {:.2}%", legacy_cache_read_rate));
         lines.push(String::new());
-        lines.push("Estimated cost: token totals avoid legacy cumulative_usage pollution; spend is priced per model-call log, and unknown models are explicitly listed with the GLM 5.1 fallback price.".to_string());
+        lines.push("Estimated cost: usage is aligned to model-call logs so in-flight spend is reflected before a turn fully finishes; any turn usage missing model-call attribution is added back separately, and unknown models use the GLM 5.1 fallback price.".to_string());
         lines.push(String::new());
         lines.push("Cumulative context compaction stats:".to_string());
         lines.push(format!("- compaction_runs: {}", compaction.run_count));
@@ -1020,6 +1039,12 @@ pub(super) struct ModelCostSummary {
     pub event_count: u64,
     pub pricing_source: String,
     pub note: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct SpendAlignedConversationUsage {
+    pub total: TokenUsage,
+    pub daily_usage: BTreeMap<chrono::NaiveDate, TokenUsage>,
 }
 
 pub(super) fn collect_conversation_usage_report(
@@ -1154,6 +1179,25 @@ pub(super) fn collect_conversation_usage_report(
     }
     report.days.sort_by_key(|day| day.date);
     report
+}
+
+pub(super) fn spend_aligned_conversation_usage(
+    report: &ConversationUsageReport,
+) -> SpendAlignedConversationUsage {
+    let mut aligned = SpendAlignedConversationUsage::default();
+    for day in &report.days {
+        let mut attributed = TokenUsage::default();
+        for usage in report.model_usages.values() {
+            if let Some(daily_usage) = usage.daily_usage.get(&day.date) {
+                attributed.add_assign(daily_usage);
+            }
+        }
+        let unattributed = subtract_token_usage_floor(&day.usage, &attributed);
+        attributed.add_assign(&unattributed);
+        aligned.total.add_assign(&attributed);
+        aligned.daily_usage.insert(day.date, attributed);
+    }
+    aligned
 }
 
 pub(super) fn price_conversation_usage_report(

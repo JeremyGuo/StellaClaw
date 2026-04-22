@@ -3425,6 +3425,7 @@ fn build_status_usage_chart(
     report: &ConversationUsageReport,
     pricing: &ConversationPricingBreakdown,
 ) -> UsageChart {
+    let spend_aligned_usage = spend_aligned_conversation_usage(report);
     let title = if language.to_ascii_lowercase().starts_with("zh") {
         format!(
             "Conversation estimated spend, last {} days",
@@ -3442,16 +3443,25 @@ fn build_status_usage_chart(
         days: report
             .days
             .iter()
-            .map(|day| UsageChartDay {
-                label: day.date.format("%m-%d").to_string(),
-                total_usd: pricing
-                    .daily_costs
+            .map(|day| {
+                let usage = spend_aligned_usage
+                    .daily_usage
                     .get(&day.date)
-                    .copied()
-                    .unwrap_or_default(),
-                input_tokens: day.usage.input_total_tokens(),
-                output_tokens: day.usage.output_total_tokens(),
-                llm_calls: day.usage.llm_calls,
+                    .cloned()
+                    .unwrap_or_default();
+                UsageChartDay {
+                    label: day.date.format("%m-%d").to_string(),
+                    total_usd: pricing
+                        .daily_costs
+                        .get(&day.date)
+                        .copied()
+                        .unwrap_or_default(),
+                    input_tokens: usage.input_total_tokens(),
+                    output_tokens: usage.output_total_tokens(),
+                    cache_read_input_tokens: usage.cache_read_input_tokens(),
+                    cache_write_input_tokens: usage.cache_write_input_tokens(),
+                    llm_calls: usage.llm_calls,
+                }
             })
             .collect(),
     }
@@ -3526,7 +3536,8 @@ mod tests {
         ImageGenerationRouting, IncomingCommandLane, ModelPricing, RuntimeContext, Server,
         SummaryTracker, TokenUsage, automatic_anthropic_cache_control,
         automatic_anthropic_cache_ttl, background_timeout_with_active_children_text,
-        build_synthetic_runtime_messages, build_user_turn_message, channel_restart_backoff_seconds,
+        build_status_usage_chart, build_synthetic_runtime_messages, build_user_turn_message,
+        channel_restart_backoff_seconds,
         coalesce_buffered_conversation_messages, collect_conversation_usage_report,
         collect_conversation_usage_window, conversation_memory_root,
         estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
@@ -5588,6 +5599,97 @@ mod tests {
         assert!(text.contains("- today_input_total_tokens: 20"));
         assert!(text.contains("- window_spend_usd: $1.200000"));
         assert!(!text.contains("current_spend_usd"));
+    }
+
+    #[test]
+    fn status_usage_chart_and_text_use_spend_aligned_tokens_for_inflight_model_calls() {
+        let temp_dir = TempDir::new().unwrap();
+        let session = build_test_session(&temp_dir);
+        let model = anthropic_cache_test_model(
+            crate::config::ModelType::Openrouter,
+            "https://openrouter.ai/api/v1",
+            "anthropic/claude-sonnet-4.6",
+            None,
+        );
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 4, 22).unwrap();
+        let inflight_usage = TokenUsage {
+            llm_calls: 2,
+            prompt_tokens: 1,
+            completion_tokens: 25_000,
+            total_tokens: 25_001,
+            cache_hit_tokens: 1_500_000,
+            cache_miss_tokens: 1,
+            cache_read_tokens: 1_500_000,
+            cache_write_tokens: 500,
+        };
+        let mut daily_usage = BTreeMap::new();
+        daily_usage.insert(day, inflight_usage.clone());
+        let mut model_usages = BTreeMap::new();
+        model_usages.insert(
+            "anthropic/claude-sonnet-4.6".to_string(),
+            crate::server::ConversationModelUsage {
+                usage: inflight_usage.clone(),
+                daily_usage,
+                event_count: 2,
+                missing_cache_breakdown_events: 0,
+            },
+        );
+        let report = ConversationUsageReport {
+            days: vec![crate::server::ConversationDailyUsage {
+                date: day,
+                usage: TokenUsage {
+                    llm_calls: 0,
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    total_tokens: 0,
+                    cache_hit_tokens: 0,
+                    cache_miss_tokens: 0,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                event_count: 0,
+                missing_cache_breakdown_events: 0,
+            }],
+            total: crate::server::ConversationUsageWindow {
+                usage: TokenUsage::default(),
+                event_count: 0,
+                session_count: 1,
+                missing_cache_breakdown_events: 0,
+            },
+            model_usages,
+            model_call_event_count: 2,
+        };
+        let pricing = ConversationPricingBreakdown {
+            total_usd: 54.8028,
+            daily_costs: BTreeMap::from([(day, 54.8028)]),
+            ..ConversationPricingBreakdown::default()
+        };
+
+        let text = format_session_status(
+            "en",
+            "test-model",
+            &model,
+            &session,
+            120.0,
+            "model default",
+            12_000,
+            115_200,
+            None,
+            true,
+            &report,
+            &pricing,
+        );
+        let chart = build_status_usage_chart("en", &report, &pricing);
+
+        assert!(text.contains("- today_spend_usd: $54.802800"));
+        assert!(text.contains("- today_input_total_tokens: 1"));
+        assert!(text.contains("- cache_read_input_tokens: 1500000"));
+        assert_eq!(chart.days.len(), 1);
+        assert_eq!(chart.days[0].input_tokens, 1);
+        assert_eq!(chart.days[0].output_tokens, 25_000);
+        assert_eq!(chart.days[0].cache_read_input_tokens, 1_500_000);
+        assert_eq!(chart.days[0].cache_write_input_tokens, 500);
+        assert_eq!(chart.days[0].llm_calls, 2);
     }
 
     #[test]

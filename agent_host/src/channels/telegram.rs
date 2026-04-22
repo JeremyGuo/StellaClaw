@@ -1012,7 +1012,13 @@ chart = json.loads(sys.stdin.read())
 days = chart.get("days", [])
 labels = [str(day.get("label", "")) for day in days]
 costs = [float(day.get("total_usd", 0.0) or 0.0) for day in days]
-tokens = [int(day.get("input_tokens", 0) or 0) + int(day.get("output_tokens", 0) or 0) for day in days]
+tokens = [
+    int(day.get("input_tokens", 0) or 0)
+    + int(day.get("output_tokens", 0) or 0)
+    + int(day.get("cache_read_input_tokens", 0) or 0)
+    + int(day.get("cache_write_input_tokens", 0) or 0)
+    for day in days
+]
 
 fig, ax_cost = plt.subplots(figsize=(9, 4.8), dpi=160)
 bars = ax_cost.bar(labels, costs, color="#2563eb", label="Estimated cost")
@@ -1023,8 +1029,8 @@ for bar, cost in zip(bars, costs):
     ax_cost.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"${cost:.4f}", ha="center", va="bottom", fontsize=8)
 
 ax_tokens = ax_cost.twinx()
-ax_tokens.plot(labels, tokens, color="#16a34a", marker="o", linewidth=2, label="Tokens")
-ax_tokens.set_ylabel("Input + output tokens")
+ax_tokens.plot(labels, tokens, color="#16a34a", marker="o", linewidth=2, label="Billable tokens")
+ax_tokens.set_ylabel("Billable tokens")
 
 lines_1, labels_1 = ax_cost.get_legend_handles_labels()
 lines_2, labels_2 = ax_tokens.get_legend_handles_labels()
