@@ -5501,6 +5501,96 @@ mod tests {
     }
 
     #[test]
+    fn session_status_distinguishes_today_usage_from_window_totals() {
+        let temp_dir = TempDir::new().unwrap();
+        let session = build_test_session(&temp_dir);
+        let model = anthropic_cache_test_model(
+            crate::config::ModelType::Openrouter,
+            "https://openrouter.ai/api/v1",
+            "anthropic/claude-sonnet-4.6",
+            None,
+        );
+        let day_one = chrono::NaiveDate::from_ymd_opt(2026, 4, 21).unwrap();
+        let day_two = chrono::NaiveDate::from_ymd_opt(2026, 4, 22).unwrap();
+        let report = ConversationUsageReport {
+            days: vec![
+                crate::server::ConversationDailyUsage {
+                    date: day_one,
+                    usage: TokenUsage {
+                        llm_calls: 2,
+                        prompt_tokens: 100,
+                        completion_tokens: 10,
+                        total_tokens: 110,
+                        cache_hit_tokens: 0,
+                        cache_miss_tokens: 100,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                    },
+                    event_count: 1,
+                    missing_cache_breakdown_events: 0,
+                },
+                crate::server::ConversationDailyUsage {
+                    date: day_two,
+                    usage: TokenUsage {
+                        llm_calls: 1,
+                        prompt_tokens: 20,
+                        completion_tokens: 5,
+                        total_tokens: 25,
+                        cache_hit_tokens: 0,
+                        cache_miss_tokens: 20,
+                        cache_read_tokens: 0,
+                        cache_write_tokens: 0,
+                    },
+                    event_count: 1,
+                    missing_cache_breakdown_events: 0,
+                },
+            ],
+            total: crate::server::ConversationUsageWindow {
+                usage: TokenUsage {
+                    llm_calls: 3,
+                    prompt_tokens: 120,
+                    completion_tokens: 15,
+                    total_tokens: 135,
+                    cache_hit_tokens: 0,
+                    cache_miss_tokens: 120,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                },
+                event_count: 2,
+                session_count: 1,
+                missing_cache_breakdown_events: 0,
+            },
+            ..ConversationUsageReport::default()
+        };
+        let pricing = ConversationPricingBreakdown {
+            total_usd: 1.2,
+            daily_costs: BTreeMap::from([(day_one, 0.5), (day_two, 0.7)]),
+            ..ConversationPricingBreakdown::default()
+        };
+
+        let text = format_session_status(
+            "en",
+            "test-model",
+            &model,
+            &session,
+            120.0,
+            "model default",
+            12_000,
+            115_200,
+            None,
+            true,
+            &report,
+            &pricing,
+        );
+
+        assert!(text.contains("Today conversation usage (2026-04-22, Asia/Shanghai):"));
+        assert!(text.contains("- today_spend_usd: $0.700000"));
+        assert!(text.contains("- today_input_total_tokens: 20"));
+        assert!(text.contains("- window_spend_usd: $1.200000"));
+        assert!(!text.contains("current_spend_usd"));
+    }
+
+    #[test]
     fn conversation_usage_window_sums_last_24h_turn_logs_for_same_conversation() {
         let temp_dir = TempDir::new().unwrap();
         let workdir = temp_dir.path();

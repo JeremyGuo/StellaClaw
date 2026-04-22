@@ -515,6 +515,16 @@ pub(super) fn format_session_status(
 ) -> String {
     let conversation_usage = &conversation_usage_report.total;
     let usage = &conversation_usage.usage;
+    let today_usage = conversation_usage_report
+        .days
+        .last()
+        .map(|day| (&day.date, &day.usage));
+    let today_spend_usd = conversation_usage_report
+        .days
+        .last()
+        .and_then(|day| conversation_pricing.daily_costs.get(&day.date))
+        .copied()
+        .unwrap_or_default();
     let legacy_usage = &session.cumulative_usage;
     let compaction = &session.cumulative_compaction;
     let cache_read_rate = if usage.input_total_tokens() == 0 {
@@ -571,12 +581,43 @@ pub(super) fn format_session_status(
                 context_source_label.as_str()
             ),
             String::new(),
+            match today_usage {
+                Some((date, _usage)) => format!(
+                    "今日 Conversation 用量（{}，Asia/Shanghai）：",
+                    date.format("%Y-%m-%d")
+                ),
+                None => "今日 Conversation 用量（Asia/Shanghai）：".to_string(),
+            },
+            format!("- today_spend_usd: ${:.6}", today_spend_usd),
+            format!(
+                "- today_input_total_tokens: {}",
+                today_usage
+                    .map(|(_, usage)| usage.input_total_tokens())
+                    .unwrap_or_default()
+            ),
+            format!(
+                "- today_output_total_tokens: {}",
+                today_usage
+                    .map(|(_, usage)| usage.output_total_tokens())
+                    .unwrap_or_default()
+            ),
+            format!(
+                "- today_context_total_tokens: {}",
+                today_usage
+                    .map(|(_, usage)| usage.context_total_tokens())
+                    .unwrap_or_default()
+            ),
+            format!(
+                "- today_llm_calls: {}",
+                today_usage.map(|(_, usage)| usage.llm_calls).unwrap_or_default()
+            ),
+            String::new(),
             format!(
                 "最近 {} 天 Conversation 总用量（所有 Agent）：",
                 conversation_usage_report.days.len()
             ),
             "- source: token totals use agent turn usage logs; model costs use per-model model-call logs".to_string(),
-            format!("- 当前已消费金额: ${:.6}", conversation_pricing.total_usd),
+            format!("- window_spend_usd: ${:.6}", conversation_pricing.total_usd),
             format!("- sessions: {}", conversation_usage.session_count),
             format!("- usage_events: {}", conversation_usage.event_count),
             format!(
@@ -738,12 +779,43 @@ pub(super) fn format_session_status(
                 context_source_label.as_str()
             ),
             String::new(),
+            match today_usage {
+                Some((date, _usage)) => format!(
+                    "Today conversation usage ({}, Asia/Shanghai):",
+                    date.format("%Y-%m-%d")
+                ),
+                None => "Today conversation usage (Asia/Shanghai):".to_string(),
+            },
+            format!("- today_spend_usd: ${:.6}", today_spend_usd),
+            format!(
+                "- today_input_total_tokens: {}",
+                today_usage
+                    .map(|(_, usage)| usage.input_total_tokens())
+                    .unwrap_or_default()
+            ),
+            format!(
+                "- today_output_total_tokens: {}",
+                today_usage
+                    .map(|(_, usage)| usage.output_total_tokens())
+                    .unwrap_or_default()
+            ),
+            format!(
+                "- today_context_total_tokens: {}",
+                today_usage
+                    .map(|(_, usage)| usage.context_total_tokens())
+                    .unwrap_or_default()
+            ),
+            format!(
+                "- today_llm_calls: {}",
+                today_usage.map(|(_, usage)| usage.llm_calls).unwrap_or_default()
+            ),
+            String::new(),
             format!(
                 "Last {} days conversation usage (all agents):",
                 conversation_usage_report.days.len()
             ),
             "- source: token totals use agent turn usage logs; model costs use per-model model-call logs".to_string(),
-            format!("- current_spend_usd: ${:.6}", conversation_pricing.total_usd),
+            format!("- window_spend_usd: ${:.6}", conversation_pricing.total_usd),
             format!("- sessions: {}", conversation_usage.session_count),
             format!("- usage_events: {}", conversation_usage.event_count),
             format!(
