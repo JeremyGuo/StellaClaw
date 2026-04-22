@@ -1,6 +1,6 @@
 use crate::attachment_prep::normalize_stored_attachment_for_persistence;
 use crate::backend::AgentBackendKind;
-use crate::channel::PendingAttachment;
+use crate::channel::{IncomingMessage, PendingAttachment};
 use crate::config::SandboxMode;
 use crate::domain::{ChannelAddress, StoredAttachment, validate_conversation_id};
 use crate::session::{SessionActorRef, SessionManager};
@@ -123,6 +123,19 @@ pub struct ConversationManager {
 }
 
 impl ConversationManager {
+    fn workdir_root(&self) -> &Path {
+        self.conversations_root
+            .parent()
+            .unwrap_or(self.conversations_root.as_path())
+    }
+
+    fn workspace_files_root_for_id(&self, workspace_id: &str) -> PathBuf {
+        self.workdir_root()
+            .join("workspaces")
+            .join(workspace_id)
+            .join("files")
+    }
+
     pub fn new(workdir: impl AsRef<Path>) -> Result<Self> {
         let conversations_root = workdir.as_ref().join("conversations");
         fs::create_dir_all(&conversations_root)
@@ -207,6 +220,28 @@ impl ConversationManager {
         }
         state.foreground_actor = Some(actor.clone());
         Ok(actor)
+    }
+
+    pub fn resolve_attachment_storage_dir(
+        &mut self,
+        address: &ChannelAddress,
+        sessions: &mut SessionManager,
+    ) -> Result<PathBuf> {
+        let workspace_id = self
+            .ensure_state_mut(address)?
+            .settings
+            .workspace_id
+            .clone();
+        if let Some(workspace_id) = workspace_id.as_deref() {
+            let attachments_dir = self
+                .workspace_files_root_for_id(workspace_id)
+                .join("upload");
+            fs::create_dir_all(&attachments_dir)
+                .with_context(|| format!("failed to create {}", attachments_dir.display()))?;
+            return Ok(attachments_dir);
+        }
+        let actor = self.ensure_foreground_actor(address, sessions)?;
+        Ok(actor.snapshot()?.attachments_dir)
     }
 
     pub fn resolve_foreground_actor(
@@ -400,6 +435,23 @@ impl ConversationManager {
     }
 }
 
+pub async fn prepare_incoming_conversation_message(
+    attachments_dir: Option<&Path>,
+    mut incoming: IncomingMessage,
+) -> Result<IncomingMessage> {
+    if let Some(attachments_dir) = attachments_dir
+        && !incoming.attachments.is_empty()
+    {
+        let mut stored_attachments = materialize_conversation_attachments(
+            attachments_dir,
+            std::mem::take(&mut incoming.attachments),
+        )
+        .await?;
+        incoming.stored_attachments.append(&mut stored_attachments);
+    }
+    Ok(incoming)
+}
+
 pub fn resolve_local_mount_path(raw: &str, base_dir: &Path) -> Result<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -541,6 +593,35 @@ mod tests {
             .unwrap()
             .expect("foreground actor should resolve from session registry");
         assert!(first.ptr_eq(&resolved));
+    }
+
+    #[test]
+    fn resolves_attachment_storage_dir_from_conversation_workspace_without_session() {
+        let temp_dir = TempDir::new().unwrap();
+        let address = test_address();
+        let workspace_manager = WorkspaceManager::load_or_create(temp_dir.path()).unwrap();
+        let mut sessions = SessionManager::new(temp_dir.path(), workspace_manager).unwrap();
+        let mut conversations = ConversationManager::new(temp_dir.path()).unwrap();
+
+        conversations
+            .set_workspace_id(&address, Some("workspace-1".to_string()))
+            .unwrap();
+
+        let attachments_dir = conversations
+            .resolve_attachment_storage_dir(&address, &mut sessions)
+            .unwrap();
+
+        assert_eq!(
+            attachments_dir,
+            temp_dir
+                .path()
+                .join("workspaces")
+                .join("workspace-1")
+                .join("files")
+                .join("upload")
+        );
+        assert!(attachments_dir.is_dir());
+        assert!(sessions.get_snapshot(&address).is_none());
     }
 
     #[test]

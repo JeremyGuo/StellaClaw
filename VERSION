@@ -1,5 +1,40 @@
-version: 0.26.4
+version: 0.27.2
 ---
+
+# 0.27.2
+
+- 统一 durable `ChatMessage` 的多模态 canonical 形态：
+  用户入站附件、tool synthetic multimodal 回灌，以及 provider/assistant 多模态输出现在都会在进入持久化消息前收敛为 workspace 相对路径的 canonical content item；运行时不再把本地多模态数据直接持久化成 inline base64。
+- 下沉 provider-specific 多模态物化到最后请求边界：
+  `agent_frame` 现在会在真正发请求前，按当前上游能力把 path-based image/pdf/audio 项临时物化成 inline request payload；assistant 历史里的多模态内容则会在请求视图里降级成稳定路径占位文本，避免 durable message 和 provider payload 混层。
+- 新增 `0.37 -> 0.38` workdir upgrade 迁移历史多模态消息：
+  upgrade 会重写 `session.json` 与 `snapshot.json` 里的历史 inline 多模态内容，把可持久化的图片/文件/音频内容落盘到 workspace 下的 `media/legacy/` 并改写为相对路径引用，确保旧 workdir 恢复后和新运行期写出的消息结构一致。
+- 补充 canonical message 回归测试：
+  新增针对 path-based user attachment 组装、tool/provider 多模态 canonicalization、request-time materialization，以及 `0.38` 历史 workdir 迁移的测试，保护新的消息边界不被回退。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  workdir 版本从 `0.37` 提升到 `0.38`；仓库版本按 workdir-only 变更策略从 `0.27.1` 提升到 `0.27.2`。
+
+# 0.27.1
+
+- 清理运行期对旧 token 日志字段的重复兼容：
+  `agent_frame` / `agent_host` 当前写出的 token/accounting 日志不再附带 `legacy_*` 字段；运行期统计与 `/status` 相关日志解析也不再直接读取 `legacy_*` 或旧的 `prompt_tokens`/`completion_tokens` 这类字段。
+- 新增 `0.36 -> 0.37` workdir upgrade 统一规范历史日志：
+  upgrade 会重写 `logs/agents/*.jsonl` 与 `logs/api/*.jsonl` 里的历史 token/accounting 事件，把旧字段折算成 `input_total_tokens`、`cache_read_input_tokens` 等 canonical 字段，并移除 legacy 字段，确保兼容边界只留在 upgrade。
+- 补充日志 schema 回归测试与文档更新：
+  新增针对日志升级重写的测试，并同步更新 logging/features 文档，明确当前运行期只认 canonical token 字段。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  workdir 版本从 `0.36` 提升到 `0.37`；仓库版本按 workdir-only 变更策略从 `0.27.0` 提升到 `0.27.1`。
+
+# 0.27.0
+
+- 收紧最新 `config` schema 的兼容边界：
+  最新 `0.28` AgentHost config loader 现在只接受当前字段名和当前嵌套结构；`models.<alias>.web_search_model`、扁平的 compaction 字段以及 `sandbox.mode = "disabled"` 不再由最新 parser 静默兼容，旧格式只保留在历史版本 loader 的升级路径里处理。
+- 清理核心运行期对旧 backend / 旧 workspace shared 形态的重复兼容：
+  `AgentBackendKind` 运行期反序列化不再直接接受历史 `"zgent"` 值；workspace 初始化也不再在正常运行时把旧的本地 `shared/` 目录合并迁移为共享 symlink，而是要求 workdir 先经过正式 upgrade。
+- 补充配置与兼容边界回归测试：
+  新增针对最新 config 拒绝旧字段、旧版本 loader 仍能升级 `"zgent"`/`"disabled"` 配置，以及 agent_frame 最新配置拒绝扁平 compaction 字段的测试，保护“兼容只留在 loader/upgrade”这一约束。
+- 本次只影响 `config` schema，不影响 `workdir` schema：
+  AgentHost config 版本从 `0.27` 提升到 `0.28`，新增 `v0_28` loader；仓库版本按 config 变更策略从 `0.26.4` 提升到 `0.27.0`。
 
 # 0.26.4
 

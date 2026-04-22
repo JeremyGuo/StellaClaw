@@ -1,5 +1,15 @@
 use super::*;
 
+macro_rules! agent_event_log {
+    ($level:expr, $($arg:tt)*) => {{
+        match $level {
+            tracing::Level::INFO => tracing::info!($($arg)*),
+            tracing::Level::DEBUG => tracing::debug!($($arg)*),
+            _ => tracing::info!($($arg)*),
+        }
+    }};
+}
+
 pub(super) fn parse_uuid_arg(
     arguments: &serde_json::Map<String, Value>,
     key: &str,
@@ -42,7 +52,11 @@ pub(super) fn optional_string_arg(
 
 #[cfg(test)]
 mod tests {
-    use super::{cron_schedule_from_required_tool_args, optional_cron_schedule_from_tool_args};
+    use super::{
+        agent_frame_event_log_level, cron_schedule_from_required_tool_args,
+        optional_cron_schedule_from_tool_args,
+    };
+    use agent_frame::SessionEvent;
     use serde_json::{Value, json};
 
     fn object(value: Value) -> serde_json::Map<String, Value> {
@@ -96,6 +110,72 @@ mod tests {
         }));
 
         assert_eq!(optional_cron_schedule_from_tool_args(&args).unwrap(), None);
+    }
+
+    #[test]
+    fn agent_frame_log_level_keeps_usage_and_terminal_events_at_info() {
+        assert_eq!(
+            agent_frame_event_log_level(&SessionEvent::ModelCallCompleted {
+                round_index: 0,
+                tool_call_count: 0,
+                api_request_id: Some("req_123".to_string()),
+                request_cache_control_type: Some("ephemeral".to_string()),
+                request_cache_control_ttl: Some("5m".to_string()),
+                request_has_cache_breakpoint: true,
+                request_cache_breakpoint_count: 1,
+                prompt_tokens: 100,
+                completion_tokens: 20,
+                total_tokens: 120,
+                cache_hit_tokens: 0,
+                cache_miss_tokens: 100,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                assistant_message: None,
+            }),
+            tracing::Level::INFO
+        );
+        assert_eq!(
+            agent_frame_event_log_level(&SessionEvent::SessionCompleted {
+                message_count: 4,
+                total_tokens: 120,
+            }),
+            tracing::Level::INFO
+        );
+    }
+
+    #[test]
+    fn agent_frame_log_level_demotes_high_frequency_process_events_to_debug() {
+        assert_eq!(
+            agent_frame_event_log_level(&SessionEvent::RoundStarted {
+                round_index: 0,
+                message_count: 3,
+            }),
+            tracing::Level::DEBUG
+        );
+        assert_eq!(
+            agent_frame_event_log_level(&SessionEvent::ToolCallCompleted {
+                round_index: 0,
+                tool_name: "exec".to_string(),
+                tool_call_id: "call_123".to_string(),
+                argument_summary: Some("exec cmd=\"ls\"".to_string()),
+                output_len: 42,
+                errored: false,
+                output: None,
+            }),
+            tracing::Level::INFO
+        );
+        assert_eq!(
+            agent_frame_event_log_level(&SessionEvent::ToolCallCompleted {
+                round_index: 0,
+                tool_name: "exec".to_string(),
+                tool_call_id: "call_456".to_string(),
+                argument_summary: Some("exec cmd=\"false\"".to_string()),
+                output_len: 42,
+                errored: true,
+                output: None,
+            }),
+            tracing::Level::INFO
+        );
     }
 }
 
@@ -1412,12 +1492,6 @@ fn event_has_cache_breakdown(value: &Value) -> bool {
         "cache_read_input_tokens",
         "cache_write_input_tokens",
         "cache_uncached_input_tokens",
-        "cache_read_tokens",
-        "cache_write_tokens",
-        "cache_miss_tokens",
-        "legacy_cache_read_tokens",
-        "legacy_cache_write_tokens",
-        "legacy_cache_miss_tokens",
     ]
     .iter()
     .any(|key| value.get(*key).is_some())
@@ -1428,62 +1502,15 @@ fn first_u64_field(value: &Value, keys: &[&str]) -> Option<u64> {
 }
 
 fn token_usage_from_log_event(value: &Value) -> TokenUsage {
-    let prompt_tokens = first_u64_field(
-        value,
-        &[
-            "input_total_tokens",
-            "prompt_tokens",
-            "legacy_prompt_tokens",
-        ],
-    )
-    .unwrap_or(0);
-    let completion_tokens = first_u64_field(
-        value,
-        &[
-            "output_total_tokens",
-            "completion_tokens",
-            "legacy_completion_tokens",
-        ],
-    )
-    .unwrap_or(0);
-    let total_tokens = first_u64_field(
-        value,
-        &[
-            "context_total_tokens",
-            "total_tokens",
-            "legacy_total_tokens",
-        ],
-    )
-    .unwrap_or_else(|| prompt_tokens.saturating_add(completion_tokens));
-    let cache_read_tokens = first_u64_field(
-        value,
-        &[
-            "cache_read_input_tokens",
-            "cache_read_tokens",
-            "legacy_cache_read_tokens",
-        ],
-    )
-    .unwrap_or(0);
-    let cache_write_tokens = first_u64_field(
-        value,
-        &[
-            "cache_write_input_tokens",
-            "cache_write_tokens",
-            "legacy_cache_write_tokens",
-        ],
-    )
-    .unwrap_or(0);
-    let cache_miss_tokens = first_u64_field(
-        value,
-        &[
-            "cache_uncached_input_tokens",
-            "cache_miss_tokens",
-            "legacy_cache_miss_tokens",
-        ],
-    )
-    .unwrap_or_else(|| prompt_tokens.saturating_sub(cache_read_tokens));
-    let cache_hit_tokens = first_u64_field(value, &["cache_hit_tokens", "legacy_cache_hit_tokens"])
-        .unwrap_or(cache_read_tokens);
+    let prompt_tokens = first_u64_field(value, &["input_total_tokens"]).unwrap_or(0);
+    let completion_tokens = first_u64_field(value, &["output_total_tokens"]).unwrap_or(0);
+    let total_tokens = first_u64_field(value, &["context_total_tokens"])
+        .unwrap_or_else(|| prompt_tokens.saturating_add(completion_tokens));
+    let cache_read_tokens = first_u64_field(value, &["cache_read_input_tokens"]).unwrap_or(0);
+    let cache_write_tokens = first_u64_field(value, &["cache_write_input_tokens"]).unwrap_or(0);
+    let cache_miss_tokens = first_u64_field(value, &["cache_uncached_input_tokens"])
+        .unwrap_or_else(|| prompt_tokens.saturating_sub(cache_read_tokens));
+    let cache_hit_tokens = cache_read_tokens;
     TokenUsage {
         llm_calls: first_u64_field(value, &["llm_calls"]).unwrap_or(1),
         prompt_tokens,
@@ -1895,15 +1922,56 @@ pub(super) fn log_turn_usage(
         cache_write_input_tokens = usage.cache_write_input_tokens(),
         cache_uncached_input_tokens = usage.cache_uncached_input_tokens(),
         normal_billed_input_tokens = usage.normal_billed_input_tokens(),
-        legacy_prompt_tokens = usage.prompt_tokens,
-        legacy_completion_tokens = usage.completion_tokens,
-        legacy_total_tokens = usage.total_tokens,
-        legacy_cache_hit_tokens = usage.cache_hit_tokens,
-        legacy_cache_miss_tokens = usage.cache_miss_tokens,
-        legacy_cache_read_tokens = usage.cache_read_tokens,
-        legacy_cache_write_tokens = usage.cache_write_tokens,
         "recorded turn token usage"
     );
+}
+
+fn agent_frame_event_log_level(event: &SessionEvent) -> tracing::Level {
+    match event {
+        SessionEvent::SessionStarted { .. }
+        | SessionEvent::CompactionCompleted { .. }
+        | SessionEvent::ModelCallCompleted { .. }
+        | SessionEvent::ToolCallCompleted { .. }
+        | SessionEvent::SessionYielded { .. }
+        | SessionEvent::SessionCompleted { .. } => tracing::Level::INFO,
+        SessionEvent::CompactionStarted { .. }
+        | SessionEvent::RoundStarted { .. }
+        | SessionEvent::ModelCallStarted { .. }
+        | SessionEvent::ToolWaitCompactionScheduled { .. }
+        | SessionEvent::ToolWaitCompactionStarted { .. }
+        | SessionEvent::ToolWaitCompactionCompleted { .. }
+        | SessionEvent::ToolCallStarted { .. }
+        | SessionEvent::PrefixRewriteApplied { .. } => tracing::Level::DEBUG,
+    }
+}
+
+fn truncate_log_preview(value: &str, max_chars: usize) -> (String, bool) {
+    let trimmed = value.trim();
+    let mut preview = String::new();
+    for character in trimmed.chars().take(max_chars) {
+        preview.push(character);
+    }
+    let truncated = trimmed.chars().count() > max_chars;
+    if truncated {
+        preview.push_str("...");
+    }
+    (preview, truncated)
+}
+
+fn tool_output_error_summary(output: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<Value>(output).ok();
+    if let Some(error) = parsed
+        .as_ref()
+        .and_then(Value::as_object)
+        .and_then(|object| object.get("error"))
+    {
+        return Some(match error {
+            Value::String(text) => truncate_log_preview(text, 180).0,
+            other => truncate_log_preview(&other.to_string(), 180).0,
+        });
+    }
+    let (preview, _) = truncate_log_preview(output, 180);
+    (!preview.is_empty()).then_some(preview)
 }
 
 pub(super) fn log_agent_frame_event(
@@ -1919,13 +1987,15 @@ pub(super) fn log_agent_frame_event(
         AgentPromptKind::MainBackground => "main_background",
         AgentPromptKind::SubAgent => "subagent",
     };
+    let level = agent_frame_event_log_level(event);
     match event {
         SessionEvent::SessionStarted {
             previous_message_count,
             prompt_len,
             tool_definition_count,
             skill_count,
-        } => info!(
+        } => agent_event_log!(
+            level,
             log_stream = "agent",
             log_key = %agent_id,
             kind = "agent_frame_session_started",
@@ -1943,7 +2013,8 @@ pub(super) fn log_agent_frame_event(
         SessionEvent::CompactionStarted {
             phase,
             message_count,
-        } => info!(
+        } => agent_event_log!(
+            level,
             log_stream = "agent",
             log_key = %agent_id,
             kind = "agent_frame_compaction_started",
@@ -1964,7 +2035,8 @@ pub(super) fn log_agent_frame_event(
             token_limit,
             structured_output,
             compacted_messages,
-        } => info!(
+        } => agent_event_log!(
+            level,
             log_stream = "agent",
             log_key = %agent_id,
             kind = "agent_frame_compaction_completed",
@@ -1988,7 +2060,8 @@ pub(super) fn log_agent_frame_event(
         SessionEvent::RoundStarted {
             round_index,
             message_count,
-        } => info!(
+        } => agent_event_log!(
+            level,
             log_stream = "agent",
             log_key = %agent_id,
             kind = "agent_frame_round_started",
@@ -2004,7 +2077,8 @@ pub(super) fn log_agent_frame_event(
         SessionEvent::ModelCallStarted {
             round_index,
             message_count,
-        } => info!(
+        } => agent_event_log!(
+            level,
             log_stream = "agent",
             log_key = %agent_id,
             kind = "agent_frame_model_call_started",
@@ -2021,47 +2095,79 @@ pub(super) fn log_agent_frame_event(
             round_index,
             tool_call_count,
             api_request_id,
+            request_cache_control_type,
+            request_cache_control_ttl,
+            request_has_cache_breakpoint,
+            request_cache_breakpoint_count,
             prompt_tokens,
             completion_tokens,
             total_tokens,
-            cache_hit_tokens,
+            cache_hit_tokens: _,
             cache_miss_tokens,
             cache_read_tokens,
             cache_write_tokens,
-            ..
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_model_call_completed",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model_key,
-            model = model_id,
-            round_index = *round_index as u64,
-            tool_call_count = *tool_call_count as u64,
-            api_request_id = api_request_id.as_deref().unwrap_or(""),
-            input_total_tokens = *prompt_tokens,
-            output_total_tokens = *completion_tokens,
-            context_total_tokens = *total_tokens,
-            cache_read_input_tokens = *cache_read_tokens,
-            cache_write_input_tokens = *cache_write_tokens,
-            cache_uncached_input_tokens = *cache_miss_tokens,
-            normal_billed_input_tokens = (*cache_miss_tokens).saturating_sub(*cache_write_tokens),
-            legacy_prompt_tokens = *prompt_tokens,
-            legacy_completion_tokens = *completion_tokens,
-            legacy_total_tokens = *total_tokens,
-            legacy_cache_hit_tokens = *cache_hit_tokens,
-            legacy_cache_miss_tokens = *cache_miss_tokens,
-            legacy_cache_read_tokens = *cache_read_tokens,
-            legacy_cache_write_tokens = *cache_write_tokens,
-            "agent_frame model call completed"
-        ),
+            assistant_message,
+        } => {
+            agent_event_log!(
+                level,
+                log_stream = "agent",
+                log_key = %agent_id,
+                kind = "agent_frame_model_call_completed",
+                log_detail = "summary",
+                session_id = %session.id,
+                channel_id = %session.address.channel_id,
+                agent_kind,
+                model_key,
+                model = model_id,
+                round_index = *round_index as u64,
+                tool_call_count = *tool_call_count as u64,
+                api_request_id = api_request_id.as_deref().unwrap_or(""),
+                request_cache_control_type = request_cache_control_type.as_deref().unwrap_or(""),
+                request_cache_control_ttl = request_cache_control_ttl.as_deref().unwrap_or(""),
+                request_has_cache_breakpoint = *request_has_cache_breakpoint,
+                request_cache_breakpoint_count = *request_cache_breakpoint_count,
+                input_total_tokens = *prompt_tokens,
+                output_total_tokens = *completion_tokens,
+                context_total_tokens = *total_tokens,
+                cache_read_input_tokens = *cache_read_tokens,
+                cache_write_input_tokens = *cache_write_tokens,
+                cache_uncached_input_tokens = *cache_miss_tokens,
+                normal_billed_input_tokens = (*cache_miss_tokens).saturating_sub(*cache_write_tokens),
+                "agent_frame model call completed"
+            );
+            let assistant_preview = assistant_message
+                .as_ref()
+                .map(|message| extract_assistant_text(std::slice::from_ref(message)))
+                .unwrap_or_default();
+            let (assistant_preview, assistant_preview_truncated) =
+                truncate_log_preview(&assistant_preview, 240);
+            tracing::debug!(
+                log_stream = "agent",
+                log_key = %agent_id,
+                kind = "agent_frame_model_call_completed_detail",
+                log_detail = "detail",
+                session_id = %session.id,
+                channel_id = %session.address.channel_id,
+                agent_kind,
+                model_key,
+                model = model_id,
+                round_index = *round_index as u64,
+                api_request_id = api_request_id.as_deref().unwrap_or(""),
+                request_cache_control_type = request_cache_control_type.as_deref().unwrap_or(""),
+                request_cache_control_ttl = request_cache_control_ttl.as_deref().unwrap_or(""),
+                request_has_cache_breakpoint = *request_has_cache_breakpoint,
+                request_cache_breakpoint_count = *request_cache_breakpoint_count,
+                assistant_preview,
+                assistant_preview_truncated,
+                "agent_frame model call completed detail"
+            );
+        }
         SessionEvent::ToolWaitCompactionScheduled {
             tool_name,
             stable_prefix_message_count,
             delay_ms,
-        } => info!(
+        } => agent_event_log!(
+            level,
             log_stream = "agent",
             log_key = %agent_id,
             kind = "agent_frame_tool_wait_compaction_scheduled",
@@ -2078,7 +2184,8 @@ pub(super) fn log_agent_frame_event(
         SessionEvent::ToolWaitCompactionStarted {
             tool_name,
             stable_prefix_message_count,
-        } => info!(
+        } => agent_event_log!(
+            level,
             log_stream = "agent",
             log_key = %agent_id,
             kind = "agent_frame_tool_wait_compaction_started",
@@ -2099,7 +2206,8 @@ pub(super) fn log_agent_frame_event(
             token_limit,
             structured_output,
             compacted_messages,
-        } => info!(
+        } => agent_event_log!(
+            level,
             log_stream = "agent",
             log_key = %agent_id,
             kind = "agent_frame_tool_wait_compaction_completed",
@@ -2125,7 +2233,8 @@ pub(super) fn log_agent_frame_event(
             tool_name,
             tool_call_id,
             arguments: _,
-        } => info!(
+        } => agent_event_log!(
+            level,
             log_stream = "agent",
             log_key = %agent_id,
             kind = "agent_frame_tool_call_started",
@@ -2143,30 +2252,86 @@ pub(super) fn log_agent_frame_event(
             round_index,
             tool_name,
             tool_call_id,
+            argument_summary,
             output_len,
             errored,
-            ..
-        } => info!(
-            log_stream = "agent",
-            log_key = %agent_id,
-            kind = "agent_frame_tool_call_completed",
-            session_id = %session.id,
-            channel_id = %session.address.channel_id,
-            agent_kind,
-            model_key,
-            model = model_id,
-            round_index = *round_index as u64,
-            tool_name,
-            tool_call_id,
-            output_len = *output_len as u64,
-            errored = *errored,
-            "agent_frame tool call completed"
-        ),
+            output,
+        } => {
+            let output_preview = output
+                .as_deref()
+                .map(|value| truncate_log_preview(value, 240))
+                .unwrap_or_else(|| (String::new(), false));
+            let error_summary = output
+                .as_deref()
+                .and_then(tool_output_error_summary)
+                .unwrap_or_default();
+            if *errored {
+                tracing::warn!(
+                    log_stream = "agent",
+                    log_key = %agent_id,
+                    kind = "agent_frame_tool_call_completed",
+                    log_detail = "summary",
+                    session_id = %session.id,
+                    channel_id = %session.address.channel_id,
+                    agent_kind,
+                    model_key,
+                    model = model_id,
+                    round_index = *round_index as u64,
+                    tool_name,
+                    tool_call_id,
+                    argument_summary = argument_summary.as_deref().unwrap_or(""),
+                    output_len = *output_len as u64,
+                    errored = *errored,
+                    error_summary,
+                    "agent_frame tool call completed with error"
+                );
+            } else {
+                tracing::info!(
+                    log_stream = "agent",
+                    log_key = %agent_id,
+                    kind = "agent_frame_tool_call_completed",
+                    log_detail = "summary",
+                    session_id = %session.id,
+                    channel_id = %session.address.channel_id,
+                    agent_kind,
+                    model_key,
+                    model = model_id,
+                    round_index = *round_index as u64,
+                    tool_name,
+                    tool_call_id,
+                    argument_summary = argument_summary.as_deref().unwrap_or(""),
+                    output_len = *output_len as u64,
+                    errored = *errored,
+                    "agent_frame tool call completed"
+                );
+            }
+            tracing::debug!(
+                log_stream = "agent",
+                log_key = %agent_id,
+                kind = "agent_frame_tool_call_completed_detail",
+                log_detail = "detail",
+                session_id = %session.id,
+                channel_id = %session.address.channel_id,
+                agent_kind,
+                model_key,
+                model = model_id,
+                round_index = *round_index as u64,
+                tool_name,
+                tool_call_id,
+                argument_summary = argument_summary.as_deref().unwrap_or(""),
+                output_len = *output_len as u64,
+                errored = *errored,
+                output_preview = output_preview.0,
+                output_preview_truncated = output_preview.1,
+                "agent_frame tool call completed detail"
+            );
+        }
         SessionEvent::SessionYielded {
             phase,
             message_count,
             total_tokens,
-        } => info!(
+        } => agent_event_log!(
+            level,
             log_stream = "agent",
             log_key = %agent_id,
             kind = "agent_frame_session_yielded",
@@ -2183,7 +2348,8 @@ pub(super) fn log_agent_frame_event(
         SessionEvent::PrefixRewriteApplied {
             previous_prefix_message_count,
             replacement_prefix_message_count,
-        } => info!(
+        } => agent_event_log!(
+            level,
             log_stream = "agent",
             log_key = %agent_id,
             kind = "agent_frame_prefix_rewrite_applied",
@@ -2199,7 +2365,8 @@ pub(super) fn log_agent_frame_event(
         SessionEvent::SessionCompleted {
             message_count,
             total_tokens,
-        } => info!(
+        } => agent_event_log!(
+            level,
             log_stream = "agent",
             log_key = %agent_id,
             kind = "agent_frame_session_completed",

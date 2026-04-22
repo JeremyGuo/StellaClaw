@@ -118,7 +118,7 @@ impl Channel for CommandLineChannel {
     }
 
     async fn send(&self, _address: &ChannelAddress, message: OutgoingMessage) -> Result<()> {
-        info!(
+        tracing::debug!(
             log_stream = "channel",
             log_key = %self.config.id,
             kind = "cli_send",
@@ -178,7 +178,7 @@ impl Channel for CommandLineChannel {
         state: ProcessingState,
     ) -> Result<()> {
         if state == ProcessingState::Typing {
-            info!(
+            tracing::debug!(
                 log_stream = "channel",
                 log_key = %self.config.id,
                 kind = "typing",

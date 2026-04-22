@@ -6,7 +6,7 @@ use crate::llm::{
     log_upstream_api_request_completed, log_upstream_api_request_failed,
     log_upstream_api_request_started, next_api_request_id, parse_usage,
     redacted_response_headers_json, redacted_upstream_request_headers_json_with_auth,
-    should_bypass_proxy, upstream_error_from_value,
+    request_cache_log_fields, should_bypass_proxy, upstream_error_from_value,
 };
 use crate::message::ChatMessage;
 use crate::tooling::Tool;
@@ -58,6 +58,7 @@ impl UpstreamProvider for ClaudeCodeProvider {
         }
 
         let payload = Value::Object(payload);
+        let request_cache = request_cache_log_fields(&payload);
         let api_request_id = next_api_request_id();
         let api_key = upstream
             .api_key
@@ -75,6 +76,7 @@ impl UpstreamProvider for ClaudeCodeProvider {
             &messages_url,
             &request_headers_json,
             &payload,
+            &request_cache,
         );
 
         let mut request = client.post(&messages_url).json(&payload);
@@ -107,6 +109,7 @@ impl UpstreamProvider for ClaudeCodeProvider {
                     "{}",
                     None,
                     &format!("{error:#}"),
+                    &request_cache,
                 );
                 return Err(error).context("upstream claude messages request failed");
             }
@@ -125,6 +128,7 @@ impl UpstreamProvider for ClaudeCodeProvider {
                     &response_headers_json,
                     None,
                     &format!("{error:#}"),
+                    &request_cache,
                 );
                 return Err(error).context("failed to read upstream claude messages body");
             }
@@ -141,6 +145,7 @@ impl UpstreamProvider for ClaudeCodeProvider {
                 &response_headers_json,
                 Some(&response_body),
                 &format!("upstream claude messages failed with {}", status),
+                &request_cache,
             );
             return Err(anyhow!(
                 "upstream claude messages failed with {}: {}",
@@ -162,6 +167,7 @@ impl UpstreamProvider for ClaudeCodeProvider {
                     &response_headers_json,
                     Some(&response_body),
                     &format!("{error:#}"),
+                    &request_cache,
                 );
                 return Err(error).context("failed to parse claude messages response");
             }
@@ -176,6 +182,7 @@ impl UpstreamProvider for ClaudeCodeProvider {
                 &response_headers_json,
                 Some(&value),
                 &error_message,
+                &request_cache,
             );
             return Err(anyhow!(
                 "upstream claude messages returned an error payload: {}",
@@ -194,6 +201,7 @@ impl UpstreamProvider for ClaudeCodeProvider {
             &value,
             &usage,
             None,
+            &request_cache,
         );
         let message = claude_messages_value_to_chat_message(&value)?;
         Ok(ChatCompletionOutcome {
@@ -201,6 +209,7 @@ impl UpstreamProvider for ClaudeCodeProvider {
             usage,
             response_id: None,
             api_request_id: Some(api_request_id),
+            request_cache,
         })
     }
 }

@@ -109,6 +109,7 @@ pub struct ChatCompletionOutcome {
     pub usage: TokenUsage,
     pub response_id: Option<String>,
     pub api_request_id: Option<String>,
+    pub request_cache: RequestCacheLogFields,
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +118,14 @@ pub struct ImageGenerationOutcome {
     pub usage: TokenUsage,
     pub response_id: Option<String>,
     pub api_request_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequestCacheLogFields {
+    pub request_cache_control_type: Option<String>,
+    pub request_cache_control_ttl: Option<String>,
+    pub request_has_cache_breakpoint: bool,
+    pub request_cache_breakpoint_count: u64,
 }
 
 pub(crate) enum ChatCompletionSession {
@@ -1738,9 +1747,10 @@ pub(super) fn log_upstream_api_request_started(
     url: &str,
     request_headers_json: &str,
     request_body: &Value,
+    request_cache: &RequestCacheLogFields,
 ) {
     let body = api_body_log_fields(request_body);
-    tracing::info!(
+    tracing::debug!(
         log_stream = "api",
         log_key = %upstream.model,
         kind = "upstream_api_request_started",
@@ -1752,6 +1762,10 @@ pub(super) fn log_upstream_api_request_started(
         method,
         url,
         timeout_seconds = upstream.timeout_seconds,
+        request_cache_control_type = request_cache.request_cache_control_type.as_deref().unwrap_or(""),
+        request_cache_control_ttl = request_cache.request_cache_control_ttl.as_deref().unwrap_or(""),
+        request_has_cache_breakpoint = request_cache.request_has_cache_breakpoint,
+        request_cache_breakpoint_count = request_cache.request_cache_breakpoint_count,
         request_headers_json,
         request_body_log_mode = body.mode,
         request_body_bytes = body.bytes,
@@ -1773,6 +1787,7 @@ pub(super) fn log_upstream_api_request_completed(
     response_body: &Value,
     usage: &TokenUsage,
     response_id: Option<&str>,
+    request_cache: &RequestCacheLogFields,
 ) {
     let body = api_body_log_fields(response_body);
     tracing::info!(
@@ -1786,6 +1801,10 @@ pub(super) fn log_upstream_api_request_completed(
         model = %upstream.model,
         status_code,
         elapsed_ms,
+        request_cache_control_type = request_cache.request_cache_control_type.as_deref().unwrap_or(""),
+        request_cache_control_ttl = request_cache.request_cache_control_ttl.as_deref().unwrap_or(""),
+        request_has_cache_breakpoint = request_cache.request_has_cache_breakpoint,
+        request_cache_breakpoint_count = request_cache.request_cache_breakpoint_count,
         response_headers_json,
         response_id = response_id.unwrap_or(""),
         llm_calls = usage.llm_calls,
@@ -1796,13 +1815,6 @@ pub(super) fn log_upstream_api_request_completed(
         cache_write_input_tokens = usage.cache_write_input_tokens(),
         cache_uncached_input_tokens = usage.cache_uncached_input_tokens(),
         normal_billed_input_tokens = usage.normal_billed_input_tokens(),
-        legacy_prompt_tokens = usage.prompt_tokens,
-        legacy_completion_tokens = usage.completion_tokens,
-        legacy_total_tokens = usage.total_tokens,
-        legacy_cache_hit_tokens = usage.cache_hit_tokens,
-        legacy_cache_miss_tokens = usage.cache_miss_tokens,
-        legacy_cache_read_tokens = usage.cache_read_tokens,
-        legacy_cache_write_tokens = usage.cache_write_tokens,
         response_body_log_mode = body.mode,
         response_body_bytes = body.bytes,
         response_body_included = body.included,
@@ -1822,6 +1834,7 @@ pub(super) fn log_upstream_api_request_failed(
     response_headers_json: &str,
     response_body: Option<&Value>,
     error: &str,
+    request_cache: &RequestCacheLogFields,
 ) {
     let body = response_body.map(api_body_log_fields);
     tracing::warn!(
@@ -1835,6 +1848,10 @@ pub(super) fn log_upstream_api_request_failed(
         model = %upstream.model,
         status_code = status_code.unwrap_or(0),
         elapsed_ms,
+        request_cache_control_type = request_cache.request_cache_control_type.as_deref().unwrap_or(""),
+        request_cache_control_ttl = request_cache.request_cache_control_ttl.as_deref().unwrap_or(""),
+        request_has_cache_breakpoint = request_cache.request_has_cache_breakpoint,
+        request_cache_breakpoint_count = request_cache.request_cache_breakpoint_count,
         response_headers_json,
         response_body_log_mode = body.as_ref().map(|body| body.mode).unwrap_or("none"),
         response_body_bytes = body.as_ref().map(|body| body.bytes).unwrap_or(0),
@@ -1845,6 +1862,75 @@ pub(super) fn log_upstream_api_request_failed(
         error,
         "upstream API request failed"
     );
+}
+
+pub(crate) fn request_cache_log_fields(request_body: &Value) -> RequestCacheLogFields {
+    let mut markers = Vec::new();
+    collect_cache_control_markers(request_body, &mut markers);
+    let top_level = request_body
+        .as_object()
+        .and_then(|object| object.get("cache_control"))
+        .and_then(parse_cache_control_marker);
+    let fallback = markers.iter().find(|marker| {
+        marker.request_cache_control_type.is_some() || marker.request_cache_control_ttl.is_some()
+    });
+
+    RequestCacheLogFields {
+        request_cache_control_type: top_level
+            .as_ref()
+            .and_then(|marker| marker.request_cache_control_type.clone())
+            .or_else(|| fallback.and_then(|marker| marker.request_cache_control_type.clone())),
+        request_cache_control_ttl: top_level
+            .as_ref()
+            .and_then(|marker| marker.request_cache_control_ttl.clone())
+            .or_else(|| fallback.and_then(|marker| marker.request_cache_control_ttl.clone())),
+        request_has_cache_breakpoint: !markers.is_empty(),
+        request_cache_breakpoint_count: markers.len() as u64,
+    }
+}
+
+fn collect_cache_control_markers(value: &Value, markers: &mut Vec<RequestCacheLogFields>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(cache_control) = object.get("cache_control")
+                && let Some(marker) = parse_cache_control_marker(cache_control)
+            {
+                markers.push(marker);
+            }
+            for nested in object.values() {
+                collect_cache_control_markers(nested, markers);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_cache_control_markers(item, markers);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_cache_control_marker(value: &Value) -> Option<RequestCacheLogFields> {
+    let object = value.as_object()?;
+    let cache_type = object
+        .get("type")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .filter(|value| !value.trim().is_empty());
+    let ttl = object
+        .get("ttl")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .filter(|value| !value.trim().is_empty());
+    if cache_type.is_none() && ttl.is_none() {
+        return None;
+    }
+    Some(RequestCacheLogFields {
+        request_cache_control_type: cache_type,
+        request_cache_control_ttl: ttl,
+        request_has_cache_breakpoint: true,
+        request_cache_breakpoint_count: 1,
+    })
 }
 
 fn first_u64(object: &Map<String, Value>, paths: &[&[&str]]) -> Option<u64> {
@@ -1867,8 +1953,8 @@ mod tests {
         claude_messages_value_to_chat_message, generated_image_reference_from_value,
         normalize_inline_image_url, parse_streamed_responses_body, parse_usage,
         redact_sensitive_json, redacted_upstream_request_headers_json,
-        redacted_upstream_request_headers_json_with_auth, responses_value_to_chat_message,
-        upstream_error_from_value,
+        redacted_upstream_request_headers_json_with_auth, request_cache_log_fields,
+        responses_value_to_chat_message, upstream_error_from_value,
     };
     use crate::config::{
         AuthCredentialsStoreMode, CacheControlConfig, NativeWebSearchConfig, ReasoningConfig,
@@ -2099,6 +2185,50 @@ mod tests {
         assert_eq!(usage.cache_read_tokens, 900);
         assert_eq!(usage.cache_write_tokens, 120);
         assert_eq!(usage.cache_miss_tokens, 300);
+    }
+
+    #[test]
+    fn request_cache_log_fields_reads_top_level_cache_control() {
+        let fields = request_cache_log_fields(&json!({
+            "model": "demo",
+            "cache_control": {
+                "type": "ephemeral",
+                "ttl": "5m"
+            }
+        }));
+
+        assert_eq!(
+            fields.request_cache_control_type.as_deref(),
+            Some("ephemeral")
+        );
+        assert_eq!(fields.request_cache_control_ttl.as_deref(), Some("5m"));
+        assert!(fields.request_has_cache_breakpoint);
+        assert_eq!(fields.request_cache_breakpoint_count, 1);
+    }
+
+    #[test]
+    fn request_cache_log_fields_reads_nested_claude_cache_breakpoint() {
+        let fields = request_cache_log_fields(&json!({
+            "messages": [{
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": "hello",
+                    "cache_control": {
+                        "type": "ephemeral",
+                        "ttl": "5m"
+                    }
+                }]
+            }]
+        }));
+
+        assert_eq!(
+            fields.request_cache_control_type.as_deref(),
+            Some("ephemeral")
+        );
+        assert_eq!(fields.request_cache_control_ttl.as_deref(), Some("5m"));
+        assert!(fields.request_has_cache_breakpoint);
+        assert_eq!(fields.request_cache_breakpoint_count, 1);
     }
 
     #[test]

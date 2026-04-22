@@ -21,7 +21,7 @@ impl<'de> Deserialize<'de> for AgentBackendKind {
     {
         let value = String::deserialize(deserializer)?;
         match value.as_str() {
-            "agent_frame" | "zgent" => Ok(Self::AgentFrame),
+            "agent_frame" => Ok(Self::AgentFrame),
             other => Err(serde::de::Error::custom(format!(
                 "unsupported agent backend '{}'",
                 other
@@ -88,8 +88,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_zgent_backend_deserializes_to_agent_frame() {
-        let backend: AgentBackendKind = serde_json::from_str("\"zgent\"").unwrap();
-        assert_eq!(backend, AgentBackendKind::AgentFrame);
+    fn unsupported_legacy_zgent_backend_is_rejected() {
+        let error = serde_json::from_str::<AgentBackendKind>("\"zgent\"").unwrap_err();
+        assert!(error.to_string().contains("unsupported agent backend"));
     }
 }

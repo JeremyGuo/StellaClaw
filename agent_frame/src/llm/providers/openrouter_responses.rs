@@ -6,8 +6,8 @@ use crate::llm::{
     generated_image_reference_from_value, log_upstream_api_request_completed,
     log_upstream_api_request_failed, log_upstream_api_request_started, next_api_request_id,
     parse_usage, redacted_response_headers_json, redacted_upstream_request_headers_json,
-    response_id_from_value, responses_value_to_chat_message, should_bypass_proxy,
-    upstream_error_from_value,
+    request_cache_log_fields, response_id_from_value, responses_value_to_chat_message,
+    should_bypass_proxy, upstream_error_from_value,
 };
 use crate::message::ChatMessage;
 use crate::tooling::Tool;
@@ -60,6 +60,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
         }
 
         let payload = Value::Object(payload);
+        let request_cache = request_cache_log_fields(&payload);
         let api_request_id = next_api_request_id();
         let api_key = upstream
             .api_key
@@ -75,6 +76,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
             &responses_url,
             &request_headers_json,
             &payload,
+            &request_cache,
         );
 
         let mut request = client.post(&responses_url).json(&payload);
@@ -100,6 +102,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
                     "{}",
                     None,
                     &format!("{error:#}"),
+                    &request_cache,
                 );
                 return Err(error).context("upstream responses request failed");
             }
@@ -118,6 +121,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
                     &response_headers_json,
                     None,
                     &format!("{error:#}"),
+                    &request_cache,
                 );
                 return Err(error).context("failed to read upstream responses body");
             }
@@ -134,6 +138,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
                 &response_headers_json,
                 Some(&response_body),
                 &format!("upstream responses failed with {}", status),
+                &request_cache,
             );
             return Err(anyhow!(
                 "upstream responses failed with {}: {}",
@@ -155,6 +160,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
                     &response_headers_json,
                     Some(&response_body),
                     &format!("{error:#}"),
+                    &request_cache,
                 );
                 return Err(error).context("failed to parse responses response");
             }
@@ -169,6 +175,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
                 &response_headers_json,
                 Some(&value),
                 &error_message,
+                &request_cache,
             );
             return Err(anyhow!(
                 "upstream responses returned an error payload: {}",
@@ -187,6 +194,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
             &value,
             &usage,
             response_id.as_deref(),
+            &request_cache,
         );
         let message = responses_value_to_chat_message(&value)?;
         Ok(ChatCompletionOutcome {
@@ -194,6 +202,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
             usage,
             response_id,
             api_request_id: Some(api_request_id),
+            request_cache,
         })
     }
 
@@ -224,6 +233,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
         insert_responses_cache_payload(&mut payload, upstream)?;
 
         let payload = Value::Object(payload);
+        let request_cache = request_cache_log_fields(&payload);
         let api_request_id = next_api_request_id();
         let api_key = upstream
             .api_key
@@ -239,6 +249,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
             &responses_url,
             &request_headers_json,
             &payload,
+            &request_cache,
         );
 
         let mut request = client.post(&responses_url).json(&payload);
@@ -264,6 +275,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
                     "{}",
                     None,
                     &format!("{error:#}"),
+                    &request_cache,
                 );
                 return Err(error).context("upstream responses image generation request failed");
             }
@@ -282,6 +294,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
                     &response_headers_json,
                     None,
                     &format!("{error:#}"),
+                    &request_cache,
                 );
                 return Err(error).context("failed to read image generation responses body");
             }
@@ -298,6 +311,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
                 &response_headers_json,
                 Some(&response_body),
                 &format!("upstream responses image generation failed with {}", status),
+                &request_cache,
             );
             return Err(anyhow!(
                 "upstream responses image generation failed with {}: {}",
@@ -319,6 +333,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
                     &response_headers_json,
                     Some(&response_body),
                     &format!("{error:#}"),
+                    &request_cache,
                 );
                 return Err(error).context("failed to parse image generation responses body");
             }
@@ -333,6 +348,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
                 &response_headers_json,
                 Some(&value),
                 &error_message,
+                &request_cache,
             );
             return Err(anyhow!(
                 "upstream responses image generation returned an error payload: {}",
@@ -352,6 +368,7 @@ impl UpstreamProvider for OpenRouterResponsesProvider {
             &value,
             &usage,
             response_id.as_deref(),
+            &request_cache,
         );
         let image_reference = generated_image_reference_from_value(&value)
             .ok_or_else(|| anyhow!("image generation response did not contain image data"))?;

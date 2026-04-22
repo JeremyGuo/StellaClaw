@@ -72,37 +72,53 @@ fn content_to_text(content: &Option<Value>) -> String {
                     "text" | "input_text" | "output_text" => {
                         object.get("text")?.as_str().map(ToOwned::to_owned)
                     }
-                    "input_image" | "image_url" => object
-                        .get("image_url")
-                        .and_then(|value| match value {
-                            Value::String(url) => Some(url.clone()),
-                            Value::Object(map) => map
-                                .get("url")
-                                .and_then(Value::as_str)
-                                .map(ToOwned::to_owned),
-                            _ => None,
+                    "input_image" | "output_image" | "image_url" => object
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .or_else(|| {
+                            object.get("image_url").and_then(|value| match value {
+                                Value::String(url) => Some(url.clone()),
+                                Value::Object(map) => map
+                                    .get("url")
+                                    .and_then(Value::as_str)
+                                    .map(ToOwned::to_owned),
+                                _ => None,
+                            })
                         })
                         .map(|value| format!("[image] {}", value)),
-                    "file" | "input_file" => {
+                    "file" | "input_file" | "output_file" => {
                         let file_value = if item_type == "file" {
                             object.get("file")?
                         } else {
                             item
                         };
+                        if let Some(path) = file_value.get("path").and_then(Value::as_str) {
+                            return Some(format!("[file] {}", path));
+                        }
                         let filename = file_value
                             .get("filename")
                             .and_then(Value::as_str)
                             .unwrap_or("document");
                         Some(format!("[file] {}", filename))
                     }
-                    "input_audio" => {
+                    "input_audio" | "output_audio" => {
+                        let path = object.get("path").and_then(Value::as_str);
                         let format = object
-                            .get("input_audio")
-                            .and_then(Value::as_object)
-                            .and_then(|audio| audio.get("format"))
+                            .get("format")
                             .and_then(Value::as_str)
+                            .or_else(|| {
+                                object
+                                    .get("input_audio")
+                                    .and_then(Value::as_object)
+                                    .and_then(|audio| audio.get("format"))
+                                    .and_then(Value::as_str)
+                            })
                             .unwrap_or("audio");
-                        Some(format!("[audio] {}", format))
+                        Some(format!(
+                            "[audio] {}",
+                            path.unwrap_or(format)
+                        ))
                     }
                     _ => content_item_text(item),
                 }
@@ -122,6 +138,9 @@ fn compaction_text_item(text: impl Into<String>) -> Value {
 }
 
 fn image_url_from_content_item(object: &Map<String, Value>) -> Option<&str> {
+    if let Some(path) = object.get("path").and_then(Value::as_str) {
+        return Some(path);
+    }
     object.get("image_url").and_then(|value| match value {
         Value::String(url) => Some(url.as_str()),
         Value::Object(map) => map.get("url").and_then(Value::as_str),
@@ -154,6 +173,9 @@ fn file_placeholder_for_compaction(item_type: &str, item: &Value) -> String {
     } else {
         item
     };
+    if let Some(path) = file_value.get("path").and_then(Value::as_str) {
+        return format!("[file omitted during context compression: {path}]");
+    }
     let filename = file_value
         .get("filename")
         .and_then(Value::as_str)
@@ -162,11 +184,15 @@ fn file_placeholder_for_compaction(item_type: &str, item: &Value) -> String {
 }
 
 fn audio_placeholder_for_compaction(object: &Map<String, Value>) -> String {
+    if let Some(path) = object.get("path").and_then(Value::as_str) {
+        return format!("[audio omitted during context compression: {path}]");
+    }
     let format = object
         .get("input_audio")
         .and_then(Value::as_object)
         .and_then(|audio| audio.get("format"))
         .and_then(Value::as_str)
+        .or_else(|| object.get("format").and_then(Value::as_str))
         .unwrap_or("audio");
     format!("[audio omitted during context compression: {format}]")
 }
@@ -179,13 +205,15 @@ fn sanitize_content_item_for_compaction_request(item: &Value) -> Value {
         return item.clone();
     };
     match item_type {
-        "input_image" | "image_url" => compaction_text_item(image_placeholder_for_compaction(
+        "input_image" | "output_image" | "image_url" => compaction_text_item(image_placeholder_for_compaction(
             image_url_from_content_item(object),
         )),
-        "file" | "input_file" => {
+        "file" | "input_file" | "output_file" => {
             compaction_text_item(file_placeholder_for_compaction(item_type, item))
         }
-        "input_audio" => compaction_text_item(audio_placeholder_for_compaction(object)),
+        "input_audio" | "output_audio" => {
+            compaction_text_item(audio_placeholder_for_compaction(object))
+        }
         _ => item.clone(),
     }
 }

@@ -31,6 +31,7 @@ mod v0_24;
 mod v0_25;
 mod v0_26;
 mod v0_27;
+mod v0_28;
 mod v0_3;
 mod v0_4;
 mod v0_5;
@@ -40,7 +41,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.27";
+pub const LATEST_CONFIG_VERSION: &str = "0.28";
 pub const VERSION_0_2: &str = "0.2";
 pub const VERSION_0_3: &str = "0.3";
 pub const VERSION_0_4: &str = "0.4";
@@ -67,6 +68,7 @@ pub const VERSION_0_24: &str = "0.24";
 pub const VERSION_0_25: &str = "0.25";
 pub const VERSION_0_26: &str = "0.26";
 pub const VERSION_0_27: &str = "0.27";
+pub const VERSION_0_28: &str = "0.28";
 
 trait ConfigLoader {
     fn version(&self) -> &'static str;
@@ -163,7 +165,7 @@ pub struct ModelConfig {
     #[serde(default)]
     pub image_tool_model: Option<String>,
     #[serde(default)]
-    #[serde(rename = "web_search", alias = "web_search_model")]
+    #[serde(rename = "web_search")]
     pub web_search_model: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
@@ -526,6 +528,97 @@ struct MainAgentConfigRaw {
     token_estimation_cache: Option<TokenEstimationCacheConfig>,
     #[serde(default)]
     memory_system: MemorySystem,
+}
+
+impl<'de> Deserialize<'de> for MainAgentConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        reject_legacy_main_agent_fields(&value).map_err(serde::de::Error::custom)?;
+        let raw: MainAgentConfigRaw =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            global_install_root: raw.global_install_root,
+            language: raw.language,
+            max_tool_roundtrips: raw.max_tool_roundtrips,
+            enable_context_compression: raw.enable_context_compression,
+            context_compaction: raw.context_compaction.unwrap_or_default(),
+            idle_compaction: raw.idle_compaction.unwrap_or_default(),
+            timeout_observation_compaction: raw.timeout_observation_compaction.unwrap_or_default(),
+            time_awareness: raw.time_awareness.unwrap_or_default(),
+            token_estimation_cache: raw.token_estimation_cache.unwrap_or_default().normalized(),
+            memory_system: raw.memory_system,
+        })
+    }
+}
+
+fn reject_legacy_main_agent_fields(value: &Value) -> Result<()> {
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    for key in [
+        "compact_trigger_ratio",
+        "effective_context_window_percent",
+        "idle_compact_min_ratio",
+        "recent_fidelity_target_ratio",
+        "auto_compact_token_limit",
+        "enable_idle_context_compaction",
+        "idle_context_compaction_poll_interval_seconds",
+    ] {
+        if object.contains_key(key) {
+            return Err(anyhow!(
+                "latest main_agent config no longer accepts legacy field '{}'",
+                key
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct LegacyMainAgentConfig(pub MainAgentConfig);
+
+impl Default for LegacyMainAgentConfig {
+    fn default() -> Self {
+        Self(MainAgentConfig {
+            global_install_root: default_global_install_root(),
+            language: default_main_agent_language(),
+            max_tool_roundtrips: default_max_tool_roundtrips(),
+            enable_context_compression: default_enable_context_compression(),
+            context_compaction: ContextCompactionConfig::default(),
+            idle_compaction: IdleCompactionConfig::default(),
+            timeout_observation_compaction: TimeoutObservationCompactionConfig::default(),
+            time_awareness: TimeAwarenessConfig::default(),
+            token_estimation_cache: TokenEstimationCacheConfig::default(),
+            memory_system: MemorySystem::default(),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct LegacyMainAgentConfigRaw {
+    #[serde(default = "default_global_install_root")]
+    global_install_root: String,
+    #[serde(default = "default_main_agent_language")]
+    language: String,
+    #[serde(default = "default_max_tool_roundtrips")]
+    max_tool_roundtrips: usize,
+    #[serde(default = "default_enable_context_compression")]
+    enable_context_compression: bool,
+    #[serde(default)]
+    context_compaction: Option<ContextCompactionConfig>,
+    #[serde(default)]
+    idle_compaction: Option<IdleCompactionConfig>,
+    #[serde(default)]
+    timeout_observation_compaction: Option<TimeoutObservationCompactionConfig>,
+    #[serde(default)]
+    time_awareness: Option<TimeAwarenessConfig>,
+    #[serde(default)]
+    token_estimation_cache: Option<TokenEstimationCacheConfig>,
+    #[serde(default)]
+    memory_system: MemorySystem,
     #[serde(default = "default_compact_trigger_ratio")]
     compact_trigger_ratio: f64,
     #[serde(default = "default_effective_context_window_percent")]
@@ -542,12 +635,12 @@ struct MainAgentConfigRaw {
     idle_context_compaction_poll_interval_seconds: u64,
 }
 
-impl<'de> Deserialize<'de> for MainAgentConfig {
+impl<'de> Deserialize<'de> for LegacyMainAgentConfig {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let raw = MainAgentConfigRaw::deserialize(deserializer)?;
+        let raw = LegacyMainAgentConfigRaw::deserialize(deserializer)?;
         let legacy_trigger_ratio = if (raw.effective_context_window_percent
             - default_effective_context_window_percent())
         .abs()
@@ -557,7 +650,7 @@ impl<'de> Deserialize<'de> for MainAgentConfig {
         } else {
             raw.compact_trigger_ratio
         };
-        Ok(Self {
+        Ok(Self(MainAgentConfig {
             global_install_root: raw.global_install_root,
             language: raw.language,
             max_tool_roundtrips: raw.max_tool_roundtrips,
@@ -576,7 +669,7 @@ impl<'de> Deserialize<'de> for MainAgentConfig {
             time_awareness: raw.time_awareness.unwrap_or_default(),
             token_estimation_cache: raw.token_estimation_cache.unwrap_or_default().normalized(),
             memory_system: raw.memory_system,
-        })
+        }))
     }
 }
 
@@ -584,7 +677,6 @@ impl<'de> Deserialize<'de> for MainAgentConfig {
 #[serde(rename_all = "snake_case")]
 pub enum SandboxMode {
     #[default]
-    #[serde(alias = "disabled")]
     Subprocess,
     Bubblewrap,
 }
@@ -597,6 +689,84 @@ pub struct SandboxConfig {
     pub bubblewrap_binary: String,
     #[serde(default)]
     pub map_docker_socket: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct LegacySandboxConfig(pub SandboxConfig);
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct LegacySandboxConfigRaw {
+    #[serde(default, deserialize_with = "deserialize_legacy_sandbox_mode")]
+    mode: SandboxMode,
+    #[serde(default = "default_bubblewrap_binary")]
+    bubblewrap_binary: String,
+    #[serde(default)]
+    map_docker_socket: bool,
+}
+
+impl<'de> Deserialize<'de> for LegacySandboxConfig {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = LegacySandboxConfigRaw::deserialize(deserializer)?;
+        Ok(Self(SandboxConfig {
+            mode: raw.mode,
+            bubblewrap_binary: raw.bubblewrap_binary,
+            map_docker_socket: raw.map_docker_socket,
+        }))
+    }
+}
+
+fn legacy_backend_from_str(raw: &str) -> Option<AgentBackendKind> {
+    match raw {
+        "agent_frame" | "zgent" => Some(AgentBackendKind::AgentFrame),
+        _ => None,
+    }
+}
+
+pub(super) fn deserialize_legacy_backend<'de, D>(
+    deserializer: D,
+) -> std::result::Result<AgentBackendKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    legacy_backend_from_str(&value)
+        .ok_or_else(|| serde::de::Error::custom(format!("unsupported agent backend '{}'", value)))
+}
+
+pub(super) fn deserialize_legacy_backend_opt<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<AgentBackendKind>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .map(|value| {
+            legacy_backend_from_str(&value).ok_or_else(|| {
+                serde::de::Error::custom(format!("unsupported agent backend '{}'", value))
+            })
+        })
+        .transpose()
+}
+
+fn deserialize_legacy_sandbox_mode<'de, D>(
+    deserializer: D,
+) -> std::result::Result<SandboxMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    match value.as_str() {
+        "subprocess" | "disabled" => Ok(SandboxMode::Subprocess),
+        "bubblewrap" => Ok(SandboxMode::Bubblewrap),
+        other => Err(serde::de::Error::custom(format!(
+            "unsupported sandbox mode '{}'",
+            other
+        ))),
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -952,7 +1122,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let loaders: [&dyn ConfigLoader; 27] = [
+    let loaders: [&dyn ConfigLoader; 28] = [
         &v0_1::LegacyConfigLoader,
         &v0_2::VersionedConfigLoader,
         &v0_3::VersionedConfigLoader,
@@ -980,6 +1150,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         &v0_25::LatestConfigLoader,
         &v0_26::LatestConfigLoader,
         &v0_27::LatestConfigLoader,
+        &v0_28::LatestConfigLoader,
     ];
     let loader = loaders
         .into_iter()
@@ -1093,7 +1264,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
     let mut config = {
-        let loaders: [&dyn ConfigLoader; 27] = [
+        let loaders: [&dyn ConfigLoader; 28] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
             &v0_3::VersionedConfigLoader,
@@ -1121,6 +1292,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
             &v0_25::LatestConfigLoader,
             &v0_26::LatestConfigLoader,
             &v0_27::LatestConfigLoader,
+            &v0_28::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()
@@ -2348,6 +2520,151 @@ mod tests {
         let rewritten = fs::read_to_string(&config_path).unwrap();
         assert!(rewritten.contains(r#""mode": "subprocess""#));
         assert!(!rewritten.contains(r#""mode": "disabled""#));
+    }
+
+    #[test]
+    fn legacy_zgent_backend_still_upgrades_through_old_loader() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.12",
+              "models": {
+                "main": {
+                  "type": "openrouter",
+                  "backend": "zgent",
+                  "api_endpoint": "https://openrouter.ai/api/v1",
+                  "model": "anthropic/claude-sonnet-4.6",
+                  "capabilities": ["chat"],
+                  "description": "demo"
+                }
+              },
+              "agent": {
+                "agent_frame": {
+                  "available_models": ["main"]
+                }
+              },
+              "main_agent": {
+                "model": "main"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let config = load_server_config_file(&config_path).unwrap();
+        assert_eq!(config.models["main"].backend, AgentBackendKind::AgentFrame);
+    }
+
+    #[test]
+    fn latest_config_rejects_legacy_disabled_sandbox_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+                {{
+                  "version": "{LATEST_CONFIG_VERSION}",
+                  "models": {{
+                    "main": {{
+                      "type": "openrouter",
+                      "model": "openai/gpt-4.1-mini",
+                      "capabilities": ["chat"],
+                      "description": "demo"
+                    }}
+                  }},
+                  "agent": {{
+                    "agent_frame": {{
+                      "available_models": ["main"]
+                    }}
+                  }},
+                  "main_agent": {{
+                    "language": "zh-CN"
+                  }},
+                  "sandbox": {{
+                    "mode": "disabled"
+                  }},
+                  "channels": [
+                    {{
+                      "kind": "command_line",
+                      "id": "local-cli"
+                    }}
+                  ]
+                }}
+                "#
+            ),
+        )
+        .unwrap();
+
+        assert!(load_server_config_file(&config_path).is_err());
+    }
+
+    #[test]
+    fn latest_config_rejects_legacy_web_search_model_key() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+                {{
+                  "version": "{LATEST_CONFIG_VERSION}",
+                  "models": {{
+                    "main": {{
+                      "type": "openrouter",
+                      "model": "openai/gpt-4.1-mini",
+                      "capabilities": ["chat"],
+                      "description": "demo",
+                      "web_search_model": "brave"
+                    }},
+                    "brave": {{
+                      "type": "brave-search",
+                      "model": "brave-web-search",
+                      "capabilities": ["web_search"],
+                      "description": "search helper",
+                      "agent_model_enabled": false
+                    }}
+                  }},
+                  "agent": {{
+                    "agent_frame": {{
+                      "available_models": ["main"]
+                    }}
+                  }},
+                  "main_agent": {{
+                    "language": "zh-CN"
+                  }},
+                  "channels": [
+                    {{
+                      "kind": "command_line",
+                      "id": "local-cli"
+                    }}
+                  ]
+                }}
+                "#
+            ),
+        )
+        .unwrap();
+
+        assert!(load_server_config_file(&config_path).is_err());
+    }
+
+    #[test]
+    fn latest_main_agent_rejects_legacy_flat_compaction_fields() {
+        let error = serde_json::from_value::<MainAgentConfig>(serde_json::json!({
+            "compact_trigger_ratio": 0.8
+        }))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("compact_trigger_ratio"));
     }
 
     #[test]

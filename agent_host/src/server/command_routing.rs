@@ -13,7 +13,7 @@ impl Server {
             .is_some_and(|text| command_matches(text, "/help"))
         {
             let help_text = self.help_text_for_channel(&incoming.address.channel_id);
-            info!(
+            tracing::debug!(
                 log_stream = "server",
                 kind = "help_requested",
                 channel_id = %incoming.address.channel_id,

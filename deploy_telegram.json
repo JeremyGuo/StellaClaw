@@ -1,5 +1,5 @@
 {
-  "version": "0.25",
+  "version": "0.28",
   "models": {
     "gemini3.1-flash-image": {
       "type": "openrouter-resp",

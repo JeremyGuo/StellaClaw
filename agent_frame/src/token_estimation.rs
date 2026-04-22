@@ -191,6 +191,9 @@ fn value_text(value: &Value) -> String {
 }
 
 fn image_url_value(item_type: &str, item: &Value) -> Option<String> {
+    if let Some(path) = item.get("path").and_then(Value::as_str) {
+        return Some(path.to_string());
+    }
     if item_type == "image_url" {
         item.get("image_url").and_then(|value| match value {
             Value::String(url) => Some(url.clone()),
@@ -213,6 +216,9 @@ fn render_file_item(item_type: &str, item: &Value, extra_tokens: &mut usize) -> 
     } else {
         item
     };
+    if let Some(path) = file_value.get("path").and_then(Value::as_str) {
+        return format!("[file: {path}]");
+    }
     let filename = file_value
         .get("filename")
         .and_then(Value::as_str)
@@ -243,7 +249,7 @@ fn render_content_item(item: &Value, extra_tokens: &mut usize) -> String {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string(),
-        "image_url" | "input_image" => {
+        "image_url" | "input_image" | "output_image" => {
             let image_url = image_url_value(item_type, item).unwrap_or_default();
             if parse_base64_image_data_url(&image_url).is_some() {
                 *extra_tokens = extra_tokens.saturating_add(estimate_payload_bytes_as_tokens(
@@ -256,15 +262,22 @@ fn render_content_item(item: &Value, extra_tokens: &mut usize) -> String {
                 format!("[image: {image_url}]")
             }
         }
-        "file" | "input_file" => render_file_item(item_type, item, extra_tokens),
-        "input_audio" => {
+        "file" | "input_file" | "output_file" => render_file_item(item_type, item, extra_tokens),
+        "input_audio" | "output_audio" => {
             let format = object
-                .get("input_audio")
-                .and_then(Value::as_object)
-                .and_then(|audio| audio.get("format"))
+                .get("format")
                 .and_then(Value::as_str)
+                .or_else(|| {
+                    object
+                        .get("input_audio")
+                        .and_then(Value::as_object)
+                        .and_then(|audio| audio.get("format"))
+                        .and_then(Value::as_str)
+                })
                 .unwrap_or("audio");
-            if object
+            if object.get("path").and_then(Value::as_str).is_some() {
+                format!("[audio: {format}]")
+            } else if object
                 .get("input_audio")
                 .and_then(Value::as_object)
                 .and_then(|audio| audio.get("data"))

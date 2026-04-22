@@ -386,14 +386,6 @@ struct AgentConfigRaw {
     timeout_observation_compaction: Option<TimeoutObservationCompactionConfig>,
     #[serde(default)]
     memory_system: MemorySystem,
-    #[serde(default = "default_compact_trigger_ratio")]
-    compact_trigger_ratio: f64,
-    #[serde(default = "default_effective_context_window_percent")]
-    effective_context_window_percent: f64,
-    #[serde(default = "default_recent_fidelity_target_ratio")]
-    recent_fidelity_target_ratio: f64,
-    #[serde(default)]
-    auto_compact_token_limit: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -497,10 +489,6 @@ fn default_enable_context_compression() -> bool {
 }
 
 fn default_compact_trigger_ratio() -> f64 {
-    0.9
-}
-
-fn default_effective_context_window_percent() -> f64 {
     0.9
 }
 
@@ -616,6 +604,7 @@ pub fn load_codex_auth_tokens(codex_home: &Path) -> Result<CodexAuthConfig> {
 
 pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Result<AgentConfig> {
     let base_dir = base_dir.as_ref();
+    reject_legacy_agent_config_fields(&config_value)?;
     let raw: AgentConfigRaw =
         serde_json::from_value(config_value).context("failed to parse config object")?;
 
@@ -709,22 +698,30 @@ pub fn load_config_value(config_value: Value, base_dir: impl AsRef<Path>) -> Res
         workspace_root,
         runtime_state_root,
         enable_context_compression: raw.enable_context_compression,
-        context_compaction: raw.context_compaction.unwrap_or(ContextCompactionConfig {
-            trigger_ratio: if (raw.effective_context_window_percent
-                - default_effective_context_window_percent())
-            .abs()
-                > f64::EPSILON
-            {
-                raw.effective_context_window_percent
-            } else {
-                raw.compact_trigger_ratio
-            },
-            token_limit_override: raw.auto_compact_token_limit,
-            recent_fidelity_target_ratio: raw.recent_fidelity_target_ratio,
-        }),
+        context_compaction: raw.context_compaction.unwrap_or_default(),
         timeout_observation_compaction: raw.timeout_observation_compaction.unwrap_or_default(),
         memory_system: raw.memory_system,
     })
+}
+
+fn reject_legacy_agent_config_fields(config_value: &Value) -> Result<()> {
+    let Some(object) = config_value.as_object() else {
+        return Ok(());
+    };
+    for key in [
+        "compact_trigger_ratio",
+        "effective_context_window_percent",
+        "recent_fidelity_target_ratio",
+        "auto_compact_token_limit",
+    ] {
+        if object.contains_key(key) {
+            return Err(anyhow!(
+                "latest agent_frame config no longer accepts legacy field '{}'",
+                key
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub fn load_config_file(path: impl AsRef<Path>) -> Result<AgentConfig> {
@@ -763,6 +760,24 @@ mod tests {
             config.max_tool_roundtrips,
             super::default_max_tool_roundtrips()
         );
+    }
+
+    #[test]
+    fn load_config_value_rejects_legacy_flat_compaction_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        let error = load_config_value(
+            json!({
+                "compact_trigger_ratio": 0.8,
+                "upstream": {
+                    "base_url": "https://example.com/v1",
+                    "model": "demo"
+                }
+            }),
+            temp_dir.path(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("compact_trigger_ratio"));
     }
 
     #[test]

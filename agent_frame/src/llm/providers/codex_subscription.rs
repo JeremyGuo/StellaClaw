@@ -5,7 +5,7 @@ use crate::llm::{
     build_chat_completions_url, build_responses_input, build_responses_tools_payload,
     load_codex_auth, log_upstream_api_request_completed, log_upstream_api_request_failed,
     log_upstream_api_request_started, next_api_request_id, refresh_codex_auth,
-    response_id_from_value, responses_value_to_chat_message,
+    request_cache_log_fields, response_id_from_value, responses_value_to_chat_message,
 };
 use crate::message::ChatMessage;
 use crate::tooling::Tool;
@@ -65,6 +65,7 @@ impl UpstreamProvider for CodexSubscriptionProvider {
 
         let payload =
             build_responses_request_payload(upstream, messages, tools, extra_payload, true)?;
+        let request_cache = request_cache_log_fields(&Value::Object(payload.clone()));
 
         let (response, api_request_id) = match session {
             Some(ChatCompletionSession::CodexSubscription(session)) => {
@@ -101,6 +102,7 @@ impl UpstreamProvider for CodexSubscriptionProvider {
             usage,
             response_id: response_id_from_value(&response),
             api_request_id: Some(api_request_id),
+            request_cache,
         })
     }
 }
@@ -405,6 +407,7 @@ fn send_response_create(
     .chain(payload)
     .collect::<Map<_, _>>();
     let request_body = Value::Object(create_request);
+    let request_cache = request_cache_log_fields(&request_body);
     let api_request_id = next_api_request_id();
     let websocket_url = build_websocket_url(&build_chat_completions_url(upstream))
         .map(|url| url.to_string())
@@ -417,6 +420,7 @@ fn send_response_create(
         &websocket_url,
         "{}",
         &request_body,
+        &request_cache,
     );
 
     let started = Instant::now();
@@ -430,6 +434,7 @@ fn send_response_create(
             "{}",
             None,
             &format!("{error:#}"),
+            &request_cache,
         );
         return Err(error).context("failed to send codex websocket request");
     }
@@ -449,6 +454,7 @@ fn send_response_create(
                     "{}",
                     None,
                     &format!("{error:#}"),
+                    &request_cache,
                 );
                 return Err(error).context("failed to read codex websocket event");
             }
@@ -468,6 +474,7 @@ fn send_response_create(
                             "{}",
                             Some(&response_body),
                             &format!("{error:#}"),
+                            &request_cache,
                         );
                         return Err(error).context("failed to parse codex websocket event");
                     }
@@ -491,6 +498,7 @@ fn send_response_create(
                             &response,
                             &usage,
                             response_id.as_deref(),
+                            &request_cache,
                         );
                         return Ok((response, api_request_id));
                     }
@@ -506,6 +514,7 @@ fn send_response_create(
                             "{}",
                             Some(&value),
                             &error_message,
+                            &request_cache,
                         );
                         return Err(anyhow!("codex websocket request failed: {}", error_message));
                     }
@@ -539,6 +548,7 @@ fn send_response_create(
                     "{}",
                     None,
                     &error,
+                    &request_cache,
                 );
                 return Err(anyhow!("{error}"));
             }

@@ -4,8 +4,6 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use tracing::info;
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum SinkTarget {
     Direct(ChannelAddress),
@@ -38,7 +36,7 @@ impl SinkRouter {
         message: OutgoingMessage,
     ) -> Result<()> {
         for address in self.resolve_targets(target) {
-            info!(
+            tracing::debug!(
                 log_stream = "channel",
                 log_key = %address.channel_id,
                 kind = "sink_dispatch",

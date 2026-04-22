@@ -13,6 +13,8 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Latest AgentHost config files do not use `main_agent.model` as a global default-model knob; user-facing model selection remains conversation-owned state.
 - Latest AgentHost config files do not use `main_agent.timeout_seconds` as a global subagent-timeout knob; subagent timeout policy is derived from the selected model/runtime flow instead of a second main-agent override field.
 - Latest AgentHost config files do not allow inline model-level `external_web_search` blocks; external search routing must flow through normal model/tooling configuration instead of a second per-model search config shape.
+- Latest AgentHost config files use `models.<alias>.web_search` instead of the legacy `web_search_model` key, require nested `main_agent.context_compaction` / `idle_compaction` fields instead of old flat compaction knobs, and only allow `sandbox.mode = "subprocess" | "bubblewrap"` in the latest schema.
+- Legacy config spellings such as `web_search_model`, flat compaction fields, legacy `"zgent"` backend values, and `sandbox.mode = "disabled"` are accepted only through dedicated old-version loaders and upgrade flows, not by the latest config parser itself.
 - Older configs may still load with those legacy fields present, but the latest config writer must not emit them again.
 - Regression coverage should protect legacy-field ignore-on-load behavior and latest-template omission.
 
@@ -42,10 +44,12 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 
 - Internal `ChatMessage` state can retain multiple tool calls on a single assistant message, structured array content, and optional reasoning payloads instead of flattening everything to plain text too early.
 - Structured `ChatMessage.content` arrays may also carry multiple multimodal items plus internal rich blocks such as `tool_result` and `context`, so one durable message can preserve richer assistant/runtime state than any single upstream provider schema.
+- Durable multimodal `ChatMessage` items are canonical workspace-relative path references rather than provider-specific inline base64 payloads; provider/base64 expansion happens only at the final upstream request-materialization boundary.
+- User ingress, synthetic tool multimodal injections, and assistant/provider multimodal outputs all canonicalize into the same path-based internal message form before they are persisted into session or snapshot history.
 - Provider adapters may still degrade or omit unsupported fields at the last upstream boundary, but internal persistence/transcript-friendly message state should keep rich assistant content whenever the source provider exposed it.
 - When a provider cannot natively represent `tool_result` or `context` content blocks inline, adapters should degrade them only at request-build time by splitting tool-result blocks into provider-native tool outputs where possible and rendering context blocks into textual fallback blocks otherwise.
 - OpenAI Responses output should preserve assistant content blocks plus reasoning blocks in internal `ChatMessage` form, while OpenAI chat-completions payloads must omit the internal-only `reasoning` field before sending upstream.
-- Regression coverage should protect mixed assistant content + multi-tool-call parsing, context/tool-result block degradation, and internal-only reasoning not leaking into incompatible upstream payloads.
+- Regression coverage should protect mixed assistant content + multi-tool-call parsing, path-based multimodal canonicalization/materialization, context/tool-result block degradation, and internal-only reasoning not leaking into incompatible upstream payloads.
 
 ### Runtime Recovery Notices
 
@@ -64,8 +68,10 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Current-turn attachment handling should stay split into an attachment-preparation phase and a message-assembly phase instead of mixing attachment capability checks, prompt-ready multimodal conversion, and final `ChatMessage` assembly in one function.
 - Prompt-ready attachment derivation for images, PDFs, audio clips, and historical inline-image normalization should live behind reusable attachment-prep helpers rather than being duplicated across message-building and history-sanitization code paths.
 - Newly materialized conversation attachments should normalize unsupported but transcodable image formats such as TIFF into canonical persisted PNG files at the channel/workdir boundary, so later prompt assembly can reuse stable stored artifacts instead of re-transcoding the same upload every turn.
+- Conversation/user-message assembly should emit canonical path-based multimodal content items under the workspace root instead of baking model capability checks or inline base64 payloads into durable user messages.
 - Existing workdirs should be upgraded by rewriting persisted `ChatMessage.content` inline images in unsupported formats into canonical supported inline image payloads when possible, or durable placeholder text when the old payload is no longer decodable.
-- Regression coverage should protect direct-vs-fallback attachment separation, prompt-ready TIFF-to-PNG image conversion, attachment materialization normalization, and historical inline-image sanitization/upgrade behavior.
+- Existing workdirs should also be upgraded by rewriting persisted inline multimodal message payloads into canonical workspace-relative media paths under `media/legacy/`, so restored sessions and snapshots reuse the same durable message shape as new runtime writes.
+- Regression coverage should protect path-based user attachment assembly, request-time multimodal materialization, attachment materialization normalization, tool/provider multimodal canonicalization, and historical multimodal upgrade behavior.
 
 ### Interruptible Conversations
 
@@ -149,14 +155,22 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 ### API Request Observability
 
 - Every upstream model API request, including HTTP and subscription WebSocket requests, should emit structured request lifecycle logs with a stable `api_request_id`, provider, API kind, model, URL/method where applicable, status, elapsed time, clear token accounting fields, cache token breakdown, and redacted request/response headers.
-- Token accounting logs should prefer unambiguous names such as `input_total_tokens`, `output_total_tokens`, `context_total_tokens`, `cache_read_input_tokens`, `cache_write_input_tokens`, `cache_uncached_input_tokens`, and `normal_billed_input_tokens`; legacy provider-style names may remain only as compatibility aliases.
+- Token accounting logs use canonical names such as `input_total_tokens`, `output_total_tokens`, `context_total_tokens`, `cache_read_input_tokens`, `cache_write_input_tokens`, `cache_uncached_input_tokens`, and `normal_billed_input_tokens`; current runtime writers and readers must not emit or depend on legacy provider-style aliases.
 - Request and response bodies are logged with secret-key redaction. By default, logs include bounded body previews for debugging; setting `AGENT_FRAME_LOG_API_BODIES=full` includes full redacted JSON bodies, and `off` disables body content while preserving sizes and metadata.
 - Agent runtime model-call events include the final `api_request_id` and cache token fields so session/agent logs can be joined to low-level API request logs without inferring from timestamps.
 - `/status` should show a rolling multi-day total usage and current estimated spend for the current conversation across foreground, background, and subagents by aggregating per-turn agent usage logs for sessions with the same channel/conversation address. It must not use legacy `session.cumulative_usage` as the primary status total because older session state may contain polluted cumulative accounting.
 - `/status` should include the current `conversation_id` near the top of the response so session transcripts and agent logs can be matched back to the channel conversation quickly.
 - `/status` spend accounting should price per-model `agent_frame_model_call_completed` logs instead of multiplying all tokens by the current model. Unknown model pricing may fall back to GLM 5.1 pricing, but the response must separately list correctly priced models, risky/best-effort models, and unknown models.
 - Telegram `/status` renders the rolling spend trend as a channel-owned matplotlib chart when available, attempts a user-level matplotlib install if missing, and falls back to the text status when chart rendering is unavailable.
-- Regression coverage should protect header/body redaction, clear token accounting names, and the model-call/API-request join fields.
+- Regression coverage should protect header/body redaction, canonical token field names plus workdir log normalization, and the model-call/API-request join fields.
+
+### Structured Logging Policy
+
+- Structured `info` logs should represent stable lifecycle boundaries, authoritative usage/accounting events, startup/shutdown transitions, and degraded-but-actionable conditions; routine internal churn must not be emitted at `info`.
+- High-frequency process breadcrumbs such as AgentFrame round starts, tool starts, non-error tool completions, session mailbox drain/stage transitions, sink fan-out steps, channel typing notifications, and similar step-by-step progress markers belong at `debug` so they do not pollute persisted operational logs or downstream analytics.
+- For upstream model traffic, `upstream_api_request_completed` and `upstream_api_request_failed` are the authoritative request outcome records; `upstream_api_request_started` remains available only as lower-verbosity debugging detail.
+- Conversation spend/usage analytics continue to treat `turn_token_usage` and `agent_frame_model_call_completed` as the authoritative accounting events, and future logging cleanup must not silently remove or rename those events without updating consumers and regression coverage together.
+- Regression coverage should protect the AgentFrame event severity split so authoritative usage/terminal events stay at `info` while high-frequency process events stay demoted to `debug`.
 
 ### Background Agent Delivery
 

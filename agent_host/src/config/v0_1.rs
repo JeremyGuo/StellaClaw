@@ -1,9 +1,9 @@
 use super::{
     AgentConfig, ChannelConfig, ConfigLoader, LATEST_CONFIG_VERSION, LEGACY_CONFIG_VERSION,
-    MainAgentConfig, ModelCatalogConfig, ModelConfig, ModelType, SandboxConfig, ServerConfig,
-    build_server_config, default_api_key_env, default_chat_completions_path,
+    LegacyMainAgentConfig, LegacySandboxConfig, ModelCatalogConfig, ModelConfig, ModelType,
+    ServerConfig, build_server_config, default_api_key_env, default_chat_completions_path,
     default_context_window_tokens, default_cron_poll_interval_seconds,
-    default_max_global_sub_agents, default_model_timeout_seconds,
+    default_max_global_sub_agents, default_model_timeout_seconds, deserialize_legacy_backend,
 };
 use crate::backend::AgentBackendKind;
 use agent_frame::config::{
@@ -20,7 +20,7 @@ pub(super) struct LegacyConfigLoader;
 struct LegacyModelConfigRaw {
     pub api_endpoint: String,
     pub model: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_legacy_backend")]
     pub backend: AgentBackendKind,
     #[serde(default)]
     pub supports_vision_input: bool,
@@ -54,9 +54,9 @@ struct LegacyModelConfigRaw {
 #[derive(Clone, Debug, Deserialize)]
 struct LegacyServerConfigRaw {
     pub models: BTreeMap<String, LegacyModelConfigRaw>,
-    pub main_agent: MainAgentConfig,
+    pub main_agent: LegacyMainAgentConfig,
     #[serde(default)]
-    pub sandbox: SandboxConfig,
+    pub sandbox: LegacySandboxConfig,
     #[serde(default = "default_max_global_sub_agents")]
     pub max_global_sub_agents: usize,
     #[serde(default = "default_cron_poll_interval_seconds")]
@@ -117,8 +117,8 @@ impl ConfigLoader for LegacyConfigLoader {
             model_catalog,
             super::ToolingConfig::default(),
             chat_model_keys,
-            raw.main_agent,
-            raw.sandbox,
+            raw.main_agent.0,
+            raw.sandbox.0,
             raw.max_global_sub_agents,
             raw.cron_poll_interval_seconds,
             raw.channels,

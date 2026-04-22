@@ -157,6 +157,36 @@ pub fn content_item_text(item: &Value) -> Option<String> {
             .get("text")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        "input_image" | "output_image" => object
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| format!("[image: {path}]"))
+            .or_else(|| {
+                object
+                    .get("image_url")
+                    .and_then(Value::as_str)
+                    .map(|url| format!("[image: {url}]"))
+            }),
+        "file" | "input_file" | "output_file" => object
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| format!("[file: {path}]"))
+            .or_else(|| {
+                object
+                    .get("filename")
+                    .and_then(Value::as_str)
+                    .map(|filename| format!("[file: {filename}]"))
+            }),
+        "input_audio" | "output_audio" => object
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| format!("[audio: {path}]"))
+            .or_else(|| {
+                object
+                    .get("format")
+                    .and_then(Value::as_str)
+                    .map(|format| format!("[audio: {format}]"))
+            }),
         TOOL_RESULT_BLOCK_TYPE => {
             let result = parse_tool_result_block(item)?;
             let label = result

@@ -1,6 +1,5 @@
 use super::*;
 use crate::attachment_prep::{
-    build_audio_content_item, build_image_data_url, build_pdf_content_item,
     infer_audio_format_for_attachment, sanitize_inline_image_item,
     unsupported_inline_image_placeholder_text,
 };
@@ -209,72 +208,106 @@ pub(super) fn fast_path_agent_selection_message(
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct PreparedUserTurnAttachments {
-    pub direct_content_items: Vec<Value>,
-    pub fallback_attachments: Vec<StoredAttachment>,
-    pub direct_image_count: usize,
-    pub direct_pdf_count: usize,
-    pub direct_audio_count: usize,
+    pub content_items: Vec<Value>,
+    pub image_count: usize,
+    pub file_count: usize,
+    pub audio_count: usize,
 }
 
 impl PreparedUserTurnAttachments {
-    fn has_direct_content(&self) -> bool {
-        !self.direct_content_items.is_empty()
+    fn has_content(&self) -> bool {
+        !self.content_items.is_empty()
     }
 
     fn visible_summary(&self) -> String {
-        direct_multimodal_summary(
-            self.direct_image_count,
-            self.direct_pdf_count,
-            self.direct_audio_count,
-        )
+        let mut parts = Vec::new();
+        if self.image_count > 0 {
+            parts.push(format!(
+                "{} image{}",
+                self.image_count,
+                if self.image_count == 1 { "" } else { "s" }
+            ));
+        }
+        if self.file_count > 0 {
+            parts.push(format!(
+                "{} file{}",
+                self.file_count,
+                if self.file_count == 1 { "" } else { "s" }
+            ));
+        }
+        if self.audio_count > 0 {
+            parts.push(format!(
+                "{} audio clip{}",
+                self.audio_count,
+                if self.audio_count == 1 { "" } else { "s" }
+            ));
+        }
+        if parts.is_empty() {
+            "Current-turn attachments are included below as canonical workspace paths.".to_string()
+        } else {
+            format!(
+                "Current-turn attachments are included below as canonical workspace paths: {}.",
+                parts.join(", ")
+            )
+        }
     }
 }
 
 pub(super) fn prepare_user_turn_attachments(
     attachments: &[StoredAttachment],
-    model: &ModelConfig,
-    backend_supports_native_multimodal: bool,
+    workspace_root: &Path,
 ) -> Result<PreparedUserTurnAttachments> {
-    let allow_images = backend_supports_native_multimodal && model.supports_image_input();
-    let allow_pdfs =
-        backend_supports_native_multimodal && model.has_capability(ModelCapability::Pdf);
-    let allow_audio =
-        backend_supports_native_multimodal && model.has_capability(ModelCapability::AudioIn);
-
     let mut prepared = PreparedUserTurnAttachments::default();
     for attachment in attachments {
-        if attachment.kind.is_image() && allow_images {
-            if let Ok(url) = build_image_data_url(attachment) {
-                prepared.direct_content_items.push(json!({
-                    "type": "image_url",
-                    "image_url": {
-                        "url": url,
-                    }
-                }));
-                prepared.direct_image_count += 1;
-                continue;
-            }
-        }
-
-        if attachment.kind.is_pdf() && allow_pdfs {
-            prepared
-                .direct_content_items
-                .push(build_pdf_content_item(attachment)?);
-            prepared.direct_pdf_count += 1;
+        let relative_path = relative_attachment_path(workspace_root, &attachment.path)?;
+        if attachment.kind.is_image() {
+            prepared.content_items.push(json!({
+                "type": "input_image",
+                "path": relative_path,
+            }));
+            prepared.image_count += 1;
             continue;
         }
 
-        if attachment.kind.is_audio() && allow_audio {
-            if infer_audio_format_for_attachment(attachment).is_some() {
-                prepared
-                    .direct_content_items
-                    .push(build_audio_content_item(attachment)?);
-                prepared.direct_audio_count += 1;
-                continue;
+        if attachment.kind.is_audio() {
+            let mut item = serde_json::Map::from_iter([
+                ("type".to_string(), Value::String("input_audio".to_string())),
+                ("path".to_string(), Value::String(relative_path)),
+            ]);
+            if let Some(format) = infer_audio_format_for_attachment(attachment) {
+                item.insert("format".to_string(), Value::String(format.to_string()));
             }
+            if let Some(media_type) = attachment.media_type.as_deref() {
+                item.insert(
+                    "media_type".to_string(),
+                    Value::String(media_type.to_string()),
+                );
+            }
+            prepared.content_items.push(Value::Object(item));
+            prepared.audio_count += 1;
+            continue;
         }
 
-        prepared.fallback_attachments.push(attachment.clone());
+        let mut item = serde_json::Map::from_iter([
+            ("type".to_string(), Value::String("input_file".to_string())),
+            ("path".to_string(), Value::String(relative_path)),
+        ]);
+        if let Some(filename) = attachment
+            .original_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| attachment.path.file_name().and_then(|value| value.to_str()))
+        {
+            item.insert("filename".to_string(), Value::String(filename.to_string()));
+        }
+        if let Some(media_type) = attachment.media_type.as_deref() {
+            item.insert(
+                "media_type".to_string(),
+                Value::String(media_type.to_string()),
+            );
+        }
+        prepared.content_items.push(Value::Object(item));
+        prepared.file_count += 1;
     }
 
     Ok(prepared)
@@ -283,13 +316,11 @@ pub(super) fn prepare_user_turn_attachments(
 pub(super) fn build_user_turn_message(
     text: Option<&str>,
     attachments: &[StoredAttachment],
-    model: &ModelConfig,
-    backend_supports_native_multimodal: bool,
+    workspace_root: &Path,
     system_date: Option<&str>,
 ) -> Result<ChatMessage> {
-    let prepared =
-        prepare_user_turn_attachments(attachments, model, backend_supports_native_multimodal)?;
-    if !prepared.has_direct_content() {
+    let prepared = prepare_user_turn_attachments(attachments, workspace_root)?;
+    if !prepared.has_content() {
         return Ok(ChatMessage::text(
             "user",
             prepend_system_date_section(vec![compose_user_prompt(text, attachments)], system_date)
@@ -302,32 +333,10 @@ pub(super) fn build_user_turn_message(
         text_sections.push(text.to_string());
     }
 
-    if !prepared.fallback_attachments.is_empty() {
-        let mut attachment_lines =
-            vec!["Additional attachments available for this turn:".to_string()];
-        for attachment in &prepared.fallback_attachments {
-            attachment_lines.push(format!(
-                "- kind={:?}, path={}, original_name={}, media_type={}",
-                attachment.kind,
-                attachment.path.display(),
-                attachment.original_name.as_deref().unwrap_or("unknown"),
-                attachment.media_type.as_deref().unwrap_or("unknown")
-            ));
-        }
-        attachment_lines.push(
-            "Use tools if you need to inspect any attachment that is not already directly visible in this request."
-                .to_string(),
-        );
-        text_sections.push(attachment_lines.join("\n"));
-    }
-
     if text_sections.is_empty() {
         text_sections.push(prepared.visible_summary());
     } else {
-        text_sections.push(format!(
-            "{} Inspect directly visible current-turn attachments here instead of calling load/query tools for the same files.",
-            prepared.visible_summary()
-        ));
+        text_sections.push(prepared.visible_summary());
     }
     let text_sections = prepend_system_date_section(text_sections, system_date);
 
@@ -335,7 +344,7 @@ pub(super) fn build_user_turn_message(
         "type": "text",
         "text": text_sections.join("\n\n")
     })];
-    content.extend(prepared.direct_content_items);
+    content.extend(prepared.content_items);
 
     Ok(ChatMessage {
         role: "user".to_string(),
@@ -392,6 +401,14 @@ fn sanitize_message_content_for_model_capabilities(
             capability_text: capability_text.to_string(),
         },
         |ctx| {
+            let is_path_based = ctx
+                .item
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty());
+            if is_path_based {
+                return Ok(ModalityItemRewrite::KeepOriginal);
+            }
             if ctx.is_downgraded {
                 return Ok(downgraded_multimodal_placeholder_text(
                     ctx.item_type,
@@ -662,23 +679,6 @@ pub(super) fn extract_loaded_skill_names(
         }
     }
     skill_names
-}
-
-fn direct_multimodal_summary(image_count: usize, pdf_count: usize, audio_count: usize) -> String {
-    let mut parts = Vec::new();
-    if image_count > 0 {
-        parts.push(format!("{image_count} image(s)"));
-    }
-    if pdf_count > 0 {
-        parts.push(format!("{pdf_count} PDF document(s)"));
-    }
-    if audio_count > 0 {
-        parts.push(format!("{audio_count} audio clip(s)"));
-    }
-    format!(
-        "The user attached {}, and they are already directly visible in this request.",
-        parts.join(", ")
-    )
 }
 
 pub(super) fn spawn_processing_keepalive(

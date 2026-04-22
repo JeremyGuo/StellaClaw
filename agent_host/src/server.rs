@@ -23,7 +23,7 @@ use crate::config::{
     default_dingtalk_commands, default_telegram_commands,
 };
 use crate::conversation::{
-    ConversationManager, ConversationSettings, materialize_conversation_attachments,
+    ConversationManager, ConversationSettings, prepare_incoming_conversation_message,
     resolve_local_mount_path,
 };
 use crate::cron::{
@@ -2561,13 +2561,6 @@ impl Server {
             cache_write_input_tokens = report.usage.cache_write_input_tokens(),
             cache_uncached_input_tokens = report.usage.cache_uncached_input_tokens(),
             normal_billed_input_tokens = report.usage.normal_billed_input_tokens(),
-            legacy_prompt_tokens = report.usage.prompt_tokens,
-            legacy_completion_tokens = report.usage.completion_tokens,
-            legacy_total_tokens = report.usage.total_tokens,
-            legacy_cache_hit_tokens = report.usage.cache_hit_tokens,
-            legacy_cache_miss_tokens = report.usage.cache_miss_tokens,
-            legacy_cache_read_tokens = report.usage.cache_read_tokens,
-            legacy_cache_write_tokens = report.usage.cache_write_tokens,
             rollout_id = rollout_id.as_deref(),
             "idle context compaction completed"
         );
@@ -2741,7 +2734,17 @@ impl Server {
             return Ok(());
         }
 
-        let incoming = self.prepare_regular_conversation_message(incoming).await?;
+        let attachments_dir = if incoming.attachments.is_empty() {
+            None
+        } else {
+            Some(
+                self.with_conversations_and_sessions(|conversations, sessions| {
+                    conversations.resolve_attachment_storage_dir(&incoming.address, sessions)
+                })?,
+            )
+        };
+        let incoming =
+            prepare_incoming_conversation_message(attachments_dir.as_deref(), incoming).await?;
         self.handle_regular_foreground_message(&channel, incoming)
             .await
     }
@@ -3943,37 +3946,11 @@ mod tests {
             path: image_path,
             size_bytes: 4,
         };
-        let model = ModelConfig {
-            model_type: crate::config::ModelType::Openrouter,
-            api_endpoint: "https://example.com/v1".to_string(),
-            model: "demo-vision".to_string(),
-            backend: AgentBackendKind::AgentFrame,
-            supports_vision_input: false,
-            image_tool_model: None,
-            web_search_model: None,
-            api_key: None,
-            api_key_env: "TEST_API_KEY".to_string(),
-            chat_completions_path: "/chat/completions".to_string(),
-            codex_home: None,
-            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
-            timeout_seconds: 30.0,
-            retry_mode: Default::default(),
-            context_window_tokens: 128_000,
-            cache_ttl: None,
-            reasoning: None,
-            headers: serde_json::Map::new(),
-            description: "vision".to_string(),
-            agent_model_enabled: true,
-            native_web_search: None,
-            token_estimation: None,
-            capabilities: vec![ModelCapability::ImageIn],
-        };
 
         let message = build_user_turn_message(
             Some("看看这张图"),
             &[attachment],
-            &model,
-            true,
+            temp_dir.path(),
             Some("[System Date: 2026-04-10 01:23:45 +08:00]"),
         )
         .unwrap();
@@ -3983,64 +3960,36 @@ mod tests {
         assert_eq!(items[0]["type"], "text");
         let text = items[0]["text"].as_str().unwrap();
         assert!(text.contains("[System Date: 2026-04-10 01:23:45 +08:00]"));
-        assert!(text.contains("already directly visible in this request"));
-        assert!(text.contains("instead of calling load/query tools"));
-        assert_eq!(items[1]["type"], "image_url");
-        let url = items[1]["image_url"]["url"].as_str().unwrap();
-        assert!(url.starts_with("data:image/png;base64,"));
+        assert!(text.contains("canonical workspace paths"));
+        assert_eq!(items[1]["type"], "input_image");
+        assert_eq!(items[1]["path"], "photo.png");
     }
 
     #[test]
-    fn builds_multimodal_user_message_transcodes_tiff_attachments_to_png() {
+    fn builds_multimodal_user_message_preserves_canonical_attachment_paths() {
         let temp_dir = TempDir::new().unwrap();
-        let image_path = temp_dir.path().join("photo.tiff");
-        fs::write(&image_path, tiny_tiff_bytes()).unwrap();
+        let image_path = temp_dir.path().join("photo.png");
+        fs::write(&image_path, [0_u8, 1, 2, 3]).unwrap();
         let attachment = StoredAttachment {
             id: Uuid::new_v4(),
             kind: AttachmentKind::Image,
-            original_name: Some("photo.tiff".to_string()),
-            media_type: Some("image/tiff".to_string()),
+            original_name: Some("photo.png".to_string()),
+            media_type: Some("image/png".to_string()),
             path: image_path,
             size_bytes: 4,
         };
-        let model = ModelConfig {
-            model_type: crate::config::ModelType::Openrouter,
-            api_endpoint: "https://example.com/v1".to_string(),
-            model: "demo-vision".to_string(),
-            backend: AgentBackendKind::AgentFrame,
-            supports_vision_input: false,
-            image_tool_model: None,
-            web_search_model: None,
-            api_key: None,
-            api_key_env: "TEST_API_KEY".to_string(),
-            chat_completions_path: "/chat/completions".to_string(),
-            codex_home: None,
-            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
-            timeout_seconds: 30.0,
-            retry_mode: Default::default(),
-            context_window_tokens: 128_000,
-            cache_ttl: None,
-            reasoning: None,
-            headers: serde_json::Map::new(),
-            description: "vision".to_string(),
-            agent_model_enabled: true,
-            native_web_search: None,
-            token_estimation: None,
-            capabilities: vec![ModelCapability::ImageIn],
-        };
 
         let message =
-            build_user_turn_message(Some("看看这张 tiff"), &[attachment], &model, true, None)
+            build_user_turn_message(Some("看看这张图"), &[attachment], temp_dir.path(), None)
                 .unwrap();
 
         let items = message.content.unwrap().as_array().unwrap().clone();
-        assert_eq!(items[1]["type"], "image_url");
-        let url = items[1]["image_url"]["url"].as_str().unwrap();
-        assert!(url.starts_with("data:image/png;base64,"));
+        assert_eq!(items[1]["type"], "input_image");
+        assert_eq!(items[1]["path"], "photo.png");
     }
 
     #[test]
-    fn builds_multimodal_user_message_downgrades_unconvertible_images_to_file_context() {
+    fn builds_multimodal_user_message_keeps_relative_path_for_unconverted_images() {
         let temp_dir = TempDir::new().unwrap();
         let image_path = temp_dir.path().join("broken.tiff");
         fs::write(&image_path, b"not actually an image").unwrap();
@@ -4052,42 +4001,18 @@ mod tests {
             path: image_path,
             size_bytes: 19,
         };
-        let model = ModelConfig {
-            model_type: crate::config::ModelType::Openrouter,
-            api_endpoint: "https://example.com/v1".to_string(),
-            model: "demo-vision".to_string(),
-            backend: AgentBackendKind::AgentFrame,
-            supports_vision_input: false,
-            image_tool_model: None,
-            web_search_model: None,
-            api_key: None,
-            api_key_env: "TEST_API_KEY".to_string(),
-            chat_completions_path: "/chat/completions".to_string(),
-            codex_home: None,
-            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
-            timeout_seconds: 30.0,
-            retry_mode: Default::default(),
-            context_window_tokens: 128_000,
-            cache_ttl: None,
-            reasoning: None,
-            headers: serde_json::Map::new(),
-            description: "vision".to_string(),
-            agent_model_enabled: true,
-            native_web_search: None,
-            token_estimation: None,
-            capabilities: vec![ModelCapability::ImageIn],
-        };
 
         let message =
-            build_user_turn_message(Some("看看这张图"), &[attachment], &model, true, None).unwrap();
+            build_user_turn_message(Some("看看这张图"), &[attachment], temp_dir.path(), None)
+                .unwrap();
 
-        let text = message.content.as_ref().and_then(Value::as_str).unwrap();
-        assert!(text.contains("Attachments available for this turn"));
-        assert!(text.contains("image/tiff"));
+        let items = message.content.unwrap().as_array().unwrap().clone();
+        assert_eq!(items[1]["type"], "input_image");
+        assert_eq!(items[1]["path"], "broken.tiff");
     }
 
     #[test]
-    fn prepares_user_turn_attachments_separating_direct_and_fallback_items() {
+    fn prepares_user_turn_attachments_as_path_based_content_items() {
         let temp_dir = TempDir::new().unwrap();
         let image_path = temp_dir.path().join("photo.png");
         let file_path = temp_dir.path().join("notes.txt");
@@ -4109,46 +4034,20 @@ mod tests {
             path: file_path,
             size_bytes: 5,
         };
-        let model = ModelConfig {
-            model_type: crate::config::ModelType::Openrouter,
-            api_endpoint: "https://example.com/v1".to_string(),
-            model: "demo-vision".to_string(),
-            backend: AgentBackendKind::AgentFrame,
-            supports_vision_input: false,
-            image_tool_model: None,
-            web_search_model: None,
-            api_key: None,
-            api_key_env: "TEST_API_KEY".to_string(),
-            chat_completions_path: "/chat/completions".to_string(),
-            codex_home: None,
-            auth_credentials_store_mode: agent_frame::config::AuthCredentialsStoreMode::Auto,
-            timeout_seconds: 30.0,
-            retry_mode: Default::default(),
-            context_window_tokens: 128_000,
-            cache_ttl: None,
-            reasoning: None,
-            headers: serde_json::Map::new(),
-            description: "vision".to_string(),
-            agent_model_enabled: true,
-            native_web_search: None,
-            token_estimation: None,
-            capabilities: vec![ModelCapability::ImageIn],
-        };
 
         let prepared =
-            prepare_user_turn_attachments(&[image_attachment, file_attachment], &model, true)
+            prepare_user_turn_attachments(&[image_attachment, file_attachment], temp_dir.path())
                 .unwrap();
 
-        assert_eq!(prepared.direct_image_count, 1);
-        assert_eq!(prepared.direct_pdf_count, 0);
-        assert_eq!(prepared.direct_audio_count, 0);
-        assert_eq!(prepared.direct_content_items.len(), 1);
-        assert_eq!(prepared.direct_content_items[0]["type"], "image_url");
-        assert_eq!(prepared.fallback_attachments.len(), 1);
-        assert_eq!(
-            prepared.fallback_attachments[0].original_name.as_deref(),
-            Some("notes.txt")
-        );
+        assert_eq!(prepared.image_count, 1);
+        assert_eq!(prepared.file_count, 1);
+        assert_eq!(prepared.audio_count, 0);
+        assert_eq!(prepared.content_items.len(), 2);
+        assert_eq!(prepared.content_items[0]["type"], "input_image");
+        assert_eq!(prepared.content_items[0]["path"], "photo.png");
+        assert_eq!(prepared.content_items[1]["type"], "input_file");
+        assert_eq!(prepared.content_items[1]["path"], "notes.txt");
+        assert_eq!(prepared.content_items[1]["filename"], "notes.txt");
     }
 
     #[test]
@@ -5858,9 +5757,9 @@ mod tests {
                 "session_id": background_session_id,
                 "agent_kind": "main_background",
                 "llm_calls": 2,
-                "prompt_tokens": 200,
-                "completion_tokens": 20,
-                "total_tokens": 220
+                "input_total_tokens": 200,
+                "output_total_tokens": 20,
+                "context_total_tokens": 220
             }),
             json!({
                 "kind": "turn_token_usage",
@@ -5978,9 +5877,9 @@ mod tests {
                 "channel_id": "telegram-main",
                 "session_id": session_id,
                 "model": "anthropic/claude-opus-4.6",
-                "prompt_tokens": 50,
-                "completion_tokens": 5,
-                "total_tokens": 55
+                "input_total_tokens": 50,
+                "output_total_tokens": 5,
+                "context_total_tokens": 55
             }),
             json!({
                 "kind": "agent_frame_model_call_completed",

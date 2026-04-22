@@ -1753,7 +1753,7 @@ impl Channel for TelegramChannel {
 
     async fn set_processing(&self, address: &ChannelAddress, state: ProcessingState) -> Result<()> {
         if state == ProcessingState::Typing {
-            info!(
+            tracing::debug!(
                 log_stream = "channel",
                 log_key = %self.id,
                 kind = "typing",

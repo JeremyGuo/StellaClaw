@@ -7,7 +7,10 @@ use crate::llm::{
     ChatCompletionSession, TokenUsage, create_chat_completion, start_chat_completion_session,
 };
 use crate::message::{ChatMessage, content_has_nonempty_visible_parts};
-use crate::modality::materialize_messages_for_upstream;
+use crate::modality::{
+    CanonicalMessageScope, canonicalize_message_multimodal_for_storage,
+    materialize_messages_for_upstream,
+};
 use crate::skills::{SkillMetadata, build_skills_meta_prompt, discover_skills};
 use crate::token_estimation::estimate_session_tokens_for_upstream;
 use crate::tooling::{
@@ -15,11 +18,8 @@ use crate::tooling::{
 };
 use anyhow::{Context, Result, anyhow};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use image::{ImageFormat, ImageReader};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::io::Cursor;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -243,64 +243,10 @@ fn is_previous_response_id_error(error: &anyhow::Error) -> bool {
         || (message.contains("response") && message.contains("invalid"))
 }
 
-fn image_path_to_data_url(path: &Path) -> Result<String> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    let guessed = ImageReader::new(Cursor::new(&bytes))
-        .with_guessed_format()
-        .with_context(|| format!("failed to guess image format for {}", path.display()))?;
-    let Some(format) = guessed.format() else {
-        return Err(anyhow!(
-            "image_load only accepts image files; could not detect an image format for {}",
-            path.display()
-        ));
-    };
-    let (media_type, output_bytes) = match format {
-        ImageFormat::Png => ("image/png", bytes),
-        ImageFormat::Jpeg => ("image/jpeg", bytes),
-        ImageFormat::Gif => ("image/gif", bytes),
-        ImageFormat::WebP => ("image/webp", bytes),
-        _ => {
-            let image = guessed
-                .decode()
-                .with_context(|| format!("failed to decode image {}", path.display()))?;
-            let mut output = Vec::new();
-            image
-                .write_to(&mut Cursor::new(&mut output), ImageFormat::Png)
-                .with_context(|| format!("failed to transcode image {} to PNG", path.display()))?;
-            ("image/png", output)
-        }
-    };
-    use base64::Engine as _;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(output_bytes);
-    Ok(format!("data:{};base64,{}", media_type, encoded))
-}
-
-fn file_path_to_base64(path: &Path) -> Result<String> {
-    let bytes =
-        std::fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
-    use base64::Engine as _;
-    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
-}
-
-fn infer_audio_format(path: &Path) -> Option<&'static str> {
-    match path
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(|value| value.to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("wav") => Some("wav"),
-        Some("mp3") | Some("mpeg") | Some("mpga") => Some("mp3"),
-        Some("ogg") | Some("opus") => Some("ogg"),
-        Some("webm") => Some("webm"),
-        Some("m4a") | Some("mp4") | Some("aac") => Some("m4a"),
-        Some("flac") => Some("flac"),
-        _ => None,
-    }
-}
-
-fn synthetic_user_message_from_tool_result(result: &str) -> Option<ChatMessage> {
+fn synthetic_user_message_from_tool_result(
+    workspace_root: &std::path::Path,
+    result: &str,
+) -> Option<ChatMessage> {
     let value: Value = serde_json::from_str(result).ok()?;
     let object = value.as_object()?;
     if object.get("kind").and_then(Value::as_str) != Some("synthetic_user_multimodal") {
@@ -312,10 +258,9 @@ fn synthetic_user_message_from_tool_result(result: &str) -> Option<ChatMessage> 
         match kind {
             "input_image" => {
                 let path = item.get("path").and_then(Value::as_str)?;
-                let image_url = image_path_to_data_url(Path::new(path)).ok()?;
                 content.push(json!({
                     "type": "input_image",
-                    "image_url": image_url,
+                    "path": path,
                 }));
             }
             "input_file" => {
@@ -323,15 +268,16 @@ fn synthetic_user_message_from_tool_result(result: &str) -> Option<ChatMessage> 
                 let filename = item
                     .get("filename")
                     .and_then(Value::as_str)
-                    .or_else(|| Path::new(path).file_name().and_then(|value| value.to_str()))
+                    .or_else(|| {
+                        std::path::Path::new(path)
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                    })
                     .unwrap_or("document.pdf");
-                let file_data = file_path_to_base64(Path::new(path)).ok()?;
                 content.push(json!({
-                    "type": "file",
-                    "file": {
-                        "file_data": file_data,
-                        "filename": filename,
-                    }
+                    "type": "input_file",
+                    "path": path,
+                    "filename": filename,
                 }));
             }
             "input_audio" => {
@@ -339,15 +285,11 @@ fn synthetic_user_message_from_tool_result(result: &str) -> Option<ChatMessage> 
                 let format = item
                     .get("format")
                     .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .or_else(|| infer_audio_format(Path::new(path)).map(ToOwned::to_owned))?;
-                let data = file_path_to_base64(Path::new(path)).ok()?;
+                    .map(ToOwned::to_owned)?;
                 content.push(json!({
                     "type": "input_audio",
-                    "input_audio": {
-                        "data": data,
-                        "format": format,
-                    }
+                    "path": path,
+                    "format": format,
                 }));
             }
             _ => {}
@@ -356,14 +298,15 @@ fn synthetic_user_message_from_tool_result(result: &str) -> Option<ChatMessage> 
     if content.is_empty() {
         return None;
     }
-    Some(ChatMessage {
+    let message = ChatMessage {
         role: "user".to_string(),
         content: Some(Value::Array(content)),
         reasoning: None,
         name: None,
         tool_call_id: None,
         tool_calls: None,
-    })
+    };
+    canonicalize_message_multimodal_for_storage(workspace_root, &message, CanonicalMessageScope::Tool).ok()
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -457,6 +400,10 @@ pub enum SessionEvent {
         round_index: usize,
         tool_call_count: usize,
         api_request_id: Option<String>,
+        request_cache_control_type: Option<String>,
+        request_cache_control_ttl: Option<String>,
+        request_has_cache_breakpoint: bool,
+        request_cache_breakpoint_count: u64,
         prompt_tokens: u64,
         completion_tokens: u64,
         total_tokens: u64,
@@ -494,6 +441,7 @@ pub enum SessionEvent {
         round_index: usize,
         tool_name: String,
         tool_call_id: String,
+        argument_summary: Option<String>,
         output_len: usize,
         errored: bool,
         output: Option<String>,
@@ -581,10 +529,63 @@ struct PendingToolWaitCompaction {
 struct CompletedToolCall {
     tool_call_id: String,
     tool_name: String,
+    argument_summary: Option<String>,
     result: String,
 }
 
 const MAX_IMAGE_LOADS_PER_TOOL_BATCH: usize = 3;
+
+fn summarize_tool_arguments(tool_name: &str, arguments: Option<&str>) -> Option<String> {
+    let arguments = arguments.map(str::trim).filter(|value| !value.is_empty())?;
+    let parsed = serde_json::from_str::<Value>(arguments).ok();
+    let mut parts = Vec::new();
+    if let Some(object) = parsed.as_ref().and_then(Value::as_object) {
+        for key in [
+            "cmd", "command", "path", "remote", "cwd", "url", "q", "pattern", "location", "ticker",
+            "prompt", "task", "name",
+        ] {
+            if let Some(fragment) = summarize_argument_value(object.get(key)) {
+                parts.push(format!("{key}={fragment}"));
+            }
+        }
+    }
+    if parts.is_empty() {
+        Some(truncate_log_value(arguments, 180))
+    } else {
+        Some(truncate_log_value(
+            &format!("{tool_name} {}", parts.join(" ")),
+            180,
+        ))
+    }
+}
+
+fn summarize_argument_value(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    match value {
+        Value::String(text) => Some(format!("{:?}", truncate_log_value(text, 96))),
+        Value::Number(number) => Some(number.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Array(items) if !items.is_empty() => {
+            Some(truncate_log_value(&value.to_string(), 96))
+        }
+        Value::Object(object) if !object.is_empty() => {
+            Some(truncate_log_value(&value.to_string(), 96))
+        }
+        _ => None,
+    }
+}
+
+fn truncate_log_value(value: &str, max_chars: usize) -> String {
+    let trimmed = value.trim();
+    let mut truncated = String::new();
+    for character in trimmed.chars().take(max_chars) {
+        truncated.push(character);
+    }
+    if trimmed.chars().count() > max_chars {
+        truncated.push_str("...");
+    }
+    truncated
+}
 
 fn enforce_image_load_batch_limit(completed: &mut [CompletedToolCall]) {
     let mut seen = 0usize;
@@ -999,6 +1000,17 @@ fn run_session_state_controlled_internal(
             }
             Err(error) => return Err(error),
         };
+        let outcome = crate::llm::ChatCompletionOutcome {
+            message: canonicalize_message_multimodal_for_storage(
+                &config.workspace_root,
+                &outcome.message,
+                CanonicalMessageScope::Assistant,
+            )?,
+            usage: outcome.usage,
+            response_id: outcome.response_id,
+            api_request_id: outcome.api_request_id,
+            request_cache: outcome.request_cache,
+        };
         usage.add_assign(&outcome.usage);
         let last_model_response_at = Instant::now();
         let tool_calls = outcome.message.tool_calls.clone().unwrap_or_default();
@@ -1007,6 +1019,15 @@ fn run_session_state_controlled_internal(
                 round_index,
                 tool_call_count: tool_calls.len(),
                 api_request_id: outcome.api_request_id.clone(),
+                request_cache_control_type: outcome
+                    .request_cache
+                    .request_cache_control_type
+                    .clone(),
+                request_cache_control_ttl: outcome.request_cache.request_cache_control_ttl.clone(),
+                request_has_cache_breakpoint: outcome.request_cache.request_has_cache_breakpoint,
+                request_cache_breakpoint_count: outcome
+                    .request_cache
+                    .request_cache_breakpoint_count,
                 prompt_tokens: outcome.usage.prompt_tokens,
                 completion_tokens: outcome.usage.completion_tokens,
                 total_tokens: outcome.usage.total_tokens,
@@ -1112,6 +1133,7 @@ fn run_session_state_controlled_internal(
             let tool_name = tool_call.function.name.clone();
             let tool_call_id = tool_call.id.clone();
             let raw_arguments = tool_call.function.arguments.clone();
+            let argument_summary = summarize_tool_arguments(&tool_name, raw_arguments.as_deref());
             let maybe_tool = registry.get(&tool_name).cloned();
             let completed_sender = completed_sender.clone();
             handles.push(thread::spawn(move || {
@@ -1125,6 +1147,7 @@ fn run_session_state_controlled_internal(
                 let completed = CompletedToolCall {
                     tool_call_id,
                     tool_name,
+                    argument_summary,
                     result,
                 };
                 let _ = completed_sender.send(completed);
@@ -1173,7 +1196,8 @@ fn run_session_state_controlled_internal(
                 completed_tool.tool_name.clone(),
                 result.clone(),
             ));
-            if let Some(synthetic_user_message) = synthetic_user_message_from_tool_result(&result)
+            if let Some(synthetic_user_message) =
+                synthetic_user_message_from_tool_result(&config.workspace_root, &result)
                 && let Some(Value::Array(items)) = synthetic_user_message.content
             {
                 synthetic_user_content.extend(items);
@@ -1183,6 +1207,7 @@ fn run_session_state_controlled_internal(
                     round_index,
                     tool_name: completed_tool.tool_name,
                     tool_call_id: completed_tool.tool_call_id,
+                    argument_summary: completed_tool.argument_summary,
                     output_len: result.len(),
                     errored: tool_result_looks_like_error(&result),
                     output: Some(result),
@@ -1499,6 +1524,7 @@ mod tests {
             .map(|index| CompletedToolCall {
                 tool_call_id: format!("call_{index}"),
                 tool_name: "image_load".to_string(),
+                argument_summary: None,
                 result: serde_json::json!({
                     "loaded": true,
                     "kind": "synthetic_user_multimodal",
@@ -1773,6 +1799,7 @@ mod tests {
         std::fs::write(&image_path, tiny_png_bytes()).unwrap();
 
         let message = synthetic_user_message_from_tool_result(
+            temp_dir.path(),
             &serde_json::json!({
                 "kind": "synthetic_user_multimodal",
                 "media": [{
@@ -1789,12 +1816,7 @@ mod tests {
         let items = content.as_array().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["type"], "input_image");
-        assert!(
-            items[0]["image_url"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("data:image/png;base64,")
-        );
+        assert_eq!(items[0]["path"], "sample.png");
         assert!(matches!(content, Value::Array(_)));
     }
 
@@ -1805,6 +1827,7 @@ mod tests {
         std::fs::write(&image_path, tiny_bmp_bytes()).unwrap();
 
         let message = synthetic_user_message_from_tool_result(
+            temp_dir.path(),
             &serde_json::json!({
                 "kind": "synthetic_user_multimodal",
                 "media": [{
@@ -1819,12 +1842,9 @@ mod tests {
         let content = message.content.unwrap();
         let items = content.as_array().unwrap();
         assert_eq!(items[0]["type"], "input_image");
-        assert!(
-            items[0]["image_url"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("data:image/png;base64,")
-        );
+        let path = items[0]["path"].as_str().unwrap();
+        assert!(path.starts_with("media/tool/by-hash/image-"));
+        assert!(path.ends_with(".png"));
     }
 
     #[test]
@@ -1834,6 +1854,7 @@ mod tests {
         std::fs::write(&file_path, b"%PDF-demo").unwrap();
 
         let message = synthetic_user_message_from_tool_result(
+            temp_dir.path(),
             &serde_json::json!({
                 "kind": "synthetic_user_multimodal",
                 "media": [{
@@ -1854,6 +1875,7 @@ mod tests {
         std::fs::write(&file_path, b"%PDF-demo").unwrap();
 
         let message = synthetic_user_message_from_tool_result(
+            temp_dir.path(),
             &serde_json::json!({
                 "kind": "synthetic_user_multimodal",
                 "media": [{
@@ -1869,14 +1891,9 @@ mod tests {
         let content = message.content.unwrap();
         let items = content.as_array().unwrap();
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["type"], "file");
-        assert_eq!(items[0]["file"]["filename"], "sample.pdf");
-        assert!(
-            items[0]["file"]["file_data"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("JVBER")
-        );
+        assert_eq!(items[0]["type"], "input_file");
+        assert_eq!(items[0]["filename"], "sample.pdf");
+        assert_eq!(items[0]["path"], "sample.pdf");
     }
 
     #[test]
@@ -1886,6 +1903,7 @@ mod tests {
         std::fs::write(&audio_path, b"RIFFdemoWAVE").unwrap();
 
         let message = synthetic_user_message_from_tool_result(
+            temp_dir.path(),
             &serde_json::json!({
                 "kind": "synthetic_user_multimodal",
                 "media": [{
@@ -1902,13 +1920,8 @@ mod tests {
         let items = content.as_array().unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0]["type"], "input_audio");
-        assert_eq!(items[0]["input_audio"]["format"], "wav");
-        assert!(
-            !items[0]["input_audio"]["data"]
-                .as_str()
-                .unwrap_or_default()
-                .is_empty()
-        );
+        assert_eq!(items[0]["format"], "wav");
+        assert_eq!(items[0]["path"], "sample.wav");
     }
 
     #[test]

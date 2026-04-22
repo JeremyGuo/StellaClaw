@@ -750,13 +750,10 @@ impl WorkspaceManager {
             if metadata.file_type().is_symlink() {
                 return Ok(());
             }
-            if metadata.is_dir() {
-                merge_directory_contents_if_missing(&target, &source)?;
-                fs::remove_dir_all(&target)
-                    .with_context(|| format!("failed to remove legacy {}", target.display()))?;
-            } else {
-                return Ok(());
-            }
+            return Err(anyhow!(
+                "workspace shared path {} is not a symlink; run workdir upgrade before use",
+                target.display()
+            ));
         }
         match create_dir_symlink(&source, &target) {
             Ok(()) => Ok(()),

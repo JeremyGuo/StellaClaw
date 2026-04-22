@@ -37,7 +37,8 @@ pub use message::{
     tool_result_content_block, value_text,
 };
 pub use modality::{
-    ModalityItemContext, ModalityItemRewrite, UpstreamModalityPolicy,
+    CanonicalMessageScope, ModalityItemContext, ModalityItemRewrite, UpstreamModalityPolicy,
+    canonicalize_message_multimodal_for_storage,
     downgraded_multimodal_placeholder_text, placeholder_text_item,
     rewrite_message_content_with_modality_policy,
 };

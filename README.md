@@ -259,7 +259,7 @@ cargo build --release --manifest-path agent_host/Cargo.toml --bin partyclaw
 
 ```json
 {
-  "version": "0.27",
+  "version": "0.28",
   "models": {
     "main": {
       "type": "openrouter",

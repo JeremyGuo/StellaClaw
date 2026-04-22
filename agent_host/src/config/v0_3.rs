@@ -1,10 +1,11 @@
 use super::{
-    AgentConfig, ChannelConfig, ConfigLoader, MainAgentConfig, ModelCatalogConfig, ModelConfig,
-    ModelType, SandboxConfig, ServerConfig, VERSION_0_3, build_server_config, default_api_key_env,
-    default_brave_search_endpoint, default_brave_search_path, default_chat_completions_path,
-    default_codex_subscription_endpoint, default_context_window_tokens,
-    default_cron_poll_interval_seconds, default_max_global_sub_agents,
-    default_model_timeout_seconds, default_responses_path,
+    AgentConfig, ChannelConfig, ConfigLoader, LegacyMainAgentConfig, LegacySandboxConfig,
+    ModelCatalogConfig, ModelConfig, ModelType, ServerConfig, VERSION_0_3, build_server_config,
+    default_api_key_env, default_brave_search_endpoint, default_brave_search_path,
+    default_chat_completions_path, default_codex_subscription_endpoint,
+    default_context_window_tokens, default_cron_poll_interval_seconds,
+    default_max_global_sub_agents, default_model_timeout_seconds, default_responses_path,
+    deserialize_legacy_backend,
 };
 use crate::backend::AgentBackendKind;
 use agent_frame::config::{
@@ -21,9 +22,9 @@ pub(super) struct VersionedConfigLoader;
 struct VersionedServerConfigRaw {
     pub version: String,
     pub models: VersionedModelCatalogRaw,
-    pub main_agent: MainAgentConfig,
+    pub main_agent: LegacyMainAgentConfig,
     #[serde(default)]
-    pub sandbox: SandboxConfig,
+    pub sandbox: LegacySandboxConfig,
     #[serde(default = "default_max_global_sub_agents")]
     pub max_global_sub_agents: usize,
     #[serde(default = "default_cron_poll_interval_seconds")]
@@ -48,7 +49,7 @@ struct VersionedModelConfigRaw {
     pub model: String,
     #[serde(default)]
     pub api_endpoint: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_legacy_backend")]
     pub backend: AgentBackendKind,
     #[serde(default)]
     pub supports_vision_input: bool,
@@ -143,8 +144,8 @@ impl ConfigLoader for VersionedConfigLoader {
             model_catalog,
             super::ToolingConfig::default(),
             chat_model_keys,
-            raw.main_agent,
-            raw.sandbox,
+            raw.main_agent.0,
+            raw.sandbox.0,
             raw.max_global_sub_agents,
             raw.cron_poll_interval_seconds,
             raw.channels,

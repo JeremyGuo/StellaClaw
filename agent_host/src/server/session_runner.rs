@@ -113,12 +113,10 @@ impl<'a> TurnCoordinator<'a> {
             &incoming.remote_message_id,
             "user_message",
         );
-        let effective_model = server.model_config_or_main(&effective_model_key)?.clone();
         let user_message = build_user_turn_message(
             incoming.text.as_deref(),
             &stored_attachments,
-            &effective_model,
-            backend_supports_native_multimodal_input(AgentBackendKind::AgentFrame),
+            &session.workspace_root,
             time_hints.system_date.as_deref(),
         )?;
         let user_receipt = session_actor.tell_user_message(SessionUserMessage {
@@ -447,24 +445,6 @@ impl Server {
             let _ = self.unregister_session_runtime_control(&address);
         }
         recovery_result
-    }
-
-    pub(super) async fn prepare_regular_conversation_message(
-        &self,
-        mut incoming: IncomingMessage,
-    ) -> Result<IncomingMessage> {
-        if !incoming.attachments.is_empty() {
-            let session = self
-                .ensure_foreground_actor(&incoming.address)?
-                .snapshot()?;
-            let mut stored_attachments = materialize_conversation_attachments(
-                &session.attachments_dir,
-                std::mem::take(&mut incoming.attachments),
-            )
-            .await?;
-            incoming.stored_attachments.append(&mut stored_attachments);
-        }
-        Ok(incoming)
     }
 
     async fn send_session_actor_outputs(

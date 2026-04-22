@@ -1100,7 +1100,7 @@ impl SessionActor {
     ) -> Result<()> {
         let attachment_count = attachments.len();
         self.session.push_message(role.clone(), text, attachments);
-        info!(
+        tracing::debug!(
             log_stream = "session",
             log_key = %self.session.id,
             kind = "message_appended",
@@ -1128,9 +1128,9 @@ impl SessionActor {
         info!(
             log_stream = "session",
             log_key = %self.session.id,
-            kind = "actor_message_received",
+            kind = "actor_message_enqueued",
             from_session_id = %message.from_session_id,
-            "received actor message"
+            "enqueued actor message in durable session mailbox"
         );
         self.session.session_state.actor_mailbox.push(message);
         self.session.persist()?;
@@ -1161,10 +1161,10 @@ impl SessionActor {
         info!(
             log_stream = "session",
             log_key = %self.session.id,
-            kind = "user_message_received",
+            kind = "user_message_enqueued",
             interrupted = receipt.interrupted,
             compaction_in_progress = receipt.compaction_in_progress,
-            "received user message into durable session mailbox"
+            "enqueued user message in durable session mailbox"
         );
         self.session.session_state.user_mailbox.push(queued);
         self.session.persist()?;
@@ -1208,7 +1208,7 @@ impl SessionActor {
         for message in messages {
             self.apply_actor_message(message);
         }
-        info!(
+        tracing::debug!(
             log_stream = "session",
             log_key = %self.session.id,
             kind = "actor_mailbox_drained",
@@ -1230,7 +1230,7 @@ impl SessionActor {
         for message in messages {
             self.apply_user_message(message);
         }
-        info!(
+        tracing::debug!(
             log_stream = "session",
             log_key = %self.session.id,
             kind = "user_mailbox_drained",
@@ -1273,7 +1273,7 @@ impl SessionActor {
             .push(message.pending_message);
         self.session
             .push_message(MessageRole::User, message.text, message.attachments);
-        info!(
+        tracing::debug!(
             log_stream = "session",
             log_key = %self.session.id,
             kind = "foreground_user_turn_staged",
@@ -2685,6 +2685,10 @@ mod tests {
             round_index: 0,
             tool_call_count: 0,
             api_request_id: None,
+            request_cache_control_type: None,
+            request_cache_control_ttl: None,
+            request_has_cache_breakpoint: false,
+            request_cache_breakpoint_count: 0,
             prompt_tokens: 10,
             completion_tokens: 5,
             total_tokens: 15,

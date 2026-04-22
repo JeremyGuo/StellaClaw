@@ -29,6 +29,8 @@ mod v0_33;
 mod v0_34;
 mod v0_35;
 mod v0_36;
+mod v0_37;
+mod v0_38;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -36,7 +38,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.36";
+pub const LATEST_WORKDIR_VERSION: &str = "0.38";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -52,7 +54,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 32] = [
+    let upgraders: [&dyn WorkdirUpgrader; 34] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
@@ -85,6 +87,8 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
         &v0_34::Upgrade,
         &v0_35::Upgrade,
         &v0_36::Upgrade,
+        &v0_37::Upgrade,
+        &v0_38::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -145,6 +149,8 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.33" => Ok("0.33"),
         "0.34" => Ok("0.34"),
         "0.35" => Ok("0.35"),
+        "0.36" => Ok("0.36"),
+        "0.37" => Ok("0.37"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -1893,5 +1899,215 @@ mod tests {
             fs::read_to_string(workspace_shared.join("nested/note.txt")).unwrap(),
             "legacy shared"
         );
+    }
+
+    #[test]
+    fn v0_37_workdir_upgrade_normalizes_legacy_token_log_fields() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.36\n").unwrap();
+
+        let agents_dir = temp_dir.path().join("logs").join("agents");
+        let api_dir = temp_dir.path().join("logs").join("api");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::create_dir_all(&api_dir).unwrap();
+
+        fs::write(
+            agents_dir.join("agent.jsonl"),
+            [
+                serde_json::json!({
+                    "kind": "turn_token_usage",
+                    "prompt_tokens": 120,
+                    "completion_tokens": 30,
+                    "total_tokens": 150,
+                    "cache_read_tokens": 80,
+                    "cache_write_tokens": 10,
+                    "cache_miss_tokens": 40,
+                    "legacy_prompt_tokens": 120,
+                    "legacy_completion_tokens": 30,
+                    "legacy_total_tokens": 150,
+                    "legacy_cache_hit_tokens": 80,
+                    "legacy_cache_miss_tokens": 40,
+                    "legacy_cache_read_tokens": 80,
+                    "legacy_cache_write_tokens": 10
+                })
+                .to_string(),
+                serde_json::json!({
+                    "kind": "agent_frame_model_call_completed",
+                    "input_total_tokens": 10,
+                    "output_total_tokens": 2,
+                    "context_total_tokens": 12,
+                    "cache_read_input_tokens": 4,
+                    "cache_write_input_tokens": 1,
+                    "cache_uncached_input_tokens": 6,
+                    "normal_billed_input_tokens": 5,
+                    "legacy_prompt_tokens": 10,
+                    "legacy_completion_tokens": 2
+                })
+                .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        fs::write(
+            api_dir.join("api.jsonl"),
+            serde_json::json!({
+                "kind": "upstream_api_request_completed",
+                "prompt_tokens": 70,
+                "completion_tokens": 7,
+                "total_tokens": 77,
+                "cache_read_tokens": 20
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("VERSION"))
+                .unwrap()
+                .trim(),
+            LATEST_WORKDIR_VERSION
+        );
+
+        let agent_lines = fs::read_to_string(agents_dir.join("agent.jsonl")).unwrap();
+        let agent_events = agent_lines
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(agent_events[0]["input_total_tokens"], 120);
+        assert_eq!(agent_events[0]["output_total_tokens"], 30);
+        assert_eq!(agent_events[0]["context_total_tokens"], 150);
+        assert_eq!(agent_events[0]["cache_read_input_tokens"], 80);
+        assert_eq!(agent_events[0]["cache_write_input_tokens"], 10);
+        assert_eq!(agent_events[0]["cache_uncached_input_tokens"], 40);
+        assert_eq!(agent_events[0]["normal_billed_input_tokens"], 30);
+        assert!(agent_events[0].get("prompt_tokens").is_none());
+        assert!(agent_events[0].get("legacy_prompt_tokens").is_none());
+        assert!(agent_events[0].get("legacy_cache_hit_tokens").is_none());
+        assert!(agent_events[1].get("legacy_prompt_tokens").is_none());
+
+        let api_event: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(api_dir.join("api.jsonl")).unwrap()).unwrap();
+        assert_eq!(api_event["input_total_tokens"], 70);
+        assert_eq!(api_event["output_total_tokens"], 7);
+        assert_eq!(api_event["context_total_tokens"], 77);
+        assert_eq!(api_event["cache_read_input_tokens"], 20);
+        assert_eq!(api_event["cache_uncached_input_tokens"], 50);
+        assert_eq!(api_event["normal_billed_input_tokens"], 50);
+        assert!(api_event.get("prompt_tokens").is_none());
+        assert!(api_event.get("cache_read_tokens").is_none());
+    }
+
+    #[test]
+    fn v0_38_workdir_upgrade_rewrites_inline_multimodal_messages_to_workspace_paths() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.37\n").unwrap();
+
+        let workspace_root = temp_dir
+            .path()
+            .join("workspaces")
+            .join("workspace-1")
+            .join("files");
+        fs::create_dir_all(&workspace_root).unwrap();
+
+        let session_dir = temp_dir
+            .path()
+            .join("sessions")
+            .join("conversation-1")
+            .join("foreground")
+            .join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&session_dir).unwrap();
+        let encoded_image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4//8/AwAI/AL+XxYl3wAAAABJRU5ErkJggg==";
+        fs::write(
+            session_dir.join("session.json"),
+            serde_json::to_string_pretty(&json!({
+                "kind": "foreground",
+                "id": Uuid::new_v4(),
+                "agent_id": Uuid::new_v4(),
+                "address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "conversation-1",
+                    "user_id": "user-1",
+                    "display_name": "User"
+                },
+                "workspace_id": "workspace-1",
+                "session_state": {
+                    "messages": [{
+                        "role": "user",
+                        "content": [{
+                            "type": "input_image",
+                            "image_url": format!("data:image/png;base64,{encoded_image}")
+                        }]
+                    }],
+                    "pending_messages": [],
+                    "user_mailbox": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let snapshot_dir = temp_dir.path().join("snapshots").join("demo");
+        fs::create_dir_all(snapshot_dir.join("workspace")).unwrap();
+        fs::write(
+            snapshot_dir.join("snapshot.json"),
+            serde_json::to_string_pretty(&json!({
+                "saved_at": "2026-04-22T00:00:00Z",
+                "source_address": {
+                    "channel_id": "telegram-main",
+                    "conversation_id": "conversation-1",
+                    "user_id": "user-1",
+                    "display_name": "User"
+                },
+                "settings": {
+                    "workspace_id": "workspace-1"
+                },
+                "session": {
+                    "messages": [{
+                        "role": "assistant",
+                        "content": [{
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:image/png;base64,{encoded_image}")
+                            }
+                        }]
+                    }],
+                    "pending_messages": [],
+                    "user_mailbox": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("VERSION"))
+                .unwrap()
+                .trim(),
+            LATEST_WORKDIR_VERSION
+        );
+
+        let session: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(session_dir.join("session.json")).unwrap())
+                .unwrap();
+        let session_item = &session["session_state"]["messages"][0]["content"][0];
+        assert_eq!(session_item["type"], "input_image");
+        let session_path = session_item["path"].as_str().unwrap();
+        assert!(session_path.starts_with("media/legacy/by-hash/image-"));
+        assert!(workspace_root.join(session_path).is_file());
+
+        let snapshot: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(snapshot_dir.join("snapshot.json")).unwrap())
+                .unwrap();
+        let snapshot_item = &snapshot["session"]["messages"][0]["content"][0];
+        assert_eq!(snapshot_item["type"], "output_image");
+        let snapshot_path = snapshot_item["path"].as_str().unwrap();
+        assert!(snapshot_path.starts_with("media/legacy/by-hash/image-"));
+        assert!(snapshot_dir.join("workspace").join(snapshot_path).is_file());
     }
 }
