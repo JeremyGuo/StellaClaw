@@ -17,6 +17,7 @@ use crate::sink::SinkRouter;
 use crate::snapshot::SnapshotManager;
 use crate::workspace::WorkspaceManager;
 use anyhow::{Result, anyhow};
+use chrono::{DateTime, Utc};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicUsize;
@@ -40,6 +41,7 @@ pub struct RuntimeContext {
     pub(super) main_agent: MainAgentConfig,
     pub(super) sink_router: Arc<RwLock<SinkRouter>>,
     pub(super) cron_manager: Arc<Mutex<CronManager>>,
+    pub(super) last_cron_poll_at: Arc<Mutex<DateTime<Utc>>>,
     pub(super) agent_registry: Arc<Mutex<AgentRegistry>>,
     pub(super) agent_registry_notify: Arc<Notify>,
     pub(super) max_global_sub_agents: usize,

@@ -30,6 +30,7 @@ mod v0_23;
 mod v0_24;
 mod v0_25;
 mod v0_26;
+mod v0_27;
 mod v0_3;
 mod v0_4;
 mod v0_5;
@@ -39,7 +40,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.26";
+pub const LATEST_CONFIG_VERSION: &str = "0.27";
 pub const VERSION_0_2: &str = "0.2";
 pub const VERSION_0_3: &str = "0.3";
 pub const VERSION_0_4: &str = "0.4";
@@ -65,6 +66,7 @@ pub const VERSION_0_23: &str = "0.23";
 pub const VERSION_0_24: &str = "0.24";
 pub const VERSION_0_25: &str = "0.25";
 pub const VERSION_0_26: &str = "0.26";
+pub const VERSION_0_27: &str = "0.27";
 
 trait ConfigLoader {
     fn version(&self) -> &'static str;
@@ -203,15 +205,17 @@ impl ModelConfig {
             ModelType::Openrouter => UpstreamApiKind::ChatCompletions,
             ModelType::OpenrouterResp | ModelType::CodexSubscription => UpstreamApiKind::Responses,
             ModelType::ClaudeCode => UpstreamApiKind::ClaudeMessages,
+            ModelType::BraveSearch => UpstreamApiKind::ChatCompletions,
         }
     }
 
     pub fn upstream_auth_kind(&self) -> UpstreamAuthKind {
         match self.model_type {
             ModelType::CodexSubscription => UpstreamAuthKind::CodexSubscription,
-            ModelType::Openrouter | ModelType::OpenrouterResp | ModelType::ClaudeCode => {
-                UpstreamAuthKind::ApiKey
-            }
+            ModelType::Openrouter
+            | ModelType::OpenrouterResp
+            | ModelType::ClaudeCode
+            | ModelType::BraveSearch => UpstreamAuthKind::ApiKey,
         }
     }
 
@@ -239,6 +243,7 @@ pub enum ModelType {
     OpenrouterResp,
     CodexSubscription,
     ClaudeCode,
+    BraveSearch,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -662,6 +667,10 @@ pub(crate) fn default_anthropic_api_key_env() -> String {
     "ANTHROPIC_API_KEY".to_string()
 }
 
+pub(crate) fn default_brave_search_api_key_env() -> String {
+    "BRAVE_SEARCH_API_KEY".to_string()
+}
+
 pub(crate) fn default_chat_completions_path() -> String {
     "/chat/completions".to_string()
 }
@@ -674,12 +683,24 @@ pub(crate) fn default_claude_messages_path() -> String {
     "/messages".to_string()
 }
 
+pub(crate) fn default_brave_search_path() -> String {
+    "/res/v1/web/search".to_string()
+}
+
 pub(crate) fn default_codex_subscription_endpoint() -> String {
     "https://chatgpt.com/backend-api/codex".to_string()
 }
 
 pub(crate) fn default_claude_messages_endpoint() -> String {
     "https://api.anthropic.com/v1".to_string()
+}
+
+pub(crate) fn default_brave_search_endpoint() -> String {
+    "https://api.search.brave.com".to_string()
+}
+
+pub(crate) fn default_brave_search_model_name() -> String {
+    "brave-web-search".to_string()
 }
 
 pub(crate) fn default_model_timeout_seconds() -> f64 {
@@ -1070,7 +1091,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
     let mut config = {
-        let loaders: [&dyn ConfigLoader; 26] = [
+        let loaders: [&dyn ConfigLoader; 27] = [
             &v0_1::LegacyConfigLoader,
             &v0_2::VersionedConfigLoader,
             &v0_3::VersionedConfigLoader,
@@ -1097,6 +1118,7 @@ pub fn load_server_config_file_and_upgrade(path: impl AsRef<Path>) -> Result<(Se
             &v0_24::LatestConfigLoader,
             &v0_25::LatestConfigLoader,
             &v0_26::LatestConfigLoader,
+            &v0_27::LatestConfigLoader,
         ];
         let loader = loaders
             .into_iter()
@@ -2476,6 +2498,76 @@ mod tests {
         );
         assert_eq!(config.models["main"].chat_completions_path, "/messages");
         assert_eq!(config.models["main"].api_key_env, "ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    fn brave_search_upgrade_defaults_to_brave_endpoint_and_search_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.26",
+              "models": {
+                "brave": {
+                  "type": "brave-search",
+                  "model": "",
+                  "capabilities": ["web_search"],
+                  "description": "Brave search helper",
+                  "agent_model_enabled": false
+                },
+                "main": {
+                  "type": "openrouter",
+                  "model": "openai/gpt-4.1-mini",
+                  "capabilities": ["chat"],
+                  "description": "demo"
+                }
+              },
+              "agent": {
+                "agent_frame": {
+                  "available_models": ["main"]
+                }
+              },
+              "tooling": {
+                "web_search": "brave"
+              },
+              "main_agent": {
+                "language": "zh-CN"
+              },
+              "channels": [
+                {
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }
+              ]
+            }
+            "#,
+        )
+        .unwrap();
+
+        let (config, upgraded) = load_server_config_file_and_upgrade(&config_path).unwrap();
+        assert!(upgraded);
+        assert_eq!(config.version, LATEST_CONFIG_VERSION);
+        assert_eq!(config.models["brave"].model_type, ModelType::BraveSearch);
+        assert_eq!(
+            config.models["brave"].api_endpoint,
+            "https://api.search.brave.com"
+        );
+        assert_eq!(
+            config.models["brave"].chat_completions_path,
+            "/res/v1/web/search"
+        );
+        assert_eq!(config.models["brave"].api_key_env, "BRAVE_SEARCH_API_KEY");
+        assert_eq!(config.models["brave"].model, "brave-web-search");
+        assert_eq!(
+            config
+                .tooling
+                .web_search
+                .as_ref()
+                .map(|target| target.alias.as_str()),
+            Some("brave")
+        );
     }
 
     #[test]

@@ -1428,6 +1428,7 @@ impl ConfigEditorApp {
                                 "openrouter".to_string(),
                                 "openrouter-resp".to_string(),
                                 "claude-code".to_string(),
+                                "brave-search".to_string(),
                                 "codex-subscription".to_string(),
                             ],
                             selected: model_type_index(&model_type),
@@ -2732,10 +2733,11 @@ struct ModelTypeWizardState {
 }
 
 impl ModelTypeWizardState {
-    const OPTIONS: [&str; 4] = [
+    const OPTIONS: [&str; 5] = [
         "openrouter",
         "openrouter-resp",
         "claude-code",
+        "brave-search",
         "codex-subscription",
     ];
 
@@ -3325,7 +3327,7 @@ impl ModelFormState {
             selected: 0,
             alias: String::new(),
             model_type: defaults.model_type.to_string(),
-            model_name: String::new(),
+            model_name: defaults.model_name.to_string(),
             api_endpoint: defaults.api_endpoint.to_string(),
             api_key_env: defaults.api_key_env.to_string(),
             chat_completions_path: defaults.chat_completions_path.to_string(),
@@ -3740,6 +3742,9 @@ impl ModelFormState {
     fn apply_model_type_defaults(&mut self, model_type: &str) {
         let defaults = default_model_type_profile(model_type);
         self.model_type = defaults.model_type.to_string();
+        if self.model_name.trim().is_empty() && !defaults.model_name.is_empty() {
+            self.model_name = defaults.model_name.to_string();
+        }
         self.api_endpoint = defaults.api_endpoint.to_string();
         self.api_key_env = defaults.api_key_env.to_string();
         self.chat_completions_path = defaults.chat_completions_path.to_string();
@@ -4143,6 +4148,7 @@ impl ChannelFormState {
 
 struct ModelTypeProfile {
     model_type: &'static str,
+    model_name: &'static str,
     api_endpoint: &'static str,
     api_key_env: &'static str,
     chat_completions_path: &'static str,
@@ -4157,6 +4163,7 @@ fn default_model_type_profile(model_type: &str) -> ModelTypeProfile {
     match model_type {
         "openrouter-resp" => ModelTypeProfile {
             model_type: "openrouter-resp",
+            model_name: "",
             api_endpoint: "https://openrouter.ai/api/v1",
             api_key_env: "OPENROUTER_API_KEY",
             chat_completions_path: "/responses",
@@ -4168,6 +4175,7 @@ fn default_model_type_profile(model_type: &str) -> ModelTypeProfile {
         },
         "claude-code" => ModelTypeProfile {
             model_type: "claude-code",
+            model_name: "",
             api_endpoint: "https://api.anthropic.com/v1",
             api_key_env: "ANTHROPIC_API_KEY",
             chat_completions_path: "/messages",
@@ -4177,8 +4185,21 @@ fn default_model_type_profile(model_type: &str) -> ModelTypeProfile {
             supports_vision_input: true,
             agent_model_enabled: true,
         },
+        "brave-search" => ModelTypeProfile {
+            model_type: "brave-search",
+            model_name: "brave-web-search",
+            api_endpoint: "https://api.search.brave.com",
+            api_key_env: "BRAVE_SEARCH_API_KEY",
+            chat_completions_path: "/res/v1/web/search",
+            codex_home: "",
+            auth_credentials_store_mode: "",
+            capabilities: "web_search",
+            supports_vision_input: false,
+            agent_model_enabled: false,
+        },
         "codex-subscription" => ModelTypeProfile {
             model_type: "codex-subscription",
+            model_name: "",
             api_endpoint: "https://chatgpt.com/backend-api/codex",
             api_key_env: "OPENAI_API_KEY",
             chat_completions_path: "/responses",
@@ -4190,6 +4211,7 @@ fn default_model_type_profile(model_type: &str) -> ModelTypeProfile {
         },
         _ => ModelTypeProfile {
             model_type: "openrouter",
+            model_name: "",
             api_endpoint: "https://openrouter.ai/api/v1",
             api_key_env: "OPENROUTER_API_KEY",
             chat_completions_path: "/chat/completions",
@@ -4226,6 +4248,19 @@ fn model_type_wizard_text(model_type: &str) -> String {
             "  api_endpoint: https://api.anthropic.com/v1",
             "  chat_completions_path: /messages",
             "  api_key_env: ANTHROPIC_API_KEY",
+        ]
+        .join("\n"),
+        "brave-search" => [
+            "Brave Search",
+            "",
+            "Use this for Brave's Web Search API helper route.",
+            "This model type is meant for tooling.web_search, not as a chat model.",
+            "",
+            "Defaults",
+            "  api_endpoint: https://api.search.brave.com",
+            "  chat_completions_path: /res/v1/web/search",
+            "  api_key_env: BRAVE_SEARCH_API_KEY",
+            "  capabilities: web_search",
         ]
         .join("\n"),
         "codex-subscription" => [
@@ -4811,7 +4846,8 @@ fn model_type_index(model_type: &str) -> usize {
         "openrouter" => 0,
         "openrouter-resp" => 1,
         "claude-code" => 2,
-        "codex-subscription" => 3,
+        "brave-search" => 3,
+        "codex-subscription" => 4,
         _ => 0,
     }
 }
@@ -5593,6 +5629,18 @@ mod tests {
         let preview = form.preview_json();
         assert_eq!(preview["supports_vision_input"], json!(true));
         assert_eq!(preview["agent_model_enabled"], json!(true));
+    }
+
+    #[test]
+    fn brave_search_model_form_uses_brave_defaults() {
+        let form = ModelFormState::new_with_type("brave-search");
+
+        assert_eq!(form.model_name, "brave-web-search");
+        assert_eq!(form.api_endpoint, "https://api.search.brave.com");
+        assert_eq!(form.api_key_env, "BRAVE_SEARCH_API_KEY");
+        assert_eq!(form.chat_completions_path, "/res/v1/web/search");
+        assert_eq!(form.capabilities, "web_search");
+        assert!(!form.agent_model_enabled);
     }
 
     #[test]

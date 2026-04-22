@@ -1676,13 +1676,23 @@ impl AgentRuntimeView {
 
     async fn poll_cron_once(&self) -> Result<()> {
         let now = Utc::now();
+        let window_start = {
+            *self
+                .last_cron_poll_at
+                .lock()
+                .map_err(|_| anyhow!("cron poll cursor lock poisoned"))?
+        };
         let due_tasks = {
             let mut manager = self
                 .cron_manager
                 .lock()
                 .map_err(|_| anyhow!("cron manager lock poisoned"))?;
-            manager.claim_due_tasks(now)?
+            manager.claim_due_tasks(window_start, now)?
         };
+        *self
+            .last_cron_poll_at
+            .lock()
+            .map_err(|_| anyhow!("cron poll cursor lock poisoned"))? = now;
 
         for claimed in due_tasks {
             if let Err(error) = self.handle_claimed_cron_task(claimed).await {
@@ -2193,6 +2203,7 @@ impl Server {
         let active_foreground_agent_frame_runtimes = Arc::new(Mutex::new(HashMap::new()));
         let subagents = Arc::new(Mutex::new(HashMap::new()));
         let background_terminate_flags = Arc::new(Mutex::new(HashSet::new()));
+        let last_cron_poll_at = Arc::new(Mutex::new(Utc::now()));
         let context = Arc::new(RuntimeContext {
             workdir,
             agent_workspace,
@@ -2209,6 +2220,7 @@ impl Server {
             main_agent: config.main_agent,
             sink_router,
             cron_manager,
+            last_cron_poll_at,
             agent_registry,
             agent_registry_notify,
             max_global_sub_agents: config.max_global_sub_agents,
@@ -3690,6 +3702,7 @@ mod tests {
             },
             sink_router: Arc::new(RwLock::new(SinkRouter::new())),
             cron_manager: Arc::new(Mutex::new(cron_manager)),
+            last_cron_poll_at: Arc::new(Mutex::new(Utc::now())),
             agent_registry: Arc::new(Mutex::new(agent_registry)),
             agent_registry_notify: Arc::new(Notify::new()),
             max_global_sub_agents: 4,

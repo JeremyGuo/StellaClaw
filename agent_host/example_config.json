@@ -1,5 +1,5 @@
 {
-  "version": "0.26",
+  "version": "0.27",
   "models": {
     "main": {
       "backend": "agent_frame",
@@ -30,7 +30,23 @@
         }
       },
       "description": "Fast general-purpose chat model for the foreground agent."
+    },
+    "brave_search": {
+      "type": "brave-search",
+      "api_endpoint": "https://api.search.brave.com",
+      "model": "brave-web-search",
+      "capabilities": [
+        "web_search"
+      ],
+      "api_key_env": "BRAVE_SEARCH_API_KEY",
+      "chat_completions_path": "/res/v1/web/search",
+      "timeout_seconds": 30,
+      "description": "Optional Brave Search helper for tooling.web_search.",
+      "agent_model_enabled": false
     }
+  },
+  "tooling": {
+    "web_search": "brave_search"
   },
   "main_agent": {
     "language": "zh-CN",

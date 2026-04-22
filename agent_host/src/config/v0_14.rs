@@ -2,8 +2,9 @@ use super::{
     AgentConfig, ChannelConfig, ConfigLoader, LATEST_CONFIG_VERSION, MainAgentConfig,
     ModelCapability, ModelCatalogConfig, ModelConfig, ModelType, SandboxConfig, ServerConfig,
     ToolingConfig, VERSION_0_14, build_server_config, default_agent_model_enabled,
-    default_anthropic_api_key_env, default_api_key_env, default_chat_completions_path,
-    default_claude_messages_endpoint, default_claude_messages_path,
+    default_anthropic_api_key_env, default_api_key_env, default_brave_search_api_key_env,
+    default_brave_search_endpoint, default_brave_search_model_name, default_brave_search_path,
+    default_chat_completions_path, default_claude_messages_endpoint, default_claude_messages_path,
     default_codex_subscription_endpoint, default_context_window_tokens,
     default_cron_poll_interval_seconds, default_max_global_sub_agents,
     default_model_timeout_seconds, default_responses_path,
@@ -136,10 +137,12 @@ fn upgrade_versioned_model(raw: VersionedModelConfigRaw) -> ModelConfig {
         }
         ModelType::CodexSubscription => default_codex_subscription_endpoint(),
         ModelType::ClaudeCode => default_claude_messages_endpoint(),
+        ModelType::BraveSearch => default_brave_search_endpoint(),
     });
     let api_key_env = if raw.api_key_env.trim().is_empty() {
         match raw.model_type {
             ModelType::ClaudeCode => default_anthropic_api_key_env(),
+            ModelType::BraveSearch => default_brave_search_api_key_env(),
             _ => default_api_key_env(),
         }
     } else {
@@ -151,12 +154,18 @@ fn upgrade_versioned_model(raw: VersionedModelConfigRaw) -> ModelConfig {
             ModelType::Openrouter => default_chat_completions_path(),
             ModelType::OpenrouterResp | ModelType::CodexSubscription => default_responses_path(),
             ModelType::ClaudeCode => default_claude_messages_path(),
+            ModelType::BraveSearch => default_brave_search_path(),
         });
+    let model = if raw.model.trim().is_empty() && raw.model_type == ModelType::BraveSearch {
+        default_brave_search_model_name()
+    } else {
+        raw.model
+    };
 
     ModelConfig {
         model_type: raw.model_type,
         api_endpoint,
-        model: raw.model,
+        model,
         backend: raw.backend.unwrap_or(AgentBackendKind::AgentFrame),
         supports_vision_input: raw.supports_vision_input,
         image_tool_model: raw.image_tool_model,

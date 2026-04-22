@@ -297,9 +297,13 @@ impl CronManager {
         Ok(view)
     }
 
-    pub fn claim_due_tasks(&mut self, now: DateTime<Utc>) -> Result<Vec<ClaimedCronTask>> {
+    pub fn claim_due_tasks(
+        &mut self,
+        window_start: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ClaimedCronTask>> {
         let mut claimed = Vec::new();
-        let mut skipped_running = false;
+        let mut touched = false;
         for task in self.tasks.values_mut() {
             if !task.enabled {
                 continue;
@@ -307,27 +311,41 @@ impl CronManager {
             let base = task
                 .last_scheduled_for
                 .unwrap_or_else(|| task.created_at - chrono::Duration::seconds(1));
-            let Some(next_run) = next_run_after(&task.schedule, &task.timezone, base)
+            let Some(mut next_run) = next_run_after(&task.schedule, &task.timezone, base)
                 .with_context(|| format!("invalid cron schedule for task {}", task.id))?
             else {
                 continue;
             };
+            if next_run <= window_start {
+                next_run = match next_run_after(&task.schedule, &task.timezone, window_start)
+                    .with_context(|| format!("invalid cron schedule for task {}", task.id))?
+                {
+                    Some(next_run) => next_run,
+                    None => {
+                        task.last_scheduled_for = Some(window_start);
+                        task.updated_at = now;
+                        touched = true;
+                        continue;
+                    }
+                };
+                task.last_scheduled_for = Some(window_start);
+                task.updated_at = now;
+                touched = true;
+            }
             if next_run <= now {
-                if trigger_outcome_is_running(task.last_trigger_outcome.as_deref()) {
-                    task.last_scheduled_for = Some(next_run);
-                    task.updated_at = now;
-                    skipped_running = true;
-                    continue;
-                }
                 task.last_scheduled_for = Some(next_run);
                 task.updated_at = now;
+                touched = true;
+                if trigger_outcome_is_running(task.last_trigger_outcome.as_deref()) {
+                    continue;
+                }
                 claimed.push(ClaimedCronTask {
                     task: task.clone(),
                     scheduled_for: next_run,
                 });
             }
         }
-        if !claimed.is_empty() || skipped_running {
+        if touched {
             self.persist()?;
         }
         Ok(claimed)
@@ -532,8 +550,9 @@ mod tests {
             })
             .unwrap();
         assert_eq!(manager.list().unwrap().len(), 1);
+        let first_due_at = manager.get(task.id).unwrap().next_run_at.unwrap();
         let due = manager
-            .claim_due_tasks(task.created_at + chrono::Duration::seconds(5))
+            .claim_due_tasks(first_due_at - chrono::Duration::seconds(1), first_due_at)
             .unwrap();
         assert_eq!(due.len(), 1);
     }
@@ -568,8 +587,10 @@ mod tests {
             })
             .unwrap();
 
-        let first_due_at = task.created_at + chrono::Duration::minutes(1);
-        let due = manager.claim_due_tasks(first_due_at).unwrap();
+        let first_due_at = manager.get(task.id).unwrap().next_run_at.unwrap();
+        let due = manager
+            .claim_due_tasks(first_due_at - chrono::Duration::seconds(1), first_due_at)
+            .unwrap();
         assert_eq!(due.len(), 1);
         manager
             .record_trigger_result(
@@ -580,11 +601,17 @@ mod tests {
             .unwrap();
 
         let skipped = manager
-            .claim_due_tasks(first_due_at + chrono::Duration::minutes(2))
+            .claim_due_tasks(
+                first_due_at + chrono::Duration::minutes(1),
+                first_due_at + chrono::Duration::minutes(2),
+            )
             .unwrap();
         assert!(skipped.is_empty());
         let skipped_again = manager
-            .claim_due_tasks(first_due_at + chrono::Duration::minutes(2))
+            .claim_due_tasks(
+                first_due_at + chrono::Duration::minutes(1),
+                first_due_at + chrono::Duration::minutes(2),
+            )
             .unwrap();
         assert!(skipped_again.is_empty());
 
@@ -592,17 +619,23 @@ mod tests {
             .record_trigger_result(task.id, first_due_at, "completed".to_string())
             .unwrap();
         let next_due = manager
-            .claim_due_tasks(first_due_at + chrono::Duration::minutes(2))
+            .claim_due_tasks(
+                first_due_at + chrono::Duration::minutes(1),
+                first_due_at + chrono::Duration::minutes(2),
+            )
             .unwrap();
         assert!(next_due.is_empty());
         let future_due = manager
-            .claim_due_tasks(first_due_at + chrono::Duration::minutes(3))
+            .claim_due_tasks(
+                first_due_at + chrono::Duration::minutes(2),
+                first_due_at + chrono::Duration::minutes(3),
+            )
             .unwrap();
         assert_eq!(future_due.len(), 1);
     }
 
     #[test]
-    fn cron_manager_clears_running_trigger_after_restart() {
+    fn cron_manager_clears_running_trigger_after_restart_without_retrying_missed_slot() {
         let temp_dir = TempDir::new().unwrap();
         let mut manager = CronManager::load_or_create(temp_dir.path()).unwrap();
         let task = manager
@@ -631,7 +664,7 @@ mod tests {
             })
             .unwrap();
 
-        let first_due_at = task.created_at + chrono::Duration::minutes(1);
+        let first_due_at = manager.get(task.id).unwrap().next_run_at.unwrap();
         {
             let stored = manager.tasks.get_mut(&task.id).unwrap();
             stored.last_scheduled_for = Some(first_due_at);
@@ -650,9 +683,84 @@ mod tests {
             Some("interrupted_by_restart")
         );
         let due = restored
-            .claim_due_tasks(first_due_at + chrono::Duration::minutes(1))
+            .claim_due_tasks(
+                first_due_at + chrono::Duration::minutes(1),
+                first_due_at + chrono::Duration::minutes(2),
+            )
             .unwrap();
         assert_eq!(due.len(), 1);
+        assert!(due[0].scheduled_for > first_due_at + chrono::Duration::minutes(1));
+    }
+
+    #[test]
+    fn cron_manager_skips_runs_missed_before_current_poll_window() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manager = CronManager::load_or_create(temp_dir.path()).unwrap();
+        let created_local = Shanghai
+            .with_ymd_and_hms(2026, 4, 21, 9, 0, 0)
+            .single()
+            .expect("test timezone should be valid");
+        let scheduled_local = Shanghai
+            .with_ymd_and_hms(2026, 4, 22, 8, 0, 0)
+            .single()
+            .expect("test timezone should be valid");
+        let startup_local = Shanghai
+            .with_ymd_and_hms(2026, 4, 22, 14, 2, 29)
+            .single()
+            .expect("test timezone should be valid");
+        let poll_local = Shanghai
+            .with_ymd_and_hms(2026, 4, 22, 14, 7, 4)
+            .single()
+            .expect("test timezone should be valid");
+        let next_local = Shanghai
+            .with_ymd_and_hms(2026, 4, 23, 8, 0, 0)
+            .single()
+            .expect("test timezone should be valid");
+        let task = manager
+            .create(CronCreateRequest {
+                name: "daily-morning-news".to_string(),
+                description: "send a morning digest".to_string(),
+                schedule: "0 0 8 * * *".to_string(),
+                timezone: default_cron_timezone(),
+                agent_backend: AgentBackendKind::AgentFrame,
+                model_key: "main".to_string(),
+                prompt: "ping".to_string(),
+                sink: SinkTarget::Direct(ChannelAddress {
+                    channel_id: "telegram-main".to_string(),
+                    conversation_id: "123".to_string(),
+                    user_id: None,
+                    display_name: None,
+                }),
+                address: ChannelAddress {
+                    channel_id: "telegram-main".to_string(),
+                    conversation_id: "123".to_string(),
+                    user_id: None,
+                    display_name: None,
+                },
+                enabled: true,
+                checker: None,
+            })
+            .unwrap();
+        let created_at = created_local.with_timezone(&chrono::Utc);
+        let scheduled_at = scheduled_local.with_timezone(&chrono::Utc);
+        let startup_at = startup_local.with_timezone(&chrono::Utc);
+        let poll_at = poll_local.with_timezone(&chrono::Utc);
+        let next_at = next_local.with_timezone(&chrono::Utc);
+        {
+            let task = manager.tasks.get_mut(&task.id).unwrap();
+            task.created_at = created_at;
+            task.updated_at = created_at;
+            task.last_scheduled_for = None;
+        }
+
+        let due = manager.claim_due_tasks(startup_at, poll_at).unwrap();
+        assert!(due.is_empty());
+        assert_eq!(manager.get(task.id).unwrap().next_run_at, Some(next_at));
+        assert_eq!(
+            manager.get(task.id).unwrap().last_scheduled_for,
+            Some(startup_at)
+        );
+        assert!(scheduled_at < startup_at);
     }
 
     #[test]
@@ -712,11 +820,16 @@ mod tests {
         assert_eq!(manager.get(task.id).unwrap().next_run_at, Some(target_at));
         assert!(
             manager
-                .claim_due_tasks(target_at - chrono::Duration::seconds(1))
+                .claim_due_tasks(
+                    target_at - chrono::Duration::seconds(2),
+                    target_at - chrono::Duration::seconds(1),
+                )
                 .unwrap()
                 .is_empty()
         );
-        let due = manager.claim_due_tasks(target_at).unwrap();
+        let due = manager
+            .claim_due_tasks(target_at - chrono::Duration::seconds(1), target_at)
+            .unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].scheduled_for, target_at);
     }

@@ -234,6 +234,7 @@ Sections include Models, Tooling, Main Agent, Runtime, Sandbox, and Channels. Su
 cp .env.example .env
 # Fill in:
 #   OPENROUTER_API_KEY=sk-or-...
+#   BRAVE_SEARCH_API_KEY=...    (optional: for Brave Search helper model)
 #   TELEGRAM_BOT_TOKEN=...        (for Telegram channel)
 #   DINGTALK_ROBOT_WEBHOOK_URL=... (for DingTalk robot replies)
 #   DINGTALK_ROBOT_APP_KEY=...     (optional: enables DingTalk attachment downloads)
@@ -258,7 +259,7 @@ cargo build --release --manifest-path agent_host/Cargo.toml --bin partyclaw
 
 ```json
 {
-  "version": "0.14",
+  "version": "0.27",
   "models": {
     "main": {
       "type": "openrouter",
@@ -282,7 +283,39 @@ cargo build --release --manifest-path agent_host/Cargo.toml --bin partyclaw
 }
 ```
 
-### 4. systemd Deployment
+### 4. Brave Search Helper
+
+If you want `tooling.web_search` to use Brave Search instead of a chat-completions-compatible search model, add a helper model like this:
+
+```json
+{
+  "models": {
+    "main": {
+      "type": "openrouter",
+      "api_endpoint": "https://openrouter.ai/api/v1",
+      "model": "anthropic/claude-sonnet-4.6",
+      "capabilities": ["chat"]
+    },
+    "brave_search": {
+      "type": "brave-search",
+      "api_endpoint": "https://api.search.brave.com",
+      "model": "brave-web-search",
+      "capabilities": ["web_search"],
+      "api_key_env": "BRAVE_SEARCH_API_KEY",
+      "chat_completions_path": "/res/v1/web/search",
+      "timeout_seconds": 30,
+      "agent_model_enabled": false
+    }
+  },
+  "tooling": {
+    "web_search": "brave_search"
+  }
+}
+```
+
+ClawParty will call Brave's `GET /res/v1/web/search` endpoint with the `X-Subscription-Token` header and return compacted result snippets plus citation URLs to the agent.
+
+### 5. systemd Deployment
 
 ```bash
 ./target/release/partyclaw setup --config config.json --workdir ./workdir

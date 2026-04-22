@@ -1571,6 +1571,7 @@ fn supports_automatic_anthropic_cache(model: &ModelConfig) -> bool {
                 && model.model.starts_with("anthropic/claude-")
         }
         crate::config::ModelType::ClaudeCode => model.model.starts_with("claude-"),
+        crate::config::ModelType::BraveSearch => false,
         crate::config::ModelType::CodexSubscription => false,
     }
 }

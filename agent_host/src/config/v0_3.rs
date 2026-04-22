@@ -1,9 +1,10 @@
 use super::{
     AgentConfig, ChannelConfig, ConfigLoader, MainAgentConfig, ModelCatalogConfig, ModelConfig,
     ModelType, SandboxConfig, ServerConfig, VERSION_0_3, build_server_config, default_api_key_env,
-    default_chat_completions_path, default_codex_subscription_endpoint,
-    default_context_window_tokens, default_cron_poll_interval_seconds,
-    default_max_global_sub_agents, default_model_timeout_seconds, default_responses_path,
+    default_brave_search_endpoint, default_brave_search_path, default_chat_completions_path,
+    default_codex_subscription_endpoint, default_context_window_tokens,
+    default_cron_poll_interval_seconds, default_max_global_sub_agents,
+    default_model_timeout_seconds, default_responses_path,
 };
 use crate::backend::AgentBackendKind;
 use agent_frame::config::{
@@ -161,6 +162,7 @@ fn upgrade_versioned_model(
         }
         ModelType::CodexSubscription => default_codex_subscription_endpoint(),
         ModelType::ClaudeCode => "https://api.anthropic.com/v1".to_string(),
+        ModelType::BraveSearch => default_brave_search_endpoint(),
     });
     let chat_completions_path = raw
         .chat_completions_path
@@ -168,6 +170,7 @@ fn upgrade_versioned_model(
             ModelType::Openrouter => default_chat_completions_path(),
             ModelType::OpenrouterResp | ModelType::CodexSubscription => default_responses_path(),
             ModelType::ClaudeCode => "/messages".to_string(),
+            ModelType::BraveSearch => default_brave_search_path(),
         });
     Ok(ModelConfig {
         model_type: raw.model_type,

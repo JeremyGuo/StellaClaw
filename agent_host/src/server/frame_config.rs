@@ -1,4 +1,13 @@
 use super::*;
+use crate::config::ModelType;
+
+fn provider_supports_native_audio_input(model: &ModelConfig) -> bool {
+    !matches!(model.upstream_api_kind(), UpstreamApiKind::ClaudeMessages)
+}
+
+fn supports_native_audio_input(model: &ModelConfig) -> bool {
+    model.has_capability(ModelCapability::AudioIn) && provider_supports_native_audio_input(model)
+}
 
 impl AgentRuntimeView {
     fn build_upstream_config(
@@ -27,7 +36,7 @@ impl AgentRuntimeView {
             auth_kind: model.upstream_auth_kind(),
             supports_vision_input: model.supports_image_input(),
             supports_pdf_input: model.has_capability(ModelCapability::Pdf),
-            supports_audio_input: model.has_capability(ModelCapability::AudioIn),
+            supports_audio_input: supports_native_audio_input(model),
             api_key: model.api_key.clone(),
             api_key_env: model.api_key_env.clone(),
             chat_completions_path: model.chat_completions_path.clone(),
@@ -57,6 +66,18 @@ impl AgentRuntimeView {
         model_key: &str,
         model: &ModelConfig,
     ) -> Option<ExternalWebSearchConfig> {
+        if model.model_type == ModelType::BraveSearch {
+            return Some(ExternalWebSearchConfig {
+                base_url: model.api_endpoint.clone(),
+                model: model.model.clone(),
+                supports_vision_input: false,
+                api_key: model.api_key.clone(),
+                api_key_env: model.api_key_env.clone(),
+                chat_completions_path: model.chat_completions_path.clone(),
+                timeout_seconds: model.timeout_seconds,
+                headers: model.headers.clone(),
+            });
+        }
         if model.upstream_api_kind() != UpstreamApiKind::ChatCompletions {
             warn!(
                 log_stream = "server",
@@ -201,7 +222,7 @@ impl AgentRuntimeView {
         let self_supported = match family {
             ToolingFamily::Image => model.supports_image_input(),
             ToolingFamily::Pdf => model.has_capability(ModelCapability::Pdf),
-            ToolingFamily::AudioInput => model.has_capability(ModelCapability::AudioIn),
+            ToolingFamily::AudioInput => supports_native_audio_input(model),
             _ => false,
         };
         if target.prefer_self && self_supported {
@@ -514,5 +535,63 @@ impl AgentRuntimeView {
                 },
             memory_system: self.main_agent.memory_system,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{provider_supports_native_audio_input, supports_native_audio_input};
+    use crate::config::{ModelCapability, ModelConfig, ModelType};
+    use agent_frame::config::{AuthCredentialsStoreMode, RetryModeConfig};
+    use serde_json::Map;
+
+    fn test_model(model_type: ModelType, capabilities: Vec<ModelCapability>) -> ModelConfig {
+        ModelConfig {
+            model_type,
+            api_endpoint: "https://example.com".to_string(),
+            model: "demo".to_string(),
+            backend: Default::default(),
+            supports_vision_input: false,
+            image_tool_model: None,
+            web_search_model: None,
+            api_key: None,
+            api_key_env: "API_KEY".to_string(),
+            chat_completions_path: "/messages".to_string(),
+            codex_home: None,
+            auth_credentials_store_mode: AuthCredentialsStoreMode::Auto,
+            timeout_seconds: 30.0,
+            retry_mode: RetryModeConfig::No,
+            context_window_tokens: 200_000,
+            cache_ttl: None,
+            reasoning: None,
+            headers: Map::new(),
+            description: String::new(),
+            agent_model_enabled: true,
+            capabilities,
+            native_web_search: None,
+            token_estimation: None,
+        }
+    }
+
+    #[test]
+    fn claude_messages_models_do_not_claim_native_audio_input() {
+        let model = test_model(
+            ModelType::ClaudeCode,
+            vec![ModelCapability::Chat, ModelCapability::AudioIn],
+        );
+
+        assert!(!provider_supports_native_audio_input(&model));
+        assert!(!supports_native_audio_input(&model));
+    }
+
+    #[test]
+    fn non_claude_models_can_keep_native_audio_input_when_capability_exists() {
+        let model = test_model(
+            ModelType::OpenrouterResp,
+            vec![ModelCapability::Chat, ModelCapability::AudioIn],
+        );
+
+        assert!(provider_supports_native_audio_input(&model));
+        assert!(supports_native_audio_input(&model));
     }
 }
