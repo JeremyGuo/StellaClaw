@@ -370,6 +370,7 @@ impl PersistentChildRuntime {
         global_install_root: PathBuf,
         token_estimation_cache_roots: Vec<PathBuf>,
         local_mounts: Vec<PathBuf>,
+        workspace_shared_source: PathBuf,
         skill_memory_source: PathBuf,
         skills_source_root: PathBuf,
         skills_dirs: &[std::path::PathBuf],
@@ -391,6 +392,7 @@ impl PersistentChildRuntime {
                 &global_install_root,
                 &token_estimation_cache_roots,
                 &local_mounts,
+                &workspace_shared_source,
                 &workspace_root.join(".skill_memory"),
                 &skill_memory_source,
                 &skills_source_root,
@@ -619,6 +621,7 @@ pub fn run_one_shot_child_turn(
     global_install_root: PathBuf,
     token_estimation_cache_roots: Vec<PathBuf>,
     local_mounts: Vec<PathBuf>,
+    workspace_shared_source: PathBuf,
     skill_memory_source: PathBuf,
     skills_source_root: PathBuf,
     extra_tools: Vec<Tool>,
@@ -631,6 +634,7 @@ pub fn run_one_shot_child_turn(
         global_install_root,
         token_estimation_cache_roots,
         local_mounts,
+        workspace_shared_source,
         skill_memory_source,
         skills_source_root,
         &config.skills_dirs,
@@ -660,6 +664,7 @@ fn build_bubblewrap_command(
     global_install_root: &Path,
     token_estimation_cache_roots: &[PathBuf],
     local_mounts: &[PathBuf],
+    workspace_shared_source: &Path,
     skill_memory_target: &Path,
     skill_memory_source: &Path,
     skills_source_root: &Path,
@@ -723,6 +728,7 @@ fn build_bubblewrap_command(
         for local_mount in local_mounts {
             ensure_home_skeleton_parent_for_target(&home_skeleton, &home_dir, local_mount)?;
         }
+        ensure_home_skeleton_parent_for_target(&home_skeleton, &home_dir, workspace_shared_source)?;
         bind_path_to(&mut command, &home_skeleton, &home_dir, true)?;
     }
     bind_path(&mut command, workspace_root, false)?;
@@ -757,6 +763,10 @@ fn build_bubblewrap_command(
     }
     if let Some(home_ssh_dir) = discover_home_ssh_dir() {
         bind_path(&mut command, &home_ssh_dir, false)?;
+    }
+    if workspace_shared_source.exists() {
+        ensure_bubblewrap_target_parent_dirs(&mut command, workspace_shared_source)?;
+        bind_path(&mut command, workspace_shared_source, false)?;
     }
     if skill_memory_source.exists() {
         bind_path_to(
@@ -928,6 +938,7 @@ mod tests {
         let workspace_root = temp_dir.path().join("workspace");
         let runtime_state_root = temp_dir.path().join("runtime");
         let global_install_root = temp_dir.path().join("global");
+        let workspace_shared_source = temp_dir.path().join("rundir").join("shared");
         let skill_memory_source = temp_dir.path().join("skill_memory");
         let skills_source_root = temp_dir.path().join("skills-source");
         let workspace_skills_dir = workspace_root.join(".skills");
@@ -936,6 +947,7 @@ mod tests {
         fs::create_dir_all(&workspace_root).unwrap();
         fs::create_dir_all(&runtime_state_root).unwrap();
         fs::create_dir_all(&global_install_root).unwrap();
+        fs::create_dir_all(&workspace_shared_source).unwrap();
         fs::create_dir_all(&skill_memory_source).unwrap();
         fs::create_dir_all(&skills_source_root).unwrap();
         fs::create_dir_all(&workspace_skills_dir).unwrap();
@@ -952,6 +964,7 @@ mod tests {
             &global_install_root,
             &[],
             &[],
+            &workspace_shared_source,
             &workspace_root.join(".skill_memory"),
             &skill_memory_source,
             &skills_source_root,
@@ -984,10 +997,12 @@ mod tests {
         let workspace_root = temp_dir.path().join("workspace");
         let runtime_state_root = temp_dir.path().join("runtime");
         let missing_global_install_root = temp_dir.path().join("missing-global");
+        let workspace_shared_source = temp_dir.path().join("rundir").join("shared");
 
         fs::write(&current_exe, b"binary").unwrap();
         fs::create_dir_all(&workspace_root).unwrap();
         fs::create_dir_all(&runtime_state_root).unwrap();
+        fs::create_dir_all(&workspace_shared_source).unwrap();
 
         let command = build_bubblewrap_command(
             &SandboxConfig {
@@ -1001,6 +1016,7 @@ mod tests {
             &missing_global_install_root,
             &[],
             &[],
+            &workspace_shared_source,
             &workspace_root.join(".skill_memory"),
             &temp_dir.path().join("skill_memory"),
             &temp_dir.path().join("skills-source"),
@@ -1029,6 +1045,7 @@ mod tests {
         let workspace_root = temp_dir.path().join("workspace");
         let runtime_state_root = temp_dir.path().join("runtime");
         let global_install_root = temp_dir.path().join("global");
+        let workspace_shared_source = temp_dir.path().join("rundir").join("shared");
         let template_cache_root = temp_dir.path().join("template-cache").join("hf");
         let tokenizer_cache_root = temp_dir.path().join("tokenizer-cache").join("hf");
 
@@ -1036,6 +1053,7 @@ mod tests {
         fs::create_dir_all(&workspace_root).unwrap();
         fs::create_dir_all(&runtime_state_root).unwrap();
         fs::create_dir_all(&global_install_root).unwrap();
+        fs::create_dir_all(&workspace_shared_source).unwrap();
 
         let command = build_bubblewrap_command(
             &SandboxConfig {
@@ -1049,6 +1067,7 @@ mod tests {
             &global_install_root,
             &[template_cache_root.clone(), tokenizer_cache_root.clone()],
             &[],
+            &workspace_shared_source,
             &workspace_root.join(".skill_memory"),
             &temp_dir.path().join("skill_memory"),
             &temp_dir.path().join("skills-source"),
@@ -1085,12 +1104,14 @@ mod tests {
         let runtime_state_root = temp_dir.path().join("runtime");
         let global_install_root = temp_dir.path().join("global");
         let local_mount = temp_dir.path().join("shared-data");
+        let workspace_shared_source = temp_dir.path().join("rundir").join("shared");
 
         fs::write(&current_exe, b"binary").unwrap();
         fs::create_dir_all(&workspace_root).unwrap();
         fs::create_dir_all(&runtime_state_root).unwrap();
         fs::create_dir_all(&global_install_root).unwrap();
         fs::create_dir_all(&local_mount).unwrap();
+        fs::create_dir_all(&workspace_shared_source).unwrap();
 
         let command = build_bubblewrap_command(
             &SandboxConfig {
@@ -1104,6 +1125,7 @@ mod tests {
             &global_install_root,
             &[],
             std::slice::from_ref(&local_mount),
+            &workspace_shared_source,
             &workspace_root.join(".skill_memory"),
             &temp_dir.path().join("skill_memory"),
             &temp_dir.path().join("skills-source"),
@@ -1135,11 +1157,13 @@ mod tests {
         let workspace_root = temp_dir.path().join("workspace");
         let runtime_state_root = temp_dir.path().join("runtime");
         let global_install_root = temp_dir.path().join("global");
+        let workspace_shared_source = temp_dir.path().join("rundir").join("shared");
 
         fs::write(&current_exe, b"binary").unwrap();
         fs::create_dir_all(&workspace_root).unwrap();
         fs::create_dir_all(&runtime_state_root).unwrap();
         fs::create_dir_all(&global_install_root).unwrap();
+        fs::create_dir_all(&workspace_shared_source).unwrap();
 
         let command = build_bubblewrap_command(
             &SandboxConfig {
@@ -1153,6 +1177,7 @@ mod tests {
             &global_install_root,
             &[],
             &[],
+            &workspace_shared_source,
             &workspace_root.join(".skill_memory"),
             &temp_dir.path().join("skill_memory"),
             &temp_dir.path().join("skills-source"),
@@ -1180,6 +1205,58 @@ mod tests {
         assert!(
             !args.iter().any(|arg| arg == "/run/docker.sock"),
             "bubblewrap args unexpectedly expose Docker socket: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn bubblewrap_mounts_workspace_shared_source_for_workspace_symlinks() {
+        let temp_dir = TempDir::new().unwrap();
+        let current_exe = temp_dir.path().join("partyclaw");
+        let workspace_root = temp_dir.path().join("workspace");
+        let runtime_state_root = temp_dir.path().join("runtime");
+        let global_install_root = temp_dir.path().join("global");
+        let workspace_shared_source = temp_dir.path().join("rundir").join("shared");
+
+        fs::write(&current_exe, b"binary").unwrap();
+        fs::create_dir_all(&workspace_root).unwrap();
+        fs::create_dir_all(&runtime_state_root).unwrap();
+        fs::create_dir_all(&global_install_root).unwrap();
+        fs::create_dir_all(&workspace_shared_source).unwrap();
+
+        let command = build_bubblewrap_command(
+            &SandboxConfig {
+                mode: SandboxMode::Bubblewrap,
+                bubblewrap_binary: "bwrap".to_string(),
+                map_docker_socket: false,
+            },
+            &current_exe,
+            &workspace_root,
+            &runtime_state_root,
+            &global_install_root,
+            &[],
+            &[],
+            &workspace_shared_source,
+            &workspace_root.join(".skill_memory"),
+            &temp_dir.path().join("skill_memory"),
+            &temp_dir.path().join("skills-source"),
+            &[],
+        )
+        .unwrap();
+
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let expected = vec![
+            "--bind".to_string(),
+            workspace_shared_source.to_string_lossy().into_owned(),
+            workspace_shared_source.to_string_lossy().into_owned(),
+        ];
+        assert!(
+            args.windows(expected.len())
+                .any(|window| window == expected),
+            "bubblewrap args did not include workspace shared bind: {:?}",
             args
         );
     }

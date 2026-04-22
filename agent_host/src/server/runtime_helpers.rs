@@ -534,17 +534,11 @@ pub(super) fn format_session_status(
         .unwrap_or_default();
     let legacy_usage = &session.cumulative_usage;
     let compaction = &session.cumulative_compaction;
-    let cache_read_rate = if usage.input_total_tokens() == 0 {
-        0.0
-    } else {
-        (usage.cache_read_input_tokens() as f64 / usage.input_total_tokens() as f64) * 100.0
-    };
-    let legacy_cache_read_rate = if legacy_usage.input_total_tokens() == 0 {
-        0.0
-    } else {
-        (legacy_usage.cache_read_input_tokens() as f64 / legacy_usage.input_total_tokens() as f64)
-            * 100.0
-    };
+    let cache_read_rate = today_usage
+        .as_ref()
+        .map(|(_, usage)| cache_read_rate_percent(usage))
+        .unwrap_or_default();
+    let legacy_cache_read_rate = cache_read_rate_percent(legacy_usage);
     let compaction_pricing = estimate_compaction_savings_usd(model, compaction);
     let context_percent = if current_context_limit == 0 {
         0.0
@@ -961,6 +955,17 @@ pub(super) fn format_session_status(
             );
         }
         lines.join("\n")
+    }
+}
+
+pub(super) fn cache_read_rate_percent(usage: &TokenUsage) -> f64 {
+    let effective_input_tokens = usage
+        .cache_read_input_tokens()
+        .saturating_add(usage.cache_uncached_input_tokens());
+    if effective_input_tokens == 0 {
+        0.0
+    } else {
+        (usage.cache_read_input_tokens() as f64 / effective_input_tokens as f64) * 100.0
     }
 }
 

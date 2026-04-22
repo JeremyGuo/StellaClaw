@@ -116,6 +116,14 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Conversation local mounts are included in the rebuilt system prompt so future turns can identify the mounted local paths without treating them as remote SSH workpaths.
 - Regression coverage should protect `/mount` parsing, conversation persistence, workdir upgrade backfill, prompt rendering, and bubblewrap bind arguments for local mounts.
 
+### Workspace Shared Directory
+
+- Every workspace root exposes a writable `./shared` entry that points at the workdir-global `rundir/shared` directory, so files placed there are visible across all workspaces in the same deployment workdir.
+- Bubblewrap sandboxes preserve `./shared` by binding the underlying `rundir/shared` source path into the sandbox, allowing the workspace-local shared symlink to resolve without copying per-workspace state.
+- The main AgentHost system prompt should explicitly tell agents that `./shared` is a cross-workspace shared directory.
+- Existing workdirs are upgraded by creating `rundir/shared` and backfilling missing workspace `shared` links, merging legacy per-workspace `shared/` directory contents into the shared source when practical.
+- Regression coverage should protect new workspace seeding, bubblewrap bind arguments, system-prompt guidance, and workdir upgrade backfill for shared workspace access.
+
 ### Agent Plan Progress
 
 - Main agents can call `update_plan` to publish a short structured checklist for non-trivial, multi-step, ambiguous, or long-running work.

@@ -189,6 +189,7 @@ fn build_static_intro_prompt_parts(
         header.to_string(),
         role_line.to_string(),
         "Your primary writable workspace is the current workspace root for this session.".to_string(),
+        "The path ./shared is a writable directory shared by every workspace in this workdir. It is backed by rundir/shared, so files written there are visible across workspaces.".to_string(),
         "Anti-fabrication rules: if you are unsure, do not answer from memory. Inspect the codebase, search history, or run a narrow verification step first. Do not guess.".to_string(),
         "Before using any library, framework, command, flag, file path, or project capability, verify that it exists in this repository or local environment instead of assuming it exists.".to_string(),
         "Default workflow: explore the relevant code and config, understand local conventions, implement the root cause, run focused verification, then run lint, typecheck, or other project checks if they exist and are relevant.".to_string(),
@@ -540,6 +541,9 @@ mod tests {
 
         assert!(prompt.contains("append one or more tags in your final reply"));
         assert!(prompt.contains("Some system-wide software packages are installed under /opt."));
+        assert!(prompt.contains(
+            "The path ./shared is a writable directory shared by every workspace in this workdir."
+        ));
         assert!(prompt.contains("Current workspace summary."));
         let local_mount_prompt = build_agent_system_prompt(
             &workspace,

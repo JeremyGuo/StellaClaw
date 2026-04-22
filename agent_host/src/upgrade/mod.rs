@@ -28,6 +28,7 @@ mod v0_32;
 mod v0_33;
 mod v0_34;
 mod v0_35;
+mod v0_36;
 mod v0_5;
 mod v0_6;
 mod v0_7;
@@ -35,7 +36,7 @@ mod v0_8;
 mod v0_9;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.4";
-pub const LATEST_WORKDIR_VERSION: &str = "0.35";
+pub const LATEST_WORKDIR_VERSION: &str = "0.36";
 const VERSION_FILE_NAME: &str = "VERSION";
 
 trait WorkdirUpgrader {
@@ -51,7 +52,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
     let version_path = workdir.join(VERSION_FILE_NAME);
     let mut current = read_workdir_version(&version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 31] = [
+    let upgraders: [&dyn WorkdirUpgrader; 32] = [
         &v0_5::Upgrade,
         &v0_6::Upgrade,
         &v0_7::Upgrade,
@@ -83,6 +84,7 @@ pub fn upgrade_workdir(workdir: impl AsRef<Path>) -> Result<bool> {
         &v0_33::Upgrade,
         &v0_34::Upgrade,
         &v0_35::Upgrade,
+        &v0_36::Upgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -142,6 +144,7 @@ fn read_workdir_version(version_path: &Path) -> Result<&'static str> {
         "0.32" => Ok("0.32"),
         "0.33" => Ok("0.33"),
         "0.34" => Ok("0.34"),
+        "0.35" => Ok("0.35"),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -1844,5 +1847,51 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(snapshot_url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn v0_36_workdir_upgrade_backfills_workspace_shared_links() {
+        let temp_dir = TempDir::new().unwrap();
+        fs::write(temp_dir.path().join("VERSION"), "0.35\n").unwrap();
+
+        let workspace_files = temp_dir
+            .path()
+            .join("workspaces")
+            .join("ws-1")
+            .join("files");
+        fs::create_dir_all(workspace_files.join("shared/nested")).unwrap();
+        fs::write(
+            workspace_files.join("shared/nested/note.txt"),
+            "legacy shared",
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(temp_dir.path()).unwrap();
+
+        assert!(upgraded);
+        assert_eq!(
+            fs::read_to_string(temp_dir.path().join("VERSION"))
+                .unwrap()
+                .trim(),
+            LATEST_WORKDIR_VERSION
+        );
+
+        let shared_source = temp_dir.path().join("rundir").join("shared");
+        let workspace_shared = workspace_files.join("shared");
+        assert!(shared_source.is_dir());
+        assert!(
+            fs::symlink_metadata(&workspace_shared)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(shared_source.join("nested/note.txt")).unwrap(),
+            "legacy shared"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace_shared.join("nested/note.txt")).unwrap(),
+            "legacy shared"
+        );
     }
 }

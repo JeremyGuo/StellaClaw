@@ -1,5 +1,18 @@
-version: 0.26.3
+version: 0.26.4
 ---
+
+# 0.26.4
+
+- 新增跨 workspace 共享目录：
+  workdir 级 `rundir/shared` 现在会作为共享源目录暴露到每个 workspace 的 `./shared` 路径下，方便不同 workspace 之间通过统一目录交换文件，而不需要再手动复制到各自 workspace。
+- 补齐 bubblewrap 下的共享目录可见性：
+  进入 bubblewrap 时会额外把底层 `rundir/shared` 按原绝对路径 bind 进沙盒，让 workspace 内部的 `./shared` symlink 在沙盒里也能正常解析，不会因为只挂了 workspace 根而变成断链。
+- 更新 Host system prompt：
+  主系统提示现在会明确说明 `./shared` 是当前 workdir 下所有 workspace 共用的可写目录，帮助 agent 正确理解这类跨 workspace 文件应放在哪里。
+- 新增 workdir 升级与回归测试：
+  `0.35 -> 0.36` upgrade step 会创建缺失的 `rundir/shared`，并为旧 workspace 回填 `shared` 入口；若旧 workspace 已经存在本地 `shared/` 目录，会尽量把内容合并进共享源目录后再切回统一入口。新增 workspace seeding、bubblewrap bind、prompt 文案和 upgrade backfill 测试保护这一行为。
+- 本次只影响 `workdir` schema，不影响 `config` schema：
+  workdir 结构版本提升到 `0.36`，新增 upgrade step；按 workdir-only 变更策略将仓库版本从 `0.26.3` 提升到 `0.26.4`。
 
 # 0.26.3
 

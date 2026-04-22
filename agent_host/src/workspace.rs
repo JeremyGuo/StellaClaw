@@ -685,6 +685,7 @@ impl WorkspaceManager {
         )?;
         fs::create_dir_all(&record.mounts_dir)
             .with_context(|| format!("failed to create {}", record.mounts_dir.display()))?;
+        self.normalize_shared_workspace_layout(record)?;
         self.normalize_skill_memory_layout(record)?;
         fs::create_dir_all(&record.host_dir)
             .with_context(|| format!("failed to create {}", record.host_dir.display()))?;
@@ -709,7 +710,10 @@ impl WorkspaceManager {
         {
             let entry = entry?;
             let source_path = entry.path();
-            if entry.file_name() == "skill_memory" || entry.file_name() == ".skill_memory" {
+            if entry.file_name() == "skill_memory"
+                || entry.file_name() == ".skill_memory"
+                || entry.file_name() == "shared"
+            {
                 continue;
             }
             let target_path = record.files_dir.join(entry.file_name());
@@ -735,6 +739,31 @@ impl WorkspaceManager {
             copy_path_recursive(&source_path, &target_path)?;
         }
         Ok(())
+    }
+
+    fn normalize_shared_workspace_layout(&self, record: &WorkspaceRecord) -> Result<()> {
+        let source = self.template_root.join("shared");
+        fs::create_dir_all(&source)
+            .with_context(|| format!("failed to create {}", source.display()))?;
+        let target = record.files_dir.join("shared");
+        if let Ok(metadata) = fs::symlink_metadata(&target) {
+            if metadata.file_type().is_symlink() {
+                return Ok(());
+            }
+            if metadata.is_dir() {
+                merge_directory_contents_if_missing(&target, &source)?;
+                fs::remove_dir_all(&target)
+                    .with_context(|| format!("failed to remove legacy {}", target.display()))?;
+            } else {
+                return Ok(());
+            }
+        }
+        match create_dir_symlink(&source, &target) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to create shared dir link {}", target.display())),
+        }
     }
 
     fn normalize_skill_memory_layout(&self, record: &WorkspaceRecord) -> Result<()> {
@@ -1181,6 +1210,7 @@ mod tests {
     fn workspace_manager_seeds_new_workspace_from_rundir_template() {
         let temp_dir = TempDir::new().unwrap();
         fs::create_dir_all(temp_dir.path().join("rundir/.skills")).unwrap();
+        fs::create_dir_all(temp_dir.path().join("rundir/shared")).unwrap();
         fs::create_dir_all(temp_dir.path().join("agent")).unwrap();
         fs::write(temp_dir.path().join("rundir/AGENTS.md"), "template agents").unwrap();
         fs::write(
@@ -1191,6 +1221,11 @@ mod tests {
         fs::write(
             temp_dir.path().join("rundir/.skills/template.txt"),
             "skill template",
+        )
+        .unwrap();
+        fs::write(
+            temp_dir.path().join("rundir/shared/shared.txt"),
+            "shared content",
         )
         .unwrap();
         fs::write(temp_dir.path().join("agent/USER.md"), "shared user").unwrap();
@@ -1220,6 +1255,16 @@ mod tests {
         assert_eq!(
             fs::read_to_string(created.files_dir.join("PARTCLAW.md")).unwrap(),
             "template partclaw"
+        );
+        assert!(
+            fs::symlink_metadata(created.files_dir.join("shared"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(created.files_dir.join("shared/shared.txt")).unwrap(),
+            "shared content"
         );
     }
 
@@ -1317,6 +1362,12 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+        assert!(
+            fs::symlink_metadata(target.files_dir.join("shared"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         assert!(target.mounts_dir.join("shared").exists());
 
         manager.prepare_bubblewrap_view(&target.id).unwrap();
@@ -1330,6 +1381,12 @@ mod tests {
         );
         assert!(
             fs::symlink_metadata(target.mounts_dir.join("shared"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::symlink_metadata(target.files_dir.join("shared"))
                 .unwrap()
                 .file_type()
                 .is_symlink()

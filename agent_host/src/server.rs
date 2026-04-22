@@ -438,6 +438,7 @@ impl AgentRuntimeView {
             PathBuf::from(&self.main_agent.global_install_root),
             self.token_estimation_cache_roots(),
             local_mounts.clone(),
+            self.agent_workspace.rundir.join("shared"),
             self.agent_workspace.rundir.join("skill_memory"),
             self.agent_workspace.skills_dir.clone(),
             &config.skills_dirs,
@@ -1143,6 +1144,7 @@ impl AgentRuntimeView {
                 PathBuf::from(&self.main_agent.global_install_root),
                 self.token_estimation_cache_roots(),
                 self.local_mount_paths_for_address(&session.address)?,
+                self.agent_workspace.rundir.join("shared"),
                 self.agent_workspace.rundir.join("skill_memory"),
                 self.agent_workspace.skills_dir.clone(),
                 extra_tools,
@@ -3537,7 +3539,7 @@ mod tests {
         SummaryTracker, TokenUsage, automatic_anthropic_cache_control,
         automatic_anthropic_cache_ttl, background_timeout_with_active_children_text,
         build_status_usage_chart, build_synthetic_runtime_messages, build_user_turn_message,
-        channel_restart_backoff_seconds,
+        cache_read_rate_percent, channel_restart_backoff_seconds,
         coalesce_buffered_conversation_messages, collect_conversation_usage_report,
         collect_conversation_usage_window, conversation_memory_root,
         estimate_compaction_savings_usd, estimate_cost_usd, extract_attachment_references,
@@ -5690,6 +5692,104 @@ mod tests {
         assert_eq!(chart.days[0].cache_read_input_tokens, 1_500_000);
         assert_eq!(chart.days[0].cache_write_input_tokens, 500);
         assert_eq!(chart.days[0].llm_calls, 2);
+    }
+
+    #[test]
+    fn cache_read_rate_uses_effective_input_tokens() {
+        let usage = TokenUsage {
+            llm_calls: 1,
+            prompt_tokens: 1,
+            completion_tokens: 10,
+            total_tokens: 11,
+            cache_hit_tokens: 111_801,
+            cache_miss_tokens: 0,
+            cache_read_tokens: 111_801,
+            cache_write_tokens: 292,
+        };
+
+        assert!((cache_read_rate_percent(&usage) - 100.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn session_status_cache_read_rate_uses_today_not_window_total() {
+        let temp_dir = TempDir::new().unwrap();
+        let session = build_test_session(&temp_dir);
+        let model = anthropic_cache_test_model(
+            crate::config::ModelType::Openrouter,
+            "https://openrouter.ai/api/v1",
+            "anthropic/claude-sonnet-4.6",
+            None,
+        );
+        let day_one = chrono::NaiveDate::from_ymd_opt(2026, 4, 21).unwrap();
+        let day_two = chrono::NaiveDate::from_ymd_opt(2026, 4, 22).unwrap();
+        let report = ConversationUsageReport {
+            days: vec![
+                crate::server::ConversationDailyUsage {
+                    date: day_one,
+                    usage: TokenUsage {
+                        llm_calls: 1,
+                        prompt_tokens: 1,
+                        completion_tokens: 10,
+                        total_tokens: 11,
+                        cache_hit_tokens: 80,
+                        cache_miss_tokens: 20,
+                        cache_read_tokens: 80,
+                        cache_write_tokens: 0,
+                    },
+                    event_count: 1,
+                    missing_cache_breakdown_events: 0,
+                },
+                crate::server::ConversationDailyUsage {
+                    date: day_two,
+                    usage: TokenUsage {
+                        llm_calls: 1,
+                        prompt_tokens: 1,
+                        completion_tokens: 10,
+                        total_tokens: 11,
+                        cache_hit_tokens: 10,
+                        cache_miss_tokens: 90,
+                        cache_read_tokens: 10,
+                        cache_write_tokens: 0,
+                    },
+                    event_count: 1,
+                    missing_cache_breakdown_events: 0,
+                },
+            ],
+            total: crate::server::ConversationUsageWindow {
+                usage: TokenUsage {
+                    llm_calls: 2,
+                    prompt_tokens: 2,
+                    completion_tokens: 20,
+                    total_tokens: 22,
+                    cache_hit_tokens: 90,
+                    cache_miss_tokens: 110,
+                    cache_read_tokens: 90,
+                    cache_write_tokens: 0,
+                },
+                event_count: 2,
+                session_count: 1,
+                missing_cache_breakdown_events: 0,
+            },
+            ..ConversationUsageReport::default()
+        };
+
+        let text = format_session_status(
+            "en",
+            "test-model",
+            &model,
+            &session,
+            120.0,
+            "model default",
+            12_000,
+            115_200,
+            None,
+            true,
+            &report,
+            &ConversationPricingBreakdown::default(),
+        );
+
+        assert!(text.contains("- cache_read_rate: 10.00%"));
+        assert!(!text.contains("- cache_read_rate: 45.00%"));
     }
 
     #[test]
