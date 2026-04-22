@@ -8,6 +8,7 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 
 ### Config Schema Invariants
 
+- Latest AgentHost config files support a `models.<alias>.type = "brave-search"` helper model type for `tooling.web_search`, with Brave-specific default endpoint/path semantics that resolve to `https://api.search.brave.com` and `/res/v1/web/search`.
 - Latest AgentHost config files support a `models.<alias>.type = "claude-code"` provider for Anthropic Messages compatible endpoints, with default endpoint/path semantics that resolve to `/v1/messages` style routing instead of OpenAI chat or responses routes.
 - Latest AgentHost config files do not use `main_agent.model` as a global default-model knob; user-facing model selection remains conversation-owned state.
 - Latest AgentHost config files do not use `main_agent.timeout_seconds` as a global subagent-timeout knob; subagent timeout policy is derived from the selected model/runtime flow instead of a second main-agent override field.
@@ -21,6 +22,21 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Automatic Anthropic prompt caching is enabled for Claude-compatible `claude-code` models and is translated into an explicit block-level `cache_control` marker on the last cacheable request block so Claude-style prompt caching works on Anthropic Messages / NewAPI style gateways.
 - Assistant tool use and tool result history are translated losslessly between internal `ChatMessage` state and Claude Messages `tool_use` / `tool_result` blocks, so tool-driven multi-round sessions keep working when a conversation runs on `claude-code`.
 - Regression coverage should protect config upgrade defaults for `claude-code`, request payload cache markers, and tool roundtrips through the Claude Messages provider.
+
+### Brave Search Web Search Helper
+
+- A `brave-search` helper model can be selected through `tooling.web_search` as a dedicated external search provider without pretending to be an OpenAI chat-completions model.
+- Brave-backed `web_search` calls use Brave Search's `GET /res/v1/web/search` transport with `x-subscription-token` authentication, clamp result count to the documented web-search limit, and return compacted snippets plus citation URLs for the agent to read.
+- Brave-backed `web_search` rejects reference-image inputs instead of silently pretending multimodal search is supported.
+- Regression coverage should protect Brave config defaults, request-shape translation, and response compaction into answer/citation output.
+
+### Helper Image Generation Providers
+
+- `image_generate` should delegate upstream-specific request construction to the shared LLM/provider layer instead of hardcoding one provider protocol inside `tool_worker`.
+- OpenRouter chat-completions image helpers should request image output through `modalities: ["image"]` and read generated images from normalized assistant image payloads.
+- OpenRouter responses image helpers should likewise support direct image generation through the Responses endpoint with image modalities, rather than assuming only OpenAI-style `image_generation` tool calls exist.
+- Generated helper images should be normalized back into canonical PNG workdir files before re-entering synthetic multimodal context.
+- Regression coverage should protect OpenRouter image-response parsing for both chat-completions and responses shapes, plus PNG canonicalization before persistence.
 
 ### Chat Message Fidelity
 
@@ -148,7 +164,8 @@ When adding a new non-bugfix capability, decide whether it is a feature. If it i
 - Cron task tools expose schedule timing through named fields such as `cron_second`, `cron_minute`, `cron_hour`, `cron_day_of_month`, `cron_month`, `cron_day_of_week`, and optional `cron_year`; models should not assemble positional cron strings themselves.
 - Internally, named cron fields are compiled to the persisted seconds-first cron expression and interpreted in the task's persisted IANA timezone, defaulting to `Asia/Shanghai` when omitted.
 - A cron task must not enqueue overlapping background jobs for the same task; if a previous trigger is still running, the due time is skipped rather than queued for catch-up.
-- Regression coverage should protect named-field schedule compilation, rejection of partial cron-field updates, task-timezone exact schedules, and non-overlapping trigger behavior.
+- Cron polling is windowed by the live host runtime: runs missed before the current poll window, including service downtime and restart gaps, are skipped instead of being backfilled later.
+- Regression coverage should protect named-field schedule compilation, rejection of partial cron-field updates, task-timezone exact schedules, non-overlapping trigger behavior, and the no-backfill poll-window rule.
 
 ### Channel Integrations
 

@@ -111,6 +111,14 @@ pub struct ChatCompletionOutcome {
     pub api_request_id: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ImageGenerationOutcome {
+    pub image_reference: String,
+    pub usage: TokenUsage,
+    pub response_id: Option<String>,
+    pub api_request_id: Option<String>,
+}
+
 pub(crate) enum ChatCompletionSession {
     CodexSubscription(providers::codex_subscription::CodexSubscriptionSession),
 }
@@ -197,6 +205,40 @@ pub(crate) fn create_chat_completion(
                     upstream,
                     messages,
                     tools,
+                    "",
+                    outcome.usage.prompt_tokens,
+                );
+                return Ok(outcome);
+            }
+            Err(error) if attempt < max_retries && should_retry_completion_error(&error) => {
+                attempt += 1;
+                if let Some(delay) = retry_delay_duration(&upstream.retry_mode) {
+                    thread::sleep(delay);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+pub(crate) fn create_image_generation(
+    upstream: &UpstreamConfig,
+    messages: &[ChatMessage],
+) -> Result<ImageGenerationOutcome> {
+    let max_retries = match upstream.retry_mode {
+        RetryModeConfig::No => 0,
+        RetryModeConfig::Random { max_retries, .. } => max_retries,
+    };
+    let mut attempt = 0;
+
+    loop {
+        let result = providers::provider_for(upstream).create_image_generation(upstream, messages);
+        match result {
+            Ok(outcome) => {
+                observe_prompt_tokens_for_upstream(
+                    upstream,
+                    messages,
+                    &[],
                     "",
                     outcome.usage.prompt_tokens,
                 );
@@ -837,6 +879,97 @@ pub(super) fn responses_value_to_chat_message(value: &Value) -> Result<ChatMessa
     })
 }
 
+pub(super) fn generated_image_reference_from_value(value: &Value) -> Option<String> {
+    if let Some(choices) = value.get("choices").and_then(Value::as_array) {
+        for choice in choices {
+            if let Some(reference) =
+                generated_image_reference_from_message(choice.get("message").unwrap_or(choice))
+            {
+                return Some(reference);
+            }
+        }
+    }
+
+    if let Some(output) = value.get("output").and_then(Value::as_array) {
+        for item in output {
+            if item.get("type").and_then(Value::as_str) == Some("image_generation_call")
+                && let Some(reference) = item.get("result").and_then(Value::as_str)
+            {
+                return Some(reference.to_string());
+            }
+            if item.get("type").and_then(Value::as_str) == Some("message")
+                && let Some(reference) = generated_image_reference_from_message(item)
+            {
+                return Some(reference);
+            }
+            if let Some(reference) = generated_image_reference_from_item(item) {
+                return Some(reference);
+            }
+        }
+    }
+
+    value
+        .get("images")
+        .and_then(Value::as_array)
+        .and_then(|images| images.iter().find_map(generated_image_reference_from_item))
+}
+
+fn generated_image_reference_from_message(message: &Value) -> Option<String> {
+    if let Some(images) = message.get("images").and_then(Value::as_array)
+        && let Some(reference) = images.iter().find_map(generated_image_reference_from_item)
+    {
+        return Some(reference);
+    }
+
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .and_then(|items| items.iter().find_map(generated_image_reference_from_item))
+}
+
+fn generated_image_reference_from_item(item: &Value) -> Option<String> {
+    if let Some(reference) = generated_image_reference_from_field(item.get("image_url")) {
+        return Some(reference);
+    }
+    if let Some(reference) = generated_image_reference_from_field(item.get("imageUrl")) {
+        return Some(reference);
+    }
+    if let Some(reference) = generated_image_reference_from_field(item.get("url")) {
+        return Some(reference);
+    }
+    if let Some(reference) = item.get("result").and_then(Value::as_str)
+        && (reference.starts_with("data:")
+            || reference.starts_with("http://")
+            || reference.starts_with("https://"))
+    {
+        return Some(reference.to_string());
+    }
+    None
+}
+
+fn generated_image_reference_from_field(value: Option<&Value>) -> Option<String> {
+    match value {
+        Some(Value::String(reference)) => Some(reference.clone()),
+        Some(Value::Object(object)) => object
+            .get("url")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| {
+                object
+                    .get("image_url")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            })
+            .or_else(|| {
+                object
+                    .get("imageUrl")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            }),
+        _ => None,
+    }
+}
+
 pub(super) fn response_id_from_value(value: &Value) -> Option<String> {
     value
         .get("id")
@@ -1242,6 +1375,7 @@ fn content_item_to_claude_block(item: &Value) -> Result<Option<Value>> {
             .get("image_url")
             .and_then(Value::as_str)
             .map(claude_image_block_from_url),
+        "file" | "input_file" => claude_document_block_from_item(kind, item),
         "context" => content_item_text(item).map(|text| json!({ "type": "text", "text": text })),
         _ => None,
     })
@@ -1266,6 +1400,73 @@ fn claude_image_block_from_url(image_url: &str) -> Value {
             }
         })
     }
+}
+
+fn claude_document_block_from_item(kind: &str, item: &Value) -> Option<Value> {
+    let file_value = if kind == "file" {
+        item.get("file")
+    } else {
+        Some(item)
+    }?;
+    let file_id = file_value.get("file_id").and_then(Value::as_str);
+    let file_data = file_value.get("file_data").and_then(Value::as_str);
+    let file_url = file_value.get("file_url").and_then(Value::as_str);
+    let filename = file_value.get("filename").and_then(Value::as_str);
+
+    if let Some(file_id) = file_id {
+        return Some(json!({
+            "type": "document",
+            "source": {
+                "type": "file",
+                "file_id": file_id,
+            }
+        }));
+    }
+
+    if let Some(file_url) = file_url
+        && filename_looks_like_pdf(filename.or_else(|| file_url.rsplit('/').next()))
+    {
+        return Some(json!({
+            "type": "document",
+            "source": {
+                "type": "url",
+                "url": file_url,
+            }
+        }));
+    }
+
+    if let Some(file_data) = file_data {
+        if let Some((media_type, data)) = parse_data_url(file_data) {
+            if media_type.eq_ignore_ascii_case("application/pdf") {
+                return Some(json!({
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": data,
+                    }
+                }));
+            }
+        } else if filename_looks_like_pdf(filename) {
+            return Some(json!({
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": file_data,
+                }
+            }));
+        }
+    }
+
+    None
+}
+
+fn filename_looks_like_pdf(filename: Option<&str>) -> bool {
+    filename
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|value| value.to_ascii_lowercase().ends_with(".pdf"))
 }
 
 fn message_content_to_claude_blocks(content: Option<&Value>) -> Result<Vec<Value>> {
@@ -1663,10 +1864,11 @@ mod tests {
     use super::{
         TokenUsage, UpstreamAuthKind, build_claude_messages_input, build_responses_input,
         build_responses_tools_payload, chat_completions_messages_payload,
-        claude_messages_value_to_chat_message, normalize_inline_image_url,
-        parse_streamed_responses_body, parse_usage, redact_sensitive_json,
-        redacted_upstream_request_headers_json, redacted_upstream_request_headers_json_with_auth,
-        responses_value_to_chat_message, upstream_error_from_value,
+        claude_messages_value_to_chat_message, generated_image_reference_from_value,
+        normalize_inline_image_url, parse_streamed_responses_body, parse_usage,
+        redact_sensitive_json, redacted_upstream_request_headers_json,
+        redacted_upstream_request_headers_json_with_auth, responses_value_to_chat_message,
+        upstream_error_from_value,
     };
     use crate::config::{
         AuthCredentialsStoreMode, CacheControlConfig, NativeWebSearchConfig, ReasoningConfig,
@@ -2035,6 +2237,44 @@ mod tests {
     }
 
     #[test]
+    fn build_claude_messages_input_converts_pdf_files_into_document_blocks() {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(json!([
+                {
+                    "type": "file",
+                    "file": {
+                        "file_data": "JVBERi0xLjQK",
+                        "filename": "report.pdf",
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": "Summarize it"
+                }
+            ])),
+            reasoning: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }];
+
+        let (_system, input) = build_claude_messages_input(&messages, None).unwrap();
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["type"], "document");
+        assert_eq!(input[0]["content"][0]["source"]["type"], "base64");
+        assert_eq!(
+            input[0]["content"][0]["source"]["media_type"],
+            "application/pdf"
+        );
+        assert_eq!(input[0]["content"][0]["source"]["data"], "JVBERi0xLjQK");
+        assert_eq!(input[0]["content"][1]["type"], "text");
+        assert_eq!(input[0]["content"][1]["text"], "Summarize it");
+    }
+
+    #[test]
     fn claude_messages_value_to_chat_message_reads_text_and_tool_use() {
         let response = json!({
             "content": [
@@ -2379,5 +2619,55 @@ mod tests {
 
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "image_generation");
+    }
+
+    #[test]
+    fn generated_image_reference_reads_chat_completions_images() {
+        let value = json!({
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "images": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "data:image/png;base64,AAAA"
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        });
+
+        assert_eq!(
+            generated_image_reference_from_value(&value).as_deref(),
+            Some("data:image/png;base64,AAAA")
+        );
+    }
+
+    #[test]
+    fn generated_image_reference_reads_responses_message_images() {
+        let value = json!({
+            "output": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "images": [
+                        {
+                            "imageUrl": {
+                                "url": "https://example.com/generated.png"
+                            }
+                        }
+                    ]
+                }
+            ]
+        });
+
+        assert_eq!(
+            generated_image_reference_from_value(&value).as_deref(),
+            Some("https://example.com/generated.png")
+        );
     }
 }

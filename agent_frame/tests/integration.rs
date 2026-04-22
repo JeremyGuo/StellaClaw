@@ -13,11 +13,12 @@ use agent_frame::{
 };
 use anyhow::Result;
 use assert_cmd::Command;
+use image::ImageFormat;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -279,7 +280,10 @@ fn handle_stream(
 
     if method == "GET" {
         if path == "/binary" {
-            let body = b"\x89PNG\r\n\x1a\nbinary-body";
+            let mut body = Vec::new();
+            image::DynamicImage::new_rgba8(1, 1)
+                .write_to(&mut Cursor::new(&mut body), ImageFormat::Png)
+                .expect("encode binary get response body");
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
@@ -288,7 +292,7 @@ fn handle_stream(
                 .write_all(header.as_bytes())
                 .expect("write binary get response header");
             stream
-                .write_all(body)
+                .write_all(&body)
                 .expect("write binary get response body");
             return;
         }
@@ -614,9 +618,12 @@ fn builtin_tools_work() -> Result<()> {
     assert!(search_result.contains("example.com/a"));
 
     let image_path = temp_dir.path().join("diagram.png");
-    fs::write(&image_path, [1_u8, 2, 3, 4])?;
+    fs::copy(&downloaded, &image_path)?;
     let image_load = execute_tool_call(&registry, "image_load", Some(r#"{"path":"diagram.png"}"#));
-    assert!(image_load.contains("\"kind\": \"synthetic_user_multimodal\""));
+    assert!(
+        image_load.contains("\"kind\": \"synthetic_user_multimodal\""),
+        "{image_load}"
+    );
     assert!(image_load.contains("\"path\":"));
 
     Ok(())

@@ -1,5 +1,18 @@
-version: 0.26.2
+version: 0.26.3
 ---
+
+# 0.26.3
+
+- 改造 `image_generate` helper 的 provider 适配边界：
+  图片生成不再由 `tool_worker` 写死成单一的 `/responses + tools:[{type:\"image_generation\"}]` 协议；现在改为走 `agent_frame::llm` provider 层分发，由各 upstream 自己构造图片生成请求。
+- 新增 OpenRouter chat-completions / responses 双路图片生成支持：
+  `openrouter` 与 `openrouter-resp` helper model 现在都会直接请求 `modalities: ["image"]` 的原生图片输出，并从 OpenRouter 规范化后的 assistant image payload 中提取生成结果，兼容 `openai/gpt-5.4-image-2` 这类图片模型。
+- 统一 helper 出图落盘格式：
+  不论上游返回 PNG/JPEG/WebP data URL 还是临时图片 URL，`image_generate` 最终都会在本地重新编码成 canonical PNG 文件，再作为 synthetic user multimodal 图片回灌会话上下文。
+- 补充回归测试覆盖：
+  新增针对 OpenRouter chat/responses 图片响应解析，以及 helper 出图 PNG 规范化的测试，防止 future refactor 再把 provider 协议写死回 `tool_worker`。
+- 本次不影响 `config` 或 `workdir` schema：
+  没有新增 config loader、没有新增 workdir upgrade step；按普通 patch 将仓库版本从 `0.26.2` 提升到 `0.26.3`。
 
 # 0.26.2
 

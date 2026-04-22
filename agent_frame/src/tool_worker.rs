@@ -1,12 +1,13 @@
 use crate::config::{ExternalWebSearchConfig, RemoteWorkpathConfig, UpstreamConfig};
-use crate::llm::create_chat_completion;
+use crate::llm::{create_chat_completion, create_image_generation};
 use crate::message::ChatMessage;
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
+use image::{ImageFormat, ImageReader};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -314,16 +315,128 @@ fn run_web_search(
     max_results: usize,
     images: &[String],
 ) -> Result<Value> {
-    let request_url = {
-        let base = search_config.base_url.trim_end_matches('/');
-        let path = if search_config.chat_completions_path.starts_with('/') {
-            search_config.chat_completions_path.clone()
-        } else {
-            format!("/{}", search_config.chat_completions_path)
-        };
-        format!("{}{}", base, path)
+    let request_spec = build_web_search_request_spec(&search_config, query, max_results, images)?;
+    let client = build_http_client(&request_spec.url, Some(search_config.timeout_seconds))?;
+    let mut request = client.request(request_spec.method.clone(), &request_spec.url);
+    if !request_spec.query.is_empty() {
+        request = request.query(&request_spec.query);
+    }
+    if let Some(body) = request_spec.json_body.as_ref() {
+        request = request.json(body);
+    }
+    if let Some((name, value)) = request_spec.auth_header.as_ref() {
+        request = request.header(name, value);
+    }
+    for (key, value) in &request_spec.headers {
+        request = request.header(key, value);
+    }
+    let response = request.send().context("web search request failed")?;
+    let status = response.status();
+    let body = response
+        .text()
+        .context("failed to read web search response")?;
+    if !status.is_success() {
+        return Err(anyhow::anyhow!(
+            "web search upstream failed with {}: {}",
+            status,
+            body
+        ));
+    }
+    let value: Value =
+        serde_json::from_str(&body).context("failed to parse web search response")?;
+    Ok(match request_spec.provider {
+        ExternalWebSearchProvider::OpenAiCompatible => {
+            parse_openai_compatible_web_search_response(&value, query, max_results)
+        }
+        ExternalWebSearchProvider::Brave => {
+            parse_brave_web_search_response(&value, query, max_results)
+        }
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExternalWebSearchProvider {
+    OpenAiCompatible,
+    Brave,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct WebSearchRequestSpec {
+    provider: ExternalWebSearchProvider,
+    method: reqwest::Method,
+    url: String,
+    query: Vec<(String, String)>,
+    json_body: Option<Value>,
+    auth_header: Option<(String, String)>,
+    headers: Vec<(String, String)>,
+}
+
+fn build_web_search_request_spec(
+    search_config: &ExternalWebSearchConfig,
+    query: &str,
+    max_results: usize,
+    images: &[String],
+) -> Result<WebSearchRequestSpec> {
+    let request_url = build_web_search_request_url(search_config);
+    let provider = detect_external_web_search_provider(search_config, &request_url);
+    match provider {
+        ExternalWebSearchProvider::OpenAiCompatible => {
+            build_openai_compatible_web_search_request_spec(
+                search_config,
+                request_url,
+                query,
+                images,
+            )
+        }
+        ExternalWebSearchProvider::Brave => build_brave_web_search_request_spec(
+            search_config,
+            request_url,
+            query,
+            max_results,
+            images,
+        ),
+    }
+}
+
+fn build_web_search_request_url(search_config: &ExternalWebSearchConfig) -> String {
+    let base = search_config.base_url.trim_end_matches('/');
+    let path = if search_config.chat_completions_path.starts_with('/') {
+        search_config.chat_completions_path.clone()
+    } else {
+        format!("/{}", search_config.chat_completions_path)
     };
-    let client = build_http_client(&request_url, Some(search_config.timeout_seconds))?;
+    format!("{}{}", base, path)
+}
+
+fn detect_external_web_search_provider(
+    search_config: &ExternalWebSearchConfig,
+    request_url: &str,
+) -> ExternalWebSearchProvider {
+    let path = if search_config.chat_completions_path.starts_with('/') {
+        search_config.chat_completions_path.as_str()
+    } else {
+        ""
+    };
+    let host_is_brave = reqwest::Url::parse(request_url)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.ends_with("search.brave.com"))
+        })
+        .unwrap_or(false);
+    if host_is_brave && (path.ends_with("/web/search") || request_url.ends_with("/web/search")) {
+        ExternalWebSearchProvider::Brave
+    } else {
+        ExternalWebSearchProvider::OpenAiCompatible
+    }
+}
+
+fn build_openai_compatible_web_search_request_spec(
+    search_config: &ExternalWebSearchConfig,
+    request_url: String,
+    query: &str,
+    images: &[String],
+) -> Result<WebSearchRequestSpec> {
     let mut payload = Map::new();
     payload.insert(
         "model".to_string(),
@@ -347,33 +460,70 @@ fn run_web_search(
             }
         ]),
     );
-    let mut request = client.post(&request_url).json(&Value::Object(payload));
-    if let Some(api_key) = search_config
+    Ok(WebSearchRequestSpec {
+        provider: ExternalWebSearchProvider::OpenAiCompatible,
+        method: reqwest::Method::POST,
+        url: request_url,
+        query: Vec::new(),
+        json_body: Some(Value::Object(payload)),
+        auth_header: resolve_web_search_api_key(search_config)
+            .map(|value| ("authorization".to_string(), format!("Bearer {value}"))),
+        headers: external_web_search_headers(search_config),
+    })
+}
+
+fn build_brave_web_search_request_spec(
+    search_config: &ExternalWebSearchConfig,
+    request_url: String,
+    query: &str,
+    max_results: usize,
+    images: &[String],
+) -> Result<WebSearchRequestSpec> {
+    if !images.is_empty() {
+        return Err(anyhow!(
+            "the configured Brave web search provider does not support image inputs"
+        ));
+    }
+    Ok(WebSearchRequestSpec {
+        provider: ExternalWebSearchProvider::Brave,
+        method: reqwest::Method::GET,
+        url: request_url,
+        query: vec![
+            ("q".to_string(), query.to_string()),
+            ("count".to_string(), max_results.clamp(1, 20).to_string()),
+            ("result_filter".to_string(), "web".to_string()),
+            ("text_decorations".to_string(), "false".to_string()),
+            ("extra_snippets".to_string(), "true".to_string()),
+        ],
+        json_body: None,
+        auth_header: resolve_web_search_api_key(search_config)
+            .map(|value| ("x-subscription-token".to_string(), value)),
+        headers: external_web_search_headers(search_config),
+    })
+}
+
+fn resolve_web_search_api_key(search_config: &ExternalWebSearchConfig) -> Option<String> {
+    search_config
         .api_key
         .clone()
         .or_else(|| std::env::var(&search_config.api_key_env).ok())
-    {
-        request = request.bearer_auth(api_key);
-    }
-    for (key, value) in &search_config.headers {
-        if let Some(value) = value.as_str() {
-            request = request.header(key, value);
-        }
-    }
-    let response = request.send().context("web search request failed")?;
-    let status = response.status();
-    let body = response
-        .text()
-        .context("failed to read web search response")?;
-    if !status.is_success() {
-        return Err(anyhow::anyhow!(
-            "web search upstream failed with {}: {}",
-            status,
-            body
-        ));
-    }
-    let value: Value =
-        serde_json::from_str(&body).context("failed to parse web search response")?;
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn external_web_search_headers(search_config: &ExternalWebSearchConfig) -> Vec<(String, String)> {
+    search_config
+        .headers
+        .iter()
+        .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_string())))
+        .collect()
+}
+
+fn parse_openai_compatible_web_search_response(
+    value: &Value,
+    query: &str,
+    max_results: usize,
+) -> Value {
     let answer = value
         .get("choices")
         .and_then(Value::as_array)
@@ -389,11 +539,128 @@ fn run_web_search(
         .into_iter()
         .take(max_results)
         .collect::<Vec<_>>();
-    Ok(json!({
+    json!({
         "query": query,
         "answer": answer,
         "citations": citations,
-    }))
+    })
+}
+
+fn parse_brave_web_search_response(value: &Value, query: &str, max_results: usize) -> Value {
+    let results = value
+        .get("web")
+        .and_then(|web| web.get("results"))
+        .and_then(Value::as_array)
+        .map(|results| {
+            results
+                .iter()
+                .filter_map(brave_web_result_summary)
+                .take(max_results)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let citations = results
+        .iter()
+        .filter_map(|result| result.get("url").cloned())
+        .collect::<Vec<_>>();
+    let answer = if results.is_empty() {
+        "No web results returned.".to_string()
+    } else {
+        results
+            .iter()
+            .enumerate()
+            .map(|(index, result)| {
+                let title = result
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Untitled result");
+                let url = result.get("url").and_then(Value::as_str).unwrap_or("");
+                let description = result
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let extra = result
+                    .get("extra_snippets")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .collect::<Vec<_>>()
+                            .join(" | ")
+                    })
+                    .filter(|value| !value.is_empty());
+
+                let mut lines = vec![format!("{}. {}", index + 1, title)];
+                if !url.is_empty() {
+                    lines.push(format!("URL: {url}"));
+                }
+                if !description.is_empty() {
+                    lines.push(format!("Snippet: {description}"));
+                }
+                if let Some(extra) = extra {
+                    lines.push(format!("Extra snippets: {extra}"));
+                }
+                lines.join("\n")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    json!({
+        "query": query,
+        "answer": answer,
+        "citations": citations,
+        "results": results,
+    })
+}
+
+fn brave_web_result_summary(result: &Value) -> Option<Value> {
+    let result = result.as_object()?;
+    let title = result
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let url = result
+        .get("url")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let description = result
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if title.is_empty() && url.is_empty() && description.is_empty() {
+        return None;
+    }
+
+    let mut summary = Map::new();
+    if !title.is_empty() {
+        summary.insert("title".to_string(), Value::String(title.to_string()));
+    }
+    if !url.is_empty() {
+        summary.insert("url".to_string(), Value::String(url.to_string()));
+    }
+    if !description.is_empty() {
+        summary.insert(
+            "description".to_string(),
+            Value::String(description.to_string()),
+        );
+    }
+    if let Some(extra_snippets) = result.get("extra_snippets").and_then(Value::as_array) {
+        let extra_snippets = extra_snippets
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(|value| Value::String(value.to_string()))
+            .collect::<Vec<_>>();
+        if !extra_snippets.is_empty() {
+            summary.insert("extra_snippets".to_string(), Value::Array(extra_snippets));
+        }
+    }
+    Some(Value::Object(summary))
 }
 
 fn run_image_job(
@@ -583,92 +850,25 @@ fn run_image_generate_job(
     output_path: &Path,
     images: &[String],
 ) -> Result<Value> {
-    if upstream.api_kind != crate::config::UpstreamApiKind::Responses {
-        return Err(anyhow!(
-            "image_generate requires a responses-compatible upstream"
-        ));
-    }
-    let request_url = {
-        let base = upstream.base_url.trim_end_matches('/');
-        let path = if upstream.chat_completions_path.starts_with('/') {
-            upstream.chat_completions_path.clone()
-        } else {
-            format!("/{}", upstream.chat_completions_path)
-        };
-        format!("{}{}", base, path)
-    };
-    let client = build_http_client(&request_url, Some(upstream.timeout_seconds))?;
-    let mut payload = Map::new();
-    payload.insert("model".to_string(), Value::String(upstream.model.clone()));
-    let input = if images.is_empty() {
-        Value::String(prompt.to_string())
-    } else {
-        let mut content = vec![json!({
-            "type": "input_text",
-            "text": prompt,
-        })];
-        append_reference_input_images(&mut content, images)?;
-        json!([{
-            "type": "message",
-            "role": "user",
-            "content": content,
-        }])
-    };
-    payload.insert("input".to_string(), input);
-    payload.insert(
-        "tools".to_string(),
-        Value::Array(vec![json!({
-            "type": "image_generation"
-        })]),
-    );
-    payload.insert("store".to_string(), Value::Bool(false));
-
-    let mut request = client.post(&request_url).json(&Value::Object(payload));
-    if let Some(api_key) = upstream
-        .api_key
-        .clone()
-        .or_else(|| std::env::var(&upstream.api_key_env).ok())
-    {
-        request = request.bearer_auth(api_key);
-    } else if upstream.auth_kind == crate::config::UpstreamAuthKind::CodexSubscription {
-        return Err(anyhow!(
-            "image_generate does not currently support codex-subscription auth in worker mode"
-        ));
-    }
-    for (key, value) in &upstream.headers {
-        if let Some(value) = value.as_str() {
-            request = request.header(key, value);
-        }
-    }
-
-    let response = request.send().context("image generation request failed")?;
-    let status = response.status();
-    let body = response
-        .text()
-        .context("failed to read image generation response body")?;
-    if !status.is_success() {
-        return Err(anyhow!("image generation failed with {}: {}", status, body));
-    }
-    let value: Value =
-        serde_json::from_str(&body).context("failed to parse image generation response")?;
-    if let Some(error_message) = crate::llm::upstream_error_from_value(&value) {
-        return Err(anyhow!(
-            "image generation returned an error payload: {}",
-            error_message
-        ));
-    }
-    let image_base64 = value
-        .get("output")
-        .and_then(Value::as_array)
-        .and_then(|output| {
-            output.iter().find_map(|item| {
-                (item.get("type").and_then(Value::as_str) == Some("image_generation_call"))
-                    .then(|| item.get("result").and_then(Value::as_str))
-                    .flatten()
-            })
-        })
-        .ok_or_else(|| anyhow!("image generation response did not contain image data"))?;
-    let image_bytes = decode_generated_image_result(image_base64)?;
+    let mut content = vec![json!({
+        "type": "input_text",
+        "text": prompt,
+    })];
+    append_reference_input_images(&mut content, images)?;
+    let outcome = create_image_generation(
+        &upstream,
+        &[ChatMessage {
+            role: "user".to_string(),
+            content: Some(Value::Array(content)),
+            reasoning: None,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }],
+    )?;
+    let image_bytes = canonicalize_generated_image_bytes_to_png(&load_generated_image_result(
+        &outcome.image_reference,
+    )?)?;
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -1501,7 +1701,23 @@ fn strip_html_tags(body: &str) -> String {
     output.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn decode_generated_image_result(result: &str) -> Result<Vec<u8>> {
+fn load_generated_image_result(result: &str) -> Result<Vec<u8>> {
+    if result.starts_with("http://") || result.starts_with("https://") {
+        let client = build_http_client(result, Some(60.0))?;
+        let response = client
+            .get(result)
+            .send()
+            .context("failed to download generated image")?;
+        let status = response.status();
+        let bytes = response
+            .bytes()
+            .context("failed to read generated image download")?;
+        if !status.is_success() {
+            return Err(anyhow!("generated image download failed with {}", status));
+        }
+        return Ok(bytes.to_vec());
+    }
+
     let payload = if let Some(payload) = parse_base64_data_url(result) {
         payload
     } else {
@@ -1511,6 +1727,19 @@ fn decode_generated_image_result(result: &str) -> Result<Vec<u8>> {
     base64::engine::general_purpose::STANDARD
         .decode(payload)
         .context("failed to decode generated image base64")
+}
+
+fn canonicalize_generated_image_bytes_to_png(bytes: &[u8]) -> Result<Vec<u8>> {
+    let image = ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .context("failed to detect generated image format")?
+        .decode()
+        .context("generated image payload was not a decodable image")?;
+    let mut output = Vec::new();
+    image
+        .write_to(&mut Cursor::new(&mut output), ImageFormat::Png)
+        .context("failed to re-encode generated image as PNG")?;
+    Ok(output)
 }
 
 fn parse_base64_data_url(value: &str) -> Option<&str> {
@@ -1645,14 +1874,22 @@ fn chat_message_text(message: &ChatMessage) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_generated_image_result, parse_base64_data_url};
+    use super::{
+        ExternalWebSearchProvider, build_brave_web_search_request_spec,
+        build_web_search_request_spec, canonicalize_generated_image_bytes_to_png,
+        load_generated_image_result, parse_base64_data_url, parse_brave_web_search_response,
+    };
+    use crate::config::ExternalWebSearchConfig;
     use base64::Engine as _;
+    use image::{GenericImageView, ImageFormat, ImageReader};
+    use serde_json::json;
+    use std::io::Cursor;
 
     #[test]
     fn generated_image_result_accepts_raw_base64() {
         let expected = b"test-image-bytes";
         let encoded = base64::engine::general_purpose::STANDARD.encode(expected);
-        let decoded = decode_generated_image_result(&encoded).unwrap();
+        let decoded = load_generated_image_result(&encoded).unwrap();
         assert_eq!(decoded, expected);
     }
 
@@ -1662,7 +1899,132 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(expected);
         let data_url = format!("data:image/png;base64,{encoded}");
         assert_eq!(parse_base64_data_url(&data_url), Some(encoded.as_str()));
-        let decoded = decode_generated_image_result(&data_url).unwrap();
+        let decoded = load_generated_image_result(&data_url).unwrap();
         assert_eq!(decoded, expected);
+    }
+
+    #[test]
+    fn generated_image_result_is_canonicalized_to_png() {
+        let image = image::DynamicImage::new_rgb8(2, 3);
+        let mut jpeg = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut jpeg), ImageFormat::Jpeg)
+            .unwrap();
+
+        let png = canonicalize_generated_image_bytes_to_png(&jpeg).unwrap();
+        let decoded = ImageReader::new(Cursor::new(&png))
+            .with_guessed_format()
+            .unwrap()
+            .decode()
+            .unwrap();
+
+        assert_eq!(decoded.dimensions(), (2, 3));
+    }
+
+    #[test]
+    fn brave_web_search_request_uses_get_query_and_subscription_header() {
+        let config = ExternalWebSearchConfig {
+            base_url: "https://api.search.brave.com".to_string(),
+            model: "ignored".to_string(),
+            supports_vision_input: false,
+            api_key: Some("brave-secret".to_string()),
+            api_key_env: "BRAVE_SEARCH_API_KEY".to_string(),
+            chat_completions_path: "/res/v1/web/search".to_string(),
+            timeout_seconds: 30.0,
+            headers: serde_json::Map::from_iter([(
+                "accept".to_string(),
+                json!("application/json"),
+            )]),
+        };
+
+        let spec = build_web_search_request_spec(&config, "rust async actors", 50, &[]).unwrap();
+
+        assert_eq!(spec.provider, ExternalWebSearchProvider::Brave);
+        assert_eq!(spec.method, reqwest::Method::GET);
+        assert_eq!(spec.url, "https://api.search.brave.com/res/v1/web/search");
+        assert_eq!(
+            spec.query[0],
+            ("q".to_string(), "rust async actors".to_string())
+        );
+        assert_eq!(spec.query[1], ("count".to_string(), "20".to_string()));
+        assert_eq!(
+            spec.auth_header,
+            Some((
+                "x-subscription-token".to_string(),
+                "brave-secret".to_string()
+            ))
+        );
+        assert_eq!(
+            spec.headers,
+            vec![("accept".to_string(), "application/json".to_string())]
+        );
+        assert!(spec.json_body.is_none());
+    }
+
+    #[test]
+    fn brave_web_search_request_rejects_images() {
+        let config = ExternalWebSearchConfig {
+            base_url: "https://api.search.brave.com".to_string(),
+            model: "ignored".to_string(),
+            supports_vision_input: false,
+            api_key: Some("brave-secret".to_string()),
+            api_key_env: "BRAVE_SEARCH_API_KEY".to_string(),
+            chat_completions_path: "/res/v1/web/search".to_string(),
+            timeout_seconds: 30.0,
+            headers: serde_json::Map::new(),
+        };
+
+        let error = build_brave_web_search_request_spec(
+            &config,
+            "https://api.search.brave.com/res/v1/web/search".to_string(),
+            "query",
+            5,
+            &[String::from("diagram.png")],
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("does not support image inputs"));
+    }
+
+    #[test]
+    fn brave_web_search_response_is_compacted_into_answer_and_citations() {
+        let parsed = parse_brave_web_search_response(
+            &json!({
+                "web": {
+                    "results": [
+                        {
+                            "title": "Tokio Tutorial",
+                            "url": "https://tokio.rs/tutorial",
+                            "description": "Learn async Rust with Tokio.",
+                            "extra_snippets": [
+                                "Covers tasks and channels.",
+                                "Includes mini-redis examples."
+                            ]
+                        },
+                        {
+                            "title": "Actix Overview",
+                            "url": "https://actix.rs",
+                            "description": "Actor framework for Rust."
+                        }
+                    ]
+                }
+            }),
+            "rust async actors",
+            2,
+        );
+
+        assert_eq!(parsed["citations"][0], json!("https://tokio.rs/tutorial"));
+        assert_eq!(parsed["citations"][1], json!("https://actix.rs"));
+        assert_eq!(parsed["results"][0]["title"], json!("Tokio Tutorial"));
+        assert_eq!(
+            parsed["results"][0]["extra_snippets"][0],
+            json!("Covers tasks and channels.")
+        );
+        assert!(
+            parsed["answer"]
+                .as_str()
+                .unwrap()
+                .contains("Snippet: Learn async Rust with Tokio.")
+        );
     }
 }

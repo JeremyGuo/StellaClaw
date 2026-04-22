@@ -3,11 +3,11 @@ pub(super) mod codex_subscription;
 pub(super) mod openrouter;
 pub(super) mod openrouter_responses;
 
-use super::{ChatCompletionOutcome, ChatCompletionSession};
+use super::{ChatCompletionOutcome, ChatCompletionSession, ImageGenerationOutcome};
 use crate::config::{UpstreamApiKind, UpstreamAuthKind, UpstreamConfig};
 use crate::message::ChatMessage;
 use crate::tooling::Tool;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde_json::{Map, Value};
 
 pub(super) trait UpstreamProvider {
@@ -23,6 +23,16 @@ pub(super) trait UpstreamProvider {
         extra_payload: Option<Map<String, Value>>,
         session: Option<&mut ChatCompletionSession>,
     ) -> Result<ChatCompletionOutcome>;
+
+    fn create_image_generation(
+        &self,
+        _upstream: &UpstreamConfig,
+        _messages: &[ChatMessage],
+    ) -> Result<ImageGenerationOutcome> {
+        Err(anyhow!(
+            "image generation is not supported for this upstream"
+        ))
+    }
 }
 
 static CODEX_SUBSCRIPTION_PROVIDER: codex_subscription::CodexSubscriptionProvider =
