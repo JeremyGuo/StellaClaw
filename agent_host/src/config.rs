@@ -952,7 +952,7 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         Some(Value::String(version)) => version.clone(),
         _ => LEGACY_CONFIG_VERSION.to_string(),
     };
-    let loaders: [&dyn ConfigLoader; 25] = [
+    let loaders: [&dyn ConfigLoader; 27] = [
         &v0_1::LegacyConfigLoader,
         &v0_2::VersionedConfigLoader,
         &v0_3::VersionedConfigLoader,
@@ -978,6 +978,8 @@ pub fn load_server_config_file(path: impl AsRef<Path>) -> Result<ServerConfig> {
         &v0_23::LatestConfigLoader,
         &v0_24::LatestConfigLoader,
         &v0_25::LatestConfigLoader,
+        &v0_26::LatestConfigLoader,
+        &v0_27::LatestConfigLoader,
     ];
     let loader = loaders
         .into_iter()
@@ -3000,6 +3002,74 @@ mod tests {
 
         let config = load_server_config_file(&config_path).unwrap();
         assert!(!config.models["helper"].agent_model_enabled);
+    }
+
+    #[test]
+    fn latest_version_config_loads_on_non_upgrade_path() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.json");
+        fs::write(
+            &config_path,
+            format!(
+                r#"
+            {{
+              "version": "{LATEST_CONFIG_VERSION}",
+              "models": {{
+                "main": {{
+                  "type": "openrouter",
+                  "api_endpoint": "https://example.com/v1",
+                  "model": "demo-main",
+                  "description": "demo",
+                  "capabilities": ["chat"]
+                }}
+              }},
+              "agent": {{
+                "agent_frame": {{"available_models": ["main"]}}
+              }},
+              "main_agent": {{
+                "global_install_root": "/opt",
+                "language": "zh-CN",
+                "memory_system": "claude_code",
+                "time_awareness": {{
+                  "emit_system_date_on_user_message": true,
+                  "emit_idle_time_gap_hint": true
+                }},
+                "enable_context_compression": true,
+                "context_compaction": {{
+                  "trigger_ratio": 0.9,
+                  "token_limit_override": null,
+                  "recent_fidelity_target_ratio": 0.18
+                }},
+                "idle_compaction": {{
+                  "enabled": false,
+                  "poll_interval_seconds": 15,
+                  "min_ratio": 0.5
+                }},
+                "timeout_observation_compaction": {{
+                  "enabled": true
+                }}
+              }},
+              "sandbox": {{
+                "mode": "subprocess",
+                "bubblewrap_binary": "bwrap",
+                "map_docker_socket": false
+              }},
+              "max_global_sub_agents": 4,
+              "cron_poll_interval_seconds": 5,
+              "channels": [
+                {{
+                  "kind": "command_line",
+                  "id": "local-cli"
+                }}
+              ]
+            }}
+            "#
+            ),
+        )
+        .unwrap();
+
+        let config = load_server_config_file(&config_path).unwrap();
+        assert_eq!(config.version, LATEST_CONFIG_VERSION);
     }
 
     #[test]
