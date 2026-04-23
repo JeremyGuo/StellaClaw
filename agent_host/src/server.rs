@@ -1012,6 +1012,22 @@ impl AgentRuntimeView {
         BackendExecutionOptions {}
     }
 
+    fn prepare_workspace_view_for_session(
+        &self,
+        session: &SessionSnapshot,
+        sandbox_mode: SandboxMode,
+    ) -> Result<()> {
+        let remote_execution_active = self.remote_execution_context(&session.address)?.is_some();
+        if workspace_registry_prep_required(sandbox_mode, remote_execution_active) {
+            self.workspace_manager
+                .cleanup_transient_mounts(&session.workspace_id)?;
+            let _ = self
+                .workspace_manager
+                .prepare_bubblewrap_view(&session.workspace_id)?;
+        }
+        Ok(())
+    }
+
     fn run_agent_turn_sync(
         &self,
         session: SessionSnapshot,
@@ -1027,16 +1043,7 @@ impl AgentRuntimeView {
         let workspace_root = session.workspace_root.clone();
         let _agent_tmp_dir = self.ensure_agent_tmp_dir(agent_id)?;
         let effective_sandbox_mode = self.effective_sandbox_mode(&session.address)?;
-        if matches!(
-            effective_sandbox_mode,
-            crate::config::SandboxMode::Bubblewrap
-        ) {
-            self.workspace_manager
-                .cleanup_transient_mounts(&session.workspace_id)?;
-            let _ = self
-                .workspace_manager
-                .prepare_bubblewrap_view(&session.workspace_id)?;
-        }
+        self.prepare_workspace_view_for_session(&session, effective_sandbox_mode)?;
         let mut config = self.build_agent_frame_config(
             &session,
             &workspace_root,
@@ -1130,9 +1137,9 @@ impl AgentRuntimeView {
                 extra_tools,
                 execution_control,
             );
-            if matches!(
+            if workspace_registry_prep_required(
                 effective_sandbox_mode,
-                crate::config::SandboxMode::Bubblewrap
+                self.remote_execution_context(&session.address)?.is_some(),
             ) {
                 let _ = self
                     .workspace_manager
@@ -1822,7 +1829,8 @@ impl WebChannelHost for Server {
         &self,
         address: &ChannelAddress,
     ) -> Result<Option<WebConversationSummary>> {
-        let conversation = self.with_conversations(|conversations| Ok(conversations.get_snapshot(address)))?;
+        let conversation =
+            self.with_conversations(|conversations| Ok(conversations.get_snapshot(address)))?;
         conversation
             .map(|conversation| self.web_conversation_summary(&conversation))
             .transpose()
@@ -1893,7 +1901,8 @@ impl Server {
         &self,
         conversation: &crate::conversation::ConversationSnapshot,
     ) -> Result<WebConversationSummary> {
-        let session = self.with_sessions(|sessions| Ok(sessions.get_snapshot(&conversation.address)))?;
+        let session =
+            self.with_sessions(|sessions| Ok(sessions.get_snapshot(&conversation.address)))?;
         let (entry_count, latest) = if let Some(session) = session {
             let transcript = SessionTranscript::open(&session.root_dir)?;
             (transcript.len(), transcript.list(0, 1)?.into_iter().next())
@@ -3316,14 +3325,7 @@ impl Server {
         let remote_execution = conversation_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.settings.remote_execution.clone());
-        let workspace_summary = if remote_execution.is_some() {
-            String::new()
-        } else {
-            self.workspace_manager
-                .ensure_workspace_exists(&session.workspace_id)
-                .map(|workspace| workspace.summary)
-                .unwrap_or_default()
-        };
+        let workspace_summary = self.workspace_summary_for_session(session)?;
         let remote_workpaths = if remote_execution.is_some() {
             Vec::new()
         } else {
@@ -3558,6 +3560,7 @@ fn spawn_channel_supervisor(channel: Arc<dyn Channel>, sender: mpsc::Sender<Inco
 
 #[cfg(test)]
 mod tests {
+    use super::command_routing::web_channel_disallows_remote_deactivation;
     use super::{
         AgentCommand, AgentPromptKind, ConversationPricingBreakdown, ConversationUsageReport,
         ImageGenerationRouting, IncomingCommandLane, ModelPricing, RuntimeContext, Server,
@@ -3584,7 +3587,6 @@ mod tests {
         sync_workspace_shared_profile_files, upload_workspace_shared_profile_files,
         user_facing_continue_error_text, workspace_visible_in_list,
     };
-    use super::command_routing::web_channel_disallows_remote_deactivation;
     use crate::agent_status::AgentRegistry;
     use crate::backend::AgentBackendKind;
     use crate::bootstrap::AgentWorkspace;
@@ -3601,6 +3603,7 @@ mod tests {
     use crate::cron::CronManager;
     use crate::domain::ChannelAddress;
     use crate::domain::{AttachmentKind, OutgoingMessage, ProcessingState, StoredAttachment};
+    use crate::remote_execution::{RemoteExecutionBinding, storage_root_for_execution_root};
     use crate::session::{
         PromptComponentChangeNotice, REMOTE_ALIASES_PROMPT_COMPONENT, tag_interrupted_followup_text,
     };
@@ -3833,6 +3836,125 @@ mod tests {
             text: Some(text.to_string()),
             attachments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn remote_sessions_build_frame_config_without_workspace_registry_lookup() {
+        let temp_dir = TempDir::new().unwrap();
+        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        let server = build_test_server(&temp_dir, channel);
+        let mut session = build_test_session(&temp_dir);
+        let remote_root = temp_dir.path().join("remote-root");
+        fs::create_dir_all(&remote_root).unwrap();
+        session.workspace_root = remote_root.clone();
+
+        let conversation = server
+            .with_conversations(|conversations| {
+                conversations.ensure_conversation(&session.address)?;
+                conversations.set_remote_execution(
+                    &session.address,
+                    Some(RemoteExecutionBinding::Local {
+                        path: remote_root.clone(),
+                    }),
+                )
+            })
+            .unwrap();
+        session.workspace_id = format!("remote-exec-{}", conversation.id.simple());
+
+        let runtime = server
+            .agent_runtime_view_for_address(&session.address)
+            .unwrap();
+        let config = runtime
+            .build_agent_frame_config(
+                &session,
+                &session.workspace_root,
+                AgentPromptKind::MainForeground,
+                "demo-model",
+                None,
+            )
+            .unwrap();
+
+        assert!(!config.enable_remote_tools);
+        assert!(
+            config
+                .system_prompt
+                .contains(&remote_root.display().to_string())
+        );
+        assert_eq!(
+            config.runtime_state_root,
+            storage_root_for_execution_root(&remote_root)
+                .join("runtime")
+                .join(conversation.id.to_string())
+        );
+    }
+
+    #[test]
+    fn remote_sessions_skip_bubblewrap_workspace_registry_prep() {
+        let temp_dir = TempDir::new().unwrap();
+        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        let server = build_test_server(&temp_dir, channel);
+        let mut session = build_test_session(&temp_dir);
+        let remote_root = temp_dir.path().join("remote-root");
+        fs::create_dir_all(&remote_root).unwrap();
+        session.workspace_root = remote_root.clone();
+
+        let conversation = server
+            .with_conversations(|conversations| {
+                conversations.ensure_conversation(&session.address)?;
+                conversations.set_remote_execution(
+                    &session.address,
+                    Some(RemoteExecutionBinding::Local { path: remote_root }),
+                )
+            })
+            .unwrap();
+        session.workspace_id = format!("remote-exec-{}", conversation.id.simple());
+
+        server
+            .agent_runtime_view_for_address(&session.address)
+            .unwrap()
+            .prepare_workspace_view_for_session(&session, crate::config::SandboxMode::Bubblewrap)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_sessions_claim_remote_foreground_actor_for_turns() {
+        let temp_dir = TempDir::new().unwrap();
+        let channel: Arc<dyn Channel> = Arc::new(RecordingChannel::default());
+        let server = build_test_server(&temp_dir, channel);
+        let session = build_test_session(&temp_dir);
+        let remote_root = temp_dir.path().join("remote-root");
+        fs::create_dir_all(&remote_root).unwrap();
+
+        let local_workspace_id = server
+            .with_sessions(|sessions| {
+                let actor = sessions.ensure_foreground_actor(&session.address)?;
+                Ok(actor.snapshot()?.workspace_id)
+            })
+            .unwrap();
+
+        let conversation = server
+            .with_conversations(|conversations| {
+                conversations.ensure_conversation(&session.address)?;
+                conversations.set_remote_execution(
+                    &session.address,
+                    Some(RemoteExecutionBinding::Local {
+                        path: remote_root.clone(),
+                    }),
+                )
+            })
+            .unwrap();
+
+        let claimed = server
+            .claim_foreground_turn_runner_when_ready(&session.address)
+            .await
+            .unwrap();
+
+        assert_ne!(claimed.workspace_id, local_workspace_id);
+        assert_eq!(
+            claimed.workspace_id,
+            format!("remote-exec-{}", conversation.id.simple())
+        );
+        assert_eq!(claimed.workspace_root, remote_root);
     }
 
     #[async_trait]
@@ -6124,7 +6246,10 @@ mod tests {
         assert!(web_channel_disallows_remote_deactivation(true, "off"));
         assert!(web_channel_disallows_remote_deactivation(true, " OFF "));
         assert!(!web_channel_disallows_remote_deactivation(false, "off"));
-        assert!(!web_channel_disallows_remote_deactivation(true, "/srv/project"));
+        assert!(!web_channel_disallows_remote_deactivation(
+            true,
+            "/srv/project"
+        ));
 
         assert_eq!(parse_think_command(Some("/think")), Some(None));
         assert_eq!(

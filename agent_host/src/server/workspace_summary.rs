@@ -30,7 +30,7 @@ impl Server {
 
     async fn summarize_workspace_before_destroy(&self, session: &SessionSnapshot) -> Result<()> {
         let _summary_guard = SummaryInProgressGuard::new(Arc::clone(&self.summary_tracker));
-        if self.remote_execution_active(&session.address)? {
+        if self.remote_execution_context(&session.address)?.is_some() {
             let actor = self.with_sessions(|sessions| {
                 sessions.resolve_foreground_by_address(&session.address)
             })?;

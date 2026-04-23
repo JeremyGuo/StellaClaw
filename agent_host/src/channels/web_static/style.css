@@ -25,6 +25,7 @@
 html,
 body {
   margin: 0;
+  height: 100%;
   min-height: 100%;
   background:
     radial-gradient(circle at top left, rgba(74, 163, 255, 0.12), transparent 28%),
@@ -52,12 +53,14 @@ button {
 #app {
   display: grid;
   grid-template-columns: 320px minmax(0, 1fr);
+  height: 100vh;
   min-height: 100vh;
 }
 
 #sidebar {
   display: flex;
   flex-direction: column;
+  height: 100vh;
   min-height: 0;
   border-right: 1px solid var(--border);
   background:
@@ -263,8 +266,10 @@ button {
 #chat-shell {
   display: flex;
   flex-direction: column;
+  height: 100vh;
   min-width: 0;
   min-height: 0;
+  overflow: hidden;
 }
 
 #topbar {
@@ -314,7 +319,9 @@ button {
 #main {
   display: flex;
   flex-direction: column;
+  flex: 1;
   min-height: 0;
+  overflow: hidden;
   width: 100%;
   max-width: 1180px;
   margin: 0 auto;
@@ -363,6 +370,7 @@ button {
   flex: 1;
   min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: 14px;

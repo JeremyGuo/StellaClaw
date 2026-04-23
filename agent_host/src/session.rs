@@ -2306,6 +2306,16 @@ impl SessionManager {
         sessions_root: &Path,
     ) -> Result<SessionActorRef> {
         let key = address.session_key();
+        if let Some(existing) = self.foreground_actors.get(&key).cloned() {
+            let should_replace = existing.snapshot().map_or(true, |snapshot| {
+                snapshot.workspace_id != workspace_id
+                    || snapshot.workspace_root != workspace_root
+                    || !snapshot.root_dir.starts_with(sessions_root)
+            });
+            if should_replace && let Some(actor) = self.foreground_actors.remove(&key) {
+                actor.close_and_shutdown()?;
+            }
+        }
         if !self.foreground_actors.contains_key(&key) {
             if let Some(actor) = self.load_foreground_actor_from_root(
                 address,

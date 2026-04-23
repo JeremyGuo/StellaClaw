@@ -6,10 +6,10 @@ use crate::domain::{
     ChannelAddress, OutgoingAttachment, OutgoingMessage, ProcessingState, ShowOptions,
     validate_conversation_id,
 };
+use crate::remote_execution::storage_root_for_execution_root;
 use crate::remote_execution::{
     RemoteExecutionBinding, validate_local_execution_path, validate_ssh_execution_binding,
 };
-use crate::remote_execution::storage_root_for_execution_root;
 use crate::transcript::{TranscriptEntry, TranscriptEntrySkeleton, TranscriptEntryType};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -540,16 +540,17 @@ async fn send_message(
     check_auth(&state, &headers, None).map_err(status_text)?;
     let text = body.text.trim();
     if text.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "text must not be empty".to_string()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "text must not be empty".to_string(),
+        ));
     }
 
     let incoming_sender = state.incoming_sender.read().await;
-    let sender = incoming_sender
-        .as_ref()
-        .ok_or((
-            StatusCode::SERVICE_UNAVAILABLE,
-            "web channel is not ready to accept incoming messages".to_string(),
-        ))?;
+    let sender = incoming_sender.as_ref().ok_or((
+        StatusCode::SERVICE_UNAVAILABLE,
+        "web channel is not ready to accept incoming messages".to_string(),
+    ))?;
     let conversation_key = normalize_or_default_conversation_key(body.conversation_key.as_deref())
         .map_err(error_text(StatusCode::BAD_REQUEST))?;
     let address = ChannelAddress {
@@ -1357,6 +1358,21 @@ mod tests {
     }
 
     #[test]
+    fn bundled_web_client_preserves_manual_history_scroll_position() {
+        assert!(APP_JS.contains("const shouldStick = autoStickToBottom || isNearBottom(160);"));
+        assert!(APP_JS.contains("if (shouldStick) scrollToBottom();"));
+    }
+
+    #[test]
+    fn bundled_web_client_routes_main_panel_wheel_scroll_into_messages() {
+        assert!(APP_JS.contains("mainEl.addEventListener('wheel'"));
+        assert!(APP_JS.contains("nearestNestedScrollable"));
+        assert!(STYLE_CSS.contains("#chat-shell {"));
+        assert!(STYLE_CSS.contains("height: 100vh;"));
+        assert!(STYLE_CSS.contains("overscroll-behavior: contain;"));
+    }
+
+    #[test]
     fn missing_host_returns_service_unavailable() {
         let state = state_with_token(None);
         let result = host_for_state(&state);
@@ -1405,15 +1421,19 @@ mod tests {
         );
 
         assert!(validate_requested_remote_execution(None).is_err());
-        assert!(validate_requested_remote_execution(Some(RemoteExecutionBinding::Local {
-            path: PathBuf::from("relative/path"),
-        }))
-        .is_err());
-        assert!(validate_requested_remote_execution(Some(RemoteExecutionBinding::Ssh {
-            host: "".to_string(),
-            path: "".to_string(),
-        }))
-        .is_err());
+        assert!(
+            validate_requested_remote_execution(Some(RemoteExecutionBinding::Local {
+                path: PathBuf::from("relative/path"),
+            }))
+            .is_err()
+        );
+        assert!(
+            validate_requested_remote_execution(Some(RemoteExecutionBinding::Ssh {
+                host: "".to_string(),
+                path: "".to_string(),
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1424,6 +1444,23 @@ mod tests {
         assert!(APP_JS.contains("/api/conversation"));
         assert!(APP_JS.contains("remote_execution"));
         assert!(APP_JS.contains("http://127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn bundled_web_client_persists_server_settings_draft_on_input() {
+        assert!(APP_JS.contains("function persistServerSettingsDraft"));
+        assert!(
+            APP_JS.contains(
+                "serverUrlInputEl.addEventListener('input', persistServerSettingsDraft);"
+            )
+        );
+        assert!(
+            APP_JS.contains(
+                "authTokenInputEl.addEventListener('input', persistServerSettingsDraft);"
+            )
+        );
+        assert!(APP_JS.contains("localStorage.setItem(SERVER_KEY, draftServerBase);"));
+        assert!(APP_JS.contains("localStorage.setItem(AUTH_KEY, draftToken);"));
     }
 
     #[test]

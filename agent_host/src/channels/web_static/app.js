@@ -17,6 +17,7 @@
   const conversationSubtitleEl = document.getElementById('conversation-subtitle');
   const heroConversationEl = document.getElementById('hero-conversation');
   const heroEl = document.getElementById('hero');
+  const mainEl = document.getElementById('main');
   const newConversationBtn = document.getElementById('new-conversation-btn');
   const refreshEl = document.getElementById('refresh-btn');
   const applyWorkspaceBtn = document.getElementById('apply-workspace-btn');
@@ -86,13 +87,19 @@
   function saveServerSettings() {
     serverBase = normalizeServerBase(serverUrlInputEl.value);
     token = authTokenInputEl.value.trim();
-    localStorage.setItem(SERVER_KEY, serverBase);
-    if (token) {
-      localStorage.setItem(AUTH_KEY, token);
+    persistServerSettingsDraft();
+    updateServerPill();
+  }
+
+  function persistServerSettingsDraft() {
+    const draftServerBase = normalizeServerBase(serverUrlInputEl.value);
+    const draftToken = authTokenInputEl.value.trim();
+    localStorage.setItem(SERVER_KEY, draftServerBase);
+    if (draftToken) {
+      localStorage.setItem(AUTH_KEY, draftToken);
     } else {
       localStorage.removeItem(AUTH_KEY);
     }
-    updateServerPill();
   }
 
   function saveWorkspaceDraft() {
@@ -476,6 +483,7 @@
   }
 
   function appendMessage(role, text, meta, options, attachments) {
+    const shouldStick = autoStickToBottom || isNearBottom(160);
     const div = document.createElement('div');
     div.className = 'msg ' + role;
     if (meta) {
@@ -491,7 +499,7 @@
     appendOptions(div, options);
     messagesEl.appendChild(div);
     updateHeroState();
-    scrollToBottom();
+    if (shouldStick) scrollToBottom();
     return div;
   }
 
@@ -1274,6 +1282,29 @@
     return remaining <= (padding || 0);
   }
 
+  function nearestNestedScrollable(target) {
+    let node = target instanceof Element ? target : null;
+    while (node && node !== messagesEl) {
+      const style = window.getComputedStyle(node);
+      const overflowY = style.overflowY;
+      if (
+        (overflowY === 'auto' || overflowY === 'scroll') &&
+        node.scrollHeight > node.clientHeight + 1
+      ) {
+        return node;
+      }
+      node = node.parentElement;
+    }
+    return null;
+  }
+
+  function canScrollForWheel(element, deltaY) {
+    if (!element || deltaY === 0) return false;
+    if (deltaY < 0) return element.scrollTop > 0;
+    const max = element.scrollHeight - element.clientHeight;
+    return element.scrollTop < max - 1;
+  }
+
   function connectWS() {
     if (reconnectTimer) {
       window.clearTimeout(reconnectTimer);
@@ -1327,8 +1358,11 @@
       case 'transcript_append':
         if (isUserTellModelCall(data.entry) || isHiddenUserTellResult(data.entry)) break;
         if (isAssistantModelCall(data.entry)) break;
-        renderSkeleton(data.entry, 'append');
-        scrollToBottom();
+        {
+          const shouldStick = autoStickToBottom || isNearBottom(160);
+          renderSkeleton(data.entry, 'append');
+          if (shouldStick) scrollToBottom();
+        }
         break;
       case 'transcript_detail':
         renderTranscriptDetail(data.entries || []);
@@ -1381,6 +1415,23 @@
     }
   });
 
+  mainEl.addEventListener('wheel', function (event) {
+    if (event.deltaY === 0) return;
+    if (event.target instanceof Element && event.target.closest('#input')) return;
+    const nested = nearestNestedScrollable(event.target);
+    if (nested && canScrollForWheel(nested, event.deltaY)) return;
+    if (messagesEl.scrollHeight <= messagesEl.clientHeight + 1) return;
+    const max = Math.max(0, messagesEl.scrollHeight - messagesEl.clientHeight);
+    const next = Math.max(0, Math.min(max, messagesEl.scrollTop + event.deltaY));
+    if (next === messagesEl.scrollTop) return;
+    event.preventDefault();
+    messagesEl.scrollTop = next;
+    autoStickToBottom = isNearBottom(160);
+    if (messagesEl.scrollTop < 20) {
+      loadTranscriptPage('older');
+    }
+  }, { passive: false });
+
   newConversationBtn.addEventListener('click', createConversation);
   refreshEl.addEventListener('click', function () {
     loadConversations().then(loadConversationState).then(function () {
@@ -1408,6 +1459,8 @@
   closeSettingsBtn.addEventListener('click', closeSettings);
   settingsBackdropEl.addEventListener('click', closeSettings);
   workspaceKindInputEl.addEventListener('change', updateWorkspaceFieldVisibility);
+  serverUrlInputEl.addEventListener('input', persistServerSettingsDraft);
+  authTokenInputEl.addEventListener('input', persistServerSettingsDraft);
   saveWorkspaceDraftBtn.addEventListener('click', function () {
     saveWorkspaceDraft();
     updateCurrentConversationCard();
