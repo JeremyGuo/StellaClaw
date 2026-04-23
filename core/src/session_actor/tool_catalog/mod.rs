@@ -194,6 +194,7 @@ impl ToolCatalog {
                 && audio_tool.model_supports(ModelCapability::AudioIn),
             enable_provider_image_generation: generation_tool
                 .model_supports(ModelCapability::ImageOut),
+            enable_skill_persistence_tools: true,
             host_tool_scope: Some(HostToolScope::from(initial.session_type)),
             ..BuiltinToolCatalogOptions::default()
         };
@@ -388,6 +389,8 @@ mod tests {
         assert!(catalog.contains("image_generation_stop"));
         assert!(catalog.contains("skill_load"));
         assert!(catalog.contains("skill_create"));
+        assert!(catalog.contains("skill_update"));
+        assert!(catalog.contains("skill_delete"));
 
         let file_read = catalog.get("file_read").unwrap();
         assert_eq!(file_read.parameters["required"], json!(["file_path"]));
@@ -642,6 +645,10 @@ mod tests {
             .unwrap()
             .contains("~/.ssh/config"));
         assert!(!catalog.contains("workpath_add"));
+        assert!(catalog.contains("skill_load"));
+        assert!(catalog.contains("skill_create"));
+        assert!(catalog.contains("skill_update"));
+        assert!(catalog.contains("skill_delete"));
     }
 
     #[test]

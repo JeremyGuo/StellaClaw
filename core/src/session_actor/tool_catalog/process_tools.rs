@@ -89,18 +89,23 @@ fn shell(
     arguments: &Map<String, Value>,
     context: &ToolExecutionContext<'_>,
 ) -> Result<Value, LocalToolError> {
-    let session_id = optional_string(arguments, "session_id")
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(generate_shell_session_id);
+    let explicit_session_id =
+        optional_string(arguments, "session_id").filter(|value| !value.trim().is_empty());
+    let command = optional_string(arguments, "command").filter(|value| !value.trim().is_empty());
+    if explicit_session_id.is_none() && command.is_none() {
+        return Err(LocalToolError::InvalidArguments(
+            "missing command; omit session_id only when starting a new shell command".to_string(),
+        ));
+    }
+    let session_id = explicit_session_id.unwrap_or_else(generate_shell_session_id);
     validate_session_id(&session_id)?;
+
+    if let Some(command) = command {
+        start_shell_command(&session_id, &command, arguments, context)?;
+    }
 
     if let Some(input) = optional_string(arguments, "input") {
         write_shell_input(&session_id, input.as_bytes())?;
-    }
-
-    let command = optional_string(arguments, "command").filter(|value| !value.trim().is_empty());
-    if let Some(command) = command {
-        start_shell_command(&session_id, &command, arguments, context)?;
     }
 
     wait_or_snapshot_shell(

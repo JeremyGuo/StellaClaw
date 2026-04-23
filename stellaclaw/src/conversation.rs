@@ -22,16 +22,18 @@ use stellaclaw_core::{
 
 use crate::{
     channels::types::{
-        OutgoingAttachment, OutgoingAttachmentKind, OutgoingDelivery, OutgoingOption,
-        OutgoingOptions,
+        OutgoingAttachment, OutgoingAttachmentKind, OutgoingDelivery, OutgoingDispatch,
+        OutgoingOption, OutgoingOptions, OutgoingProcessing, OutgoingProgressFeedback,
+        ProcessingState, ProgressFeedbackFinalState,
     },
-    config::{SandboxConfig, SessionDefaults, SessionProfile, StellaclawConfig},
+    config::{SandboxConfig, SandboxMode, SessionDefaults, SessionProfile, StellaclawConfig},
     cron::{
         cron_schedule_from_required_tool_args, optional_cron_schedule_from_tool_args,
         optional_string_arg, parse_enabled_flag, string_arg_required, timezone_or_default,
         CreateCronTaskRequest, CronManager, CronTaskRecord, UpdateCronTaskRequest,
     },
     logger::StellaclawLogger,
+    sandbox::bubblewrap_support_error,
     session_client::AgentServerClient,
     workspace::{ensure_workspace_for_remote_mode, ensure_workspace_seed, unmount_sshfs_workspace},
 };
@@ -50,12 +52,16 @@ pub struct IncomingConversationMessage {
 pub enum ConversationControl {
     Continue,
     Cancel,
+    ShowStatus,
     ShowModel,
     SwitchModel { model_name: String },
     ShowRemote,
     SetRemote { host: String, path: String },
     DisableRemote,
     InvalidRemote { reason: String },
+    ShowSandbox,
+    SetSandbox { mode: Option<SandboxMode> },
+    InvalidSandbox { reason: String },
 }
 
 #[derive(Debug)]
@@ -63,6 +69,8 @@ pub enum ConversationCommand {
     Incoming(IncomingConversationMessage),
     RunCronTask { task: CronTaskRecord },
 }
+
+const TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(4);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationState {
@@ -137,7 +145,7 @@ pub fn spawn_conversation(
     config: Arc<StellaclawConfig>,
     agent_server_path: PathBuf,
     cron_manager: Arc<CronManager>,
-    outgoing_tx: Sender<OutgoingDelivery>,
+    outgoing_tx: Sender<OutgoingDispatch>,
     host_logger: Arc<StellaclawLogger>,
 ) -> Sender<ConversationCommand> {
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -165,7 +173,7 @@ fn run_conversation(
     agent_server_path: PathBuf,
     cron_manager: Arc<CronManager>,
     rx: Receiver<ConversationCommand>,
-    outgoing_tx: Sender<OutgoingDelivery>,
+    outgoing_tx: Sender<OutgoingDispatch>,
     host_logger: Arc<StellaclawLogger>,
 ) -> Result<()> {
     let conversation_root = workdir.join("conversations").join(&state.conversation_id);
@@ -203,6 +211,7 @@ fn run_conversation(
         while runtime.pump_session_events()? {
             changed = true;
         }
+        runtime.pump_processing_keepalive()?;
         if changed {
             runtime.persist_state()?;
         }
@@ -274,12 +283,13 @@ struct ConversationRuntime {
     state: ConversationState,
     config: Arc<StellaclawConfig>,
     cron_manager: Arc<CronManager>,
-    outgoing_tx: Sender<OutgoingDelivery>,
+    outgoing_tx: Sender<OutgoingDispatch>,
     logger: Arc<StellaclawLogger>,
     host_logger: Arc<StellaclawLogger>,
     foreground: ForegroundSessionRuntime,
     background: BTreeMap<String, ManagedSessionRuntime>,
     subagents: BTreeMap<String, ManagedSessionRuntime>,
+    foreground_progress: Option<ActiveForegroundProgress>,
 }
 
 struct ForegroundSessionRuntime {
@@ -293,6 +303,12 @@ struct ManagedSessionRuntime {
     events: Option<mpsc::Receiver<SessionEvent>>,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveForegroundProgress {
+    turn_id: String,
+    next_typing_at: Instant,
+}
+
 impl ConversationRuntime {
     fn new(
         workdir: PathBuf,
@@ -301,7 +317,7 @@ impl ConversationRuntime {
         config: Arc<StellaclawConfig>,
         cron_manager: Arc<CronManager>,
         agent_server_path: PathBuf,
-        outgoing_tx: Sender<OutgoingDelivery>,
+        outgoing_tx: Sender<OutgoingDispatch>,
         logger: Arc<StellaclawLogger>,
         host_logger: Arc<StellaclawLogger>,
     ) -> Result<Self> {
@@ -384,6 +400,7 @@ impl ConversationRuntime {
             foreground,
             background,
             subagents,
+            foreground_progress: None,
         })
     }
 
@@ -410,6 +427,16 @@ impl ConversationRuntime {
                         }
                     }
                 }
+                Some(
+                    ConversationControl::ShowStatus
+                    | ConversationControl::ShowRemote
+                    | ConversationControl::SetRemote { .. }
+                    | ConversationControl::DisableRemote
+                    | ConversationControl::InvalidRemote { .. }
+                    | ConversationControl::ShowSandbox
+                    | ConversationControl::SetSandbox { .. }
+                    | ConversationControl::InvalidSandbox { .. },
+                ) => {}
                 _ => {
                     self.send_model_selection()?;
                     return Ok(false);
@@ -428,6 +455,10 @@ impl ConversationRuntime {
                 self.foreground_client()?
                     .send_session_request(&SessionRequest::CancelTurn { reason: None })
                     .map_err(anyhow::Error::msg)?;
+                return Ok(false);
+            }
+            Some(ConversationControl::ShowStatus) => {
+                self.send_status()?;
                 return Ok(false);
             }
             Some(ConversationControl::ShowModel) => {
@@ -466,6 +497,23 @@ impl ConversationRuntime {
             Some(ConversationControl::InvalidRemote { reason }) => {
                 self.send_delivery_from_text(format!(
                     "{reason}\n用法: `/remote <ssh-host> <path>`，查看状态: `/remote`，关闭: `/remote off`。"
+                ))?;
+                return Ok(false);
+            }
+            Some(ConversationControl::ShowSandbox) => {
+                self.send_sandbox_status()?;
+                return Ok(false);
+            }
+            Some(ConversationControl::SetSandbox { mode }) => match self.set_sandbox_mode(mode) {
+                Ok(()) => return Ok(true),
+                Err(error) => {
+                    self.send_delivery_from_text(format!("沙盒模式切换失败: {error}"))?;
+                    return Ok(false);
+                }
+            },
+            Some(ConversationControl::InvalidSandbox { reason }) => {
+                self.send_delivery_from_text(format!(
+                    "{reason}\n用法: `/sandbox`，`/sandbox bubblewrap`，`/sandbox subprocess`，`/sandbox default`。"
                 ))?;
                 return Ok(false);
             }
@@ -565,6 +613,9 @@ impl ConversationRuntime {
                         "turn_id": turn_id,
                     }),
                 );
+                if session_type == SessionType::Foreground {
+                    self.start_foreground_progress(turn_id)?;
+                }
                 Ok(false)
             }
             SessionEvent::Progress { message } => {
@@ -576,6 +627,9 @@ impl ConversationRuntime {
                         "message": message,
                     }),
                 );
+                if session_type == SessionType::Foreground {
+                    self.update_foreground_progress(&message)?;
+                }
                 Ok(false)
             }
             SessionEvent::TurnCompleted { message } => {
@@ -633,6 +687,7 @@ impl ConversationRuntime {
     ) -> Result<bool> {
         match session_type {
             SessionType::Foreground => {
+                self.finish_foreground_progress(ProgressFeedbackFinalState::Done, None)?;
                 self.send_delivery_from_text(render_chat_message(&message))?;
                 Ok(false)
             }
@@ -701,6 +756,7 @@ impl ConversationRuntime {
     ) -> Result<bool> {
         match session_type {
             SessionType::Foreground => {
+                self.finish_foreground_progress(ProgressFeedbackFinalState::Failed, Some(&error))?;
                 let suffix = if can_continue {
                     "\n发送 /continue 继续，或 /cancel 取消当前回合。"
                 } else {
@@ -867,6 +923,9 @@ impl ConversationRuntime {
                     json!({"terminated": true}).to_string(),
                 ))
             }
+            "skill_create" => self.persist_skill(request, SkillPersistMode::Create),
+            "skill_update" => self.persist_skill(request, SkillPersistMode::Update),
+            "skill_delete" => self.persist_skill(request, SkillPersistMode::Delete),
             "list_cron_tasks" => {
                 let tasks = self
                     .cron_manager
@@ -948,6 +1007,82 @@ impl ConversationRuntime {
                 request,
                 json!({"error": format!("unsupported host action {}", request.action)}).to_string(),
             )),
+        }
+    }
+
+    fn persist_skill(
+        &self,
+        request: &ConversationBridgeRequest,
+        mode: SkillPersistMode,
+    ) -> Result<ToolResultItem> {
+        let skill_name = request
+            .payload
+            .get("skill_name")
+            .or_else(|| request.payload.get("name"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("{} requires skill_name", request.action))?;
+        validate_skill_name(skill_name)?;
+
+        let runtime_skill_root = self.workdir.join("rundir").join(".skill");
+        let runtime_skill_path = runtime_skill_root.join(skill_name);
+        let staged_skill_path = self.workspace_root.join(".skill").join(skill_name);
+
+        match mode {
+            SkillPersistMode::Create => {
+                if runtime_skill_path.exists() {
+                    return Err(anyhow!(
+                        "skill {skill_name} already exists in runtime store"
+                    ));
+                }
+                validate_skill_directory(&staged_skill_path, skill_name)?;
+                copy_skill_atomically(&staged_skill_path, &runtime_skill_path)?;
+                let synced = sync_skill_to_conversation_workspaces(
+                    &self.workdir,
+                    skill_name,
+                    Some(&staged_skill_path),
+                )?;
+                Ok(bridge_result(
+                    request,
+                    json!({"created": true, "skill_name": skill_name, "synced_workspaces": synced})
+                        .to_string(),
+                ))
+            }
+            SkillPersistMode::Update => {
+                if !runtime_skill_path.exists() {
+                    return Err(anyhow!(
+                        "skill {skill_name} does not exist in runtime store"
+                    ));
+                }
+                validate_skill_directory(&staged_skill_path, skill_name)?;
+                copy_skill_atomically(&staged_skill_path, &runtime_skill_path)?;
+                let synced = sync_skill_to_conversation_workspaces(
+                    &self.workdir,
+                    skill_name,
+                    Some(&staged_skill_path),
+                )?;
+                Ok(bridge_result(
+                    request,
+                    json!({"updated": true, "skill_name": skill_name, "synced_workspaces": synced})
+                        .to_string(),
+                ))
+            }
+            SkillPersistMode::Delete => {
+                if !runtime_skill_path.exists() {
+                    return Err(anyhow!(
+                        "skill {skill_name} does not exist in runtime store"
+                    ));
+                }
+                fs::remove_dir_all(&runtime_skill_path).with_context(|| {
+                    format!("failed to remove {}", runtime_skill_path.display())
+                })?;
+                let synced =
+                    sync_skill_to_conversation_workspaces(&self.workdir, skill_name, None)?;
+                Ok(bridge_result(
+                    request,
+                    json!({"deleted": true, "skill_name": skill_name, "synced_workspaces": synced})
+                        .to_string(),
+                ))
+            }
         }
     }
 
@@ -1159,17 +1294,111 @@ impl ConversationRuntime {
         options: Option<OutgoingOptions>,
     ) -> Result<()> {
         self.outgoing_tx
-            .send(OutgoingDelivery {
+            .send(OutgoingDispatch::Delivery(OutgoingDelivery {
                 channel_id: self.state.channel_id.clone(),
                 platform_chat_id: self.state.platform_chat_id.clone(),
                 text,
                 attachments,
                 options,
-            })
+            }))
             .map_err(|_| anyhow!("outgoing delivery channel closed"))
     }
 
+    fn send_processing_state(&self, state: ProcessingState) -> Result<()> {
+        self.outgoing_tx
+            .send(OutgoingDispatch::Processing(OutgoingProcessing {
+                channel_id: self.state.channel_id.clone(),
+                platform_chat_id: self.state.platform_chat_id.clone(),
+                state,
+            }))
+            .map_err(|_| anyhow!("outgoing processing channel closed"))
+    }
+
+    fn send_progress_feedback(
+        &self,
+        turn_id: String,
+        text: String,
+        final_state: Option<ProgressFeedbackFinalState>,
+        important: bool,
+    ) -> Result<()> {
+        self.outgoing_tx
+            .send(OutgoingDispatch::ProgressFeedback(
+                OutgoingProgressFeedback {
+                    channel_id: self.state.channel_id.clone(),
+                    platform_chat_id: self.state.platform_chat_id.clone(),
+                    turn_id,
+                    text,
+                    final_state,
+                    important,
+                },
+            ))
+            .map_err(|_| anyhow!("outgoing progress channel closed"))
+    }
+
+    fn start_foreground_progress(&mut self, turn_id: String) -> Result<()> {
+        let now = Instant::now();
+        self.foreground_progress = Some(ActiveForegroundProgress {
+            turn_id: turn_id.clone(),
+            next_typing_at: now + TYPING_KEEPALIVE_INTERVAL,
+        });
+        self.send_processing_state(ProcessingState::Typing)?;
+        self.send_progress_feedback(
+            turn_id,
+            progress_text_thinking(&self.state.session_profile.main_model.model_name),
+            None,
+            true,
+        )
+    }
+
+    fn update_foreground_progress(&self, message: &str) -> Result<()> {
+        let Some(progress) = &self.foreground_progress else {
+            return Ok(());
+        };
+        self.send_progress_feedback(
+            progress.turn_id.clone(),
+            progress_text_update(&self.state.session_profile.main_model.model_name, message),
+            None,
+            false,
+        )
+    }
+
+    fn finish_foreground_progress(
+        &mut self,
+        final_state: ProgressFeedbackFinalState,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let Some(progress) = self.foreground_progress.take() else {
+            return Ok(());
+        };
+        self.send_processing_state(ProcessingState::Idle)?;
+        let text = match final_state {
+            ProgressFeedbackFinalState::Done => {
+                progress_text_done(&self.state.session_profile.main_model.model_name)
+            }
+            ProgressFeedbackFinalState::Failed => {
+                progress_text_failed(&self.state.session_profile.main_model.model_name, error)
+            }
+        };
+        self.send_progress_feedback(progress.turn_id, text, Some(final_state), true)
+    }
+
+    fn pump_processing_keepalive(&mut self) -> Result<()> {
+        let Some(progress) = &mut self.foreground_progress else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        if now < progress.next_typing_at {
+            return Ok(());
+        }
+        progress.next_typing_at = now + TYPING_KEEPALIVE_INTERVAL;
+        self.send_processing_state(ProcessingState::Typing)
+    }
+
     fn shutdown(&mut self) {
+        let _ = self.finish_foreground_progress(
+            ProgressFeedbackFinalState::Failed,
+            Some("conversation stopped"),
+        );
         if let Some(client) = self.foreground.client.take() {
             let _ = client.shutdown();
         }
@@ -1269,6 +1498,45 @@ impl ConversationRuntime {
         )
     }
 
+    fn send_status(&self) -> Result<()> {
+        let sandbox = effective_sandbox_config(self.state.sandbox.as_ref(), &self.config.sandbox);
+        let sandbox_source = if self.state.sandbox.is_some() {
+            "conversation"
+        } else {
+            "default"
+        };
+        let remote = match &self.state.tool_remote_mode {
+            ToolRemoteMode::Selectable => "selectable".to_string(),
+            ToolRemoteMode::FixedSsh { host, cwd } => {
+                format!("fixed ssh `{host}` `{}`", cwd.as_deref().unwrap_or(""))
+            }
+        };
+        let running_background = self
+            .state
+            .session_binding
+            .background_sessions
+            .values()
+            .filter(|record| record.status == ManagedSessionStatus::Running)
+            .count();
+        let running_subagents = self
+            .state
+            .session_binding
+            .subagent_sessions
+            .values()
+            .filter(|record| record.status == ManagedSessionStatus::Running)
+            .count();
+        self.send_delivery_from_text(format!(
+            "当前状态\nconversation: `{}`\nmodel: `{}`\nreasoning: `{}`\nsandbox: `{}` ({sandbox_source})\nremote: {remote}\nworkspace: `{}`\nbackground: {running_background} running / {} total\nsubagents: {running_subagents} running / {} total",
+            self.state.conversation_id,
+            self.state.session_profile.main_model.model_name,
+            self.state.reasoning_effort.as_deref().unwrap_or("model default"),
+            sandbox_mode_label(&sandbox.mode),
+            self.workspace_root.display(),
+            self.state.session_binding.background_sessions.len(),
+            self.state.session_binding.subagent_sessions.len(),
+        ))
+    }
+
     fn send_remote_status(&self) -> Result<()> {
         let text = match &self.state.tool_remote_mode {
             ToolRemoteMode::Selectable => {
@@ -1285,6 +1553,26 @@ impl ConversationRuntime {
         self.send_delivery_from_text(text)
     }
 
+    fn send_sandbox_status(&self) -> Result<()> {
+        let sandbox = effective_sandbox_config(self.state.sandbox.as_ref(), &self.config.sandbox);
+        let source = if self.state.sandbox.is_some() {
+            "conversation override"
+        } else {
+            "default config"
+        };
+        let support = match sandbox.mode {
+            SandboxMode::Bubblewrap => bubblewrap_support_error(&sandbox)
+                .map(|reason| format!("\n当前 bubblewrap 不可用: {reason}"))
+                .unwrap_or_else(|| "\nbubblewrap 可用。".to_string()),
+            SandboxMode::Subprocess => String::new(),
+        };
+        self.send_delivery_from_text(format!(
+            "当前 sandbox: `{}` ({source})\nbubblewrap_binary: `{}`{support}\n用法: `/sandbox bubblewrap`，`/sandbox subprocess`，`/sandbox default`。",
+            sandbox_mode_label(&sandbox.mode),
+            sandbox.bubblewrap_binary,
+        ))
+    }
+
     fn set_remote_mode(&mut self, host: String, path: String) -> Result<()> {
         let old_mode = self.state.tool_remote_mode.clone();
         let new_mode = ToolRemoteMode::FixedSsh {
@@ -1297,7 +1585,9 @@ impl ConversationRuntime {
         }
 
         if let ToolRemoteMode::FixedSsh { .. } = old_mode {
-            self.stop_running_managed_sessions_for_workspace_change();
+            self.stop_running_managed_sessions_for_config_change(
+                "stopped because conversation remote workspace changed",
+            );
             let _ = unmount_sshfs_workspace(&self.workdir, &self.state.conversation_id);
         }
         let workspace_root = match ensure_workspace_for_remote_mode(
@@ -1321,7 +1611,9 @@ impl ConversationRuntime {
                 return Err(error);
             }
         };
-        self.stop_running_managed_sessions_for_workspace_change();
+        self.stop_running_managed_sessions_for_config_change(
+            "stopped because conversation remote workspace changed",
+        );
         self.state.tool_remote_mode = new_mode;
         self.workspace_root = workspace_root;
         self.restart_foreground_session()?;
@@ -1333,12 +1625,56 @@ impl ConversationRuntime {
         Ok(())
     }
 
+    fn set_sandbox_mode(&mut self, mode: Option<SandboxMode>) -> Result<()> {
+        let new_sandbox = mode.map(|mode| SandboxConfig {
+            mode,
+            ..self.config.sandbox.clone()
+        });
+        let old_effective =
+            effective_sandbox_config(self.state.sandbox.as_ref(), &self.config.sandbox).clone();
+        let new_effective =
+            effective_sandbox_config(new_sandbox.as_ref(), &self.config.sandbox).clone();
+        let old_mode_label = sandbox_mode_label(&old_effective.mode);
+        let new_mode_label = sandbox_mode_label(&new_effective.mode);
+        if old_effective.mode == new_effective.mode
+            && old_effective.bubblewrap_binary == new_effective.bubblewrap_binary
+            && self.state.sandbox.is_some() == new_sandbox.is_some()
+        {
+            self.send_sandbox_status()?;
+            return Ok(());
+        }
+        if matches!(new_effective.mode, SandboxMode::Bubblewrap) {
+            if let Some(reason) = bubblewrap_support_error(&new_effective) {
+                return Err(anyhow!(reason));
+            }
+        }
+
+        self.stop_running_managed_sessions_for_config_change(
+            "stopped because conversation sandbox changed",
+        );
+        self.state.sandbox = new_sandbox;
+        self.restart_foreground_session()?;
+        self.send_delivery_from_text(format!(
+            "已切换 sandbox: `{}` -> `{}`{}。",
+            old_mode_label,
+            new_mode_label,
+            if self.state.sandbox.is_some() {
+                " (conversation override)"
+            } else {
+                " (default config)"
+            }
+        ))?;
+        Ok(())
+    }
+
     fn disable_remote_mode(&mut self) -> Result<()> {
         if matches!(self.state.tool_remote_mode, ToolRemoteMode::Selectable) {
             self.send_remote_status()?;
             return Ok(());
         }
-        self.stop_running_managed_sessions_for_workspace_change();
+        self.stop_running_managed_sessions_for_config_change(
+            "stopped because conversation remote workspace changed",
+        );
         let _ = unmount_sshfs_workspace(&self.workdir, &self.state.conversation_id);
         self.state.tool_remote_mode = ToolRemoteMode::Selectable;
         self.workspace_root = ensure_workspace_for_remote_mode(
@@ -1373,7 +1709,7 @@ impl ConversationRuntime {
         Ok(())
     }
 
-    fn stop_running_managed_sessions_for_workspace_change(&mut self) {
+    fn stop_running_managed_sessions_for_config_change(&mut self, reason: &'static str) {
         for (agent_id, mut runtime) in std::mem::take(&mut self.background) {
             if let Some(client) = runtime.client.take() {
                 let _ = client.shutdown();
@@ -1386,8 +1722,7 @@ impl ConversationRuntime {
             {
                 if record.status == ManagedSessionStatus::Running {
                     record.status = ManagedSessionStatus::Killed;
-                    record.last_error =
-                        Some("stopped because conversation remote workspace changed".to_string());
+                    record.last_error = Some(reason.to_string());
                 }
             }
         }
@@ -1403,8 +1738,7 @@ impl ConversationRuntime {
             {
                 if record.status == ManagedSessionStatus::Running {
                     record.status = ManagedSessionStatus::Killed;
-                    record.last_error =
-                        Some("stopped because conversation remote workspace changed".to_string());
+                    record.last_error = Some(reason.to_string());
                 }
             }
         }
@@ -1441,6 +1775,35 @@ impl ConversationRuntime {
         ))?;
         Ok(())
     }
+}
+
+fn progress_text_thinking(model_key: &str) -> String {
+    format!(
+        "⚙️ 正在执行\n🤖 模型：{}\n🧠 状态：思考中...\n\n💡 发送新消息可打断；/continue 可继续最近中断的回合。",
+        model_key
+    )
+}
+
+fn progress_text_update(model_key: &str, activity: &str) -> String {
+    let activity = activity.trim();
+    if activity.is_empty() {
+        return progress_text_thinking(model_key);
+    }
+    format!(
+        "⚙️ 正在执行\n🤖 模型：{}\n📌 阶段：{}\n\n💡 发送新消息可打断；/continue 可继续最近中断的回合。",
+        model_key, activity
+    )
+}
+
+fn progress_text_done(model_key: &str) -> String {
+    format!("✅ 已完成\n🤖 模型：{model_key}")
+}
+
+fn progress_text_failed(model_key: &str, error: Option<&str>) -> String {
+    let Some(error) = error.map(str::trim).filter(|value| !value.is_empty()) else {
+        return format!("❌ 本轮失败\n🤖 模型：{model_key}");
+    };
+    format!("❌ 本轮失败\n🤖 模型：{model_key}\n📌 {error}")
 }
 
 fn start_foreground_session(
@@ -1560,6 +1923,209 @@ fn to_session_type(kind: ManagedSessionType) -> SessionType {
         ManagedSessionType::Background => SessionType::Background,
         ManagedSessionType::Subagent => SessionType::Subagent,
     }
+}
+
+fn effective_sandbox_config<'a>(
+    conversation_sandbox: Option<&'a SandboxConfig>,
+    default_sandbox: &'a SandboxConfig,
+) -> &'a SandboxConfig {
+    conversation_sandbox.unwrap_or(default_sandbox)
+}
+
+fn sandbox_mode_label(mode: &SandboxMode) -> &'static str {
+    match mode {
+        SandboxMode::Subprocess => "subprocess",
+        SandboxMode::Bubblewrap => "bubblewrap",
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SkillPersistMode {
+    Create,
+    Update,
+    Delete,
+}
+
+fn validate_skill_name(skill_name: &str) -> Result<()> {
+    let name = skill_name.trim();
+    if name.is_empty() {
+        return Err(anyhow!("skill_name must not be empty"));
+    }
+    if name != skill_name {
+        return Err(anyhow!(
+            "skill_name must not contain leading or trailing whitespace"
+        ));
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return Err(anyhow!(
+            "skill_name may only contain ASCII letters, digits, '_' and '-'"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_skill_directory(skill_path: &Path, skill_name: &str) -> Result<()> {
+    if !skill_path.is_dir() {
+        return Err(anyhow!(
+            "staged skill directory {} does not exist",
+            skill_path.display()
+        ));
+    }
+    let entry_path = skill_path.join("SKILL.md");
+    let content = fs::read_to_string(&entry_path)
+        .with_context(|| format!("failed to read {}", entry_path.display()))?;
+    let frontmatter = extract_yaml_frontmatter(&content)
+        .ok_or_else(|| anyhow!("{} must start with YAML frontmatter", entry_path.display()))?;
+    let name = frontmatter_scalar(frontmatter, "name")
+        .ok_or_else(|| anyhow!("{} frontmatter must contain name", entry_path.display()))?;
+    if name != skill_name {
+        return Err(anyhow!(
+            "{} frontmatter name `{}` does not match folder `{}`",
+            entry_path.display(),
+            name,
+            skill_name
+        ));
+    }
+    let description = frontmatter_scalar(frontmatter, "description").ok_or_else(|| {
+        anyhow!(
+            "{} frontmatter must contain description",
+            entry_path.display()
+        )
+    })?;
+    if description.trim().is_empty() {
+        return Err(anyhow!(
+            "{} frontmatter description must not be empty",
+            entry_path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn extract_yaml_frontmatter(content: &str) -> Option<&str> {
+    let mut lines = content.lines();
+    if lines.next()? != "---" {
+        return None;
+    }
+    let body_start = 4;
+    let end = content[body_start..].find("\n---")?;
+    Some(&content[body_start..body_start + end])
+}
+
+fn frontmatter_scalar(frontmatter: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    for line in frontmatter.lines() {
+        let line = line.trim();
+        let value = line.strip_prefix(&prefix)?.trim();
+        if value.is_empty() || matches!(value, "|" | ">") {
+            return None;
+        }
+        return Some(
+            value
+                .trim_matches('"')
+                .trim_matches('\'')
+                .trim()
+                .to_string(),
+        );
+    }
+    None
+}
+
+fn copy_skill_atomically(source: &Path, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent", destination.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let tmp = destination.with_extension("tmp-skill-copy");
+    if tmp.exists() {
+        fs::remove_dir_all(&tmp).with_context(|| format!("failed to remove {}", tmp.display()))?;
+    }
+    copy_directory_recursive_local(source, &tmp)?;
+    if destination.exists() {
+        fs::remove_dir_all(destination)
+            .with_context(|| format!("failed to remove {}", destination.display()))?;
+    }
+    fs::rename(&tmp, destination).with_context(|| {
+        format!(
+            "failed to rename {} to {}",
+            tmp.display(),
+            destination.display()
+        )
+    })
+}
+
+fn sync_skill_to_conversation_workspaces(
+    workdir: &Path,
+    skill_name: &str,
+    source: Option<&Path>,
+) -> Result<usize> {
+    let conversations_root = workdir.join("conversations");
+    if !conversations_root.is_dir() {
+        return Ok(0);
+    }
+    let mut synced = 0usize;
+    for entry in fs::read_dir(&conversations_root)
+        .with_context(|| format!("failed to read {}", conversations_root.display()))?
+    {
+        let entry = entry
+            .with_context(|| format!("failed to enumerate {}", conversations_root.display()))?;
+        if !entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", entry.path().display()))?
+            .is_dir()
+        {
+            continue;
+        }
+        let skill_root = entry.path().join(".skill");
+        if !skill_root.is_dir() {
+            continue;
+        }
+        let destination = skill_root.join(skill_name);
+        match source {
+            Some(source) => {
+                copy_skill_atomically(source, &destination)?;
+                synced += 1;
+            }
+            None => {
+                if destination.exists() {
+                    fs::remove_dir_all(&destination)
+                        .with_context(|| format!("failed to remove {}", destination.display()))?;
+                    synced += 1;
+                }
+            }
+        }
+    }
+    Ok(synced)
+}
+
+fn copy_directory_recursive_local(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)
+        .with_context(|| format!("failed to create {}", destination.display()))?;
+    for entry in
+        fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to enumerate {}", source.display()))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", source_path.display()))?
+            .is_dir()
+        {
+            copy_directory_recursive_local(&source_path, &destination_path)?;
+        } else {
+            fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "failed to copy {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn bridge_result(request: &ConversationBridgeRequest, text: String) -> ToolResultItem {

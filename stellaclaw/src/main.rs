@@ -19,7 +19,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use channels::{
-    types::{IncomingDispatch, OutgoingDelivery},
+    types::{IncomingDispatch, OutgoingDispatch},
     Channel, TelegramChannel,
 };
 use config::{ChannelConfig, StellaclawConfig};
@@ -86,7 +86,7 @@ fn run() -> Result<()> {
     ));
     let cron_manager = Arc::new(CronManager::load_under(&args.workdir)?);
     let (incoming_tx, incoming_rx) = unbounded::<IncomingDispatch>();
-    let (outgoing_tx, outgoing_rx) = unbounded::<OutgoingDelivery>();
+    let (outgoing_tx, outgoing_rx) = unbounded::<OutgoingDispatch>();
 
     let mut channels: HashMap<String, Arc<dyn Channel>> = HashMap::new();
     for channel in &config.channels {
@@ -112,8 +112,9 @@ fn run() -> Result<()> {
     }
 
     let send_channels = channels.clone();
+    let outgoing_logger = logger.clone();
     thread::spawn(move || {
-        if let Err(error) = run_outgoing_loop(outgoing_rx, send_channels) {
+        if let Err(error) = run_outgoing_loop(outgoing_rx, send_channels, outgoing_logger) {
             eprintln!("stellaclaw outgoing loop failed: {error:#}");
         }
     });
@@ -130,14 +131,73 @@ fn run() -> Result<()> {
 }
 
 fn run_outgoing_loop(
-    rx: Receiver<OutgoingDelivery>,
+    rx: Receiver<OutgoingDispatch>,
     channels: HashMap<String, Arc<dyn Channel>>,
+    logger: Arc<StellaclawLogger>,
 ) -> Result<()> {
-    while let Ok(delivery) = rx.recv() {
-        let channel = channels
-            .get(&delivery.channel_id)
-            .ok_or_else(|| anyhow!("unknown channel {}", delivery.channel_id))?;
-        channel.send_delivery(&delivery)?;
+    while let Ok(dispatch) = rx.recv() {
+        match dispatch {
+            OutgoingDispatch::Delivery(delivery) => {
+                let Some(channel) = channels.get(&delivery.channel_id) else {
+                    logger.warn(
+                        "outgoing_delivery_failed",
+                        serde_json::json!({"channel_id": delivery.channel_id, "error": "unknown channel"}),
+                    );
+                    continue;
+                };
+                if let Err(error) = channel.send_delivery(&delivery) {
+                    logger.warn(
+                        "outgoing_delivery_failed",
+                        serde_json::json!({
+                            "channel_id": delivery.channel_id,
+                            "platform_chat_id": delivery.platform_chat_id,
+                            "error": format!("{error:#}"),
+                        }),
+                    );
+                }
+            }
+            OutgoingDispatch::Processing(processing) => {
+                let Some(channel) = channels.get(&processing.channel_id) else {
+                    logger.warn(
+                        "outgoing_processing_failed",
+                        serde_json::json!({"channel_id": processing.channel_id, "error": "unknown channel"}),
+                    );
+                    continue;
+                };
+                if let Err(error) =
+                    channel.set_processing(&processing.platform_chat_id, processing.state)
+                {
+                    logger.warn(
+                        "outgoing_processing_failed",
+                        serde_json::json!({
+                            "channel_id": processing.channel_id,
+                            "platform_chat_id": processing.platform_chat_id,
+                            "error": format!("{error:#}"),
+                        }),
+                    );
+                }
+            }
+            OutgoingDispatch::ProgressFeedback(feedback) => {
+                let Some(channel) = channels.get(&feedback.channel_id) else {
+                    logger.warn(
+                        "outgoing_progress_failed",
+                        serde_json::json!({"channel_id": feedback.channel_id, "error": "unknown channel"}),
+                    );
+                    continue;
+                };
+                if let Err(error) = channel.update_progress_feedback(&feedback) {
+                    logger.warn(
+                        "outgoing_progress_failed",
+                        serde_json::json!({
+                            "channel_id": feedback.channel_id,
+                            "platform_chat_id": feedback.platform_chat_id,
+                            "turn_id": feedback.turn_id,
+                            "error": format!("{error:#}"),
+                        }),
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -148,7 +208,7 @@ fn run_dispatcher_loop(
     agent_server_path: PathBuf,
     cron_manager: Arc<CronManager>,
     incoming_rx: Receiver<IncomingDispatch>,
-    outgoing_tx: Sender<OutgoingDelivery>,
+    outgoing_tx: Sender<OutgoingDispatch>,
     logger: Arc<StellaclawLogger>,
 ) -> Result<()> {
     let mut conversations: HashMap<String, Sender<ConversationCommand>> = HashMap::new();
@@ -212,7 +272,7 @@ fn ensure_conversation_sender(
     config: &Arc<StellaclawConfig>,
     agent_server_path: &PathBuf,
     cron_manager: &Arc<CronManager>,
-    outgoing_tx: &Sender<OutgoingDelivery>,
+    outgoing_tx: &Sender<OutgoingDispatch>,
     logger: &Arc<StellaclawLogger>,
     conversation_id: &str,
     channel_id: &str,

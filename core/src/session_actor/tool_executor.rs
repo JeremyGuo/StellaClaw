@@ -777,6 +777,23 @@ mod tests {
     }
 
     #[test]
+    fn shell_reports_missing_command_without_generated_unknown_session() {
+        let workspace = temp_workspace();
+        let executor = LocalToolBatchExecutor::new(&workspace);
+        let message = start_and_wait(
+            &executor,
+            ToolBatch::new(
+                "batch_shell_missing_command",
+                vec![tool_call("shell", json!({}))],
+            ),
+        );
+
+        let text = result_text(&message, 0);
+        assert!(text.contains("missing command"));
+        assert!(!text.contains("unknown shell session"));
+    }
+
+    #[test]
     fn shell_truncates_agent_visible_output_but_keeps_artifacts() {
         let workspace = temp_workspace();
         let executor = LocalToolBatchExecutor::new(&workspace);

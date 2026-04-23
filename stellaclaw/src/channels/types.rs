@@ -46,3 +46,39 @@ pub struct OutgoingDelivery {
     pub attachments: Vec<OutgoingAttachment>,
     pub options: Option<OutgoingOptions>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessingState {
+    Idle,
+    Typing,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutgoingProcessing {
+    pub channel_id: String,
+    pub platform_chat_id: String,
+    pub state: ProcessingState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressFeedbackFinalState {
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutgoingProgressFeedback {
+    pub channel_id: String,
+    pub platform_chat_id: String,
+    pub turn_id: String,
+    pub text: String,
+    pub final_state: Option<ProgressFeedbackFinalState>,
+    pub important: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum OutgoingDispatch {
+    Delivery(OutgoingDelivery),
+    Processing(OutgoingProcessing),
+    ProgressFeedback(OutgoingProgressFeedback),
+}

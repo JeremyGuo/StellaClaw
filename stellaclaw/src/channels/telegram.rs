@@ -1,10 +1,10 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -25,7 +25,7 @@ use crate::{
 use super::{
     types::{
         IncomingDispatch, OutgoingAttachment, OutgoingAttachmentKind, OutgoingDelivery,
-        OutgoingOptions,
+        OutgoingOptions, OutgoingProgressFeedback, ProcessingState, ProgressFeedbackFinalState,
     },
     Channel,
 };
@@ -64,11 +64,21 @@ pub struct TelegramChannel {
     workdir: PathBuf,
     security_path: PathBuf,
     security: Mutex<SecurityState>,
+    progress_messages: Mutex<HashMap<String, TelegramProgressMessage>>,
+}
+
+#[derive(Debug, Clone)]
+struct TelegramProgressMessage {
+    message_id: i64,
+    last_text: String,
+    last_update: Instant,
+    started_at: Instant,
 }
 
 impl TelegramChannel {
     const MAX_MESSAGE_CHARS: usize = 4096;
     const MAX_CAPTION_CHARS: usize = 1024;
+    const MIN_PROGRESS_EDIT_INTERVAL: Duration = Duration::from_secs(1);
 
     pub fn new(
         id: String,
@@ -103,19 +113,31 @@ impl TelegramChannel {
         security.admin_user_ids.sort_unstable();
         security.admin_user_ids.dedup();
 
+        let request_timeout = Duration::from_secs(poll_timeout_seconds.saturating_add(15).max(30));
+        let client = Client::builder()
+            .timeout(request_timeout)
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .context("failed to build telegram HTTP client")?;
+
         let instance = Self {
             id,
             bot_token,
             api_base_url: api_base_url.trim_end_matches('/').to_string(),
             poll_timeout_seconds,
             poll_interval_ms,
-            client: Client::new(),
+            client,
             workdir: workdir.to_path_buf(),
             security_path,
             security: Mutex::new(security),
+            progress_messages: Mutex::new(HashMap::new()),
         };
         instance.save_security_state()?;
         Ok(instance)
+    }
+
+    fn progress_message_key(platform_chat_id: &str, turn_id: &str) -> String {
+        format!("{platform_chat_id}:{}", turn_id)
     }
 
     fn run_loop(
@@ -131,11 +153,28 @@ impl TelegramChannel {
                 "timeout": self.poll_timeout_seconds,
                 "allowed_updates": ["message", "callback_query"],
             });
-            let updates: Vec<TelegramUpdate> = self.call_api("getUpdates", &payload)?;
+            let updates: Vec<TelegramUpdate> = match self.call_api("getUpdates", &payload) {
+                Ok(updates) => updates,
+                Err(error) => {
+                    logger.warn(
+                        "telegram_poll_failed",
+                        json!({"channel_id": self.id, "error": format!("{error:#}")}),
+                    );
+                    thread::sleep(Duration::from_millis(self.poll_interval_ms.max(1000)));
+                    continue;
+                }
+            };
             for update in updates {
                 offset = update.update_id.saturating_add(1);
                 if let Some(message) = update.message {
-                    self.handle_message(message, &dispatch_tx, &id_manager, &logger)?;
+                    if let Err(error) =
+                        self.handle_message(message, &dispatch_tx, &id_manager, &logger)
+                    {
+                        logger.warn(
+                            "telegram_update_failed",
+                            json!({"channel_id": self.id, "update_id": update.update_id, "error": format!("{error:#}")}),
+                        );
+                    }
                 } else if let Some(callback_query) = update.callback_query {
                     if let Err(error) = self.answer_callback_query(&callback_query.id) {
                         logger.warn(
@@ -147,7 +186,17 @@ impl TelegramChannel {
                             }),
                         );
                     }
-                    self.handle_callback_query(callback_query, &dispatch_tx, &id_manager, &logger)?;
+                    if let Err(error) = self.handle_callback_query(
+                        callback_query,
+                        &dispatch_tx,
+                        &id_manager,
+                        &logger,
+                    ) {
+                        logger.warn(
+                            "telegram_update_failed",
+                            json!({"channel_id": self.id, "update_id": update.update_id, "error": format!("{error:#}")}),
+                        );
+                    }
                 }
             }
             thread::sleep(Duration::from_millis(self.poll_interval_ms));
@@ -549,6 +598,37 @@ impl TelegramChannel {
         Ok(())
     }
 
+    fn send_progress_text(&self, platform_chat_id: &str, text: &str) -> Result<i64> {
+        let rendered = render_markdown_chunks_to_telegram_entities(text, Self::MAX_MESSAGE_CHARS)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| TelegramRenderedText {
+                text: text.to_string(),
+                entities: Vec::new(),
+            });
+        let payload = build_send_text_payload(platform_chat_id, rendered, None)?;
+        let message: TelegramMessage = self.call_api("sendMessage", &payload)?;
+        Ok(message.message_id)
+    }
+
+    fn edit_progress_text(
+        &self,
+        platform_chat_id: &str,
+        message_id: i64,
+        text: &str,
+    ) -> Result<()> {
+        let rendered = render_markdown_chunks_to_telegram_entities(text, Self::MAX_MESSAGE_CHARS)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| TelegramRenderedText {
+                text: text.to_string(),
+                entities: Vec::new(),
+            });
+        let payload = build_edit_text_payload(platform_chat_id, message_id, rendered)?;
+        let _: serde_json::Value = self.call_api("editMessageText", &payload)?;
+        Ok(())
+    }
+
     fn send_attachment(
         &self,
         platform_chat_id: &str,
@@ -772,6 +852,95 @@ impl Channel for TelegramChannel {
         &self.id
     }
 
+    fn set_processing(&self, platform_chat_id: &str, state: ProcessingState) -> Result<()> {
+        if state == ProcessingState::Typing {
+            let _: serde_json::Value = self.call_api(
+                "sendChatAction",
+                &json!({
+                    "chat_id": platform_chat_id,
+                    "action": "typing",
+                }),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn update_progress_feedback(&self, feedback: &OutgoingProgressFeedback) -> Result<()> {
+        let key = Self::progress_message_key(&feedback.platform_chat_id, &feedback.turn_id);
+        if feedback.final_state == Some(ProgressFeedbackFinalState::Done) {
+            let existing = self.progress_messages.lock().unwrap().remove(&key);
+            if let Some(existing) = existing {
+                let elapsed = Instant::now().duration_since(existing.started_at);
+                let summary = format!("{}\n⏱️ 用时：{}", feedback.text, format_duration(elapsed));
+                if let Err(error) = self.edit_progress_text(
+                    &feedback.platform_chat_id,
+                    existing.message_id,
+                    &summary,
+                ) {
+                    eprintln!("telegram progress completion edit failed: {error:#}");
+                }
+            }
+            return Ok(());
+        }
+
+        let now = Instant::now();
+        let is_final = feedback.final_state.is_some();
+        let existing = self.progress_messages.lock().unwrap().get(&key).cloned();
+        let Some(existing) = existing else {
+            let message_id = self.send_progress_text(&feedback.platform_chat_id, &feedback.text)?;
+            if is_final {
+                return Ok(());
+            }
+            self.progress_messages.lock().unwrap().insert(
+                key,
+                TelegramProgressMessage {
+                    message_id,
+                    last_text: feedback.text.clone(),
+                    last_update: now,
+                    started_at: now,
+                },
+            );
+            return Ok(());
+        };
+
+        if existing.last_text == feedback.text && !is_final {
+            return Ok(());
+        }
+        if !feedback.important
+            && !is_final
+            && now.duration_since(existing.last_update) < Self::MIN_PROGRESS_EDIT_INTERVAL
+        {
+            return Ok(());
+        }
+
+        if let Err(error) = self.edit_progress_text(
+            &feedback.platform_chat_id,
+            existing.message_id,
+            &feedback.text,
+        ) {
+            eprintln!("telegram progress edit failed: {error:#}");
+            if is_final {
+                self.progress_messages.lock().unwrap().remove(&key);
+            }
+            return Ok(());
+        }
+
+        if is_final {
+            self.progress_messages.lock().unwrap().remove(&key);
+        } else {
+            self.progress_messages.lock().unwrap().insert(
+                key,
+                TelegramProgressMessage {
+                    message_id: existing.message_id,
+                    last_text: feedback.text.clone(),
+                    last_update: now,
+                    started_at: existing.started_at,
+                },
+            );
+        }
+        Ok(())
+    }
+
     fn send_delivery(&self, delivery: &OutgoingDelivery) -> Result<()> {
         let options = delivery.options.as_ref();
         let text = if !delivery.text.trim().is_empty() {
@@ -978,6 +1147,7 @@ fn parse_conversation_control(text: &str) -> Option<ConversationControl> {
     match command {
         "/continue" if argument.is_empty() => Some(ConversationControl::Continue),
         "/cancel" if argument.is_empty() => Some(ConversationControl::Cancel),
+        "/status" if argument.is_empty() => Some(ConversationControl::ShowStatus),
         "/model" if argument.is_empty() => Some(ConversationControl::ShowModel),
         "/model" => Some(ConversationControl::SwitchModel {
             model_name: argument.to_string(),
@@ -987,6 +1157,8 @@ fn parse_conversation_control(text: &str) -> Option<ConversationControl> {
             Some(ConversationControl::DisableRemote)
         }
         "/remote" => parse_remote_control(argument),
+        "/sandbox" if argument.is_empty() => Some(ConversationControl::ShowSandbox),
+        "/sandbox" => parse_sandbox_control(argument),
         _ => None,
     }
 }
@@ -1003,6 +1175,30 @@ fn parse_remote_control(argument: &str) -> Option<ConversationControl> {
     Some(ConversationControl::SetRemote {
         host: host.to_string(),
         path: path.to_string(),
+    })
+}
+
+fn parse_sandbox_control(argument: &str) -> Option<ConversationControl> {
+    let argument = argument.trim();
+    if argument.eq_ignore_ascii_case("default") || argument.eq_ignore_ascii_case("global") {
+        return Some(ConversationControl::SetSandbox { mode: None });
+    }
+    if argument.eq_ignore_ascii_case("subprocess")
+        || argument.eq_ignore_ascii_case("off")
+        || argument.eq_ignore_ascii_case("none")
+        || argument.eq_ignore_ascii_case("disabled")
+    {
+        return Some(ConversationControl::SetSandbox {
+            mode: Some(crate::config::SandboxMode::Subprocess),
+        });
+    }
+    if argument.eq_ignore_ascii_case("bubblewrap") || argument.eq_ignore_ascii_case("bwrap") {
+        return Some(ConversationControl::SetSandbox {
+            mode: Some(crate::config::SandboxMode::Bubblewrap),
+        });
+    }
+    Some(ConversationControl::InvalidSandbox {
+        reason: format!("未知 sandbox 模式 `{argument}`。"),
     })
 }
 
@@ -1236,6 +1432,29 @@ fn build_send_text_payload(
             object.insert(
                 "reply_markup".to_string(),
                 build_inline_keyboard_markup(options),
+            );
+        }
+    }
+    Ok(payload)
+}
+
+fn build_edit_text_payload(
+    chat_id: &str,
+    message_id: i64,
+    rendered: TelegramRenderedText,
+) -> Result<serde_json::Value> {
+    let mut payload = json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": rendered.text,
+        "disable_web_page_preview": true,
+    });
+    if !rendered.entities.is_empty() {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "entities".to_string(),
+                serde_json::to_value(rendered.entities)
+                    .context("failed to encode telegram entities")?,
             );
         }
     }
@@ -2640,6 +2859,17 @@ fn infer_media_type(path: &Path) -> Option<String> {
     }
 }
 
+fn format_duration(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let minutes = total_secs / 60;
+    let seconds = total_secs % 60;
+    if minutes > 0 {
+        format!("{minutes}m{seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
 fn kind_label(kind: OutgoingAttachmentKind) -> &'static str {
     match kind {
         OutgoingAttachmentKind::Image => "image",
@@ -2660,8 +2890,13 @@ mod tests {
         TelegramMessage, TelegramMessageEntity, TelegramRenderedText, TelegramUser,
     };
     use crate::channels::types::{OutgoingOption, OutgoingOptions};
+    use crate::config::SandboxMode;
     use crate::conversation::ConversationControl;
-    use std::{collections::BTreeMap, path::PathBuf, sync::Mutex};
+    use std::{
+        collections::{BTreeMap, HashMap},
+        path::PathBuf,
+        sync::Mutex,
+    };
 
     #[test]
     fn parses_model_control_commands() {
@@ -2689,6 +2924,30 @@ mod tests {
             parse_conversation_control("/remote off"),
             Some(ConversationControl::DisableRemote)
         ));
+        assert!(matches!(
+            parse_conversation_control("/status"),
+            Some(ConversationControl::ShowStatus)
+        ));
+        assert!(matches!(
+            parse_conversation_control("/sandbox"),
+            Some(ConversationControl::ShowSandbox)
+        ));
+        assert!(matches!(
+            parse_conversation_control("/sandbox bubblewrap"),
+            Some(ConversationControl::SetSandbox {
+                mode: Some(SandboxMode::Bubblewrap)
+            })
+        ));
+        assert!(matches!(
+            parse_conversation_control("/sandbox subprocess"),
+            Some(ConversationControl::SetSandbox {
+                mode: Some(SandboxMode::Subprocess)
+            })
+        ));
+        assert!(matches!(
+            parse_conversation_control("/sandbox default"),
+            Some(ConversationControl::SetSandbox { mode: None })
+        ));
     }
 
     #[test]
@@ -2706,6 +2965,7 @@ mod tests {
                 admin_user_ids: Vec::new(),
                 chats: BTreeMap::<String, ChatAuthorization>::new(),
             }),
+            progress_messages: Mutex::new(HashMap::new()),
         };
         let message = TelegramMessage {
             message_id: 1,

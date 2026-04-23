@@ -25,6 +25,8 @@ use super::{
     ToolBatchCompletion, ToolBatchExecutor, ToolCatalog, ToolExecutionOp,
 };
 
+const DEFAULT_MAX_MODEL_STEPS_PER_TURN: usize = 200;
+
 pub struct SessionActor {
     model_config: ModelConfig,
     provider: Arc<dyn Provider + Send + Sync>,
@@ -143,7 +145,7 @@ impl SessionActor {
             runtime_metadata_state: RuntimeMetadataState::default(),
             next_turn_id: 1,
             next_batch_id: 1,
-            max_model_steps_per_turn: 8,
+            max_model_steps_per_turn: DEFAULT_MAX_MODEL_STEPS_PER_TURN,
             shutdown: false,
             logger: None,
             state_store: None,

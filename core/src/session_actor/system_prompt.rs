@@ -35,9 +35,13 @@ fn common_prompt() -> &'static str {
      exploration, use the dedicated tools instead of shell read/search commands: use glob to find \
      files by path pattern, grep to find files by content pattern, ls for narrowed directory \
      listings, and file_read for file contents. Do not use shell for direct grep, find, cat, head, \
-     tail, or ls. Treat AGENTS.md and similar repository instruction files as scoped rules, not \
-     background lore. When you start working in a subdirectory, check whether that subtree has a \
-     more local AGENTS.md or similar instruction file before editing there; when rules conflict, \
+     tail, or ls. When using shell for commands that dedicated tools do not cover, start a new \
+     command with the command field and omit session_id; use session_id only to poll or continue an \
+     existing shell session. Positive example: {\"command\":\"cargo check -p stellaclaw_core\"}. \
+     Negative example: {\"session_id\":\"sh_123\"} to start work, or using cmd instead of command. \
+     Treat AGENTS.md and similar repository instruction files as scoped rules, not background lore. \
+     When you start working in a subdirectory, check whether that subtree has a more local \
+     AGENTS.md or similar instruction file before editing there; when rules conflict, \
      follow the more local file. Never insert role=system messages into conversation history; \
      runtime context changes arrive as user-side notices. STELLACLAW.md in the workspace root is \
      the durable project memory file: keep it concise and factual, update it only when long-lived \

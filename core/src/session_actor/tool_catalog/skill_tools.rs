@@ -49,6 +49,18 @@ pub fn skill_tool_definitions(
                 action: "skill_update".to_string(),
             },
         ));
+        tools.push(ToolDefinition::new(
+            "skill_delete",
+            "Persist deletion of an existing skill by removing .skill/<skill_name>/ from the runtime skills store and active local workspaces.",
+            object_schema(
+                properties([("skill_name", json!({"type": "string"}))]),
+                &["skill_name"],
+            ),
+            ToolExecutionMode::Immediate,
+            ToolBackend::ConversationBridge {
+                action: "skill_delete".to_string(),
+            },
+        ));
     }
 
     tools
