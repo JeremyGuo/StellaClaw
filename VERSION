@@ -1,0 +1,19 @@
+version: 1.0.0
+---
+
+# 1.0.0
+
+- 将当前 Stellaclaw / core / agent_server 架构作为新的稳定起点：
+  Host 由 `stellaclaw` 承载，session 执行边界由独立 `agent_server` 承载，核心会话、provider、tool batch、Telegram channel 和 workdir upgrade 链路已经落地。
+- 建立新的版本维护规则：
+  根目录 `VERSION` 记录项目发布版本和 changelog；config schema 版本继续由 `stellaclaw/src/config/mod.rs` 管理；workdir schema 版本继续由 `stellaclaw/src/upgrade/mod.rs` 和运行目录 `STELLA_VERSION` 管理。
+- 建立 GitHub Actions CI/CD：
+  main / pull request 会运行 Rust 格式检查和 workspace 测试；main 上根 `VERSION` 变化且 tag 不存在时自动构建 release artifact 并发布 GitHub Release。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.2`；当前 Stellaclaw workdir schema 仍为 `0.2`。
+
+# Versioning
+
+- 项目发布版本使用 SemVer，从 `1.0.0` 开始编号。
+- 根 `VERSION` 的 `version:` 字段是当前项目发布版本。
+- `config` schema version 和 `workdir` schema version 独立维护，不要求和项目发布版本相同。

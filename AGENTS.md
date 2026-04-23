@@ -31,3 +31,50 @@
 - `ROAD_MAP.md` 负责方向、边界和阶段性目标。
 - 具体实现细节优先放在代码、提交说明或独立设计文档中，而不是持续膨胀 `ROAD_MAP.md`。
 - 当文档与代码不一致时，修正时应优先澄清差异来源，并与用户确认是否需要更新 roadmap。
+
+## 版本维护约定
+
+本仓库从 `1.0.0` 开始使用 SemVer 维护项目发布版本。根目录 [VERSION](VERSION) 是项目发布版本和 changelog 的唯一入口；每次做非平凡变更时，都应先阅读它，避免回退已经记录过的行为。
+
+项目同时有两条 schema 版本线，它们和根目录发布版本相互独立：
+
+- `config` schema version：由 [stellaclaw/src/config/mod.rs](stellaclaw/src/config/mod.rs) 中的 `LATEST_CONFIG_VERSION` 管理，对应用户配置 JSON 顶层 `version` 字段。
+- `workdir` schema version：由 [stellaclaw/src/upgrade/mod.rs](stellaclaw/src/upgrade/mod.rs) 中的 `LATEST_WORKDIR_VERSION` 管理，对应运行目录里的 `STELLA_VERSION` 文件。
+
+不要假设 `config`、`workdir` 和根目录发布版本必须相同。`config` / `workdir` 是数据结构兼容版本；根 `VERSION` 是项目发布版本。
+
+### 如果改了 workdir 结构
+
+凡是改变运行目录内持久化布局或 schema 的变更，包括 `conversations/`、`rundir/`、`.log/stellaclaw/`、session state、cron、skill store、workspace seed、runtime binding 等，都必须：
+
+- 更新 [stellaclaw/src/upgrade/mod.rs](stellaclaw/src/upgrade/mod.rs) 的 `LATEST_WORKDIR_VERSION`。
+- 在 [stellaclaw/src/upgrade/](stellaclaw/src/upgrade) 下新增或更新顺序 upgrade step，并在 `upgrade_workdir` 的 upgrader 链里注册。
+- 确保旧 workdir 可以按版本顺序升级到最新版本；不要跳过中间迁移。
+- 更新根 [VERSION](VERSION) changelog，明确说明这是 `workdir` schema 变更。
+
+运行目录里的版本文件规则：
+
+- 新 Stellaclaw workdir 使用 `STELLA_VERSION`。
+- 旧 PartyClaw workdir 可能只有 `VERSION`；迁移后应写入 `STELLA_VERSION`，旧 `VERSION` 只作为兼容输入。
+- 不要把某个本地部署目录里的 `STELLA_VERSION` 当作项目发布版本；它只描述该 workdir 的 schema。
+
+### 如果改了 config 结构
+
+凡是新增、删除、重命名或改变用户配置 JSON 字段含义的变更，都必须：
+
+- 更新 [stellaclaw/src/config/mod.rs](stellaclaw/src/config/mod.rs) 的 `LATEST_CONFIG_VERSION`。
+- 在 [stellaclaw/src/config/loaders/](stellaclaw/src/config/loaders) 下新增或更新 loader，保留旧 config 的升级路径。
+- 更新 [example_config.json](example_config.json) 以及相关部署样例中的配置形态。
+- 更新根 [VERSION](VERSION) changelog，明确说明这是 `config` schema 变更。
+
+本地部署配置文件里的顶层 `version` 字段只描述 config schema，不是项目发布版本。
+
+### 根 VERSION bump 策略
+
+根 [VERSION](VERSION) 使用 SemVer：
+
+- 不兼容的运行行为或 schema 破坏性变化：提升 `MAJOR`，`MINOR=0`，`PATCH=0`。
+- config schema 变化、新功能、重要用户可见行为变化：提升 `MINOR`，`PATCH=0`。
+- workdir-only schema 迁移、bug fix、文档/CI 改进：提升 `PATCH`。
+
+每次 bump 都要在 [VERSION](VERSION) 顶部新增对应 changelog 小节，并说明是否影响 `config`、`workdir` 或两者都不影响。
