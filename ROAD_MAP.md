@@ -10,7 +10,7 @@
 其中：
 
 - 一个消息从 `Channel` 进来后，先进入 `Conversation`。
-- `Conversation` 负责 workspace 是否存在、每个 agent 的 workpath/workdir 绑定、附件落盘、消息 canonicalization 和路由。
+- `Conversation` 负责 workspace 是否存在、conversation/session 绑定、远程 workspace 绑定、附件落盘、消息 canonicalization 和路由。
 - incoming message 会先在这里被 canonicalize 成可投递给 session 的 `ChatMessage`。
 - 然后由 `Conversation` 作为 router，把消息或命令投递到跨进程运行的 `Session RPC Thread`。
 - `Session RPC Thread` 把请求写入 `SessionActorInbox`；`SessionActor` 内部维护两条优先级队列：
@@ -28,9 +28,27 @@
 ## 1.1 Host Surface Direction
 
 - Host 侧的 `Channel` 应该是统一抽象，允许同时存在多个 channel 实例，各自维护自己的平台安全策略和管理员逻辑。
-- 当前优先接好 `Telegram`；后续会增加 `Web` 作为新的 channel 类型。
+- 当前 `Telegram` 已经是主要可用 channel：支持入站消息/附件、模型切换、remote workspace 切换、conversation 级 sandbox 切换、状态查询、typing indicator 和进度面板。
+- 后续会增加 `Web` 作为新的 channel 类型。
 - 在 channel 抽象之上，后续会补一层统一的 `RESTful API`，作为外部系统接入和管理面的稳定边界。
 - 更后续阶段，前端界面应优先基于这层 `RESTful API` 构建，而不是直接耦合内部运行时。
+
+## 1.2 当前实现快照
+
+这一节记录已经落地的事实，用来避免 roadmap 和代码状态继续漂移。
+
+- Host 进程目前由 `stellaclaw` binary 承载，session 执行边界由独立 `agent_server` binary 承载。
+- `Conversation` 是每个 active conversation 的串行线程；session 侧通过 stdin/stdout line-delimited JSON-RPC 与 `agent_server` 通信。
+- `SessionActor` 已经有 control/data mailbox、turn loop、tool batch executor、session state store、runtime metadata snapshot、idle compaction 和 crash/unfinished-turn 继续机制。
+- `ToolRemoteMode` 当前支持 selectable SSH alias 和 fixed SSH workspace；fixed mode 下 schema 会隐藏各工具上的 `remote` 字段。
+- conversation 级配置已经包括 `model_selection_pending`、`tool_remote_mode`、`sandbox` override、`reasoning_effort` 和 foreground/background/subagent session binding。
+- Telegram 控制面当前支持 `/model`、`/remote`、`/sandbox`、`/status`、`/continue`、`/cancel`。
+- Telegram 输出面当前支持普通 delivery、typing indicator、可编辑 progress feedback 面板和最终完成/失败状态。
+- Codex subscription provider 当前按官方订阅 websocket 形态调用，支持 access token 自动刷新；`reasoning.service_tier = fast/priority` 会映射到请求级 `service_tier = priority`，不会塞进 `reasoning` payload。
+- 多模态输入在 `SessionActor` 发 provider 前统一 normalization：模型支持对应模态时按 `ModelConfig.multimodal_input` 发送；不支持或文件损坏时降级为包含文件路径/原因的文本上下文。
+- `reasoning_effort` 是 conversation 级 override；已有 conversation 的 `session_profile.main_model` 是持久化快照，不会自动跟随全局 config 更新。
+- 每轮 model/tool loop 默认上限是 200 步，主要作为防无限循环兜底，而不是正常工作流限制。
+- skill 工具当前包括 `skill_load`、`skill_create`、`skill_update`、`skill_delete`；持久化类工具走 ConversationBridge，由 Host/Conversation 写回 runtime skill store 并同步已有 conversation workspace。
 
 ## 2. 线程优先视图
 
@@ -61,10 +79,10 @@ flowchart LR
         H2[H2 Outgoing Delivery Thread]
 
         CS[(Conversation Store)]
-        WS[(Workspace and Workpath Store)]
+        WS[(Workspace and Runtime Binding Store)]
     end
 
-    IPC{Session IPC}
+    IPC{stdio JSON-RPC IPC}
 
     subgraph SP[SessionActor Process]
         S0[S_n_0 Session RPC Thread]
@@ -105,7 +123,7 @@ flowchart LR
 - `S[n].0` 是专门和 `ConversationThread` 沟通的 Session RPC 线程
 - `S[n].0` 只负责 non-blocking JSON-RPC 收发，以及把请求写进 `SessionActorInbox`
 - `S[n].1` 才是真正的 SessionActor 状态机线程
-- `Session IPC` 只是跨进程 transport，不代表 Host 持有消息存储
+- `Session IPC` / stdio JSON-RPC 只是跨进程 transport，不代表 Host 持有消息存储
 - `S[n].1` 收到请求后会按优先级放入两条内部队列：
   - `Control Path`
   - `Data Path`
@@ -194,7 +212,7 @@ Bridge 工具的完整链路是：
 - 压缩完成后，才允许更新当前 session 的 canonical system prompt snapshot。
 - `STELLACLAW.md` 是 workspace 根目录下唯一的长期项目记录文件；它只作为 snapshot 进入 system prompt，不生成运行期 notice。压缩完成后直接把最新文件内容提升到 canonical system prompt snapshot。
 - `skill metadata`、已加载 skill 内容、`user meta`、identity、SSH remote alias 列表发生变化时，必须在真实 user message 前插入 synthetic `role = "user"` 通知；这些通知进入 durable history。
-- SSH remote alias 列表来源是 `~/.ssh/config` 的 `Host` alias（支持 `Include`），不是 Conversation 自己维护的 workpath remote 列表。
+- SSH remote alias 列表来源是 `~/.ssh/config` 的 `Host` alias（支持 `Include`），不是 Conversation 自己维护的 remote workspace 列表。
 - `session.json` 必须持久化当前 runtime prompt component snapshot、已通知 snapshot、skill content/load state、`current_messages` 和 `all_messages`，保证 crash 后恢复不会重复通知或丢失旧 system prompt 组装依据。
 
 ### 2.2 建议创建的线程
@@ -213,7 +231,7 @@ Bridge 工具的完整链路是：
 
 | 线程名 | 数量 | 职责 |
 |---|---|---|
-| `C[n] Conversation Thread` | 每个 active conversation 1 个 | 这是 conversation 的唯一串行执行点；负责 workspace/workpath、附件落盘、消息 canonicalization 和路由到 session。 |
+| `C[n] Conversation Thread` | 每个 active conversation 1 个 | 这是 conversation 的唯一串行执行点；负责 workspace、runtime binding、附件落盘、消息 canonicalization 和路由到 session。 |
 
 #### SessionActor process 按 session 增长的线程
 
@@ -258,10 +276,10 @@ flowchart LR
         C1[C_n Conversation Thread]
         H2[H2 Outgoing Delivery Thread]
         CS[(Conversation Store)]
-        WS[(Workspace and Workpath Store)]
+        WS[(Workspace and Runtime Binding Store)]
     end
 
-    IPC{Unix Socket IPC}
+    IPC{stdio JSON-RPC IPC}
 
     subgraph SP[SessionActor Process]
         S0[S_n_0 Session RPC Thread]
@@ -380,17 +398,17 @@ flowchart LR
 
 | 线路 | 边界类型 | 建议协议 | 原因 |
 |---|---|---|---|
-| `Channel Adapter -> Incoming Dispatcher` | 同进程跨任务 | typed Rust message + `tokio::mpsc` | 轻量、无需序列化。 |
-| `Incoming Dispatcher -> Conversation Actor` | 同进程跨任务 | typed Rust actor mailbox + `tokio::mpsc` | 保证同 conversation 串行。 |
+| `Channel Adapter -> Incoming Dispatcher` | 同进程跨线程 | typed Rust message + `crossbeam_channel` | 当前实现轻量、无需序列化。 |
+| `Incoming Dispatcher -> Conversation Actor` | 同进程跨线程 | typed Rust actor mailbox + `crossbeam_channel` | 保证同 conversation 串行。 |
 | `Conversation Actor <-> Conversation Store / Workspace Manager` | 同线程 | 直接 trait / function call | 这是本地持久化边界，不需要 IPC。 |
-| `Conversation Actor -> Session RPC` | 跨进程 | 长连接 JSON-RPC，推荐 `Unix Domain Socket + length-prefixed JSON` | `Request` 方向，只承接 `UserMessage` 和其他 `Command`。 |
-| `Session RPC -> Conversation Actor` | 跨进程 | 同一条 JSON-RPC 连接上的单向 event push | `Event` 方向，只承接 turn 生命周期和进度事件。 |
+| `Conversation Actor -> Session RPC` | 跨进程 | 当前是 agent_server stdin/stdout line-delimited JSON-RPC；后续可替换为 Unix Domain Socket / length-prefixed JSON | `Request` 方向，只承接 `UserMessage` 和其他 `Command`。 |
+| `Session RPC -> Conversation Actor` | 跨进程 | 当前是同一条 stdio JSON-RPC 连接上的 event notification | `Event` 方向，只承接 turn 生命周期和进度事件。 |
 | `Session RPC -> SessionActorInbox` | 同进程跨线程 | typed in-process channel | RPC 线程把请求非阻塞写入 actor request channel。 |
 | `SessionActor Loop 内部队列` | 同线程 | prioritized queue drain | SessionActor 收到 request 后按 `Control > Data` 的优先级消费。 |
 | `SessionActor Loop <-> Session State Store` | 同线程 | 直接 trait / function call | session history/checkpoint 必须由 loop 串行持有。 |
 | `SessionActor Loop <-> Provider Request Runtime` | 平台相关隔离 | typed `ProviderRequest` | Unix/macOS 使用 agent_server 启动早期 fork 出的单线程 forkserver；每次模型请求由 forkserver 再 fork request child 执行。Windows 不支持 fork，使用同 API 的线程 fallback：等待方可被 `abort` 立即释放，但底层 in-flight HTTP 不能被强杀。actor 同步等待结果，active model request 不抢占。 |
 | `SessionActor Loop <-> ToolBatchExecutor` | 同进程跨线程 | typed in-process channel | 所有工具调用统一进入工具线程；工具完成后通过 `ToolBatchCompletion` channel 回到 actor loop。 |
-| `Conversation Actor -> Outgoing Sink / Channel` | 同进程跨任务 | typed Rust message + async send | 统一把用户可见输出从 Conversation 发回 channel。 |
+| `Conversation Actor -> Outgoing Sink / Channel` | 同进程跨线程 | typed Rust message + `crossbeam_channel` | 统一把用户可见输出从 Conversation 发回 channel。 |
 
 ### 4.1 为什么 `Conversation <-> SessionActor` 不建议直接用函数调用
 
@@ -434,7 +452,7 @@ flowchart LR
 | 消息/记录类型 | 发出方 -> 接收方 | 何时发出 | 用途 |
 |---|---|---|---|
 | `WorkspaceCommand::EnsureWorkspace` | `Conversation Actor -> Workspace Manager` | conversation 首次收消息，或 workspace 缺失 | 保证 workspace 存在。 |
-| `WorkspaceCommand::EnsureAgentWorkpath` | `Conversation Actor -> Workspace Manager` | 需要为 foreground/background/subagent 分配 workpath/workdir 时 | 保证每个 agent 的文件根明确可恢复。 |
+| `WorkspaceCommand::EnsureSessionWorkspace` | `Conversation Actor -> Workspace Manager` | 需要为 foreground/background/subagent 确认 workspace 或运行根时 | 保证每个 session 的文件根明确可恢复。 |
 | `WorkspaceCommand::MaterializeAttachments` | `Conversation Actor -> Workspace Manager` | 入站消息含附件 | 把附件落到 workspace/conversation 管理的路径下。 |
 | `ConversationRecord::IngressEnvelope` | `Conversation Actor -> Conversation Store` | 入站消息被 conversation 接收并完成路由前置处理时 | 记录 conversation 侧的 ingress / routing 元信息，而不是 session transcript 本体。 |
 | `ConversationRecord::RoutingDecision` | `Conversation Actor -> Conversation Store` | 准备把消息转发到某个 session 时 | 记录这条 message 被路由到哪个 session，便于恢复与去重。 |
@@ -552,8 +570,8 @@ flowchart LR
 
 | 子类型 | 谁真正执行 | 何时需要 | 返回给 Session 的结果 |
 |---|---|---|---|
-| `SpawnSubagent` | `Conversation + Session/Host registry` | foreground session 里的 subagent tool 请求创建子 agent | `subagent_id`、目标 session/workpath、失败原因。 |
-| `StartBackgroundAgent` | `Conversation + Session/Host registry` | foreground session 请求启动 background agent | `background_agent_id`、目标 session/workpath、失败原因。 |
+| `SpawnSubagent` | `Conversation + Session/Host registry` | foreground session 里的 subagent tool 请求创建子 agent | `subagent_id`、目标 session/workspace binding、失败原因。 |
+| `StartBackgroundAgent` | `Conversation + Session/Host registry` | foreground session 请求启动 background agent | `background_agent_id`、目标 session/workspace binding、失败原因。 |
 | `DeliverBackgroundResult` | `Conversation` | background agent 完成后，需要把结果投递回 foreground conversation | delivery 是否成功、目标 session 是否存在。 |
 | `CronCreate` | `Conversation + CronManager` | session tool 请求创建 cron task | `cron_task_id`、规范化后的 schedule、失败原因。 |
 | `CronUpdate` | `Conversation + CronManager` | session tool 请求更新 cron task | 更新后的任务视图或失败原因。 |
@@ -571,7 +589,7 @@ flowchart LR
 
 - Web 用户通过 `/api/send` 发来的普通消息
   - 这仍然只是 `SessionRequest::EnqueueUserMessage`
-- `ShowOptions`、progress、assistant 输出、tool/detail skeleton 这类由 session 产生、由 channel 特殊渲染的内容
+- `ShowOptions`、progress、assistant 输出、typing/progress feedback、tool/detail skeleton 这类由 session 产生、由 channel 特殊渲染的内容
   - 这属于 `SessionEvent::InteractiveOutputRequested` 或普通 `TurnCompleted/Progress`
 - 实时 transcript append 通知
   - 这可以作为 `SessionEvent::InteractiveOutputRequested` 的一种特例，或者作为独立的 transcript-append channel event
@@ -582,7 +600,7 @@ flowchart LR
 不应该进入这条协议的：
 
 - Web conversation create/delete
-- Web remote execution 绑定创建或修改
+- Web remote execution / sandbox 绑定创建或修改
 - WebSocket 客户端订阅和认证
 
 这些都属于 `Channel / Conversation / Host service` 自己的职责，不应该伪装成 session control message。
@@ -676,7 +694,7 @@ flowchart LR
 
 - `Subagent`
   - 由 `SessionActor` 发起请求
-  - 由 `Conversation/Host` 分配目标 session、workpath、registry entry
+  - 由 `Conversation/Host` 分配目标 session、workspace binding、registry entry
 - `Background Agent`
   - 由 `SessionActor` 发起请求
   - 由 `Conversation/Host` 创建后台 session，并在完成后再投递结果
@@ -832,7 +850,7 @@ loop {
 - `tool_executor` 只负责统一调度、统一中断语义和统一结果包装，不承载各工具族自己的业务状态机。
 - 每个工具文件负责自己的核心执行语义；新增工具族时，允许在 `tool_executor` 中增加一个显式分发 case。
 - 特殊状态默认留在工具模块内部，不回流到 `tool_executor`；避免把工具内部 job 管理、权限细节和业务分叉重新集中到 executor。
-- 当前已落地的工具执行族包括：file/search/patch、`shell`、`file_download_*`、`web_fetch`、`web_search`、`skill_load`、native `*_load`、Provider-backed `*_analysis` / `*_stop` / `image_generation`。
+- 当前已落地的工具执行族包括：file/search/patch、`shell`、`file_download_*`、`web_fetch`、`web_search`、`skill_load`、`skill_create`、`skill_update`、`skill_delete`、native `*_load`、Provider-backed `*_analysis` / `*_stop` / `image_generation`。
 - 工具内部 job 状态默认是内存临时状态；只有工具产出闭合的 tool result 后，结果才进入 session history 并参与持久化。
 
 ## 7. 统一消息接入流
@@ -1032,7 +1050,7 @@ sequenceDiagram
 
 - conversation settings
 - workspace existence
-- workpath/workdir binding
+- workspace / remote / sandbox binding
 - ingress canonical `ChatMessage`
 - attachment durable path
 - message delivery state
@@ -1056,7 +1074,7 @@ sequenceDiagram
 
 下面这些不应该再散落在两个边界里同时拥有写权限：
 
-- workspace/workpath 主绑定
+- workspace / runtime binding 主绑定
 - 入站消息的 canonicalization
 - ingress canonical message history
 - “消息是否已经被 session 消费” 的最终判断
@@ -1086,7 +1104,7 @@ sequenceDiagram
 | Web | `web_fetch`、`web_search` | `Interruptible` | 获取网页或调用搜索 provider。 |
 | 多模态加载与分析 | `image_load`、`pdf_load`、`audio_load`、`image_analysis`、`image_stop`、`pdf_analysis`、`pdf_stop`、`audio_analysis`、`audio_stop`、`image_generation`、`image_generation_stop` | 混合型，见下面明细 | 把本地媒体放进上下文，或调用 helper 做分析/生成。 |
 | 下载 | `file_download_start`、`file_download_progress`、`file_download_wait`、`file_download_cancel` | 混合型，见下面明细 | 后台下载远端资源到本地。 |
-| Skill | `skill_load`、`skill_create`、`skill_update` | `Immediate` | 读取或管理 skill。 |
+| Skill | `skill_load`、`skill_create`、`skill_update`、`skill_delete` | `Immediate` | 读取或管理 skill。 |
 
 ### 13.1.1 执行类型定义
 
@@ -1169,10 +1187,10 @@ ToolSchemaContext {
 
 这组里最重要的动态 option 是 `remote`：
 
-- 普通本地/多 workpath 模式下：
+- selectable remote 模式下：
   - `remote` 是可选 string
   - 模型可以选择本地或某个 SSH alias
-- `/remote` execution mode 下：
+- fixed `/remote` execution mode 下：
   - `remote` 不应该出现在 schema 里
   - 当前绑定 execution root 直接成为隐式默认目标
   - 这不是 “remote=某个默认值”，而是“根本不给模型这个选择”
@@ -1197,6 +1215,8 @@ ToolSchemaContext {
 - `command`
   - 有值：启动下一条命令
   - 无值：只观察当前状态
+  - 新建 shell command 时必须使用 `command` 字段；当前 schema 不再支持 `cmd` alias
+  - 没有 `session_id` 时必须提供非空 `command`，否则会返回 missing command
 - `input`
   - 给交互式进程写 stdin
   - 和 `command` 互斥
@@ -1210,6 +1230,7 @@ ToolSchemaContext {
 - `shell` / `shell_close` 已经在 core 内执行。
 - `shell` 的 interrupt 只打断本次等待，不默认杀死底层进程；需要停止时由 `shell_close` 显式关闭。
 - shell 输出由工具侧落盘到 `.output` 下，再通过 tool result 返回摘要和路径。
+- `session_id` 只用于轮询或继续已有 shell session；新启动命令时应省略 `session_id` 让工具生成新 session。
 
 ### 13.5 Web 与搜索类 tools
 
@@ -1245,6 +1266,7 @@ ToolSchemaContext {
 - 如果模型要求 `inline_base64`，`SessionActor` 在发 Provider 前统一读取、校验并转成 data URL；图片可按模型格式和尺寸限制在内存中转码/缩放。
 - 如果模型只需要 `file_reference`，发送前不强制读取文件内容。
 - 如果文件不可读、不可解码或签名不匹配，history 仍可保留 crashed `FileItem`；真正发 Provider 前会降级成带文件路径和原因的文本提示，而不是把坏文件作为多模态输入发送。
+- 如果模型不支持对应输入模态，`FileItem` 在 provider request 前会降级为 plain context，保留文件路径、名称和 media type，而不是强行作为多模态内容发送。
 - `token_estimator_type=local` 使用 OpenAI/tiktoken 本地估算，按 `ModelConfig.model_name` 自动选择 tokenizer；`token_estimator_type=hugging_face` 才需要 `token_estimator_url` 指向 tokenizer_config/template。
 - `TokenEstimator` 当前只支持图片 token 估计；遇到 PDF/audio 文件时必须返回错误，不能静默忽略或套用图片估计算法。
 
@@ -1311,13 +1333,16 @@ ToolSchemaContext {
 | `skill_load` | `Immediate` | `skill_name` | `skill_name` 应来自当前可用 skill 列表，通常是 enum。 |
 | `skill_create` | `Immediate` | `skill_name` | 从工作区内 staged skill 持久化为新 skill。 |
 | `skill_update` | `Immediate` | `skill_name` | 更新已存在 skill。 |
+| `skill_delete` | `Immediate` | `skill_name` | 删除 runtime skill store 和已有 conversation workspace 中的 skill。 |
 
 这组的动态点在于：
 
 - `skill_load.skill_name` 不应该是自由文本
 - 它应该根据当前 runtime 可见 skill catalog 动态生成 enum
 - `skill_load` 在 core 内执行；SessionActor 构造 `ToolBatch` 时把 `SessionInitial.runtime_metadata.skills` 中对应 skill 内容嵌入 operation，避免 ToolBatchExecutor 反向依赖 actor 状态。
-- `skill_create` / `skill_update` 仍然是 ConversationBridge 工具，由 Host/Conversation 侧负责持久化。
+- `skill_create` / `skill_update` / `skill_delete` 是 ConversationBridge 工具，由 Host/Conversation 侧负责持久化。
+- 持久化目标是 `rundir/.skill/<skill_name>`；成功后同步到已有 conversation workspace 的 `.skill/<skill_name>`。
+- `skill_create` / `skill_update` 会校验 staged skill 目录中 `SKILL.md` 存在、frontmatter `name` 匹配目录名、`description` 非空。
 
 ### 13.9 哪些状态会改变 schema
 
