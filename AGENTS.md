@@ -1,92 +1,33 @@
 # AGENTS.md
 
-This file defines project-specific rules for LLM-assisted development in this repository.
+本仓库后续实现以 [ROAD_MAP.md](/Users/jeremyguo/Projects/ClawParty/ROAD_MAP.md) 为主要指导文件。
 
-## Development History Awareness
+## 目标
 
-Before making non-trivial project changes, read the root `VERSION` file for recent changelog entries that may explain important bug fixes, compatibility work, and feature invariants. Use that history to avoid reintroducing previously fixed bugs or accidentally disabling important behavior that earlier versions added.
+- 围绕 `ROAD_MAP.md` 的方向，逐步实现一个支持多端的 Agent Server。
+- 整个项目使用 Rust 开发。
+- 优先把核心链路做对，再补外围能力。
+- 保持实现可落地、可维护、可演进。
 
-Before making non-trivial project changes, also read the root `FEATURES.md` file. It records core user-facing and architecture-level features that should remain protected during future development.
+## 协作原则
 
-## Feature Tracking And Tests
+- 默认先参考 `ROAD_MAP.md`，再决定实现方案、目录结构和重构方向。
+- 不要主动往 `ROAD_MAP.md` 增加过多细节。
+- 如果认为某个设计、约束、流程、里程碑应该写入 `ROAD_MAP.md`，必须先询问用户，再决定是否加入。
+- 如果任务没有明确要求，不要把临时想法、备选方案、局部实现细节直接写进 `ROAD_MAP.md`。
 
-When the user asks for a change that is not only a bug fix:
+## 工程原则
 
-- decide whether the change adds, removes, or meaningfully changes a project feature
-- if it is a feature change, update `FEATURES.md` in the same change so the feature list stays current
-- add or update focused tests that protect the new or changed feature from future regressions
-- if a listed feature is intentionally removed or weakened, call that out explicitly and update `FEATURES.md` rather than silently deleting coverage
+- 默认使用 Rust 完成服务端、核心模块和配套工程代码。
+- 避免过度设计。
+- 避免为了“未来可能需要”提前引入过多抽象、层次或通用框架。
+- 优先选择直接、清晰、容易验证的实现。
+- 新增抽象前，先说明它正在解决的当前问题，而不是假设未来问题。
+- 尽量让代码结构贴近真实运行边界和真实职责，减少额外心智负担。
+- 像强工程团队一样工作：先把边界、职责、数据流和失败路径想清楚，再做实现。
 
-Bug fixes do not need a new `FEATURES.md` entry unless they introduce or redefine a durable feature. However, bug fixes should still add regression tests when practical.
+## 文档约定
 
-## Versioning Responsibilities
-
-There are two independent version tracks in this project:
-
-- `config` version
-  Managed in `agent_host/src/config.rs` and the corresponding `agent_host/src/config/v0_x.rs` loaders.
-- `workdir` version
-  Managed in `agent_host/src/upgrade/mod.rs` and the corresponding `agent_host/src/upgrade/v0_x.rs` upgrade steps.
-
-Do not assume the `config` minor version and the `workdir` minor version must always match. They are logically independent even if they currently share the same visible number.
-
-## Rule 1: Workdir Schema Changes
-
-If a change affects the schema or layout of persisted files inside the runtime workdir:
-
-- add or update the appropriate upgrade step in `agent_host/src/upgrade/v0_x.rs`
-- register it in `agent_host/src/upgrade/mod.rs`
-- preserve sequential upgrade behavior
-
-Workdir upgrades must run from old to new in order. Do not introduce a migration that assumes skipping intermediate versions is safe unless the ordered chain still works.
-
-## Rule 2: Config Schema Changes
-
-If a change affects config structure or config serialization format:
-
-- update the config version in `agent_host/src/config.rs`
-- add or update the relevant loader in `agent_host/src/config/v0_x.rs`
-- bump the config `MINOR` version
-
-Keep old config loaders working so existing saved configs can still be loaded and upgraded.
-
-If a change adds, removes, renames, or changes a user-facing config field:
-
-- update the TUI config editor in `agent_host/src/config_editor.rs` so the field is visible and editable there as well
-- update the latest config skeleton and any relevant example config files
-- if the field only accepts a fixed set of values, expose it in the TUI as an explicit selection list instead of free-form text input
-- do not make users guess valid enum-like values from documentation or source code
-
-## Rule 3: Top-Level VERSION Bump Policy
-
-The repository root `VERSION` file must follow this policy:
-
-- if Rule 2 applies, bump the repository `MINOR` version and reset `PATCH` to `0`
-- otherwise, if only Rule 1 applies, bump `PATCH` by `1`
-
-In short:
-
-- config change => `MINOR + 1`, `PATCH = 0`
-- workdir-only change => `PATCH + 1`
-
-## Rule 4: Changelog Maintenance
-
-Whenever Rule 1 or Rule 2 applies:
-
-- update the root `VERSION` changelog
-- describe the schema/upgrade impact clearly
-- mention whether the change affects `config`, `workdir`, or both
-
-Do not leave schema-affecting changes undocumented.
-
-## Practical Checklist
-
-Before pushing schema-related changes, verify:
-
-- whether `config` changed
-- whether `workdir` changed
-- whether upgrade code was added where required
-- whether `agent_host/src/config_editor.rs` was updated for any user-facing config change
-- whether fixed-choice config fields use a TUI selection list instead of raw text entry
-- whether `VERSION` was updated according to the policy above
-- whether the changelog explains the migration clearly
+- `ROAD_MAP.md` 负责方向、边界和阶段性目标。
+- 具体实现细节优先放在代码、提交说明或独立设计文档中，而不是持续膨胀 `ROAD_MAP.md`。
+- 当文档与代码不一致时，修正时应优先澄清差异来源，并与用户确认是否需要更新 roadmap。

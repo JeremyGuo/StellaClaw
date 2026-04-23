@@ -6,7 +6,15 @@ __pycache__/
 .env.*
 !.env.example
 
+target/
 **/target/
+.log/
+**/.log/
+.output/
+**/.output/
+.cache/
+3party
+
 *_workdir/
 test_telegram_workdir/
 agent_host/example_config_workdir/

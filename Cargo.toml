@@ -1,0 +1,3 @@
+[workspace]
+members = ["core", "agent_server"]
+resolver = "2"
