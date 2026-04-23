@@ -12,7 +12,7 @@ use stellaclaw_core::model_config::{
 };
 
 use crate::config::{
-    AgentServerConfig, ChannelConfig, SandboxConfig, SandboxMode, SessionDefaults, SessionProfile,
+    AgentServerConfig, ChannelConfig, SandboxConfig, SandboxMode, SessionDefaults,
     StellaclawConfig, TelegramChannelConfig,
 };
 
@@ -252,6 +252,7 @@ enum LegacyModelCapability {
     ImageOut,
     Pdf,
     AudioIn,
+    FileIn,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -345,25 +346,25 @@ fn convert_legacy_config(legacy: LegacyServerConfig, path: &Path) -> Result<Stel
     let named_models =
         convert_named_models(&legacy.models, &legacy.model_catalog.web_search, base_dir)?;
     let main_model_name = select_main_model_name(&legacy)?;
-    let main_model = named_models.get(&main_model_name).cloned().ok_or_else(|| {
-        anyhow!(
+    if !named_models.contains_key(&main_model_name) {
+        return Err(anyhow!(
             "main model '{}' is missing after conversion",
             main_model_name
-        )
-    })?;
+        ));
+    }
     let session_defaults = convert_session_defaults(&legacy, &named_models, &main_model_name)?;
 
     let channels = legacy
         .channels
         .into_iter()
-        .map(convert_channel)
-        .collect::<Result<Vec<_>>>()?;
+        .filter_map(convert_channel)
+        .collect::<Vec<_>>();
 
     Ok(StellaclawConfig {
         version: crate::config::LATEST_CONFIG_VERSION.to_string(),
         agent_server: legacy.agent_server,
-        default_profile: SessionProfile { main_model },
-        named_models,
+        default_profile: None,
+        models: named_models,
         session_defaults,
         sandbox: SandboxConfig {
             mode: match legacy.sandbox.mode {
@@ -488,6 +489,7 @@ fn convert_capabilities(legacy: &LegacyModelConfig) -> Vec<ModelCapability> {
             LegacyModelCapability::ImageOut => ModelCapability::ImageOut,
             LegacyModelCapability::Pdf => ModelCapability::PdfIn,
             LegacyModelCapability::AudioIn => ModelCapability::AudioIn,
+            LegacyModelCapability::FileIn => ModelCapability::FileIn,
         })
         .collect::<Vec<_>>();
     if legacy.supports_vision_input && !capabilities.contains(&ModelCapability::ImageIn) {
@@ -499,7 +501,8 @@ fn convert_capabilities(legacy: &LegacyModelConfig) -> Vec<ModelCapability> {
         ModelCapability::ImageOut => 2,
         ModelCapability::PdfIn => 3,
         ModelCapability::AudioIn => 4,
-        ModelCapability::WebSearch => 5,
+        ModelCapability::FileIn => 5,
+        ModelCapability::WebSearch => 6,
     });
     capabilities.dedup();
     capabilities
@@ -541,13 +544,7 @@ fn convert_token_estimator(
         field,
     }) = config.template.as_ref()
     {
-        if file.as_deref().unwrap_or("tokenizer_config.json") != "tokenizer_config.json" {
-            return Err(anyhow!(
-                "model '{}' uses unsupported huggingface token template file '{}'",
-                name,
-                file.as_deref().unwrap_or("tokenizer_config.json")
-            ));
-        }
+        let template_file = file.as_deref().unwrap_or("tokenizer_config.json");
         if field.as_deref().unwrap_or("chat_template") != "chat_template" {
             return Err(anyhow!(
                 "model '{}' uses unsupported huggingface token template field '{}'",
@@ -594,6 +591,30 @@ fn convert_token_estimator(
             }
         };
         let revision = revision.as_deref().unwrap_or("main");
+        if template_file == "chat_template.jinja" {
+            if let Some((template_path, tokenizer_path)) =
+                find_legacy_huggingface_token_estimator_assets(
+                    name,
+                    repo,
+                    revision,
+                    template_file,
+                    base_dir,
+                )?
+            {
+                return migrate_token_estimator_assets_from_paths(
+                    name,
+                    &template_path,
+                    &tokenizer_path,
+                    base_dir,
+                );
+            }
+        } else if template_file != "tokenizer_config.json" {
+            return Err(anyhow!(
+                "model '{}' uses unsupported huggingface token template file '{}'",
+                name,
+                template_file
+            ));
+        }
         return Ok((
             TokenEstimatorType::HuggingFace,
             Some(format!(
@@ -666,6 +687,15 @@ fn migrate_local_token_estimator_assets(
         }
     };
     let template_path = template.0;
+    migrate_token_estimator_assets_from_paths(name, &template_path, &tokenizer_path, base_dir)
+}
+
+fn migrate_token_estimator_assets_from_paths(
+    name: &str,
+    template_path: &Path,
+    tokenizer_path: &Path,
+    base_dir: &Path,
+) -> Result<(TokenEstimatorType, Option<String>)> {
     let template_path = template_path
         .canonicalize()
         .with_context(|| format!("failed to resolve {}", template_path.display()))?;
@@ -723,6 +753,83 @@ fn migrate_local_token_estimator_assets(
                 .to_string(),
         ),
     ))
+}
+
+fn find_legacy_huggingface_token_estimator_assets(
+    name: &str,
+    repo: &str,
+    revision: &str,
+    template_file: &str,
+    base_dir: &Path,
+) -> Result<Option<(PathBuf, PathBuf)>> {
+    let template_path = find_legacy_huggingface_cache_file(
+        base_dir,
+        "template-cache",
+        name,
+        repo,
+        revision,
+        template_file,
+    )?;
+    let tokenizer_path = find_legacy_huggingface_cache_file(
+        base_dir,
+        "tokenizer-cache",
+        name,
+        repo,
+        revision,
+        "tokenizer.json",
+    )?;
+    Ok(template_path.zip(tokenizer_path))
+}
+
+fn find_legacy_huggingface_cache_file(
+    base_dir: &Path,
+    cache_dir: &str,
+    name: &str,
+    repo: &str,
+    revision: &str,
+    file: &str,
+) -> Result<Option<PathBuf>> {
+    let repo_dir = base_dir
+        .join(cache_dir)
+        .join("hf")
+        .join(name)
+        .join(format!("models--{}", repo.replace('/', "--")));
+    let snapshots_dir = repo_dir.join("snapshots");
+    if !snapshots_dir.is_dir() {
+        return Ok(None);
+    }
+
+    let ref_path = repo_dir.join("refs").join(revision);
+    if ref_path.is_file() {
+        let snapshot = fs::read_to_string(&ref_path)
+            .with_context(|| format!("failed to read {}", ref_path.display()))?;
+        let candidate = snapshots_dir.join(snapshot.trim()).join(file);
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+    }
+
+    let candidate = snapshots_dir.join(revision).join(file);
+    if candidate.is_file() {
+        return Ok(Some(candidate));
+    }
+
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(&snapshots_dir)
+        .with_context(|| format!("failed to read {}", snapshots_dir.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to enumerate {}", snapshots_dir.display()))?;
+        let candidate = entry.path().join(file);
+        if candidate.is_file() {
+            matches.push(candidate);
+        }
+    }
+    if matches.len() == 1 {
+        return Ok(matches.pop());
+    }
+
+    Ok(None)
 }
 
 fn read_local_chat_template(name: &str, path: &Path) -> Result<String> {
@@ -1020,10 +1127,10 @@ fn select_main_model_name(legacy: &LegacyServerConfig) -> Result<String> {
         .ok_or_else(|| anyhow!("unable to determine main chat model from partyclaw config"))
 }
 
-fn convert_channel(channel: LegacyChannelConfig) -> Result<ChannelConfig> {
+fn convert_channel(channel: LegacyChannelConfig) -> Option<ChannelConfig> {
     match channel {
         LegacyChannelConfig::Telegram(telegram) => {
-            Ok(ChannelConfig::Telegram(TelegramChannelConfig {
+            Some(ChannelConfig::Telegram(TelegramChannelConfig {
                 id: telegram.id,
                 bot_token: telegram.bot_token,
                 bot_token_env: telegram.bot_token_env,
@@ -1033,22 +1140,13 @@ fn convert_channel(channel: LegacyChannelConfig) -> Result<ChannelConfig> {
                 admin_user_ids: telegram.admin_user_ids,
             }))
         }
-        LegacyChannelConfig::CommandLine(channel) => Err(anyhow!(
-            "partyclaw channel '{}' is command_line, which stellaclaw does not support yet",
-            channel.id
-        )),
-        LegacyChannelConfig::Dingtalk(channel) => Err(anyhow!(
-            "partyclaw channel '{}' is dingtalk, which stellaclaw does not support yet",
-            channel.id
-        )),
-        LegacyChannelConfig::DingtalkRobot(channel) => Err(anyhow!(
-            "partyclaw channel '{}' is dingtalk_robot, which stellaclaw does not support yet",
-            channel.id
-        )),
-        LegacyChannelConfig::Web(channel) => Err(anyhow!(
-            "partyclaw channel '{}' is web, which stellaclaw does not support yet",
-            channel.id
-        )),
+        LegacyChannelConfig::CommandLine(channel)
+        | LegacyChannelConfig::Dingtalk(channel)
+        | LegacyChannelConfig::DingtalkRobot(channel)
+        | LegacyChannelConfig::Web(channel) => {
+            let _ = channel.id;
+            None
+        }
     }
 }
 
@@ -1173,15 +1271,59 @@ mod tests {
         let config = load_and_upgrade(raw, path).expect("legacy config should convert");
 
         assert_eq!(
-            config.default_profile.main_model.model_name,
+            config
+                .initial_main_model()
+                .expect("main model should exist")
+                .model_name,
             "openai/gpt-4.1-mini"
         );
         assert_eq!(config.channels.len(), 1);
         assert!(config.session_defaults.search_tool_model.is_some());
         assert_eq!(
-            config.named_models["brave"].provider_type,
+            config.models["brave"].provider_type,
             ProviderType::BraveSearch
         );
+    }
+
+    #[test]
+    fn skips_legacy_channels_that_are_not_supported_yet() {
+        let raw = r#"
+        {
+          "version": "0.28",
+          "models": {
+            "main": {
+              "type": "openrouter",
+              "api_endpoint": "https://openrouter.ai/api/v1",
+              "chat_completions_path": "/chat/completions",
+              "model": "openai/gpt-4.1-mini",
+              "api_key_env": "OPENROUTER_API_KEY",
+              "context_window_tokens": 128000,
+              "capabilities": ["chat"]
+            }
+          },
+          "agent": {
+            "agent_frame": { "available_models": ["main"] }
+          },
+          "channels": [
+            {
+              "kind": "telegram",
+              "id": "telegram-main",
+              "bot_token_env": "TG_TOKEN"
+            },
+            {
+              "kind": "web",
+              "id": "web-main"
+            }
+          ]
+        }
+        "#;
+        let path = Path::new("/tmp/config.json");
+        let config = load_and_upgrade(raw, path).expect("legacy config should convert");
+
+        assert_eq!(config.channels.len(), 1);
+        match &config.channels[0] {
+            ChannelConfig::Telegram(channel) => assert_eq!(channel.id, "telegram-main"),
+        }
     }
 
     #[test]
@@ -1244,7 +1386,9 @@ mod tests {
         "#;
         let path = root.join("config.json");
         let config = load_and_upgrade(raw, &path).expect("legacy config should convert");
-        let main = &config.default_profile.main_model;
+        let main = config
+            .initial_main_model()
+            .expect("main model should exist");
 
         assert_eq!(
             main.reasoning
@@ -1263,6 +1407,96 @@ mod tests {
 
         let migrated = fs::read_to_string(estimator_url).expect("migrated config should exist");
         assert!(migrated.contains("\"chat_template\""));
+
+        fs::remove_dir_all(&root).expect("temp root should be cleaned");
+    }
+
+    #[test]
+    fn imports_legacy_huggingface_split_template_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "stellaclaw_legacy_hf_loader_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        let repo_root = root.join("template-cache/hf/glm-5.1/models--zai-org--GLM-5.1");
+        let tokenizer_repo_root = root.join("tokenizer-cache/hf/glm-5.1/models--zai-org--GLM-5.1");
+        fs::create_dir_all(repo_root.join("snapshots/snapshot-a")).expect("template cache exists");
+        fs::create_dir_all(repo_root.join("refs")).expect("template refs exists");
+        fs::create_dir_all(tokenizer_repo_root.join("snapshots/snapshot-a"))
+            .expect("tokenizer cache exists");
+        fs::create_dir_all(tokenizer_repo_root.join("refs")).expect("tokenizer refs exists");
+        fs::write(repo_root.join("refs/main"), "snapshot-a").expect("template ref should write");
+        fs::write(tokenizer_repo_root.join("refs/main"), "snapshot-a")
+            .expect("tokenizer ref should write");
+        fs::write(
+            repo_root.join("snapshots/snapshot-a/chat_template.jinja"),
+            "{{ messages }}",
+        )
+        .expect("template should write");
+        fs::write(
+            tokenizer_repo_root.join("snapshots/snapshot-a/tokenizer.json"),
+            "{\"version\":\"1.0\"}",
+        )
+        .expect("tokenizer should write");
+
+        let raw = r#"
+        {
+          "version": "0.28",
+          "models": {
+            "glm-5.1": {
+              "type": "openrouter",
+              "api_endpoint": "https://openrouter.ai/api/v1",
+              "chat_completions_path": "/chat/completions",
+              "model": "zai-org/glm-5.1",
+              "api_key_env": "OPENROUTER_API_KEY",
+              "context_window_tokens": 128000,
+              "token_estimation": {
+                "template": {
+                  "source": "huggingface",
+                  "repo": "zai-org/GLM-5.1",
+                  "revision": "main",
+                  "file": "chat_template.jinja",
+                  "field": "chat_template"
+                },
+                "tokenizer": {
+                  "source": "huggingface",
+                  "repo": "zai-org/GLM-5.1",
+                  "revision": "main",
+                  "file": "tokenizer.json"
+                }
+              },
+              "capabilities": ["chat"]
+            }
+          },
+          "agent": {
+            "agent_frame": { "available_models": ["glm-5.1"] }
+          },
+          "channels": [
+            {
+              "kind": "telegram",
+              "id": "telegram-main",
+              "bot_token_env": "TG_TOKEN"
+            }
+          ]
+        }
+        "#;
+        let path = root.join("config.json");
+        let config = load_and_upgrade(raw, &path).expect("legacy config should convert");
+        let main_model = config
+            .initial_main_model()
+            .expect("main model should exist");
+        let estimator_url = main_model
+            .token_estimator_url
+            .as_deref()
+            .expect("token estimator url should exist");
+
+        assert!(estimator_url.contains(".stellaclaw_migrated"));
+        assert!(Path::new(estimator_url).is_file());
+        assert!(Path::new(estimator_url)
+            .with_file_name("tokenizer.json")
+            .is_file());
 
         fs::remove_dir_all(&root).expect("temp root should be cleaned");
     }

@@ -4,7 +4,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use stellaclaw_core::model_config::ModelConfig;
+use stellaclaw_core::model_config::{ModelCapability, ModelConfig};
 
 pub mod loaders;
 
@@ -17,9 +17,10 @@ pub struct StellaclawConfig {
     pub version: String,
     #[serde(default)]
     pub agent_server: AgentServerConfig,
-    pub default_profile: SessionProfile,
-    #[serde(default)]
-    pub named_models: BTreeMap<String, ModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<SessionProfile>,
+    #[serde(default, alias = "named_models")]
+    pub models: BTreeMap<String, ModelConfig>,
     #[serde(default)]
     pub session_defaults: SessionDefaults,
     #[serde(default)]
@@ -120,6 +121,16 @@ impl StellaclawConfig {
         if self.channels.is_empty() {
             return Err("config must include at least one channel".to_string());
         }
+        if self.models.is_empty() {
+            return Err("config must include at least one model".to_string());
+        }
+        if !self
+            .models
+            .values()
+            .any(|model| model.supports(ModelCapability::Chat))
+        {
+            return Err("config must include at least one chat-capable model".to_string());
+        }
         Ok(())
     }
 
@@ -154,7 +165,28 @@ impl StellaclawConfig {
     }
 
     pub fn resolve_named_model(&self, name: &str) -> Option<ModelConfig> {
-        self.named_models.get(name).cloned()
+        self.models.get(name).cloned()
+    }
+
+    pub fn initial_session_profile(&self) -> Result<SessionProfile, String> {
+        if let Some(profile) = &self.default_profile {
+            return Ok(profile.clone());
+        }
+        self.initial_main_model()
+            .map(|main_model| SessionProfile { main_model })
+            .ok_or_else(|| "config must include at least one chat-capable model".to_string())
+    }
+
+    pub fn initial_main_model(&self) -> Option<ModelConfig> {
+        self.default_profile
+            .as_ref()
+            .map(|profile| profile.main_model.clone())
+            .or_else(|| {
+                self.models
+                    .values()
+                    .find(|model| model.supports(ModelCapability::Chat))
+                    .cloned()
+            })
     }
 }
 

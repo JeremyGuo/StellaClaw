@@ -226,7 +226,7 @@ fn ensure_conversation_sender(
         conversation_id,
         channel_id,
         platform_chat_id,
-        &config.default_profile,
+        config,
     )?;
     let sender = spawn_conversation(
         workdir.clone(),

@@ -1061,32 +1061,6 @@ sequenceDiagram
 - ingress canonical message history
 - “消息是否已经被 session 消费” 的最终判断
 
-## 11. 这份理想结构和当前实现的主要差异
-
-当前实现更接近：
-
-- core 已经有 `SessionActorInbox`，actor 主循环用 request channel 和 tool completion channel 推进。
-- `ToolBatchExecutor` 已经是 start / interrupt / finish 语义，工具完成后只回传一条 `ChatMessage` 或稳定错误。
-- session history 已经由 `session.json`、`all_messages.jsonl`、`current_messages.jsonl` 在安全点持久化。
-- Conversation/Host 侧 actor 化和跨进程 JSON-RPC 还没有完全落地。
-
-理想目标则是：
-
-- `Conversation` 先成为真正的 actor 和 canonical ingress boundary
-- `SessionActor` 退回成纯执行状态机
-- `SessionActor` 通过 IPC 接收已经 canonicalize 好的 `ChatMessage`
-- session history 的 durable 持久化由 `SessionActor` 自己完成
-- 中断、失败、恢复全部围绕 “Conversation 先 canonicalize and route，Session 再进入 actor request queue，Session 在安全点持久化闭合 history” 这条原则展开
-
-## 12. 一个可以直接指导重构的最小结论
-
-如果只保留最关键的改造原则，就是下面四条：
-
-1. `Channel` 的原始消息不能直接成为 session 的事实来源，必须先在 `Conversation` 层落成 canonical `ChatMessage`。
-2. `Conversation` 是 workspace/workpath/attachment/ingress canonical message/routing metadata 的唯一主边界。
-3. `SessionActor` 是独立进程里的执行状态机，只接收 typed IPC request，只发出 typed IPC event，并独占 session history、runtime metadata snapshot 和 tool/model lifecycle。
-4. interrupt、error、recovery 都必须建立在 “request 进入 actor request queue，tool batch 只在 call/result 闭包完成后持久化，interrupt 与 gate 决策完全属于 SessionActor 内部状态机” 的前提上。
-
 ## 13. Tools 与动态 Schema
 
 这一节要回答三个问题：

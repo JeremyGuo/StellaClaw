@@ -10,10 +10,24 @@ use super::partyclaw;
 pub fn load(raw: &str, path: &Path) -> Result<StellaclawConfig> {
     let value: Value =
         serde_json::from_str(raw).context("failed to parse v0.2 stellaclaw config")?;
-    if value.get("models").is_some() {
+    if is_partyclaw_compatible_config(&value) {
         return partyclaw::load_compatible(raw, path);
     }
     serde_json::from_value(value).context("failed to parse v0.2 stellaclaw runtime config")
+}
+
+fn is_partyclaw_compatible_config(value: &Value) -> bool {
+    value
+        .get("models")
+        .and_then(Value::as_object)
+        .map(|models| {
+            models.values().any(|model| {
+                model.get("type").is_some()
+                    || model.get("api_endpoint").is_some()
+                    || model.get("context_window_tokens").is_some()
+            })
+        })
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -84,22 +98,16 @@ mod tests {
             config.agent_server.path.as_deref(),
             Some("target/debug/agent_server")
         );
-        assert_eq!(
-            config.default_profile.main_model.model_name,
-            "openai/gpt-4.1-mini"
-        );
-        assert_eq!(
-            config.default_profile.main_model.provider_type,
-            ProviderType::OpenRouterCompletion
-        );
-        assert!(config
-            .default_profile
-            .main_model
-            .capabilities
-            .contains(&ModelCapability::ImageIn));
-        let image_input = config
-            .default_profile
-            .main_model
+        let main_model = config
+            .initial_main_model()
+            .expect("main model should exist");
+        assert_eq!(main_model.model_name, "openai/gpt-4.1-mini");
+        assert_eq!(main_model.provider_type, ProviderType::OpenRouterCompletion);
+        assert!(main_model.capabilities.contains(&ModelCapability::ImageIn));
+        let main_model = config
+            .initial_main_model()
+            .expect("main model should exist");
+        let image_input = main_model
             .multimodal_input
             .as_ref()
             .and_then(|input| input.image.as_ref())
@@ -130,21 +138,70 @@ mod tests {
         let raw = include_str!("../../../../example_config.json");
         let config = load(raw, std::path::Path::new("example_config.json"))
             .expect("example config should load");
-        let image_input = config
-            .default_profile
-            .main_model
+        let main_model = config
+            .initial_main_model()
+            .expect("main model should exist");
+        let image_input = main_model
             .multimodal_input
             .as_ref()
             .and_then(|input| input.image.as_ref())
             .expect("example should configure image input");
 
-        assert_eq!(
-            config.default_profile.main_model.model_name,
-            "openai/gpt-4.1-mini"
-        );
+        assert_eq!(main_model.model_name, "openai/gpt-4.1-mini");
         assert_eq!(image_input.max_width, Some(4096));
         assert!(image_input
             .supported_media_types
             .contains(&"image/webp".to_string()));
+    }
+
+    #[test]
+    fn loads_native_runtime_config_without_default_profile() {
+        let raw = r#"
+        {
+          "version": "0.2",
+          "agent_server": {"path": null},
+          "models": {
+            "main": {
+              "provider_type": "claude_code",
+              "model_name": "claude-opus-4-6",
+              "url": "https://example.invalid/v1/messages",
+              "api_key_env": "TEST_API_KEY",
+              "capabilities": ["chat", "image_in"],
+              "token_max_context": 262144,
+              "cache_timeout": 300,
+              "conn_timeout": 300,
+              "retry_mode": "once",
+              "token_estimator_type": "local",
+              "multimodal_input": {
+                "image": {
+                  "transport": "inline_base64",
+                  "supported_media_types": ["image/png", "image/jpeg"],
+                  "max_width": 4096,
+                  "max_height": 4096
+                }
+              }
+            }
+          },
+          "channels": [
+            {
+              "kind": "telegram",
+              "id": "telegram-main",
+              "bot_token_env": "TELEGRAM_BOT_TOKEN"
+            }
+          ]
+        }
+        "#;
+
+        let config = load(raw, std::path::Path::new("/tmp/config.json"))
+            .expect("native runtime config should load");
+
+        assert!(config.default_profile.is_none());
+        assert_eq!(
+            config
+                .initial_main_model()
+                .expect("main model should exist")
+                .model_name,
+            "claude-opus-4-6"
+        );
     }
 }

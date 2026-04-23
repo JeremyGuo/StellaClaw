@@ -20,6 +20,7 @@ pub enum ModelCapability {
     ImageOut,
     PdfIn,
     AudioIn,
+    FileIn,
     WebSearch,
 }
 

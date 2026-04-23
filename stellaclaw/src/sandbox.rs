@@ -91,6 +91,12 @@ fn build_bubblewrap_command(
     if let Some(home_ssh_dir) = discover_home_ssh_dir() {
         bind_path(&mut command, &home_ssh_dir, false)?;
     }
+    if let Some(home_config_dir) = discover_home_config_dir() {
+        bind_path(&mut command, &home_config_dir, false)?;
+    }
+    for codex_auth_path in discover_codex_auth_paths() {
+        bind_path(&mut command, &codex_auth_path, false)?;
+    }
     if let Some(home_dir) = env::var_os("HOME").map(PathBuf::from) {
         command.args(["--setenv", "HOME", &home_dir.to_string_lossy()]);
     }
@@ -122,6 +128,35 @@ fn discover_home_ssh_dir() -> Option<PathBuf> {
     let home_dir = env::var_os("HOME").map(PathBuf::from)?;
     let ssh_dir = home_dir.join(".ssh");
     ssh_dir.exists().then_some(ssh_dir)
+}
+
+fn discover_home_config_dir() -> Option<PathBuf> {
+    let home_dir = env::var_os("HOME").map(PathBuf::from)?;
+    let config_dir = home_dir.join(".config");
+    config_dir.exists().then_some(config_dir)
+}
+
+fn discover_codex_auth_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for env_key in ["CODEX_AUTH_JSON", "CHATGPT_AUTH_JSON"] {
+        if let Some(path) = env::var_os(env_key).map(PathBuf::from) {
+            push_existing_unique_path(&mut paths, path);
+        }
+    }
+    if let Some(path) = env::var_os("CODEX_HOME").map(PathBuf::from) {
+        push_existing_unique_path(&mut paths, path);
+    }
+    if let Some(home_dir) = env::var_os("HOME").map(PathBuf::from) {
+        push_existing_unique_path(&mut paths, home_dir.join(".codex"));
+    }
+    paths
+}
+
+fn push_existing_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !path.exists() || paths.iter().any(|existing| existing == &path) {
+        return;
+    }
+    paths.push(path);
 }
 
 fn discover_runtime_root(workspace_root: &Path) -> Option<PathBuf> {

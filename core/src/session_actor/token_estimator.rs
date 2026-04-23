@@ -17,6 +17,8 @@ use crate::{
 
 use super::{normalize_messages_for_model, ChatMessage, ChatMessageItem, ChatRole, FileItem};
 
+const FALLBACK_TIKTOKEN_MODEL: &str = "gpt-4o";
+
 #[derive(Debug, Clone)]
 pub struct TokenEstimator {
     backend: TokenEstimatorBackend,
@@ -230,6 +232,10 @@ pub enum MultimodalTokenStrategy {
 
 impl MultimodalTokenStrategy {
     pub fn estimate(self, file: &FileItem) -> Result<u64, TokenEstimatorError> {
+        if matches!(self, Self::Ignore) {
+            return Ok(0);
+        }
+
         if let Some(media_type) = unsupported_token_estimate_media_type(file) {
             return Err(TokenEstimatorError::UnsupportedMediaTokenEstimate {
                 media_type: media_type.to_string(),
@@ -237,7 +243,7 @@ impl MultimodalTokenStrategy {
         }
 
         let tokens = match self {
-            Self::Ignore => 0,
+            Self::Ignore => unreachable!("ignore strategy returns before media token estimation"),
             Self::FixedTokens { tokens_per_file } => tokens_per_file,
             Self::PatchGrid {
                 patch_size,
@@ -480,7 +486,7 @@ fn normalize_tiktoken_model_name(model_name: &str) -> Option<String> {
             return Some(candidate);
         }
     }
-    None
+    Some(FALLBACK_TIKTOKEN_MODEL.to_string())
 }
 
 fn tiktoken_model_name_candidates(model_name: &str) -> Vec<String> {
@@ -697,7 +703,8 @@ mod tests {
     use super::*;
     use crate::{
         model_config::{
-            ModelCapability, ModelConfig, MultimodalEstimatorConfig, ProviderType, RetryMode,
+            MediaInputConfig, MediaInputTransport, ModelCapability, ModelConfig,
+            MultimodalEstimatorConfig, MultimodalInputConfig, ProviderType, RetryMode,
             TokenEstimatorType,
         },
         session_actor::{
@@ -764,7 +771,7 @@ mod tests {
     }
 
     #[test]
-    fn fails_token_estimation_for_pdf_and_audio_files() {
+    fn ignores_pdf_and_audio_files_when_multimodal_strategy_is_ignore() {
         let estimator = build_test_estimator(
             "{% for message in messages %}{{ message.role }} {{ message.content }}\n{% endfor %}",
             MultimodalTokenStrategy::Ignore,
@@ -774,7 +781,7 @@ mod tests {
             ("application/pdf", "report.pdf"),
             ("audio/mpeg", "voice.mp3"),
         ] {
-            let error = estimator
+            let estimate = estimator
                 .estimate(&[ChatMessage::new(
                     ChatRole::User,
                     vec![ChatMessageItem::File(FileItem {
@@ -786,6 +793,31 @@ mod tests {
                         state: None,
                     })],
                 )])
+                .expect("pdf/audio should be ignored by the multimodal estimator");
+
+            assert_eq!(estimate.multimodal_tokens, 0);
+        }
+    }
+
+    #[test]
+    fn media_strategy_rejects_pdf_and_audio_files_directly() {
+        let strategy = MultimodalTokenStrategy::FixedTokens {
+            tokens_per_file: 100,
+        };
+
+        for (media_type, name) in [
+            ("application/pdf", "report.pdf"),
+            ("audio/mpeg", "voice.mp3"),
+        ] {
+            let error = strategy
+                .estimate(&FileItem {
+                    uri: format!("file:///tmp/{name}"),
+                    name: Some(name.to_string()),
+                    media_type: Some(media_type.to_string()),
+                    width: None,
+                    height: None,
+                    state: None,
+                })
                 .expect_err("pdf/audio token estimation should fail");
 
             assert!(matches!(
@@ -795,6 +827,33 @@ mod tests {
                 } if returned == media_type
             ));
         }
+    }
+
+    #[test]
+    fn estimates_downgraded_pdf_reference_as_text() {
+        let estimator = build_test_estimator(
+            "{% for message in messages %}{{ message.role }} {{ message.content }}\n{% endfor %}",
+            MultimodalTokenStrategy::FixedTokens {
+                tokens_per_file: 100,
+            },
+        );
+
+        let estimate = estimator
+            .estimate(&[ChatMessage::new(
+                ChatRole::User,
+                vec![ChatMessageItem::File(FileItem {
+                    uri: "file:///tmp/report.pdf".to_string(),
+                    name: Some("report.pdf".to_string()),
+                    media_type: Some("application/pdf".to_string()),
+                    width: None,
+                    height: None,
+                    state: None,
+                })],
+            )])
+            .expect("unsupported pdf should be downgraded to text before token estimation");
+
+        assert!(estimate.text_tokens > 0);
+        assert_eq!(estimate.multimodal_tokens, 0);
     }
 
     #[test]
@@ -929,22 +988,27 @@ mod tests {
     }
 
     #[test]
-    fn local_tiktoken_estimator_rejects_unknown_models() {
+    fn local_tiktoken_estimator_falls_back_for_unknown_models() {
         let resolver = HuggingFaceFileResolver::new().expect("resolver should build");
-        let error = TokenEstimator::from_model_config(
+        let estimator = TokenEstimator::from_model_config(
             &local_tiktoken_model_config(
                 "anthropic/claude-3-5-sonnet",
                 MultimodalTokenStrategy::Ignore,
             ),
             &resolver,
         )
-        .expect_err("unknown local model should fail");
+        .expect("unknown local model should use fallback tokenizer");
 
-        assert!(matches!(
-            error,
-            TokenEstimatorError::UnsupportedLocalTokenEstimatorModel { model_name }
-                if model_name == "anthropic/claude-3-5-sonnet"
-        ));
+        let estimate = estimator
+            .estimate(&[ChatMessage::new(
+                ChatRole::User,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "hello from fallback tokenizer".to_string(),
+                })],
+            )])
+            .expect("fallback estimate should work");
+
+        assert!(estimate.text_tokens > 0);
     }
 
     fn test_tokenizer() -> HuggingFaceTokenizer {
@@ -1004,7 +1068,7 @@ mod tests {
             model_name: "openai/gpt-4o-mini".to_string(),
             url: "https://openrouter.ai/api/v1/chat/completions".to_string(),
             api_key_env: "OPENROUTER_API_KEY".to_string(),
-            capabilities: vec![ModelCapability::Chat],
+            capabilities: vec![ModelCapability::Chat, ModelCapability::ImageIn],
             token_max_context: 128_000,
             cache_timeout: 300,
             conn_timeout: 10,
@@ -1014,7 +1078,16 @@ mod tests {
             multimodal_estimator: Some(MultimodalEstimatorConfig {
                 image: Some(multimodal_strategy),
             }),
-            multimodal_input: None,
+            multimodal_input: Some(MultimodalInputConfig {
+                image: Some(MediaInputConfig {
+                    transport: MediaInputTransport::FileReference,
+                    supported_media_types: vec!["image/png".to_string(), "image/jpeg".to_string()],
+                    max_width: None,
+                    max_height: None,
+                }),
+                pdf: None,
+                audio: None,
+            }),
             token_estimator_url: Some(
                 directory
                     .join("tokenizer_config.json")
@@ -1040,7 +1113,7 @@ mod tests {
             model_name: model_name.to_string(),
             url: "https://openrouter.ai/api/v1/chat/completions".to_string(),
             api_key_env: "OPENROUTER_API_KEY".to_string(),
-            capabilities: vec![ModelCapability::Chat],
+            capabilities: vec![ModelCapability::Chat, ModelCapability::ImageIn],
             token_max_context: 128_000,
             cache_timeout: 300,
             conn_timeout: 10,
@@ -1050,7 +1123,16 @@ mod tests {
             multimodal_estimator: Some(MultimodalEstimatorConfig {
                 image: Some(multimodal_strategy),
             }),
-            multimodal_input: None,
+            multimodal_input: Some(MultimodalInputConfig {
+                image: Some(MediaInputConfig {
+                    transport: MediaInputTransport::FileReference,
+                    supported_media_types: vec!["image/png".to_string(), "image/jpeg".to_string()],
+                    max_width: None,
+                    max_height: None,
+                }),
+                pdf: None,
+                audio: None,
+            }),
             token_estimator_url: None,
         }
     }

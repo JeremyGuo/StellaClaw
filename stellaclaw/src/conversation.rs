@@ -12,7 +12,7 @@ use crossbeam_channel::{Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use stellaclaw_core::{
-    model_config::ModelConfig,
+    model_config::{ModelCapability, ModelConfig},
     session_actor::{
         ChatMessage, ChatMessageItem, ChatRole, ContextItem, ConversationBridgeRequest,
         ConversationBridgeResponse, FileItem, SessionEvent, SessionInitial, SessionRequest,
@@ -71,6 +71,8 @@ pub struct ConversationState {
     pub channel_id: String,
     pub platform_chat_id: String,
     pub session_profile: SessionProfile,
+    #[serde(default)]
+    pub model_selection_pending: bool,
     #[serde(default)]
     pub tool_remote_mode: ToolRemoteMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -231,7 +233,7 @@ pub fn load_or_create_conversation_state(
     conversation_id: &str,
     channel_id: &str,
     platform_chat_id: &str,
-    default_profile: &SessionProfile,
+    config: &StellaclawConfig,
 ) -> Result<ConversationState> {
     let root = workdir.join("conversations").join(conversation_id);
     fs::create_dir_all(&root).with_context(|| format!("failed to create {}", root.display()))?;
@@ -247,7 +249,10 @@ pub fn load_or_create_conversation_state(
         conversation_id: conversation_id.to_string(),
         channel_id: channel_id.to_string(),
         platform_chat_id: platform_chat_id.to_string(),
-        session_profile: default_profile.clone(),
+        session_profile: config
+            .initial_session_profile()
+            .map_err(anyhow::Error::msg)?,
+        model_selection_pending: true,
         tool_remote_mode: ToolRemoteMode::Selectable,
         sandbox: None,
         reasoning_effort: None,
@@ -390,6 +395,28 @@ impl ConversationRuntime {
     }
 
     fn handle_incoming(&mut self, message: IncomingConversationMessage) -> Result<bool> {
+        if self.state.model_selection_pending {
+            match &message.control {
+                Some(ConversationControl::ShowModel) => {
+                    self.send_model_selection()?;
+                    return Ok(false);
+                }
+                Some(ConversationControl::SwitchModel { model_name }) => {
+                    match self.switch_main_model(model_name) {
+                        Ok(()) => return Ok(true),
+                        Err(error) => {
+                            self.send_delivery_from_text(format!("模型切换失败: {error}"))?;
+                            return Ok(false);
+                        }
+                    }
+                }
+                _ => {
+                    self.send_model_selection()?;
+                    return Ok(false);
+                }
+            }
+        }
+
         match message.control {
             Some(ConversationControl::Continue) => {
                 self.foreground_client()?
@@ -1182,13 +1209,25 @@ impl ConversationRuntime {
 
     fn render_model_selection(&self) -> String {
         let current_name = &self.state.session_profile.main_model.model_name;
-        let mut lines = vec![format!("当前模型: {current_name}")];
-        if self.config.named_models.is_empty() {
+        let mut lines = if self.state.model_selection_pending {
+            vec![format!("请选择 foreground 模型。当前预选: {current_name}")]
+        } else {
+            vec![format!("当前模型: {current_name}")]
+        };
+        if !self
+            .config
+            .models
+            .values()
+            .any(|model| model.supports(ModelCapability::Chat))
+        {
             return lines.join("\n");
         }
 
         lines.push("可切换模型:".to_string());
-        for (name, model) in &self.config.named_models {
+        for (name, model) in &self.config.models {
+            if !model.supports(ModelCapability::Chat) {
+                continue;
+            }
             let marker = if model.model_name == *current_name {
                 " [current]"
             } else {
@@ -1204,8 +1243,9 @@ impl ConversationRuntime {
         let prompt = self.render_model_selection();
         let options = self
             .config
-            .named_models
+            .models
             .iter()
+            .filter(|(_, model)| model.supports(ModelCapability::Chat))
             .map(|(name, model)| {
                 let marker = if model.model_name == self.state.session_profile.main_model.model_name
                 {
@@ -1375,8 +1415,12 @@ impl ConversationRuntime {
             .config
             .resolve_named_model(model_name)
             .ok_or_else(|| anyhow!("unknown model {model_name}"))?;
+        if !new_model.supports(ModelCapability::Chat) {
+            return Err(anyhow!("model {model_name} is not chat-capable"));
+        }
         let old_model_name = self.state.session_profile.main_model.model_name.clone();
         if self.state.session_profile.main_model == new_model {
+            self.state.model_selection_pending = false;
             self.send_delivery_from_text(format!(
                 "当前 foreground 模型已经是 `{}`。",
                 old_model_name
@@ -1389,6 +1433,7 @@ impl ConversationRuntime {
         }
         self.foreground.events = None;
         self.state.session_profile.main_model = new_model;
+        self.state.model_selection_pending = false;
         self.restart_foreground_session()?;
         self.send_delivery_from_text(format!(
             "已切换主模型: `{}` -> `{}`",

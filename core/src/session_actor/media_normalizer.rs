@@ -3,7 +3,7 @@ use std::{fs, io::Cursor, path::PathBuf};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use image::{imageops::FilterType, ImageFormat, ImageReader};
 
-use crate::model_config::{MediaInputConfig, MediaInputTransport, ModelConfig};
+use crate::model_config::{MediaInputConfig, MediaInputTransport, ModelCapability, ModelConfig};
 
 use super::{ChatMessage, ChatMessageItem, ContextItem, FileItem, FileState};
 
@@ -47,35 +47,61 @@ fn normalize_item_for_model(
     };
 
     match normalize_file_for_model(file, model_config) {
-        Ok(Some(file)) => vec![ChatMessageItem::File(file)],
-        Ok(None) => vec![item.clone()],
+        Ok(NormalizedFile::File(file)) => vec![ChatMessageItem::File(file)],
+        Ok(NormalizedFile::Text(text)) => vec![ChatMessageItem::Context(ContextItem { text })],
+        Ok(NormalizedFile::Unchanged) => vec![item.clone()],
         Err(reason) => vec![ChatMessageItem::Context(ContextItem {
             text: crashed_file_prompt(file, &reason),
         })],
     }
 }
 
+enum NormalizedFile {
+    File(FileItem),
+    Text(String),
+    Unchanged,
+}
+
 fn normalize_file_for_model(
     file: &FileItem,
     model_config: &ModelConfig,
-) -> Result<Option<FileItem>, String> {
+) -> Result<NormalizedFile, String> {
     if let Some(FileState::Crashed { reason }) = &file.state {
         return Err(reason.clone());
     }
 
     let Some(kind) = media_kind(file) else {
-        return Ok(None);
+        if model_config.supports(ModelCapability::FileIn) {
+            return Ok(NormalizedFile::Unchanged);
+        }
+        return Ok(NormalizedFile::Text(file_reference_prompt(
+            file,
+            "model does not support generic file input",
+        )));
     };
+
+    if !model_supports_media_kind(model_config, kind) {
+        return Ok(NormalizedFile::Text(file_reference_prompt(
+            file,
+            "model does not support this media type as direct input",
+        )));
+    }
+
     let Some(config) = media_input_config(model_config, kind) else {
-        return Ok(None);
+        return Ok(NormalizedFile::Text(file_reference_prompt(
+            file,
+            "model has no direct input transport configured for this media type",
+        )));
     };
     if matches!(config.transport, MediaInputTransport::FileReference) {
-        return Ok(None);
+        return Ok(NormalizedFile::Unchanged);
     }
 
     match kind {
-        MediaKind::Image => normalize_image_inline(file, config).map(Some),
-        MediaKind::Pdf | MediaKind::Audio => normalize_binary_inline(file, config, kind).map(Some),
+        MediaKind::Image => normalize_image_inline(file, config).map(NormalizedFile::File),
+        MediaKind::Pdf | MediaKind::Audio => {
+            normalize_binary_inline(file, config, kind).map(NormalizedFile::File)
+        }
     }
 }
 
@@ -162,6 +188,14 @@ fn media_input_config<'a>(
         MediaKind::Image => multimodal.image.as_ref(),
         MediaKind::Pdf => multimodal.pdf.as_ref(),
         MediaKind::Audio => multimodal.audio.as_ref(),
+    }
+}
+
+fn model_supports_media_kind(model_config: &ModelConfig, kind: MediaKind) -> bool {
+    match kind {
+        MediaKind::Image => model_config.supports(ModelCapability::ImageIn),
+        MediaKind::Pdf => model_config.supports(ModelCapability::PdfIn),
+        MediaKind::Audio => model_config.supports(ModelCapability::AudioIn),
     }
 }
 
@@ -282,11 +316,23 @@ fn crashed_file_prompt(file: &FileItem, reason: &str) -> String {
     )
 }
 
+fn file_reference_prompt(file: &FileItem, reason: &str) -> String {
+    format!(
+        "[File attached as text reference]\nuri: {}\nname: {}\nmedia_type: {}\nreason: {}",
+        file.uri,
+        file.name.as_deref().unwrap_or("<unknown>"),
+        file.media_type.as_deref().unwrap_or("<unknown>"),
+        reason
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        model_config::{MediaInputConfig, MediaInputTransport, MultimodalInputConfig},
+        model_config::{
+            MediaInputConfig, MediaInputTransport, ModelCapability, MultimodalInputConfig,
+        },
         session_actor::{ChatMessage, ChatRole, ReasoningItem},
     };
 
@@ -377,5 +423,309 @@ mod tests {
             &normalized[0].data[0],
             ChatMessageItem::Context(context) if context.text == "visible"
         ));
+    }
+
+    #[test]
+    fn unsupported_pdf_is_downgraded_to_text_reference() {
+        let config = ModelConfig {
+            provider_type: crate::model_config::ProviderType::ClaudeCode,
+            model_name: "claude-opus-4-6".to_string(),
+            url: "http://localhost".to_string(),
+            api_key_env: "TEST".to_string(),
+            capabilities: vec![ModelCapability::Chat, ModelCapability::ImageIn],
+            token_max_context: 1,
+            cache_timeout: 0,
+            conn_timeout: 1,
+            retry_mode: crate::model_config::RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: crate::model_config::TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: Some(MultimodalInputConfig {
+                image: Some(MediaInputConfig {
+                    transport: MediaInputTransport::InlineBase64,
+                    supported_media_types: vec!["image/png".to_string()],
+                    max_width: None,
+                    max_height: None,
+                }),
+                pdf: None,
+                audio: None,
+            }),
+            token_estimator_url: None,
+        };
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::File(FileItem {
+                uri: "file:///tmp/report.pdf".to_string(),
+                name: Some("report.pdf".to_string()),
+                media_type: Some("application/pdf".to_string()),
+                width: None,
+                height: None,
+                state: None,
+            })],
+        )];
+
+        let normalized = normalize_messages_for_model(&messages, &config);
+
+        assert!(matches!(
+            &normalized[0].data[0],
+            ChatMessageItem::Context(context)
+                if context.text.contains("file:///tmp/report.pdf")
+                    && context.text.contains("model does not support")
+        ));
+    }
+
+    #[test]
+    fn unsupported_image_is_downgraded_to_text_reference() {
+        let config = ModelConfig {
+            provider_type: crate::model_config::ProviderType::ClaudeCode,
+            model_name: "text-only".to_string(),
+            url: "http://localhost".to_string(),
+            api_key_env: "TEST".to_string(),
+            capabilities: vec![ModelCapability::Chat],
+            token_max_context: 1,
+            cache_timeout: 0,
+            conn_timeout: 1,
+            retry_mode: crate::model_config::RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: crate::model_config::TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: None,
+            token_estimator_url: None,
+        };
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::File(FileItem {
+                uri: "file:///tmp/cat.png".to_string(),
+                name: Some("cat.png".to_string()),
+                media_type: Some("image/png".to_string()),
+                width: Some(640),
+                height: Some(480),
+                state: None,
+            })],
+        )];
+
+        let normalized = normalize_messages_for_model(&messages, &config);
+
+        assert!(matches!(
+            &normalized[0].data[0],
+            ChatMessageItem::Context(context)
+                if context.text.contains("file:///tmp/cat.png")
+                    && context.text.contains("model does not support")
+        ));
+    }
+
+    #[test]
+    fn unsupported_audio_is_downgraded_to_text_reference() {
+        let config = ModelConfig {
+            provider_type: crate::model_config::ProviderType::ClaudeCode,
+            model_name: "claude-opus-4-6".to_string(),
+            url: "http://localhost".to_string(),
+            api_key_env: "TEST".to_string(),
+            capabilities: vec![ModelCapability::Chat, ModelCapability::ImageIn],
+            token_max_context: 1,
+            cache_timeout: 0,
+            conn_timeout: 1,
+            retry_mode: crate::model_config::RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: crate::model_config::TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: Some(MultimodalInputConfig {
+                image: Some(MediaInputConfig {
+                    transport: MediaInputTransport::InlineBase64,
+                    supported_media_types: vec!["image/png".to_string()],
+                    max_width: None,
+                    max_height: None,
+                }),
+                pdf: None,
+                audio: None,
+            }),
+            token_estimator_url: None,
+        };
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::File(FileItem {
+                uri: "file:///tmp/voice.mp3".to_string(),
+                name: Some("voice.mp3".to_string()),
+                media_type: Some("audio/mpeg".to_string()),
+                width: None,
+                height: None,
+                state: None,
+            })],
+        )];
+
+        let normalized = normalize_messages_for_model(&messages, &config);
+
+        assert!(matches!(
+            &normalized[0].data[0],
+            ChatMessageItem::Context(context)
+                if context.text.contains("file:///tmp/voice.mp3")
+                    && context.text.contains("model does not support")
+        ));
+    }
+
+    #[test]
+    fn unsupported_generic_file_is_downgraded_to_text_reference() {
+        let config = ModelConfig {
+            provider_type: crate::model_config::ProviderType::OpenRouterCompletion,
+            model_name: "text-only".to_string(),
+            url: "http://localhost".to_string(),
+            api_key_env: "TEST".to_string(),
+            capabilities: vec![ModelCapability::Chat],
+            token_max_context: 1,
+            cache_timeout: 0,
+            conn_timeout: 1,
+            retry_mode: crate::model_config::RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: crate::model_config::TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: None,
+            token_estimator_url: None,
+        };
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::File(FileItem {
+                uri: "file:///tmp/notes.txt".to_string(),
+                name: Some("notes.txt".to_string()),
+                media_type: Some("text/plain".to_string()),
+                width: None,
+                height: None,
+                state: None,
+            })],
+        )];
+
+        let normalized = normalize_messages_for_model(&messages, &config);
+
+        assert!(matches!(
+            &normalized[0].data[0],
+            ChatMessageItem::Context(context)
+                if context.text.contains("file:///tmp/notes.txt")
+                    && context.text.contains("generic file input")
+        ));
+    }
+
+    #[test]
+    fn supported_generic_file_reference_is_preserved() {
+        let config = ModelConfig {
+            provider_type: crate::model_config::ProviderType::CodexSubscription,
+            model_name: "gpt-5.5".to_string(),
+            url: "http://localhost".to_string(),
+            api_key_env: "TEST".to_string(),
+            capabilities: vec![ModelCapability::Chat, ModelCapability::FileIn],
+            token_max_context: 1,
+            cache_timeout: 0,
+            conn_timeout: 1,
+            retry_mode: crate::model_config::RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: crate::model_config::TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: None,
+            token_estimator_url: None,
+        };
+        let file = FileItem {
+            uri: "file:///tmp/notes.txt".to_string(),
+            name: Some("notes.txt".to_string()),
+            media_type: Some("text/plain".to_string()),
+            width: None,
+            height: None,
+            state: None,
+        };
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::File(file.clone())],
+        )];
+
+        let normalized = normalize_messages_for_model(&messages, &config);
+
+        assert_eq!(normalized[0].data, vec![ChatMessageItem::File(file)]);
+    }
+
+    #[test]
+    fn supported_pdf_file_reference_is_preserved() {
+        let config = ModelConfig {
+            provider_type: crate::model_config::ProviderType::OpenRouterResponses,
+            model_name: "pdf-model".to_string(),
+            url: "http://localhost".to_string(),
+            api_key_env: "TEST".to_string(),
+            capabilities: vec![ModelCapability::Chat, ModelCapability::PdfIn],
+            token_max_context: 1,
+            cache_timeout: 0,
+            conn_timeout: 1,
+            retry_mode: crate::model_config::RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: crate::model_config::TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: Some(MultimodalInputConfig {
+                image: None,
+                pdf: Some(MediaInputConfig {
+                    transport: MediaInputTransport::FileReference,
+                    supported_media_types: vec!["application/pdf".to_string()],
+                    max_width: None,
+                    max_height: None,
+                }),
+                audio: None,
+            }),
+            token_estimator_url: None,
+        };
+        let file = FileItem {
+            uri: "file:///tmp/report.pdf".to_string(),
+            name: Some("report.pdf".to_string()),
+            media_type: Some("application/pdf".to_string()),
+            width: None,
+            height: None,
+            state: None,
+        };
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::File(file.clone())],
+        )];
+
+        let normalized = normalize_messages_for_model(&messages, &config);
+
+        assert_eq!(normalized[0].data, vec![ChatMessageItem::File(file)]);
+    }
+
+    #[test]
+    fn supported_audio_file_reference_is_preserved() {
+        let config = ModelConfig {
+            provider_type: crate::model_config::ProviderType::OpenRouterResponses,
+            model_name: "audio-model".to_string(),
+            url: "http://localhost".to_string(),
+            api_key_env: "TEST".to_string(),
+            capabilities: vec![ModelCapability::Chat, ModelCapability::AudioIn],
+            token_max_context: 1,
+            cache_timeout: 0,
+            conn_timeout: 1,
+            retry_mode: crate::model_config::RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: crate::model_config::TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: Some(MultimodalInputConfig {
+                image: None,
+                pdf: None,
+                audio: Some(MediaInputConfig {
+                    transport: MediaInputTransport::FileReference,
+                    supported_media_types: vec!["audio/mpeg".to_string()],
+                    max_width: None,
+                    max_height: None,
+                }),
+            }),
+            token_estimator_url: None,
+        };
+        let file = FileItem {
+            uri: "file:///tmp/voice.mp3".to_string(),
+            name: Some("voice.mp3".to_string()),
+            media_type: Some("audio/mpeg".to_string()),
+            width: None,
+            height: None,
+            state: None,
+        };
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::File(file.clone())],
+        )];
+
+        let normalized = normalize_messages_for_model(&messages, &config);
+
+        assert_eq!(normalized[0].data, vec![ChatMessageItem::File(file)]);
     }
 }

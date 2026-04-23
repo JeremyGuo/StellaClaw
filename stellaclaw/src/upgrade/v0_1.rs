@@ -113,6 +113,7 @@ struct LegacyConversationSettings {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum LegacyRemoteExecutionBinding {
     Local { path: PathBuf },
@@ -173,8 +174,6 @@ struct LegacyDurableSessionState {
     actor_mailbox: Vec<Value>,
     #[serde(default)]
     user_mailbox: Vec<Value>,
-    #[serde(default)]
-    current_plan: Option<Value>,
     #[serde(default)]
     pending_messages: Vec<Value>,
 }
@@ -383,9 +382,9 @@ fn migrate_channel_authorizations(workdir: &Path) -> Result<()> {
                     conversation_id,
                     MigratedChatAuthorization {
                         state: match item.state {
-                            LegacyApprovalState::Pending => "pending",
-                            LegacyApprovalState::Approved => "approved",
-                            LegacyApprovalState::Rejected => "rejected",
+                            LegacyApprovalState::Pending => "Pending",
+                            LegacyApprovalState::Approved => "Approved",
+                            LegacyApprovalState::Rejected => "Rejected",
                         },
                         last_title: None,
                         last_user: item.display_name,
@@ -433,10 +432,12 @@ fn migrate_conversations_and_sessions(workdir: &Path, config: &StellaclawConfig)
             continue;
         }
 
-        let raw = fs::read_to_string(&legacy_state_path)
-            .with_context(|| format!("failed to read {}", legacy_state_path.display()))?;
-        let legacy: LegacyConversation = serde_json::from_str(&raw)
-            .with_context(|| format!("failed to parse {}", legacy_state_path.display()))?;
+        let Ok(raw) = fs::read_to_string(&legacy_state_path) else {
+            continue;
+        };
+        let Ok(legacy) = serde_json::from_str::<LegacyConversation>(&raw) else {
+            continue;
+        };
         validate_legacy_conversation(&legacy, &legacy_state_path)?;
 
         let conversation_id = id_manager
@@ -447,10 +448,13 @@ fn migrate_conversations_and_sessions(workdir: &Path, config: &StellaclawConfig)
             .with_context(|| format!("failed to create {}", conversation_root.display()))?;
 
         let main_model = match legacy.settings.main_model.as_deref() {
-            Some(name) => config.resolve_named_model(name).ok_or_else(|| {
-                anyhow!("legacy conversation references unknown model '{}'", name)
-            })?,
-            None => config.default_profile.main_model.clone(),
+            Some(name) => config
+                .resolve_named_model(name)
+                .or_else(|| config.initial_main_model())
+                .ok_or_else(|| anyhow!("missing fallback main model"))?,
+            None => config
+                .initial_main_model()
+                .ok_or_else(|| anyhow!("missing fallback main model"))?,
         };
         let session_profile = SessionProfile { main_model };
         let tool_remote_mode = migrated_tool_remote_mode(&legacy, &legacy_state_path)?;
@@ -480,6 +484,7 @@ fn migrate_conversations_and_sessions(workdir: &Path, config: &StellaclawConfig)
             channel_id: legacy.address.channel_id.clone(),
             platform_chat_id: legacy.address.conversation_id.clone(),
             session_profile: session_profile.clone(),
+            model_selection_pending: false,
             tool_remote_mode: tool_remote_mode.clone(),
             sandbox: migrated_conversation_sandbox(&legacy),
             reasoning_effort: legacy.settings.reasoning_effort.clone(),
@@ -518,38 +523,12 @@ fn migrate_conversations_and_sessions(workdir: &Path, config: &StellaclawConfig)
 }
 
 fn validate_legacy_conversation(legacy: &LegacyConversation, path: &Path) -> Result<()> {
-    if !legacy.settings.remote_workpaths.is_empty() {
-        return Err(anyhow!(
-            "{} uses remote_workpaths, which stellaclaw conversation migration does not support yet",
-            path.display()
-        ));
-    }
-    if !legacy.settings.local_mounts.is_empty() {
-        return Err(anyhow!(
-            "{} uses local_mounts, which stellaclaw conversation migration does not support yet",
-            path.display()
-        ));
-    }
-    if legacy
-        .settings
-        .remote_execution
-        .as_ref()
-        .and_then(|value| {
-            serde_json::from_value::<LegacyRemoteExecutionBinding>(value.clone()).ok()
-        })
-        .is_some_and(|binding| matches!(binding, LegacyRemoteExecutionBinding::Local { .. }))
-    {
-        return Err(anyhow!(
-            "{} uses local remote_execution, which stellaclaw cannot preserve yet",
-            path.display()
-        ));
-    }
-    if legacy.settings.context_compaction_enabled.is_some() {
-        return Err(anyhow!(
-            "{} uses per-conversation context compaction settings that stellaclaw cannot preserve yet",
-            path.display()
-        ));
-    }
+    let _ = (
+        legacy.settings.remote_workpaths.len(),
+        legacy.settings.local_mounts.len(),
+        legacy.settings.context_compaction_enabled,
+        path,
+    );
     Ok(())
 }
 
@@ -560,10 +539,12 @@ fn scan_legacy_sessions(root: &Path) -> Result<HashMap<String, LegacySessionEntr
     }
     for session_root in find_session_roots(root)? {
         let state_path = session_root.join("session.json");
-        let raw = fs::read_to_string(&state_path)
-            .with_context(|| format!("failed to read {}", state_path.display()))?;
-        let session: LegacySession = serde_json::from_str(&raw)
-            .with_context(|| format!("failed to parse {}", state_path.display()))?;
+        let Ok(raw) = fs::read_to_string(&state_path) else {
+            continue;
+        };
+        let Ok(session) = serde_json::from_str::<LegacySession>(&raw) else {
+            continue;
+        };
         if session.closed_at.is_some() || session.kind != LegacySessionKind::Foreground {
             continue;
         }
@@ -586,7 +567,6 @@ fn scan_legacy_sessions(root: &Path) -> Result<HashMap<String, LegacySessionEntr
 fn validate_legacy_session(session: &LegacySession, path: &Path) -> Result<()> {
     if !session.session_state.actor_mailbox.is_empty()
         || !session.session_state.user_mailbox.is_empty()
-        || session.session_state.current_plan.is_some()
         || !session.session_state.pending_messages.is_empty()
     {
         return Err(anyhow!(
@@ -684,6 +664,7 @@ fn migrate_foreground_session(
             convert_legacy_session_message(message, workspace_root.as_deref(), conversation_root)
         })
         .collect::<Vec<_>>();
+    let current_messages = truncate_current_messages_for_context(&history, config);
     let initial = SessionInitial {
         session_id: legacy.session.id.clone(),
         session_type: SessionType::Foreground,
@@ -700,7 +681,7 @@ fn migrate_foreground_session(
         version: 1,
         initial: &initial,
         all_messages: &history,
-        current_messages: &history,
+        current_messages: &current_messages,
         next_turn_id: legacy.session.turn_count.saturating_add(1).max(1),
         next_batch_id: 1,
         runtime_metadata_state: MigratedRuntimeMetadataState {
@@ -726,32 +707,112 @@ fn migrate_foreground_session(
         )
     })?;
     write_messages_jsonl(&session_dir.join("all_messages.jsonl"), &history)?;
-    write_messages_jsonl(&session_dir.join("current_messages.jsonl"), &history)?;
+    write_messages_jsonl(
+        &session_dir.join("current_messages.jsonl"),
+        &current_messages,
+    )?;
 
     Ok(())
 }
 
-fn migrated_tool_remote_mode(legacy: &LegacyConversation, path: &Path) -> Result<ToolRemoteMode> {
+fn truncate_current_messages_for_context(
+    history: &[ChatMessage],
+    config: &StellaclawConfig,
+) -> Vec<ChatMessage> {
+    let budget = config
+        .session_defaults
+        .compression_threshold_tokens
+        .unwrap_or_else(|| {
+            config
+                .initial_main_model()
+                .map(|model| model.token_max_context.saturating_mul(8) / 10)
+                .unwrap_or(128_000)
+        })
+        .max(1) as usize;
+    let mut retained = Vec::new();
+    let mut total = 0usize;
+    for message in history.iter().rev() {
+        let estimate = estimate_message_tokens(message);
+        if total.saturating_add(estimate) > budget && !retained.is_empty() {
+            break;
+        }
+        total = total.saturating_add(estimate);
+        retained.push(message.clone());
+    }
+    retained.reverse();
+    retained
+}
+
+fn estimate_message_tokens(message: &ChatMessage) -> usize {
+    let mut chars = 16usize;
+    if let Some(user_name) = &message.user_name {
+        chars = chars.saturating_add(user_name.len());
+    }
+    if let Some(message_time) = &message.message_time {
+        chars = chars.saturating_add(message_time.len());
+    }
+    for item in &message.data {
+        chars = chars.saturating_add(match item {
+            ChatMessageItem::Reasoning(reasoning) => reasoning.text.len(),
+            ChatMessageItem::Context(context) => context.text.len(),
+            ChatMessageItem::File(file) => estimate_file_item_chars(file),
+            ChatMessageItem::ToolCall(tool_call) => {
+                tool_call.tool_call_id.len()
+                    + tool_call.tool_name.len()
+                    + tool_call.arguments.text.len()
+            }
+            ChatMessageItem::ToolResult(tool_result) => {
+                let context_len = tool_result
+                    .result
+                    .context
+                    .as_ref()
+                    .map(|context| context.text.len())
+                    .unwrap_or(0);
+                let file_len = tool_result
+                    .result
+                    .file
+                    .as_ref()
+                    .map(estimate_file_item_chars)
+                    .unwrap_or(0);
+                tool_result.tool_call_id.len()
+                    + tool_result.tool_name.len()
+                    + context_len
+                    + file_len
+            }
+        });
+    }
+    (chars / 4).saturating_add(32).max(1)
+}
+
+fn estimate_file_item_chars(file: &FileItem) -> usize {
+    let mut chars = file.uri.len();
+    if let Some(name) = &file.name {
+        chars = chars.saturating_add(name.len());
+    }
+    if let Some(media_type) = &file.media_type {
+        chars = chars.saturating_add(media_type.len());
+    }
+    if let Some(FileState::Crashed { reason }) = &file.state {
+        chars = chars.saturating_add(reason.len());
+    }
+    chars
+}
+
+fn migrated_tool_remote_mode(legacy: &LegacyConversation, _path: &Path) -> Result<ToolRemoteMode> {
     let Some(remote_execution) = legacy.settings.remote_execution.as_ref() else {
         return Ok(ToolRemoteMode::Selectable);
     };
-    let binding: LegacyRemoteExecutionBinding = serde_json::from_value(remote_execution.clone())
-        .with_context(|| {
-            format!(
-                "failed to parse legacy remote_execution in {}",
-                path.display()
-            )
-        })?;
+    let Ok(binding) =
+        serde_json::from_value::<LegacyRemoteExecutionBinding>(remote_execution.clone())
+    else {
+        return Ok(ToolRemoteMode::Selectable);
+    };
     match binding {
         LegacyRemoteExecutionBinding::Ssh { host, path } => Ok(ToolRemoteMode::FixedSsh {
             host,
             cwd: Some(path),
         }),
-        LegacyRemoteExecutionBinding::Local { path: local_path } => Err(anyhow!(
-            "{} uses local remote_execution '{}', which stellaclaw cannot preserve yet",
-            path.display(),
-            local_path.display()
-        )),
+        LegacyRemoteExecutionBinding::Local { .. } => Ok(ToolRemoteMode::Selectable),
     }
 }
 
@@ -915,21 +976,38 @@ fn merge_directory_contents_if_missing(source: &Path, target: &Path) -> Result<(
         if file_type.is_dir() {
             merge_directory_contents_if_missing(&source_path, &target_path)?;
         } else if file_type.is_symlink() {
-            let target_link = fs::read_link(&source_path)
-                .with_context(|| format!("failed to read symlink {}", source_path.display()))?;
-            let resolved = if target_link.is_absolute() {
-                target_link
-            } else {
-                source_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(target_link)
-            };
-            merge_directory_contents_if_missing(&resolved, &target_path)?;
+            copy_symlink_if_missing(&source_path, &target_path)?;
         } else {
             copy_file_if_missing(&source_path, &target_path)?;
         }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink_if_missing(source: &Path, target: &Path) -> Result<()> {
+    if fs::symlink_metadata(target).is_ok() {
+        return Ok(());
+    }
+    let link = match fs::read_link(source) {
+        Ok(link) => link,
+        Err(_) => return Ok(()),
+    };
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::os::unix::fs::symlink(&link, target).with_context(|| {
+        format!(
+            "failed to copy symlink {} to {}",
+            source.display(),
+            target.display()
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn copy_symlink_if_missing(_source: &Path, _target: &Path) -> Result<()> {
     Ok(())
 }
 
