@@ -54,7 +54,7 @@ pub(super) fn optional_string_arg(
 mod tests {
     use super::{
         agent_frame_event_log_level, cron_schedule_from_required_tool_args,
-        optional_cron_schedule_from_tool_args,
+        optional_cron_schedule_from_tool_args, workspace_registry_prep_required,
     };
     use agent_frame::SessionEvent;
     use serde_json::{Value, json};
@@ -176,6 +176,22 @@ mod tests {
             }),
             tracing::Level::INFO
         );
+    }
+
+    #[test]
+    fn workspace_registry_prep_is_disabled_for_remote_bubblewrap_sessions() {
+        assert!(!workspace_registry_prep_required(
+            crate::config::SandboxMode::Bubblewrap,
+            true
+        ));
+        assert!(workspace_registry_prep_required(
+            crate::config::SandboxMode::Bubblewrap,
+            false
+        ));
+        assert!(!workspace_registry_prep_required(
+            crate::config::SandboxMode::Subprocess,
+            false
+        ));
     }
 }
 
@@ -1895,6 +1911,13 @@ pub(super) fn workspace_visible_in_list(
 
 pub(super) fn tool_phase_timeout_grace_seconds() -> f64 {
     15.0
+}
+
+pub(super) fn workspace_registry_prep_required(
+    sandbox_mode: crate::config::SandboxMode,
+    remote_execution_active: bool,
+) -> bool {
+    matches!(sandbox_mode, crate::config::SandboxMode::Bubblewrap) && !remote_execution_active
 }
 
 pub(super) fn log_turn_usage(

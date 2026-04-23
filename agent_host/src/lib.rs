@@ -18,6 +18,7 @@ pub mod remote_execution;
 pub mod sandbox;
 pub mod server;
 pub mod session;
+pub mod session_protocol;
 pub mod sink;
 pub mod snapshot;
 pub mod subagent;

@@ -202,6 +202,20 @@ impl AgentRuntimeView {
             .join("runtime")
             .join(&session.workspace_id))
     }
+
+    pub(super) fn workspace_summary_for_session(
+        &self,
+        session: &SessionSnapshot,
+    ) -> Result<String> {
+        if self.remote_execution_context(&session.address)?.is_some() {
+            return Ok(String::new());
+        }
+        Ok(self
+            .workspace_manager
+            .ensure_workspace_exists(&session.workspace_id)
+            .map(|workspace| workspace.summary)
+            .unwrap_or_default())
+    }
 }
 
 impl Server {
@@ -254,6 +268,20 @@ impl Server {
             workspace_root,
             storage_root,
         }))
+    }
+
+    pub(super) fn workspace_summary_for_session(
+        &self,
+        session: &SessionSnapshot,
+    ) -> Result<String> {
+        if self.remote_execution_context(&session.address)?.is_some() {
+            return Ok(String::new());
+        }
+        Ok(self
+            .workspace_manager
+            .ensure_workspace_exists(&session.workspace_id)
+            .map(|workspace| workspace.summary)
+            .unwrap_or_default())
     }
 
     fn ensure_execution_root_for_binding(

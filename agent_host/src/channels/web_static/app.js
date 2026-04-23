@@ -2,8 +2,10 @@
 (function () {
   'use strict';
 
+  const SERVER_KEY = 'clawparty_server_base';
   const AUTH_KEY = 'clawparty_auth_token';
   const CONVERSATION_KEY = 'clawparty_conversation_key';
+  const WORKSPACE_DRAFT_KEY = 'clawparty_workspace_draft';
   const PAGE_SIZE = 30;
 
   const messagesEl = document.getElementById('messages');
@@ -12,16 +14,46 @@
   const statusEl = document.getElementById('connection-status');
   const conversationListEl = document.getElementById('conversation-list');
   const conversationTitleEl = document.getElementById('conversation-title');
+  const conversationSubtitleEl = document.getElementById('conversation-subtitle');
+  const heroConversationEl = document.getElementById('hero-conversation');
+  const heroEl = document.getElementById('hero');
+  const mainEl = document.getElementById('main');
   const newConversationBtn = document.getElementById('new-conversation-btn');
   const refreshEl = document.getElementById('refresh-btn');
+  const applyWorkspaceBtn = document.getElementById('apply-workspace-btn');
+  const settingsBtn = document.getElementById('settings-btn');
+  const sidebarSettingsBtn = document.getElementById('sidebar-settings-btn');
+  const heroConfigureBtn = document.getElementById('hero-configure-btn');
+  const heroRefreshBtn = document.getElementById('hero-refresh-btn');
+  const workspacePillEl = document.getElementById('workspace-pill');
+  const serverPillEl = document.getElementById('server-pill');
+  const settingsBackdropEl = document.getElementById('settings-backdrop');
+  const settingsDrawerEl = document.getElementById('settings-drawer');
+  const closeSettingsBtn = document.getElementById('close-settings-btn');
+  const serverUrlInputEl = document.getElementById('server-url-input');
+  const authTokenInputEl = document.getElementById('auth-token-input');
+  const workspaceKindInputEl = document.getElementById('workspace-kind-input');
+  const localPathFieldEl = document.getElementById('local-path-field');
+  const sshHostFieldEl = document.getElementById('ssh-host-field');
+  const sshPathFieldEl = document.getElementById('ssh-path-field');
+  const workspaceLocalPathInputEl = document.getElementById('workspace-local-path-input');
+  const workspaceSshHostInputEl = document.getElementById('workspace-ssh-host-input');
+  const workspaceSshPathInputEl = document.getElementById('workspace-ssh-path-input');
+  const saveServerSettingsBtn = document.getElementById('save-server-settings-btn');
+  const saveWorkspaceDraftBtn = document.getElementById('save-workspace-draft-btn');
+  const bindWorkspaceBtn = document.getElementById('bind-workspace-btn');
+  const currentConversationSummaryEl = document.getElementById('current-conversation-summary');
 
   let ws = null;
+  let reconnectTimer = null;
+  let serverBase = normalizeServerBase(localStorage.getItem(SERVER_KEY) || defaultServerBase());
   let token = localStorage.getItem(AUTH_KEY) || '';
   let currentConversation = (
-    new URLSearchParams(location.search).get('conversation') ||
+    new URLSearchParams(window.location.search).get('conversation') ||
     localStorage.getItem(CONVERSATION_KEY) ||
-    'web-default'
+    ''
   );
+  let currentConversationSummary = null;
   let transcriptOffset = 0;
   let hasMoreTranscript = true;
   let loadMoreEl = null;
@@ -31,92 +63,344 @@
   let composingInput = false;
   const renderedSeqs = new Set();
 
-  function ensureToken(force) {
-    if (force) {
-      token = '';
+  function defaultServerBase() {
+    if (window.location.protocol === 'file:') {
+      return 'http://127.0.0.1:8080';
+    }
+    return window.location.origin;
+  }
+
+  function normalizeServerBase(raw) {
+    const value = String(raw || '').trim();
+    if (!value) return defaultServerBase();
+    try {
+      const url = new URL(value, window.location.origin);
+      if (url.protocol === 'file:') {
+        return defaultServerBase();
+      }
+      return url.href.replace(/\/+$/, '');
+    } catch (e) {
+      return defaultServerBase();
+    }
+  }
+
+  function saveServerSettings() {
+    serverBase = normalizeServerBase(serverUrlInputEl.value);
+    token = authTokenInputEl.value.trim();
+    persistServerSettingsDraft();
+    updateServerPill();
+  }
+
+  function persistServerSettingsDraft() {
+    const draftServerBase = normalizeServerBase(serverUrlInputEl.value);
+    const draftToken = authTokenInputEl.value.trim();
+    localStorage.setItem(SERVER_KEY, draftServerBase);
+    if (draftToken) {
+      localStorage.setItem(AUTH_KEY, draftToken);
+    } else {
       localStorage.removeItem(AUTH_KEY);
     }
-    if (!token) {
-      token = prompt('Enter auth token (or leave empty for open channels):') || '';
-      if (token) localStorage.setItem(AUTH_KEY, token);
+  }
+
+  function saveWorkspaceDraft() {
+    const draft = {
+      kind: workspaceKindInputEl.value === 'ssh' ? 'ssh' : 'local',
+      localPath: workspaceLocalPathInputEl.value.trim(),
+      sshHost: workspaceSshHostInputEl.value.trim(),
+      sshPath: workspaceSshPathInputEl.value.trim(),
+    };
+    localStorage.setItem(WORKSPACE_DRAFT_KEY, JSON.stringify(draft));
+    updateWorkspaceFieldVisibility();
+    updateWorkspacePill();
+  }
+
+  function loadWorkspaceDraft() {
+    try {
+      const draft = JSON.parse(localStorage.getItem(WORKSPACE_DRAFT_KEY) || '{}');
+      workspaceKindInputEl.value = draft.kind === 'ssh' ? 'ssh' : 'local';
+      workspaceLocalPathInputEl.value = draft.localPath || '';
+      workspaceSshHostInputEl.value = draft.sshHost || '';
+      workspaceSshPathInputEl.value = draft.sshPath || '';
+    } catch (e) {
+      workspaceKindInputEl.value = 'local';
+      workspaceLocalPathInputEl.value = '';
+      workspaceSshHostInputEl.value = '';
+      workspaceSshPathInputEl.value = '';
     }
-    return token;
+    updateWorkspaceFieldVisibility();
   }
 
-  function authHeaders() {
-    const h = { 'Content-Type': 'application/json' };
-    if (token) h.Authorization = 'Bearer ' + token;
-    return h;
-  }
-
-  async function apiGet(path, retried) {
-    const resp = await fetch(path, { headers: authHeaders() });
-    if (resp.status === 401 && !retried) {
-      ensureToken(true);
-      reconnectWS();
-      return apiGet(path, true);
+  function applyRemoteExecutionToInputs(remoteExecution) {
+    if (!remoteExecution || !remoteExecution.kind) return;
+    if (remoteExecution.kind === 'ssh') {
+      workspaceKindInputEl.value = 'ssh';
+      workspaceLocalPathInputEl.value = '';
+      workspaceSshHostInputEl.value = remoteExecution.host || '';
+      workspaceSshPathInputEl.value = remoteExecution.path || '';
+    } else {
+      workspaceKindInputEl.value = 'local';
+      workspaceLocalPathInputEl.value = remoteExecution.path || '';
+      workspaceSshHostInputEl.value = '';
+      workspaceSshPathInputEl.value = '';
     }
-    if (!resp.ok) throw new Error(resp.status + ' ' + (await resp.text()));
-    return resp.json();
+    updateWorkspaceFieldVisibility();
   }
 
-  async function apiPost(path, body, retried) {
-    const resp = await fetch(path, {
-      method: 'POST',
-      headers: authHeaders(),
-      body: JSON.stringify(body),
+  function updateWorkspaceFieldVisibility() {
+    const useSsh = workspaceKindInputEl.value === 'ssh';
+    localPathFieldEl.hidden = useSsh;
+    sshHostFieldEl.hidden = !useSsh;
+    sshPathFieldEl.hidden = !useSsh;
+  }
+
+  function draftWorkspaceLabel() {
+    if (workspaceKindInputEl.value === 'ssh') {
+      const host = workspaceSshHostInputEl.value.trim();
+      const path = workspaceSshPathInputEl.value.trim();
+      return host && path ? host + ' ' + path : 'Draft not ready';
+    }
+    const path = workspaceLocalPathInputEl.value.trim();
+    return path || 'Draft not ready';
+  }
+
+  function conversationWorkspaceLabel(conversation) {
+    return (conversation && conversation.remote_execution_label) || null;
+  }
+
+  function updateWorkspacePill() {
+    const label = conversationWorkspaceLabel(currentConversationSummary) || draftWorkspaceLabel();
+    workspacePillEl.textContent = label || 'Not bound';
+    workspacePillEl.classList.toggle('muted', !conversationWorkspaceLabel(currentConversationSummary));
+  }
+
+  function updateServerPill() {
+    serverPillEl.textContent = serverBase.replace(/^https?:\/\//, '').replace(/^wss?:\/\//, '');
+  }
+
+  function updateConversationHeader() {
+    const fallback = currentConversation || 'Untitled conversation';
+    conversationTitleEl.textContent = fallback;
+    heroConversationEl.textContent = fallback;
+    if (currentConversationSummary && currentConversationSummary.remote_execution_label) {
+      conversationSubtitleEl.textContent =
+        'Execution root: ' + currentConversationSummary.remote_execution_label;
+    } else {
+      conversationSubtitleEl.textContent =
+        'Configure a remote execution root before sending the first message';
+    }
+    updateCurrentConversationCard();
+    updateWorkspacePill();
+  }
+
+  function updateCurrentConversationCard() {
+    if (!currentConversation) {
+      currentConversationSummaryEl.textContent = 'No conversation selected.';
+      return;
+    }
+    if (!currentConversationSummary) {
+      currentConversationSummaryEl.textContent =
+        'This conversation has not been created on the server yet. Bind a workspace to create it.';
+      return;
+    }
+    const lines = [
+      'Conversation: ' + currentConversationSummary.conversation_key,
+      'Messages: ' + currentConversationSummary.entry_count,
+      'Workspace: ' + (currentConversationSummary.remote_execution_label || 'Not bound'),
+    ];
+    if (currentConversationSummary.latest_summary) {
+      lines.push('Latest: ' + currentConversationSummary.latest_summary);
+    }
+    currentConversationSummaryEl.textContent = lines.join('\n');
+  }
+
+  function updateHeroState() {
+    const hasRenderableMessages = Array.from(messagesEl.children).some(function (node) {
+      return node !== loadMoreEl;
     });
-    if (resp.status === 401 && !retried) {
-      ensureToken(true);
-      reconnectWS();
-      return apiPost(path, body, true);
-    }
-    return resp;
-  }
-
-  async function apiDelete(path, body, retried) {
-    const resp = await fetch(path, {
-      method: 'DELETE',
-      headers: authHeaders(),
-      body: JSON.stringify(body),
-    });
-    if (resp.status === 401 && !retried) {
-      ensureToken(true);
-      reconnectWS();
-      return apiDelete(path, body, true);
-    }
-    return resp;
+    heroEl.hidden = hasRenderableMessages;
   }
 
   function setConversation(key) {
-    currentConversation = key || 'web-default';
+    currentConversation = key;
+    currentConversationSummary = null;
     localStorage.setItem(CONVERSATION_KEY, currentConversation);
-    const url = new URL(location.href);
+    const url = new URL(window.location.href);
     url.searchParams.set('conversation', currentConversation);
-    history.replaceState(null, '', url);
-    updateConversationTitle();
+    window.history.replaceState(null, '', url);
+    updateConversationHeader();
     renderConversationList(conversationCache);
   }
 
-  async function loadConversations() {
-    if (!conversationListEl) return;
-    try {
-      conversationCache = await apiGet('/api/conversations');
-      if (!conversationCache.some(function (item) { return item.conversation_key === currentConversation; })) {
-        conversationCache.unshift({
-          conversation_key: currentConversation,
-          entry_count: 0,
-          latest_summary: 'No messages yet',
-        });
-      }
-      renderConversationList(conversationCache);
-    } catch (e) {
-      appendEvent('Conversation list failed: ' + e.message);
+  function generateConversationKey() {
+    return 'web-' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-4);
+  }
+
+  function openSettings() {
+    settingsBackdropEl.hidden = false;
+    settingsDrawerEl.hidden = false;
+  }
+
+  function closeSettings() {
+    settingsBackdropEl.hidden = true;
+    settingsDrawerEl.hidden = true;
+  }
+
+  function authHeaders() {
+    const headers = { 'Content-Type': 'application/json' };
+    if (token) headers.Authorization = 'Bearer ' + token;
+    return headers;
+  }
+
+  function apiUrl(path, params) {
+    const url = new URL(path, serverBase + '/');
+    if (params) {
+      Object.keys(params).forEach(function (key) {
+        const value = params[key];
+        if (value != null && value !== '') url.searchParams.set(key, value);
+      });
     }
+    return url;
+  }
+
+  function wsUrl() {
+    const http = new URL('/ws', serverBase + '/');
+    http.protocol = http.protocol === 'https:' ? 'wss:' : 'ws:';
+    if (token) http.searchParams.set('token', token);
+    return http.toString();
+  }
+
+  async function parseError(resp) {
+    const text = (await resp.text()).trim();
+    return text || (resp.status + ' ' + resp.statusText);
+  }
+
+  async function apiRequest(method, path, body, params) {
+    const resp = await fetch(apiUrl(path, params), {
+      method: method,
+      headers: authHeaders(),
+      body: body == null ? undefined : JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      throw new Error(await parseError(resp));
+    }
+    if (resp.status === 204) return null;
+    return resp.json();
+  }
+
+  function apiGet(path, params) {
+    return apiRequest('GET', path, null, params);
+  }
+
+  function apiPost(path, body) {
+    return apiRequest('POST', path, body);
+  }
+
+  function apiPut(path, body) {
+    return apiRequest('PUT', path, body);
+  }
+
+  function apiDelete(path, body) {
+    return apiRequest('DELETE', path, body);
+  }
+
+  function normalizeConversationList(conversations) {
+    const items = (conversations || []).slice();
+    if (currentConversation && !items.some(function (item) { return item.conversation_key === currentConversation; })) {
+      items.unshift({
+        conversation_key: currentConversation,
+        entry_count: 0,
+        latest_summary: 'Bind a workspace to create this conversation',
+        remote_execution: null,
+        remote_execution_label: null,
+      });
+    }
+    return items;
+  }
+
+  async function loadConversations() {
+    conversationCache = normalizeConversationList(await apiGet('/api/conversations'));
+    if (!currentConversation) {
+      currentConversation = conversationCache[0]
+        ? conversationCache[0].conversation_key
+        : generateConversationKey();
+      localStorage.setItem(CONVERSATION_KEY, currentConversation);
+    }
+    renderConversationList(conversationCache);
+    updateConversationHeader();
+  }
+
+  async function loadConversationState() {
+    if (!currentConversation) return null;
+    try {
+      currentConversationSummary = await apiGet('/api/conversation', {
+        conversation_key: currentConversation,
+      });
+      if (currentConversationSummary && currentConversationSummary.remote_execution) {
+        applyRemoteExecutionToInputs(currentConversationSummary.remote_execution);
+        saveWorkspaceDraft();
+      }
+    } catch (error) {
+      if (String(error.message).indexOf('404') !== -1 || String(error.message).indexOf('Not Found') !== -1) {
+        currentConversationSummary = null;
+      } else {
+        throw error;
+      }
+    }
+    updateConversationHeader();
+    return currentConversationSummary;
+  }
+
+  function serializeWorkspaceDraft() {
+    saveWorkspaceDraft();
+    if (workspaceKindInputEl.value === 'ssh') {
+      const host = workspaceSshHostInputEl.value.trim();
+      const path = workspaceSshPathInputEl.value.trim();
+      if (!host || !path) {
+        throw new Error('SSH workspace requires both host and remote path');
+      }
+      return { kind: 'ssh', host: host, path: path };
+    }
+    const path = workspaceLocalPathInputEl.value.trim();
+    if (!path) {
+      throw new Error('Local workspace requires an absolute path');
+    }
+    return { kind: 'local', path: path };
+  }
+
+  async function bindCurrentConversation(forceUpdate) {
+    if (!currentConversation) {
+      setConversation(generateConversationKey());
+    }
+    const remoteExecution = serializeWorkspaceDraft();
+    const body = {
+      conversation_key: currentConversation,
+      remote_execution: remoteExecution,
+    };
+    currentConversationSummary = forceUpdate || currentConversationSummary
+      ? await apiPut('/api/conversation', body)
+      : await apiPost('/api/conversation', body);
+    conversationCache = normalizeConversationList(
+      [currentConversationSummary].concat(
+        conversationCache.filter(function (item) {
+          return item.conversation_key !== currentConversationSummary.conversation_key;
+        })
+      )
+    );
+    renderConversationList(conversationCache);
+    updateConversationHeader();
+    return currentConversationSummary;
+  }
+
+  async function ensureConversationConfigured() {
+    await loadConversationState();
+    if (currentConversationSummary && currentConversationSummary.remote_execution) {
+      return currentConversationSummary;
+    }
+    openSettings();
+    return bindCurrentConversation(Boolean(currentConversationSummary));
   }
 
   function renderConversationList(conversations) {
-    if (!conversationListEl) return;
     conversationListEl.textContent = '';
     conversations.forEach(function (conversation) {
       const key = conversation.conversation_key;
@@ -136,9 +420,14 @@
       name.textContent = key;
       button.appendChild(name);
 
+      const root = document.createElement('div');
+      root.className = 'conversation-root';
+      root.textContent = conversation.remote_execution_label || 'Remote workspace not bound';
+      button.appendChild(root);
+
       const summary = document.createElement('div');
       summary.className = 'conversation-summary';
-      summary.textContent = conversation.latest_summary || 'No messages yet';
+      summary.textContent = conversation.latest_summary || 'No transcript yet';
       button.appendChild(summary);
 
       const del = document.createElement('button');
@@ -155,79 +444,46 @@
       row.appendChild(del);
       conversationListEl.appendChild(row);
     });
-    updateConversationTitle();
   }
 
-  function updateConversationTitle() {
-    if (conversationTitleEl) conversationTitleEl.textContent = currentConversation;
-  }
-
-  function switchConversation(key) {
+  async function switchConversation(key) {
     if (!key || key === currentConversation) return;
     setConversation(key);
     resetTranscript();
-    loadTranscriptPage('latest');
+    await loadConversationState();
+    await loadTranscriptPage('latest');
   }
 
   async function createConversation() {
-    try {
-      const resp = await apiPost('/api/conversation', {});
-      if (!resp.ok) {
-        appendEvent('Create conversation failed: ' + resp.status + ' ' + (await resp.text()));
-        return;
-      }
-      const conversation = await resp.json();
-      conversationCache = [conversation].concat(
-        conversationCache.filter(function (item) {
-          return item.conversation_key !== conversation.conversation_key;
-        })
-      );
-      setConversation(conversation.conversation_key);
-      resetTranscript();
-      renderConversationList(conversationCache);
-      await loadConversations();
-      await loadTranscriptPage('latest');
-      inputEl.focus();
-    } catch (e) {
-      appendEvent('Create conversation failed: ' + e.message);
-    }
+    setConversation(generateConversationKey());
+    resetTranscript();
+    updateHeroState();
+    openSettings();
+    inputEl.focus();
   }
 
   async function deleteConversation(key) {
     if (!key) return;
-    if (!confirm('Delete conversation "' + key + '"?')) return;
-    try {
-      const resp = await apiDelete('/api/conversation', { conversation_key: key });
-      if (!resp.ok) {
-        appendEvent('Delete conversation failed: ' + resp.status + ' ' + (await resp.text()));
-        return;
-      }
-      const wasCurrent = key === currentConversation;
-      conversationCache = conversationCache.filter(function (item) {
-        return item.conversation_key !== key;
-      });
-      await loadConversations();
-      if (!wasCurrent) {
-        renderConversationList(conversationCache);
-        return;
-      }
-      const next = conversationCache.find(function (item) {
-        return item.conversation_key !== key;
-      });
-      if (next) {
-        setConversation(next.conversation_key);
-        resetTranscript();
-        await loadTranscriptPage('latest');
-      } else {
-        resetTranscript();
-        await createConversation();
-      }
-    } catch (e) {
-      appendEvent('Delete conversation failed: ' + e.message);
+    if (!window.confirm('Delete conversation "' + key + '"?')) return;
+    await apiDelete('/api/conversation', { conversation_key: key });
+    const wasCurrent = key === currentConversation;
+    conversationCache = conversationCache.filter(function (item) {
+      return item.conversation_key !== key;
+    });
+    if (!wasCurrent) {
+      renderConversationList(conversationCache);
+      return;
+    }
+    const next = conversationCache[0];
+    if (next) {
+      await switchConversation(next.conversation_key);
+    } else {
+      await createConversation();
     }
   }
 
   function appendMessage(role, text, meta, options, attachments) {
+    const shouldStick = autoStickToBottom || isNearBottom(160);
     const div = document.createElement('div');
     div.className = 'msg ' + role;
     if (meta) {
@@ -242,7 +498,8 @@
     appendAttachments(div, attachments || []);
     appendOptions(div, options);
     messagesEl.appendChild(div);
-    scrollToBottom();
+    updateHeroState();
+    if (shouldStick) scrollToBottom();
     return div;
   }
 
@@ -603,7 +860,7 @@
 
   function safeHref(raw) {
     try {
-      const url = new URL(raw, location.href);
+      const url = new URL(raw, window.location.href);
       if (url.protocol === 'http:' || url.protocol === 'https:' || url.protocol === 'mailto:') {
         return url.href;
       }
@@ -656,13 +913,13 @@
   }
 
   function attachmentUrl(source, path) {
-    const params = new URLSearchParams({
+    const url = apiUrl('/api/attachment', {
       conversation_key: currentConversation,
       source: source,
       path: path,
     });
-    if (token) params.set('token', token);
-    return '/api/attachment?' + params.toString();
+    if (token) url.searchParams.set('token', token);
+    return url.toString();
   }
 
   function guessAttachmentKind(path) {
@@ -675,20 +932,17 @@
 
   async function sendMessage(text) {
     try {
-      const resp = await apiPost('/api/send', {
+      await ensureConversationConfigured();
+      await apiPost('/api/send', {
         text: text,
         conversation_key: currentConversation,
       });
-      if (!resp.ok) {
-        appendEvent('Send failed: ' + resp.status + ' ' + (await resp.text()));
-      } else {
-        loadConversations();
-        setTimeout(function () {
-          loadTranscriptPage('latest');
-        }, 250);
-      }
+      await loadConversations();
+      window.setTimeout(function () {
+        loadTranscriptPage('latest');
+      }, 250);
     } catch (e) {
-      appendEvent('Network error: ' + e.message);
+      appendEvent('Send failed: ' + e.message);
     }
   }
 
@@ -706,22 +960,23 @@
       loadTranscriptPage('older');
     });
     messagesEl.appendChild(loadMoreEl);
+    updateHeroState();
   }
 
   async function loadTranscriptPage(mode) {
+    if (!currentConversation) return;
     if (mode === 'older' && !hasMoreTranscript) return;
     if (mode === 'older' && loadingOlder) return;
     if (mode === 'older') loadingOlder = true;
     const previousHeight = messagesEl.scrollHeight;
     const previousTop = messagesEl.scrollTop;
     const offset = mode === 'older' ? transcriptOffset : 0;
-    const params = new URLSearchParams({
-      conversation_key: currentConversation,
-      offset: String(offset),
-      limit: String(PAGE_SIZE),
-    });
     try {
-      const newestFirst = await apiGet('/api/transcript?' + params.toString());
+      const newestFirst = await apiGet('/api/transcript', {
+        conversation_key: currentConversation,
+        offset: String(offset),
+        limit: String(PAGE_SIZE),
+      });
       const chronological = newestFirst.slice().reverse();
       const entriesToRender = mode === 'older' ? chronological.slice().reverse() : chronological;
       entriesToRender.forEach(function (entry) {
@@ -731,6 +986,7 @@
       if (mode !== 'older') transcriptOffset = Math.max(transcriptOffset, newestFirst.length);
       hasMoreTranscript = newestFirst.length === PAGE_SIZE;
       updateLoadMore();
+      updateHeroState();
       if (mode === 'older') {
         messagesEl.scrollTop = previousTop + (messagesEl.scrollHeight - previousHeight);
       } else {
@@ -769,6 +1025,7 @@
     }
     element.dataset.seq = String(entry.seq);
     insertTranscriptElement(element, mode);
+    updateHeroState();
   }
 
   function buildMessageElement(role, text, meta, options) {
@@ -1011,13 +1268,13 @@
       messagesEl.scrollTop = messagesEl.scrollHeight;
     };
     apply();
-    requestAnimationFrame(function () {
+    window.requestAnimationFrame(function () {
       apply();
-      requestAnimationFrame(apply);
+      window.requestAnimationFrame(apply);
     });
-    setTimeout(apply, 80);
-    setTimeout(apply, 250);
-    setTimeout(apply, 700);
+    window.setTimeout(apply, 80);
+    window.setTimeout(apply, 250);
+    window.setTimeout(apply, 700);
   }
 
   function isNearBottom(padding) {
@@ -1025,9 +1282,35 @@
     return remaining <= (padding || 0);
   }
 
+  function nearestNestedScrollable(target) {
+    let node = target instanceof Element ? target : null;
+    while (node && node !== messagesEl) {
+      const style = window.getComputedStyle(node);
+      const overflowY = style.overflowY;
+      if (
+        (overflowY === 'auto' || overflowY === 'scroll') &&
+        node.scrollHeight > node.clientHeight + 1
+      ) {
+        return node;
+      }
+      node = node.parentElement;
+    }
+    return null;
+  }
+
+  function canScrollForWheel(element, deltaY) {
+    if (!element || deltaY === 0) return false;
+    if (deltaY < 0) return element.scrollTop > 0;
+    const max = element.scrollHeight - element.clientHeight;
+    return element.scrollTop < max - 1;
+  }
+
   function connectWS() {
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    ws = new WebSocket(proto + '//' + location.host + '/ws');
+    if (reconnectTimer) {
+      window.clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    ws = new window.WebSocket(wsUrl());
 
     ws.onopen = function () {
       statusEl.className = 'connected';
@@ -1037,7 +1320,7 @@
     ws.onclose = function () {
       statusEl.className = 'disconnected';
       statusEl.title = 'Disconnected';
-      setTimeout(connectWS, 3000);
+      reconnectTimer = window.setTimeout(connectWS, 3000);
     };
     ws.onerror = function () {
       ws.close();
@@ -1046,7 +1329,7 @@
       try {
         handleEvent(JSON.parse(evt.data));
       } catch (e) {
-        console.warn('bad ws message', evt.data);
+        window.console.warn('bad ws message', evt.data);
       }
     };
   }
@@ -1075,8 +1358,11 @@
       case 'transcript_append':
         if (isUserTellModelCall(data.entry) || isHiddenUserTellResult(data.entry)) break;
         if (isAssistantModelCall(data.entry)) break;
-        renderSkeleton(data.entry, 'append');
-        scrollToBottom();
+        {
+          const shouldStick = autoStickToBottom || isNearBottom(160);
+          renderSkeleton(data.entry, 'append');
+          if (shouldStick) scrollToBottom();
+        }
         break;
       case 'transcript_detail':
         renderTranscriptDetail(data.entries || []);
@@ -1086,6 +1372,9 @@
         break;
       case 'processing':
         if (data.state === 'typing') appendEvent('Processing...');
+        break;
+      case 'progress':
+        if (data.text) appendEvent(data.text);
         break;
       case 'media_group':
         appendEvent('Media group (' + data.count + ' items)');
@@ -1119,32 +1408,109 @@
     composingInput = false;
   });
 
-  if (newConversationBtn) {
-    newConversationBtn.addEventListener('click', function () {
-      createConversation();
-    });
-  }
-
-  if (refreshEl) {
-    refreshEl.addEventListener('click', function () {
-      loadTranscriptPage('latest');
-    });
-  }
-
   messagesEl.addEventListener('scroll', function () {
-    if (!loadingOlder) {
-      autoStickToBottom = isNearBottom(160);
-    }
-    if (messagesEl.scrollTop <= 24) {
+    autoStickToBottom = isNearBottom(160);
+    if (messagesEl.scrollTop < 20) {
       loadTranscriptPage('older');
     }
   });
 
-  ensureToken();
-  setConversation(currentConversation);
-  resetTranscript();
-  loadConversations().then(function () {
-    return loadTranscriptPage('latest');
+  mainEl.addEventListener('wheel', function (event) {
+    if (event.deltaY === 0) return;
+    if (event.target instanceof Element && event.target.closest('#input')) return;
+    const nested = nearestNestedScrollable(event.target);
+    if (nested && canScrollForWheel(nested, event.deltaY)) return;
+    if (messagesEl.scrollHeight <= messagesEl.clientHeight + 1) return;
+    const max = Math.max(0, messagesEl.scrollHeight - messagesEl.clientHeight);
+    const next = Math.max(0, Math.min(max, messagesEl.scrollTop + event.deltaY));
+    if (next === messagesEl.scrollTop) return;
+    event.preventDefault();
+    messagesEl.scrollTop = next;
+    autoStickToBottom = isNearBottom(160);
+    if (messagesEl.scrollTop < 20) {
+      loadTranscriptPage('older');
+    }
+  }, { passive: false });
+
+  newConversationBtn.addEventListener('click', createConversation);
+  refreshEl.addEventListener('click', function () {
+    loadConversations().then(loadConversationState).then(function () {
+      resetTranscript();
+      return loadTranscriptPage('latest');
+    }).catch(function (error) {
+      appendEvent('Refresh failed: ' + error.message);
+    });
   });
-  connectWS();
+  applyWorkspaceBtn.addEventListener('click', function () {
+    bindCurrentConversation(Boolean(currentConversationSummary))
+      .then(loadConversations)
+      .then(loadConversationState)
+      .catch(function (error) {
+        appendEvent('Workspace update failed: ' + error.message);
+        openSettings();
+      });
+  });
+  settingsBtn.addEventListener('click', openSettings);
+  sidebarSettingsBtn.addEventListener('click', openSettings);
+  heroConfigureBtn.addEventListener('click', openSettings);
+  heroRefreshBtn.addEventListener('click', function () {
+    loadTranscriptPage('latest');
+  });
+  closeSettingsBtn.addEventListener('click', closeSettings);
+  settingsBackdropEl.addEventListener('click', closeSettings);
+  workspaceKindInputEl.addEventListener('change', updateWorkspaceFieldVisibility);
+  serverUrlInputEl.addEventListener('input', persistServerSettingsDraft);
+  authTokenInputEl.addEventListener('input', persistServerSettingsDraft);
+  saveWorkspaceDraftBtn.addEventListener('click', function () {
+    saveWorkspaceDraft();
+    updateCurrentConversationCard();
+  });
+  saveServerSettingsBtn.addEventListener('click', function () {
+    saveServerSettings();
+    closeSettings();
+    reconnectWS();
+    loadConversations().then(loadConversationState).catch(function (error) {
+      appendEvent('Server reconnect failed: ' + error.message);
+    });
+  });
+  bindWorkspaceBtn.addEventListener('click', function () {
+    bindCurrentConversation(Boolean(currentConversationSummary))
+      .then(function () {
+        closeSettings();
+        return loadConversations();
+      })
+      .then(loadConversationState)
+      .then(function () {
+        resetTranscript();
+        return loadTranscriptPage('latest');
+      })
+      .catch(function (error) {
+        appendEvent('Workspace update failed: ' + error.message);
+      });
+  });
+
+  async function bootstrap() {
+    serverUrlInputEl.value = serverBase;
+    authTokenInputEl.value = token;
+    loadWorkspaceDraft();
+    updateServerPill();
+    updateWorkspacePill();
+    if (!currentConversation) {
+      currentConversation = generateConversationKey();
+    }
+    setConversation(currentConversation);
+    resetTranscript();
+    try {
+      await loadConversations();
+      await loadConversationState();
+      await loadTranscriptPage('latest');
+    } catch (error) {
+      appendEvent('Bootstrap failed: ' + error.message);
+      openSettings();
+    }
+    connectWS();
+    updateHeroState();
+  }
+
+  bootstrap();
 })();

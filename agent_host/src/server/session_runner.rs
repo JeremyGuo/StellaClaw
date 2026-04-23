@@ -470,19 +470,17 @@ impl Server {
         }
     }
 
-    async fn claim_foreground_turn_runner_when_ready(
+    pub(super) async fn claim_foreground_turn_runner_when_ready(
         &self,
         address: &ChannelAddress,
     ) -> Result<SessionSnapshot> {
         loop {
-            let claimed = self.with_conversations_and_sessions(|conversations, sessions| {
-                let actor = conversations.ensure_foreground_actor(address, sessions)?;
-                if actor.try_claim_turn_runner()? {
-                    actor.snapshot().map(Some)
-                } else {
-                    Ok(None)
-                }
-            })?;
+            let actor = self.ensure_foreground_actor(address)?;
+            let claimed = if actor.try_claim_turn_runner()? {
+                Some(actor.snapshot()?)
+            } else {
+                None
+            };
             if let Some(session) = claimed {
                 return Ok(session);
             }
@@ -1637,14 +1635,7 @@ impl AgentRuntimeView {
         let remote_execution = conversation_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.settings.remote_execution.clone());
-        let workspace_summary = if remote_execution.is_some() {
-            String::new()
-        } else {
-            self.workspace_manager
-                .ensure_workspace_exists(&session.workspace_id)
-                .map(|workspace| workspace.summary)
-                .unwrap_or_default()
-        };
+        let workspace_summary = self.workspace_summary_for_session(session)?;
         let remote_workpaths = if remote_execution.is_some() {
             Vec::new()
         } else {

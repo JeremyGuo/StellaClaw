@@ -388,11 +388,7 @@ impl AgentRuntimeView {
             self.resolve_native_or_tool_upstream(ToolingFamily::Pdf, model_key, model);
         let (native_audio_input, audio_tool_upstream) =
             self.resolve_native_or_tool_upstream(ToolingFamily::AudioInput, model_key, model);
-        let workspace_summary = self
-            .workspace_manager
-            .ensure_workspace_exists(&session.workspace_id)
-            .map(|workspace| workspace.summary)
-            .unwrap_or_default();
+        let workspace_summary = self.workspace_summary_for_session(session)?;
         let reasoning =
             effective_reasoning_config(model, self.selected_reasoning_effort.as_deref());
         let (native_web_search, external_web_search) =
