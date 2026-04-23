@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use rand::Rng;
 use reqwest::{blocking::Client, StatusCode};
@@ -15,7 +11,10 @@ use crate::{
     },
 };
 
-use super::{OutputPersistor, Provider, ProviderError, ProviderRequest};
+use super::{
+    common::openrouter_cache_control_payload, OutputPersistor, Provider, ProviderError,
+    ProviderRequest,
+};
 
 #[derive(Debug, Default)]
 pub struct OpenRouterCompletionProvider {
@@ -71,6 +70,8 @@ impl OpenRouterCompletionProvider {
                 .iter()
                 .map(|tool| tool.openai_tool_schema())
                 .collect(),
+            reasoning: model_config.reasoning.clone(),
+            cache_control: openrouter_cache_control_payload(model_config),
         };
 
         let client = self.client_for_timeout(model_config.conn_timeout)?;
@@ -131,7 +132,7 @@ impl Provider for OpenRouterCompletionProvider {
         model_config: &ModelConfig,
         request: ProviderRequest<'_>,
     ) -> Result<ChatMessage, ProviderError> {
-        let started_at = Instant::now();
+        let mut retries_used = 0_u64;
 
         loop {
             match self.send_once(model_config, &request) {
@@ -140,11 +141,12 @@ impl Provider for OpenRouterCompletionProvider {
                     RetryMode::Once => return Err(error),
                     RetryMode::RandomInterval {
                         max_interval_secs,
-                        max_time_secs,
+                        max_retries,
                     } => {
-                        if started_at.elapsed() >= Duration::from_secs(*max_time_secs) {
+                        if retries_used >= *max_retries {
                             return Err(error);
                         }
+                        retries_used = retries_used.saturating_add(1);
 
                         let sleep_secs = if *max_interval_secs == 0 {
                             0
@@ -166,6 +168,10 @@ struct OpenRouterChatCompletionRequest {
     messages: Vec<OpenRouterRequestMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cache_control: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -484,6 +490,8 @@ fn convert_openrouter_response(
 
     Ok(ChatMessage {
         role: ChatRole::Assistant,
+        user_name: None,
+        message_time: None,
         token_usage,
         data,
     })
@@ -509,6 +517,7 @@ mod tests {
             cache_timeout: 300,
             conn_timeout: 5,
             retry_mode: RetryMode::Once,
+            reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,
             multimodal_estimator: None,
             multimodal_input: None,
@@ -604,6 +613,62 @@ mod tests {
             value["content"][1]["image_url"]["url"],
             "https://example.com/cat.png"
         );
+    }
+
+    #[test]
+    fn anthropic_openrouter_request_adds_cache_control() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/api/v1/chat/completions")
+            .match_header("authorization", "Bearer test-key")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "model": "anthropic/claude-sonnet-4.5",
+                "cache_control": {
+                    "type": "ephemeral"
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "id": "gen_cache",
+                    "model": "anthropic/claude-sonnet-4.5",
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": "cached",
+                                "tool_calls": []
+                            }
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 12,
+                        "completion_tokens": 7
+                    }
+                }"#,
+            )
+            .create();
+
+        std::env::set_var("OPENROUTER_API_KEY_TEST", "test-key");
+
+        let provider = OpenRouterCompletionProvider::new();
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "hello".to_string(),
+            })],
+        )];
+        let mut model_config =
+            test_model_config(format!("{}/api/v1/chat/completions", server.url()));
+        model_config.model_name = "anthropic/claude-sonnet-4.5".to_string();
+        model_config.cache_timeout = 300;
+
+        provider
+            .send(&model_config, ProviderRequest::new(&messages))
+            .expect("request should succeed");
+
+        mock.assert();
     }
 
     #[test]

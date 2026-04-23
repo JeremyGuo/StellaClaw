@@ -16,7 +16,8 @@ use super::{
     ToolBackend, ToolDefinition, ToolExecutionMode, ToolRemoteMode,
 };
 use crate::session_actor::tool_runtime::{
-    shell_quote, usize_arg_with_default, ExecutionTarget, LocalToolError, ToolExecutionContext,
+    clamp_tool_output_chars, shell_quote, truncate_tool_text, usize_arg_with_default,
+    ExecutionTarget, LocalToolError, ToolExecutionContext,
 };
 
 const SHELL_DEFAULT_WAIT_MS: usize = 10_000;
@@ -43,13 +44,17 @@ pub fn process_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinit
         ("input", json!({"type": "string"})),
         ("interactive", json!({"type": "boolean"})),
         ("wait_ms", json!({"type": "integer"})),
+        (
+            "max_output_chars",
+            json!({"type": "integer", "minimum": 0, "maximum": 1000}),
+        ),
     ]);
     add_remote_property(&mut shell_properties, remote_mode);
 
     vec![
         ToolDefinition::new(
             "shell",
-            "Run or continue a persistent shell session. Pass command to start the next command in a session. Pass no command to only observe or collect the current command result. Pass input to write to the current interactive command. command=\"\" is treated the same as omitting command. session_id only reuses an existing session; omit it when creating a new one. If a finished command result has not been returned yet and you start a new command in the same session, the older unreturned result is discarded. Returned stdout/stderr describe only the current process. Full stdout/stderr are saved under out_path/stdout and out_path/stderr.",
+            "Run or continue a persistent shell session. Pass command to start the next command in a session. Pass no command to only observe or collect the current command result. Pass input to write to the current interactive command. command=\"\" is treated the same as omitting command. session_id only reuses an existing session; omit it when creating a new one. If a finished command result has not been returned yet and you start a new command in the same session, the older unreturned result is discarded. Returned stdout/stderr describe only the current process and are capped by max_output_chars; full stdout/stderr are saved under out_path/stdout and out_path/stderr.",
             object_schema(shell_properties, &[]),
             ToolExecutionMode::Interruptible,
             ToolBackend::Local,
@@ -101,6 +106,7 @@ fn shell(
     wait_or_snapshot_shell(
         &session_id,
         usize_arg_with_default(arguments, "wait_ms", SHELL_DEFAULT_WAIT_MS)?,
+        clamp_tool_output_chars(usize_arg_with_default(arguments, "max_output_chars", 1000)?),
     )
 }
 
@@ -203,7 +209,11 @@ fn start_shell_command(
     Ok(())
 }
 
-fn wait_or_snapshot_shell(session_id: &str, wait_ms: usize) -> Result<Value, LocalToolError> {
+fn wait_or_snapshot_shell(
+    session_id: &str,
+    wait_ms: usize,
+    max_output_chars: usize,
+) -> Result<Value, LocalToolError> {
     let deadline = Instant::now() + Duration::from_millis(wait_ms as u64);
     loop {
         let snapshot = {
@@ -217,30 +227,75 @@ fn wait_or_snapshot_shell(session_id: &str, wait_ms: usize) -> Result<Value, Loc
                 ))
             })? {
                 Some(status) => {
-                    let stdout = read_tail(&session.stdout_path)?;
-                    let stderr = read_tail(&session.stderr_path)?;
+                    let (stdout, stdout_truncated) =
+                        read_tail_preview(&session.stdout_path, max_output_chars)?;
+                    let (stderr, stderr_truncated) =
+                        read_tail_preview(&session.stderr_path, max_output_chars)?;
                     let out_path = session.out_path.clone();
                     let command = session.command.clone();
                     sessions.remove(session_id);
-                    return Ok(json!({
-                        "session_id": session_id,
-                        "running": false,
-                        "exit_code": status.code(),
-                        "success": status.success(),
-                        "command": command,
-                        "stdout": stdout,
-                        "stderr": stderr,
-                        "out_path": out_path.display().to_string(),
-                    }));
+                    let mut result = Map::new();
+                    result.insert(
+                        "session_id".to_string(),
+                        Value::String(session_id.to_string()),
+                    );
+                    result.insert("running".to_string(), Value::Bool(false));
+                    result.insert("success".to_string(), Value::Bool(status.success()));
+                    result.insert("command".to_string(), Value::String(command));
+                    result.insert(
+                        "out_path".to_string(),
+                        Value::String(out_path.display().to_string()),
+                    );
+                    if let Some(exit_code) = status.code() {
+                        result.insert("exit_code".to_string(), Value::from(exit_code));
+                    }
+                    if !stdout.is_empty() {
+                        result.insert("stdout".to_string(), Value::String(stdout));
+                    }
+                    if !stderr.is_empty() {
+                        result.insert("stderr".to_string(), Value::String(stderr));
+                    }
+                    if stdout_truncated {
+                        result.insert("stdout_truncated".to_string(), Value::Bool(true));
+                    }
+                    if stderr_truncated {
+                        result.insert("stderr_truncated".to_string(), Value::Bool(true));
+                    }
+                    return Ok(Value::Object(result));
                 }
-                None => json!({
-                    "session_id": session_id,
-                    "running": true,
-                    "command": session.command,
-                    "stdout": read_tail(&session.stdout_path)?,
-                    "stderr": read_tail(&session.stderr_path)?,
-                    "out_path": session.out_path.display().to_string(),
-                }),
+                None => {
+                    let (stdout, stdout_truncated) =
+                        read_tail_preview(&session.stdout_path, max_output_chars)?;
+                    let (stderr, stderr_truncated) =
+                        read_tail_preview(&session.stderr_path, max_output_chars)?;
+                    let mut result = Map::new();
+                    result.insert(
+                        "session_id".to_string(),
+                        Value::String(session_id.to_string()),
+                    );
+                    result.insert("running".to_string(), Value::Bool(true));
+                    result.insert(
+                        "command".to_string(),
+                        Value::String(session.command.clone()),
+                    );
+                    result.insert(
+                        "out_path".to_string(),
+                        Value::String(session.out_path.display().to_string()),
+                    );
+                    if !stdout.is_empty() {
+                        result.insert("stdout".to_string(), Value::String(stdout));
+                    }
+                    if !stderr.is_empty() {
+                        result.insert("stderr".to_string(), Value::String(stderr));
+                    }
+                    if stdout_truncated {
+                        result.insert("stdout_truncated".to_string(), Value::Bool(true));
+                    }
+                    if stderr_truncated {
+                        result.insert("stderr_truncated".to_string(), Value::Bool(true));
+                    }
+                    Value::Object(result)
+                }
             }
         };
 
@@ -299,8 +354,13 @@ fn nonce() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
-fn read_tail(path: &Path) -> Result<String, LocalToolError> {
+fn read_tail_preview(
+    path: &Path,
+    max_output_chars: usize,
+) -> Result<(String, bool), LocalToolError> {
     let bytes = fs::read(path).unwrap_or_default();
     let start = bytes.len().saturating_sub(SHELL_OUTPUT_TAIL_BYTES);
-    Ok(String::from_utf8_lossy(&bytes[start..]).to_string())
+    let tail = String::from_utf8_lossy(&bytes[start..]).to_string();
+    let (preview, chars_truncated) = truncate_tool_text(&tail, max_output_chars);
+    Ok((preview, start > 0 || chars_truncated))
 }

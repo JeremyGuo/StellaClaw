@@ -1,7 +1,10 @@
 use base64::{engine::general_purpose, Engine as _};
 use serde_json::{Map, Value};
 
-use crate::session_actor::{FileItem, TokenUsage};
+use crate::{
+    model_config::{ModelConfig, ProviderType},
+    session_actor::{FileItem, TokenUsage},
+};
 
 pub(crate) fn is_image_file(file: &FileItem) -> bool {
     matches!(file.media_type.as_deref(), Some(media_type) if media_type.starts_with("image/"))
@@ -95,6 +98,45 @@ pub(crate) fn data_url_parts(url: &str) -> Option<(String, String)> {
     Some((media_type, data.to_string()))
 }
 
+pub(crate) fn openrouter_cache_control_payload(model_config: &ModelConfig) -> Option<Value> {
+    let ttl = automatic_anthropic_cache_ttl(model_config)?;
+    let mut object = Map::new();
+    object.insert("type".to_string(), Value::String("ephemeral".to_string()));
+    if ttl != "5m" {
+        object.insert("ttl".to_string(), Value::String(ttl));
+    }
+    Some(Value::Object(object))
+}
+
+pub(crate) fn claude_cache_control_payload(model_config: &ModelConfig) -> Option<Value> {
+    let ttl = automatic_anthropic_cache_ttl(model_config)?;
+    let mut object = Map::new();
+    object.insert("type".to_string(), Value::String("ephemeral".to_string()));
+    object.insert("ttl".to_string(), Value::String(ttl));
+    Some(Value::Object(object))
+}
+
+fn automatic_anthropic_cache_ttl(model_config: &ModelConfig) -> Option<String> {
+    if !supports_anthropic_prompt_cache(model_config) {
+        return None;
+    }
+    match model_config.cache_timeout {
+        300 => Some("5m".to_string()),
+        3600 => Some("1h".to_string()),
+        _ => None,
+    }
+}
+
+fn supports_anthropic_prompt_cache(model_config: &ModelConfig) -> bool {
+    match model_config.provider_type {
+        ProviderType::OpenRouterCompletion | ProviderType::OpenRouterResponses => {
+            model_config.model_name.starts_with("anthropic/claude-")
+        }
+        ProviderType::ClaudeCode => model_config.model_name.starts_with("claude-"),
+        ProviderType::CodexSubscription | ProviderType::BraveSearch => false,
+    }
+}
+
 pub(crate) fn nonce(prefix: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -128,6 +170,30 @@ fn first_u64(object: &Map<String, Value>, paths: &[&[&str]]) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_config::{ModelCapability, RetryMode, TokenEstimatorType};
+
+    fn test_model_config(
+        provider_type: ProviderType,
+        model_name: &str,
+        cache_timeout: u64,
+    ) -> ModelConfig {
+        ModelConfig {
+            provider_type,
+            model_name: model_name.to_string(),
+            url: "https://example.invalid".to_string(),
+            api_key_env: "TEST_API_KEY".to_string(),
+            capabilities: vec![ModelCapability::Chat],
+            token_max_context: 128_000,
+            cache_timeout,
+            conn_timeout: 30,
+            retry_mode: RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: None,
+            token_estimator_url: None,
+        }
+    }
 
     #[test]
     fn parses_codex_account_id_from_jwt() {
@@ -139,5 +205,35 @@ mod tests {
             account_id_from_access_token(&token),
             Some("acc_123".to_string())
         );
+    }
+
+    #[test]
+    fn cache_control_only_targets_anthropic_models_with_supported_ttl() {
+        let openrouter = test_model_config(
+            ProviderType::OpenRouterCompletion,
+            "anthropic/claude-sonnet-4.5",
+            300,
+        );
+        assert_eq!(
+            openrouter_cache_control_payload(&openrouter),
+            Some(serde_json::json!({"type": "ephemeral"}))
+        );
+
+        let claude = test_model_config(ProviderType::ClaudeCode, "claude-sonnet-4-5", 3600);
+        assert_eq!(
+            claude_cache_control_payload(&claude),
+            Some(serde_json::json!({"type": "ephemeral", "ttl": "1h"}))
+        );
+
+        let non_anthropic =
+            test_model_config(ProviderType::OpenRouterCompletion, "openai/gpt-4.1", 300);
+        assert!(openrouter_cache_control_payload(&non_anthropic).is_none());
+
+        let unsupported_ttl = test_model_config(
+            ProviderType::OpenRouterCompletion,
+            "anthropic/claude-sonnet-4.5",
+            600,
+        );
+        assert!(openrouter_cache_control_payload(&unsupported_ttl).is_none());
     }
 }

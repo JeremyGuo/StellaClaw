@@ -10,7 +10,7 @@ use super::{
     TokenEstimatorError, ToolResultContent,
 };
 
-pub const COMPRESSION_MARKER: &str = "[PartyClaw Context Compression]";
+pub const COMPRESSION_MARKER: &str = "[StellaClaw Context Compression]";
 
 #[derive(Debug)]
 pub struct SessionCompressor {
@@ -69,12 +69,22 @@ impl SessionCompressor {
             });
         };
 
-        let summary_message =
-            self.generate_summary_message(messages, &plan, provider, model_config)?;
-        let mut compressed_messages = vec![summary_message];
+        let summary_message = self.generate_summary_message(
+            &messages[..plan.recent_start],
+            messages.len() - plan.recent_start,
+            provider,
+            model_config,
+        )?;
+        let summary_present = summary_message.is_some();
+        let mut compressed_messages = Vec::new();
+        if let Some(summary_message) = summary_message {
+            compressed_messages.push(summary_message);
+        }
         compressed_messages.extend_from_slice(&messages[plan.recent_start..]);
         let compressed_message_count = plan.recent_start;
-        let retained_message_count = compressed_messages.len().saturating_sub(1);
+        let retained_message_count = compressed_messages
+            .len()
+            .saturating_sub(usize::from(summary_present));
 
         *messages = compressed_messages;
         messages.push(next_message);
@@ -85,6 +95,83 @@ impl SessionCompressor {
             estimated_tokens_before,
             estimated_tokens_after,
             threshold_tokens: self.threshold_tokens,
+            retained_message_count,
+            compressed_message_count,
+        })
+    }
+
+    pub fn compact_if_needed(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+        provider: &(dyn Provider + Send + Sync),
+        model_config: &ModelConfig,
+    ) -> Result<CompressionReport, CompressionError> {
+        self.compact_if_needed_with_threshold(
+            messages,
+            provider,
+            model_config,
+            self.threshold_tokens,
+        )
+    }
+
+    pub fn compact_if_needed_with_threshold(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+        provider: &(dyn Provider + Send + Sync),
+        model_config: &ModelConfig,
+        threshold_tokens: u64,
+    ) -> Result<CompressionReport, CompressionError> {
+        if threshold_tokens == 0 {
+            return Err(CompressionError::InvalidThreshold);
+        }
+        let estimated_tokens_before = self.estimator.estimate(messages)?.total_tokens;
+        if estimated_tokens_before <= threshold_tokens {
+            return Ok(CompressionReport {
+                compressed: false,
+                estimated_tokens_before,
+                estimated_tokens_after: estimated_tokens_before,
+                threshold_tokens,
+                retained_message_count: messages.len(),
+                compressed_message_count: 0,
+            });
+        }
+
+        let Some(plan) = self.plan_compression(messages)? else {
+            return Ok(CompressionReport {
+                compressed: false,
+                estimated_tokens_before,
+                estimated_tokens_after: estimated_tokens_before,
+                threshold_tokens,
+                retained_message_count: messages.len(),
+                compressed_message_count: 0,
+            });
+        };
+
+        let summary_message = self.generate_summary_message(
+            &messages[..plan.recent_start],
+            messages.len() - plan.recent_start,
+            provider,
+            model_config,
+        )?;
+        let summary_present = summary_message.is_some();
+        let mut compressed_messages = Vec::new();
+        if let Some(summary_message) = summary_message {
+            compressed_messages.push(summary_message);
+        }
+        compressed_messages.extend_from_slice(&messages[plan.recent_start..]);
+        let compressed_message_count = plan.recent_start;
+        let retained_message_count = compressed_messages
+            .len()
+            .saturating_sub(usize::from(summary_present));
+
+        *messages = compressed_messages;
+
+        let estimated_tokens_after = self.estimator.estimate(messages)?.total_tokens;
+        Ok(CompressionReport {
+            compressed: true,
+            estimated_tokens_before,
+            estimated_tokens_after,
+            threshold_tokens,
             retained_message_count,
             compressed_message_count,
         })
@@ -123,16 +210,19 @@ impl SessionCompressor {
 
     fn generate_summary_message(
         &self,
-        messages: &[ChatMessage],
-        plan: &CompressionPlan,
+        messages_to_summarize: &[ChatMessage],
+        preserved_recent_count: usize,
         provider: &(dyn Provider + Send + Sync),
         model_config: &ModelConfig,
-    ) -> Result<ChatMessage, CompressionError> {
-        let mut request_messages = sanitize_messages_for_compression_request(messages);
+    ) -> Result<Option<ChatMessage>, CompressionError> {
+        let mut request_messages = sanitize_messages_for_compression_request(messages_to_summarize);
+        if request_messages.is_empty() {
+            return Ok(None);
+        }
         request_messages.push(ChatMessage::new(
             ChatRole::User,
             vec![ChatMessageItem::Context(ContextItem {
-                text: compression_instruction(messages.len() - plan.recent_start),
+                text: compression_instruction(preserved_recent_count),
             })],
         ));
 
@@ -144,7 +234,7 @@ impl SessionCompressor {
             return Err(CompressionError::EmptySummary);
         }
 
-        Ok(ChatMessage::new(
+        Ok(Some(ChatMessage::new(
             ChatRole::Assistant,
             vec![ChatMessageItem::Context(ContextItem {
                 text: format!(
@@ -152,7 +242,7 @@ impl SessionCompressor {
                     summary_text.trim()
                 ),
             })],
-        ))
+        )))
     }
 }
 
@@ -194,7 +284,11 @@ fn recent_tail_start_by_token_budget(
     let mut start = messages.len();
     let mut total_tokens = 0_u64;
     while start > 0 {
-        let candidate_start = start - 1;
+        let candidate_start =
+            adjust_split_index_to_preserve_tool_context(messages, start.saturating_sub(1));
+        if candidate_start >= start {
+            break;
+        }
         let slice_tokens = estimator
             .estimate(&messages[candidate_start..start])?
             .total_tokens;
@@ -215,11 +309,12 @@ fn recent_tail_start_by_token_budget(
 fn sanitize_messages_for_compression_request(messages: &[ChatMessage]) -> Vec<ChatMessage> {
     messages
         .iter()
-        .map(sanitize_message_for_compression_request)
+        .filter(|message| !is_runtime_update_message(message))
+        .filter_map(sanitize_message_for_compression_request)
         .collect()
 }
 
-fn sanitize_message_for_compression_request(message: &ChatMessage) -> ChatMessage {
+fn sanitize_message_for_compression_request(message: &ChatMessage) -> Option<ChatMessage> {
     let mut data = Vec::new();
     for item in &message.data {
         match item {
@@ -253,25 +348,94 @@ fn sanitize_message_for_compression_request(message: &ChatMessage) -> ChatMessag
         }
     }
 
-    ChatMessage {
+    if data.is_empty() {
+        return None;
+    }
+
+    Some(ChatMessage {
         role: message.role.clone(),
+        user_name: message.user_name.clone(),
+        message_time: message.message_time.clone(),
         token_usage: None,
         data,
-    }
+    })
 }
 
 fn compression_instruction(preserved_recent_count: usize) -> String {
     format!(
-        "Compress the older conversation history in this same transcript.\n\n\
-Return a concise, factual summary that is useful for continuing the session.\n\n\
+        "Compress the older stable conversation history that appears above this request.\n\n\
+Return a concise, factual summary that is useful for safely continuing the session.\n\n\
 Rules:\n\
-- preserve concrete decisions, file paths, commands, errors, ids, URLs, and current next steps\n\
+- keep the summary factual, compact, and continuation-oriented\n\
+- preserve concrete decisions, file paths, commands, errors, ids, URLs, and the current next step\n\
 - redact long secrets; mention that a secret was provided without copying the full value\n\
 - do not invent details\n\
-- intermediate tool calls and tool results should be summarized by outcome, not replayed step by step\n\
+- do not restate shared context that already lives in the canonical system prompt snapshots\n\
+- ignore transient runtime update notices; they are reconstructed separately and should not be preserved in the summary\n\
+- if unfinished work still matters, preserve the continuation-critical identifier needed to resume it safely, especially shell session_id, download_id, file_download id, subagent id, plus any path, cwd, or url needed to continue\n\
+- if a task is already finished or no longer relevant, do not preserve its identifier just because it appeared earlier\n\
+- intermediate tool calls and tool results should be summarized by outcome, not replayed step by step, unless a still-needed identifier or exact reference is required to continue safely\n\
 - the most recent {preserved_recent_count} message(s) immediately before this request are preserved separately as high-fidelity context; do not summarize them unless continuity requires a short pointer\n\
+- output markdown bullet points only\n\
 - return plain text only"
     )
+}
+
+fn find_originating_tool_call_index(
+    messages: &[ChatMessage],
+    search_before: usize,
+    tool_call_id: &str,
+) -> Option<usize> {
+    messages[..search_before].iter().rposition(|message| {
+        message.data.iter().any(|item| {
+            matches!(
+                item,
+                ChatMessageItem::ToolCall(tool_call) if tool_call.tool_call_id == tool_call_id
+            )
+        })
+    })
+}
+
+fn adjust_split_index_to_preserve_tool_context(
+    messages: &[ChatMessage],
+    mut split_index: usize,
+) -> usize {
+    while split_index < messages.len() {
+        let mut earliest_origin: Option<usize> = None;
+        for item in &messages[split_index].data {
+            let ChatMessageItem::ToolResult(tool_result) = item else {
+                continue;
+            };
+            let Some(origin_index) =
+                find_originating_tool_call_index(messages, split_index, &tool_result.tool_call_id)
+            else {
+                continue;
+            };
+            earliest_origin = Some(match earliest_origin {
+                Some(current) => current.min(origin_index),
+                None => origin_index,
+            });
+        }
+
+        let Some(origin_index) = earliest_origin else {
+            break;
+        };
+        split_index = origin_index;
+    }
+    split_index
+}
+
+fn is_runtime_update_message(message: &ChatMessage) -> bool {
+    if message.role != ChatRole::User || message.data.len() != 1 {
+        return false;
+    }
+    let Some(ChatMessageItem::Context(context)) = message.data.first() else {
+        return false;
+    };
+    let text = context.text.trim_start();
+    text.starts_with("[Runtime Prompt Updates]")
+        || text.starts_with("[Runtime Skill Updates]")
+        || text.starts_with("[Incoming User Metadata]")
 }
 
 fn message_text(message: &ChatMessage) -> String {
@@ -385,6 +549,7 @@ mod tests {
             cache_timeout: 300,
             conn_timeout: 10,
             retry_mode: RetryMode::Once,
+            reasoning: None,
             token_estimator_type: TokenEstimatorType::HuggingFace,
             multimodal_estimator: None,
             multimodal_input: None,
@@ -412,7 +577,7 @@ mod tests {
         tokenizer.with_pre_tokenizer(Some(Whitespace));
 
         let directory = std::env::temp_dir().join(format!(
-            "claw-party-compressor-test-{}-{}",
+            "stellaclaw-compressor-test-{}-{}",
             std::process::id(),
             rand::random::<u64>()
         ));
@@ -485,6 +650,14 @@ mod tests {
         let requests = seen_requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert!(message_text(requests[0].last().unwrap()).contains("Compress the older"));
+        let request_body = requests[0]
+            .iter()
+            .take(requests[0].len().saturating_sub(1))
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(request_body.contains("old"));
+        assert!(!request_body.contains("recent context"));
 
         fs::remove_dir_all(directory).expect("test directory should be removed");
     }
@@ -553,5 +726,77 @@ mod tests {
                 .iter()
                 .all(|item| matches!(item, ChatMessageItem::Context(_)))
         }));
+    }
+
+    #[test]
+    fn compression_request_skips_runtime_update_messages() {
+        let messages = vec![
+            ChatMessage::new(
+                ChatRole::User,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "[Runtime Prompt Updates]\nIgnore me".to_string(),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::User,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "[Incoming User Metadata]\nSpeaker: alice".to_string(),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "real stable content".to_string(),
+                })],
+            ),
+        ];
+
+        let sanitized = sanitize_messages_for_compression_request(&messages);
+
+        assert_eq!(sanitized.len(), 1);
+        assert!(message_text(&sanitized[0]).contains("real stable content"));
+    }
+
+    #[test]
+    fn recent_tail_split_moves_before_tool_result_origin() {
+        let (estimator, _model_config, directory) = build_test_estimator();
+        let messages = vec![
+            ChatMessage::new(
+                ChatRole::User,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "old ".repeat(40),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "shell".to_string(),
+                    arguments: ContextItem {
+                        text: "{\"command\":\"echo hi\"}".to_string(),
+                    },
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::ToolResult(ToolResultItem {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "shell".to_string(),
+                    result: ToolResultContent {
+                        context: Some(ContextItem {
+                            text: "hi".to_string(),
+                        }),
+                        file: None,
+                    },
+                })],
+            ),
+        ];
+
+        let split_index =
+            recent_tail_start_by_token_budget(&messages, 4, &estimator).expect("split works");
+
+        assert_eq!(split_index, 1);
+
+        fs::remove_dir_all(directory).expect("test directory should be removed");
     }
 }

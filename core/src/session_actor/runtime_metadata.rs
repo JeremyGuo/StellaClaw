@@ -7,20 +7,26 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use super::ToolRemoteMode;
+
 pub(crate) const IDENTITY_PROMPT_COMPONENT: &str = "identity";
 pub(crate) const REMOTE_ALIASES_PROMPT_COMPONENT: &str = "ssh_remote_aliases";
 pub(crate) const SKILLS_METADATA_PROMPT_COMPONENT: &str = "skills_metadata";
+pub(crate) const STELLACLAW_MEMORY_PROMPT_COMPONENT: &str = "stellaclaw_memory";
 pub(crate) const USER_META_PROMPT_COMPONENT: &str = "user_meta";
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionRuntimeMetadata {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub identity: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_meta: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skills_metadata: Option<String>,
-    #[serde(default)]
+const USER_META_PATH: &str = ".stellaclaw/USER.md";
+const IDENTITY_PATH: &str = ".stellaclaw/IDENTITY.md";
+const STELLACLAW_MEMORY_PATH: &str = "STELLACLAW.md";
+const SKILL_ROOT: &str = ".skill";
+const SKILL_ENTRY_FILE: &str = "SKILL.md";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct WorkspaceRuntimeMetadata {
+    pub identity: String,
+    pub stellaclaw_memory: String,
+    pub user_meta: String,
+    pub skills_metadata: String,
     pub skills: Vec<SessionSkillObservation>,
 }
 
@@ -64,37 +70,41 @@ pub(crate) struct RuntimeMetadataState {
 }
 
 impl RuntimeMetadataState {
-    pub(crate) fn initialize_from(
+    pub(crate) fn initialize_from_workspace(
         &mut self,
-        metadata: Option<&SessionRuntimeMetadata>,
+        workspace_root: &Path,
         remote_aliases_prompt: String,
-    ) {
-        if let Some(metadata) = metadata {
-            initialize_component(
-                &mut self.prompt_components,
-                IDENTITY_PROMPT_COMPONENT,
-                metadata.identity.clone().unwrap_or_default(),
-            );
-            initialize_component(
-                &mut self.prompt_components,
-                USER_META_PROMPT_COMPONENT,
-                metadata.user_meta.clone().unwrap_or_default(),
-            );
-            initialize_component(
-                &mut self.prompt_components,
-                SKILLS_METADATA_PROMPT_COMPONENT,
-                metadata.skills_metadata.clone().unwrap_or_default(),
-            );
+    ) -> Result<(), String> {
+        let metadata = load_workspace_runtime_metadata(workspace_root)?;
+        initialize_component(
+            &mut self.prompt_components,
+            IDENTITY_PROMPT_COMPONENT,
+            metadata.identity,
+        );
+        initialize_component(
+            &mut self.prompt_components,
+            STELLACLAW_MEMORY_PROMPT_COMPONENT,
+            metadata.stellaclaw_memory,
+        );
+        initialize_component(
+            &mut self.prompt_components,
+            USER_META_PROMPT_COMPONENT,
+            metadata.user_meta,
+        );
+        initialize_component(
+            &mut self.prompt_components,
+            SKILLS_METADATA_PROMPT_COMPONENT,
+            metadata.skills_metadata,
+        );
 
-            for skill in &metadata.skills {
-                self.skill_states
-                    .entry(skill.name.clone())
-                    .or_insert_with(|| SessionSkillState {
-                        description: skill.description.clone(),
-                        content: skill.content.clone(),
-                        last_loaded_turn: None,
-                    });
-            }
+        for skill in metadata.skills {
+            self.skill_states
+                .entry(skill.name)
+                .or_insert_with(|| SessionSkillState {
+                    description: skill.description,
+                    content: skill.content,
+                    last_loaded_turn: None,
+                });
         }
 
         initialize_component(
@@ -102,34 +112,39 @@ impl RuntimeMetadataState {
             REMOTE_ALIASES_PROMPT_COMPONENT,
             remote_aliases_prompt,
         );
+        Ok(())
     }
 
-    pub(crate) fn observe_for_user_turn(
+    pub(crate) fn observe_for_user_turn_from_workspace(
         &mut self,
-        metadata: Option<&SessionRuntimeMetadata>,
+        workspace_root: &Path,
         remote_aliases_prompt: String,
-    ) -> Vec<String> {
+    ) -> Result<Vec<String>, String> {
+        let metadata = load_workspace_runtime_metadata(workspace_root)?;
         let mut prompt_notices = Vec::new();
-        if let Some(metadata) = metadata {
-            observe_component(
-                &mut self.prompt_components,
-                IDENTITY_PROMPT_COMPONENT,
-                metadata.identity.clone().unwrap_or_default(),
-                &mut prompt_notices,
-            );
-            observe_component(
-                &mut self.prompt_components,
-                USER_META_PROMPT_COMPONENT,
-                metadata.user_meta.clone().unwrap_or_default(),
-                &mut prompt_notices,
-            );
-            observe_component(
-                &mut self.prompt_components,
-                SKILLS_METADATA_PROMPT_COMPONENT,
-                metadata.skills_metadata.clone().unwrap_or_default(),
-                &mut prompt_notices,
-            );
-        }
+        observe_component(
+            &mut self.prompt_components,
+            IDENTITY_PROMPT_COMPONENT,
+            metadata.identity,
+            &mut prompt_notices,
+        );
+        observe_component_without_notice(
+            &mut self.prompt_components,
+            STELLACLAW_MEMORY_PROMPT_COMPONENT,
+            metadata.stellaclaw_memory,
+        );
+        observe_component(
+            &mut self.prompt_components,
+            USER_META_PROMPT_COMPONENT,
+            metadata.user_meta,
+            &mut prompt_notices,
+        );
+        observe_component(
+            &mut self.prompt_components,
+            SKILLS_METADATA_PROMPT_COMPONENT,
+            metadata.skills_metadata,
+            &mut prompt_notices,
+        );
         observe_component(
             &mut self.prompt_components,
             REMOTE_ALIASES_PROMPT_COMPONENT,
@@ -137,10 +152,7 @@ impl RuntimeMetadataState {
             &mut prompt_notices,
         );
 
-        let skill_notices = metadata
-            .map(|metadata| self.observe_skill_changes(&metadata.skills))
-            .unwrap_or_default();
-
+        let skill_notices = self.observe_skill_changes(&metadata.skills);
         let mut rendered = Vec::new();
         let prompt_text = render_prompt_component_change_notices(&prompt_notices);
         if !prompt_text.is_empty() {
@@ -150,7 +162,16 @@ impl RuntimeMetadataState {
         if !skill_text.is_empty() {
             rendered.push(skill_text);
         }
-        rendered
+        Ok(rendered)
+    }
+
+    pub(crate) fn skill_observation(&self, skill_name: &str) -> Option<SessionSkillObservation> {
+        let state = self.skill_states.get(skill_name)?;
+        Some(SessionSkillObservation {
+            name: skill_name.to_string(),
+            description: state.description.clone(),
+            content: state.content.clone(),
+        })
     }
 
     pub(crate) fn mark_loaded_skills(&mut self, skill_names: &[String], turn_number: u64) {
@@ -172,11 +193,25 @@ impl RuntimeMetadataState {
         }
     }
 
+    pub(crate) fn snapshot_value(&self, key: &str) -> Option<&str> {
+        let value = self.prompt_components.get(key)?.system_prompt_value.trim();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
     fn observe_skill_changes(
         &mut self,
         observed_skills: &[SessionSkillObservation],
     ) -> Vec<SkillChangeNotice> {
         let mut notices = Vec::new();
+        let observed_names = observed_skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect::<BTreeSet<_>>();
+
         for observed in observed_skills {
             match self.skill_states.get_mut(&observed.name) {
                 Some(state) => {
@@ -208,6 +243,10 @@ impl RuntimeMetadataState {
                 }
             }
         }
+
+        self.skill_states
+            .retain(|name, _| observed_names.contains(name));
+
         notices
     }
 }
@@ -229,6 +268,118 @@ enum SkillChangeNotice {
         description: String,
         content: String,
     },
+}
+
+pub(crate) fn load_workspace_runtime_metadata(
+    workspace_root: &Path,
+) -> Result<WorkspaceRuntimeMetadata, String> {
+    Ok(WorkspaceRuntimeMetadata {
+        identity: read_optional_workspace_file(workspace_root, IDENTITY_PATH)?,
+        stellaclaw_memory: read_optional_workspace_file(workspace_root, STELLACLAW_MEMORY_PATH)?,
+        user_meta: read_optional_workspace_file(workspace_root, USER_META_PATH)?,
+        skills: load_workspace_skills(workspace_root)?,
+        skills_metadata: String::new(),
+    })
+    .map(|mut metadata| {
+        metadata.skills_metadata = render_skills_metadata(&metadata.skills);
+        metadata
+    })
+}
+
+fn read_optional_workspace_file(
+    workspace_root: &Path,
+    relative_path: &str,
+) -> Result<String, String> {
+    let path = workspace_root.join(relative_path);
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    fs::read_to_string(&path)
+        .map(|content| content.trim().to_string())
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))
+}
+
+fn load_workspace_skills(workspace_root: &Path) -> Result<Vec<SessionSkillObservation>, String> {
+    let skill_root = workspace_root.join(SKILL_ROOT);
+    if !skill_root.exists() {
+        return Ok(Vec::new());
+    }
+    let mut skills = Vec::new();
+    let entries = fs::read_dir(&skill_root)
+        .map_err(|error| format!("failed to read {}: {error}", skill_root.display()))?;
+
+    let mut by_name = BTreeMap::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to enumerate skill directories under {}: {error}",
+                skill_root.display()
+            )
+        })?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("failed to inspect {}: {error}", entry.path().display()))?;
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        by_name.insert(name, entry.path());
+    }
+
+    for (name, path) in by_name {
+        let skill_path = path.join(SKILL_ENTRY_FILE);
+        if !skill_path.exists() {
+            continue;
+        }
+        let content = fs::read_to_string(&skill_path)
+            .map_err(|error| format!("failed to read {}: {error}", skill_path.display()))?;
+        skills.push(SessionSkillObservation {
+            name,
+            description: infer_skill_description(&content),
+            content,
+        });
+    }
+
+    Ok(skills)
+}
+
+fn infer_skill_description(content: &str) -> String {
+    let mut paragraph = Vec::new();
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !paragraph.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if trimmed.starts_with('#') && paragraph.is_empty() {
+            continue;
+        }
+        paragraph.push(trimmed);
+    }
+    paragraph.join(" ").trim().to_string()
+}
+
+fn render_skills_metadata(skills: &[SessionSkillObservation]) -> String {
+    if skills.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec![
+        "Available skills from .skill/ in the current workspace:".to_string(),
+        "Load a skill by exact name before relying on its detailed instructions.".to_string(),
+    ];
+    for skill in skills {
+        if skill.description.trim().is_empty() {
+            lines.push(format!("- {}", skill.name));
+        } else {
+            lines.push(format!("- {}: {}", skill.name, skill.description.trim()));
+        }
+    }
+    lines.join("\n")
 }
 
 fn initialize_component(
@@ -277,6 +428,31 @@ fn observe_component(
             key: key.to_string(),
             value,
         });
+    }
+}
+
+fn observe_component_without_notice(
+    components: &mut BTreeMap<String, SessionPromptComponentState>,
+    key: &str,
+    value: String,
+) {
+    let hash = prompt_component_hash(&value);
+    let state = components.entry(key.to_string()).or_default();
+    if state.system_prompt_hash.is_empty()
+        && state.system_prompt_value.is_empty()
+        && state.notified_hash.is_empty()
+        && state.notified_value.is_empty()
+    {
+        state.system_prompt_value = value.clone();
+        state.system_prompt_hash = hash.clone();
+        state.notified_value = value;
+        state.notified_hash = hash;
+        return;
+    }
+
+    if state.notified_hash != hash {
+        state.notified_value = value;
+        state.notified_hash = hash;
     }
 }
 
@@ -374,7 +550,14 @@ fn render_skill_change_notices(notices: &[SkillChangeNotice]) -> String {
     sections.join("\n\n")
 }
 
-pub(crate) fn current_ssh_remote_aliases_prompt() -> String {
+pub(crate) fn remote_aliases_prompt_for_mode(remote_mode: &ToolRemoteMode) -> String {
+    match remote_mode {
+        ToolRemoteMode::Selectable => current_ssh_remote_aliases_prompt(),
+        ToolRemoteMode::FixedSsh { .. } => String::new(),
+    }
+}
+
+fn current_ssh_remote_aliases_prompt() -> String {
     let aliases = discover_ssh_remote_aliases();
     render_ssh_remote_aliases_for_prompt(&aliases)
 }
@@ -515,56 +698,141 @@ fn expand_tilde_path(raw: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
+    use crate::session_actor::ToolRemoteMode;
+
+    fn temp_root() -> PathBuf {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("stellaclaw_runtime_metadata_{id}"))
+    }
 
     #[test]
     fn detects_prompt_component_change_once() {
-        let mut state = RuntimeMetadataState::default();
-        let first = SessionRuntimeMetadata {
-            user_meta: Some("tier: pro".to_string()),
-            ..SessionRuntimeMetadata::default()
-        };
-        state.initialize_from(Some(&first), String::new());
+        let root = temp_root();
+        fs::create_dir_all(root.join(".stellaclaw")).unwrap();
+        fs::write(root.join(".stellaclaw/USER.md"), "tier: pro").unwrap();
 
-        let changed = SessionRuntimeMetadata {
-            user_meta: Some("tier: enterprise".to_string()),
-            ..SessionRuntimeMetadata::default()
-        };
-        let notices = state.observe_for_user_turn(Some(&changed), String::new());
+        let mut state = RuntimeMetadataState::default();
+        state
+            .initialize_from_workspace(&root, String::new())
+            .expect("initial metadata should load");
+
+        fs::write(root.join(".stellaclaw/USER.md"), "tier: enterprise").unwrap();
+        let notices = state
+            .observe_for_user_turn_from_workspace(&root, String::new())
+            .expect("changed metadata should load");
         assert_eq!(notices.len(), 1);
         assert!(notices[0].contains("[Runtime Prompt Updates]"));
         assert!(notices[0].contains("tier: enterprise"));
 
         assert!(state
-            .observe_for_user_turn(Some(&changed), String::new())
+            .observe_for_user_turn_from_workspace(&root, String::new())
+            .expect("metadata should still load")
             .is_empty());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn reports_loaded_skill_content_change() {
+        let root = temp_root();
+        fs::create_dir_all(root.join(".skill/demo")).unwrap();
+        fs::write(root.join(".skill/demo/SKILL.md"), "# Demo\n\nold body").unwrap();
+
         let mut state = RuntimeMetadataState::default();
-        let first = SessionRuntimeMetadata {
-            skills: vec![SessionSkillObservation {
-                name: "demo".to_string(),
-                description: "old desc".to_string(),
-                content: "old body".to_string(),
-            }],
-            ..SessionRuntimeMetadata::default()
-        };
-        state.initialize_from(Some(&first), String::new());
+        state
+            .initialize_from_workspace(&root, String::new())
+            .expect("initial metadata should load");
         state.mark_loaded_skills(&["demo".to_string()], 1);
 
-        let changed = SessionRuntimeMetadata {
-            skills: vec![SessionSkillObservation {
-                name: "demo".to_string(),
-                description: "new desc".to_string(),
-                content: "new body".to_string(),
-            }],
-            ..SessionRuntimeMetadata::default()
-        };
-        let notices = state.observe_for_user_turn(Some(&changed), String::new());
-        assert_eq!(notices.len(), 1);
-        assert!(notices[0].contains("[Runtime Skill Updates]"));
-        assert!(notices[0].contains("new body"));
+        fs::write(root.join(".skill/demo/SKILL.md"), "# Demo\n\nnew body").unwrap();
+        let notices = state
+            .observe_for_user_turn_from_workspace(&root, String::new())
+            .expect("changed metadata should load");
+        assert!(notices
+            .iter()
+            .any(|notice| notice.contains("[Runtime Skill Updates]")));
+        assert!(notices.iter().any(|notice| notice.contains("new body")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn remote_aliases_prompt_only_exists_for_selectable_mode() {
+        std::env::set_var("AGENT_HOST_SSH_CONFIG", "/path/that/does/not/exist");
+
+        assert_eq!(
+            remote_aliases_prompt_for_mode(&ToolRemoteMode::Selectable),
+            String::new()
+        );
+        assert_eq!(
+            remote_aliases_prompt_for_mode(&ToolRemoteMode::FixedSsh {
+                host: "demo".to_string(),
+                cwd: Some("/work".to_string()),
+            }),
+            String::new()
+        );
+    }
+
+    #[test]
+    fn renders_skills_metadata_from_workspace_skills() {
+        let root = temp_root();
+        fs::create_dir_all(root.join(".skill/example")).unwrap();
+        fs::write(
+            root.join(".skill/example/SKILL.md"),
+            "# Example\n\nDo the important thing.",
+        )
+        .unwrap();
+
+        let metadata = load_workspace_runtime_metadata(&root).expect("metadata should load");
+
+        assert_eq!(metadata.skills.len(), 1);
+        assert_eq!(metadata.skills[0].name, "example");
+        assert_eq!(metadata.skills[0].description, "Do the important thing.");
+        assert!(metadata
+            .skills_metadata
+            .contains("- example: Do the important thing."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stellaclaw_memory_updates_without_runtime_notice() {
+        let root = temp_root();
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("STELLACLAW.md"), "old durable note").unwrap();
+
+        let mut state = RuntimeMetadataState::default();
+        state
+            .initialize_from_workspace(&root, String::new())
+            .expect("initial metadata should load");
+
+        fs::write(root.join("STELLACLAW.md"), "new durable note").unwrap();
+        let notices = state
+            .observe_for_user_turn_from_workspace(&root, String::new())
+            .expect("updated metadata should load");
+
+        assert!(notices.is_empty());
+        assert_eq!(
+            state
+                .snapshot_value(STELLACLAW_MEMORY_PROMPT_COMPONENT)
+                .expect("snapshot should exist"),
+            "old durable note"
+        );
+
+        state.promote_notified_components_to_system_snapshot();
+        assert_eq!(
+            state
+                .snapshot_value(STELLACLAW_MEMORY_PROMPT_COMPONENT)
+                .expect("promoted snapshot should exist"),
+            "new durable note"
+        );
+
+        let _ = fs::remove_dir_all(root);
     }
 }

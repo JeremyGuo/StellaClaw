@@ -38,6 +38,10 @@ fn normalize_item_for_model(
     item: &ChatMessageItem,
     model_config: &ModelConfig,
 ) -> Vec<ChatMessageItem> {
+    if matches!(item, ChatMessageItem::Reasoning(_)) {
+        return Vec::new();
+    }
+
     let ChatMessageItem::File(file) = item else {
         return vec![item.clone()];
     };
@@ -283,7 +287,7 @@ mod tests {
     use super::*;
     use crate::{
         model_config::{MediaInputConfig, MediaInputTransport, MultimodalInputConfig},
-        session_actor::{ChatMessage, ChatRole},
+        session_actor::{ChatMessage, ChatRole, ReasoningItem},
     };
 
     #[test]
@@ -298,6 +302,7 @@ mod tests {
             cache_timeout: 0,
             conn_timeout: 1,
             retry_mode: crate::model_config::RetryMode::Once,
+            reasoning: None,
             token_estimator_type: crate::model_config::TokenEstimatorType::Local,
             multimodal_estimator: None,
             multimodal_input: Some(MultimodalInputConfig {
@@ -331,6 +336,46 @@ mod tests {
         assert!(matches!(
             &normalized[0].data[0],
             ChatMessageItem::Context(context) if context.text.contains("decode failed")
+        ));
+    }
+
+    #[test]
+    fn reasoning_is_removed_during_model_normalization() {
+        let config = ModelConfig {
+            provider_type: crate::model_config::ProviderType::OpenRouterCompletion,
+            model_name: "test".to_string(),
+            url: "http://localhost".to_string(),
+            api_key_env: "TEST".to_string(),
+            capabilities: Vec::new(),
+            token_max_context: 1,
+            cache_timeout: 0,
+            conn_timeout: 1,
+            retry_mode: crate::model_config::RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: crate::model_config::TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: None,
+            token_estimator_url: None,
+        };
+        let messages = vec![ChatMessage::new(
+            ChatRole::Assistant,
+            vec![
+                ChatMessageItem::Reasoning(ReasoningItem {
+                    text: "hidden".to_string(),
+                }),
+                ChatMessageItem::Context(ContextItem {
+                    text: "visible".to_string(),
+                }),
+            ],
+        )];
+
+        let normalized = normalize_messages_for_model(&messages, &config);
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].data.len(), 1);
+        assert!(matches!(
+            &normalized[0].data[0],
+            ChatMessageItem::Context(context) if context.text == "visible"
         ));
     }
 }

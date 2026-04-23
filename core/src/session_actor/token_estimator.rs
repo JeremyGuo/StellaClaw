@@ -15,19 +15,25 @@ use crate::{
     model_config::{ModelConfig, TokenEstimatorType},
 };
 
-use super::{ChatMessage, ChatMessageItem, ChatRole, FileItem};
+use super::{normalize_messages_for_model, ChatMessage, ChatMessageItem, ChatRole, FileItem};
 
 #[derive(Debug, Clone)]
 pub struct TokenEstimator {
     backend: TokenEstimatorBackend,
     multimodal_strategy: MultimodalTokenStrategy,
+    model_config: ModelConfig,
 }
 
 impl TokenEstimator {
-    fn new(backend: TokenEstimatorBackend, multimodal_strategy: MultimodalTokenStrategy) -> Self {
+    fn new(
+        backend: TokenEstimatorBackend,
+        multimodal_strategy: MultimodalTokenStrategy,
+        model_config: ModelConfig,
+    ) -> Self {
         Self {
             backend,
             multimodal_strategy,
+            model_config,
         }
     }
 
@@ -50,11 +56,16 @@ impl TokenEstimator {
             ),
         };
 
-        Ok(Self::new(backend, multimodal_strategy))
+        Ok(Self::new(
+            backend,
+            multimodal_strategy,
+            model_config.clone(),
+        ))
     }
 
     pub fn estimate(&self, messages: &[ChatMessage]) -> Result<TokenEstimate, TokenEstimatorError> {
-        let rendered = self.backend.estimate_text(messages)?;
+        let normalized_messages = normalize_messages_for_model(messages, &self.model_config);
+        let rendered = self.backend.estimate_text(&normalized_messages)?;
         let text_tokens = rendered.text_tokens;
         let mut multimodal_tokens = 0;
         for file in &rendered.files {
@@ -968,7 +979,7 @@ mod tests {
     ) -> TokenEstimator {
         let tokenizer = test_tokenizer();
         let directory = std::env::temp_dir().join(format!(
-            "claw-party-token-estimator-{}-{}",
+            "stellaclaw-token-estimator-{}-{}",
             std::process::id(),
             rand::random::<u64>()
         ));
@@ -998,6 +1009,7 @@ mod tests {
             cache_timeout: 300,
             conn_timeout: 10,
             retry_mode: RetryMode::Once,
+            reasoning: None,
             token_estimator_type: TokenEstimatorType::HuggingFace,
             multimodal_estimator: Some(MultimodalEstimatorConfig {
                 image: Some(multimodal_strategy),
@@ -1033,6 +1045,7 @@ mod tests {
             cache_timeout: 300,
             conn_timeout: 10,
             retry_mode: RetryMode::Once,
+            reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,
             multimodal_estimator: Some(MultimodalEstimatorConfig {
                 image: Some(multimodal_strategy),

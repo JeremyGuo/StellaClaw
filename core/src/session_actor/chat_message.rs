@@ -18,6 +18,10 @@ pub struct TokenUsage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: ChatRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_time: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_usage: Option<TokenUsage>,
     pub data: Vec<ChatMessageItem>,
@@ -27,9 +31,31 @@ impl ChatMessage {
     pub fn new(role: ChatRole, data: Vec<ChatMessageItem>) -> Self {
         Self {
             role,
+            user_name: None,
+            message_time: None,
             token_usage: None,
             data,
         }
+    }
+
+    pub fn with_user_name(mut self, user_name: impl Into<String>) -> Self {
+        self.user_name = Some(user_name.into());
+        self
+    }
+
+    pub fn with_user_name_option(mut self, user_name: Option<String>) -> Self {
+        self.user_name = user_name;
+        self
+    }
+
+    pub fn with_message_time(mut self, message_time: impl Into<String>) -> Self {
+        self.message_time = Some(message_time.into());
+        self
+    }
+
+    pub fn with_message_time_option(mut self, message_time: Option<String>) -> Self {
+        self.message_time = message_time;
+        self
     }
 
     pub fn with_token_usage(mut self, token_usage: TokenUsage) -> Self {
@@ -151,6 +177,8 @@ mod tests {
         let json = serde_json::to_value(&message).expect("message should serialize");
 
         assert_eq!(json["role"], "assistant");
+        assert!(json.get("user_name").is_none());
+        assert!(json.get("message_time").is_none());
         assert_eq!(json["token_usage"]["cache_read"], 10);
         assert_eq!(json["data"][1]["type"], "tool_result");
         assert_eq!(
@@ -178,6 +206,8 @@ mod tests {
         let message: ChatMessage = serde_json::from_str(raw).expect("message should deserialize");
 
         assert_eq!(message.role, ChatRole::User);
+        assert!(message.user_name.is_none());
+        assert!(message.message_time.is_none());
         assert!(message.token_usage.is_none());
         assert_eq!(
             message.data,
@@ -185,5 +215,22 @@ mod tests {
                 text: "hello".to_string(),
             })]
         );
+    }
+
+    #[test]
+    fn serializes_user_message_metadata() {
+        let message = ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "hello".to_string(),
+            })],
+        )
+        .with_user_name("alice")
+        .with_message_time("2026-04-23T10:20:30Z");
+
+        let json = serde_json::to_value(&message).expect("message should serialize");
+
+        assert_eq!(json["user_name"], "alice");
+        assert_eq!(json["message_time"], "2026-04-23T10:20:30Z");
     }
 }

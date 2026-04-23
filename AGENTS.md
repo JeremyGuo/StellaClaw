@@ -1,6 +1,6 @@
 # AGENTS.md
 
-本仓库后续实现以 [ROAD_MAP.md](/Users/jeremyguo/Projects/ClawParty/ROAD_MAP.md) 为主要指导文件。
+本仓库后续实现以 [ROAD_MAP.md](ROAD_MAP.md) 为主要指导文件。
 
 ## 目标
 

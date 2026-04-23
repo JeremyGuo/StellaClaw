@@ -15,9 +15,8 @@ use serde_json::{Map, Value};
 use super::tool_runtime::ExecutionTarget;
 use super::{
     tool_catalog::{
-        execute_download_tool, execute_dsl_tool, execute_file_tool, execute_media_tool,
-        execute_process_tool, execute_provider_backed_media_tool, execute_skill_load_tool,
-        execute_web_tool,
+        execute_download_tool, execute_file_tool, execute_media_tool, execute_process_tool,
+        execute_provider_backed_media_tool, execute_skill_load_tool, execute_web_tool,
     },
     tool_runtime::{
         normalize_tool_value, parse_arguments, LocalToolError, ToolCancellationToken,
@@ -267,15 +266,10 @@ impl ToolOperationRunner {
                 Some(result) => result,
                 None => match execute_download_tool(&tool_call.tool_name, &arguments, &context)? {
                     Some(result) => result,
-                    None => match execute_dsl_tool(&tool_call.tool_name, &arguments, &context)? {
+                    None => match execute_web_tool(&tool_call.tool_name, &arguments, None)? {
                         Some(result) => result,
-                        None => match execute_web_tool(&tool_call.tool_name, &arguments, None)? {
-                            Some(result) => result,
-                            None => match execute_media_tool(
-                                &tool_call.tool_name,
-                                &arguments,
-                                &context,
-                            )? {
+                        None => {
+                            match execute_media_tool(&tool_call.tool_name, &arguments, &context)? {
                                 Some(result) => {
                                     return Ok(ToolResultItem {
                                         tool_call_id: tool_call.tool_call_id.clone(),
@@ -288,8 +282,8 @@ impl ToolOperationRunner {
                                         tool_call.tool_name.clone(),
                                     ));
                                 }
-                            },
-                        },
+                            }
+                        }
                     },
                 },
             },
@@ -491,7 +485,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = std::env::temp_dir().join(format!("claw_party_tool_executor_{id}"));
+        let path = std::env::temp_dir().join(format!("stellaclaw_tool_executor_{id}"));
         fs::create_dir_all(&path).unwrap();
         path
     }
@@ -639,6 +633,7 @@ mod tests {
         let message = start_and_wait(&executor, patch_batch);
 
         assert!(result_text(&message, 0).contains("\"applied\": true"));
+        assert!(result_text(&message, 0).contains("\"out_path\":"));
         assert_eq!(
             fs::read_to_string(workspace.join("patch.txt")).unwrap(),
             "new\n"
@@ -754,6 +749,7 @@ mod tests {
 
         assert!(result_text(&message, 0).contains("\"running\": false"));
         assert!(result_text(&message, 0).contains("hello"));
+        assert!(!result_text(&message, 0).contains("\"stderr\":"));
 
         let message = start_and_wait(
             &executor,
@@ -778,6 +774,31 @@ mod tests {
             ),
         );
         assert!(result_text(&message, 0).contains("\"closed\": true"));
+    }
+
+    #[test]
+    fn shell_truncates_agent_visible_output_but_keeps_artifacts() {
+        let workspace = temp_workspace();
+        let executor = LocalToolBatchExecutor::new(&workspace);
+        let message = start_and_wait(
+            &executor,
+            ToolBatch::new(
+                "batch_shell_truncated",
+                vec![tool_call(
+                    "shell",
+                    json!({
+                        "session_id": "truncated_shell",
+                        "command": "python3 -c \"print('x' * 4000)\"",
+                        "wait_ms": 1000,
+                        "max_output_chars": 80
+                    }),
+                )],
+            ),
+        );
+
+        let text = result_text(&message, 0);
+        assert!(text.contains("\"stdout_truncated\": true"));
+        assert!(text.contains("\"out_path\":"));
     }
 
     #[test]
@@ -808,32 +829,11 @@ mod tests {
         );
 
         assert!(result_text(&message, 0).contains("\"completed\": true"));
+        assert!(!result_text(&message, 0).contains("\"failed\": false"));
         assert_eq!(
             fs::read_to_string(workspace.join("downloads/file.txt")).unwrap(),
             "download body"
         );
-    }
-
-    #[test]
-    fn executes_dsl_lifecycle_locally() {
-        let workspace = temp_workspace();
-        let executor = LocalToolBatchExecutor::new(&workspace);
-        let message = start_and_wait(
-            &executor,
-            ToolBatch::new(
-                "batch_dsl",
-                vec![tool_call(
-                    "dsl_start",
-                    json!({
-                        "code": "print('dsl ok')",
-                        "wait_timeout_seconds": 2
-                    }),
-                )],
-            ),
-        );
-
-        assert!(result_text(&message, 0).contains("\"running\": false"));
-        assert!(result_text(&message, 0).contains("dsl ok"));
     }
 
     #[test]
@@ -849,7 +849,7 @@ mod tests {
             )
             .create();
         std::env::set_var(
-            "PARTYCLAW_WEB_SEARCH_URL",
+            "STELLACLAW_WEB_SEARCH_URL",
             format!("{}/search", server.url()),
         );
         let workspace = temp_workspace();
@@ -864,7 +864,7 @@ mod tests {
                 )],
             ),
         );
-        std::env::remove_var("PARTYCLAW_WEB_SEARCH_URL");
+        std::env::remove_var("STELLACLAW_WEB_SEARCH_URL");
 
         assert!(result_text(&message, 0).contains("https://example.com"));
     }

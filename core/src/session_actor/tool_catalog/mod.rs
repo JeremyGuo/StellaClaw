@@ -21,8 +21,6 @@ use super::{SessionInitial, SessionType};
 
 pub use download_tools::download_tool_definitions;
 pub(crate) use download_tools::execute_download_tool;
-pub use dsl_tools::dsl_tool_definitions;
-pub(crate) use dsl_tools::execute_dsl_tool;
 pub(crate) use file_tools::execute_file_tool;
 pub use file_tools::file_tool_definitions;
 pub use host_tools::{host_tool_definitions, HostToolScope};
@@ -197,17 +195,6 @@ impl ToolCatalog {
             enable_provider_image_generation: generation_tool
                 .model_supports(ModelCapability::ImageOut),
             host_tool_scope: Some(HostToolScope::from(initial.session_type)),
-            skill_names: initial
-                .runtime_metadata
-                .as_ref()
-                .map(|metadata| {
-                    metadata
-                        .skills
-                        .iter()
-                        .map(|skill| skill.name.clone())
-                        .collect()
-                })
-                .unwrap_or_default(),
             ..BuiltinToolCatalogOptions::default()
         };
 
@@ -337,9 +324,6 @@ pub fn builtin_tool_catalog(
     for tool in download_tool_definitions() {
         catalog.add(tool)?;
     }
-    for tool in dsl_tool_definitions() {
-        catalog.add(tool)?;
-    }
     for tool in web_tool_definitions(options.enable_web_search) {
         catalog.add(tool)?;
     }
@@ -391,7 +375,7 @@ mod tests {
         assert!(catalog.contains("file_read"));
         assert!(catalog.contains("shell"));
         assert!(catalog.contains("file_download_start"));
-        assert!(catalog.contains("dsl_start"));
+        assert!(!catalog.contains("dsl_start"));
         assert!(catalog.contains("web_search"));
         assert!(catalog.contains("image_analysis"));
         assert!(catalog.contains("image_stop"));
@@ -444,6 +428,7 @@ mod tests {
             cache_timeout: 300,
             conn_timeout: 10,
             retry_mode: RetryMode::Once,
+            reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,
             multimodal_estimator: None,
             multimodal_input: None,
@@ -471,6 +456,7 @@ mod tests {
             cache_timeout: 300,
             conn_timeout: 10,
             retry_mode: RetryMode::Once,
+            reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,
             multimodal_estimator: None,
             multimodal_input: None,
@@ -516,6 +502,7 @@ mod tests {
             cache_timeout: 300,
             conn_timeout: 10,
             retry_mode: RetryMode::Once,
+            reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,
             multimodal_estimator: None,
             multimodal_input: None,
@@ -548,6 +535,7 @@ mod tests {
             cache_timeout: 300,
             conn_timeout: 10,
             retry_mode: RetryMode::Once,
+            reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,
             multimodal_estimator: None,
             multimodal_input: None,
@@ -634,6 +622,7 @@ mod tests {
             cache_timeout: 300,
             conn_timeout: 10,
             retry_mode: RetryMode::Once,
+            reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,
             multimodal_estimator: None,
             multimodal_input: None,

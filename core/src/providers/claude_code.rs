@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use rand::Rng;
 use reqwest::{blocking::Client, StatusCode};
@@ -16,7 +12,10 @@ use crate::{
 };
 
 use super::{
-    common::{data_url_parts, is_image_file, provider_error_message, token_usage_from_value},
+    common::{
+        claude_cache_control_payload, data_url_parts, is_image_file, provider_error_message,
+        token_usage_from_value,
+    },
     Provider, ProviderError, ProviderRequest,
 };
 
@@ -54,6 +53,7 @@ impl ClaudeCodeProvider {
     ) -> Result<ChatMessage, ProviderError> {
         let api_key = std::env::var(&model_config.api_key_env)
             .map_err(|_| ProviderError::MissingApiKeyEnv(model_config.api_key_env.clone()))?;
+        let cache_control = claude_cache_control_payload(model_config);
 
         let mut payload = Map::new();
         payload.insert(
@@ -62,14 +62,19 @@ impl ClaudeCodeProvider {
         );
         payload.insert(
             "messages".to_string(),
-            Value::Array(build_claude_messages(request.messages)),
+            Value::Array(build_claude_messages(
+                request.messages,
+                cache_control.as_ref(),
+            )),
         );
         if let Some(system_prompt) = request.system_prompt {
             if !system_prompt.trim().is_empty() {
-                payload.insert(
-                    "system".to_string(),
-                    Value::String(system_prompt.to_string()),
-                );
+                let system_value = if request.messages.is_empty() {
+                    claude_system_with_optional_cache_control(system_prompt, cache_control.as_ref())
+                } else {
+                    Value::String(system_prompt.to_string())
+                };
+                payload.insert("system".to_string(), system_value);
             }
         }
         if !request.tools.is_empty() {
@@ -133,7 +138,7 @@ impl Provider for ClaudeCodeProvider {
         model_config: &ModelConfig,
         request: ProviderRequest<'_>,
     ) -> Result<ChatMessage, ProviderError> {
-        let started_at = Instant::now();
+        let mut retries_used = 0_u64;
 
         loop {
             match self.send_once(model_config, &request) {
@@ -142,11 +147,12 @@ impl Provider for ClaudeCodeProvider {
                     RetryMode::Once => return Err(error),
                     RetryMode::RandomInterval {
                         max_interval_secs,
-                        max_time_secs,
+                        max_retries,
                     } => {
-                        if started_at.elapsed() >= Duration::from_secs(*max_time_secs) {
+                        if retries_used >= *max_retries {
                             return Err(error);
                         }
+                        retries_used = retries_used.saturating_add(1);
 
                         let sleep_secs = if *max_interval_secs == 0 {
                             0
@@ -162,7 +168,7 @@ impl Provider for ClaudeCodeProvider {
     }
 }
 
-fn build_claude_messages(messages: &[ChatMessage]) -> Vec<Value> {
+fn build_claude_messages(messages: &[ChatMessage], cache_control: Option<&Value>) -> Vec<Value> {
     let mut converted = Vec::new();
 
     for message in messages {
@@ -197,7 +203,38 @@ fn build_claude_messages(messages: &[ChatMessage]) -> Vec<Value> {
         }
     }
 
+    if let Some(cache_control) = cache_control {
+        add_cache_control_to_last_claude_block(&mut converted, cache_control);
+    }
+
     converted
+}
+
+fn add_cache_control_to_last_claude_block(messages: &mut [Value], cache_control: &Value) -> bool {
+    for message in messages.iter_mut().rev() {
+        let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let Some(last_block) = content.last_mut().and_then(Value::as_object_mut) else {
+            continue;
+        };
+        last_block.insert("cache_control".to_string(), cache_control.clone());
+        return true;
+    }
+    false
+}
+
+fn claude_system_with_optional_cache_control(
+    system_prompt: &str,
+    cache_control: Option<&Value>,
+) -> Value {
+    let mut block = Map::new();
+    block.insert("type".to_string(), Value::String("text".to_string()));
+    block.insert("text".to_string(), Value::String(system_prompt.to_string()));
+    if let Some(cache_control) = cache_control {
+        block.insert("cache_control".to_string(), cache_control.clone());
+    }
+    Value::Array(vec![Value::Object(block)])
 }
 
 fn claude_value_to_chat_message(value: &Value) -> Result<ChatMessage, ProviderError> {
@@ -259,6 +296,8 @@ fn claude_value_to_chat_message(value: &Value) -> Result<ChatMessage, ProviderEr
 
     Ok(ChatMessage {
         role: ChatRole::Assistant,
+        user_name: None,
+        message_time: None,
         token_usage: token_usage_from_value(value),
         data,
     })
@@ -382,6 +421,7 @@ mod tests {
             cache_timeout: 300,
             conn_timeout: 5,
             retry_mode: RetryMode::Once,
+            reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,
             multimodal_estimator: None,
             multimodal_input: None,
@@ -396,6 +436,23 @@ mod tests {
             .mock("POST", "/v1/messages")
             .match_header("x-api-key", "test-key")
             .match_header("anthropic-version", "2023-06-01")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "hello",
+                                "cache_control": {
+                                    "type": "ephemeral",
+                                    "ttl": "5m"
+                                }
+                            }
+                        ]
+                    }
+                ]
+            })))
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(
@@ -442,5 +499,21 @@ mod tests {
         );
         assert_eq!(response.token_usage.unwrap().cache_read, 3);
         assert!(matches!(response.data[1], ChatMessageItem::ToolCall(_)));
+    }
+
+    #[test]
+    fn claude_system_only_request_gets_cache_control_block() {
+        let cache_control = serde_json::json!({
+            "type": "ephemeral",
+            "ttl": "1h"
+        });
+
+        let system =
+            claude_system_with_optional_cache_control("system prompt", Some(&cache_control));
+
+        assert_eq!(system[0]["type"], "text");
+        assert_eq!(system[0]["text"], "system prompt");
+        assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(system[0]["cache_control"]["ttl"], "1h");
     }
 }

@@ -25,6 +25,13 @@
 
 `SessionActor = execution boundary + state machine`
 
+## 1.1 Host Surface Direction
+
+- Host 侧的 `Channel` 应该是统一抽象，允许同时存在多个 channel 实例，各自维护自己的平台安全策略和管理员逻辑。
+- 当前优先接好 `Telegram`；后续会增加 `Web` 作为新的 channel 类型。
+- 在 channel 抽象之上，后续会补一层统一的 `RESTful API`，作为外部系统接入和管理面的稳定边界。
+- 更后续阶段，前端界面应优先基于这层 `RESTful API` 构建，而不是直接耦合内部运行时。
+
 ## 2. 线程优先视图
 
 这一节改成“线程优先”表述，不再把“模块”和“线程”画成同一种框。
@@ -115,7 +122,7 @@ flowchart LR
 
 当前新增一个最小可执行入口 `agent_server`：
 
-- 它是独立 binary crate，依赖 `claw_party_core`。
+- 它是独立 binary crate，依赖 `stellaclaw_core`。
 - transport 先固定为 stdin/stdout 的 line-delimited JSON-RPC。
 - `initialize` 请求只携带 `model_config` 和 `initial`；工具工作目录就是 `agent_server` 进程启动时的 cwd，不再单独传 `workspace_root`。
 - 收到 `initialize` 后，server 创建 `SessionRpcThread`、`SessionActor` 和本地 `ToolBatchExecutor`，并把 `Initial` 通过 RPC 线程投递给 actor。
@@ -185,6 +192,7 @@ Bridge 工具的完整链路是：
 - `history` 中不持久化 `role = "system"`；canonical system prompt snapshot 由 session state 持有，并且只能由 `SessionKind` 决定。
 - 禁止在 `history` 中间插入新的 `system` message；运行期提示变化应作为本轮用户消息前的 `user` 侧运行期通知进入上下文。
 - 压缩完成后，才允许更新当前 session 的 canonical system prompt snapshot。
+- `STELLACLAW.md` 是 workspace 根目录下唯一的长期项目记录文件；它只作为 snapshot 进入 system prompt，不生成运行期 notice。压缩完成后直接把最新文件内容提升到 canonical system prompt snapshot。
 - `skill metadata`、已加载 skill 内容、`user meta`、identity、SSH remote alias 列表发生变化时，必须在真实 user message 前插入 synthetic `role = "user"` 通知；这些通知进入 durable history。
 - SSH remote alias 列表来源是 `~/.ssh/config` 的 `Host` alias（支持 `Include`），不是 Conversation 自己维护的 workpath remote 列表。
 - `session.json` 必须持久化当前 runtime prompt component snapshot、已通知 snapshot、skill content/load state、`current_messages` 和 `all_messages`，保证 crash 后恢复不会重复通知或丢失旧 system prompt 组装依据。
@@ -821,7 +829,10 @@ loop {
 - tool batch 最终只返回一条 `ChatMessage`。
 - 这条 `ChatMessage` 的 `data` 里可以包含多个 `tool_result` item。
 - 如果 tool 产生多模态文件，tool 自己先把文件持久化，再把落盘后的 `file://...` 放进返回的 `ChatMessage`。
-- 当前已落地的工具执行族包括：file/search/patch、`shell`、`file_download_*`、`dsl_*`、`web_fetch`、`web_search`、`skill_load`、native `*_load`、Provider-backed `*_analysis` / `*_stop` / `image_generation`。
+- `tool_executor` 只负责统一调度、统一中断语义和统一结果包装，不承载各工具族自己的业务状态机。
+- 每个工具文件负责自己的核心执行语义；新增工具族时，允许在 `tool_executor` 中增加一个显式分发 case。
+- 特殊状态默认留在工具模块内部，不回流到 `tool_executor`；避免把工具内部 job 管理、权限细节和业务分叉重新集中到 executor。
+- 当前已落地的工具执行族包括：file/search/patch、`shell`、`file_download_*`、`web_fetch`、`web_search`、`skill_load`、native `*_load`、Provider-backed `*_analysis` / `*_stop` / `image_generation`。
 - 工具内部 job 状态默认是内存临时状态；只有工具产出闭合的 tool result 后，结果才进入 session history 并参与持久化。
 
 ## 7. 统一消息接入流
@@ -1101,7 +1112,6 @@ sequenceDiagram
 | Web | `web_fetch`、`web_search` | `Interruptible` | 获取网页或调用搜索 provider。 |
 | 多模态加载与分析 | `image_load`、`pdf_load`、`audio_load`、`image_analysis`、`image_stop`、`pdf_analysis`、`pdf_stop`、`audio_analysis`、`audio_stop`、`image_generation`、`image_generation_stop` | 混合型，见下面明细 | 把本地媒体放进上下文，或调用 helper 做分析/生成。 |
 | 下载 | `file_download_start`、`file_download_progress`、`file_download_wait`、`file_download_cancel` | 混合型，见下面明细 | 后台下载远端资源到本地。 |
-| DSL | `dsl_start`、`dsl_wait`、`dsl_kill` | 混合型，见下面明细 | 运行长生命周期 DSL worker。 |
 | Skill | `skill_load`、`skill_create`、`skill_update` | `Immediate` | 读取或管理 skill。 |
 
 ### 13.1.1 执行类型定义
@@ -1245,7 +1255,7 @@ ToolSchemaContext {
 
 - `web_fetch` / `web_search` 已经在 core 内执行。
 - `web_search` 优先使用 `SessionInitial.search_tool_model: Option<ModelConfig>` 指定的搜索模型；Brave Search 已作为独立 `ProviderType::BraveSearch` 接入，`url` 指向 `/res/v1/web/search`，`api_key_env` 指向 Brave API key。
-- 如果没有 `search_tool_model`，`web_search` 保留 `PARTYCLAW_WEB_SEARCH_URL` 配置式 endpoint 和本地 DuckDuckGo HTML fallback，主要用于本地测试/降级。
+- 如果没有 `search_tool_model`，`web_search` 保留 `STELLACLAW_WEB_SEARCH_URL` 配置式 endpoint 和本地 DuckDuckGo HTML fallback，主要用于本地测试/降级。
 
 ### 13.6 多模态加载与分析类 tools
 
@@ -1297,10 +1307,10 @@ ToolSchemaContext {
 
 | 阶段 | 代表 tool | 类型 | 常见字段 | 语义 |
 |---|---|---|---|
-| `start` | `file_download_start`、`image_analysis`、`pdf_analysis`、`audio_analysis`、`image_generation`、`dsl_start` | `Interruptible` | `return_immediate?`、`wait_timeout_seconds?`、`on_timeout?` | 启动任务，并决定是立即返回还是先等一会儿。 |
+| `start` | `file_download_start`、`image_analysis`、`pdf_analysis`、`audio_analysis`、`image_generation` | `Interruptible` | `return_immediate?`、`wait_timeout_seconds?`、`on_timeout?` | 启动任务，并决定是立即返回还是先等一会儿。 |
 | `progress/read` | `file_download_progress` | `Immediate` | `download_id` | 只读快照，不阻塞。 |
-| `wait` | `file_download_wait`、`*_analysis`、`image_generation`、`dsl_wait` | `Interruptible` | `<task_id>`、`wait_timeout_seconds?`、`on_timeout?` | 等待任务，但 timeout 不等于自动取消。 |
-| `cancel/kill` | `file_download_cancel`、`*_stop`、`image_generation_stop`、`dsl_kill` | `Immediate` | `<task_id>`、`kill_children?` | 终止任务。 |
+| `wait` | `file_download_wait`、`*_analysis`、`image_generation` | `Interruptible` | `<task_id>`、`wait_timeout_seconds?`、`on_timeout?` | 等待任务，但 timeout 不等于自动取消。 |
+| `cancel/kill` | `file_download_cancel`、`*_stop`、`image_generation_stop` | `Immediate` | `<task_id>`、`kill_children?` | 终止任务。 |
 
 这组通用 option 的语义建议固定：
 
@@ -1317,7 +1327,7 @@ ToolSchemaContext {
 当前实现状态：
 
 - `file_download_*` 已经在 core 内按后台任务生命周期执行。
-- `dsl_*` 已经在 core 内具备最小可用的 CPython worker 生命周期；完整 DSL bridge、权限边界和模型/工具绑定后续再补。
+- `dsl_*` 相关实现代码当前保留在仓库中，但 tool surface 已临时关闭；后续需要先补 DSL bridge、权限边界和模型/工具绑定，再重新开放。
 - 长生命周期任务的 interrupt 只要求当前 tool batch 尽快收敛；后台任务是否继续由 `on_timeout` 或对应的 cancel/kill tool 决定。
 
 ### 13.8 Skill 类 tools

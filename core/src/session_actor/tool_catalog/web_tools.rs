@@ -165,11 +165,11 @@ fn web_search(
 
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs_f64(timeout_seconds))
-        .user_agent("partyclaw-core/0.1")
+        .user_agent("stellaclaw-core/0.1")
         .build()
         .map_err(|error| LocalToolError::Io(format!("failed to build web client: {error}")))?;
 
-    if let Ok(base_url) = std::env::var("PARTYCLAW_WEB_SEARCH_URL") {
+    if let Ok(base_url) = std::env::var("STELLACLAW_WEB_SEARCH_URL") {
         return web_search_json_endpoint(&client, &base_url, &query, max_results);
     }
 
@@ -430,6 +430,7 @@ mod tests {
             cache_timeout: 0,
             conn_timeout: 30,
             retry_mode: RetryMode::Once,
+            reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,
             multimodal_estimator: None,
             multimodal_input: None,

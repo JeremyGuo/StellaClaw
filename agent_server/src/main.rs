@@ -4,7 +4,9 @@ use std::{
     thread,
 };
 
-use claw_party_core::{
+use serde::Deserialize;
+use serde_json::{json, Value};
+use stellaclaw_core::{
     model_config::ModelConfig,
     providers::{init_global_provider_fork_server, ForkServerProvider},
     session_actor::{
@@ -13,8 +15,6 @@ use claw_party_core::{
         SessionRpcThread, ToolCatalog,
     },
 };
-use serde::Deserialize;
-use serde_json::{json, Value};
 
 fn main() {
     if let Err(error) = run() {
@@ -138,7 +138,7 @@ fn initialize(params: Value, output: Arc<JsonRpcOutput>) -> Result<AgentRuntime,
     let tool_executor = Arc::new(
         LocalToolBatchExecutor::new(workspace_root).with_conversation_bridge(Arc::new(bridge)),
     );
-    let provider: Arc<dyn claw_party_core::providers::Provider + Send + Sync> =
+    let provider: Arc<dyn stellaclaw_core::providers::Provider + Send + Sync> =
         Arc::new(ForkServerProvider::global().map_err(|error| error.to_string())?);
     let catalog = ToolCatalog::from_model_config_and_initial(&params.model_config, &params.initial)
         .map_err(|error| format!("failed to build tool catalog: {error}"))?;

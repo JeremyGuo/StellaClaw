@@ -1,8 +1,4 @@
-use std::{
-    collections::HashMap,
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use rand::Rng;
 use reqwest::{blocking::Client, StatusCode};
@@ -16,7 +12,10 @@ use crate::{
 };
 
 use super::{
-    common::{is_image_file, provider_error_message, token_usage_from_value},
+    common::{
+        is_image_file, openrouter_cache_control_payload, provider_error_message,
+        token_usage_from_value,
+    },
     OutputPersistor, Provider, ProviderError, ProviderRequest,
 };
 
@@ -96,6 +95,12 @@ impl OpenRouterResponsesProvider {
                 ),
             );
         }
+        if let Some(reasoning) = reasoning_payload(model_config) {
+            payload.insert("reasoning".to_string(), reasoning);
+        }
+        if let Some(cache_control) = openrouter_cache_control_payload(model_config) {
+            payload.insert("cache_control".to_string(), cache_control);
+        }
         payload.insert("store".to_string(), Value::Bool(false));
         let payload = Value::Object(payload);
 
@@ -150,7 +155,7 @@ impl Provider for OpenRouterResponsesProvider {
         model_config: &ModelConfig,
         request: ProviderRequest<'_>,
     ) -> Result<ChatMessage, ProviderError> {
-        let started_at = Instant::now();
+        let mut retries_used = 0_u64;
 
         loop {
             match self.send_once(model_config, &request) {
@@ -159,11 +164,12 @@ impl Provider for OpenRouterResponsesProvider {
                     RetryMode::Once => return Err(error),
                     RetryMode::RandomInterval {
                         max_interval_secs,
-                        max_time_secs,
+                        max_retries,
                     } => {
-                        if started_at.elapsed() >= Duration::from_secs(*max_time_secs) {
+                        if retries_used >= *max_retries {
                             return Err(error);
                         }
+                        retries_used = retries_used.saturating_add(1);
 
                         let sleep_secs = if *max_interval_secs == 0 {
                             0
@@ -220,6 +226,17 @@ fn build_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
     }
 
     input
+}
+
+fn reasoning_payload(model_config: &ModelConfig) -> Option<Value> {
+    model_config
+        .reasoning
+        .as_ref()
+        .and_then(|reasoning| match reasoning {
+            Value::Null => None,
+            Value::Object(_) => Some(reasoning.clone()),
+            _ => Some(reasoning.clone()),
+        })
 }
 
 fn responses_value_to_chat_message(
@@ -281,6 +298,8 @@ fn responses_value_to_chat_message(
 
     Ok(ChatMessage {
         role: ChatRole::Assistant,
+        user_name: None,
+        message_time: None,
         token_usage: token_usage_from_value(value),
         data,
     })
@@ -512,6 +531,7 @@ mod tests {
             cache_timeout: 300,
             conn_timeout: 5,
             retry_mode: RetryMode::Once,
+            reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,
             multimodal_estimator: None,
             multimodal_input: None,
@@ -580,6 +600,61 @@ mod tests {
         );
         assert_eq!(response.token_usage.unwrap().cache_read, 2);
         assert!(matches!(response.data[1], ChatMessageItem::ToolCall(_)));
+    }
+
+    #[test]
+    fn anthropic_openrouter_responses_request_adds_one_hour_cache_control() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/api/v1/responses")
+            .match_header("authorization", "Bearer test-key")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "model": "anthropic/claude-sonnet-4.5",
+                "cache_control": {
+                    "type": "ephemeral",
+                    "ttl": "1h"
+                }
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "id": "resp_cache",
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": "cached"}
+                            ]
+                        }
+                    ],
+                    "usage": {
+                        "input_tokens": 9,
+                        "output_tokens": 4
+                    }
+                }"#,
+            )
+            .create();
+
+        std::env::set_var("OPENROUTER_RESPONSES_API_KEY_TEST", "test-key");
+
+        let provider = OpenRouterResponsesProvider::new();
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "hello".to_string(),
+            })],
+        )];
+        let mut model_config = test_model_config(format!("{}/api/v1/responses", server.url()));
+        model_config.model_name = "anthropic/claude-sonnet-4.5".to_string();
+        model_config.cache_timeout = 3600;
+
+        provider
+            .send(&model_config, ProviderRequest::new(&messages))
+            .expect("provider should return message");
+
+        mock.assert();
     }
 
     #[test]

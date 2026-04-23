@@ -1,9 +1,4 @@
-use std::{
-    net::TcpStream,
-    sync::Mutex,
-    thread::sleep,
-    time::{Duration, Instant},
-};
+use std::{net::TcpStream, sync::Mutex, thread::sleep, time::Duration};
 
 use rand::Rng;
 use serde_json::{json, Map, Value};
@@ -86,6 +81,9 @@ impl CodexSubscriptionProvider {
                 ),
             );
         }
+        if let Some(reasoning) = codex_reasoning_payload(model_config) {
+            payload.insert("reasoning".to_string(), reasoning);
+        }
         payload.insert("store".to_string(), Value::Bool(false));
         payload.insert("stream".to_string(), Value::Bool(true));
 
@@ -131,7 +129,7 @@ impl Provider for CodexSubscriptionProvider {
         model_config: &ModelConfig,
         request: ProviderRequest<'_>,
     ) -> Result<ChatMessage, ProviderError> {
-        let started_at = Instant::now();
+        let mut retries_used = 0_u64;
 
         loop {
             match self.send_once(model_config, &request) {
@@ -140,11 +138,12 @@ impl Provider for CodexSubscriptionProvider {
                     RetryMode::Once => return Err(error),
                     RetryMode::RandomInterval {
                         max_interval_secs,
-                        max_time_secs,
+                        max_retries,
                     } => {
-                        if started_at.elapsed() >= Duration::from_secs(*max_time_secs) {
+                        if retries_used >= *max_retries {
                             return Err(error);
                         }
+                        retries_used = retries_used.saturating_add(1);
 
                         let sleep_secs = if *max_interval_secs == 0 {
                             0
@@ -272,6 +271,15 @@ fn send_response_create(
             _ => {}
         }
     }
+}
+
+fn codex_reasoning_payload(model_config: &ModelConfig) -> Option<Value> {
+    let mut payload = model_config.reasoning.clone()?;
+    let object = payload.as_object_mut()?;
+    object.remove("max_tokens");
+    object.remove("exclude");
+    object.remove("enabled");
+    Some(payload)
 }
 
 fn build_websocket_url(http_url: &str) -> Result<Url, ProviderError> {
@@ -484,6 +492,8 @@ fn responses_value_to_chat_message(
 
     Ok(ChatMessage {
         role: ChatRole::Assistant,
+        user_name: None,
+        message_time: None,
         token_usage: token_usage_from_value(value),
         data,
     })

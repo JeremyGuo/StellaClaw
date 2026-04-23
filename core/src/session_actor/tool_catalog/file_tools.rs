@@ -109,13 +109,17 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
         ),
         ToolDefinition::new(
             "apply_patch",
-            "Apply a unified diff patch inside the workspace using git apply. The patch must be a valid unified diff.",
+            "Apply a unified diff patch inside the workspace using git apply. The patch must be a valid unified diff. Returned stdout/stderr are capped by max_output_chars; full stdout/stderr are saved under out_path.",
             file_tool_schema(
                 properties([
                     ("patch", json!({"type": "string"})),
                     ("strip", json!({"type": "integer"})),
                     ("reverse", json!({"type": "boolean"})),
                     ("check", json!({"type": "boolean"})),
+                    (
+                        "max_output_chars",
+                        json!({"type": "integer", "minimum": 0, "maximum": 1000}),
+                    ),
                 ]),
                 &["patch"],
                 remote_mode,

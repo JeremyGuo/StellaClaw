@@ -1,13 +1,17 @@
 use std::{
+    fs,
     io::Write,
+    path::PathBuf,
     process::{Command, Stdio},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
 use crate::session_actor::tool_runtime::{
-    bool_arg_with_default, run_remote_command_with_stdin, shell_quote, string_arg,
-    usize_arg_with_default, ExecutionTarget, LocalToolError, ToolExecutionContext,
+    bool_arg_with_default, clamp_tool_output_chars, run_remote_command_with_stdin, shell_quote,
+    string_arg, truncate_tool_text, usize_arg_with_default, ExecutionTarget, LocalToolError,
+    ToolExecutionContext,
 };
 
 pub(super) fn execute_patch_tool(
@@ -22,7 +26,7 @@ pub(super) fn execute_patch_tool(
     let result = match context.execution_target(arguments)? {
         ExecutionTarget::Local => apply_patch_local(arguments, context.workspace_root)?,
         ExecutionTarget::RemoteSsh { host, cwd } => {
-            apply_patch_remote(arguments, &host, cwd.as_deref())?
+            apply_patch_remote(arguments, context.workspace_root, &host, cwd.as_deref())?
         }
     };
     Ok(Some(result))
@@ -36,6 +40,9 @@ fn apply_patch_local(
     let strip = usize_arg_with_default(arguments, "strip", 0)?;
     let reverse = bool_arg_with_default(arguments, "reverse", false)?;
     let check = bool_arg_with_default(arguments, "check", false)?;
+    let max_output_chars =
+        clamp_tool_output_chars(usize_arg_with_default(arguments, "max_output_chars", 1000)?);
+    let out_path = make_patch_output_dir(workspace_root)?;
 
     let mut command = Command::new("git");
     command
@@ -67,17 +74,12 @@ fn apply_patch_local(
     let output = child
         .wait_with_output()
         .map_err(|error| LocalToolError::Io(format!("failed to wait for git apply: {error}")))?;
-
-    Ok(json!({
-        "applied": output.status.success(),
-        "returncode": output.status.code().unwrap_or(-1),
-        "stdout": String::from_utf8_lossy(&output.stdout),
-        "stderr": String::from_utf8_lossy(&output.stderr),
-    }))
+    patch_result(output, out_path, None, max_output_chars)
 }
 
 fn apply_patch_remote(
     arguments: &Map<String, Value>,
+    workspace_root: &std::path::Path,
     host: &str,
     cwd: Option<&str>,
 ) -> Result<Value, LocalToolError> {
@@ -85,6 +87,8 @@ fn apply_patch_remote(
     let strip = usize_arg_with_default(arguments, "strip", 0)?;
     let reverse = bool_arg_with_default(arguments, "reverse", false)?;
     let check = bool_arg_with_default(arguments, "check", false)?;
+    let max_output_chars =
+        clamp_tool_output_chars(usize_arg_with_default(arguments, "max_output_chars", 1000)?);
     let mut args = vec![
         "git".to_string(),
         "apply".to_string(),
@@ -108,11 +112,69 @@ fn apply_patch_remote(
         None => remote_command,
     };
     let output = run_remote_command_with_stdin(host, &remote_command, patch.as_bytes())?;
-    Ok(json!({
-        "remote": host,
-        "applied": output.status.success(),
-        "returncode": output.status.code().unwrap_or(-1),
-        "stdout": String::from_utf8_lossy(&output.stdout),
-        "stderr": String::from_utf8_lossy(&output.stderr),
-    }))
+    let out_path = make_patch_output_dir(workspace_root)?;
+    patch_result(output, out_path, Some(host), max_output_chars)
+}
+
+fn patch_result(
+    output: std::process::Output,
+    out_path: PathBuf,
+    remote: Option<&str>,
+    max_output_chars: usize,
+) -> Result<Value, LocalToolError> {
+    fs::write(out_path.join("stdout"), &output.stdout).map_err(|error| {
+        LocalToolError::Io(format!("failed to write patch stdout artifact: {error}"))
+    })?;
+    fs::write(out_path.join("stderr"), &output.stderr).map_err(|error| {
+        LocalToolError::Io(format!("failed to write patch stderr artifact: {error}"))
+    })?;
+
+    let stdout_text = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr_text = String::from_utf8_lossy(&output.stderr).to_string();
+    let (stdout, stdout_truncated) = truncate_tool_text(&stdout_text, max_output_chars);
+    let (stderr, stderr_truncated) = truncate_tool_text(&stderr_text, max_output_chars);
+
+    let mut result = Map::new();
+    result.insert("applied".to_string(), Value::Bool(output.status.success()));
+    result.insert(
+        "out_path".to_string(),
+        Value::String(out_path.display().to_string()),
+    );
+    if let Some(returncode) = output.status.code() {
+        result.insert("returncode".to_string(), Value::from(returncode));
+    }
+    if let Some(remote) = remote {
+        result.insert("remote".to_string(), Value::String(remote.to_string()));
+    }
+    if !stdout.is_empty() {
+        result.insert("stdout".to_string(), Value::String(stdout));
+    }
+    if !stderr.is_empty() {
+        result.insert("stderr".to_string(), Value::String(stderr));
+    }
+    if stdout_truncated {
+        result.insert("stdout_truncated".to_string(), Value::Bool(true));
+    }
+    if stderr_truncated {
+        result.insert("stderr_truncated".to_string(), Value::Bool(true));
+    }
+    Ok(Value::Object(result))
+}
+
+fn make_patch_output_dir(workspace_root: &std::path::Path) -> Result<PathBuf, LocalToolError> {
+    let out_path = workspace_root
+        .join(".output")
+        .join("apply_patch")
+        .join(nonce());
+    fs::create_dir_all(&out_path).map_err(|error| {
+        LocalToolError::Io(format!("failed to create {}: {error}", out_path.display()))
+    })?;
+    Ok(out_path)
+}
+
+fn nonce() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }

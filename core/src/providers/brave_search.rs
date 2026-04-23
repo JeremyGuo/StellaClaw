@@ -278,6 +278,7 @@ mod tests {
             cache_timeout: 0,
             conn_timeout: 5,
             retry_mode: RetryMode::Once,
+            reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,
             multimodal_estimator: None,
             multimodal_input: None,

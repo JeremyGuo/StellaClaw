@@ -26,7 +26,7 @@ impl SessionActorLogger {
         let dir = root
             .as_ref()
             .join(".log")
-            .join("partyclaw")
+            .join("stellaclaw")
             .join(safe_session_id);
         std::fs::create_dir_all(&dir)
             .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
@@ -107,19 +107,19 @@ mod tests {
     }
 
     #[test]
-    fn writes_actor_log_under_partyclaw_session_dir() {
+    fn writes_actor_log_under_stellaclaw_session_dir() {
         let id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("partyclaw_logger_test_{id}"));
+        let root = std::env::temp_dir().join(format!("stellaclaw_logger_test_{id}"));
         let logger = SessionActorLogger::open_under(&root, "session/1").expect("logger opens");
 
         logger.info("demo_event", serde_json::json!({"ok": true}));
 
         let log_path = root
             .join(".log")
-            .join("partyclaw")
+            .join("stellaclaw")
             .join("session_1")
             .join("actor.log");
         assert_eq!(logger.path(), log_path.as_path());

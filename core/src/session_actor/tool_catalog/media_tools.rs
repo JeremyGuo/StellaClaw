@@ -858,6 +858,7 @@ mod tests {
             cache_timeout: 300,
             conn_timeout: 10,
             retry_mode: RetryMode::Once,
+            reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,
             multimodal_estimator: None,
             multimodal_input: None,
@@ -905,7 +906,7 @@ mod tests {
     impl TempDir {
         fn new(prefix: &str) -> Self {
             let path = std::env::temp_dir().join(format!(
-                "claw-party-{prefix}-{}-{}",
+                "stellaclaw-{prefix}-{}-{}",
                 std::process::id(),
                 rand::random::<u64>()
             ));

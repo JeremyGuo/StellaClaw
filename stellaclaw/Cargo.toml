@@ -1,0 +1,18 @@
+[package]
+name = "stellaclaw"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+stellaclaw_core = { path = "../core" }
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = { version = "0.10", features = ["serde"] }
+cron = "0.12"
+crossbeam-channel = "0.5"
+pulldown-cmark = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["formatting", "local-offset", "macros"] }

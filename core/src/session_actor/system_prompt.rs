@@ -1,25 +1,62 @@
-use super::{SessionInitial, SessionType, ToolRemoteMode};
+use super::{
+    runtime_metadata::{
+        RuntimeMetadataState, IDENTITY_PROMPT_COMPONENT, REMOTE_ALIASES_PROMPT_COMPONENT,
+        SKILLS_METADATA_PROMPT_COMPONENT, STELLACLAW_MEMORY_PROMPT_COMPONENT,
+        USER_META_PROMPT_COMPONENT,
+    },
+    SessionInitial, SessionType, ToolRemoteMode,
+};
 
-pub fn system_prompt_for_initial(initial: &SessionInitial) -> String {
+pub(crate) fn system_prompt_for_initial(
+    initial: &SessionInitial,
+    runtime_metadata_state: &RuntimeMetadataState,
+) -> String {
     let session_kind = match initial.session_type {
         SessionType::Foreground => foreground_prompt(),
         SessionType::Background => background_prompt(),
         SessionType::Subagent => subagent_prompt(),
     };
-
-    format!(
-        "{}\n\n{}\n\n{}",
-        common_prompt(),
-        session_kind,
-        remote_prompt(&initial.tool_remote_mode)
-    )
+    let mut sections = vec![
+        common_prompt().to_string(),
+        session_kind.to_string(),
+        remote_prompt(&initial.tool_remote_mode),
+    ];
+    sections.extend(snapshot_sections(initial, runtime_metadata_state));
+    sections.join("\n\n")
 }
 
 fn common_prompt() -> &'static str {
-    "You are PartyClaw, a pragmatic coding agent. Work in Rust-first codebases with minimal, \
+    "You are StellaClaw, a pragmatic coding agent. Work in Rust-first codebases with minimal, \
      direct abstractions. Use tools when they materially advance the task. Keep answers concise \
-     and grounded in the current workspace. Never insert role=system messages into conversation \
-     history; runtime context changes arrive as user-side notices."
+     and grounded in the current workspace. If you are unsure, do not answer from memory: inspect \
+     the repository, current session context, or run a narrow verification step first. Before using \
+     any library, framework, command, flag, file path, or project capability, verify that it exists \
+     in this repository or local environment instead of assuming it exists. For repository \
+     exploration, use the dedicated tools instead of shell read/search commands: use glob to find \
+     files by path pattern, grep to find files by content pattern, ls for narrowed directory \
+     listings, and file_read for file contents. Do not use shell for direct grep, find, cat, head, \
+     tail, or ls. Treat AGENTS.md and similar repository instruction files as scoped rules, not \
+     background lore. When you start working in a subdirectory, check whether that subtree has a \
+     more local AGENTS.md or similar instruction file before editing there; when rules conflict, \
+     follow the more local file. Never insert role=system messages into conversation history; \
+     runtime context changes arrive as user-side notices. STELLACLAW.md in the workspace root is \
+     the durable project memory file: keep it concise and factual, update it only when long-lived \
+     project facts, stable conventions, confirmed architecture notes, or handoff-critical decisions \
+     change. Do not use STELLACLAW.md for transient per-turn chatter, guesses, or unconfirmed \
+     notes. Use user_tell only for mid-task progress or coordination that must become visible \
+     before the current turn is ready to finish. If you can return the final answer now, do not \
+     send an extra user_tell first. Positive example: a long-running edit, benchmark, or debug \
+     session is still in progress and the user needs an immediate visible status update. Negative \
+     example: you already have the result and are about to finish, so a separate 'working on it' \
+     or 'done' user_tell is unnecessary. Use update_plan for multi-step, long-running, or \
+     ambiguous work so the user can see the current checklist. Positive examples: a refactor \
+     across several files, a bug investigation with multiple plausible causes, or a task that \
+     needs several verification steps. Negative examples: a one-line fix, a single file read, or \
+     a straightforward reply that can be finished immediately without a visible plan. If you need \
+     to send files or images back to the user, append one or more tags in this exact format: \
+     <attachment>relative/path/from/workspace_root</attachment>. Each path must be relative to the \
+     current workspace root. This attachment syntax is supported in both the final assistant reply \
+     and user_tell text."
 }
 
 fn foreground_prompt() -> &'static str {
@@ -55,20 +92,164 @@ fn remote_prompt(remote_mode: &ToolRemoteMode) -> String {
     }
 }
 
+fn snapshot_sections(
+    initial: &SessionInitial,
+    runtime_metadata_state: &RuntimeMetadataState,
+) -> Vec<String> {
+    let mut sections = Vec::new();
+
+    if let Some(identity) = runtime_metadata_state.snapshot_value(IDENTITY_PROMPT_COMPONENT) {
+        sections.push(format!(
+            "[Identity Snapshot]\nTreat this as the canonical durable identity context:\n{}",
+            identity
+        ));
+    }
+
+    if let Some(user_meta) = runtime_metadata_state.snapshot_value(USER_META_PROMPT_COMPONENT) {
+        sections.push(format!(
+            "[User Metadata Snapshot]\nTreat this as the canonical durable user metadata:\n{}",
+            user_meta
+        ));
+    }
+
+    if let Some(stellaclaw_memory) =
+        runtime_metadata_state.snapshot_value(STELLACLAW_MEMORY_PROMPT_COMPONENT)
+    {
+        sections.push(format!(
+            "[STELLACLAW Memory Snapshot]\nTreat this as the canonical durable project memory from STELLACLAW.md:\n{}",
+            stellaclaw_memory
+        ));
+    }
+
+    if let Some(skills_metadata) =
+        runtime_metadata_state.snapshot_value(SKILLS_METADATA_PROMPT_COMPONENT)
+    {
+        sections.push(format!(
+            "[Skills Metadata Snapshot]\nTreat this as the canonical durable skill registry metadata:\n{}",
+            skills_metadata
+        ));
+    }
+
+    if matches!(initial.tool_remote_mode, ToolRemoteMode::Selectable) {
+        if let Some(remote_aliases) =
+            runtime_metadata_state.snapshot_value(REMOTE_ALIASES_PROMPT_COMPONENT)
+        {
+            sections.push(format!(
+                "[Remote Aliases Snapshot]\nTreat this as the canonical durable SSH alias list for selectable remote tool calls:\n{}",
+                remote_aliases
+            ));
+        }
+    }
+
+    sections
+}
+
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::*;
+    use crate::session_actor::runtime_metadata::remote_aliases_prompt_for_mode;
+
+    fn temp_root() -> PathBuf {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("stellaclaw_system_prompt_{id}"))
+    }
 
     #[test]
     fn system_prompt_changes_by_session_type() {
+        let state = RuntimeMetadataState::default();
         let foreground =
-            system_prompt_for_initial(&SessionInitial::new("s1", SessionType::Foreground));
+            system_prompt_for_initial(&SessionInitial::new("s1", SessionType::Foreground), &state);
         let background =
-            system_prompt_for_initial(&SessionInitial::new("s2", SessionType::Background));
-        let subagent = system_prompt_for_initial(&SessionInitial::new("s3", SessionType::Subagent));
+            system_prompt_for_initial(&SessionInitial::new("s2", SessionType::Background), &state);
+        let subagent =
+            system_prompt_for_initial(&SessionInitial::new("s3", SessionType::Subagent), &state);
 
         assert!(foreground.contains("Session kind: foreground"));
         assert!(background.contains("Session kind: background"));
         assert!(subagent.contains("Session kind: subagent"));
+    }
+
+    #[test]
+    fn system_prompt_uses_snapshot_values_not_notified_values() {
+        let mut initial = SessionInitial::new("s1", SessionType::Foreground);
+        initial.tool_remote_mode = ToolRemoteMode::Selectable;
+
+        let mut state = RuntimeMetadataState::default();
+        let root = temp_root();
+        fs::create_dir_all(root.join(".stellaclaw")).unwrap();
+        fs::create_dir_all(root.join(".skill/demo")).unwrap();
+        fs::write(root.join(".stellaclaw/IDENTITY.md"), "identity: old").unwrap();
+        fs::write(root.join(".stellaclaw/USER.md"), "tier: old").unwrap();
+        fs::write(root.join("STELLACLAW.md"), "memory: old").unwrap();
+        fs::write(root.join(".skill/demo/SKILL.md"), "# Demo\n\nskills: old").unwrap();
+        state
+            .initialize_from_workspace(
+                &root,
+                "Available SSH remote aliases from ~/.ssh/config:\n- `old-host`".to_string(),
+            )
+            .unwrap();
+
+        fs::write(root.join(".stellaclaw/IDENTITY.md"), "identity: new").unwrap();
+        fs::write(root.join(".stellaclaw/USER.md"), "tier: new").unwrap();
+        fs::write(root.join("STELLACLAW.md"), "memory: new").unwrap();
+        fs::write(root.join(".skill/demo/SKILL.md"), "# Demo\n\nskills: new").unwrap();
+        state
+            .observe_for_user_turn_from_workspace(
+                &root,
+                "Available SSH remote aliases from ~/.ssh/config:\n- `new-host`".to_string(),
+            )
+            .unwrap();
+
+        let prompt_before_promote = system_prompt_for_initial(&initial, &state);
+        assert!(prompt_before_promote.contains("identity: old"));
+        assert!(prompt_before_promote.contains("tier: old"));
+        assert!(prompt_before_promote.contains("memory: old"));
+        assert!(prompt_before_promote.contains("skills: old"));
+        assert!(prompt_before_promote.contains("old-host"));
+        assert!(!prompt_before_promote.contains("identity: new"));
+        assert!(!prompt_before_promote.contains("tier: new"));
+        assert!(!prompt_before_promote.contains("memory: new"));
+        assert!(!prompt_before_promote.contains("skills: new"));
+        assert!(!prompt_before_promote.contains("new-host"));
+
+        state.promote_notified_components_to_system_snapshot();
+        let prompt_after_promote = system_prompt_for_initial(&initial, &state);
+        assert!(prompt_after_promote.contains("identity: new"));
+        assert!(prompt_after_promote.contains("tier: new"));
+        assert!(prompt_after_promote.contains("memory: new"));
+        assert!(prompt_after_promote.contains("skills: new"));
+        assert!(prompt_after_promote.contains("new-host"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fixed_ssh_system_prompt_does_not_include_remote_alias_snapshot() {
+        let mut initial = SessionInitial::new("s1", SessionType::Foreground);
+        initial.tool_remote_mode = ToolRemoteMode::FixedSsh {
+            host: "prod".to_string(),
+            cwd: Some("/work".to_string()),
+        };
+        let mut state = RuntimeMetadataState::default();
+        let root = temp_root();
+        state
+            .initialize_from_workspace(
+                &root,
+                remote_aliases_prompt_for_mode(&ToolRemoteMode::Selectable),
+            )
+            .unwrap();
+
+        let prompt = system_prompt_for_initial(&initial, &state);
+        assert!(prompt.contains("Tool remote mode: fixed SSH"));
+        assert!(!prompt.contains("[Remote Aliases Snapshot]"));
     }
 }

@@ -20,7 +20,7 @@ use super::{
 };
 use crate::session_actor::tool_runtime::{
     bool_arg_with_default, f64_arg_with_default, resolve_local_path, string_arg,
-    string_arg_with_default, LocalToolError, ToolExecutionContext,
+    string_arg_with_default, truncate_tool_text, LocalToolError, ToolExecutionContext,
 };
 
 static DOWNLOADS: OnceLock<Mutex<HashMap<String, DownloadTask>>> = OnceLock::new();
@@ -132,11 +132,7 @@ fn file_download_start(
         "url": url,
         "path": path.display().to_string(),
         "running": true,
-        "completed": false,
-        "cancelled": false,
-        "failed": false,
         "bytes_downloaded": 0_u64,
-        "total_bytes": null,
     })));
     let cancel = Arc::new(AtomicBool::new(false));
     downloads().lock().expect("mutex poisoned").insert(
@@ -189,7 +185,7 @@ fn file_download_cancel(arguments: &Map<String, Value>) -> Result<Value, LocalTo
             json!({"running": false, "cancelled": true, "completed": false}),
         );
     }
-    Ok(status.clone())
+    Ok(compact_download_snapshot(status.clone()))
 }
 
 fn wait_for_download(
@@ -235,7 +231,7 @@ fn file_download_progress_by_id(download_id: &str) -> Result<Value, LocalToolErr
             LocalToolError::InvalidArguments(format!("unknown download_id {download_id}"))
         })?;
     let snapshot = status.lock().expect("mutex poisoned").clone();
-    Ok(snapshot)
+    Ok(compact_download_snapshot(snapshot))
 }
 
 fn run_download(
@@ -249,7 +245,7 @@ fn run_download(
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        let temp_path = path.with_extension("partyclaw-download-part");
+        let temp_path = path.with_extension("stellaclaw-download-part");
         let client = reqwest::blocking::Client::builder()
             .build()
             .map_err(|error| error.to_string())?;
@@ -300,18 +296,17 @@ fn run_download(
 
     let mut value = status.lock().expect("mutex poisoned");
     match result {
-        Ok(()) => set_status_fields(
-            &mut value,
-            json!({"running": false, "completed": true, "failed": false, "cancelled": false}),
-        ),
-        Err(error) if error == "cancelled" => set_status_fields(
-            &mut value,
-            json!({"running": false, "completed": false, "failed": false, "cancelled": true}),
-        ),
-        Err(error) => set_status_fields(
-            &mut value,
-            json!({"running": false, "completed": false, "failed": true, "error": error}),
-        ),
+        Ok(()) => set_status_fields(&mut value, json!({"running": false, "completed": true})),
+        Err(error) if error == "cancelled" => {
+            set_status_fields(&mut value, json!({"running": false, "cancelled": true}))
+        }
+        Err(error) => {
+            let (error, _) = truncate_tool_text(&error, 1000);
+            set_status_fields(
+                &mut value,
+                json!({"running": false, "failed": true, "error": error}),
+            )
+        }
     }
 }
 
@@ -362,6 +357,40 @@ fn set_status_fields(status: &mut Value, patch: Value) {
             status.insert(key, value);
         }
     }
+}
+
+fn compact_download_snapshot(snapshot: Value) -> Value {
+    let Some(object) = snapshot.as_object() else {
+        return snapshot;
+    };
+
+    let mut compact = Map::new();
+    for required in ["download_id", "url", "path"] {
+        if let Some(value) = object.get(required) {
+            compact.insert(required.to_string(), value.clone());
+        }
+    }
+    for truthy in ["running", "completed", "cancelled", "failed"] {
+        if object.get(truthy).and_then(Value::as_bool).unwrap_or(false) {
+            compact.insert(truthy.to_string(), Value::Bool(true));
+        }
+    }
+    for numeric in ["bytes_downloaded", "total_bytes", "http_status"] {
+        if let Some(value) = object.get(numeric) {
+            if !value.is_null() {
+                compact.insert(numeric.to_string(), value.clone());
+            }
+        }
+    }
+    for text in ["final_url", "content_type", "error"] {
+        if let Some(value) = object.get(text).and_then(Value::as_str) {
+            if !value.is_empty() {
+                compact.insert(text.to_string(), Value::String(value.to_string()));
+            }
+        }
+    }
+
+    Value::Object(compact)
 }
 
 fn nonce() -> String {

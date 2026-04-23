@@ -123,6 +123,43 @@ pub(super) fn normalize_tool_value(value: Value) -> String {
     }
 }
 
+pub(super) fn clamp_tool_output_chars(requested: usize) -> usize {
+    requested.min(1000)
+}
+
+pub(super) fn truncate_tool_text(value: &str, max_chars: usize) -> (String, bool) {
+    let max_chars = clamp_tool_output_chars(max_chars);
+    let total_chars = value.chars().count();
+    if total_chars <= max_chars {
+        return (value.to_string(), false);
+    }
+    if max_chars == 0 {
+        return (String::new(), true);
+    }
+
+    let marker_template = format!("\n...<{} chars truncated>...\n", total_chars);
+    let marker_chars = marker_template.chars().count().min(max_chars);
+    if marker_chars >= max_chars {
+        return (value.chars().take(max_chars).collect::<String>(), true);
+    }
+
+    let available = max_chars - marker_chars;
+    let head_chars = available / 2;
+    let tail_chars = available - head_chars;
+    let omitted = total_chars.saturating_sub(head_chars + tail_chars);
+    let marker = format!("\n...<{omitted} chars truncated>...\n");
+    let head = value.chars().take(head_chars).collect::<String>();
+    let tail = value
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    (format!("{head}{marker}{tail}"), true)
+}
+
 pub(super) fn resolve_local_path(workspace_root: &Path, path: &str) -> PathBuf {
     if path.is_empty() {
         return workspace_root.to_path_buf();

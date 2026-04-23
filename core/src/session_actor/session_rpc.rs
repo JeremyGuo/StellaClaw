@@ -11,8 +11,8 @@ use thiserror::Error;
 use crate::model_config::ModelConfig;
 
 use super::{
-    runtime_metadata::SessionRuntimeMetadata, ChatMessage, ConversationBridge,
-    ConversationBridgeRequest, ConversationBridgeResponse, ToolBatchError,
+    ChatMessage, ConversationBridge, ConversationBridgeRequest, ConversationBridgeResponse,
+    ToolBatchError,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,8 +47,6 @@ pub struct SessionInitial {
     #[serde(default)]
     pub tool_remote_mode: ToolRemoteMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_metadata: Option<SessionRuntimeMetadata>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression_threshold_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression_retain_recent_tokens: Option<u64>,
@@ -70,7 +68,6 @@ impl SessionInitial {
             session_id: session_id.into(),
             session_type,
             tool_remote_mode: ToolRemoteMode::Selectable,
-            runtime_metadata: None,
             compression_threshold_tokens: None,
             compression_retain_recent_tokens: None,
             image_tool_model: None,
@@ -97,8 +94,6 @@ pub enum SessionRequest {
     },
     EnqueueUserMessage {
         message: ChatMessage,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        runtime_metadata: Option<SessionRuntimeMetadata>,
     },
     EnqueueActorMessage {
         message: ChatMessage,

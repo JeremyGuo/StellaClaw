@@ -6,10 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{
-    runtime_metadata::{RuntimeMetadataState, SessionRuntimeMetadata},
-    ChatMessage, SessionInitial,
-};
+use super::{runtime_metadata::RuntimeMetadataState, ChatMessage, SessionInitial};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SessionActorPersistedState {
@@ -21,8 +18,6 @@ pub(crate) struct SessionActorPersistedState {
     pub current_messages: Vec<ChatMessage>,
     pub next_turn_id: u64,
     pub next_batch_id: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub runtime_metadata: Option<SessionRuntimeMetadata>,
     #[serde(default)]
     pub runtime_metadata_state: RuntimeMetadataState,
 }
@@ -42,7 +37,7 @@ impl SessionStateStore {
         let dir = root
             .as_ref()
             .join(".log")
-            .join("partyclaw")
+            .join("stellaclaw")
             .join(sanitize_session_id(session_id));
         fs::create_dir_all(&dir)
             .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
@@ -124,7 +119,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("claw_party_session_state_{id}"))
+        std::env::temp_dir().join(format!("stellaclaw_session_state_{id}"))
     }
 
     #[test]
@@ -144,7 +139,6 @@ mod tests {
             current_messages: vec![message],
             next_turn_id: 2,
             next_batch_id: 1,
-            runtime_metadata: None,
             runtime_metadata_state: RuntimeMetadataState::default(),
         };
 
@@ -153,10 +147,10 @@ mod tests {
 
         assert_eq!(loaded.next_turn_id, 2);
         assert!(root
-            .join(".log/partyclaw/session_1/all_messages.jsonl")
+            .join(".log/stellaclaw/session_1/all_messages.jsonl")
             .exists());
         assert!(root
-            .join(".log/partyclaw/session_1/current_messages.jsonl")
+            .join(".log/stellaclaw/session_1/current_messages.jsonl")
             .exists());
     }
 }

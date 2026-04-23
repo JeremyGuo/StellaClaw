@@ -1,4 +1,10 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::VecDeque,
+    env,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use crossbeam_channel::{select, Receiver, Sender};
 use thiserror::Error;
@@ -11,9 +17,7 @@ use crate::{
 use super::{
     logger::SessionActorLogger,
     normalize_messages_for_model,
-    runtime_metadata::{
-        current_ssh_remote_aliases_prompt, RuntimeMetadataState, SessionRuntimeMetadata,
-    },
+    runtime_metadata::{remote_aliases_prompt_for_mode, RuntimeMetadataState},
     session_state::{SessionActorPersistedState, SessionStateStore},
     system_prompt_for_initial, ChatMessage, ChatMessageItem, ChatRole, CompressionReport,
     ContextItem, ConversationBridgeRequest, SessionCompressor, SessionEvent, SessionInitial,
@@ -37,7 +41,6 @@ pub struct SessionActor {
     all_messages: Vec<ChatMessage>,
     initial: Option<SessionInitial>,
     active_tool_batch: Option<ActiveToolBatch>,
-    runtime_metadata: Option<SessionRuntimeMetadata>,
     runtime_metadata_state: RuntimeMetadataState,
     next_turn_id: u64,
     next_batch_id: u64,
@@ -47,6 +50,9 @@ pub struct SessionActor {
     state_store: Option<SessionStateStore>,
     compressor: Option<SessionCompressor>,
     pending_continuation: Option<PendingContinuation>,
+    last_agent_returned_at: Option<Instant>,
+    last_completed_turn_number: u64,
+    last_idle_compaction_turn_number: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -134,7 +140,6 @@ impl SessionActor {
             all_messages: Vec::new(),
             initial: None,
             active_tool_batch: None,
-            runtime_metadata: None,
             runtime_metadata_state: RuntimeMetadataState::default(),
             next_turn_id: 1,
             next_batch_id: 1,
@@ -144,6 +149,9 @@ impl SessionActor {
             state_store: None,
             compressor: None,
             pending_continuation: None,
+            last_agent_returned_at: None,
+            last_completed_turn_number: 0,
+            last_idle_compaction_turn_number: 0,
         }
     }
 
@@ -174,14 +182,39 @@ impl SessionActor {
             return self.process_ready_step();
         }
 
-        select! {
-            recv(self.request_rx) -> request => {
-                let request = request.map_err(|_| SessionActorError::Mailbox("session actor request channel closed".to_string()))?;
-                self.enqueue_request(request);
+        if let Some(delay) = self.idle_compaction_delay() {
+            if delay.is_zero() {
+                if self.try_run_idle_compaction()? {
+                    return Ok(SessionActorStep::ProcessedIdleCompaction);
+                }
+            } else {
+                let idle_timer = crossbeam_channel::after(delay);
+                select! {
+                    recv(self.request_rx) -> request => {
+                        let request = request.map_err(|_| SessionActorError::Mailbox("session actor request channel closed".to_string()))?;
+                        self.enqueue_request(request);
+                    }
+                    recv(self.tool_completion_rx) -> completion => {
+                        let completion = completion.map_err(|_| SessionActorError::Tool("tool completion channel disconnected".to_string()))?;
+                        self.pending_tool_completions.push_back(completion);
+                    }
+                    recv(idle_timer) -> _ => {
+                        if self.try_run_idle_compaction()? {
+                            return Ok(SessionActorStep::ProcessedIdleCompaction);
+                        }
+                    }
+                }
             }
-            recv(self.tool_completion_rx) -> completion => {
-                let completion = completion.map_err(|_| SessionActorError::Tool("tool completion channel disconnected".to_string()))?;
-                self.pending_tool_completions.push_back(completion);
+        } else {
+            select! {
+                recv(self.request_rx) -> request => {
+                    let request = request.map_err(|_| SessionActorError::Mailbox("session actor request channel closed".to_string()))?;
+                    self.enqueue_request(request);
+                }
+                recv(self.tool_completion_rx) -> completion => {
+                    let completion = completion.map_err(|_| SessionActorError::Tool("tool completion channel disconnected".to_string()))?;
+                    self.pending_tool_completions.push_back(completion);
+                }
             }
         }
         self.process_ready_step()
@@ -295,7 +328,7 @@ impl SessionActor {
                 let compressor = build_session_compressor(&self.model_config, &initial)?;
                 let loaded = state_store.load().map_err(SessionActorError::Persistence)?;
                 if let Some(saved) = loaded {
-                    self.restore_persisted_state(saved, initial.clone());
+                    self.restore_persisted_state(saved, initial.clone())?;
                     logger.info(
                         "session_state_restored",
                         serde_json::json!({
@@ -307,11 +340,14 @@ impl SessionActor {
                         }),
                     );
                 } else {
-                    self.runtime_metadata = initial.runtime_metadata.clone();
-                    self.runtime_metadata_state.initialize_from(
-                        self.runtime_metadata.as_ref(),
-                        current_ssh_remote_aliases_prompt(),
-                    );
+                    self.runtime_metadata_state
+                        .initialize_from_workspace(
+                            &self
+                                .workspace_root()
+                                .map_err(SessionActorError::RuntimeMetadata)?,
+                            remote_aliases_prompt_for_mode(&initial.tool_remote_mode),
+                        )
+                        .map_err(SessionActorError::RuntimeMetadata)?;
                 }
                 logger.info(
                     "initial_applied",
@@ -558,14 +594,8 @@ impl SessionActor {
         self.pending_continuation = None;
         let retry_request = request.clone();
         let input_message = match request {
-            SessionRequest::EnqueueUserMessage {
-                message,
-                runtime_metadata,
-            } => {
-                if runtime_metadata.is_some() {
-                    self.runtime_metadata = runtime_metadata;
-                }
-                if let Err(error) = self.append_runtime_synthetic_messages() {
+            SessionRequest::EnqueueUserMessage { message } => {
+                if let Err(error) = self.append_runtime_synthetic_messages(&message) {
                     return self.finish_turn_error(
                         "pre_turn",
                         error,
@@ -684,7 +714,7 @@ impl SessionActor {
             let system_prompt = self
                 .initial
                 .as_ref()
-                .map(system_prompt_for_initial)
+                .map(|initial| system_prompt_for_initial(initial, &self.runtime_metadata_state))
                 .ok_or(SessionActorError::MissingInitial)?;
             let tools = self
                 .tool_catalog
@@ -724,6 +754,7 @@ impl SessionActor {
                 self.emit(SessionEvent::TurnCompleted {
                     message: model_message,
                 })?;
+                self.mark_turn_returned(turn_number);
                 return Ok(());
             }
 
@@ -840,13 +871,7 @@ impl SessionActor {
             .get("skill_name")
             .or_else(|| arguments.get("name"))
             .and_then(serde_json::Value::as_str)?;
-        let skill = self
-            .runtime_metadata
-            .as_ref()?
-            .skills
-            .iter()
-            .find(|skill| skill.name == skill_name)?
-            .clone();
+        let skill = self.runtime_metadata_state.skill_observation(skill_name)?;
         Some(ToolExecutionOp::SkillLoad { tool_call, skill })
     }
 
@@ -948,12 +973,32 @@ impl SessionActor {
         Ok(())
     }
 
-    fn append_runtime_synthetic_messages(&mut self) -> Result<(), SessionActorError> {
-        let notices = self.runtime_metadata_state.observe_for_user_turn(
-            self.runtime_metadata.as_ref(),
-            current_ssh_remote_aliases_prompt(),
-        );
+    fn append_runtime_synthetic_messages(
+        &mut self,
+        input_message: &ChatMessage,
+    ) -> Result<(), SessionActorError> {
+        let notices = self
+            .runtime_metadata_state
+            .observe_for_user_turn_from_workspace(
+                &self
+                    .workspace_root()
+                    .map_err(SessionActorError::RuntimeMetadata)?,
+                self.initial
+                    .as_ref()
+                    .map(|initial| remote_aliases_prompt_for_mode(&initial.tool_remote_mode))
+                    .unwrap_or_default(),
+            )
+            .map_err(SessionActorError::RuntimeMetadata)?;
         for notice in notices {
+            self.append_history_message(
+                "runtime_synthetic",
+                ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem { text: notice })],
+                ),
+            )?;
+        }
+        if let Some(notice) = render_incoming_user_metadata_notice(input_message) {
             self.append_history_message(
                 "runtime_synthetic",
                 ChatMessage::new(
@@ -983,22 +1028,23 @@ impl SessionActor {
         &mut self,
         saved: SessionActorPersistedState,
         incoming_initial: SessionInitial,
-    ) {
+    ) -> Result<(), SessionActorError> {
         self.history = saved.current_messages;
         self.all_messages = saved.all_messages;
         self.next_turn_id = saved.next_turn_id.max(1);
         self.next_batch_id = saved.next_batch_id.max(1);
-        self.runtime_metadata = incoming_initial
-            .runtime_metadata
-            .clone()
-            .or(saved.runtime_metadata);
         self.runtime_metadata_state = saved.runtime_metadata_state;
         if self.runtime_metadata_state.prompt_components.is_empty() {
-            self.runtime_metadata_state.initialize_from(
-                self.runtime_metadata.as_ref(),
-                current_ssh_remote_aliases_prompt(),
-            );
+            self.runtime_metadata_state
+                .initialize_from_workspace(
+                    &self
+                        .workspace_root()
+                        .map_err(SessionActorError::RuntimeMetadata)?,
+                    remote_aliases_prompt_for_mode(&incoming_initial.tool_remote_mode),
+                )
+                .map_err(SessionActorError::RuntimeMetadata)?;
         }
+        Ok(())
     }
 
     fn persist_state(&self) -> Result<(), SessionActorError> {
@@ -1013,7 +1059,6 @@ impl SessionActor {
                 current_messages: self.history.clone(),
                 next_turn_id: self.next_turn_id,
                 next_batch_id: self.next_batch_id,
-                runtime_metadata: self.runtime_metadata.clone(),
                 runtime_metadata_state: self.runtime_metadata_state.clone(),
             })
             .map_err(SessionActorError::Persistence)
@@ -1056,6 +1101,91 @@ impl SessionActor {
         );
     }
 
+    fn mark_turn_returned(&mut self, turn_number: u64) {
+        self.last_agent_returned_at = Some(Instant::now());
+        self.last_completed_turn_number = self.last_completed_turn_number.max(turn_number);
+    }
+
+    fn idle_compaction_delay(&self) -> Option<Duration> {
+        self.initial.as_ref()?;
+        self.compressor.as_ref()?;
+        if self.shutdown
+            || self.active_tool_batch.is_some()
+            || !self.pending_control.is_empty()
+            || !self.pending_data.is_empty()
+            || !self.pending_tool_completions.is_empty()
+            || self.last_completed_turn_number <= self.last_idle_compaction_turn_number
+            || count_unclosed_tool_calls(&self.history) > 0
+        {
+            return None;
+        }
+
+        let returned_at = self.last_agent_returned_at?;
+        let threshold = idle_compaction_threshold(&self.model_config)?;
+        let elapsed = returned_at.elapsed();
+        Some(threshold.saturating_sub(elapsed))
+    }
+
+    fn try_run_idle_compaction(&mut self) -> Result<bool, SessionActorError> {
+        if !matches!(self.idle_compaction_delay(), Some(delay) if delay.is_zero()) {
+            return Ok(false);
+        }
+
+        let Some(compressor) = self.compressor.as_ref() else {
+            return Ok(false);
+        };
+
+        self.log_info(
+            "idle_compaction_started",
+            serde_json::json!({
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+                "last_completed_turn_number": self.last_completed_turn_number,
+            }),
+        );
+
+        let threshold_tokens =
+            idle_compaction_token_threshold(&self.model_config, self.initial.as_ref());
+        match compressor.compact_if_needed_with_threshold(
+            &mut self.history,
+            self.provider.as_ref(),
+            &self.model_config,
+            threshold_tokens,
+        ) {
+            Ok(report) => {
+                self.log_compression_report("idle", &report);
+                if report.compressed {
+                    self.runtime_metadata_state
+                        .promote_notified_components_to_system_snapshot();
+                    self.persist_state_if_history_closed("idle_compaction")?;
+                }
+                self.last_idle_compaction_turn_number = self.last_completed_turn_number;
+                self.log_info(
+                    "idle_compaction_finished",
+                    serde_json::json!({
+                        "compressed": report.compressed,
+                        "estimated_tokens_before": report.estimated_tokens_before,
+                        "estimated_tokens_after": report.estimated_tokens_after,
+                        "threshold_tokens": report.threshold_tokens,
+                        "history_len": self.history.len(),
+                    }),
+                );
+                Ok(report.compressed)
+            }
+            Err(error) => {
+                self.last_idle_compaction_turn_number = self.last_completed_turn_number;
+                self.log_error(
+                    "idle_compaction_failed",
+                    serde_json::json!({"error": error.to_string()}),
+                );
+                self.emit(SessionEvent::Progress {
+                    message: format!("idle context compression failed: {error}"),
+                })?;
+                Ok(false)
+            }
+        }
+    }
+
     fn log_info(&self, event: &str, data: serde_json::Value) {
         if let Some(logger) = &self.logger {
             logger.info(event, data);
@@ -1085,6 +1215,10 @@ impl SessionActor {
         self.next_batch_id = self.next_batch_id.saturating_add(1);
         id
     }
+
+    fn workspace_root(&self) -> Result<PathBuf, String> {
+        env::current_dir().map_err(|error| format!("failed to resolve cwd: {error}"))
+    }
 }
 
 pub trait SessionActorEventSink: Send + Sync + 'static {
@@ -1096,6 +1230,7 @@ pub enum SessionActorStep {
     Idle,
     ProcessedControl,
     ProcessedData,
+    ProcessedIdleCompaction,
     WaitingToolBatch,
     Shutdown,
 }
@@ -1118,6 +1253,8 @@ pub enum SessionActorError {
     Compression(String),
     #[error("session actor persistence failed: {0}")]
     Persistence(String),
+    #[error("session actor runtime metadata failed: {0}")]
+    RuntimeMetadata(String),
     #[error("data mailbox head changed while starting a turn")]
     DataHeadChanged,
     #[error("unexpected request in data mailbox")]
@@ -1137,6 +1274,7 @@ impl SessionActorError {
             Self::Provider(_)
                 | Self::Compression(_)
                 | Self::Tool(_)
+                | Self::RuntimeMetadata(_)
                 | Self::ModelStepLimitExceeded(_)
         )
     }
@@ -1167,6 +1305,30 @@ fn default_retain_recent_tokens(threshold_tokens: u64) -> u64 {
         return 1;
     }
     (threshold_tokens / 4).max(512).min(threshold_tokens - 1)
+}
+
+fn idle_compaction_threshold(model_config: &ModelConfig) -> Option<Duration> {
+    const CACHE_EXPIRY_LEAD_TIME_SECS: u64 = 30;
+    if model_config.cache_timeout <= CACHE_EXPIRY_LEAD_TIME_SECS {
+        return None;
+    }
+    Some(Duration::from_secs(
+        model_config.cache_timeout - CACHE_EXPIRY_LEAD_TIME_SECS,
+    ))
+}
+
+fn idle_compaction_token_threshold(
+    model_config: &ModelConfig,
+    initial: Option<&SessionInitial>,
+) -> u64 {
+    const IDLE_COMPACTION_MIN_RATIO: f64 = 0.4;
+    let idle_threshold = ((model_config.token_max_context as f64) * IDLE_COMPACTION_MIN_RATIO)
+        .floor()
+        .max(1.0) as u64;
+    initial
+        .and_then(|initial| initial.compression_threshold_tokens)
+        .map(|active_threshold| active_threshold.min(idle_threshold).max(1))
+        .unwrap_or(idle_threshold)
 }
 
 fn collect_tool_calls(message: &ChatMessage) -> Vec<super::ToolCallItem> {
@@ -1242,6 +1404,34 @@ fn synthetic_media_message_from_tool_results(message: &ChatMessage) -> Option<Ch
     })];
     data.extend(files);
     Some(ChatMessage::new(ChatRole::User, data))
+}
+
+fn render_incoming_user_metadata_notice(message: &ChatMessage) -> Option<String> {
+    if message.role != ChatRole::User {
+        return None;
+    }
+    let mut lines = vec!["[Incoming User Metadata]".to_string()];
+    let mut has_metadata = false;
+    if let Some(user_name) = message.user_name.as_deref().map(str::trim) {
+        if !user_name.is_empty() {
+            lines.push(format!("Speaker: {user_name}"));
+            has_metadata = true;
+        }
+    }
+    if let Some(message_time) = message.message_time.as_deref().map(str::trim) {
+        if !message_time.is_empty() {
+            lines.push(format!("Message time: {message_time}"));
+            has_metadata = true;
+        }
+    }
+    if !has_metadata {
+        return None;
+    }
+    lines.push(
+        "Treat this metadata as context for the immediately following user message only."
+            .to_string(),
+    );
+    Some(lines.join("\n"))
 }
 
 fn session_request_kind(request: &SessionRequest) -> &'static str {
@@ -1350,6 +1540,7 @@ mod tests {
         collections::VecDeque,
         fs,
         sync::{mpsc, Mutex},
+        time::{Duration, Instant},
     };
 
     use ahash::AHashMap;
@@ -1363,9 +1554,8 @@ mod tests {
         providers::{Provider, ProviderError},
         session_actor::{
             builtin_tool_catalog, BuiltinToolCatalogOptions, ChatRole, ContextItem, FileItem,
-            HostToolScope, SessionMailboxKind, SessionRuntimeMetadata, SessionSkillObservation,
-            ToolBatchError, ToolBatchHandle, ToolCallItem, ToolResultContent, ToolResultItem,
-            COMPRESSION_MARKER,
+            HostToolScope, SessionMailboxKind, ToolBatchError, ToolBatchHandle, ToolCallItem,
+            ToolResultContent, ToolResultItem, COMPRESSION_MARKER,
         },
         test_support::temp_cwd,
     };
@@ -1618,6 +1808,7 @@ mod tests {
             cache_timeout: 300,
             conn_timeout: 10,
             retry_mode: RetryMode::Once,
+            reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,
             multimodal_estimator: None,
             multimodal_input: None,
@@ -1645,7 +1836,7 @@ mod tests {
         tokenizer.with_pre_tokenizer(Some(Whitespace));
 
         let directory = std::env::temp_dir().join(format!(
-            "claw-party-actor-compression-test-{}-{}",
+            "stellaclaw-actor-compression-test-{}-{}",
             std::process::id(),
             rand::random::<u64>()
         ));
@@ -1695,7 +1886,6 @@ mod tests {
         mailbox.append(
             SessionMailboxKind::Data,
             SessionRequest::EnqueueUserMessage {
-                runtime_metadata: None,
                 message: ChatMessage::new(
                     ChatRole::User,
                     vec![ChatMessageItem::Context(ContextItem {
@@ -1760,7 +1950,6 @@ mod tests {
         mailbox.append(
             SessionMailboxKind::Data,
             SessionRequest::EnqueueUserMessage {
-                runtime_metadata: None,
                 message: ChatMessage::new(
                     ChatRole::User,
                     vec![ChatMessageItem::Context(ContextItem {
@@ -1854,7 +2043,6 @@ mod tests {
         mailbox.append(
             SessionMailboxKind::Data,
             SessionRequest::EnqueueUserMessage {
-                runtime_metadata: None,
                 message: ChatMessage::new(
                     ChatRole::User,
                     vec![ChatMessageItem::Context(ContextItem {
@@ -1950,7 +2138,6 @@ mod tests {
         mailbox.append(
             SessionMailboxKind::Data,
             SessionRequest::EnqueueUserMessage {
-                runtime_metadata: None,
                 message: ChatMessage::new(
                     ChatRole::User,
                     vec![ChatMessageItem::Context(ContextItem {
@@ -2018,7 +2205,6 @@ mod tests {
         mailbox.append(
             SessionMailboxKind::Data,
             SessionRequest::EnqueueUserMessage {
-                runtime_metadata: None,
                 message: ChatMessage::new(
                     ChatRole::User,
                     vec![ChatMessageItem::Context(ContextItem {
@@ -2079,7 +2265,6 @@ mod tests {
         mailbox.append(
             SessionMailboxKind::Data,
             SessionRequest::EnqueueUserMessage {
-                runtime_metadata: None,
                 message: ChatMessage::new(
                     ChatRole::User,
                     vec![ChatMessageItem::Context(ContextItem {
@@ -2130,44 +2315,82 @@ mod tests {
     #[test]
     fn injects_runtime_metadata_updates_before_user_message() {
         let _cwd = temp_cwd("actor-runtime-meta");
+        fs::create_dir_all(".stellaclaw").expect("metadata dir should exist");
+        fs::create_dir_all(".skill/demo").expect("skill dir should exist");
+        fs::write(".stellaclaw/USER.md", "tier: old").expect("user metadata should seed");
+        fs::write(".skill/demo/SKILL.md", "# Demo\n\nold desc\n\nold body")
+            .expect("skill should seed");
         let (inbox, mailbox) = test_inbox();
-        let mut initial = SessionInitial::new(
-            test_session_id("session_runtime_meta"),
-            super::super::SessionType::Foreground,
-        );
-        initial.runtime_metadata = Some(SessionRuntimeMetadata {
-            user_meta: Some("tier: old".to_string()),
-            skills_metadata: Some("skills: old".to_string()),
-            skills: vec![SessionSkillObservation {
-                name: "demo".to_string(),
-                description: "old desc".to_string(),
-                content: "old body".to_string(),
-            }],
-            ..SessionRuntimeMetadata::default()
-        });
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(ScriptedProvider::new(vec![ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "done".to_string(),
+            })],
+        )]));
+        let tools = Arc::new(EchoToolExecutor::new());
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
+        let mut actor =
+            SessionActor::new(test_model_config(), provider, tools, inbox, events, catalog);
+
         mailbox.append(
             SessionMailboxKind::Control,
-            SessionRequest::Initial { initial },
+            SessionRequest::Initial {
+                initial: SessionInitial::new(
+                    test_session_id("session_runtime_meta"),
+                    super::super::SessionType::Foreground,
+                ),
+            },
         );
+        actor.step().expect("initial should apply");
+
+        fs::write(".stellaclaw/USER.md", "tier: new").expect("user metadata should update");
+        fs::write(".skill/demo/SKILL.md", "# Demo\n\nnew desc\n\nold body")
+            .expect("skill should update");
         mailbox.append(
             SessionMailboxKind::Data,
             SessionRequest::EnqueueUserMessage {
-                runtime_metadata: Some(SessionRuntimeMetadata {
-                    user_meta: Some("tier: new".to_string()),
-                    skills_metadata: Some("skills: new".to_string()),
-                    skills: vec![SessionSkillObservation {
-                        name: "demo".to_string(),
-                        description: "new desc".to_string(),
-                        content: "old body".to_string(),
-                    }],
-                    ..SessionRuntimeMetadata::default()
-                }),
                 message: ChatMessage::new(
                     ChatRole::User,
                     vec![ChatMessageItem::Context(ContextItem {
                         text: "real user request".to_string(),
                     })],
                 ),
+            },
+        );
+
+        actor.run_until_idle(4).expect("actor should run");
+
+        assert!(message_text_for_test(&actor.history()[0]).contains("[Runtime Prompt Updates]"));
+        assert!(message_text_for_test(&actor.history()[0]).contains("tier: new"));
+        assert!(message_text_for_test(&actor.history()[1]).contains("[Runtime Skill Updates]"));
+        assert!(message_text_for_test(&actor.history()[2]).contains("real user request"));
+    }
+
+    #[test]
+    fn user_message_metadata_inserts_synthetic_notice_before_user_input() {
+        let _cwd = temp_cwd("actor-user-message-metadata");
+        let (inbox, mailbox) = test_inbox();
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial {
+                initial: SessionInitial::new(
+                    test_session_id("session_user_message_metadata"),
+                    super::super::SessionType::Foreground,
+                ),
+            },
+        );
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "hello".to_string(),
+                    })],
+                )
+                .with_user_name("alice")
+                .with_message_time("2026-04-23T10:20:30Z"),
             },
         );
         let events = Arc::new(MemoryEventSink::default());
@@ -2184,10 +2407,15 @@ mod tests {
 
         actor.run_until_idle(4).expect("actor should run");
 
-        assert!(message_text_for_test(&actor.history()[0]).contains("[Runtime Prompt Updates]"));
-        assert!(message_text_for_test(&actor.history()[0]).contains("tier: new"));
-        assert!(message_text_for_test(&actor.history()[1]).contains("[Runtime Skill Updates]"));
-        assert!(message_text_for_test(&actor.history()[2]).contains("real user request"));
+        assert!(message_text_for_test(&actor.history()[0]).contains("[Incoming User Metadata]"));
+        assert!(message_text_for_test(&actor.history()[0]).contains("Speaker: alice"));
+        assert!(message_text_for_test(&actor.history()[0])
+            .contains("Message time: 2026-04-23T10:20:30Z"));
+        assert_eq!(actor.history()[1].user_name.as_deref(), Some("alice"));
+        assert_eq!(
+            actor.history()[1].message_time.as_deref(),
+            Some("2026-04-23T10:20:30Z")
+        );
     }
 
     #[test]
@@ -2207,7 +2435,6 @@ mod tests {
         mailbox.append(
             SessionMailboxKind::Data,
             SessionRequest::EnqueueUserMessage {
-                runtime_metadata: None,
                 message: ChatMessage::new(
                     ChatRole::User,
                     vec![ChatMessageItem::Context(ContextItem {
@@ -2267,7 +2494,6 @@ mod tests {
         mailbox.append(
             SessionMailboxKind::Data,
             SessionRequest::EnqueueUserMessage {
-                runtime_metadata: None,
                 message: ChatMessage::new(
                     ChatRole::User,
                     vec![ChatMessageItem::Context(ContextItem {
@@ -2337,7 +2563,6 @@ mod tests {
         mailbox.append(
             SessionMailboxKind::Data,
             SessionRequest::EnqueueUserMessage {
-                runtime_metadata: None,
                 message: ChatMessage::new(
                     ChatRole::User,
                     vec![ChatMessageItem::Context(ContextItem {
@@ -2391,7 +2616,7 @@ mod tests {
         let state_path = std::env::current_dir()
             .unwrap()
             .join(".log")
-            .join("partyclaw")
+            .join("stellaclaw")
             .join(&session_id)
             .join("session.json");
         let state_before_release: SessionActorPersistedState = serde_json::from_str(
@@ -2458,7 +2683,6 @@ mod tests {
         mailbox.append(
             SessionMailboxKind::Data,
             SessionRequest::EnqueueUserMessage {
-                runtime_metadata: None,
                 message: ChatMessage::new(
                     ChatRole::User,
                     vec![ChatMessageItem::Context(ContextItem {
@@ -2470,7 +2694,6 @@ mod tests {
         mailbox.append(
             SessionMailboxKind::Data,
             SessionRequest::EnqueueUserMessage {
-                runtime_metadata: None,
                 message: ChatMessage::new(
                     ChatRole::User,
                     vec![ChatMessageItem::Context(ContextItem {
@@ -2513,6 +2736,77 @@ mod tests {
             .history()
             .iter()
             .any(|message| message_text_for_test(message).contains("second final")));
+
+        fs::remove_dir_all(tokenizer_dir).expect("tokenizer dir should be removed");
+    }
+
+    #[test]
+    fn idle_compaction_runs_after_cache_lead_time() {
+        let _cwd = temp_cwd("actor-idle-compression");
+        let (inbox, mailbox) = test_inbox();
+        let mut initial = SessionInitial::new(
+            test_session_id("session_idle_compression"),
+            super::super::SessionType::Foreground,
+        );
+        initial.compression_threshold_tokens = Some(1_000);
+        initial.compression_retain_recent_tokens = Some(12);
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial { initial },
+        );
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "old ".repeat(50),
+                    })],
+                ),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "first final".to_string(),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "summary".to_string(),
+                })],
+            ),
+        ]));
+        let tools = Arc::new(EchoToolExecutor::new());
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
+        let (mut model_config, tokenizer_dir) = test_model_config_with_tokenizer();
+        model_config.token_max_context = 64;
+        model_config.cache_timeout = 300;
+        let mut actor = SessionActor::new(
+            model_config,
+            provider.clone(),
+            tools,
+            inbox,
+            events,
+            catalog,
+        );
+
+        actor.run_until_idle(4).expect("actor should run");
+        assert_eq!(actor.history().len(), 2);
+        assert!(!message_text_for_test(&actor.history()[0]).contains(COMPRESSION_MARKER));
+
+        actor.last_agent_returned_at = Some(Instant::now() - Duration::from_secs(271));
+        let compacted = actor
+            .try_run_idle_compaction()
+            .expect("idle compaction should not fail");
+
+        assert!(compacted);
+        assert!(message_text_for_test(&actor.history()[0]).contains(COMPRESSION_MARKER));
+        assert!(message_text_for_test(&actor.history()[0]).contains("summary"));
+        assert_eq!(provider.seen_requests.lock().unwrap().len(), 2);
 
         fs::remove_dir_all(tokenizer_dir).expect("tokenizer dir should be removed");
     }

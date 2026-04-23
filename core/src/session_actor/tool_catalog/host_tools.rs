@@ -21,10 +21,8 @@ pub fn host_tool_definitions(scope: HostToolScope) -> Vec<ToolDefinition> {
         scope,
         HostToolScope::MainForeground | HostToolScope::MainBackground
     ) {
-        tools.extend(memory_tools());
         tools.extend(cron_tools());
         tools.extend(managed_agent_tools());
-        tools.push(shared_profile_upload_tool());
     }
 
     tools.push(user_tell_tool(scope));
@@ -42,64 +40,6 @@ pub fn host_tool_definitions(scope: HostToolScope) -> Vec<ToolDefinition> {
     }
 
     tools
-}
-
-fn memory_tools() -> Vec<ToolDefinition> {
-    vec![
-        bridge_tool(
-            "memory_search",
-            "Search the current conversation memory layers. Use this before opening rollout summaries or transcript snippets when you need older conversation context.",
-            object_schema(
-                properties([
-                    ("query", json!({"type": "string"})),
-                    ("limit", json!({"type": "integer"})),
-                ]),
-                &["query"],
-            ),
-            ToolExecutionMode::Immediate,
-        ),
-        bridge_tool(
-            "rollout_search",
-            "Search rollout transcripts for exact historical evidence. Prefer passing rollout_id when you already know which rollout is relevant.",
-            object_schema(
-                properties([
-                    ("query", json!({"type": "string"})),
-                    ("rollout_id", json!({"type": "string"})),
-                    (
-                        "kinds",
-                        json!({"type": "array", "items": {"type": "string"}}),
-                    ),
-                    ("limit", json!({"type": "integer"})),
-                ]),
-                &["query"],
-            ),
-            ToolExecutionMode::Immediate,
-        ),
-        bridge_tool(
-            "rollout_read",
-            "Read a small snippet around one rollout transcript event. Use this after rollout_search instead of opening the whole transcript.",
-            object_schema(
-                properties([
-                    ("rollout_id", json!({"type": "string"})),
-                    ("anchor_event_id", json!({"type": "integer"})),
-                    ("mode", json!({"type": "string"})),
-                    ("before", json!({"type": "integer"})),
-                    ("after", json!({"type": "integer"})),
-                ]),
-                &["rollout_id", "anchor_event_id"],
-            ),
-            ToolExecutionMode::Immediate,
-        ),
-    ]
-}
-
-fn shared_profile_upload_tool() -> ToolDefinition {
-    bridge_tool(
-        "shared_profile_upload",
-        "Upload the workspace copies of USER.md and IDENTITY.md back to the shared profile files.",
-        object_schema(properties([]), &[]),
-        ToolExecutionMode::Immediate,
-    )
 }
 
 fn user_tell_tool(scope: HostToolScope) -> ToolDefinition {

@@ -26,7 +26,7 @@ pub(crate) fn temp_cwd(prefix: &str) -> TempCwdGuard {
         .expect("test cwd lock should not be poisoned");
     let previous = std::env::current_dir().expect("current dir should be available");
     let root = std::env::temp_dir().join(format!(
-        "claw-party-test-{}-{}-{}",
+        "stellaclaw-test-{}-{}-{}",
         prefix,
         std::process::id(),
         rand::random::<u64>()

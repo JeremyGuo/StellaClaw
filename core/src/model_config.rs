@@ -36,7 +36,7 @@ pub enum RetryMode {
     Once,
     RandomInterval {
         max_interval_secs: u64,
-        max_time_secs: u64,
+        max_retries: u64,
     },
 }
 
@@ -85,6 +85,8 @@ pub struct ModelConfig {
     pub cache_timeout: u64,
     pub conn_timeout: u64,
     pub retry_mode: RetryMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<serde_json::Value>,
     pub token_estimator_type: TokenEstimatorType,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub multimodal_estimator: Option<MultimodalEstimatorConfig>,
@@ -125,8 +127,12 @@ mod tests {
             conn_timeout: 30,
             retry_mode: RetryMode::RandomInterval {
                 max_interval_secs: 3,
-                max_time_secs: 30,
+                max_retries: 5,
             },
+            reasoning: Some(serde_json::json!({
+                "effort": "medium",
+                "max_tokens": 4096
+            })),
             token_estimator_type: TokenEstimatorType::HuggingFace,
             multimodal_estimator: Some(MultimodalEstimatorConfig {
                 image: Some(MultimodalTokenStrategy::PatchGrid {
@@ -158,7 +164,8 @@ mod tests {
         assert_eq!(json["capabilities"][0], "chat");
         assert_eq!(json["token_max_context"], 128000);
         assert_eq!(json["conn_timeout"], 30);
-        assert_eq!(json["retry_mode"]["random_interval"]["max_time_secs"], 30);
+        assert_eq!(json["retry_mode"]["random_interval"]["max_retries"], 5);
+        assert_eq!(json["reasoning"]["effort"], "medium");
         assert_eq!(json["token_estimator_type"], "hugging_face");
         assert_eq!(
             json["multimodal_estimator"]["image"]["patch_grid"]["patch_size"],
@@ -182,6 +189,7 @@ mod tests {
             cache_timeout: 120,
             conn_timeout: 10,
             retry_mode: RetryMode::Once,
+            reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,
             multimodal_estimator: None,
             multimodal_input: None,
