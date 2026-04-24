@@ -127,6 +127,22 @@ impl ProviderError {
     pub fn request(error: reqwest::Error) -> Self {
         Self::Request(error_chain_message(&error))
     }
+
+    pub fn is_request_too_large(&self) -> bool {
+        match self {
+            Self::HttpStatus { status, body, .. } => *status == 413 || request_too_large_text(body),
+            Self::Request(message)
+            | Self::InvalidResponse(message)
+            | Self::WebSocket(message)
+            | Self::Subprocess(message) => request_too_large_text(message),
+            Self::MissingApiKeyEnv(_)
+            | Self::BuildHttpClient(_)
+            | Self::DecodeResponse(_)
+            | Self::DecodeJson(_)
+            | Self::PersistOutput(_)
+            | Self::EmptyChoices => false,
+        }
+    }
 }
 
 pub(crate) fn error_chain_message(error: &dyn StdError) -> String {
@@ -143,4 +159,18 @@ pub(crate) fn error_chain_message(error: &dyn StdError) -> String {
         source = error.source();
     }
     message
+}
+
+pub(crate) fn request_too_large_text(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("request_too_large")
+        || message.contains("request too large")
+        || message.contains("request exceeds the maximum size")
+        || message.contains("exceeds the maximum size")
+        || message.contains("context_length_exceeded")
+        || message.contains("maximum context length")
+        || message.contains("context window")
+        || message.contains("prompt is too long")
+        || message.contains("input is too long")
+        || message.contains("status 413")
 }

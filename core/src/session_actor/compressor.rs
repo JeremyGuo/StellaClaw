@@ -12,7 +12,7 @@ use super::{
 
 pub const COMPRESSION_MARKER: &str = "[StellaClaw Context Compression]";
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SessionCompressor {
     estimator: TokenEstimator,
     threshold_tokens: u64,

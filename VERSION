@@ -1,5 +1,16 @@
-version: 1.5.4
+version: 1.5.5
 ---
+
+# 1.5.5
+
+- 修正强制 context compression 阈值：
+  新消息进入前的压缩阈值现在会按当前 session model 的 `token_max_context * 0.9` 计算上限；显式配置的 `compression_threshold_tokens` 仍可作为更低的提前压缩阈值，但不会再高于当前模型上下文的 90%。
+- 修正多模态 token 估算默认值：
+  未显式配置 `multimodal_estimator.image` 时，图片默认使用 GPT tile-grid 估算，不再按 0 token 忽略。
+- 增加 request-too-large 自恢复：
+  正常对话和压缩请求遇到 413 / `request_too_large` 时，会按 tool call/result 边界从旧到新丢弃约半数当前上下文、写 warning 日志、向 channel 通知发生数据丢失并自动重试；发送前本地估算已经超过 `token_max_context` 时也会直接进入同样的剪裁恢复流程，不先发送必然失败的请求。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.5`；当前 Stellaclaw workdir schema 仍为 `0.6`。
 
 # 1.5.4
 

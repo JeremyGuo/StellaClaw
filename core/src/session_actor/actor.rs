@@ -10,8 +10,10 @@ use crossbeam_channel::{select, Receiver, Sender};
 use thiserror::Error;
 
 use crate::{
-    huggingface::HuggingFaceFileResolver, model_config::ModelConfig, providers::Provider,
-    providers::ProviderRequest, session_actor::tool_catalog::ToolBackend,
+    huggingface::HuggingFaceFileResolver,
+    model_config::ModelConfig,
+    providers::{request_too_large_text, Provider, ProviderRequest},
+    session_actor::tool_catalog::ToolBackend,
 };
 
 use super::{
@@ -19,13 +21,16 @@ use super::{
     normalize_messages_for_model,
     runtime_metadata::{remote_aliases_prompt_for_mode, RuntimeMetadataState},
     session_state::{SessionActorPersistedState, SessionStateStore},
-    system_prompt_for_initial, ChatMessage, ChatMessageItem, ChatRole, CompressionReport,
-    ContextItem, ConversationBridgeRequest, SessionCompressor, SessionEvent, SessionInitial,
-    SessionMailbox, SessionMailboxKind, SessionRequest, TokenEstimator, ToolBatch,
+    system_prompt_for_initial, ChatMessage, ChatMessageItem, ChatRole, CompressionError,
+    CompressionReport, ContextItem, ConversationBridgeRequest, SessionCompressor, SessionEvent,
+    SessionInitial, SessionMailbox, SessionMailboxKind, SessionRequest, TokenEstimator, ToolBatch,
     ToolBatchCompletion, ToolBatchExecutor, ToolCatalog, ToolExecutionOp,
 };
 
 const DEFAULT_MAX_MODEL_STEPS_PER_TURN: usize = 200;
+const ACTIVE_COMPRESSION_THRESHOLD_RATIO: f64 = 0.9;
+const IDLE_COMPACTION_MIN_RATIO: f64 = 0.4;
+const REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS: usize = 8;
 
 pub struct SessionActor {
     model_config: ModelConfig,
@@ -51,6 +56,7 @@ pub struct SessionActor {
     logger: Option<SessionActorLogger>,
     state_store: Option<SessionStateStore>,
     compressor: Option<SessionCompressor>,
+    token_estimator: Option<TokenEstimator>,
     pending_continuation: Option<PendingContinuation>,
     last_agent_returned_at: Option<Instant>,
     last_completed_turn_number: u64,
@@ -157,6 +163,7 @@ impl SessionActor {
             logger: None,
             state_store: None,
             compressor: None,
+            token_estimator: None,
             pending_continuation: None,
             last_agent_returned_at: None,
             last_completed_turn_number: 0,
@@ -341,7 +348,29 @@ impl SessionActor {
                 self.tool_catalog =
                     ToolCatalog::from_model_config_and_initial(&self.model_config, &initial)
                         .map_err(|error| SessionActorError::ToolCatalog(error.to_string()))?;
-                let compressor = build_session_compressor(&self.model_config, &initial)?;
+                let active_compression_threshold_tokens =
+                    active_compression_threshold_tokens(&self.model_config, &initial);
+                let token_estimator = match build_session_token_estimator(&self.model_config) {
+                    Ok(estimator) => Some(estimator),
+                    Err(error) if active_compression_threshold_tokens.is_none() => {
+                        logger.warn(
+                            "token_estimator_unavailable",
+                            serde_json::json!({
+                                "error": error.to_string(),
+                                "preflight_context_check": false,
+                            }),
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        return Err(SessionActorError::Compression(error.to_string()));
+                    }
+                };
+                let compressor = build_session_compressor(
+                    active_compression_threshold_tokens,
+                    &initial,
+                    token_estimator.as_ref(),
+                )?;
                 let loaded = state_store.load().map_err(SessionActorError::Persistence)?;
                 if let Some(saved) = loaded {
                     self.restore_persisted_state(saved, initial.clone())?;
@@ -372,6 +401,7 @@ impl SessionActor {
                         "session_type": &initial.session_type,
                         "tool_remote_mode": &initial.tool_remote_mode,
                         "compression_threshold_tokens": initial.compression_threshold_tokens,
+                        "active_compression_threshold_tokens": active_compression_threshold_tokens,
                         "compression_retain_recent_tokens": initial.compression_retain_recent_tokens,
                         "tool_count": self.tool_catalog.len(),
                         "log_path": logger.path(),
@@ -380,6 +410,7 @@ impl SessionActor {
                 self.logger = Some(logger);
                 self.state_store = Some(state_store);
                 self.compressor = compressor;
+                self.token_estimator = token_estimator;
                 self.initial = Some(initial);
                 self.persist_state()?;
                 if restored_history_needs_continuation(&self.history) {
@@ -764,26 +795,75 @@ impl SessionActor {
                 .as_ref()
                 .map(|initial| system_prompt_for_initial(initial, &self.runtime_metadata_state))
                 .ok_or(SessionActorError::MissingInitial)?;
-            let tools = self
-                .tool_catalog
-                .iter()
-                .map(|(_, tool)| tool)
-                .collect::<Vec<_>>();
-            let tools = self
-                .provider
-                .filter_tools_for_provider(&self.model_config, tools);
-            let normalized_history =
-                normalize_messages_for_model(&self.history, &self.model_config);
-            let provider_history = self
-                .provider
-                .normalize_messages_for_provider(&self.model_config, &normalized_history);
-            let request = ProviderRequest::new(&provider_history)
-                .with_system_prompt(Some(system_prompt.as_str()))
-                .with_tools(tools);
-            let model_message = self
-                .provider
-                .send(&self.model_config, request)
-                .map_err(|error| SessionActorError::Provider(error.to_string()))?;
+            let model_message = {
+                let mut request_too_large_attempts = 0usize;
+                loop {
+                    let normalized_history =
+                        normalize_messages_for_model(&self.history, &self.model_config);
+                    let provider_history = self
+                        .provider
+                        .normalize_messages_for_provider(&self.model_config, &normalized_history);
+                    if let Some(estimated_tokens) =
+                        self.provider_request_exceeds_context(&provider_history)?
+                    {
+                        if request_too_large_attempts >= REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS {
+                            return Err(SessionActorError::Provider(format!(
+                                "estimated provider request tokens {estimated_tokens} exceed model context {} after {REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS} prune attempts",
+                                self.model_config.token_max_context
+                            )));
+                        }
+                        request_too_large_attempts += 1;
+                        let error = format!(
+                            "estimated provider request tokens {estimated_tokens} exceed model context {}",
+                            self.model_config.token_max_context
+                        );
+                        if self.prune_history_after_request_too_large(
+                            "provider_request_preflight",
+                            Some(turn_id),
+                            Some(step_index),
+                            &error,
+                        )? {
+                            continue;
+                        }
+                        return Err(SessionActorError::Provider(error));
+                    }
+
+                    let send_result = {
+                        let tools = self
+                            .tool_catalog
+                            .iter()
+                            .map(|(_, tool)| tool)
+                            .collect::<Vec<_>>();
+                        let tools = self
+                            .provider
+                            .filter_tools_for_provider(&self.model_config, tools);
+                        let request = ProviderRequest::new(&provider_history)
+                            .with_system_prompt(Some(system_prompt.as_str()))
+                            .with_tools(tools);
+                        self.provider.send(&self.model_config, request)
+                    };
+                    match send_result {
+                        Ok(message) => break message,
+                        Err(error)
+                            if error.is_request_too_large()
+                                && request_too_large_attempts
+                                    < REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS =>
+                        {
+                            request_too_large_attempts += 1;
+                            if self.prune_history_after_request_too_large(
+                                "provider_request",
+                                Some(turn_id),
+                                Some(step_index),
+                                &error.to_string(),
+                            )? {
+                                continue;
+                            }
+                            return Err(SessionActorError::Provider(error.to_string()));
+                        }
+                        Err(error) => return Err(SessionActorError::Provider(error.to_string())),
+                    }
+                }
+            };
 
             let tool_calls = collect_tool_calls(&model_message);
             self.log_info(
@@ -1014,7 +1094,7 @@ impl SessionActor {
         phase: &str,
         message: ChatMessage,
     ) -> Result<(), SessionActorError> {
-        let Some(compressor) = self.compressor.as_ref() else {
+        let Some(compressor) = self.compressor.clone() else {
             self.all_messages.push(message.clone());
             self.history.push(message);
             self.persist_state_if_history_closed(phase)?;
@@ -1026,15 +1106,37 @@ impl SessionActor {
             .initial
             .as_ref()
             .map(|initial| system_prompt_for_initial(initial, &self.runtime_metadata_state));
-        let report = compressor
-            .append_with_compression(
-                &mut self.history,
-                message,
-                self.provider.as_ref(),
-                &self.model_config,
-                system_prompt.as_deref(),
-            )
-            .map_err(|error| SessionActorError::Compression(error.to_string()))?;
+        let report = {
+            let mut request_too_large_attempts = 0usize;
+            loop {
+                match compressor.append_with_compression(
+                    &mut self.history,
+                    message.clone(),
+                    self.provider.as_ref(),
+                    &self.model_config,
+                    system_prompt.as_deref(),
+                ) {
+                    Ok(report) => break report,
+                    Err(error)
+                        if compression_error_is_request_too_large(&error)
+                            && request_too_large_attempts
+                                < REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS =>
+                    {
+                        request_too_large_attempts += 1;
+                        if self.prune_history_after_request_too_large(
+                            phase,
+                            None,
+                            None,
+                            &error.to_string(),
+                        )? {
+                            continue;
+                        }
+                        return Err(SessionActorError::Compression(error.to_string()));
+                    }
+                    Err(error) => return Err(SessionActorError::Compression(error.to_string())),
+                }
+            }
+        };
         self.log_compression_report(phase, &report);
         if report.compressed {
             self.runtime_metadata_state
@@ -1202,7 +1304,7 @@ impl SessionActor {
             return Ok(false);
         }
 
-        let Some(compressor) = self.compressor.as_ref() else {
+        let Some(compressor) = self.compressor.clone() else {
             return Ok(false);
         };
 
@@ -1221,13 +1323,36 @@ impl SessionActor {
             .initial
             .as_ref()
             .map(|initial| system_prompt_for_initial(initial, &self.runtime_metadata_state));
-        match compressor.compact_if_needed_with_threshold(
-            &mut self.history,
-            self.provider.as_ref(),
-            &self.model_config,
-            system_prompt.as_deref(),
-            threshold_tokens,
-        ) {
+        let mut request_too_large_attempts = 0usize;
+        let report = loop {
+            match compressor.compact_if_needed_with_threshold(
+                &mut self.history,
+                self.provider.as_ref(),
+                &self.model_config,
+                system_prompt.as_deref(),
+                threshold_tokens,
+            ) {
+                Ok(report) => break Ok(report),
+                Err(error)
+                    if compression_error_is_request_too_large(&error)
+                        && request_too_large_attempts < REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS =>
+                {
+                    request_too_large_attempts += 1;
+                    if self.prune_history_after_request_too_large(
+                        "idle_compaction",
+                        None,
+                        None,
+                        &error.to_string(),
+                    )? {
+                        continue;
+                    }
+                    break Err(error);
+                }
+                Err(error) => break Err(error),
+            }
+        };
+
+        match report {
             Ok(report) => {
                 self.log_compression_report("idle", &report);
                 if report.compressed {
@@ -1260,6 +1385,73 @@ impl SessionActor {
                 Ok(false)
             }
         }
+    }
+
+    fn prune_history_after_request_too_large(
+        &mut self,
+        phase: &str,
+        turn_id: Option<&str>,
+        step_index: Option<usize>,
+        error: &str,
+    ) -> Result<bool, SessionActorError> {
+        let before_len = self.history.len();
+        let Some(prune_start) = request_too_large_prune_start(&self.history) else {
+            self.log_warn(
+                "request_too_large_history_prune_failed",
+                serde_json::json!({
+                    "phase": phase,
+                    "turn_id": turn_id,
+                    "step_index": step_index,
+                    "history_len": before_len,
+                    "error": error,
+                }),
+            );
+            return Ok(false);
+        };
+
+        self.history.drain(..prune_start);
+        let retained_len = self.history.len();
+        self.log_warn(
+            "request_too_large_history_pruned",
+            serde_json::json!({
+                "phase": phase,
+                "turn_id": turn_id,
+                "step_index": step_index,
+                "dropped_message_count": prune_start,
+                "retained_message_count": retained_len,
+                "history_len_before": before_len,
+                "history_len_after": retained_len,
+                "data_loss": true,
+                "bug": true,
+                "error": error,
+            }),
+        );
+        self.emit(SessionEvent::Progress {
+            message: format!(
+                "警告：上游拒绝了本轮请求，原因是请求体过大。系统已从当前上下文中丢弃较早的 {prune_start} 条消息并自动重试；这代表发生了上下文数据丢失，应按 bug 处理并排查。"
+            ),
+        })?;
+        self.persist_state_if_history_closed("request_too_large_prune")?;
+        Ok(true)
+    }
+
+    fn provider_request_exceeds_context(
+        &self,
+        messages: &[ChatMessage],
+    ) -> Result<Option<u64>, SessionActorError> {
+        if self.model_config.token_max_context == 0 {
+            return Ok(None);
+        }
+        let Some(estimator) = self.token_estimator.as_ref() else {
+            return Ok(None);
+        };
+        let estimate = estimator
+            .estimate(messages)
+            .map_err(|error| SessionActorError::Compression(error.to_string()))?;
+        if estimate.total_tokens >= self.model_config.token_max_context {
+            return Ok(Some(estimate.total_tokens));
+        }
+        Ok(None)
     }
 
     fn log_info(&self, event: &str, data: serde_json::Value) {
@@ -1356,24 +1548,51 @@ impl SessionActorError {
     }
 }
 
+fn build_session_token_estimator(model_config: &ModelConfig) -> Result<TokenEstimator, String> {
+    let file_resolver = HuggingFaceFileResolver::new().map_err(|error| error.to_string())?;
+    TokenEstimator::from_model_config(model_config, &file_resolver)
+        .map_err(|error| error.to_string())
+}
+
 fn build_session_compressor(
-    model_config: &ModelConfig,
+    threshold_tokens: Option<u64>,
     initial: &SessionInitial,
+    token_estimator: Option<&TokenEstimator>,
 ) -> Result<Option<SessionCompressor>, SessionActorError> {
-    let Some(threshold_tokens) = initial.compression_threshold_tokens else {
+    let Some(threshold_tokens) = threshold_tokens else {
         return Ok(None);
     };
 
     let retain_recent_tokens = initial
         .compression_retain_recent_tokens
         .unwrap_or_else(|| default_retain_recent_tokens(threshold_tokens));
-    let file_resolver = HuggingFaceFileResolver::new()
-        .map_err(|error| SessionActorError::Compression(error.to_string()))?;
-    let estimator = TokenEstimator::from_model_config(model_config, &file_resolver)
-        .map_err(|error| SessionActorError::Compression(error.to_string()))?;
+    let estimator = token_estimator.cloned().ok_or_else(|| {
+        SessionActorError::Compression("token estimator is unavailable".to_string())
+    })?;
     let compressor = SessionCompressor::new(estimator, threshold_tokens, retain_recent_tokens)
         .map_err(|error| SessionActorError::Compression(error.to_string()))?;
     Ok(Some(compressor))
+}
+
+fn active_compression_threshold_tokens(
+    model_config: &ModelConfig,
+    initial: &SessionInitial,
+) -> Option<u64> {
+    let configured_threshold = initial.compression_threshold_tokens?;
+    Some(
+        configured_threshold
+            .min(model_context_ratio_threshold(
+                model_config,
+                ACTIVE_COMPRESSION_THRESHOLD_RATIO,
+            ))
+            .max(1),
+    )
+}
+
+fn model_context_ratio_threshold(model_config: &ModelConfig, ratio: f64) -> u64 {
+    ((model_config.token_max_context as f64) * ratio)
+        .floor()
+        .max(1.0) as u64
 }
 
 fn default_retain_recent_tokens(threshold_tokens: u64) -> u64 {
@@ -1397,10 +1616,7 @@ fn idle_compaction_token_threshold(
     model_config: &ModelConfig,
     initial: Option<&SessionInitial>,
 ) -> u64 {
-    const IDLE_COMPACTION_MIN_RATIO: f64 = 0.4;
-    let idle_threshold = ((model_config.token_max_context as f64) * IDLE_COMPACTION_MIN_RATIO)
-        .floor()
-        .max(1.0) as u64;
+    let idle_threshold = model_context_ratio_threshold(model_config, IDLE_COMPACTION_MIN_RATIO);
     initial
         .and_then(|initial| initial.compression_threshold_tokens)
         .map(|active_threshold| active_threshold.min(idle_threshold).max(1))
@@ -1459,6 +1675,39 @@ fn count_unclosed_tool_calls(messages: &[ChatMessage]) -> usize {
         }
     }
     open.len()
+}
+
+fn compression_error_is_request_too_large(error: &CompressionError) -> bool {
+    request_too_large_text(&error.to_string())
+}
+
+fn request_too_large_prune_start(messages: &[ChatMessage]) -> Option<usize> {
+    if messages.len() <= 1 {
+        return None;
+    }
+
+    let target = (messages.len() / 2).max(1);
+    (target..messages.len()).find(|&start| is_tool_protocol_closed_suffix(&messages[start..]))
+}
+
+fn is_tool_protocol_closed_suffix(messages: &[ChatMessage]) -> bool {
+    let mut open = std::collections::BTreeSet::new();
+    for message in messages {
+        for item in &message.data {
+            match item {
+                ChatMessageItem::ToolCall(tool_call) => {
+                    open.insert(tool_call.tool_call_id.clone());
+                }
+                ChatMessageItem::ToolResult(tool_result) => {
+                    if !open.remove(&tool_result.tool_call_id) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    open.is_empty()
 }
 
 fn synthetic_media_message_from_tool_results(message: &ChatMessage) -> Option<ChatMessage> {
@@ -1626,7 +1875,10 @@ mod tests {
 
     use crate::{
         huggingface::HuggingFaceFileResolver,
-        model_config::{ModelCapability, ProviderType, RetryMode, TokenEstimatorType},
+        model_config::{
+            MediaInputConfig, MediaInputTransport, ModelCapability, MultimodalInputConfig,
+            ProviderType, RetryMode, TokenEstimatorType,
+        },
         providers::{Provider, ProviderError},
         session_actor::{
             builtin_tool_catalog, BuiltinToolCatalogOptions, ChatRole, ContextItem, FileItem,
@@ -1708,6 +1960,48 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .ok_or(ProviderError::EmptyChoices)
+        }
+    }
+
+    struct RequestTooLargeThenOkProvider {
+        calls: Mutex<usize>,
+        seen_message_counts: Mutex<Vec<usize>>,
+    }
+
+    impl RequestTooLargeThenOkProvider {
+        fn new() -> Self {
+            Self {
+                calls: Mutex::new(0),
+                seen_message_counts: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl Provider for RequestTooLargeThenOkProvider {
+        fn send(
+            &self,
+            _model_config: &ModelConfig,
+            request: ProviderRequest<'_>,
+        ) -> Result<ChatMessage, ProviderError> {
+            self.seen_message_counts
+                .lock()
+                .unwrap()
+                .push(request.messages.len());
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                return Err(ProviderError::HttpStatus {
+                    url: "https://example.invalid/chat".to_string(),
+                    status: 413,
+                    body: r#"{"error":{"type":"request_too_large","message":"Request exceeds the maximum size"}}"#.to_string(),
+                });
+            }
+            Ok(ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "recovered".to_string(),
+                })],
+            ))
         }
     }
 
@@ -1959,6 +2253,69 @@ mod tests {
     }
 
     #[test]
+    fn active_compression_threshold_is_capped_by_model_context() {
+        let mut model_config = test_model_config();
+        model_config.token_max_context = 200_000;
+        let mut initial = SessionInitial::new(
+            test_session_id("session_compression_threshold"),
+            super::super::SessionType::Foreground,
+        );
+        initial.compression_threshold_tokens = Some(235_929);
+
+        assert_eq!(
+            active_compression_threshold_tokens(&model_config, &initial),
+            Some(180_000)
+        );
+
+        initial.compression_threshold_tokens = Some(120_000);
+        assert_eq!(
+            active_compression_threshold_tokens(&model_config, &initial),
+            Some(120_000)
+        );
+
+        initial.compression_threshold_tokens = None;
+        assert_eq!(
+            active_compression_threshold_tokens(&model_config, &initial),
+            None
+        );
+    }
+
+    #[test]
+    fn request_too_large_prune_start_preserves_tool_call_result_pairs() {
+        let messages = vec![
+            text_message(ChatRole::User, "old user"),
+            text_message(ChatRole::Assistant, "old assistant"),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "file_read".to_string(),
+                    arguments: ContextItem {
+                        text: r#"{"path":"README.md"}"#.to_string(),
+                    },
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::ToolResult(ToolResultItem {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "file_read".to_string(),
+                    result: ToolResultContent {
+                        context: Some(ContextItem {
+                            text: "contents".to_string(),
+                        }),
+                        file: None,
+                    },
+                })],
+            ),
+            text_message(ChatRole::Assistant, "after tool"),
+            text_message(ChatRole::User, "new user"),
+        ];
+
+        assert_eq!(request_too_large_prune_start(&messages), Some(4));
+    }
+
+    #[test]
     fn runs_user_turn_without_tools() {
         let _cwd = temp_cwd("actor-runs-user-turn");
         let (inbox, mailbox) = test_inbox();
@@ -2114,6 +2471,133 @@ mod tests {
         ));
         assert_eq!(actor.history().len(), 2);
         assert_eq!(provider.seen_requests.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn request_too_large_provider_error_prunes_history_and_retries() {
+        let _cwd = temp_cwd("actor-request-too-large-retry");
+        let (inbox, mailbox) = test_inbox();
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial {
+                initial: SessionInitial::new(
+                    test_session_id("session_request_too_large"),
+                    super::super::SessionType::Foreground,
+                ),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(RequestTooLargeThenOkProvider::new());
+        let tools = Arc::new(EchoToolExecutor::new());
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
+        let mut actor = SessionActor::new(
+            test_model_config(),
+            provider.clone(),
+            tools,
+            inbox,
+            events.clone(),
+            catalog,
+        );
+        actor.run_until_idle(2).expect("initial should apply");
+        actor.history = vec![
+            text_message(ChatRole::User, "old 1"),
+            text_message(ChatRole::Assistant, "old 2"),
+            text_message(ChatRole::User, "old 3"),
+            text_message(ChatRole::Assistant, "new 1"),
+            text_message(ChatRole::User, "new 2"),
+            text_message(ChatRole::Assistant, "new 3"),
+        ];
+        actor.all_messages = actor.history.clone();
+
+        actor
+            .run_model_tool_loop("turn_retry", 1, 0)
+            .expect("request too large should recover by pruning history");
+
+        assert_eq!(*provider.calls.lock().unwrap(), 2);
+        assert_eq!(
+            provider.seen_message_counts.lock().unwrap().as_slice(),
+            &[6, 3]
+        );
+        assert_eq!(actor.history().len(), 4);
+        assert!(events.events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            SessionEvent::Progress { message } if message.contains("数据丢失")
+        )));
+        assert!(matches!(
+            events.events.lock().unwrap().last(),
+            Some(SessionEvent::TurnCompleted { .. })
+        ));
+    }
+
+    #[test]
+    fn preflight_prunes_when_estimate_already_exceeds_context() {
+        let _cwd = temp_cwd("actor-request-too-large-preflight");
+        let (inbox, mailbox) = test_inbox();
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial {
+                initial: SessionInitial::new(
+                    test_session_id("session_preflight_too_large"),
+                    super::super::SessionType::Foreground,
+                ),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(ScriptedProvider::new(vec![text_message(
+            ChatRole::Assistant,
+            "recovered after preflight prune",
+        )]));
+        let tools = Arc::new(EchoToolExecutor::new());
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
+        let mut model_config = test_model_config();
+        model_config.capabilities.push(ModelCapability::ImageIn);
+        model_config.multimodal_input = Some(MultimodalInputConfig {
+            image: Some(MediaInputConfig {
+                transport: MediaInputTransport::FileReference,
+                supported_media_types: vec!["image/png".to_string()],
+                max_width: None,
+                max_height: None,
+            }),
+            pdf: None,
+            audio: None,
+        });
+        model_config.token_max_context = 1_000;
+        let mut actor = SessionActor::new(
+            model_config,
+            provider.clone(),
+            tools,
+            inbox,
+            events.clone(),
+            catalog,
+        );
+        actor.run_until_idle(2).expect("initial should apply");
+        let image_message = || {
+            ChatMessage::new(
+                ChatRole::User,
+                vec![ChatMessageItem::File(FileItem {
+                    uri: "file:///tmp/large.png".to_string(),
+                    name: Some("large.png".to_string()),
+                    media_type: Some("image/png".to_string()),
+                    width: Some(1024),
+                    height: Some(1024),
+                    state: None,
+                })],
+            )
+        };
+        actor.history = vec![image_message(), image_message(), image_message()];
+        actor.all_messages = actor.history.clone();
+
+        actor
+            .run_model_tool_loop("turn_preflight", 1, 0)
+            .expect("oversized local estimate should recover by pruning history before send");
+
+        let seen_requests = provider.seen_requests.lock().unwrap();
+        assert_eq!(seen_requests.len(), 1);
+        assert_eq!(seen_requests[0].message_count, 1);
+        assert!(events.events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            SessionEvent::Progress { message } if message.contains("数据丢失")
+        )));
     }
 
     #[test]
@@ -3049,6 +3533,15 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    fn text_message(role: ChatRole, text: &str) -> ChatMessage {
+        ChatMessage::new(
+            role,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: text.to_string(),
+            })],
+        )
     }
 
     fn session_view_payload_for_test(

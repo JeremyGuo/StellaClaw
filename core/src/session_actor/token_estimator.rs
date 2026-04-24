@@ -47,7 +47,7 @@ impl TokenEstimator {
             .multimodal_estimator
             .as_ref()
             .and_then(|config| config.image)
-            .unwrap_or(MultimodalTokenStrategy::Ignore);
+            .unwrap_or_else(default_multimodal_image_token_strategy);
 
         let backend = match model_config.token_estimator_type {
             TokenEstimatorType::Local => TokenEstimatorBackend::OpenAiTiktoken(
@@ -305,6 +305,18 @@ fn unsupported_token_estimate_media_type(file: &FileItem) -> Option<&str> {
 pub enum VisionDetail {
     Low,
     High,
+}
+
+fn default_multimodal_image_token_strategy() -> MultimodalTokenStrategy {
+    MultimodalTokenStrategy::TileGrid {
+        low_detail_tokens: 85,
+        base_tokens: 85,
+        tokens_per_tile: 170,
+        max_dimension: 2048,
+        target_shortest_side: 768,
+        tile_size: 512,
+        detail: VisionDetail::High,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1159,6 +1171,32 @@ tool reference
             .expect("local estimate should work");
 
         assert_eq!(estimate.multimodal_tokens, 85);
+        assert!(estimate.total_tokens >= estimate.multimodal_tokens);
+    }
+
+    #[test]
+    fn local_tiktoken_estimator_defaults_images_to_openai_tile_grid() {
+        let resolver = HuggingFaceFileResolver::new().expect("resolver should build");
+        let mut config = local_tiktoken_model_config("gpt-4o", MultimodalTokenStrategy::Ignore);
+        config.multimodal_estimator = None;
+        let estimator = TokenEstimator::from_model_config(&config, &resolver)
+            .expect("openai local estimator should build");
+
+        let estimate = estimator
+            .estimate(&[ChatMessage::new(
+                ChatRole::User,
+                vec![ChatMessageItem::File(FileItem {
+                    uri: "file:///tmp/cat.png".to_string(),
+                    name: Some("cat.png".to_string()),
+                    media_type: Some("image/png".to_string()),
+                    width: Some(1024),
+                    height: Some(1024),
+                    state: None,
+                })],
+            )])
+            .expect("local estimate should work");
+
+        assert_eq!(estimate.multimodal_tokens, 765);
         assert!(estimate.total_tokens >= estimate.multimodal_tokens);
     }
 
