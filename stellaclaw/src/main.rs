@@ -20,7 +20,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use channels::{
     types::{IncomingDispatch, OutgoingDispatch},
-    Channel, TelegramChannel,
+    Channel, TelegramChannel, WebChannel,
 };
 use config::{ChannelConfig, StellaclawConfig};
 use conversation::{
@@ -112,6 +112,22 @@ fn run() -> Result<()> {
                     telegram.admin_user_ids.clone(),
                     &args.workdir,
                 )?);
+                instance.clone().spawn_ingress(
+                    incoming_tx.clone(),
+                    id_manager.clone(),
+                    logger.clone(),
+                );
+                channels.insert(instance.id().to_string(), instance);
+            }
+            ChannelConfig::Web(web) => {
+                let instance = Arc::new(WebChannel::new(
+                    web.id.clone(),
+                    web.bind_addr.clone(),
+                    web.resolve_token().map_err(anyhow::Error::msg)?,
+                    args.workdir.clone(),
+                    config.clone(),
+                    logger.clone(),
+                ));
                 instance.clone().spawn_ingress(
                     incoming_tx.clone(),
                     id_manager.clone(),

@@ -12,7 +12,8 @@ pub const LEGACY_CONFIG_VERSION: &str = "0.1";
 pub const CONFIG_VERSION_0_2: &str = "0.2";
 pub const CONFIG_VERSION_0_3: &str = "0.3";
 pub const CONFIG_VERSION_0_4: &str = "0.4";
-pub const LATEST_CONFIG_VERSION: &str = "0.5";
+pub const CONFIG_VERSION_0_5: &str = "0.5";
+pub const LATEST_CONFIG_VERSION: &str = "0.6";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StellaclawConfig {
@@ -183,6 +184,7 @@ impl Default for SandboxConfig {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ChannelConfig {
     Telegram(TelegramChannelConfig),
+    Web(WebChannelConfig),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +202,15 @@ pub struct TelegramChannelConfig {
     pub poll_interval_ms: u64,
     #[serde(default)]
     pub admin_user_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebChannelConfig {
+    pub id: String,
+    #[serde(default = "default_web_bind_addr")]
+    pub bind_addr: String,
+    #[serde(default = "default_web_token_env")]
+    pub token_env: String,
 }
 
 impl StellaclawConfig {
@@ -224,6 +235,11 @@ impl StellaclawConfig {
             return Err("config must include at least one chat-capable model".to_string());
         }
         self.sandbox.validate()?;
+        for channel in &self.channels {
+            if let ChannelConfig::Web(channel) = channel {
+                channel.validate()?;
+            }
+        }
         validate_skill_sync(&self.skill_sync)?;
         Ok(())
     }
@@ -401,6 +417,36 @@ impl TelegramChannelConfig {
     }
 }
 
+impl WebChannelConfig {
+    pub fn resolve_token(&self) -> Result<String, String> {
+        std::env::var(&self.token_env).map_err(|_| {
+            format!(
+                "web channel {} requires env {} for Authorization token",
+                self.id, self.token_env
+            )
+        })
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.id.trim().is_empty() {
+            return Err("web channel id must not be empty".to_string());
+        }
+        if self.bind_addr.trim().is_empty() {
+            return Err(format!(
+                "web channel {} bind_addr must not be empty",
+                self.id
+            ));
+        }
+        if self.token_env.trim().is_empty() {
+            return Err(format!(
+                "web channel {} token_env must not be empty",
+                self.id
+            ));
+        }
+        Ok(())
+    }
+}
+
 fn default_version() -> String {
     LATEST_CONFIG_VERSION.to_string()
 }
@@ -419,6 +465,14 @@ fn default_poll_timeout_seconds() -> u64 {
 
 fn default_poll_interval_ms() -> u64 {
     250
+}
+
+fn default_web_bind_addr() -> String {
+    "127.0.0.1:3111".to_string()
+}
+
+fn default_web_token_env() -> String {
+    "STELLACLAW_WEB_TOKEN".to_string()
 }
 
 fn default_bubblewrap_binary() -> String {

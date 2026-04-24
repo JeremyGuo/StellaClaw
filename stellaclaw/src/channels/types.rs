@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use serde::Serialize;
+
 use crate::conversation::IncomingConversationMessage;
 
 #[derive(Debug, Clone)]
@@ -76,7 +78,7 @@ pub struct OutgoingProgressFeedback {
     pub important: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct OutgoingStatus {
     pub channel_id: String,
     pub platform_chat_id: String,
@@ -94,7 +96,7 @@ pub struct OutgoingStatus {
     pub usage: OutgoingUsageSummary,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct OutgoingUsageSummary {
     pub foreground: OutgoingUsageTotals,
     pub background: OutgoingUsageTotals,
@@ -102,7 +104,7 @@ pub struct OutgoingUsageSummary {
     pub media_tools: OutgoingUsageTotals,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct OutgoingUsageTotals {
     pub cache_read: u64,
     pub cache_write: u64,
@@ -111,7 +113,7 @@ pub struct OutgoingUsageTotals {
     pub cost: OutgoingUsageCost,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct OutgoingUsageCost {
     pub cache_read: f64,
     pub cache_write: f64,

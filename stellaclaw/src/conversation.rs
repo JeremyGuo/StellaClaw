@@ -41,7 +41,10 @@ use crate::{
     logger::StellaclawLogger,
     sandbox::bubblewrap_support_error,
     session_client::AgentServerClient,
-    workspace::{ensure_workspace_for_remote_mode, ensure_workspace_seed, unmount_sshfs_workspace},
+    workspace::{
+        ensure_workspace_for_remote_mode, ensure_workspace_seed, sshfs_workspace_root,
+        unmount_sshfs_workspace,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -323,6 +326,42 @@ pub fn load_or_create_conversation_state(
             subagent_sessions: BTreeMap::new(),
         },
     })
+}
+
+pub fn persist_conversation_state(workdir: &Path, state: &ConversationState) -> Result<()> {
+    let root = workdir.join("conversations").join(&state.conversation_id);
+    fs::create_dir_all(&root).with_context(|| format!("failed to create {}", root.display()))?;
+    let path = root.join("conversation.json");
+    let raw =
+        serde_json::to_string_pretty(state).context("failed to serialize conversation state")?;
+    fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))
+}
+
+pub fn load_conversation_status_snapshot(
+    workdir: &Path,
+    config: &StellaclawConfig,
+    conversation_id: &str,
+) -> Result<OutgoingStatus> {
+    let state = load_existing_conversation_state(workdir, conversation_id)?;
+    let conversation_root = workdir.join("conversations").join(conversation_id);
+    let workspace_root = match &state.tool_remote_mode {
+        ToolRemoteMode::Selectable => conversation_root,
+        ToolRemoteMode::FixedSsh { .. } => sshfs_workspace_root(workdir, conversation_id),
+    };
+    conversation_status_snapshot(workdir, &workspace_root, &state, config)
+}
+
+fn load_existing_conversation_state(
+    workdir: &Path,
+    conversation_id: &str,
+) -> Result<ConversationState> {
+    let path = workdir
+        .join("conversations")
+        .join(conversation_id)
+        .join("conversation.json");
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 struct ConversationRuntime {
@@ -1674,80 +1713,15 @@ impl ConversationRuntime {
     }
 
     fn send_status(&self) -> Result<()> {
-        let sandbox = effective_sandbox_config(self.state.sandbox.as_ref(), &self.config.sandbox);
-        let sandbox_source = if self.state.sandbox.is_some() {
-            "conversation"
-        } else {
-            "default"
-        };
-        let remote = match &self.state.tool_remote_mode {
-            ToolRemoteMode::Selectable => "selectable".to_string(),
-            ToolRemoteMode::FixedSsh { host, cwd } => {
-                format!("fixed ssh `{host}` `{}`", cwd.as_deref().unwrap_or(""))
-            }
-        };
-        let running_background = self
-            .state
-            .session_binding
-            .background_sessions
-            .values()
-            .filter(|record| record.status == ManagedSessionStatus::Running)
-            .count();
-        let running_subagents = self
-            .state
-            .session_binding
-            .subagent_sessions
-            .values()
-            .filter(|record| record.status == ManagedSessionStatus::Running)
-            .count();
-        let usage = self.conversation_usage_summary();
-        self.outgoing_tx
-            .send(OutgoingDispatch::Status(OutgoingStatus {
-                channel_id: self.state.channel_id.clone(),
-                platform_chat_id: self.state.platform_chat_id.clone(),
-                conversation_id: self.state.conversation_id.clone(),
-                model: self.current_main_model_name(),
-                reasoning: self
-                    .state
-                    .reasoning_effort
-                    .as_deref()
-                    .unwrap_or("model default")
-                    .to_string(),
-                sandbox: sandbox_mode_label(&sandbox.mode).to_string(),
-                sandbox_source: sandbox_source.to_string(),
-                remote,
-                workspace: self.workspace_root.display().to_string(),
-                running_background,
-                total_background: self.state.session_binding.background_sessions.len(),
-                running_subagents,
-                total_subagents: self.state.session_binding.subagent_sessions.len(),
-                usage: outgoing_usage_summary(&usage),
-            }))
-            .map_err(|_| anyhow!("outgoing status channel closed"))
-    }
-
-    fn conversation_usage_summary(&self) -> ConversationUsageSummary {
-        let mut summary = ConversationUsageSummary::default();
-        summary.foreground.add_totals(&session_usage_totals(
+        let status = conversation_status_snapshot(
+            &self.workdir,
             &self.workspace_root,
-            &self.state.session_binding.foreground_session_id,
-        ));
-        for record in self.state.session_binding.background_sessions.values() {
-            summary.background.add_totals(&session_usage_totals(
-                &self.workspace_root,
-                &record.session_id,
-            ));
-        }
-        for record in self.state.session_binding.subagent_sessions.values() {
-            summary.subagents.add_totals(&session_usage_totals(
-                &self.workspace_root,
-                &record.session_id,
-            ));
-        }
-        summary
-            .media_tools
-            .add_totals(&media_tool_usage_totals(&self.workspace_root));
-        summary
+            &self.state,
+            &self.config,
+        )?;
+        self.outgoing_tx
+            .send(OutgoingDispatch::Status(status))
+            .map_err(|_| anyhow!("outgoing status channel closed"))
     }
 
     fn send_remote_status(&self) -> Result<()> {
@@ -3125,6 +3099,80 @@ fn media_tool_usage_totals(workspace_root: &Path) -> UsageTotals {
         totals.add_token_usage(&usage);
     }
     totals
+}
+
+fn conversation_status_snapshot(
+    _workdir: &Path,
+    workspace_root: &Path,
+    state: &ConversationState,
+    config: &StellaclawConfig,
+) -> Result<OutgoingStatus> {
+    let sandbox = effective_sandbox_config(state.sandbox.as_ref(), &config.sandbox);
+    let sandbox_source = if state.sandbox.is_some() {
+        "conversation"
+    } else {
+        "default"
+    };
+    let remote = match &state.tool_remote_mode {
+        ToolRemoteMode::Selectable => "selectable".to_string(),
+        ToolRemoteMode::FixedSsh { host, cwd } => {
+            format!("fixed ssh `{host}` `{}`", cwd.as_deref().unwrap_or(""))
+        }
+    };
+    let running_background = state
+        .session_binding
+        .background_sessions
+        .values()
+        .filter(|record| record.status == ManagedSessionStatus::Running)
+        .count();
+    let running_subagents = state
+        .session_binding
+        .subagent_sessions
+        .values()
+        .filter(|record| record.status == ManagedSessionStatus::Running)
+        .count();
+    let mut usage = ConversationUsageSummary::default();
+    usage.foreground.add_totals(&session_usage_totals(
+        workspace_root,
+        &state.session_binding.foreground_session_id,
+    ));
+    for record in state.session_binding.background_sessions.values() {
+        usage
+            .background
+            .add_totals(&session_usage_totals(workspace_root, &record.session_id));
+    }
+    for record in state.session_binding.subagent_sessions.values() {
+        usage
+            .subagents
+            .add_totals(&session_usage_totals(workspace_root, &record.session_id));
+    }
+    usage
+        .media_tools
+        .add_totals(&media_tool_usage_totals(workspace_root));
+
+    Ok(OutgoingStatus {
+        channel_id: state.channel_id.clone(),
+        platform_chat_id: state.platform_chat_id.clone(),
+        conversation_id: state.conversation_id.clone(),
+        model: state
+            .session_profile
+            .main_model
+            .display_name(&config.models),
+        reasoning: state
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or("model default")
+            .to_string(),
+        sandbox: sandbox_mode_label(&sandbox.mode).to_string(),
+        sandbox_source: sandbox_source.to_string(),
+        remote,
+        workspace: workspace_root.display().to_string(),
+        running_background,
+        total_background: state.session_binding.background_sessions.len(),
+        running_subagents,
+        total_subagents: state.session_binding.subagent_sessions.len(),
+        usage: outgoing_usage_summary(&usage),
+    })
 }
 
 fn outgoing_usage_summary(summary: &ConversationUsageSummary) -> OutgoingUsageSummary {

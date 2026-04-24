@@ -1,5 +1,12 @@
-version: 1.5.6
+version: 1.6.0
 ---
+
+# 1.6.0
+
+- 新增 Web channel 的第一版 JSON API：
+  config channel 支持 `kind: "web"`，通过 `token_env` 指定 Authorization token，并在 `bind_addr` 监听 HTTP `/api/...`。当前 API 支持创建 conversation、分页获取消息骨架、按消息 ID 获取详情、向 conversation 投递消息、获取某条消息之后的增量骨架列表，以及获取 conversation 状态快照。前端网页暂未实现。
+- 更新 `config` schema 到 `0.6`：
+  新增 `WebChannelConfig`；旧 `0.5` config 会自动升级，未配置 web channel 的部署保持原行为。当前 Stellaclaw workdir schema 仍为 `0.6`。
 
 # 1.5.6
 

@@ -7,11 +7,13 @@ use crate::{conversation_id_manager::ConversationIdManager, logger::StellaclawLo
 
 pub mod telegram;
 pub mod types;
+pub mod web;
 
 pub use telegram::TelegramChannel;
 pub use types::{
     IncomingDispatch, OutgoingDelivery, OutgoingProgressFeedback, OutgoingStatus, ProcessingState,
 };
+pub use web::WebChannel;
 
 pub trait Channel: Send + Sync {
     fn id(&self) -> &str;

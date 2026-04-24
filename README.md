@@ -242,12 +242,26 @@ Start from [example_config.json](example_config.json).
 
 Important fields:
 
-- `version`: current config schema version, currently `0.5`.
+- `version`: current config schema version, currently `0.6`.
 - `agent_server.path`: path to the `agent_server` binary.
 - `models`: named model configs.
 - `skill_sync`: optional runtime skill git sync targets.
-- `channels`: Telegram and future channel definitions.
+- `channels`: Telegram and Web channel definitions.
 - `sandbox`: default sandbox mode.
+
+Optional Web channel config:
+
+```json
+{
+  "kind": "web",
+  "id": "web-main",
+  "bind_addr": "127.0.0.1:3111",
+  "token_env": "STELLACLAW_WEB_TOKEN"
+}
+```
+
+The Web channel exposes JSON APIs under `/api/` and accepts
+`Authorization: Bearer <token>`.
 
 For a release build, set:
 
@@ -297,7 +311,7 @@ Stellaclaw deliberately has separate version tracks:
 | File / Field | Meaning |
 |---|---|
 | Root `VERSION` | Project release version and changelog. Starts at `1.0.0`. |
-| Config JSON `version` | Config schema version. Currently `0.5`. |
+| Config JSON `version` | Config schema version. Currently `0.6`. |
 | Workdir `STELLA_VERSION` | Workdir schema version. Currently `0.6`. |
 | Legacy workdir `VERSION` | PartyClaw compatibility input, not the project release version. |
 
