@@ -8,14 +8,17 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use stellaclaw_core::session_actor::{
-    ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, FileState, SessionInitial,
-    SessionType, ToolRemoteMode,
+use stellaclaw_core::{
+    model_config::ModelConfig,
+    session_actor::{
+        ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, FileState, SessionInitial,
+        SessionType, ToolRemoteMode,
+    },
 };
 
 use super::{WorkdirUpgrader, PARTYCLAW_LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_2};
 use crate::{
-    config::{SandboxConfig, SandboxMode, SessionProfile, StellaclawConfig},
+    config::{SandboxConfig, SandboxMode, SessionProfile, StellaclawConfig, ToolModelTarget},
     conversation::{ConversationSessionBinding, ConversationState},
     conversation_id_manager::ConversationIdManager,
     workspace::ensure_workspace_seed,
@@ -512,6 +515,7 @@ fn migrate_conversations_and_sessions(workdir: &Path, config: &StellaclawConfig)
             migrate_foreground_session(
                 workdir,
                 config,
+                &session_profile.main_model,
                 &tool_remote_mode,
                 legacy_session,
                 &conversation_root,
@@ -647,6 +651,7 @@ fn migrate_workspace(workdir: &Path, workspace_id: &str, conversation_root: &Pat
 fn migrate_foreground_session(
     workdir: &Path,
     config: &StellaclawConfig,
+    session_model: &ModelConfig,
     tool_remote_mode: &ToolRemoteMode,
     legacy: &LegacySessionEntry,
     conversation_root: &Path,
@@ -671,11 +676,36 @@ fn migrate_foreground_session(
         tool_remote_mode: tool_remote_mode.clone(),
         compression_threshold_tokens: config.session_defaults.compression_threshold_tokens,
         compression_retain_recent_tokens: config.session_defaults.compression_retain_recent_tokens,
-        image_tool_model: config.session_defaults.image_tool_model.clone(),
-        pdf_tool_model: config.session_defaults.pdf_tool_model.clone(),
-        audio_tool_model: config.session_defaults.audio_tool_model.clone(),
-        image_generation_tool_model: config.session_defaults.image_generation_tool_model.clone(),
-        search_tool_model: config.session_defaults.search_tool_model.clone(),
+        image_tool_model: resolve_tool_model_target(
+            "image_tool_model",
+            config.session_defaults.image_tool_model.as_ref(),
+            config,
+            session_model,
+        )?,
+        pdf_tool_model: resolve_tool_model_target(
+            "pdf_tool_model",
+            config.session_defaults.pdf_tool_model.as_ref(),
+            config,
+            session_model,
+        )?,
+        audio_tool_model: resolve_tool_model_target(
+            "audio_tool_model",
+            config.session_defaults.audio_tool_model.as_ref(),
+            config,
+            session_model,
+        )?,
+        image_generation_tool_model: resolve_tool_model_target(
+            "image_generation_tool_model",
+            config.session_defaults.image_generation_tool_model.as_ref(),
+            config,
+            session_model,
+        )?,
+        search_tool_model: resolve_tool_model_target(
+            "search_tool_model",
+            config.session_defaults.search_tool_model.as_ref(),
+            config,
+            session_model,
+        )?,
     };
     let persisted = MigratedSessionState {
         version: 1,
@@ -1038,6 +1068,21 @@ fn write_messages_jsonl(path: &Path, messages: &[ChatMessage]) -> Result<()> {
     }
     file.flush()
         .with_context(|| format!("failed to flush {}", path.display()))
+}
+
+fn resolve_tool_model_target(
+    field_name: &str,
+    target: Option<&ToolModelTarget>,
+    config: &StellaclawConfig,
+    session_model: &ModelConfig,
+) -> Result<Option<ModelConfig>> {
+    target
+        .map(|target| {
+            target
+                .resolve(&config.models, session_model)
+                .map_err(|error| anyhow!("failed to resolve {field_name}: {error}"))
+        })
+        .transpose()
 }
 
 fn sanitize_session_id(session_id: &str) -> String {

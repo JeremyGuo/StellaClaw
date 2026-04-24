@@ -123,14 +123,14 @@ mod tests {
             config.session_defaults.compression_retain_recent_tokens,
             Some(25000)
         );
-        assert_eq!(
-            config
-                .session_defaults
-                .search_tool_model
-                .as_ref()
-                .map(|model| &model.provider_type),
-            Some(&ProviderType::BraveSearch)
-        );
+        let search_model = config
+            .session_defaults
+            .search_tool_model
+            .as_ref()
+            .expect("search model target should exist")
+            .resolve(&config.models, &main_model)
+            .expect("search model target should resolve");
+        assert_eq!(search_model.provider_type, ProviderType::BraveSearch);
     }
 
     #[test]
@@ -203,5 +203,95 @@ mod tests {
                 .model_name,
             "claude-opus-4-6"
         );
+    }
+
+    #[test]
+    fn loads_native_runtime_config_with_tool_model_aliases() {
+        let raw = r#"
+        {
+          "version": "0.2",
+          "models": {
+            "main": {
+              "provider_type": "claude_code",
+              "model_name": "claude-opus-4-6",
+              "url": "https://example.invalid/v1/messages",
+              "api_key_env": "TEST_API_KEY",
+              "capabilities": ["chat"],
+              "token_max_context": 262144,
+              "cache_timeout": 300,
+              "conn_timeout": 300,
+              "retry_mode": "once",
+              "token_estimator_type": "local"
+            },
+            "search": {
+              "provider_type": "brave_search",
+              "model_name": "brave-web-search",
+              "url": "https://api.search.brave.com/res/v1/web/search",
+              "api_key_env": "BRAVE_SEARCH_API_KEY",
+              "capabilities": ["web_search"],
+              "token_max_context": 32768,
+              "cache_timeout": 300,
+              "conn_timeout": 30,
+              "retry_mode": "once",
+              "token_estimator_type": "local"
+            },
+            "image": {
+              "provider_type": "open_router_completion",
+              "model_name": "openai/gpt-image-1",
+              "url": "https://openrouter.ai/api/v1/chat/completions",
+              "api_key_env": "OPENROUTER_API_KEY",
+              "capabilities": ["chat", "image_out"],
+              "token_max_context": 128000,
+              "cache_timeout": 300,
+              "conn_timeout": 120,
+              "retry_mode": "once",
+              "token_estimator_type": "local"
+            }
+          },
+          "session_defaults": {
+            "search_tool_model": "search",
+            "image_generation_tool_model": "image",
+            "image_tool_model": "image:self"
+          },
+          "channels": [
+            {
+              "kind": "telegram",
+              "id": "telegram-main",
+              "bot_token_env": "TELEGRAM_BOT_TOKEN"
+            }
+          ]
+        }
+        "#;
+
+        let config = load(raw, std::path::Path::new("/tmp/config.json"))
+            .expect("native runtime config should load");
+        let main_model = config
+            .initial_main_model()
+            .expect("main model should exist");
+        let search_model = config
+            .session_defaults
+            .search_tool_model
+            .as_ref()
+            .expect("search model target should exist")
+            .resolve(&config.models, &main_model)
+            .expect("search model target should resolve");
+        let image_model = config
+            .session_defaults
+            .image_generation_tool_model
+            .as_ref()
+            .expect("image generation target should exist")
+            .resolve(&config.models, &main_model)
+            .expect("image generation target should resolve");
+        let self_model = config
+            .session_defaults
+            .image_tool_model
+            .as_ref()
+            .expect("self target should exist")
+            .resolve(&config.models, &main_model)
+            .expect("self target should resolve");
+
+        assert_eq!(search_model.provider_type, ProviderType::BraveSearch);
+        assert_eq!(image_model.model_name, "openai/gpt-image-1");
+        assert_eq!(self_model.model_name, main_model.model_name);
     }
 }

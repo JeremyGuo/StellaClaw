@@ -13,7 +13,7 @@ use stellaclaw_core::model_config::{
 
 use crate::config::{
     AgentServerConfig, ChannelConfig, SandboxConfig, SandboxMode, SessionDefaults,
-    StellaclawConfig, TelegramChannelConfig,
+    StellaclawConfig, TelegramChannelConfig, ToolModelTarget,
 };
 
 pub fn load_and_upgrade(raw: &str, path: &Path) -> Result<StellaclawConfig> {
@@ -1041,19 +1041,23 @@ fn resolve_helper_model(
     models: &BTreeMap<String, ModelConfig>,
     main_model_name: &str,
     raw: Option<&str>,
-) -> Result<Option<ModelConfig>> {
+) -> Result<Option<ToolModelTarget>> {
     let Some(target) = raw else {
         return Ok(None);
     };
     let (alias, prefer_self) = parse_tooling_target(target)?;
     if alias == main_model_name || prefer_self {
-        return Ok(Some(models.get(main_model_name).cloned().ok_or_else(
-            || anyhow!("missing main model '{}'", main_model_name),
-        )?));
+        return Ok(Some(ToolModelTarget::inline(
+            models
+                .get(main_model_name)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing main model '{}'", main_model_name))?,
+        )));
     }
     models
         .get(alias)
         .cloned()
+        .map(ToolModelTarget::inline)
         .map(Some)
         .ok_or_else(|| anyhow!("unknown tooling model alias '{}'", alias))
 }
@@ -1062,7 +1066,7 @@ fn resolve_search_model(
     models: &BTreeMap<String, ModelConfig>,
     main_model_name: &str,
     raw: Option<&str>,
-) -> Result<Option<ModelConfig>> {
+) -> Result<Option<ToolModelTarget>> {
     let Some(target) = raw else {
         return Ok(None);
     };
@@ -1075,6 +1079,7 @@ fn resolve_search_model(
     models
         .get(resolved_alias)
         .cloned()
+        .map(ToolModelTarget::inline)
         .map(Some)
         .ok_or_else(|| {
             anyhow!(

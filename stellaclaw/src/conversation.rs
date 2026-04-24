@@ -26,7 +26,10 @@ use crate::{
         OutgoingOption, OutgoingOptions, OutgoingProcessing, OutgoingProgressFeedback,
         ProcessingState, ProgressFeedbackFinalState,
     },
-    config::{SandboxConfig, SandboxMode, SessionDefaults, SessionProfile, StellaclawConfig},
+    config::{
+        SandboxConfig, SandboxMode, SessionDefaults, SessionProfile, StellaclawConfig,
+        ToolModelTarget,
+    },
     cron::{
         cron_schedule_from_required_tool_args, optional_cron_schedule_from_tool_args,
         optional_string_arg, parse_enabled_flag, string_arg_required, timezone_or_default,
@@ -335,6 +338,7 @@ impl ConversationRuntime {
             &state.tool_remote_mode,
             state.sandbox.as_ref().unwrap_or(&config.sandbox),
             state.reasoning_effort.as_deref(),
+            &config.models,
             &config.session_defaults,
         )?;
 
@@ -357,6 +361,7 @@ impl ConversationRuntime {
                     &state.tool_remote_mode,
                     state.sandbox.as_ref().unwrap_or(&config.sandbox),
                     state.reasoning_effort.as_deref(),
+                    &config.models,
                     &config.session_defaults,
                 )?,
             );
@@ -381,6 +386,7 @@ impl ConversationRuntime {
                     &state.tool_remote_mode,
                     state.sandbox.as_ref().unwrap_or(&config.sandbox),
                     state.reasoning_effort.as_deref(),
+                    &config.models,
                     &config.session_defaults,
                 )?,
             );
@@ -1141,6 +1147,7 @@ impl ConversationRuntime {
             &self.state.tool_remote_mode,
             self.state.sandbox.as_ref().unwrap_or(&self.config.sandbox),
             self.state.reasoning_effort.as_deref(),
+            &self.config.models,
             &self.config.session_defaults,
         )?;
 
@@ -1711,6 +1718,7 @@ impl ConversationRuntime {
             &self.state.tool_remote_mode,
             self.state.sandbox.as_ref().unwrap_or(&self.config.sandbox),
             self.state.reasoning_effort.as_deref(),
+            &self.config.models,
             &self.config.session_defaults,
         )?;
         Ok(())
@@ -1821,6 +1829,7 @@ fn start_foreground_session(
     tool_remote_mode: &ToolRemoteMode,
     sandbox: &SandboxConfig,
     reasoning_effort: Option<&str>,
+    models: &BTreeMap<String, ModelConfig>,
     defaults: &SessionDefaults,
 ) -> Result<ForegroundSessionRuntime> {
     let (client, events) = start_session_process(
@@ -1832,6 +1841,7 @@ fn start_foreground_session(
         tool_remote_mode,
         sandbox,
         reasoning_effort,
+        models,
         defaults,
     )?;
     Ok(ForegroundSessionRuntime {
@@ -1848,6 +1858,7 @@ fn start_managed_session_runtime(
     tool_remote_mode: &ToolRemoteMode,
     sandbox: &SandboxConfig,
     reasoning_effort: Option<&str>,
+    models: &BTreeMap<String, ModelConfig>,
     defaults: &SessionDefaults,
 ) -> Result<ManagedSessionRuntime> {
     let (client, events) = start_session_process(
@@ -1859,6 +1870,7 @@ fn start_managed_session_runtime(
         tool_remote_mode,
         sandbox,
         reasoning_effort,
+        models,
         defaults,
     )?;
     Ok(ManagedSessionRuntime {
@@ -1877,6 +1889,7 @@ fn start_session_process(
     tool_remote_mode: &ToolRemoteMode,
     sandbox: &SandboxConfig,
     reasoning_effort: Option<&str>,
+    models: &BTreeMap<String, ModelConfig>,
     defaults: &SessionDefaults,
 ) -> Result<(AgentServerClient, mpsc::Receiver<SessionEvent>)> {
     let (client, events) = AgentServerClient::spawn(agent_server_path, conversation_root, sandbox)
@@ -1885,11 +1898,36 @@ fn start_session_process(
     initial.tool_remote_mode = tool_remote_mode.clone();
     initial.compression_threshold_tokens = defaults.compression_threshold_tokens;
     initial.compression_retain_recent_tokens = defaults.compression_retain_recent_tokens;
-    initial.image_tool_model = defaults.image_tool_model.clone();
-    initial.pdf_tool_model = defaults.pdf_tool_model.clone();
-    initial.audio_tool_model = defaults.audio_tool_model.clone();
-    initial.image_generation_tool_model = defaults.image_generation_tool_model.clone();
-    initial.search_tool_model = defaults.search_tool_model.clone();
+    initial.image_tool_model = resolve_tool_model_target(
+        "image_tool_model",
+        defaults.image_tool_model.as_ref(),
+        models,
+        model_config,
+    )?;
+    initial.pdf_tool_model = resolve_tool_model_target(
+        "pdf_tool_model",
+        defaults.pdf_tool_model.as_ref(),
+        models,
+        model_config,
+    )?;
+    initial.audio_tool_model = resolve_tool_model_target(
+        "audio_tool_model",
+        defaults.audio_tool_model.as_ref(),
+        models,
+        model_config,
+    )?;
+    initial.image_generation_tool_model = resolve_tool_model_target(
+        "image_generation_tool_model",
+        defaults.image_generation_tool_model.as_ref(),
+        models,
+        model_config,
+    )?;
+    initial.search_tool_model = resolve_tool_model_target(
+        "search_tool_model",
+        defaults.search_tool_model.as_ref(),
+        models,
+        model_config,
+    )?;
     client
         .initialize(
             &effective_model_config(model_config, reasoning_effort),
@@ -1897,6 +1935,21 @@ fn start_session_process(
         )
         .map_err(anyhow::Error::msg)?;
     Ok((client, events))
+}
+
+fn resolve_tool_model_target(
+    field_name: &str,
+    target: Option<&ToolModelTarget>,
+    models: &BTreeMap<String, ModelConfig>,
+    session_model: &ModelConfig,
+) -> Result<Option<ModelConfig>> {
+    target
+        .map(|target| {
+            target
+                .resolve(models, session_model)
+                .map_err(|error| anyhow!("failed to resolve {field_name}: {error}"))
+        })
+        .transpose()
 }
 
 fn effective_model_config(

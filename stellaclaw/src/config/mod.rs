@@ -46,15 +46,48 @@ pub struct SessionDefaults {
     #[serde(default)]
     pub compression_retain_recent_tokens: Option<u64>,
     #[serde(default)]
-    pub image_tool_model: Option<ModelConfig>,
+    pub image_tool_model: Option<ToolModelTarget>,
     #[serde(default)]
-    pub pdf_tool_model: Option<ModelConfig>,
+    pub pdf_tool_model: Option<ToolModelTarget>,
     #[serde(default)]
-    pub audio_tool_model: Option<ModelConfig>,
+    pub audio_tool_model: Option<ToolModelTarget>,
     #[serde(default)]
-    pub image_generation_tool_model: Option<ModelConfig>,
+    pub image_generation_tool_model: Option<ToolModelTarget>,
     #[serde(default)]
-    pub search_tool_model: Option<ModelConfig>,
+    pub search_tool_model: Option<ToolModelTarget>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolModelTarget {
+    Alias(String),
+    Inline(ModelConfig),
+}
+
+impl ToolModelTarget {
+    pub fn inline(model_config: ModelConfig) -> Self {
+        Self::Inline(model_config)
+    }
+
+    pub fn resolve(
+        &self,
+        models: &BTreeMap<String, ModelConfig>,
+        session_model: &ModelConfig,
+    ) -> Result<ModelConfig, String> {
+        match self {
+            Self::Inline(model_config) => Ok(model_config.clone()),
+            Self::Alias(raw) => {
+                let (alias, prefer_self) = parse_tool_model_target(raw)?;
+                if prefer_self {
+                    return Ok(session_model.clone());
+                }
+                models
+                    .get(alias)
+                    .cloned()
+                    .ok_or_else(|| format!("unknown tool model alias '{}'", alias))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -226,4 +259,24 @@ fn default_poll_interval_ms() -> u64 {
 
 fn default_bubblewrap_binary() -> String {
     "bwrap".to_string()
+}
+
+fn parse_tool_model_target(raw: &str) -> Result<(&str, bool), String> {
+    if raw.trim().is_empty() {
+        return Err("tool model target must not be empty".to_string());
+    }
+    if let Some((alias, suffix)) = raw.split_once(':') {
+        if suffix.trim() != "self" {
+            return Err(format!(
+                "unsupported tool model target suffix '{}'; expected ':self'",
+                suffix.trim()
+            ));
+        }
+        let alias = alias.trim();
+        if alias.is_empty() {
+            return Err("tool model target alias must not be empty".to_string());
+        }
+        return Ok((alias, true));
+    }
+    Ok((raw.trim(), false))
 }
