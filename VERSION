@@ -1,5 +1,10 @@
-version: 1.7.0
+version: 1.7.1
 ---
+
+# 1.7.1
+
+- 修正 Web channel 控制命令覆盖：
+  Web channel 现在和 Telegram 一样识别 `/remote`、`/remote off`、`/remote <ssh-host> <path>` 控制命令；此前这些输入会被当作普通文本消息。当前 `config` schema 仍为 `0.6`，当前 Stellaclaw workdir schema 仍为 `0.6`。
 
 # 1.7.0
 

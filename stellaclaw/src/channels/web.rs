@@ -910,7 +910,27 @@ fn parse_web_control(text: &str) -> Option<ConversationControl> {
         "/model" => Some(ConversationControl::SwitchModel {
             model_name: argument.to_string(),
         }),
+        "/remote" if argument.is_empty() => Some(ConversationControl::ShowRemote),
+        "/remote" if argument.eq_ignore_ascii_case("off") => {
+            Some(ConversationControl::DisableRemote)
+        }
+        "/remote" => Some(parse_web_remote_control(argument)),
         _ => None,
+    }
+}
+
+fn parse_web_remote_control(argument: &str) -> ConversationControl {
+    let mut parts = argument.trim().splitn(2, char::is_whitespace);
+    let host = parts.next().unwrap_or_default().trim();
+    let path = parts.next().map(str::trim).unwrap_or_default();
+    if host.is_empty() || path.is_empty() {
+        return ConversationControl::InvalidRemote {
+            reason: "remote command requires host and path.".to_string(),
+        };
+    }
+    ConversationControl::SetRemote {
+        host: host.to_string(),
+        path: path.to_string(),
     }
 }
 
@@ -935,6 +955,15 @@ mod tests {
         assert!(matches!(
             parse_web_control("/status"),
             Some(ConversationControl::ShowStatus)
+        ));
+        assert!(matches!(
+            parse_web_control("/remote demo-host ~/repo"),
+            Some(ConversationControl::SetRemote { host, path })
+                if host == "demo-host" && path == "~/repo"
+        ));
+        assert!(matches!(
+            parse_web_control("/remote off"),
+            Some(ConversationControl::DisableRemote)
         ));
     }
 }
