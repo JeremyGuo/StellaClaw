@@ -1,5 +1,14 @@
-version: 1.2.0
+version: 1.3.0
 ---
+
+# 1.3.0
+
+- 扩展 OpenAI-compatible image provider：
+  新增 canonical provider type `openai_image`，同时保留 `openai_image_edit` 作为兼容 alias。
+- 合并 Images Generations 和 Images Edits：
+  provider request 带 user image 时使用 `multipart/form-data` 调用 `/v1/images/edits`；不带 user image 时使用 JSON 调用 `/v1/images/generations`。配置中的 `url` 可以指向 edits 或 generations，provider 会自动推导对应 sibling endpoint。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.3`；当前 Stellaclaw workdir schema 仍为 `0.4`。
 
 # 1.2.0
 

@@ -7,7 +7,7 @@ use crate::session_actor::MultimodalTokenStrategy;
 pub enum ProviderType {
     OpenRouterCompletion,
     OpenRouterResponses,
-    #[serde(rename = "openai_image_edit")]
+    #[serde(rename = "openai_image", alias = "openai_image_edit")]
     OpenAiImageEdit,
     ClaudeCode,
     CodexSubscription,
@@ -181,11 +181,15 @@ mod tests {
     }
 
     #[test]
-    fn serializes_openai_image_edit_provider_name() {
+    fn serializes_openai_image_provider_name_and_accepts_edit_alias() {
         let value = serde_json::to_value(ProviderType::OpenAiImageEdit).unwrap();
-        assert_eq!(value, serde_json::json!("openai_image_edit"));
+        assert_eq!(value, serde_json::json!("openai_image"));
         assert_eq!(
             serde_json::from_value::<ProviderType>(value).unwrap(),
+            ProviderType::OpenAiImageEdit
+        );
+        assert_eq!(
+            serde_json::from_value::<ProviderType>(serde_json::json!("openai_image_edit")).unwrap(),
             ProviderType::OpenAiImageEdit
         );
     }

@@ -7,6 +7,7 @@ use reqwest::{
     StatusCode,
 };
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::{
     model_config::{ModelConfig, RetryMode},
@@ -53,23 +54,39 @@ impl OpenAiImageEditProvider {
     ) -> Result<ChatMessage, ProviderError> {
         let api_key = std::env::var(&model_config.api_key_env)
             .map_err(|_| ProviderError::MissingApiKeyEnv(model_config.api_key_env.clone()))?;
-        let (prompt, image) = prompt_and_image_from_request(request)?;
-        let image_part = image_file_part(&image)?;
-
-        let form = multipart::Form::new()
-            .text("model", model_config.model_name.clone())
-            .text("prompt", prompt)
-            .text("n", "1")
-            .text("response_format", "b64_json")
-            .part("image", image_part);
+        let (prompt, image) = prompt_and_optional_image_from_request(request)?;
 
         let client = self.client_for_timeout(model_config.conn_timeout)?;
-        let response = client
-            .post(&model_config.url)
-            .bearer_auth(api_key)
-            .multipart(form)
-            .send()
-            .map_err(ProviderError::Request)?;
+        let response = if let Some(image) = image {
+            let image_part = image_file_part(&image)?;
+            let form = multipart::Form::new()
+                .text("model", model_config.model_name.clone())
+                .text("prompt", prompt)
+                .text("n", "1")
+                .text("response_format", "b64_json")
+                .part("image", image_part);
+
+            client
+                .post(image_edit_url(&model_config.url))
+                .bearer_auth(api_key)
+                .multipart(form)
+                .send()
+                .map_err(ProviderError::Request)?
+        } else {
+            let payload = json!({
+                "model": model_config.model_name.clone(),
+                "prompt": prompt,
+                "n": 1,
+                "response_format": "b64_json",
+            });
+            client
+                .post(image_generation_url(&model_config.url))
+                .bearer_auth(api_key)
+                .header("Content-Type", "application/json")
+                .json(&payload)
+                .send()
+                .map_err(ProviderError::Request)?
+        };
         let status = response.status();
         let body = response.text().map_err(ProviderError::DecodeResponse)?;
 
@@ -151,9 +168,9 @@ struct OpenAiImageData {
     revised_prompt: Option<String>,
 }
 
-fn prompt_and_image_from_request(
+fn prompt_and_optional_image_from_request(
     request: &ProviderRequest<'_>,
-) -> Result<(String, FileItem), ProviderError> {
+) -> Result<(String, Option<FileItem>), ProviderError> {
     let mut prompt_parts = Vec::new();
     let mut first_image = None;
 
@@ -183,15 +200,24 @@ fn prompt_and_image_from_request(
     let prompt = prompt_parts.join("\n\n");
     if prompt.is_empty() {
         return Err(ProviderError::InvalidResponse(
-            "openai_image_edit requires a prompt".to_string(),
+            "openai_image requires a prompt".to_string(),
         ));
     }
-    let image = first_image.ok_or_else(|| {
-        ProviderError::InvalidResponse(
-            "openai_image_edit requires at least one user image".to_string(),
-        )
-    })?;
-    Ok((prompt, image))
+    Ok((prompt, first_image))
+}
+
+fn image_edit_url(configured_url: &str) -> String {
+    if configured_url.ends_with("/generations") {
+        return configured_url.trim_end_matches("/generations").to_string() + "/edits";
+    }
+    configured_url.to_string()
+}
+
+fn image_generation_url(configured_url: &str) -> String {
+    if configured_url.ends_with("/edits") {
+        return configured_url.trim_end_matches("/edits").to_string() + "/generations";
+    }
+    configured_url.to_string()
 }
 
 fn image_file_part(file: &FileItem) -> Result<multipart::Part, ProviderError> {
@@ -240,7 +266,7 @@ fn file_path_from_uri(uri: &str) -> Result<PathBuf, ProviderError> {
         return Ok(PathBuf::from(path));
     }
     Err(ProviderError::InvalidResponse(format!(
-        "openai_image_edit only supports local file:// or data: image inputs, got {uri}"
+        "openai_image only supports local file:// or data: image inputs, got {uri}"
     )))
 }
 
@@ -288,7 +314,7 @@ fn convert_image_response(
 
     if data.is_empty() {
         return Err(ProviderError::InvalidResponse(
-            "image edit response did not include image data".to_string(),
+            "image response did not include image data".to_string(),
         ));
     }
 
@@ -342,7 +368,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_requests_without_user_image() {
+    fn sends_json_image_generation_without_input_image() {
+        let _cwd = temp_cwd("openai-image-generation-provider");
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/v1/images/generations")
+            .match_header("authorization", "Bearer test-key")
+            .match_header("content-type", "application/json")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "model": "gpt-image-2",
+                "prompt": "draw a cat",
+                "n": 1,
+                "response_format": "b64_json"
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"data":[{"b64_json":"aGVsbG8="}]}"#)
+            .create();
+
         std::env::set_var("OPENAI_IMAGE_EDIT_API_KEY_TEST", "test-key");
         let provider = OpenAiImageEditProvider::new();
         let messages = vec![ChatMessage::new(
@@ -351,16 +394,33 @@ mod tests {
                 text: "draw a cat".to_string(),
             })],
         )];
+
+        let response = provider
+            .send(
+                &test_model_config(format!("{}/v1/images/edits", server.url())),
+                ProviderRequest::new(&messages),
+            )
+            .expect("image generation request should succeed");
+
+        mock.assert();
+        assert!(response.data.iter().any(
+            |item| matches!(item, ChatMessageItem::File(file) if file.uri.starts_with("file://"))
+        ));
+    }
+
+    #[test]
+    fn rejects_requests_without_prompt() {
+        std::env::set_var("OPENAI_IMAGE_EDIT_API_KEY_TEST", "test-key");
+        let provider = OpenAiImageEditProvider::new();
+        let messages = vec![ChatMessage::new(ChatRole::User, Vec::new())];
         let error = provider
             .send(
                 &test_model_config("http://127.0.0.1:9/v1/images/edits".to_string()),
                 ProviderRequest::new(&messages),
             )
-            .expect_err("missing image should fail");
+            .expect_err("missing prompt should fail");
 
-        assert!(error
-            .to_string()
-            .contains("requires at least one user image"));
+        assert!(error.to_string().contains("requires a prompt"));
     }
 
     #[test]
