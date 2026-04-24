@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use rand::Rng;
-use reqwest::{blocking::Client, StatusCode};
+use reqwest::{blocking::Client, header::ACCEPT_ENCODING, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -15,6 +15,8 @@ use super::{
     common::openrouter_cache_control_payload, OutputPersistor, Provider, ProviderError,
     ProviderRequest,
 };
+
+const RESPONSE_PREVIEW_CHARS: usize = 2000;
 
 #[derive(Debug, Default)]
 pub struct OpenRouterCompletionProvider {
@@ -78,6 +80,7 @@ impl OpenRouterCompletionProvider {
         let mut request_builder = client
             .post(&model_config.url)
             .bearer_auth(api_key)
+            .header(ACCEPT_ENCODING, "identity")
             .header("Content-Type", "application/json")
             .json(&request);
 
@@ -90,9 +93,15 @@ impl OpenRouterCompletionProvider {
 
         let response = request_builder.send().map_err(ProviderError::request)?;
         let status = response.status();
+        let body = response.bytes().map_err(|error| {
+            ProviderError::InvalidResponse(format!(
+                "failed to read response body from {} with status {status}: {error}",
+                model_config.url
+            ))
+        })?;
+        let body = String::from_utf8_lossy(&body).to_string();
 
         if !status.is_success() {
-            let body = response.text().unwrap_or_default();
             return Err(ProviderError::HttpStatus {
                 url: model_config.url.clone(),
                 status: status.as_u16(),
@@ -100,9 +109,14 @@ impl OpenRouterCompletionProvider {
             });
         }
 
-        let response_body = response
-            .json::<OpenRouterChatCompletionResponse>()
-            .map_err(ProviderError::DecodeResponse)?;
+        let response_body = serde_json::from_str::<OpenRouterChatCompletionResponse>(&body)
+            .map_err(|error| {
+                ProviderError::InvalidResponse(format!(
+                    "OpenRouter chat completion response from {} was not valid JSON: {error}; body preview: {}",
+                    model_config.url,
+                    preview_body(&body)
+                ))
+            })?;
 
         convert_openrouter_response(response_body, &self.output_persistor)
     }
@@ -124,6 +138,17 @@ impl OpenRouterCompletionProvider {
             | ProviderError::Subprocess(_) => false,
         }
     }
+}
+
+fn preview_body(body: &str) -> String {
+    let mut preview = body
+        .chars()
+        .take(RESPONSE_PREVIEW_CHARS)
+        .collect::<String>();
+    if body.chars().count() > RESPONSE_PREVIEW_CHARS {
+        preview.push_str("...");
+    }
+    preview
 }
 
 impl Provider for OpenRouterCompletionProvider {
@@ -584,6 +609,39 @@ mod tests {
                 text: "hello from openrouter".to_string(),
             })]
         );
+    }
+
+    #[test]
+    fn invalid_openrouter_success_body_reports_preview() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/api/v1/chat/completions")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body("not json")
+            .create();
+
+        std::env::set_var("OPENROUTER_API_KEY_TEST", "test-key");
+
+        let provider = OpenRouterCompletionProvider::new();
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "hello".to_string(),
+            })],
+        )];
+
+        let error = provider
+            .send(
+                &test_model_config(format!("{}/api/v1/chat/completions", server.url())),
+                ProviderRequest::new(&messages),
+            )
+            .expect_err("invalid JSON should fail with preview");
+
+        mock.assert();
+        let error = error.to_string();
+        assert!(error.contains("OpenRouter chat completion response"));
+        assert!(error.contains("body preview: not json"));
     }
 
     #[test]

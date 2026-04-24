@@ -1,5 +1,12 @@
-version: 1.4.4
+version: 1.4.5
 ---
+
+# 1.4.5
+
+- 改进 `open_router_completion` provider 响应诊断：
+  OpenRouter chat completion 请求会显式要求 `Accept-Encoding: identity`；响应体读取失败会带上请求 URL 和状态码，成功状态下 JSON 解析失败会带上响应体预览，便于排查 OpenRouter-compatible 图片模型返回空响应、HTML、损坏压缩体或非 chat-completion JSON。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.4`；当前 Stellaclaw workdir schema 仍为 `0.5`。
 
 # 1.4.4
 
