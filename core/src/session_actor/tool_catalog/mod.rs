@@ -322,7 +322,7 @@ pub fn builtin_tool_catalog(
     for tool in process_tool_definitions(&options.remote_mode) {
         catalog.add(tool)?;
     }
-    for tool in download_tool_definitions() {
+    for tool in download_tool_definitions(&options.remote_mode) {
         catalog.add(tool)?;
     }
     for tool in web_tool_definitions(options.enable_web_search) {
@@ -647,6 +647,11 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("~/.ssh/config"));
+        assert!(
+            catalog.get("file_download_start").unwrap().parameters["properties"]
+                .get("remote")
+                .is_some()
+        );
         assert!(!catalog.contains("workpath_add"));
         assert!(catalog.contains("skill_load"));
         assert!(catalog.contains("skill_create"));
@@ -669,5 +674,36 @@ mod tests {
         assert!(file_read.parameters["properties"].get("remote").is_none());
         let shell = catalog.get("shell").unwrap();
         assert!(shell.parameters["properties"].get("remote").is_none());
+        let download = catalog.get("file_download_start").unwrap();
+        assert!(download.parameters["properties"].get("remote").is_none());
+    }
+
+    #[test]
+    fn media_path_tools_expose_remote_schema_in_selectable_mode() {
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions {
+            remote_mode: ToolRemoteMode::Selectable,
+            enable_native_image_load: true,
+            enable_native_pdf_load: true,
+            enable_native_audio_load: true,
+            enable_provider_image_analysis: true,
+            enable_provider_pdf_analysis: true,
+            enable_provider_audio_analysis: true,
+            ..BuiltinToolCatalogOptions::default()
+        })
+        .expect("catalog should build");
+
+        for name in [
+            "image_load",
+            "pdf_load",
+            "audio_load",
+            "image_analysis",
+            "pdf_analysis",
+            "audio_analysis",
+        ] {
+            let tool = catalog
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert!(tool.parameters["properties"].get("remote").is_some());
+        }
     }
 }

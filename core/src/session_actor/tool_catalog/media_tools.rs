@@ -3,6 +3,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{Cursor, Write},
     path::{Path, PathBuf},
+    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
@@ -15,7 +16,7 @@ use image::ImageReader;
 use serde_json::{json, Map, Value};
 
 use super::{
-    schema::{add_images_property, object_schema, properties},
+    schema::{add_images_property, add_remote_property, object_schema, properties},
     BuiltinToolCatalogOptions, ProviderBackedToolKind, ToolBackend, ToolDefinition,
     ToolExecutionMode,
 };
@@ -25,8 +26,9 @@ use crate::{
     session_actor::{
         normalize_messages_for_model,
         tool_runtime::{
-            bool_arg_with_default, f64_arg_with_default, resolve_local_path, string_arg,
-            LocalToolError, ToolCancellationToken, ToolExecutionContext,
+            bool_arg_with_default, f64_arg_with_default, resolve_local_path, shell_quote,
+            string_arg, ExecutionTarget, LocalToolError, ToolCancellationToken,
+            ToolExecutionContext,
         },
         ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, FileState, TokenUsage,
         ToolResultContent,
@@ -63,6 +65,7 @@ pub fn media_tool_definitions(options: &BuiltinToolCatalogOptions) -> Vec<ToolDe
             "image_id",
             "Analyze a local image using the configured helper model. First call with path and question starts a job and returns an id; call again with image_id to wait or observe.",
             ProviderBackedToolKind::ImageAnalysis,
+            &options.remote_mode,
         ));
         tools.push(stop_tool_definition(
             "image_stop",
@@ -75,7 +78,7 @@ pub fn media_tool_definitions(options: &BuiltinToolCatalogOptions) -> Vec<ToolDe
         tools.push(ToolDefinition::new(
             "image_load",
             "Load a local image file into the next model request for direct multimodal inspection by the current model. Returns immediately. Do not call image_load more than 3 times in the same assistant tool-call batch; excess image_load calls in that batch will fail. Load more images after inspecting the first batch.",
-            object_schema(properties([("path", json!({"type": "string"}))]), &["path"]),
+            media_load_schema("path", &options.remote_mode),
             ToolExecutionMode::Immediate,
             ToolBackend::Local,
         ));
@@ -85,7 +88,7 @@ pub fn media_tool_definitions(options: &BuiltinToolCatalogOptions) -> Vec<ToolDe
         tools.push(ToolDefinition::new(
             "pdf_load",
             "Load a local PDF file into the next model request for direct inspection by the current model. Returns immediately.",
-            object_schema(properties([("path", json!({"type": "string"}))]), &["path"]),
+            media_load_schema("path", &options.remote_mode),
             ToolExecutionMode::Immediate,
             ToolBackend::Local,
         ));
@@ -95,7 +98,7 @@ pub fn media_tool_definitions(options: &BuiltinToolCatalogOptions) -> Vec<ToolDe
         tools.push(ToolDefinition::new(
             "audio_load",
             "Load a local audio file into the next model request for direct inspection by the current model. Returns immediately.",
-            object_schema(properties([("path", json!({"type": "string"}))]), &["path"]),
+            media_load_schema("path", &options.remote_mode),
             ToolExecutionMode::Immediate,
             ToolBackend::Local,
         ));
@@ -107,6 +110,7 @@ pub fn media_tool_definitions(options: &BuiltinToolCatalogOptions) -> Vec<ToolDe
             "pdf_id",
             "Analyze a local PDF using the configured helper model. First call with path and question starts a job and returns an id; call again with pdf_id to wait or observe.",
             ProviderBackedToolKind::PdfAnalysis,
+            &options.remote_mode,
         ));
         tools.push(stop_tool_definition(
             "pdf_stop",
@@ -121,6 +125,7 @@ pub fn media_tool_definitions(options: &BuiltinToolCatalogOptions) -> Vec<ToolDe
             "audio_id",
             "Analyze or transcribe a local audio file using the configured helper model. First call with path and optional question starts a job and returns an id; call again with audio_id to wait or observe.",
             ProviderBackedToolKind::AudioAnalysis,
+            &options.remote_mode,
         ));
         tools.push(stop_tool_definition(
             "audio_stop",
@@ -166,6 +171,7 @@ fn analysis_tool_definition(
     id_field: &str,
     description: &str,
     kind: ProviderBackedToolKind,
+    remote_mode: &super::ToolRemoteMode,
 ) -> ToolDefinition {
     let mut schema_properties = properties([
         ("path", json!({"type": "string"})),
@@ -179,6 +185,7 @@ fn analysis_tool_definition(
     ]);
     schema_properties.insert(id_field.to_string(), json!({"type": "string"}));
     add_images_property(&mut schema_properties, true);
+    add_remote_property(&mut schema_properties, remote_mode);
 
     ToolDefinition::new(
         name,
@@ -187,6 +194,12 @@ fn analysis_tool_definition(
         ToolExecutionMode::Interruptible,
         ToolBackend::ProviderBacked { kind },
     )
+}
+
+fn media_load_schema(path_field: &'static str, remote_mode: &super::ToolRemoteMode) -> Value {
+    let mut schema_properties = properties([(path_field, json!({"type": "string"}))]);
+    add_remote_property(&mut schema_properties, remote_mode);
+    object_schema(schema_properties, &[path_field])
 }
 
 fn stop_tool_definition(name: &str, id_field: &str, description: &str) -> ToolDefinition {
@@ -680,7 +693,22 @@ fn file_item_from_path(
     media_kind: &str,
 ) -> Result<FileItem, LocalToolError> {
     let path = string_arg(arguments, "path")?;
+    if matches!(context.remote_mode, super::ToolRemoteMode::Selectable) {
+        if let ExecutionTarget::RemoteSsh { host, cwd } = context.execution_target(arguments)? {
+            return remote_file_item_from_path(
+                context.workspace_root,
+                &host,
+                cwd.as_deref(),
+                &path,
+                media_kind,
+            );
+        }
+    }
     let path = resolve_local_path(context.workspace_root, &path);
+    local_file_item_from_path(&path, media_kind)
+}
+
+fn local_file_item_from_path(path: &Path, media_kind: &str) -> Result<FileItem, LocalToolError> {
     if !path.is_file() {
         return Err(LocalToolError::InvalidArguments(format!(
             "{} path is not a file: {}",
@@ -706,6 +734,81 @@ fn file_item_from_path(
     };
     enrich_or_mark_crashed(&mut file, &canonical, media_kind);
     Ok(file)
+}
+
+fn remote_file_item_from_path(
+    workspace_root: &Path,
+    host: &str,
+    cwd: Option<&str>,
+    path: &str,
+    media_kind: &str,
+) -> Result<FileItem, LocalToolError> {
+    let file_name = remote_file_name(path);
+    let local_dir = workspace_root.join(".output").join("remote-media");
+    fs::create_dir_all(&local_dir).map_err(|error| {
+        LocalToolError::Io(format!("failed to create {}: {error}", local_dir.display()))
+    })?;
+    let local_path = local_dir.join(format!("{}-{}", nonce(), sanitize_file_name(&file_name)));
+    let remote_command = remote_media_read_command(cwd, path);
+    let output = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-T")
+        .arg(host)
+        .arg(remote_command)
+        .output()
+        .map_err(|error| LocalToolError::Remote(format!("failed to spawn ssh: {error}")))?;
+    if !output.status.success() {
+        return Err(LocalToolError::Remote(format!(
+            "ssh exited with {}; stderr: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    fs::write(&local_path, &output.stdout).map_err(|error| {
+        LocalToolError::Io(format!("failed to write {}: {error}", local_path.display()))
+    })?;
+    local_file_item_from_path(&local_path, media_kind)
+}
+
+fn remote_media_read_command(cwd: Option<&str>, path: &str) -> String {
+    let script = r#"
+import os, sys
+
+path = os.path.expanduser(sys.argv[1])
+if not os.path.isfile(path):
+    raise SystemExit(f"path is not a file: {path}")
+with open(path, "rb") as handle:
+    sys.stdout.buffer.write(handle.read())
+"#;
+    let command = format!("python3 -c {} {}", shell_quote(script), shell_quote(path));
+    match cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
+        Some(cwd) => format!("cd {} && {}", shell_quote(cwd), command),
+        None => command,
+    }
+}
+
+fn remote_file_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("remote-media")
+        .to_string()
+}
+
+fn sanitize_file_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn enrich_or_mark_crashed(file: &mut FileItem, path: &Path, media_kind: &str) {
@@ -787,6 +890,13 @@ fn collect_optional_images(
             file_item_from_path(&map, context, "image")
         })
         .collect()
+}
+
+fn nonce() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 fn media_type_for_path(path: &Path, media_kind: &str) -> &'static str {

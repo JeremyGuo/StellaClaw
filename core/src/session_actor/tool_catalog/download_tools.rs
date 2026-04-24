@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::PathBuf,
+    process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
@@ -15,13 +16,13 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{json, Map, Value};
 
 use super::{
-    schema::{object_schema, properties},
-    ToolBackend, ToolDefinition, ToolExecutionMode,
+    schema::{add_remote_property, object_schema, properties},
+    ToolBackend, ToolDefinition, ToolExecutionMode, ToolRemoteMode,
 };
 use crate::session_actor::tool_runtime::{
-    bool_arg_with_default, f64_arg_with_default, resolve_local_path, string_arg,
-    string_arg_with_default, truncate_tool_text, LocalToolError, ToolCancellationToken,
-    ToolExecutionContext,
+    bool_arg_with_default, f64_arg_with_default, resolve_local_path, shell_quote, string_arg,
+    string_arg_with_default, truncate_tool_text, ExecutionTarget, LocalToolError,
+    ToolCancellationToken, ToolExecutionContext,
 };
 
 static DOWNLOADS: OnceLock<Mutex<HashMap<String, DownloadTask>>> = OnceLock::new();
@@ -31,30 +32,50 @@ struct DownloadTask {
     cancel: Arc<AtomicBool>,
 }
 
+enum DownloadTarget {
+    Local {
+        path: PathBuf,
+    },
+    RemoteSsh {
+        host: String,
+        cwd: Option<String>,
+        path: String,
+    },
+}
+
+impl DownloadTarget {
+    fn remote_label(&self) -> Option<&str> {
+        match self {
+            Self::Local { .. } => None,
+            Self::RemoteSsh { host, .. } => Some(host.as_str()),
+        }
+    }
+}
+
 fn downloads() -> &'static Mutex<HashMap<String, DownloadTask>> {
     DOWNLOADS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub fn download_tool_definitions() -> Vec<ToolDefinition> {
+pub fn download_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition> {
+    let mut start_properties = properties([
+        ("url", json!({"type": "string"})),
+        ("path", json!({"type": "string"})),
+        ("headers", json!({"type": "object"})),
+        ("overwrite", json!({"type": "boolean"})),
+        ("return_immediate", json!({"type": "boolean"})),
+        ("wait_timeout_seconds", json!({"type": "number"})),
+        (
+            "on_timeout",
+            json!({"type": "string", "enum": ["continue", "kill", "CONTINUE", "KILL"]}),
+        ),
+    ]);
+    add_remote_property(&mut start_properties, remote_mode);
+
     vec![
         ToolDefinition::new(
             "file_download_start",
-            "Start downloading an HTTP resource to a local file.",
-            object_schema(
-                properties([
-                    ("url", json!({"type": "string"})),
-                    ("path", json!({"type": "string"})),
-                    ("headers", json!({"type": "object"})),
-                    ("overwrite", json!({"type": "boolean"})),
-                    ("return_immediate", json!({"type": "boolean"})),
-                    ("wait_timeout_seconds", json!({"type": "number"})),
-                    (
-                        "on_timeout",
-                        json!({"type": "string", "enum": ["continue", "kill", "CONTINUE", "KILL"]}),
-                    ),
-                ]),
-                &["url", "path"],
-            ),
+            "Start downloading an HTTP resource to a file. In selectable remote mode, pass remote to download using that SSH host's network directly.",
+            object_schema(start_properties, &["url", "path"]),
             ToolExecutionMode::Interruptible,
             ToolBackend::Local,
         ),
@@ -119,19 +140,39 @@ fn file_download_start(
 ) -> Result<Value, LocalToolError> {
     let url = string_arg(arguments, "url")?;
     let path_arg = string_arg(arguments, "path")?;
-    let path = resolve_local_path(context.workspace_root, &path_arg);
     let overwrite = bool_arg_with_default(arguments, "overwrite", false)?;
-    if path.exists() && !overwrite {
-        return Err(LocalToolError::InvalidArguments(format!(
-            "{} already exists; pass overwrite=true to replace it",
-            path.display()
-        )));
-    }
     let download_id = format!("dl_{}", nonce());
+    let target = context.execution_target(arguments)?;
+    let display_path = match &target {
+        ExecutionTarget::Local => resolve_local_path(context.workspace_root, &path_arg)
+            .display()
+            .to_string(),
+        ExecutionTarget::RemoteSsh { host, cwd } => {
+            remote_display_path(host, cwd.as_deref(), &path_arg)
+        }
+    };
+    let download_target = match target {
+        ExecutionTarget::Local => {
+            let path = resolve_local_path(context.workspace_root, &path_arg);
+            if path.exists() && !overwrite {
+                return Err(LocalToolError::InvalidArguments(format!(
+                    "{} already exists; pass overwrite=true to replace it",
+                    path.display()
+                )));
+            }
+            DownloadTarget::Local { path }
+        }
+        ExecutionTarget::RemoteSsh { host, cwd } => DownloadTarget::RemoteSsh {
+            host,
+            cwd,
+            path: path_arg,
+        },
+    };
     let status = Arc::new(Mutex::new(json!({
         "download_id": download_id,
         "url": url,
-        "path": path.display().to_string(),
+        "path": display_path,
+        "remote": download_target.remote_label(),
         "running": true,
         "bytes_downloaded": 0_u64,
     })));
@@ -145,7 +186,14 @@ fn file_download_start(
     );
 
     let headers = request_headers(arguments.get("headers"))?;
-    thread::spawn(move || run_download(url, path, headers, status, cancel));
+    thread::spawn(move || match download_target {
+        DownloadTarget::Local { path } => {
+            run_download(url, path, headers, overwrite, status, cancel)
+        }
+        DownloadTarget::RemoteSsh { host, cwd, path } => {
+            run_remote_download(url, path, headers, overwrite, host, cwd, status, cancel)
+        }
+    });
 
     let wait_timeout = f64_arg_with_default(arguments, "wait_timeout_seconds", 0.0)?;
     if bool_arg_with_default(arguments, "return_immediate", false)? || wait_timeout <= 0.0 {
@@ -256,12 +304,19 @@ fn run_download(
     url: String,
     path: PathBuf,
     headers: HeaderMap,
+    overwrite: bool,
     status: Arc<Mutex<Value>>,
     cancel: Arc<AtomicBool>,
 ) {
     let result = (|| -> Result<(), String> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        }
+        if path.exists() && !overwrite {
+            return Err(format!(
+                "{} already exists; pass overwrite=true to replace it",
+                path.display()
+            ));
         }
         let temp_path = path.with_extension("stellaclaw-download-part");
         let client = reqwest::blocking::Client::builder()
@@ -328,6 +383,159 @@ fn run_download(
     }
 }
 
+fn run_remote_download(
+    url: String,
+    path: String,
+    headers: HeaderMap,
+    overwrite: bool,
+    host: String,
+    cwd: Option<String>,
+    status: Arc<Mutex<Value>>,
+    cancel: Arc<AtomicBool>,
+) {
+    let result = (|| -> Result<(), String> {
+        let payload = remote_download_payload(&url, &path, &headers, overwrite)?;
+        let command = remote_download_command(cwd.as_deref(), &payload);
+        let mut child = Command::new("ssh")
+            .arg("-o")
+            .arg("BatchMode=yes")
+            .arg("-o")
+            .arg("ConnectTimeout=10")
+            .arg("-T")
+            .arg(&host)
+            .arg(command)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("failed to spawn ssh: {error}"))?;
+
+        loop {
+            if cancel.load(Ordering::SeqCst) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("cancelled".to_string());
+            }
+            match child.try_wait().map_err(|error| error.to_string())? {
+                Some(_) => break,
+                None => thread::sleep(Duration::from_millis(100)),
+            }
+        }
+
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("failed to wait for ssh: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "ssh exited with {}; stderr: {}",
+                output.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let value: Value = serde_json::from_slice(&output.stdout).map_err(|error| {
+            format!(
+                "remote download output was not JSON: {error}; stdout: {}",
+                String::from_utf8_lossy(&output.stdout)
+            )
+        })?;
+        let mut status_value = status.lock().expect("mutex poisoned");
+        set_status_fields(&mut status_value, value);
+        Ok(())
+    })();
+
+    let mut value = status.lock().expect("mutex poisoned");
+    match result {
+        Ok(()) => set_status_fields(&mut value, json!({"running": false, "completed": true})),
+        Err(error) if error == "cancelled" => {
+            set_status_fields(&mut value, json!({"running": false, "cancelled": true}))
+        }
+        Err(error) => {
+            let (error, _) = truncate_tool_text(&error, 1000);
+            set_status_fields(
+                &mut value,
+                json!({"running": false, "failed": true, "error": error}),
+            )
+        }
+    }
+}
+
+fn remote_download_payload(
+    url: &str,
+    path: &str,
+    headers: &HeaderMap,
+    overwrite: bool,
+) -> Result<String, String> {
+    let headers = headers
+        .iter()
+        .map(|(name, value)| {
+            let value = value
+                .to_str()
+                .map_err(|error| format!("invalid header value for remote download: {error}"))?;
+            Ok(json!([name.as_str(), value]))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    serde_json::to_string(&json!({
+        "url": url,
+        "path": path,
+        "headers": headers,
+        "overwrite": overwrite,
+    }))
+    .map_err(|error| error.to_string())
+}
+
+fn remote_download_command(cwd: Option<&str>, payload: &str) -> String {
+    let script = r#"
+import json, os, sys, tempfile, urllib.request
+
+payload = json.loads(sys.argv[1])
+path = os.path.expanduser(payload["path"])
+parent = os.path.dirname(path)
+if parent:
+    os.makedirs(parent, exist_ok=True)
+if os.path.exists(path) and not payload.get("overwrite", False):
+    raise SystemExit(f"{path} already exists; pass overwrite=true to replace it")
+
+request = urllib.request.Request(payload["url"])
+for name, value in payload.get("headers", []):
+    request.add_header(name, value)
+
+with urllib.request.urlopen(request) as response:
+    fd, temp_path = tempfile.mkstemp(prefix=".stellaclaw-download-", dir=parent or ".")
+    bytes_downloaded = 0
+    try:
+        with os.fdopen(fd, "wb") as output:
+            while True:
+                chunk = response.read(1024 * 64)
+                if not chunk:
+                    break
+                output.write(chunk)
+                bytes_downloaded += len(chunk)
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+        raise
+
+    print(json.dumps({
+        "http_status": response.getcode(),
+        "final_url": response.geturl(),
+        "content_type": response.headers.get("content-type"),
+        "total_bytes": int(response.headers.get("content-length") or 0) or None,
+        "bytes_downloaded": bytes_downloaded,
+    }))
+"#;
+    let command = format!(
+        "python3 -c {} {}",
+        shell_quote(script),
+        shell_quote(payload)
+    );
+    match cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
+        Some(cwd) => format!("cd {} && {}", shell_quote(cwd), command),
+        None => command,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TimeoutAction {
     Continue,
@@ -366,6 +574,13 @@ fn request_headers(value: Option<&Value>) -> Result<HeaderMap, LocalToolError> {
     Ok(headers)
 }
 
+fn remote_display_path(host: &str, cwd: Option<&str>, path: &str) -> String {
+    match cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) {
+        Some(cwd) => format!("{host}:{cwd}/{path}"),
+        None => format!("{host}:{path}"),
+    }
+}
+
 fn set_status_fields(status: &mut Value, patch: Value) {
     let Some(status) = status.as_object_mut() else {
         return;
@@ -400,7 +615,7 @@ fn compact_download_snapshot(snapshot: Value) -> Value {
             }
         }
     }
-    for text in ["final_url", "content_type", "error"] {
+    for text in ["final_url", "content_type", "error", "remote"] {
         if let Some(value) = object.get(text).and_then(Value::as_str) {
             if !value.is_empty() {
                 compact.insert(text.to_string(), Value::String(value.to_string()));
