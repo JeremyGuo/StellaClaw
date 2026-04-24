@@ -13,8 +13,8 @@ use crate::{
 
 use super::{
     common::{
-        is_image_file, openrouter_cache_control_payload, provider_error_message,
-        token_usage_from_value,
+        is_image_file, openrouter_cache_control_payload, provider_error_kind,
+        provider_error_message, token_usage_from_value,
     },
     error_chain_message, OutputPersistor, Provider, ProviderError, ProviderRequest,
 };
@@ -157,8 +157,13 @@ impl OpenRouterResponsesProvider {
                 preview_body(&body)
             ))
         })?;
-        if let Some(error) = provider_error_message(&value) {
-            return Err(ProviderError::InvalidResponse(error));
+        if let Some(kind) = provider_error_kind(&value) {
+            return Err(ProviderError::ProviderFailure {
+                kind,
+                message: provider_error_message(&value)
+                    .unwrap_or_else(|| "provider returned an error".to_string()),
+                body,
+            });
         }
 
         responses_value_to_chat_message(&value, model_config, &self.output_persistor)
@@ -297,8 +302,13 @@ fn responses_value_to_chat_message(
     model_config: &ModelConfig,
     output_persistor: &OutputPersistor,
 ) -> Result<ChatMessage, ProviderError> {
-    if let Some(error) = provider_error_message(value) {
-        return Err(ProviderError::InvalidResponse(error));
+    if let Some(kind) = provider_error_kind(value) {
+        return Err(ProviderError::ProviderFailure {
+            kind,
+            message: provider_error_message(value)
+                .unwrap_or_else(|| "provider returned an error".to_string()),
+            body: value.to_string(),
+        });
     }
 
     let output = value

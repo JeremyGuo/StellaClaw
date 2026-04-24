@@ -6,15 +6,14 @@ use crate::{
     session_actor::{FileItem, TokenUsage},
 };
 
-use super::pricing::PriceManager;
+use super::{pricing::PriceManager, ProviderFailureKind};
 
 pub(crate) fn is_image_file(file: &FileItem) -> bool {
     matches!(file.media_type.as_deref(), Some(media_type) if media_type.starts_with("image/"))
 }
 
 pub(crate) fn provider_error_message(value: &Value) -> Option<String> {
-    value
-        .get("error")
+    provider_error_value(value)
         .and_then(|error| {
             error
                 .get("message")
@@ -22,18 +21,56 @@ pub(crate) fn provider_error_message(value: &Value) -> Option<String> {
                 .or_else(|| error.as_str())
         })
         .map(str::to_string)
-        .or_else(|| {
+}
+
+pub(crate) fn provider_error_kind(value: &Value) -> Option<ProviderFailureKind> {
+    let error = provider_error_value(value)?;
+    let text = [
+        error.get("type").and_then(Value::as_str),
+        error.get("message").and_then(Value::as_str),
+        error.get("code").and_then(Value::as_str),
+        error.as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .to_ascii_lowercase();
+
+    if super::request_too_large_text(&text) || numeric_error_code(error) == Some(413) {
+        return Some(ProviderFailureKind::RequestTooLarge);
+    }
+    if text.contains("rate_limit") || text.contains("too many requests") {
+        return Some(ProviderFailureKind::RateLimited);
+    }
+    match numeric_error_code(error) {
+        Some(401) => Some(ProviderFailureKind::Authentication),
+        Some(403) => Some(ProviderFailureKind::Permission),
+        Some(429) => Some(ProviderFailureKind::RateLimited),
+        Some(500..=599) => Some(ProviderFailureKind::ProviderUnavailable),
+        Some(_) => Some(ProviderFailureKind::Unknown),
+        None => Some(ProviderFailureKind::Unknown),
+    }
+}
+
+fn provider_error_value(value: &Value) -> Option<&Value> {
+    value.get("error").or_else(|| {
+        value
+            .get("response")
+            .and_then(|response| response.get("error"))
+    })
+}
+
+fn numeric_error_code(error: &Value) -> Option<u16> {
+    let code = ["status", "status_code", "code"]
+        .into_iter()
+        .filter_map(|field| error.get(field))
+        .find_map(|value| {
             value
-                .get("response")
-                .and_then(|response| response.get("error"))
-                .and_then(|error| {
-                    error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .or_else(|| error.as_str())
-                })
-                .map(str::to_string)
-        })
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+        })?;
+    (100..=599).contains(&code).then_some(code as u16)
 }
 
 pub(crate) fn token_usage_from_value(

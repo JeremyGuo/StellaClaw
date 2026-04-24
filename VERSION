@@ -1,5 +1,10 @@
-version: 1.6.0
+version: 1.6.1
 ---
+
+# 1.6.1
+
+- 修正 OpenRouter error envelope 的错误语义：
+  OpenRouter 可能在 HTTP 200 的响应体中返回 `{"error":{"code":413,...}}`，此前会被 chat completion parser 当成正常响应解析并报 `missing field id`，导致 actor 无法识别 request-too-large 并触发剪历史重试。现在 provider 会把这类错误归一成语义化 `request_too_large` provider failure；本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.6.0
 

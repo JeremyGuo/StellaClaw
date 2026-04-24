@@ -113,6 +113,12 @@ pub enum ProviderError {
     DecodeJson(serde_json::Error),
     #[error("invalid provider response: {0}")]
     InvalidResponse(String),
+    #[error("provider rejected request as {kind}: {message}")]
+    ProviderFailure {
+        kind: ProviderFailureKind,
+        message: String,
+        body: String,
+    },
     #[error("websocket provider request failed: {0}")]
     WebSocket(String),
     #[error("failed to persist provider output: {0}")]
@@ -123,6 +129,30 @@ pub enum ProviderError {
     Subprocess(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderFailureKind {
+    RequestTooLarge,
+    RateLimited,
+    Authentication,
+    Permission,
+    ProviderUnavailable,
+    Unknown,
+}
+
+impl std::fmt::Display for ProviderFailureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            Self::RequestTooLarge => "request_too_large",
+            Self::RateLimited => "rate_limited",
+            Self::Authentication => "authentication",
+            Self::Permission => "permission",
+            Self::ProviderUnavailable => "provider_unavailable",
+            Self::Unknown => "unknown",
+        };
+        f.write_str(label)
+    }
+}
+
 impl ProviderError {
     pub fn request(error: reqwest::Error) -> Self {
         Self::Request(error_chain_message(&error))
@@ -130,6 +160,10 @@ impl ProviderError {
 
     pub fn is_request_too_large(&self) -> bool {
         match self {
+            Self::ProviderFailure {
+                kind: ProviderFailureKind::RequestTooLarge,
+                ..
+            } => true,
             Self::HttpStatus { status, body, .. } => *status == 413 || request_too_large_text(body),
             Self::Request(message)
             | Self::InvalidResponse(message)
@@ -140,6 +174,7 @@ impl ProviderError {
             | Self::DecodeResponse(_)
             | Self::DecodeJson(_)
             | Self::PersistOutput(_)
+            | Self::ProviderFailure { .. }
             | Self::EmptyChoices => false,
         }
     }
@@ -172,5 +207,9 @@ pub(crate) fn request_too_large_text(message: &str) -> bool {
         || message.contains("context window")
         || message.contains("prompt is too long")
         || message.contains("input is too long")
+        || message.contains("code\":413")
+        || message.contains("code\": 413")
+        || message.contains("code:413")
+        || message.contains("code: 413")
         || message.contains("status 413")
 }
