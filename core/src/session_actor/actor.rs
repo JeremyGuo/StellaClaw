@@ -1022,12 +1022,17 @@ impl SessionActor {
         };
 
         self.all_messages.push(message.clone());
+        let system_prompt = self
+            .initial
+            .as_ref()
+            .map(|initial| system_prompt_for_initial(initial, &self.runtime_metadata_state));
         let report = compressor
             .append_with_compression(
                 &mut self.history,
                 message,
                 self.provider.as_ref(),
                 &self.model_config,
+                system_prompt.as_deref(),
             )
             .map_err(|error| SessionActorError::Compression(error.to_string()))?;
         self.log_compression_report(phase, &report);
@@ -1212,10 +1217,15 @@ impl SessionActor {
 
         let threshold_tokens =
             idle_compaction_token_threshold(&self.model_config, self.initial.as_ref());
+        let system_prompt = self
+            .initial
+            .as_ref()
+            .map(|initial| system_prompt_for_initial(initial, &self.runtime_metadata_state));
         match compressor.compact_if_needed_with_threshold(
             &mut self.history,
             self.provider.as_ref(),
             &self.model_config,
+            system_prompt.as_deref(),
             threshold_tokens,
         ) {
             Ok(report) => {

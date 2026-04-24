@@ -1,5 +1,12 @@
-version: 1.4.1
+version: 1.4.2
 ---
+
+# 1.4.2
+
+- 修复 context compression 请求缺少 system prompt 的问题：
+  主动压缩和 idle compaction 调用 provider 生成摘要时，现在会携带当前 session system prompt，避免 `codex_subscription` provider 因缺少 `instructions` 返回 400。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.4`；当前 Stellaclaw workdir schema 仍为 `0.5`。
 
 # 1.4.1
 

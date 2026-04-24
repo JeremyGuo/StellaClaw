@@ -42,6 +42,7 @@ impl SessionCompressor {
         next_message: ChatMessage,
         provider: &(dyn Provider + Send + Sync),
         model_config: &ModelConfig,
+        system_prompt: Option<&str>,
     ) -> Result<CompressionReport, CompressionError> {
         let estimated_tokens_before = self.estimate_with_next(messages, &next_message)?;
         if estimated_tokens_before <= self.threshold_tokens {
@@ -74,6 +75,7 @@ impl SessionCompressor {
             messages.len() - plan.recent_start,
             provider,
             model_config,
+            system_prompt,
         )?;
         let summary_present = summary_message.is_some();
         let mut compressed_messages = Vec::new();
@@ -105,11 +107,13 @@ impl SessionCompressor {
         messages: &mut Vec<ChatMessage>,
         provider: &(dyn Provider + Send + Sync),
         model_config: &ModelConfig,
+        system_prompt: Option<&str>,
     ) -> Result<CompressionReport, CompressionError> {
         self.compact_if_needed_with_threshold(
             messages,
             provider,
             model_config,
+            system_prompt,
             self.threshold_tokens,
         )
     }
@@ -119,6 +123,7 @@ impl SessionCompressor {
         messages: &mut Vec<ChatMessage>,
         provider: &(dyn Provider + Send + Sync),
         model_config: &ModelConfig,
+        system_prompt: Option<&str>,
         threshold_tokens: u64,
     ) -> Result<CompressionReport, CompressionError> {
         if threshold_tokens == 0 {
@@ -152,6 +157,7 @@ impl SessionCompressor {
             messages.len() - plan.recent_start,
             provider,
             model_config,
+            system_prompt,
         )?;
         let summary_present = summary_message.is_some();
         let mut compressed_messages = Vec::new();
@@ -214,6 +220,7 @@ impl SessionCompressor {
         preserved_recent_count: usize,
         provider: &(dyn Provider + Send + Sync),
         model_config: &ModelConfig,
+        system_prompt: Option<&str>,
     ) -> Result<Option<ChatMessage>, CompressionError> {
         let mut request_messages = sanitize_messages_for_compression_request(messages_to_summarize);
         if request_messages.is_empty() {
@@ -227,7 +234,10 @@ impl SessionCompressor {
         ));
 
         let summary = provider
-            .send(model_config, ProviderRequest::new(&request_messages))
+            .send(
+                model_config,
+                ProviderRequest::new(&request_messages).with_system_prompt(system_prompt),
+            )
             .map_err(|error| CompressionError::Provider(error.to_string()))?;
         let summary_text = message_text(&summary);
         if summary_text.trim().is_empty() {
@@ -509,12 +519,18 @@ mod tests {
         session_actor::{FileItem, ToolCallItem, ToolResultContent, ToolResultItem},
     };
 
+    #[derive(Debug, Clone)]
+    struct SummaryRequestSnapshot {
+        system_prompt: Option<String>,
+        messages: Vec<ChatMessage>,
+    }
+
     struct SummaryProvider {
-        seen_requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>,
+        seen_requests: Arc<Mutex<Vec<SummaryRequestSnapshot>>>,
     }
 
     impl SummaryProvider {
-        fn new(seen_requests: Arc<Mutex<Vec<Vec<ChatMessage>>>>) -> Self {
+        fn new(seen_requests: Arc<Mutex<Vec<SummaryRequestSnapshot>>>) -> Self {
             Self { seen_requests }
         }
     }
@@ -528,7 +544,10 @@ mod tests {
             self.seen_requests
                 .lock()
                 .unwrap()
-                .push(request.messages.to_vec());
+                .push(SummaryRequestSnapshot {
+                    system_prompt: request.system_prompt.map(str::to_string),
+                    messages: request.messages.to_vec(),
+                });
             Ok(ChatMessage::new(
                 ChatRole::Assistant,
                 vec![ChatMessageItem::Context(ContextItem {
@@ -636,7 +655,13 @@ mod tests {
         );
 
         let report = compressor
-            .append_with_compression(&mut messages, next_message, &provider, &model_config)
+            .append_with_compression(
+                &mut messages,
+                next_message,
+                &provider,
+                &model_config,
+                Some("stable compression instructions"),
+            )
             .expect("append should compress");
 
         assert!(report.compressed);
@@ -649,10 +674,15 @@ mod tests {
 
         let requests = seen_requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
-        assert!(message_text(requests[0].last().unwrap()).contains("Compress the older"));
+        assert_eq!(
+            requests[0].system_prompt.as_deref(),
+            Some("stable compression instructions")
+        );
+        assert!(message_text(requests[0].messages.last().unwrap()).contains("Compress the older"));
         let request_body = requests[0]
+            .messages
             .iter()
-            .take(requests[0].len().saturating_sub(1))
+            .take(requests[0].messages.len().saturating_sub(1))
             .map(message_text)
             .collect::<Vec<_>>()
             .join("\n");
