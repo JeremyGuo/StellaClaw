@@ -57,42 +57,48 @@ impl OpenAiImageEditProvider {
         let (prompt, image) = prompt_and_optional_image_from_request(request)?;
 
         let client = self.client_for_timeout(model_config.conn_timeout)?;
-        let response = if let Some(image) = image {
+        let (request_url, response) = if let Some(image) = image {
             let image_part = image_file_part(&image)?;
+            let request_url = image_edit_url(&model_config.url);
             let form = multipart::Form::new()
                 .text("model", model_config.model_name.clone())
                 .text("prompt", prompt)
                 .text("n", "1")
-                .text("response_format", "b64_json")
                 .part("image", image_part);
 
-            client
-                .post(image_edit_url(&model_config.url))
-                .bearer_auth(api_key)
-                .multipart(form)
-                .send()
-                .map_err(ProviderError::Request)?
+            (
+                request_url.clone(),
+                client
+                    .post(request_url)
+                    .bearer_auth(api_key)
+                    .multipart(form)
+                    .send()
+                    .map_err(ProviderError::Request)?,
+            )
         } else {
+            let request_url = image_generation_url(&model_config.url);
             let payload = json!({
                 "model": model_config.model_name.clone(),
                 "prompt": prompt,
                 "n": 1,
-                "response_format": "b64_json",
             });
-            client
-                .post(image_generation_url(&model_config.url))
-                .bearer_auth(api_key)
-                .header("Content-Type", "application/json")
-                .json(&payload)
-                .send()
-                .map_err(ProviderError::Request)?
+            (
+                request_url.clone(),
+                client
+                    .post(request_url)
+                    .bearer_auth(api_key)
+                    .header("Content-Type", "application/json")
+                    .json(&payload)
+                    .send()
+                    .map_err(ProviderError::Request)?,
+            )
         };
         let status = response.status();
         let body = response.text().map_err(ProviderError::DecodeResponse)?;
 
         if !status.is_success() {
             return Err(ProviderError::HttpStatus {
-                url: model_config.url.clone(),
+                url: request_url,
                 status: status.as_u16(),
                 body,
             });
@@ -380,11 +386,10 @@ mod tests {
             .mock("POST", "/v1/images/generations")
             .match_header("authorization", "Bearer test-key")
             .match_header("content-type", "application/json")
-            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            .match_body(mockito::Matcher::Json(serde_json::json!({
                 "model": "gpt-image-2",
                 "prompt": "draw a cat",
-                "n": 1,
-                "response_format": "b64_json"
+                "n": 1
             })))
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -435,9 +440,13 @@ mod tests {
         let mock = server
             .mock("POST", "/v1/images/edits")
             .match_header("authorization", "Bearer test-key")
-            .match_header("content-type", mockito::Matcher::Regex("multipart/form-data; boundary=.*".to_string()))
+            .match_header(
+                "content-type",
+                mockito::Matcher::Regex("multipart/form-data; boundary=.*".to_string()),
+            )
             .match_body(mockito::Matcher::Regex(
-                "(?s).*name=\"model\".*gpt-image-2.*name=\"prompt\".*draw a moon.*name=\"response_format\".*b64_json.*name=\"image\".*".to_string(),
+                "(?s).*name=\"model\".*gpt-image-2.*name=\"prompt\".*draw a moon.*name=\"image\".*"
+                    .to_string(),
             ))
             .with_status(200)
             .with_header("content-type", "application/json")
