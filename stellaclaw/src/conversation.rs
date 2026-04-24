@@ -26,6 +26,7 @@ use crate::{
     channels::types::{
         OutgoingAttachment, OutgoingAttachmentKind, OutgoingDelivery, OutgoingDispatch,
         OutgoingOption, OutgoingOptions, OutgoingProcessing, OutgoingProgressFeedback,
+        OutgoingStatus, OutgoingUsageCost, OutgoingUsageSummary, OutgoingUsageTotals,
         ProcessingState, ProgressFeedbackFinalState,
     },
     config::{
@@ -1700,17 +1701,29 @@ impl ConversationRuntime {
             .filter(|record| record.status == ManagedSessionStatus::Running)
             .count();
         let usage = self.conversation_usage_summary();
-        self.send_delivery_from_text(format!(
-            "当前状态\nconversation: `{}`\nmodel: `{}`\nreasoning: `{}`\nsandbox: `{}` ({sandbox_source})\nremote: {remote}\nworkspace: `{}`\nbackground: {running_background} running / {} total\nsubagents: {running_subagents} running / {} total\n\n{}",
-            self.state.conversation_id,
-            self.current_main_model_name(),
-            self.state.reasoning_effort.as_deref().unwrap_or("model default"),
-            sandbox_mode_label(&sandbox.mode),
-            self.workspace_root.display(),
-            self.state.session_binding.background_sessions.len(),
-            self.state.session_binding.subagent_sessions.len(),
-            render_usage_summary(&usage),
-        ))
+        self.outgoing_tx
+            .send(OutgoingDispatch::Status(OutgoingStatus {
+                channel_id: self.state.channel_id.clone(),
+                platform_chat_id: self.state.platform_chat_id.clone(),
+                conversation_id: self.state.conversation_id.clone(),
+                model: self.current_main_model_name(),
+                reasoning: self
+                    .state
+                    .reasoning_effort
+                    .as_deref()
+                    .unwrap_or("model default")
+                    .to_string(),
+                sandbox: sandbox_mode_label(&sandbox.mode).to_string(),
+                sandbox_source: sandbox_source.to_string(),
+                remote,
+                workspace: self.workspace_root.display().to_string(),
+                running_background,
+                total_background: self.state.session_binding.background_sessions.len(),
+                running_subagents,
+                total_subagents: self.state.session_binding.subagent_sessions.len(),
+                usage: outgoing_usage_summary(&usage),
+            }))
+            .map_err(|_| anyhow!("outgoing status channel closed"))
     }
 
     fn conversation_usage_summary(&self) -> ConversationUsageSummary {
@@ -2914,36 +2927,28 @@ fn media_tool_usage_totals(workspace_root: &Path) -> UsageTotals {
     totals
 }
 
-fn render_usage_summary(summary: &ConversationUsageSummary) -> String {
-    let mut total = UsageTotals::default();
-    total.add_totals(&summary.foreground);
-    total.add_totals(&summary.background);
-    total.add_totals(&summary.subagents);
-    total.add_totals(&summary.media_tools);
-
-    format!(
-        "token usage\n{}\n{}\n{}\n{}\n{}",
-        render_usage_line("total", &total),
-        render_usage_line("foreground", &summary.foreground),
-        render_usage_line("background", &summary.background),
-        render_usage_line("subagents", &summary.subagents),
-        render_usage_line("media tools", &summary.media_tools),
-    )
+fn outgoing_usage_summary(summary: &ConversationUsageSummary) -> OutgoingUsageSummary {
+    OutgoingUsageSummary {
+        foreground: outgoing_usage_totals(&summary.foreground),
+        background: outgoing_usage_totals(&summary.background),
+        subagents: outgoing_usage_totals(&summary.subagents),
+        media_tools: outgoing_usage_totals(&summary.media_tools),
+    }
 }
 
-fn render_usage_line(label: &str, totals: &UsageTotals) -> String {
-    format!(
-        "- {label}: read {} (${:.3}), write {} (${:.3}), input {} (${:.3}), output {} (${:.3}), total ${:.3}",
-        totals.cache_read,
-        totals.cost.cache_read,
-        totals.cache_write,
-        totals.cost.cache_write,
-        totals.uncache_input,
-        totals.cost.uncache_input,
-        totals.output,
-        totals.cost.output,
-        totals.cost.cache_read + totals.cost.cache_write + totals.cost.uncache_input + totals.cost.output,
-    )
+fn outgoing_usage_totals(totals: &UsageTotals) -> OutgoingUsageTotals {
+    OutgoingUsageTotals {
+        cache_read: totals.cache_read,
+        cache_write: totals.cache_write,
+        uncache_input: totals.uncache_input,
+        output: totals.output,
+        cost: OutgoingUsageCost {
+            cache_read: totals.cost.cache_read,
+            cache_write: totals.cost.cache_write,
+            uncache_input: totals.cost.uncache_input,
+            output: totals.cost.output,
+        },
+    }
 }
 
 fn sanitize_session_id_for_log_path(session_id: &str) -> String {

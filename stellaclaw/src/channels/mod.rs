@@ -9,11 +9,14 @@ pub mod telegram;
 pub mod types;
 
 pub use telegram::TelegramChannel;
-pub use types::{IncomingDispatch, OutgoingDelivery, OutgoingProgressFeedback, ProcessingState};
+pub use types::{
+    IncomingDispatch, OutgoingDelivery, OutgoingProgressFeedback, OutgoingStatus, ProcessingState,
+};
 
 pub trait Channel: Send + Sync {
     fn id(&self) -> &str;
     fn send_delivery(&self, delivery: &OutgoingDelivery) -> Result<()>;
+    fn send_status(&self, status: &OutgoingStatus) -> Result<()>;
     fn set_processing(&self, _platform_chat_id: &str, _state: ProcessingState) -> Result<()> {
         Ok(())
     }

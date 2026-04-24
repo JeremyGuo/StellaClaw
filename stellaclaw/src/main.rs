@@ -197,6 +197,25 @@ fn run_outgoing_loop(
                     );
                 }
             }
+            OutgoingDispatch::Status(status) => {
+                let Some(channel) = channels.get(&status.channel_id) else {
+                    logger.warn(
+                        "outgoing_status_failed",
+                        serde_json::json!({"channel_id": status.channel_id, "error": "unknown channel"}),
+                    );
+                    continue;
+                };
+                if let Err(error) = channel.send_status(&status) {
+                    logger.warn(
+                        "outgoing_status_failed",
+                        serde_json::json!({
+                            "channel_id": status.channel_id,
+                            "platform_chat_id": status.platform_chat_id,
+                            "error": format!("{error:#}"),
+                        }),
+                    );
+                }
+            }
         }
     }
     Ok(())

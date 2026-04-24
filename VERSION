@@ -1,5 +1,12 @@
-version: 1.5.2
+version: 1.5.3
 ---
+
+# 1.5.3
+
+- 调整 `/status` 的渲染边界：
+  Conversation 现在只生成结构化 `OutgoingStatus` 状态快照，并通过 `OutgoingDispatch::Status` 交给 channel；Telegram channel 负责把状态渲染为当前文字消息。后续如果接入图表渲染或图片消息，只需要在 channel 层扩展，不再让 Conversation 依赖具体前端形态。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.5`；当前 Stellaclaw workdir schema 仍为 `0.6`。
 
 # 1.5.2
 

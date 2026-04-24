@@ -25,7 +25,8 @@ use crate::{
 use super::{
     types::{
         IncomingDispatch, OutgoingAttachment, OutgoingAttachmentKind, OutgoingDelivery,
-        OutgoingOptions, OutgoingProgressFeedback, ProcessingState, ProgressFeedbackFinalState,
+        OutgoingOptions, OutgoingProgressFeedback, OutgoingStatus, OutgoingUsageSummary,
+        OutgoingUsageTotals, ProcessingState, ProgressFeedbackFinalState,
     },
     Channel,
 };
@@ -964,6 +965,10 @@ impl Channel for TelegramChannel {
         Ok(())
     }
 
+    fn send_status(&self, status: &OutgoingStatus) -> Result<()> {
+        self.send_text(&status.platform_chat_id, &render_status_text(status), None)
+    }
+
     fn spawn_ingress(
         self: Arc<Self>,
         dispatch_tx: Sender<IncomingDispatch>,
@@ -1131,6 +1136,67 @@ fn render_message_time(unix_timestamp: i64) -> Option<String> {
         .ok()?
         .format(&Rfc3339)
         .ok()
+}
+
+fn render_status_text(status: &OutgoingStatus) -> String {
+    format!(
+        "当前状态\nconversation: `{}`\nmodel: `{}`\nreasoning: `{}`\nsandbox: `{}` ({})\nremote: {}\nworkspace: `{}`\nbackground: {} running / {} total\nsubagents: {} running / {} total\n\n{}",
+        status.conversation_id,
+        status.model,
+        status.reasoning,
+        status.sandbox,
+        status.sandbox_source,
+        status.remote,
+        status.workspace,
+        status.running_background,
+        status.total_background,
+        status.running_subagents,
+        status.total_subagents,
+        render_usage_summary(&status.usage),
+    )
+}
+
+fn render_usage_summary(summary: &OutgoingUsageSummary) -> String {
+    let mut total = OutgoingUsageTotals::default();
+    add_usage_totals(&mut total, &summary.foreground);
+    add_usage_totals(&mut total, &summary.background);
+    add_usage_totals(&mut total, &summary.subagents);
+    add_usage_totals(&mut total, &summary.media_tools);
+
+    format!(
+        "token usage\n{}\n{}\n{}\n{}\n{}",
+        render_usage_line("total", &total),
+        render_usage_line("foreground", &summary.foreground),
+        render_usage_line("background", &summary.background),
+        render_usage_line("subagents", &summary.subagents),
+        render_usage_line("media tools", &summary.media_tools),
+    )
+}
+
+fn render_usage_line(label: &str, totals: &OutgoingUsageTotals) -> String {
+    format!(
+        "- {label}: read {} (${:.3}), write {} (${:.3}), input {} (${:.3}), output {} (${:.3}), total ${:.3}",
+        totals.cache_read,
+        totals.cost.cache_read,
+        totals.cache_write,
+        totals.cost.cache_write,
+        totals.uncache_input,
+        totals.cost.uncache_input,
+        totals.output,
+        totals.cost.output,
+        totals.cost.cache_read + totals.cost.cache_write + totals.cost.uncache_input + totals.cost.output,
+    )
+}
+
+fn add_usage_totals(target: &mut OutgoingUsageTotals, source: &OutgoingUsageTotals) {
+    target.cache_read = target.cache_read.saturating_add(source.cache_read);
+    target.cache_write = target.cache_write.saturating_add(source.cache_write);
+    target.uncache_input = target.uncache_input.saturating_add(source.uncache_input);
+    target.output = target.output.saturating_add(source.output);
+    target.cost.cache_read += source.cost.cache_read;
+    target.cost.cache_write += source.cost.cache_write;
+    target.cost.uncache_input += source.cost.uncache_input;
+    target.cost.output += source.cost.output;
 }
 
 fn parse_conversation_control(text: &str) -> Option<ConversationControl> {
