@@ -60,20 +60,27 @@ impl ClaudeCodeProvider {
             "model".to_string(),
             Value::String(model_config.model_name.clone()),
         );
+        let has_cacheable_system = request
+            .system_prompt
+            .is_some_and(|system_prompt| !system_prompt.trim().is_empty());
+        let message_cache_control = if has_cacheable_system {
+            None
+        } else {
+            cache_control.as_ref()
+        };
         payload.insert(
             "messages".to_string(),
             Value::Array(build_claude_messages(
                 request.messages,
-                cache_control.as_ref(),
+                message_cache_control,
             )),
         );
         if let Some(system_prompt) = request.system_prompt {
             if !system_prompt.trim().is_empty() {
-                let system_value = if request.messages.is_empty() {
-                    claude_system_with_optional_cache_control(system_prompt, cache_control.as_ref())
-                } else {
-                    Value::String(system_prompt.to_string())
-                };
+                let system_value = claude_system_with_optional_cache_control(
+                    system_prompt,
+                    cache_control.as_ref(),
+                );
                 payload.insert("system".to_string(), system_value);
             }
         }
@@ -497,6 +504,73 @@ mod tests {
         );
         assert_eq!(response.token_usage.unwrap().cache_read, 3);
         assert!(matches!(response.data[1], ChatMessageItem::ToolCall(_)));
+    }
+
+    #[test]
+    fn sends_claude_system_prompt_as_cache_control_block() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "system": [
+                    {
+                        "type": "text",
+                        "text": "stable system prompt",
+                        "cache_control": {
+                            "type": "ephemeral",
+                            "ttl": "5m"
+                        }
+                    }
+                ],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "hello"
+                            }
+                        ]
+                    }
+                ]
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "id": "msg_123",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "ok"}
+                    ],
+                    "usage": {
+                        "input_tokens": 10,
+                        "cache_creation_input_tokens": 8,
+                        "output_tokens": 2
+                    }
+                }"#,
+            )
+            .create();
+
+        std::env::set_var("CLAUDE_CODE_API_KEY_TEST", "test-key");
+
+        let provider = ClaudeCodeProvider::new();
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "hello".to_string(),
+            })],
+        )];
+        let response = provider
+            .send(
+                &test_model_config(format!("{}/v1/messages", server.url())),
+                ProviderRequest::new(&messages).with_system_prompt(Some("stable system prompt")),
+            )
+            .expect("provider should return message");
+
+        mock.assert();
+        assert_eq!(response.token_usage.unwrap().cache_write, 8);
     }
 
     #[test]

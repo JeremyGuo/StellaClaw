@@ -1,5 +1,12 @@
-version: 1.0.2
+version: 1.0.3
 ---
+
+# 1.0.3
+
+- 修复 `claude_code` provider 的 prompt cache breakpoint：
+  当请求包含 system prompt 时，`cache_control` 现在挂在 Anthropic Messages API 要求的 system text block 上，而不是把 system 作为普通字符串并只缓存最后一个 message block。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.2`；当前 Stellaclaw workdir schema 仍为 `0.3`。
 
 # 1.0.2
 
