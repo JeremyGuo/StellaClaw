@@ -367,7 +367,7 @@ fn collect_visible_text_segments(message: &ChatMessage) -> Vec<String> {
             ChatMessageItem::Reasoning(_) => {}
             ChatMessageItem::Context(context) => segments.push(context.text.clone()),
             ChatMessageItem::File(file) => {
-                if !is_image_file(file) {
+                if !is_image_file(file) || !matches!(message.role, ChatRole::User) {
                     segments.push(file.uri.clone());
                 }
             }
@@ -414,6 +414,10 @@ fn tool_result_content_text(tool_result: &crate::session_actor::ToolResultItem) 
 }
 
 fn collect_image_files(message: &ChatMessage) -> Vec<FileItem> {
+    if !matches!(message.role, ChatRole::User) {
+        return Vec::new();
+    }
+
     let mut files = Vec::new();
 
     for item in &message.data {
@@ -613,6 +617,28 @@ mod tests {
             value["content"][1]["image_url"]["url"],
             "https://example.com/cat.png"
         );
+    }
+
+    #[test]
+    fn encodes_assistant_images_as_text_references() {
+        let request_messages = OpenRouterRequestMessage::from_chat_message(&ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::File(FileItem {
+                uri: "file:///tmp/generated.png".to_string(),
+                name: Some("generated.png".to_string()),
+                media_type: Some("image/png".to_string()),
+                width: Some(640),
+                height: Some(480),
+                state: None,
+            })],
+        ));
+        let request_message = request_messages
+            .first()
+            .expect("assistant image reference should convert");
+
+        let value = serde_json::to_value(request_message).expect("message should serialize");
+        assert_eq!(value["role"], "assistant");
+        assert_eq!(value["content"], "file:///tmp/generated.png");
     }
 
     #[test]

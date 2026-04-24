@@ -322,7 +322,9 @@ fn claude_content_blocks(message: &ChatMessage) -> Vec<Value> {
                     "text": context.text,
                 }));
             }
-            ChatMessageItem::File(file) if is_image_file(file) => {
+            ChatMessageItem::File(file)
+                if matches!(message.role, ChatRole::User) && is_image_file(file) =>
+            {
                 blocks.push(claude_image_block(file));
             }
             ChatMessageItem::File(file) => {
@@ -571,6 +573,25 @@ mod tests {
 
         mock.assert();
         assert_eq!(response.token_usage.unwrap().cache_write, 8);
+    }
+
+    #[test]
+    fn assistant_images_are_encoded_as_text_references() {
+        let blocks = claude_content_blocks(&ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::File(FileItem {
+                uri: "file:///tmp/generated.png".to_string(),
+                name: Some("generated.png".to_string()),
+                media_type: Some("image/png".to_string()),
+                width: Some(640),
+                height: Some(480),
+                state: None,
+            })],
+        ));
+
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "file:///tmp/generated.png");
+        assert!(blocks[0].get("source").is_none());
     }
 
     #[test]

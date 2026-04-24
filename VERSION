@@ -1,5 +1,14 @@
-version: 1.1.1
+version: 1.1.2
 ---
+
+# 1.1.2
+
+- 修复 assistant/user 多模态角色降级：
+  `image_in` 只表示 user 消息可以携带直接图片输入；assistant 历史里的图片只有在模型具备 `image_out` 时才保留为文件，否则降级为文本引用。
+- 收紧 provider 编码：
+  Claude 和 OpenRouter chat completions 不再把 assistant 历史图片误编码成 direct image input；OpenRouter chat completions 会把 assistant 图片保留为文本 URI，避免图片历史被静默丢弃。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.3`；当前 Stellaclaw workdir schema 仍为 `0.3`。
 
 # 1.1.1
 

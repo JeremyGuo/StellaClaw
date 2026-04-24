@@ -5,7 +5,7 @@ use image::{imageops::FilterType, ImageFormat, ImageReader};
 
 use crate::model_config::{MediaInputConfig, MediaInputTransport, ModelCapability, ModelConfig};
 
-use super::{ChatMessage, ChatMessageItem, ContextItem, FileItem, FileState};
+use super::{ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, FileState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MediaKind {
@@ -29,13 +29,14 @@ fn normalize_message_for_model(message: &ChatMessage, model_config: &ModelConfig
     normalized.data = message
         .data
         .iter()
-        .flat_map(|item| normalize_item_for_model(item, model_config))
+        .flat_map(|item| normalize_item_for_model(item, &message.role, model_config))
         .collect();
     normalized
 }
 
 fn normalize_item_for_model(
     item: &ChatMessageItem,
+    role: &ChatRole,
     model_config: &ModelConfig,
 ) -> Vec<ChatMessageItem> {
     if let ChatMessageItem::Reasoning(reasoning) = item {
@@ -48,6 +49,9 @@ fn normalize_item_for_model(
     let ChatMessageItem::File(file) = item else {
         return vec![item.clone()];
     };
+    if !matches!(role, ChatRole::User) {
+        return vec![normalize_assistant_file_for_model(file, model_config)];
+    }
 
     match normalize_file_for_model(file, model_config) {
         Ok(NormalizedFile::File(file)) => vec![ChatMessageItem::File(file)],
@@ -56,6 +60,38 @@ fn normalize_item_for_model(
         Err(reason) => vec![ChatMessageItem::Context(ContextItem {
             text: crashed_file_prompt(file, &reason),
         })],
+    }
+}
+
+fn normalize_assistant_file_for_model(
+    file: &FileItem,
+    model_config: &ModelConfig,
+) -> ChatMessageItem {
+    match media_kind(file) {
+        Some(MediaKind::Image) if model_config.supports(ModelCapability::ImageOut) => {
+            ChatMessageItem::File(file.clone())
+        }
+        Some(MediaKind::Image) => ChatMessageItem::Context(ContextItem {
+            text: file_reference_prompt(
+                file,
+                "model does not support image output in assistant history",
+            ),
+        }),
+        Some(MediaKind::Pdf | MediaKind::Audio) => ChatMessageItem::Context(ContextItem {
+            text: file_reference_prompt(
+                file,
+                "model does not support this media type as assistant output",
+            ),
+        }),
+        None if model_config.supports(ModelCapability::FileIn) => {
+            ChatMessageItem::File(file.clone())
+        }
+        None => ChatMessageItem::Context(ContextItem {
+            text: file_reference_prompt(
+                file,
+                "model does not support generic file output in assistant history",
+            ),
+        }),
     }
 }
 
@@ -551,6 +587,91 @@ mod tests {
                 if context.text.contains("file:///tmp/cat.png")
                     && context.text.contains("model does not support")
         ));
+    }
+
+    #[test]
+    fn assistant_image_without_image_out_is_downgraded_to_text_reference() {
+        let config = ModelConfig {
+            provider_type: crate::model_config::ProviderType::ClaudeCode,
+            model_name: "claude-opus-4-6".to_string(),
+            url: "http://localhost".to_string(),
+            api_key_env: "TEST".to_string(),
+            capabilities: vec![ModelCapability::Chat, ModelCapability::ImageIn],
+            token_max_context: 1,
+            cache_timeout: 0,
+            conn_timeout: 1,
+            retry_mode: crate::model_config::RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: crate::model_config::TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: Some(MultimodalInputConfig {
+                image: Some(MediaInputConfig {
+                    transport: MediaInputTransport::InlineBase64,
+                    supported_media_types: vec!["image/png".to_string()],
+                    max_width: Some(2000),
+                    max_height: Some(2000),
+                }),
+                pdf: None,
+                audio: None,
+            }),
+            token_estimator_url: None,
+        };
+        let messages = vec![ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::File(FileItem {
+                uri: "file:///tmp/generated.png".to_string(),
+                name: Some("generated.png".to_string()),
+                media_type: Some("image/png".to_string()),
+                width: Some(4096),
+                height: Some(4096),
+                state: None,
+            })],
+        )];
+
+        let normalized = normalize_messages_for_model(&messages, &config);
+
+        assert!(matches!(
+            &normalized[0].data[0],
+            ChatMessageItem::Context(context)
+                if context.text.contains("file:///tmp/generated.png")
+                    && context.text.contains("image output")
+        ));
+    }
+
+    #[test]
+    fn assistant_image_with_image_out_is_preserved() {
+        let config = ModelConfig {
+            provider_type: crate::model_config::ProviderType::OpenRouterCompletion,
+            model_name: "image-output-model".to_string(),
+            url: "http://localhost".to_string(),
+            api_key_env: "TEST".to_string(),
+            capabilities: vec![ModelCapability::Chat, ModelCapability::ImageOut],
+            token_max_context: 1,
+            cache_timeout: 0,
+            conn_timeout: 1,
+            retry_mode: crate::model_config::RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: crate::model_config::TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: None,
+            token_estimator_url: None,
+        };
+        let file = FileItem {
+            uri: "file:///tmp/generated.png".to_string(),
+            name: Some("generated.png".to_string()),
+            media_type: Some("image/png".to_string()),
+            width: Some(4096),
+            height: Some(4096),
+            state: None,
+        };
+        let messages = vec![ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::File(file.clone())],
+        )];
+
+        let normalized = normalize_messages_for_model(&messages, &config);
+
+        assert_eq!(normalized[0].data, vec![ChatMessageItem::File(file)]);
     }
 
     #[test]
