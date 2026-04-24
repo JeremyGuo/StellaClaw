@@ -1,5 +1,12 @@
-version: 1.5.5
+version: 1.5.6
 ---
+
+# 1.5.6
+
+- 启动时执行一次配置的 skill upstream 同步：
+  Host 启动并完成 workdir upgrade 后，会遍历 `skill_sync.skill_name`，对已存在的 runtime skill 执行一次 best-effort git commit/push；同步时会把 skill 拷贝到 upstream repo 的 `<skill_name>/` 子目录，允许一个 upstream repo 保存多个 skill。skill 缺失或 push 失败只写 warning 日志，不阻断服务启动。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.5`；当前 Stellaclaw workdir schema 仍为 `0.6`。
 
 # 1.5.5
 

@@ -23,7 +23,10 @@ use channels::{
     Channel, TelegramChannel,
 };
 use config::{ChannelConfig, StellaclawConfig};
-use conversation::{load_or_create_conversation_state, spawn_conversation, ConversationCommand};
+use conversation::{
+    load_or_create_conversation_state, push_configured_skill_sync_on_startup, spawn_conversation,
+    ConversationCommand,
+};
 use conversation_id_manager::ConversationIdManager;
 use cron::CronManager;
 use crossbeam_channel::{unbounded, Receiver, Sender};
@@ -76,6 +79,14 @@ fn run() -> Result<()> {
         logger.info(
             "workdir_upgraded",
             serde_json::json!({"workdir": args.workdir.display().to_string()}),
+        );
+    }
+    let startup_skill_sync =
+        push_configured_skill_sync_on_startup(&loaded_config.skill_sync, &args.workdir, &logger);
+    if !startup_skill_sync.is_empty() {
+        logger.info(
+            "skill_sync_startup_finished",
+            serde_json::json!({"skills": startup_skill_sync}),
         );
     }
 

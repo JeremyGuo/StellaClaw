@@ -5,7 +5,7 @@ use std::{
     process::{Command, Stdio},
     sync::{mpsc, Arc},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -2313,8 +2313,77 @@ struct SkillSyncPushTargetResult {
     upstream: String,
     branch: String,
     pushed: bool,
+    committed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct StartupSkillSyncResult {
+    skill_name: String,
+    found: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    push: Option<SkillSyncPushResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
+}
+
+pub(crate) fn push_configured_skill_sync_on_startup(
+    skill_sync: &[SkillSyncConfig],
+    workdir: &Path,
+    logger: &StellaclawLogger,
+) -> Vec<StartupSkillSyncResult> {
+    let mut skill_names = Vec::new();
+    for entry in skill_sync {
+        for skill_name in &entry.skill_name {
+            if !skill_names.contains(skill_name) {
+                skill_names.push(skill_name.clone());
+            }
+        }
+    }
+    if skill_names.is_empty() {
+        return Vec::new();
+    }
+
+    let runtime_skill_root = workdir.join("rundir").join(".skill");
+    let mut results = Vec::new();
+    for skill_name in skill_names {
+        let skill_path = runtime_skill_root.join(&skill_name);
+        if !skill_path.exists() {
+            let warning = format!("runtime skill {} does not exist", skill_path.display());
+            logger.warn(
+                "skill_sync_startup_skill_missing",
+                json!({
+                    "skill_name": skill_name,
+                    "skill_path": skill_path.display().to_string(),
+                    "warning": warning,
+                }),
+            );
+            results.push(StartupSkillSyncResult {
+                skill_name,
+                found: false,
+                push: None,
+                warning: Some(warning),
+            });
+            continue;
+        }
+
+        let push = push_skill_sync_if_configured(skill_sync, &skill_name, &skill_path, logger);
+        logger.info(
+            "skill_sync_startup_skill_pushed",
+            json!({
+                "skill_name": skill_name,
+                "push": &push,
+            }),
+        );
+        results.push(StartupSkillSyncResult {
+            skill_name,
+            found: true,
+            push: Some(push),
+            warning: None,
+        });
+    }
+    results
 }
 
 fn push_skill_sync_if_configured(
@@ -2333,20 +2402,12 @@ fn push_skill_sync_if_configured(
     }
 
     let branch = "main";
-    let prepare_result = prepare_skill_git_sync(skill_path, skill_name, branch);
-    let committed = prepare_result.as_ref().copied().unwrap_or(false);
-    let prepare_warning = prepare_result.err().map(|error| error.to_string());
     let mut pushes = Vec::new();
 
     for upstream in upstreams {
-        let warning = match prepare_warning.as_ref() {
-            Some(warning) => Some(warning.clone()),
-            None => {
-                run_git_push_with_timeout(skill_path, &upstream, branch, Duration::from_secs(4))
-                    .err()
-                    .map(|error| error.to_string())
-            }
-        };
+        let push_result = sync_skill_to_upstream_repo(skill_name, skill_path, &upstream, branch);
+        let committed = push_result.as_ref().copied().unwrap_or(false);
+        let warning = push_result.err().map(|error| error.to_string());
         let pushed = warning.is_none();
         if let Some(warning) = warning.as_deref() {
             logger.warn(
@@ -2363,13 +2424,14 @@ fn push_skill_sync_if_configured(
             upstream,
             branch: branch.to_string(),
             pushed,
+            committed,
             warning,
         });
     }
 
     SkillSyncPushResult {
         configured: true,
-        committed,
+        committed: pushes.iter().any(|push| push.committed),
         pushes,
     }
 }
@@ -2391,27 +2453,117 @@ fn configured_skill_sync_upstreams(
     upstreams
 }
 
-fn prepare_skill_git_sync(skill_path: &Path, skill_name: &str, branch: &str) -> Result<bool> {
+fn sync_skill_to_upstream_repo(
+    skill_name: &str,
+    skill_path: &Path,
+    upstream: &str,
+    branch: &str,
+) -> Result<bool> {
     validate_git_branch_name(branch)?;
-    ensure_skill_git_repo(skill_path, branch)?;
-    run_git(skill_path, ["add", "-A"])?;
+    validate_skill_directory(skill_path, skill_name)?;
 
-    let has_staged_changes = git_has_staged_changes(skill_path)?;
-    if has_staged_changes {
-        run_git(
-            skill_path,
-            ["commit", "-m", &format!("Update skill {skill_name}")],
-        )?;
+    let sync_root = std::env::temp_dir().join(format!(
+        "stellaclaw-skill-sync-{}-{}-{}",
+        std::process::id(),
+        safe_temp_path_component(skill_name),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let repo_path = sync_root.join("repo");
+    let result = (|| {
+        fs::create_dir_all(&repo_path)
+            .with_context(|| format!("failed to create {}", repo_path.display()))?;
+        run_git(&repo_path, ["init"])?;
+        ensure_git_identity(&repo_path)?;
+        run_git(&repo_path, ["remote", "add", "origin", upstream])?;
+        match run_git_with_timeout(
+            &repo_path,
+            ["fetch", "--depth=1", "origin", branch],
+            Duration::from_secs(4),
+        ) {
+            Ok(()) => run_git(&repo_path, ["checkout", "-B", branch, "FETCH_HEAD"])?,
+            Err(error) => {
+                run_git(&repo_path, ["checkout", "--orphan", branch])?;
+                if repo_path.join("SKILL.md").exists() {
+                    return Err(error)
+                        .context("upstream fetch failed after creating empty fallback branch");
+                }
+            }
+        }
+
+        remove_legacy_root_skill_payload_if_present(&repo_path, skill_name)?;
+        copy_skill_payload_to_repo_subdir(skill_path, &repo_path.join(skill_name))?;
+        run_git(&repo_path, ["add", "-A"])?;
+
+        let committed = git_has_staged_changes(&repo_path)?;
+        if committed {
+            run_git(
+                &repo_path,
+                ["commit", "-m", &format!("Update skill {skill_name}")],
+            )?;
+        }
+        run_git_push_with_timeout(&repo_path, upstream, branch, Duration::from_secs(4))?;
+        Ok(committed)
+    })();
+    let cleanup = fs::remove_dir_all(&sync_root);
+    if let Err(error) = cleanup {
+        if result.is_ok() {
+            return Err(error).with_context(|| format!("failed to remove {}", sync_root.display()));
+        }
     }
-    Ok(has_staged_changes)
+    result
 }
 
-fn ensure_skill_git_repo(skill_path: &Path, branch: &str) -> Result<()> {
-    if !skill_path.join(".git").exists() {
-        run_git(skill_path, ["init"])?;
+fn safe_temp_path_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn remove_legacy_root_skill_payload_if_present(repo_path: &Path, skill_name: &str) -> Result<()> {
+    let root_skill = repo_path.join("SKILL.md");
+    if !root_skill.is_file() {
+        return Ok(());
     }
-    ensure_git_identity(skill_path)?;
-    run_git(skill_path, ["checkout", "-B", branch])?;
+    let content = fs::read_to_string(&root_skill)
+        .with_context(|| format!("failed to read {}", root_skill.display()))?;
+    let Some(frontmatter) = extract_yaml_frontmatter(&content) else {
+        return Ok(());
+    };
+    if frontmatter_scalar(frontmatter, "name").as_deref() != Some(skill_name) {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(repo_path)
+        .with_context(|| format!("failed to read {}", repo_path.display()))?
+    {
+        let entry =
+            entry.with_context(|| format!("failed to enumerate {}", repo_path.display()))?;
+        let name = entry.file_name();
+        if name == ".git" || name == skill_name {
+            continue;
+        }
+        let path = entry.path();
+        if entry
+            .file_type()
+            .with_context(|| format!("failed to inspect {}", path.display()))?
+            .is_dir()
+        {
+            continue;
+        } else {
+            fs::remove_file(&path)
+                .with_context(|| format!("failed to remove {}", path.display()))?;
+        }
+    }
     Ok(())
 }
 
@@ -2474,29 +2626,36 @@ fn run_git_push_with_timeout(
     timeout: Duration,
 ) -> Result<()> {
     let refspec = format!("HEAD:{branch}");
-    let args = ["push", upstream, refspec.as_str()];
+    run_git_with_timeout(cwd, ["push", upstream, refspec.as_str()], timeout)
+}
+
+fn run_git_with_timeout<const N: usize>(
+    cwd: &Path,
+    args: [&str; N],
+    timeout: Duration,
+) -> Result<()> {
     let mut child = Command::new("git")
         .args(args)
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("failed to run git push in {}", cwd.display()))?;
+        .with_context(|| format!("failed to run git in {}", cwd.display()))?;
     let started = Instant::now();
     loop {
         if child
             .try_wait()
-            .with_context(|| format!("failed to wait for git push in {}", cwd.display()))?
+            .with_context(|| format!("failed to wait for git in {}", cwd.display()))?
             .is_some()
         {
             let output = child
                 .wait_with_output()
-                .with_context(|| format!("failed to read git push output in {}", cwd.display()))?;
+                .with_context(|| format!("failed to read git output in {}", cwd.display()))?;
             if output.status.success() {
                 return Ok(());
             }
             return Err(anyhow!(
-                "git push failed in {}: {}\n{}",
+                "git command failed in {}: {}\n{}",
                 cwd.display(),
                 String::from_utf8_lossy(&output.stdout).trim(),
                 String::from_utf8_lossy(&output.stderr).trim()
@@ -2680,6 +2839,29 @@ fn copy_skill_atomically(source: &Path, destination: &Path) -> Result<()> {
     })
 }
 
+fn copy_skill_payload_to_repo_subdir(source: &Path, destination: &Path) -> Result<()> {
+    let parent = destination
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent", destination.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    let tmp = destination.with_extension("tmp-skill-sync");
+    if tmp.exists() {
+        fs::remove_dir_all(&tmp).with_context(|| format!("failed to remove {}", tmp.display()))?;
+    }
+    copy_directory_recursive_local_excluding(source, &tmp, &[".git"])?;
+    if destination.exists() {
+        fs::remove_dir_all(destination)
+            .with_context(|| format!("failed to remove {}", destination.display()))?;
+    }
+    fs::rename(&tmp, destination).with_context(|| {
+        format!(
+            "failed to rename {} to {}",
+            tmp.display(),
+            destination.display()
+        )
+    })
+}
+
 fn sync_skill_to_conversation_workspaces(
     workdir: &Path,
     skill_name: &str,
@@ -2725,12 +2907,26 @@ fn sync_skill_to_conversation_workspaces(
 }
 
 fn copy_directory_recursive_local(source: &Path, destination: &Path) -> Result<()> {
+    copy_directory_recursive_local_excluding(source, destination, &[])
+}
+
+fn copy_directory_recursive_local_excluding(
+    source: &Path,
+    destination: &Path,
+    excluded_names: &[&str],
+) -> Result<()> {
     fs::create_dir_all(destination)
         .with_context(|| format!("failed to create {}", destination.display()))?;
     for entry in
         fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
     {
         let entry = entry.with_context(|| format!("failed to enumerate {}", source.display()))?;
+        if excluded_names
+            .iter()
+            .any(|excluded| entry.file_name() == *excluded)
+        {
+            continue;
+        }
         let source_path = entry.path();
         let destination_path = destination.join(entry.file_name());
         if entry
@@ -2738,7 +2934,11 @@ fn copy_directory_recursive_local(source: &Path, destination: &Path) -> Result<(
             .with_context(|| format!("failed to inspect {}", source_path.display()))?
             .is_dir()
         {
-            copy_directory_recursive_local(&source_path, &destination_path)?;
+            copy_directory_recursive_local_excluding(
+                &source_path,
+                &destination_path,
+                excluded_names,
+            )?;
         } else {
             fs::copy(&source_path, &destination_path).with_context(|| {
                 format!(
@@ -3058,18 +3258,122 @@ mod tests {
         assert_eq!(result.pushes.len(), 2);
         assert!(result.pushes.iter().all(|push| push.pushed));
         for bare_repo in [&bare_repo_a, &bare_repo_b] {
-            let verify = Command::new("git")
-                .args(["--git-dir"])
-                .arg(bare_repo)
-                .args(["rev-parse", "--verify", "main"])
-                .output()
-                .expect("git rev-parse should run");
-            assert!(
-                verify.status.success(),
-                "{}",
-                String::from_utf8_lossy(&verify.stderr)
-            );
+            assert_git_path_exists(bare_repo, "main:demo/SKILL.md");
+            assert_git_path_missing(bare_repo, "main:SKILL.md");
         }
         fs::remove_dir_all(&root).expect("temp root should be removed");
+    }
+
+    #[test]
+    fn startup_skill_sync_pushes_configured_runtime_skills() {
+        let root = std::env::temp_dir().join(format!(
+            "stellaclaw-startup-skill-sync-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("temp root should exist");
+        let bare_repo = root.join("upstream.git");
+        let init = Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&bare_repo)
+            .output()
+            .expect("git init --bare should run");
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+
+        let skill_path = root.join("rundir").join(".skill").join("demo");
+        fs::create_dir_all(&skill_path).expect("skill path should exist");
+        fs::write(
+            skill_path.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo skill\n---\nbody\n",
+        )
+        .expect("skill should be written");
+        let other_skill_path = root.join("rundir").join(".skill").join("other");
+        fs::create_dir_all(&other_skill_path).expect("other skill path should exist");
+        fs::write(
+            other_skill_path.join("SKILL.md"),
+            "---\nname: other\ndescription: Other skill\n---\nbody\n",
+        )
+        .expect("other skill should be written");
+        let logger = StellaclawLogger::open_under(&root, "test.log").expect("logger should open");
+        let sync = vec![SkillSyncConfig {
+            skill_name: vec![
+                "demo".to_string(),
+                "other".to_string(),
+                "missing".to_string(),
+            ],
+            upstream: vec![bare_repo.to_string_lossy().to_string()],
+        }];
+
+        let result = push_configured_skill_sync_on_startup(&sync, &root, &logger);
+
+        assert_eq!(result.len(), 3);
+        let demo = result
+            .iter()
+            .find(|entry| entry.skill_name == "demo")
+            .expect("demo result should exist");
+        assert!(demo.found);
+        assert!(demo.push.as_ref().unwrap().committed);
+        assert!(demo
+            .push
+            .as_ref()
+            .unwrap()
+            .pushes
+            .iter()
+            .all(|push| push.pushed));
+        let other = result
+            .iter()
+            .find(|entry| entry.skill_name == "other")
+            .expect("other result should exist");
+        assert!(other.found);
+        assert!(other.push.as_ref().unwrap().committed);
+        assert!(other
+            .push
+            .as_ref()
+            .unwrap()
+            .pushes
+            .iter()
+            .all(|push| push.pushed));
+        let missing = result
+            .iter()
+            .find(|entry| entry.skill_name == "missing")
+            .expect("missing result should exist");
+        assert!(!missing.found);
+        assert!(missing.warning.is_some());
+
+        assert_git_path_exists(&bare_repo, "main:demo/SKILL.md");
+        assert_git_path_exists(&bare_repo, "main:other/SKILL.md");
+        assert_git_path_missing(&bare_repo, "main:SKILL.md");
+        fs::remove_dir_all(&root).expect("temp root should be removed");
+    }
+
+    fn assert_git_path_exists(bare_repo: &Path, pathspec: &str) {
+        let output = Command::new("git")
+            .args(["--git-dir"])
+            .arg(bare_repo)
+            .args(["show", pathspec])
+            .output()
+            .expect("git show should run");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn assert_git_path_missing(bare_repo: &Path, pathspec: &str) {
+        let output = Command::new("git")
+            .args(["--git-dir"])
+            .arg(bare_repo)
+            .args(["show", pathspec])
+            .output()
+            .expect("git show should run");
+        assert!(
+            !output.status.success(),
+            "expected {pathspec} to be absent, but git show succeeded"
+        );
     }
 }
