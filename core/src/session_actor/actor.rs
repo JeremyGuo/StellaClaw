@@ -63,6 +63,13 @@ struct ActiveToolBatch {
     turn_number: u64,
     step_index: usize,
     handle: super::ToolBatchHandle,
+    interrupt: Option<ToolBatchInterrupt>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolBatchInterrupt {
+    Cancel,
+    SupersededByUserMessage,
 }
 
 #[derive(Debug, Clone)]
@@ -241,6 +248,12 @@ impl SessionActor {
         }
 
         if self.active_tool_batch.is_some() {
+            if self.has_pending_user_message_interrupt() {
+                self.request_active_tool_interrupt(
+                    ToolBatchInterrupt::SupersededByUserMessage,
+                    "newer user message arrived".to_string(),
+                )?;
+            }
             return self.handle_ready_tool_completion();
         }
 
@@ -288,6 +301,7 @@ impl SessionActor {
             || !self.pending_control.is_empty()
             || (!self.pending_data.is_empty() && self.active_tool_batch.is_none())
             || (self.active_tool_batch.is_some() && !self.pending_tool_completions.is_empty())
+            || (self.active_tool_batch.is_some() && self.has_pending_user_message_interrupt())
     }
 
     pub fn run_until_idle(
@@ -403,30 +417,62 @@ impl SessionActor {
     }
 
     fn handle_cancel_turn(&mut self, reason: Option<String>) -> Result<(), SessionActorError> {
-        let Some(active) = self.active_tool_batch.as_ref() else {
+        self.request_active_tool_interrupt(
+            ToolBatchInterrupt::Cancel,
+            reason.unwrap_or_else(|| "user_cancelled".to_string()),
+        )
+    }
+
+    fn request_active_tool_interrupt(
+        &mut self,
+        interrupt: ToolBatchInterrupt,
+        reason: String,
+    ) -> Result<(), SessionActorError> {
+        let Some(active) = self.active_tool_batch.as_mut() else {
             return self.emit(SessionEvent::ControlRejected {
-                reason: reason.unwrap_or_else(|| "no active interruptible turn".to_string()),
+                reason: "no active interruptible turn".to_string(),
                 payload: serde_json::json!({"command": "cancel_turn"}),
             });
         };
+        if active.interrupt.is_some() {
+            return Ok(());
+        }
 
         self.tool_executor
             .interrupt(&active.handle)
             .map_err(|error| SessionActorError::Tool(error.to_string()))?;
+        active.interrupt = Some(interrupt);
+        let turn_id = active.turn_id.clone();
+        let batch_id = active.handle.batch_id.clone();
         self.log_info(
             "tool_batch_interrupt_requested",
             serde_json::json!({
-                "turn_id": &active.turn_id,
-                "batch_id": &active.handle.batch_id,
-                "reason": reason,
+                "turn_id": turn_id,
+                "batch_id": batch_id,
+                "reason": match interrupt {
+                    ToolBatchInterrupt::Cancel => "cancel",
+                    ToolBatchInterrupt::SupersededByUserMessage => "superseded_by_user_message",
+                },
+                "detail": reason,
             }),
         );
+        if interrupt == ToolBatchInterrupt::SupersededByUserMessage {
+            return Ok(());
+        }
+
         self.emit(SessionEvent::Progress {
-            message: format!(
-                "interrupt requested for tool batch {}",
-                active.handle.batch_id
-            ),
+            message: format!("interrupt requested for tool batch {batch_id}"),
         })
+    }
+
+    fn has_pending_user_message_interrupt(&self) -> bool {
+        self.active_tool_batch
+            .as_ref()
+            .is_some_and(|active| active.interrupt.is_none())
+            && self
+                .pending_data
+                .iter()
+                .any(|request| matches!(request, SessionRequest::EnqueueUserMessage { .. }))
     }
 
     fn handle_query_session_view(
@@ -723,9 +769,15 @@ impl SessionActor {
                 .iter()
                 .map(|(_, tool)| tool)
                 .collect::<Vec<_>>();
+            let tools = self
+                .provider
+                .filter_tools_for_provider(&self.model_config, tools);
             let normalized_history =
                 normalize_messages_for_model(&self.history, &self.model_config);
-            let request = ProviderRequest::new(&normalized_history)
+            let provider_history = self
+                .provider
+                .normalize_messages_for_provider(&self.model_config, &normalized_history);
+            let request = ProviderRequest::new(&provider_history)
                 .with_system_prompt(Some(system_prompt.as_str()))
                 .with_tools(tools);
             let model_message = self
@@ -782,6 +834,7 @@ impl SessionActor {
                 turn_number,
                 step_index,
                 handle,
+                interrupt: None,
             });
             return Ok(());
         }
@@ -914,6 +967,17 @@ impl SessionActor {
         self.append_history_message("tool_result", tool_message)?;
         if let Some(message) = synthetic_media_message {
             self.append_history_message("tool_media_context", message)?;
+        }
+        if active.interrupt == Some(ToolBatchInterrupt::SupersededByUserMessage) {
+            self.log_info(
+                "tool_batch_superseded_by_user_message",
+                serde_json::json!({
+                    "turn_id": &active.turn_id,
+                    "batch_id": &active.handle.batch_id,
+                }),
+            );
+            self.mark_turn_returned(active.turn_number);
+            return Ok(SessionActorStep::ProcessedData);
         }
         if let Err(error) =
             self.run_model_tool_loop(&active.turn_id, active.turn_number, active.step_index + 1)
@@ -1733,13 +1797,23 @@ mod tests {
     struct BlockingToolExecutor {
         started_tx: Mutex<Option<mpsc::Sender<()>>>,
         release_rx: Mutex<Option<mpsc::Receiver<()>>>,
+        interrupt_tx: Mutex<Option<mpsc::Sender<()>>>,
     }
 
     impl BlockingToolExecutor {
         fn new(started_tx: mpsc::Sender<()>, release_rx: mpsc::Receiver<()>) -> Self {
+            Self::with_interrupt_tx(started_tx, release_rx, None)
+        }
+
+        fn with_interrupt_tx(
+            started_tx: mpsc::Sender<()>,
+            release_rx: mpsc::Receiver<()>,
+            interrupt_tx: Option<mpsc::Sender<()>>,
+        ) -> Self {
             Self {
                 started_tx: Mutex::new(Some(started_tx)),
                 release_rx: Mutex::new(Some(release_rx)),
+                interrupt_tx: Mutex::new(interrupt_tx),
             }
         }
     }
@@ -1782,6 +1856,9 @@ mod tests {
         }
 
         fn interrupt(&self, _handle: &ToolBatchHandle) -> Result<(), ToolBatchError> {
+            if let Some(interrupt_tx) = self.interrupt_tx.lock().unwrap().take() {
+                let _ = interrupt_tx.send(());
+            }
             Ok(())
         }
 
@@ -2666,6 +2743,145 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item, ChatMessageItem::ToolResult(_)))
         }));
+    }
+
+    #[test]
+    fn newer_user_message_interrupts_active_tool_batch_and_runs_next_turn() {
+        let _cwd = temp_cwd("actor-user-interrupt");
+        let session_id = test_session_id("session_user_interrupt");
+        let (inbox, mailbox) = test_inbox();
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial {
+                initial: SessionInitial::new(session_id, super::super::SessionType::Foreground),
+            },
+        );
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "run a slow tool".to_string(),
+                    })],
+                ),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "user_tell".to_string(),
+                    arguments: ContextItem {
+                        text: r#"{"text":"working"}"#.to_string(),
+                    },
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "handled newer message".to_string(),
+                })],
+            ),
+        ]));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (interrupt_tx, interrupt_rx) = mpsc::channel();
+        let tools = Arc::new(BlockingToolExecutor::with_interrupt_tx(
+            started_tx,
+            release_rx,
+            Some(interrupt_tx),
+        ));
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions {
+            host_tool_scope: Some(HostToolScope::MainForeground),
+            ..BuiltinToolCatalogOptions::default()
+        })
+        .unwrap();
+        let mut actor = SessionActor::new(
+            test_model_config(),
+            provider,
+            tools,
+            inbox,
+            events.clone(),
+            catalog,
+        );
+
+        assert_eq!(
+            actor.step().expect("initial should apply"),
+            SessionActorStep::ProcessedControl
+        );
+        assert_eq!(
+            actor.step().expect("tool batch should start"),
+            SessionActorStep::WaitingToolBatch
+        );
+        started_rx
+            .recv()
+            .expect("tool batch should start after model tool call");
+
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "new instruction".to_string(),
+                    })],
+                ),
+            },
+        );
+        assert_eq!(
+            actor
+                .step()
+                .expect("new user message should request interrupt"),
+            SessionActorStep::WaitingToolBatch
+        );
+        interrupt_rx
+            .recv()
+            .expect("new user message should interrupt active tool batch");
+
+        release_tx.send(()).expect("tool wait should release");
+        let mut yielded = false;
+        for _ in 0..20 {
+            if actor.step().expect("interrupted batch should yield")
+                == SessionActorStep::ProcessedData
+            {
+                yielded = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(yielded, "interrupted batch should yield after completion");
+        assert_eq!(
+            actor.step().expect("new user message should run next"),
+            SessionActorStep::ProcessedData
+        );
+
+        let completed = events
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::TurnCompleted { message } => Some(message_text_for_test(message)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completed, vec!["handled newer message".to_string()]);
+        let progress = events
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::Progress { message } => Some(message.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(progress
+            .iter()
+            .all(|message| !message.contains("newer user message")));
     }
 
     #[test]

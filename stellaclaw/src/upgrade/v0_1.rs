@@ -13,7 +13,7 @@ use stellaclaw_core::session_actor::{
     SessionType, ToolRemoteMode,
 };
 
-use super::{WorkdirUpgrader, LATEST_WORKDIR_VERSION, PARTYCLAW_LATEST_WORKDIR_VERSION};
+use super::{WorkdirUpgrader, PARTYCLAW_LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_2};
 use crate::{
     config::{SandboxConfig, SandboxMode, SessionProfile, StellaclawConfig},
     conversation::{ConversationSessionBinding, ConversationState},
@@ -30,7 +30,7 @@ impl WorkdirUpgrader for LegacyUpgrade {
     }
 
     fn to_version(&self) -> &'static str {
-        LATEST_WORKDIR_VERSION
+        WORKDIR_VERSION_0_2
     }
 
     fn upgrade(&self, workdir: &Path, _config: &StellaclawConfig) -> Result<()> {
@@ -58,7 +58,7 @@ impl WorkdirUpgrader for PartyClawUpgrade {
     }
 
     fn to_version(&self) -> &'static str {
-        LATEST_WORKDIR_VERSION
+        WORKDIR_VERSION_0_2
     }
 
     fn upgrade(&self, workdir: &Path, config: &StellaclawConfig) -> Result<()> {

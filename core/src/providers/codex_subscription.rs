@@ -22,6 +22,7 @@ use crate::{
     model_config::{ModelConfig, RetryMode},
     session_actor::{
         ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, ReasoningItem, ToolCallItem,
+        ToolDefinition,
     },
 };
 
@@ -236,6 +237,28 @@ impl Default for CodexSubscriptionProvider {
 }
 
 impl Provider for CodexSubscriptionProvider {
+    fn normalize_messages_for_provider(
+        &self,
+        _model_config: &ModelConfig,
+        messages: &[ChatMessage],
+    ) -> Vec<ChatMessage> {
+        messages
+            .iter()
+            .filter_map(normalize_message_for_codex_provider)
+            .collect()
+    }
+
+    fn filter_tools_for_provider<'a>(
+        &self,
+        _model_config: &ModelConfig,
+        tools: Vec<&'a ToolDefinition>,
+    ) -> Vec<&'a ToolDefinition> {
+        tools
+            .into_iter()
+            .filter(|tool| tool.name != "user_tell")
+            .collect()
+    }
+
     fn send(
         &self,
         model_config: &ModelConfig,
@@ -269,6 +292,35 @@ impl Provider for CodexSubscriptionProvider {
             }
         }
     }
+}
+
+fn normalize_message_for_codex_provider(message: &ChatMessage) -> Option<ChatMessage> {
+    let data = message
+        .data
+        .iter()
+        .filter_map(|item| match item {
+            ChatMessageItem::Reasoning(reasoning) => reasoning
+                .codex_encrypted_content
+                .as_ref()
+                .filter(|content| !content.is_empty())
+                .map(|encrypted_content| {
+                    ChatMessageItem::Reasoning(ReasoningItem::codex(
+                        reasoning.codex_summary.clone(),
+                        Some(encrypted_content.clone()),
+                        None,
+                    ))
+                }),
+            _ => Some(item.clone()),
+        })
+        .collect::<Vec<_>>();
+
+    (!data.is_empty()).then(|| ChatMessage {
+        role: message.role.clone(),
+        user_name: message.user_name.clone(),
+        message_time: message.message_time.clone(),
+        token_usage: message.token_usage.clone(),
+        data,
+    })
 }
 
 fn connect_codex_websocket(
@@ -962,6 +1014,7 @@ fn build_responses_input(messages: &[ChatMessage]) -> Result<Vec<Value>, Provide
                 append_responses_tool_outputs(&mut input, message);
             }
             ChatRole::Assistant => {
+                append_codex_reasoning_items(&mut input, message);
                 let content = assistant_responses_content(message);
                 if !content.is_empty() {
                     input.push(json!({
@@ -1011,8 +1064,8 @@ fn responses_value_to_chat_message(
                 }
             }
             Some("reasoning") => {
-                if let Some(text) = extract_reasoning_text(item) {
-                    data.push(ChatMessageItem::Reasoning(ReasoningItem { text }));
+                if let Some(reasoning) = extract_codex_reasoning(item) {
+                    data.push(ChatMessageItem::Reasoning(reasoning));
                 }
             }
             Some("function_call") => {
@@ -1052,6 +1105,44 @@ fn responses_value_to_chat_message(
         token_usage: token_usage_from_value(value),
         data,
     })
+}
+
+fn append_codex_reasoning_items(target: &mut Vec<Value>, message: &ChatMessage) {
+    for item in &message.data {
+        let ChatMessageItem::Reasoning(reasoning) = item else {
+            continue;
+        };
+        let Some(encrypted_content) = reasoning
+            .codex_encrypted_content
+            .as_deref()
+            .filter(|content| !content.is_empty())
+        else {
+            continue;
+        };
+
+        let mut payload = Map::new();
+        payload.insert("type".to_string(), Value::String("reasoning".to_string()));
+        payload.insert("summary".to_string(), reasoning_summary_payload(reasoning));
+        payload.insert(
+            "encrypted_content".to_string(),
+            Value::String(encrypted_content.to_string()),
+        );
+        target.push(Value::Object(payload));
+    }
+}
+
+fn reasoning_summary_payload(reasoning: &ReasoningItem) -> Value {
+    match reasoning
+        .codex_summary
+        .as_deref()
+        .filter(|summary| !summary.is_empty())
+    {
+        Some(summary) => Value::Array(vec![json!({
+            "type": "summary_text",
+            "text": summary,
+        })]),
+        None => Value::Array(Vec::new()),
+    }
 }
 
 fn user_responses_content(message: &ChatMessage) -> Result<Vec<Value>, ProviderError> {
@@ -1296,7 +1387,29 @@ fn value_string_or_url(value: Option<&Value>) -> Option<String> {
     }
 }
 
-fn extract_reasoning_text(item: &Value) -> Option<String> {
+fn extract_codex_reasoning(item: &Value) -> Option<ReasoningItem> {
+    let summary = extract_reasoning_summary(item);
+    let encrypted_content = item
+        .get("encrypted_content")
+        .and_then(Value::as_str)
+        .filter(|content| !content.is_empty())
+        .map(str::to_string);
+
+    if encrypted_content.is_some() {
+        return Some(ReasoningItem::codex(summary, encrypted_content, None));
+    }
+
+    summary
+        .or_else(|| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string)
+        })
+        .map(ReasoningItem::from_text)
+}
+
+fn extract_reasoning_summary(item: &Value) -> Option<String> {
     item.get("summary")
         .and_then(Value::as_array)
         .and_then(|summary| {
@@ -1312,13 +1425,6 @@ fn extract_reasoning_text(item: &Value) -> Option<String> {
                 .collect::<Vec<_>>();
             (!parts.is_empty()).then(|| parts.join("\n"))
         })
-        .or_else(|| {
-            item.get("text")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .map(str::to_string)
-        })
-        .or_else(|| Some(item.to_string()))
 }
 
 fn tool_result_text(tool_result: &crate::session_actor::ToolResultItem) -> String {
@@ -1345,6 +1451,7 @@ fn value_to_arguments_string(value: &Value) -> String {
 mod tests {
     use super::*;
     use crate::model_config::{ModelCapability, ProviderType, RetryMode, TokenEstimatorType};
+    use crate::session_actor::{ToolBackend, ToolExecutionMode};
     use std::path::PathBuf;
 
     #[test]
@@ -1591,6 +1698,110 @@ mod tests {
         assert!(payload.get("file_url").is_none());
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn encrypted_reasoning_without_summary_is_not_exposed_as_text() {
+        let item = serde_json::json!({
+            "type": "reasoning",
+            "encrypted_content": "opaque",
+            "summary": []
+        });
+
+        let reasoning = extract_codex_reasoning(&item).expect("encrypted reasoning is retained");
+        assert!(reasoning.text.is_empty());
+        assert_eq!(reasoning.codex_summary, None);
+        assert_eq!(reasoning.codex_encrypted_content.as_deref(), Some("opaque"));
+    }
+
+    #[test]
+    fn codex_reasoning_round_trips_as_responses_reasoning_item() {
+        let messages = vec![ChatMessage::new(
+            ChatRole::Assistant,
+            vec![
+                ChatMessageItem::Reasoning(ReasoningItem::codex(
+                    Some("checked repository state".to_string()),
+                    Some("encrypted-state".to_string()),
+                    Some("raw text should not be sent".to_string()),
+                )),
+                ChatMessageItem::Context(ContextItem {
+                    text: "visible answer".to_string(),
+                }),
+            ],
+        )];
+
+        let provider = CodexSubscriptionProvider::new();
+        let normalized = provider.normalize_messages_for_provider(&test_model_config(), &messages);
+        let input = build_responses_input(&normalized).expect("input should build");
+
+        assert_eq!(input[0]["type"], "reasoning");
+        assert_eq!(input[0]["encrypted_content"], "encrypted-state");
+        assert_eq!(input[0]["summary"][0]["text"], "checked repository state");
+        assert!(input[0].get("text").is_none());
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["content"][0]["text"], "visible answer");
+    }
+
+    #[test]
+    fn codex_provider_normalization_drops_plain_reasoning_and_sanitizes_text() {
+        let messages = vec![ChatMessage::new(
+            ChatRole::Assistant,
+            vec![
+                ChatMessageItem::Reasoning(ReasoningItem::from_text("plain reasoning")),
+                ChatMessageItem::Reasoning(ReasoningItem::codex(
+                    Some("summary".to_string()),
+                    Some("encrypted".to_string()),
+                    Some("raw text".to_string()),
+                )),
+            ],
+        )];
+
+        let provider = CodexSubscriptionProvider::new();
+        let normalized = provider.normalize_messages_for_provider(&test_model_config(), &messages);
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].data.len(), 1);
+        let ChatMessageItem::Reasoning(reasoning) = &normalized[0].data[0] else {
+            panic!("expected reasoning item");
+        };
+        assert!(reasoning.text.is_empty());
+        assert_eq!(reasoning.codex_summary.as_deref(), Some("summary"));
+        assert_eq!(
+            reasoning.codex_encrypted_content.as_deref(),
+            Some("encrypted")
+        );
+    }
+
+    #[test]
+    fn codex_provider_filters_user_tell_tool() {
+        let user_tell = ToolDefinition::new(
+            "user_tell",
+            "send progress",
+            json!({"type": "object"}),
+            ToolExecutionMode::Immediate,
+            ToolBackend::ConversationBridge {
+                action: "user_tell".to_string(),
+            },
+        );
+        let file_read = ToolDefinition::new(
+            "file_read",
+            "read file",
+            json!({"type": "object"}),
+            ToolExecutionMode::Immediate,
+            ToolBackend::Local,
+        );
+        let tools = vec![&user_tell, &file_read];
+
+        let provider = CodexSubscriptionProvider::new();
+        let filtered = provider.filter_tools_for_provider(&test_model_config(), tools);
+
+        assert_eq!(
+            filtered
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["file_read"]
+        );
     }
 
     fn fake_jwt(payload: &str) -> String {

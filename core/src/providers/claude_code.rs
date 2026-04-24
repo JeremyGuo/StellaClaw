@@ -267,9 +267,7 @@ fn claude_value_to_chat_message(value: &Value) -> Result<ChatMessage, ProviderEr
                     .and_then(Value::as_str)
                 {
                     if !text.is_empty() {
-                        data.push(ChatMessageItem::Reasoning(ReasoningItem {
-                            text: text.to_string(),
-                        }));
+                        data.push(ChatMessageItem::Reasoning(ReasoningItem::from_text(text)));
                     }
                 }
             }

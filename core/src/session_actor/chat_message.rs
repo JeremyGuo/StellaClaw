@@ -76,7 +76,41 @@ pub enum ChatMessageItem {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningItem {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_encrypted_content: Option<String>,
+}
+
+impl ReasoningItem {
+    pub fn from_text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            codex_summary: None,
+            codex_encrypted_content: None,
+        }
+    }
+
+    pub fn codex(
+        codex_summary: Option<String>,
+        codex_encrypted_content: Option<String>,
+        fallback_text: Option<String>,
+    ) -> Self {
+        let text = fallback_text.unwrap_or_default();
+        Self {
+            text,
+            codex_summary,
+            codex_encrypted_content,
+        }
+    }
+
+    pub fn has_codex_encrypted_content(&self) -> bool {
+        self.codex_encrypted_content
+            .as_deref()
+            .is_some_and(|content| !content.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,9 +179,7 @@ mod tests {
         let message = ChatMessage::new(
             ChatRole::Assistant,
             vec![
-                ChatMessageItem::Reasoning(ReasoningItem {
-                    text: "need to inspect workspace".to_string(),
-                }),
+                ChatMessageItem::Reasoning(ReasoningItem::from_text("need to inspect workspace")),
                 ChatMessageItem::ToolResult(ToolResultItem {
                     tool_call_id: "call_1".to_string(),
                     tool_name: "read_file".to_string(),

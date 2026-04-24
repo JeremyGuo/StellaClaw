@@ -38,7 +38,10 @@ fn normalize_item_for_model(
     item: &ChatMessageItem,
     model_config: &ModelConfig,
 ) -> Vec<ChatMessageItem> {
-    if matches!(item, ChatMessageItem::Reasoning(_)) {
+    if let ChatMessageItem::Reasoning(reasoning) = item {
+        if reasoning.has_codex_encrypted_content() {
+            return vec![item.clone()];
+        }
         return Vec::new();
     }
 
@@ -406,9 +409,7 @@ mod tests {
         let messages = vec![ChatMessage::new(
             ChatRole::Assistant,
             vec![
-                ChatMessageItem::Reasoning(ReasoningItem {
-                    text: "hidden".to_string(),
-                }),
+                ChatMessageItem::Reasoning(ReasoningItem::from_text("hidden")),
                 ChatMessageItem::Context(ContextItem {
                     text: "visible".to_string(),
                 }),
@@ -422,6 +423,44 @@ mod tests {
         assert!(matches!(
             &normalized[0].data[0],
             ChatMessageItem::Context(context) if context.text == "visible"
+        ));
+    }
+
+    #[test]
+    fn codex_encrypted_reasoning_is_retained_during_model_normalization() {
+        let config = ModelConfig {
+            provider_type: crate::model_config::ProviderType::CodexSubscription,
+            model_name: "gpt-5.5".to_string(),
+            url: "http://localhost".to_string(),
+            api_key_env: "TEST".to_string(),
+            capabilities: Vec::new(),
+            token_max_context: 1,
+            cache_timeout: 0,
+            conn_timeout: 1,
+            retry_mode: crate::model_config::RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: crate::model_config::TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: None,
+            token_estimator_url: None,
+        };
+        let messages = vec![ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Reasoning(ReasoningItem::codex(
+                Some("summary".to_string()),
+                Some("encrypted".to_string()),
+                Some("raw text".to_string()),
+            ))],
+        )];
+
+        let normalized = normalize_messages_for_model(&messages, &config);
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].data.len(), 1);
+        assert!(matches!(
+            &normalized[0].data[0],
+            ChatMessageItem::Reasoning(reasoning)
+                if reasoning.codex_encrypted_content.as_deref() == Some("encrypted")
         ));
     }
 

@@ -40,12 +40,15 @@
 - Host 进程目前由 `stellaclaw` binary 承载，session 执行边界由独立 `agent_server` binary 承载。
 - `Conversation` 是每个 active conversation 的串行线程；session 侧通过 stdin/stdout line-delimited JSON-RPC 与 `agent_server` 通信。
 - `SessionActor` 已经有 control/data mailbox、turn loop、tool batch executor、session state store、runtime metadata snapshot、idle compaction 和 crash/unfinished-turn 继续机制。
+- `SessionActor` 会在 active tool batch 期间接收新的用户消息并触发 cooperative interrupt；工具尽快返回稳定结果后，旧 turn 在安全边界 yield，新用户消息进入下一轮处理。
 - `ToolRemoteMode` 当前支持 selectable SSH alias 和 fixed SSH workspace；fixed mode 下 schema 会隐藏各工具上的 `remote` 字段。
 - conversation 级配置已经包括 `model_selection_pending`、`tool_remote_mode`、`sandbox` override、`reasoning_effort` 和 foreground/background/subagent session binding。
 - Telegram 控制面当前支持 `/model`、`/remote`、`/sandbox`、`/status`、`/continue`、`/cancel`。
 - Telegram 输出面当前支持普通 delivery、typing indicator、可编辑 progress feedback 面板和最终完成/失败状态。
 - Codex subscription provider 当前按官方订阅 websocket 形态调用，支持 access token 自动刷新；`reasoning.service_tier = fast/priority` 会映射到请求级 `service_tier = priority`，不会塞进 `reasoning` payload。
 - 多模态输入在 `SessionActor` 发 provider 前统一 normalization：模型支持对应模态时按 `ModelConfig.multimodal_input` 发送；不支持或文件损坏时降级为包含文件路径/原因的文本上下文。
+- Provider 请求前的消息规整采用双层 normalization：先做通用模型能力降级，再做 provider 特化 normalization。Codex subscription provider 会保留并回传 `codex_summary` / `codex_encrypted_content`，普通 reasoning text 仍不会作为 model-visible 内容回传。
+- `ChatMessage::Reasoning` 当前支持 Codex 专用 encrypted reasoning continuation；token 估算按 Codex 风格把 `codex_encrypted_content` 作为上下文成本估入，但展示层和普通文本路径不暴露密文。
 - `reasoning_effort` 是 conversation 级 override；已有 conversation 的 `session_profile.main_model` 是持久化快照，不会自动跟随全局 config 更新。
 - 每轮 model/tool loop 默认上限是 200 步，主要作为防无限循环兜底，而不是正常工作流限制。
 - skill 工具当前包括 `skill_load`、`skill_create`、`skill_update`、`skill_delete`；持久化类工具走 ConversationBridge，由 Host/Conversation 写回 runtime skill store 并同步已有 conversation workspace。

@@ -1,5 +1,28 @@
-version: 1.0.1
+version: 1.0.2
 ---
+
+# 1.0.2
+
+- 新增项目根 README：
+  基于当前 `ROAD_MAP.md` 和已落地代码状态，重新说明 Stellaclaw 的定位、架构、Telegram 体验、工具系统、skills、多模态降级、provider、快速启动、版本文件和 CI/CD。
+- 隐藏 provider reasoning 中不可展示的内容：
+  provider 返回的 encrypted reasoning 不再被当作普通文本写入 assistant 消息；Host 输出渲染也会跳过 reasoning item，避免 Telegram 偶发显示大段 `[reasoning] {"encrypted_content": ...}`。
+- 收紧 `subagent_start` 模型选择：
+  subagent 不再暴露或接受模型覆盖，总是继承当前 conversation 的主模型，避免模型自行试错不存在的 named model。
+- 强化 `ChatMessage::Reasoning`：
+  新增 Codex 专用 `codex_summary` 和 `codex_encrypted_content` 字段，允许 Codex subscription provider 按官方 Responses reasoning item 形态把 encrypted reasoning continuation 带回下一轮，同时不把 raw reasoning text 放进普通文本上下文。
+- 新增双层消息 normalization：
+  `SessionActor` 先执行通用模型能力降级，再调用 provider 特化 normalization；Codex subscription provider 会净化并保留 encrypted reasoning，其他 provider 默认沿用通用结果。
+- 扩展 token 估算：
+  `codex_encrypted_content` 会按 Codex 的 encrypted reasoning 长度估算规则计入上下文成本，避免保留 continuation 后低估上下文长度。
+- 修复新用户消息对运行中 tool batch 的打断语义：
+  当 active tool batch 正在运行时，新的 foreground 用户消息会由 `SessionActor` 触发 cooperative interrupt；工具返回稳定结果后旧 turn 在安全边界 yield，新消息作为下一轮继续处理，而不是一直排队等工具自然结束。
+- 修复 Telegram 前台进度面板的打断交接：
+  新消息接管当前回合时不再发送固定“已被打断”文案，也不会新建第二个进度框；后续状态会复用并编辑当前 active progress message。
+- 新增根目录 `run.sh`：
+  支持不依赖 systemd 的前台启动路线，用户可直接传入 config 路径，由脚本构建 release binary、推导 workdir 并在当前终端运行。
+- 本次不改变 `config` schema，更新 `workdir` schema：
+  当前 config schema 仍为 `0.2`；当前 Stellaclaw workdir schema 更新为 `0.3`，用于记录 `ChatMessage::Reasoning` 的 Codex continuation 字段扩展。
 
 # 1.0.1
 

@@ -37,6 +37,22 @@ pub fn provider_from_model_config(model_config: &ModelConfig) -> Box<dyn Provide
 }
 
 pub trait Provider {
+    fn normalize_messages_for_provider(
+        &self,
+        _model_config: &ModelConfig,
+        messages: &[ChatMessage],
+    ) -> Vec<ChatMessage> {
+        messages.to_vec()
+    }
+
+    fn filter_tools_for_provider<'a>(
+        &self,
+        _model_config: &ModelConfig,
+        tools: Vec<&'a ToolDefinition>,
+    ) -> Vec<&'a ToolDefinition> {
+        tools
+    }
+
     fn send(
         &self,
         model_config: &ModelConfig,

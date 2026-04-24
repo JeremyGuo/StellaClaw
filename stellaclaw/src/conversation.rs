@@ -866,11 +866,10 @@ impl ConversationRuntime {
                     .get("description")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow!("subagent_start requires description"))?;
-                let model_override = self.resolve_model_override(&request.payload)?;
                 let started = self.start_managed_session(
                     ManagedSessionType::Subagent,
                     description.to_string(),
-                    model_override,
+                    None,
                 )?;
                 Ok(bridge_result(request, serde_json::to_string(&started)?))
             }
@@ -1284,6 +1283,9 @@ impl ConversationRuntime {
 
     fn send_delivery_from_text(&self, text: String) -> Result<()> {
         let (clean_text, attachments) = extract_attachment_references(&text, &self.workspace_root)?;
+        if clean_text.trim().is_empty() && attachments.is_empty() {
+            return Ok(());
+        }
         self.send_delivery(clean_text, attachments, None)
     }
 
@@ -1337,13 +1339,18 @@ impl ConversationRuntime {
 
     fn start_foreground_progress(&mut self, turn_id: String) -> Result<()> {
         let now = Instant::now();
+        let progress_turn_id = self
+            .foreground_progress
+            .as_ref()
+            .map(|progress| progress.turn_id.clone())
+            .unwrap_or_else(|| turn_id.clone());
         self.foreground_progress = Some(ActiveForegroundProgress {
-            turn_id: turn_id.clone(),
+            turn_id: progress_turn_id.clone(),
             next_typing_at: now + TYPING_KEEPALIVE_INTERVAL,
         });
         self.send_processing_state(ProcessingState::Typing)?;
         self.send_progress_feedback(
-            turn_id,
+            progress_turn_id,
             progress_text_thinking(&self.state.session_profile.main_model.model_name),
             None,
             true,
@@ -2255,9 +2262,7 @@ pub fn render_chat_message(message: &ChatMessage) -> String {
         match item {
             ChatMessageItem::Context(context) => parts.push(context.text.clone()),
             ChatMessageItem::File(file) => parts.push(render_file_item(file)),
-            ChatMessageItem::Reasoning(reasoning) => {
-                parts.push(format!("[reasoning] {}", reasoning.text))
-            }
+            ChatMessageItem::Reasoning(_) => {}
             ChatMessageItem::ToolCall(ToolCallItem {
                 tool_name,
                 arguments,
@@ -2278,7 +2283,7 @@ pub fn render_chat_message(message: &ChatMessage) -> String {
         }
     }
     if parts.is_empty() {
-        serde_json::to_string_pretty(message).unwrap_or_else(|_| "{}".to_string())
+        String::new()
     } else {
         parts.join("\n\n")
     }
@@ -2318,5 +2323,24 @@ mod tests {
             frontmatter_scalar(folded, "description").as_deref(),
             Some("Deploy reports safely")
         );
+    }
+
+    #[test]
+    fn render_chat_message_hides_reasoning_items() {
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![
+                ChatMessageItem::Reasoning(stellaclaw_core::session_actor::ReasoningItem::codex(
+                    None,
+                    Some("opaque".to_string()),
+                    None,
+                )),
+                ChatMessageItem::Context(ContextItem {
+                    text: "visible answer".to_string(),
+                }),
+            ],
+        );
+
+        assert_eq!(render_chat_message(&message), "visible answer");
     }
 }

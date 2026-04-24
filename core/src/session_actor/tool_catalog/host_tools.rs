@@ -96,12 +96,9 @@ fn subagent_tools() -> Vec<ToolDefinition> {
     vec![
         bridge_tool(
             "subagent_start",
-            "Start a session-bound subagent for a small delegated task. Requires description. Optionally set model.",
+            "Start a session-bound subagent for a small delegated task. Requires description. The subagent always inherits this conversation's current model.",
             object_schema(
-                properties([
-                    ("description", json!({"type": "string"})),
-                    ("model", json!({"type": "string"})),
-                ]),
+                properties([("description", json!({"type": "string"}))]),
                 &["description"],
             ),
             ToolExecutionMode::Immediate,

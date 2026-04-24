@@ -73,11 +73,13 @@ impl TokenEstimator {
         for file in &rendered.files {
             multimodal_tokens += self.multimodal_strategy.estimate(file)?;
         }
+        let reasoning_tokens = estimate_codex_encrypted_reasoning_tokens(&normalized_messages);
 
         Ok(TokenEstimate {
             text_tokens,
             multimodal_tokens,
-            total_tokens: text_tokens + multimodal_tokens,
+            reasoning_tokens,
+            total_tokens: text_tokens + multimodal_tokens + reasoning_tokens,
         })
     }
 }
@@ -309,6 +311,7 @@ pub enum VisionDetail {
 pub struct TokenEstimate {
     pub text_tokens: u64,
     pub multimodal_tokens: u64,
+    pub reasoning_tokens: u64,
     pub total_tokens: u64,
 }
 
@@ -541,6 +544,28 @@ fn collect_all_files(messages: &[ChatMessage]) -> Vec<FileItem> {
     files
 }
 
+fn estimate_codex_encrypted_reasoning_tokens(messages: &[ChatMessage]) -> u64 {
+    messages
+        .iter()
+        .flat_map(|message| &message.data)
+        .filter_map(|item| match item {
+            ChatMessageItem::Reasoning(reasoning) => reasoning.codex_encrypted_content.as_deref(),
+            _ => None,
+        })
+        .map(estimate_codex_encrypted_reasoning_item_tokens)
+        .sum()
+}
+
+fn estimate_codex_encrypted_reasoning_item_tokens(encrypted_content: &str) -> u64 {
+    let visible_bytes = encrypted_content
+        .len()
+        .saturating_mul(3)
+        .checked_div(4)
+        .unwrap_or(0)
+        .saturating_sub(650);
+    (visible_bytes as u64).div_ceil(4)
+}
+
 fn role_name(role: &ChatRole) -> &'static str {
     match role {
         ChatRole::User => "user",
@@ -721,9 +746,7 @@ mod tests {
         let messages = vec![ChatMessage::new(
             ChatRole::Assistant,
             vec![
-                ChatMessageItem::Reasoning(ReasoningItem {
-                    text: "hidden chain of thought".to_string(),
-                }),
+                ChatMessageItem::Reasoning(ReasoningItem::from_text("hidden chain of thought")),
                 ChatMessageItem::Context(ContextItem {
                     text: "hello world".to_string(),
                 }),
@@ -740,6 +763,31 @@ mod tests {
 
         assert!(estimate.text_tokens > 0);
         assert_eq!(estimate.multimodal_tokens, 0);
+        assert_eq!(estimate.reasoning_tokens, 0);
+    }
+
+    #[test]
+    fn estimates_codex_encrypted_reasoning_tokens() {
+        let estimator = build_test_estimator(
+            "{% for message in messages %}{{ message.role }} {{ message.content }}\n{% endfor %}",
+            MultimodalTokenStrategy::Ignore,
+        );
+        let messages = vec![ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Reasoning(ReasoningItem::codex(
+                None,
+                Some("a".repeat(1_000)),
+                None,
+            ))],
+        )];
+
+        let estimate = estimator.estimate(&messages).expect("estimate should work");
+
+        assert_eq!(estimate.reasoning_tokens, 25);
+        assert_eq!(
+            estimate.total_tokens,
+            estimate.text_tokens + estimate.reasoning_tokens
+        );
     }
 
     #[test]
@@ -941,9 +989,7 @@ mod tests {
             .estimate(&[ChatMessage::new(
                 ChatRole::User,
                 vec![
-                    ChatMessageItem::Reasoning(ReasoningItem {
-                        text: "do not count this".to_string(),
-                    }),
+                    ChatMessageItem::Reasoning(ReasoningItem::from_text("do not count this")),
                     ChatMessageItem::Context(ContextItem {
                         text: "hello from local tiktoken".to_string(),
                     }),

@@ -560,7 +560,10 @@ mod tests {
         assert!(background.contains("terminate"));
         assert!(!background.contains("start_background_agent"));
         assert!(subagent.contains("user_tell"));
-        assert!(subagent.contains("subagent_start"));
+        let subagent_start = subagent.get("subagent_start").unwrap();
+        assert!(subagent_start.parameters["properties"]
+            .get("model")
+            .is_none());
         assert!(!subagent.contains("list_cron_tasks"));
     }
 

@@ -263,7 +263,7 @@ fn responses_value_to_chat_message(
             }
             Some("reasoning") => {
                 if let Some(text) = extract_reasoning_text(item) {
-                    data.push(ChatMessageItem::Reasoning(ReasoningItem { text }));
+                    data.push(ChatMessageItem::Reasoning(ReasoningItem::from_text(text)));
                 }
             }
             Some("function_call") => {
@@ -489,7 +489,6 @@ fn extract_reasoning_text(item: &Value) -> Option<String> {
                 .filter(|text| !text.is_empty())
                 .map(str::to_string)
         })
-        .or_else(|| Some(item.to_string()))
 }
 
 fn tool_result_text(tool_result: &crate::session_actor::ToolResultItem) -> String {
@@ -680,5 +679,16 @@ mod tests {
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "function_call_output");
         assert_eq!(input[0]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn encrypted_reasoning_without_summary_is_not_exposed_as_text() {
+        let item = serde_json::json!({
+            "type": "reasoning",
+            "encrypted_content": "opaque",
+            "summary": []
+        });
+
+        assert_eq!(extract_reasoning_text(&item), None);
     }
 }
