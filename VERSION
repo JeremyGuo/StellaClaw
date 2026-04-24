@@ -1,5 +1,14 @@
-version: 1.0.0
+version: 1.0.1
 ---
+
+# 1.0.1
+
+- 修复 `skill_update` 对 `SKILL.md` YAML frontmatter 的误判：
+  校验逻辑现在会正确扫描 `name` 后面的 `description` 字段，不会再因为 `description` 不是第一行而错误返回 `frontmatter must contain description`。
+- 扩展 skill frontmatter description 解析：
+  支持普通 scalar、quoted scalar 和简单 folded/block YAML 描述；runtime skill metadata 也会优先使用 frontmatter description，避免工具校验和运行时刷新显示不一致。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.2`；当前 Stellaclaw workdir schema 仍为 `0.2`。
 
 # 1.0.0
 

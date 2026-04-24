@@ -347,6 +347,12 @@ fn load_workspace_skills(workspace_root: &Path) -> Result<Vec<SessionSkillObserv
 }
 
 fn infer_skill_description(content: &str) -> String {
+    if let Some(frontmatter) = extract_yaml_frontmatter(content) {
+        if let Some(description) = frontmatter_scalar(frontmatter, "description") {
+            return description;
+        }
+    }
+
     let mut paragraph = Vec::new();
     for line in content.lines() {
         let trimmed = line.trim();
@@ -362,6 +368,68 @@ fn infer_skill_description(content: &str) -> String {
         paragraph.push(trimmed);
     }
     paragraph.join(" ").trim().to_string()
+}
+
+fn extract_yaml_frontmatter(content: &str) -> Option<&str> {
+    let mut lines = content.lines();
+    if lines.next()? != "---" {
+        return None;
+    }
+    let body_start = 4;
+    let end = content[body_start..].find("\n---")?;
+    Some(&content[body_start..body_start + end])
+}
+
+fn frontmatter_scalar(frontmatter: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}:");
+    let lines: Vec<&str> = frontmatter.lines().collect();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let line = lines[index].trim();
+        let Some(value) = line.strip_prefix(&prefix) else {
+            index += 1;
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        if value == "|" || value == ">" || value.starts_with("|-") || value.starts_with(">-") {
+            let folded = value.starts_with('>');
+            let mut block = Vec::new();
+            for next in lines.iter().skip(index + 1) {
+                if !next.trim().is_empty() && !next.starts_with(char::is_whitespace) {
+                    break;
+                }
+                let trimmed = next.trim();
+                if !trimmed.is_empty() {
+                    block.push(trimmed);
+                }
+            }
+            let joined = if folded {
+                block.join(" ")
+            } else {
+                block.join("\n")
+            };
+            let joined = joined.trim().to_string();
+            return (!joined.is_empty()).then_some(joined);
+        }
+        return Some(unquote_yaml_scalar(value));
+    }
+    None
+}
+
+fn unquote_yaml_scalar(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        if (bytes[0] == b'"' && bytes[trimmed.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[trimmed.len() - 1] == b'\'')
+        {
+            return trimmed[1..trimmed.len() - 1].trim().to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 fn render_skills_metadata(skills: &[SessionSkillObservation]) -> String {
@@ -797,6 +865,30 @@ mod tests {
         assert!(metadata
             .skills_metadata
             .contains("- example: Do the important thing."));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn renders_skills_metadata_from_yaml_frontmatter_description() {
+        let root = temp_root();
+        fs::create_dir_all(root.join(".skill/example")).unwrap();
+        fs::write(
+            root.join(".skill/example/SKILL.md"),
+            "---\nname: example\ndescription: >\n  Do the important thing\n  with care.\n---\n\n# Example\n\nBody.",
+        )
+        .unwrap();
+
+        let metadata = load_workspace_runtime_metadata(&root).expect("metadata should load");
+
+        assert_eq!(metadata.skills.len(), 1);
+        assert_eq!(
+            metadata.skills[0].description,
+            "Do the important thing with care."
+        );
+        assert!(metadata
+            .skills_metadata
+            .contains("- example: Do the important thing with care."));
 
         let _ = fs::remove_dir_all(root);
     }

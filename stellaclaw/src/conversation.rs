@@ -2016,21 +2016,54 @@ fn extract_yaml_frontmatter(content: &str) -> Option<&str> {
 
 fn frontmatter_scalar(frontmatter: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}:");
-    for line in frontmatter.lines() {
-        let line = line.trim();
-        let value = line.strip_prefix(&prefix)?.trim();
-        if value.is_empty() || matches!(value, "|" | ">") {
+    let lines: Vec<&str> = frontmatter.lines().collect();
+    let mut index = 0usize;
+    while index < lines.len() {
+        let line = lines[index].trim();
+        let Some(value) = line.strip_prefix(&prefix) else {
+            index += 1;
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
             return None;
         }
-        return Some(
-            value
-                .trim_matches('"')
-                .trim_matches('\'')
-                .trim()
-                .to_string(),
-        );
+        if value == "|" || value == ">" || value.starts_with("|-") || value.starts_with(">-") {
+            let folded = value.starts_with('>');
+            let mut block = Vec::new();
+            for next in lines.iter().skip(index + 1) {
+                if !next.trim().is_empty() && !next.starts_with(char::is_whitespace) {
+                    break;
+                }
+                let trimmed = next.trim();
+                if !trimmed.is_empty() {
+                    block.push(trimmed);
+                }
+            }
+            let joined = if folded {
+                block.join(" ")
+            } else {
+                block.join("\n")
+            };
+            let joined = joined.trim().to_string();
+            return (!joined.is_empty()).then_some(joined);
+        }
+        return Some(unquote_yaml_scalar(value));
     }
     None
+}
+
+fn unquote_yaml_scalar(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() >= 2 {
+        let bytes = trimmed.as_bytes();
+        if (bytes[0] == b'"' && bytes[trimmed.len() - 1] == b'"')
+            || (bytes[0] == b'\'' && bytes[trimmed.len() - 1] == b'\'')
+        {
+            return trimmed[1..trimmed.len() - 1].trim().to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 fn copy_skill_atomically(source: &Path, destination: &Path) -> Result<()> {
@@ -2255,5 +2288,35 @@ fn render_file_item(file: &FileItem) -> String {
     match &file.name {
         Some(name) => format!("[file] {name} ({})", file.uri),
         None => format!("[file] {}", file.uri),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frontmatter_scalar_finds_description_after_name() {
+        let frontmatter = "name: web-report-deploy\ndescription: Deploy reports\n";
+
+        assert_eq!(
+            frontmatter_scalar(frontmatter, "description").as_deref(),
+            Some("Deploy reports")
+        );
+    }
+
+    #[test]
+    fn frontmatter_scalar_supports_quoted_and_folded_values() {
+        let quoted = "name: demo\ndescription: \"Deploy reports: safely\"\n";
+        assert_eq!(
+            frontmatter_scalar(quoted, "description").as_deref(),
+            Some("Deploy reports: safely")
+        );
+
+        let folded = "name: demo\ndescription: >\n  Deploy reports\n  safely\nnext: value\n";
+        assert_eq!(
+            frontmatter_scalar(folded, "description").as_deref(),
+            Some("Deploy reports safely")
+        );
     }
 }
