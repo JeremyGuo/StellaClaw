@@ -190,6 +190,7 @@ impl CodexSubscriptionProvider {
             let mut cached = self.socket.lock().expect("mutex poisoned");
             cached.take()
         };
+        let reused_cached_socket = socket.is_some();
         if socket.is_none() {
             socket = Some(connect_codex_websocket(
                 model_config,
@@ -199,7 +200,18 @@ impl CodexSubscriptionProvider {
         }
 
         let mut socket = socket.expect("socket should be initialized");
-        let response = send_response_create(&mut socket, payload);
+        let response = send_response_create(&mut socket, payload.clone());
+        if reused_cached_socket && is_websocket_transport_error(&response) {
+            socket = connect_codex_websocket(model_config, auth, &self.session_id)?;
+            let response = send_response_create(&mut socket, payload);
+            if response.is_ok() {
+                let mut cached = self.socket.lock().expect("mutex poisoned");
+                *cached = Some(socket);
+            }
+            let response = response?;
+            return responses_value_to_chat_message(&response, &self.output_persistor);
+        }
+
         if response.is_ok() {
             let mut cached = self.socket.lock().expect("mutex poisoned");
             *cached = Some(socket);
@@ -922,6 +934,10 @@ fn map_websocket_connect_error(error: tungstenite::Error) -> ProviderError {
     }
 }
 
+fn is_websocket_transport_error(response: &Result<Value, ProviderError>) -> bool {
+    matches!(response, Err(ProviderError::WebSocket(_)))
+}
+
 fn is_unauthorized(error: &ProviderError) -> bool {
     matches!(
         error,
@@ -1463,6 +1479,24 @@ mod tests {
             url.as_str(),
             "wss://chatgpt.com/backend-api/codex/responses"
         );
+    }
+
+    #[test]
+    fn websocket_transport_error_is_reconnectable_for_cached_socket() {
+        let response = Err(ProviderError::WebSocket(
+            "WebSocket protocol error: Connection reset without closing handshake".to_string(),
+        ));
+
+        assert!(is_websocket_transport_error(&response));
+    }
+
+    #[test]
+    fn provider_payload_error_is_not_websocket_transport_error() {
+        let response = Err(ProviderError::InvalidResponse(
+            "provider returned response.failed".to_string(),
+        ));
+
+        assert!(!is_websocket_transport_error(&response));
     }
 
     #[test]

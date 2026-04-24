@@ -53,6 +53,158 @@
 - 每轮 model/tool loop 默认上限是 200 步，主要作为防无限循环兜底，而不是正常工作流限制。
 - skill 工具当前包括 `skill_load`、`skill_create`、`skill_update`、`skill_delete`；持久化类工具走 ConversationBridge，由 Host/Conversation 写回 runtime skill store 并同步已有 conversation workspace。
 
+## 1.3 当前核心组件内部构筑
+
+这一节只描述当前大文件内部已经承担的真实职责，目的是给后续拆分提供人类可读的边界图。它不是要求一次性重写，而是把“哪些职责现在挤在一起”说清楚。
+
+### 1.3.1 `SessionActor` 当前内部结构
+
+`core/src/session_actor/actor.rs` 现在是 session 执行边界的总控文件。它同时承担 request 调度、turn 状态机、provider/tool loop、tool batch 编排、history 持久化、压缩、runtime metadata 和 session view 查询。
+
+```mermaid
+flowchart TB
+    subgraph ActorFile[core/src/session_actor/actor.rs]
+        Inbox[SessionActorInbox and request sender]
+        Actor[SessionActor state machine]
+        Queues[control/data request queues]
+        Turn[turn lifecycle and continuation]
+        Loop[model/tool loop]
+        Batch[tool batch construction and interrupt]
+        History[history append and closed-history invariant]
+        Runtime[runtime metadata synthetic messages]
+        Store[session state restore/persist]
+        Compression[idle and threshold compression]
+        View[session view query payloads]
+        Events[SessionEvent emission and summaries]
+    end
+
+    Provider[Provider implementation]
+    Tools[ToolBatchExecutor]
+    StateFile[(session.json / jsonl)]
+    Conversation[Conversation via Session RPC]
+
+    Conversation --> Inbox
+    Inbox --> Queues
+    Queues --> Actor
+    Actor --> Turn
+    Turn --> Runtime
+    Runtime --> History
+    Turn --> Loop
+    Loop --> Provider
+    Loop --> Batch
+    Batch --> Tools
+    Tools --> Actor
+    Actor --> Compression
+    Actor --> Store
+    Store <--> StateFile
+    Actor --> View
+    Actor --> Events
+    Events --> Conversation
+```
+
+当前可以优先拆出的候选边界：
+
+| 候选模块 | 可以承接的职责 | 保留在 `SessionActor` 的职责 |
+|---|---|---|
+| `session_actor::mailbox` | inbox、request sender、control/data queue 策略 | 决定何时消费哪类 request |
+| `session_actor::turn` | turn start/finish、continuation、recoverable failure 规则 | 顶层状态机调度 |
+| `session_actor::model_loop` | provider/tool loop、tool call 收集、tool operation 构造 | loop 的启动条件和结果落点 |
+| `session_actor::history` | append invariant、synthetic media/user metadata、unclosed tool call 检查 | 何时持久化和何时压缩 |
+| `session_actor::view` | transcript page、message detail、live state payload | control request 路由 |
+| `session_actor::compaction` | idle compaction、threshold compaction 参数和日志 | actor 对压缩时机的最终决策 |
+
+拆分后的目标不是让 `SessionActor` 消失，而是让它退回到“状态机协调者”：接收 request、推进 turn、调用 provider/tool/history/store 子模块、发出事件。
+
+### 1.3.2 `Conversation` 当前内部结构
+
+`stellaclaw/src/conversation.rs` 现在是 host 侧 conversation 串行边界。它同时承担 conversation durable state、session process lifecycle、入站消息路由、Session RPC event pump、Telegram 反馈输出、控制命令、bridge action、skill store、subagent 管理、remote/sandbox/model 切换。
+
+Session RPC / JSON-RPC 事件不能直接绕过 `ConversationRuntime` 访问 delivery、progress feedback、bridge 或 skill store。当前实现里，来自 agent_server 的 `SessionEvent` 和 `ConversationBridgeCall` 都先进入 conversation 的事件泵，再由 `ConversationRuntime::handle_session_event` / bridge handler 在同一个串行 owner 内部做状态修改和 channel 输出。下面的图把 delivery、bridge、skill 等画成 `ConversationRuntime` 内部组件，表达的是调用职责边界，不是外部可直连的 actor。
+
+```mermaid
+flowchart TB
+    subgraph ConversationFile[stellaclaw/src/conversation.rs]
+        subgraph RuntimeBoundary[ConversationRuntime serial owner]
+            Runtime[ConversationRuntime coordinator]
+            State[ConversationState load/persist]
+            Incoming[incoming message and control command handling]
+            EventPump[SessionEvent / BridgeCall pump]
+            SessionLife[foreground and managed session lifecycle]
+            Bridge[ConversationBridge action dispatch]
+            Skill[shared skill store and upstream push]
+            Managed[background/subagent start/join/kill]
+            Delivery[channel delivery and progress feedback]
+            Control[model/remote/sandbox/status commands]
+            Workspace[workspace, attachment and runtime binding helpers]
+            Render[chat message and attachment rendering]
+        end
+    end
+
+    Channel[Channel thread]
+    Workdir[(conversation/workdir stores)]
+    AgentServer[agent_server process]
+    SessionRpc[Session RPC / JSON-RPC events]
+    SkillStore[(runtime skill store)]
+    WorkspaceStore[(workspace dirs)]
+
+    Channel --> Incoming
+    Incoming --> Runtime
+    Runtime <--> State
+    State <--> Workdir
+    Runtime --> SessionLife
+    SessionLife <--> AgentServer
+    AgentServer --> SessionRpc
+    SessionRpc --> EventPump
+    EventPump --> Runtime
+    Runtime --> Bridge
+    Bridge --> Skill
+    Skill <--> SkillStore
+    Runtime --> Managed
+    Runtime --> Control
+    Control --> SessionLife
+    Runtime --> Workspace
+    Workspace <--> WorkspaceStore
+    Runtime --> Delivery
+    Runtime --> Render
+    Render --> Delivery
+    Delivery --> Channel
+```
+
+当前可以优先拆出的候选边界：
+
+| 候选模块 | 可以承接的职责 | 保留在 `ConversationRuntime` 的职责 |
+|---|---|---|
+| `conversation::session_lifecycle` | foreground/managed session 启停、agent_server process、session binding | 选择当前消息应该进入哪个 session |
+| `conversation::event_handler` | `SessionEvent` 分发、turn completed/failed、host coordination routing | 串行调用顺序和 state mutation |
+| `conversation::bridge` | bridge action registry、bridge result 构造 | bridge request 的权限和当前 conversation 上下文 |
+| `conversation::skills` | skill validate/copy/sync/upstream push | bridge action 对 skill store 的调用入口 |
+| `conversation::control` | `/model`、`/remote`、`/sandbox`、`/status` 的渲染和状态修改 | command dispatch 和持久化时机 |
+| `conversation::delivery` | progress panel、processing state、outgoing attachment resolving | 什么时候向 channel 发什么事件 |
+| `conversation::rendering` | `render_chat_message`、file item 渲染、attachment reference 提取 | 无 |
+
+拆分后的目标是让 `ConversationRuntime` 只保留 conversation 串行一致性：接受 channel 输入、维护 durable state、决定 session 路由、协调子模块副作用。
+
+### 1.3.3 建议拆分顺序
+
+```mermaid
+flowchart LR
+    A[先抽纯函数和无状态 helpers] --> B[抽只依赖少量 context 的服务模块]
+    B --> C[抽 session/process lifecycle]
+    C --> D[收缩 Runtime/Actor 为协调层]
+
+    A1[rendering, validation, payload builders] -.-> A
+    B1[view, history, bridge, skills] -.-> B
+    C1[agent_server lifecycle, managed sessions] -.-> C
+    D1[ConversationRuntime and SessionActor keep ownership of queues/state] -.-> D
+```
+
+原则：
+
+- 先拆无状态逻辑，再拆有副作用逻辑。
+- 先移动代码，不改行为；每一步保持现有测试通过。
+- `ConversationRuntime` 和 `SessionActor` 仍然是串行 owner，不先引入新的并发 owner。
+- bridge、skill、delivery 这类 host-side effect 要有明确输入输出，避免继续把 channel、workspace、session process 互相穿透。
+
 ## 2. 线程优先视图
 
 这一节改成“线程优先”表述，不再把“模块”和“线程”画成同一种框。

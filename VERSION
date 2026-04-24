@@ -1,5 +1,14 @@
-version: 1.4.2
+version: 1.4.3
 ---
+
+# 1.4.3
+
+- 修复 `codex_subscription` provider 复用缓存 WebSocket 时的断连恢复：
+  如果缓存 socket 在请求读写时返回 WebSocket transport error，会丢弃旧连接、重新握手并重发一次，避免闲置连接被上游 reset 后直接让本轮失败。
+- 更新 `ROAD_MAP.md`：
+  增加 `SessionActor` 和 `Conversation` 当前内部构筑的 Mermaid 图，以及后续拆分候选边界。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.4`；当前 Stellaclaw workdir schema 仍为 `0.5`。
 
 # 1.4.2
 
