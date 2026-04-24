@@ -17,7 +17,7 @@ use super::{
 };
 use crate::session_actor::tool_runtime::{
     clamp_tool_output_chars, shell_quote, truncate_tool_text, usize_arg_with_default,
-    ExecutionTarget, LocalToolError, ToolExecutionContext,
+    ExecutionTarget, LocalToolError, ToolCancellationToken, ToolExecutionContext,
 };
 
 const SHELL_DEFAULT_WAIT_MS: usize = 10_000;
@@ -112,6 +112,7 @@ fn shell(
         &session_id,
         usize_arg_with_default(arguments, "wait_ms", SHELL_DEFAULT_WAIT_MS)?,
         clamp_tool_output_chars(usize_arg_with_default(arguments, "max_output_chars", 1000)?),
+        &context.cancel_token,
     )
 }
 
@@ -218,6 +219,7 @@ fn wait_or_snapshot_shell(
     session_id: &str,
     wait_ms: usize,
     max_output_chars: usize,
+    cancel_token: &ToolCancellationToken,
 ) -> Result<Value, LocalToolError> {
     let deadline = Instant::now() + Duration::from_millis(wait_ms as u64);
     loop {
@@ -305,6 +307,9 @@ fn wait_or_snapshot_shell(
         };
 
         if Instant::now() >= deadline {
+            return Ok(snapshot);
+        }
+        if cancel_token.is_cancelled() {
             return Ok(snapshot);
         }
         thread::sleep(Duration::from_millis(20));

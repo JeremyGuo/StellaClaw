@@ -20,7 +20,8 @@ use super::{
 };
 use crate::session_actor::tool_runtime::{
     bool_arg_with_default, f64_arg_with_default, resolve_local_path, string_arg,
-    string_arg_with_default, truncate_tool_text, LocalToolError, ToolExecutionContext,
+    string_arg_with_default, truncate_tool_text, LocalToolError, ToolCancellationToken,
+    ToolExecutionContext,
 };
 
 static DOWNLOADS: OnceLock<Mutex<HashMap<String, DownloadTask>>> = OnceLock::new();
@@ -105,7 +106,7 @@ pub(crate) fn execute_download_tool(
     let result = match tool_name {
         "file_download_start" => file_download_start(arguments, context)?,
         "file_download_progress" => file_download_progress(arguments)?,
-        "file_download_wait" => file_download_wait(arguments)?,
+        "file_download_wait" => file_download_wait(arguments, context)?,
         "file_download_cancel" => file_download_cancel(arguments)?,
         _ => return Ok(None),
     };
@@ -150,17 +151,30 @@ fn file_download_start(
     if bool_arg_with_default(arguments, "return_immediate", false)? || wait_timeout <= 0.0 {
         return file_download_progress_by_id(&download_id);
     }
-    wait_for_download(&download_id, wait_timeout, timeout_action(arguments)?)
+    wait_for_download(
+        &download_id,
+        wait_timeout,
+        timeout_action(arguments)?,
+        &context.cancel_token,
+    )
 }
 
 fn file_download_progress(arguments: &Map<String, Value>) -> Result<Value, LocalToolError> {
     file_download_progress_by_id(&string_arg(arguments, "download_id")?)
 }
 
-fn file_download_wait(arguments: &Map<String, Value>) -> Result<Value, LocalToolError> {
+fn file_download_wait(
+    arguments: &Map<String, Value>,
+    context: &ToolExecutionContext<'_>,
+) -> Result<Value, LocalToolError> {
     let download_id = string_arg(arguments, "download_id")?;
     let wait_timeout = f64_arg_with_default(arguments, "wait_timeout_seconds", 30.0)?;
-    wait_for_download(&download_id, wait_timeout, timeout_action(arguments)?)
+    wait_for_download(
+        &download_id,
+        wait_timeout,
+        timeout_action(arguments)?,
+        &context.cancel_token,
+    )
 }
 
 fn file_download_cancel(arguments: &Map<String, Value>) -> Result<Value, LocalToolError> {
@@ -192,6 +206,7 @@ fn wait_for_download(
     download_id: &str,
     wait_timeout_seconds: f64,
     on_timeout: TimeoutAction,
+    cancel_token: &ToolCancellationToken,
 ) -> Result<Value, LocalToolError> {
     if !wait_timeout_seconds.is_finite() || wait_timeout_seconds < 0.0 {
         return Err(LocalToolError::InvalidArguments(
@@ -216,6 +231,9 @@ fn wait_for_download(
                 )]));
             }
             return Ok(json!({"timeout": true, "download": snapshot}));
+        }
+        if cancel_token.is_cancelled() {
+            return Ok(json!({"interrupted": true, "download": snapshot}));
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -398,4 +416,41 @@ fn nonce() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos().to_string())
         .unwrap_or_else(|_| "0".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_returns_snapshot_when_cancel_token_is_cancelled() {
+        let download_id = format!("dl_test_{}", nonce());
+        let status = Arc::new(Mutex::new(json!({
+            "download_id": download_id,
+            "url": "https://example.invalid/file",
+            "path": "/tmp/file",
+            "running": true,
+            "bytes_downloaded": 42_u64,
+        })));
+        downloads().lock().expect("mutex poisoned").insert(
+            download_id.clone(),
+            DownloadTask {
+                status,
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        let cancel_token = ToolCancellationToken::default();
+        cancel_token.cancel();
+
+        let result = wait_for_download(&download_id, 30.0, TimeoutAction::Continue, &cancel_token)
+            .expect("wait should return snapshot");
+
+        assert_eq!(result["interrupted"], true);
+        assert_eq!(result["download"]["running"], true);
+        assert_eq!(result["download"]["bytes_downloaded"], 42);
+        downloads()
+            .lock()
+            .expect("mutex poisoned")
+            .remove(&download_id);
+    }
 }

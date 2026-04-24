@@ -17,7 +17,8 @@ use super::{
     ToolBackend, ToolDefinition, ToolExecutionMode,
 };
 use crate::session_actor::tool_runtime::{
-    f64_arg_with_default, string_arg, string_arg_with_default, LocalToolError, ToolExecutionContext,
+    f64_arg_with_default, string_arg, string_arg_with_default, LocalToolError,
+    ToolCancellationToken, ToolExecutionContext,
 };
 
 static DSL_JOBS: OnceLock<Mutex<HashMap<String, DslJob>>> = OnceLock::new();
@@ -116,7 +117,7 @@ pub(crate) fn execute_dsl_tool(
 ) -> Result<Option<Value>, LocalToolError> {
     let result = match tool_name {
         "dsl_start" => dsl_start(arguments, context)?,
-        "dsl_wait" => dsl_wait(arguments)?,
+        "dsl_wait" => dsl_wait(arguments, context)?,
         "dsl_kill" => dsl_kill(arguments)?,
         _ => return Ok(None),
     };
@@ -183,13 +184,26 @@ fn dsl_start(
     {
         return dsl_snapshot(&dsl_id);
     }
-    wait_for_dsl(&dsl_id, wait_timeout, timeout_action(arguments)?)
+    wait_for_dsl(
+        &dsl_id,
+        wait_timeout,
+        timeout_action(arguments)?,
+        &context.cancel_token,
+    )
 }
 
-fn dsl_wait(arguments: &Map<String, Value>) -> Result<Value, LocalToolError> {
+fn dsl_wait(
+    arguments: &Map<String, Value>,
+    context: &ToolExecutionContext<'_>,
+) -> Result<Value, LocalToolError> {
     let dsl_id = string_arg(arguments, "dsl_id")?;
     let wait_timeout = f64_arg_with_default(arguments, "wait_timeout_seconds", 30.0)?;
-    wait_for_dsl(&dsl_id, wait_timeout, timeout_action(arguments)?)
+    wait_for_dsl(
+        &dsl_id,
+        wait_timeout,
+        timeout_action(arguments)?,
+        &context.cancel_token,
+    )
 }
 
 fn dsl_kill(arguments: &Map<String, Value>) -> Result<Value, LocalToolError> {
@@ -213,6 +227,7 @@ fn wait_for_dsl(
     dsl_id: &str,
     wait_timeout_seconds: f64,
     on_timeout: TimeoutAction,
+    cancel_token: &ToolCancellationToken,
 ) -> Result<Value, LocalToolError> {
     let deadline = Instant::now() + Duration::from_secs_f64(wait_timeout_seconds);
     loop {
@@ -232,6 +247,9 @@ fn wait_for_dsl(
                 )]));
             }
             return Ok(json!({"timeout": true, "dsl": snapshot}));
+        }
+        if cancel_token.is_cancelled() {
+            return Ok(json!({"interrupted": true, "dsl": snapshot}));
         }
         thread::sleep(Duration::from_millis(50));
     }

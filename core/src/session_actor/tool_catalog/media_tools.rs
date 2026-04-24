@@ -26,7 +26,7 @@ use crate::{
         normalize_messages_for_model,
         tool_runtime::{
             bool_arg_with_default, f64_arg_with_default, resolve_local_path, string_arg,
-            LocalToolError, ToolExecutionContext,
+            LocalToolError, ToolCancellationToken, ToolExecutionContext,
         },
         ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, FileState,
         ToolResultContent,
@@ -292,7 +292,7 @@ fn analysis_tool(
     media_kind: &str,
 ) -> Result<ToolResultContent, LocalToolError> {
     if let Some(job_id) = arguments.get(id_field).and_then(Value::as_str) {
-        return wait_media_job(job_id, arguments, id_field);
+        return wait_media_job(job_id, arguments, id_field, &context.cancel_token);
     }
 
     let file = file_item_from_path(arguments, context, media_kind)?;
@@ -304,7 +304,13 @@ fn analysis_tool(
     let job_id = next_media_job_id(media_kind);
     let prompt = format!("{question}\n\nReturn a concise answer based only on the attached file.");
     start_provider_job(job_id.clone(), model_config.clone(), prompt, vec![file]);
-    initial_job_result(tool_name, &job_id, id_field, arguments)
+    initial_job_result(
+        tool_name,
+        &job_id,
+        id_field,
+        arguments,
+        &context.cancel_token,
+    )
 }
 
 fn image_generation_tool(
@@ -314,14 +320,20 @@ fn image_generation_tool(
     model_config: &ModelConfig,
 ) -> Result<ToolResultContent, LocalToolError> {
     if let Some(job_id) = arguments.get("generation_id").and_then(Value::as_str) {
-        return wait_media_job(job_id, arguments, "generation_id");
+        return wait_media_job(job_id, arguments, "generation_id", &context.cancel_token);
     }
 
     let prompt = string_arg(arguments, "prompt")?;
     let images = collect_optional_images(arguments, context)?;
     let job_id = next_media_job_id("image_generation");
     start_provider_job(job_id.clone(), model_config.clone(), prompt, images);
-    initial_job_result(tool_name, &job_id, "generation_id", arguments)
+    initial_job_result(
+        tool_name,
+        &job_id,
+        "generation_id",
+        arguments,
+        &context.cancel_token,
+    )
 }
 
 fn start_provider_job(
@@ -405,17 +417,19 @@ fn initial_job_result(
     job_id: &str,
     id_field: &str,
     arguments: &Map<String, Value>,
+    cancel_token: &ToolCancellationToken,
 ) -> Result<ToolResultContent, LocalToolError> {
     if bool_arg_with_default(arguments, "return_immediate", true)? {
         return Ok(job_snapshot_result(tool_name, job_id, id_field, "running"));
     }
-    wait_media_job(job_id, arguments, id_field)
+    wait_media_job(job_id, arguments, id_field, cancel_token)
 }
 
 fn wait_media_job(
     job_id: &str,
     arguments: &Map<String, Value>,
     id_field: &str,
+    cancel_token: &ToolCancellationToken,
 ) -> Result<ToolResultContent, LocalToolError> {
     let timeout = Duration::from_secs_f64(f64_arg_with_default(
         arguments,
@@ -442,6 +456,14 @@ fn wait_media_job(
                         return Ok(job_snapshot_result("media", job_id, id_field, "cancelled"));
                     }
                     return Ok(job_snapshot_result("media", job_id, id_field, "running"));
+                }
+                if cancel_token.is_cancelled() {
+                    return Ok(job_snapshot_result(
+                        "media",
+                        job_id,
+                        id_field,
+                        "interrupted",
+                    ));
                 }
                 thread::sleep(Duration::from_millis(25));
             }
@@ -838,12 +860,83 @@ mod tests {
             .expect("provider request child connection should close after stop");
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn provider_backed_media_wait_returns_snapshot_on_interrupt() {
+        let _lock = MEDIA_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("media test lock should not be poisoned");
+        let temp = TempDir::new("provider-media-interrupt");
+        let accepted = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(AtomicBool::new(false));
+        let server = TestHttpServer::hanging(accepted.clone(), closed.clone());
+        let image = temp.write_file("input.png", b"not-a-real-image");
+        let _env = EnvVarGuard::set("OPENROUTER_API_KEY_TEST", "test-key");
+        init_global_provider_fork_server().expect("forkserver should start");
+
+        let mut arguments = Map::new();
+        arguments.insert(
+            "path".to_string(),
+            Value::String(image.to_string_lossy().to_string()),
+        );
+        let start_result = execute_provider_backed_media_tool(
+            "image_analysis",
+            ProviderBackedToolKind::ImageAnalysis,
+            &test_model_config(server.url()),
+            &arguments,
+            &test_context(temp.path()),
+        )
+        .expect("provider-backed media tool should start");
+        let start_payload: Value =
+            serde_json::from_str(&start_result.context.unwrap().text).expect("valid json");
+        let job_id = start_payload["image_id"]
+            .as_str()
+            .expect("image_id should be returned")
+            .to_string();
+
+        wait_until(Duration::from_secs(2), || accepted.load(Ordering::SeqCst))
+            .expect("provider request child should connect before interrupt");
+
+        let cancel_token = ToolCancellationToken::default();
+        cancel_token.cancel();
+        let mut wait_arguments = Map::new();
+        wait_arguments.insert("image_id".to_string(), Value::String(job_id.clone()));
+        wait_arguments.insert("wait_timeout_seconds".to_string(), json!(30.0));
+        let wait_result = execute_provider_backed_media_tool(
+            "image_analysis",
+            ProviderBackedToolKind::ImageAnalysis,
+            &test_model_config(server.url()),
+            &wait_arguments,
+            &test_context_with_cancel(temp.path(), cancel_token),
+        )
+        .expect("interrupted wait should return snapshot");
+        let wait_payload: Value =
+            serde_json::from_str(&wait_result.context.unwrap().text).expect("valid json");
+
+        assert_eq!(wait_payload["status"], "interrupted");
+        assert_eq!(wait_payload["image_id"], job_id);
+
+        let mut stop_arguments = Map::new();
+        stop_arguments.insert("image_id".to_string(), Value::String(job_id));
+        let _ = execute_media_tool("image_stop", &stop_arguments, &test_context(temp.path()));
+        wait_until(Duration::from_secs(2), || closed.load(Ordering::SeqCst))
+            .expect("provider request child connection should close after cleanup");
+    }
+
     fn test_context(root: &Path) -> ToolExecutionContext<'_> {
+        test_context_with_cancel(root, ToolCancellationToken::default())
+    }
+
+    fn test_context_with_cancel(
+        root: &Path,
+        cancel_token: ToolCancellationToken,
+    ) -> ToolExecutionContext<'_> {
         static REMOTE_MODE: ToolRemoteMode = ToolRemoteMode::Selectable;
         ToolExecutionContext {
             workspace_root: root,
             remote_mode: &REMOTE_MODE,
-            cancel_token: ToolCancellationToken::default(),
+            cancel_token,
         }
     }
 

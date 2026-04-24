@@ -819,6 +819,58 @@ mod tests {
     }
 
     #[test]
+    fn interrupting_running_shell_returns_snapshot_instead_of_error() {
+        let workspace = temp_workspace();
+        let executor = LocalToolBatchExecutor::new(&workspace);
+        let batch = ToolBatch::new(
+            "batch_shell_interrupt",
+            vec![tool_call(
+                "shell",
+                json!({
+                    "session_id": "interrupt_shell",
+                    "command": "sleep 5",
+                    "wait_ms": 10_000
+                }),
+            )],
+        );
+        let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+        let handle = executor
+            .start(batch, completion_tx)
+            .expect("batch should start");
+
+        thread::sleep(Duration::from_millis(50));
+        let wait_started = Instant::now();
+        executor
+            .interrupt(&handle)
+            .expect("interrupt should mark batch cancelled");
+        let completion = completion_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("interrupted shell should return promptly");
+        executor
+            .finish(&completion.batch_id)
+            .expect("interrupted shell batch should finish");
+        let message = completion.result.expect("interrupted shell result");
+        assert!(wait_started.elapsed() < Duration::from_secs(1));
+
+        let text = result_text(&message, 0);
+        assert!(text.contains("\"running\": true"));
+        assert!(text.contains("\"session_id\": \"interrupt_shell\""));
+        assert!(!text.contains("tool batch interrupted"));
+
+        let message = start_and_wait(
+            &executor,
+            ToolBatch::new(
+                "batch_shell_interrupt_close",
+                vec![tool_call(
+                    "shell_close",
+                    json!({"session_id": "interrupt_shell"}),
+                )],
+            ),
+        );
+        assert!(result_text(&message, 0).contains("\"closed\": true"));
+    }
+
+    #[test]
     fn executes_file_download_lifecycle_locally() {
         let mut server = mockito::Server::new();
         let _mock = server
