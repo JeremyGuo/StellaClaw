@@ -1,5 +1,14 @@
-version: 1.4.3
+version: 1.4.4
 ---
+
+# 1.4.4
+
+- 改进 `openai_image` provider 响应诊断：
+  图片生成/编辑请求会显式要求 `Accept-Encoding: identity`；响应体读取失败会带上请求 URL 和状态码，JSON 解析失败会带上响应体预览，便于排查上游返回空响应、HTML、损坏压缩体或非 OpenAI-compatible JSON。
+- 记录 provider-backed media tool token usage：
+  图片生成、图片分析、PDF 分析、音频分析等工具模型调用完成后，如果 provider 返回 `token_usage`，会 append 到 workspace 下 `.log/stellaclaw/tool_usage.jsonl`，不混入对话历史。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.4`；当前 Stellaclaw workdir schema 仍为 `0.5`。
 
 # 1.4.3
 

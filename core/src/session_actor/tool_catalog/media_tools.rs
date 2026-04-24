@@ -1,8 +1,8 @@
 use std::{
     collections::HashMap,
-    fs,
-    io::Cursor,
-    path::Path,
+    fs::{self, OpenOptions},
+    io::{Cursor, Write},
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
@@ -28,12 +28,13 @@ use crate::{
             bool_arg_with_default, f64_arg_with_default, resolve_local_path, string_arg,
             LocalToolError, ToolCancellationToken, ToolExecutionContext,
         },
-        ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, FileState,
+        ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, FileState, TokenUsage,
         ToolResultContent,
     },
 };
 
 static MEDIA_JOBS: OnceLock<Mutex<HashMap<String, MediaJob>>> = OnceLock::new();
+const TOOL_USAGE_LOG_PATH: &str = ".log/stellaclaw/tool_usage.jsonl";
 
 struct MediaJob {
     status: Arc<Mutex<MediaJobStatus>>,
@@ -303,7 +304,14 @@ fn analysis_tool(
         .to_string();
     let job_id = next_media_job_id(media_kind);
     let prompt = format!("{question}\n\nReturn a concise answer based only on the attached file.");
-    start_provider_job(job_id.clone(), model_config.clone(), prompt, vec![file]);
+    start_provider_job(
+        tool_name.to_string(),
+        job_id.clone(),
+        model_config.clone(),
+        prompt,
+        vec![file],
+        tool_usage_log_path(context.workspace_root),
+    );
     initial_job_result(
         tool_name,
         &job_id,
@@ -326,7 +334,14 @@ fn image_generation_tool(
     let prompt = string_arg(arguments, "prompt")?;
     let images = collect_optional_images(arguments, context)?;
     let job_id = next_media_job_id("image_generation");
-    start_provider_job(job_id.clone(), model_config.clone(), prompt, images);
+    start_provider_job(
+        tool_name.to_string(),
+        job_id.clone(),
+        model_config.clone(),
+        prompt,
+        images,
+        tool_usage_log_path(context.workspace_root),
+    );
     initial_job_result(
         tool_name,
         &job_id,
@@ -337,10 +352,12 @@ fn image_generation_tool(
 }
 
 fn start_provider_job(
+    tool_name: String,
     job_id: String,
     model_config: ModelConfig,
     prompt: String,
     files: Vec<FileItem>,
+    usage_log_path: PathBuf,
 ) {
     let status = Arc::new(Mutex::new(MediaJobStatus::Running));
     let cancel = Arc::new(AtomicBool::new(false));
@@ -397,7 +414,16 @@ fn start_provider_job(
 
         let result = handle
             .wait()
-            .map(provider_message_to_tool_result)
+            .map(|message| {
+                append_tool_usage(
+                    &usage_log_path,
+                    &tool_name,
+                    &job_id,
+                    &model_config,
+                    &message,
+                );
+                provider_message_to_tool_result(message)
+            })
             .map_err(|error| error.to_string());
 
         if cancel.load(Ordering::SeqCst) {
@@ -585,6 +611,61 @@ fn provider_message_to_tool_result(message: ChatMessage) -> ToolResultContent {
         }),
         file,
     }
+}
+
+fn tool_usage_log_path(workspace_root: &Path) -> PathBuf {
+    workspace_root.join(TOOL_USAGE_LOG_PATH)
+}
+
+fn append_tool_usage(
+    path: &Path,
+    tool_name: &str,
+    job_id: &str,
+    model_config: &ModelConfig,
+    message: &ChatMessage,
+) {
+    let Some(token_usage) = &message.token_usage else {
+        return;
+    };
+
+    if let Some(parent) = path.parent() {
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+    }
+
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+
+    let record = json!({
+        "time_unix_ms": current_unix_ms(),
+        "kind": "provider_media_tool",
+        "tool_name": tool_name,
+        "job_id": job_id,
+        "provider_type": model_config.provider_type,
+        "model_name": model_config.model_name,
+        "token_usage": token_usage_json(token_usage),
+    });
+    if let Ok(line) = serde_json::to_string(&record) {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn current_unix_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+fn token_usage_json(token_usage: &TokenUsage) -> Value {
+    json!({
+        "cache_read": token_usage.cache_read,
+        "cache_write": token_usage.cache_write,
+        "uncache_input": token_usage.uncache_input,
+        "output": token_usage.output,
+    })
 }
 
 fn file_item_from_path(
@@ -824,6 +905,20 @@ mod tests {
         .expect("provider-backed media tool should complete");
 
         assert_eq!(result.context.unwrap().text, "media ok");
+        let usage_log = fs::read_to_string(temp.path().join(TOOL_USAGE_LOG_PATH))
+            .expect("tool usage log should be written");
+        let usage_record: Value = serde_json::from_str(
+            usage_log
+                .lines()
+                .last()
+                .expect("usage log line should exist"),
+        )
+        .expect("usage log line should be JSON");
+        assert_eq!(usage_record["kind"], "provider_media_tool");
+        assert_eq!(usage_record["tool_name"], "image_analysis");
+        assert_eq!(usage_record["model_name"], "openai/gpt-4o-mini");
+        assert_eq!(usage_record["token_usage"]["uncache_input"], 1);
+        assert_eq!(usage_record["token_usage"]["output"], 1);
     }
 
     #[test]

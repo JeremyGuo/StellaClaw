@@ -4,10 +4,11 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use rand::Rng;
 use reqwest::{
     blocking::{multipart, Client},
+    header::ACCEPT_ENCODING,
     StatusCode,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::{
     model_config::{ModelConfig, RetryMode},
@@ -15,9 +16,11 @@ use crate::{
 };
 
 use super::{
-    common::{data_url_parts, is_image_file},
+    common::{data_url_parts, is_image_file, token_usage_from_value},
     OutputPersistor, Provider, ProviderError, ProviderRequest,
 };
+
+const RESPONSE_PREVIEW_CHARS: usize = 2000;
 
 #[derive(Debug, Default)]
 pub struct OpenAiImageEditProvider {
@@ -71,6 +74,7 @@ impl OpenAiImageEditProvider {
                 client
                     .post(request_url)
                     .bearer_auth(api_key)
+                    .header(ACCEPT_ENCODING, "identity")
                     .multipart(form)
                     .send()
                     .map_err(ProviderError::request)?,
@@ -87,6 +91,7 @@ impl OpenAiImageEditProvider {
                 client
                     .post(request_url)
                     .bearer_auth(api_key)
+                    .header(ACCEPT_ENCODING, "identity")
                     .header("Content-Type", "application/json")
                     .json(&payload)
                     .send()
@@ -94,7 +99,12 @@ impl OpenAiImageEditProvider {
             )
         };
         let status = response.status();
-        let body = response.text().map_err(ProviderError::DecodeResponse)?;
+        let body = response.bytes().map_err(|error| {
+            ProviderError::InvalidResponse(format!(
+                "failed to read response body from {request_url} with status {status}: {error}"
+            ))
+        })?;
+        let body = String::from_utf8_lossy(&body).to_string();
 
         if !status.is_success() {
             return Err(ProviderError::HttpStatus {
@@ -104,9 +114,16 @@ impl OpenAiImageEditProvider {
             });
         }
 
-        let response = serde_json::from_str::<OpenAiImageResponse>(&body)
+        let value = serde_json::from_str::<Value>(&body).map_err(|error| {
+            ProviderError::InvalidResponse(format!(
+                "image response from {request_url} was not valid JSON: {error}; body preview: {}",
+                preview_body(&body)
+            ))
+        })?;
+        let token_usage = token_usage_from_value(&value);
+        let response = serde_json::from_value::<OpenAiImageResponse>(value)
             .map_err(ProviderError::DecodeJson)?;
-        convert_image_response(response, &self.output_persistor)
+        convert_image_response(response, token_usage, &self.output_persistor)
     }
 
     fn should_retry(error: &ProviderError) -> bool {
@@ -292,6 +309,7 @@ fn image_extension(media_type: &str) -> &'static str {
 
 fn convert_image_response(
     response: OpenAiImageResponse,
+    token_usage: Option<crate::session_actor::TokenUsage>,
     output_persistor: &OutputPersistor,
 ) -> Result<ChatMessage, ProviderError> {
     if let Some(error) = response.error.as_ref().and_then(image_error_message) {
@@ -333,9 +351,20 @@ fn convert_image_response(
         role: ChatRole::Assistant,
         user_name: None,
         message_time: None,
-        token_usage: None,
+        token_usage,
         data,
     })
+}
+
+fn preview_body(body: &str) -> String {
+    let mut preview = body
+        .chars()
+        .take(RESPONSE_PREVIEW_CHARS)
+        .collect::<String>();
+    if body.chars().count() > RESPONSE_PREVIEW_CHARS {
+        preview.push_str("...");
+    }
+    preview
 }
 
 fn image_error_message(error: &serde_json::Value) -> Option<String> {
@@ -393,7 +422,9 @@ mod tests {
             })))
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(r#"{"data":[{"b64_json":"aGVsbG8="}]}"#)
+            .with_body(
+                r#"{"data":[{"b64_json":"aGVsbG8="}],"usage":{"input_tokens":11,"output_tokens":22}}"#,
+            )
             .create();
 
         std::env::set_var("OPENAI_IMAGE_EDIT_API_KEY_TEST", "test-key");
@@ -416,6 +447,41 @@ mod tests {
         assert!(response.data.iter().any(
             |item| matches!(item, ChatMessageItem::File(file) if file.uri.starts_with("file://"))
         ));
+        let usage = response.token_usage.expect("usage should be parsed");
+        assert_eq!(usage.uncache_input, 11);
+        assert_eq!(usage.output, 22);
+    }
+
+    #[test]
+    fn image_generation_invalid_json_reports_body_preview() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/v1/images/generations")
+            .with_status(200)
+            .with_header("content-type", "text/plain")
+            .with_body("not json")
+            .create();
+
+        std::env::set_var("OPENAI_IMAGE_EDIT_API_KEY_TEST", "test-key");
+        let provider = OpenAiImageEditProvider::new();
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "draw a cat".to_string(),
+            })],
+        )];
+
+        let error = provider
+            .send(
+                &test_model_config(format!("{}/v1", server.url())),
+                ProviderRequest::new(&messages),
+            )
+            .expect_err("invalid JSON should fail with preview");
+
+        mock.assert();
+        let error = error.to_string();
+        assert!(error.contains("was not valid JSON"));
+        assert!(error.contains("body preview: not json"));
     }
 
     #[test]
