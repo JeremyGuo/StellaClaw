@@ -374,6 +374,7 @@ fn convert_legacy_config(legacy: LegacyServerConfig, path: &Path) -> Result<Stel
                 LegacySandboxMode::Bubblewrap => SandboxMode::Bubblewrap,
             },
             bubblewrap_binary: legacy.sandbox.bubblewrap_binary,
+            ..SandboxConfig::default()
         },
         channels,
     })

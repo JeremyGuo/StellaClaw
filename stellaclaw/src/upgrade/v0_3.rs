@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use stellaclaw_core::model_config::ModelConfig;
 
-use super::{WorkdirUpgrader, LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_3};
+use super::{WorkdirUpgrader, WORKDIR_VERSION_0_3, WORKDIR_VERSION_0_4};
 use crate::config::StellaclawConfig;
 
 pub struct ModelSelectionUpgrade;
@@ -15,7 +15,7 @@ impl WorkdirUpgrader for ModelSelectionUpgrade {
     }
 
     fn to_version(&self) -> &'static str {
-        LATEST_WORKDIR_VERSION
+        WORKDIR_VERSION_0_4
     }
 
     fn upgrade(&self, workdir: &Path, config: &StellaclawConfig) -> Result<()> {

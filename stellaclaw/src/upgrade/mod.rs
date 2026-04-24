@@ -8,11 +8,13 @@ use crate::config::StellaclawConfig;
 mod v0_1;
 mod v0_2;
 mod v0_3;
+mod v0_4;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.1";
 pub const WORKDIR_VERSION_0_2: &str = "0.2";
 pub const WORKDIR_VERSION_0_3: &str = "0.3";
-pub const LATEST_WORKDIR_VERSION: &str = "0.4";
+pub const WORKDIR_VERSION_0_4: &str = "0.4";
+pub const LATEST_WORKDIR_VERSION: &str = "0.5";
 pub const PARTYCLAW_LATEST_WORKDIR_VERSION: &str = "0.39";
 
 const WORKDIR_VERSION_FILE: &str = "STELLA_VERSION";
@@ -31,11 +33,12 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
     let legacy_version_path = workdir.join(LEGACY_WORKDIR_VERSION_FILE);
     let mut current = read_workdir_version(&version_path, &legacy_version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 4] = [
+    let upgraders: [&dyn WorkdirUpgrader; 5] = [
         &v0_1::LegacyUpgrade,
         &v0_1::PartyClawUpgrade,
         &v0_2::ChatMessageReasoningUpgrade,
         &v0_3::ModelSelectionUpgrade,
+        &v0_4::SkillUpstreamUpgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -77,6 +80,7 @@ fn read_version_file(version_path: &Path) -> Result<&'static str> {
         PARTYCLAW_LATEST_WORKDIR_VERSION => Ok(PARTYCLAW_LATEST_WORKDIR_VERSION),
         WORKDIR_VERSION_0_2 => Ok(WORKDIR_VERSION_0_2),
         WORKDIR_VERSION_0_3 => Ok(WORKDIR_VERSION_0_3),
+        WORKDIR_VERSION_0_4 => Ok(WORKDIR_VERSION_0_4),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }

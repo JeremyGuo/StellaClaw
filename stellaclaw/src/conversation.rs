@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    process::Command,
     sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
@@ -940,6 +941,7 @@ impl ConversationRuntime {
             }
             "skill_create" => self.persist_skill(request, SkillPersistMode::Create),
             "skill_update" => self.persist_skill(request, SkillPersistMode::Update),
+            "skill_set_upstream" => self.set_skill_upstream(request),
             "skill_delete" => self.persist_skill(request, SkillPersistMode::Delete),
             "list_cron_tasks" => {
                 let tasks = self
@@ -1070,6 +1072,11 @@ impl ConversationRuntime {
                 }
                 validate_skill_directory(&staged_skill_path, skill_name)?;
                 copy_skill_atomically(&staged_skill_path, &runtime_skill_path)?;
+                let upstream_push = push_skill_upstream_if_configured(
+                    &self.workdir,
+                    skill_name,
+                    &runtime_skill_path,
+                )?;
                 let synced = sync_skill_to_conversation_workspaces(
                     &self.workdir,
                     skill_name,
@@ -1077,8 +1084,13 @@ impl ConversationRuntime {
                 )?;
                 Ok(bridge_result(
                     request,
-                    json!({"updated": true, "skill_name": skill_name, "synced_workspaces": synced})
-                        .to_string(),
+                    json!({
+                        "updated": true,
+                        "skill_name": skill_name,
+                        "synced_workspaces": synced,
+                        "upstream_push": upstream_push,
+                    })
+                    .to_string(),
                 ))
             }
             SkillPersistMode::Delete => {
@@ -1090,6 +1102,7 @@ impl ConversationRuntime {
                 fs::remove_dir_all(&runtime_skill_path).with_context(|| {
                     format!("failed to remove {}", runtime_skill_path.display())
                 })?;
+                remove_skill_upstream_config(&self.workdir, skill_name)?;
                 let synced =
                     sync_skill_to_conversation_workspaces(&self.workdir, skill_name, None)?;
                 Ok(bridge_result(
@@ -1099,6 +1112,57 @@ impl ConversationRuntime {
                 ))
             }
         }
+    }
+
+    fn set_skill_upstream(&self, request: &ConversationBridgeRequest) -> Result<ToolResultItem> {
+        let skill_name = request
+            .payload
+            .get("skill_name")
+            .or_else(|| request.payload.get("name"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("{} requires skill_name", request.action))?;
+        validate_skill_name(skill_name)?;
+        let repo_url = string_arg_required(
+            request
+                .payload
+                .as_object()
+                .ok_or_else(|| anyhow!("{} payload must be an object", request.action))?,
+            "repo_url",
+        )?;
+        validate_skill_repo_url(&repo_url)?;
+        let branch = optional_string_arg(
+            request
+                .payload
+                .as_object()
+                .ok_or_else(|| anyhow!("{} payload must be an object", request.action))?,
+            "branch",
+        )?
+        .map(|branch| branch.trim().to_string())
+        .filter(|branch| !branch.is_empty());
+        if let Some(branch) = branch.as_deref() {
+            validate_git_branch_name(branch)?;
+        }
+
+        let runtime_skill_path = self.workdir.join("rundir").join(".skill").join(skill_name);
+        if !runtime_skill_path.exists() {
+            return Err(anyhow!(
+                "skill {skill_name} does not exist in runtime store"
+            ));
+        }
+        let config = SkillUpstreamConfig { repo_url, branch };
+        write_skill_upstream_config(&self.workdir, skill_name, &config)?;
+
+        Ok(bridge_result(
+            request,
+            json!({
+                "configured": true,
+                "skill_name": skill_name,
+                "repo_url": config.repo_url,
+                "branch": config.branch,
+                "push_on_update": true,
+            })
+            .to_string(),
+        ))
     }
 
     fn resolve_model_override(&self, payload: &Value) -> Result<Option<String>> {
@@ -1598,8 +1662,15 @@ impl ConversationRuntime {
                 .unwrap_or_else(|| "\nbubblewrap 可用。".to_string()),
             SandboxMode::Subprocess => String::new(),
         };
+        let software = match sandbox.software_dir.as_deref().map(str::trim) {
+            Some(path) if !path.is_empty() => format!(
+                "\nsoftware_dir: `{}` -> `{}`",
+                path, sandbox.software_mount_path
+            ),
+            _ => "\nsoftware_dir: unset".to_string(),
+        };
         self.send_delivery_from_text(format!(
-            "当前 sandbox: `{}` ({source})\nbubblewrap_binary: `{}`{support}\n用法: `/sandbox bubblewrap`，`/sandbox subprocess`，`/sandbox default`。",
+            "当前 sandbox: `{}` ({source})\nbubblewrap_binary: `{}`{software}{support}\n用法: `/sandbox bubblewrap`，`/sandbox subprocess`，`/sandbox default`。",
             sandbox_mode_label(&sandbox.mode),
             sandbox.bubblewrap_binary,
         ))
@@ -2042,6 +2113,225 @@ enum SkillPersistMode {
     Delete,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SkillUpstreamConfig {
+    repo_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SkillUpstreamPushResult {
+    configured: bool,
+    pushed: bool,
+    repo_url: Option<String>,
+    branch: Option<String>,
+    committed: bool,
+}
+
+fn skill_upstream_config_path(workdir: &Path, skill_name: &str) -> PathBuf {
+    workdir
+        .join("rundir")
+        .join(".skill_upstreams")
+        .join(format!("{skill_name}.json"))
+}
+
+fn read_skill_upstream_config(
+    workdir: &Path,
+    skill_name: &str,
+) -> Result<Option<SkillUpstreamConfig>> {
+    let path = skill_upstream_config_path(workdir, skill_name);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    let config = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    Ok(Some(config))
+}
+
+fn write_skill_upstream_config(
+    workdir: &Path,
+    skill_name: &str,
+    config: &SkillUpstreamConfig,
+) -> Result<()> {
+    let path = skill_upstream_config_path(workdir, skill_name);
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
+    fs::write(
+        &path,
+        serde_json::to_string_pretty(config)
+            .context("failed to serialize skill upstream config")?,
+    )
+    .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn remove_skill_upstream_config(workdir: &Path, skill_name: &str) -> Result<()> {
+    let path = skill_upstream_config_path(workdir, skill_name);
+    if path.exists() {
+        fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn push_skill_upstream_if_configured(
+    workdir: &Path,
+    skill_name: &str,
+    skill_path: &Path,
+) -> Result<SkillUpstreamPushResult> {
+    let Some(config) = read_skill_upstream_config(workdir, skill_name)? else {
+        return Ok(SkillUpstreamPushResult {
+            configured: false,
+            pushed: false,
+            repo_url: None,
+            branch: None,
+            committed: false,
+        });
+    };
+
+    let branch = config.branch.clone().unwrap_or_else(|| "main".to_string());
+    validate_git_branch_name(&branch)?;
+    ensure_skill_git_repo(skill_path, &config.repo_url, &branch)?;
+    run_git(skill_path, ["add", "-A"])?;
+
+    let has_staged_changes = git_has_staged_changes(skill_path)?;
+    if has_staged_changes {
+        run_git(
+            skill_path,
+            ["commit", "-m", &format!("Update skill {skill_name}")],
+        )?;
+    }
+    run_git(skill_path, ["push", "-u", "origin", &branch])?;
+
+    Ok(SkillUpstreamPushResult {
+        configured: true,
+        pushed: true,
+        repo_url: Some(config.repo_url),
+        branch: Some(branch),
+        committed: has_staged_changes,
+    })
+}
+
+fn ensure_skill_git_repo(skill_path: &Path, repo_url: &str, branch: &str) -> Result<()> {
+    if !skill_path.join(".git").exists() {
+        run_git(skill_path, ["init"])?;
+    }
+    ensure_git_identity(skill_path)?;
+    run_git(skill_path, ["checkout", "-B", branch])?;
+    if git_remote_exists(skill_path, "origin")? {
+        run_git(skill_path, ["remote", "set-url", "origin", repo_url])?;
+    } else {
+        run_git(skill_path, ["remote", "add", "origin", repo_url])?;
+    }
+    Ok(())
+}
+
+fn ensure_git_identity(skill_path: &Path) -> Result<()> {
+    if !git_config_has_value(skill_path, "user.name")? {
+        run_git(skill_path, ["config", "user.name", "Stellaclaw"])?;
+    }
+    if !git_config_has_value(skill_path, "user.email")? {
+        run_git(skill_path, ["config", "user.email", "stellaclaw@localhost"])?;
+    }
+    Ok(())
+}
+
+fn git_config_has_value(skill_path: &Path, key: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["config", "--get", key])
+        .current_dir(skill_path)
+        .output()
+        .with_context(|| format!("failed to run git config --get {key}"))?;
+    Ok(output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+fn git_remote_exists(skill_path: &Path, name: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["remote", "get-url", name])
+        .current_dir(skill_path)
+        .output()
+        .with_context(|| format!("failed to run git remote get-url {name}"))?;
+    Ok(output.status.success())
+}
+
+fn git_has_staged_changes(skill_path: &Path) -> Result<bool> {
+    let output = Command::new("git")
+        .args(["diff", "--cached", "--quiet"])
+        .current_dir(skill_path)
+        .output()
+        .context("failed to run git diff --cached --quiet")?;
+    match output.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        _ => Err(anyhow!(
+            "git diff --cached --quiet failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )),
+    }
+}
+
+fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<()> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("failed to run git in {}", cwd.display()))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "git command failed in {}: {}\n{}",
+        cwd.display(),
+        String::from_utf8_lossy(&output.stdout).trim(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn validate_skill_repo_url(repo_url: &str) -> Result<()> {
+    let trimmed = repo_url.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("repo_url must not be empty"));
+    }
+    if trimmed != repo_url {
+        return Err(anyhow!(
+            "repo_url must not contain leading or trailing whitespace"
+        ));
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err(anyhow!("repo_url must not contain whitespace"));
+    }
+    Ok(())
+}
+
+fn validate_git_branch_name(branch: &str) -> Result<()> {
+    let trimmed = branch.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("branch must not be empty"));
+    }
+    if trimmed != branch {
+        return Err(anyhow!(
+            "branch must not contain leading or trailing whitespace"
+        ));
+    }
+    if branch.starts_with('-')
+        || branch.starts_with('/')
+        || branch.ends_with('/')
+        || branch.ends_with(".lock")
+        || branch.contains("..")
+        || branch.contains("//")
+        || branch.contains('@')
+        || branch
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
+    {
+        return Err(anyhow!("branch is not a safe git branch name"));
+    }
+    Ok(())
+}
+
 fn validate_skill_name(skill_name: &str) -> Result<()> {
     let name = skill_name.trim();
     if name.is_empty() {
@@ -2431,5 +2721,60 @@ mod tests {
         );
 
         assert_eq!(render_chat_message(&message), "visible answer");
+    }
+
+    #[test]
+    fn configured_skill_upstream_pushes_runtime_skill_to_git_repo() {
+        let root =
+            std::env::temp_dir().join(format!("stellaclaw-skill-upstream-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("temp root should exist");
+        let bare_repo = root.join("upstream.git");
+        let init = Command::new("git")
+            .args(["init", "--bare"])
+            .arg(&bare_repo)
+            .output()
+            .expect("git init --bare should run");
+        assert!(
+            init.status.success(),
+            "{}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+
+        let skill_path = root.join("rundir").join(".skill").join("demo");
+        fs::create_dir_all(&skill_path).expect("skill path should exist");
+        fs::write(
+            skill_path.join("SKILL.md"),
+            "---\nname: demo\ndescription: Demo skill\n---\nbody\n",
+        )
+        .expect("skill should be written");
+        write_skill_upstream_config(
+            &root,
+            "demo",
+            &SkillUpstreamConfig {
+                repo_url: bare_repo.to_string_lossy().to_string(),
+                branch: Some("main".to_string()),
+            },
+        )
+        .expect("upstream config should write");
+
+        let result = push_skill_upstream_if_configured(&root, "demo", &skill_path)
+            .expect("skill should push");
+
+        assert!(result.configured);
+        assert!(result.pushed);
+        assert!(result.committed);
+        let verify = Command::new("git")
+            .args(["--git-dir"])
+            .arg(&bare_repo)
+            .args(["rev-parse", "--verify", "main"])
+            .output()
+            .expect("git rev-parse should run");
+        assert!(
+            verify.status.success(),
+            "{}",
+            String::from_utf8_lossy(&verify.stderr)
+        );
+        fs::remove_dir_all(&root).expect("temp root should be removed");
     }
 }

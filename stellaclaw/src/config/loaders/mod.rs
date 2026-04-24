@@ -6,13 +6,15 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 
 use crate::config::{
-    StellaclawConfig, CONFIG_VERSION_0_2, LATEST_CONFIG_VERSION, LEGACY_CONFIG_VERSION,
+    StellaclawConfig, CONFIG_VERSION_0_2, CONFIG_VERSION_0_3, LATEST_CONFIG_VERSION,
+    LEGACY_CONFIG_VERSION,
 };
 
 mod partyclaw;
 mod v0_1;
 mod v0_2;
 mod v0_3;
+mod v0_4;
 
 const PARTYCLAW_LATEST_CONFIG_VERSION: &str = "0.28";
 
@@ -23,7 +25,8 @@ pub fn load_config_file_and_upgrade(path: &Path) -> Result<(StellaclawConfig, bo
     let mut config = match version.as_str() {
         LEGACY_CONFIG_VERSION => v0_1::load_and_upgrade(&raw)?,
         CONFIG_VERSION_0_2 => v0_2::load_and_upgrade(&raw, path)?,
-        LATEST_CONFIG_VERSION => v0_3::load(&raw, path)?,
+        CONFIG_VERSION_0_3 => v0_3::load_and_upgrade(&raw, path)?,
+        LATEST_CONFIG_VERSION => v0_4::load(&raw, path)?,
         PARTYCLAW_LATEST_CONFIG_VERSION => partyclaw::load_and_upgrade(&raw, path)?,
         other => return Err(anyhow!("unsupported config version '{}'", other)),
     };
@@ -182,7 +185,7 @@ mod tests {
 
         assert!(upgraded);
         assert_eq!(config.version, crate::config::LATEST_CONFIG_VERSION);
-        assert!(rewritten.contains(r#""version": "0.3""#));
+        assert!(rewritten.contains(r#""version": "0.4""#));
         assert!(rewritten.contains(r#""search_tool_model": "search""#));
         assert!(config_path
             .with_file_name("config.json.pre-stellaclaw-upgrade.bak")

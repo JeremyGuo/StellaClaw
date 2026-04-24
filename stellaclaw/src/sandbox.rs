@@ -34,6 +34,9 @@ pub fn build_agent_server_command(
         SandboxMode::Subprocess => {
             let mut command = Command::new(binary_path);
             command.current_dir(current_dir);
+            if let Some(software_dir) = configured_software_dir(sandbox) {
+                command.env("STELLACLAW_SOFTWARE_DIR", software_dir);
+            }
             Ok(command)
         }
         SandboxMode::Bubblewrap => build_bubblewrap_command(sandbox, binary_path, current_dir),
@@ -88,6 +91,15 @@ fn build_bubblewrap_command(
     if let Some(runtime_root) = discover_runtime_root(&workspace_root) {
         bind_path(&mut command, &runtime_root, false)?;
     }
+    if let Some(software_dir) = configured_software_dir(sandbox) {
+        let software_dir = software_dir
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize {}", software_dir.display()))?;
+        let software_mount_path = configured_software_mount_path(sandbox)?;
+        bind_path_to(&mut command, &software_dir, &software_mount_path, false)?;
+        let software_mount_path = software_mount_path.to_string_lossy().to_string();
+        command.args(["--setenv", "STELLACLAW_SOFTWARE_DIR", &software_mount_path]);
+    }
     if let Some(home_ssh_dir) = discover_home_ssh_dir() {
         bind_path(&mut command, &home_ssh_dir, false)?;
     }
@@ -103,6 +115,26 @@ fn build_bubblewrap_command(
     command.args(["--chdir", &workspace_root.to_string_lossy()]);
     command.arg("/__stellaclaw/bin/agent_server");
     Ok(command)
+}
+
+fn configured_software_dir(sandbox: &SandboxConfig) -> Option<PathBuf> {
+    sandbox
+        .software_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn configured_software_mount_path(sandbox: &SandboxConfig) -> Result<PathBuf> {
+    let path = PathBuf::from(sandbox.software_mount_path.trim());
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    Err(anyhow!(
+        "sandbox.software_mount_path must be absolute, got {}",
+        sandbox.software_mount_path
+    ))
 }
 
 fn bind_path(command: &mut Command, source: &Path, readonly: bool) -> Result<()> {
@@ -182,4 +214,37 @@ fn binary_in_path(binary: &str) -> bool {
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_agent_server_command;
+    use crate::config::{SandboxConfig, SandboxMode};
+
+    #[test]
+    fn subprocess_sets_software_dir_env_when_configured() {
+        let sandbox = SandboxConfig {
+            mode: SandboxMode::Subprocess,
+            software_dir: Some("/opt/stellaclaw-software".to_string()),
+            ..SandboxConfig::default()
+        };
+        let command = build_agent_server_command(
+            &sandbox,
+            std::path::Path::new("/bin/echo"),
+            std::path::Path::new("/tmp"),
+        )
+        .expect("subprocess command should build");
+
+        let software_env = command
+            .get_envs()
+            .find_map(|(key, value)| {
+                (key == "STELLACLAW_SOFTWARE_DIR").then(|| value.map(|value| value.to_owned()))
+            })
+            .flatten();
+
+        assert_eq!(
+            software_env.as_deref(),
+            Some(std::ffi::OsStr::new("/opt/stellaclaw-software"))
+        );
+    }
 }

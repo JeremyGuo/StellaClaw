@@ -10,7 +10,8 @@ pub mod loaders;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
 pub const CONFIG_VERSION_0_2: &str = "0.2";
-pub const LATEST_CONFIG_VERSION: &str = "0.3";
+pub const CONFIG_VERSION_0_3: &str = "0.3";
+pub const LATEST_CONFIG_VERSION: &str = "0.4";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StellaclawConfig {
@@ -147,6 +148,13 @@ pub struct SandboxConfig {
     pub mode: SandboxMode,
     #[serde(default = "default_bubblewrap_binary")]
     pub bubblewrap_binary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub software_dir: Option<String>,
+    #[serde(
+        default = "default_software_mount_path",
+        skip_serializing_if = "is_default_software_mount_path"
+    )]
+    pub software_mount_path: String,
 }
 
 impl Default for SandboxConfig {
@@ -154,6 +162,8 @@ impl Default for SandboxConfig {
         Self {
             mode: SandboxMode::Subprocess,
             bubblewrap_binary: default_bubblewrap_binary(),
+            software_dir: None,
+            software_mount_path: default_software_mount_path(),
         }
     }
 }
@@ -202,6 +212,7 @@ impl StellaclawConfig {
         {
             return Err("config must include at least one chat-capable model".to_string());
         }
+        self.sandbox.validate()?;
         Ok(())
     }
 
@@ -294,6 +305,25 @@ impl StellaclawConfig {
     }
 }
 
+impl SandboxConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.bubblewrap_binary.trim().is_empty() {
+            return Err("sandbox.bubblewrap_binary must not be empty".to_string());
+        }
+        if matches!(self.software_dir.as_deref().map(str::trim), Some("")) {
+            return Err("sandbox.software_dir must not be empty when set".to_string());
+        }
+        let mount_path = self.software_mount_path.trim();
+        if mount_path.is_empty() {
+            return Err("sandbox.software_mount_path must not be empty".to_string());
+        }
+        if !Path::new(mount_path).is_absolute() {
+            return Err("sandbox.software_mount_path must be an absolute path".to_string());
+        }
+        Ok(())
+    }
+}
+
 impl TelegramChannelConfig {
     pub fn resolve_bot_token(&self) -> Result<String, String> {
         match self.bot_token.as_deref() {
@@ -330,6 +360,14 @@ fn default_poll_interval_ms() -> u64 {
 
 fn default_bubblewrap_binary() -> String {
     "bwrap".to_string()
+}
+
+fn default_software_mount_path() -> String {
+    "/opt".to_string()
+}
+
+fn is_default_software_mount_path(value: &str) -> bool {
+    value == default_software_mount_path()
 }
 
 fn parse_tool_model_target(raw: &str) -> Result<(&str, bool), String> {

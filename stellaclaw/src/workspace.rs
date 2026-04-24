@@ -11,6 +11,7 @@ const RUNDIR: &str = "rundir";
 const SHARED_DIR: &str = "shared";
 const PROFILE_DIR: &str = ".stellaclaw";
 const SKILL_DIR: &str = ".skill";
+const SKILL_UPSTREAM_DIR: &str = ".skill_upstreams";
 const SHARED_SKILL_MEMORY_DIR: &str = "skill_memory";
 const WORKSPACE_SKILL_MEMORY_DIR: &str = ".skill_memory";
 
@@ -43,6 +44,7 @@ pub fn ensure_workspace_seed(workdir: &Path, conversation_root: &Path) -> Result
     let runtime_shared = runtime_root.join(SHARED_DIR);
     let runtime_profile = runtime_root.join(PROFILE_DIR);
     let runtime_skill = runtime_root.join(SKILL_DIR);
+    let runtime_skill_upstream = runtime_root.join(SKILL_UPSTREAM_DIR);
     let runtime_skill_memory = runtime_root.join(SHARED_SKILL_MEMORY_DIR);
 
     fs::create_dir_all(&runtime_shared)
@@ -51,6 +53,8 @@ pub fn ensure_workspace_seed(workdir: &Path, conversation_root: &Path) -> Result
         .with_context(|| format!("failed to create {}", runtime_profile.display()))?;
     fs::create_dir_all(&runtime_skill)
         .with_context(|| format!("failed to create {}", runtime_skill.display()))?;
+    fs::create_dir_all(&runtime_skill_upstream)
+        .with_context(|| format!("failed to create {}", runtime_skill_upstream.display()))?;
     fs::create_dir_all(&runtime_skill_memory)
         .with_context(|| format!("failed to create {}", runtime_skill_memory.display()))?;
 
@@ -372,7 +376,7 @@ fn create_directory_link(target: &Path, link_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::sshfs_workspace_root;
+    use super::{ensure_workspace_seed, sshfs_workspace_root};
     use std::path::Path;
 
     #[test]
@@ -383,5 +387,28 @@ mod tests {
                 .join("conversations")
                 .join("sshfs-telegram-main-000001")
         );
+    }
+
+    #[test]
+    fn workspace_shared_directory_points_to_runtime_shared() {
+        let root = std::env::temp_dir().join(format!(
+            "stellaclaw-workspace-shared-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let conversation_a = root.join("conversations").join("telegram-main-000001");
+        let conversation_b = root.join("conversations").join("telegram-main-000002");
+
+        ensure_workspace_seed(&root, &conversation_a).expect("first workspace should seed");
+        ensure_workspace_seed(&root, &conversation_b).expect("second workspace should seed");
+        std::fs::write(conversation_a.join("shared").join("marker.txt"), "shared")
+            .expect("shared file should be writable");
+
+        assert_eq!(
+            std::fs::read_to_string(conversation_b.join("shared").join("marker.txt"))
+                .expect("shared file should be visible from other workspace"),
+            "shared"
+        );
+        std::fs::remove_dir_all(&root).expect("temp dir should be cleaned");
     }
 }

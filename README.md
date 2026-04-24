@@ -149,7 +149,7 @@ Stellaclaw exposes tools through a dynamic catalog that is rebuilt from runtime 
 | Downloads | `file_download_start`, `file_download_progress`, `file_download_wait`, `file_download_cancel` |
 | Media | `image_load`, `pdf_load`, `audio_load`, provider-backed analysis/generation tools |
 | Host coordination | subagents, background sessions, cron, status and conversation bridge tools |
-| Skills | `skill_load`, `skill_create`, `skill_update`, `skill_delete` |
+| Skills | `skill_load`, `skill_create`, `skill_update`, `skill_set_upstream`, `skill_delete` |
 
 Remote mode is schema-aware:
 
@@ -179,6 +179,7 @@ Persistent skill operations are host bridge tools:
 
 - `skill_create` persists a staged workspace skill into `rundir/.skill/<name>`.
 - `skill_update` validates and updates an existing runtime skill.
+- `skill_set_upstream` configures a git repo for a shared runtime skill. Future `skill_update` calls commit and push that runtime skill to the configured repo and branch.
 - `skill_delete` removes it from the runtime store and existing conversation workspaces.
 
 `SKILL.md` frontmatter should include at least:
@@ -199,6 +200,8 @@ Files and media are normalized at the session boundary, just before provider req
 If the selected model supports the modality, Stellaclaw sends it using the configured model transport. If it does not, the file becomes plain text context containing the file path, name, media type, and downgrade reason.
 
 That means a conversation can keep working even when a model lacks `image_in`, `pdf`, `audio_in`, or generic file input support.
+
+Each local conversation workspace has a `shared/` directory linked to `rundir/shared`, so files placed there are visible from other conversation workspaces in the same workdir. `sandbox.software_dir` can also expose a shared software/tooling directory; in bubblewrap mode it is mounted at `sandbox.software_mount_path` (default `/opt`) and tools receive `STELLACLAW_SOFTWARE_DIR`.
 
 ---
 
@@ -240,7 +243,7 @@ Start from [example_config.json](example_config.json).
 
 Important fields:
 
-- `version`: current config schema version, currently `0.3`.
+- `version`: current config schema version, currently `0.4`.
 - `agent_server.path`: path to the `agent_server` binary.
 - `models`: named model configs.
 - `channels`: Telegram and future channel definitions.
@@ -294,8 +297,8 @@ Stellaclaw deliberately has separate version tracks:
 | File / Field | Meaning |
 |---|---|
 | Root `VERSION` | Project release version and changelog. Starts at `1.0.0`. |
-| Config JSON `version` | Config schema version. Currently `0.3`. |
-| Workdir `STELLA_VERSION` | Workdir schema version. Currently `0.4`. |
+| Config JSON `version` | Config schema version. Currently `0.4`. |
+| Workdir `STELLA_VERSION` | Workdir schema version. Currently `0.5`. |
 | Legacy workdir `VERSION` | PartyClaw compatibility input, not the project release version. |
 
 Before bumping the root `VERSION`, check whether the previous GitHub Release exists. If it does not, merge the unpublished changelog into the next release notes so release history does not skip user-visible changes.

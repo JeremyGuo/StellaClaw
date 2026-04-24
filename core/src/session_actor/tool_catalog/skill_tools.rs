@@ -50,6 +50,22 @@ pub fn skill_tool_definitions(
             },
         ));
         tools.push(ToolDefinition::new(
+            "skill_set_upstream",
+            "Configure a git upstream repository for a shared runtime skill. After this is set, future skill_update calls for that skill automatically commit and push the shared runtime skill to the configured repository. The operator must ensure this process has git credentials and repository write permission.",
+            object_schema(
+                properties([
+                    ("skill_name", json!({"type": "string"})),
+                    ("repo_url", json!({"type": "string"})),
+                    ("branch", json!({"type": "string"})),
+                ]),
+                &["skill_name", "repo_url"],
+            ),
+            ToolExecutionMode::Immediate,
+            ToolBackend::ConversationBridge {
+                action: "skill_set_upstream".to_string(),
+            },
+        ));
+        tools.push(ToolDefinition::new(
             "skill_delete",
             "Persist deletion of an existing skill by removing .skill/<skill_name>/ from the runtime skills store and active local workspaces.",
             object_schema(

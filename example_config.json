@@ -1,5 +1,5 @@
 {
-  "version": "0.3",
+  "version": "0.4",
   "agent_server": {
     "path": "target/debug/agent_server"
   },
@@ -71,7 +71,9 @@
   },
   "sandbox": {
     "mode": "subprocess",
-    "bubblewrap_binary": "bwrap"
+    "bubblewrap_binary": "bwrap",
+    "software_dir": null,
+    "software_mount_path": "/opt"
   },
   "channels": [
     {

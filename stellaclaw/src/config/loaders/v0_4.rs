@@ -3,23 +3,17 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::config::{StellaclawConfig, LATEST_CONFIG_VERSION};
+use crate::config::StellaclawConfig;
 
 use super::partyclaw;
 
 pub fn load(raw: &str, path: &Path) -> Result<StellaclawConfig> {
     let value: Value =
-        serde_json::from_str(raw).context("failed to parse v0.3 stellaclaw config")?;
+        serde_json::from_str(raw).context("failed to parse v0.4 stellaclaw config")?;
     if is_partyclaw_compatible_config(&value) {
         return partyclaw::load_compatible(raw, path);
     }
-    serde_json::from_value(value).context("failed to parse v0.3 stellaclaw runtime config")
-}
-
-pub fn load_and_upgrade(raw: &str, path: &Path) -> Result<StellaclawConfig> {
-    let mut config = load(raw, path)?;
-    config.version = LATEST_CONFIG_VERSION.to_string();
-    Ok(config)
+    serde_json::from_value(value).context("failed to parse v0.4 stellaclaw runtime config")
 }
 
 fn is_partyclaw_compatible_config(value: &Value) -> bool {
@@ -60,5 +54,6 @@ mod tests {
             .supported_media_types
             .contains(&"image/webp".to_string()));
         assert!(config.session_defaults.search_tool_model.is_some());
+        assert_eq!(config.sandbox.software_mount_path, "/opt");
     }
 }

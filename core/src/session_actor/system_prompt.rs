@@ -60,7 +60,10 @@ fn common_prompt() -> &'static str {
      to send files or images back to the user, append one or more tags in this exact format: \
      <attachment>relative/path/from/workspace_root</attachment>. Each path must be relative to the \
      current workspace root. This attachment syntax is supported in both the final assistant reply \
-     and user_tell text."
+     and user_tell text. The workspace may contain shared/; that directory is shared across \
+     conversations in this Stellaclaw workdir and is appropriate for reusable artifacts. If \
+     STELLACLAW_SOFTWARE_DIR is set in the tool environment, that path is the configured shared \
+     software directory for reusable binaries, checkouts, caches, or other tool installations."
 }
 
 fn foreground_prompt() -> &'static str {
