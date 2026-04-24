@@ -1,5 +1,14 @@
-version: 1.3.0
+version: 1.3.1
 ---
+
+# 1.3.1
+
+- 修正 `openai_image` provider 的 URL 语义：
+  配置中的 `url` 规范上应指向 OpenAI-compatible API base，例如 `https://host/v1`；provider 会按功能自动路由到 `/images/generations` 或 `/images/edits`。
+- 保留 endpoint URL 兼容：
+  如果旧配置仍写成 `/v1/images/edits` 或 `/v1/images/generations`，provider 仍会推导到对应 sibling endpoint，避免已有部署立刻失效。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.3`；当前 Stellaclaw workdir schema 仍为 `0.4`。
 
 # 1.3.0
 

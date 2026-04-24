@@ -215,6 +215,8 @@ Current provider support includes:
 
 Model behavior is configured with `ModelConfig`, including capabilities, multimodal input transport, context window, timeout, retry mode, token estimation, cache TTL, and optional fast/priority service tier.
 
+For `openai_image`, configure `url` as the API base such as `https://host/v1`; Stellaclaw routes generation requests to `/images/generations` and image edit requests to `/images/edits`.
+
 ---
 
 ## Quick Start

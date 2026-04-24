@@ -207,17 +207,22 @@ fn prompt_and_optional_image_from_request(
 }
 
 fn image_edit_url(configured_url: &str) -> String {
-    if configured_url.ends_with("/generations") {
-        return configured_url.trim_end_matches("/generations").to_string() + "/edits";
-    }
-    configured_url.to_string()
+    image_endpoint_url(configured_url, "edits")
 }
 
 fn image_generation_url(configured_url: &str) -> String {
-    if configured_url.ends_with("/edits") {
-        return configured_url.trim_end_matches("/edits").to_string() + "/generations";
+    image_endpoint_url(configured_url, "generations")
+}
+
+fn image_endpoint_url(configured_url: &str, operation: &str) -> String {
+    let trimmed = configured_url.trim_end_matches('/');
+    if let Some(base_url) = trimmed.strip_suffix("/images/edits") {
+        return format!("{base_url}/images/{operation}");
     }
-    configured_url.to_string()
+    if let Some(base_url) = trimmed.strip_suffix("/images/generations") {
+        return format!("{base_url}/images/{operation}");
+    }
+    format!("{trimmed}/images/{operation}")
 }
 
 fn image_file_part(file: &FileItem) -> Result<multipart::Part, ProviderError> {
@@ -397,7 +402,7 @@ mod tests {
 
         let response = provider
             .send(
-                &test_model_config(format!("{}/v1/images/edits", server.url())),
+                &test_model_config(format!("{}/v1", server.url())),
                 ProviderRequest::new(&messages),
             )
             .expect("image generation request should succeed");
@@ -415,7 +420,7 @@ mod tests {
         let messages = vec![ChatMessage::new(ChatRole::User, Vec::new())];
         let error = provider
             .send(
-                &test_model_config("http://127.0.0.1:9/v1/images/edits".to_string()),
+                &test_model_config("http://127.0.0.1:9/v1".to_string()),
                 ProviderRequest::new(&messages),
             )
             .expect_err("missing prompt should fail");
@@ -460,7 +465,7 @@ mod tests {
 
         let response = provider
             .send(
-                &test_model_config(format!("{}/v1/images/edits", server.url())),
+                &test_model_config(format!("{}/v1", server.url())),
                 ProviderRequest::new(&messages),
             )
             .expect("image edit request should succeed");
@@ -470,5 +475,25 @@ mod tests {
         assert!(response.data.iter().any(
             |item| matches!(item, ChatMessageItem::File(file) if file.uri.starts_with("file://"))
         ));
+    }
+
+    #[test]
+    fn derives_image_endpoints_from_base_url_and_legacy_endpoint_urls() {
+        assert_eq!(
+            image_edit_url("https://example.test/v1"),
+            "https://example.test/v1/images/edits"
+        );
+        assert_eq!(
+            image_generation_url("https://example.test/v1/"),
+            "https://example.test/v1/images/generations"
+        );
+        assert_eq!(
+            image_edit_url("https://example.test/v1/images/generations"),
+            "https://example.test/v1/images/edits"
+        );
+        assert_eq!(
+            image_generation_url("https://example.test/v1/images/edits"),
+            "https://example.test/v1/images/generations"
+        );
     }
 }
