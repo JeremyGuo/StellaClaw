@@ -1,5 +1,12 @@
-version: 1.5.1
+version: 1.5.2
 ---
+
+# 1.5.2
+
+- 补齐 OpenRouter pricing 并增加更新脚本：
+  新增 `scripts/update_openrouter_pricing.py`，从 OpenRouter `/api/v1/models` 拉取所有带 prompt/completion token 价格的模型，换算为 USD / 1M tokens 后写入 `open_router_completion.json` 和 `open_router_responses.json`。当前生成 350 个模型价格。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.5`；当前 Stellaclaw workdir schema 仍为 `0.6`。
 
 # 1.5.1
 
