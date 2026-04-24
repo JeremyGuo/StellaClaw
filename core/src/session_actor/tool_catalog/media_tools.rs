@@ -291,7 +291,7 @@ fn analysis_tool(
     id_field: &str,
     media_kind: &str,
 ) -> Result<ToolResultContent, LocalToolError> {
-    if let Some(job_id) = arguments.get(id_field).and_then(Value::as_str) {
+    if let Some(job_id) = optional_non_empty_string_arg(arguments, id_field)? {
         return wait_media_job(job_id, arguments, id_field, &context.cancel_token);
     }
 
@@ -319,7 +319,7 @@ fn image_generation_tool(
     context: &ToolExecutionContext<'_>,
     model_config: &ModelConfig,
 ) -> Result<ToolResultContent, LocalToolError> {
-    if let Some(job_id) = arguments.get("generation_id").and_then(Value::as_str) {
+    if let Some(job_id) = optional_non_empty_string_arg(arguments, "generation_id")? {
         return wait_media_job(job_id, arguments, "generation_id", &context.cancel_token);
     }
 
@@ -518,6 +518,24 @@ fn timeout_on_kill(arguments: &Map<String, Value>) -> Result<bool, LocalToolErro
             .as_str(),
         "kill" | "cancel"
     ))
+}
+
+fn optional_non_empty_string_arg<'a>(
+    arguments: &'a Map<String, Value>,
+    key: &str,
+) -> Result<Option<&'a str>, LocalToolError> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(None);
+    };
+    let value = value.as_str().ok_or_else(|| {
+        LocalToolError::InvalidArguments(format!("argument {key} must be a string"))
+    })?;
+    let value = value.trim();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(value))
+    }
 }
 
 fn job_snapshot_result(
@@ -806,6 +824,83 @@ mod tests {
         .expect("provider-backed media tool should complete");
 
         assert_eq!(result.context.unwrap().text, "media ok");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn image_generation_empty_generation_id_starts_new_job() {
+        let _lock = MEDIA_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("media test lock should not be poisoned");
+        let temp = TempDir::new("image-generation-empty-id");
+        let _env = EnvVarGuard::set("OPENROUTER_API_KEY_TEST", "test-key");
+        init_global_provider_fork_server().expect("forkserver should start");
+
+        let mut arguments = Map::new();
+        arguments.insert(
+            "prompt".to_string(),
+            Value::String("draw a quiet moon".to_string()),
+        );
+        arguments.insert("generation_id".to_string(), Value::String(String::new()));
+        arguments.insert("return_immediate".to_string(), Value::Bool(true));
+
+        let result = execute_provider_backed_media_tool(
+            "image_generation",
+            ProviderBackedToolKind::ImageGeneration,
+            &test_model_config("http://127.0.0.1:9/v1/chat/completions".to_string()),
+            &arguments,
+            &test_context(temp.path()),
+        )
+        .expect("empty generation_id should start a new job");
+        let payload: Value =
+            serde_json::from_str(&result.context.unwrap().text).expect("valid json");
+
+        let job_id = payload["generation_id"]
+            .as_str()
+            .expect("generation_id should be returned");
+        assert!(job_id.starts_with("image_generation_"));
+        assert_eq!(payload["status"], "running");
+        cancel_media_job(job_id);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn analysis_empty_job_id_starts_new_job() {
+        let _lock = MEDIA_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("media test lock should not be poisoned");
+        let temp = TempDir::new("analysis-empty-id");
+        let image = temp.write_file("input.png", b"not-a-real-image");
+        let _env = EnvVarGuard::set("OPENROUTER_API_KEY_TEST", "test-key");
+        init_global_provider_fork_server().expect("forkserver should start");
+
+        let mut arguments = Map::new();
+        arguments.insert(
+            "path".to_string(),
+            Value::String(image.to_string_lossy().to_string()),
+        );
+        arguments.insert("image_id".to_string(), Value::String("   ".to_string()));
+        arguments.insert("return_immediate".to_string(), Value::Bool(true));
+
+        let result = execute_provider_backed_media_tool(
+            "image_analysis",
+            ProviderBackedToolKind::ImageAnalysis,
+            &test_model_config("http://127.0.0.1:9/v1/chat/completions".to_string()),
+            &arguments,
+            &test_context(temp.path()),
+        )
+        .expect("empty image_id should start a new job");
+        let payload: Value =
+            serde_json::from_str(&result.context.unwrap().text).expect("valid json");
+
+        let job_id = payload["image_id"]
+            .as_str()
+            .expect("image_id should be returned");
+        assert!(job_id.starts_with("image_"));
+        assert_eq!(payload["status"], "running");
+        cancel_media_job(job_id);
     }
 
     #[test]
