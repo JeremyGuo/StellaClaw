@@ -73,7 +73,7 @@ impl OpenAiImageEditProvider {
                     .bearer_auth(api_key)
                     .multipart(form)
                     .send()
-                    .map_err(ProviderError::Request)?,
+                    .map_err(ProviderError::request)?,
             )
         } else {
             let request_url = image_generation_url(&model_config.url);
@@ -90,7 +90,7 @@ impl OpenAiImageEditProvider {
                     .header("Content-Type", "application/json")
                     .json(&payload)
                     .send()
-                    .map_err(ProviderError::Request)?,
+                    .map_err(ProviderError::request)?,
             )
         };
         let status = response.status();

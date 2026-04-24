@@ -8,6 +8,8 @@ mod openrouter_completion;
 mod openrouter_responses;
 mod output_persistor;
 
+use std::error::Error as StdError;
+
 use thiserror::Error;
 
 use crate::{
@@ -97,7 +99,7 @@ pub enum ProviderError {
     #[error("http client build failed: {0}")]
     BuildHttpClient(reqwest::Error),
     #[error("request failed: {0}")]
-    Request(reqwest::Error),
+    Request(String),
     #[error("request to {url} failed with status {status}: {body}")]
     HttpStatus {
         url: String,
@@ -118,4 +120,26 @@ pub enum ProviderError {
     EmptyChoices,
     #[error("provider request isolation failed: {0}")]
     Subprocess(String),
+}
+
+impl ProviderError {
+    pub fn request(error: reqwest::Error) -> Self {
+        Self::Request(error_chain_message(&error))
+    }
+}
+
+fn error_chain_message(error: &dyn StdError) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(error) = source {
+        let source_message = error.to_string();
+        if !source_message.is_empty() && !message.contains(&source_message) {
+            if !message.is_empty() {
+                message.push_str(": ");
+            }
+            message.push_str(&source_message);
+        }
+        source = error.source();
+    }
+    message
 }

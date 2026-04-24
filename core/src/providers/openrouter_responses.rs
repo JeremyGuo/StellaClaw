@@ -118,7 +118,7 @@ impl OpenRouterResponsesProvider {
             request_builder = request_builder.header("X-OpenRouter-Title", title);
         }
 
-        let response = request_builder.send().map_err(ProviderError::Request)?;
+        let response = request_builder.send().map_err(ProviderError::request)?;
         let status = response.status();
         let body = response.text().map_err(ProviderError::DecodeResponse)?;
 

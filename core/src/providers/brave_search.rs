@@ -42,7 +42,7 @@ impl BraveSearchProvider {
                 ("extra_snippets", "true".to_string()),
             ])
             .send()
-            .map_err(ProviderError::Request)?;
+            .map_err(ProviderError::request)?;
         let status = response.status();
         if !status.is_success() {
             let body = response.text().unwrap_or_default();

@@ -765,7 +765,7 @@ fn request_chatgpt_token_refresh(
             refresh_token,
         })
         .send()
-        .map_err(ProviderError::Request)?;
+        .map_err(ProviderError::request)?;
     let status = response.status();
     let body = response.text().map_err(ProviderError::DecodeResponse)?;
     if !status.is_success() {

@@ -107,7 +107,7 @@ impl ClaudeCodeProvider {
             .header("anthropic-version", "2023-06-01")
             .json(&payload)
             .send()
-            .map_err(ProviderError::Request)?;
+            .map_err(ProviderError::request)?;
 
         let status = response.status();
         let body = response.text().map_err(ProviderError::DecodeResponse)?;
