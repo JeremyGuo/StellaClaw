@@ -10,7 +10,7 @@ globset = "0.4"
 hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"] }
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 libc = "0.2"
-minijinja = { version = "2.19.0", features = ["json", "loop_controls"] }
+jinja = "0.1.1"
 rand = "0.9"
 regex = "1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls"] }

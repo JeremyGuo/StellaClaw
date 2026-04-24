@@ -1,4 +1,4 @@
-use minijinja::{context, Environment};
+use jinja::{context, new_jinja2};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tiktoken_rs::{
@@ -361,9 +361,10 @@ impl JinjaChatTemplate {
 
 impl ChatTemplate for JinjaChatTemplate {
     fn render(&self, messages: &[ChatMessage]) -> Result<RenderedChatPrompt, ChatTemplateError> {
-        let mut environment = Environment::new();
+        let mut environment = new_jinja2();
+        let normalized_source = normalize_huggingface_chat_template(&self.source);
         environment
-            .add_template("chat", &self.source)
+            .add_template("chat", &normalized_source)
             .map_err(ChatTemplateError::Compile)?;
         let template = environment
             .get_template("chat")
@@ -387,6 +388,107 @@ impl ChatTemplate for JinjaChatTemplate {
             files: collect_all_files(messages),
         })
     }
+}
+
+fn normalize_huggingface_chat_template(source: &str) -> String {
+    let mut normalized = String::with_capacity(source.len());
+    let mut remaining = source;
+
+    while let Some(start) = find_next_jinja_tag_start(remaining) {
+        normalized.push_str(&remaining[..start]);
+        let tag = &remaining[start..start + 2];
+        let end_delimiter = if tag == "{{" { "}}" } else { "%}" };
+
+        if let Some(end) = remaining[start + 2..].find(end_delimiter) {
+            let tag_end = start + 2 + end + 2;
+            normalized.push_str(&normalize_numeric_attr_lookup_in_jinja_tag(
+                &remaining[start..tag_end],
+            ));
+            remaining = &remaining[tag_end..];
+        } else {
+            normalized.push_str(&remaining[start..]);
+            remaining = "";
+        }
+    }
+
+    normalized.push_str(remaining);
+    normalized
+}
+
+fn find_next_jinja_tag_start(input: &str) -> Option<usize> {
+    let expression = input.find("{{");
+    let block = input.find("{%");
+    match (expression, block) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn normalize_numeric_attr_lookup_in_jinja_tag(tag: &str) -> String {
+    let chars = tag.chars().collect::<Vec<_>>();
+    let mut normalized = String::with_capacity(tag.len());
+    let mut index = 0;
+    let mut quote: Option<char> = None;
+
+    while index < chars.len() {
+        let current = chars[index];
+        if let Some(active_quote) = quote {
+            normalized.push(current);
+            if current == active_quote && !is_escaped(&chars, index) {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+
+        if current == '\'' || current == '"' {
+            quote = Some(current);
+            normalized.push(current);
+            index += 1;
+            continue;
+        }
+
+        if current == '.'
+            && index > 0
+            && is_numeric_attr_lookup_receiver(chars[index - 1])
+            && chars
+                .get(index + 1)
+                .is_some_and(|next| next.is_ascii_digit())
+        {
+            let mut digit_end = index + 1;
+            while digit_end < chars.len() && chars[digit_end].is_ascii_digit() {
+                digit_end += 1;
+            }
+            normalized.push('[');
+            for digit in &chars[index + 1..digit_end] {
+                normalized.push(*digit);
+            }
+            normalized.push(']');
+            index = digit_end;
+            continue;
+        }
+
+        normalized.push(current);
+        index += 1;
+    }
+
+    normalized
+}
+
+fn is_numeric_attr_lookup_receiver(ch: char) -> bool {
+    ch == '_' || ch == ')' || ch == ']' || ch.is_ascii_alphabetic()
+}
+
+fn is_escaped(chars: &[char], index: usize) -> bool {
+    let mut slash_count = 0;
+    let mut cursor = index;
+    while cursor > 0 && chars[cursor - 1] == '\\' {
+        slash_count += 1;
+        cursor -= 1;
+    }
+    slash_count % 2 == 1
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -576,9 +678,9 @@ fn role_name(role: &ChatRole) -> &'static str {
 #[derive(Debug, Error)]
 pub enum ChatTemplateError {
     #[error("failed to compile jinja chat template: {0}")]
-    Compile(minijinja::Error),
+    Compile(jinja::Error),
     #[error("failed to render jinja chat template: {0}")]
-    Render(minijinja::Error),
+    Render(jinja::Error),
 }
 
 fn estimate_patch_tokens(
@@ -956,6 +1058,32 @@ mod tests {
         assert!(prompt.text.contains("<s><|assistant|>"));
         assert!(prompt.text.contains("loaded</s><|assistant|>"));
         assert_eq!(prompt.files.len(), 1);
+    }
+
+    #[test]
+    fn renders_huggingface_template_with_numeric_attr_lookup() {
+        let prompt = JinjaChatTemplate::from_source(
+            r#"version 1.0
+{% for m in messages %}
+{%- if m.role == 'tool' and m.content is iterable and m.content is not mapping and m.content and m.content.0.type == "tool_reference" -%}
+tool reference
+{%- elif m.content is string -%}
+{{ m.content }}
+{%- endif -%}
+{% endfor %}
+{{ "keep m.content.0.type inside strings" }}"#,
+        )
+        .render(&[ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "hello world".to_string(),
+            })],
+        )])
+        .expect("template should render");
+
+        assert!(prompt.text.contains("version 1.0"));
+        assert!(prompt.text.contains("hello world"));
+        assert!(prompt.text.contains("keep m.content.0.type inside strings"));
     }
 
     #[test]

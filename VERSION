@@ -1,5 +1,12 @@
-version: 1.4.0
+version: 1.4.1
 ---
+
+# 1.4.1
+
+- 修复 HuggingFace chat template 兼容性：
+  token estimation 改用 Jinja2 compatibility 环境，并在编译模板前把 Jinja 标签内部的 `foo.0` 数字属性访问归一化为 `foo[0]`，兼容 GLM-5.1 等 Transformers 模板，避免压缩时失败于 `unexpected float`。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.4`；当前 Stellaclaw workdir schema 仍为 `0.5`。
 
 # 1.4.0
 
