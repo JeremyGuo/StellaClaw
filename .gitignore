@@ -8,6 +8,8 @@ __pycache__/
 
 target/
 **/target/
+apps/*/node_modules/
+apps/*/dist/
 .log/
 **/.log/
 .output/

@@ -86,7 +86,16 @@ pub struct ModelConfig {
     pub capabilities: Vec<ModelCapability>,
     pub token_max_context: u64,
     pub cache_timeout: u64,
+    #[serde(default = "default_conn_timeout")]
     pub conn_timeout: u64,
+    #[serde(default = "default_request_timeout")]
+    pub request_timeout: u64,
+    #[serde(
+        default = "default_max_request_size",
+        rename = "maxRequestSize",
+        alias = "max_request_size"
+    )]
+    pub max_request_size: u64,
     pub retry_mode: RetryMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<serde_json::Value>,
@@ -104,9 +113,33 @@ impl ModelConfig {
         self.capabilities.contains(&capability)
     }
 
+    pub fn conn_timeout_secs(&self) -> u64 {
+        self.conn_timeout.max(1)
+    }
+
+    pub fn request_timeout_secs(&self) -> u64 {
+        self.request_timeout.max(1)
+    }
+
+    pub fn max_request_size_bytes(&self) -> u64 {
+        self.max_request_size.max(1)
+    }
+
     pub fn uses_huggingface_token_estimator(&self) -> bool {
         matches!(self.token_estimator_type, TokenEstimatorType::HuggingFace)
     }
+}
+
+pub fn default_conn_timeout() -> u64 {
+    2
+}
+
+pub fn default_request_timeout() -> u64 {
+    600
+}
+
+pub fn default_max_request_size() -> u64 {
+    30 * 1024 * 1024
 }
 
 #[cfg(test)]
@@ -128,6 +161,8 @@ mod tests {
             token_max_context: 128_000,
             cache_timeout: 300,
             conn_timeout: 30,
+            request_timeout: 600,
+            max_request_size: 30 * 1024 * 1024,
             retry_mode: RetryMode::RandomInterval {
                 max_interval_secs: 3,
                 max_retries: 5,
@@ -167,6 +202,8 @@ mod tests {
         assert_eq!(json["capabilities"][0], "chat");
         assert_eq!(json["token_max_context"], 128000);
         assert_eq!(json["conn_timeout"], 30);
+        assert_eq!(json["request_timeout"], 600);
+        assert_eq!(json["maxRequestSize"], 31457280);
         assert_eq!(json["retry_mode"]["random_interval"]["max_retries"], 5);
         assert_eq!(json["reasoning"]["effort"], "medium");
         assert_eq!(json["token_estimator_type"], "hugging_face");
@@ -205,6 +242,8 @@ mod tests {
             token_max_context: 200_000,
             cache_timeout: 120,
             conn_timeout: 10,
+            request_timeout: 600,
+            max_request_size: 30 * 1024 * 1024,
             retry_mode: RetryMode::Once,
             reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,
@@ -216,5 +255,70 @@ mod tests {
         assert!(config.supports(ModelCapability::Chat));
         assert!(!config.supports(ModelCapability::ImageOut));
         assert!(!config.uses_huggingface_token_estimator());
+    }
+
+    #[test]
+    fn model_config_uses_timeout_defaults_when_omitted() {
+        let config: ModelConfig = serde_json::from_value(serde_json::json!({
+            "provider_type": "open_router_completion",
+            "model_name": "openai/gpt-4o-mini",
+            "url": "https://openrouter.ai/api/v1/chat/completions",
+            "api_key_env": "OPENROUTER_API_KEY",
+            "capabilities": ["chat"],
+            "token_max_context": 128000,
+            "cache_timeout": 300,
+            "retry_mode": "once",
+            "token_estimator_type": "local"
+        }))
+        .expect("model config should deserialize with timeout defaults");
+
+        assert_eq!(config.conn_timeout, 2);
+        assert_eq!(config.request_timeout, 600);
+        assert_eq!(config.max_request_size, 30 * 1024 * 1024);
+        assert_eq!(config.conn_timeout_secs(), 2);
+        assert_eq!(config.request_timeout_secs(), 600);
+        assert_eq!(config.max_request_size_bytes(), 30 * 1024 * 1024);
+    }
+
+    #[test]
+    fn model_config_accepts_camel_case_max_request_size() {
+        let config: ModelConfig = serde_json::from_value(serde_json::json!({
+            "provider_type": "open_router_completion",
+            "model_name": "openai/gpt-4o-mini",
+            "url": "https://openrouter.ai/api/v1/chat/completions",
+            "api_key_env": "OPENROUTER_API_KEY",
+            "capabilities": ["chat"],
+            "token_max_context": 128000,
+            "cache_timeout": 300,
+            "conn_timeout": 2,
+            "request_timeout": 600,
+            "maxRequestSize": 1234,
+            "retry_mode": "once",
+            "token_estimator_type": "local"
+        }))
+        .expect("model config should accept camelCase maxRequestSize");
+
+        assert_eq!(config.max_request_size, 1234);
+    }
+
+    #[test]
+    fn model_config_accepts_snake_case_max_request_size_alias() {
+        let config: ModelConfig = serde_json::from_value(serde_json::json!({
+            "provider_type": "open_router_completion",
+            "model_name": "openai/gpt-4o-mini",
+            "url": "https://openrouter.ai/api/v1/chat/completions",
+            "api_key_env": "OPENROUTER_API_KEY",
+            "capabilities": ["chat"],
+            "token_max_context": 128000,
+            "cache_timeout": 300,
+            "conn_timeout": 2,
+            "request_timeout": 600,
+            "max_request_size": 4321,
+            "retry_mode": "once",
+            "token_estimator_type": "local"
+        }))
+        .expect("model config should accept snake_case max_request_size");
+
+        assert_eq!(config.max_request_size, 4321);
     }
 }

@@ -2190,6 +2190,8 @@ mod tests {
             token_max_context: 128_000,
             cache_timeout: 300,
             conn_timeout: 10,
+            request_timeout: 600,
+            max_request_size: 30 * 1024 * 1024,
             retry_mode: RetryMode::Once,
             reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,

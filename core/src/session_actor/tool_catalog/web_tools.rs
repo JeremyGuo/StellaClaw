@@ -206,7 +206,7 @@ fn search_with_provider(
     match model_config.provider_type {
         ProviderType::BraveSearch => {
             let mut model_config = model_config.clone();
-            model_config.conn_timeout = timeout_seconds.ceil().max(1.0) as u64;
+            model_config.request_timeout = timeout_seconds.ceil().max(1.0) as u64;
             BraveSearchProvider::new()
                 .search(&model_config, query, max_results)
                 .map_err(provider_error_to_local_tool_error)
@@ -429,6 +429,8 @@ mod tests {
             token_max_context: 0,
             cache_timeout: 0,
             conn_timeout: 30,
+            request_timeout: 600,
+            max_request_size: 30 * 1024 * 1024,
             retry_mode: RetryMode::Once,
             reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,

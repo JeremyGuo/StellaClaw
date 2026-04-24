@@ -28,8 +28,8 @@ use crate::{
 
 use super::{
     common::{
-        account_id_from_access_token, is_image_file, nonce, provider_error_message,
-        token_usage_from_value,
+        account_id_from_access_token, ensure_request_payload_size, is_image_file, nonce,
+        provider_error_message, token_usage_from_value,
     },
     OutputPersistor, Provider, ProviderError, ProviderRequest,
 };
@@ -186,42 +186,50 @@ impl CodexSubscriptionProvider {
         payload: Map<String, Value>,
         auth: &CodexAuthMaterial,
     ) -> Result<ChatMessage, ProviderError> {
-        let mut socket = {
+        let socket = {
             let mut cached = self.socket.lock().expect("mutex poisoned");
             cached.take()
         };
-        let reused_cached_socket = socket.is_some();
-        if socket.is_none() {
-            socket = Some(connect_codex_websocket(
-                model_config,
-                auth,
-                &self.session_id,
-            )?);
-        }
 
-        let mut socket = socket.expect("socket should be initialized");
-        let response = send_response_create(&mut socket, payload.clone());
-        if reused_cached_socket && is_websocket_transport_error(&response) {
-            socket = connect_codex_websocket(model_config, auth, &self.session_id)?;
-            let response = send_response_create(&mut socket, payload);
+        let response = self.send_response_create_with_transport_reconnect(
+            model_config,
+            payload,
+            auth,
+            socket,
+        )?;
+        responses_value_to_chat_message(&response, model_config, &self.output_persistor)
+    }
+
+    fn send_response_create_with_transport_reconnect(
+        &self,
+        model_config: &ModelConfig,
+        payload: Map<String, Value>,
+        auth: &CodexAuthMaterial,
+        initial_socket: Option<WebSocket<MaybeTlsStream<TcpStream>>>,
+    ) -> Result<Value, ProviderError> {
+        let mut socket = initial_socket;
+        let mut retried_transport_error = false;
+
+        loop {
+            let mut active_socket = match socket.take() {
+                Some(socket) => socket,
+                None => connect_codex_websocket(model_config, auth, &self.session_id)?,
+            };
+            let response = send_response_create(&mut active_socket, payload.clone(), model_config);
             if response.is_ok() {
                 let mut cached = self.socket.lock().expect("mutex poisoned");
-                *cached = Some(socket);
+                *cached = Some(active_socket);
             }
-            let response = response?;
-            return responses_value_to_chat_message(
-                &response,
-                model_config,
-                &self.output_persistor,
-            );
-        }
 
-        if response.is_ok() {
-            let mut cached = self.socket.lock().expect("mutex poisoned");
-            *cached = Some(socket);
+            if is_websocket_transport_error(&response) && !retried_transport_error {
+                retried_transport_error = true;
+                self.clear_socket();
+                socket = None;
+                continue;
+            }
+
+            return response;
         }
-        let response = response?;
-        responses_value_to_chat_message(&response, model_config, &self.output_persistor)
     }
 
     fn clear_socket(&self) {
@@ -389,13 +397,17 @@ fn connect_codex_websocket(
     );
 
     let (mut socket, _) = connect(request).map_err(map_websocket_connect_error)?;
-    set_socket_timeout(&mut socket, Duration::from_secs(model_config.conn_timeout))?;
+    set_socket_timeout(
+        &mut socket,
+        Duration::from_secs(model_config.request_timeout_secs()),
+    )?;
     Ok(socket)
 }
 
 fn send_response_create(
     socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
     payload: Map<String, Value>,
+    model_config: &ModelConfig,
 ) -> Result<Value, ProviderError> {
     let mut request = Map::new();
     request.insert(
@@ -404,8 +416,11 @@ fn send_response_create(
     );
     request.extend(payload);
 
+    let body = Value::Object(request).to_string();
+    ensure_request_payload_size(model_config, "codex_subscription websocket", body.len())?;
+
     socket
-        .send(Message::Text(Value::Object(request).to_string().into()))
+        .send(Message::Text(body.into()))
         .map_err(|error| ProviderError::WebSocket(error.to_string()))?;
 
     let mut accumulator = StreamAccumulator::default();
@@ -768,8 +783,8 @@ fn request_chatgpt_token_refresh(
     let endpoint = std::env::var(CHATGPT_REFRESH_TOKEN_URL_OVERRIDE_ENV)
         .unwrap_or_else(|_| CHATGPT_REFRESH_TOKEN_URL.to_string());
     let client = Client::builder()
-        .connect_timeout(Duration::from_secs(model_config.conn_timeout.max(1)))
-        .timeout(Duration::from_secs(model_config.conn_timeout.max(1)))
+        .connect_timeout(Duration::from_secs(model_config.conn_timeout_secs()))
+        .timeout(Duration::from_secs(model_config.request_timeout_secs()))
         .build()
         .map_err(ProviderError::BuildHttpClient)?;
     let response = client
@@ -939,7 +954,21 @@ fn map_websocket_connect_error(error: tungstenite::Error) -> ProviderError {
 }
 
 fn is_websocket_transport_error(response: &Result<Value, ProviderError>) -> bool {
-    matches!(response, Err(ProviderError::WebSocket(_)))
+    matches!(response, Err(ProviderError::WebSocket(message)) if websocket_message_is_transport_error(message))
+}
+
+fn websocket_message_is_transport_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("broken pipe")
+        || message.contains("connection reset")
+        || message.contains("connection aborted")
+        || message.contains("connection refused")
+        || message.contains("connection closed")
+        || message.contains("closed before response.completed")
+        || message.contains("closing handshake")
+        || message.contains("reset without closing handshake")
+        || message.contains("io error")
+        || message.contains("transport error")
 }
 
 fn is_unauthorized(error: &ProviderError) -> bool {
@@ -1496,9 +1525,27 @@ mod tests {
     }
 
     #[test]
+    fn websocket_broken_pipe_is_reconnectable_transport_error() {
+        let response = Err(ProviderError::WebSocket(
+            "IO error: Broken pipe (os error 32)".to_string(),
+        ));
+
+        assert!(is_websocket_transport_error(&response));
+    }
+
+    #[test]
     fn provider_payload_error_is_not_websocket_transport_error() {
         let response = Err(ProviderError::InvalidResponse(
             "provider returned response.failed".to_string(),
+        ));
+
+        assert!(!is_websocket_transport_error(&response));
+    }
+
+    #[test]
+    fn websocket_provider_payload_error_is_not_reconnectable_transport_error() {
+        let response = Err(ProviderError::WebSocket(
+            "model rejected this request".to_string(),
         ));
 
         assert!(!is_websocket_transport_error(&response));
@@ -1863,6 +1910,8 @@ mod tests {
             token_max_context: 128_000,
             cache_timeout: 300,
             conn_timeout: 5,
+            request_timeout: 600,
+            max_request_size: 30 * 1024 * 1024,
             retry_mode: RetryMode::Once,
             reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,

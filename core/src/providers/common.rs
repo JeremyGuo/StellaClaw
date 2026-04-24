@@ -1,4 +1,5 @@
 use base64::{engine::general_purpose, Engine as _};
+use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::{
@@ -6,7 +7,40 @@ use crate::{
     session_actor::{FileItem, TokenUsage},
 };
 
-use super::{pricing::PriceManager, ProviderFailureKind};
+use super::{pricing::PriceManager, ProviderError, ProviderFailureKind};
+
+pub(crate) fn serialize_json_request_body<T: Serialize>(
+    model_config: &ModelConfig,
+    provider_name: &str,
+    payload: &T,
+) -> Result<Vec<u8>, ProviderError> {
+    let body = serde_json::to_vec(payload).map_err(|error| {
+        ProviderError::InvalidResponse(format!(
+            "failed to serialize {provider_name} request body: {error}"
+        ))
+    })?;
+    ensure_request_payload_size(model_config, provider_name, body.len())?;
+    Ok(body)
+}
+
+pub(crate) fn ensure_request_payload_size(
+    model_config: &ModelConfig,
+    provider_name: &str,
+    payload_bytes: usize,
+) -> Result<(), ProviderError> {
+    let limit = model_config.max_request_size_bytes();
+    if payload_bytes as u64 <= limit {
+        return Ok(());
+    }
+    let message = format!(
+        "{provider_name} request payload too large before send: serialized payload is {payload_bytes} bytes, maxRequestSize is {limit} bytes"
+    );
+    Err(ProviderError::ProviderFailure {
+        kind: ProviderFailureKind::RequestTooLarge,
+        message: message.clone(),
+        body: message,
+    })
+}
 
 pub(crate) fn is_image_file(file: &FileItem) -> bool {
     matches!(file.media_type.as_deref(), Some(media_type) if media_type.starts_with("image/"))
@@ -235,6 +269,8 @@ mod tests {
             token_max_context: 128_000,
             cache_timeout,
             conn_timeout: 30,
+            request_timeout: 600,
+            max_request_size: 30 * 1024 * 1024,
             retry_mode: RetryMode::Once,
             reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,
@@ -313,5 +349,22 @@ mod tests {
         assert_eq!(usage.uncache_input, 3);
         assert_eq!(usage.output, 4);
         assert!(usage.cost_usd.is_some());
+    }
+
+    #[test]
+    fn oversized_serialized_payload_maps_to_request_too_large() {
+        let mut model_config =
+            test_model_config(ProviderType::OpenRouterCompletion, "openai/gpt-4.1", 300);
+        model_config.max_request_size = 8;
+
+        let error = serialize_json_request_body(
+            &model_config,
+            "test_provider",
+            &serde_json::json!({"payload": "this is too large"}),
+        )
+        .expect_err("payload should exceed max_request_size");
+
+        assert!(error.is_request_too_large());
+        assert!(error.to_string().contains("maxRequestSize"));
     }
 }

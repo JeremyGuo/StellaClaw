@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self';"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Stellacode</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="window-spacer"></div>
+        <div class="primary-actions">
+          <button id="newConversationButton" class="nav-action" type="button">
+            <span class="action-icon">+</span>
+            <span>新对话</span>
+          </button>
+          <button id="serverStatusButton" class="nav-action" type="button">
+            <span class="action-icon">⌁</span>
+            <span>服务器</span>
+          </button>
+        </div>
+        <div id="serverPopover" class="server-popover hidden"></div>
+        <div class="sidebar-section-title">Conversations</div>
+        <div id="conversationList" class="conversation-list"></div>
+        <div class="sidebar-footer">
+          <button id="settingsButton" class="nav-action" type="button">
+            <span class="action-icon">⚙</span>
+            <span>设置</span>
+          </button>
+        </div>
+      </aside>
+
+      <main class="chat-panel">
+        <header class="chat-header">
+          <div>
+            <div id="conversationTitle" class="conversation-title">Stellacode</div>
+            <div id="conversationSubtitle" class="conversation-subtitle">选择或创建一个 Conversation</div>
+          </div>
+          <div class="header-actions">
+            <button id="refreshButton" class="icon-button" type="button" title="刷新当前会话">↻</button>
+          </div>
+        </header>
+
+        <section id="messageList" class="message-list" aria-live="polite"></section>
+
+        <footer class="composer-wrap">
+          <div class="composer">
+            <textarea
+              id="composerInput"
+              rows="1"
+              placeholder="输入消息，Enter 发送，Shift+Enter 换行"
+            ></textarea>
+            <button id="sendButton" class="send-button" type="button" title="发送">↑</button>
+          </div>
+          <div id="composerHint" class="composer-hint">本地模式</div>
+        </footer>
+      </main>
+    </div>
+
+    <div id="modalLayer" class="modal-layer hidden"></div>
+    <script src="./renderer.js"></script>
+  </body>
+</html>

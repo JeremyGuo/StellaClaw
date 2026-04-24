@@ -27,7 +27,8 @@ impl BraveSearchProvider {
         let api_key = std::env::var(&model_config.api_key_env)
             .map_err(|_| ProviderError::MissingApiKeyEnv(model_config.api_key_env.clone()))?;
         let client = Client::builder()
-            .timeout(Duration::from_secs(model_config.conn_timeout.max(1)))
+            .connect_timeout(Duration::from_secs(model_config.conn_timeout_secs()))
+            .timeout(Duration::from_secs(model_config.request_timeout_secs()))
             .build()
             .map_err(ProviderError::BuildHttpClient)?;
         let response = client
@@ -277,6 +278,8 @@ mod tests {
             token_max_context: 0,
             cache_timeout: 0,
             conn_timeout: 5,
+            request_timeout: 600,
+            max_request_size: 30 * 1024 * 1024,
             retry_mode: RetryMode::Once,
             reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,

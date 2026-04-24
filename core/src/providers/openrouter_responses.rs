@@ -14,7 +14,7 @@ use crate::{
 use super::{
     common::{
         is_image_file, openrouter_cache_control_payload, provider_error_kind,
-        provider_error_message, token_usage_from_value,
+        provider_error_message, serialize_json_request_body, token_usage_from_value,
     },
     error_chain_message, OutputPersistor, Provider, ProviderError, ProviderRequest,
 };
@@ -23,7 +23,7 @@ const RESPONSE_PREVIEW_CHARS: usize = 2000;
 
 #[derive(Debug, Default)]
 pub struct OpenRouterResponsesProvider {
-    clients_by_timeout: Mutex<HashMap<u64, Client>>,
+    clients_by_timeout: Mutex<HashMap<(u64, u64), Client>>,
     http_referer: Option<String>,
     title: Option<String>,
     output_persistor: OutputPersistor,
@@ -43,20 +43,25 @@ impl OpenRouterResponsesProvider {
         }
     }
 
-    fn client_for_timeout(&self, timeout_secs: u64) -> Result<Client, ProviderError> {
+    fn client_for_timeout(
+        &self,
+        connect_timeout_secs: u64,
+        request_timeout_secs: u64,
+    ) -> Result<Client, ProviderError> {
         let mut clients = self.clients_by_timeout.lock().expect("mutex poisoned");
+        let key = (connect_timeout_secs, request_timeout_secs);
 
-        if let Some(client) = clients.get(&timeout_secs) {
+        if let Some(client) = clients.get(&key) {
             return Ok(client.clone());
         }
 
         let client = Client::builder()
-            .connect_timeout(Duration::from_secs(timeout_secs))
-            .timeout(Duration::from_secs(timeout_secs))
+            .connect_timeout(Duration::from_secs(connect_timeout_secs))
+            .timeout(Duration::from_secs(request_timeout_secs))
             .build()
             .map_err(ProviderError::BuildHttpClient)?;
 
-        clients.insert(timeout_secs, client.clone());
+        clients.insert(key, client.clone());
         Ok(client)
     }
 
@@ -117,13 +122,17 @@ impl OpenRouterResponsesProvider {
         payload.insert("store".to_string(), Value::Bool(false));
         let payload = Value::Object(payload);
 
-        let client = self.client_for_timeout(model_config.conn_timeout)?;
+        let body = serialize_json_request_body(model_config, "open_router_responses", &payload)?;
+        let client = self.client_for_timeout(
+            model_config.conn_timeout_secs(),
+            model_config.request_timeout_secs(),
+        )?;
         let mut request_builder = client
             .post(&model_config.url)
             .bearer_auth(api_key)
             .header(ACCEPT_ENCODING, "identity")
             .header("Content-Type", "application/json")
-            .json(&payload);
+            .body(body);
 
         if let Some(http_referer) = &self.http_referer {
             request_builder = request_builder.header("HTTP-Referer", http_referer);
@@ -612,6 +621,8 @@ mod tests {
             token_max_context: 128_000,
             cache_timeout: 300,
             conn_timeout: 5,
+            request_timeout: 600,
+            max_request_size: 30 * 1024 * 1024,
             retry_mode: RetryMode::Once,
             reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,

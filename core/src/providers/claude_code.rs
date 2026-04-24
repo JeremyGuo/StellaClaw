@@ -14,14 +14,14 @@ use crate::{
 use super::{
     common::{
         claude_cache_control_payload, data_url_parts, is_image_file, provider_error_message,
-        token_usage_from_value,
+        serialize_json_request_body, token_usage_from_value,
     },
     Provider, ProviderError, ProviderRequest,
 };
 
 #[derive(Debug, Default)]
 pub struct ClaudeCodeProvider {
-    clients_by_timeout: Mutex<HashMap<u64, Client>>,
+    clients_by_timeout: Mutex<HashMap<(u64, u64), Client>>,
 }
 
 impl ClaudeCodeProvider {
@@ -29,20 +29,25 @@ impl ClaudeCodeProvider {
         Self::default()
     }
 
-    fn client_for_timeout(&self, timeout_secs: u64) -> Result<Client, ProviderError> {
+    fn client_for_timeout(
+        &self,
+        connect_timeout_secs: u64,
+        request_timeout_secs: u64,
+    ) -> Result<Client, ProviderError> {
         let mut clients = self.clients_by_timeout.lock().expect("mutex poisoned");
+        let key = (connect_timeout_secs, request_timeout_secs);
 
-        if let Some(client) = clients.get(&timeout_secs) {
+        if let Some(client) = clients.get(&key) {
             return Ok(client.clone());
         }
 
         let client = Client::builder()
-            .connect_timeout(Duration::from_secs(timeout_secs))
-            .timeout(Duration::from_secs(timeout_secs))
+            .connect_timeout(Duration::from_secs(connect_timeout_secs))
+            .timeout(Duration::from_secs(request_timeout_secs))
             .build()
             .map_err(ProviderError::BuildHttpClient)?;
 
-        clients.insert(timeout_secs, client.clone());
+        clients.insert(key, client.clone());
         Ok(client)
     }
 
@@ -99,13 +104,17 @@ impl ClaudeCodeProvider {
         payload.insert("max_tokens".to_string(), json!(4096));
         let payload = Value::Object(payload);
 
-        let client = self.client_for_timeout(model_config.conn_timeout)?;
+        let body = serialize_json_request_body(model_config, "claude_code", &payload)?;
+        let client = self.client_for_timeout(
+            model_config.conn_timeout_secs(),
+            model_config.request_timeout_secs(),
+        )?;
         let response = client
             .post(&model_config.url)
             .header("Content-Type", "application/json")
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
-            .json(&payload)
+            .body(body)
             .send()
             .map_err(ProviderError::request)?;
 
@@ -430,6 +439,8 @@ mod tests {
             token_max_context: 200_000,
             cache_timeout: 300,
             conn_timeout: 5,
+            request_timeout: 600,
+            max_request_size: 30 * 1024 * 1024,
             retry_mode: RetryMode::Once,
             reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,

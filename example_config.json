@@ -1,5 +1,5 @@
 {
-  "version": "0.6",
+  "version": "0.8",
   "agent_server": {
     "path": "target/debug/agent_server"
   },
@@ -17,7 +17,9 @@
       ],
       "token_max_context": 1048576,
       "cache_timeout": 300,
-      "conn_timeout": 30,
+      "conn_timeout": 2,
+      "request_timeout": 600,
+      "maxRequestSize": 31457280,
       "retry_mode": "once",
       "token_estimator_type": "local",
       "multimodal_input": {
@@ -59,7 +61,9 @@
       ],
       "token_max_context": 32768,
       "cache_timeout": 300,
-      "conn_timeout": 15,
+      "conn_timeout": 2,
+      "request_timeout": 600,
+      "maxRequestSize": 31457280,
       "retry_mode": "once",
       "token_estimator_type": "local"
     }

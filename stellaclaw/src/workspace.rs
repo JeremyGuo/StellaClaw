@@ -114,6 +114,7 @@ fn ensure_sshfs_workspace(
     remote_path: &str,
 ) -> Result<PathBuf> {
     validate_sshfs_binding(host, remote_path)?;
+    ensure_passwordless_ssh_login(host)?;
     ensure_sshfs_available()?;
 
     let mountpoint = sshfs_workspace_root(workdir, conversation_id);
@@ -175,6 +176,57 @@ fn validate_sshfs_binding(host: &str, remote_path: &str) -> Result<()> {
         return Err(anyhow!("remote path must not be empty"));
     }
     Ok(())
+}
+
+fn ensure_passwordless_ssh_login(host: &str) -> Result<()> {
+    let output = passwordless_ssh_login_check_command(host)
+        .output()
+        .with_context(|| format!("failed to run passwordless SSH login check for {host}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = trimmed_output_preview(&output.stderr);
+    let suffix = if stderr.is_empty() {
+        format!(
+            "ssh exited with status {}",
+            output.status.code().unwrap_or(-1)
+        )
+    } else {
+        stderr
+    };
+    Err(anyhow!(
+        "remote host `{host}` must allow passwordless SSH login before Remote Mode can be enabled: {suffix}"
+    ))
+}
+
+fn passwordless_ssh_login_check_command(host: &str) -> Command {
+    let mut command = Command::new("ssh");
+    command
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("PasswordAuthentication=no")
+        .arg("-o")
+        .arg("KbdInteractiveAuthentication=no")
+        .arg("-o")
+        .arg("ConnectTimeout=5")
+        .arg("-T")
+        .arg(host)
+        .arg("true");
+    command
+}
+
+fn trimmed_output_preview(output: &[u8]) -> String {
+    let text = String::from_utf8_lossy(output);
+    let trimmed = text.trim();
+    const MAX_CHARS: usize = 600;
+    if trimmed.chars().count() <= MAX_CHARS {
+        return trimmed.to_string();
+    }
+    let mut preview = trimmed.chars().take(MAX_CHARS).collect::<String>();
+    preview.push_str("...");
+    preview
 }
 
 fn ensure_sshfs_available() -> Result<()> {
@@ -372,7 +424,10 @@ fn create_directory_link(target: &Path, link_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ensure_workspace_seed, sshfs_workspace_root};
+    use super::{
+        ensure_workspace_seed, passwordless_ssh_login_check_command, sshfs_workspace_root,
+        trimmed_output_preview, validate_sshfs_binding,
+    };
     use std::path::Path;
 
     #[test]
@@ -406,5 +461,46 @@ mod tests {
             "shared"
         );
         std::fs::remove_dir_all(&root).expect("temp dir should be cleaned");
+    }
+
+    #[test]
+    fn sshfs_binding_rejects_unsafe_remote_hosts() {
+        assert!(validate_sshfs_binding("demo-host", "~/repo").is_ok());
+        assert!(validate_sshfs_binding("", "~/repo").is_err());
+        assert!(validate_sshfs_binding("demo host", "~/repo").is_err());
+        assert!(validate_sshfs_binding("demo;host", "~/repo").is_err());
+    }
+
+    #[test]
+    fn passwordless_ssh_check_uses_batch_mode_without_password_auth() {
+        let command = passwordless_ssh_login_check_command("demo-host");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "PasswordAuthentication=no",
+                "-o",
+                "KbdInteractiveAuthentication=no",
+                "-o",
+                "ConnectTimeout=5",
+                "-T",
+                "demo-host",
+                "true",
+            ]
+        );
+    }
+
+    #[test]
+    fn command_output_preview_is_trimmed_and_bounded() {
+        let output = format!("  {}  ", "x".repeat(700));
+        let preview = trimmed_output_preview(output.as_bytes());
+        assert_eq!(preview.chars().count(), 603);
+        assert!(preview.ends_with("..."));
     }
 }

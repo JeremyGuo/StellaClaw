@@ -1,5 +1,21 @@
-version: 1.8.0
+version: 1.9.0
 ---
+
+# 1.9.0
+
+- 新增 Stellacode Electron 客户端：
+  在 `apps/stellacode` 下加入本地桌面聊天程序骨架，可配置多个 Stellaclaw Web channel 后端，支持直接连接或 SSH proxy 连接，展示 Web channel conversation 列表、状态、消息骨架/详情，并可创建 conversation 与发送消息。界面包含类聊天侧边栏、服务器状态弹窗、服务器设置、按需展开消息详情、浅色/深色系统主题适配。本次不改变 `config` schema，不改变 `workdir` schema。
+- 修复 Codex subscription WebSocket 传输错误恢复：
+  `IO error: Broken pipe`、connection reset、缺少 closing handshake 等 WebSocket 传输层错误现在会丢弃当前 socket 并立即新建连接重试一次，不依赖模型 `retry_mode`；provider 业务错误不会被当作传输错误重试。本次不改变 `config` schema，不改变 `workdir` schema。
+- 拆分 provider 建连和请求超时：
+  `open_router_completion`、`open_router_responses`、`claude_code`、`openai_image`、`codex_subscription` 和 `brave_search` 现在用 `conn_timeout` 控制建连，用 `request_timeout` 控制整体请求或 WebSocket 读取窗口，避免一个超时字段同时承担两种语义。
+- 更新 `config` schema 到 `0.8`：
+  模型配置新增 `request_timeout` 和 `maxRequestSize`；`request_timeout` 控制 provider 整体请求/读取超时，`maxRequestSize` 控制每次 provider 请求序列化后允许发送的最大 payload 字节数。默认值为 `conn_timeout=2` 秒、`request_timeout=600` 秒、`maxRequestSize=31457280` 字节。超过 `maxRequestSize` 会在发送前抛出 `request_too_large` provider failure，由 actor 走已有请求过大恢复流程。旧 `max_request_size` 作为兼容 alias 仍可读取；旧 `0.6`/`0.7` config 会自动升级；本次不改变 `workdir` schema。
+
+# 1.8.1
+
+- 修正 Remote Mode 启用前校验：
+  `/remote <ssh-host> <path>` 现在会先使用 `ssh` 的 BatchMode 对目标 host 做免密码登录检查；只有确认可以免密码 SSH 登录后才继续创建 sshfs workspace 并开启 fixed Remote Mode。检查失败会直接返回远程 workspace 切换失败，不写入新的 remote 绑定。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.8.0
 

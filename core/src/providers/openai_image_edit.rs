@@ -16,7 +16,10 @@ use crate::{
 };
 
 use super::{
-    common::{data_url_parts, is_image_file, token_usage_from_value},
+    common::{
+        data_url_parts, ensure_request_payload_size, is_image_file, serialize_json_request_body,
+        token_usage_from_value,
+    },
     OutputPersistor, Provider, ProviderError, ProviderRequest,
 };
 
@@ -24,7 +27,7 @@ const RESPONSE_PREVIEW_CHARS: usize = 2000;
 
 #[derive(Debug, Default)]
 pub struct OpenAiImageEditProvider {
-    clients_by_timeout: Mutex<HashMap<u64, Client>>,
+    clients_by_timeout: Mutex<HashMap<(u64, u64), Client>>,
     output_persistor: OutputPersistor,
 }
 
@@ -33,20 +36,25 @@ impl OpenAiImageEditProvider {
         Self::default()
     }
 
-    fn client_for_timeout(&self, timeout_secs: u64) -> Result<Client, ProviderError> {
+    fn client_for_timeout(
+        &self,
+        connect_timeout_secs: u64,
+        request_timeout_secs: u64,
+    ) -> Result<Client, ProviderError> {
         let mut clients = self.clients_by_timeout.lock().expect("mutex poisoned");
+        let key = (connect_timeout_secs, request_timeout_secs);
 
-        if let Some(client) = clients.get(&timeout_secs) {
+        if let Some(client) = clients.get(&key) {
             return Ok(client.clone());
         }
 
         let client = Client::builder()
-            .connect_timeout(Duration::from_secs(timeout_secs))
-            .timeout(Duration::from_secs(timeout_secs))
+            .connect_timeout(Duration::from_secs(connect_timeout_secs))
+            .timeout(Duration::from_secs(request_timeout_secs))
             .build()
             .map_err(ProviderError::BuildHttpClient)?;
 
-        clients.insert(timeout_secs, client.clone());
+        clients.insert(key, client.clone());
         Ok(client)
     }
 
@@ -59,10 +67,22 @@ impl OpenAiImageEditProvider {
             .map_err(|_| ProviderError::MissingApiKeyEnv(model_config.api_key_env.clone()))?;
         let (prompt, image) = prompt_and_optional_image_from_request(request)?;
 
-        let client = self.client_for_timeout(model_config.conn_timeout)?;
+        let client = self.client_for_timeout(
+            model_config.conn_timeout_secs(),
+            model_config.request_timeout_secs(),
+        )?;
         let (request_url, response) = if let Some(image) = image {
-            let image_part = image_file_part(&image)?;
+            let (image_part, image_payload_bytes) = image_file_part(&image)?;
             let request_url = image_edit_url(&model_config.url);
+            let estimated_payload_bytes = image_payload_bytes
+                .saturating_add(prompt.len())
+                .saturating_add(model_config.model_name.len())
+                .saturating_add(1024);
+            ensure_request_payload_size(
+                model_config,
+                "openai_image multipart",
+                estimated_payload_bytes,
+            )?;
             let form = multipart::Form::new()
                 .text("model", model_config.model_name.clone())
                 .text("prompt", prompt)
@@ -86,6 +106,7 @@ impl OpenAiImageEditProvider {
                 "prompt": prompt,
                 "n": 1,
             });
+            let body = serialize_json_request_body(model_config, "openai_image", &payload)?;
             (
                 request_url.clone(),
                 client
@@ -93,7 +114,7 @@ impl OpenAiImageEditProvider {
                     .bearer_auth(api_key)
                     .header(ACCEPT_ENCODING, "identity")
                     .header("Content-Type", "application/json")
-                    .json(&payload)
+                    .body(body)
                     .send()
                     .map_err(ProviderError::request)?,
             )
@@ -248,14 +269,16 @@ fn image_endpoint_url(configured_url: &str, operation: &str) -> String {
     format!("{trimmed}/images/{operation}")
 }
 
-fn image_file_part(file: &FileItem) -> Result<multipart::Part, ProviderError> {
+fn image_file_part(file: &FileItem) -> Result<(multipart::Part, usize), ProviderError> {
     let (bytes, filename, media_type) = image_file_bytes(file)?;
+    let byte_len = bytes.len();
     multipart::Part::bytes(bytes)
         .file_name(filename)
         .mime_str(&media_type)
         .map_err(|error| {
             ProviderError::InvalidResponse(format!("invalid image mime type: {error}"))
         })
+        .map(|part| (part, byte_len))
 }
 
 fn image_file_bytes(file: &FileItem) -> Result<(Vec<u8>, String, String), ProviderError> {
@@ -398,6 +421,8 @@ mod tests {
             token_max_context: 128_000,
             cache_timeout: 300,
             conn_timeout: 5,
+            request_timeout: 600,
+            max_request_size: 30 * 1024 * 1024,
             retry_mode: RetryMode::Once,
             reasoning: None,
             token_estimator_type: TokenEstimatorType::Local,

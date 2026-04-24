@@ -13,7 +13,9 @@ pub const CONFIG_VERSION_0_2: &str = "0.2";
 pub const CONFIG_VERSION_0_3: &str = "0.3";
 pub const CONFIG_VERSION_0_4: &str = "0.4";
 pub const CONFIG_VERSION_0_5: &str = "0.5";
-pub const LATEST_CONFIG_VERSION: &str = "0.6";
+pub const CONFIG_VERSION_0_6: &str = "0.6";
+pub const CONFIG_VERSION_0_7: &str = "0.7";
+pub const LATEST_CONFIG_VERSION: &str = "0.8";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StellaclawConfig {
