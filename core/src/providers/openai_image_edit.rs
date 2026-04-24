@@ -120,7 +120,7 @@ impl OpenAiImageEditProvider {
                 preview_body(&body)
             ))
         })?;
-        let token_usage = token_usage_from_value(&value);
+        let token_usage = token_usage_from_value(&value, model_config);
         let response = serde_json::from_value::<OpenAiImageResponse>(value)
             .map_err(ProviderError::DecodeJson)?;
         convert_image_response(response, token_usage, &self.output_persistor)

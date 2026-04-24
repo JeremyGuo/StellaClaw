@@ -13,14 +13,13 @@ use serde_json::Value;
 use crate::{
     model_config::{ModelCapability, ModelConfig, RetryMode},
     session_actor::{
-        ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, TokenUsage, TokenUsageCost,
-        ToolCallItem,
+        ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, TokenUsage, ToolCallItem,
     },
 };
 
 use super::{
-    common::openrouter_cache_control_payload, error_chain_message, OutputPersistor, Provider,
-    ProviderError, ProviderRequest,
+    common::openrouter_cache_control_payload, error_chain_message, pricing::PriceManager,
+    OutputPersistor, Provider, ProviderError, ProviderRequest,
 };
 
 const RESPONSE_PREVIEW_CHARS: usize = 2000;
@@ -120,7 +119,9 @@ impl OpenRouterCompletionProvider {
             }
 
             return parse_openrouter_stream(response, &model_config.url, status).and_then(
-                |response| convert_openrouter_response(response, &self.output_persistor),
+                |response| {
+                    convert_openrouter_response(response, model_config, &self.output_persistor)
+                },
             );
         }
 
@@ -149,7 +150,7 @@ impl OpenRouterCompletionProvider {
                 ))
             })?;
 
-        convert_openrouter_response(response_body, &self.output_persistor)
+        convert_openrouter_response(response_body, model_config, &self.output_persistor)
     }
 
     fn should_retry(error: &ProviderError) -> bool {
@@ -415,22 +416,6 @@ struct OpenRouterUsage {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
-    #[serde(default)]
-    cost: Option<f64>,
-    #[serde(default)]
-    cost_details: Option<OpenRouterCostDetails>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenRouterCostDetails {
-    #[serde(default)]
-    upstream_inference_prompt_cost: Option<f64>,
-    #[serde(default)]
-    upstream_inference_input_cost: Option<f64>,
-    #[serde(default)]
-    upstream_inference_completions_cost: Option<f64>,
-    #[serde(default)]
-    upstream_inference_output_cost: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -661,6 +646,7 @@ fn openrouter_role(role: &ChatRole) -> &'static str {
 
 fn convert_openrouter_response(
     response: OpenRouterChatCompletionResponse,
+    model_config: &ModelConfig,
     output_persistor: &OutputPersistor,
 ) -> Result<ChatMessage, ProviderError> {
     let choice = response
@@ -692,12 +678,16 @@ fn convert_openrouter_response(
         data.push(ChatMessageItem::File(file));
     }
 
-    let token_usage = response.usage.map(|usage| TokenUsage {
-        cache_read: 0,
-        cache_write: 0,
-        uncache_input: usage.prompt_tokens,
-        output: usage.completion_tokens,
-        cost_usd: openrouter_usage_cost(&usage),
+    let token_usage = response.usage.map(|usage| {
+        let mut token_usage = TokenUsage {
+            cache_read: 0,
+            cache_write: 0,
+            uncache_input: usage.prompt_tokens,
+            output: usage.completion_tokens,
+            cost_usd: None,
+        };
+        PriceManager::attach_cost(model_config, &mut token_usage);
+        token_usage
     });
 
     let _ = response.id;
@@ -711,39 +701,6 @@ fn convert_openrouter_response(
         token_usage,
         data,
     })
-}
-
-fn openrouter_usage_cost(usage: &OpenRouterUsage) -> Option<TokenUsageCost> {
-    let input = usage.cost_details.as_ref().and_then(|details| {
-        details
-            .upstream_inference_prompt_cost
-            .or(details.upstream_inference_input_cost)
-    });
-    let output = usage.cost_details.as_ref().and_then(|details| {
-        details
-            .upstream_inference_completions_cost
-            .or(details.upstream_inference_output_cost)
-    });
-
-    if input.is_some() || output.is_some() {
-        return Some(TokenUsageCost {
-            cache_read: 0.0,
-            cache_write: 0.0,
-            uncache_input: round_usd(input.unwrap_or(0.0)),
-            output: round_usd(output.unwrap_or(0.0)),
-        });
-    }
-
-    usage.cost.map(|cost| TokenUsageCost {
-        cache_read: 0.0,
-        cache_write: 0.0,
-        uncache_input: round_usd(cost),
-        output: 0.0,
-    })
-}
-
-fn round_usd(value: f64) -> f64 {
-    (value * 1000.0).round() / 1000.0
 }
 
 #[cfg(test)]
@@ -1035,6 +992,8 @@ mod tests {
     #[test]
     fn persists_openrouter_output_images_into_output_directory() {
         let _cwd = temp_cwd("openrouter-completion-output-images");
+        let model_config =
+            test_model_config("https://openrouter.ai/api/v1/chat/completions".to_string());
         let message = convert_openrouter_response(
             OpenRouterChatCompletionResponse {
                 id: "gen_456".to_string(),
@@ -1053,6 +1012,7 @@ mod tests {
                     },
                 }],
             },
+            &model_config,
             &OutputPersistor,
         )
         .expect("image output should persist");

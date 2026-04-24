@@ -3,8 +3,10 @@ use serde_json::{Map, Value};
 
 use crate::{
     model_config::{ModelConfig, ProviderType},
-    session_actor::{FileItem, TokenUsage, TokenUsageCost},
+    session_actor::{FileItem, TokenUsage},
 };
+
+use super::pricing::PriceManager;
 
 pub(crate) fn is_image_file(file: &FileItem) -> bool {
     matches!(file.media_type.as_deref(), Some(media_type) if media_type.starts_with("image/"))
@@ -34,7 +36,10 @@ pub(crate) fn provider_error_message(value: &Value) -> Option<String> {
         })
 }
 
-pub(crate) fn token_usage_from_value(value: &Value) -> Option<TokenUsage> {
+pub(crate) fn token_usage_from_value(
+    value: &Value,
+    model_config: &ModelConfig,
+) -> Option<TokenUsage> {
     let usage = value.get("usage").and_then(Value::as_object)?;
 
     let input = first_u64(
@@ -67,89 +72,15 @@ pub(crate) fn token_usage_from_value(value: &Value) -> Option<TokenUsage> {
     )
     .unwrap_or(0);
 
-    Some(TokenUsage {
+    let mut token_usage = TokenUsage {
         cache_read,
         cache_write,
         uncache_input: input.saturating_sub(cache_read.saturating_add(cache_write)),
         output,
-        cost_usd: token_usage_cost_from_value(value),
-    })
-}
-
-fn token_usage_cost_from_value(value: &Value) -> Option<TokenUsageCost> {
-    let usage = value.get("usage").and_then(Value::as_object)?;
-    let cost_details = usage.get("cost_details").and_then(Value::as_object);
-
-    let cache_read = first_f64_in(
-        usage,
-        cost_details,
-        &[
-            &["cache_read_cost"],
-            &["cached_tokens_cost"],
-            &["prompt_tokens_details", "cached_tokens_cost"],
-            &["input_tokens_details", "cached_tokens_cost"],
-        ],
-    )
-    .unwrap_or(0.0);
-    let cache_write = first_f64_in(
-        usage,
-        cost_details,
-        &[
-            &["cache_write_cost"],
-            &["cache_creation_cost"],
-            &["cache_creation_input_tokens_cost"],
-            &["prompt_tokens_details", "cache_write_tokens_cost"],
-            &["input_tokens_details", "cache_creation_tokens_cost"],
-        ],
-    )
-    .unwrap_or(0.0);
-    let uncache_input = first_f64_in(
-        usage,
-        cost_details,
-        &[
-            &["input_cost"],
-            &["prompt_cost"],
-            &["prompt_tokens_cost"],
-            &["upstream_inference_prompt_cost"],
-            &["upstream_inference_input_cost"],
-        ],
-    )
-    .unwrap_or(0.0);
-    let output = first_f64_in(
-        usage,
-        cost_details,
-        &[
-            &["output_cost"],
-            &["completion_cost"],
-            &["completion_tokens_cost"],
-            &["upstream_inference_completions_cost"],
-            &["upstream_inference_output_cost"],
-        ],
-    )
-    .unwrap_or(0.0);
-
-    if cache_read == 0.0 && cache_write == 0.0 && uncache_input == 0.0 && output == 0.0 {
-        usage
-            .get("cost")
-            .and_then(Value::as_f64)
-            .map(|cost| TokenUsageCost {
-                cache_read: 0.0,
-                cache_write: 0.0,
-                uncache_input: round_usd(cost),
-                output: 0.0,
-            })
-    } else {
-        Some(TokenUsageCost {
-            cache_read: round_usd(cache_read),
-            cache_write: round_usd(cache_write),
-            uncache_input: round_usd(uncache_input),
-            output: round_usd(output),
-        })
-    }
-}
-
-fn round_usd(value: f64) -> f64 {
-    (value * 1000.0).round() / 1000.0
+        cost_usd: None,
+    };
+    PriceManager::attach_cost(model_config, &mut token_usage);
+    Some(token_usage)
 }
 
 pub(crate) fn account_id_from_access_token(access_token: &str) -> Option<String> {
@@ -239,36 +170,6 @@ fn first_u64(object: &Map<String, Value>, paths: &[&[&str]]) -> Option<u64> {
             }
         }
         if let Some(value) = current.and_then(Value::as_u64) {
-            return Some(value);
-        }
-    }
-
-    None
-}
-
-fn first_f64_in(
-    usage: &Map<String, Value>,
-    cost_details: Option<&Map<String, Value>>,
-    paths: &[&[&str]],
-) -> Option<f64> {
-    first_f64(usage, paths).or_else(|| cost_details.and_then(|object| first_f64(object, paths)))
-}
-
-fn first_f64(object: &Map<String, Value>, paths: &[&[&str]]) -> Option<f64> {
-    'paths: for path in paths {
-        let mut current = None;
-        for (index, key) in path.iter().enumerate() {
-            current = if index == 0 {
-                object.get(*key)
-            } else {
-                current.and_then(|value: &Value| value.get(*key))
-            };
-
-            if current.is_none() {
-                continue 'paths;
-            }
-        }
-        if let Some(value) = current.and_then(Value::as_f64) {
             return Some(value);
         }
     }

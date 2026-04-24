@@ -1,5 +1,14 @@
-version: 1.5.0
+version: 1.5.1
 ---
+
+# 1.5.1
+
+- 改为本地价格表计算 token cost：
+  core 编译期嵌入根目录 `pricing/<provider_type>.json`，由 `PriceManager` 根据 `ModelConfig.provider_type`、`model_name` 和 `TokenUsage` 计算 `cost_usd`；provider 不再解析响应体里的 `usage.cost` 或 `cost_details`。
+- 新增 provider pricing 维护约定：
+  [AGENTS.md](AGENTS.md) 规定新增或修改 provider 时必须同步检查 pricing 文件，尽量补齐实际使用模型的 USD / 1M tokens 价格；订阅制或无法按 token 归因的 provider 可保持空字典。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.5`；当前 Stellaclaw workdir schema 仍为 `0.6`。
 
 # 1.5.0
 

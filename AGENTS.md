@@ -26,6 +26,14 @@
 - 尽量让代码结构贴近真实运行边界和真实职责，减少额外心智负担。
 - 像强工程团队一样工作：先把边界、职责、数据流和失败路径想清楚，再做实现。
 
+## Provider pricing 约定
+
+- 新增或修改 provider 时，必须同步检查根目录 [pricing](pricing) 下对应 `<provider_type>.json` 的模型价格表。
+- pricing 文件是按 provider type 拆分的模型价格字典，编译时嵌入 `stellaclaw_core`；模型未配置价格时，系统应视为不计算美元成本，而不是解析 provider 返回值中的成本字段。
+- 价格表应尽量覆盖该 provider 实际会使用的模型；订阅制、固定包月、外部计费或无法按 token 可靠归因的 provider 可以保持空字典。
+- core 内部的成本计算应集中在独立的价格管理模块中，例如 `PriceManager`，provider 只传入 `ModelConfig` 和 `TokenUsage` 获取成本，避免把 pricing JSON、字段名或计算公式散落到各个 provider 实现里。
+- pricing 单位使用 USD / 1M tokens，字段为 `cache_read`、`cache_write`、`input`、`output`。
+
 ## 文档约定
 
 - `ROAD_MAP.md` 负责方向、边界和阶段性目标。

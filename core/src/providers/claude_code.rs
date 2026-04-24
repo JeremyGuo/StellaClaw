@@ -125,7 +125,7 @@ impl ClaudeCodeProvider {
             return Err(ProviderError::InvalidResponse(error));
         }
 
-        claude_value_to_chat_message(&value)
+        claude_value_to_chat_message(&value, model_config)
     }
 
     fn should_retry(error: &ProviderError) -> bool {
@@ -244,7 +244,10 @@ fn claude_system_with_optional_cache_control(
     Value::Array(vec![Value::Object(block)])
 }
 
-fn claude_value_to_chat_message(value: &Value) -> Result<ChatMessage, ProviderError> {
+fn claude_value_to_chat_message(
+    value: &Value,
+    model_config: &ModelConfig,
+) -> Result<ChatMessage, ProviderError> {
     if let Some(error) = provider_error_message(value) {
         return Err(ProviderError::InvalidResponse(error));
     }
@@ -303,7 +306,7 @@ fn claude_value_to_chat_message(value: &Value) -> Result<ChatMessage, ProviderEr
         role: ChatRole::Assistant,
         user_name: None,
         message_time: None,
-        token_usage: token_usage_from_value(value),
+        token_usage: token_usage_from_value(value, model_config),
         data,
     })
 }

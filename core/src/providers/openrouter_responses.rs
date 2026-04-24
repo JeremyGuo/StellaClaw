@@ -161,7 +161,7 @@ impl OpenRouterResponsesProvider {
             return Err(ProviderError::InvalidResponse(error));
         }
 
-        responses_value_to_chat_message(&value, &self.output_persistor)
+        responses_value_to_chat_message(&value, model_config, &self.output_persistor)
     }
 
     fn should_retry(error: &ProviderError) -> bool {
@@ -294,6 +294,7 @@ fn reasoning_payload(model_config: &ModelConfig) -> Option<Value> {
 
 fn responses_value_to_chat_message(
     value: &Value,
+    model_config: &ModelConfig,
     output_persistor: &OutputPersistor,
 ) -> Result<ChatMessage, ProviderError> {
     if let Some(error) = provider_error_message(value) {
@@ -355,7 +356,7 @@ fn responses_value_to_chat_message(
         role: ChatRole::Assistant,
         user_name: None,
         message_time: None,
-        token_usage: token_usage_from_value(value),
+        token_usage: token_usage_from_value(value, model_config),
         data,
     })
 }
@@ -803,7 +804,8 @@ mod tests {
             }
         });
 
-        let response = responses_value_to_chat_message(&value, &OutputPersistor)
+        let model_config = test_model_config("https://openrouter.ai/api/v1/responses".to_string());
+        let response = responses_value_to_chat_message(&value, &model_config, &OutputPersistor)
             .expect("server tool image output should parse");
 
         assert!(matches!(

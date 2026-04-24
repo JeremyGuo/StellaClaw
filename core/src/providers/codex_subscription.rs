@@ -209,7 +209,11 @@ impl CodexSubscriptionProvider {
                 *cached = Some(socket);
             }
             let response = response?;
-            return responses_value_to_chat_message(&response, &self.output_persistor);
+            return responses_value_to_chat_message(
+                &response,
+                model_config,
+                &self.output_persistor,
+            );
         }
 
         if response.is_ok() {
@@ -217,7 +221,7 @@ impl CodexSubscriptionProvider {
             *cached = Some(socket);
         }
         let response = response?;
-        responses_value_to_chat_message(&response, &self.output_persistor)
+        responses_value_to_chat_message(&response, model_config, &self.output_persistor)
     }
 
     fn clear_socket(&self) {
@@ -1059,6 +1063,7 @@ fn build_responses_input(messages: &[ChatMessage]) -> Result<Vec<Value>, Provide
 
 fn responses_value_to_chat_message(
     value: &Value,
+    model_config: &ModelConfig,
     output_persistor: &OutputPersistor,
 ) -> Result<ChatMessage, ProviderError> {
     if let Some(error) = provider_error_message(value) {
@@ -1118,7 +1123,7 @@ fn responses_value_to_chat_message(
         role: ChatRole::Assistant,
         user_name: None,
         message_time: None,
-        token_usage: token_usage_from_value(value),
+        token_usage: token_usage_from_value(value, model_config),
         data,
     })
 }

@@ -7,6 +7,7 @@ mod openai_image_edit;
 mod openrouter_completion;
 mod openrouter_responses;
 mod output_persistor;
+mod pricing;
 
 use std::error::Error as StdError;
 
