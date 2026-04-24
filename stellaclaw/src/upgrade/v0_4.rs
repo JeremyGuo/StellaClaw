@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use super::{WorkdirUpgrader, LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_4};
+use super::{WorkdirUpgrader, WORKDIR_VERSION_0_4, WORKDIR_VERSION_0_5};
 use crate::config::StellaclawConfig;
 
 pub struct SkillUpstreamUpgrade;
@@ -13,7 +13,7 @@ impl WorkdirUpgrader for SkillUpstreamUpgrade {
     }
 
     fn to_version(&self) -> &'static str {
-        LATEST_WORKDIR_VERSION
+        WORKDIR_VERSION_0_5
     }
 
     fn upgrade(&self, workdir: &Path, _config: &StellaclawConfig) -> Result<()> {

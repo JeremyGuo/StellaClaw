@@ -223,6 +223,7 @@ mod tests {
             default_profile: None,
             models: BTreeMap::from([("opus-4.6".to_string(), model)]),
             session_defaults: SessionDefaults::default(),
+            skill_sync: Vec::new(),
             sandbox: SandboxConfig::default(),
             channels: vec![ChannelConfig::Telegram(TelegramChannelConfig {
                 id: "telegram-main".to_string(),

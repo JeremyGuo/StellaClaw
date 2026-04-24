@@ -665,6 +665,12 @@ fn token_usage_json(token_usage: &TokenUsage) -> Value {
         "cache_write": token_usage.cache_write,
         "uncache_input": token_usage.uncache_input,
         "output": token_usage.output,
+        "cost_usd": token_usage.cost_usd.as_ref().map(|cost| json!({
+            "cache_read": cost.cache_read,
+            "cache_write": cost.cache_write,
+            "uncache_input": cost.uncache_input,
+            "output": cost.output,
+        })),
     })
 }
 

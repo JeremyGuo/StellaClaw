@@ -366,6 +366,7 @@ fn convert_legacy_config(legacy: LegacyServerConfig, path: &Path) -> Result<Stel
         default_profile: None,
         models: named_models,
         session_defaults,
+        skill_sync: Vec::new(),
         sandbox: SandboxConfig {
             mode: match legacy.sandbox.mode {
                 LegacySandboxMode::Subprocess | LegacySandboxMode::Disabled => {

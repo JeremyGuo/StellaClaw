@@ -1,5 +1,5 @@
 {
-  "version": "0.4",
+  "version": "0.5",
   "agent_server": {
     "path": "target/debug/agent_server"
   },
@@ -69,6 +69,7 @@
     "compression_retain_recent_tokens": 36000,
     "search_tool_model": "search_brave"
   },
+  "skill_sync": [],
   "sandbox": {
     "mode": "subprocess",
     "bubblewrap_binary": "bwrap",

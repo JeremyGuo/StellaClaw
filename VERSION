@@ -1,5 +1,20 @@
-version: 1.4.7
+version: 1.5.0
 ---
+
+# 1.5.0
+
+- 更新 `/status` usage 统计：
+  状态页会汇总当前 conversation 下 foreground、background、subagent 以及 provider-backed media tool 的 token usage，并按 cache read、cache write、uncached input、output 分桶显示 token 和美元开销，金额保留三位小数。
+- 扩展 `TokenUsage`：
+  provider 若返回成本字段，会记录可选 `cost_usd`，包含 cache read、cache write、uncached input、output 四类开销；没有明确成本字段的 provider 继续只记录 token 数，金额显示为 `$0.000`。
+- 更新 `config` schema 到 `0.5`：
+  root 新增 `skill_sync`，格式为 `[{ "skill_name": ["A", "B"], "upstream": ["C", "D"] }]`。`skill_update` 会把匹配 skill commit 后 push 到所有 upstream；每个 push 约 4 秒超时，失败只写 warning 并返回在工具结果中，不阻断 skill 更新。
+- 移除模型可见的 `skill_set_upstream` 工具：
+  skill upstream 同步目标现在由部署 config 管理，不再由会话运行时工具写入。
+- 修复 Telegram 进度中的 `update_plan` 渲染：
+  `update_plan` 现在会更新当前 turn 的内存态计划并刷新 progress 消息；每个 user 大轮结束、失败或进入 idle 后自动清空，不写入持久化 state。
+- 更新 `workdir` schema 到 `0.6`：
+  session/media usage 日志支持可选 `token_usage.cost_usd`。旧日志无需重写，本次迁移为兼容性 no-op。
 
 # 1.4.7
 

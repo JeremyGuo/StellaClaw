@@ -7,15 +7,25 @@ pub enum ChatRole {
     Assistant,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TokenUsage {
     pub cache_read: u64,
     pub cache_write: u64,
     pub uncache_input: u64,
     pub output: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<TokenUsageCost>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct TokenUsageCost {
+    pub cache_read: f64,
+    pub cache_write: f64,
+    pub uncache_input: f64,
+    pub output: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: ChatRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -204,6 +214,12 @@ mod tests {
             cache_write: 2,
             uncache_input: 20,
             output: 30,
+            cost_usd: Some(TokenUsageCost {
+                cache_read: 0.001,
+                cache_write: 0.002,
+                uncache_input: 0.003,
+                output: 0.004,
+            }),
         });
 
         let json = serde_json::to_value(&message).expect("message should serialize");
@@ -212,6 +228,7 @@ mod tests {
         assert!(json.get("user_name").is_none());
         assert!(json.get("message_time").is_none());
         assert_eq!(json["token_usage"]["cache_read"], 10);
+        assert_eq!(json["token_usage"]["cost_usd"]["output"], 0.004);
         assert_eq!(json["data"][1]["type"], "tool_result");
         assert_eq!(
             json["data"][1]["payload"]["result"]["file"]["media_type"],

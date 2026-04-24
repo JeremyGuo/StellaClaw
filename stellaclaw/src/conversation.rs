@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
@@ -17,7 +17,8 @@ use stellaclaw_core::{
     session_actor::{
         ChatMessage, ChatMessageItem, ChatRole, ContextItem, ConversationBridgeRequest,
         ConversationBridgeResponse, FileItem, SessionEvent, SessionInitial, SessionRequest,
-        SessionType, ToolCallItem, ToolRemoteMode, ToolResultContent, ToolResultItem,
+        SessionType, TokenUsage, TokenUsageCost, ToolCallItem, ToolRemoteMode, ToolResultContent,
+        ToolResultItem,
     },
 };
 
@@ -29,7 +30,7 @@ use crate::{
     },
     config::{
         ModelSelection, SandboxConfig, SandboxMode, SessionDefaults, SessionProfile,
-        StellaclawConfig, ToolModelTarget,
+        SkillSyncConfig, StellaclawConfig, ToolModelTarget,
     },
     cron::{
         cron_schedule_from_required_tool_args, optional_cron_schedule_from_tool_args,
@@ -137,6 +138,50 @@ pub enum ManagedSessionStatus {
     Completed,
     Failed,
     Killed,
+}
+
+#[derive(Debug, Clone, Default)]
+struct UsageTotals {
+    cache_read: u64,
+    cache_write: u64,
+    uncache_input: u64,
+    output: u64,
+    cost: TokenUsageCost,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConversationUsageSummary {
+    foreground: UsageTotals,
+    background: UsageTotals,
+    subagents: UsageTotals,
+    media_tools: UsageTotals,
+}
+
+impl UsageTotals {
+    fn add_token_usage(&mut self, usage: &TokenUsage) {
+        self.cache_read = self.cache_read.saturating_add(usage.cache_read);
+        self.cache_write = self.cache_write.saturating_add(usage.cache_write);
+        self.uncache_input = self.uncache_input.saturating_add(usage.uncache_input);
+        self.output = self.output.saturating_add(usage.output);
+        if let Some(cost) = &usage.cost_usd {
+            self.add_cost(cost);
+        }
+    }
+
+    fn add_cost(&mut self, cost: &TokenUsageCost) {
+        self.cost.cache_read += cost.cache_read;
+        self.cost.cache_write += cost.cache_write;
+        self.cost.uncache_input += cost.uncache_input;
+        self.cost.output += cost.output;
+    }
+
+    fn add_totals(&mut self, other: &UsageTotals) {
+        self.cache_read = self.cache_read.saturating_add(other.cache_read);
+        self.cache_write = self.cache_write.saturating_add(other.cache_write);
+        self.uncache_input = self.uncache_input.saturating_add(other.uncache_input);
+        self.output = self.output.saturating_add(other.output);
+        self.add_cost(&other.cost);
+    }
 }
 
 fn default_index() -> u64 {
@@ -294,6 +339,7 @@ struct ConversationRuntime {
     background: BTreeMap<String, ManagedSessionRuntime>,
     subagents: BTreeMap<String, ManagedSessionRuntime>,
     foreground_progress: Option<ActiveForegroundProgress>,
+    session_plans: BTreeMap<String, TaskPlanView>,
 }
 
 struct ForegroundSessionRuntime {
@@ -311,6 +357,29 @@ struct ManagedSessionRuntime {
 struct ActiveForegroundProgress {
     turn_id: String,
     next_typing_at: Instant,
+    activity: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TaskPlanView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    explanation: Option<String>,
+    #[serde(default)]
+    plan: Vec<TaskPlanItemView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TaskPlanItemView {
+    step: String,
+    status: TaskPlanItemStatus,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum TaskPlanItemStatus {
+    Pending,
+    InProgress,
+    Completed,
 }
 
 impl ConversationRuntime {
@@ -405,6 +474,7 @@ impl ConversationRuntime {
             background,
             subagents,
             foreground_progress: None,
+            session_plans: BTreeMap::new(),
         })
     }
 
@@ -622,6 +692,7 @@ impl ConversationRuntime {
     ) -> Result<bool> {
         match event {
             SessionEvent::TurnStarted { turn_id } => {
+                self.clear_session_plan(agent_id.as_deref(), session_type);
                 self.logger.info(
                     "turn_started",
                     json!({
@@ -679,6 +750,7 @@ impl ConversationRuntime {
                 Ok(false)
             }
             SessionEvent::RuntimeCrashed { error } => {
+                self.clear_session_plan(agent_id.as_deref(), session_type);
                 self.host_logger.warn(
                     "session_runtime_crashed",
                     json!({
@@ -702,6 +774,7 @@ impl ConversationRuntime {
         session_type: SessionType,
         message: ChatMessage,
     ) -> Result<bool> {
+        self.clear_session_plan(agent_id.as_deref(), session_type);
         match session_type {
             SessionType::Foreground => {
                 self.finish_foreground_progress(ProgressFeedbackFinalState::Done, None)?;
@@ -771,6 +844,7 @@ impl ConversationRuntime {
         error: String,
         can_continue: bool,
     ) -> Result<bool> {
+        self.clear_session_plan(agent_id.as_deref(), session_type);
         match session_type {
             SessionType::Foreground => {
                 self.finish_foreground_progress(ProgressFeedbackFinalState::Failed, Some(&error))?;
@@ -862,7 +936,14 @@ impl ConversationRuntime {
                 self.send_delivery_from_text(text.to_string())?;
                 Ok(bridge_result(request, json!({"sent": true}).to_string()))
             }
-            "update_plan" => Ok(bridge_result(request, json!({"updated": true}).to_string())),
+            "update_plan" => {
+                let plan = parse_task_plan_view(&request.payload)?;
+                self.update_session_plan(agent_id.as_deref(), session_type, plan.clone())?;
+                Ok(bridge_result(
+                    request,
+                    json!({"updated": true, "plan": plan}).to_string(),
+                ))
+            }
             "start_background_agent" => {
                 let task = request
                     .payload
@@ -941,7 +1022,6 @@ impl ConversationRuntime {
             }
             "skill_create" => self.persist_skill(request, SkillPersistMode::Create),
             "skill_update" => self.persist_skill(request, SkillPersistMode::Update),
-            "skill_set_upstream" => self.set_skill_upstream(request),
             "skill_delete" => self.persist_skill(request, SkillPersistMode::Delete),
             "list_cron_tasks" => {
                 let tasks = self
@@ -1027,6 +1107,45 @@ impl ConversationRuntime {
         }
     }
 
+    fn update_session_plan(
+        &mut self,
+        agent_id: Option<&str>,
+        session_type: SessionType,
+        plan: TaskPlanView,
+    ) -> Result<()> {
+        let key = self.session_plan_key(agent_id, session_type);
+        self.session_plans.insert(key, plan);
+        if session_type == SessionType::Foreground {
+            self.update_foreground_progress_from_state(true)?;
+        }
+        Ok(())
+    }
+
+    fn clear_session_plan(&mut self, agent_id: Option<&str>, session_type: SessionType) {
+        let key = self.session_plan_key(agent_id, session_type);
+        self.session_plans.remove(&key);
+    }
+
+    fn current_session_plan(
+        &self,
+        agent_id: Option<&str>,
+        session_type: SessionType,
+    ) -> Option<&TaskPlanView> {
+        let key = self.session_plan_key(agent_id, session_type);
+        self.session_plans.get(&key)
+    }
+
+    fn session_plan_key(&self, agent_id: Option<&str>, session_type: SessionType) -> String {
+        match session_type {
+            SessionType::Foreground => format!(
+                "foreground:{}",
+                self.state.session_binding.foreground_session_id
+            ),
+            SessionType::Background => format!("background:{}", agent_id.unwrap_or("unknown")),
+            SessionType::Subagent => format!("subagent:{}", agent_id.unwrap_or("unknown")),
+        }
+    }
+
     fn persist_skill(
         &self,
         request: &ConversationBridgeRequest,
@@ -1072,11 +1191,12 @@ impl ConversationRuntime {
                 }
                 validate_skill_directory(&staged_skill_path, skill_name)?;
                 copy_skill_atomically(&staged_skill_path, &runtime_skill_path)?;
-                let upstream_push = push_skill_upstream_if_configured(
-                    &self.workdir,
+                let upstream_push = push_skill_sync_if_configured(
+                    &self.config.skill_sync,
                     skill_name,
                     &runtime_skill_path,
-                )?;
+                    &self.logger,
+                );
                 let synced = sync_skill_to_conversation_workspaces(
                     &self.workdir,
                     skill_name,
@@ -1102,7 +1222,6 @@ impl ConversationRuntime {
                 fs::remove_dir_all(&runtime_skill_path).with_context(|| {
                     format!("failed to remove {}", runtime_skill_path.display())
                 })?;
-                remove_skill_upstream_config(&self.workdir, skill_name)?;
                 let synced =
                     sync_skill_to_conversation_workspaces(&self.workdir, skill_name, None)?;
                 Ok(bridge_result(
@@ -1112,57 +1231,6 @@ impl ConversationRuntime {
                 ))
             }
         }
-    }
-
-    fn set_skill_upstream(&self, request: &ConversationBridgeRequest) -> Result<ToolResultItem> {
-        let skill_name = request
-            .payload
-            .get("skill_name")
-            .or_else(|| request.payload.get("name"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("{} requires skill_name", request.action))?;
-        validate_skill_name(skill_name)?;
-        let repo_url = string_arg_required(
-            request
-                .payload
-                .as_object()
-                .ok_or_else(|| anyhow!("{} payload must be an object", request.action))?,
-            "repo_url",
-        )?;
-        validate_skill_repo_url(&repo_url)?;
-        let branch = optional_string_arg(
-            request
-                .payload
-                .as_object()
-                .ok_or_else(|| anyhow!("{} payload must be an object", request.action))?,
-            "branch",
-        )?
-        .map(|branch| branch.trim().to_string())
-        .filter(|branch| !branch.is_empty());
-        if let Some(branch) = branch.as_deref() {
-            validate_git_branch_name(branch)?;
-        }
-
-        let runtime_skill_path = self.workdir.join("rundir").join(".skill").join(skill_name);
-        if !runtime_skill_path.exists() {
-            return Err(anyhow!(
-                "skill {skill_name} does not exist in runtime store"
-            ));
-        }
-        let config = SkillUpstreamConfig { repo_url, branch };
-        write_skill_upstream_config(&self.workdir, skill_name, &config)?;
-
-        Ok(bridge_result(
-            request,
-            json!({
-                "configured": true,
-                "skill_name": skill_name,
-                "repo_url": config.repo_url,
-                "branch": config.branch,
-                "push_on_update": true,
-            })
-            .to_string(),
-        ))
     }
 
     fn resolve_model_override(&self, payload: &Value) -> Result<Option<String>> {
@@ -1432,26 +1500,36 @@ impl ConversationRuntime {
         self.foreground_progress = Some(ActiveForegroundProgress {
             turn_id: progress_turn_id.clone(),
             next_typing_at: now + TYPING_KEEPALIVE_INTERVAL,
+            activity: None,
         });
         self.send_processing_state(ProcessingState::Typing)?;
         self.send_progress_feedback(
             progress_turn_id,
-            progress_text_thinking(&model_name),
+            progress_text_thinking(&model_name, None),
             None,
             true,
         )
     }
 
-    fn update_foreground_progress(&self, message: &str) -> Result<()> {
+    fn update_foreground_progress(&mut self, message: &str) -> Result<()> {
+        let Some(progress) = &mut self.foreground_progress else {
+            return Ok(());
+        };
+        progress.activity = Some(message.trim().to_string()).filter(|value| !value.is_empty());
+        self.update_foreground_progress_from_state(false)
+    }
+
+    fn update_foreground_progress_from_state(&self, important: bool) -> Result<()> {
         let Some(progress) = &self.foreground_progress else {
             return Ok(());
         };
         let model_name = self.current_main_model_name();
+        let plan = self.current_session_plan(None, SessionType::Foreground);
         self.send_progress_feedback(
             progress.turn_id.clone(),
-            progress_text_update(&model_name, message),
+            progress_text_update(&model_name, progress.activity.as_deref(), plan),
             None,
-            false,
+            important,
         )
     }
 
@@ -1621,8 +1699,9 @@ impl ConversationRuntime {
             .values()
             .filter(|record| record.status == ManagedSessionStatus::Running)
             .count();
+        let usage = self.conversation_usage_summary();
         self.send_delivery_from_text(format!(
-            "当前状态\nconversation: `{}`\nmodel: `{}`\nreasoning: `{}`\nsandbox: `{}` ({sandbox_source})\nremote: {remote}\nworkspace: `{}`\nbackground: {running_background} running / {} total\nsubagents: {running_subagents} running / {} total",
+            "当前状态\nconversation: `{}`\nmodel: `{}`\nreasoning: `{}`\nsandbox: `{}` ({sandbox_source})\nremote: {remote}\nworkspace: `{}`\nbackground: {running_background} running / {} total\nsubagents: {running_subagents} running / {} total\n\n{}",
             self.state.conversation_id,
             self.current_main_model_name(),
             self.state.reasoning_effort.as_deref().unwrap_or("model default"),
@@ -1630,7 +1709,32 @@ impl ConversationRuntime {
             self.workspace_root.display(),
             self.state.session_binding.background_sessions.len(),
             self.state.session_binding.subagent_sessions.len(),
+            render_usage_summary(&usage),
         ))
+    }
+
+    fn conversation_usage_summary(&self) -> ConversationUsageSummary {
+        let mut summary = ConversationUsageSummary::default();
+        summary.foreground.add_totals(&session_usage_totals(
+            &self.workspace_root,
+            &self.state.session_binding.foreground_session_id,
+        ));
+        for record in self.state.session_binding.background_sessions.values() {
+            summary.background.add_totals(&session_usage_totals(
+                &self.workspace_root,
+                &record.session_id,
+            ));
+        }
+        for record in self.state.session_binding.subagent_sessions.values() {
+            summary.subagents.add_totals(&session_usage_totals(
+                &self.workspace_root,
+                &record.session_id,
+            ));
+        }
+        summary
+            .media_tools
+            .add_totals(&media_tool_usage_totals(&self.workspace_root));
+        summary
     }
 
     fn send_remote_status(&self) -> Result<()> {
@@ -1882,22 +1986,93 @@ impl ConversationRuntime {
     }
 }
 
-fn progress_text_thinking(model_key: &str) -> String {
-    format!(
+fn progress_text_thinking(model_key: &str, plan: Option<&TaskPlanView>) -> String {
+    let mut text = format!(
         "⚙️ 正在执行\n🤖 模型：{}\n🧠 状态：思考中...\n\n💡 发送新消息可打断；/continue 可继续最近中断的回合。",
         model_key
-    )
+    );
+    append_task_plan(&mut text, plan);
+    text
 }
 
-fn progress_text_update(model_key: &str, activity: &str) -> String {
-    let activity = activity.trim();
-    if activity.is_empty() {
-        return progress_text_thinking(model_key);
-    }
-    format!(
+fn progress_text_update(
+    model_key: &str,
+    activity: Option<&str>,
+    plan: Option<&TaskPlanView>,
+) -> String {
+    let Some(activity) = activity.map(str::trim).filter(|value| !value.is_empty()) else {
+        return progress_text_thinking(model_key, plan);
+    };
+    let mut text = format!(
         "⚙️ 正在执行\n🤖 模型：{}\n📌 阶段：{}\n\n💡 发送新消息可打断；/continue 可继续最近中断的回合。",
         model_key, activity
-    )
+    );
+    append_task_plan(&mut text, plan);
+    text
+}
+
+fn append_task_plan(text: &mut String, plan: Option<&TaskPlanView>) {
+    let Some(plan) = plan else {
+        return;
+    };
+    if plan.explanation.is_none() && plan.plan.is_empty() {
+        return;
+    }
+    text.push_str("\n\n计划");
+    if let Some(explanation) = plan
+        .explanation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        text.push_str("\n");
+        text.push_str(explanation);
+    }
+    for item in &plan.plan {
+        let step = item.step.trim();
+        if step.is_empty() {
+            continue;
+        }
+        text.push_str("\n");
+        text.push_str(task_plan_status_marker(item.status));
+        text.push(' ');
+        text.push_str(step);
+    }
+}
+
+fn task_plan_status_marker(status: TaskPlanItemStatus) -> &'static str {
+    match status {
+        TaskPlanItemStatus::Pending => "☐",
+        TaskPlanItemStatus::InProgress => "◐",
+        TaskPlanItemStatus::Completed => "☑",
+    }
+}
+
+fn parse_task_plan_view(payload: &Value) -> Result<TaskPlanView> {
+    let mut plan: TaskPlanView =
+        serde_json::from_value(payload.clone()).context("failed to parse update_plan payload")?;
+    plan.explanation = plan
+        .explanation
+        .take()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    for item in &mut plan.plan {
+        item.step = item.step.trim().to_string();
+        if item.step.is_empty() {
+            return Err(anyhow!("update_plan step must not be empty"));
+        }
+    }
+    let in_progress_count = plan
+        .plan
+        .iter()
+        .filter(|item| matches!(item.status, TaskPlanItemStatus::InProgress))
+        .count();
+    if in_progress_count > 1 {
+        return Err(anyhow!(
+            "update_plan may include at most one in_progress step"
+        ));
+    }
+    Ok(plan)
 }
 
 fn progress_text_done(model_key: &str) -> String {
@@ -2113,88 +2288,99 @@ enum SkillPersistMode {
     Delete,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SkillUpstreamConfig {
-    repo_url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    branch: Option<String>,
+#[derive(Debug, Clone, Serialize)]
+struct SkillSyncPushResult {
+    configured: bool,
+    committed: bool,
+    pushes: Vec<SkillSyncPushTargetResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct SkillUpstreamPushResult {
-    configured: bool,
+struct SkillSyncPushTargetResult {
+    upstream: String,
+    branch: String,
     pushed: bool,
-    repo_url: Option<String>,
-    branch: Option<String>,
-    committed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    warning: Option<String>,
 }
 
-fn skill_upstream_config_path(workdir: &Path, skill_name: &str) -> PathBuf {
-    workdir
-        .join("rundir")
-        .join(".skill_upstreams")
-        .join(format!("{skill_name}.json"))
-}
-
-fn read_skill_upstream_config(
-    workdir: &Path,
-    skill_name: &str,
-) -> Result<Option<SkillUpstreamConfig>> {
-    let path = skill_upstream_config_path(workdir, skill_name);
-    if !path.exists() {
-        return Ok(None);
-    }
-    let raw =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    let config = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse {}", path.display()))?;
-    Ok(Some(config))
-}
-
-fn write_skill_upstream_config(
-    workdir: &Path,
-    skill_name: &str,
-    config: &SkillUpstreamConfig,
-) -> Result<()> {
-    let path = skill_upstream_config_path(workdir, skill_name);
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent", path.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    fs::write(
-        &path,
-        serde_json::to_string_pretty(config)
-            .context("failed to serialize skill upstream config")?,
-    )
-    .with_context(|| format!("failed to write {}", path.display()))
-}
-
-fn remove_skill_upstream_config(workdir: &Path, skill_name: &str) -> Result<()> {
-    let path = skill_upstream_config_path(workdir, skill_name);
-    if path.exists() {
-        fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn push_skill_upstream_if_configured(
-    workdir: &Path,
+fn push_skill_sync_if_configured(
+    skill_sync: &[SkillSyncConfig],
     skill_name: &str,
     skill_path: &Path,
-) -> Result<SkillUpstreamPushResult> {
-    let Some(config) = read_skill_upstream_config(workdir, skill_name)? else {
-        return Ok(SkillUpstreamPushResult {
+    logger: &StellaclawLogger,
+) -> SkillSyncPushResult {
+    let upstreams = configured_skill_sync_upstreams(skill_sync, skill_name);
+    if upstreams.is_empty() {
+        return SkillSyncPushResult {
             configured: false,
-            pushed: false,
-            repo_url: None,
-            branch: None,
             committed: false,
-        });
-    };
+            pushes: Vec::new(),
+        };
+    }
 
-    let branch = config.branch.clone().unwrap_or_else(|| "main".to_string());
-    validate_git_branch_name(&branch)?;
-    ensure_skill_git_repo(skill_path, &config.repo_url, &branch)?;
+    let branch = "main";
+    let prepare_result = prepare_skill_git_sync(skill_path, skill_name, branch);
+    let committed = prepare_result.as_ref().copied().unwrap_or(false);
+    let prepare_warning = prepare_result.err().map(|error| error.to_string());
+    let mut pushes = Vec::new();
+
+    for upstream in upstreams {
+        let warning = match prepare_warning.as_ref() {
+            Some(warning) => Some(warning.clone()),
+            None => {
+                run_git_push_with_timeout(skill_path, &upstream, branch, Duration::from_secs(4))
+                    .err()
+                    .map(|error| error.to_string())
+            }
+        };
+        let pushed = warning.is_none();
+        if let Some(warning) = warning.as_deref() {
+            logger.warn(
+                "skill_sync_push_failed",
+                json!({
+                    "skill_name": skill_name,
+                    "upstream": upstream,
+                    "branch": branch,
+                    "warning": warning,
+                }),
+            );
+        }
+        pushes.push(SkillSyncPushTargetResult {
+            upstream,
+            branch: branch.to_string(),
+            pushed,
+            warning,
+        });
+    }
+
+    SkillSyncPushResult {
+        configured: true,
+        committed,
+        pushes,
+    }
+}
+
+fn configured_skill_sync_upstreams(
+    skill_sync: &[SkillSyncConfig],
+    skill_name: &str,
+) -> Vec<String> {
+    let mut upstreams = Vec::new();
+    for entry in skill_sync {
+        if entry.skill_name.iter().any(|name| name == skill_name) {
+            for upstream in &entry.upstream {
+                if !upstreams.contains(upstream) {
+                    upstreams.push(upstream.clone());
+                }
+            }
+        }
+    }
+    upstreams
+}
+
+fn prepare_skill_git_sync(skill_path: &Path, skill_name: &str, branch: &str) -> Result<bool> {
+    validate_git_branch_name(branch)?;
+    ensure_skill_git_repo(skill_path, branch)?;
     run_git(skill_path, ["add", "-A"])?;
 
     let has_staged_changes = git_has_staged_changes(skill_path)?;
@@ -2204,28 +2390,15 @@ fn push_skill_upstream_if_configured(
             ["commit", "-m", &format!("Update skill {skill_name}")],
         )?;
     }
-    run_git(skill_path, ["push", "-u", "origin", &branch])?;
-
-    Ok(SkillUpstreamPushResult {
-        configured: true,
-        pushed: true,
-        repo_url: Some(config.repo_url),
-        branch: Some(branch),
-        committed: has_staged_changes,
-    })
+    Ok(has_staged_changes)
 }
 
-fn ensure_skill_git_repo(skill_path: &Path, repo_url: &str, branch: &str) -> Result<()> {
+fn ensure_skill_git_repo(skill_path: &Path, branch: &str) -> Result<()> {
     if !skill_path.join(".git").exists() {
         run_git(skill_path, ["init"])?;
     }
     ensure_git_identity(skill_path)?;
     run_git(skill_path, ["checkout", "-B", branch])?;
-    if git_remote_exists(skill_path, "origin")? {
-        run_git(skill_path, ["remote", "set-url", "origin", repo_url])?;
-    } else {
-        run_git(skill_path, ["remote", "add", "origin", repo_url])?;
-    }
     Ok(())
 }
 
@@ -2246,15 +2419,6 @@ fn git_config_has_value(skill_path: &Path, key: &str) -> Result<bool> {
         .output()
         .with_context(|| format!("failed to run git config --get {key}"))?;
     Ok(output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty())
-}
-
-fn git_remote_exists(skill_path: &Path, name: &str) -> Result<bool> {
-    let output = Command::new("git")
-        .args(["remote", "get-url", name])
-        .current_dir(skill_path)
-        .output()
-        .with_context(|| format!("failed to run git remote get-url {name}"))?;
-    Ok(output.status.success())
 }
 
 fn git_has_staged_changes(skill_path: &Path) -> Result<bool> {
@@ -2290,20 +2454,48 @@ fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<()> {
     ))
 }
 
-fn validate_skill_repo_url(repo_url: &str) -> Result<()> {
-    let trimmed = repo_url.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("repo_url must not be empty"));
+fn run_git_push_with_timeout(
+    cwd: &Path,
+    upstream: &str,
+    branch: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let refspec = format!("HEAD:{branch}");
+    let args = ["push", upstream, refspec.as_str()];
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to run git push in {}", cwd.display()))?;
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .with_context(|| format!("failed to wait for git push in {}", cwd.display()))?
+            .is_some()
+        {
+            let output = child
+                .wait_with_output()
+                .with_context(|| format!("failed to read git push output in {}", cwd.display()))?;
+            if output.status.success() {
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "git push failed in {}: {}\n{}",
+                cwd.display(),
+                String::from_utf8_lossy(&output.stdout).trim(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("git push timed out after {}s", timeout.as_secs()));
+        }
+        thread::sleep(Duration::from_millis(50));
     }
-    if trimmed != repo_url {
-        return Err(anyhow!(
-            "repo_url must not contain leading or trailing whitespace"
-        ));
-    }
-    if trimmed.chars().any(char::is_whitespace) {
-        return Err(anyhow!("repo_url must not contain whitespace"));
-    }
-    Ok(())
 }
 
 fn validate_git_branch_name(branch: &str) -> Result<()> {
@@ -2675,6 +2867,100 @@ fn render_file_item(file: &FileItem) -> String {
     }
 }
 
+fn session_usage_totals(workspace_root: &Path, session_id: &str) -> UsageTotals {
+    let path = workspace_root
+        .join(".log")
+        .join("stellaclaw")
+        .join(sanitize_session_id_for_log_path(session_id))
+        .join("all_messages.jsonl");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return UsageTotals::default();
+    };
+
+    let mut totals = UsageTotals::default();
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(message) = serde_json::from_str::<ChatMessage>(line) else {
+            continue;
+        };
+        if let Some(usage) = &message.token_usage {
+            totals.add_token_usage(usage);
+        }
+    }
+    totals
+}
+
+fn media_tool_usage_totals(workspace_root: &Path) -> UsageTotals {
+    let path = workspace_root
+        .join(".log")
+        .join("stellaclaw")
+        .join("tool_usage.jsonl");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return UsageTotals::default();
+    };
+
+    let mut totals = UsageTotals::default();
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(token_usage) = value.get("token_usage") else {
+            continue;
+        };
+        let Ok(usage) = serde_json::from_value::<TokenUsage>(token_usage.clone()) else {
+            continue;
+        };
+        totals.add_token_usage(&usage);
+    }
+    totals
+}
+
+fn render_usage_summary(summary: &ConversationUsageSummary) -> String {
+    let mut total = UsageTotals::default();
+    total.add_totals(&summary.foreground);
+    total.add_totals(&summary.background);
+    total.add_totals(&summary.subagents);
+    total.add_totals(&summary.media_tools);
+
+    format!(
+        "token usage\n{}\n{}\n{}\n{}\n{}",
+        render_usage_line("total", &total),
+        render_usage_line("foreground", &summary.foreground),
+        render_usage_line("background", &summary.background),
+        render_usage_line("subagents", &summary.subagents),
+        render_usage_line("media tools", &summary.media_tools),
+    )
+}
+
+fn render_usage_line(label: &str, totals: &UsageTotals) -> String {
+    format!(
+        "- {label}: read {} (${:.3}), write {} (${:.3}), input {} (${:.3}), output {} (${:.3}), total ${:.3}",
+        totals.cache_read,
+        totals.cost.cache_read,
+        totals.cache_write,
+        totals.cost.cache_write,
+        totals.uncache_input,
+        totals.cost.uncache_input,
+        totals.output,
+        totals.cost.output,
+        totals.cost.cache_read + totals.cost.cache_write + totals.cost.uncache_input + totals.cost.output,
+    )
+}
+
+fn sanitize_session_id_for_log_path(session_id: &str) -> String {
+    let safe = session_id
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | '.' => ch,
+            _ => '_',
+        })
+        .collect::<String>();
+    if safe.trim_matches('_').is_empty() || safe == "." || safe == ".." {
+        "session".to_string()
+    } else {
+        safe
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2724,22 +3010,25 @@ mod tests {
     }
 
     #[test]
-    fn configured_skill_upstream_pushes_runtime_skill_to_git_repo() {
+    fn configured_skill_sync_pushes_runtime_skill_to_git_repos() {
         let root =
-            std::env::temp_dir().join(format!("stellaclaw-skill-upstream-{}", std::process::id()));
+            std::env::temp_dir().join(format!("stellaclaw-skill-sync-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("temp root should exist");
-        let bare_repo = root.join("upstream.git");
-        let init = Command::new("git")
-            .args(["init", "--bare"])
-            .arg(&bare_repo)
-            .output()
-            .expect("git init --bare should run");
-        assert!(
-            init.status.success(),
-            "{}",
-            String::from_utf8_lossy(&init.stderr)
-        );
+        let bare_repo_a = root.join("upstream-a.git");
+        let bare_repo_b = root.join("upstream-b.git");
+        for bare_repo in [&bare_repo_a, &bare_repo_b] {
+            let init = Command::new("git")
+                .args(["init", "--bare"])
+                .arg(bare_repo)
+                .output()
+                .expect("git init --bare should run");
+            assert!(
+                init.status.success(),
+                "{}",
+                String::from_utf8_lossy(&init.stderr)
+            );
+        }
 
         let skill_path = root.join("rundir").join(".skill").join("demo");
         fs::create_dir_all(&skill_path).expect("skill path should exist");
@@ -2748,33 +3037,34 @@ mod tests {
             "---\nname: demo\ndescription: Demo skill\n---\nbody\n",
         )
         .expect("skill should be written");
-        write_skill_upstream_config(
-            &root,
-            "demo",
-            &SkillUpstreamConfig {
-                repo_url: bare_repo.to_string_lossy().to_string(),
-                branch: Some("main".to_string()),
-            },
-        )
-        .expect("upstream config should write");
+        let logger = StellaclawLogger::open_under(&root, "test.log").expect("logger should open");
+        let sync = vec![SkillSyncConfig {
+            skill_name: vec!["demo".to_string()],
+            upstream: vec![
+                bare_repo_a.to_string_lossy().to_string(),
+                bare_repo_b.to_string_lossy().to_string(),
+            ],
+        }];
 
-        let result = push_skill_upstream_if_configured(&root, "demo", &skill_path)
-            .expect("skill should push");
+        let result = push_skill_sync_if_configured(&sync, "demo", &skill_path, &logger);
 
         assert!(result.configured);
-        assert!(result.pushed);
         assert!(result.committed);
-        let verify = Command::new("git")
-            .args(["--git-dir"])
-            .arg(&bare_repo)
-            .args(["rev-parse", "--verify", "main"])
-            .output()
-            .expect("git rev-parse should run");
-        assert!(
-            verify.status.success(),
-            "{}",
-            String::from_utf8_lossy(&verify.stderr)
-        );
+        assert_eq!(result.pushes.len(), 2);
+        assert!(result.pushes.iter().all(|push| push.pushed));
+        for bare_repo in [&bare_repo_a, &bare_repo_b] {
+            let verify = Command::new("git")
+                .args(["--git-dir"])
+                .arg(bare_repo)
+                .args(["rev-parse", "--verify", "main"])
+                .output()
+                .expect("git rev-parse should run");
+            assert!(
+                verify.status.success(),
+                "{}",
+                String::from_utf8_lossy(&verify.stderr)
+            );
+        }
         fs::remove_dir_all(&root).expect("temp root should be removed");
     }
 }

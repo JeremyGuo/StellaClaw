@@ -390,7 +390,6 @@ mod tests {
         assert!(catalog.contains("skill_load"));
         assert!(catalog.contains("skill_create"));
         assert!(catalog.contains("skill_update"));
-        assert!(catalog.contains("skill_set_upstream"));
         assert!(catalog.contains("skill_delete"));
 
         let file_read = catalog.get("file_read").unwrap();

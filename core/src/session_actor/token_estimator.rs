@@ -859,6 +859,7 @@ mod tests {
             cache_write: 0,
             uncache_input: 0,
             output: 2,
+            cost_usd: None,
         })];
 
         let estimate = estimator.estimate(&messages).expect("estimate should work");

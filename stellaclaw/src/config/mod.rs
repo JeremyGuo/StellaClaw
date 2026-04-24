@@ -11,7 +11,8 @@ pub mod loaders;
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
 pub const CONFIG_VERSION_0_2: &str = "0.2";
 pub const CONFIG_VERSION_0_3: &str = "0.3";
-pub const LATEST_CONFIG_VERSION: &str = "0.4";
+pub const CONFIG_VERSION_0_4: &str = "0.4";
+pub const LATEST_CONFIG_VERSION: &str = "0.5";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StellaclawConfig {
@@ -26,6 +27,8 @@ pub struct StellaclawConfig {
     #[serde(default)]
     pub session_defaults: SessionDefaults,
     #[serde(default)]
+    pub skill_sync: Vec<SkillSyncConfig>,
+    #[serde(default)]
     pub sandbox: SandboxConfig,
     pub channels: Vec<ChannelConfig>,
 }
@@ -34,6 +37,14 @@ pub struct StellaclawConfig {
 pub struct AgentServerConfig {
     #[serde(default)]
     pub path: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SkillSyncConfig {
+    #[serde(default)]
+    pub skill_name: Vec<String>,
+    #[serde(default)]
+    pub upstream: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +224,7 @@ impl StellaclawConfig {
             return Err("config must include at least one chat-capable model".to_string());
         }
         self.sandbox.validate()?;
+        validate_skill_sync(&self.skill_sync)?;
         Ok(())
     }
 
@@ -303,6 +315,57 @@ impl StellaclawConfig {
                 }),
         }
     }
+}
+
+fn validate_skill_sync(entries: &[SkillSyncConfig]) -> Result<(), String> {
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.skill_name.is_empty() {
+            return Err(format!("skill_sync[{index}].skill_name must not be empty"));
+        }
+        if entry.upstream.is_empty() {
+            return Err(format!("skill_sync[{index}].upstream must not be empty"));
+        }
+        for skill_name in &entry.skill_name {
+            validate_skill_sync_name(skill_name)
+                .map_err(|error| format!("skill_sync[{index}].skill_name: {error}"))?;
+        }
+        for upstream in &entry.upstream {
+            validate_skill_sync_upstream(upstream)
+                .map_err(|error| format!("skill_sync[{index}].upstream: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_skill_sync_name(skill_name: &str) -> Result<(), &'static str> {
+    let name = skill_name.trim();
+    if name.is_empty() {
+        return Err("skill name must not be empty");
+    }
+    if name != skill_name {
+        return Err("skill name must not contain leading or trailing whitespace");
+    }
+    if !name
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        return Err("skill name may only contain ASCII letters, digits, '_' and '-'");
+    }
+    Ok(())
+}
+
+fn validate_skill_sync_upstream(upstream: &str) -> Result<(), &'static str> {
+    let trimmed = upstream.trim();
+    if trimmed.is_empty() {
+        return Err("upstream must not be empty");
+    }
+    if trimmed != upstream {
+        return Err("upstream must not contain leading or trailing whitespace");
+    }
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err("upstream must not contain whitespace");
+    }
+    Ok(())
 }
 
 impl SandboxConfig {

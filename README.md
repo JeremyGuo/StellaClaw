@@ -149,7 +149,7 @@ Stellaclaw exposes tools through a dynamic catalog that is rebuilt from runtime 
 | Downloads | `file_download_start`, `file_download_progress`, `file_download_wait`, `file_download_cancel` |
 | Media | `image_load`, `pdf_load`, `audio_load`, provider-backed analysis/generation tools |
 | Host coordination | subagents, background sessions, cron, status and conversation bridge tools |
-| Skills | `skill_load`, `skill_create`, `skill_update`, `skill_set_upstream`, `skill_delete` |
+| Skills | `skill_load`, `skill_create`, `skill_update`, `skill_delete` |
 
 Remote mode is schema-aware:
 
@@ -178,8 +178,7 @@ The runtime tracks skill metadata and loaded skill content. When a skill changes
 Persistent skill operations are host bridge tools:
 
 - `skill_create` persists a staged workspace skill into `rundir/.skill/<name>`.
-- `skill_update` validates and updates an existing runtime skill.
-- `skill_set_upstream` configures a git repo for a shared runtime skill. Future `skill_update` calls commit and push that runtime skill to the configured repo and branch.
+- `skill_update` validates and updates an existing runtime skill. If root config `skill_sync` includes the skill, Stellaclaw commits the runtime skill and pushes it to each configured upstream. Each push has a short timeout; failures are reported as warnings and do not fail the skill update.
 - `skill_delete` removes it from the runtime store and existing conversation workspaces.
 
 `SKILL.md` frontmatter should include at least:
@@ -243,9 +242,10 @@ Start from [example_config.json](example_config.json).
 
 Important fields:
 
-- `version`: current config schema version, currently `0.4`.
+- `version`: current config schema version, currently `0.5`.
 - `agent_server.path`: path to the `agent_server` binary.
 - `models`: named model configs.
+- `skill_sync`: optional runtime skill git sync targets.
 - `channels`: Telegram and future channel definitions.
 - `sandbox`: default sandbox mode.
 
@@ -297,8 +297,8 @@ Stellaclaw deliberately has separate version tracks:
 | File / Field | Meaning |
 |---|---|
 | Root `VERSION` | Project release version and changelog. Starts at `1.0.0`. |
-| Config JSON `version` | Config schema version. Currently `0.4`. |
-| Workdir `STELLA_VERSION` | Workdir schema version. Currently `0.5`. |
+| Config JSON `version` | Config schema version. Currently `0.5`. |
+| Workdir `STELLA_VERSION` | Workdir schema version. Currently `0.6`. |
 | Legacy workdir `VERSION` | PartyClaw compatibility input, not the project release version. |
 
 Before bumping the root `VERSION`, check whether the previous GitHub Release exists. If it does not, merge the unpublished changelog into the next release notes so release history does not skip user-visible changes.
