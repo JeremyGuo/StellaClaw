@@ -1,5 +1,12 @@
-version: 1.5.3
+version: 1.5.4
 ---
+
+# 1.5.4
+
+- 修复 OpenRouter prompt cache write usage 解析：
+  OpenRouter chat-completions 的 Anthropic prompt caching 会在 `usage.prompt_tokens_details.cache_write_tokens` 返回写缓存 token；`TokenUsage` 现在会把它计入 `cache_write`，并使用本地 pricing 计算对应美元开销。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.5`；当前 Stellaclaw workdir schema 仍为 `0.6`。
 
 # 1.5.3
 

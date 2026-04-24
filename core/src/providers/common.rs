@@ -64,6 +64,8 @@ pub(crate) fn token_usage_from_value(
     let cache_write = first_u64(
         usage,
         &[
+            &["prompt_tokens_details", "cache_write_tokens"],
+            &["input_tokens_details", "cache_write_tokens"],
             &["input_tokens_details", "cache_creation_tokens"],
             &["cache_creation_input_tokens"],
             &["cache_creation", "ephemeral_5m_input_tokens"],
@@ -245,5 +247,34 @@ mod tests {
             600,
         );
         assert!(openrouter_cache_control_payload(&unsupported_ttl).is_none());
+    }
+
+    #[test]
+    fn parses_openrouter_cache_write_tokens() {
+        let model_config = test_model_config(
+            ProviderType::OpenRouterCompletion,
+            "anthropic/claude-opus-4.6",
+            300,
+        );
+        let usage = token_usage_from_value(
+            &serde_json::json!({
+                "usage": {
+                    "prompt_tokens": 15326,
+                    "completion_tokens": 4,
+                    "prompt_tokens_details": {
+                        "cached_tokens": 0,
+                        "cache_write_tokens": 15323
+                    }
+                }
+            }),
+            &model_config,
+        )
+        .expect("usage should parse");
+
+        assert_eq!(usage.cache_read, 0);
+        assert_eq!(usage.cache_write, 15323);
+        assert_eq!(usage.uncache_input, 3);
+        assert_eq!(usage.output, 4);
+        assert!(usage.cost_usd.is_some());
     }
 }
