@@ -5,11 +5,14 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 
-use crate::config::{StellaclawConfig, LATEST_CONFIG_VERSION, LEGACY_CONFIG_VERSION};
+use crate::config::{
+    StellaclawConfig, CONFIG_VERSION_0_2, LATEST_CONFIG_VERSION, LEGACY_CONFIG_VERSION,
+};
 
 mod partyclaw;
 mod v0_1;
 mod v0_2;
+mod v0_3;
 
 const PARTYCLAW_LATEST_CONFIG_VERSION: &str = "0.28";
 
@@ -19,14 +22,17 @@ pub fn load_config_file_and_upgrade(path: &Path) -> Result<(StellaclawConfig, bo
     let version = detect_config_version(&raw)?;
     let mut config = match version.as_str() {
         LEGACY_CONFIG_VERSION => v0_1::load_and_upgrade(&raw)?,
-        LATEST_CONFIG_VERSION => v0_2::load(&raw, path)?,
+        CONFIG_VERSION_0_2 => v0_2::load_and_upgrade(&raw, path)?,
+        LATEST_CONFIG_VERSION => v0_3::load(&raw, path)?,
         PARTYCLAW_LATEST_CONFIG_VERSION => partyclaw::load_and_upgrade(&raw, path)?,
         other => return Err(anyhow!("unsupported config version '{}'", other)),
     };
-    config.validate().map_err(anyhow::Error::msg)?;
     let upgraded = version != LATEST_CONFIG_VERSION;
     if upgraded {
         config.version = LATEST_CONFIG_VERSION.to_string();
+    }
+    config.validate().map_err(anyhow::Error::msg)?;
+    if upgraded {
         let rewritten =
             serde_json::to_string_pretty(&config).context("failed to serialize upgraded config")?;
         let backup_path = next_config_backup_path(path)?;
@@ -79,7 +85,7 @@ fn next_config_backup_path(path: &Path) -> Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::next_config_backup_path;
+    use super::{load_config_file_and_upgrade, next_config_backup_path};
 
     #[test]
     fn allocates_non_conflicting_config_backup_path() {
@@ -101,6 +107,86 @@ mod tests {
             backup.file_name().and_then(|value| value.to_str()),
             Some("config.json.pre-stellaclaw-upgrade.1.bak")
         );
+        std::fs::remove_dir_all(&root).expect("temp dir should be cleaned");
+    }
+
+    #[test]
+    fn upgrades_v0_2_config_and_folds_inline_tool_models_to_aliases() {
+        let root = std::env::temp_dir().join(format!(
+            "stellaclaw-config-v02-upgrade-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temp dir should be created");
+        let config_path = root.join("config.json");
+        std::fs::write(
+            &config_path,
+            r#"
+            {
+              "version": "0.2",
+              "models": {
+                "main": {
+                  "provider_type": "claude_code",
+                  "model_name": "claude-opus-4-6",
+                  "url": "https://example.invalid/v1/messages",
+                  "api_key_env": "TEST_API_KEY",
+                  "capabilities": ["chat"],
+                  "token_max_context": 262144,
+                  "cache_timeout": 300,
+                  "conn_timeout": 300,
+                  "retry_mode": "once",
+                  "token_estimator_type": "local"
+                },
+                "search": {
+                  "provider_type": "brave_search",
+                  "model_name": "brave-web-search",
+                  "url": "https://api.search.brave.com/res/v1/web/search",
+                  "api_key_env": "BRAVE_SEARCH_API_KEY",
+                  "capabilities": ["web_search"],
+                  "token_max_context": 32768,
+                  "cache_timeout": 300,
+                  "conn_timeout": 30,
+                  "retry_mode": "once",
+                  "token_estimator_type": "local"
+                }
+              },
+              "session_defaults": {
+                "search_tool_model": {
+                  "provider_type": "brave_search",
+                  "model_name": "brave-web-search",
+                  "url": "https://api.search.brave.com/res/v1/web/search",
+                  "api_key_env": "BRAVE_SEARCH_API_KEY",
+                  "capabilities": ["web_search"],
+                  "token_max_context": 32768,
+                  "cache_timeout": 300,
+                  "conn_timeout": 30,
+                  "retry_mode": "once",
+                  "token_estimator_type": "local"
+                }
+              },
+              "channels": [
+                {
+                  "kind": "telegram",
+                  "id": "telegram-main",
+                  "bot_token_env": "TELEGRAM_BOT_TOKEN"
+                }
+              ]
+            }
+            "#,
+        )
+        .expect("config should be written");
+
+        let (config, upgraded) =
+            load_config_file_and_upgrade(&config_path).expect("config should upgrade");
+        let rewritten = std::fs::read_to_string(&config_path).expect("config should be readable");
+
+        assert!(upgraded);
+        assert_eq!(config.version, crate::config::LATEST_CONFIG_VERSION);
+        assert!(rewritten.contains(r#""version": "0.3""#));
+        assert!(rewritten.contains(r#""search_tool_model": "search""#));
+        assert!(config_path
+            .with_file_name("config.json.pre-stellaclaw-upgrade.bak")
+            .is_file());
         std::fs::remove_dir_all(&root).expect("temp dir should be cleaned");
     }
 }

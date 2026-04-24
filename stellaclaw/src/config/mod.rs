@@ -9,7 +9,8 @@ use stellaclaw_core::model_config::{ModelCapability, ModelConfig};
 pub mod loaders;
 
 pub const LEGACY_CONFIG_VERSION: &str = "0.1";
-pub const LATEST_CONFIG_VERSION: &str = "0.2";
+pub const CONFIG_VERSION_0_2: &str = "0.2";
+pub const LATEST_CONFIG_VERSION: &str = "0.3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StellaclawConfig {

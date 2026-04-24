@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use crate::config::StellaclawConfig;
+use crate::config::{StellaclawConfig, ToolModelTarget, LATEST_CONFIG_VERSION};
 
 use super::partyclaw;
 
@@ -14,6 +14,41 @@ pub fn load(raw: &str, path: &Path) -> Result<StellaclawConfig> {
         return partyclaw::load_compatible(raw, path);
     }
     serde_json::from_value(value).context("failed to parse v0.2 stellaclaw runtime config")
+}
+
+pub fn load_and_upgrade(raw: &str, path: &Path) -> Result<StellaclawConfig> {
+    let mut config = load(raw, path)?;
+    prefer_named_tool_model_targets(&mut config);
+    config.version = LATEST_CONFIG_VERSION.to_string();
+    Ok(config)
+}
+
+fn prefer_named_tool_model_targets(config: &mut StellaclawConfig) {
+    let models = &config.models;
+    prefer_named_tool_model_target(&mut config.session_defaults.image_tool_model, models);
+    prefer_named_tool_model_target(&mut config.session_defaults.pdf_tool_model, models);
+    prefer_named_tool_model_target(&mut config.session_defaults.audio_tool_model, models);
+    prefer_named_tool_model_target(
+        &mut config.session_defaults.image_generation_tool_model,
+        models,
+    );
+    prefer_named_tool_model_target(&mut config.session_defaults.search_tool_model, models);
+}
+
+fn prefer_named_tool_model_target(
+    target: &mut Option<ToolModelTarget>,
+    models: &std::collections::BTreeMap<String, stellaclaw_core::model_config::ModelConfig>,
+) {
+    let Some(ToolModelTarget::Inline(model)) = target else {
+        return;
+    };
+    let Some(alias) = models
+        .iter()
+        .find_map(|(alias, candidate)| (candidate == model).then(|| alias.clone()))
+    else {
+        return;
+    };
+    *target = Some(ToolModelTarget::Alias(alias));
 }
 
 fn is_partyclaw_compatible_config(value: &Value) -> bool {
@@ -131,27 +166,6 @@ mod tests {
             .resolve(&config.models, &main_model)
             .expect("search model target should resolve");
         assert_eq!(search_model.provider_type, ProviderType::BraveSearch);
-    }
-
-    #[test]
-    fn loads_repository_example_config() {
-        let raw = include_str!("../../../../example_config.json");
-        let config = load(raw, std::path::Path::new("example_config.json"))
-            .expect("example config should load");
-        let main_model = config
-            .initial_main_model()
-            .expect("main model should exist");
-        let image_input = main_model
-            .multimodal_input
-            .as_ref()
-            .and_then(|input| input.image.as_ref())
-            .expect("example should configure image input");
-
-        assert_eq!(main_model.model_name, "openai/gpt-4.1-mini");
-        assert_eq!(image_input.max_width, Some(4096));
-        assert!(image_input
-            .supported_media_types
-            .contains(&"image/webp".to_string()));
     }
 
     #[test]

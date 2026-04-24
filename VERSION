@@ -1,5 +1,14 @@
-version: 1.0.3
+version: 1.1.0
 ---
+
+# 1.1.0
+
+- 更新 `config` schema 到 `0.3`：
+  `session_defaults` 中的 `image_tool_model`、`pdf_tool_model`、`audio_tool_model`、`image_generation_tool_model` 和 `search_tool_model` 现在正式使用 `<model_alias>[:self]` 形式；旧的完整 `ModelConfig` 对象仍可读取，升级时会尽量折叠为匹配的 model alias。
+- 更新 [example_config.json](example_config.json) 为原生 `0.3` 配置形态：
+  顶层 `models` 使用当前 runtime 字段名，工具模型默认值使用 alias 字符串。
+- 本次改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 更新为 `0.3`；当前 Stellaclaw workdir schema 仍为 `0.3`。
 
 # 1.0.3
 

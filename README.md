@@ -237,7 +237,7 @@ Start from [example_config.json](example_config.json).
 
 Important fields:
 
-- `version`: current config schema version, currently `0.2`.
+- `version`: current config schema version, currently `0.3`.
 - `agent_server.path`: path to the `agent_server` binary.
 - `models`: named model configs.
 - `channels`: Telegram and future channel definitions.
@@ -291,7 +291,7 @@ Stellaclaw deliberately has separate version tracks:
 | File / Field | Meaning |
 |---|---|
 | Root `VERSION` | Project release version and changelog. Starts at `1.0.0`. |
-| Config JSON `version` | Config schema version. Currently `0.2`. |
+| Config JSON `version` | Config schema version. Currently `0.3`. |
 | Workdir `STELLA_VERSION` | Workdir schema version. Currently `0.3`. |
 | Legacy workdir `VERSION` | PartyClaw compatibility input, not the project release version. |
 
