@@ -209,6 +209,7 @@ Current provider support includes:
 - Codex subscription websocket with automatic access token refresh.
 - OpenRouter chat completions.
 - OpenRouter responses.
+- OpenAI-compatible image edits.
 - Claude messages.
 - Brave Search.
 

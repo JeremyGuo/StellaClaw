@@ -7,6 +7,8 @@ use crate::session_actor::MultimodalTokenStrategy;
 pub enum ProviderType {
     OpenRouterCompletion,
     OpenRouterResponses,
+    #[serde(rename = "openai_image_edit")]
+    OpenAiImageEdit,
     ClaudeCode,
     CodexSubscription,
     BraveSearch,
@@ -175,6 +177,16 @@ mod tests {
         assert_eq!(
             json["multimodal_input"]["image"]["transport"],
             "inline_base64"
+        );
+    }
+
+    #[test]
+    fn serializes_openai_image_edit_provider_name() {
+        let value = serde_json::to_value(ProviderType::OpenAiImageEdit).unwrap();
+        assert_eq!(value, serde_json::json!("openai_image_edit"));
+        assert_eq!(
+            serde_json::from_value::<ProviderType>(value).unwrap(),
+            ProviderType::OpenAiImageEdit
         );
     }
 

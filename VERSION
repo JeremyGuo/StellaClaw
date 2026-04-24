@@ -1,5 +1,14 @@
-version: 1.1.4
+version: 1.2.0
 ---
+
+# 1.2.0
+
+- 新增 `openai_image_edit` provider：
+  支持 OpenAI Images Edits 兼容接口，使用 `multipart/form-data` POST 到配置中的 `/v1/images/edits` 端点，发送 `model`、`prompt`、第一张 user image 和 `response_format=b64_json`，并把返回的 `b64_json` 图片持久化为本地 `FileItem`。
+- `openai_image_edit` 面向图片编辑：
+  provider request 必须包含至少一张 user 图片；纯文本生图仍应使用支持 generation 协议的 provider。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.3`；当前 Stellaclaw workdir schema 仍为 `0.4`。
 
 # 1.1.4
 

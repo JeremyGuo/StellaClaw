@@ -3,6 +3,7 @@ mod claude_code;
 mod codex_subscription;
 mod common;
 mod forkserver;
+mod openai_image_edit;
 mod openrouter_completion;
 mod openrouter_responses;
 mod output_persistor;
@@ -22,6 +23,7 @@ pub use forkserver::{
     ProviderRequestAbortHandle, ProviderRequestForkServer, ProviderRequestHandle,
     ProviderRequestOwned,
 };
+pub use openai_image_edit::OpenAiImageEditProvider;
 pub use openrouter_completion::OpenRouterCompletionProvider;
 pub use openrouter_responses::OpenRouterResponsesProvider;
 pub use output_persistor::{OutputPersistor, OutputPersistorError};
@@ -30,6 +32,7 @@ pub fn provider_from_model_config(model_config: &ModelConfig) -> Box<dyn Provide
     match model_config.provider_type {
         ProviderType::OpenRouterCompletion => Box::new(OpenRouterCompletionProvider::new()),
         ProviderType::OpenRouterResponses => Box::new(OpenRouterResponsesProvider::new()),
+        ProviderType::OpenAiImageEdit => Box::new(OpenAiImageEditProvider::new()),
         ProviderType::ClaudeCode => Box::new(ClaudeCodeProvider::new()),
         ProviderType::CodexSubscription => Box::new(CodexSubscriptionProvider::new()),
         ProviderType::BraveSearch => Box::new(BraveSearchProvider::new()),
