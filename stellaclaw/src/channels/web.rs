@@ -145,6 +145,7 @@ impl WebChannel {
     ) -> ApiResult<HttpResponse> {
         let segments = api_segments(&request.path);
         match (request.method.as_str(), segments.as_slice()) {
+            ("GET", ["conversations"]) => self.list_conversations(&request.query),
             ("POST", ["conversations"]) => self.create_conversation(&request.body, id_manager),
             ("GET", ["conversations", conversation_id, "messages"]) => {
                 self.list_messages(conversation_id, &request.query)
@@ -163,6 +164,59 @@ impl WebChannel {
             }
             _ => Err(ApiError::new(404, "not_found")),
         }
+    }
+
+    fn list_conversations(&self, query: &HashMap<String, String>) -> ApiResult<HttpResponse> {
+        let offset = query_usize(query, "offset", 0);
+        let limit = query_usize(query, "limit", 50).min(200);
+        let mut conversations = Vec::new();
+        let root = self.workdir.join("conversations");
+        if root.exists() {
+            for entry in fs::read_dir(&root).map_err(ApiError::internal)? {
+                let entry = entry.map_err(ApiError::internal)?;
+                let path = entry.path().join("conversation.json");
+                if !path.exists() {
+                    continue;
+                }
+                let raw = match fs::read_to_string(&path) {
+                    Ok(raw) => raw,
+                    Err(error) => {
+                        self.logger.warn(
+                            "web_conversation_list_read_failed",
+                            json!({"path": path.display().to_string(), "error": error.to_string()}),
+                        );
+                        continue;
+                    }
+                };
+                let state: ConversationState = match serde_json::from_str(&raw) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        self.logger.warn(
+                            "web_conversation_list_parse_failed",
+                            json!({"path": path.display().to_string(), "error": error.to_string()}),
+                        );
+                        continue;
+                    }
+                };
+                if state.channel_id == self.id {
+                    conversations.push(ConversationSummary::from_state(&state, &self.config));
+                }
+            }
+        }
+        conversations.sort_by(|left, right| left.conversation_id.cmp(&right.conversation_id));
+        let total = conversations.len();
+        let start = offset.min(total);
+        let end = start.saturating_add(limit).min(total);
+        Ok(json_response(
+            200,
+            json!({
+                "channel_id": self.id,
+                "offset": offset,
+                "limit": limit,
+                "total": total,
+                "conversations": &conversations[start..end],
+            }),
+        ))
     }
 
     fn authorized(&self, request: &HttpRequest) -> bool {
@@ -535,6 +589,34 @@ struct MessageSkeleton {
     user_name: Option<String>,
     message_time: Option<String>,
     has_token_usage: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ConversationSummary {
+    conversation_id: String,
+    platform_chat_id: String,
+    model: String,
+    model_selection_pending: bool,
+    foreground_session_id: String,
+    total_background: usize,
+    total_subagents: usize,
+}
+
+impl ConversationSummary {
+    fn from_state(state: &ConversationState, config: &StellaclawConfig) -> Self {
+        Self {
+            conversation_id: state.conversation_id.clone(),
+            platform_chat_id: state.platform_chat_id.clone(),
+            model: state
+                .session_profile
+                .main_model
+                .display_name(&config.models),
+            model_selection_pending: state.model_selection_pending,
+            foreground_session_id: state.session_binding.foreground_session_id.clone(),
+            total_background: state.session_binding.background_sessions.len(),
+            total_subagents: state.session_binding.subagent_sessions.len(),
+        }
+    }
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {

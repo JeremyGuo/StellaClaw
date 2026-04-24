@@ -1,5 +1,10 @@
-version: 1.6.1
+version: 1.7.0
 ---
+
+# 1.7.0
+
+- 扩展 Web channel API：
+  新增 `GET /api/conversations?offset=0&limit=50`，用于分页列出当前 Web channel 创建或绑定的 conversations。列表只返回当前 Web channel 的 conversation 摘要，不混入 Telegram 等其他 channel 的会话；本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.6.1
 

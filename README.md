@@ -263,6 +263,16 @@ Optional Web channel config:
 The Web channel exposes JSON APIs under `/api/` and accepts
 `Authorization: Bearer <token>`.
 
+Current Web channel endpoints:
+
+- `GET /api/conversations?offset=0&limit=50`
+- `POST /api/conversations`
+- `GET /api/conversations/{conversation_id}/messages?offset=0&limit=50`
+- `GET /api/conversations/{conversation_id}/messages/{message_id}`
+- `POST /api/conversations/{conversation_id}/messages`
+- `GET /api/conversations/{conversation_id}/messages/after/{message_id}?limit=50`
+- `GET /api/conversations/{conversation_id}/status`
+
 For a release build, set:
 
 ```json
