@@ -1,5 +1,14 @@
-version: 1.4.6
+version: 1.4.7
 ---
+
+# 1.4.7
+
+- 修复 OpenRouter chat-completions 图片输出读取超时：
+  `open_router_completion` 在模型具备 `image_out` 且本轮没有工具调用 schema 时，会使用 OpenRouter streaming chat-completions 协议读取图片输出。OpenRouter 会在长时间图片生成期间发送 keepalive 事件，避免非流式请求已经返回 `200 OK` 但完整 body 迟迟未结束而触发 body read timeout。
+- Streaming 图片输出解析：
+  支持 `choices[].delta.images[].image_url.url`，并继续解析最终 chunk 中的 `usage`，用于 provider-backed media tool usage 记录。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.4`；当前 Stellaclaw workdir schema 仍为 `0.5`。
 
 # 1.4.6
 

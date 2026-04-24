@@ -1,8 +1,14 @@
-use std::{collections::HashMap, sync::Mutex, time::Duration};
+use std::{
+    collections::HashMap,
+    io::{BufRead, BufReader},
+    sync::Mutex,
+    time::Duration,
+};
 
 use rand::Rng;
 use reqwest::{blocking::Client, header::ACCEPT_ENCODING, StatusCode};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{
     model_config::{ModelCapability, ModelConfig, RetryMode},
@@ -63,6 +69,7 @@ impl OpenRouterCompletionProvider {
     ) -> Result<ChatMessage, ProviderError> {
         let api_key = std::env::var(&model_config.api_key_env)
             .map_err(|_| ProviderError::MissingApiKeyEnv(model_config.api_key_env.clone()))?;
+        let stream = should_stream_openrouter_response(model_config, request);
 
         let request = OpenRouterChatCompletionRequest {
             model: model_config.model_name.clone(),
@@ -73,6 +80,7 @@ impl OpenRouterCompletionProvider {
                 .map(|tool| tool.openai_tool_schema())
                 .collect(),
             modalities: openrouter_output_modalities(model_config),
+            stream: stream.then_some(true),
             reasoning: model_config.reasoning.clone(),
             cache_control: openrouter_cache_control_payload(model_config),
         };
@@ -94,6 +102,27 @@ impl OpenRouterCompletionProvider {
 
         let response = request_builder.send().map_err(ProviderError::request)?;
         let status = response.status();
+
+        if stream {
+            if !status.is_success() {
+                let body = response.bytes().map_err(|error| {
+                    ProviderError::InvalidResponse(format!(
+                        "failed to read response body from {}",
+                        body_read_error_context(&model_config.url, status, &error)
+                    ))
+                })?;
+                return Err(ProviderError::HttpStatus {
+                    url: model_config.url.clone(),
+                    status: status.as_u16(),
+                    body: String::from_utf8_lossy(&body).to_string(),
+                });
+            }
+
+            return parse_openrouter_stream(response, &model_config.url, status).and_then(
+                |response| convert_openrouter_response(response, &self.output_persistor),
+            );
+        }
+
         let body = response.bytes().map_err(|error| {
             ProviderError::InvalidResponse(format!(
                 "failed to read response body from {}",
@@ -168,6 +197,13 @@ fn openrouter_output_modalities(model_config: &ModelConfig) -> Option<Vec<&'stat
     Some(modalities)
 }
 
+fn should_stream_openrouter_response(
+    model_config: &ModelConfig,
+    request: &ProviderRequest<'_>,
+) -> bool {
+    model_config.supports(ModelCapability::ImageOut) && request.tools.is_empty()
+}
+
 impl Provider for OpenRouterCompletionProvider {
     fn send(
         &self,
@@ -212,6 +248,8 @@ struct OpenRouterChatCompletionRequest {
     tools: Vec<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     modalities: Option<Vec<&'static str>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reasoning: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -386,6 +424,118 @@ struct OpenRouterImage {
 #[derive(Debug, Deserialize)]
 struct OpenRouterReturnedImageUrl {
     url: String,
+}
+
+fn parse_openrouter_stream(
+    response: reqwest::blocking::Response,
+    url: &str,
+    status: StatusCode,
+) -> Result<OpenRouterChatCompletionResponse, ProviderError> {
+    let mut reader = BufReader::new(response);
+    let mut line = String::new();
+    let mut id = String::new();
+    let mut model = String::new();
+    let mut content = String::new();
+    let mut images = Vec::new();
+    let mut usage = None;
+    let mut preview = String::new();
+
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line).map_err(|error| {
+            ProviderError::InvalidResponse(format!(
+                "failed to read streaming response body from {url} with status {status}: {error}"
+            ))
+        })?;
+        if bytes == 0 {
+            break;
+        }
+
+        if preview.len() < RESPONSE_PREVIEW_CHARS {
+            preview.push_str(&line);
+        }
+
+        let trimmed = line.trim();
+        let Some(data) = trimmed.strip_prefix("data:") else {
+            continue;
+        };
+        let data = data.trim();
+        if data == "[DONE]" {
+            break;
+        }
+        if data.is_empty() {
+            continue;
+        }
+
+        let value = serde_json::from_str::<Value>(data).map_err(|error| {
+            ProviderError::InvalidResponse(format!(
+                "OpenRouter streaming chunk from {url} was not valid JSON: {error}; chunk preview: {}",
+                preview_body(data)
+            ))
+        })?;
+        if let Some(error) = value
+            .get("error")
+            .and_then(|error| error.get("message").or(Some(error)))
+        {
+            return Err(ProviderError::InvalidResponse(error.to_string()));
+        }
+
+        if id.is_empty() {
+            if let Some(value_id) = value.get("id").and_then(Value::as_str) {
+                id = value_id.to_string();
+            }
+        }
+        if model.is_empty() {
+            if let Some(value_model) = value.get("model").and_then(Value::as_str) {
+                model = value_model.to_string();
+            }
+        }
+        if usage.is_none() {
+            usage = value
+                .get("usage")
+                .and_then(|usage| serde_json::from_value::<OpenRouterUsage>(usage.clone()).ok());
+        }
+
+        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+            continue;
+        };
+        for choice in choices {
+            let Some(delta) = choice.get("delta").or_else(|| choice.get("message")) else {
+                continue;
+            };
+            if let Some(text) = delta.get("content").and_then(Value::as_str) {
+                content.push_str(text);
+            }
+            if let Some(delta_images) = delta.get("images").and_then(Value::as_array) {
+                for image in delta_images {
+                    if let Ok(image) = serde_json::from_value::<OpenRouterImage>(image.clone()) {
+                        images.push(image);
+                    }
+                }
+            }
+        }
+    }
+
+    if content.is_empty() && images.is_empty() {
+        return Err(ProviderError::InvalidResponse(format!(
+            "OpenRouter streaming response from {url} did not include content or images; body preview: {}",
+            preview_body(&preview)
+        )));
+    }
+
+    Ok(OpenRouterChatCompletionResponse {
+        id,
+        model,
+        usage,
+        choices: vec![OpenRouterChoice {
+            finish_reason: None,
+            message: OpenRouterAssistantMessage {
+                content: (!content.is_empty()).then_some(content),
+                tool_calls: Vec::new(),
+                images,
+            },
+        }],
+    })
 }
 
 fn build_openrouter_messages(request: &ProviderRequest<'_>) -> Vec<OpenRouterRequestMessage> {
@@ -671,36 +821,13 @@ mod tests {
             .match_header("authorization", "Bearer test-key")
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({
                 "model": "openai/gpt-5.4-image-2",
-                "modalities": ["image", "text"]
+                "modalities": ["image", "text"],
+                "stream": true
             })))
             .with_status(200)
-            .with_header("content-type", "application/json")
+            .with_header("content-type", "text/event-stream")
             .with_body(
-                r#"{
-                    "id": "gen_image",
-                    "model": "openai/gpt-5.4-image-2",
-                    "choices": [
-                        {
-                            "finish_reason": "stop",
-                            "message": {
-                                "content": null,
-                                "images": [
-                                    {
-                                        "type": "image_url",
-                                        "image_url": {
-                                            "url": "data:image/png;base64,aGVsbG8="
-                                        }
-                                    }
-                                ],
-                                "tool_calls": []
-                            }
-                        }
-                    ],
-                    "usage": {
-                        "prompt_tokens": 12,
-                        "completion_tokens": 7
-                    }
-                }"#,
+                "data: {\"id\":\"gen_image\",\"model\":\"openai/gpt-5.4-image-2\",\"choices\":[{\"delta\":{\"images\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,aGVsbG8=\"}}]}}]}\n\ndata: [DONE]\n\n",
             )
             .create();
 
@@ -727,6 +854,20 @@ mod tests {
             response.data.first(),
             Some(ChatMessageItem::File(_))
         ));
+    }
+
+    #[test]
+    fn non_image_output_request_does_not_stream() {
+        let model_config = test_model_config("https://example.test".to_string());
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "hello".to_string(),
+            })],
+        )];
+        let request = ProviderRequest::new(&messages);
+
+        assert!(!should_stream_openrouter_response(&model_config, &request));
     }
 
     #[test]
