@@ -37,7 +37,44 @@ pub struct AgentServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionProfile {
-    pub main_model: ModelConfig,
+    pub main_model: ModelSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ModelSelection {
+    Alias(String),
+    Inline(ModelConfig),
+}
+
+impl ModelSelection {
+    pub fn alias(alias: impl Into<String>) -> Self {
+        Self::Alias(alias.into())
+    }
+
+    pub fn resolve(&self, models: &BTreeMap<String, ModelConfig>) -> Option<ModelConfig> {
+        match self {
+            Self::Alias(alias) => models.get(alias).cloned(),
+            Self::Inline(model) => Some(model.clone()),
+        }
+    }
+
+    pub fn display_name(&self, models: &BTreeMap<String, ModelConfig>) -> String {
+        match self {
+            Self::Alias(alias) => models
+                .get(alias)
+                .map(|model| model.model_name.clone())
+                .unwrap_or_else(|| alias.clone()),
+            Self::Inline(model) => model.model_name.clone(),
+        }
+    }
+
+    pub fn alias_name(&self) -> Option<&str> {
+        match self {
+            Self::Alias(alias) => Some(alias),
+            Self::Inline(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -202,25 +239,58 @@ impl StellaclawConfig {
         self.models.get(name).cloned()
     }
 
+    pub fn resolve_session_model(&self, profile: &SessionProfile) -> Option<ModelConfig> {
+        profile.main_model.resolve(&self.models)
+    }
+
     pub fn initial_session_profile(&self) -> Result<SessionProfile, String> {
-        if let Some(profile) = &self.default_profile {
-            return Ok(profile.clone());
-        }
-        self.initial_main_model()
-            .map(|main_model| SessionProfile { main_model })
+        self.initial_main_model_name()
+            .map(|main_model| SessionProfile {
+                main_model: ModelSelection::alias(main_model),
+            })
             .ok_or_else(|| "config must include at least one chat-capable model".to_string())
+    }
+
+    pub fn initial_main_model_name(&self) -> Option<String> {
+        self.default_profile
+            .as_ref()
+            .and_then(|profile| self.model_selection_alias(&profile.main_model))
+            .or_else(|| {
+                self.models.iter().find_map(|(name, model)| {
+                    model.supports(ModelCapability::Chat).then(|| name.clone())
+                })
+            })
     }
 
     pub fn initial_main_model(&self) -> Option<ModelConfig> {
         self.default_profile
             .as_ref()
-            .map(|profile| profile.main_model.clone())
+            .and_then(|profile| self.resolve_session_model(profile))
             .or_else(|| {
                 self.models
                     .values()
                     .find(|model| model.supports(ModelCapability::Chat))
                     .cloned()
             })
+    }
+
+    fn model_selection_alias(&self, selection: &ModelSelection) -> Option<String> {
+        match selection {
+            ModelSelection::Alias(alias) if self.models.contains_key(alias) => Some(alias.clone()),
+            ModelSelection::Alias(alias) => self
+                .models
+                .iter()
+                .find_map(|(name, model)| (model.model_name == *alias).then(|| name.clone())),
+            ModelSelection::Inline(target) => self
+                .models
+                .iter()
+                .find_map(|(name, model)| (model == target).then(|| name.clone()))
+                .or_else(|| {
+                    self.models.iter().find_map(|(name, model)| {
+                        (model.model_name == target.model_name).then(|| name.clone())
+                    })
+                }),
+        }
     }
 }
 

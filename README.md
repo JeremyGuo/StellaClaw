@@ -292,7 +292,7 @@ Stellaclaw deliberately has separate version tracks:
 |---|---|
 | Root `VERSION` | Project release version and changelog. Starts at `1.0.0`. |
 | Config JSON `version` | Config schema version. Currently `0.3`. |
-| Workdir `STELLA_VERSION` | Workdir schema version. Currently `0.3`. |
+| Workdir `STELLA_VERSION` | Workdir schema version. Currently `0.4`. |
 | Legacy workdir `VERSION` | PartyClaw compatibility input, not the project release version. |
 
 Before bumping the root `VERSION`, check whether the previous GitHub Release exists. If it does not, merge the unpublished changelog into the next release notes so release history does not skip user-visible changes.

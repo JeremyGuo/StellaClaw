@@ -27,8 +27,8 @@ use crate::{
         ProcessingState, ProgressFeedbackFinalState,
     },
     config::{
-        SandboxConfig, SandboxMode, SessionDefaults, SessionProfile, StellaclawConfig,
-        ToolModelTarget,
+        ModelSelection, SandboxConfig, SandboxMode, SessionDefaults, SessionProfile,
+        StellaclawConfig, ToolModelTarget,
     },
     cron::{
         cron_schedule_from_required_tool_args, optional_cron_schedule_from_tool_args,
@@ -119,7 +119,7 @@ pub struct ManagedSessionRecord {
     #[serde(default)]
     pub suppress_output: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_override: Option<ModelConfig>,
+    pub model_override: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -330,11 +330,14 @@ impl ConversationRuntime {
             &state.conversation_id,
             &state.tool_remote_mode,
         )?;
+        let main_model = config
+            .resolve_session_model(&state.session_profile)
+            .ok_or_else(|| anyhow!("unknown main model selection"))?;
         let foreground = start_foreground_session(
             &agent_server_path,
             &workspace_root,
             &state.session_binding.foreground_session_id,
-            &state.session_profile.main_model,
+            &main_model,
             &state.tool_remote_mode,
             state.sandbox.as_ref().unwrap_or(&config.sandbox),
             state.reasoning_effort.as_deref(),
@@ -347,17 +350,14 @@ impl ConversationRuntime {
             if record.status != ManagedSessionStatus::Running {
                 continue;
             }
-            let model = record
-                .model_override
-                .as_ref()
-                .unwrap_or(&state.session_profile.main_model);
+            let model = resolve_managed_session_model(&config, record, &main_model)?;
             background.insert(
                 agent_id.clone(),
                 start_managed_session_runtime(
                     &agent_server_path,
                     &workspace_root,
                     record.clone(),
-                    model,
+                    &model,
                     &state.tool_remote_mode,
                     state.sandbox.as_ref().unwrap_or(&config.sandbox),
                     state.reasoning_effort.as_deref(),
@@ -372,17 +372,14 @@ impl ConversationRuntime {
             if record.status != ManagedSessionStatus::Running {
                 continue;
             }
-            let model = record
-                .model_override
-                .as_ref()
-                .unwrap_or(&state.session_profile.main_model);
+            let model = resolve_managed_session_model(&config, record, &main_model)?;
             subagents.insert(
                 agent_id.clone(),
                 start_managed_session_runtime(
                     &agent_server_path,
                     &workspace_root,
                     record.clone(),
-                    model,
+                    &model,
                     &state.tool_remote_mode,
                     state.sandbox.as_ref().unwrap_or(&config.sandbox),
                     state.reasoning_effort.as_deref(),
@@ -415,6 +412,19 @@ impl ConversationRuntime {
         let raw = serde_json::to_string_pretty(&self.state)
             .context("failed to serialize conversation state")?;
         fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))
+    }
+
+    fn current_main_model(&self) -> Result<ModelConfig> {
+        self.config
+            .resolve_session_model(&self.state.session_profile)
+            .ok_or_else(|| anyhow!("unknown main model selection"))
+    }
+
+    fn current_main_model_name(&self) -> String {
+        self.state
+            .session_profile
+            .main_model
+            .display_name(&self.config.models)
     }
 
     fn handle_incoming(&mut self, message: IncomingConversationMessage) -> Result<bool> {
@@ -1091,21 +1101,25 @@ impl ConversationRuntime {
         }
     }
 
-    fn resolve_model_override(&self, payload: &Value) -> Result<Option<ModelConfig>> {
+    fn resolve_model_override(&self, payload: &Value) -> Result<Option<String>> {
         let Some(name) = payload.get("model").and_then(Value::as_str) else {
             return Ok(None);
         };
-        self.config
+        let model = self
+            .config
             .resolve_named_model(name)
-            .ok_or_else(|| anyhow!("unknown named model {name}"))
-            .map(Some)
+            .ok_or_else(|| anyhow!("unknown named model {name}"))?;
+        if !model.supports(ModelCapability::Chat) {
+            return Err(anyhow!("model {name} is not chat-capable"));
+        }
+        Ok(Some(name.to_string()))
     }
 
     fn start_managed_session(
         &mut self,
         kind: ManagedSessionType,
         task: String,
-        model_override: Option<ModelConfig>,
+        model_override: Option<String>,
     ) -> Result<Value> {
         let (agent_id, session_id) = match kind {
             ManagedSessionType::Background => {
@@ -1136,14 +1150,13 @@ impl ConversationRuntime {
             suppress_output: false,
             model_override: model_override.clone(),
         };
-        let model = model_override
-            .as_ref()
-            .unwrap_or(&self.state.session_profile.main_model);
+        let main_model = self.current_main_model()?;
+        let model = resolve_managed_session_model(&self.config, &record, &main_model)?;
         let runtime = start_managed_session_runtime(
             &self.agent_server_path,
             &self.workspace_root,
             record.clone(),
-            model,
+            &model,
             &self.state.tool_remote_mode,
             self.state.sandbox.as_ref().unwrap_or(&self.config.sandbox),
             self.state.reasoning_effort.as_deref(),
@@ -1346,6 +1359,7 @@ impl ConversationRuntime {
 
     fn start_foreground_progress(&mut self, turn_id: String) -> Result<()> {
         let now = Instant::now();
+        let model_name = self.current_main_model_name();
         let progress_turn_id = self
             .foreground_progress
             .as_ref()
@@ -1358,7 +1372,7 @@ impl ConversationRuntime {
         self.send_processing_state(ProcessingState::Typing)?;
         self.send_progress_feedback(
             progress_turn_id,
-            progress_text_thinking(&self.state.session_profile.main_model.model_name),
+            progress_text_thinking(&model_name),
             None,
             true,
         )
@@ -1368,9 +1382,10 @@ impl ConversationRuntime {
         let Some(progress) = &self.foreground_progress else {
             return Ok(());
         };
+        let model_name = self.current_main_model_name();
         self.send_progress_feedback(
             progress.turn_id.clone(),
-            progress_text_update(&self.state.session_profile.main_model.model_name, message),
+            progress_text_update(&model_name, message),
             None,
             false,
         )
@@ -1384,14 +1399,11 @@ impl ConversationRuntime {
         let Some(progress) = self.foreground_progress.take() else {
             return Ok(());
         };
+        let model_name = self.current_main_model_name();
         self.send_processing_state(ProcessingState::Idle)?;
         let text = match final_state {
-            ProgressFeedbackFinalState::Done => {
-                progress_text_done(&self.state.session_profile.main_model.model_name)
-            }
-            ProgressFeedbackFinalState::Failed => {
-                progress_text_failed(&self.state.session_profile.main_model.model_name, error)
-            }
+            ProgressFeedbackFinalState::Done => progress_text_done(&model_name),
+            ProgressFeedbackFinalState::Failed => progress_text_failed(&model_name, error),
         };
         self.send_progress_feedback(progress.turn_id, text, Some(final_state), true)
     }
@@ -1438,11 +1450,16 @@ impl ConversationRuntime {
             }),
         );
         let model_override = match task.model.as_deref() {
-            Some(name) => Some(
-                self.config
+            Some(name) => {
+                let model = self
+                    .config
                     .resolve_named_model(name)
-                    .ok_or_else(|| anyhow!("unknown cron model {name}"))?,
-            ),
+                    .ok_or_else(|| anyhow!("unknown cron model {name}"))?;
+                if !model.supports(ModelCapability::Chat) {
+                    return Err(anyhow!("cron model {name} is not chat-capable"));
+                }
+                Some(name.to_string())
+            }
             None => None,
         };
         let _ =
@@ -1451,7 +1468,8 @@ impl ConversationRuntime {
     }
 
     fn render_model_selection(&self) -> String {
-        let current_name = &self.state.session_profile.main_model.model_name;
+        let current_alias = self.state.session_profile.main_model.alias_name();
+        let current_name = self.current_main_model_name();
         let mut lines = if self.state.model_selection_pending {
             vec![format!("请选择 foreground 模型。当前预选: {current_name}")]
         } else {
@@ -1471,7 +1489,7 @@ impl ConversationRuntime {
             if !model.supports(ModelCapability::Chat) {
                 continue;
             }
-            let marker = if model.model_name == *current_name {
+            let marker = if Some(name.as_str()) == current_alias {
                 " [current]"
             } else {
                 ""
@@ -1489,13 +1507,13 @@ impl ConversationRuntime {
             .models
             .iter()
             .filter(|(_, model)| model.supports(ModelCapability::Chat))
-            .map(|(name, model)| {
-                let marker = if model.model_name == self.state.session_profile.main_model.model_name
-                {
-                    " [current]"
-                } else {
-                    ""
-                };
+            .map(|(name, _model)| {
+                let marker =
+                    if Some(name.as_str()) == self.state.session_profile.main_model.alias_name() {
+                        " [current]"
+                    } else {
+                        ""
+                    };
                 OutgoingOption {
                     label: format!("{name}{marker}"),
                     value: format!("/model {name}"),
@@ -1542,7 +1560,7 @@ impl ConversationRuntime {
         self.send_delivery_from_text(format!(
             "当前状态\nconversation: `{}`\nmodel: `{}`\nreasoning: `{}`\nsandbox: `{}` ({sandbox_source})\nremote: {remote}\nworkspace: `{}`\nbackground: {running_background} running / {} total\nsubagents: {running_subagents} running / {} total",
             self.state.conversation_id,
-            self.state.session_profile.main_model.model_name,
+            self.current_main_model_name(),
             self.state.reasoning_effort.as_deref().unwrap_or("model default"),
             sandbox_mode_label(&sandbox.mode),
             self.workspace_root.display(),
@@ -1710,11 +1728,12 @@ impl ConversationRuntime {
             let _ = client.shutdown();
         }
         self.foreground.events = None;
+        let main_model = self.current_main_model()?;
         self.foreground = start_foreground_session(
             &self.agent_server_path,
             &self.workspace_root,
             &self.state.session_binding.foreground_session_id,
-            &self.state.session_profile.main_model,
+            &main_model,
             &self.state.tool_remote_mode,
             self.state.sandbox.as_ref().unwrap_or(&self.config.sandbox),
             self.state.reasoning_effort.as_deref(),
@@ -1767,8 +1786,8 @@ impl ConversationRuntime {
         if !new_model.supports(ModelCapability::Chat) {
             return Err(anyhow!("model {model_name} is not chat-capable"));
         }
-        let old_model_name = self.state.session_profile.main_model.model_name.clone();
-        if self.state.session_profile.main_model == new_model {
+        let old_model_name = self.current_main_model_name();
+        if self.state.session_profile.main_model.alias_name() == Some(model_name) {
             self.state.model_selection_pending = false;
             self.send_delivery_from_text(format!(
                 "当前 foreground 模型已经是 `{}`。",
@@ -1781,12 +1800,12 @@ impl ConversationRuntime {
             let _ = client.shutdown();
         }
         self.foreground.events = None;
-        self.state.session_profile.main_model = new_model;
+        self.state.session_profile.main_model = ModelSelection::alias(model_name.to_string());
         self.state.model_selection_pending = false;
         self.restart_foreground_session()?;
         self.send_delivery_from_text(format!(
             "已切换主模型: `{}` -> `{}`",
-            old_model_name, self.state.session_profile.main_model.model_name
+            old_model_name, new_model.model_name
         ))?;
         Ok(())
     }
@@ -1878,6 +1897,23 @@ fn start_managed_session_runtime(
         client: Some(client),
         events: Some(events),
     })
+}
+
+fn resolve_managed_session_model(
+    config: &StellaclawConfig,
+    record: &ManagedSessionRecord,
+    main_model: &ModelConfig,
+) -> Result<ModelConfig> {
+    let Some(alias) = record.model_override.as_deref() else {
+        return Ok(main_model.clone());
+    };
+    let model = config
+        .resolve_named_model(alias)
+        .ok_or_else(|| anyhow!("unknown managed session model {alias}"))?;
+    if !model.supports(ModelCapability::Chat) {
+        return Err(anyhow!("managed session model {alias} is not chat-capable"));
+    }
+    Ok(model)
 }
 
 fn start_session_process(

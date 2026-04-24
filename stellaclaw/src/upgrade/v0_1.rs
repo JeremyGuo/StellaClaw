@@ -18,7 +18,10 @@ use stellaclaw_core::{
 
 use super::{WorkdirUpgrader, PARTYCLAW_LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_2};
 use crate::{
-    config::{SandboxConfig, SandboxMode, SessionProfile, StellaclawConfig, ToolModelTarget},
+    config::{
+        ModelSelection, SandboxConfig, SandboxMode, SessionProfile, StellaclawConfig,
+        ToolModelTarget,
+    },
     conversation::{ConversationSessionBinding, ConversationState},
     conversation_id_manager::ConversationIdManager,
     workspace::ensure_workspace_seed,
@@ -450,16 +453,18 @@ fn migrate_conversations_and_sessions(workdir: &Path, config: &StellaclawConfig)
         fs::create_dir_all(&conversation_root)
             .with_context(|| format!("failed to create {}", conversation_root.display()))?;
 
-        let main_model = match legacy.settings.main_model.as_deref() {
-            Some(name) => config
-                .resolve_named_model(name)
-                .or_else(|| config.initial_main_model())
-                .ok_or_else(|| anyhow!("missing fallback main model"))?,
-            None => config
-                .initial_main_model()
+        let main_model_alias = match legacy.settings.main_model.as_deref() {
+            Some(name) if config.resolve_named_model(name).is_some() => name.to_string(),
+            _ => config
+                .initial_main_model_name()
                 .ok_or_else(|| anyhow!("missing fallback main model"))?,
         };
-        let session_profile = SessionProfile { main_model };
+        let main_model = config
+            .resolve_named_model(&main_model_alias)
+            .ok_or_else(|| anyhow!("missing fallback main model"))?;
+        let session_profile = SessionProfile {
+            main_model: ModelSelection::alias(main_model_alias),
+        };
         let tool_remote_mode = migrated_tool_remote_mode(&legacy, &legacy_state_path)?;
 
         let session_key = format!(
@@ -515,7 +520,7 @@ fn migrate_conversations_and_sessions(workdir: &Path, config: &StellaclawConfig)
             migrate_foreground_session(
                 workdir,
                 config,
-                &session_profile.main_model,
+                &main_model,
                 &tool_remote_mode,
                 legacy_session,
                 &conversation_root,
