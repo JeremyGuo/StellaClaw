@@ -1,5 +1,16 @@
-version: 1.4.5
+version: 1.4.6
 ---
+
+# 1.4.6
+
+- 修复 OpenRouter 图片输出请求协议：
+  `open_router_completion` 和 `open_router_responses` 在模型具备 `image_out` 时会按模型能力自动发送 `modalities`；同时保留 `chat` 能力时发送 `["image", "text"]`，纯图片输出模型发送 `["image"]`。
+- 补齐 OpenRouter Responses 图片输出解析：
+  支持 `image_generation_call.result` 的裸 base64 图片，以及 `openrouter:image_generation` server-tool 输出中的 `result`、`imageUrl`、`imageB64`。
+- 改进 `open_router_responses` 响应诊断：
+  请求会显式要求 `Accept-Encoding: identity`；响应体读取失败带 URL/status 和错误链，JSON 解析失败带 body preview。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.4`；当前 Stellaclaw workdir schema 仍为 `0.5`。
 
 # 1.4.5
 

@@ -1,11 +1,11 @@
 use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use rand::Rng;
-use reqwest::{blocking::Client, StatusCode};
+use reqwest::{blocking::Client, header::ACCEPT_ENCODING, StatusCode};
 use serde_json::{json, Map, Value};
 
 use crate::{
-    model_config::{ModelConfig, RetryMode},
+    model_config::{ModelCapability, ModelConfig, RetryMode},
     session_actor::{
         ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, ReasoningItem, ToolCallItem,
     },
@@ -16,8 +16,10 @@ use super::{
         is_image_file, openrouter_cache_control_payload, provider_error_message,
         token_usage_from_value,
     },
-    OutputPersistor, Provider, ProviderError, ProviderRequest,
+    error_chain_message, OutputPersistor, Provider, ProviderError, ProviderRequest,
 };
+
+const RESPONSE_PREVIEW_CHARS: usize = 2000;
 
 #[derive(Debug, Default)]
 pub struct OpenRouterResponsesProvider {
@@ -101,6 +103,17 @@ impl OpenRouterResponsesProvider {
         if let Some(cache_control) = openrouter_cache_control_payload(model_config) {
             payload.insert("cache_control".to_string(), cache_control);
         }
+        if let Some(modalities) = openrouter_output_modalities(model_config) {
+            payload.insert(
+                "modalities".to_string(),
+                Value::Array(
+                    modalities
+                        .into_iter()
+                        .map(|modality| Value::String(modality.to_string()))
+                        .collect(),
+                ),
+            );
+        }
         payload.insert("store".to_string(), Value::Bool(false));
         let payload = Value::Object(payload);
 
@@ -108,6 +121,7 @@ impl OpenRouterResponsesProvider {
         let mut request_builder = client
             .post(&model_config.url)
             .bearer_auth(api_key)
+            .header(ACCEPT_ENCODING, "identity")
             .header("Content-Type", "application/json")
             .json(&payload);
 
@@ -120,7 +134,13 @@ impl OpenRouterResponsesProvider {
 
         let response = request_builder.send().map_err(ProviderError::request)?;
         let status = response.status();
-        let body = response.text().map_err(ProviderError::DecodeResponse)?;
+        let body = response.bytes().map_err(|error| {
+            ProviderError::InvalidResponse(format!(
+                "failed to read response body from {}",
+                body_read_error_context(&model_config.url, status, &error)
+            ))
+        })?;
+        let body = String::from_utf8_lossy(&body).to_string();
 
         if !status.is_success() {
             return Err(ProviderError::HttpStatus {
@@ -130,7 +150,13 @@ impl OpenRouterResponsesProvider {
             });
         }
 
-        let value = serde_json::from_str::<Value>(&body).map_err(ProviderError::DecodeJson)?;
+        let value = serde_json::from_str::<Value>(&body).map_err(|error| {
+            ProviderError::InvalidResponse(format!(
+                "OpenRouter responses response from {} was not valid JSON: {error}; body preview: {}",
+                model_config.url,
+                preview_body(&body)
+            ))
+        })?;
         if let Some(error) = provider_error_message(&value) {
             return Err(ProviderError::InvalidResponse(error));
         }
@@ -147,6 +173,33 @@ impl OpenRouterResponsesProvider {
             _ => false,
         }
     }
+}
+
+fn body_read_error_context(url: &str, status: StatusCode, error: &reqwest::Error) -> String {
+    format!("{url} with status {status}: {}", error_chain_message(error))
+}
+
+fn preview_body(body: &str) -> String {
+    let mut preview = body
+        .chars()
+        .take(RESPONSE_PREVIEW_CHARS)
+        .collect::<String>();
+    if body.chars().count() > RESPONSE_PREVIEW_CHARS {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn openrouter_output_modalities(model_config: &ModelConfig) -> Option<Vec<&'static str>> {
+    if !model_config.supports(ModelCapability::ImageOut) {
+        return None;
+    }
+
+    let mut modalities = vec!["image"];
+    if model_config.supports(ModelCapability::Chat) {
+        modalities.push("text");
+    }
+    Some(modalities)
 }
 
 impl Provider for OpenRouterResponsesProvider {
@@ -287,9 +340,11 @@ fn responses_value_to_chat_message(
                     arguments: ContextItem { text: arguments },
                 }));
             }
-            Some("image_generation_call") => {
+            Some("image_generation_call") | Some("openrouter:image_generation") => {
                 if let Some(reference) = item.get("result").and_then(Value::as_str) {
                     append_image_reference(&mut data, reference, output_persistor)?;
+                } else if let Some(reference) = image_reference_from_item(item) {
+                    append_image_reference(&mut data, &reference, output_persistor)?;
                 }
             }
             _ => {}
@@ -429,6 +484,11 @@ fn append_image_reference(
         data.push(ChatMessageItem::File(
             output_persistor.persist_image_data_url(reference)?,
         ));
+    } else if is_probable_base64_image(reference) {
+        let data_url = format!("data:image/png;base64,{reference}");
+        data.push(ChatMessageItem::File(
+            output_persistor.persist_image_data_url(&data_url)?,
+        ));
     } else {
         data.push(ChatMessageItem::File(FileItem {
             uri: reference.to_string(),
@@ -446,11 +506,22 @@ fn append_image_reference(
 fn image_reference_from_item(item: &Value) -> Option<String> {
     value_string_or_url(item.get("image_url"))
         .or_else(|| value_string_or_url(item.get("imageUrl")))
+        .or_else(|| value_string_or_url(item.get("imageB64")))
         .or_else(|| value_string_or_url(item.get("url")))
         .or_else(|| {
             item.get("result")
                 .and_then(Value::as_str)
                 .map(str::to_string)
+        })
+}
+
+fn is_probable_base64_image(reference: &str) -> bool {
+    let trimmed = reference.trim();
+    !trimmed.is_empty()
+        && !trimmed.contains("://")
+        && trimmed.len() % 4 == 0
+        && trimmed.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=' | b'\n' | b'\r')
         })
 }
 
@@ -517,6 +588,7 @@ mod tests {
     use crate::{
         model_config::{ModelCapability, ProviderType, TokenEstimatorType},
         session_actor::{ChatMessageItem, ChatRole, ContextItem},
+        test_support::temp_cwd,
     };
 
     fn test_model_config(url: String) -> ModelConfig {
@@ -654,6 +726,90 @@ mod tests {
             .expect("provider should return message");
 
         mock.assert();
+    }
+
+    #[test]
+    fn image_output_request_adds_openrouter_modalities() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/api/v1/responses")
+            .match_header("authorization", "Bearer test-key")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "model": "openai/gpt-5.4-image-2",
+                "modalities": ["image", "text"]
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "id": "resp_image",
+                    "output": [
+                        {
+                            "type": "image_generation_call",
+                            "id": "img_1",
+                            "status": "completed",
+                            "result": "aGVsbG8="
+                        }
+                    ],
+                    "usage": {
+                        "input_tokens": 9,
+                        "output_tokens": 4
+                    }
+                }"#,
+            )
+            .create();
+
+        std::env::set_var("OPENROUTER_RESPONSES_API_KEY_TEST", "test-key");
+
+        let _cwd = temp_cwd("openrouter-responses-image-modalities");
+        let provider = OpenRouterResponsesProvider::new();
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "draw a square".to_string(),
+            })],
+        )];
+        let mut model_config = test_model_config(format!("{}/api/v1/responses", server.url()));
+        model_config.model_name = "openai/gpt-5.4-image-2".to_string();
+        model_config.capabilities = vec![ModelCapability::Chat, ModelCapability::ImageOut];
+
+        let response = provider
+            .send(&model_config, ProviderRequest::new(&messages))
+            .expect("provider should return image file");
+
+        mock.assert();
+        assert!(matches!(
+            response.data.first(),
+            Some(ChatMessageItem::File(_))
+        ));
+    }
+
+    #[test]
+    fn parses_openrouter_image_generation_server_tool_output() {
+        let _cwd = temp_cwd("openrouter-responses-server-image-output");
+        let value = serde_json::json!({
+            "id": "resp_image_tool",
+            "output": [
+                {
+                    "type": "openrouter:image_generation",
+                    "id": "ig_1",
+                    "status": "completed",
+                    "imageB64": "aGVsbG8="
+                }
+            ],
+            "usage": {
+                "input_tokens": 9,
+                "output_tokens": 4
+            }
+        });
+
+        let response = responses_value_to_chat_message(&value, &OutputPersistor)
+            .expect("server tool image output should parse");
+
+        assert!(matches!(
+            response.data.first(),
+            Some(ChatMessageItem::File(_))
+        ));
     }
 
     #[test]

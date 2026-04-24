@@ -5,15 +5,15 @@ use reqwest::{blocking::Client, header::ACCEPT_ENCODING, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    model_config::{ModelConfig, RetryMode},
+    model_config::{ModelCapability, ModelConfig, RetryMode},
     session_actor::{
         ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, TokenUsage, ToolCallItem,
     },
 };
 
 use super::{
-    common::openrouter_cache_control_payload, OutputPersistor, Provider, ProviderError,
-    ProviderRequest,
+    common::openrouter_cache_control_payload, error_chain_message, OutputPersistor, Provider,
+    ProviderError, ProviderRequest,
 };
 
 const RESPONSE_PREVIEW_CHARS: usize = 2000;
@@ -72,6 +72,7 @@ impl OpenRouterCompletionProvider {
                 .iter()
                 .map(|tool| tool.openai_tool_schema())
                 .collect(),
+            modalities: openrouter_output_modalities(model_config),
             reasoning: model_config.reasoning.clone(),
             cache_control: openrouter_cache_control_payload(model_config),
         };
@@ -95,8 +96,8 @@ impl OpenRouterCompletionProvider {
         let status = response.status();
         let body = response.bytes().map_err(|error| {
             ProviderError::InvalidResponse(format!(
-                "failed to read response body from {} with status {status}: {error}",
-                model_config.url
+                "failed to read response body from {}",
+                body_read_error_context(&model_config.url, status, &error)
             ))
         })?;
         let body = String::from_utf8_lossy(&body).to_string();
@@ -151,6 +152,22 @@ fn preview_body(body: &str) -> String {
     preview
 }
 
+fn body_read_error_context(url: &str, status: StatusCode, error: &reqwest::Error) -> String {
+    format!("{url} with status {status}: {}", error_chain_message(error))
+}
+
+fn openrouter_output_modalities(model_config: &ModelConfig) -> Option<Vec<&'static str>> {
+    if !model_config.supports(ModelCapability::ImageOut) {
+        return None;
+    }
+
+    let mut modalities = vec!["image"];
+    if model_config.supports(ModelCapability::Chat) {
+        modalities.push("text");
+    }
+    Some(modalities)
+}
+
 impl Provider for OpenRouterCompletionProvider {
     fn send(
         &self,
@@ -193,6 +210,8 @@ struct OpenRouterChatCompletionRequest {
     messages: Vec<OpenRouterRequestMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    modalities: Option<Vec<&'static str>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reasoning: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -642,6 +661,72 @@ mod tests {
         let error = error.to_string();
         assert!(error.contains("OpenRouter chat completion response"));
         assert!(error.contains("body preview: not json"));
+    }
+
+    #[test]
+    fn image_output_request_adds_openrouter_modalities() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/api/v1/chat/completions")
+            .match_header("authorization", "Bearer test-key")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "model": "openai/gpt-5.4-image-2",
+                "modalities": ["image", "text"]
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "id": "gen_image",
+                    "model": "openai/gpt-5.4-image-2",
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {
+                                "content": null,
+                                "images": [
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": "data:image/png;base64,aGVsbG8="
+                                        }
+                                    }
+                                ],
+                                "tool_calls": []
+                            }
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 12,
+                        "completion_tokens": 7
+                    }
+                }"#,
+            )
+            .create();
+
+        std::env::set_var("OPENROUTER_API_KEY_TEST", "test-key");
+
+        let provider = OpenRouterCompletionProvider::new();
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "draw a square".to_string(),
+            })],
+        )];
+        let mut model_config =
+            test_model_config(format!("{}/api/v1/chat/completions", server.url()));
+        model_config.model_name = "openai/gpt-5.4-image-2".to_string();
+        model_config.capabilities = vec![ModelCapability::Chat, ModelCapability::ImageOut];
+
+        let response = provider
+            .send(&model_config, ProviderRequest::new(&messages))
+            .expect("image output request should succeed");
+
+        mock.assert();
+        assert!(matches!(
+            response.data.first(),
+            Some(ChatMessageItem::File(_))
+        ));
     }
 
     #[test]

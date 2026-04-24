@@ -128,7 +128,7 @@ impl ProviderError {
     }
 }
 
-fn error_chain_message(error: &dyn StdError) -> String {
+pub(crate) fn error_chain_message(error: &dyn StdError) -> String {
     let mut message = error.to_string();
     let mut source = error.source();
     while let Some(error) = source {
