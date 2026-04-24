@@ -78,3 +78,12 @@
 - workdir-only schema 迁移、bug fix、文档/CI 改进：提升 `PATCH`。
 
 每次 bump 都要在 [VERSION](VERSION) 顶部新增对应 changelog 小节，并说明是否影响 `config`、`workdir` 或两者都不影响。
+
+### 发布前检查
+
+在新增根 [VERSION](VERSION) 小节前，必须检查 GitHub 上一个版本是否已经成功发布：
+
+- 查询上一个版本对应的 tag 和 GitHub Release，例如 `v1.0.0`。
+- 如果上一个版本已经有非 draft release，新版本 changelog 只记录本次增量。
+- 如果上一个版本没有成功发布，不要让 changelog 断档；把未发布版本的小节内容合并进当前新版本小节，再发布当前版本。
+- 推送后继续检查当前版本的 CI / Release workflow，确认 tag 和 GitHub Release 最终创建成功。
