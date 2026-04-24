@@ -36,6 +36,7 @@ if [[ -d "$STEM_WORKDIR" && ( -f "$STEM_WORKDIR/STELLA_VERSION" || -f "$STEM_WOR
   DEFAULT_WORKDIR="$STEM_WORKDIR"
 fi
 WORKDIR="${STELLACLAW_WORKDIR:-$DEFAULT_WORKDIR}"
+export STELLACLAW_LOG_STDOUT="${STELLACLAW_LOG_STDOUT:-1}"
 
 if [[ -f "$SCRIPT_DIR/.env" ]]; then
   set -a
@@ -49,6 +50,7 @@ cargo build --workspace --release
 echo "Starting stellaclaw in foreground ..."
 echo "  config: $CONFIG_PATH"
 echo "  workdir: $WORKDIR"
+echo "  stdout logs: $STELLACLAW_LOG_STDOUT"
 
 exec "$SCRIPT_DIR/target/release/stellaclaw" \
   --config "$CONFIG_PATH" \

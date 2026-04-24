@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{self, Write},
     path::Path,
     sync::Mutex,
 };
@@ -11,6 +11,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 #[derive(Debug)]
 pub struct StellaclawLogger {
     file: Mutex<File>,
+    mirror_stdout: bool,
 }
 
 impl StellaclawLogger {
@@ -26,6 +27,7 @@ impl StellaclawLogger {
             .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
         Ok(Self {
             file: Mutex::new(file),
+            mirror_stdout: stdout_logging_enabled(),
         })
     }
 
@@ -52,10 +54,20 @@ impl StellaclawLogger {
             "event": event,
             "data": data,
         });
-        let Ok(mut file) = self.file.lock() else {
-            return;
-        };
-        let _ = writeln!(file, "{line}");
-        let _ = file.flush();
+        if let Ok(mut file) = self.file.lock() {
+            let _ = writeln!(file, "{line}");
+            let _ = file.flush();
+        }
+        if self.mirror_stdout {
+            let mut stdout = io::stdout().lock();
+            let _ = writeln!(stdout, "{line}");
+            let _ = stdout.flush();
+        }
     }
+}
+
+fn stdout_logging_enabled() -> bool {
+    std::env::var("STELLACLAW_LOG_STDOUT")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
 }

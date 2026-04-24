@@ -1,5 +1,12 @@
-version: 1.1.0
+version: 1.1.1
 ---
+
+# 1.1.1
+
+- 打开前台运行日志：
+  `run.sh` 默认设置 `STELLACLAW_LOG_STDOUT=1`，Host 日志仍写入文件，同时会镜像到 stdout，方便直接用前台进程排障。
+- 本次不改变 `config` schema，不改变 `workdir` schema：
+  当前 config schema 仍为 `0.3`；当前 Stellaclaw workdir schema 仍为 `0.3`。
 
 # 1.1.0
 
