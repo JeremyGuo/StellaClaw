@@ -1,5 +1,10 @@
-version: 1.10.3
+version: 1.10.4
 ---
+
+# 1.10.4
+
+- 修复附件示例误触发发送：
+  `<attachment>...</attachment>` 解析现在会跳过 Markdown fenced code block 内的示例文本，避免说明文档或代码块中的占位路径被当成真实附件发送；同时 shared 附件路径识别兼容 Windows 风格 `shared\\...` 分隔符。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.10.3
 

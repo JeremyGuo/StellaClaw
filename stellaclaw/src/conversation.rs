@@ -3000,6 +3000,12 @@ fn extract_attachment_references(
 
     while let Some(start_rel) = text[cursor..].find(START) {
         let start = cursor + start_rel;
+        if is_inside_fenced_code_block(text, start) {
+            let start_end = start + START.len();
+            clean.push_str(&text[cursor..start_end]);
+            cursor = start_end;
+            continue;
+        }
         clean.push_str(&text[cursor..start]);
         let path_start = start + START.len();
         let Some(end_rel) = text[path_start..].find(END) else {
@@ -3030,6 +3036,12 @@ fn strip_attachment_tags(text: &str) -> String {
     let mut cursor = 0usize;
     while let Some(start_rel) = text[cursor..].find(START) {
         let start = cursor + start_rel;
+        if is_inside_fenced_code_block(text, start) {
+            let start_end = start + START.len();
+            clean.push_str(&text[cursor..start_end]);
+            cursor = start_end;
+            continue;
+        }
         clean.push_str(&text[cursor..start]);
         let path_start = start + START.len();
         let Some(end_rel) = text[path_start..].find(END) else {
@@ -3047,6 +3059,32 @@ fn strip_attachment_tags(text: &str) -> String {
     clean
 }
 
+fn is_inside_fenced_code_block(text: &str, byte_index: usize) -> bool {
+    let mut inside = false;
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        if offset >= byte_index {
+            break;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            inside = !inside;
+        }
+        offset += line.len();
+    }
+    inside
+}
+
+fn is_shared_attachment_path(path_text: &str) -> bool {
+    path_text == "shared"
+        || path_text
+            .strip_prefix("shared/")
+            .is_some_and(|relative| !relative.trim().is_empty())
+        || path_text
+            .strip_prefix("shared\\")
+            .is_some_and(|relative| !relative.trim().is_empty())
+}
+
 fn resolve_outgoing_attachment(
     workspace_root: &Path,
     shared_root: &Path,
@@ -3059,10 +3097,7 @@ fn resolve_outgoing_attachment(
     let root = workspace_root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", workspace_root.display()))?;
-    let allowed_runtime_shared = path_text == "shared"
-        || path_text
-            .strip_prefix("shared/")
-            .is_some_and(|relative| !relative.trim().is_empty());
+    let allowed_runtime_shared = is_shared_attachment_path(path_text);
     let shared_root = shared_root.canonicalize().ok();
     let in_runtime_shared = allowed_runtime_shared
         && shared_root
@@ -3331,6 +3366,28 @@ mod tests {
             frontmatter_scalar(folded, "description").as_deref(),
             Some("Deploy reports safely")
         );
+    }
+
+    #[test]
+    fn extract_attachment_references_ignores_tags_in_fenced_code() {
+        let text = "example:\n```text\n<attachment>shared/foo.pdf</attachment>\n```\ndone";
+        let root = Path::new("/tmp/stellaclaw-no-such-workspace");
+
+        let (clean, attachments) = extract_attachment_references(text, root, &root.join("shared"))
+            .expect("code-only tag should not resolve");
+
+        assert_eq!(clean, text);
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn shared_attachment_path_accepts_unix_and_windows_separators() {
+        assert!(is_shared_attachment_path("shared"));
+        assert!(is_shared_attachment_path("shared/foo.pdf"));
+        assert!(is_shared_attachment_path("shared\\foo.pdf"));
+        assert!(!is_shared_attachment_path("shared/"));
+        assert!(!is_shared_attachment_path("shared\\"));
+        assert!(!is_shared_attachment_path("not-shared/foo.pdf"));
     }
 
     #[test]
