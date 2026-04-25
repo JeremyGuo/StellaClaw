@@ -1,5 +1,14 @@
-version: 1.10.5
+version: 1.11.0
 ---
+
+# 1.11.0
+
+- 扩展 Web channel workspace API：
+  新增 `GET /api/conversations/{conversation_id}/workspace?path=<relative>&limit=<n>`，用于前端列出当前 conversation 实际 workspace 的一层目录内容；fixed SSH Remote Mode 下会解析到 sshfs workspace 并复用现有健康恢复逻辑，返回 local mount root、remote host/cwd、相对路径、parent 和目录项元数据。本次不改变 `config` schema，不改变 `workdir` schema。
+- 拆出 remote workspace 查询边界：
+  新增 `stellaclaw/src/remote_actor.rs` 承载 workspace 路径校验和目录 listing 响应结构，Web channel 只做鉴权、conversation ownership 校验和转发，给后续把 SSH/Remote 专用指令收敛到 Remote Actor 留出边界。本次不改变 `config` schema，不改变 `workdir` schema。
+- 接入 Stellacode workspace 浏览：
+  Stellacode 右侧概览栏现在会调用 Web channel workspace API 展示当前 conversation 的实际工作目录，支持目录进入、面包屑返回和刷新；Remote Mode 下显示对应 remote host/cwd 和本地 sshfs workspace root。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.10.5
 

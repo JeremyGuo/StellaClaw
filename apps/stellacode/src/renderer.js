@@ -7,6 +7,10 @@ const state = {
   conversations: new Map(),
   statuses: new Map(),
   serverHealth: new Map(),
+  workspaceListings: new Map(),
+  workspacePaths: new Map(),
+  workspaceErrors: new Map(),
+  workspaceLoading: new Set(),
   messages: [],
   messagesSignature: '',
   messageDetails: new Map(),
@@ -98,6 +102,21 @@ function formatCost(value) {
   return `$${Number(value || 0).toFixed(3)}`;
 }
 
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (bytes <= 0) {
+    return '';
+  }
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let size = bytes;
+  let index = 0;
+  while (size >= 1024 && index < units.length - 1) {
+    size /= 1024;
+    index += 1;
+  }
+  return `${size >= 10 || index === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[index]}`;
+}
+
 function stableSignature(value) {
   return JSON.stringify(value ?? null);
 }
@@ -131,6 +150,26 @@ function selectedStatus() {
     return null;
   }
   return state.statuses.get(conversationKey(state.selected.serverId, state.selected.conversationId));
+}
+
+function selectedKey() {
+  if (!state.selected) {
+    return '';
+  }
+  return conversationKey(state.selected.serverId, state.selected.conversationId);
+}
+
+function currentWorkspacePath() {
+  const key = selectedKey();
+  return key ? state.workspacePaths.get(key) || '' : '';
+}
+
+function normalizeWorkspacePath(value) {
+  return safeText(value)
+    .replaceAll('\\', '/')
+    .split('/')
+    .filter((part) => part && part !== '.')
+    .join('/');
 }
 
 function displayConversationName(serverId, conversation) {
@@ -387,6 +426,10 @@ async function selectConversation(serverId, conversationId) {
   state.selected = { serverId, conversationId };
   state.activeServerId = serverId;
   state.settings.activeServerId = serverId;
+  const key = selectedKey();
+  if (!state.workspacePaths.has(key)) {
+    state.workspacePaths.set(key, '');
+  }
   state.messages = [];
   state.messagesSignature = '';
   state.messageDetails.clear();
@@ -398,6 +441,7 @@ async function selectConversation(serverId, conversationId) {
   renderMessages();
   renderContext();
   await refreshConversation();
+  await refreshWorkspace();
 }
 
 async function refreshConversation() {
@@ -433,6 +477,36 @@ async function refreshConversation() {
     renderMessages();
   }
   renderContext();
+}
+
+async function refreshWorkspace(path = currentWorkspacePath()) {
+  if (!state.selected) {
+    return;
+  }
+  const { serverId, conversationId } = state.selected;
+  const key = selectedKey();
+  const nextPath = normalizeWorkspacePath(path);
+  state.workspacePaths.set(key, nextPath);
+  state.workspaceLoading.add(key);
+  state.workspaceErrors.delete(key);
+  if (state.activeContextTab === 'overview') {
+    renderContext();
+  }
+  try {
+    const response = await api(
+      serverId,
+      `/api/conversations/${conversationId}/workspace?path=${encodeURIComponent(nextPath)}&limit=300`
+    );
+    state.workspaceListings.set(key, response.data);
+    state.workspacePaths.set(key, normalizeWorkspacePath(response.data?.path || nextPath));
+  } catch (error) {
+    state.workspaceErrors.set(key, error.message);
+  } finally {
+    state.workspaceLoading.delete(key);
+    if (selectedKey() === key && state.activeContextTab === 'overview') {
+      renderContext();
+    }
+  }
 }
 
 async function fetchMessageDetail(messageId) {
@@ -721,8 +795,6 @@ function renderOverviewContext() {
   }
   const usage = statusUsageTotals(status);
   const remote = isRemoteStatus(status);
-  const workspace = status?.workspace || 'workspace pending';
-  const crumbs = compactPath(workspace).split('/').filter(Boolean);
   elements.contextContent.innerHTML = `
     <section class="inspector-card hero-card">
       <div class="inspector-kicker">${escapeHtml(conversation?.conversation_id || state.selected.conversationId)}</div>
@@ -755,11 +827,7 @@ function renderOverviewContext() {
         <span>subagents</span><strong>${Number(status?.running_subagents || 0)} / ${Number(status?.total_subagents || 0)}</strong>
       </div>
     </section>
-    <section class="inspector-card">
-      <div class="inspector-title">Workspace</div>
-      <div class="path-chip">${escapeHtml(workspace)}</div>
-      <div class="crumb-row">${crumbs.map((part) => `<span>${escapeHtml(part)}</span>`).join('')}</div>
-    </section>
+    ${renderWorkspaceCard(status)}
     <section class="inspector-card">
       <div class="inspector-title">Usage</div>
       ${usageBar('Cache Read', usage.cacheRead, usage.totalTokens)}
@@ -768,6 +836,7 @@ function renderOverviewContext() {
       ${usageBar('Output', usage.output, usage.totalTokens)}
     </section>
   `;
+  bindWorkspaceActions();
 }
 
 function usageBar(label, value, total) {
@@ -778,6 +847,115 @@ function usageBar(label, value, total) {
       <div class="usage-track"><span style="width: ${percent}%"></span></div>
     </div>
   `;
+}
+
+function workspaceKindIcon(kind) {
+  if (kind === 'directory') {
+    return '▸';
+  }
+  if (kind === 'symlink') {
+    return '↪';
+  }
+  return '·';
+}
+
+function workspaceCrumbs(path) {
+  const parts = normalizeWorkspacePath(path).split('/').filter(Boolean);
+  const crumbs = [{ label: 'workspace', path: '' }];
+  let current = '';
+  for (const part of parts) {
+    current = current ? `${current}/${part}` : part;
+    crumbs.push({ label: part, path: current });
+  }
+  return crumbs;
+}
+
+function renderWorkspaceCard(status) {
+  const key = selectedKey();
+  const listing = state.workspaceListings.get(key);
+  const loading = state.workspaceLoading.has(key);
+  const error = state.workspaceErrors.get(key);
+  const activePath = listing?.path ?? currentWorkspacePath();
+  const root = listing?.workspace_root || status?.workspace || 'workspace pending';
+  const remote = listing?.remote;
+  const entries = [...(listing?.entries || [])].sort((left, right) => {
+    const leftDir = left.kind === 'directory';
+    const rightDir = right.kind === 'directory';
+    if (leftDir !== rightDir) {
+      return leftDir ? -1 : 1;
+    }
+    return safeText(left.name).localeCompare(safeText(right.name), undefined, { numeric: true });
+  });
+  const rows = [];
+  if (listing?.parent !== null && listing?.parent !== undefined) {
+    rows.push(`
+      <button class="workspace-row directory parent" type="button" data-workspace-path="${escapeHtml(listing.parent || '')}">
+        <span class="workspace-icon">↰</span>
+        <span class="workspace-name">..</span>
+        <span class="workspace-row-meta">parent</span>
+      </button>
+    `);
+  }
+  for (const entry of entries) {
+    const isDirectory = entry.kind === 'directory';
+    const metaParts = [formatBytes(entry.size_bytes), entry.readonly ? 'readonly' : '', entry.hidden ? 'hidden' : ''].filter(Boolean);
+    const tag = isDirectory ? 'button' : 'div';
+    const action = isDirectory ? ` type="button" data-workspace-path="${escapeHtml(entry.path)}"` : '';
+    rows.push(`
+      <${tag} class="workspace-row ${escapeHtml(entry.kind || 'other')}"${action}>
+        <span class="workspace-icon">${workspaceKindIcon(entry.kind)}</span>
+        <span class="workspace-name">${escapeHtml(entry.name)}</span>
+        <span class="workspace-row-meta">${escapeHtml(metaParts.join(' · '))}</span>
+      </${tag}>
+    `);
+  }
+  const crumbs = workspaceCrumbs(activePath)
+    .map(
+      (crumb, index) => `
+      <button class="crumb-button${index === 0 ? ' root' : ''}" type="button" data-workspace-path="${escapeHtml(crumb.path)}">
+        ${escapeHtml(crumb.label)}
+      </button>
+    `
+    )
+    .join('');
+  const body = error
+    ? `<div class="workspace-empty error">${escapeHtml(error)}</div>`
+    : loading && !listing
+      ? '<div class="workspace-empty">正在加载 workspace...</div>'
+      : rows.length > 0
+        ? `<div class="workspace-list">${rows.join('')}</div>`
+        : '<div class="workspace-empty">这个目录是空的。</div>';
+  const footer = listing?.truncated
+    ? `<div class="workspace-footer">已显示 ${Number(listing.returned_entries || 0)} / ${Number(listing.total_entries || 0)} 项</div>`
+    : listing
+      ? `<div class="workspace-footer">${Number(listing.returned_entries || 0)} 项</div>`
+      : '';
+  return `
+    <section class="inspector-card workspace-card">
+      <div class="inspector-title-row">
+        <div>
+          <div class="inspector-title">Workspace</div>
+          <div class="workspace-mode">${remote ? `${escapeHtml(remote.host)} · ${escapeHtml(remote.cwd)}` : 'local workspace'}</div>
+        </div>
+        <button class="tiny-button" type="button" data-workspace-refresh>${loading ? '加载中' : '刷新'}</button>
+      </div>
+      <div class="path-chip">${escapeHtml(root)}</div>
+      <div class="crumb-row">${crumbs}</div>
+      ${body}
+      ${footer}
+    </section>
+  `;
+}
+
+function bindWorkspaceActions() {
+  elements.contextContent.querySelectorAll('[data-workspace-path]').forEach((button) => {
+    button.addEventListener('click', () => {
+      refreshWorkspace(button.dataset.workspacePath || '').catch((error) => showToast(error.message));
+    });
+  });
+  elements.contextContent.querySelector('[data-workspace-refresh]')?.addEventListener('click', () => {
+    refreshWorkspace().catch((error) => showToast(error.message));
+  });
 }
 
 function renderDetailContext() {
@@ -1009,7 +1187,10 @@ async function init() {
 function bindEvents() {
   elements.newConversationButton.addEventListener('click', openNewConversationModal);
   elements.settingsButton.addEventListener('click', openSettingsModal);
-  elements.refreshButton.addEventListener('click', refreshConversation);
+  elements.refreshButton.addEventListener('click', async () => {
+    await refreshConversation();
+    await refreshWorkspace();
+  });
   elements.toggleContextButton.addEventListener('click', () => {
     state.contextCollapsed = !state.contextCollapsed;
     renderContext();

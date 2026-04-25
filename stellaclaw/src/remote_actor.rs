@@ -1,0 +1,270 @@
+use std::{
+    fmt, fs,
+    path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::Context;
+use serde::Serialize;
+use stellaclaw_core::session_actor::ToolRemoteMode;
+
+use crate::{conversation::ConversationState, workspace::ensure_workspace_for_remote_mode};
+
+#[derive(Debug)]
+pub enum RemoteActorError {
+    InvalidPath(String),
+    Internal(anyhow::Error),
+}
+
+impl fmt::Display for RemoteActorError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidPath(message) => formatter.write_str(message),
+            Self::Internal(error) => write!(formatter, "{error:#}"),
+        }
+    }
+}
+
+impl std::error::Error for RemoteActorError {}
+
+impl From<anyhow::Error> for RemoteActorError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Internal(error)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceListing {
+    pub conversation_id: String,
+    pub mode: WorkspaceMode,
+    pub remote: Option<WorkspaceRemote>,
+    pub workspace_root: String,
+    pub path: String,
+    pub parent: Option<String>,
+    pub total_entries: usize,
+    pub returned_entries: usize,
+    pub truncated: bool,
+    pub entries: Vec<WorkspaceEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceMode {
+    Local,
+    FixedSsh,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceRemote {
+    pub host: String,
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceEntry {
+    pub name: String,
+    pub path: String,
+    pub kind: WorkspaceEntryKind,
+    pub size_bytes: Option<u64>,
+    pub modified_ms: Option<u128>,
+    pub hidden: bool,
+    pub readonly: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceEntryKind {
+    Directory,
+    File,
+    Symlink,
+    Other,
+}
+
+pub fn list_workspace_entries(
+    workdir: &Path,
+    state: &ConversationState,
+    relative_path: Option<&str>,
+    limit: usize,
+) -> std::result::Result<WorkspaceListing, RemoteActorError> {
+    let normalized = normalize_workspace_path(relative_path.unwrap_or_default())?;
+    let conversation_root = workdir.join("conversations").join(&state.conversation_id);
+    let workspace_root = ensure_workspace_for_remote_mode(
+        workdir,
+        &conversation_root,
+        &state.conversation_id,
+        &state.tool_remote_mode,
+    )?;
+    let target = workspace_root.join(&normalized);
+    let metadata = fs::metadata(&target).with_context(|| {
+        format!(
+            "failed to inspect workspace path {}",
+            display_workspace_path(&normalized)
+        )
+    })?;
+    if !metadata.is_dir() {
+        return Err(RemoteActorError::InvalidPath(format!(
+            "workspace path {} is not a directory",
+            display_workspace_path(&normalized)
+        )));
+    }
+
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(&target)
+        .with_context(|| format!("failed to read workspace path {}", target.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to enumerate {}", target.display()))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let relative_entry_path = normalized.join(&name);
+        let metadata = fs::symlink_metadata(entry.path())
+            .with_context(|| format!("failed to inspect {}", entry.path().display()))?;
+        entries.push(WorkspaceEntry {
+            hidden: name.starts_with('.'),
+            path: path_to_api_string(&relative_entry_path),
+            name,
+            kind: entry_kind(&metadata),
+            size_bytes: metadata.is_file().then_some(metadata.len()),
+            modified_ms: metadata.modified().ok().and_then(system_time_ms),
+            readonly: metadata.permissions().readonly(),
+        });
+    }
+    entries.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
+    let total_entries = entries.len();
+    let effective_limit = limit.max(1);
+    let truncated = total_entries > effective_limit;
+    entries.truncate(effective_limit);
+    let returned_entries = entries.len();
+
+    Ok(WorkspaceListing {
+        conversation_id: state.conversation_id.clone(),
+        mode: match state.tool_remote_mode {
+            ToolRemoteMode::Selectable => WorkspaceMode::Local,
+            ToolRemoteMode::FixedSsh { .. } => WorkspaceMode::FixedSsh,
+        },
+        remote: match &state.tool_remote_mode {
+            ToolRemoteMode::Selectable => None,
+            ToolRemoteMode::FixedSsh { host, cwd } => Some(WorkspaceRemote {
+                host: host.clone(),
+                cwd: cwd.clone(),
+            }),
+        },
+        workspace_root: workspace_root.display().to_string(),
+        parent: parent_api_path(&normalized),
+        path: path_to_api_string(&normalized),
+        total_entries,
+        returned_entries,
+        truncated,
+        entries,
+    })
+}
+
+fn normalize_workspace_path(value: &str) -> std::result::Result<PathBuf, RemoteActorError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed == "." {
+        return Ok(PathBuf::new());
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err(RemoteActorError::InvalidPath(
+            "workspace path must be relative".to_string(),
+        ));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => normalized.push(value),
+            Component::ParentDir => {
+                return Err(RemoteActorError::InvalidPath(
+                    "workspace path must not contain parent components".to_string(),
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(RemoteActorError::InvalidPath(
+                    "workspace path must be relative".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn entry_kind(metadata: &fs::Metadata) -> WorkspaceEntryKind {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        WorkspaceEntryKind::Symlink
+    } else if file_type.is_dir() {
+        WorkspaceEntryKind::Directory
+    } else if file_type.is_file() {
+        WorkspaceEntryKind::File
+    } else {
+        WorkspaceEntryKind::Other
+    }
+}
+
+fn parent_api_path(path: &Path) -> Option<String> {
+    let parent = path.parent()?;
+    Some(path_to_api_string(parent))
+}
+
+fn path_to_api_string(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn display_workspace_path(path: &Path) -> String {
+    let value = path_to_api_string(path);
+    if value.is_empty() {
+        ".".to_string()
+    } else {
+        value
+    }
+}
+
+fn system_time_ms(value: SystemTime) -> Option<u128> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_relative_workspace_paths() {
+        assert_eq!(
+            normalize_workspace_path("./src/../bad")
+                .unwrap_err()
+                .to_string(),
+            "workspace path must not contain parent components"
+        );
+        assert_eq!(
+            path_to_api_string(&normalize_workspace_path("./src/bin").unwrap()),
+            "src/bin"
+        );
+        assert_eq!(
+            path_to_api_string(&normalize_workspace_path("").unwrap()),
+            ""
+        );
+    }
+
+    #[test]
+    fn parent_path_uses_api_separators() {
+        let path = normalize_workspace_path("src/bin").unwrap();
+        assert_eq!(parent_api_path(&path).as_deref(), Some("src"));
+        let root = normalize_workspace_path("").unwrap();
+        assert_eq!(parent_api_path(&root), None);
+    }
+}

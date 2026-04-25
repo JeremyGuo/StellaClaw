@@ -4,6 +4,7 @@ mod conversation;
 mod conversation_id_manager;
 mod cron;
 mod logger;
+mod remote_actor;
 mod sandbox;
 mod session_client;
 mod upgrade;

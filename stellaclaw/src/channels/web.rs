@@ -25,6 +25,7 @@ use crate::{
     },
     conversation_id_manager::ConversationIdManager,
     logger::StellaclawLogger,
+    remote_actor::{list_workspace_entries, RemoteActorError},
 };
 
 use super::{
@@ -161,6 +162,9 @@ impl WebChannel {
             }
             ("GET", ["conversations", conversation_id, "status"]) => {
                 self.conversation_status(conversation_id)
+            }
+            ("GET", ["conversations", conversation_id, "workspace"]) => {
+                self.conversation_workspace(conversation_id, &request.query)
             }
             _ => Err(ApiError::new(404, "not_found")),
         }
@@ -383,6 +387,23 @@ impl WebChannel {
             load_conversation_status_snapshot(&self.workdir, &self.config, conversation_id)
                 .map_err(ApiError::internal)?;
         Ok(json_response(200, json!(status)))
+    }
+
+    fn conversation_workspace(
+        &self,
+        conversation_id: &str,
+        query: &HashMap<String, String>,
+    ) -> ApiResult<HttpResponse> {
+        let state = self.load_web_state(conversation_id)?;
+        let path = query.get("path").map(String::as_str);
+        let limit = query_usize(query, "limit", 200).min(1000);
+        let listing = list_workspace_entries(&self.workdir, &state, path, limit).map_err(
+            |error| match error {
+                RemoteActorError::InvalidPath(message) => ApiError::new(400, message),
+                RemoteActorError::Internal(error) => ApiError::internal(error),
+            },
+        )?;
+        Ok(json_response(200, json!(listing)))
     }
 
     fn load_web_state(&self, conversation_id: &str) -> ApiResult<ConversationState> {

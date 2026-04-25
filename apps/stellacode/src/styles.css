@@ -267,7 +267,8 @@ body.context-collapsed .app-shell {
 .header-actions,
 .context-header,
 .context-tabs,
-.message-actions {
+.message-actions,
+.inspector-title-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -717,9 +718,15 @@ body.context-collapsed .context-panel {
 }
 
 .inspector-kicker,
-.inspector-title {
+.inspector-title,
+.workspace-mode,
+.workspace-footer {
   color: var(--muted);
   font-size: 12px;
+}
+
+.inspector-title-row {
+  gap: 12px;
 }
 
 .inspector-card h2 {
@@ -815,14 +822,109 @@ body.context-collapsed .context-panel {
   margin-top: 9px;
 }
 
-.crumb-row span {
+.crumb-row span,
+.crumb-button {
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   padding: 3px 7px;
+  border: 0;
   border-radius: 999px;
+  color: var(--muted);
   background: var(--panel);
+  cursor: pointer;
+}
+
+.crumb-button:hover {
+  color: var(--text);
+  background: var(--panel-3);
+}
+
+.workspace-mode {
+  margin-top: 3px;
+  overflow-wrap: anywhere;
+}
+
+.workspace-list {
+  display: grid;
+  gap: 3px;
+  margin-top: 10px;
+}
+
+.workspace-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: center;
+  min-height: 31px;
+  gap: 8px;
+  padding: 4px 7px;
+  border: 0;
+  border-radius: 7px;
+  color: var(--text);
+  background: transparent;
+  text-align: left;
+}
+
+button.workspace-row {
+  cursor: pointer;
+}
+
+button.workspace-row:hover {
+  background: var(--panel);
+}
+
+.workspace-row.directory .workspace-name {
+  font-weight: 650;
+}
+
+.workspace-row.file,
+.workspace-row.symlink,
+.workspace-row.other {
+  color: color-mix(in srgb, var(--text), var(--muted) 20%);
+}
+
+.workspace-icon {
+  display: inline-grid;
+  place-items: center;
+  color: var(--muted);
+  font-family: var(--font-mono);
+}
+
+.workspace-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-row-meta {
+  max-width: 110px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-empty {
+  margin-top: 10px;
+  padding: 14px 10px;
+  border-radius: 8px;
+  color: var(--muted);
+  background: var(--panel);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.workspace-empty.error {
+  color: #c75050;
+  background: rgba(199, 80, 80, 0.1);
+}
+
+.workspace-footer {
+  margin-top: 8px;
+  text-align: right;
 }
 
 .usage-row {
