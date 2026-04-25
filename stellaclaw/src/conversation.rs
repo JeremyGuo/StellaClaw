@@ -1489,7 +1489,24 @@ impl ConversationRuntime {
     }
 
     fn send_delivery_from_text(&self, text: String) -> Result<()> {
-        let (clean_text, attachments) = extract_attachment_references(&text, &self.workspace_root)?;
+        let (clean_text, attachments) = match extract_attachment_references(
+            &text,
+            &self.workspace_root,
+            &self.workdir.join("rundir").join("shared"),
+        ) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                let fallback = format!(
+                    "{}\n\n⚠️ 附件发送失败: {error:#}",
+                    strip_attachment_tags(&text).trim()
+                );
+                self.logger.warn(
+                    "outgoing_attachment_resolution_failed",
+                    json!({"error": format!("{error:#}")}),
+                );
+                (fallback, Vec::new())
+            }
+        };
         if clean_text.trim().is_empty() && attachments.is_empty() {
             return Ok(());
         }
@@ -2972,6 +2989,7 @@ fn format_session_error(error: &str, detail: &SessionErrorDetail) -> String {
 fn extract_attachment_references(
     text: &str,
     workspace_root: &Path,
+    shared_root: &Path,
 ) -> Result<(String, Vec<OutgoingAttachment>)> {
     const START: &str = "<attachment>";
     const END: &str = "</attachment>";
@@ -2991,7 +3009,11 @@ fn extract_attachment_references(
         let path_end = path_start + end_rel;
         let path_text = text[path_start..path_end].trim();
         if !path_text.is_empty() {
-            attachments.push(resolve_outgoing_attachment(workspace_root, path_text)?);
+            attachments.push(resolve_outgoing_attachment(
+                workspace_root,
+                shared_root,
+                path_text,
+            )?);
         }
         cursor = path_end + END.len();
     }
@@ -3000,8 +3022,34 @@ fn extract_attachment_references(
     Ok((clean.trim().to_string(), attachments))
 }
 
+fn strip_attachment_tags(text: &str) -> String {
+    const START: &str = "<attachment>";
+    const END: &str = "</attachment>";
+
+    let mut clean = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while let Some(start_rel) = text[cursor..].find(START) {
+        let start = cursor + start_rel;
+        clean.push_str(&text[cursor..start]);
+        let path_start = start + START.len();
+        let Some(end_rel) = text[path_start..].find(END) else {
+            clean.push_str(&text[start..]);
+            return clean;
+        };
+        let path_end = path_start + end_rel;
+        let path_text = text[path_start..path_end].trim();
+        if !path_text.is_empty() {
+            clean.push_str(path_text);
+        }
+        cursor = path_end + END.len();
+    }
+    clean.push_str(&text[cursor..]);
+    clean
+}
+
 fn resolve_outgoing_attachment(
     workspace_root: &Path,
+    shared_root: &Path,
     path_text: &str,
 ) -> Result<OutgoingAttachment> {
     let joined = workspace_root.join(path_text);
@@ -3011,7 +3059,16 @@ fn resolve_outgoing_attachment(
     let root = workspace_root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", workspace_root.display()))?;
-    if !canonical.starts_with(&root) {
+    let allowed_runtime_shared = path_text == "shared"
+        || path_text
+            .strip_prefix("shared/")
+            .is_some_and(|relative| !relative.trim().is_empty());
+    let shared_root = shared_root.canonicalize().ok();
+    let in_runtime_shared = allowed_runtime_shared
+        && shared_root
+            .as_ref()
+            .is_some_and(|shared_root| canonical.starts_with(shared_root));
+    if !canonical.starts_with(&root) && !in_runtime_shared {
         return Err(anyhow!(
             "attachment path escapes conversation root: {}",
             canonical.display()

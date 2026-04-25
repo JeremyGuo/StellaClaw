@@ -1,5 +1,10 @@
-version: 1.10.2
+version: 1.10.3
 ---
+
+# 1.10.3
+
+- 修复 shared 附件发送：
+  conversation workspace 的 `shared/` 是指向 `rundir/shared` 的 symlink；附件路径校验现在允许 `<attachment>shared/...</attachment>` 解析到该共享目录，避免 canonicalize 后因落在 conversation root 外而拒绝发送。同时附件解析失败只会降级为可见错误提示并写 warning，不再让 conversation 线程直接退出。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.10.2
 
