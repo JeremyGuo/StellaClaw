@@ -25,6 +25,12 @@ pub struct CronTaskRecord {
     pub task: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checker_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checker_timeout_seconds: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checker_cwd: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -46,6 +52,9 @@ pub struct CreateCronTaskRequest {
     pub timezone: String,
     pub task: String,
     pub model: Option<String>,
+    pub checker_command: Option<String>,
+    pub checker_timeout_seconds: Option<f64>,
+    pub checker_cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -56,6 +65,9 @@ pub struct UpdateCronTaskRequest {
     pub timezone: Option<String>,
     pub task: Option<String>,
     pub model: Option<Option<String>>,
+    pub checker_command: Option<Option<String>>,
+    pub checker_timeout_seconds: Option<Option<f64>>,
+    pub checker_cwd: Option<Option<String>>,
     pub enabled: Option<bool>,
 }
 
@@ -161,6 +173,9 @@ impl CronManager {
             timezone: request.timezone,
             task: request.task,
             model: request.model,
+            checker_command: request.checker_command,
+            checker_timeout_seconds: request.checker_timeout_seconds,
+            checker_cwd: request.checker_cwd,
             enabled: true,
             next_run_at: None,
             last_run_at: None,
@@ -209,6 +224,19 @@ impl CronManager {
         }
         if let Some(model) = update.model {
             task.model = model;
+        }
+        if let Some(checker_command) = update.checker_command {
+            task.checker_command = checker_command;
+            if task.checker_command.is_none() {
+                task.checker_timeout_seconds = None;
+                task.checker_cwd = None;
+            }
+        }
+        if let Some(checker_timeout_seconds) = update.checker_timeout_seconds {
+            task.checker_timeout_seconds = checker_timeout_seconds;
+        }
+        if let Some(checker_cwd) = update.checker_cwd {
+            task.checker_cwd = checker_cwd;
         }
         if let Some(enabled) = update.enabled {
             task.enabled = enabled;
@@ -399,6 +427,24 @@ pub fn parse_enabled_flag(arguments: &serde_json::Map<String, Value>) -> Result<
     }
 }
 
+pub fn optional_positive_f64_arg(
+    arguments: &serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<Option<f64>> {
+    match arguments.get(key) {
+        Some(value) => {
+            let number = value
+                .as_f64()
+                .ok_or_else(|| anyhow!("{key} must be a number"))?;
+            if !number.is_finite() || number <= 0.0 {
+                return Err(anyhow!("{key} must be a positive finite number"));
+            }
+            Ok(Some(number))
+        }
+        None => Ok(None),
+    }
+}
+
 fn refresh_next_run_at(task: &mut CronTaskRecord, from: Option<DateTime<Utc>>) -> Result<()> {
     if !task.enabled {
         task.next_run_at = None;
@@ -472,8 +518,21 @@ mod tests {
                 timezone: "Asia/Shanghai".to_string(),
                 task: "check status".to_string(),
                 model: Some("main".to_string()),
+                checker_command: Some("python3 checker.py".to_string()),
+                checker_timeout_seconds: Some(3.0),
+                checker_cwd: Some("checks".to_string()),
             })
             .expect("task should create");
+        let stored = manager
+            .get_for_conversation("telegram-main-000001", &task.id)
+            .expect("task should load")
+            .expect("task should exist");
+        assert_eq!(
+            stored.checker_command.as_deref(),
+            Some("python3 checker.py")
+        );
+        assert_eq!(stored.checker_timeout_seconds, Some(3.0));
+        assert_eq!(stored.checker_cwd.as_deref(), Some("checks"));
 
         let listed = manager
             .list_for_conversation("telegram-main-000001")
@@ -488,10 +547,18 @@ mod tests {
                 &task.id,
                 UpdateCronTaskRequest {
                     enabled: Some(false),
+                    checker_command: Some(None),
                     ..UpdateCronTaskRequest::default()
                 },
             )
             .expect("task should update");
+        let cleared = manager
+            .get_for_conversation("telegram-main-000001", &task.id)
+            .expect("task should load")
+            .expect("task should exist");
+        assert!(cleared.checker_command.is_none());
+        assert!(cleared.checker_timeout_seconds.is_none());
+        assert!(cleared.checker_cwd.is_none());
         assert!(manager
             .collect_due_tasks(Utc::now() + chrono::Duration::minutes(1))
             .expect("collect should work")

@@ -9,6 +9,8 @@ version: 1.11.0
   新增 `stellaclaw/src/remote_actor.rs` 承载 workspace 路径校验和目录 listing 响应结构，Web channel 只做鉴权、conversation ownership 校验和转发，给后续把 SSH/Remote 专用指令收敛到 Remote Actor 留出边界。本次不改变 `config` schema，不改变 `workdir` schema。
 - 接入 Stellacode workspace 浏览：
   Stellacode 右侧概览栏现在会调用 Web channel workspace API 展示当前 conversation 的实际工作目录，支持目录进入、面包屑返回和刷新；Remote Mode 下显示对应 remote host/cwd 和本地 sshfs workspace root。本次不改变 `config` schema，不改变 `workdir` schema。
+- 实装 cron checker：
+  cron task 现在会持久化并执行 `checker_command`；触发时先在当前 conversation sandbox/workspace 中以 `sh -lc` 运行 checker，返回 `0` 则跳过 background agent，返回非零则把 checker stdout 追加到 task prompt 后唤醒 background agent。`checker_cwd` 只能是 workspace 内相对路径，`checker_timeout_seconds` 默认 30 秒。`workdir` schema 更新到 `0.7`，`config` schema 不变。
 
 # 1.10.5
 

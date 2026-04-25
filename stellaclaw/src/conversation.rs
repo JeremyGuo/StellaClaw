@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Stdio},
     sync::{mpsc, Arc},
     thread,
@@ -35,11 +35,12 @@ use crate::{
     },
     cron::{
         cron_schedule_from_required_tool_args, optional_cron_schedule_from_tool_args,
-        optional_string_arg, parse_enabled_flag, string_arg_required, timezone_or_default,
-        CreateCronTaskRequest, CronManager, CronTaskRecord, UpdateCronTaskRequest,
+        optional_positive_f64_arg, optional_string_arg, parse_enabled_flag, string_arg_required,
+        timezone_or_default, CreateCronTaskRequest, CronManager, CronTaskRecord,
+        UpdateCronTaskRequest,
     },
     logger::StellaclawLogger,
-    sandbox::bubblewrap_support_error,
+    sandbox::{bubblewrap_support_error, build_workspace_shell_command},
     session_client::AgentServerClient,
     workspace::{
         ensure_workspace_for_remote_mode, ensure_workspace_seed, sshfs_workspace_root,
@@ -80,6 +81,8 @@ pub enum ConversationCommand {
 }
 
 const TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(4);
+const DEFAULT_CRON_CHECKER_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_CRON_CHECKER_STDOUT_CHARS: usize = 16_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationState {
@@ -421,6 +424,19 @@ enum TaskPlanItemStatus {
     Pending,
     InProgress,
     Completed,
+}
+
+#[derive(Debug)]
+enum CronCheckerDecision {
+    Skip,
+    Wake { prompt: String },
+}
+
+#[derive(Debug)]
+struct CronCheckerResult {
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
 }
 
 impl ConversationRuntime {
@@ -1109,6 +1125,12 @@ impl ConversationRuntime {
                     timezone: timezone_or_default(optional_string_arg(object, "timezone")?)?,
                     task: string_arg_required(object, "task")?,
                     model: optional_string_arg(object, "model")?,
+                    checker_command: optional_string_arg(object, "checker_command")?,
+                    checker_timeout_seconds: optional_positive_f64_arg(
+                        object,
+                        "checker_timeout_seconds",
+                    )?,
+                    checker_cwd: optional_string_arg(object, "checker_cwd")?,
                 })?;
                 Ok(bridge_result(request, serde_json::to_string(&task)?))
             }
@@ -1128,6 +1150,15 @@ impl ConversationRuntime {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let model = optional_string_arg(object, "model")?.map(Some);
+                let (checker_command, checker_timeout_seconds, checker_cwd) = if _clear_checker {
+                    (Some(None), Some(None), Some(None))
+                } else {
+                    (
+                        optional_string_arg(object, "checker_command")?.map(Some),
+                        optional_positive_f64_arg(object, "checker_timeout_seconds")?.map(Some),
+                        optional_string_arg(object, "checker_cwd")?.map(Some),
+                    )
+                };
                 let task = self.cron_manager.update_task(
                     &self.state.conversation_id,
                     &id,
@@ -1138,6 +1169,9 @@ impl ConversationRuntime {
                         timezone,
                         task: optional_string_arg(object, "task")?,
                         model,
+                        checker_command,
+                        checker_timeout_seconds,
+                        checker_cwd,
                         enabled: parse_enabled_flag(object)?,
                     },
                 )?;
@@ -1655,6 +1689,10 @@ impl ConversationRuntime {
     }
 
     fn run_cron_task(&mut self, task: CronTaskRecord) -> Result<bool> {
+        let prompt = match self.run_cron_checker(&task)? {
+            CronCheckerDecision::Skip => return Ok(false),
+            CronCheckerDecision::Wake { prompt } => prompt,
+        };
         self.logger.info(
             "cron_task_starting_background_agent",
             json!({
@@ -1677,8 +1715,47 @@ impl ConversationRuntime {
             None => None,
         };
         let _ =
-            self.start_managed_session(ManagedSessionType::Background, task.task, model_override)?;
+            self.start_managed_session(ManagedSessionType::Background, prompt, model_override)?;
         Ok(true)
+    }
+
+    fn run_cron_checker(&mut self, task: &CronTaskRecord) -> Result<CronCheckerDecision> {
+        let Some(command) = task.checker_command.as_deref() else {
+            return Ok(CronCheckerDecision::Wake {
+                prompt: task.task.clone(),
+            });
+        };
+        let result = run_checker_command(
+            task,
+            command,
+            &self.conversation_root,
+            &self.workspace_root,
+            self.state.sandbox.as_ref().unwrap_or(&self.config.sandbox),
+        )?;
+        if result.exit_code == Some(0) {
+            self.logger.info(
+                "cron_checker_skipped",
+                json!({
+                    "task_id": task.id,
+                    "conversation_id": self.state.conversation_id,
+                    "exit_code": result.exit_code,
+                }),
+            );
+            return Ok(CronCheckerDecision::Skip);
+        }
+        self.logger.info(
+            "cron_checker_triggered",
+            json!({
+                "task_id": task.id,
+                "conversation_id": self.state.conversation_id,
+                "exit_code": result.exit_code,
+                "stdout_bytes": result.stdout.len(),
+                "stderr_bytes": result.stderr.len(),
+            }),
+        );
+        Ok(CronCheckerDecision::Wake {
+            prompt: append_checker_stdout(&task.task, &result.stdout),
+        })
     }
 
     fn render_model_selection(&self) -> String {
@@ -2299,6 +2376,137 @@ fn effective_sandbox_config<'a>(
     default_sandbox: &'a SandboxConfig,
 ) -> &'a SandboxConfig {
     conversation_sandbox.unwrap_or(default_sandbox)
+}
+
+fn run_checker_command(
+    task: &CronTaskRecord,
+    command: &str,
+    conversation_root: &Path,
+    workspace_root: &Path,
+    sandbox: &SandboxConfig,
+) -> Result<CronCheckerResult> {
+    let checker_cwd = resolve_checker_cwd(workspace_root, task.checker_cwd.as_deref())?;
+    let checker_script = checker_script(command, workspace_root, &checker_cwd);
+    let timeout = task
+        .checker_timeout_seconds
+        .map(Duration::from_secs_f64)
+        .unwrap_or(DEFAULT_CRON_CHECKER_TIMEOUT);
+    let output_root = conversation_root
+        .join(".log")
+        .join("stellaclaw")
+        .join("cron_checker")
+        .join(&task.id)
+        .join(format!(
+            "{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+    fs::create_dir_all(&output_root)
+        .with_context(|| format!("failed to create {}", output_root.display()))?;
+    let stdout_path = output_root.join("stdout");
+    let stderr_path = output_root.join("stderr");
+    let stdout = fs::File::create(&stdout_path)
+        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
+    let stderr = fs::File::create(&stderr_path)
+        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
+    let mut child =
+        build_workspace_shell_command(sandbox, workspace_root, conversation_root, &checker_script)
+            .context("failed to build cron checker command")?
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr))
+            .spawn()
+            .with_context(|| format!("failed to spawn cron checker for {}", task.id))?;
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("failed to wait for cron checker {}", task.id))?
+        {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!(
+                "cron checker {} timed out after {:.1}s",
+                task.id,
+                timeout.as_secs_f64()
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+
+    Ok(CronCheckerResult {
+        exit_code: status.code(),
+        stdout: fs::read_to_string(&stdout_path).unwrap_or_default(),
+        stderr: fs::read_to_string(&stderr_path).unwrap_or_default(),
+    })
+}
+
+fn resolve_checker_cwd(workspace_root: &Path, checker_cwd: Option<&str>) -> Result<PathBuf> {
+    let Some(raw) = checker_cwd.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(workspace_root.to_path_buf());
+    };
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return Err(anyhow!(
+            "checker_cwd must be relative to the conversation workspace"
+        ));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(value) => normalized.push(value),
+            Component::ParentDir => return Err(anyhow!("checker_cwd must not contain '..'")),
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "checker_cwd must be relative to the conversation workspace"
+                ))
+            }
+        }
+    }
+    let path = workspace_root.join(normalized);
+    if !path.is_dir() {
+        return Err(anyhow!("checker_cwd does not exist or is not a directory"));
+    }
+    Ok(path)
+}
+
+fn checker_script(command: &str, workspace_root: &Path, checker_cwd: &Path) -> String {
+    if checker_cwd == workspace_root {
+        return command.to_string();
+    }
+    format!("cd {} && {}", shell_quote_path(checker_cwd), command)
+}
+
+fn shell_quote_path(path: &Path) -> String {
+    let value = path.to_string_lossy();
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn append_checker_stdout(task: &str, stdout: &str) -> String {
+    let stdout = truncate_checker_stdout(stdout.trim());
+    if stdout.is_empty() {
+        return task.to_string();
+    }
+    format!("{task}\n\nCron checker stdout:\n{stdout}")
+}
+
+fn truncate_checker_stdout(stdout: &str) -> String {
+    let mut output = String::new();
+    for (index, ch) in stdout.chars().enumerate() {
+        if index >= MAX_CRON_CHECKER_STDOUT_CHARS {
+            output.push_str("\n[cron checker stdout truncated]");
+            return output;
+        }
+        output.push(ch);
+    }
+    output
 }
 
 fn sandbox_mode_label(mode: &SandboxMode) -> &'static str {
@@ -3407,6 +3615,64 @@ mod tests {
         );
 
         assert_eq!(render_chat_message(&message), "visible answer");
+    }
+
+    #[test]
+    fn cron_checker_nonzero_output_can_be_appended_to_prompt() {
+        let root = std::env::temp_dir().join(format!(
+            "stellaclaw-cron-checker-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        let conversation_root = root.join("conversation");
+        let workspace_root = root.join("workspace");
+        let checker_dir = workspace_root.join("checks");
+        fs::create_dir_all(&checker_dir).expect("checker dir should exist");
+        let task = CronTaskRecord {
+            id: "cron_test".to_string(),
+            conversation_id: "telegram-main-000001".to_string(),
+            channel_id: "telegram-main".to_string(),
+            platform_chat_id: "123".to_string(),
+            name: "checked".to_string(),
+            description: "checked task".to_string(),
+            schedule: "* * * * * *".to_string(),
+            timezone: "Asia/Shanghai".to_string(),
+            task: "handle calendar change".to_string(),
+            model: None,
+            checker_command: Some("printf changed && exit 7".to_string()),
+            checker_timeout_seconds: Some(2.0),
+            checker_cwd: Some("checks".to_string()),
+            enabled: true,
+            next_run_at: None,
+            last_run_at: None,
+            last_error: None,
+        };
+
+        let result = run_checker_command(
+            &task,
+            task.checker_command.as_deref().unwrap(),
+            &conversation_root,
+            &workspace_root,
+            &SandboxConfig::default(),
+        )
+        .expect("checker should run");
+
+        assert_eq!(result.exit_code, Some(7));
+        assert_eq!(result.stdout, "changed");
+        assert_eq!(
+            append_checker_stdout(&task.task, &result.stdout),
+            "handle calendar change\n\nCron checker stdout:\nchanged"
+        );
+        fs::remove_dir_all(&root).expect("temp root should be removed");
+    }
+
+    #[test]
+    fn cron_checker_cwd_rejects_parent_components() {
+        let workspace_root = Path::new("/tmp/stellaclaw-workspace");
+        assert!(resolve_checker_cwd(workspace_root, Some("../bad")).is_err());
+        assert!(resolve_checker_cwd(workspace_root, Some("/tmp")).is_err());
     }
 
     #[test]

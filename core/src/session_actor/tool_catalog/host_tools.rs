@@ -161,13 +161,13 @@ fn cron_tools() -> Vec<ToolDefinition> {
         ),
         bridge_tool(
             "create_cron_task",
-            "Create a persisted cron task that later launches a main background agent. Provide each cron time field as a named argument; the host builds a seconds-first cron expression in the task timezone. Use timezone as an IANA name such as 'Asia/Shanghai'; if omitted, Asia/Shanghai is used.",
+            "Create a persisted cron task that later launches a main background agent. Provide each cron time field as a named argument; the host builds a seconds-first cron expression in the task timezone. Use timezone as an IANA name such as 'Asia/Shanghai'; if omitted, Asia/Shanghai is used. checker_command is an optional shell command run as sh -lc inside the conversation sandbox before launch: exit 0 skips the background agent, non-zero appends checker stdout to task and launches it. Before setting checker_command, verify it works with the shell tool.",
             cron_create_schema(),
             ToolExecutionMode::Immediate,
         ),
         bridge_tool(
             "update_cron_task",
-            "Update a cron task. To change timing, provide all named cron fields together: cron_second, cron_minute, cron_hour, cron_day_of_month, cron_month, cron_day_of_week, plus optional cron_year. Use timezone to change the IANA timezone, enabled to pause or resume it, and clear_checker=true to remove the checker.",
+            "Update a cron task. To change timing, provide all named cron fields together: cron_second, cron_minute, cron_hour, cron_day_of_month, cron_month, cron_day_of_week, plus optional cron_year. Use timezone to change the IANA timezone, enabled to pause or resume it, checker_command/checker_timeout_seconds/checker_cwd to change the shell checker, and clear_checker=true to remove the checker.",
             cron_update_schema(),
             ToolExecutionMode::Immediate,
         ),
@@ -263,9 +263,18 @@ fn cron_common_properties() -> serde_json::Map<String, serde_json::Value> {
         ),
         ("task", json!({"type": "string"})),
         ("enabled", json!({"type": "boolean"})),
-        ("checker_command", json!({"type": "string"})),
-        ("checker_timeout_seconds", json!({"type": "number"})),
-        ("checker_cwd", json!({"type": "string"})),
+        (
+            "checker_command",
+            json!({"type": "string", "description": "Optional shell command executed as sh -lc inside the conversation sandbox before the cron task launches. Exit 0 means no wake-up; non-zero means wake and append stdout to the task prompt. Prefer a checked-in Python script such as 'python3 scripts/check_calendar.py' and verify it with shell before saving."}),
+        ),
+        (
+            "checker_timeout_seconds",
+            json!({"type": "number", "description": "Optional positive timeout for checker_command. Defaults to 30 seconds."}),
+        ),
+        (
+            "checker_cwd",
+            json!({"type": "string", "description": "Optional relative working directory inside the conversation workspace for checker_command. Absolute paths and '..' are rejected."}),
+        ),
     ])
 }
 
