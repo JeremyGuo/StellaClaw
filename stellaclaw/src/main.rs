@@ -261,7 +261,7 @@ fn run_dispatcher_loop(
     loop {
         match incoming_rx.recv_timeout(std::time::Duration::from_secs(1)) {
             Ok(dispatch) => {
-                let sender = ensure_conversation_sender(
+                if let Err(error) = send_conversation_command(
                     &mut conversations,
                     &workdir,
                     &config,
@@ -272,10 +272,18 @@ fn run_dispatcher_loop(
                     &dispatch.conversation_id,
                     &dispatch.channel_id,
                     &dispatch.platform_chat_id,
-                )?;
-                sender
-                    .send(ConversationCommand::Incoming(dispatch.message))
-                    .map_err(|_| anyhow!("conversation thread stopped"))?;
+                    ConversationCommand::Incoming(dispatch.message),
+                ) {
+                    logger.warn(
+                        "incoming_dispatch_failed",
+                        serde_json::json!({
+                            "conversation_id": dispatch.conversation_id,
+                            "channel_id": dispatch.channel_id,
+                            "platform_chat_id": dispatch.platform_chat_id,
+                            "error": format!("{error:#}"),
+                        }),
+                    );
+                }
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -291,7 +299,10 @@ fn run_dispatcher_loop(
                     "next_run_at": task.next_run_at,
                 }),
             );
-            let sender = ensure_conversation_sender(
+            let conversation_id = task.conversation_id.clone();
+            let channel_id = task.channel_id.clone();
+            let platform_chat_id = task.platform_chat_id.clone();
+            if let Err(error) = send_conversation_command(
                 &mut conversations,
                 &workdir,
                 &config,
@@ -299,16 +310,75 @@ fn run_dispatcher_loop(
                 &cron_manager,
                 &outgoing_tx,
                 &logger,
-                &task.conversation_id,
-                &task.channel_id,
-                &task.platform_chat_id,
-            )?;
-            sender
-                .send(ConversationCommand::RunCronTask { task })
-                .map_err(|_| anyhow!("conversation thread stopped"))?;
+                &conversation_id,
+                &channel_id,
+                &platform_chat_id,
+                ConversationCommand::RunCronTask { task },
+            ) {
+                logger.warn(
+                    "cron_dispatch_failed",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "channel_id": channel_id,
+                        "platform_chat_id": platform_chat_id,
+                        "error": format!("{error:#}"),
+                    }),
+                );
+            }
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn send_conversation_command(
+    conversations: &mut HashMap<String, Sender<ConversationCommand>>,
+    workdir: &PathBuf,
+    config: &Arc<StellaclawConfig>,
+    agent_server_path: &PathBuf,
+    cron_manager: &Arc<CronManager>,
+    outgoing_tx: &Sender<OutgoingDispatch>,
+    logger: &Arc<StellaclawLogger>,
+    conversation_id: &str,
+    channel_id: &str,
+    platform_chat_id: &str,
+    command: ConversationCommand,
+) -> Result<()> {
+    let mut last_error = None;
+    for attempt in 0..2 {
+        let sender = ensure_conversation_sender(
+            conversations,
+            workdir,
+            config,
+            agent_server_path,
+            cron_manager,
+            outgoing_tx,
+            logger,
+            conversation_id,
+            channel_id,
+            platform_chat_id,
+        )?;
+        match sender.send(command.clone()) {
+            Ok(()) => return Ok(()),
+            Err(_) => {
+                conversations.remove(conversation_id);
+                let error = anyhow!("conversation thread stopped before command delivery");
+                logger.warn(
+                    "conversation_command_send_failed",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "channel_id": channel_id,
+                        "platform_chat_id": platform_chat_id,
+                        "attempt": attempt + 1,
+                        "will_retry": attempt == 0,
+                        "error": format!("{error:#}"),
+                    }),
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("conversation command was not delivered")))
 }
 
 #[allow(clippy::too_many_arguments)]

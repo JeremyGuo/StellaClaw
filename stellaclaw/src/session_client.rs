@@ -31,10 +31,12 @@ impl AgentServerClient {
     pub fn spawn(
         binary_path: &Path,
         current_dir: &Path,
+        session_root: &Path,
         sandbox: &SandboxConfig,
     ) -> Result<(Self, mpsc::Receiver<SessionEvent>), String> {
-        let mut command = build_agent_server_command(sandbox, binary_path, current_dir)
-            .map_err(|error| format!("failed to build agent_server command: {error:#}"))?;
+        let mut command =
+            build_agent_server_command(sandbox, binary_path, current_dir, session_root)
+                .map_err(|error| format!("failed to build agent_server command: {error:#}"))?;
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

@@ -1,5 +1,18 @@
-version: 1.10.1
+version: 1.10.2
 ---
+
+# 1.10.2
+
+- 修正 Remote Mode 下 session 持久化根目录：
+  fixed SSH Remote Mode 仍然让工具工作目录指向 sshfs workspace，但 agent session 的日志、`session.json` 和 `all_messages.jsonl` 现在固定写入本地 conversation 目录，避免 remote workspace/sshfs 路径承载会话状态导致历史、状态统计和前端轮询读不到反馈。本次不改变 `config` schema，不改变 `workdir` schema。
+- 增强 sshfs workspace 恢复：
+  fixed SSH Remote Mode 复用已有 sshfs mount 前会先做轻量探活；如果遇到 `Transport endpoint is not connected`，会自动卸载坏 mount 并重新挂载，避免 conversation 线程在重启后因为断开的 sshfs workspace 直接失败。本次不改变 `config` schema，不改变 `workdir` schema。
+- 修正坏 sshfs mount 的恢复边界：
+  卸载 sshfs workspace 时不再依赖 `Path::exists()`，避免断开的 FUSE mount 因 `exists()` 返回 false 而跳过卸载；同时增加 lazy unmount fallback，并兼容 mountpoint 目录已存在的恢复路径。本次不改变 `config` schema，不改变 `workdir` schema。
+- 修正工具执行器 remote mode 注入：
+  agent server 初始化 `LocalToolBatchExecutor` 时现在会传入 session initial 的 `tool_remote_mode`，避免 catalog 已切到 fixed SSH 但工具执行器仍按默认 selectable/local 执行，导致 `shell pwd` 等工具返回本地 sshfs mount 路径。本次不改变 `config` schema，不改变 `workdir` schema。
+- 增强 dispatcher 对已停止 conversation 的恢复：
+  向 conversation 线程投递消息时如果发现旧 sender 已失效，会移除缓存 sender、重新拉起 conversation 并重试一次；重试仍失败时只写 warning，不再让单个 conversation 初始化失败导致整个 Stellaclaw 服务退出。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.10.1
 

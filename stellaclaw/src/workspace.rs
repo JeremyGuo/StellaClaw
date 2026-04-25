@@ -84,12 +84,7 @@ pub fn sshfs_workspace_root(workdir: &Path, conversation_id: &str) -> PathBuf {
 
 pub fn unmount_sshfs_workspace(workdir: &Path, conversation_id: &str) -> Result<()> {
     let mountpoint = sshfs_workspace_root(workdir, conversation_id);
-    if !mountpoint.exists() || !is_mountpoint(&mountpoint) {
-        return Ok(());
-    }
-
-    let status = Command::new("umount").arg(&mountpoint).status();
-    if status.map(|status| status.success()).unwrap_or(false) {
+    if !is_mountpoint(&mountpoint) {
         return Ok(());
     }
 
@@ -97,6 +92,19 @@ pub fn unmount_sshfs_workspace(workdir: &Path, conversation_id: &str) -> Result<
         .arg("-u")
         .arg(&mountpoint)
         .status();
+    if status.map(|status| status.success()).unwrap_or(false) {
+        return Ok(());
+    }
+
+    let status = Command::new("fusermount")
+        .arg("-uz")
+        .arg(&mountpoint)
+        .status();
+    if status.map(|status| status.success()).unwrap_or(false) {
+        return Ok(());
+    }
+
+    let status = Command::new("umount").arg("-l").arg(&mountpoint).status();
     if status.map(|status| status.success()).unwrap_or(false) {
         return Ok(());
     }
@@ -119,7 +127,10 @@ fn ensure_sshfs_workspace(
 
     let mountpoint = sshfs_workspace_root(workdir, conversation_id);
     if is_mountpoint(&mountpoint) {
-        return Ok(mountpoint);
+        if sshfs_workspace_is_usable(&mountpoint) {
+            return Ok(mountpoint);
+        }
+        unmount_sshfs_workspace(workdir, conversation_id)?;
     }
 
     if mountpoint.exists() && directory_has_entries(&mountpoint)? {
@@ -132,8 +143,7 @@ fn ensure_sshfs_workspace(
             )
         })?;
     }
-    fs::create_dir_all(&mountpoint)
-        .with_context(|| format!("failed to create {}", mountpoint.display()))?;
+    create_mountpoint_directory(&mountpoint)?;
 
     let target = format!("{host}:{remote_path}");
     let output = Command::new("sshfs")
@@ -272,6 +282,28 @@ fn directory_has_entries(path: &Path) -> Result<bool> {
     let mut entries =
         fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?;
     Ok(entries.next().transpose()?.is_some())
+}
+
+fn create_mountpoint_directory(path: &Path) -> Result<()> {
+    match fs::create_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed to create {}", path.display())),
+    }
+}
+
+fn sshfs_workspace_is_usable(path: &Path) -> bool {
+    match fs::read_dir(path) {
+        Ok(_) => true,
+        Err(error) => !is_disconnected_transport_error(&error),
+    }
+}
+
+fn is_disconnected_transport_error(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(107)
+        || error
+            .to_string()
+            .contains("Transport endpoint is not connected")
 }
 
 fn next_backup_path(path: &Path) -> Result<PathBuf> {

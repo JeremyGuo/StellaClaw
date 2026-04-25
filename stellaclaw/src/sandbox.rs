@@ -29,17 +29,21 @@ pub fn build_agent_server_command(
     sandbox: &SandboxConfig,
     binary_path: &Path,
     current_dir: &Path,
+    session_root: &Path,
 ) -> Result<Command> {
     match sandbox.mode {
         SandboxMode::Subprocess => {
             let mut command = Command::new(binary_path);
             command.current_dir(current_dir);
+            command.env("STELLACLAW_SESSION_ROOT", session_root);
             if let Some(software_dir) = configured_software_dir(sandbox) {
                 command.env("STELLACLAW_SOFTWARE_DIR", software_dir);
             }
             Ok(command)
         }
-        SandboxMode::Bubblewrap => build_bubblewrap_command(sandbox, binary_path, current_dir),
+        SandboxMode::Bubblewrap => {
+            build_bubblewrap_command(sandbox, binary_path, current_dir, session_root)
+        }
     }
 }
 
@@ -47,6 +51,7 @@ fn build_bubblewrap_command(
     sandbox: &SandboxConfig,
     binary_path: &Path,
     current_dir: &Path,
+    session_root: &Path,
 ) -> Result<Command> {
     if let Some(reason) = bubblewrap_support_error(sandbox) {
         return Err(anyhow!(reason));
@@ -58,6 +63,9 @@ fn build_bubblewrap_command(
     let workspace_root = current_dir
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", current_dir.display()))?;
+    let session_root = session_root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", session_root.display()))?;
 
     let mut command = Command::new(&sandbox.bubblewrap_binary);
     command.arg("--die-with-parent").arg("--new-session");
@@ -88,9 +96,18 @@ fn build_bubblewrap_command(
         true,
     )?;
     bind_path(&mut command, &workspace_root, false)?;
+    if session_root != workspace_root {
+        bind_path(&mut command, &session_root, false)?;
+    }
     if let Some(runtime_root) = discover_runtime_root(&workspace_root) {
         bind_path(&mut command, &runtime_root, false)?;
     }
+    let session_root_env = session_root.to_string_lossy().to_string();
+    command.args([
+        "--setenv",
+        "STELLACLAW_SESSION_ROOT",
+        session_root_env.as_str(),
+    ]);
     if let Some(software_dir) = configured_software_dir(sandbox) {
         let software_dir = software_dir
             .canonicalize()
@@ -232,6 +249,7 @@ mod tests {
             &sandbox,
             std::path::Path::new("/bin/echo"),
             std::path::Path::new("/tmp"),
+            std::path::Path::new("/tmp/session"),
         )
         .expect("subprocess command should build");
 
@@ -245,6 +263,18 @@ mod tests {
         assert_eq!(
             software_env.as_deref(),
             Some(std::ffi::OsStr::new("/opt/stellaclaw-software"))
+        );
+
+        let session_root_env = command
+            .get_envs()
+            .find_map(|(key, value)| {
+                (key == "STELLACLAW_SESSION_ROOT").then(|| value.map(|value| value.to_owned()))
+            })
+            .flatten();
+
+        assert_eq!(
+            session_root_env.as_deref(),
+            Some(std::ffi::OsStr::new("/tmp/session"))
         );
     }
 }

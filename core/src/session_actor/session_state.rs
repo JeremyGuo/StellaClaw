@@ -28,9 +28,7 @@ pub(crate) struct SessionStateStore {
 
 impl SessionStateStore {
     pub(crate) fn open_default(session_id: &str) -> Result<Self, String> {
-        let cwd =
-            std::env::current_dir().map_err(|error| format!("failed to resolve cwd: {error}"))?;
-        Self::open_under(cwd, session_id)
+        Self::open_under(default_session_root()?, session_id)
     }
 
     pub(crate) fn open_under(root: impl AsRef<Path>, session_id: &str) -> Result<Self, String> {
@@ -76,6 +74,13 @@ impl SessionStateStore {
 
     fn current_messages_path(&self) -> PathBuf {
         self.dir.join("current_messages.jsonl")
+    }
+}
+
+fn default_session_root() -> Result<PathBuf, String> {
+    match std::env::var_os("STELLACLAW_SESSION_ROOT") {
+        Some(root) => Ok(PathBuf::from(root)),
+        None => std::env::current_dir().map_err(|error| format!("failed to resolve cwd: {error}")),
     }
 }
 

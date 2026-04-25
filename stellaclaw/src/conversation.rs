@@ -73,7 +73,7 @@ pub enum ConversationControl {
     InvalidSandbox { reason: String },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum ConversationCommand {
     Incoming(IncomingConversationMessage),
     RunCronTask { task: CronTaskRecord },
@@ -348,7 +348,8 @@ pub fn load_conversation_status_snapshot(
         ToolRemoteMode::Selectable => conversation_root,
         ToolRemoteMode::FixedSsh { .. } => sshfs_workspace_root(workdir, conversation_id),
     };
-    conversation_status_snapshot(workdir, &workspace_root, &state, config)
+    let session_root = workdir.join("conversations").join(conversation_id);
+    conversation_status_snapshot(workdir, &session_root, &workspace_root, &state, config)
 }
 
 fn load_existing_conversation_state(
@@ -445,6 +446,7 @@ impl ConversationRuntime {
             .ok_or_else(|| anyhow!("unknown main model selection"))?;
         let foreground = start_foreground_session(
             &agent_server_path,
+            &conversation_root,
             &workspace_root,
             &state.session_binding.foreground_session_id,
             &main_model,
@@ -465,6 +467,7 @@ impl ConversationRuntime {
                 agent_id.clone(),
                 start_managed_session_runtime(
                     &agent_server_path,
+                    &conversation_root,
                     &workspace_root,
                     record.clone(),
                     &model,
@@ -487,6 +490,7 @@ impl ConversationRuntime {
                 agent_id.clone(),
                 start_managed_session_runtime(
                     &agent_server_path,
+                    &conversation_root,
                     &workspace_root,
                     record.clone(),
                     &model,
@@ -1336,6 +1340,7 @@ impl ConversationRuntime {
         let model = resolve_managed_session_model(&self.config, &record, &main_model)?;
         let runtime = start_managed_session_runtime(
             &self.agent_server_path,
+            &self.conversation_root,
             &self.workspace_root,
             record.clone(),
             &model,
@@ -1725,6 +1730,7 @@ impl ConversationRuntime {
     fn send_status(&self) -> Result<()> {
         let status = conversation_status_snapshot(
             &self.workdir,
+            &self.conversation_root,
             &self.workspace_root,
             &self.state,
             &self.config,
@@ -1903,6 +1909,7 @@ impl ConversationRuntime {
         let main_model = self.current_main_model()?;
         self.foreground = start_foreground_session(
             &self.agent_server_path,
+            &self.conversation_root,
             &self.workspace_root,
             &self.state.session_binding.foreground_session_id,
             &main_model,
@@ -2085,7 +2092,8 @@ fn progress_text_failed(model_key: &str, error: Option<&str>) -> String {
 
 fn start_foreground_session(
     agent_server_path: &Path,
-    conversation_root: &Path,
+    session_root: &Path,
+    workspace_root: &Path,
     session_id: &str,
     model_config: &ModelConfig,
     tool_remote_mode: &ToolRemoteMode,
@@ -2096,7 +2104,8 @@ fn start_foreground_session(
 ) -> Result<ForegroundSessionRuntime> {
     let (client, events) = start_session_process(
         agent_server_path,
-        conversation_root,
+        session_root,
+        workspace_root,
         session_id,
         SessionType::Foreground,
         model_config,
@@ -2114,7 +2123,8 @@ fn start_foreground_session(
 
 fn start_managed_session_runtime(
     agent_server_path: &Path,
-    conversation_root: &Path,
+    session_root: &Path,
+    workspace_root: &Path,
     record: ManagedSessionRecord,
     model_config: &ModelConfig,
     tool_remote_mode: &ToolRemoteMode,
@@ -2125,7 +2135,8 @@ fn start_managed_session_runtime(
 ) -> Result<ManagedSessionRuntime> {
     let (client, events) = start_session_process(
         agent_server_path,
-        conversation_root,
+        session_root,
+        workspace_root,
         &record.session_id,
         to_session_type(record.session_type),
         model_config,
@@ -2161,7 +2172,8 @@ fn resolve_managed_session_model(
 
 fn start_session_process(
     agent_server_path: &Path,
-    conversation_root: &Path,
+    session_root: &Path,
+    workspace_root: &Path,
     session_id: &str,
     session_type: SessionType,
     model_config: &ModelConfig,
@@ -2171,8 +2183,9 @@ fn start_session_process(
     models: &BTreeMap<String, ModelConfig>,
     defaults: &SessionDefaults,
 ) -> Result<(AgentServerClient, mpsc::Receiver<SessionEvent>)> {
-    let (client, events) = AgentServerClient::spawn(agent_server_path, conversation_root, sandbox)
-        .map_err(anyhow::Error::msg)?;
+    let (client, events) =
+        AgentServerClient::spawn(agent_server_path, workspace_root, session_root, sandbox)
+            .map_err(anyhow::Error::msg)?;
     let mut initial = SessionInitial::new(session_id.to_string(), session_type);
     initial.tool_remote_mode = tool_remote_mode.clone();
     initial.compression_threshold_tokens = defaults.compression_threshold_tokens;
@@ -3122,6 +3135,7 @@ fn media_tool_usage_totals(workspace_root: &Path) -> UsageTotals {
 
 fn conversation_status_snapshot(
     _workdir: &Path,
+    session_root: &Path,
     workspace_root: &Path,
     state: &ConversationState,
     config: &StellaclawConfig,
@@ -3152,18 +3166,18 @@ fn conversation_status_snapshot(
         .count();
     let mut usage = ConversationUsageSummary::default();
     usage.foreground.add_totals(&session_usage_totals(
-        workspace_root,
+        session_root,
         &state.session_binding.foreground_session_id,
     ));
     for record in state.session_binding.background_sessions.values() {
         usage
             .background
-            .add_totals(&session_usage_totals(workspace_root, &record.session_id));
+            .add_totals(&session_usage_totals(session_root, &record.session_id));
     }
     for record in state.session_binding.subagent_sessions.values() {
         usage
             .subagents
-            .add_totals(&session_usage_totals(workspace_root, &record.session_id));
+            .add_totals(&session_usage_totals(session_root, &record.session_id));
     }
     usage
         .media_tools

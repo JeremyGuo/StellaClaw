@@ -136,7 +136,9 @@ fn initialize(params: Value, output: Arc<JsonRpcOutput>) -> Result<AgentRuntime,
     let rpc_thread = SessionRpcThread::spawn(Arc::new(sender.clone()), event_sink.clone());
     let bridge = rpc_thread.conversation_bridge();
     let tool_executor = Arc::new(
-        LocalToolBatchExecutor::new(workspace_root).with_conversation_bridge(Arc::new(bridge)),
+        LocalToolBatchExecutor::new(workspace_root)
+            .with_remote_mode(params.initial.tool_remote_mode.clone())
+            .with_conversation_bridge(Arc::new(bridge)),
     );
     let provider: Arc<dyn stellaclaw_core::providers::Provider + Send + Sync> = Arc::new(
         ForkServerProvider::global(params.model_config.clone())

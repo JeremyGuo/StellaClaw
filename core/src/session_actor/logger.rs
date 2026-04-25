@@ -16,9 +16,7 @@ pub struct SessionActorLogger {
 
 impl SessionActorLogger {
     pub fn open_default(session_id: &str) -> Result<Self, String> {
-        let cwd =
-            std::env::current_dir().map_err(|error| format!("failed to resolve cwd: {error}"))?;
-        Self::open_under(cwd, session_id)
+        Self::open_under(default_session_root()?, session_id)
     }
 
     pub fn open_under(root: impl AsRef<Path>, session_id: &str) -> Result<Self, String> {
@@ -76,6 +74,13 @@ impl SessionActorLogger {
         };
         let _ = writeln!(file, "{line}");
         let _ = file.flush();
+    }
+}
+
+fn default_session_root() -> Result<PathBuf, String> {
+    match std::env::var_os("STELLACLAW_SESSION_ROOT") {
+        Some(root) => Ok(PathBuf::from(root)),
+        None => std::env::current_dir().map_err(|error| format!("failed to resolve cwd: {error}")),
     }
 }
 
