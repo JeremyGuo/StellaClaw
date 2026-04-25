@@ -22,36 +22,95 @@ mod unix_impl {
         session_actor::{ChatMessage, ToolDefinition},
     };
 
-    use crate::providers::{provider_from_model_config, Provider, ProviderError, ProviderRequest};
+    use crate::providers::{
+        provider_from_model_config, Provider, ProviderError, ProviderErrorReport, ProviderRequest,
+    };
 
     static FORK_SERVER: OnceLock<Arc<ProviderRequestForkServer>> = OnceLock::new();
 
     #[derive(Debug, Clone)]
     pub struct ForkServerProvider {
+        model_config: ModelConfig,
         fork_server: Arc<ProviderRequestForkServer>,
+        worker: Arc<Mutex<Option<ProviderWorkerBinding>>>,
     }
 
     impl ForkServerProvider {
-        pub fn global() -> Result<Self, ProviderError> {
+        pub fn global(model_config: ModelConfig) -> Result<Self, ProviderError> {
             Ok(Self {
+                model_config,
                 fork_server: global_provider_fork_server()?,
+                worker: Arc::new(Mutex::new(None)),
             })
+        }
+
+        fn ensure_worker(&self) -> Result<String, ProviderError> {
+            let signature = provider_worker_signature(&self.model_config);
+            let mut worker = self.worker.lock().expect("mutex poisoned");
+            if let Some(binding) = worker.as_ref() {
+                if binding.signature == signature {
+                    return Ok(binding.worker_id.clone());
+                }
+                let _ = self.fork_server.shutdown_worker(&binding.worker_id);
+            }
+
+            let worker_id = self.fork_server.start_worker(self.model_config.clone())?;
+            *worker = Some(ProviderWorkerBinding {
+                worker_id: worker_id.clone(),
+                signature,
+            });
+            Ok(worker_id)
+        }
+
+        fn clear_worker(&self, worker_id: &str) {
+            let mut worker = self.worker.lock().expect("mutex poisoned");
+            if worker
+                .as_ref()
+                .is_some_and(|binding| binding.worker_id == worker_id)
+            {
+                *worker = None;
+            }
         }
     }
 
     impl Provider for ForkServerProvider {
-        fn send(
-            &self,
-            model_config: &ModelConfig,
-            request: ProviderRequest<'_>,
-        ) -> Result<ChatMessage, ProviderError> {
-            self.fork_server
-                .start(
-                    model_config.clone(),
-                    ProviderRequestOwned::from_provider_request(&request),
-                )?
-                .wait()
+        fn model_config(&self) -> &ModelConfig {
+            &self.model_config
         }
+
+        fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
+            let request = ProviderRequestOwned::from_provider_request(&request);
+            let mut retried_worker = false;
+            loop {
+                let worker_id = self.ensure_worker()?;
+                let result = self
+                    .fork_server
+                    .start_on_worker(worker_id.clone(), request.clone())?
+                    .wait();
+                if should_recreate_provider_worker(&result) && !retried_worker {
+                    retried_worker = true;
+                    self.clear_worker(&worker_id);
+                    continue;
+                }
+                return result;
+            }
+        }
+    }
+
+    impl Drop for ForkServerProvider {
+        fn drop(&mut self) {
+            if let Ok(worker) = self.worker.lock() {
+                if let Some(binding) = worker.as_ref() {
+                    let _ = self.fork_server.shutdown_worker(&binding.worker_id);
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ProviderWorkerBinding {
+        worker_id: String,
+        signature: String,
     }
 
     pub fn init_global_provider_fork_server(
@@ -77,6 +136,7 @@ mod unix_impl {
         writer: Mutex<UnixStream>,
         pending: Arc<Mutex<HashMap<String, mpsc::Sender<Result<ChatMessage, ProviderError>>>>>,
         next_request_id: AtomicU64,
+        next_worker_id: AtomicU64,
     }
 
     impl ProviderRequestForkServer {
@@ -114,6 +174,61 @@ mod unix_impl {
                 writer: Mutex::new(parent_stream),
                 pending,
                 next_request_id: AtomicU64::new(1),
+                next_worker_id: AtomicU64::new(1),
+            })
+        }
+
+        pub fn start_worker(&self, model_config: ModelConfig) -> Result<String, ProviderError> {
+            let worker_id = format!(
+                "provider_worker_{}_{}",
+                process::id(),
+                self.next_worker_id.fetch_add(1, Ordering::SeqCst)
+            );
+            self.send_command(ForkServerCommand::StartWorker {
+                worker_id: worker_id.clone(),
+                model_config,
+                temporary: false,
+            })?;
+            Ok(worker_id)
+        }
+
+        pub fn shutdown_worker(&self, worker_id: &str) -> Result<(), ProviderError> {
+            self.send_command(ForkServerCommand::ShutdownWorker {
+                worker_id: worker_id.to_string(),
+            })
+        }
+
+        pub fn start_on_worker(
+            &self,
+            worker_id: String,
+            request: ProviderRequestOwned,
+        ) -> Result<ProviderRequestHandle, ProviderError> {
+            let request_id = format!(
+                "provider_request_{}_{}",
+                process::id(),
+                self.next_request_id.fetch_add(1, Ordering::SeqCst)
+            );
+            let (result_tx, result_rx) = mpsc::channel();
+            self.pending
+                .lock()
+                .expect("mutex poisoned")
+                .insert(request_id.clone(), result_tx);
+
+            if let Err(error) = self.send_command(ForkServerCommand::StartOnWorker {
+                request_id: request_id.clone(),
+                worker_id,
+                request,
+            }) {
+                self.pending
+                    .lock()
+                    .expect("mutex poisoned")
+                    .remove(&request_id);
+                return Err(error);
+            }
+
+            Ok(ProviderRequestHandle {
+                request_id,
+                result_rx,
             })
         }
 
@@ -133,11 +248,26 @@ mod unix_impl {
                 .expect("mutex poisoned")
                 .insert(request_id.clone(), result_tx);
 
-            if let Err(error) = self.send_command(ForkServerCommand::Start {
-                request_id: request_id.clone(),
-                model_config,
-                request,
-            }) {
+            let worker_id = format!(
+                "provider_worker_{}_one_shot_{}",
+                process::id(),
+                self.next_worker_id.fetch_add(1, Ordering::SeqCst)
+            );
+            let start_request = self
+                .send_command(ForkServerCommand::StartWorker {
+                    worker_id: worker_id.clone(),
+                    model_config,
+                    temporary: true,
+                })
+                .and_then(|_| {
+                    self.send_command(ForkServerCommand::StartOnWorker {
+                        request_id: request_id.clone(),
+                        worker_id,
+                        request,
+                    })
+                });
+
+            if let Err(error) = start_request {
                 self.pending
                     .lock()
                     .expect("mutex poisoned")
@@ -242,13 +372,21 @@ mod unix_impl {
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     enum ForkServerCommand {
-        Start {
-            request_id: String,
+        StartWorker {
+            worker_id: String,
             model_config: ModelConfig,
+            temporary: bool,
+        },
+        StartOnWorker {
+            request_id: String,
+            worker_id: String,
             request: ProviderRequestOwned,
         },
         Cancel {
             request_id: String,
+        },
+        ShutdownWorker {
+            worker_id: String,
         },
         Shutdown,
     }
@@ -258,17 +396,38 @@ mod unix_impl {
     enum ForkServerEvent {
         Completed {
             request_id: String,
-            result: Result<ChatMessage, String>,
+            result: Result<ChatMessage, ProviderErrorReport>,
+        },
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum ProviderWorkerCommand {
+        Start {
+            request_id: String,
+            request: ProviderRequestOwned,
+        },
+        Shutdown,
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    enum ProviderWorkerEvent {
+        Completed {
+            request_id: String,
+            result: Result<ChatMessage, ProviderErrorReport>,
         },
     }
 
     #[derive(Debug)]
-    struct RunningRequest {
-        request_id: String,
+    struct ProviderWorkerProcess {
+        worker_id: String,
         pid: libc::pid_t,
+        command_fd: RawFd,
         result_fd: RawFd,
         buffer: Vec<u8>,
-        cancelled: bool,
+        active_request_id: Option<String>,
+        temporary: bool,
     }
 
     fn spawn_parent_event_reader(
@@ -286,7 +445,8 @@ mod unix_impl {
                             if let Some(sender) =
                                 pending.lock().expect("mutex poisoned").remove(&request_id)
                             {
-                                let result = result.map_err(ProviderError::Subprocess);
+                                let result =
+                                    result.map_err(ProviderErrorReport::into_provider_error);
                                 let _ = sender.send(result);
                             }
                         }
@@ -322,19 +482,19 @@ mod unix_impl {
     fn run_forkserver_process(mut stream: UnixStream) {
         let command_fd = stream.as_raw_fd();
         let mut command_buffer = Vec::new();
-        let mut running = Vec::<RunningRequest>::new();
+        let mut workers = Vec::<ProviderWorkerProcess>::new();
 
         loop {
-            let mut poll_fds = Vec::with_capacity(1 + running.len());
-            let polled_running_len = running.len();
+            let mut poll_fds = Vec::with_capacity(1 + workers.len());
+            let polled_worker_len = workers.len();
             poll_fds.push(libc::pollfd {
                 fd: command_fd,
                 events: libc::POLLIN,
                 revents: 0,
             });
-            for request in &running {
+            for worker in &workers {
                 poll_fds.push(libc::pollfd {
-                    fd: request.result_fd,
+                    fd: worker.result_fd,
                     events: libc::POLLIN | libc::POLLHUP,
                     revents: 0,
                 });
@@ -350,7 +510,7 @@ mod unix_impl {
                 match read_available(command_fd, &mut command_buffer) {
                     ReadStatus::Open => {
                         while let Some(line) = take_line(&mut command_buffer) {
-                            if !handle_forkserver_command(&line, &mut stream, &mut running) {
+                            if !handle_forkserver_command(&line, &mut stream, &mut workers) {
                                 return;
                             }
                         }
@@ -359,21 +519,28 @@ mod unix_impl {
                 }
             }
 
-            let mut completed_indexes = Vec::new();
-            for index in 0..polled_running_len {
-                let revents = poll_fds[index + 1].revents;
+            let worker_offset = 1;
+            let mut completed_worker_indexes = Vec::new();
+            for index in 0..polled_worker_len {
+                let revents = poll_fds[worker_offset + index].revents;
                 if revents & (libc::POLLIN | libc::POLLHUP) == 0 {
                     continue;
                 }
-                let status = read_available(running[index].result_fd, &mut running[index].buffer);
-                if matches!(status, ReadStatus::Closed) {
-                    completed_indexes.push(index);
+                let status = read_available(workers[index].result_fd, &mut workers[index].buffer);
+                let mut remove_after_event = false;
+                while let Some(line) = take_line(&mut workers[index].buffer) {
+                    if complete_worker_event(&mut stream, &mut workers[index], &line) {
+                        remove_after_event = true;
+                    }
+                }
+                if matches!(status, ReadStatus::Closed) || remove_after_event {
+                    completed_worker_indexes.push(index);
                 }
             }
 
-            for index in completed_indexes.into_iter().rev() {
-                let request = running.swap_remove(index);
-                complete_running_request(&mut stream, request);
+            for index in completed_worker_indexes.into_iter().rev() {
+                let worker = workers.swap_remove(index);
+                complete_worker_exit(&mut stream, worker);
             }
         }
     }
@@ -381,7 +548,7 @@ mod unix_impl {
     fn handle_forkserver_command(
         line: &[u8],
         stream: &mut UnixStream,
-        running: &mut Vec<RunningRequest>,
+        workers: &mut Vec<ProviderWorkerProcess>,
     ) -> bool {
         let command = match serde_json::from_slice::<ForkServerCommand>(line) {
             Ok(command) => command,
@@ -390,7 +557,9 @@ mod unix_impl {
                     stream,
                     ForkServerEvent::Completed {
                         request_id: "invalid".to_string(),
-                        result: Err(format!("invalid forkserver command: {error}")),
+                        result: Err(subprocess_report(format!(
+                            "invalid forkserver command: {error}"
+                        ))),
                     },
                 );
                 return true;
@@ -398,13 +567,21 @@ mod unix_impl {
         };
 
         match command {
-            ForkServerCommand::Start {
-                request_id,
+            ForkServerCommand::StartWorker {
+                worker_id,
                 model_config,
+                temporary,
+            } => start_provider_worker(worker_id, model_config, temporary, workers),
+            ForkServerCommand::StartOnWorker {
+                request_id,
+                worker_id,
                 request,
-            } => start_request_child(request_id, model_config, request, running),
+            } => start_request_on_worker(request_id, &worker_id, request, stream, workers),
             ForkServerCommand::Cancel { request_id } => {
-                cancel_running_request(&request_id, running);
+                cancel_worker_request(&request_id, stream, workers);
+            }
+            ForkServerCommand::ShutdownWorker { worker_id } => {
+                shutdown_provider_worker(&worker_id, workers);
             }
             ForkServerCommand::Shutdown => return false,
         }
@@ -412,129 +589,347 @@ mod unix_impl {
         true
     }
 
-    fn start_request_child(
-        request_id: String,
+    fn start_provider_worker(
+        worker_id: String,
         model_config: ModelConfig,
-        request: ProviderRequestOwned,
-        running: &mut Vec<RunningRequest>,
+        temporary: bool,
+        workers: &mut Vec<ProviderWorkerProcess>,
     ) {
-        let mut pipe_fds = [0; 2];
-        if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } != 0 {
+        if workers.iter().any(|worker| worker.worker_id == worker_id) {
+            return;
+        }
+
+        let mut command_pipe = [0; 2];
+        let mut result_pipe = [0; 2];
+        if unsafe { libc::pipe(command_pipe.as_mut_ptr()) } != 0 {
+            return;
+        }
+        if unsafe { libc::pipe(result_pipe.as_mut_ptr()) } != 0 {
+            unsafe {
+                libc::close(command_pipe[0]);
+                libc::close(command_pipe[1]);
+            }
             return;
         }
 
         let pid = unsafe { libc::fork() };
         if pid < 0 {
             unsafe {
-                libc::close(pipe_fds[0]);
-                libc::close(pipe_fds[1]);
+                libc::close(command_pipe[0]);
+                libc::close(command_pipe[1]);
+                libc::close(result_pipe[0]);
+                libc::close(result_pipe[1]);
             }
             return;
         }
 
         if pid == 0 {
             unsafe {
-                libc::close(pipe_fds[0]);
+                libc::close(command_pipe[1]);
+                libc::close(result_pipe[0]);
             }
-            run_request_child(pipe_fds[1], model_config, request);
+            run_provider_worker(command_pipe[0], result_pipe[1], model_config);
             unsafe {
                 libc::_exit(0);
             }
         }
 
         unsafe {
-            libc::close(pipe_fds[1]);
+            libc::close(command_pipe[0]);
+            libc::close(result_pipe[1]);
         }
-        running.push(RunningRequest {
-            request_id,
+        workers.push(ProviderWorkerProcess {
+            worker_id,
             pid,
-            result_fd: pipe_fds[0],
+            command_fd: command_pipe[1],
+            result_fd: result_pipe[0],
             buffer: Vec::new(),
-            cancelled: false,
+            active_request_id: None,
+            temporary,
         });
     }
 
-    fn cancel_running_request(request_id: &str, running: &mut [RunningRequest]) {
-        if let Some(request) = running
-            .iter_mut()
-            .find(|request| request.request_id == request_id)
-        {
-            request.cancelled = true;
-            unsafe {
-                libc::kill(request.pid, libc::SIGKILL);
-            }
-        }
-    }
-
-    fn run_request_child(
-        result_fd: RawFd,
-        model_config: ModelConfig,
+    fn start_request_on_worker(
+        request_id: String,
+        worker_id: &str,
         request: ProviderRequestOwned,
+        stream: &mut UnixStream,
+        workers: &mut [ProviderWorkerProcess],
     ) {
-        let mut writer = unsafe { std::fs::File::from_raw_fd(result_fd) };
-        let provider = provider_from_model_config(&model_config);
-        let result = provider
-            .send(&model_config, request.as_provider_request())
-            .map_err(|error| error.to_string());
-        let event = ForkServerEvent::Completed {
-            request_id: String::new(),
-            result,
+        let Some(worker) = workers
+            .iter_mut()
+            .find(|worker| worker.worker_id == worker_id)
+        else {
+            let _ = write_event(
+                stream,
+                ForkServerEvent::Completed {
+                    request_id,
+                    result: Err(subprocess_report(format!(
+                        "unknown provider worker {worker_id}"
+                    ))),
+                },
+            );
+            return;
         };
-        let _ = serde_json::to_writer(&mut writer, &event);
-        let _ = writer.write_all(b"\n");
-        let _ = writer.flush();
+
+        if let Some(active_request_id) = &worker.active_request_id {
+            let _ = write_event(
+                stream,
+                ForkServerEvent::Completed {
+                    request_id,
+                    result: Err(subprocess_report(format!(
+                        "provider worker {worker_id} is busy with {active_request_id}"
+                    ))),
+                },
+            );
+            return;
+        }
+
+        let command = ProviderWorkerCommand::Start {
+            request_id: request_id.clone(),
+            request,
+        };
+        if let Err(error) = write_fd_json_line(worker.command_fd, &command) {
+            let _ = write_event(
+                stream,
+                ForkServerEvent::Completed {
+                    request_id,
+                    result: Err(subprocess_report(format!(
+                        "failed to write provider worker command: {error}"
+                    ))),
+                },
+            );
+            return;
+        }
+
+        worker.active_request_id = Some(request_id);
     }
 
-    fn complete_running_request(stream: &mut UnixStream, request: RunningRequest) {
+    fn cancel_worker_request(
+        request_id: &str,
+        stream: &mut UnixStream,
+        workers: &mut Vec<ProviderWorkerProcess>,
+    ) {
+        let Some(index) = workers
+            .iter()
+            .position(|worker| worker.active_request_id.as_deref() == Some(request_id))
+        else {
+            return;
+        };
+        let worker = workers.swap_remove(index);
         unsafe {
-            libc::close(request.result_fd);
+            libc::kill(worker.pid, libc::SIGKILL);
+        }
+        close_provider_worker_fds(&worker);
+        let _ = write_event(
+            stream,
+            ForkServerEvent::Completed {
+                request_id: request_id.to_string(),
+                result: Err(subprocess_report("provider request cancelled")),
+            },
+        );
+    }
+
+    fn shutdown_provider_worker(worker_id: &str, workers: &mut Vec<ProviderWorkerProcess>) {
+        let Some(index) = workers
+            .iter()
+            .position(|worker| worker.worker_id == worker_id)
+        else {
+            return;
+        };
+        let worker = workers.swap_remove(index);
+        let _ = write_fd_json_line(worker.command_fd, &ProviderWorkerCommand::Shutdown);
+        unsafe {
+            libc::kill(worker.pid, libc::SIGTERM);
+        }
+        close_provider_worker_fds(&worker);
+    }
+
+    fn complete_worker_event(
+        stream: &mut UnixStream,
+        worker: &mut ProviderWorkerProcess,
+        line: &[u8],
+    ) -> bool {
+        let event = match serde_json::from_slice::<ProviderWorkerEvent>(line) {
+            Ok(ProviderWorkerEvent::Completed { request_id, result }) => {
+                worker.active_request_id = None;
+                ForkServerEvent::Completed { request_id, result }
+            }
+            Err(error) => {
+                let request_id = worker
+                    .active_request_id
+                    .take()
+                    .unwrap_or_else(|| format!("{}_decode_error", worker.worker_id));
+                ForkServerEvent::Completed {
+                    request_id,
+                    result: Err(subprocess_report(format!(
+                        "failed to decode provider worker response: {error}"
+                    ))),
+                }
+            }
+        };
+        let _ = write_event(stream, event);
+        if worker.temporary {
+            let _ = write_fd_json_line(worker.command_fd, &ProviderWorkerCommand::Shutdown);
+            unsafe {
+                libc::kill(worker.pid, libc::SIGTERM);
+            }
+            return true;
+        }
+        false
+    }
+
+    fn complete_worker_exit(stream: &mut UnixStream, worker: ProviderWorkerProcess) {
+        unsafe {
+            libc::close(worker.command_fd);
+            libc::close(worker.result_fd);
         }
         let mut status = 0;
         unsafe {
-            libc::waitpid(request.pid, &mut status, 0);
+            libc::waitpid(worker.pid, &mut status, 0);
         }
-
-        if request.cancelled {
+        if let Some(request_id) = worker.active_request_id {
             let _ = write_event(
                 stream,
                 ForkServerEvent::Completed {
-                    request_id: request.request_id,
-                    result: Err("provider request cancelled".to_string()),
+                    request_id,
+                    result: Err(subprocess_report(format!(
+                        "provider worker {} exited before completing request",
+                        worker.worker_id
+                    ))),
                 },
             );
-            return;
         }
+    }
 
-        let Some(line) = first_line(&request.buffer) else {
-            let _ = write_event(
-                stream,
-                ForkServerEvent::Completed {
-                    request_id: request.request_id,
-                    result: Err("provider request child exited without a response".to_string()),
-                },
-            );
-            return;
-        };
+    fn close_provider_worker_fds(worker: &ProviderWorkerProcess) {
+        unsafe {
+            libc::close(worker.command_fd);
+            libc::close(worker.result_fd);
+        }
+    }
 
-        let child_event = match serde_json::from_slice::<ForkServerEvent>(line) {
-            Ok(ForkServerEvent::Completed { result, .. }) => ForkServerEvent::Completed {
-                request_id: request.request_id,
-                result,
-            },
-            Err(error) => ForkServerEvent::Completed {
-                request_id: request.request_id,
-                result: Err(format!(
-                    "failed to decode provider request child response: {error}"
-                )),
-            },
-        };
-        let _ = write_event(stream, child_event);
+    fn run_provider_worker(command_fd: RawFd, result_fd: RawFd, model_config: ModelConfig) {
+        let command_stream = unsafe { std::fs::File::from_raw_fd(command_fd) };
+        let mut writer = unsafe { std::fs::File::from_raw_fd(result_fd) };
+        let mut reader = BufReader::new(command_stream);
+        let provider = provider_from_model_config(model_config);
+
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = write_worker_event(
+                        &mut writer,
+                        ProviderWorkerEvent::Completed {
+                            request_id: "worker_read_error".to_string(),
+                            result: Err(subprocess_report(format!(
+                                "failed to read provider worker command: {error}"
+                            ))),
+                        },
+                    );
+                    break;
+                }
+            }
+
+            let command = match serde_json::from_str::<ProviderWorkerCommand>(&line) {
+                Ok(command) => command,
+                Err(error) => {
+                    let _ = write_worker_event(
+                        &mut writer,
+                        ProviderWorkerEvent::Completed {
+                            request_id: "invalid_worker_command".to_string(),
+                            result: Err(subprocess_report(format!(
+                                "invalid provider worker command: {error}"
+                            ))),
+                        },
+                    );
+                    continue;
+                }
+            };
+
+            match command {
+                ProviderWorkerCommand::Start {
+                    request_id,
+                    request,
+                } => {
+                    let result = provider
+                        .send(request.as_provider_request())
+                        .map_err(ProviderErrorReport::from_provider_error);
+                    let _ = write_worker_event(
+                        &mut writer,
+                        ProviderWorkerEvent::Completed { request_id, result },
+                    );
+                }
+                ProviderWorkerCommand::Shutdown => break,
+            }
+        }
     }
 
     fn write_event(stream: &mut UnixStream, event: ForkServerEvent) -> std::io::Result<()> {
         serde_json::to_writer(&mut *stream, &event)?;
         stream.write_all(b"\n")?;
         stream.flush()
+    }
+
+    fn write_worker_event(
+        writer: &mut std::fs::File,
+        event: ProviderWorkerEvent,
+    ) -> std::io::Result<()> {
+        serde_json::to_writer(&mut *writer, &event)?;
+        writer.write_all(b"\n")?;
+        writer.flush()
+    }
+
+    fn write_fd_json_line<T: Serialize>(fd: RawFd, value: &T) -> std::io::Result<()> {
+        let rendered = serde_json::to_vec(value)?;
+        let mut written = 0usize;
+        while written < rendered.len() {
+            let result = unsafe {
+                libc::write(
+                    fd,
+                    rendered[written..].as_ptr().cast(),
+                    rendered.len() - written,
+                )
+            };
+            if result < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            written += result as usize;
+        }
+        let newline = [b'\n'];
+        let result = unsafe { libc::write(fd, newline.as_ptr().cast(), newline.len()) };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn subprocess_report(message: impl Into<String>) -> ProviderErrorReport {
+        ProviderErrorReport::Subprocess {
+            message: message.into(),
+        }
+    }
+
+    fn provider_worker_signature(model_config: &ModelConfig) -> String {
+        serde_json::to_string(model_config).unwrap_or_else(|_| {
+            format!(
+                "{:?}:{}:{}",
+                model_config.provider_type, model_config.model_name, model_config.url
+            )
+        })
+    }
+
+    fn should_recreate_provider_worker(result: &Result<ChatMessage, ProviderError>) -> bool {
+        matches!(
+            result,
+            Err(ProviderError::Subprocess(message))
+                if message.contains("unknown provider worker")
+                    || message.contains("provider worker")
+                        && message.contains("exited before completing request")
+        )
     }
 
     enum ReadStatus {
@@ -567,11 +962,6 @@ mod unix_impl {
         }
         Some(line)
     }
-
-    fn first_line(buffer: &[u8]) -> Option<&[u8]> {
-        let end = buffer.iter().position(|byte| *byte == b'\n')?;
-        Some(&buffer[..end])
-    }
 }
 
 #[cfg(unix)]
@@ -601,26 +991,28 @@ mod portable_impl {
 
     #[derive(Debug, Clone)]
     pub struct ForkServerProvider {
+        model_config: ModelConfig,
         fork_server: Arc<ProviderRequestForkServer>,
     }
 
     impl ForkServerProvider {
-        pub fn global() -> Result<Self, ProviderError> {
+        pub fn global(model_config: ModelConfig) -> Result<Self, ProviderError> {
             Ok(Self {
+                model_config,
                 fork_server: global_provider_fork_server()?,
             })
         }
     }
 
     impl Provider for ForkServerProvider {
-        fn send(
-            &self,
-            model_config: &ModelConfig,
-            request: ProviderRequest<'_>,
-        ) -> Result<ChatMessage, ProviderError> {
+        fn model_config(&self) -> &ModelConfig {
+            &self.model_config
+        }
+
+        fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
             self.fork_server
                 .start(
-                    model_config.clone(),
+                    self.model_config.clone(),
                     ProviderRequestOwned::from_provider_request(&request),
                 )?
                 .wait()
@@ -687,8 +1079,8 @@ mod portable_impl {
             let pending = self.pending.clone();
             let thread_request_id = request_id.clone();
             thread::spawn(move || {
-                let provider = provider_from_model_config(&model_config);
-                let result = provider.send(&model_config, request.as_provider_request());
+                let provider = provider_from_model_config(model_config);
+                let result = provider.send(request.as_provider_request());
                 let Some(running) = pending
                     .lock()
                     .expect("mutex poisoned")

@@ -25,9 +25,9 @@ pub use compressor::{CompressionError, CompressionReport, SessionCompressor, COM
 pub(crate) use media_normalizer::normalize_messages_for_model;
 pub use runtime_metadata::SessionSkillObservation;
 pub use session_rpc::{
-    ConversationTransport, SessionEvent, SessionInitial, SessionMailbox, SessionMailboxKind,
-    SessionRequest, SessionRpcConversationBridge, SessionRpcError, SessionRpcThread, SessionType,
-    ToolRemoteMode,
+    ConversationTransport, SessionErrorDetail, SessionEvent, SessionInitial, SessionMailbox,
+    SessionMailboxKind, SessionRequest, SessionRpcConversationBridge, SessionRpcError,
+    SessionRpcThread, SessionType, ToolRemoteMode,
 };
 pub(crate) use system_prompt::system_prompt_for_initial;
 pub use token_estimator::{

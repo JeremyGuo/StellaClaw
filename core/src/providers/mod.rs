@@ -2,6 +2,7 @@ mod brave_search;
 mod claude_code;
 mod codex_subscription;
 mod common;
+mod error_report;
 mod forkserver;
 mod openai_image_edit;
 mod openrouter_completion;
@@ -11,6 +12,7 @@ mod pricing;
 
 use std::error::Error as StdError;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
@@ -21,6 +23,7 @@ use crate::{
 pub use brave_search::BraveSearchProvider;
 pub use claude_code::ClaudeCodeProvider;
 pub use codex_subscription::CodexSubscriptionProvider;
+pub use error_report::ProviderErrorReport;
 pub use forkserver::{
     global_provider_fork_server, init_global_provider_fork_server, ForkServerProvider,
     ProviderRequestAbortHandle, ProviderRequestForkServer, ProviderRequestHandle,
@@ -31,18 +34,32 @@ pub use openrouter_completion::OpenRouterCompletionProvider;
 pub use openrouter_responses::OpenRouterResponsesProvider;
 pub use output_persistor::{OutputPersistor, OutputPersistorError};
 
-pub fn provider_from_model_config(model_config: &ModelConfig) -> Box<dyn Provider + Send + Sync> {
-    match model_config.provider_type {
-        ProviderType::OpenRouterCompletion => Box::new(OpenRouterCompletionProvider::new()),
-        ProviderType::OpenRouterResponses => Box::new(OpenRouterResponsesProvider::new()),
-        ProviderType::OpenAiImageEdit => Box::new(OpenAiImageEditProvider::new()),
-        ProviderType::ClaudeCode => Box::new(ClaudeCodeProvider::new()),
-        ProviderType::CodexSubscription => Box::new(CodexSubscriptionProvider::new()),
-        ProviderType::BraveSearch => Box::new(BraveSearchProvider::new()),
-    }
+pub fn provider_from_model_config(model_config: ModelConfig) -> Box<dyn Provider + Send + Sync> {
+    let backend = provider_backend_from_model_config(&model_config);
+    Box::new(ModelBoundProvider {
+        model_config,
+        backend,
+    })
 }
 
 pub trait Provider {
+    fn model_config(&self) -> &ModelConfig;
+
+    fn normalize_messages_for_provider(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        messages.to_vec()
+    }
+
+    fn filter_tools_for_provider<'a>(
+        &self,
+        tools: Vec<&'a ToolDefinition>,
+    ) -> Vec<&'a ToolDefinition> {
+        tools
+    }
+
+    fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError>;
+}
+
+pub(crate) trait ProviderBackend: Send + Sync {
     fn normalize_messages_for_provider(
         &self,
         _model_config: &ModelConfig,
@@ -64,6 +81,47 @@ pub trait Provider {
         model_config: &ModelConfig,
         request: ProviderRequest<'_>,
     ) -> Result<ChatMessage, ProviderError>;
+}
+
+struct ModelBoundProvider {
+    model_config: ModelConfig,
+    backend: Box<dyn ProviderBackend>,
+}
+
+impl Provider for ModelBoundProvider {
+    fn model_config(&self) -> &ModelConfig {
+        &self.model_config
+    }
+
+    fn normalize_messages_for_provider(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
+        self.backend
+            .normalize_messages_for_provider(&self.model_config, messages)
+    }
+
+    fn filter_tools_for_provider<'a>(
+        &self,
+        tools: Vec<&'a ToolDefinition>,
+    ) -> Vec<&'a ToolDefinition> {
+        self.backend
+            .filter_tools_for_provider(&self.model_config, tools)
+    }
+
+    fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
+        self.backend.send(&self.model_config, request)
+    }
+}
+
+fn provider_backend_from_model_config(
+    model_config: &ModelConfig,
+) -> Box<dyn ProviderBackend + Send + Sync> {
+    match model_config.provider_type {
+        ProviderType::OpenRouterCompletion => Box::new(OpenRouterCompletionProvider::new()),
+        ProviderType::OpenRouterResponses => Box::new(OpenRouterResponsesProvider::new()),
+        ProviderType::OpenAiImageEdit => Box::new(OpenAiImageEditProvider::new()),
+        ProviderType::ClaudeCode => Box::new(ClaudeCodeProvider::new()),
+        ProviderType::CodexSubscription => Box::new(CodexSubscriptionProvider::new()),
+        ProviderType::BraveSearch => Box::new(BraveSearchProvider::new()),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -129,7 +187,8 @@ pub enum ProviderError {
     Subprocess(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderFailureKind {
     RequestTooLarge,
     RateLimited,

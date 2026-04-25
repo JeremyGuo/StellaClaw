@@ -1150,7 +1150,7 @@ mod tests {
             .to_string();
 
         wait_until(Duration::from_secs(2), || accepted.load(Ordering::SeqCst))
-            .expect("provider request child should connect before stop");
+            .expect("provider worker should connect before stop");
 
         let mut stop_arguments = Map::new();
         stop_arguments.insert("image_id".to_string(), Value::String(job_id));
@@ -1163,7 +1163,7 @@ mod tests {
 
         assert_eq!(stop_payload["status"], "cancelled");
         wait_until(Duration::from_secs(2), || closed.load(Ordering::SeqCst))
-            .expect("provider request child connection should close after stop");
+            .expect("provider worker connection should close after stop");
     }
 
     #[test]
@@ -1202,7 +1202,7 @@ mod tests {
             .to_string();
 
         wait_until(Duration::from_secs(2), || accepted.load(Ordering::SeqCst))
-            .expect("provider request child should connect before interrupt");
+            .expect("provider worker should connect before interrupt");
 
         let cancel_token = ToolCancellationToken::default();
         cancel_token.cancel();
@@ -1227,7 +1227,7 @@ mod tests {
         stop_arguments.insert("image_id".to_string(), Value::String(job_id));
         let _ = execute_media_tool("image_stop", &stop_arguments, &test_context(temp.path()));
         wait_until(Duration::from_secs(2), || closed.load(Ordering::SeqCst))
-            .expect("provider request child connection should close after cleanup");
+            .expect("provider worker connection should close after cleanup");
     }
 
     fn test_context(root: &Path) -> ToolExecutionContext<'_> {

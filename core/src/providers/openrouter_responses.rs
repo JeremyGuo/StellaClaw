@@ -16,7 +16,7 @@ use super::{
         is_image_file, openrouter_cache_control_payload, provider_error_kind,
         provider_error_message, serialize_json_request_body, token_usage_from_value,
     },
-    error_chain_message, OutputPersistor, Provider, ProviderError, ProviderRequest,
+    error_chain_message, OutputPersistor, ProviderBackend, ProviderError, ProviderRequest,
 };
 
 const RESPONSE_PREVIEW_CHARS: usize = 2000;
@@ -216,7 +216,7 @@ fn openrouter_output_modalities(model_config: &ModelConfig) -> Option<Vec<&'stat
     Some(modalities)
 }
 
-impl Provider for OpenRouterResponsesProvider {
+impl ProviderBackend for OpenRouterResponsesProvider {
     fn send(
         &self,
         model_config: &ModelConfig,

@@ -11,8 +11,8 @@ use stellaclaw_core::{
     providers::{init_global_provider_fork_server, ForkServerProvider},
     session_actor::{
         ConversationTransport, LocalToolBatchExecutor, SessionActor, SessionActorEventSink,
-        SessionActorInbox, SessionActorStep, SessionEvent, SessionInitial, SessionRequest,
-        SessionRpcThread, ToolCatalog,
+        SessionActorInbox, SessionActorStep, SessionErrorDetail, SessionEvent, SessionInitial,
+        SessionRequest, SessionRpcThread, ToolCatalog,
     },
 };
 
@@ -138,8 +138,10 @@ fn initialize(params: Value, output: Arc<JsonRpcOutput>) -> Result<AgentRuntime,
     let tool_executor = Arc::new(
         LocalToolBatchExecutor::new(workspace_root).with_conversation_bridge(Arc::new(bridge)),
     );
-    let provider: Arc<dyn stellaclaw_core::providers::Provider + Send + Sync> =
-        Arc::new(ForkServerProvider::global().map_err(|error| error.to_string())?);
+    let provider: Arc<dyn stellaclaw_core::providers::Provider + Send + Sync> = Arc::new(
+        ForkServerProvider::global(params.model_config.clone())
+            .map_err(|error| error.to_string())?,
+    );
     let catalog = ToolCatalog::from_model_config_and_initial(&params.model_config, &params.initial)
         .map_err(|error| format!("failed to build tool catalog: {error}"))?;
     let mut actor = SessionActor::new(
@@ -184,6 +186,11 @@ fn run_actor_loop(
                     "session_event",
                     SessionEvent::RuntimeCrashed {
                         error: error.to_string(),
+                        error_detail: SessionErrorDetail::new(
+                            "agent_server.session_actor",
+                            "runtime_crashed",
+                            error.to_string(),
+                        ),
                     },
                 );
                 break;

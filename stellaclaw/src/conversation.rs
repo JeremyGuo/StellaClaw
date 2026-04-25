@@ -16,9 +16,9 @@ use stellaclaw_core::{
     model_config::{ModelCapability, ModelConfig},
     session_actor::{
         ChatMessage, ChatMessageItem, ChatRole, ContextItem, ConversationBridgeRequest,
-        ConversationBridgeResponse, FileItem, SessionEvent, SessionInitial, SessionRequest,
-        SessionType, TokenUsage, TokenUsageCost, ToolCallItem, ToolRemoteMode, ToolResultContent,
-        ToolResultItem,
+        ConversationBridgeResponse, FileItem, SessionErrorDetail, SessionEvent, SessionInitial,
+        SessionRequest, SessionType, TokenUsage, TokenUsageCost, ToolCallItem, ToolRemoteMode,
+        ToolResultContent, ToolResultItem,
     },
 };
 
@@ -765,8 +765,9 @@ impl ConversationRuntime {
             }
             SessionEvent::TurnFailed {
                 error,
+                error_detail,
                 can_continue,
-            } => self.on_turn_failed(agent_id, session_type, error, can_continue),
+            } => self.on_turn_failed(agent_id, session_type, error, error_detail, can_continue),
             SessionEvent::HostCoordinationRequested { request } => {
                 self.on_host_coordination(agent_id, session_type, request)?;
                 Ok(false)
@@ -789,7 +790,10 @@ impl ConversationRuntime {
                 );
                 Ok(false)
             }
-            SessionEvent::RuntimeCrashed { error } => {
+            SessionEvent::RuntimeCrashed {
+                error,
+                error_detail,
+            } => {
                 self.clear_session_plan(agent_id.as_deref(), session_type);
                 self.host_logger.warn(
                     "session_runtime_crashed",
@@ -798,6 +802,7 @@ impl ConversationRuntime {
                         "session_type": format!("{session_type:?}"),
                         "agent_id": agent_id,
                         "error": error,
+                        "error_detail": error_detail,
                     }),
                 );
                 self.send_delivery_from_text(
@@ -882,25 +887,30 @@ impl ConversationRuntime {
         agent_id: Option<String>,
         session_type: SessionType,
         error: String,
+        error_detail: SessionErrorDetail,
         can_continue: bool,
     ) -> Result<bool> {
         self.clear_session_plan(agent_id.as_deref(), session_type);
+        let visible_error = format_session_error(&error, &error_detail);
         match session_type {
             SessionType::Foreground => {
-                self.finish_foreground_progress(ProgressFeedbackFinalState::Failed, Some(&error))?;
+                self.finish_foreground_progress(
+                    ProgressFeedbackFinalState::Failed,
+                    Some(&visible_error),
+                )?;
                 let suffix = if can_continue {
                     "\n发送 /continue 继续，或 /cancel 取消当前回合。"
                 } else {
                     ""
                 };
-                self.send_delivery_from_text(format!("本轮失败: {error}{suffix}"))?;
+                self.send_delivery_from_text(format!("本轮失败: {visible_error}{suffix}"))?;
                 Ok(false)
             }
             SessionType::Background => {
                 if let Some(agent_id) = agent_id {
                     if let Some(runtime) = self.background.get_mut(&agent_id) {
                         runtime.record.status = ManagedSessionStatus::Failed;
-                        runtime.record.last_error = Some(error.clone());
+                        runtime.record.last_error = Some(visible_error.clone());
                     }
                     if let Some(record) = self
                         .state
@@ -909,17 +919,17 @@ impl ConversationRuntime {
                         .get_mut(&agent_id)
                     {
                         record.status = ManagedSessionStatus::Failed;
-                        record.last_error = Some(error.clone());
+                        record.last_error = Some(visible_error.clone());
                     }
                 }
-                self.send_delivery_from_text(format!("后台任务失败: {error}"))?;
+                self.send_delivery_from_text(format!("后台任务失败: {visible_error}"))?;
                 Ok(true)
             }
             SessionType::Subagent => {
                 if let Some(agent_id) = agent_id {
                     if let Some(runtime) = self.subagents.get_mut(&agent_id) {
                         runtime.record.status = ManagedSessionStatus::Failed;
-                        runtime.record.last_error = Some(error.clone());
+                        runtime.record.last_error = Some(visible_error.clone());
                     }
                     if let Some(record) = self
                         .state
@@ -928,7 +938,7 @@ impl ConversationRuntime {
                         .get_mut(&agent_id)
                     {
                         record.status = ManagedSessionStatus::Failed;
-                        record.last_error = Some(error);
+                        record.last_error = Some(visible_error);
                     }
                 }
                 Ok(true)
@@ -2934,6 +2944,15 @@ fn bridge_result(request: &ConversationBridgeRequest, text: String) -> ToolResul
             context: Some(ContextItem { text }),
             file: None,
         },
+    }
+}
+
+fn format_session_error(error: &str, detail: &SessionErrorDetail) -> String {
+    let summary = detail.summary();
+    if error == summary || error.contains(&summary) {
+        error.to_string()
+    } else {
+        format!("{summary}\n{error}")
     }
 }
 

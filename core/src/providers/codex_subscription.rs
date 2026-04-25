@@ -31,7 +31,7 @@ use super::{
         account_id_from_access_token, ensure_request_payload_size, is_image_file, nonce,
         provider_error_message, token_usage_from_value,
     },
-    OutputPersistor, Provider, ProviderError, ProviderRequest,
+    OutputPersistor, ProviderBackend, ProviderError, ProviderRequest,
 };
 
 const OPENAI_BETA_RESPONSES_WEBSOCKETS: &str = "responses_websockets=2026-02-06";
@@ -260,7 +260,7 @@ impl Default for CodexSubscriptionProvider {
     }
 }
 
-impl Provider for CodexSubscriptionProvider {
+impl ProviderBackend for CodexSubscriptionProvider {
     fn normalize_messages_for_provider(
         &self,
         _model_config: &ModelConfig,

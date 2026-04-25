@@ -219,7 +219,7 @@ impl SessionCompressor {
         messages_to_summarize: &[ChatMessage],
         preserved_recent_count: usize,
         provider: &(dyn Provider + Send + Sync),
-        model_config: &ModelConfig,
+        _model_config: &ModelConfig,
         system_prompt: Option<&str>,
     ) -> Result<Option<ChatMessage>, CompressionError> {
         let mut request_messages = sanitize_messages_for_compression_request(messages_to_summarize);
@@ -234,10 +234,7 @@ impl SessionCompressor {
         ));
 
         let summary = provider
-            .send(
-                model_config,
-                ProviderRequest::new(&request_messages).with_system_prompt(system_prompt),
-            )
+            .send(ProviderRequest::new(&request_messages).with_system_prompt(system_prompt))
             .map_err(|error| CompressionError::Provider(error.to_string()))?;
         let summary_text = message_text(&summary);
         if summary_text.trim().is_empty() {
@@ -526,21 +523,25 @@ mod tests {
     }
 
     struct SummaryProvider {
+        model_config: ModelConfig,
         seen_requests: Arc<Mutex<Vec<SummaryRequestSnapshot>>>,
     }
 
     impl SummaryProvider {
         fn new(seen_requests: Arc<Mutex<Vec<SummaryRequestSnapshot>>>) -> Self {
-            Self { seen_requests }
+            Self {
+                model_config: test_model_config(String::new()),
+                seen_requests,
+            }
         }
     }
 
     impl Provider for SummaryProvider {
-        fn send(
-            &self,
-            _model_config: &ModelConfig,
-            request: ProviderRequest<'_>,
-        ) -> Result<ChatMessage, ProviderError> {
+        fn model_config(&self) -> &ModelConfig {
+            &self.model_config
+        }
+
+        fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
             self.seen_requests
                 .lock()
                 .unwrap()

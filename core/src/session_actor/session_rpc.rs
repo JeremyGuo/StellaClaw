@@ -133,15 +133,63 @@ impl SessionRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum SessionEvent {
-    TurnStarted { turn_id: String },
-    Progress { message: String },
-    TurnCompleted { message: ChatMessage },
-    TurnFailed { error: String, can_continue: bool },
-    HostCoordinationRequested { request: ConversationBridgeRequest },
-    InteractiveOutputRequested { payload: Value },
-    SessionViewResult { query_id: String, payload: Value },
-    ControlRejected { reason: String, payload: Value },
-    RuntimeCrashed { error: String },
+    TurnStarted {
+        turn_id: String,
+    },
+    Progress {
+        message: String,
+    },
+    TurnCompleted {
+        message: ChatMessage,
+    },
+    TurnFailed {
+        error: String,
+        error_detail: SessionErrorDetail,
+        can_continue: bool,
+    },
+    HostCoordinationRequested {
+        request: ConversationBridgeRequest,
+    },
+    InteractiveOutputRequested {
+        payload: Value,
+    },
+    SessionViewResult {
+        query_id: String,
+        payload: Value,
+    },
+    ControlRejected {
+        reason: String,
+        payload: Value,
+    },
+    RuntimeCrashed {
+        error: String,
+        error_detail: SessionErrorDetail,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionErrorDetail {
+    pub module: String,
+    pub kind: String,
+    pub reason: String,
+}
+
+impl SessionErrorDetail {
+    pub fn new(
+        module: impl Into<String>,
+        kind: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            module: module.into(),
+            kind: kind.into(),
+            reason: reason.into(),
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        format!("{} [{}]: {}", self.module, self.kind, self.reason)
+    }
 }
 
 pub trait SessionMailbox: Send + Sync + 'static {

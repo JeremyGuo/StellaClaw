@@ -48,6 +48,8 @@
 - Codex subscription provider 当前按官方订阅 websocket 形态调用，支持 access token 自动刷新；`reasoning.service_tier = fast/priority` 会映射到请求级 `service_tier = priority`，不会塞进 `reasoning` payload。
 - 多模态输入在 `SessionActor` 发 provider 前统一 normalization：模型支持对应模态时按 `ModelConfig.multimodal_input` 发送；不支持或文件损坏时降级为包含文件路径/原因的文本上下文。
 - Provider 请求前的消息规整采用双层 normalization：先做通用模型能力降级，再做 provider 特化 normalization。Codex subscription provider 会保留并回传 `codex_summary` / `codex_encrypted_content`，普通 reasoning text 仍不会作为 model-visible 内容回传。
+- Provider request isolation 当前采用长期 worker 转发结构：`SessionActor` 持有长期 `Provider` 实例，`Provider` 内部懒创建 forkserver worker child，真实 provider client 在 worker 内只创建一次并跨请求复用。Codex subscription 的 WebSocket、auth cache 与 `auth.json` refresh 状态因此跟随 provider 生命周期保留。
+- Provider worker IPC 返回结构化 `ProviderErrorReport`，父进程会还原成 `ProviderError`，避免 request-too-large、HTTP status、WebSocket 等语义在 isolation 边界被压成普通字符串。
 - `ChatMessage::Reasoning` 当前支持 Codex 专用 encrypted reasoning continuation；token 估算按 Codex 风格把 `codex_encrypted_content` 作为上下文成本估入，但展示层和普通文本路径不暴露密文。
 - `reasoning_effort` 是 conversation 级 override；已有 conversation 的 `session_profile.main_model` 是持久化快照，不会自动跟随全局 config 更新。
 - 每轮 model/tool loop 默认上限是 200 步，主要作为防无限循环兜底，而不是正常工作流限制。
@@ -204,6 +206,74 @@ flowchart LR
 - 先移动代码，不改行为；每一步保持现有测试通过。
 - `ConversationRuntime` 和 `SessionActor` 仍然是串行 owner，不先引入新的并发 owner。
 - bridge、skill、delivery 这类 host-side effect 要有明确输入输出，避免继续把 channel、workspace、session process 互相穿透。
+
+### 1.3.4 Provider Runtime / Worker 当前结构
+
+Provider 层的关键边界是：`SessionActor` 不直接执行网络请求，也不直接拥有具体 provider protocol client；它只持有一个长期、model-bound 的 `Provider` 实例。`ModelConfig` 是 `Provider` 实例的内部状态，`send(ProviderRequest)` 不再每次单独传入模型配置。这个 `Provider` 是主进程内的轻量代理，内部持有 forkserver worker handle。真实 provider client 位于 worker child 进程内，并且在该 worker 生命周期中只创建一次。
+
+这让两类 provider 都能用同一个入口：
+
+- OpenRouter / Claude Code / Brave Search 等无状态或弱状态 HTTP provider：worker 复用主要带来统一隔离、统一 abort 和 HTTP client cache。
+- Codex subscription 这类有状态 provider：worker 复用是语义要求，WebSocket、access token cache、refresh token 和 `auth.json` 写回必须跨请求保留。
+
+```mermaid
+flowchart TB
+    subgraph AgentServer[agent_server session process]
+        Actor[SessionActor]
+        ProviderProxy[Arc<dyn Provider>\nmodel-bound ForkServerProvider proxy]
+        ForkRuntime[global ProviderRequestForkServer]
+    end
+
+    subgraph ForkServer[forkserver process]
+        Router[worker router and request registry]
+        WorkerHandle[ProviderWorkerProcess\npid + command/result pipes]
+    end
+
+    subgraph ProviderWorker[long-lived provider worker child]
+        Client[Concrete Provider Client\ncreated once]
+        Auth[provider-owned state\nauth cache / token refresh]
+        Socket[provider-owned transport\nHTTP client / WebSocket]
+    end
+
+    Actor -->|ProviderRequest only| ProviderProxy
+    ProviderProxy -->|uses internal ModelConfig\nensure worker| ForkRuntime
+    ForkRuntime -->|StartWorker / StartOnWorker| Router
+    Router -->|ProviderWorkerCommand::Start| WorkerHandle
+    WorkerHandle --> Client
+    Client --> Auth
+    Client --> Socket
+    Socket -->|network provider| ExternalProvider[(Provider API)]
+    Client -->|ChatMessage or ProviderErrorReport| WorkerHandle
+    WorkerHandle -->|ForkServerEvent::Completed| Router
+    Router --> ForkRuntime
+    ForkRuntime --> ProviderProxy
+    ProviderProxy --> Actor
+```
+
+Provider request 的返回值在 isolation 边界必须保持结构化：
+
+```mermaid
+flowchart LR
+    Backend[Concrete Provider Client] --> RawResult{Result}
+    RawResult -->|Ok| Chat[ChatMessage]
+    RawResult -->|Err ProviderError| Report[ProviderErrorReport]
+    Report --> IPC[worker/forkserver IPC]
+    IPC --> Restore[into_provider_error]
+    Restore --> ActorError[ProviderError]
+
+    ActorError --> R1[request_too_large recovery]
+    ActorError --> R2[retry / failure display]
+    ActorError --> R3[status and usage logging]
+```
+
+设计约束：
+
+- `Provider` 是 Actor 侧长期代理对象，不应直接包含具体 provider 协议实现。
+- `Provider` 必须是 model-bound；`ModelConfig` 在 provider 创建时注入，不能作为每次 `send` 的临时参数传入。
+- `ProviderWorker` 是隔离边界内的真实 owner，负责跨请求 provider state。
+- `provider_from_model_config` 只在 worker child 内创建 concrete provider client；不要在每次 `send` 都新建并丢弃 stateful provider。
+- forkserver 对 media tool 的 one-shot provider request 也走 worker 转发，但 worker 标记为 temporary，请求完成或取消后关闭。
+- child/worker 返回错误时必须使用 `ProviderErrorReport`，不能只返回 `error.to_string()`，否则 Actor 无法可靠识别 request-too-large、auth、rate limit 或 transport failure。
 
 ## 2. 线程优先视图
 
@@ -561,7 +631,7 @@ flowchart LR
 | `Session RPC -> SessionActorInbox` | 同进程跨线程 | typed in-process channel | RPC 线程把请求非阻塞写入 actor request channel。 |
 | `SessionActor Loop 内部队列` | 同线程 | prioritized queue drain | SessionActor 收到 request 后按 `Control > Data` 的优先级消费。 |
 | `SessionActor Loop <-> Session State Store` | 同线程 | 直接 trait / function call | session history/checkpoint 必须由 loop 串行持有。 |
-| `SessionActor Loop <-> Provider Request Runtime` | 平台相关隔离 | typed `ProviderRequest` | Unix/macOS 使用 agent_server 启动早期 fork 出的单线程 forkserver；每次模型请求由 forkserver 再 fork request child 执行。Windows 不支持 fork，使用同 API 的线程 fallback：等待方可被 `abort` 立即释放，但底层 in-flight HTTP 不能被强杀。actor 同步等待结果，active model request 不抢占。 |
+| `SessionActor Loop <-> Provider Request Runtime` | 平台相关隔离 | typed `ProviderRequest` | Unix/macOS 使用 agent_server 启动早期 fork 出的单线程 forkserver；Actor 侧长期 `Provider` 代理为每个 provider 实例懒创建长期 worker child，真实 provider client 在 worker 内跨请求复用。media tool 的 one-shot provider request 也走 temporary worker。Windows 线程 fallback 保持同 API：等待方可被 `abort` 立即释放，但底层 in-flight HTTP 不能被强杀。actor 同步等待结果，active model request 不抢占。 |
 | `SessionActor Loop <-> ToolBatchExecutor` | 同进程跨线程 | typed in-process channel | 所有工具调用统一进入工具线程；工具完成后通过 `ToolBatchCompletion` channel 回到 actor loop。 |
 | `Conversation Actor -> Outgoing Sink / Channel` | 同进程跨线程 | typed Rust message + `crossbeam_channel` | 统一把用户可见输出从 Conversation 发回 channel。 |
 
@@ -1415,7 +1485,7 @@ ToolSchemaContext {
 - `image_generation` 表示生成图片；如果配置了 `image_generation_tool_model` 就使用该模型，否则使用主模型的 `image_out` 能力。
 - Provider-backed media tool 复用 Provider 层，不在工具层重新实现模型协议。
 - Provider-backed media job 的真实请求统一通过 provider request runtime 执行。
-- Unix/macOS 下由 forkserver fork 出 request child，`*_stop` 会标记 job cancelled，并 kill 对应 request child。
+- Unix/macOS 下由 forkserver 创建 temporary provider worker，`*_stop` 会标记 job cancelled，并 kill 对应 worker。
 - Windows 下没有 fork；`*_stop` 会让等待方立刻得到 cancelled，但底层已经发出的 provider HTTP 请求不会被强杀，只是结果会被丢弃。
 - `ModelConfig.multimodal_input` 描述模型输入侧约束，包括每类 media 的 `transport`、`supported_media_types`、图片 `max_width` / `max_height`。
 - 如果模型要求 `inline_base64`，`SessionActor` 在发 Provider 前统一读取、校验并转成 data URL；图片可按模型格式和尺寸限制在内存中转码/缩放。

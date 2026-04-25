@@ -12,7 +12,9 @@ use thiserror::Error;
 use crate::{
     huggingface::HuggingFaceFileResolver,
     model_config::ModelConfig,
-    providers::{request_too_large_text, Provider, ProviderRequest},
+    providers::{
+        request_too_large_text, Provider, ProviderError, ProviderFailureKind, ProviderRequest,
+    },
     session_actor::tool_catalog::ToolBackend,
 };
 
@@ -22,9 +24,10 @@ use super::{
     runtime_metadata::{remote_aliases_prompt_for_mode, RuntimeMetadataState},
     session_state::{SessionActorPersistedState, SessionStateStore},
     system_prompt_for_initial, ChatMessage, ChatMessageItem, ChatRole, CompressionError,
-    CompressionReport, ContextItem, ConversationBridgeRequest, SessionCompressor, SessionEvent,
-    SessionInitial, SessionMailbox, SessionMailboxKind, SessionRequest, TokenEstimator, ToolBatch,
-    ToolBatchCompletion, ToolBatchExecutor, ToolCatalog, ToolExecutionOp,
+    CompressionReport, ContextItem, ConversationBridgeRequest, SessionCompressor,
+    SessionErrorDetail, SessionEvent, SessionInitial, SessionMailbox, SessionMailboxKind,
+    SessionRequest, TokenEstimator, ToolBatch, ToolBatchCompletion, ToolBatchExecutor, ToolCatalog,
+    ToolExecutionOp,
 };
 
 const DEFAULT_MAX_MODEL_STEPS_PER_TURN: usize = 200;
@@ -424,6 +427,11 @@ impl SessionActor {
                     );
                     self.emit_turn_failed(
                         "session restored with an unfinished turn; ask the user whether to continue processing".to_string(),
+                        SessionErrorDetail::new(
+                            "session_actor.restore",
+                            "unfinished_turn",
+                            "session restored with an unfinished turn",
+                        ),
                         true,
                     )?;
                 }
@@ -765,7 +773,7 @@ impl SessionActor {
         if can_continue {
             self.pending_continuation = continuation;
         }
-        self.emit_turn_failed(error.to_string(), can_continue)?;
+        self.emit_turn_failed(error.to_string(), error.detail(), can_continue)?;
         if can_continue {
             Ok(())
         } else {
@@ -802,12 +810,12 @@ impl SessionActor {
                         normalize_messages_for_model(&self.history, &self.model_config);
                     let provider_history = self
                         .provider
-                        .normalize_messages_for_provider(&self.model_config, &normalized_history);
+                        .normalize_messages_for_provider(&normalized_history);
                     if let Some(estimated_tokens) =
                         self.provider_request_exceeds_context(&provider_history)?
                     {
                         if request_too_large_attempts >= REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS {
-                            return Err(SessionActorError::Provider(format!(
+                            return Err(SessionActorError::provider_preflight(format!(
                                 "estimated provider request tokens {estimated_tokens} exceed model context {} after {REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS} prune attempts",
                                 self.model_config.token_max_context
                             )));
@@ -825,7 +833,7 @@ impl SessionActor {
                         )? {
                             continue;
                         }
-                        return Err(SessionActorError::Provider(error));
+                        return Err(SessionActorError::provider_preflight(error));
                     }
 
                     let send_result = {
@@ -834,13 +842,11 @@ impl SessionActor {
                             .iter()
                             .map(|(_, tool)| tool)
                             .collect::<Vec<_>>();
-                        let tools = self
-                            .provider
-                            .filter_tools_for_provider(&self.model_config, tools);
+                        let tools = self.provider.filter_tools_for_provider(tools);
                         let request = ProviderRequest::new(&provider_history)
                             .with_system_prompt(Some(system_prompt.as_str()))
                             .with_tools(tools);
-                        self.provider.send(&self.model_config, request)
+                        self.provider.send(request)
                     };
                     match send_result {
                         Ok(message) => break message,
@@ -858,9 +864,9 @@ impl SessionActor {
                             )? {
                                 continue;
                             }
-                            return Err(SessionActorError::Provider(error.to_string()));
+                            return Err(SessionActorError::from_provider_error(error));
                         }
-                        Err(error) => return Err(SessionActorError::Provider(error.to_string())),
+                        Err(error) => return Err(SessionActorError::from_provider_error(error)),
                     }
                 }
             };
@@ -1082,9 +1088,15 @@ impl SessionActor {
             .map_err(SessionActorError::Event)
     }
 
-    fn emit_turn_failed(&self, error: String, can_continue: bool) -> Result<(), SessionActorError> {
+    fn emit_turn_failed(
+        &self,
+        error: String,
+        error_detail: SessionErrorDetail,
+        can_continue: bool,
+    ) -> Result<(), SessionActorError> {
         self.emit(SessionEvent::TurnFailed {
             error,
+            error_detail,
             can_continue,
         })
     }
@@ -1509,8 +1521,19 @@ pub enum SessionActorError {
     Mailbox(String),
     #[error("session actor event sink failed: {0}")]
     Event(String),
-    #[error("provider failed: {0}")]
-    Provider(String),
+    #[error("provider request failed in {module}: {reason}")]
+    ProviderPreflight {
+        module: &'static str,
+        reason: String,
+    },
+    #[error("provider request failed in {module}: {reason}")]
+    Provider {
+        module: &'static str,
+        kind: &'static str,
+        reason: String,
+        #[source]
+        source: ProviderError,
+    },
     #[error("tool batch failed: {0}")]
     Tool(String),
     #[error("tool catalog failed: {0}")]
@@ -1536,16 +1559,192 @@ pub enum SessionActorError {
 }
 
 impl SessionActorError {
+    fn provider_preflight(reason: impl Into<String>) -> Self {
+        Self::ProviderPreflight {
+            module: "session_actor.provider_preflight",
+            reason: reason.into(),
+        }
+    }
+
+    fn from_provider_error(error: ProviderError) -> Self {
+        let (module, kind, reason) = provider_error_parts(&error);
+        Self::Provider {
+            module,
+            kind,
+            reason,
+            source: error,
+        }
+    }
+
     fn is_recoverable_turn_error(&self) -> bool {
         matches!(
             self,
-            Self::Provider(_)
+            Self::Provider { .. }
+                | Self::ProviderPreflight { .. }
                 | Self::Compression(_)
                 | Self::Tool(_)
                 | Self::RuntimeMetadata(_)
                 | Self::ModelStepLimitExceeded(_)
         )
     }
+
+    fn detail(&self) -> SessionErrorDetail {
+        match self {
+            Self::Mailbox(reason) => {
+                SessionErrorDetail::new("session_actor.mailbox", "mailbox", reason.clone())
+            }
+            Self::Event(reason) => {
+                SessionErrorDetail::new("session_actor.event_sink", "event_sink", reason.clone())
+            }
+            Self::ProviderPreflight { module, reason } => {
+                SessionErrorDetail::new(*module, "request_too_large_preflight", reason.clone())
+            }
+            Self::Provider {
+                module,
+                kind,
+                reason,
+                ..
+            } => SessionErrorDetail::new(*module, *kind, reason.clone()),
+            Self::Tool(reason) => {
+                SessionErrorDetail::new("session_actor.tool_batch", "tool_batch", reason.clone())
+            }
+            Self::ToolCatalog(reason) => SessionErrorDetail::new(
+                "session_actor.tool_catalog",
+                "tool_catalog",
+                reason.clone(),
+            ),
+            Self::Logging(reason) => {
+                SessionErrorDetail::new("session_actor.logger", "logging", reason.clone())
+            }
+            Self::Compression(reason) => {
+                SessionErrorDetail::new("session_actor.compression", "compression", reason.clone())
+            }
+            Self::Persistence(reason) => {
+                SessionErrorDetail::new("session_actor.persistence", "persistence", reason.clone())
+            }
+            Self::RuntimeMetadata(reason) => SessionErrorDetail::new(
+                "session_actor.runtime_metadata",
+                "runtime_metadata",
+                reason.clone(),
+            ),
+            Self::DataHeadChanged => SessionErrorDetail::new(
+                "session_actor.mailbox",
+                "data_head_changed",
+                "data mailbox head changed while starting a turn",
+            ),
+            Self::UnexpectedDataRequest => SessionErrorDetail::new(
+                "session_actor.mailbox",
+                "unexpected_data_request",
+                "unexpected request in data mailbox",
+            ),
+            Self::MissingInitial => SessionErrorDetail::new(
+                "session_actor.initialization",
+                "missing_initial",
+                "session initial message has not been applied",
+            ),
+            Self::StepLimitExceeded(max_steps) => SessionErrorDetail::new(
+                "session_actor.loop",
+                "step_limit_exceeded",
+                format!("session actor exceeded step limit {max_steps}"),
+            ),
+            Self::ModelStepLimitExceeded(max_steps) => SessionErrorDetail::new(
+                "session_actor.model_loop",
+                "model_step_limit_exceeded",
+                format!("model/tool loop exceeded max model steps {max_steps}"),
+            ),
+        }
+    }
+}
+
+fn provider_error_parts(error: &ProviderError) -> (&'static str, &'static str, String) {
+    match error {
+        ProviderError::MissingApiKeyEnv(env) => (
+            "provider.config",
+            "missing_api_key_env",
+            format!("missing api key in environment variable {env}"),
+        ),
+        ProviderError::BuildHttpClient(error) => (
+            "provider.http_client",
+            "build_http_client",
+            error.to_string(),
+        ),
+        ProviderError::Request(message) => (
+            "provider.http_transport",
+            "request",
+            concise_error_reason(message),
+        ),
+        ProviderError::HttpStatus { url, status, body } => (
+            "provider.http_status",
+            "http_status",
+            format!(
+                "request to {url} returned HTTP {status}: {}",
+                concise_error_reason(body)
+            ),
+        ),
+        ProviderError::DecodeResponse(error) => (
+            "provider.response_body",
+            "decode_response",
+            error.to_string(),
+        ),
+        ProviderError::DecodeJson(error) => {
+            ("provider.response_json", "decode_json", error.to_string())
+        }
+        ProviderError::InvalidResponse(message) => (
+            "provider.response_validation",
+            "invalid_response",
+            concise_error_reason(message),
+        ),
+        ProviderError::ProviderFailure { kind, message, .. } => (
+            "provider.failure",
+            provider_failure_kind_label(*kind),
+            concise_error_reason(message),
+        ),
+        ProviderError::WebSocket(message) => (
+            "provider.websocket",
+            "websocket",
+            concise_error_reason(message),
+        ),
+        ProviderError::PersistOutput(error) => (
+            "provider.output_persistor",
+            "persist_output",
+            error.to_string(),
+        ),
+        ProviderError::EmptyChoices => (
+            "provider.response_validation",
+            "empty_choices",
+            "provider response did not include any completion choices".to_string(),
+        ),
+        ProviderError::Subprocess(message) => (
+            "provider.runtime",
+            "isolation",
+            concise_error_reason(message),
+        ),
+    }
+}
+
+fn provider_failure_kind_label(kind: ProviderFailureKind) -> &'static str {
+    match kind {
+        ProviderFailureKind::RequestTooLarge => "request_too_large",
+        ProviderFailureKind::RateLimited => "rate_limited",
+        ProviderFailureKind::Authentication => "authentication",
+        ProviderFailureKind::Permission => "permission",
+        ProviderFailureKind::ProviderUnavailable => "provider_unavailable",
+        ProviderFailureKind::Unknown => "unknown",
+    }
+}
+
+fn concise_error_reason(message: &str) -> String {
+    const MAX_REASON_CHARS: usize = 600;
+    let message = message.trim();
+    let mut reason = String::new();
+    for (index, ch) in message.chars().enumerate() {
+        if index >= MAX_REASON_CHARS {
+            reason.push_str("...");
+            return reason;
+        }
+        reason.push(ch);
+    }
+    reason
 }
 
 fn build_session_token_estimator(model_config: &ModelConfig) -> Result<TokenEstimator, String> {
@@ -1786,9 +1985,15 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
         }),
         SessionEvent::TurnFailed {
             error,
+            error_detail,
             can_continue,
         } => {
-            serde_json::json!({"event": "turn_failed", "error": error, "can_continue": can_continue})
+            serde_json::json!({
+                "event": "turn_failed",
+                "error": error,
+                "error_detail": error_detail,
+                "can_continue": can_continue,
+            })
         }
         SessionEvent::HostCoordinationRequested { request } => serde_json::json!({
             "event": "host_coordination_requested",
@@ -1811,8 +2016,11 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "reason": reason,
             "payload": payload,
         }),
-        SessionEvent::RuntimeCrashed { error } => {
-            serde_json::json!({"event": "runtime_crashed", "error": error})
+        SessionEvent::RuntimeCrashed {
+            error,
+            error_detail,
+        } => {
+            serde_json::json!({"event": "runtime_crashed", "error": error, "error_detail": error_detail})
         }
     }
 }
@@ -1921,6 +2129,7 @@ mod tests {
     }
 
     struct ScriptedProvider {
+        model_config: ModelConfig,
         responses: Mutex<VecDeque<ChatMessage>>,
         seen_requests: Mutex<Vec<ProviderRequestSnapshot>>,
     }
@@ -1928,6 +2137,7 @@ mod tests {
     impl ScriptedProvider {
         fn new(responses: Vec<ChatMessage>) -> Self {
             Self {
+                model_config: test_model_config(),
                 responses: Mutex::new(VecDeque::from(responses)),
                 seen_requests: Mutex::new(Vec::new()),
             }
@@ -1942,11 +2152,11 @@ mod tests {
     }
 
     impl Provider for ScriptedProvider {
-        fn send(
-            &self,
-            _model_config: &ModelConfig,
-            request: ProviderRequest<'_>,
-        ) -> Result<ChatMessage, ProviderError> {
+        fn model_config(&self) -> &ModelConfig {
+            &self.model_config
+        }
+
+        fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
             self.seen_requests
                 .lock()
                 .unwrap()
@@ -1964,6 +2174,7 @@ mod tests {
     }
 
     struct RequestTooLargeThenOkProvider {
+        model_config: ModelConfig,
         calls: Mutex<usize>,
         seen_message_counts: Mutex<Vec<usize>>,
     }
@@ -1971,6 +2182,7 @@ mod tests {
     impl RequestTooLargeThenOkProvider {
         fn new() -> Self {
             Self {
+                model_config: test_model_config(),
                 calls: Mutex::new(0),
                 seen_message_counts: Mutex::new(Vec::new()),
             }
@@ -1978,11 +2190,11 @@ mod tests {
     }
 
     impl Provider for RequestTooLargeThenOkProvider {
-        fn send(
-            &self,
-            _model_config: &ModelConfig,
-            request: ProviderRequest<'_>,
-        ) -> Result<ChatMessage, ProviderError> {
+        fn model_config(&self) -> &ModelConfig {
+            &self.model_config
+        }
+
+        fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
             self.seen_message_counts
                 .lock()
                 .unwrap()

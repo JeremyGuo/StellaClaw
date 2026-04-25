@@ -8,7 +8,7 @@ use crate::{
     session_actor::{ChatMessage, ChatMessageItem, ChatRole, ContextItem},
 };
 
-use super::{Provider, ProviderError, ProviderRequest};
+use super::{ProviderBackend, ProviderError, ProviderRequest};
 
 #[derive(Debug, Default)]
 pub struct BraveSearchProvider;
@@ -64,7 +64,7 @@ impl BraveSearchProvider {
     }
 }
 
-impl Provider for BraveSearchProvider {
+impl ProviderBackend for BraveSearchProvider {
     fn send(
         &self,
         model_config: &ModelConfig,

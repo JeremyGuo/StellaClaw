@@ -16,7 +16,7 @@ use super::{
         claude_cache_control_payload, data_url_parts, is_image_file, provider_error_message,
         serialize_json_request_body, token_usage_from_value,
     },
-    Provider, ProviderError, ProviderRequest,
+    ProviderBackend, ProviderError, ProviderRequest,
 };
 
 #[derive(Debug, Default)]
@@ -148,7 +148,7 @@ impl ClaudeCodeProvider {
     }
 }
 
-impl Provider for ClaudeCodeProvider {
+impl ProviderBackend for ClaudeCodeProvider {
     fn send(
         &self,
         model_config: &ModelConfig,

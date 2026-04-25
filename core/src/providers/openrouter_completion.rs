@@ -24,7 +24,7 @@ use super::{
     },
     error_chain_message,
     pricing::PriceManager,
-    OutputPersistor, Provider, ProviderError, ProviderRequest,
+    OutputPersistor, ProviderBackend, ProviderError, ProviderRequest,
 };
 
 const RESPONSE_PREVIEW_CHARS: usize = 2000;
@@ -245,7 +245,7 @@ fn should_stream_openrouter_response(
     model_config.supports(ModelCapability::ImageOut) && request.tools.is_empty()
 }
 
-impl Provider for OpenRouterCompletionProvider {
+impl ProviderBackend for OpenRouterCompletionProvider {
     fn send(
         &self,
         model_config: &ModelConfig,

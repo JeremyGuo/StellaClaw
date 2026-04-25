@@ -1,5 +1,16 @@
-version: 1.9.0
+version: 1.10.0
 ---
+
+# 1.10.0
+
+- 调整 provider request isolation 生命周期：
+  `ForkServerProvider` 现在为每个 provider 实例懒创建一个长期 provider worker child，真实 provider client 在 worker 内只创建一次并跨请求复用。Codex subscription 的 WebSocket、auth cache 与 `auth.json` refresh 状态因此可以跟随 Actor/provider 生命周期保留；provider drop 时会通知 forkserver 关闭对应 worker。provider-backed media tool 的 one-shot 请求也复用同一套 worker 转发机制，不再保留独立的 per-request child 实现。本次不改变 `config` schema，不改变 `workdir` schema。
+- 内化 Provider 的模型配置：
+  `Provider` 现在是 model-bound 实例，`ModelConfig` 在 provider 创建时注入，`send` 只接收 `ProviderRequest`，不再每次单独传入模型配置。这让 Codex subscription 这类 stateful provider 的持久 WebSocket/auth 状态和具体模型配置一一绑定，避免跨模型复用语义混乱。本次不改变 `config` schema，不改变 `workdir` schema。
+- 规范化 provider isolation 错误返回：
+  forkserver/worker IPC 不再把 provider error 简化成纯字符串，而是传递结构化 `ProviderErrorReport`，保留 HTTP status、provider failure kind、WebSocket、request-too-large 等语义后再在父进程还原成 `ProviderError`。这让 Actor 的 request-too-large 恢复路径不再依赖 provider child 字符串格式。本次不改变 `config` schema，不改变 `workdir` schema。
+- 增强 Core 错误事件语义：
+  `SessionEvent::TurnFailed` 和 `SessionEvent::RuntimeCrashed` 现在携带结构化 `SessionErrorDetail { module, kind, reason }`，用于说明错误来自哪个 core 模块、错误类别和具体原因；Telegram/Channel 展示层可以直接使用该结构化信息，而不是解析长串嵌套错误。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.9.0
 

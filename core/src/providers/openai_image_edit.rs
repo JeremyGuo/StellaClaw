@@ -20,7 +20,7 @@ use super::{
         data_url_parts, ensure_request_payload_size, is_image_file, serialize_json_request_body,
         token_usage_from_value,
     },
-    OutputPersistor, Provider, ProviderError, ProviderRequest,
+    OutputPersistor, ProviderBackend, ProviderError, ProviderRequest,
 };
 
 const RESPONSE_PREVIEW_CHARS: usize = 2000;
@@ -158,7 +158,7 @@ impl OpenAiImageEditProvider {
     }
 }
 
-impl Provider for OpenAiImageEditProvider {
+impl ProviderBackend for OpenAiImageEditProvider {
     fn send(
         &self,
         model_config: &ModelConfig,
