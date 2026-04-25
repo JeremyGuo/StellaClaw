@@ -1,5 +1,12 @@
-version: 1.10.0
+version: 1.10.1
 ---
+
+# 1.10.1
+
+- 修复递归文件工具误入慢挂载：
+  `glob`、`grep` 和递归 `ls` 现在会在本地和远端执行时识别并跳过 sshfs、NFS、CIFS/SMB、9p、rclone/s3fs/gcsfuse 等慢速远端挂载，避免从工作区父目录搜索时误扫 sshfs conversation 或网络目录导致工具长时间挂起。工具说明和系统提示同步说明该默认行为。本次不改变 `config` schema，不改变 `workdir` schema。
+- 增强工具批次进度提示：
+  `SessionEvent::Progress` 中的 tool batch 阶段现在会带上前几个工具的名称和关键参数摘要，例如 `grep core/src`、`file_read AGENTS.md`，方便前端/Telegram 判断当前具体卡在哪个工具或路径。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.10.0
 

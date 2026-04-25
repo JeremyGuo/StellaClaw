@@ -51,7 +51,7 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
         ),
         ToolDefinition::new(
             "glob",
-            "Fast file pattern matching tool. Supports glob patterns like **/*.rs and src/**/*.ts. Omit path or pass an empty string to search from the current workspace directory.",
+            "Fast file pattern matching tool. Supports glob patterns like **/*.rs and src/**/*.ts. Omit path or pass an empty string to search from the current workspace directory. Skips slow remote mounts such as sshfs/NFS by default.",
             file_tool_schema(
                 properties([
                     ("pattern", json!({"type": "string"})),
@@ -65,7 +65,7 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
         ),
         ToolDefinition::new(
             "grep",
-            "Fast content search tool. Searches file contents with a regex pattern and returns matching file paths. Omit path or pass an empty string to search from the current workspace directory.",
+            "Fast content search tool. Searches file contents with a regex pattern and returns matching file paths. Omit path or pass an empty string to search from the current workspace directory. Skips slow remote mounts such as sshfs/NFS by default.",
             file_tool_schema(
                 properties([
                     ("pattern", json!({"type": "string"})),
@@ -80,7 +80,7 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
         ),
         ToolDefinition::new(
             "ls",
-            "List a recursive directory tree for non-hidden files and directories under a path. Omit path or pass an empty string to list the current workspace directory. Skips common cache/build directories by default. Large trees are truncated to the first 1000 files and directories; pass a more specific path or use glob/grep when you know what to search for.",
+            "List a recursive directory tree for non-hidden files and directories under a path. Omit path or pass an empty string to list the current workspace directory. Skips common cache/build directories and slow remote mounts such as sshfs/NFS by default. Large trees are truncated to the first 1000 files and directories; pass a more specific path or use glob/grep when you know what to search for.",
             file_tool_schema(
                 properties([("path", json!({"type": "string"}))]),
                 &[],

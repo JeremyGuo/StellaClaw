@@ -34,7 +34,8 @@ fn common_prompt() -> &'static str {
      in this repository or local environment instead of assuming it exists. For repository \
      exploration, use the dedicated tools instead of shell read/search commands: use glob to find \
      files by path pattern, grep to find files by content pattern, ls for narrowed directory \
-     listings, and file_read for file contents. Do not use shell for direct grep, find, cat, head, \
+     listings, and file_read for file contents. These dedicated recursive tools skip slow remote \
+     mounts such as sshfs/NFS by default. Do not use shell for direct grep, find, cat, head, \
      tail, or ls. When using shell for commands that dedicated tools do not cover, start a new \
      command with the command field and omit session_id; use session_id only to poll or continue an \
      existing shell session. Positive example: {\"command\":\"cargo check -p stellaclaw_core\"}. \

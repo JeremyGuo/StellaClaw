@@ -3,7 +3,7 @@ use std::{
     env,
     path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossbeam_channel::{select, Receiver, Sender};
@@ -72,6 +72,8 @@ struct ActiveToolBatch {
     turn_number: u64,
     step_index: usize,
     handle: super::ToolBatchHandle,
+    operation_summary: String,
+    started_at_ms: u128,
     interrupt: Option<ToolBatchInterrupt>,
 }
 
@@ -613,6 +615,8 @@ impl SessionActor {
                 "turn_id": active.turn_id,
                 "batch_id": active.handle.batch_id,
                 "step_index": active.step_index,
+                "operation_summary": active.operation_summary,
+                "started_at_ms": active.started_at_ms,
             })),
             "can_continue": self.pending_continuation.is_some(),
         })
@@ -899,16 +903,18 @@ impl SessionActor {
             }
 
             let batch = self.build_tool_batch(turn_id, tool_calls)?;
+            let batch_progress = batch.progress_summary();
             self.log_info(
                 "tool_batch_started",
                 serde_json::json!({
                     "turn_id": turn_id,
                     "batch_id": &batch.batch_id,
                     "operations": batch.operations.len(),
+                    "operation_summary": &batch_progress,
                 }),
             );
             self.emit(SessionEvent::Progress {
-                message: format!("running tool batch {}", batch.batch_id),
+                message: format!("running tool batch {}: {}", batch.batch_id, batch_progress),
             })?;
 
             let handle = self
@@ -920,6 +926,8 @@ impl SessionActor {
                 turn_number,
                 step_index,
                 handle,
+                operation_summary: batch_progress,
+                started_at_ms: current_time_millis(),
                 interrupt: None,
             });
             return Ok(());
@@ -1887,6 +1895,13 @@ fn request_too_large_prune_start(messages: &[ChatMessage]) -> Option<usize> {
 
     let target = (messages.len() / 2).max(1);
     (target..messages.len()).find(|&start| is_tool_protocol_closed_suffix(&messages[start..]))
+}
+
+fn current_time_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
 }
 
 fn is_tool_protocol_closed_suffix(messages: &[ChatMessage]) -> bool {

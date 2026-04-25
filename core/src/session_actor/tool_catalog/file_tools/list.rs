@@ -8,7 +8,8 @@ use crate::session_actor::tool_runtime::{
 };
 
 use super::common::{
-    relative_display_path, remote_file_tool, LsEntry, COMMON_LS_SKIP_DIRS, LS_MAX_ENTRIES,
+    relative_display_path, remote_file_tool, LsEntry, SlowMountTable, COMMON_LS_SKIP_DIRS,
+    LS_MAX_ENTRIES,
 };
 
 pub(super) fn execute_list_tool(
@@ -52,7 +53,14 @@ fn ls_local(
 
     let mut entries = Vec::new();
     let mut truncated = false;
-    collect_ls_entries(&base_path, &base_path, &mut entries, &mut truncated)?;
+    let slow_mounts = SlowMountTable::load();
+    collect_ls_entries(
+        &base_path,
+        &base_path,
+        &slow_mounts,
+        &mut entries,
+        &mut truncated,
+    )?;
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(Value::String(render_ls_tree(
         &base_path, &entries, truncated,
@@ -62,10 +70,14 @@ fn ls_local(
 fn collect_ls_entries(
     base: &std::path::Path,
     path: &std::path::Path,
+    slow_mounts: &SlowMountTable,
     entries: &mut Vec<LsEntry>,
     truncated: &mut bool,
 ) -> Result<(), LocalToolError> {
     if *truncated {
+        return Ok(());
+    }
+    if slow_mounts.contains(path) {
         return Ok(());
     }
     let mut children = fs::read_dir(path)
@@ -87,12 +99,15 @@ fn collect_ls_entries(
             continue;
         }
         let path = entry.path();
+        if slow_mounts.contains(&path) {
+            continue;
+        }
         entries.push(LsEntry {
             path: relative_display_path(&path, base),
             is_dir: file_type.is_dir(),
         });
         if file_type.is_dir() {
-            collect_ls_entries(base, &path, entries, truncated)?;
+            collect_ls_entries(base, &path, slow_mounts, entries, truncated)?;
         }
     }
     Ok(())

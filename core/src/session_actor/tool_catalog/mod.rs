@@ -622,6 +622,10 @@ mod tests {
                 action: "user_tell".to_string()
             }
         );
+
+        let background = catalog.get("start_background_agent").unwrap();
+        assert_eq!(background.parameters["required"], json!(["task"]));
+        assert!(background.parameters["properties"].get("model").is_none());
     }
 
     #[test]

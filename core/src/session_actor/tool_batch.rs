@@ -28,6 +28,24 @@ impl ToolBatch {
         self.operations.is_empty()
     }
 
+    pub fn progress_summary(&self) -> String {
+        let labels = self
+            .operations
+            .iter()
+            .map(ToolExecutionOp::progress_label)
+            .collect::<Vec<_>>();
+        let mut summary = labels
+            .iter()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
+        if labels.len() > 4 {
+            summary.push_str(&format!("; +{} more", labels.len() - 4));
+        }
+        summary
+    }
+
     pub fn into_result_message(self, tool_results: Vec<ToolResultItem>) -> ChatMessage {
         ChatMessage::new(
             ChatRole::Assistant,
@@ -56,6 +74,62 @@ pub enum ToolExecutionOp {
         model_config: ModelConfig,
     },
     ConversationBridge(ConversationBridgeRequest),
+}
+
+impl ToolExecutionOp {
+    pub fn progress_label(&self) -> String {
+        match self {
+            Self::LocalTool(tool_call)
+            | Self::SkillLoad { tool_call, .. }
+            | Self::ProviderBacked { tool_call, .. }
+            | Self::WebSearch { tool_call, .. } => tool_call_progress_label(tool_call),
+            Self::ConversationBridge(request) => {
+                format!("bridge:{} {}", request.action, request.tool_name)
+            }
+        }
+    }
+}
+
+fn tool_call_progress_label(tool_call: &ToolCallItem) -> String {
+    let Some(hint) = tool_call_argument_hint(&tool_call.arguments.text) else {
+        return tool_call.tool_name.clone();
+    };
+    format!("{} {}", tool_call.tool_name, hint)
+}
+
+fn tool_call_argument_hint(arguments: &str) -> Option<String> {
+    let value = serde_json::from_str::<Value>(arguments).ok()?;
+    let object = value.as_object()?;
+    for key in [
+        "path",
+        "file_path",
+        "query",
+        "url",
+        "command",
+        "skill_name",
+        "prompt",
+    ] {
+        if let Some(value) = object.get(key).and_then(Value::as_str) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(truncate_progress_hint(value));
+            }
+        }
+    }
+    None
+}
+
+fn truncate_progress_hint(value: &str) -> String {
+    const MAX_CHARS: usize = 80;
+    let mut hint = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index >= MAX_CHARS {
+            hint.push_str("...");
+            return hint;
+        }
+        hint.push(ch);
+    }
+    hint
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

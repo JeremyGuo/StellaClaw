@@ -130,14 +130,8 @@ fn subagent_tools() -> Vec<ToolDefinition> {
 fn start_background_agent_tool() -> ToolDefinition {
     bridge_tool(
         "start_background_agent",
-        "Start a main background agent. Arguments: task (string), optional model (string). The final user-facing reply is delivered to the current foreground conversation and inserted into the main foreground context.",
-        object_schema(
-            properties([
-                ("task", json!({"type": "string"})),
-                ("model", json!({"type": "string"})),
-            ]),
-            &["task"],
-        ),
+        "Start a main background agent. Requires task. The background agent inherits this conversation's current model. The final user-facing reply is delivered to the current foreground conversation and inserted into the main foreground context.",
+        object_schema(properties([("task", json!({"type": "string"}))]), &["task"]),
         ToolExecutionMode::Immediate,
     )
 }

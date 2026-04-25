@@ -21,6 +21,64 @@ pub(super) const COMMON_LS_SKIP_DIRS: &[&str] = &[
     "venv",
 ];
 
+const SLOW_MOUNT_FS_TYPES: &[&str] = &[
+    "fuse.sshfs",
+    "sshfs",
+    "nfs",
+    "nfs4",
+    "cifs",
+    "smb3",
+    "9p",
+    "davfs",
+    "fuse.rclone",
+    "fuse.s3fs",
+    "fuse.gcsfuse",
+];
+
+#[derive(Debug, Default)]
+pub(super) struct SlowMountTable {
+    mount_points: Vec<PathBuf>,
+}
+
+impl SlowMountTable {
+    pub(super) fn load() -> Self {
+        let Ok(raw) = fs::read_to_string("/proc/self/mountinfo") else {
+            return Self::default();
+        };
+        let mut mount_points = Vec::new();
+        for line in raw.lines() {
+            let Some((before_sep, after_sep)) = line.split_once(" - ") else {
+                continue;
+            };
+            let mut before_fields = before_sep.split_whitespace();
+            let mount_point = before_fields.nth(4);
+            let fs_type = after_sep.split_whitespace().next();
+            let (Some(mount_point), Some(fs_type)) = (mount_point, fs_type) else {
+                continue;
+            };
+            if slow_mount_fs_type(fs_type) {
+                mount_points.push(PathBuf::from(decode_mountinfo_path(mount_point)));
+            }
+        }
+        mount_points
+            .sort_by(|left, right| right.components().count().cmp(&left.components().count()));
+        Self { mount_points }
+    }
+
+    pub(super) fn contains(&self, path: &Path) -> bool {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        };
+        self.mount_points
+            .iter()
+            .any(|mount_point| path.starts_with(mount_point))
+    }
+}
+
 pub(super) struct SearchMatch {
     pub path: String,
     pub mtime_ms: u128,
@@ -42,15 +100,20 @@ pub(super) fn collect_walk_paths(
     files_only: bool,
 ) -> Result<Vec<PathBuf>, LocalToolError> {
     let mut paths = Vec::new();
-    collect_walk_paths_inner(base, files_only, &mut paths)?;
+    let slow_mounts = SlowMountTable::load();
+    collect_walk_paths_inner(base, files_only, &slow_mounts, &mut paths)?;
     Ok(paths)
 }
 
 fn collect_walk_paths_inner(
     path: &Path,
     files_only: bool,
+    slow_mounts: &SlowMountTable,
     paths: &mut Vec<PathBuf>,
 ) -> Result<(), LocalToolError> {
+    if slow_mounts.contains(path) {
+        return Ok(());
+    }
     let metadata = fs::metadata(path).map_err(|error| {
         LocalToolError::Io(format!("failed to stat {}: {error}", path.display()))
     })?;
@@ -77,9 +140,34 @@ fn collect_walk_paths_inner(
         {
             continue;
         }
-        collect_walk_paths_inner(&entry_path, files_only, paths)?;
+        collect_walk_paths_inner(&entry_path, files_only, slow_mounts, paths)?;
     }
     Ok(())
+}
+
+fn slow_mount_fs_type(fs_type: &str) -> bool {
+    SLOW_MOUNT_FS_TYPES.contains(&fs_type)
+}
+
+fn decode_mountinfo_path(value: &str) -> String {
+    let mut decoded = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            let digits = (0..3).filter_map(|_| chars.next()).collect::<String>();
+            if digits.len() == 3 {
+                if let Ok(byte) = u8::from_str_radix(&digits, 8) {
+                    decoded.push(byte as char);
+                    continue;
+                }
+            }
+            decoded.push('\\');
+            decoded.push_str(&digits);
+        } else {
+            decoded.push(ch);
+        }
+    }
+    decoded
 }
 
 pub(super) fn relative_display_path(path: &Path, base: &Path) -> String {
@@ -170,6 +258,7 @@ payload = json.loads({payload:?})
 SEARCH_MAX_RESULTS = 100
 LS_MAX_ENTRIES = 1000
 COMMON_LS_SKIP_DIRS = {{"__pycache__", "node_modules", "target", "dist", "build", "coverage", "venv"}}
+SLOW_MOUNT_FS_TYPES = {{"fuse.sshfs", "sshfs", "nfs", "nfs4", "cifs", "smb3", "9p", "davfs", "fuse.rclone", "fuse.s3fs", "fuse.gcsfuse"}}
 
 def resolve(path, root):
     if os.path.isabs(path):
@@ -182,11 +271,61 @@ def file_mtime_ms(path):
     except OSError:
         return 0
 
+def decode_mountinfo_path(value):
+    def repl(match):
+        try:
+            return chr(int(match.group(1), 8))
+        except ValueError:
+            return match.group(0)
+    return re.sub(r"\\([0-7]{{3}})", repl, value)
+
+def load_slow_mounts():
+    mounts = []
+    try:
+        with open("/proc/self/mountinfo", "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return mounts
+    for line in lines:
+        if " - " not in line:
+            continue
+        before, after = line.split(" - ", 1)
+        before_fields = before.split()
+        after_fields = after.split()
+        if len(before_fields) < 5 or not after_fields:
+            continue
+        mount_point = decode_mountinfo_path(before_fields[4])
+        fs_type = after_fields[0]
+        if fs_type in SLOW_MOUNT_FS_TYPES:
+            mounts.append(os.path.abspath(mount_point))
+    mounts.sort(key=lambda path: path.count(os.sep), reverse=True)
+    return mounts
+
+SLOW_MOUNTS = load_slow_mounts()
+
+def is_slow_mount_path(path):
+    try:
+        absolute = os.path.abspath(path)
+        for mount in SLOW_MOUNTS:
+            if os.path.commonpath([absolute, mount]) == mount:
+                return True
+    except (OSError, ValueError):
+        return False
+    return False
+
 def walk_files(base):
+    if is_slow_mount_path(base):
+        return []
     paths = []
     for root, dirs, files in os.walk(base, followlinks=False):
+        dirs[:] = [
+            name for name in dirs
+            if not is_slow_mount_path(os.path.join(root, name))
+        ]
         for name in files:
             path = os.path.join(root, name)
+            if is_slow_mount_path(path):
+                continue
             if os.path.isfile(path):
                 paths.append(path)
     return paths
@@ -266,8 +405,15 @@ def handle_ls(args, workspace_root):
         raise ValueError(f"{{base}} is not a directory")
     entries = []
     truncated = False
+    if is_slow_mount_path(base):
+        lines = [f"num_entries: 0", "", f"- {{base.rstrip(os.sep) + os.sep}}"]
+        return "\n".join(lines)
     for root, dirs, files in os.walk(base, followlinks=False):
-        dirs[:] = [name for name in dirs if not should_skip_ls(name, True)]
+        dirs[:] = [
+            name for name in dirs
+            if not should_skip_ls(name, True)
+            and not is_slow_mount_path(os.path.join(root, name))
+        ]
         for name in dirs:
             if len(entries) >= LS_MAX_ENTRIES:
                 truncated = True
