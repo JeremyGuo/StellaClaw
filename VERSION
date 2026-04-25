@@ -1,5 +1,14 @@
-version: 1.10.4
+version: 1.10.5
 ---
+
+# 1.10.5
+
+- 修复 Stellacode 轮询导致聊天区反复刷新的问题：
+  当前 conversation 轮询刷新时会先比较消息骨架签名；只有消息 ID、角色、发送者、时间、预览文本或 usage 标记发生变化时才重绘中间消息列表，避免每轮 poll 都重建 DOM、重复播放进入动画并滚动到底部。本次不改变 `config` schema，不改变 `workdir` schema。
+- 调整 Stellacode 详情栏折叠入口：
+  详情栏现在默认收起，聊天头部保留固定的详情开关按钮；右侧栏内部按钮只负责收起，避免关闭详情后找不到重新打开入口。本次不改变 `config` schema，不改变 `workdir` schema。
+- 增加 Stellacode 聊天内容 Markdown 渲染：
+  中间聊天区和详情预览现在支持常用 Markdown，包括标题、段落、列表、引用、分隔线、链接、粗体、斜体、删除线、行内代码和 fenced code block；渲染前仍会转义文本，链接仅允许 `http(s)` 和 `mailto`。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.10.4
 

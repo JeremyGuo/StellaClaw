@@ -329,6 +329,10 @@ body.context-collapsed .app-shell {
   -webkit-app-region: drag;
 }
 
+.header-actions {
+  gap: 6px;
+}
+
 .conversation-title {
   font-size: 14px;
   font-weight: 760;
@@ -436,10 +440,118 @@ body.context-collapsed .app-shell {
 }
 
 .message-text {
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
   line-height: 1.58;
   font-size: 14px;
+}
+
+.message-text p,
+.preview-card p {
+  margin: 0 0 10px;
+}
+
+.message-text p:last-child,
+.preview-card p:last-child,
+.message-text ul:last-child,
+.message-text ol:last-child,
+.preview-card ul:last-child,
+.preview-card ol:last-child {
+  margin-bottom: 0;
+}
+
+.message-text h2,
+.message-text h3,
+.message-text h4,
+.message-text h5,
+.message-text h6,
+.preview-card h2,
+.preview-card h3,
+.preview-card h4,
+.preview-card h5,
+.preview-card h6 {
+  margin: 14px 0 8px;
+  line-height: 1.25;
+}
+
+.message-text h2:first-child,
+.message-text h3:first-child,
+.message-text h4:first-child,
+.message-text h5:first-child,
+.message-text h6:first-child,
+.preview-card h2:first-child,
+.preview-card h3:first-child,
+.preview-card h4:first-child,
+.preview-card h5:first-child,
+.preview-card h6:first-child {
+  margin-top: 0;
+}
+
+.message-text h2,
+.preview-card h2 {
+  font-size: 18px;
+}
+
+.message-text h3,
+.preview-card h3 {
+  font-size: 16px;
+}
+
+.message-text h4,
+.message-text h5,
+.message-text h6,
+.preview-card h4,
+.preview-card h5,
+.preview-card h6 {
+  font-size: 14px;
+}
+
+.message-text ul,
+.message-text ol,
+.preview-card ul,
+.preview-card ol {
+  margin: 0 0 10px;
+  padding-left: 22px;
+}
+
+.message-text li,
+.preview-card li {
+  margin: 3px 0;
+}
+
+.message-text blockquote,
+.preview-card blockquote {
+  margin: 0 0 10px;
+  padding: 2px 0 2px 12px;
+  border-left: 3px solid var(--border-strong);
+  color: var(--muted);
+}
+
+.message-text hr,
+.preview-card hr {
+  height: 1px;
+  margin: 14px 0;
+  border: 0;
+  background: var(--border);
+}
+
+.message-text a,
+.preview-card a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.message-text a:hover,
+.preview-card a:hover {
+  text-decoration: underline;
+}
+
+.message-text code,
+.preview-card code {
+  padding: 1px 4px;
+  border-radius: 5px;
+  background: var(--panel-2);
+  font-family: var(--font-mono);
+  font-size: 0.92em;
 }
 
 .message-actions {
@@ -465,6 +577,14 @@ body.context-collapsed .app-shell {
   font-family: var(--font-mono);
   font-size: 13px;
   line-height: 1.55;
+}
+
+.message-text .code-card code,
+.preview-card .code-card code {
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: inherit;
 }
 
 .message-empty {

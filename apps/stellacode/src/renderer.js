@@ -8,11 +8,12 @@ const state = {
   statuses: new Map(),
   serverHealth: new Map(),
   messages: [],
+  messagesSignature: '',
   messageDetails: new Map(),
   expandedMessages: new Set(),
   activeContextTab: 'overview',
   activePreviewMessageId: null,
-  contextCollapsed: false,
+  contextCollapsed: true,
   activePoll: null,
   saveTimer: null
 };
@@ -28,6 +29,7 @@ const elements = {
   sendButton: $('#sendButton'),
   attachButton: $('#attachButton'),
   refreshButton: $('#refreshButton'),
+  toggleContextButton: $('#toggleContextButton'),
   newConversationButton: $('#newConversationButton'),
   serverStatusButton: $('#serverStatusButton'),
   serverPopover: $('#serverPopover'),
@@ -96,6 +98,23 @@ function formatCost(value) {
   return `$${Number(value || 0).toFixed(3)}`;
 }
 
+function stableSignature(value) {
+  return JSON.stringify(value ?? null);
+}
+
+function messageListSignature(messages) {
+  return stableSignature(
+    messages.map((message) => ({
+      id: message.id,
+      role: message.role,
+      user_name: message.user_name,
+      message_time: message.message_time,
+      preview: message.preview,
+      has_token_usage: message.has_token_usage
+    }))
+  );
+}
+
 function createId(prefix) {
   if (crypto.randomUUID) {
     return `${prefix}-${crypto.randomUUID()}`;
@@ -152,7 +171,124 @@ function statusUsageTotals(status) {
   return totals;
 }
 
-function renderInlineMessage(value) {
+function safeLinkHref(value) {
+  const text = safeText(value).trim();
+  if (/^(https?:\/\/|mailto:)/i.test(text)) {
+    return text;
+  }
+  return '';
+}
+
+function renderInlineMarkdown(value) {
+  const codeSpans = [];
+  const protectedText = safeText(value).replace(/`([^`\n]+)`/g, (_match, code) => {
+    const token = `%%STELLACODE_CODE_${codeSpans.length}%%`;
+    codeSpans.push(`<code>${escapeHtml(code)}</code>`);
+    return token;
+  });
+  let rendered = escapeHtml(protectedText);
+  rendered = rendered.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+|mailto:[^\s)]+)\)/gi, (_match, label, href) => {
+    const safeHref = safeLinkHref(href);
+    if (!safeHref) {
+      return label;
+    }
+    return `<a href="${escapeHtml(safeHref)}" target="_blank" rel="noreferrer">${label}</a>`;
+  });
+  rendered = rendered
+    .replace(/\*\*([^*\n][\s\S]*?[^*\n])\*\*/g, '<strong>$1</strong>')
+    .replace(/__([^_\n][\s\S]*?[^_\n])__/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
+    .replace(/(^|[^_])_([^_\n]+)_/g, '$1<em>$2</em>')
+    .replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
+  codeSpans.forEach((html, index) => {
+    rendered = rendered.replaceAll(`%%STELLACODE_CODE_${index}%%`, html);
+  });
+  return rendered;
+}
+
+function renderMarkdownLines(text) {
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  const html = [];
+  let paragraph = [];
+  let listItems = [];
+  let listOrdered = false;
+  let quote = [];
+
+  const flushParagraph = () => {
+    if (paragraph.length === 0) {
+      return;
+    }
+    html.push(`<p>${paragraph.map(renderInlineMarkdown).join('<br>')}</p>`);
+    paragraph = [];
+  };
+  const flushList = () => {
+    if (listItems.length === 0) {
+      return;
+    }
+    const tag = listOrdered ? 'ol' : 'ul';
+    html.push(`<${tag}>${listItems.map((item) => `<li>${renderInlineMarkdown(item)}</li>`).join('')}</${tag}>`);
+    listItems = [];
+  };
+  const flushQuote = () => {
+    if (quote.length === 0) {
+      return;
+    }
+    html.push(`<blockquote>${renderMarkdownLines(quote.join('\n'))}</blockquote>`);
+    quote = [];
+  };
+  const flushAll = () => {
+    flushParagraph();
+    flushList();
+    flushQuote();
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      flushAll();
+      continue;
+    }
+    const heading = /^(#{1,6})\s+(.+)$/.exec(trimmed);
+    if (heading) {
+      flushAll();
+      const level = Math.min(heading[1].length + 1, 6);
+      html.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+      continue;
+    }
+    if (/^[-*_]{3,}$/.test(trimmed)) {
+      flushAll();
+      html.push('<hr>');
+      continue;
+    }
+    const quoteMatch = /^>\s?(.*)$/.exec(line);
+    if (quoteMatch) {
+      flushParagraph();
+      flushList();
+      quote.push(quoteMatch[1]);
+      continue;
+    }
+    const unordered = /^\s*[-*+]\s+(.+)$/.exec(line);
+    const ordered = /^\s*\d+[.)]\s+(.+)$/.exec(line);
+    if (unordered || ordered) {
+      flushParagraph();
+      flushQuote();
+      const orderedLine = Boolean(ordered);
+      if (listItems.length > 0 && listOrdered !== orderedLine) {
+        flushList();
+      }
+      listOrdered = orderedLine;
+      listItems.push((unordered || ordered)[1]);
+      continue;
+    }
+    flushList();
+    flushQuote();
+    paragraph.push(line);
+  }
+  flushAll();
+  return html.join('');
+}
+
+function renderMarkdownMessage(value) {
   const text = safeText(value).trim();
   if (!text) {
     return '<span class="message-empty">空消息</span>';
@@ -161,10 +297,10 @@ function renderInlineMessage(value) {
   return blocks
     .map((block) => {
       if (block.startsWith('```') && block.endsWith('```')) {
-        const inner = block.slice(3, -3).replace(/^\w+\n/, '');
-        return `<pre class="code-card"><code>${escapeHtml(inner.trim())}</code></pre>`;
+        const inner = block.slice(3, -3).replace(/^[\w-]+\n/, '');
+        return `<pre class="code-card"><code>${escapeHtml(inner.replace(/^\n|\n$/g, ''))}</code></pre>`;
       }
-      return escapeHtml(block).replace(/\n{3,}/g, '\n\n');
+      return renderMarkdownLines(block);
     })
     .join('');
 }
@@ -252,6 +388,7 @@ async function selectConversation(serverId, conversationId) {
   state.activeServerId = serverId;
   state.settings.activeServerId = serverId;
   state.messages = [];
+  state.messagesSignature = '';
   state.messageDetails.clear();
   state.expandedMessages.clear();
   state.activePreviewMessageId = null;
@@ -270,18 +407,31 @@ async function refreshConversation() {
     return;
   }
   const { serverId, conversationId } = state.selected;
+  let shouldRenderMessages = false;
   try {
     const messages = await api(serverId, `/api/conversations/${conversationId}/messages?offset=0&limit=200`);
-    state.messages = messages.data?.messages || [];
+    const nextMessages = messages.data?.messages || [];
+    const nextSignature = messageListSignature(nextMessages);
+    if (nextSignature !== state.messagesSignature) {
+      state.messages = nextMessages;
+      state.messagesSignature = nextSignature;
+      shouldRenderMessages = true;
+    }
     const status = await api(serverId, `/api/conversations/${conversationId}/status`);
     state.statuses.set(conversationKey(serverId, conversationId), status.data);
   } catch (error) {
-    state.messages = [];
+    if (state.messages.length > 0 || state.messagesSignature !== messageListSignature([])) {
+      state.messages = [];
+      state.messagesSignature = messageListSignature([]);
+      shouldRenderMessages = true;
+    }
     setHealth(serverId, { state: 'offline', error: error.message, total: 0 });
   }
   renderSidebar();
   renderHeader();
-  renderMessages();
+  if (shouldRenderMessages) {
+    renderMessages();
+  }
   renderContext();
 }
 
@@ -498,7 +648,7 @@ function renderMessages() {
         <span class="message-meta">${escapeHtml(message.user_name || message.role || 'assistant')} ${
           message.message_time ? `· ${escapeHtml(formatRelative(message.message_time))}` : ''
         }</span>
-        <div class="message-text">${renderInlineMessage(bodyText)}</div>
+        <div class="message-text">${renderMarkdownMessage(bodyText)}</div>
         <span class="message-actions">
           <span>${expanded ? '收起详情' : '展开详情'}</span>
           ${message.has_token_usage ? '<span>usage</span>' : ''}
@@ -542,6 +692,8 @@ function currentConversation() {
 
 function renderContext() {
   document.body.classList.toggle('context-collapsed', state.contextCollapsed);
+  elements.toggleContextButton.textContent = state.contextCollapsed ? '◰' : '◱';
+  elements.toggleContextButton.title = state.contextCollapsed ? '打开详情' : '收起详情';
   document.querySelectorAll('.context-tab').forEach((tab) => {
     tab.classList.toggle('active', tab.dataset.contextTab === state.activeContextTab);
   });
@@ -652,7 +804,7 @@ function renderDetailContext() {
       </div>
     </section>
     <section class="preview-card">
-      ${renderInlineMessage(rendered)}
+      ${renderMarkdownMessage(rendered)}
     </section>
   `;
 }
@@ -858,10 +1010,14 @@ function bindEvents() {
   elements.newConversationButton.addEventListener('click', openNewConversationModal);
   elements.settingsButton.addEventListener('click', openSettingsModal);
   elements.refreshButton.addEventListener('click', refreshConversation);
+  elements.toggleContextButton.addEventListener('click', () => {
+    state.contextCollapsed = !state.contextCollapsed;
+    renderContext();
+  });
   elements.sendButton.addEventListener('click', sendMessage);
   elements.attachButton.addEventListener('click', () => showToast('文件上下文会跟随后端 API 一起接入。'));
   elements.collapseContextButton.addEventListener('click', () => {
-    state.contextCollapsed = !state.contextCollapsed;
+    state.contextCollapsed = true;
     renderContext();
   });
   document.querySelectorAll('.context-tab').forEach((tab) => {
