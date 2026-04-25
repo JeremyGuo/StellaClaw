@@ -10,6 +10,9 @@ const state = {
   messages: [],
   messageDetails: new Map(),
   expandedMessages: new Set(),
+  activeContextTab: 'overview',
+  activePreviewMessageId: null,
+  contextCollapsed: false,
   activePoll: null,
   saveTimer: null
 };
@@ -21,12 +24,16 @@ const elements = {
   conversationSubtitle: $('#conversationSubtitle'),
   composerInput: $('#composerInput'),
   composerHint: $('#composerHint'),
+  composerModePill: $('#composerModePill'),
   sendButton: $('#sendButton'),
+  attachButton: $('#attachButton'),
   refreshButton: $('#refreshButton'),
   newConversationButton: $('#newConversationButton'),
   serverStatusButton: $('#serverStatusButton'),
   serverPopover: $('#serverPopover'),
   settingsButton: $('#settingsButton'),
+  contextContent: $('#contextContent'),
+  collapseContextButton: $('#collapseContextButton'),
   modalLayer: $('#modalLayer')
 };
 
@@ -74,6 +81,21 @@ function formatRelative(value) {
   return `${Math.round(days / 30)} 个月`;
 }
 
+function formatCompactNumber(value) {
+  const number = Number(value || 0);
+  if (number >= 1_000_000) {
+    return `${(number / 1_000_000).toFixed(1)}M`;
+  }
+  if (number >= 10_000) {
+    return `${Math.round(number / 1000)}K`;
+  }
+  return number.toLocaleString();
+}
+
+function formatCost(value) {
+  return `$${Number(value || 0).toFixed(3)}`;
+}
+
 function createId(prefix) {
   if (crypto.randomUUID) {
     return `${prefix}-${crypto.randomUUID()}`;
@@ -103,6 +125,48 @@ function isRemoteStatus(status) {
   }
   const normalized = String(status.remote).toLowerCase();
   return !['selectable', 'disabled', 'local', 'none'].includes(normalized);
+}
+
+function statusUsageTotals(status) {
+  const totals = {
+    cacheRead: 0,
+    cacheWrite: 0,
+    input: 0,
+    output: 0,
+    cost: 0
+  };
+  for (const bucket of Object.values(status?.usage || {})) {
+    totals.cacheRead += Number(bucket?.cache_read || 0);
+    totals.cacheWrite += Number(bucket?.cache_write || 0);
+    totals.input += Number(bucket?.uncache_input || 0);
+    totals.output += Number(bucket?.output || 0);
+    const cost = bucket?.cost || {};
+    totals.cost +=
+      Number(cost.cache_read || 0) +
+      Number(cost.cache_write || 0) +
+      Number(cost.uncache_input || 0) +
+      Number(cost.output || 0);
+  }
+  totals.totalTokens = totals.cacheRead + totals.cacheWrite + totals.input + totals.output;
+  totals.cacheHit = totals.cacheRead + totals.input > 0 ? totals.cacheRead / (totals.cacheRead + totals.input) : 0;
+  return totals;
+}
+
+function renderInlineMessage(value) {
+  const text = safeText(value).trim();
+  if (!text) {
+    return '<span class="message-empty">空消息</span>';
+  }
+  const blocks = text.split(/(```[\s\S]*?```)/g);
+  return blocks
+    .map((block) => {
+      if (block.startsWith('```') && block.endsWith('```')) {
+        const inner = block.slice(3, -3).replace(/^\w+\n/, '');
+        return `<pre class="code-card"><code>${escapeHtml(inner.trim())}</code></pre>`;
+      }
+      return escapeHtml(block).replace(/\n{3,}/g, '\n\n');
+    })
+    .join('');
 }
 
 function api(serverId, path, options = {}) {
@@ -176,6 +240,7 @@ async function refreshServer(serverId) {
   }
   renderSidebar();
   renderServerPopover();
+  renderContext();
 }
 
 async function refreshAllServers() {
@@ -189,10 +254,12 @@ async function selectConversation(serverId, conversationId) {
   state.messages = [];
   state.messageDetails.clear();
   state.expandedMessages.clear();
+  state.activePreviewMessageId = null;
   saveSettingsSoon();
   renderSidebar();
   renderHeader();
   renderMessages();
+  renderContext();
   await refreshConversation();
 }
 
@@ -215,6 +282,7 @@ async function refreshConversation() {
   renderSidebar();
   renderHeader();
   renderMessages();
+  renderContext();
 }
 
 async function fetchMessageDetail(messageId) {
@@ -227,6 +295,8 @@ async function fetchMessageDetail(messageId) {
 }
 
 async function toggleMessage(messageId) {
+  state.activePreviewMessageId = messageId;
+  state.activeContextTab = 'detail';
   if (state.expandedMessages.has(messageId)) {
     state.expandedMessages.delete(messageId);
   } else {
@@ -234,6 +304,7 @@ async function toggleMessage(messageId) {
     await fetchMessageDetail(messageId);
   }
   renderMessages();
+  renderContext();
 }
 
 async function createConversation(serverId, localName) {
@@ -315,55 +386,52 @@ function renameConversation(serverId, conversation) {
 
 function renderSidebar() {
   const fragment = document.createDocumentFragment();
+  const rows = [];
   for (const server of getServers()) {
     const conversations = state.conversations.get(server.id) || [];
-    const group = document.createElement('div');
-    group.className = 'conversation-group';
-    group.innerHTML = `
-      <div class="conversation-group-title">
-        <span>${escapeHtml(server.name)}</span>
-        <button class="tiny-button" data-refresh-server="${escapeHtml(server.id)}" title="刷新">↻</button>
-      </div>
-    `;
     for (const conversation of conversations) {
-      const status = state.statuses.get(conversationKey(server.id, conversation.conversation_id));
-      const selected =
-        state.selected?.serverId === server.id &&
-        state.selected?.conversationId === conversation.conversation_id;
-      const row = document.createElement('button');
-      row.type = 'button';
-      row.className = `conversation-row${selected ? ' selected' : ''}${isRemoteStatus(status) ? ' remote' : ''}`;
-      row.dataset.serverId = server.id;
-      row.dataset.conversationId = conversation.conversation_id;
-      const remoteMeta = isRemoteStatus(status)
-        ? `<span class="remote-meta">${escapeHtml(status.remote)} · ${escapeHtml(status.workspace)}</span>`
-        : '';
-      row.innerHTML = `
-        <span class="conversation-main">
-          <span class="conversation-name">${escapeHtml(displayConversationName(server.id, conversation))}</span>
-          ${remoteMeta}
-        </span>
-        <span class="conversation-age">${escapeHtml(conversation.model || '')}</span>
-      `;
-      row.addEventListener('click', () => selectConversation(server.id, conversation.conversation_id));
-      row.addEventListener('dblclick', () => renameConversation(server.id, conversation));
-      group.append(row);
+      rows.push({ server, conversation });
     }
-    if (conversations.length === 0) {
-      const empty = document.createElement('div');
-      empty.className = 'empty-server';
-      empty.textContent = '暂无会话';
-      group.append(empty);
-    }
-    fragment.append(group);
   }
+
+  rows.sort((left, right) =>
+    left.conversation.conversation_id.localeCompare(right.conversation.conversation_id, undefined, {
+      numeric: true
+    })
+  );
+
+  for (const { server, conversation } of rows) {
+    const status = state.statuses.get(conversationKey(server.id, conversation.conversation_id));
+    const selected =
+      state.selected?.serverId === server.id && state.selected?.conversationId === conversation.conversation_id;
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = `conversation-row${selected ? ' selected' : ''}${isRemoteStatus(status) ? ' remote' : ''}`;
+    row.dataset.serverId = server.id;
+    row.dataset.conversationId = conversation.conversation_id;
+    const remoteMeta = isRemoteStatus(status)
+      ? `<span class="remote-meta">${escapeHtml(status.remote)} · ${escapeHtml(compactPath(status.workspace))}</span>`
+      : `<span class="remote-meta">${escapeHtml(server.name)}</span>`;
+    row.innerHTML = `
+      <span class="conversation-main">
+        <span class="conversation-name">${escapeHtml(displayConversationName(server.id, conversation))}</span>
+        ${remoteMeta}
+      </span>
+      <span class="conversation-age">${escapeHtml(conversation.model || '')}</span>
+    `;
+    row.addEventListener('click', () => selectConversation(server.id, conversation.conversation_id));
+    row.addEventListener('dblclick', () => renameConversation(server.id, conversation));
+    fragment.append(row);
+  }
+
+  if (rows.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty-server sidebar-empty';
+    empty.textContent = '还没有 Conversation';
+    fragment.append(empty);
+  }
+
   elements.conversationList.replaceChildren(fragment);
-  elements.conversationList.querySelectorAll('[data-refresh-server]').forEach((button) => {
-    button.addEventListener('click', (event) => {
-      event.stopPropagation();
-      refreshServer(button.dataset.refreshServer);
-    });
-  });
 }
 
 function renderHeader() {
@@ -371,6 +439,7 @@ function renderHeader() {
     elements.conversationTitle.textContent = 'Stellacode';
     elements.conversationSubtitle.textContent = '选择或创建一个 Conversation';
     elements.composerHint.textContent = '未连接会话';
+    elements.composerModePill.textContent = '未连接';
     return;
   }
   const server = getServers().find((item) => item.id === state.selected.serverId);
@@ -387,6 +456,7 @@ function renderHeader() {
   elements.composerHint.textContent = isRemoteStatus(status)
     ? `Remote: ${status.remote} · ${status.workspace}`
     : '本地模式';
+  elements.composerModePill.textContent = isRemoteStatus(status) ? 'Remote' : '本地';
 }
 
 function roleClass(role) {
@@ -417,25 +487,174 @@ function renderMessages() {
     const expanded = state.expandedMessages.has(message.id);
     const detail = state.messageDetails.get(message.id);
     const article = document.createElement('article');
-    article.className = `message ${roleClass(message.role)}${expanded ? ' expanded' : ''}`;
+    const activePreview = state.activePreviewMessageId === message.id;
+    article.className = `message ${roleClass(message.role)}${expanded ? ' expanded' : ''}${
+      activePreview ? ' active-preview' : ''
+    }`;
     article.dataset.messageId = message.id;
     const bodyText = expanded ? detail?.rendered_text || message.preview : message.preview;
     article.innerHTML = `
-      <button class="message-bubble" type="button">
+      <div class="message-bubble" role="button" tabindex="0">
         <span class="message-meta">${escapeHtml(message.user_name || message.role || 'assistant')} ${
           message.message_time ? `· ${escapeHtml(formatRelative(message.message_time))}` : ''
         }</span>
-        <span class="message-text">${escapeHtml(bodyText)}</span>
-        <span class="message-foot">${expanded ? '收起详情' : '展开详情'}${
-          message.has_token_usage ? ' · usage' : ''
-        }</span>
-      </button>
+        <div class="message-text">${renderInlineMessage(bodyText)}</div>
+        <span class="message-actions">
+          <span>${expanded ? '收起详情' : '展开详情'}</span>
+          ${message.has_token_usage ? '<span>usage</span>' : ''}
+        </span>
+      </div>
     `;
-    article.querySelector('.message-bubble').addEventListener('click', () => toggleMessage(message.id));
+    const bubble = article.querySelector('.message-bubble');
+    bubble.addEventListener('click', () => toggleMessage(message.id));
+    bubble.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        toggleMessage(message.id);
+      }
+    });
     fragment.append(article);
   }
   elements.messageList.replaceChildren(fragment);
   elements.messageList.scrollTop = elements.messageList.scrollHeight;
+}
+
+function compactPath(value) {
+  const text = safeText(value);
+  if (text.length <= 38) {
+    return text;
+  }
+  const parts = text.split('/').filter(Boolean);
+  if (parts.length >= 2) {
+    return `…/${parts.slice(-2).join('/')}`;
+  }
+  return `…${text.slice(-35)}`;
+}
+
+function currentConversation() {
+  if (!state.selected) {
+    return null;
+  }
+  return (state.conversations.get(state.selected.serverId) || []).find(
+    (item) => item.conversation_id === state.selected.conversationId
+  );
+}
+
+function renderContext() {
+  document.body.classList.toggle('context-collapsed', state.contextCollapsed);
+  document.querySelectorAll('.context-tab').forEach((tab) => {
+    tab.classList.toggle('active', tab.dataset.contextTab === state.activeContextTab);
+  });
+  if (!elements.contextContent) {
+    return;
+  }
+  if (state.activeContextTab === 'detail') {
+    renderDetailContext();
+  } else {
+    renderOverviewContext();
+  }
+}
+
+function renderOverviewContext() {
+  const status = selectedStatus();
+  const conversation = currentConversation();
+  if (!state.selected) {
+    elements.contextContent.innerHTML = `
+      <div class="context-empty">
+        <strong>没有选中会话</strong>
+        <span>从左侧选择一个 Conversation。</span>
+      </div>
+    `;
+    return;
+  }
+  const usage = statusUsageTotals(status);
+  const remote = isRemoteStatus(status);
+  const workspace = status?.workspace || 'workspace pending';
+  const crumbs = compactPath(workspace).split('/').filter(Boolean);
+  elements.contextContent.innerHTML = `
+    <section class="inspector-card hero-card">
+      <div class="inspector-kicker">${escapeHtml(conversation?.conversation_id || state.selected.conversationId)}</div>
+      <h2>${escapeHtml(conversation ? displayConversationName(state.selected.serverId, conversation) : state.selected.conversationId)}</h2>
+      <div class="status-line">
+        <span class="status-dot ${remote ? 'remote' : ''}"></span>
+        <span>${remote ? escapeHtml(status.remote) : 'local workspace'}</span>
+      </div>
+    </section>
+    <section class="metric-grid">
+      <div class="metric-card">
+        <span>Cache</span>
+        <strong>${Math.round(usage.cacheHit * 100)}%</strong>
+      </div>
+      <div class="metric-card">
+        <span>Tokens</span>
+        <strong>${formatCompactNumber(usage.totalTokens)}</strong>
+      </div>
+      <div class="metric-card">
+        <span>Cost</span>
+        <strong>${formatCost(usage.cost)}</strong>
+      </div>
+    </section>
+    <section class="inspector-card">
+      <div class="inspector-title">运行状态</div>
+      <div class="kv-list">
+        <span>model</span><strong>${escapeHtml(status?.model || conversation?.model || 'pending')}</strong>
+        <span>sandbox</span><strong>${escapeHtml(status?.sandbox || 'pending')}</strong>
+        <span>background</span><strong>${Number(status?.running_background || 0)} / ${Number(status?.total_background || 0)}</strong>
+        <span>subagents</span><strong>${Number(status?.running_subagents || 0)} / ${Number(status?.total_subagents || 0)}</strong>
+      </div>
+    </section>
+    <section class="inspector-card">
+      <div class="inspector-title">Workspace</div>
+      <div class="path-chip">${escapeHtml(workspace)}</div>
+      <div class="crumb-row">${crumbs.map((part) => `<span>${escapeHtml(part)}</span>`).join('')}</div>
+    </section>
+    <section class="inspector-card">
+      <div class="inspector-title">Usage</div>
+      ${usageBar('Cache Read', usage.cacheRead, usage.totalTokens)}
+      ${usageBar('Cache Write', usage.cacheWrite, usage.totalTokens)}
+      ${usageBar('Input', usage.input, usage.totalTokens)}
+      ${usageBar('Output', usage.output, usage.totalTokens)}
+    </section>
+  `;
+}
+
+function usageBar(label, value, total) {
+  const percent = total > 0 ? Math.max(3, Math.round((value / total) * 100)) : 0;
+  return `
+    <div class="usage-row">
+      <div class="usage-row-head"><span>${escapeHtml(label)}</span><strong>${formatCompactNumber(value)}</strong></div>
+      <div class="usage-track"><span style="width: ${percent}%"></span></div>
+    </div>
+  `;
+}
+
+function renderDetailContext() {
+  const messageId = state.activePreviewMessageId;
+  const message = state.messages.find((item) => item.id === messageId);
+  const detail = messageId ? state.messageDetails.get(messageId) : null;
+  if (!message) {
+    elements.contextContent.innerHTML = `
+      <div class="context-empty">
+        <strong>未选择消息</strong>
+        <span>点击中间消息查看细节。</span>
+      </div>
+    `;
+    return;
+  }
+  const rendered = detail?.rendered_text || message.preview || '';
+  elements.contextContent.innerHTML = `
+    <section class="inspector-card hero-card">
+      <div class="inspector-kicker">${escapeHtml(message.role || 'message')}</div>
+      <h2>${escapeHtml(message.user_name || message.role || 'assistant')}</h2>
+      <div class="status-line">
+        <span class="status-dot"></span>
+        <span>${escapeHtml(message.message_time ? formatRelative(message.message_time) : 'no timestamp')}</span>
+      </div>
+    </section>
+    <section class="preview-card">
+      ${renderInlineMessage(rendered)}
+    </section>
+  `;
 }
 
 function renderServerPopover() {
@@ -631,6 +850,7 @@ async function init() {
   renderSidebar();
   renderHeader();
   renderMessages();
+  renderContext();
   await refreshAllServers();
 }
 
@@ -639,6 +859,17 @@ function bindEvents() {
   elements.settingsButton.addEventListener('click', openSettingsModal);
   elements.refreshButton.addEventListener('click', refreshConversation);
   elements.sendButton.addEventListener('click', sendMessage);
+  elements.attachButton.addEventListener('click', () => showToast('文件上下文会跟随后端 API 一起接入。'));
+  elements.collapseContextButton.addEventListener('click', () => {
+    state.contextCollapsed = !state.contextCollapsed;
+    renderContext();
+  });
+  document.querySelectorAll('.context-tab').forEach((tab) => {
+    tab.addEventListener('click', () => {
+      state.activeContextTab = tab.dataset.contextTab;
+      renderContext();
+    });
+  });
   elements.serverStatusButton.addEventListener('click', () => {
     elements.serverPopover.classList.toggle('hidden');
     renderServerPopover();

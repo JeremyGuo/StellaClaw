@@ -50,16 +50,31 @@
 
         <footer class="composer-wrap">
           <div class="composer">
+            <button id="attachButton" class="composer-icon" type="button" title="添加上下文">+</button>
             <textarea
               id="composerInput"
               rows="1"
-              placeholder="输入消息，Enter 发送，Shift+Enter 换行"
+              placeholder="要求后续变更"
             ></textarea>
+            <div class="composer-tools">
+              <span id="composerModePill" class="mode-pill">本地</span>
+            </div>
             <button id="sendButton" class="send-button" type="button" title="发送">↑</button>
           </div>
           <div id="composerHint" class="composer-hint">本地模式</div>
         </footer>
       </main>
+
+      <aside class="context-panel">
+        <header class="context-header">
+          <div class="context-tabs">
+            <button class="context-tab active" type="button" data-context-tab="overview">概览</button>
+            <button class="context-tab" type="button" data-context-tab="detail">详情</button>
+          </div>
+          <button id="collapseContextButton" class="icon-button" type="button" title="收起侧栏">◱</button>
+        </header>
+        <section id="contextContent" class="context-content"></section>
+      </aside>
     </div>
 
     <div id="modalLayer" class="modal-layer hidden"></div>
