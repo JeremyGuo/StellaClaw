@@ -161,13 +161,13 @@ fn cron_tools() -> Vec<ToolDefinition> {
         ),
         bridge_tool(
             "create_cron_task",
-            "Create a persisted cron task that later launches a main background agent. Provide each cron time field as a named argument; the host builds a seconds-first cron expression in the task timezone. Use timezone as an IANA name such as 'Asia/Shanghai'; if omitted, Asia/Shanghai is used. checker_command is an optional shell command run as sh -lc inside the conversation sandbox before launch: exit 0 skips the background agent, non-zero appends checker stdout to task and launches it. Before setting checker_command, verify it works with the shell tool.",
+            "Create a persisted cron task. Provide each cron time field as a named argument; the host builds a seconds-first cron expression in the task timezone. Set exactly one of task or script_command. task launches a background agent with that prompt. script_command runs as sh -lc inside the conversation sandbox; exit 0 parses stdout as up to three JSONL messages like {\"to\":[\"user\",\"foreground\"],\"text\":\"...\"}, while non-zero disables the cron and notifies the user plus foreground agent. Before saving a script, verify it with the shell tool.",
             cron_create_schema(),
             ToolExecutionMode::Immediate,
         ),
         bridge_tool(
             "update_cron_task",
-            "Update a cron task. To change timing, provide all named cron fields together: cron_second, cron_minute, cron_hour, cron_day_of_month, cron_month, cron_day_of_week, plus optional cron_year. Use timezone to change the IANA timezone, enabled to pause or resume it, checker_command/checker_timeout_seconds/checker_cwd to change the shell checker, and clear_checker=true to remove the checker.",
+            "Update a cron task. To change timing, provide all named cron fields together: cron_second, cron_minute, cron_hour, cron_day_of_month, cron_month, cron_day_of_week, plus optional cron_year. Use timezone to change the IANA timezone and enabled to pause or resume it. Setting task switches to prompt mode and clears the script; setting script_command switches to script mode and clears task. clear_script removes the script, and clear_task removes the prompt.",
             cron_update_schema(),
             ToolExecutionMode::Immediate,
         ),
@@ -212,7 +212,6 @@ fn cron_create_schema() -> serde_json::Value {
             "cron_day_of_month",
             "cron_month",
             "cron_day_of_week",
-            "task",
         ],
     )
 }
@@ -221,7 +220,8 @@ fn cron_update_schema() -> serde_json::Value {
     let mut schema_properties = cron_common_properties();
     schema_properties.insert("id".to_string(), json!({"type": "string"}));
     schema_properties.insert("model".to_string(), json!({"type": "string"}));
-    schema_properties.insert("clear_checker".to_string(), json!({"type": "boolean"}));
+    schema_properties.insert("clear_script".to_string(), json!({"type": "boolean"}));
+    schema_properties.insert("clear_task".to_string(), json!({"type": "boolean"}));
     object_schema(schema_properties, &["id"])
 }
 
@@ -261,19 +261,22 @@ fn cron_common_properties() -> serde_json::Map<String, serde_json::Value> {
             "timezone",
             json!({"type": "string", "description": "IANA timezone for these cron fields, e.g. 'Asia/Shanghai'. Defaults to 'Asia/Shanghai'."}),
         ),
-        ("task", json!({"type": "string"})),
+        (
+            "task",
+            json!({"type": "string", "description": "Prompt for a background agent. Mutually exclusive with script_command."}),
+        ),
         ("enabled", json!({"type": "boolean"})),
         (
-            "checker_command",
-            json!({"type": "string", "description": "Optional shell command executed as sh -lc inside the conversation sandbox before the cron task launches. Exit 0 means no wake-up; non-zero means wake and append stdout to the task prompt. Prefer a checked-in Python script such as 'python3 scripts/check_calendar.py' and verify it with shell before saving."}),
+            "script_command",
+            json!({"type": "string", "description": "Shell script executed as sh -lc inside the conversation sandbox. Mutually exclusive with task. Exit 0 parses stdout as JSONL delivery messages; non-zero disables the cron and notifies user plus foreground agent."}),
         ),
         (
-            "checker_timeout_seconds",
-            json!({"type": "number", "description": "Optional positive timeout for checker_command. Defaults to 30 seconds."}),
+            "script_timeout_seconds",
+            json!({"type": "number", "description": "Optional positive timeout for script_command. Defaults to 30 seconds."}),
         ),
         (
-            "checker_cwd",
-            json!({"type": "string", "description": "Optional relative working directory inside the conversation workspace for checker_command. Absolute paths and '..' are rejected."}),
+            "script_cwd",
+            json!({"type": "string", "description": "Optional relative working directory inside the conversation workspace for script_command. Absolute paths and '..' are rejected."}),
         ),
     ])
 }

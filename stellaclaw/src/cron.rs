@@ -26,11 +26,11 @@ pub struct CronTaskRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checker_command: Option<String>,
+    pub script_command: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checker_timeout_seconds: Option<f64>,
+    pub script_timeout_seconds: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checker_cwd: Option<String>,
+    pub script_cwd: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -52,9 +52,9 @@ pub struct CreateCronTaskRequest {
     pub timezone: String,
     pub task: String,
     pub model: Option<String>,
-    pub checker_command: Option<String>,
-    pub checker_timeout_seconds: Option<f64>,
-    pub checker_cwd: Option<String>,
+    pub script_command: Option<String>,
+    pub script_timeout_seconds: Option<f64>,
+    pub script_cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -65,9 +65,9 @@ pub struct UpdateCronTaskRequest {
     pub timezone: Option<String>,
     pub task: Option<String>,
     pub model: Option<Option<String>>,
-    pub checker_command: Option<Option<String>>,
-    pub checker_timeout_seconds: Option<Option<f64>>,
-    pub checker_cwd: Option<Option<String>>,
+    pub script_command: Option<Option<String>>,
+    pub script_timeout_seconds: Option<Option<f64>>,
+    pub script_cwd: Option<Option<String>>,
     pub enabled: Option<bool>,
 }
 
@@ -173,14 +173,15 @@ impl CronManager {
             timezone: request.timezone,
             task: request.task,
             model: request.model,
-            checker_command: request.checker_command,
-            checker_timeout_seconds: request.checker_timeout_seconds,
-            checker_cwd: request.checker_cwd,
+            script_command: request.script_command,
+            script_timeout_seconds: request.script_timeout_seconds,
+            script_cwd: request.script_cwd,
             enabled: true,
             next_run_at: None,
             last_run_at: None,
             last_error: None,
         };
+        validate_task_mode(&task)?;
         refresh_next_run_at(&mut task, None)?;
         store.tasks.insert(id, task.clone());
         drop(store);
@@ -221,27 +222,63 @@ impl CronManager {
         }
         if let Some(task_text) = update.task {
             task.task = task_text;
+            if !task.task.trim().is_empty() {
+                task.script_command = None;
+                task.script_timeout_seconds = None;
+                task.script_cwd = None;
+            }
         }
         if let Some(model) = update.model {
             task.model = model;
         }
-        if let Some(checker_command) = update.checker_command {
-            task.checker_command = checker_command;
-            if task.checker_command.is_none() {
-                task.checker_timeout_seconds = None;
-                task.checker_cwd = None;
+        if let Some(script_command) = update.script_command {
+            task.script_command = script_command;
+            if task.script_command.is_some() {
+                task.task.clear();
+            } else {
+                task.script_timeout_seconds = None;
+                task.script_cwd = None;
             }
         }
-        if let Some(checker_timeout_seconds) = update.checker_timeout_seconds {
-            task.checker_timeout_seconds = checker_timeout_seconds;
+        if let Some(script_timeout_seconds) = update.script_timeout_seconds {
+            task.script_timeout_seconds = script_timeout_seconds;
         }
-        if let Some(checker_cwd) = update.checker_cwd {
-            task.checker_cwd = checker_cwd;
+        if let Some(script_cwd) = update.script_cwd {
+            task.script_cwd = script_cwd;
         }
         if let Some(enabled) = update.enabled {
             task.enabled = enabled;
         }
+        validate_task_mode(task)?;
         refresh_next_run_at(task, None)?;
+        let updated = task.clone();
+        drop(store);
+        self.save()?;
+        Ok(updated)
+    }
+
+    pub fn disable_task(
+        &self,
+        conversation_id: &str,
+        id: &str,
+        reason: String,
+    ) -> Result<CronTaskRecord> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| anyhow!("cron store lock poisoned"))?;
+        let task = store
+            .tasks
+            .get_mut(id)
+            .ok_or_else(|| anyhow!("unknown cron task {id}"))?;
+        if task.conversation_id != conversation_id {
+            return Err(anyhow!(
+                "cron task {id} does not belong to this conversation"
+            ));
+        }
+        task.enabled = false;
+        task.next_run_at = None;
+        task.last_error = Some(reason);
         let updated = task.clone();
         drop(store);
         self.save()?;
@@ -462,6 +499,24 @@ fn refresh_next_run_at(task: &mut CronTaskRecord, from: Option<DateTime<Utc>>) -
     Ok(())
 }
 
+fn validate_task_mode(task: &CronTaskRecord) -> Result<()> {
+    let has_prompt = !task.task.trim().is_empty();
+    let has_script = task
+        .script_command
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    match (has_prompt, has_script) {
+        (true, false) | (false, true) => Ok(()),
+        (true, true) => Err(anyhow!(
+            "cron task must set either task prompt or script_command, not both"
+        )),
+        (false, false) => Err(anyhow!(
+            "cron task must set either task prompt or script_command"
+        )),
+    }
+}
+
 fn validate_schedule(schedule: &str) -> Result<Schedule> {
     schedule
         .parse::<Schedule>()
@@ -516,23 +571,21 @@ mod tests {
                 description: "run a task".to_string(),
                 schedule: "* * * * * *".to_string(),
                 timezone: "Asia/Shanghai".to_string(),
-                task: "check status".to_string(),
+                task: "".to_string(),
                 model: Some("main".to_string()),
-                checker_command: Some("python3 checker.py".to_string()),
-                checker_timeout_seconds: Some(3.0),
-                checker_cwd: Some("checks".to_string()),
+                script_command: Some("python3 script.py".to_string()),
+                script_timeout_seconds: Some(3.0),
+                script_cwd: Some("checks".to_string()),
             })
             .expect("task should create");
         let stored = manager
             .get_for_conversation("telegram-main-000001", &task.id)
             .expect("task should load")
             .expect("task should exist");
-        assert_eq!(
-            stored.checker_command.as_deref(),
-            Some("python3 checker.py")
-        );
-        assert_eq!(stored.checker_timeout_seconds, Some(3.0));
-        assert_eq!(stored.checker_cwd.as_deref(), Some("checks"));
+        assert_eq!(stored.script_command.as_deref(), Some("python3 script.py"));
+        assert_eq!(stored.script_timeout_seconds, Some(3.0));
+        assert_eq!(stored.script_cwd.as_deref(), Some("checks"));
+        assert!(stored.task.is_empty());
 
         let listed = manager
             .list_for_conversation("telegram-main-000001")
@@ -547,7 +600,7 @@ mod tests {
                 &task.id,
                 UpdateCronTaskRequest {
                     enabled: Some(false),
-                    checker_command: Some(None),
+                    task: Some("check status".to_string()),
                     ..UpdateCronTaskRequest::default()
                 },
             )
@@ -556,9 +609,10 @@ mod tests {
             .get_for_conversation("telegram-main-000001", &task.id)
             .expect("task should load")
             .expect("task should exist");
-        assert!(cleared.checker_command.is_none());
-        assert!(cleared.checker_timeout_seconds.is_none());
-        assert!(cleared.checker_cwd.is_none());
+        assert!(cleared.script_command.is_none());
+        assert!(cleared.script_timeout_seconds.is_none());
+        assert!(cleared.script_cwd.is_none());
+        assert_eq!(cleared.task, "check status");
         assert!(manager
             .collect_due_tasks(Utc::now() + chrono::Duration::minutes(1))
             .expect("collect should work")

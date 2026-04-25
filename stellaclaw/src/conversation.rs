@@ -1,11 +1,10 @@
 use std::{
     collections::BTreeMap,
     fs,
-    path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
+    path::{Path, PathBuf},
     sync::{mpsc, Arc},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -17,21 +16,19 @@ use stellaclaw_core::{
     session_actor::{
         ChatMessage, ChatMessageItem, ChatRole, ContextItem, ConversationBridgeRequest,
         ConversationBridgeResponse, FileItem, SessionErrorDetail, SessionEvent, SessionInitial,
-        SessionRequest, SessionType, TokenUsage, TokenUsageCost, ToolCallItem, ToolRemoteMode,
-        ToolResultContent, ToolResultItem,
+        SessionRequest, SessionType, ToolRemoteMode, ToolResultContent, ToolResultItem,
     },
 };
 
 use crate::{
     channels::types::{
-        OutgoingAttachment, OutgoingAttachmentKind, OutgoingDelivery, OutgoingDispatch,
-        OutgoingOption, OutgoingOptions, OutgoingProcessing, OutgoingProgressFeedback,
-        OutgoingStatus, OutgoingUsageCost, OutgoingUsageSummary, OutgoingUsageTotals,
-        ProcessingState, ProgressFeedbackFinalState,
+        OutgoingAttachment, OutgoingDelivery, OutgoingDispatch, OutgoingOption, OutgoingOptions,
+        OutgoingProcessing, OutgoingProgressFeedback, OutgoingStatus, ProcessingState,
+        ProgressFeedbackFinalState,
     },
     config::{
         ModelSelection, SandboxConfig, SandboxMode, SessionDefaults, SessionProfile,
-        SkillSyncConfig, StellaclawConfig, ToolModelTarget,
+        StellaclawConfig, ToolModelTarget,
     },
     cron::{
         cron_schedule_from_required_tool_args, optional_cron_schedule_from_tool_args,
@@ -40,13 +37,28 @@ use crate::{
         UpdateCronTaskRequest,
     },
     logger::StellaclawLogger,
-    sandbox::{bubblewrap_support_error, build_workspace_shell_command},
+    sandbox::bubblewrap_support_error,
     session_client::AgentServerClient,
     workspace::{
         ensure_workspace_for_remote_mode, ensure_workspace_seed, sshfs_workspace_root,
         unmount_sshfs_workspace,
     },
 };
+
+mod attachments;
+mod cron_script;
+mod skill_sync;
+mod status;
+
+pub use attachments::render_chat_message;
+use attachments::{extract_attachment_references, strip_attachment_tags};
+use cron_script::{parse_script_stdout, run_script_command, CronScriptMessage, CronScriptTarget};
+pub(crate) use skill_sync::push_configured_skill_sync_on_startup;
+use skill_sync::{
+    copy_skill_atomically, push_skill_sync_if_configured, sync_skill_to_conversation_workspaces,
+    validate_skill_directory, validate_skill_name, SkillPersistMode,
+};
+use status::conversation_status_snapshot;
 
 #[derive(Debug, Clone)]
 pub struct IncomingConversationMessage {
@@ -81,8 +93,6 @@ pub enum ConversationCommand {
 }
 
 const TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(4);
-const DEFAULT_CRON_CHECKER_TIMEOUT: Duration = Duration::from_secs(30);
-const MAX_CRON_CHECKER_STDOUT_CHARS: usize = 16_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationState {
@@ -145,50 +155,6 @@ pub enum ManagedSessionStatus {
     Completed,
     Failed,
     Killed,
-}
-
-#[derive(Debug, Clone, Default)]
-struct UsageTotals {
-    cache_read: u64,
-    cache_write: u64,
-    uncache_input: u64,
-    output: u64,
-    cost: TokenUsageCost,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ConversationUsageSummary {
-    foreground: UsageTotals,
-    background: UsageTotals,
-    subagents: UsageTotals,
-    media_tools: UsageTotals,
-}
-
-impl UsageTotals {
-    fn add_token_usage(&mut self, usage: &TokenUsage) {
-        self.cache_read = self.cache_read.saturating_add(usage.cache_read);
-        self.cache_write = self.cache_write.saturating_add(usage.cache_write);
-        self.uncache_input = self.uncache_input.saturating_add(usage.uncache_input);
-        self.output = self.output.saturating_add(usage.output);
-        if let Some(cost) = &usage.cost_usd {
-            self.add_cost(cost);
-        }
-    }
-
-    fn add_cost(&mut self, cost: &TokenUsageCost) {
-        self.cost.cache_read += cost.cache_read;
-        self.cost.cache_write += cost.cache_write;
-        self.cost.uncache_input += cost.uncache_input;
-        self.cost.output += cost.output;
-    }
-
-    fn add_totals(&mut self, other: &UsageTotals) {
-        self.cache_read = self.cache_read.saturating_add(other.cache_read);
-        self.cache_write = self.cache_write.saturating_add(other.cache_write);
-        self.uncache_input = self.uncache_input.saturating_add(other.uncache_input);
-        self.output = self.output.saturating_add(other.output);
-        self.add_cost(&other.cost);
-    }
 }
 
 fn default_index() -> u64 {
@@ -424,19 +390,6 @@ enum TaskPlanItemStatus {
     Pending,
     InProgress,
     Completed,
-}
-
-#[derive(Debug)]
-enum CronCheckerDecision {
-    Skip,
-    Wake { prompt: String },
-}
-
-#[derive(Debug)]
-struct CronCheckerResult {
-    exit_code: Option<i32>,
-    stdout: String,
-    stderr: String,
 }
 
 impl ConversationRuntime {
@@ -1123,14 +1076,14 @@ impl ConversationRuntime {
                     description: string_arg_required(object, "description")?,
                     schedule: cron_schedule_from_required_tool_args(object)?,
                     timezone: timezone_or_default(optional_string_arg(object, "timezone")?)?,
-                    task: string_arg_required(object, "task")?,
+                    task: optional_string_arg(object, "task")?.unwrap_or_default(),
                     model: optional_string_arg(object, "model")?,
-                    checker_command: optional_string_arg(object, "checker_command")?,
-                    checker_timeout_seconds: optional_positive_f64_arg(
+                    script_command: optional_string_arg(object, "script_command")?,
+                    script_timeout_seconds: optional_positive_f64_arg(
                         object,
-                        "checker_timeout_seconds",
+                        "script_timeout_seconds",
                     )?,
-                    checker_cwd: optional_string_arg(object, "checker_cwd")?,
+                    script_cwd: optional_string_arg(object, "script_cwd")?,
                 })?;
                 Ok(bridge_result(request, serde_json::to_string(&task)?))
             }
@@ -1145,19 +1098,28 @@ impl ConversationRuntime {
                     Some(value) => Some(timezone_or_default(Some(value))?),
                     None => None,
                 };
-                let _clear_checker = object
-                    .get("clear_checker")
+                let _clear_script = object
+                    .get("clear_script")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let clear_task = object
+                    .get("clear_task")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let model = optional_string_arg(object, "model")?.map(Some);
-                let (checker_command, checker_timeout_seconds, checker_cwd) = if _clear_checker {
+                let (script_command, script_timeout_seconds, script_cwd) = if _clear_script {
                     (Some(None), Some(None), Some(None))
                 } else {
                     (
-                        optional_string_arg(object, "checker_command")?.map(Some),
-                        optional_positive_f64_arg(object, "checker_timeout_seconds")?.map(Some),
-                        optional_string_arg(object, "checker_cwd")?.map(Some),
+                        optional_string_arg(object, "script_command")?.map(Some),
+                        optional_positive_f64_arg(object, "script_timeout_seconds")?.map(Some),
+                        optional_string_arg(object, "script_cwd")?.map(Some),
                     )
+                };
+                let task_prompt = if clear_task {
+                    Some(String::new())
+                } else {
+                    optional_string_arg(object, "task")?
                 };
                 let task = self.cron_manager.update_task(
                     &self.state.conversation_id,
@@ -1167,11 +1129,11 @@ impl ConversationRuntime {
                         description: optional_string_arg(object, "description")?,
                         schedule,
                         timezone,
-                        task: optional_string_arg(object, "task")?,
+                        task: task_prompt,
                         model,
-                        checker_command,
-                        checker_timeout_seconds,
-                        checker_cwd,
+                        script_command,
+                        script_timeout_seconds,
+                        script_cwd,
                         enabled: parse_enabled_flag(object)?,
                     },
                 )?;
@@ -1689,10 +1651,14 @@ impl ConversationRuntime {
     }
 
     fn run_cron_task(&mut self, task: CronTaskRecord) -> Result<bool> {
-        let prompt = match self.run_cron_checker(&task)? {
-            CronCheckerDecision::Skip => return Ok(false),
-            CronCheckerDecision::Wake { prompt } => prompt,
-        };
+        if task.script_command.is_some() {
+            return self.run_cron_script_task(task);
+        }
+        self.start_cron_background_agent(&task, task.task.clone())?;
+        Ok(true)
+    }
+
+    fn start_cron_background_agent(&mut self, task: &CronTaskRecord, prompt: String) -> Result<()> {
         self.logger.info(
             "cron_task_starting_background_agent",
             json!({
@@ -1716,46 +1682,144 @@ impl ConversationRuntime {
         };
         let _ =
             self.start_managed_session(ManagedSessionType::Background, prompt, model_override)?;
-        Ok(true)
+        Ok(())
     }
 
-    fn run_cron_checker(&mut self, task: &CronTaskRecord) -> Result<CronCheckerDecision> {
-        let Some(command) = task.checker_command.as_deref() else {
-            return Ok(CronCheckerDecision::Wake {
-                prompt: task.task.clone(),
-            });
-        };
-        let result = run_checker_command(
-            task,
+    fn run_cron_script_task(&mut self, task: CronTaskRecord) -> Result<bool> {
+        let command = task
+            .script_command
+            .as_deref()
+            .context("cron script task missing script_command")?;
+        let result = match run_script_command(
+            &task,
             command,
             &self.conversation_root,
             &self.workspace_root,
             self.state.sandbox.as_ref().unwrap_or(&self.config.sandbox),
-        )?;
-        if result.exit_code == Some(0) {
-            self.logger.info(
-                "cron_checker_skipped",
-                json!({
-                    "task_id": task.id,
-                    "conversation_id": self.state.conversation_id,
-                    "exit_code": result.exit_code,
-                }),
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                self.disable_cron_script_task(
+                    &task,
+                    format!("cron script execution failed: {error:#}"),
+                    "",
+                    "",
+                )?;
+                return Ok(false);
+            }
+        };
+        if result.exit_code != Some(0) {
+            let reason = format!(
+                "cron script exited with code {}",
+                result
+                    .exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
             );
-            return Ok(CronCheckerDecision::Skip);
+            self.disable_cron_script_task(&task, reason, &result.stdout, &result.stderr)?;
+            return Ok(false);
         }
+
+        let messages = match parse_script_stdout(&result.stdout) {
+            Ok(messages) => messages,
+            Err(error) => {
+                self.disable_cron_script_task(
+                    &task,
+                    format!("cron script stdout parse failed: {error:#}"),
+                    &result.stdout,
+                    &result.stderr,
+                )?;
+                return Ok(false);
+            }
+        };
+
         self.logger.info(
-            "cron_checker_triggered",
+            "cron_script_emitted_messages",
             json!({
                 "task_id": task.id,
                 "conversation_id": self.state.conversation_id,
                 "exit_code": result.exit_code,
+                "messages": messages.len(),
                 "stdout_bytes": result.stdout.len(),
                 "stderr_bytes": result.stderr.len(),
             }),
         );
-        Ok(CronCheckerDecision::Wake {
-            prompt: append_checker_stdout(&task.task, &result.stdout),
-        })
+
+        let mut started_background = false;
+        for message in messages {
+            if self.deliver_cron_script_message(&task, message)? {
+                started_background = true;
+            }
+        }
+        Ok(started_background)
+    }
+
+    fn deliver_cron_script_message(
+        &mut self,
+        task: &CronTaskRecord,
+        message: CronScriptMessage,
+    ) -> Result<bool> {
+        let mut started_background = false;
+        for target in message.targets {
+            match target {
+                CronScriptTarget::User => {
+                    self.send_delivery_from_text(message.text.clone())?;
+                }
+                CronScriptTarget::Foreground => {
+                    self.send_foreground_actor_message(message.text.clone())?;
+                }
+                CronScriptTarget::Background => {
+                    self.start_cron_background_agent(task, message.text.clone())?;
+                    started_background = true;
+                }
+            }
+        }
+        Ok(started_background)
+    }
+
+    fn disable_cron_script_task(
+        &mut self,
+        task: &CronTaskRecord,
+        reason: String,
+        stdout: &str,
+        stderr: &str,
+    ) -> Result<()> {
+        let _ = self.cron_manager.disable_task(
+            &self.state.conversation_id,
+            &task.id,
+            reason.clone(),
+        )?;
+        self.logger.warn(
+            "cron_script_disabled_task",
+            json!({
+                "task_id": task.id,
+                "conversation_id": self.state.conversation_id,
+                "reason": reason.clone(),
+                "stdout_bytes": stdout.len(),
+                "stderr_bytes": stderr.len(),
+            }),
+        );
+        let notice = format!(
+            "Cron task `{}` has been disabled because its script failed: {}{}{}",
+            task.id,
+            reason,
+            format_script_output_section("stdout", stdout),
+            format_script_output_section("stderr", stderr),
+        );
+        self.send_delivery_from_text(notice.clone())?;
+        self.send_foreground_actor_message(notice)?;
+        Ok(())
+    }
+
+    fn send_foreground_actor_message(&self, text: String) -> Result<()> {
+        self.foreground_client()?
+            .send_session_request(&SessionRequest::EnqueueActorMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem { text })],
+                ),
+            })
+            .map_err(anyhow::Error::msg)
     }
 
     fn render_model_selection(&self) -> String {
@@ -2378,800 +2442,11 @@ fn effective_sandbox_config<'a>(
     conversation_sandbox.unwrap_or(default_sandbox)
 }
 
-fn run_checker_command(
-    task: &CronTaskRecord,
-    command: &str,
-    conversation_root: &Path,
-    workspace_root: &Path,
-    sandbox: &SandboxConfig,
-) -> Result<CronCheckerResult> {
-    let checker_cwd = resolve_checker_cwd(workspace_root, task.checker_cwd.as_deref())?;
-    let checker_script = checker_script(command, workspace_root, &checker_cwd);
-    let timeout = task
-        .checker_timeout_seconds
-        .map(Duration::from_secs_f64)
-        .unwrap_or(DEFAULT_CRON_CHECKER_TIMEOUT);
-    let output_root = conversation_root
-        .join(".log")
-        .join("stellaclaw")
-        .join("cron_checker")
-        .join(&task.id)
-        .join(format!(
-            "{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis()
-        ));
-    fs::create_dir_all(&output_root)
-        .with_context(|| format!("failed to create {}", output_root.display()))?;
-    let stdout_path = output_root.join("stdout");
-    let stderr_path = output_root.join("stderr");
-    let stdout = fs::File::create(&stdout_path)
-        .with_context(|| format!("failed to create {}", stdout_path.display()))?;
-    let stderr = fs::File::create(&stderr_path)
-        .with_context(|| format!("failed to create {}", stderr_path.display()))?;
-    let mut child =
-        build_workspace_shell_command(sandbox, workspace_root, conversation_root, &checker_script)
-            .context("failed to build cron checker command")?
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(stdout))
-            .stderr(Stdio::from(stderr))
-            .spawn()
-            .with_context(|| format!("failed to spawn cron checker for {}", task.id))?;
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .with_context(|| format!("failed to wait for cron checker {}", task.id))?
-        {
-            break status;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(anyhow!(
-                "cron checker {} timed out after {:.1}s",
-                task.id,
-                timeout.as_secs_f64()
-            ));
-        }
-        thread::sleep(Duration::from_millis(50));
-    };
-
-    Ok(CronCheckerResult {
-        exit_code: status.code(),
-        stdout: fs::read_to_string(&stdout_path).unwrap_or_default(),
-        stderr: fs::read_to_string(&stderr_path).unwrap_or_default(),
-    })
-}
-
-fn resolve_checker_cwd(workspace_root: &Path, checker_cwd: Option<&str>) -> Result<PathBuf> {
-    let Some(raw) = checker_cwd.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(workspace_root.to_path_buf());
-    };
-    let path = Path::new(raw);
-    if path.is_absolute() {
-        return Err(anyhow!(
-            "checker_cwd must be relative to the conversation workspace"
-        ));
-    }
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(value) => normalized.push(value),
-            Component::ParentDir => return Err(anyhow!("checker_cwd must not contain '..'")),
-            Component::RootDir | Component::Prefix(_) => {
-                return Err(anyhow!(
-                    "checker_cwd must be relative to the conversation workspace"
-                ))
-            }
-        }
-    }
-    let path = workspace_root.join(normalized);
-    if !path.is_dir() {
-        return Err(anyhow!("checker_cwd does not exist or is not a directory"));
-    }
-    Ok(path)
-}
-
-fn checker_script(command: &str, workspace_root: &Path, checker_cwd: &Path) -> String {
-    if checker_cwd == workspace_root {
-        return command.to_string();
-    }
-    format!("cd {} && {}", shell_quote_path(checker_cwd), command)
-}
-
-fn shell_quote_path(path: &Path) -> String {
-    let value = path.to_string_lossy();
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn append_checker_stdout(task: &str, stdout: &str) -> String {
-    let stdout = truncate_checker_stdout(stdout.trim());
-    if stdout.is_empty() {
-        return task.to_string();
-    }
-    format!("{task}\n\nCron checker stdout:\n{stdout}")
-}
-
-fn truncate_checker_stdout(stdout: &str) -> String {
-    let mut output = String::new();
-    for (index, ch) in stdout.chars().enumerate() {
-        if index >= MAX_CRON_CHECKER_STDOUT_CHARS {
-            output.push_str("\n[cron checker stdout truncated]");
-            return output;
-        }
-        output.push(ch);
-    }
-    output
-}
-
 fn sandbox_mode_label(mode: &SandboxMode) -> &'static str {
     match mode {
         SandboxMode::Subprocess => "subprocess",
         SandboxMode::Bubblewrap => "bubblewrap",
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum SkillPersistMode {
-    Create,
-    Update,
-    Delete,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct SkillSyncPushResult {
-    configured: bool,
-    committed: bool,
-    pushes: Vec<SkillSyncPushTargetResult>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct SkillSyncPushTargetResult {
-    upstream: String,
-    branch: String,
-    pushed: bool,
-    committed: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    warning: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub(crate) struct StartupSkillSyncResult {
-    skill_name: String,
-    found: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    push: Option<SkillSyncPushResult>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    warning: Option<String>,
-}
-
-pub(crate) fn push_configured_skill_sync_on_startup(
-    skill_sync: &[SkillSyncConfig],
-    workdir: &Path,
-    logger: &StellaclawLogger,
-) -> Vec<StartupSkillSyncResult> {
-    let mut skill_names = Vec::new();
-    for entry in skill_sync {
-        for skill_name in &entry.skill_name {
-            if !skill_names.contains(skill_name) {
-                skill_names.push(skill_name.clone());
-            }
-        }
-    }
-    if skill_names.is_empty() {
-        return Vec::new();
-    }
-
-    let runtime_skill_root = workdir.join("rundir").join(".skill");
-    let mut results = Vec::new();
-    for skill_name in skill_names {
-        let skill_path = runtime_skill_root.join(&skill_name);
-        if !skill_path.exists() {
-            let warning = format!("runtime skill {} does not exist", skill_path.display());
-            logger.warn(
-                "skill_sync_startup_skill_missing",
-                json!({
-                    "skill_name": skill_name,
-                    "skill_path": skill_path.display().to_string(),
-                    "warning": warning,
-                }),
-            );
-            results.push(StartupSkillSyncResult {
-                skill_name,
-                found: false,
-                push: None,
-                warning: Some(warning),
-            });
-            continue;
-        }
-
-        let push = push_skill_sync_if_configured(skill_sync, &skill_name, &skill_path, logger);
-        logger.info(
-            "skill_sync_startup_skill_pushed",
-            json!({
-                "skill_name": skill_name,
-                "push": &push,
-            }),
-        );
-        results.push(StartupSkillSyncResult {
-            skill_name,
-            found: true,
-            push: Some(push),
-            warning: None,
-        });
-    }
-    results
-}
-
-fn push_skill_sync_if_configured(
-    skill_sync: &[SkillSyncConfig],
-    skill_name: &str,
-    skill_path: &Path,
-    logger: &StellaclawLogger,
-) -> SkillSyncPushResult {
-    let upstreams = configured_skill_sync_upstreams(skill_sync, skill_name);
-    if upstreams.is_empty() {
-        return SkillSyncPushResult {
-            configured: false,
-            committed: false,
-            pushes: Vec::new(),
-        };
-    }
-
-    let branch = "main";
-    let mut pushes = Vec::new();
-
-    for upstream in upstreams {
-        let push_result = sync_skill_to_upstream_repo(skill_name, skill_path, &upstream, branch);
-        let committed = push_result.as_ref().copied().unwrap_or(false);
-        let warning = push_result.err().map(|error| error.to_string());
-        let pushed = warning.is_none();
-        if let Some(warning) = warning.as_deref() {
-            logger.warn(
-                "skill_sync_push_failed",
-                json!({
-                    "skill_name": skill_name,
-                    "upstream": upstream,
-                    "branch": branch,
-                    "warning": warning,
-                }),
-            );
-        }
-        pushes.push(SkillSyncPushTargetResult {
-            upstream,
-            branch: branch.to_string(),
-            pushed,
-            committed,
-            warning,
-        });
-    }
-
-    SkillSyncPushResult {
-        configured: true,
-        committed: pushes.iter().any(|push| push.committed),
-        pushes,
-    }
-}
-
-fn configured_skill_sync_upstreams(
-    skill_sync: &[SkillSyncConfig],
-    skill_name: &str,
-) -> Vec<String> {
-    let mut upstreams = Vec::new();
-    for entry in skill_sync {
-        if entry.skill_name.iter().any(|name| name == skill_name) {
-            for upstream in &entry.upstream {
-                if !upstreams.contains(upstream) {
-                    upstreams.push(upstream.clone());
-                }
-            }
-        }
-    }
-    upstreams
-}
-
-fn sync_skill_to_upstream_repo(
-    skill_name: &str,
-    skill_path: &Path,
-    upstream: &str,
-    branch: &str,
-) -> Result<bool> {
-    validate_git_branch_name(branch)?;
-    validate_skill_directory(skill_path, skill_name)?;
-
-    let sync_root = std::env::temp_dir().join(format!(
-        "stellaclaw-skill-sync-{}-{}-{}",
-        std::process::id(),
-        safe_temp_path_component(skill_name),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    let repo_path = sync_root.join("repo");
-    let result = (|| {
-        fs::create_dir_all(&repo_path)
-            .with_context(|| format!("failed to create {}", repo_path.display()))?;
-        run_git(&repo_path, ["init"])?;
-        ensure_git_identity(&repo_path)?;
-        run_git(&repo_path, ["remote", "add", "origin", upstream])?;
-        match run_git_with_timeout(
-            &repo_path,
-            ["fetch", "--depth=1", "origin", branch],
-            Duration::from_secs(4),
-        ) {
-            Ok(()) => run_git(&repo_path, ["checkout", "-B", branch, "FETCH_HEAD"])?,
-            Err(error) => {
-                run_git(&repo_path, ["checkout", "--orphan", branch])?;
-                if repo_path.join("SKILL.md").exists() {
-                    return Err(error)
-                        .context("upstream fetch failed after creating empty fallback branch");
-                }
-            }
-        }
-
-        remove_legacy_root_skill_payload_if_present(&repo_path, skill_name)?;
-        copy_skill_payload_to_repo_subdir(skill_path, &repo_path.join(skill_name))?;
-        run_git(&repo_path, ["add", "-A"])?;
-
-        let committed = git_has_staged_changes(&repo_path)?;
-        if committed {
-            run_git(
-                &repo_path,
-                ["commit", "-m", &format!("Update skill {skill_name}")],
-            )?;
-        }
-        run_git_push_with_timeout(&repo_path, upstream, branch, Duration::from_secs(4))?;
-        Ok(committed)
-    })();
-    let cleanup = fs::remove_dir_all(&sync_root);
-    if let Err(error) = cleanup {
-        if result.is_ok() {
-            return Err(error).with_context(|| format!("failed to remove {}", sync_root.display()));
-        }
-    }
-    result
-}
-
-fn safe_temp_path_component(value: &str) -> String {
-    value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn remove_legacy_root_skill_payload_if_present(repo_path: &Path, skill_name: &str) -> Result<()> {
-    let root_skill = repo_path.join("SKILL.md");
-    if !root_skill.is_file() {
-        return Ok(());
-    }
-    let content = fs::read_to_string(&root_skill)
-        .with_context(|| format!("failed to read {}", root_skill.display()))?;
-    let Some(frontmatter) = extract_yaml_frontmatter(&content) else {
-        return Ok(());
-    };
-    if frontmatter_scalar(frontmatter, "name").as_deref() != Some(skill_name) {
-        return Ok(());
-    }
-
-    for entry in fs::read_dir(repo_path)
-        .with_context(|| format!("failed to read {}", repo_path.display()))?
-    {
-        let entry =
-            entry.with_context(|| format!("failed to enumerate {}", repo_path.display()))?;
-        let name = entry.file_name();
-        if name == ".git" || name == skill_name {
-            continue;
-        }
-        let path = entry.path();
-        if entry
-            .file_type()
-            .with_context(|| format!("failed to inspect {}", path.display()))?
-            .is_dir()
-        {
-            continue;
-        } else {
-            fs::remove_file(&path)
-                .with_context(|| format!("failed to remove {}", path.display()))?;
-        }
-    }
-    Ok(())
-}
-
-fn ensure_git_identity(skill_path: &Path) -> Result<()> {
-    if !git_config_has_value(skill_path, "user.name")? {
-        run_git(skill_path, ["config", "user.name", "Stellaclaw"])?;
-    }
-    if !git_config_has_value(skill_path, "user.email")? {
-        run_git(skill_path, ["config", "user.email", "stellaclaw@localhost"])?;
-    }
-    Ok(())
-}
-
-fn git_config_has_value(skill_path: &Path, key: &str) -> Result<bool> {
-    let output = Command::new("git")
-        .args(["config", "--get", key])
-        .current_dir(skill_path)
-        .output()
-        .with_context(|| format!("failed to run git config --get {key}"))?;
-    Ok(output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty())
-}
-
-fn git_has_staged_changes(skill_path: &Path) -> Result<bool> {
-    let output = Command::new("git")
-        .args(["diff", "--cached", "--quiet"])
-        .current_dir(skill_path)
-        .output()
-        .context("failed to run git diff --cached --quiet")?;
-    match output.status.code() {
-        Some(0) => Ok(false),
-        Some(1) => Ok(true),
-        _ => Err(anyhow!(
-            "git diff --cached --quiet failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )),
-    }
-}
-
-fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<()> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .with_context(|| format!("failed to run git in {}", cwd.display()))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    Err(anyhow!(
-        "git command failed in {}: {}\n{}",
-        cwd.display(),
-        String::from_utf8_lossy(&output.stdout).trim(),
-        String::from_utf8_lossy(&output.stderr).trim()
-    ))
-}
-
-fn run_git_push_with_timeout(
-    cwd: &Path,
-    upstream: &str,
-    branch: &str,
-    timeout: Duration,
-) -> Result<()> {
-    let refspec = format!("HEAD:{branch}");
-    run_git_with_timeout(cwd, ["push", upstream, refspec.as_str()], timeout)
-}
-
-fn run_git_with_timeout<const N: usize>(
-    cwd: &Path,
-    args: [&str; N],
-    timeout: Duration,
-) -> Result<()> {
-    let mut child = Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to run git in {}", cwd.display()))?;
-    let started = Instant::now();
-    loop {
-        if child
-            .try_wait()
-            .with_context(|| format!("failed to wait for git in {}", cwd.display()))?
-            .is_some()
-        {
-            let output = child
-                .wait_with_output()
-                .with_context(|| format!("failed to read git output in {}", cwd.display()))?;
-            if output.status.success() {
-                return Ok(());
-            }
-            return Err(anyhow!(
-                "git command failed in {}: {}\n{}",
-                cwd.display(),
-                String::from_utf8_lossy(&output.stdout).trim(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(anyhow!("git push timed out after {}s", timeout.as_secs()));
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-}
-
-fn validate_git_branch_name(branch: &str) -> Result<()> {
-    let trimmed = branch.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("branch must not be empty"));
-    }
-    if trimmed != branch {
-        return Err(anyhow!(
-            "branch must not contain leading or trailing whitespace"
-        ));
-    }
-    if branch.starts_with('-')
-        || branch.starts_with('/')
-        || branch.ends_with('/')
-        || branch.ends_with(".lock")
-        || branch.contains("..")
-        || branch.contains("//")
-        || branch.contains('@')
-        || branch
-            .chars()
-            .any(|ch| ch.is_whitespace() || matches!(ch, '~' | '^' | ':' | '?' | '*' | '[' | '\\'))
-    {
-        return Err(anyhow!("branch is not a safe git branch name"));
-    }
-    Ok(())
-}
-
-fn validate_skill_name(skill_name: &str) -> Result<()> {
-    let name = skill_name.trim();
-    if name.is_empty() {
-        return Err(anyhow!("skill_name must not be empty"));
-    }
-    if name != skill_name {
-        return Err(anyhow!(
-            "skill_name must not contain leading or trailing whitespace"
-        ));
-    }
-    if !name
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
-    {
-        return Err(anyhow!(
-            "skill_name may only contain ASCII letters, digits, '_' and '-'"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_skill_directory(skill_path: &Path, skill_name: &str) -> Result<()> {
-    if !skill_path.is_dir() {
-        return Err(anyhow!(
-            "staged skill directory {} does not exist",
-            skill_path.display()
-        ));
-    }
-    let entry_path = skill_path.join("SKILL.md");
-    let content = fs::read_to_string(&entry_path)
-        .with_context(|| format!("failed to read {}", entry_path.display()))?;
-    let frontmatter = extract_yaml_frontmatter(&content)
-        .ok_or_else(|| anyhow!("{} must start with YAML frontmatter", entry_path.display()))?;
-    let name = frontmatter_scalar(frontmatter, "name")
-        .ok_or_else(|| anyhow!("{} frontmatter must contain name", entry_path.display()))?;
-    if name != skill_name {
-        return Err(anyhow!(
-            "{} frontmatter name `{}` does not match folder `{}`",
-            entry_path.display(),
-            name,
-            skill_name
-        ));
-    }
-    let description = frontmatter_scalar(frontmatter, "description").ok_or_else(|| {
-        anyhow!(
-            "{} frontmatter must contain description",
-            entry_path.display()
-        )
-    })?;
-    if description.trim().is_empty() {
-        return Err(anyhow!(
-            "{} frontmatter description must not be empty",
-            entry_path.display()
-        ));
-    }
-    Ok(())
-}
-
-fn extract_yaml_frontmatter(content: &str) -> Option<&str> {
-    let mut lines = content.lines();
-    if lines.next()? != "---" {
-        return None;
-    }
-    let body_start = 4;
-    let end = content[body_start..].find("\n---")?;
-    Some(&content[body_start..body_start + end])
-}
-
-fn frontmatter_scalar(frontmatter: &str, key: &str) -> Option<String> {
-    let prefix = format!("{key}:");
-    let lines: Vec<&str> = frontmatter.lines().collect();
-    let mut index = 0usize;
-    while index < lines.len() {
-        let line = lines[index].trim();
-        let Some(value) = line.strip_prefix(&prefix) else {
-            index += 1;
-            continue;
-        };
-        let value = value.trim();
-        if value.is_empty() {
-            return None;
-        }
-        if value == "|" || value == ">" || value.starts_with("|-") || value.starts_with(">-") {
-            let folded = value.starts_with('>');
-            let mut block = Vec::new();
-            for next in lines.iter().skip(index + 1) {
-                if !next.trim().is_empty() && !next.starts_with(char::is_whitespace) {
-                    break;
-                }
-                let trimmed = next.trim();
-                if !trimmed.is_empty() {
-                    block.push(trimmed);
-                }
-            }
-            let joined = if folded {
-                block.join(" ")
-            } else {
-                block.join("\n")
-            };
-            let joined = joined.trim().to_string();
-            return (!joined.is_empty()).then_some(joined);
-        }
-        return Some(unquote_yaml_scalar(value));
-    }
-    None
-}
-
-fn unquote_yaml_scalar(value: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.len() >= 2 {
-        let bytes = trimmed.as_bytes();
-        if (bytes[0] == b'"' && bytes[trimmed.len() - 1] == b'"')
-            || (bytes[0] == b'\'' && bytes[trimmed.len() - 1] == b'\'')
-        {
-            return trimmed[1..trimmed.len() - 1].trim().to_string();
-        }
-    }
-    trimmed.to_string()
-}
-
-fn copy_skill_atomically(source: &Path, destination: &Path) -> Result<()> {
-    let parent = destination
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent", destination.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let tmp = destination.with_extension("tmp-skill-copy");
-    if tmp.exists() {
-        fs::remove_dir_all(&tmp).with_context(|| format!("failed to remove {}", tmp.display()))?;
-    }
-    copy_directory_recursive_local(source, &tmp)?;
-    if destination.exists() {
-        fs::remove_dir_all(destination)
-            .with_context(|| format!("failed to remove {}", destination.display()))?;
-    }
-    fs::rename(&tmp, destination).with_context(|| {
-        format!(
-            "failed to rename {} to {}",
-            tmp.display(),
-            destination.display()
-        )
-    })
-}
-
-fn copy_skill_payload_to_repo_subdir(source: &Path, destination: &Path) -> Result<()> {
-    let parent = destination
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no parent", destination.display()))?;
-    fs::create_dir_all(parent).with_context(|| format!("failed to create {}", parent.display()))?;
-    let tmp = destination.with_extension("tmp-skill-sync");
-    if tmp.exists() {
-        fs::remove_dir_all(&tmp).with_context(|| format!("failed to remove {}", tmp.display()))?;
-    }
-    copy_directory_recursive_local_excluding(source, &tmp, &[".git"])?;
-    if destination.exists() {
-        fs::remove_dir_all(destination)
-            .with_context(|| format!("failed to remove {}", destination.display()))?;
-    }
-    fs::rename(&tmp, destination).with_context(|| {
-        format!(
-            "failed to rename {} to {}",
-            tmp.display(),
-            destination.display()
-        )
-    })
-}
-
-fn sync_skill_to_conversation_workspaces(
-    workdir: &Path,
-    skill_name: &str,
-    source: Option<&Path>,
-) -> Result<usize> {
-    let conversations_root = workdir.join("conversations");
-    if !conversations_root.is_dir() {
-        return Ok(0);
-    }
-    let mut synced = 0usize;
-    for entry in fs::read_dir(&conversations_root)
-        .with_context(|| format!("failed to read {}", conversations_root.display()))?
-    {
-        let entry = entry
-            .with_context(|| format!("failed to enumerate {}", conversations_root.display()))?;
-        if !entry
-            .file_type()
-            .with_context(|| format!("failed to inspect {}", entry.path().display()))?
-            .is_dir()
-        {
-            continue;
-        }
-        let skill_root = entry.path().join(".skill");
-        if !skill_root.is_dir() {
-            continue;
-        }
-        let destination = skill_root.join(skill_name);
-        match source {
-            Some(source) => {
-                copy_skill_atomically(source, &destination)?;
-                synced += 1;
-            }
-            None => {
-                if destination.exists() {
-                    fs::remove_dir_all(&destination)
-                        .with_context(|| format!("failed to remove {}", destination.display()))?;
-                    synced += 1;
-                }
-            }
-        }
-    }
-    Ok(synced)
-}
-
-fn copy_directory_recursive_local(source: &Path, destination: &Path) -> Result<()> {
-    copy_directory_recursive_local_excluding(source, destination, &[])
-}
-
-fn copy_directory_recursive_local_excluding(
-    source: &Path,
-    destination: &Path,
-    excluded_names: &[&str],
-) -> Result<()> {
-    fs::create_dir_all(destination)
-        .with_context(|| format!("failed to create {}", destination.display()))?;
-    for entry in
-        fs::read_dir(source).with_context(|| format!("failed to read {}", source.display()))?
-    {
-        let entry = entry.with_context(|| format!("failed to enumerate {}", source.display()))?;
-        if excluded_names
-            .iter()
-            .any(|excluded| entry.file_name() == *excluded)
-        {
-            continue;
-        }
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
-        if entry
-            .file_type()
-            .with_context(|| format!("failed to inspect {}", source_path.display()))?
-            .is_dir()
-        {
-            copy_directory_recursive_local_excluding(
-                &source_path,
-                &destination_path,
-                excluded_names,
-            )?;
-        } else {
-            fs::copy(&source_path, &destination_path).with_context(|| {
-                format!(
-                    "failed to copy {} to {}",
-                    source_path.display(),
-                    destination_path.display()
-                )
-            })?;
-        }
-    }
-    Ok(())
 }
 
 fn bridge_result(request: &ConversationBridgeRequest, text: String) -> ToolResultItem {
@@ -3185,656 +2460,31 @@ fn bridge_result(request: &ConversationBridgeRequest, text: String) -> ToolResul
     }
 }
 
+fn format_script_output_section(label: &str, value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return String::new();
+    }
+    format!("\n\n{label}:\n{}", truncate_text_for_notice(value, 2_000))
+}
+
+fn truncate_text_for_notice(value: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for (index, ch) in value.chars().enumerate() {
+        if index >= max_chars {
+            output.push_str("\n[truncated]");
+            return output;
+        }
+        output.push(ch);
+    }
+    output
+}
+
 fn format_session_error(error: &str, detail: &SessionErrorDetail) -> String {
     let summary = detail.summary();
     if error == summary || error.contains(&summary) {
         error.to_string()
     } else {
         format!("{summary}\n{error}")
-    }
-}
-
-fn extract_attachment_references(
-    text: &str,
-    workspace_root: &Path,
-    shared_root: &Path,
-) -> Result<(String, Vec<OutgoingAttachment>)> {
-    const START: &str = "<attachment>";
-    const END: &str = "</attachment>";
-
-    let mut clean = String::with_capacity(text.len());
-    let mut attachments = Vec::new();
-    let mut cursor = 0usize;
-
-    while let Some(start_rel) = text[cursor..].find(START) {
-        let start = cursor + start_rel;
-        if is_inside_fenced_code_block(text, start) {
-            let start_end = start + START.len();
-            clean.push_str(&text[cursor..start_end]);
-            cursor = start_end;
-            continue;
-        }
-        clean.push_str(&text[cursor..start]);
-        let path_start = start + START.len();
-        let Some(end_rel) = text[path_start..].find(END) else {
-            clean.push_str(&text[start..]);
-            return Ok((clean.trim().to_string(), attachments));
-        };
-        let path_end = path_start + end_rel;
-        let path_text = text[path_start..path_end].trim();
-        if !path_text.is_empty() {
-            attachments.push(resolve_outgoing_attachment(
-                workspace_root,
-                shared_root,
-                path_text,
-            )?);
-        }
-        cursor = path_end + END.len();
-    }
-
-    clean.push_str(&text[cursor..]);
-    Ok((clean.trim().to_string(), attachments))
-}
-
-fn strip_attachment_tags(text: &str) -> String {
-    const START: &str = "<attachment>";
-    const END: &str = "</attachment>";
-
-    let mut clean = String::with_capacity(text.len());
-    let mut cursor = 0usize;
-    while let Some(start_rel) = text[cursor..].find(START) {
-        let start = cursor + start_rel;
-        if is_inside_fenced_code_block(text, start) {
-            let start_end = start + START.len();
-            clean.push_str(&text[cursor..start_end]);
-            cursor = start_end;
-            continue;
-        }
-        clean.push_str(&text[cursor..start]);
-        let path_start = start + START.len();
-        let Some(end_rel) = text[path_start..].find(END) else {
-            clean.push_str(&text[start..]);
-            return clean;
-        };
-        let path_end = path_start + end_rel;
-        let path_text = text[path_start..path_end].trim();
-        if !path_text.is_empty() {
-            clean.push_str(path_text);
-        }
-        cursor = path_end + END.len();
-    }
-    clean.push_str(&text[cursor..]);
-    clean
-}
-
-fn is_inside_fenced_code_block(text: &str, byte_index: usize) -> bool {
-    let mut inside = false;
-    let mut offset = 0usize;
-    for line in text.split_inclusive('\n') {
-        if offset >= byte_index {
-            break;
-        }
-        let trimmed = line.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            inside = !inside;
-        }
-        offset += line.len();
-    }
-    inside
-}
-
-fn is_shared_attachment_path(path_text: &str) -> bool {
-    path_text == "shared"
-        || path_text
-            .strip_prefix("shared/")
-            .is_some_and(|relative| !relative.trim().is_empty())
-        || path_text
-            .strip_prefix("shared\\")
-            .is_some_and(|relative| !relative.trim().is_empty())
-}
-
-fn resolve_outgoing_attachment(
-    workspace_root: &Path,
-    shared_root: &Path,
-    path_text: &str,
-) -> Result<OutgoingAttachment> {
-    let joined = workspace_root.join(path_text);
-    let canonical = joined
-        .canonicalize()
-        .with_context(|| format!("attachment path does not exist: {}", joined.display()))?;
-    let root = workspace_root
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize {}", workspace_root.display()))?;
-    let allowed_runtime_shared = is_shared_attachment_path(path_text);
-    let shared_root = shared_root.canonicalize().ok();
-    let in_runtime_shared = allowed_runtime_shared
-        && shared_root
-            .as_ref()
-            .is_some_and(|shared_root| canonical.starts_with(shared_root));
-    if !canonical.starts_with(&root) && !in_runtime_shared {
-        return Err(anyhow!(
-            "attachment path escapes conversation root: {}",
-            canonical.display()
-        ));
-    }
-    if !canonical.is_file() {
-        return Err(anyhow!(
-            "attachment path is not a regular file: {}",
-            canonical.display()
-        ));
-    }
-    Ok(OutgoingAttachment {
-        kind: infer_outgoing_attachment_kind(&canonical),
-        path: canonical,
-    })
-}
-
-fn infer_outgoing_attachment_kind(path: &Path) -> OutgoingAttachmentKind {
-    match path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or_default()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "png" | "jpg" | "jpeg" | "webp" => OutgoingAttachmentKind::Image,
-        "gif" => OutgoingAttachmentKind::Animation,
-        "mp3" | "wav" => OutgoingAttachmentKind::Audio,
-        "ogg" => OutgoingAttachmentKind::Voice,
-        "mp4" | "mov" | "mkv" => OutgoingAttachmentKind::Video,
-        _ => OutgoingAttachmentKind::Document,
-    }
-}
-
-pub fn render_chat_message(message: &ChatMessage) -> String {
-    let mut parts = Vec::new();
-    for item in &message.data {
-        match item {
-            ChatMessageItem::Context(context) => parts.push(context.text.clone()),
-            ChatMessageItem::File(file) => parts.push(render_file_item(file)),
-            ChatMessageItem::Reasoning(_) => {}
-            ChatMessageItem::ToolCall(ToolCallItem {
-                tool_name,
-                arguments,
-                ..
-            }) => parts.push(format!("[tool_call {tool_name}] {}", arguments.text)),
-            ChatMessageItem::ToolResult(tool_result) => {
-                let mut line = format!("[tool_result {}]", tool_result.tool_name);
-                if let Some(context) = &tool_result.result.context {
-                    line.push('\n');
-                    line.push_str(&context.text);
-                }
-                if let Some(file) = &tool_result.result.file {
-                    line.push('\n');
-                    line.push_str(&render_file_item(file));
-                }
-                parts.push(line);
-            }
-        }
-    }
-    if parts.is_empty() {
-        String::new()
-    } else {
-        parts.join("\n\n")
-    }
-}
-
-fn render_file_item(file: &FileItem) -> String {
-    match &file.name {
-        Some(name) => format!("[file] {name} ({})", file.uri),
-        None => format!("[file] {}", file.uri),
-    }
-}
-
-fn session_usage_totals(workspace_root: &Path, session_id: &str) -> UsageTotals {
-    let path = workspace_root
-        .join(".log")
-        .join("stellaclaw")
-        .join(sanitize_session_id_for_log_path(session_id))
-        .join("all_messages.jsonl");
-    let Ok(raw) = fs::read_to_string(path) else {
-        return UsageTotals::default();
-    };
-
-    let mut totals = UsageTotals::default();
-    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(message) = serde_json::from_str::<ChatMessage>(line) else {
-            continue;
-        };
-        if let Some(usage) = &message.token_usage {
-            totals.add_token_usage(usage);
-        }
-    }
-    totals
-}
-
-fn media_tool_usage_totals(workspace_root: &Path) -> UsageTotals {
-    let path = workspace_root
-        .join(".log")
-        .join("stellaclaw")
-        .join("tool_usage.jsonl");
-    let Ok(raw) = fs::read_to_string(path) else {
-        return UsageTotals::default();
-    };
-
-    let mut totals = UsageTotals::default();
-    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(token_usage) = value.get("token_usage") else {
-            continue;
-        };
-        let Ok(usage) = serde_json::from_value::<TokenUsage>(token_usage.clone()) else {
-            continue;
-        };
-        totals.add_token_usage(&usage);
-    }
-    totals
-}
-
-fn conversation_status_snapshot(
-    _workdir: &Path,
-    session_root: &Path,
-    workspace_root: &Path,
-    state: &ConversationState,
-    config: &StellaclawConfig,
-) -> Result<OutgoingStatus> {
-    let sandbox = effective_sandbox_config(state.sandbox.as_ref(), &config.sandbox);
-    let sandbox_source = if state.sandbox.is_some() {
-        "conversation"
-    } else {
-        "default"
-    };
-    let remote = match &state.tool_remote_mode {
-        ToolRemoteMode::Selectable => "selectable".to_string(),
-        ToolRemoteMode::FixedSsh { host, cwd } => {
-            format!("fixed ssh `{host}` `{}`", cwd.as_deref().unwrap_or(""))
-        }
-    };
-    let running_background = state
-        .session_binding
-        .background_sessions
-        .values()
-        .filter(|record| record.status == ManagedSessionStatus::Running)
-        .count();
-    let running_subagents = state
-        .session_binding
-        .subagent_sessions
-        .values()
-        .filter(|record| record.status == ManagedSessionStatus::Running)
-        .count();
-    let mut usage = ConversationUsageSummary::default();
-    usage.foreground.add_totals(&session_usage_totals(
-        session_root,
-        &state.session_binding.foreground_session_id,
-    ));
-    for record in state.session_binding.background_sessions.values() {
-        usage
-            .background
-            .add_totals(&session_usage_totals(session_root, &record.session_id));
-    }
-    for record in state.session_binding.subagent_sessions.values() {
-        usage
-            .subagents
-            .add_totals(&session_usage_totals(session_root, &record.session_id));
-    }
-    usage
-        .media_tools
-        .add_totals(&media_tool_usage_totals(workspace_root));
-
-    Ok(OutgoingStatus {
-        channel_id: state.channel_id.clone(),
-        platform_chat_id: state.platform_chat_id.clone(),
-        conversation_id: state.conversation_id.clone(),
-        model: state
-            .session_profile
-            .main_model
-            .display_name(&config.models),
-        reasoning: state
-            .reasoning_effort
-            .as_deref()
-            .unwrap_or("model default")
-            .to_string(),
-        sandbox: sandbox_mode_label(&sandbox.mode).to_string(),
-        sandbox_source: sandbox_source.to_string(),
-        remote,
-        workspace: workspace_root.display().to_string(),
-        running_background,
-        total_background: state.session_binding.background_sessions.len(),
-        running_subagents,
-        total_subagents: state.session_binding.subagent_sessions.len(),
-        usage: outgoing_usage_summary(&usage),
-    })
-}
-
-fn outgoing_usage_summary(summary: &ConversationUsageSummary) -> OutgoingUsageSummary {
-    OutgoingUsageSummary {
-        foreground: outgoing_usage_totals(&summary.foreground),
-        background: outgoing_usage_totals(&summary.background),
-        subagents: outgoing_usage_totals(&summary.subagents),
-        media_tools: outgoing_usage_totals(&summary.media_tools),
-    }
-}
-
-fn outgoing_usage_totals(totals: &UsageTotals) -> OutgoingUsageTotals {
-    OutgoingUsageTotals {
-        cache_read: totals.cache_read,
-        cache_write: totals.cache_write,
-        uncache_input: totals.uncache_input,
-        output: totals.output,
-        cost: OutgoingUsageCost {
-            cache_read: totals.cost.cache_read,
-            cache_write: totals.cost.cache_write,
-            uncache_input: totals.cost.uncache_input,
-            output: totals.cost.output,
-        },
-    }
-}
-
-fn sanitize_session_id_for_log_path(session_id: &str) -> String {
-    let safe = session_id
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | '.' => ch,
-            _ => '_',
-        })
-        .collect::<String>();
-    if safe.trim_matches('_').is_empty() || safe == "." || safe == ".." {
-        "session".to_string()
-    } else {
-        safe
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn frontmatter_scalar_finds_description_after_name() {
-        let frontmatter = "name: web-report-deploy\ndescription: Deploy reports\n";
-
-        assert_eq!(
-            frontmatter_scalar(frontmatter, "description").as_deref(),
-            Some("Deploy reports")
-        );
-    }
-
-    #[test]
-    fn frontmatter_scalar_supports_quoted_and_folded_values() {
-        let quoted = "name: demo\ndescription: \"Deploy reports: safely\"\n";
-        assert_eq!(
-            frontmatter_scalar(quoted, "description").as_deref(),
-            Some("Deploy reports: safely")
-        );
-
-        let folded = "name: demo\ndescription: >\n  Deploy reports\n  safely\nnext: value\n";
-        assert_eq!(
-            frontmatter_scalar(folded, "description").as_deref(),
-            Some("Deploy reports safely")
-        );
-    }
-
-    #[test]
-    fn extract_attachment_references_ignores_tags_in_fenced_code() {
-        let text = "example:\n```text\n<attachment>shared/foo.pdf</attachment>\n```\ndone";
-        let root = Path::new("/tmp/stellaclaw-no-such-workspace");
-
-        let (clean, attachments) = extract_attachment_references(text, root, &root.join("shared"))
-            .expect("code-only tag should not resolve");
-
-        assert_eq!(clean, text);
-        assert!(attachments.is_empty());
-    }
-
-    #[test]
-    fn shared_attachment_path_accepts_unix_and_windows_separators() {
-        assert!(is_shared_attachment_path("shared"));
-        assert!(is_shared_attachment_path("shared/foo.pdf"));
-        assert!(is_shared_attachment_path("shared\\foo.pdf"));
-        assert!(!is_shared_attachment_path("shared/"));
-        assert!(!is_shared_attachment_path("shared\\"));
-        assert!(!is_shared_attachment_path("not-shared/foo.pdf"));
-    }
-
-    #[test]
-    fn render_chat_message_hides_reasoning_items() {
-        let message = ChatMessage::new(
-            ChatRole::Assistant,
-            vec![
-                ChatMessageItem::Reasoning(stellaclaw_core::session_actor::ReasoningItem::codex(
-                    None,
-                    Some("opaque".to_string()),
-                    None,
-                )),
-                ChatMessageItem::Context(ContextItem {
-                    text: "visible answer".to_string(),
-                }),
-            ],
-        );
-
-        assert_eq!(render_chat_message(&message), "visible answer");
-    }
-
-    #[test]
-    fn cron_checker_nonzero_output_can_be_appended_to_prompt() {
-        let root = std::env::temp_dir().join(format!(
-            "stellaclaw-cron-checker-{}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time should move forward")
-                .as_nanos()
-        ));
-        let conversation_root = root.join("conversation");
-        let workspace_root = root.join("workspace");
-        let checker_dir = workspace_root.join("checks");
-        fs::create_dir_all(&checker_dir).expect("checker dir should exist");
-        let task = CronTaskRecord {
-            id: "cron_test".to_string(),
-            conversation_id: "telegram-main-000001".to_string(),
-            channel_id: "telegram-main".to_string(),
-            platform_chat_id: "123".to_string(),
-            name: "checked".to_string(),
-            description: "checked task".to_string(),
-            schedule: "* * * * * *".to_string(),
-            timezone: "Asia/Shanghai".to_string(),
-            task: "handle calendar change".to_string(),
-            model: None,
-            checker_command: Some("printf changed && exit 7".to_string()),
-            checker_timeout_seconds: Some(2.0),
-            checker_cwd: Some("checks".to_string()),
-            enabled: true,
-            next_run_at: None,
-            last_run_at: None,
-            last_error: None,
-        };
-
-        let result = run_checker_command(
-            &task,
-            task.checker_command.as_deref().unwrap(),
-            &conversation_root,
-            &workspace_root,
-            &SandboxConfig::default(),
-        )
-        .expect("checker should run");
-
-        assert_eq!(result.exit_code, Some(7));
-        assert_eq!(result.stdout, "changed");
-        assert_eq!(
-            append_checker_stdout(&task.task, &result.stdout),
-            "handle calendar change\n\nCron checker stdout:\nchanged"
-        );
-        fs::remove_dir_all(&root).expect("temp root should be removed");
-    }
-
-    #[test]
-    fn cron_checker_cwd_rejects_parent_components() {
-        let workspace_root = Path::new("/tmp/stellaclaw-workspace");
-        assert!(resolve_checker_cwd(workspace_root, Some("../bad")).is_err());
-        assert!(resolve_checker_cwd(workspace_root, Some("/tmp")).is_err());
-    }
-
-    #[test]
-    fn configured_skill_sync_pushes_runtime_skill_to_git_repos() {
-        let root =
-            std::env::temp_dir().join(format!("stellaclaw-skill-sync-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("temp root should exist");
-        let bare_repo_a = root.join("upstream-a.git");
-        let bare_repo_b = root.join("upstream-b.git");
-        for bare_repo in [&bare_repo_a, &bare_repo_b] {
-            let init = Command::new("git")
-                .args(["init", "--bare"])
-                .arg(bare_repo)
-                .output()
-                .expect("git init --bare should run");
-            assert!(
-                init.status.success(),
-                "{}",
-                String::from_utf8_lossy(&init.stderr)
-            );
-        }
-
-        let skill_path = root.join("rundir").join(".skill").join("demo");
-        fs::create_dir_all(&skill_path).expect("skill path should exist");
-        fs::write(
-            skill_path.join("SKILL.md"),
-            "---\nname: demo\ndescription: Demo skill\n---\nbody\n",
-        )
-        .expect("skill should be written");
-        let logger = StellaclawLogger::open_under(&root, "test.log").expect("logger should open");
-        let sync = vec![SkillSyncConfig {
-            skill_name: vec!["demo".to_string()],
-            upstream: vec![
-                bare_repo_a.to_string_lossy().to_string(),
-                bare_repo_b.to_string_lossy().to_string(),
-            ],
-        }];
-
-        let result = push_skill_sync_if_configured(&sync, "demo", &skill_path, &logger);
-
-        assert!(result.configured);
-        assert!(result.committed);
-        assert_eq!(result.pushes.len(), 2);
-        assert!(result.pushes.iter().all(|push| push.pushed));
-        for bare_repo in [&bare_repo_a, &bare_repo_b] {
-            assert_git_path_exists(bare_repo, "main:demo/SKILL.md");
-            assert_git_path_missing(bare_repo, "main:SKILL.md");
-        }
-        fs::remove_dir_all(&root).expect("temp root should be removed");
-    }
-
-    #[test]
-    fn startup_skill_sync_pushes_configured_runtime_skills() {
-        let root = std::env::temp_dir().join(format!(
-            "stellaclaw-startup-skill-sync-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).expect("temp root should exist");
-        let bare_repo = root.join("upstream.git");
-        let init = Command::new("git")
-            .args(["init", "--bare"])
-            .arg(&bare_repo)
-            .output()
-            .expect("git init --bare should run");
-        assert!(
-            init.status.success(),
-            "{}",
-            String::from_utf8_lossy(&init.stderr)
-        );
-
-        let skill_path = root.join("rundir").join(".skill").join("demo");
-        fs::create_dir_all(&skill_path).expect("skill path should exist");
-        fs::write(
-            skill_path.join("SKILL.md"),
-            "---\nname: demo\ndescription: Demo skill\n---\nbody\n",
-        )
-        .expect("skill should be written");
-        let other_skill_path = root.join("rundir").join(".skill").join("other");
-        fs::create_dir_all(&other_skill_path).expect("other skill path should exist");
-        fs::write(
-            other_skill_path.join("SKILL.md"),
-            "---\nname: other\ndescription: Other skill\n---\nbody\n",
-        )
-        .expect("other skill should be written");
-        let logger = StellaclawLogger::open_under(&root, "test.log").expect("logger should open");
-        let sync = vec![SkillSyncConfig {
-            skill_name: vec![
-                "demo".to_string(),
-                "other".to_string(),
-                "missing".to_string(),
-            ],
-            upstream: vec![bare_repo.to_string_lossy().to_string()],
-        }];
-
-        let result = push_configured_skill_sync_on_startup(&sync, &root, &logger);
-
-        assert_eq!(result.len(), 3);
-        let demo = result
-            .iter()
-            .find(|entry| entry.skill_name == "demo")
-            .expect("demo result should exist");
-        assert!(demo.found);
-        assert!(demo.push.as_ref().unwrap().committed);
-        assert!(demo
-            .push
-            .as_ref()
-            .unwrap()
-            .pushes
-            .iter()
-            .all(|push| push.pushed));
-        let other = result
-            .iter()
-            .find(|entry| entry.skill_name == "other")
-            .expect("other result should exist");
-        assert!(other.found);
-        assert!(other.push.as_ref().unwrap().committed);
-        assert!(other
-            .push
-            .as_ref()
-            .unwrap()
-            .pushes
-            .iter()
-            .all(|push| push.pushed));
-        let missing = result
-            .iter()
-            .find(|entry| entry.skill_name == "missing")
-            .expect("missing result should exist");
-        assert!(!missing.found);
-        assert!(missing.warning.is_some());
-
-        assert_git_path_exists(&bare_repo, "main:demo/SKILL.md");
-        assert_git_path_exists(&bare_repo, "main:other/SKILL.md");
-        assert_git_path_missing(&bare_repo, "main:SKILL.md");
-        fs::remove_dir_all(&root).expect("temp root should be removed");
-    }
-
-    fn assert_git_path_exists(bare_repo: &Path, pathspec: &str) {
-        let output = Command::new("git")
-            .args(["--git-dir"])
-            .arg(bare_repo)
-            .args(["show", pathspec])
-            .output()
-            .expect("git show should run");
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    fn assert_git_path_missing(bare_repo: &Path, pathspec: &str) {
-        let output = Command::new("git")
-            .args(["--git-dir"])
-            .arg(bare_repo)
-            .args(["show", pathspec])
-            .output()
-            .expect("git show should run");
-        assert!(
-            !output.status.success(),
-            "expected {pathspec} to be absent, but git show succeeded"
-        );
     }
 }

@@ -1,0 +1,269 @@
+use std::path::Path;
+
+use anyhow::{anyhow, Context, Result};
+use stellaclaw_core::session_actor::{ChatMessage, ChatMessageItem, FileItem, ToolCallItem};
+
+use crate::channels::types::{OutgoingAttachment, OutgoingAttachmentKind};
+
+pub(super) fn extract_attachment_references(
+    text: &str,
+    workspace_root: &Path,
+    shared_root: &Path,
+) -> Result<(String, Vec<OutgoingAttachment>)> {
+    const START: &str = "<attachment>";
+    const END: &str = "</attachment>";
+
+    let mut clean = String::with_capacity(text.len());
+    let mut attachments = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(start_rel) = text[cursor..].find(START) {
+        let start = cursor + start_rel;
+        if is_inside_fenced_code_block(text, start) {
+            let start_end = start + START.len();
+            clean.push_str(&text[cursor..start_end]);
+            cursor = start_end;
+            continue;
+        }
+        clean.push_str(&text[cursor..start]);
+        let path_start = start + START.len();
+        let Some(end_rel) = text[path_start..].find(END) else {
+            clean.push_str(&text[start..]);
+            return Ok((clean.trim().to_string(), attachments));
+        };
+        let path_end = path_start + end_rel;
+        let path_text = text[path_start..path_end].trim();
+        if !path_text.is_empty() {
+            attachments.push(resolve_outgoing_attachment(
+                workspace_root,
+                shared_root,
+                path_text,
+            )?);
+        }
+        cursor = path_end + END.len();
+    }
+
+    clean.push_str(&text[cursor..]);
+    Ok((clean.trim().to_string(), attachments))
+}
+
+pub(super) fn strip_attachment_tags(text: &str) -> String {
+    const START: &str = "<attachment>";
+    const END: &str = "</attachment>";
+
+    let mut clean = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while let Some(start_rel) = text[cursor..].find(START) {
+        let start = cursor + start_rel;
+        if is_inside_fenced_code_block(text, start) {
+            let start_end = start + START.len();
+            clean.push_str(&text[cursor..start_end]);
+            cursor = start_end;
+            continue;
+        }
+        clean.push_str(&text[cursor..start]);
+        let path_start = start + START.len();
+        let Some(end_rel) = text[path_start..].find(END) else {
+            clean.push_str(&text[start..]);
+            return clean;
+        };
+        let path_end = path_start + end_rel;
+        let path_text = text[path_start..path_end].trim();
+        if !path_text.is_empty() {
+            clean.push_str(path_text);
+        }
+        cursor = path_end + END.len();
+    }
+    clean.push_str(&text[cursor..]);
+    clean
+}
+
+fn is_inside_fenced_code_block(text: &str, byte_index: usize) -> bool {
+    let mut inside = false;
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        if offset >= byte_index {
+            break;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            inside = !inside;
+        }
+        offset += line.len();
+    }
+    inside
+}
+
+fn is_shared_attachment_path(path_text: &str) -> bool {
+    path_text == "shared"
+        || path_text
+            .strip_prefix("shared/")
+            .is_some_and(|relative| !relative.trim().is_empty())
+        || path_text
+            .strip_prefix("shared\\")
+            .is_some_and(|relative| !relative.trim().is_empty())
+}
+
+fn resolve_outgoing_attachment(
+    workspace_root: &Path,
+    shared_root: &Path,
+    path_text: &str,
+) -> Result<OutgoingAttachment> {
+    let joined = workspace_root.join(path_text);
+    let canonical = joined
+        .canonicalize()
+        .with_context(|| format!("attachment path does not exist: {}", joined.display()))?;
+    let root = workspace_root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", workspace_root.display()))?;
+    let allowed_runtime_shared = is_shared_attachment_path(path_text);
+    let shared_root = shared_root.canonicalize().ok();
+    let in_runtime_shared = allowed_runtime_shared
+        && shared_root
+            .as_ref()
+            .is_some_and(|shared_root| canonical.starts_with(shared_root));
+    if !canonical.starts_with(&root) && !in_runtime_shared {
+        return Err(anyhow!(
+            "attachment path escapes conversation root: {}",
+            canonical.display()
+        ));
+    }
+    if !canonical.is_file() {
+        return Err(anyhow!(
+            "attachment path is not a regular file: {}",
+            canonical.display()
+        ));
+    }
+    Ok(OutgoingAttachment {
+        kind: infer_outgoing_attachment_kind(&canonical),
+        path: canonical,
+    })
+}
+
+fn infer_outgoing_attachment_kind(path: &Path) -> OutgoingAttachmentKind {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" | "jpg" | "jpeg" | "webp" => OutgoingAttachmentKind::Image,
+        "gif" => OutgoingAttachmentKind::Animation,
+        "mp3" | "wav" => OutgoingAttachmentKind::Audio,
+        "ogg" => OutgoingAttachmentKind::Voice,
+        "mp4" | "mov" | "mkv" => OutgoingAttachmentKind::Video,
+        _ => OutgoingAttachmentKind::Document,
+    }
+}
+
+pub fn render_chat_message(message: &ChatMessage) -> String {
+    let mut parts = Vec::new();
+    for item in &message.data {
+        match item {
+            ChatMessageItem::Context(context) => parts.push(context.text.clone()),
+            ChatMessageItem::File(file) => parts.push(render_file_item(file)),
+            ChatMessageItem::Reasoning(_) => {}
+            ChatMessageItem::ToolCall(ToolCallItem {
+                tool_name,
+                arguments,
+                ..
+            }) => parts.push(format!("[tool_call {tool_name}] {}", arguments.text)),
+            ChatMessageItem::ToolResult(tool_result) => {
+                let mut line = format!("[tool_result {}]", tool_result.tool_name);
+                if let Some(context) = &tool_result.result.context {
+                    line.push('\n');
+                    line.push_str(&context.text);
+                }
+                if let Some(file) = &tool_result.result.file {
+                    line.push('\n');
+                    line.push_str(&render_file_item(file));
+                }
+                parts.push(line);
+            }
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        parts.join("\n\n")
+    }
+}
+
+fn render_file_item(file: &FileItem) -> String {
+    match &file.name {
+        Some(name) => format!("[file] {name} ({})", file.uri),
+        None => format!("[file] {}", file.uri),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use stellaclaw_core::session_actor::{ChatRole, ContextItem, ReasoningItem};
+
+    #[test]
+    fn extract_attachment_references_ignores_tags_in_fenced_code() {
+        let text = "example:\n```text\n<attachment>shared/foo.pdf</attachment>\n```\ndone";
+        let root = Path::new("/tmp/stellaclaw-no-such-workspace");
+
+        let (clean, attachments) = extract_attachment_references(text, root, &root.join("shared"))
+            .expect("code-only tag should not resolve");
+
+        assert_eq!(clean, text);
+        assert!(attachments.is_empty());
+    }
+
+    #[test]
+    fn shared_attachment_path_accepts_unix_and_windows_separators() {
+        assert!(is_shared_attachment_path("shared"));
+        assert!(is_shared_attachment_path("shared/foo.pdf"));
+        assert!(is_shared_attachment_path("shared\\foo.pdf"));
+        assert!(!is_shared_attachment_path("shared/"));
+        assert!(!is_shared_attachment_path("shared\\"));
+        assert!(!is_shared_attachment_path("not-shared/foo.pdf"));
+    }
+
+    #[test]
+    fn render_chat_message_hides_reasoning_items() {
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![
+                ChatMessageItem::Reasoning(ReasoningItem::codex(
+                    None,
+                    Some("opaque".to_string()),
+                    None,
+                )),
+                ChatMessageItem::Context(ContextItem {
+                    text: "visible answer".to_string(),
+                }),
+            ],
+        );
+
+        assert_eq!(render_chat_message(&message), "visible answer");
+    }
+
+    #[test]
+    fn canonicalized_shared_path_can_escape_workspace_root() {
+        let root =
+            std::env::temp_dir().join(format!("stellaclaw-attachment-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = root.join("workspace");
+        let shared = root.join("shared");
+        std::fs::create_dir_all(&workspace).expect("workspace should exist");
+        std::fs::create_dir_all(&shared).expect("shared should exist");
+        let file = shared.join("report.txt");
+        std::fs::write(&file, "hello").expect("file should write");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&shared, workspace.join("shared"))
+            .expect("shared symlink should exist");
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&shared, workspace.join("shared"))
+            .expect("shared symlink should exist");
+
+        let resolved = resolve_outgoing_attachment(&workspace, &shared, "shared/report.txt")
+            .expect("shared attachment should resolve");
+        assert_eq!(resolved.path, file.canonicalize().unwrap());
+        std::fs::remove_dir_all(&root).expect("temp root should be removed");
+    }
+}
