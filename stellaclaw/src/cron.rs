@@ -372,31 +372,26 @@ fn build_cron_schedule_from_tool_args(
     arguments: &serde_json::Map<String, Value>,
     required: bool,
 ) -> Result<Option<String>> {
-    let keys = [
+    let required_fields = [
         "cron_second",
         "cron_minute",
         "cron_hour",
         "cron_day_of_month",
         "cron_month",
         "cron_day_of_week",
-        "cron_year",
     ];
-    let present = keys
-        .iter()
-        .filter(|key| arguments.contains_key(**key))
-        .count();
-    if present == 0 {
-        return Ok(None);
-    }
-    let required_fields = &keys[..6];
+    let cron_year = optional_string_arg(arguments, "cron_year")?;
     let required_present = required_fields
         .iter()
         .filter(|key| arguments.contains_key(**key))
         .count();
-    if present != required_present && present != keys.len() {
-        return Err(anyhow!(
-            "cron schedule updates must include all required named fields together"
-        ));
+    if required_present == 0 {
+        if cron_year.is_some() {
+            return Err(anyhow!(
+                "cron schedule updates must include all required named fields together"
+            ));
+        }
+        return Ok(None);
     }
     if required && required_present != required_fields.len() {
         return Err(anyhow!("missing required cron schedule fields"));
@@ -408,11 +403,11 @@ fn build_cron_schedule_from_tool_args(
     }
 
     let mut parts = Vec::new();
-    for key in required_fields {
+    for key in &required_fields {
         parts.push(string_arg_required(arguments, key)?);
     }
-    if arguments.contains_key("cron_year") {
-        parts.push(string_arg_required(arguments, "cron_year")?);
+    if let Some(cron_year) = cron_year {
+        parts.push(cron_year);
     }
     let schedule = parts.join(" ");
     validate_schedule(&schedule)?;
@@ -437,13 +432,16 @@ pub fn optional_string_arg(
     key: &str,
 ) -> Result<Option<String>> {
     match arguments.get(key) {
-        Some(value) => value
-            .as_str()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(ToOwned::to_owned)
-            .map(Some)
-            .ok_or_else(|| anyhow!("{key} must be a non-empty string")),
+        Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            if value.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(value.to_string()))
+            }
+        }
+        Some(_) => Err(anyhow!("{key} must be a string")),
         None => Ok(None),
     }
 }
@@ -545,6 +543,7 @@ fn default_next_index() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_workdir() -> PathBuf {
@@ -555,6 +554,71 @@ mod tests {
                 .expect("time should move forward")
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn optional_string_arg_treats_empty_as_absent() {
+        let object = json!({
+            "missing_prompt": "",
+            "blank_prompt": "   ",
+            "null_prompt": null,
+            "script_command": "  python3 script.py  "
+        });
+        let object = object
+            .as_object()
+            .expect("test payload should be an object");
+
+        assert_eq!(
+            optional_string_arg(object, "missing_prompt").expect("empty should parse"),
+            None
+        );
+        assert_eq!(
+            optional_string_arg(object, "blank_prompt").expect("blank should parse"),
+            None
+        );
+        assert_eq!(
+            optional_string_arg(object, "null_prompt").expect("null should parse"),
+            None
+        );
+        assert_eq!(
+            optional_string_arg(object, "script_command").expect("script should parse"),
+            Some("python3 script.py".to_string())
+        );
+    }
+
+    #[test]
+    fn cron_year_empty_is_ignored() {
+        let object = json!({
+            "cron_second": "0",
+            "cron_minute": "30",
+            "cron_hour": "8",
+            "cron_day_of_month": "*",
+            "cron_month": "*",
+            "cron_day_of_week": "*",
+            "cron_year": ""
+        });
+        let object = object
+            .as_object()
+            .expect("test payload should be an object");
+
+        let schedule =
+            cron_schedule_from_required_tool_args(object).expect("schedule should parse");
+        assert_eq!(schedule, "0 30 8 * * *");
+    }
+
+    #[test]
+    fn optional_schedule_rejects_year_without_required_fields() {
+        let object = json!({
+            "cron_year": "2026"
+        });
+        let object = object
+            .as_object()
+            .expect("test payload should be an object");
+
+        let error = optional_cron_schedule_from_tool_args(object)
+            .expect_err("year alone should not be a valid schedule update");
+        assert!(format!("{error:#}")
+            .contains("cron schedule updates must include all required named fields together"));
     }
 
     #[test]
