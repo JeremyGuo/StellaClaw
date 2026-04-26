@@ -17,7 +17,7 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
     vec![
         ToolDefinition::new(
             "file_read",
-            "Read a UTF-8 text file. Supports file_path plus optional offset and limit for large files. Returned content is hard-capped; use smaller ranges for huge files.",
+            "Read a UTF-8 text file. Supports file_path plus optional offset and limit for large files. All tool results are capped by the runtime; use smaller ranges for huge files.",
             file_tool_schema(
                 properties([
                     ("file_path", json!({"type": "string"})),

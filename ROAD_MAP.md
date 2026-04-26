@@ -53,6 +53,7 @@
 - `ChatMessage::Reasoning` 当前支持 Codex 专用 encrypted reasoning continuation；token 估算按 Codex 风格把 `codex_encrypted_content` 作为上下文成本估入，但展示层和普通文本路径不暴露密文。
 - `reasoning_effort` 是 conversation 级 override；已有 conversation 的 `session_profile.main_model` 是持久化快照，不会自动跟随全局 config 更新。
 - 每轮 model/tool loop 默认上限是 200 步，主要作为防无限循环兜底，而不是正常工作流限制。
+- 所有工具结果在进入 `ChatMessage::ToolResult` 前必须经过统一输出上限：单个 tool result 的 model-visible `context.text` 不得超过 100,000 字符；超过时返回截断提示和预览，并把完整未截断结果保存到 workspace 的 `.output/tool_results/`。这条规则适用于现在和未来所有工具；工具自身可以有更小的业务级 preview/limit，但不能绕过统一上限。
 - skill 工具当前包括 `skill_load`、`skill_create`、`skill_update`、`skill_delete`；持久化类工具走 ConversationBridge，由 Host/Conversation 写回 runtime skill store 并同步已有 conversation workspace。
 
 ## 1.3 当前核心组件内部构筑

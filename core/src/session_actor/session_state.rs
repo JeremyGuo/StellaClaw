@@ -5,11 +5,9 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use super::{runtime_metadata::RuntimeMetadataState, ChatMessage, ChatMessageItem, SessionInitial};
 
-const MAX_PERSISTED_FILE_READ_CONTENT_CHARS: usize = 60_000;
 const MAX_PERSISTED_TOOL_CONTEXT_CHARS: usize = 100_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,11 +110,6 @@ fn sanitize_persisted_messages(messages: &mut [ChatMessage]) {
             let Some(context) = tool_result.result.context.as_mut() else {
                 continue;
             };
-            if matches!(tool_result.tool_name.as_str(), "file_read" | "read_file")
-                && sanitize_file_read_tool_context(&mut context.text)
-            {
-                continue;
-            }
             let (text, truncated) =
                 truncate_context_text(&context.text, MAX_PERSISTED_TOOL_CONTEXT_CHARS);
             if truncated {
@@ -124,29 +117,6 @@ fn sanitize_persisted_messages(messages: &mut [ChatMessage]) {
             }
         }
     }
-}
-
-fn sanitize_file_read_tool_context(text: &mut String) -> bool {
-    let Ok(mut value) = serde_json::from_str::<Value>(text) else {
-        return false;
-    };
-    let Some(object) = value.as_object_mut() else {
-        return false;
-    };
-    let Some(content) = object.get("content").and_then(Value::as_str) else {
-        return false;
-    };
-    let (content, truncated) =
-        truncate_context_text(content, MAX_PERSISTED_FILE_READ_CONTENT_CHARS);
-    if !truncated {
-        return false;
-    }
-    object.insert("content".to_string(), Value::String(content));
-    object.insert("truncated".to_string(), Value::Bool(true));
-    object.insert("content_truncated".to_string(), Value::Bool(true));
-    *text = serde_json::to_string_pretty(&value)
-        .unwrap_or_else(|_| truncate_context_text(text, MAX_PERSISTED_TOOL_CONTEXT_CHARS).0);
-    true
 }
 
 fn truncate_context_text(value: &str, max_chars: usize) -> (String, bool) {
@@ -246,23 +216,18 @@ mod tests {
     }
 
     #[test]
-    fn load_sanitizes_persisted_large_file_read_results() {
+    fn load_sanitizes_persisted_large_tool_results() {
         let root = temp_root();
         let store = SessionStateStore::open_under(&root, "session/large").expect("store opens");
-        let large_content = "x".repeat(MAX_PERSISTED_FILE_READ_CONTENT_CHARS + 10_000);
+        let large_content = "x".repeat(MAX_PERSISTED_TOOL_CONTEXT_CHARS + 10_000);
         let message = ChatMessage::new(
             ChatRole::Assistant,
             vec![ChatMessageItem::ToolResult(ToolResultItem {
                 tool_call_id: "call_1".to_string(),
-                tool_name: "file_read".to_string(),
+                tool_name: "any_tool".to_string(),
                 result: ToolResultContent {
                     context: Some(ContextItem {
-                        text: serde_json::json!({
-                            "file_path": "huge.json",
-                            "content": large_content,
-                            "truncated": false
-                        })
-                        .to_string(),
+                        text: large_content,
                     }),
                     file: None,
                 },
@@ -284,14 +249,8 @@ mod tests {
             panic!("expected tool result");
         };
         let text = &result.result.context.as_ref().expect("context").text;
-        let value: Value = serde_json::from_str(text).expect("sanitized context remains JSON");
 
-        assert_eq!(value["truncated"], true);
-        assert_eq!(value["content_truncated"], true);
-        assert!(value["content"]
-            .as_str()
-            .unwrap()
-            .contains("chars truncated"));
-        assert!(value["content"].as_str().unwrap().len() <= MAX_PERSISTED_FILE_READ_CONTENT_CHARS);
+        assert!(text.contains("chars truncated"));
+        assert!(text.len() <= MAX_PERSISTED_TOOL_CONTEXT_CHARS);
     }
 }

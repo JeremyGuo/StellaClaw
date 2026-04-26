@@ -1,9 +1,10 @@
 use std::{
     collections::HashMap,
-    path::PathBuf,
+    fs,
+    path::{Path, PathBuf},
     sync::{mpsc, Arc, Mutex},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crossbeam_channel::Sender;
@@ -29,6 +30,8 @@ use super::{
 
 const TOOL_INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const TOOL_COOPERATIVE_INTERRUPT_GRACE: Duration = Duration::from_millis(250);
+const MAX_TOOL_RESULT_CONTEXT_CHARS: usize = 100_000;
+const DEFAULT_TRUNCATED_TOOL_RESULT_PREVIEW_CHARS: usize = 80_000;
 
 pub struct LocalToolBatchExecutor {
     workspace_root: PathBuf,
@@ -227,7 +230,7 @@ impl ToolOperationRunner {
         &self,
         operation: &ToolExecutionOp,
     ) -> Result<ToolResultItem, LocalToolError> {
-        match operation {
+        let result = match operation {
             ToolExecutionOp::LocalTool(tool_call) => self.execute_local_tool(tool_call),
             ToolExecutionOp::SkillLoad { tool_call, skill } => {
                 self.execute_skill_load_tool(tool_call, skill)
@@ -251,7 +254,8 @@ impl ToolOperationRunner {
                     "conversation bridge is not configured".to_string(),
                 )),
             },
-        }
+        }?;
+        Ok(self.cap_tool_result_context(result))
     }
 
     fn execute_local_tool(
@@ -368,6 +372,148 @@ impl ToolOperationRunner {
             cancel_token: self.cancel_token.clone(),
         }
     }
+
+    fn cap_tool_result_context(&self, mut result: ToolResultItem) -> ToolResultItem {
+        let Some(context) = result.result.context.as_mut() else {
+            return result;
+        };
+        let total_chars = context.text.chars().count();
+        if total_chars <= MAX_TOOL_RESULT_CONTEXT_CHARS {
+            return result;
+        }
+
+        let saved_path = save_full_tool_result(
+            &self.workspace_root,
+            &result.tool_name,
+            &result.tool_call_id,
+            &context.text,
+        );
+        context.text = capped_truncated_tool_result_message(
+            total_chars,
+            saved_path.as_deref(),
+            saved_path.is_none(),
+            &context.text,
+        );
+        result
+    }
+}
+
+fn capped_truncated_tool_result_message(
+    total_chars: usize,
+    full_output_path: Option<&str>,
+    save_failed: bool,
+    original: &str,
+) -> String {
+    let mut preview_chars = DEFAULT_TRUNCATED_TOOL_RESULT_PREVIEW_CHARS;
+    loop {
+        let (preview, _) = truncate_context_text(original, preview_chars);
+        let message =
+            truncated_tool_result_message(total_chars, full_output_path, save_failed, &preview);
+        if message.chars().count() <= MAX_TOOL_RESULT_CONTEXT_CHARS || preview_chars == 0 {
+            return message;
+        }
+        preview_chars = preview_chars.saturating_mul(4) / 5;
+    }
+}
+
+fn truncated_tool_result_message(
+    total_chars: usize,
+    full_output_path: Option<&str>,
+    save_failed: bool,
+    preview: &str,
+) -> String {
+    let note = match full_output_path {
+        Some(path) => format!(
+            "Tool result exceeded the 100000 character runtime limit and was truncated to 100000 characters. The complete untruncated result was saved at: {path}."
+        ),
+        None if save_failed => {
+            "Tool result exceeded the 100000 character runtime limit and was truncated to 100000 characters. Saving the complete result failed.".to_string()
+        }
+        None => {
+            "Tool result exceeded the 100000 character runtime limit and was truncated to 100000 characters.".to_string()
+        }
+    };
+    normalize_tool_value(json!({
+        "truncated": true,
+        "limit_chars": MAX_TOOL_RESULT_CONTEXT_CHARS,
+        "original_chars": total_chars,
+        "full_output_path": full_output_path,
+        "note": note,
+        "preview": preview,
+    }))
+}
+
+fn save_full_tool_result(
+    workspace_root: &Path,
+    tool_name: &str,
+    tool_call_id: &str,
+    text: &str,
+) -> Option<String> {
+    let dir = workspace_root.join(".output").join("tool_results");
+    fs::create_dir_all(&dir).ok()?;
+    let file_name = format!(
+        "{}-{}-{}.txt",
+        nonce(),
+        sanitize_path_component(tool_name),
+        sanitize_path_component(tool_call_id)
+    );
+    let path = dir.join(file_name);
+    fs::write(&path, text).ok()?;
+    Some(path.display().to_string())
+}
+
+fn sanitize_path_component(value: &str) -> String {
+    let safe = value
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | '.' => ch,
+            _ => '_',
+        })
+        .collect::<String>();
+    if safe.trim_matches('_').is_empty() {
+        "tool".to_string()
+    } else {
+        safe
+    }
+}
+
+fn truncate_context_text(value: &str, max_chars: usize) -> (String, bool) {
+    let total_chars = value.chars().count();
+    if total_chars <= max_chars {
+        return (value.to_string(), false);
+    }
+    if max_chars == 0 {
+        return (String::new(), true);
+    }
+
+    let marker_template = format!("\n...<{total_chars} chars truncated>...\n");
+    let marker_chars = marker_template.chars().count().min(max_chars);
+    if marker_chars >= max_chars {
+        return (value.chars().take(max_chars).collect(), true);
+    }
+
+    let available = max_chars - marker_chars;
+    let head_chars = available / 2;
+    let tail_chars = available - head_chars;
+    let omitted = total_chars.saturating_sub(head_chars + tail_chars);
+    let marker = format!("\n...<{omitted} chars truncated>...\n");
+    let head = value.chars().take(head_chars).collect::<String>();
+    let tail = value
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    (format!("{head}{marker}{tail}"), true)
+}
+
+fn nonce() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 impl ToolBatchExecutor for LocalToolBatchExecutor {
@@ -571,9 +717,9 @@ mod tests {
     }
 
     #[test]
-    fn file_read_caps_large_outputs() {
+    fn tool_results_are_capped_and_full_output_is_saved() {
         let workspace = temp_workspace();
-        let huge_line = "x".repeat(70_000);
+        let huge_line = "x".repeat(120_000);
         fs::write(
             workspace.join("huge.txt"),
             format!("first\n{huge_line}\nlast\n"),
@@ -591,14 +737,22 @@ mod tests {
         let message = start_and_wait(&executor, batch);
         let value: Value =
             serde_json::from_str(result_text(&message, 0)).expect("file_read should return JSON");
-        let content = value["content"]
-            .as_str()
-            .expect("content should be a string");
 
         assert!(value["truncated"].as_bool().unwrap());
-        assert!(value["content_truncated"].as_bool().unwrap());
-        assert!(content.contains("chars truncated"));
-        assert!(content.len() < 70_000);
+        assert_eq!(value["limit_chars"], MAX_TOOL_RESULT_CONTEXT_CHARS);
+        assert!(value["original_chars"].as_u64().unwrap() > MAX_TOOL_RESULT_CONTEXT_CHARS as u64);
+        assert!(value["note"]
+            .as_str()
+            .unwrap()
+            .contains("complete untruncated result was saved"));
+        assert!(value["preview"]
+            .as_str()
+            .unwrap()
+            .contains("chars truncated"));
+        let full_output_path = value["full_output_path"].as_str().unwrap();
+        assert!(std::path::Path::new(full_output_path).exists());
+        let full_output = fs::read_to_string(full_output_path).unwrap();
+        assert!(full_output.contains(&huge_line));
     }
 
     #[test]

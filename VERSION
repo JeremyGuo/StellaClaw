@@ -3,6 +3,8 @@ version: 1.11.0
 
 # 1.11.0
 
+- 增加统一工具结果上限：
+  所有标准工具结果在进入 `ChatMessage::ToolResult` 前都会经过 100,000 字符的 model-visible `context.text` 上限；超过时返回截断提示和预览，并把完整未截断结果写入 workspace 的 `.output/tool_results/`。旧 session 加载时也会对已持久化的超大 tool result 做同样级别的安全截断，避免历史中已有的大输出继续撑爆 provider preflight。本次不改变 `config` schema，不改变 `workdir` schema。
 - 扩展 Web channel workspace API：
   新增 `GET /api/conversations/{conversation_id}/workspace?path=<relative>&limit=<n>`，用于前端列出当前 conversation 实际 workspace 的一层目录内容；fixed SSH Remote Mode 下会解析到 sshfs workspace 并复用现有健康恢复逻辑，返回 local mount root、remote host/cwd、相对路径、parent 和目录项元数据。本次不改变 `config` schema，不改变 `workdir` schema。
 - 拆出 remote workspace 查询边界：
