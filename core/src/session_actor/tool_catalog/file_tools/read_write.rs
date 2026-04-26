@@ -8,6 +8,8 @@ use crate::session_actor::tool_runtime::{
     ToolExecutionContext,
 };
 
+const MAX_FILE_READ_CONTENT_CHARS: usize = 60_000;
+
 pub(super) fn execute_read_write_tool(
     tool_name: &str,
     arguments: &Map<String, Value>,
@@ -78,13 +80,17 @@ fn file_read_local(
         start_line + selected.len() - 1
     };
 
+    let content = selected.join("\n");
+    let (content, content_truncated) = truncate_file_read_content(&content);
+
     Ok(json!({
         "file_path": path.display().to_string(),
         "start_line": start_line,
         "end_line": end_line,
         "total_lines": total_lines,
-        "truncated": end_line < total_lines,
-        "content": selected.join("\n"),
+        "truncated": end_line < total_lines || content_truncated,
+        "content_truncated": content_truncated,
+        "content": content,
     }))
 }
 
@@ -159,6 +165,23 @@ fn remote_file_read_script(path: &str, offset: usize, limit: usize) -> String {
     format!(
         r#"
 import json, pathlib
+MAX_CONTENT_CHARS = {max_content_chars}
+
+def truncate_content(value):
+    if len(value) <= MAX_CONTENT_CHARS:
+        return value, False
+    if MAX_CONTENT_CHARS == 0:
+        return "", True
+    marker_template = f"\n...<{{len(value)}} chars truncated>...\n"
+    if len(marker_template) >= MAX_CONTENT_CHARS:
+        return value[:MAX_CONTENT_CHARS], True
+    available = MAX_CONTENT_CHARS - len(marker_template)
+    head_chars = available // 2
+    tail_chars = available - head_chars
+    omitted = len(value) - head_chars - tail_chars
+    marker = f"\n...<{{omitted}} chars truncated>...\n"
+    return value[:head_chars] + marker + value[-tail_chars:], True
+
 path = pathlib.Path({path:?}).expanduser()
 text = path.read_text(encoding="utf-8")
 lines = text.splitlines()
@@ -166,16 +189,57 @@ start = max(1, int({offset}))
 limit = int({limit})
 selected = [f"{{idx + 1}}: {{line}}" for idx, line in list(enumerate(lines))[start - 1:start - 1 + limit]]
 end = start + len(selected) - 1 if selected else start - 1
+content, content_truncated = truncate_content("\n".join(selected))
 print(json.dumps({{
   "file_path": str(path),
   "start_line": start,
   "end_line": end,
   "total_lines": len(lines),
-  "truncated": end < len(lines),
-  "content": "\n".join(selected),
+  "truncated": end < len(lines) or content_truncated,
+  "content_truncated": content_truncated,
+  "content": content,
 }}))
-"#
+"#,
+        max_content_chars = MAX_FILE_READ_CONTENT_CHARS
     )
+}
+
+fn truncate_file_read_content(value: &str) -> (String, bool) {
+    let total_chars = value.chars().count();
+    if total_chars <= MAX_FILE_READ_CONTENT_CHARS {
+        return (value.to_string(), false);
+    }
+    if MAX_FILE_READ_CONTENT_CHARS == 0 {
+        return (String::new(), true);
+    }
+
+    let marker_template = format!("\n...<{total_chars} chars truncated>...\n");
+    let marker_chars = marker_template
+        .chars()
+        .count()
+        .min(MAX_FILE_READ_CONTENT_CHARS);
+    if marker_chars >= MAX_FILE_READ_CONTENT_CHARS {
+        return (
+            value.chars().take(MAX_FILE_READ_CONTENT_CHARS).collect(),
+            true,
+        );
+    }
+
+    let available = MAX_FILE_READ_CONTENT_CHARS - marker_chars;
+    let head_chars = available / 2;
+    let tail_chars = available - head_chars;
+    let omitted = total_chars.saturating_sub(head_chars + tail_chars);
+    let marker = format!("\n...<{omitted} chars truncated>...\n");
+    let head = value.chars().take(head_chars).collect::<String>();
+    let tail = value
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    (format!("{head}{marker}{tail}"), true)
 }
 
 fn remote_file_write_script(path: &str, content: &str, mode: &str) -> String {

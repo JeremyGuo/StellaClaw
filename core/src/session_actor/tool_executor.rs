@@ -571,6 +571,37 @@ mod tests {
     }
 
     #[test]
+    fn file_read_caps_large_outputs() {
+        let workspace = temp_workspace();
+        let huge_line = "x".repeat(70_000);
+        fs::write(
+            workspace.join("huge.txt"),
+            format!("first\n{huge_line}\nlast\n"),
+        )
+        .unwrap();
+        let executor = LocalToolBatchExecutor::new(&workspace);
+        let batch = ToolBatch::new(
+            "batch_huge_read",
+            vec![tool_call(
+                "file_read",
+                json!({"file_path": "huge.txt", "limit": 10}),
+            )],
+        );
+
+        let message = start_and_wait(&executor, batch);
+        let value: Value =
+            serde_json::from_str(result_text(&message, 0)).expect("file_read should return JSON");
+        let content = value["content"]
+            .as_str()
+            .expect("content should be a string");
+
+        assert!(value["truncated"].as_bool().unwrap());
+        assert!(value["content_truncated"].as_bool().unwrap());
+        assert!(content.contains("chars truncated"));
+        assert!(content.len() < 70_000);
+    }
+
+    #[test]
     fn executes_search_list_edit_and_apply_patch_locally() {
         let workspace = temp_workspace();
         fs::create_dir_all(workspace.join("src")).unwrap();
