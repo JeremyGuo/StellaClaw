@@ -1,4 +1,7 @@
 mod brave_search;
+mod brave_search_image;
+mod brave_search_news;
+mod brave_search_video;
 mod claude_code;
 mod codex_subscription;
 mod common;
@@ -21,6 +24,9 @@ use crate::{
 };
 
 pub use brave_search::BraveSearchProvider;
+pub use brave_search_image::BraveSearchImageProvider;
+pub use brave_search_news::BraveSearchNewsProvider;
+pub use brave_search_video::BraveSearchVideoProvider;
 pub use claude_code::ClaudeCodeProvider;
 pub use codex_subscription::CodexSubscriptionProvider;
 pub use error_report::ProviderErrorReport;
@@ -121,6 +127,9 @@ fn provider_backend_from_model_config(
         ProviderType::ClaudeCode => Box::new(ClaudeCodeProvider::new()),
         ProviderType::CodexSubscription => Box::new(CodexSubscriptionProvider::new()),
         ProviderType::BraveSearch => Box::new(BraveSearchProvider::new()),
+        ProviderType::BraveSearchImage => Box::new(BraveSearchImageProvider::new()),
+        ProviderType::BraveSearchVideo => Box::new(BraveSearchVideoProvider::new()),
+        ProviderType::BraveSearchNews => Box::new(BraveSearchNewsProvider::new()),
     }
 }
 

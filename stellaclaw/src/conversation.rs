@@ -74,6 +74,7 @@ pub struct IncomingConversationMessage {
 pub enum ConversationControl {
     Continue,
     Cancel,
+    Compact,
     ShowStatus,
     ShowModel,
     SwitchModel { model_name: String },
@@ -159,6 +160,25 @@ pub enum ManagedSessionStatus {
 
 fn default_index() -> u64 {
     1
+}
+
+fn format_compact_completed_message(
+    compressed: bool,
+    estimated_tokens_before: u64,
+    estimated_tokens_after: u64,
+    threshold_tokens: u64,
+    retained_message_count: usize,
+    compressed_message_count: usize,
+) -> String {
+    if compressed {
+        format!(
+            "✅ 已主动压缩当前上下文。\n\nBefore: {estimated_tokens_before}\nAfter: {estimated_tokens_after}\nThreshold: {threshold_tokens}\nCompressed messages: {compressed_message_count}\nRetained recent messages: {retained_message_count}"
+        )
+    } else {
+        format!(
+            "当前上下文暂时无法进一步压缩。\n\nEstimated tokens: {estimated_tokens_before}\nThreshold: {threshold_tokens}"
+        )
+    }
 }
 
 pub fn spawn_conversation(
@@ -529,6 +549,7 @@ impl ConversationRuntime {
                 }
                 Some(
                     ConversationControl::ShowStatus
+                    | ConversationControl::Compact
                     | ConversationControl::ShowRemote
                     | ConversationControl::SetRemote { .. }
                     | ConversationControl::DisableRemote
@@ -554,6 +575,12 @@ impl ConversationRuntime {
             Some(ConversationControl::Cancel) => {
                 self.foreground_client()?
                     .send_session_request(&SessionRequest::CancelTurn { reason: None })
+                    .map_err(anyhow::Error::msg)?;
+                return Ok(false);
+            }
+            Some(ConversationControl::Compact) => {
+                self.foreground_client()?
+                    .send_session_request(&SessionRequest::CompactNow)
                     .map_err(anyhow::Error::msg)?;
                 return Ok(false);
             }
@@ -756,11 +783,48 @@ impl ConversationRuntime {
                 );
                 Ok(false)
             }
+            SessionEvent::CompactCompleted {
+                compressed,
+                estimated_tokens_before,
+                estimated_tokens_after,
+                threshold_tokens,
+                retained_message_count,
+                compressed_message_count,
+            } => {
+                self.logger.info(
+                    "compact_completed",
+                    json!({
+                        "compressed": compressed,
+                        "estimated_tokens_before": estimated_tokens_before,
+                        "estimated_tokens_after": estimated_tokens_after,
+                        "threshold_tokens": threshold_tokens,
+                        "retained_message_count": retained_message_count,
+                        "compressed_message_count": compressed_message_count,
+                    }),
+                );
+                if session_type == SessionType::Foreground {
+                    self.send_delivery_from_text(format_compact_completed_message(
+                        compressed,
+                        estimated_tokens_before,
+                        estimated_tokens_after,
+                        threshold_tokens,
+                        retained_message_count,
+                        compressed_message_count,
+                    ))?;
+                }
+                Ok(false)
+            }
             SessionEvent::ControlRejected { reason, payload } => {
                 self.logger.warn(
                     "control_rejected",
                     json!({"reason": reason, "payload": payload, "agent_id": agent_id}),
                 );
+                if session_type == SessionType::Foreground
+                    && payload.get("type").and_then(serde_json::Value::as_str)
+                        == Some("compact_now")
+                {
+                    self.send_delivery_from_text(format!("无法执行 /compact: {reason}"))?;
+                }
                 Ok(false)
             }
             SessionEvent::RuntimeCrashed {
@@ -1291,6 +1355,9 @@ impl ConversationRuntime {
             .config
             .resolve_named_model(name)
             .ok_or_else(|| anyhow!("unknown named model {name}"))?;
+        if !self.config.is_available_agent_model(name) {
+            return Err(anyhow!("model {name} is not available for agent selection"));
+        }
         if !model.supports(ModelCapability::Chat) {
             return Err(anyhow!("model {name} is not chat-capable"));
         }
@@ -1830,20 +1897,12 @@ impl ConversationRuntime {
         } else {
             vec![format!("当前模型: {current_name}")]
         };
-        if !self
-            .config
-            .models
-            .values()
-            .any(|model| model.supports(ModelCapability::Chat))
-        {
+        if self.config.available_agent_models().is_empty() {
             return lines.join("\n");
         }
 
         lines.push("可切换模型:".to_string());
-        for (name, model) in &self.config.models {
-            if !model.supports(ModelCapability::Chat) {
-                continue;
-            }
+        for (name, model) in self.config.available_agent_models() {
             let marker = if Some(name.as_str()) == current_alias {
                 " [current]"
             } else {
@@ -1859,9 +1918,8 @@ impl ConversationRuntime {
         let prompt = self.render_model_selection();
         let options = self
             .config
-            .models
-            .iter()
-            .filter(|(_, model)| model.supports(ModelCapability::Chat))
+            .available_agent_models()
+            .into_iter()
             .map(|(name, _model)| {
                 let marker =
                     if Some(name.as_str()) == self.state.session_profile.main_model.alias_name() {
@@ -2120,6 +2178,11 @@ impl ConversationRuntime {
             .config
             .resolve_named_model(model_name)
             .ok_or_else(|| anyhow!("unknown model {model_name}"))?;
+        if !self.config.is_available_agent_model(model_name) {
+            return Err(anyhow!(
+                "model {model_name} is not available for agent selection"
+            ));
+        }
         if !new_model.supports(ModelCapability::Chat) {
             return Err(anyhow!("model {model_name} is not chat-capable"));
         }
@@ -2372,11 +2435,33 @@ fn start_session_process(
         models,
         model_config,
     )?;
-    initial.search_tool_model = resolve_tool_model_target(
+    initial.search_tool_model = resolve_tool_model_target_with_capability(
         "search_tool_model",
         defaults.search_tool_model.as_ref(),
         models,
         model_config,
+        ModelCapability::WebSearch,
+    )?;
+    initial.search_image_tool_model = resolve_tool_model_target_with_capability(
+        "search_image_tool_model",
+        defaults.search_image_tool_model.as_ref(),
+        models,
+        model_config,
+        ModelCapability::WebSearch,
+    )?;
+    initial.search_video_tool_model = resolve_tool_model_target_with_capability(
+        "search_video_tool_model",
+        defaults.search_video_tool_model.as_ref(),
+        models,
+        model_config,
+        ModelCapability::WebSearch,
+    )?;
+    initial.search_news_tool_model = resolve_tool_model_target_with_capability(
+        "search_news_tool_model",
+        defaults.search_news_tool_model.as_ref(),
+        models,
+        model_config,
+        ModelCapability::WebSearch,
     )?;
     client
         .initialize(
@@ -2400,6 +2485,26 @@ fn resolve_tool_model_target(
                 .map_err(|error| anyhow!("failed to resolve {field_name}: {error}"))
         })
         .transpose()
+}
+
+fn resolve_tool_model_target_with_capability(
+    field_name: &str,
+    target: Option<&ToolModelTarget>,
+    models: &BTreeMap<String, ModelConfig>,
+    session_model: &ModelConfig,
+    capability: ModelCapability,
+) -> Result<Option<ModelConfig>> {
+    let model = resolve_tool_model_target(field_name, target, models, session_model)?;
+    if let Some(model) = model.as_ref() {
+        if !model.supports(capability.clone()) {
+            return Err(anyhow!(
+                "{field_name} model {} does not support {:?}",
+                model.model_name,
+                capability
+            ));
+        }
+    }
+    Ok(model)
 }
 
 fn effective_model_config(

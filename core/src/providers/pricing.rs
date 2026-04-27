@@ -34,6 +34,15 @@ static CODEX_SUBSCRIPTION_PRICING: LazyLock<ProviderPricing> = LazyLock::new(|| 
 });
 static BRAVE_SEARCH_PRICING: LazyLock<ProviderPricing> =
     LazyLock::new(|| load_provider_pricing(include_str!("../../../pricing/brave_search.json")));
+static BRAVE_SEARCH_IMAGE_PRICING: LazyLock<ProviderPricing> = LazyLock::new(|| {
+    load_provider_pricing(include_str!("../../../pricing/brave_search_image.json"))
+});
+static BRAVE_SEARCH_VIDEO_PRICING: LazyLock<ProviderPricing> = LazyLock::new(|| {
+    load_provider_pricing(include_str!("../../../pricing/brave_search_video.json"))
+});
+static BRAVE_SEARCH_NEWS_PRICING: LazyLock<ProviderPricing> = LazyLock::new(|| {
+    load_provider_pricing(include_str!("../../../pricing/brave_search_news.json"))
+});
 
 pub(crate) struct PriceManager;
 
@@ -64,6 +73,9 @@ fn provider_pricing(provider_type: &ProviderType) -> &'static ProviderPricing {
         ProviderType::ClaudeCode => &CLAUDE_CODE_PRICING,
         ProviderType::CodexSubscription => &CODEX_SUBSCRIPTION_PRICING,
         ProviderType::BraveSearch => &BRAVE_SEARCH_PRICING,
+        ProviderType::BraveSearchImage => &BRAVE_SEARCH_IMAGE_PRICING,
+        ProviderType::BraveSearchVideo => &BRAVE_SEARCH_VIDEO_PRICING,
+        ProviderType::BraveSearchNews => &BRAVE_SEARCH_NEWS_PRICING,
     }
 }
 
@@ -88,6 +100,9 @@ mod tests {
             ProviderType::ClaudeCode,
             ProviderType::CodexSubscription,
             ProviderType::BraveSearch,
+            ProviderType::BraveSearchImage,
+            ProviderType::BraveSearchVideo,
+            ProviderType::BraveSearchNews,
         ] {
             let _ = provider_pricing(&provider_type);
         }

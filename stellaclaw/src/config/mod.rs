@@ -15,7 +15,9 @@ pub const CONFIG_VERSION_0_4: &str = "0.4";
 pub const CONFIG_VERSION_0_5: &str = "0.5";
 pub const CONFIG_VERSION_0_6: &str = "0.6";
 pub const CONFIG_VERSION_0_7: &str = "0.7";
-pub const LATEST_CONFIG_VERSION: &str = "0.8";
+pub const CONFIG_VERSION_0_8: &str = "0.8";
+pub const CONFIG_VERSION_0_9: &str = "0.9";
+pub const LATEST_CONFIG_VERSION: &str = "0.10";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StellaclawConfig {
@@ -27,6 +29,8 @@ pub struct StellaclawConfig {
     pub default_profile: Option<SessionProfile>,
     #[serde(default, alias = "named_models")]
     pub models: BTreeMap<String, ModelConfig>,
+    #[serde(default)]
+    pub available_agent_models: Vec<String>,
     #[serde(default)]
     pub session_defaults: SessionDefaults,
     #[serde(default)]
@@ -108,6 +112,12 @@ pub struct SessionDefaults {
     pub image_generation_tool_model: Option<ToolModelTarget>,
     #[serde(default)]
     pub search_tool_model: Option<ToolModelTarget>,
+    #[serde(default)]
+    pub search_image_tool_model: Option<ToolModelTarget>,
+    #[serde(default)]
+    pub search_video_tool_model: Option<ToolModelTarget>,
+    #[serde(default)]
+    pub search_news_tool_model: Option<ToolModelTarget>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -229,11 +239,8 @@ impl StellaclawConfig {
         if self.models.is_empty() {
             return Err("config must include at least one model".to_string());
         }
-        if !self
-            .models
-            .values()
-            .any(|model| model.supports(ModelCapability::Chat))
-        {
+        self.validate_available_agent_models()?;
+        if self.available_agent_models().is_empty() {
             return Err("config must include at least one chat-capable model".to_string());
         }
         self.sandbox.validate()?;
@@ -243,6 +250,20 @@ impl StellaclawConfig {
             }
         }
         validate_skill_sync(&self.skill_sync)?;
+        Ok(())
+    }
+
+    fn validate_available_agent_models(&self) -> Result<(), String> {
+        for alias in &self.available_agent_models {
+            let model = self.models.get(alias).ok_or_else(|| {
+                format!("available_agent_models references unknown model {alias}")
+            })?;
+            if !model.supports(ModelCapability::Chat) {
+                return Err(format!(
+                    "available_agent_models entry {alias} is not chat-capable"
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -280,6 +301,30 @@ impl StellaclawConfig {
         self.models.get(name).cloned()
     }
 
+    pub fn is_available_agent_model(&self, name: &str) -> bool {
+        self.available_agent_models()
+            .iter()
+            .any(|(alias, _model)| alias.as_str() == name)
+    }
+
+    pub fn available_agent_models(&self) -> Vec<(&String, &ModelConfig)> {
+        if self.available_agent_models.is_empty() {
+            return self
+                .models
+                .iter()
+                .filter(|(_, model)| model.supports(ModelCapability::Chat))
+                .collect();
+        }
+        self.available_agent_models
+            .iter()
+            .filter_map(|alias| {
+                self.models
+                    .get_key_value(alias)
+                    .filter(|(_, model)| model.supports(ModelCapability::Chat))
+            })
+            .collect()
+    }
+
     pub fn resolve_session_model(&self, profile: &SessionProfile) -> Option<ModelConfig> {
         profile.main_model.resolve(&self.models)
     }
@@ -297,9 +342,10 @@ impl StellaclawConfig {
             .as_ref()
             .and_then(|profile| self.model_selection_alias(&profile.main_model))
             .or_else(|| {
-                self.models.iter().find_map(|(name, model)| {
-                    model.supports(ModelCapability::Chat).then(|| name.clone())
-                })
+                self.available_agent_models()
+                    .into_iter()
+                    .next()
+                    .map(|(name, _model)| name.clone())
             })
     }
 
@@ -308,10 +354,10 @@ impl StellaclawConfig {
             .as_ref()
             .and_then(|profile| self.resolve_session_model(profile))
             .or_else(|| {
-                self.models
-                    .values()
-                    .find(|model| model.supports(ModelCapability::Chat))
-                    .cloned()
+                self.available_agent_models()
+                    .into_iter()
+                    .next()
+                    .map(|(_name, model)| model.clone())
             })
     }
 

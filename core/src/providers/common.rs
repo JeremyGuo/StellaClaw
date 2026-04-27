@@ -216,7 +216,10 @@ fn supports_anthropic_prompt_cache(model_config: &ModelConfig) -> bool {
         ProviderType::ClaudeCode => model_config.model_name.starts_with("claude-"),
         ProviderType::OpenAiImageEdit
         | ProviderType::CodexSubscription
-        | ProviderType::BraveSearch => false,
+        | ProviderType::BraveSearch
+        | ProviderType::BraveSearchImage
+        | ProviderType::BraveSearchVideo
+        | ProviderType::BraveSearchNews => false,
     }
 }
 

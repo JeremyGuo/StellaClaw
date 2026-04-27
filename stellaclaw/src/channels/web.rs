@@ -292,6 +292,12 @@ impl WebChannel {
             let Some(model_config) = self.config.models.get(&model) else {
                 return Err(ApiError::new(400, format!("unknown model alias {model}")));
             };
+            if !self.config.is_available_agent_model(&model) {
+                return Err(ApiError::new(
+                    400,
+                    format!("model {model} is not available for agent selection"),
+                ));
+            }
             if !model_config.supports(stellaclaw_core::model_config::ModelCapability::Chat) {
                 return Err(ApiError::new(
                     400,
@@ -1091,6 +1097,7 @@ fn parse_web_control(text: &str) -> Option<ConversationControl> {
     match command {
         "/continue" if argument.is_empty() => Some(ConversationControl::Continue),
         "/cancel" if argument.is_empty() => Some(ConversationControl::Cancel),
+        "/compact" if argument.is_empty() => Some(ConversationControl::Compact),
         "/status" if argument.is_empty() => Some(ConversationControl::ShowStatus),
         "/model" if argument.is_empty() => Some(ConversationControl::ShowModel),
         "/model" => Some(ConversationControl::SwitchModel {
@@ -1141,6 +1148,10 @@ mod tests {
         assert!(matches!(
             parse_web_control("/status"),
             Some(ConversationControl::ShowStatus)
+        ));
+        assert!(matches!(
+            parse_web_control("/compact"),
+            Some(ConversationControl::Compact)
         ));
         assert!(matches!(
             parse_web_control("/remote demo-host ~/repo"),

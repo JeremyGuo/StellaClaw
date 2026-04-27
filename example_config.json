@@ -1,5 +1,5 @@
 {
-  "version": "0.8",
+  "version": "0.10",
   "agent_server": {
     "path": "target/debug/agent_server"
   },
@@ -66,12 +66,66 @@
       "maxRequestSize": 31457280,
       "retry_mode": "once",
       "token_estimator_type": "local"
+    },
+    "search_brave_image": {
+      "provider_type": "brave_search_image",
+      "model_name": "brave-image-search",
+      "url": "https://api.search.brave.com/res/v1/images/search",
+      "api_key_env": "BRAVE_SEARCH_API_KEY",
+      "capabilities": [
+        "web_search"
+      ],
+      "token_max_context": 32768,
+      "cache_timeout": 300,
+      "conn_timeout": 2,
+      "request_timeout": 600,
+      "maxRequestSize": 31457280,
+      "retry_mode": "once",
+      "token_estimator_type": "local"
+    },
+    "search_brave_video": {
+      "provider_type": "brave_search_video",
+      "model_name": "brave-video-search",
+      "url": "https://api.search.brave.com/res/v1/videos/search",
+      "api_key_env": "BRAVE_SEARCH_API_KEY",
+      "capabilities": [
+        "web_search"
+      ],
+      "token_max_context": 32768,
+      "cache_timeout": 300,
+      "conn_timeout": 2,
+      "request_timeout": 600,
+      "maxRequestSize": 31457280,
+      "retry_mode": "once",
+      "token_estimator_type": "local"
+    },
+    "search_brave_news": {
+      "provider_type": "brave_search_news",
+      "model_name": "brave-news-search",
+      "url": "https://api.search.brave.com/res/v1/news/search",
+      "api_key_env": "BRAVE_SEARCH_API_KEY",
+      "capabilities": [
+        "web_search"
+      ],
+      "token_max_context": 32768,
+      "cache_timeout": 300,
+      "conn_timeout": 2,
+      "request_timeout": 600,
+      "maxRequestSize": 31457280,
+      "retry_mode": "once",
+      "token_estimator_type": "local"
     }
   },
+  "available_agent_models": [
+    "main"
+  ],
   "session_defaults": {
     "compression_threshold_tokens": 180000,
     "compression_retain_recent_tokens": 36000,
-    "search_tool_model": "search_brave"
+    "search_tool_model": "search_brave",
+    "search_image_tool_model": "search_brave_image",
+    "search_video_tool_model": "search_brave_video",
+    "search_news_tool_model": "search_brave_news"
   },
   "skill_sync": [],
   "sandbox": {

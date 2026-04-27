@@ -30,3 +30,4 @@ learnable_materials/
 /zgent*
 
 .codex
+tmp/

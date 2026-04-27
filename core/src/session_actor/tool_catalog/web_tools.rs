@@ -10,14 +10,27 @@ use super::{
     ToolBackend, ToolDefinition, ToolExecutionMode,
 };
 use crate::{
-    model_config::{ModelConfig, ProviderType},
-    providers::{BraveSearchProvider, ProviderError},
-    session_actor::tool_runtime::{
-        f64_arg_with_default, string_arg, usize_arg_with_default, LocalToolError,
+    model_config::{ModelCapability, ModelConfig, ProviderType},
+    providers::{
+        BraveSearchImageProvider, BraveSearchNewsProvider, BraveSearchProvider,
+        BraveSearchVideoProvider, ProviderError,
     },
+    session_actor::tool_runtime::{
+        bool_arg_with_default, f64_arg_with_default, string_arg, usize_arg_with_default,
+        LocalToolError,
+    },
+    session_actor::SearchToolModels,
 };
 
-pub fn web_tool_definitions(enable_web_search: bool) -> Vec<ToolDefinition> {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WebSearchOptions {
+    pub enabled: bool,
+    pub image: bool,
+    pub video: bool,
+    pub news: bool,
+}
+
+pub fn web_tool_definitions(search_options: WebSearchOptions) -> Vec<ToolDefinition> {
     let mut tools = vec![ToolDefinition::new(
         "web_fetch",
         "Fetch a web page or HTTP resource and return a readable text body. If interrupted by a newer user message or timeout observation, cancel the in-flight fetch. The model must choose timeout_seconds.",
@@ -34,16 +47,20 @@ pub fn web_tool_definitions(enable_web_search: bool) -> Vec<ToolDefinition> {
         ToolBackend::Local,
     )];
 
-    if enable_web_search {
+    if search_options.enabled {
         let mut schema_properties = properties([
             ("query", json!({"type": "string"})),
             ("timeout_seconds", json!({"type": "number"})),
             ("max_results", json!({"type": "integer"})),
+            ("image", json!({"type": "boolean"})),
+            ("video", json!({"type": "boolean"})),
+            ("news", json!({"type": "boolean"})),
         ]);
         add_images_property(&mut schema_properties, false);
+        let description = web_search_description(search_options);
         tools.push(ToolDefinition::new(
             "web_search",
-            "Search the web using the configured search provider and return an answer plus citations. If interrupted by a newer user message or timeout observation, this tool cancels the in-flight search result and returns immediately.",
+            &description,
             object_schema(schema_properties, &["query", "timeout_seconds"]),
             ToolExecutionMode::Interruptible,
             ToolBackend::Local,
@@ -53,14 +70,46 @@ pub fn web_tool_definitions(enable_web_search: bool) -> Vec<ToolDefinition> {
     tools
 }
 
+fn web_search_description(options: WebSearchOptions) -> String {
+    let mut supported = vec!["web"];
+    if options.image {
+        supported.push("image");
+    }
+    if options.video {
+        supported.push("video");
+    }
+    if options.news {
+        supported.push("news");
+    }
+    let unsupported = [
+        (!options.image).then_some("image=true"),
+        (!options.video).then_some("video=true"),
+        (!options.news).then_some("news=true"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(", ");
+    let unsupported = if unsupported.is_empty() {
+        String::new()
+    } else {
+        format!(" This session does not support: {unsupported}.")
+    };
+    format!(
+        "Search using the configured provider and return an answer plus citations. Supported result types: {}. Set at most one of image=true, video=true, or news=true; omit them for normal web results.{} If interrupted by a newer user message or timeout observation, this tool cancels the in-flight search result and returns immediately.",
+        supported.join(", "),
+        unsupported
+    )
+}
+
 pub(crate) fn execute_web_tool(
     tool_name: &str,
     arguments: &Map<String, Value>,
-    search_tool_model: Option<&ModelConfig>,
+    search_tool_models: Option<&SearchToolModels>,
 ) -> Result<Option<Value>, LocalToolError> {
     let result = match tool_name {
         "web_fetch" => web_fetch(arguments)?,
-        "web_search" => web_search(arguments, search_tool_model)?,
+        "web_search" => web_search(arguments, search_tool_models)?,
         _ => return Ok(None),
     };
     Ok(Some(result))
@@ -142,7 +191,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> (String, bool) {
 
 fn web_search(
     arguments: &Map<String, Value>,
-    search_tool_model: Option<&ModelConfig>,
+    search_tool_models: Option<&SearchToolModels>,
 ) -> Result<Value, LocalToolError> {
     let query = string_arg(arguments, "query")?;
     let timeout_seconds = f64_arg_with_default(arguments, "timeout_seconds", 30.0)?;
@@ -152,7 +201,23 @@ fn web_search(
         ));
     }
     let max_results = usize_arg_with_default(arguments, "max_results", 5)?;
-    if let Some(search_tool_model) = search_tool_model {
+    let vertical = requested_search_vertical(arguments)?;
+    if vertical != SearchVertical::Web {
+        let Some(search_tool_models) = search_tool_models else {
+            return Err(LocalToolError::InvalidArguments(format!(
+                "web_search {} results require a configured provider",
+                vertical.name()
+            )));
+        };
+        return search_with_vertical_provider(
+            search_tool_models,
+            vertical,
+            &query,
+            timeout_seconds,
+            max_results,
+        );
+    }
+    if let Some(search_tool_model) = search_tool_models.and_then(|models| models.web.as_ref()) {
         return search_with_provider(
             search_tool_model,
             arguments,
@@ -193,6 +258,11 @@ fn search_with_provider(
     timeout_seconds: f64,
     max_results: usize,
 ) -> Result<Value, LocalToolError> {
+    if !model_config.supports(ModelCapability::WebSearch) {
+        return Err(LocalToolError::InvalidArguments(
+            "the configured search provider does not have web_search capability".to_string(),
+        ));
+    }
     if arguments
         .get("images")
         .and_then(Value::as_array)
@@ -214,6 +284,106 @@ fn search_with_provider(
         _ => Err(LocalToolError::InvalidArguments(format!(
             "unsupported web_search provider {:?}",
             model_config.provider_type
+        ))),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchVertical {
+    Web,
+    Image,
+    Video,
+    News,
+}
+
+impl SearchVertical {
+    fn name(self) -> &'static str {
+        match self {
+            SearchVertical::Web => "web",
+            SearchVertical::Image => "image",
+            SearchVertical::Video => "video",
+            SearchVertical::News => "news",
+        }
+    }
+}
+
+fn requested_search_vertical(
+    arguments: &Map<String, Value>,
+) -> Result<SearchVertical, LocalToolError> {
+    let image = bool_arg_with_default(arguments, "image", false)?;
+    let video = bool_arg_with_default(arguments, "video", false)?;
+    let news = bool_arg_with_default(arguments, "news", false)?;
+    let requested = [image, video, news]
+        .into_iter()
+        .filter(|value| *value)
+        .count();
+    if requested > 1 {
+        return Err(LocalToolError::InvalidArguments(
+            "set at most one of image, video, or news to true".to_string(),
+        ));
+    }
+    Ok(if image {
+        SearchVertical::Image
+    } else if video {
+        SearchVertical::Video
+    } else if news {
+        SearchVertical::News
+    } else {
+        SearchVertical::Web
+    })
+}
+
+fn search_with_vertical_provider(
+    models: &SearchToolModels,
+    vertical: SearchVertical,
+    query: &str,
+    timeout_seconds: f64,
+    max_results: usize,
+) -> Result<Value, LocalToolError> {
+    let model_config = match vertical {
+        SearchVertical::Web => models.web.as_ref(),
+        SearchVertical::Image => models.image.as_ref(),
+        SearchVertical::Video => models.video.as_ref(),
+        SearchVertical::News => models.news.as_ref(),
+    }
+    .ok_or_else(|| {
+        LocalToolError::InvalidArguments(format!(
+            "web_search {} results are not configured in this session",
+            vertical.name()
+        ))
+    })?;
+    if !model_config.supports(ModelCapability::WebSearch) {
+        return Err(LocalToolError::InvalidArguments(format!(
+            "the configured {} search provider does not have web_search capability",
+            vertical.name()
+        )));
+    }
+    match (vertical, &model_config.provider_type) {
+        (SearchVertical::Image, ProviderType::BraveSearchImage) => {
+            let mut model_config = model_config.clone();
+            model_config.request_timeout = timeout_seconds.ceil().max(1.0) as u64;
+            BraveSearchImageProvider::new()
+                .search_images(&model_config, query, max_results.clamp(1, 200))
+                .map_err(provider_error_to_local_tool_error)
+        }
+        (SearchVertical::Video, ProviderType::BraveSearchVideo) => {
+            let mut model_config = model_config.clone();
+            model_config.request_timeout = timeout_seconds.ceil().max(1.0) as u64;
+            BraveSearchVideoProvider::new()
+                .search_videos(&model_config, query, max_results.clamp(1, 50))
+                .map_err(provider_error_to_local_tool_error)
+        }
+        (SearchVertical::News, ProviderType::BraveSearchNews) => {
+            let mut model_config = model_config.clone();
+            model_config.request_timeout = timeout_seconds.ceil().max(1.0) as u64;
+            BraveSearchNewsProvider::new()
+                .search_news(&model_config, query, max_results.clamp(1, 50))
+                .map_err(provider_error_to_local_tool_error)
+        }
+        _ => Err(LocalToolError::InvalidArguments(format!(
+            "unsupported web_search {} provider {:?}",
+            vertical.name(),
+            model_config.provider_type,
         ))),
     }
 }
@@ -392,7 +562,11 @@ mod tests {
         arguments.insert("timeout_seconds".to_string(), json!(2.0));
         arguments.insert("max_results".to_string(), json!(50));
 
-        let result = execute_web_tool("web_search", &arguments, Some(&model))
+        let models = SearchToolModels {
+            web: Some(model),
+            ..SearchToolModels::default()
+        };
+        let result = execute_web_tool("web_search", &arguments, Some(&models))
             .expect("web search should run")
             .expect("web search should return a value");
 
@@ -413,16 +587,123 @@ mod tests {
         arguments.insert("timeout_seconds".to_string(), json!(2.0));
         arguments.insert("images".to_string(), json!(["diagram.png"]));
 
-        let error = execute_web_tool("web_search", &arguments, Some(&model))
+        let models = SearchToolModels {
+            web: Some(model),
+            ..SearchToolModels::default()
+        };
+        let error = execute_web_tool("web_search", &arguments, Some(&models))
             .expect_err("brave search should reject image inputs");
 
         assert!(error.to_string().contains("does not support image inputs"));
+    }
+
+    #[test]
+    fn brave_image_search_uses_subscription_header_and_compacts_results() {
+        let mut server = mockito::Server::new();
+        let _mock = server
+            .mock("GET", "/res/v1/images/search")
+            .match_header("x-subscription-token", "brave-secret")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("q".to_string(), "architecture".to_string()),
+                mockito::Matcher::UrlEncoded("count".to_string(), "200".to_string()),
+                mockito::Matcher::UrlEncoded("safesearch".to_string(), "strict".to_string()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "type": "images",
+                    "results": [
+                        {
+                            "title": "Modern Building",
+                            "url": "https://example.com/building",
+                            "thumbnail": {
+                                "src": "https://imgs.search.brave.com/thumb",
+                                "width": 500,
+                                "height": 300
+                            },
+                            "properties": {
+                                "url": "https://example.com/building.jpg",
+                                "width": 1200,
+                                "height": 720
+                            }
+                        }
+                    ],
+                    "extra": {}
+                }"#,
+            )
+            .create();
+        let _env = EnvVarGuard::set("BRAVE_SEARCH_API_KEY_TEST", "brave-secret");
+        let model = test_brave_image_model_config(format!("{}/res/v1/images/search", server.url()));
+        let mut arguments = Map::new();
+        arguments.insert(
+            "query".to_string(),
+            Value::String("architecture".to_string()),
+        );
+        arguments.insert("timeout_seconds".to_string(), json!(2.0));
+        arguments.insert("max_results".to_string(), json!(250));
+        arguments.insert("image".to_string(), json!(true));
+
+        let models = SearchToolModels {
+            image: Some(model),
+            ..SearchToolModels::default()
+        };
+        let result = execute_web_tool("web_search", &arguments, Some(&models))
+            .expect("image search should run")
+            .expect("image search should return a value");
+
+        assert_eq!(result["citations"][0], "https://example.com/building");
+        assert_eq!(
+            result["results"][0]["thumbnail_url"],
+            "https://imgs.search.brave.com/thumb"
+        );
+        assert_eq!(
+            result["results"][0]["image_url"],
+            "https://example.com/building.jpg"
+        );
+    }
+
+    #[test]
+    fn web_search_image_mode_requires_image_provider() {
+        let mut arguments = Map::new();
+        arguments.insert("query".to_string(), Value::String("diagram".to_string()));
+        arguments.insert("timeout_seconds".to_string(), json!(2.0));
+        arguments.insert("image".to_string(), json!(true));
+        let models = SearchToolModels::default();
+
+        let error = execute_web_tool("web_search", &arguments, Some(&models))
+            .expect_err("image search should reject missing image provider");
+
+        assert!(error
+            .to_string()
+            .contains("image results are not configured"));
     }
 
     fn test_brave_model_config(url: String) -> ModelConfig {
         ModelConfig {
             provider_type: ProviderType::BraveSearch,
             model_name: "brave-web-search".to_string(),
+            url,
+            api_key_env: "BRAVE_SEARCH_API_KEY_TEST".to_string(),
+            capabilities: vec![ModelCapability::WebSearch],
+            token_max_context: 0,
+            cache_timeout: 0,
+            conn_timeout: 30,
+            request_timeout: 600,
+            max_request_size: 30 * 1024 * 1024,
+            retry_mode: RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: None,
+            token_estimator_url: None,
+        }
+    }
+
+    fn test_brave_image_model_config(url: String) -> ModelConfig {
+        ModelConfig {
+            provider_type: ProviderType::BraveSearchImage,
+            model_name: "brave-image-search".to_string(),
             url,
             api_key_env: "BRAVE_SEARCH_API_KEY_TEST".to_string(),
             capabilities: vec![ModelCapability::WebSearch],

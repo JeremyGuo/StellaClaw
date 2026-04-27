@@ -222,6 +222,7 @@ mod tests {
             agent_server: AgentServerConfig::default(),
             default_profile: None,
             models: BTreeMap::from([("opus-4.6".to_string(), model)]),
+            available_agent_models: Vec::new(),
             session_defaults: SessionDefaults::default(),
             skill_sync: Vec::new(),
             sandbox: SandboxConfig::default(),

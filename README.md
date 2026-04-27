@@ -213,7 +213,7 @@ Current provider support includes:
 - OpenRouter responses.
 - OpenAI-compatible image generation and edits.
 - Claude messages.
-- Brave Search.
+- Brave Search, including image, video, and news verticals.
 
 Model behavior is configured with `ModelConfig`, including capabilities, multimodal input transport, context window, timeout, retry mode, token estimation, cache TTL, and optional fast/priority service tier.
 

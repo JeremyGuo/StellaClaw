@@ -1213,6 +1213,7 @@ fn parse_conversation_control(text: &str) -> Option<ConversationControl> {
     match command {
         "/continue" if argument.is_empty() => Some(ConversationControl::Continue),
         "/cancel" if argument.is_empty() => Some(ConversationControl::Cancel),
+        "/compact" if argument.is_empty() => Some(ConversationControl::Compact),
         "/status" if argument.is_empty() => Some(ConversationControl::ShowStatus),
         "/model" if argument.is_empty() => Some(ConversationControl::ShowModel),
         "/model" => Some(ConversationControl::SwitchModel {
@@ -2993,6 +2994,10 @@ mod tests {
         assert!(matches!(
             parse_conversation_control("/status"),
             Some(ConversationControl::ShowStatus)
+        ));
+        assert!(matches!(
+            parse_conversation_control("/compact"),
+            Some(ConversationControl::Compact)
         ));
         assert!(matches!(
             parse_conversation_control("/sandbox"),

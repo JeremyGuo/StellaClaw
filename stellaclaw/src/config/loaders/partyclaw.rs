@@ -365,6 +365,7 @@ fn convert_legacy_config(legacy: LegacyServerConfig, path: &Path) -> Result<Stel
         agent_server: legacy.agent_server,
         default_profile: None,
         models: named_models,
+        available_agent_models: Vec::new(),
         session_defaults,
         skill_sync: Vec::new(),
         sandbox: SandboxConfig {
@@ -999,7 +1000,7 @@ fn convert_session_defaults(
                 .context_compaction
                 .recent_fidelity_target_ratio
         } else {
-            0.2
+            0.18
         };
         ((threshold as f64) * ratio).round().max(256.0) as u64
     });
@@ -1040,6 +1041,9 @@ fn convert_session_defaults(
                 .as_deref()
                 .or(main_model.web_search_model.as_deref()),
         )?,
+        search_image_tool_model: None,
+        search_video_tool_model: None,
+        search_news_tool_model: None,
     })
 }
 
@@ -1269,6 +1273,12 @@ mod tests {
           "tooling": {
             "web_search": "brave"
           },
+          "main_agent": {
+            "enable_context_compression": true,
+            "context_compaction": {
+              "token_limit_override": 100000
+            }
+          },
           "channels": [
             {
               "kind": "telegram",
@@ -1293,6 +1303,10 @@ mod tests {
         assert_eq!(
             config.models["brave"].provider_type,
             ProviderType::BraveSearch
+        );
+        assert_eq!(
+            config.session_defaults.compression_retain_recent_tokens,
+            Some(18_000)
         );
     }
 

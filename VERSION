@@ -1,5 +1,19 @@
-version: 1.12.3
+version: 1.13.0
 ---
+
+# 1.13.0
+
+- 扩展 Brave 垂直搜索：
+  `web_search` 工具新增 `image`、`video`、`news` 布尔参数，按当前 session 配置动态说明哪些垂直搜索可用；不再新增独立图片搜索工具或图片搜索能力，所有搜索 provider 统一使用 `web_search` 能力。新增 `brave_search_image`、`brave_search_video`、`brave_search_news` provider，分别调用 Brave `/res/v1/images/search`、`/res/v1/videos/search`、`/res/v1/news/search` 并返回对应结构化元数据。新增 `session_defaults.search_image_tool_model`、`search_video_tool_model` 和 `search_news_tool_model` 用于单独指定垂直搜索 provider。新增 `pricing/brave_search_image.json`、`pricing/brave_search_video.json`、`pricing/brave_search_news.json`，保持空字典，因为 Brave Search 垂直接口按请求计费，不按 token 归因。
+- 增加 agent 模型选择白名单：
+  根配置新增 `available_agent_models: string[]`，用于限制 `/model` 展示和 `/model <alias>` 可切换的 foreground agent 模型；为空时保持旧行为，所有 chat-capable 模型都可选。Web API 创建 conversation 时显式指定 `model` 也会使用同一白名单校验。`config` schema 更新到 `0.10`，`workdir` schema 不变。
+
+- 增加长期记忆系统设计文档：
+  新增 `MEMORY_DESIGN.md`，记录 MemoryStore 作为独立、无工具的长期记忆边界，并明确只有 ConversationActor 可以调用 memory JSON-RPC handle，普通 SessionActor 只能通过 SessionEvent 或 `memory_query` 工具桥接回所属 ConversationActor 后间接触发 memory RPC。文档采用独立 `memory_core`、同进程单 MemoryThread JSON-RPC、memory-specific provider 和可插拔 `MemoryAlgorithm`，默认算法为单一全局记忆池的 MemTree；同时覆盖 user/assistant 消息 copy、agent-to-agent 观察、`STELLACLAW.md` turn-boundary checkpoint/diff、Memory Node 三层结构、append-only entry event log、常规创建/替换/失效、容量溢出或每日整理时的维护合并、节点溢出下沉、由命中频率计算的重要性、稳定 `rendered_context`、provider/cache 复用和失败策略。本次不改变 `config` schema，不改变 `workdir` schema。
+- 对齐 ClawParty 默认 recent 保留比例：
+  自动上下文压缩在未显式配置 `compression_retain_recent_tokens` 时，默认保留最近区从阈值的 25% 调整为 18%；PartyClaw 兼容配置迁移在缺少 `recent_fidelity_target_ratio` 时也按 18% 生成 retain recent。显式配置的值不变。本次不改变 `config` schema，不改变 `workdir` schema。
+- 恢复手动上下文压缩命令：
+  Telegram/Web conversation 现在支持 `/compact`，会向 foreground session 发送 `CompactNow` 控制请求并主动压缩当前上下文；完成后返回压缩前后估算 token、阈值和消息保留/压缩数量。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.12.3
 

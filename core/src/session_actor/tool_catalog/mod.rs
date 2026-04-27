@@ -31,7 +31,7 @@ pub use process_tools::process_tool_definitions;
 pub(crate) use skill_tools::execute_skill_load_tool;
 pub use skill_tools::skill_tool_definitions;
 pub(crate) use web_tools::execute_web_tool;
-pub use web_tools::web_tool_definitions;
+pub use web_tools::{web_tool_definitions, WebSearchOptions};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -138,7 +138,10 @@ impl ToolCatalog {
     pub fn from_model_config(model_config: &ModelConfig) -> Result<Self, ToolCatalogError> {
         let options = BuiltinToolCatalogOptions {
             remote_mode: ToolRemoteMode::Selectable,
-            enable_web_search: model_config.supports(ModelCapability::WebSearch),
+            web_search: WebSearchOptions {
+                enabled: model_config.supports(ModelCapability::WebSearch),
+                ..WebSearchOptions::default()
+            },
             enable_native_image_load: model_config.supports(ModelCapability::ImageIn),
             enable_native_pdf_load: model_config.supports(ModelCapability::PdfIn),
             enable_native_audio_load: model_config.supports(ModelCapability::AudioIn),
@@ -155,7 +158,10 @@ impl ToolCatalog {
     ) -> Result<Self, ToolCatalogError> {
         let options = BuiltinToolCatalogOptions {
             remote_mode: ToolRemoteMode::Selectable,
-            enable_web_search: model_config.supports(ModelCapability::WebSearch),
+            web_search: WebSearchOptions {
+                enabled: model_config.supports(ModelCapability::WebSearch),
+                ..WebSearchOptions::default()
+            },
             enable_native_image_load: model_config.supports(ModelCapability::ImageIn),
             enable_native_pdf_load: model_config.supports(ModelCapability::PdfIn),
             enable_native_audio_load: model_config.supports(ModelCapability::AudioIn),
@@ -176,10 +182,27 @@ impl ToolCatalog {
         let audio_tool = selected_media_tool(model_config, initial.audio_tool_model.as_ref());
         let generation_tool =
             selected_media_tool(model_config, initial.image_generation_tool_model.as_ref());
+        let search_tool = selected_media_tool(model_config, initial.search_tool_model.as_ref());
         let options = BuiltinToolCatalogOptions {
             remote_mode: initial.tool_remote_mode.clone(),
-            enable_web_search: model_config.supports(ModelCapability::WebSearch)
-                || initial.search_tool_model.is_some(),
+            web_search: WebSearchOptions {
+                enabled: search_tool.model_supports(ModelCapability::WebSearch)
+                    || initial.search_image_tool_model.is_some()
+                    || initial.search_video_tool_model.is_some()
+                    || initial.search_news_tool_model.is_some(),
+                image: initial
+                    .search_image_tool_model
+                    .as_ref()
+                    .is_some_and(|model| model.supports(ModelCapability::WebSearch)),
+                video: initial
+                    .search_video_tool_model
+                    .as_ref()
+                    .is_some_and(|model| model.supports(ModelCapability::WebSearch)),
+                news: initial
+                    .search_news_tool_model
+                    .as_ref()
+                    .is_some_and(|model| model.supports(ModelCapability::WebSearch)),
+            },
             enable_native_image_load: image_tool.self_model
                 && image_tool.model_supports(ModelCapability::ImageIn),
             enable_native_pdf_load: pdf_tool.self_model
@@ -279,7 +302,7 @@ impl From<SessionType> for HostToolScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltinToolCatalogOptions {
     pub remote_mode: ToolRemoteMode,
-    pub enable_web_search: bool,
+    pub web_search: WebSearchOptions,
     pub enable_native_image_load: bool,
     pub enable_native_pdf_load: bool,
     pub enable_native_audio_load: bool,
@@ -296,7 +319,7 @@ impl Default for BuiltinToolCatalogOptions {
     fn default() -> Self {
         Self {
             remote_mode: ToolRemoteMode::Selectable,
-            enable_web_search: false,
+            web_search: WebSearchOptions::default(),
             enable_native_image_load: false,
             enable_native_pdf_load: false,
             enable_native_audio_load: false,
@@ -325,7 +348,7 @@ pub fn builtin_tool_catalog(
     for tool in download_tool_definitions(&options.remote_mode) {
         catalog.add(tool)?;
     }
-    for tool in web_tool_definitions(options.enable_web_search) {
+    for tool in web_tool_definitions(options.web_search) {
         catalog.add(tool)?;
     }
     for tool in media_tool_definitions(&options) {
@@ -359,7 +382,12 @@ mod tests {
     fn builds_builtin_catalog_with_copied_core_tool_schemas() {
         let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions {
             remote_mode: ToolRemoteMode::Selectable,
-            enable_web_search: true,
+            web_search: WebSearchOptions {
+                enabled: true,
+                image: true,
+                video: true,
+                news: true,
+            },
             enable_native_image_load: true,
             enable_native_pdf_load: true,
             enable_native_audio_load: true,
@@ -530,6 +558,45 @@ mod tests {
             ToolCatalog::from_model_config_and_initial(&primary, &initial).expect("catalog");
 
         assert!(catalog.contains("web_search"));
+    }
+
+    #[test]
+    fn initial_image_search_model_enables_image_mode_on_web_search() {
+        let primary = ModelConfig {
+            provider_type: ProviderType::OpenRouterCompletion,
+            model_name: "text-model".to_string(),
+            url: "https://openrouter.ai/api/v1/chat/completions".to_string(),
+            api_key_env: "OPENROUTER_API_KEY".to_string(),
+            capabilities: vec![ModelCapability::Chat],
+            token_max_context: 128_000,
+            cache_timeout: 300,
+            conn_timeout: 10,
+            request_timeout: 600,
+            max_request_size: 30 * 1024 * 1024,
+            retry_mode: RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: None,
+            token_estimator_url: None,
+        };
+        let mut image_search_model = primary.clone();
+        image_search_model.provider_type = ProviderType::BraveSearchImage;
+        image_search_model.model_name = "brave-image-search".to_string();
+        image_search_model.url = "https://api.search.brave.com/res/v1/images/search".to_string();
+        image_search_model.api_key_env = "BRAVE_SEARCH_API_KEY".to_string();
+        image_search_model.capabilities = vec![ModelCapability::WebSearch];
+        let mut initial = SessionInitial::new("session_1", SessionType::Foreground);
+        initial.search_image_tool_model = Some(image_search_model);
+
+        let catalog =
+            ToolCatalog::from_model_config_and_initial(&primary, &initial).expect("catalog");
+
+        let tool = catalog
+            .get("web_search")
+            .expect("web_search should be exposed");
+        assert!(tool.description.contains("image"));
+        assert!(tool.parameters["properties"].get("image").is_some());
     }
 
     #[test]

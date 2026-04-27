@@ -118,6 +118,56 @@ impl SessionCompressor {
         )
     }
 
+    pub fn compact_now(
+        &self,
+        messages: &mut Vec<ChatMessage>,
+        provider: &(dyn Provider + Send + Sync),
+        model_config: &ModelConfig,
+        system_prompt: Option<&str>,
+    ) -> Result<CompressionReport, CompressionError> {
+        let estimated_tokens_before = self.estimator.estimate(messages)?.total_tokens;
+        let Some(plan) = self.plan_compression(messages)? else {
+            return Ok(CompressionReport {
+                compressed: false,
+                estimated_tokens_before,
+                estimated_tokens_after: estimated_tokens_before,
+                threshold_tokens: self.threshold_tokens,
+                retained_message_count: messages.len(),
+                compressed_message_count: 0,
+            });
+        };
+
+        let summary_message = self.generate_summary_message(
+            &messages[..plan.recent_start],
+            messages.len() - plan.recent_start,
+            provider,
+            model_config,
+            system_prompt,
+        )?;
+        let summary_present = summary_message.is_some();
+        let mut compressed_messages = Vec::new();
+        if let Some(summary_message) = summary_message {
+            compressed_messages.push(summary_message);
+        }
+        compressed_messages.extend_from_slice(&messages[plan.recent_start..]);
+        let compressed_message_count = plan.recent_start;
+        let retained_message_count = compressed_messages
+            .len()
+            .saturating_sub(usize::from(summary_present));
+
+        *messages = compressed_messages;
+
+        let estimated_tokens_after = self.estimator.estimate(messages)?.total_tokens;
+        Ok(CompressionReport {
+            compressed: true,
+            estimated_tokens_before,
+            estimated_tokens_after,
+            threshold_tokens: self.threshold_tokens,
+            retained_message_count,
+            compressed_message_count,
+        })
+    }
+
     pub fn compact_if_needed_with_threshold(
         &self,
         messages: &mut Vec<ChatMessage>,

@@ -60,6 +60,12 @@ pub struct SessionInitial {
     pub image_generation_tool_model: Option<ModelConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_tool_model: Option<ModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_image_tool_model: Option<ModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_video_tool_model: Option<ModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_news_tool_model: Option<ModelConfig>,
 }
 
 impl SessionInitial {
@@ -75,6 +81,9 @@ impl SessionInitial {
             audio_tool_model: None,
             image_generation_tool_model: None,
             search_tool_model: None,
+            search_image_tool_model: None,
+            search_video_tool_model: None,
+            search_news_tool_model: None,
         }
     }
 }
@@ -105,6 +114,7 @@ pub enum SessionRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    CompactNow,
     ResolveHostCoordination {
         response: ConversationBridgeResponse,
     },
@@ -123,6 +133,7 @@ impl SessionRequest {
             SessionRequest::Initial { .. }
             | SessionRequest::CancelTurn { .. }
             | SessionRequest::ContinueTurn { .. }
+            | SessionRequest::CompactNow
             | SessionRequest::ResolveHostCoordination { .. }
             | SessionRequest::QuerySessionView { .. }
             | SessionRequest::Shutdown => SessionMailboxKind::Control,
@@ -156,6 +167,14 @@ pub enum SessionEvent {
     SessionViewResult {
         query_id: String,
         payload: Value,
+    },
+    CompactCompleted {
+        compressed: bool,
+        estimated_tokens_before: u64,
+        estimated_tokens_after: u64,
+        threshold_tokens: u64,
+        retained_message_count: usize,
+        compressed_message_count: usize,
     },
     ControlRejected {
         reason: String,

@@ -16,6 +16,18 @@ pub struct ToolBatch {
     pub operations: Vec<ToolExecutionOp>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SearchToolModels {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<ModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video: Option<ModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub news: Option<ModelConfig>,
+}
+
 impl ToolBatch {
     pub fn new(batch_id: impl Into<String>, operations: Vec<ToolExecutionOp>) -> Self {
         Self {
@@ -71,7 +83,7 @@ pub enum ToolExecutionOp {
     },
     WebSearch {
         tool_call: ToolCallItem,
-        model_config: ModelConfig,
+        models: SearchToolModels,
     },
     ConversationBridge(ConversationBridgeRequest),
 }

@@ -127,6 +127,7 @@ mod tests {
             agent_server: AgentServerConfig::default(),
             default_profile: None,
             models: BTreeMap::new(),
+            available_agent_models: Vec::new(),
             session_defaults: SessionDefaults::default(),
             skill_sync: Vec::new(),
             sandbox: SandboxConfig::default(),

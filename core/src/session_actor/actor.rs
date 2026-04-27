@@ -34,6 +34,7 @@ const DEFAULT_MAX_MODEL_STEPS_PER_TURN: usize = 200;
 const ACTIVE_COMPRESSION_THRESHOLD_RATIO: f64 = 0.9;
 const IDLE_COMPACTION_MIN_RATIO: f64 = 0.4;
 const REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS: usize = 8;
+const DEFAULT_RETAIN_RECENT_PERCENT: u64 = 18;
 
 pub struct SessionActor {
     model_config: ModelConfig,
@@ -446,6 +447,7 @@ impl SessionActor {
             }
             SessionRequest::CancelTurn { reason } => self.handle_cancel_turn(reason),
             SessionRequest::ContinueTurn { reason } => self.handle_continue_turn(reason),
+            SessionRequest::CompactNow => self.handle_compact_now(),
             SessionRequest::QuerySessionView { query_id, payload } => {
                 self.handle_query_session_view(query_id, payload)
             }
@@ -455,6 +457,85 @@ impl SessionActor {
                     .unwrap_or_else(|_| serde_json::json!({"error": "serialize control failed"})),
             }),
         }
+    }
+
+    fn handle_compact_now(&mut self) -> Result<(), SessionActorError> {
+        if self.active_tool_batch.is_some() || count_unclosed_tool_calls(&self.history) > 0 {
+            return self.emit(SessionEvent::ControlRejected {
+                reason: "cannot compact while a tool batch or unfinished tool call is active"
+                    .to_string(),
+                payload: serde_json::json!({"type": "compact_now"}),
+            });
+        }
+
+        let Some(compressor) = self.compressor.clone() else {
+            return self.emit(SessionEvent::ControlRejected {
+                reason: "context compression is not available for this session".to_string(),
+                payload: serde_json::json!({"type": "compact_now"}),
+            });
+        };
+
+        self.log_info(
+            "manual_compaction_started",
+            serde_json::json!({
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+            }),
+        );
+        let system_prompt = self
+            .initial
+            .as_ref()
+            .map(|initial| system_prompt_for_initial(initial, &self.runtime_metadata_state));
+
+        let report = match compressor.compact_now(
+            &mut self.history,
+            self.provider.as_ref(),
+            &self.model_config,
+            system_prompt.as_deref(),
+        ) {
+            Ok(report) => report,
+            Err(error) => {
+                let reason = format!("manual context compression failed: {error}");
+                self.log_error(
+                    "manual_compaction_failed",
+                    serde_json::json!({
+                        "error": reason,
+                        "history_len": self.history.len(),
+                    }),
+                );
+                return self.emit(SessionEvent::ControlRejected {
+                    reason,
+                    payload: serde_json::json!({"type": "compact_now"}),
+                });
+            }
+        };
+
+        self.log_compression_report("manual", &report);
+        if report.compressed {
+            self.runtime_metadata_state
+                .promote_notified_components_to_system_snapshot();
+            self.persist_state_if_history_closed("manual_compaction")?;
+        }
+        self.log_info(
+            "manual_compaction_finished",
+            serde_json::json!({
+                "compressed": report.compressed,
+                "estimated_tokens_before": report.estimated_tokens_before,
+                "estimated_tokens_after": report.estimated_tokens_after,
+                "threshold_tokens": report.threshold_tokens,
+                "retained_message_count": report.retained_message_count,
+                "compressed_message_count": report.compressed_message_count,
+                "history_len": self.history.len(),
+            }),
+        );
+        self.emit(SessionEvent::CompactCompleted {
+            compressed: report.compressed,
+            estimated_tokens_before: report.estimated_tokens_before,
+            estimated_tokens_after: report.estimated_tokens_after,
+            threshold_tokens: report.threshold_tokens,
+            retained_message_count: report.retained_message_count,
+            compressed_message_count: report.compressed_message_count,
+        })
     }
 
     fn handle_cancel_turn(&mut self, reason: Option<String>) -> Result<(), SessionActorError> {
@@ -981,10 +1062,15 @@ impl SessionActor {
         &self,
         tool_call: super::ToolCallItem,
     ) -> Option<ToolExecutionOp> {
-        let search_tool_model = self.initial.as_ref()?.search_tool_model.clone()?;
+        let initial = self.initial.as_ref()?;
         Some(ToolExecutionOp::WebSearch {
             tool_call,
-            model_config: search_tool_model,
+            models: super::SearchToolModels {
+                web: initial.search_tool_model.clone(),
+                image: initial.search_image_tool_model.clone(),
+                video: initial.search_video_tool_model.clone(),
+                news: initial.search_news_tool_model.clone(),
+            },
         })
     }
 
@@ -1806,7 +1892,9 @@ fn default_retain_recent_tokens(threshold_tokens: u64) -> u64 {
     if threshold_tokens <= 2 {
         return 1;
     }
-    (threshold_tokens / 4).max(512).min(threshold_tokens - 1)
+    ((threshold_tokens.saturating_mul(DEFAULT_RETAIN_RECENT_PERCENT)) / 100)
+        .max(512)
+        .min(threshold_tokens - 1)
 }
 
 fn idle_compaction_threshold(model_config: &ModelConfig) -> Option<Duration> {
@@ -1980,6 +2068,7 @@ fn session_request_kind(request: &SessionRequest) -> &'static str {
         SessionRequest::EnqueueActorMessage { .. } => "enqueue_actor_message",
         SessionRequest::CancelTurn { .. } => "cancel_turn",
         SessionRequest::ContinueTurn { .. } => "continue_turn",
+        SessionRequest::CompactNow => "compact_now",
         SessionRequest::ResolveHostCoordination { .. } => "resolve_host_coordination",
         SessionRequest::QuerySessionView { .. } => "query_session_view",
         SessionRequest::Shutdown => "shutdown",
@@ -2025,6 +2114,19 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "event": "session_view_result",
             "query_id": query_id,
             "payload": payload,
+        }),
+        SessionEvent::CompactCompleted {
+            compressed,
+            estimated_tokens_before,
+            estimated_tokens_after,
+            threshold_tokens,
+            ..
+        } => serde_json::json!({
+            "event": "compact_completed",
+            "compressed": compressed,
+            "estimated_tokens_before": estimated_tokens_before,
+            "estimated_tokens_after": estimated_tokens_after,
+            "threshold_tokens": threshold_tokens,
         }),
         SessionEvent::ControlRejected { reason, payload } => serde_json::json!({
             "event": "control_rejected",
@@ -2507,6 +2609,14 @@ mod tests {
             active_compression_threshold_tokens(&model_config, &initial),
             None
         );
+    }
+
+    #[test]
+    fn default_retain_recent_tokens_uses_clawparty_ratio() {
+        assert_eq!(default_retain_recent_tokens(235_929), 42_467);
+        assert_eq!(default_retain_recent_tokens(200_000), 36_000);
+        assert_eq!(default_retain_recent_tokens(1_000), 512);
+        assert_eq!(default_retain_recent_tokens(2), 1);
     }
 
     #[test]
@@ -3677,6 +3787,78 @@ mod tests {
             .history()
             .iter()
             .any(|message| message_text_for_test(message).contains("second final")));
+
+        fs::remove_dir_all(tokenizer_dir).expect("tokenizer dir should be removed");
+    }
+
+    #[test]
+    fn manual_compact_now_forces_context_compression() {
+        let _cwd = temp_cwd("actor-manual-compression");
+        let (inbox, mailbox) = test_inbox();
+        let mut initial = SessionInitial::new(
+            test_session_id("session_manual_compression"),
+            super::super::SessionType::Foreground,
+        );
+        initial.compression_threshold_tokens = Some(1_000);
+        initial.compression_retain_recent_tokens = Some(12);
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial { initial },
+        );
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "old ".repeat(50),
+                    })],
+                ),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "first final".to_string(),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "manual summary".to_string(),
+                })],
+            ),
+        ]));
+        let tools = Arc::new(EchoToolExecutor::new());
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
+        let (model_config, tokenizer_dir) = test_model_config_with_tokenizer();
+        let mut actor = SessionActor::new(
+            model_config,
+            provider,
+            tools,
+            inbox,
+            events.clone(),
+            catalog,
+        );
+
+        actor.run_until_idle(4).expect("initial turn should run");
+        mailbox.append(SessionMailboxKind::Control, SessionRequest::CompactNow);
+        actor.run_until_idle(4).expect("manual compact should run");
+
+        assert!(message_text_for_test(&actor.history()[0]).contains(COMPRESSION_MARKER));
+        assert!(message_text_for_test(&actor.history()[0]).contains("manual summary"));
+        let completed = events.events.lock().unwrap().iter().any(|event| {
+            matches!(
+                event,
+                SessionEvent::CompactCompleted {
+                    compressed: true,
+                    ..
+                }
+            )
+        });
+        assert!(completed);
 
         fs::remove_dir_all(tokenizer_dir).expect("tokenizer dir should be removed");
     }

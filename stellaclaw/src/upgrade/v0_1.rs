@@ -711,6 +711,24 @@ fn migrate_foreground_session(
             config,
             session_model,
         )?,
+        search_image_tool_model: resolve_tool_model_target(
+            "search_image_tool_model",
+            config.session_defaults.search_image_tool_model.as_ref(),
+            config,
+            session_model,
+        )?,
+        search_video_tool_model: resolve_tool_model_target(
+            "search_video_tool_model",
+            config.session_defaults.search_video_tool_model.as_ref(),
+            config,
+            session_model,
+        )?,
+        search_news_tool_model: resolve_tool_model_target(
+            "search_news_tool_model",
+            config.session_defaults.search_news_tool_model.as_ref(),
+            config,
+            session_model,
+        )?,
     };
     let persisted = MigratedSessionState {
         version: 1,

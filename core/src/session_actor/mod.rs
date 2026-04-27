@@ -35,8 +35,9 @@ pub use token_estimator::{
     RenderedChatPrompt, TokenEstimate, TokenEstimator, TokenEstimatorError, VisionDetail,
 };
 pub use tool_batch::{
-    ConversationBridge, ConversationBridgeRequest, ConversationBridgeResponse, ToolBatch,
-    ToolBatchCompletion, ToolBatchError, ToolBatchExecutor, ToolBatchHandle, ToolExecutionOp,
+    ConversationBridge, ConversationBridgeRequest, ConversationBridgeResponse, SearchToolModels,
+    ToolBatch, ToolBatchCompletion, ToolBatchError, ToolBatchExecutor, ToolBatchHandle,
+    ToolExecutionOp,
 };
 pub use tool_catalog::{
     builtin_tool_catalog, download_tool_definitions, file_tool_definitions, host_tool_definitions,

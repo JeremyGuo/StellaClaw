@@ -240,10 +240,9 @@ impl ToolOperationRunner {
                 kind,
                 model_config,
             } => self.execute_provider_backed_tool(tool_call, *kind, model_config),
-            ToolExecutionOp::WebSearch {
-                tool_call,
-                model_config,
-            } => self.execute_web_search_tool(tool_call, model_config),
+            ToolExecutionOp::WebSearch { tool_call, models } => {
+                self.execute_web_search_tool(tool_call, models)
+            }
             ToolExecutionOp::ConversationBridge(request) => match self.conversation_bridge.as_ref()
             {
                 Some(bridge) => bridge
@@ -330,10 +329,10 @@ impl ToolOperationRunner {
     fn execute_web_search_tool(
         &self,
         tool_call: &super::ToolCallItem,
-        model_config: &crate::model_config::ModelConfig,
+        models: &super::SearchToolModels,
     ) -> Result<ToolResultItem, LocalToolError> {
         let arguments = parse_arguments(&tool_call.arguments.text)?;
-        let result = execute_web_tool(&tool_call.tool_name, &arguments, Some(model_config))?
+        let result = execute_web_tool(&tool_call.tool_name, &arguments, Some(models))?
             .ok_or_else(|| LocalToolError::UnsupportedTool(tool_call.tool_name.clone()))?;
         Ok(ToolResultItem {
             tool_call_id: tool_call.tool_call_id.clone(),
