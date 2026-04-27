@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs,
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -144,9 +144,7 @@ fn file_download_start(
     let download_id = format!("dl_{}", nonce());
     let target = context.execution_target(arguments)?;
     let display_path = match &target {
-        ExecutionTarget::Local => resolve_local_path(context.workspace_root, &path_arg)
-            .display()
-            .to_string(),
+        ExecutionTarget::Local => local_display_path(context.workspace_root, &path_arg),
         ExecutionTarget::RemoteSsh { host, cwd } => {
             remote_display_path(host, cwd.as_deref(), &path_arg)
         }
@@ -579,6 +577,17 @@ fn remote_display_path(host: &str, cwd: Option<&str>, path: &str) -> String {
         Some(cwd) => format!("{host}:{cwd}/{path}"),
         None => format!("{host}:{path}"),
     }
+}
+
+fn local_display_path(workspace_root: &Path, path: &str) -> String {
+    let resolved = resolve_local_path(workspace_root, path);
+    if let Ok(relative) = resolved.strip_prefix(workspace_root) {
+        let display = relative.display().to_string();
+        if !display.is_empty() {
+            return display;
+        }
+    }
+    path.to_string()
 }
 
 fn set_status_fields(status: &mut Value, patch: Value) {

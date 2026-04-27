@@ -1,5 +1,10 @@
-version: 1.12.2
+version: 1.12.3
 ---
+
+# 1.12.3
+
+- 修复下载附件路径提示：
+  本地 `file_download_start` 现在在工具结果中返回 workspace 相对路径，避免模型把机器相关的绝对路径写入 `<attachment>` 标签导致 Telegram 附件发送失败；附件解析同时兼容旧机器/旧 workdir 中同一 conversation 的绝对路径，只要对应文件已存在于当前 conversation workspace，就会自动重映射。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.12.2
 

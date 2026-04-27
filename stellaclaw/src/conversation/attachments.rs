@@ -109,7 +109,7 @@ fn resolve_outgoing_attachment(
     shared_root: &Path,
     path_text: &str,
 ) -> Result<OutgoingAttachment> {
-    let joined = workspace_root.join(path_text);
+    let joined = attachment_candidate_path(workspace_root, path_text);
     let canonical = joined
         .canonicalize()
         .with_context(|| format!("attachment path does not exist: {}", joined.display()))?;
@@ -138,6 +138,45 @@ fn resolve_outgoing_attachment(
         kind: infer_outgoing_attachment_kind(&canonical),
         path: canonical,
     })
+}
+
+fn attachment_candidate_path(workspace_root: &Path, path_text: &str) -> std::path::PathBuf {
+    let path = Path::new(path_text);
+    if !path.is_absolute() {
+        return workspace_root.join(path);
+    }
+
+    if let Some(remapped) = remap_absolute_conversation_path(workspace_root, path) {
+        if remapped.exists() {
+            return remapped;
+        }
+    }
+    path.to_path_buf()
+}
+
+fn remap_absolute_conversation_path(
+    workspace_root: &Path,
+    path: &Path,
+) -> Option<std::path::PathBuf> {
+    let conversation_name = workspace_root.file_name()?;
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        if component.as_os_str() != "conversations" {
+            continue;
+        }
+        let Some(next) = components.next() else {
+            return None;
+        };
+        if next.as_os_str() != conversation_name {
+            continue;
+        }
+        let mut remapped = workspace_root.to_path_buf();
+        for rest in components {
+            remapped.push(rest.as_os_str());
+        }
+        return Some(remapped);
+    }
+    None
 }
 
 fn infer_outgoing_attachment_kind(path: &Path) -> OutgoingAttachmentKind {
@@ -263,6 +302,32 @@ mod tests {
 
         let resolved = resolve_outgoing_attachment(&workspace, &shared, "shared/report.txt")
             .expect("shared attachment should resolve");
+        assert_eq!(resolved.path, file.canonicalize().unwrap());
+        std::fs::remove_dir_all(&root).expect("temp root should be removed");
+    }
+
+    #[test]
+    fn remaps_absolute_path_from_same_conversation_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "stellaclaw-attachment-remap-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let workspace = root
+            .join("current")
+            .join("conversations")
+            .join("telegram-main-000009");
+        let shared = root.join("shared");
+        std::fs::create_dir_all(&workspace).expect("workspace should exist");
+        std::fs::create_dir_all(&shared).expect("shared should exist");
+        let file = workspace.join("shibuya_sky_1.jpg");
+        std::fs::write(&file, "jpg").expect("file should write");
+
+        let old_absolute =
+            "/Users/syk/Desktop/ClawParty/deploy_telegram_workdir/conversations/telegram-main-000009/shibuya_sky_1.jpg";
+        let resolved = resolve_outgoing_attachment(&workspace, &shared, old_absolute)
+            .expect("old absolute workspace path should remap");
+
         assert_eq!(resolved.path, file.canonicalize().unwrap());
         std::fs::remove_dir_all(&root).expect("temp root should be removed");
     }

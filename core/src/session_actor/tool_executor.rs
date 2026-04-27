@@ -1083,6 +1083,8 @@ mod tests {
         );
 
         assert!(result_text(&message, 0).contains("\"completed\": true"));
+        assert!(result_text(&message, 0).contains("\"path\": \"downloads/file.txt\""));
+        assert!(!result_text(&message, 0).contains(&workspace.display().to_string()));
         assert!(!result_text(&message, 0).contains("\"failed\": false"));
         assert_eq!(
             fs::read_to_string(workspace.join("downloads/file.txt")).unwrap(),
