@@ -9,6 +9,7 @@ const state = {
   serverHealth: new Map(),
   workspaceListings: new Map(),
   workspacePaths: new Map(),
+  workspaceExpandedPaths: new Map(),
   workspaceErrors: new Map(),
   workspaceLoading: new Set(),
   messages: [],
@@ -162,6 +163,31 @@ function selectedKey() {
 function currentWorkspacePath() {
   const key = selectedKey();
   return key ? state.workspacePaths.get(key) || '' : '';
+}
+
+function workspaceCacheKey(key, path) {
+  return `${key}::${normalizeWorkspacePath(path)}`;
+}
+
+function workspaceListing(key, path) {
+  return state.workspaceListings.get(workspaceCacheKey(key, path));
+}
+
+function workspaceError(key, path) {
+  return state.workspaceErrors.get(workspaceCacheKey(key, path));
+}
+
+function workspaceIsLoading(key, path) {
+  return state.workspaceLoading.has(workspaceCacheKey(key, path));
+}
+
+function workspaceExpandedSet(key) {
+  let expanded = state.workspaceExpandedPaths.get(key);
+  if (!expanded) {
+    expanded = new Set(['']);
+    state.workspaceExpandedPaths.set(key, expanded);
+  }
+  return expanded;
 }
 
 function normalizeWorkspacePath(value) {
@@ -430,6 +456,7 @@ async function selectConversation(serverId, conversationId) {
   if (!state.workspacePaths.has(key)) {
     state.workspacePaths.set(key, '');
   }
+  workspaceExpandedSet(key);
   state.messages = [];
   state.messagesSignature = '';
   state.messageDetails.clear();
@@ -479,16 +506,23 @@ async function refreshConversation() {
   renderContext();
 }
 
-async function refreshWorkspace(path = currentWorkspacePath()) {
+async function refreshWorkspace(path = currentWorkspacePath(), options = {}) {
   if (!state.selected) {
     return;
   }
+  const { expand = false, setActive = true } = options;
   const { serverId, conversationId } = state.selected;
   const key = selectedKey();
   const nextPath = normalizeWorkspacePath(path);
-  state.workspacePaths.set(key, nextPath);
-  state.workspaceLoading.add(key);
-  state.workspaceErrors.delete(key);
+  const cacheKey = workspaceCacheKey(key, nextPath);
+  if (setActive) {
+    state.workspacePaths.set(key, nextPath);
+  }
+  if (expand) {
+    workspaceExpandedSet(key).add(nextPath);
+  }
+  state.workspaceLoading.add(cacheKey);
+  state.workspaceErrors.delete(cacheKey);
   if (state.activeContextTab === 'overview') {
     renderContext();
   }
@@ -497,12 +531,19 @@ async function refreshWorkspace(path = currentWorkspacePath()) {
       serverId,
       `/api/conversations/${conversationId}/workspace?path=${encodeURIComponent(nextPath)}&limit=300`
     );
-    state.workspaceListings.set(key, response.data);
-    state.workspacePaths.set(key, normalizeWorkspacePath(response.data?.path || nextPath));
+    const listingPath = normalizeWorkspacePath(response.data?.path || nextPath);
+    state.workspaceListings.set(cacheKey, response.data);
+    state.workspaceListings.set(workspaceCacheKey(key, listingPath), response.data);
+    if (setActive) {
+      state.workspacePaths.set(key, listingPath);
+    }
+    if (expand) {
+      workspaceExpandedSet(key).add(listingPath);
+    }
   } catch (error) {
-    state.workspaceErrors.set(key, error.message);
+    state.workspaceErrors.set(cacheKey, error.message);
   } finally {
-    state.workspaceLoading.delete(key);
+    state.workspaceLoading.delete(cacheKey);
     if (selectedKey() === key && state.activeContextTab === 'overview') {
       renderContext();
     }
@@ -849,36 +890,31 @@ function usageBar(label, value, total) {
   `;
 }
 
-function workspaceKindIcon(kind) {
-  if (kind === 'directory') {
-    return '▸';
+function workspaceKindIcon(entry) {
+  const name = safeText(entry?.name).toLowerCase();
+  if (entry?.kind === 'symlink') {
+    return '<span class="file-badge symlink">↪</span>';
   }
-  if (kind === 'symlink') {
-    return '↪';
+  if (name.endsWith('.md')) {
+    return '<span class="file-badge md">M</span>';
   }
-  return '·';
+  if (name.endsWith('.json')) {
+    return '<span class="file-badge json">{}</span>';
+  }
+  if (name.endsWith('.sh') || name.endsWith('.bash') || name.endsWith('.zsh')) {
+    return '<span class="file-badge shell">$</span>';
+  }
+  if (name.endsWith('.png') || name.endsWith('.jpg') || name.endsWith('.jpeg') || name.endsWith('.gif') || name.endsWith('.webp')) {
+    return '<span class="file-badge image">▰</span>';
+  }
+  if (name.endsWith('.pdf')) {
+    return '<span class="file-badge pdf">P</span>';
+  }
+  return '<span class="file-badge file"></span>';
 }
 
-function workspaceCrumbs(path) {
-  const parts = normalizeWorkspacePath(path).split('/').filter(Boolean);
-  const crumbs = [{ label: 'workspace', path: '' }];
-  let current = '';
-  for (const part of parts) {
-    current = current ? `${current}/${part}` : part;
-    crumbs.push({ label: part, path: current });
-  }
-  return crumbs;
-}
-
-function renderWorkspaceCard(status) {
-  const key = selectedKey();
-  const listing = state.workspaceListings.get(key);
-  const loading = state.workspaceLoading.has(key);
-  const error = state.workspaceErrors.get(key);
-  const activePath = listing?.path ?? currentWorkspacePath();
-  const root = listing?.workspace_root || status?.workspace || 'workspace pending';
-  const remote = listing?.remote;
-  const entries = [...(listing?.entries || [])].sort((left, right) => {
+function sortedWorkspaceEntries(entries) {
+  return [...(entries || [])].sort((left, right) => {
     const leftDir = left.kind === 'directory';
     const rightDir = right.kind === 'directory';
     if (leftDir !== rightDir) {
@@ -886,75 +922,125 @@ function renderWorkspaceCard(status) {
     }
     return safeText(left.name).localeCompare(safeText(right.name), undefined, { numeric: true });
   });
-  const rows = [];
-  if (listing?.parent !== null && listing?.parent !== undefined) {
-    rows.push(`
-      <button class="workspace-row directory parent" type="button" data-workspace-path="${escapeHtml(listing.parent || '')}">
-        <span class="workspace-icon">↰</span>
-        <span class="workspace-name">..</span>
-        <span class="workspace-row-meta">parent</span>
-      </button>
-    `);
+}
+
+function renderWorkspaceTree(key, path = '', depth = 0) {
+  const listing = workspaceListing(key, path);
+  const loading = workspaceIsLoading(key, path);
+  const error = workspaceError(key, path);
+  if (error) {
+    return `<div class="workspace-tree-note error" style="--tree-level: ${depth}">${escapeHtml(error)}</div>`;
   }
-  for (const entry of entries) {
-    const isDirectory = entry.kind === 'directory';
-    const metaParts = [formatBytes(entry.size_bytes), entry.readonly ? 'readonly' : '', entry.hidden ? 'hidden' : ''].filter(Boolean);
-    const tag = isDirectory ? 'button' : 'div';
-    const action = isDirectory ? ` type="button" data-workspace-path="${escapeHtml(entry.path)}"` : '';
-    rows.push(`
-      <${tag} class="workspace-row ${escapeHtml(entry.kind || 'other')}"${action}>
-        <span class="workspace-icon">${workspaceKindIcon(entry.kind)}</span>
-        <span class="workspace-name">${escapeHtml(entry.name)}</span>
-        <span class="workspace-row-meta">${escapeHtml(metaParts.join(' · '))}</span>
-      </${tag}>
-    `);
+  if (!listing) {
+    return loading
+      ? `<div class="workspace-tree-note" style="--tree-level: ${depth}">正在加载...</div>`
+      : `<div class="workspace-tree-note" style="--tree-level: ${depth}">尚未读取这个目录。</div>`;
   }
-  const crumbs = workspaceCrumbs(activePath)
-    .map(
-      (crumb, index) => `
-      <button class="crumb-button${index === 0 ? ' root' : ''}" type="button" data-workspace-path="${escapeHtml(crumb.path)}">
-        ${escapeHtml(crumb.label)}
-      </button>
-    `
-    )
+  const entries = sortedWorkspaceEntries(listing.entries);
+  if (entries.length === 0) {
+    return `<div class="workspace-tree-note" style="--tree-level: ${depth}">空目录</div>`;
+  }
+  const expanded = workspaceExpandedSet(key);
+  const activePath = currentWorkspacePath();
+  return entries
+    .map((entry) => {
+      const entryPath = normalizeWorkspacePath(entry.path);
+      const isDirectory = entry.kind === 'directory';
+      const isExpanded = isDirectory && expanded.has(entryPath);
+      const isSelected = entryPath === activePath;
+      const metaParts = [formatBytes(entry.size_bytes), entry.readonly ? 'readonly' : '', entry.hidden ? 'hidden' : ''].filter(Boolean);
+      const meta = metaParts.length > 0 ? `<span class="workspace-tree-meta">${escapeHtml(metaParts.join(' · '))}</span>` : '';
+      const row = isDirectory
+        ? `
+          <button class="workspace-tree-row directory${isSelected ? ' selected' : ''}" type="button" style="--tree-level: ${depth}" data-workspace-toggle="${escapeHtml(entryPath)}" aria-expanded="${isExpanded ? 'true' : 'false'}">
+            <span class="workspace-tree-guide"></span>
+            <span class="workspace-chevron">${isExpanded ? '⌄' : '›'}</span>
+            <span class="workspace-file-icon directory-spacer"></span>
+            <span class="workspace-tree-name">${escapeHtml(entry.name)}</span>
+            ${meta}
+          </button>
+        `
+        : `
+          <div class="workspace-tree-row ${escapeHtml(entry.kind || 'other')}" style="--tree-level: ${depth}">
+            <span class="workspace-tree-guide"></span>
+            <span class="workspace-chevron"></span>
+            <span class="workspace-file-icon">${workspaceKindIcon(entry)}</span>
+            <span class="workspace-tree-name">${escapeHtml(entry.name)}</span>
+            ${meta}
+          </div>
+        `;
+      const children = isExpanded
+        ? `<div class="workspace-tree-children">${renderWorkspaceTree(key, entryPath, depth + 1)}</div>`
+        : '';
+      return `${row}${children}`;
+    })
     .join('');
+}
+
+function renderWorkspaceCard(status) {
+  const key = selectedKey();
+  const listing = workspaceListing(key, '');
+  const loading = workspaceIsLoading(key, '');
+  const error = workspaceError(key, '');
+  const root = listing?.workspace_root || status?.workspace || 'workspace pending';
+  const remote = listing?.remote;
   const body = error
     ? `<div class="workspace-empty error">${escapeHtml(error)}</div>`
     : loading && !listing
       ? '<div class="workspace-empty">正在加载 workspace...</div>'
-      : rows.length > 0
-        ? `<div class="workspace-list">${rows.join('')}</div>`
-        : '<div class="workspace-empty">这个目录是空的。</div>';
+      : `<div class="workspace-tree" role="tree">${renderWorkspaceTree(key)}</div>`;
   const footer = listing?.truncated
     ? `<div class="workspace-footer">已显示 ${Number(listing.returned_entries || 0)} / ${Number(listing.total_entries || 0)} 项</div>`
     : listing
       ? `<div class="workspace-footer">${Number(listing.returned_entries || 0)} 项</div>`
       : '';
   return `
-    <section class="inspector-card workspace-card">
-      <div class="inspector-title-row">
+    <section class="inspector-card workspace-card file-tree-card">
+      <div class="inspector-title-row workspace-tree-head">
         <div>
-          <div class="inspector-title">Workspace</div>
+          <div class="workspace-tree-title">所有文件</div>
           <div class="workspace-mode">${remote ? `${escapeHtml(remote.host)} · ${escapeHtml(remote.cwd)}` : 'local workspace'}</div>
         </div>
         <button class="tiny-button" type="button" data-workspace-refresh>${loading ? '加载中' : '刷新'}</button>
       </div>
-      <div class="path-chip">${escapeHtml(root)}</div>
-      <div class="crumb-row">${crumbs}</div>
+      <div class="workspace-root-line">${escapeHtml(root)}</div>
       ${body}
       ${footer}
     </section>
   `;
 }
 
+function toggleWorkspaceDirectory(path) {
+  const key = selectedKey();
+  if (!key) {
+    return Promise.resolve();
+  }
+  const normalized = normalizeWorkspacePath(path);
+  const expanded = workspaceExpandedSet(key);
+  state.workspacePaths.set(key, normalized);
+  if (expanded.has(normalized)) {
+    if (normalized !== '') {
+      expanded.delete(normalized);
+    }
+    renderContext();
+    return Promise.resolve();
+  }
+  expanded.add(normalized);
+  if (workspaceListing(key, normalized)) {
+    renderContext();
+    return Promise.resolve();
+  }
+  return refreshWorkspace(normalized, { expand: true, setActive: true });
+}
+
 function bindWorkspaceActions() {
-  elements.contextContent.querySelectorAll('[data-workspace-path]').forEach((button) => {
+  elements.contextContent.querySelectorAll('[data-workspace-toggle]').forEach((button) => {
     button.addEventListener('click', () => {
-      refreshWorkspace(button.dataset.workspacePath || '').catch((error) => showToast(error.message));
+      toggleWorkspaceDirectory(button.dataset.workspaceToggle || '').catch((error) => showToast(error.message));
     });
   });
   elements.contextContent.querySelector('[data-workspace-refresh]')?.addEventListener('click', () => {
-    refreshWorkspace().catch((error) => showToast(error.message));
+    refreshWorkspace(currentWorkspacePath(), { expand: true, setActive: true }).catch((error) => showToast(error.message));
   });
 }
 
