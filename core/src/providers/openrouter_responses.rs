@@ -13,8 +13,8 @@ use crate::{
 
 use super::{
     common::{
-        is_image_file, openrouter_cache_control_payload, provider_error_kind,
-        provider_error_message, serialize_json_request_body, token_usage_from_value,
+        is_image_file, provider_error_kind, provider_error_message, serialize_json_request_body,
+        token_usage_from_value,
     },
     error_chain_message, OutputPersistor, ProviderBackend, ProviderError, ProviderRequest,
 };
@@ -105,8 +105,12 @@ impl OpenRouterResponsesProvider {
         if let Some(reasoning) = reasoning_payload(model_config) {
             payload.insert("reasoning".to_string(), reasoning);
         }
-        if let Some(cache_control) = openrouter_cache_control_payload(model_config) {
-            payload.insert("cache_control".to_string(), cache_control);
+        if let Some(prompt_cache_key) = openrouter_responses_prompt_cache_key(model_config, request)
+        {
+            payload.insert(
+                "prompt_cache_key".to_string(),
+                Value::String(prompt_cache_key),
+            );
         }
         if let Some(modalities) = openrouter_output_modalities(model_config) {
             payload.insert(
@@ -214,6 +218,39 @@ fn openrouter_output_modalities(model_config: &ModelConfig) -> Option<Vec<&'stat
         modalities.push("text");
     }
     Some(modalities)
+}
+
+fn openrouter_responses_prompt_cache_key(
+    model_config: &ModelConfig,
+    request: &ProviderRequest<'_>,
+) -> Option<String> {
+    if model_config.cache_timeout == 0 {
+        return None;
+    }
+
+    let mut hash = FNV_OFFSET_BASIS;
+    fnv1a_write(&mut hash, model_config.model_name.as_bytes());
+    fnv1a_write(&mut hash, b"\0");
+    if let Some(system_prompt) = request.system_prompt {
+        fnv1a_write(&mut hash, system_prompt.as_bytes());
+    }
+    fnv1a_write(&mut hash, b"\0");
+    if let Some(first_message) = request.messages.first() {
+        let serialized = serde_json::to_vec(first_message).ok()?;
+        fnv1a_write(&mut hash, &serialized);
+    }
+
+    Some(format!("stellaclaw-or-responses-{hash:016x}"))
+}
+
+const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+const FNV_PRIME: u64 = 0x00000100000001b3;
+
+fn fnv1a_write(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV_PRIME);
+    }
 }
 
 impl ProviderBackend for OpenRouterResponsesProvider {
@@ -696,17 +733,27 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_openrouter_responses_request_adds_one_hour_cache_control() {
+    fn openrouter_responses_request_adds_prompt_cache_key() {
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "hello".to_string(),
+            })],
+        )];
+        let mut model_config = test_model_config("https://openrouter.test/api/v1/responses".into());
+        model_config.model_name = "anthropic/claude-sonnet-4.5".to_string();
+        model_config.cache_timeout = 3600;
+        let expected_prompt_cache_key =
+            openrouter_responses_prompt_cache_key(&model_config, &ProviderRequest::new(&messages))
+                .expect("cache key should be generated");
+
         let mut server = mockito::Server::new();
         let mock = server
             .mock("POST", "/api/v1/responses")
             .match_header("authorization", "Bearer test-key")
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({
                 "model": "anthropic/claude-sonnet-4.5",
-                "cache_control": {
-                    "type": "ephemeral",
-                    "ttl": "1h"
-                }
+                "prompt_cache_key": expected_prompt_cache_key
             })))
             .with_status(200)
             .with_header("content-type", "application/json")
@@ -733,21 +780,28 @@ mod tests {
         std::env::set_var("OPENROUTER_RESPONSES_API_KEY_TEST", "test-key");
 
         let provider = OpenRouterResponsesProvider::new();
-        let messages = vec![ChatMessage::new(
-            ChatRole::User,
-            vec![ChatMessageItem::Context(ContextItem {
-                text: "hello".to_string(),
-            })],
-        )];
-        let mut model_config = test_model_config(format!("{}/api/v1/responses", server.url()));
-        model_config.model_name = "anthropic/claude-sonnet-4.5".to_string();
-        model_config.cache_timeout = 3600;
+        model_config.url = format!("{}/api/v1/responses", server.url());
 
         provider
             .send(&model_config, ProviderRequest::new(&messages))
             .expect("provider should return message");
 
         mock.assert();
+    }
+
+    #[test]
+    fn openrouter_responses_prompt_cache_key_is_disabled_when_cache_timeout_is_zero() {
+        let mut model_config = test_model_config("https://openrouter.test/api/v1/responses".into());
+        model_config.cache_timeout = 0;
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "hello".to_string(),
+            })],
+        )];
+        let request = ProviderRequest::new(&messages).with_system_prompt(Some("system"));
+
+        assert!(openrouter_responses_prompt_cache_key(&model_config, &request).is_none());
     }
 
     #[test]

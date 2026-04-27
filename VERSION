@@ -1,5 +1,12 @@
-version: 1.12.0
+version: 1.12.1
 ---
+
+# 1.12.1
+
+- 修复 `claude_code` prompt cache breakpoint：
+  Claude Messages 请求现在恢复为优先在最后一个 message content block 上打 `cache_control`，只有没有可缓存 message block 时才回退到 system block。这样保留 Anthropic system block 格式的同时，避免长对话只缓存 system prompt，恢复旧 ClawParty 中大段历史前缀被 prompt cache 命中的行为。本次不改变 `config` schema，不改变 `workdir` schema。
+- 对齐 OpenRouter Responses API 的缓存字段：
+  `open_router_responses` 不再发送未出现在官方 Responses request schema 中的顶层 `cache_control`，改为在启用缓存时发送稳定的 `prompt_cache_key`，用于保持 OpenRouter/OpenResponses 缓存路由语义。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.12.0
 
