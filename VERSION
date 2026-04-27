@@ -1,5 +1,12 @@
-version: 1.11.0
+version: 1.12.0
 ---
+
+# 1.12.0
+
+- 增加 Web channel terminal 后端 API：
+  Web channel 现在为每个 conversation 提供内存态多 terminal 管理能力，支持创建/list/get、轮询读取 PTY 输出、写入 stdin、resize 和 terminate。local conversation 会在本地 workspace 中启动 shell；fixed SSH Remote Mode 会通过 `ssh -tt <host>` 在远端 configured cwd 下启动 shell，避免把交互终端跑在 sshfs mount 上。本次不改变 `config` schema，不改变 `workdir` schema。
+- 增加 Web channel workspace 文件读取 API：
+  新增 `GET /api/conversations/{conversation_id}/workspace/file?path=<relative>&offset=<n>&limit_bytes=<n>`，用于读取当前 conversation workspace 内单个文件的一段内容；文本以 UTF-8 返回，二进制以 base64 返回，并带文件大小、offset、返回字节数和 truncated 标记。fixed SSH Remote Mode 继续复用当前 workspace 解析逻辑。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.11.0
 

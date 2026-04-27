@@ -25,7 +25,7 @@ use crate::{
     },
     conversation_id_manager::ConversationIdManager,
     logger::StellaclawLogger,
-    remote_actor::{list_workspace_entries, RemoteActorError},
+    remote_actor::{list_workspace_entries, read_workspace_file, RemoteActorError},
 };
 
 use super::{
@@ -33,11 +33,17 @@ use super::{
         IncomingDispatch, OutgoingDelivery, OutgoingProgressFeedback, OutgoingStatus,
         ProcessingState,
     },
+    web_terminal::{
+        output_limit, TerminalCreateRequest, TerminalInputRequest, TerminalManager,
+        TerminalResizeRequest, WebTerminalError,
+    },
     Channel,
 };
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_WORKSPACE_FILE_LIMIT_BYTES: usize = 1024 * 1024;
+const MAX_WORKSPACE_FILE_LIMIT_BYTES: usize = 5 * 1024 * 1024;
 
 pub struct WebChannel {
     id: String,
@@ -46,6 +52,7 @@ pub struct WebChannel {
     workdir: PathBuf,
     config: Arc<StellaclawConfig>,
     logger: Arc<StellaclawLogger>,
+    terminal_manager: Arc<TerminalManager>,
 }
 
 impl WebChannel {
@@ -64,6 +71,7 @@ impl WebChannel {
             workdir,
             config,
             logger,
+            terminal_manager: Arc::new(TerminalManager::new()),
         }
     }
 
@@ -165,6 +173,30 @@ impl WebChannel {
             }
             ("GET", ["conversations", conversation_id, "workspace"]) => {
                 self.conversation_workspace(conversation_id, &request.query)
+            }
+            ("GET", ["conversations", conversation_id, "workspace", "file"]) => {
+                self.conversation_workspace_file(conversation_id, &request.query)
+            }
+            ("GET", ["conversations", conversation_id, "terminals"]) => {
+                self.list_terminals(conversation_id)
+            }
+            ("POST", ["conversations", conversation_id, "terminals"]) => {
+                self.create_terminal(conversation_id, &request.body)
+            }
+            ("GET", ["conversations", conversation_id, "terminals", terminal_id]) => {
+                self.get_terminal(conversation_id, terminal_id)
+            }
+            ("DELETE", ["conversations", conversation_id, "terminals", terminal_id]) => {
+                self.terminate_terminal(conversation_id, terminal_id)
+            }
+            ("GET", ["conversations", conversation_id, "terminals", terminal_id, "output"]) => {
+                self.terminal_output(conversation_id, terminal_id, &request.query)
+            }
+            ("POST", ["conversations", conversation_id, "terminals", terminal_id, "input"]) => {
+                self.terminal_input(conversation_id, terminal_id, &request.body)
+            }
+            ("POST", ["conversations", conversation_id, "terminals", terminal_id, "resize"]) => {
+                self.resize_terminal(conversation_id, terminal_id, &request.body)
             }
             _ => Err(ApiError::new(404, "not_found")),
         }
@@ -404,6 +436,130 @@ impl WebChannel {
             },
         )?;
         Ok(json_response(200, json!(listing)))
+    }
+
+    fn conversation_workspace_file(
+        &self,
+        conversation_id: &str,
+        query: &HashMap<String, String>,
+    ) -> ApiResult<HttpResponse> {
+        let state = self.load_web_state(conversation_id)?;
+        let path = query
+            .get("path")
+            .map(String::as_str)
+            .ok_or_else(|| ApiError::new(400, "workspace file path is required"))?;
+        let offset = query
+            .get("offset")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let limit_bytes = query
+            .get("limit_bytes")
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_WORKSPACE_FILE_LIMIT_BYTES)
+            .clamp(1, MAX_WORKSPACE_FILE_LIMIT_BYTES);
+        let file = read_workspace_file(&self.workdir, &state, path, offset, limit_bytes).map_err(
+            |error| match error {
+                RemoteActorError::InvalidPath(message) => ApiError::new(400, message),
+                RemoteActorError::Internal(error) => ApiError::internal(error),
+            },
+        )?;
+        Ok(json_response(200, json!(file)))
+    }
+
+    fn list_terminals(&self, conversation_id: &str) -> ApiResult<HttpResponse> {
+        self.load_web_state(conversation_id)?;
+        Ok(json_response(
+            200,
+            json!({
+                "conversation_id": conversation_id,
+                "terminals": self.terminal_manager.list(conversation_id),
+            }),
+        ))
+    }
+
+    fn create_terminal(&self, conversation_id: &str, body: &[u8]) -> ApiResult<HttpResponse> {
+        let state = self.load_web_state(conversation_id)?;
+        let request: TerminalCreateRequest = parse_optional_json(body)?;
+        let terminal = self
+            .terminal_manager
+            .create(&self.workdir, &state, request)
+            .map_err(terminal_api_error)?;
+        Ok(json_response(201, json!(terminal)))
+    }
+
+    fn get_terminal(&self, conversation_id: &str, terminal_id: &str) -> ApiResult<HttpResponse> {
+        self.load_web_state(conversation_id)?;
+        let terminal = self
+            .terminal_manager
+            .get(conversation_id, terminal_id)
+            .map_err(terminal_api_error)?;
+        Ok(json_response(200, json!(terminal)))
+    }
+
+    fn terminal_output(
+        &self,
+        conversation_id: &str,
+        terminal_id: &str,
+        query: &HashMap<String, String>,
+    ) -> ApiResult<HttpResponse> {
+        self.load_web_state(conversation_id)?;
+        let offset = query
+            .get("offset")
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0);
+        let limit = output_limit(
+            query
+                .get("limit_bytes")
+                .and_then(|value| value.parse().ok()),
+        );
+        let output = self
+            .terminal_manager
+            .output(conversation_id, terminal_id, offset, limit)
+            .map_err(terminal_api_error)?;
+        Ok(json_response(200, json!(output)))
+    }
+
+    fn terminal_input(
+        &self,
+        conversation_id: &str,
+        terminal_id: &str,
+        body: &[u8],
+    ) -> ApiResult<HttpResponse> {
+        self.load_web_state(conversation_id)?;
+        let request: TerminalInputRequest = parse_json(body)?;
+        let terminal = self
+            .terminal_manager
+            .input(conversation_id, terminal_id, &request.data)
+            .map_err(terminal_api_error)?;
+        Ok(json_response(202, json!(terminal)))
+    }
+
+    fn resize_terminal(
+        &self,
+        conversation_id: &str,
+        terminal_id: &str,
+        body: &[u8],
+    ) -> ApiResult<HttpResponse> {
+        self.load_web_state(conversation_id)?;
+        let request: TerminalResizeRequest = parse_json(body)?;
+        let terminal = self
+            .terminal_manager
+            .resize(conversation_id, terminal_id, request)
+            .map_err(terminal_api_error)?;
+        Ok(json_response(200, json!(terminal)))
+    }
+
+    fn terminate_terminal(
+        &self,
+        conversation_id: &str,
+        terminal_id: &str,
+    ) -> ApiResult<HttpResponse> {
+        self.load_web_state(conversation_id)?;
+        let terminal = self
+            .terminal_manager
+            .terminate(conversation_id, terminal_id)
+            .map_err(terminal_api_error)?;
+        Ok(json_response(200, json!(terminal)))
     }
 
     fn load_web_state(&self, conversation_id: &str) -> ApiResult<ConversationState> {
@@ -710,7 +866,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
 fn write_http_response(stream: &mut TcpStream, response: HttpResponse) -> Result<()> {
     let reason = status_reason(response.status);
     let headers = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nConnection: close\r\n\r\n",
         response.status,
         reason,
         response.content_type,
@@ -745,6 +901,15 @@ fn parse_optional_json<T: for<'de> Deserialize<'de> + Default>(body: &[u8]) -> A
         return Ok(T::default());
     }
     parse_json(body)
+}
+
+fn terminal_api_error(error: WebTerminalError) -> ApiError {
+    match error {
+        WebTerminalError::InvalidRequest(message) => ApiError::new(400, message),
+        WebTerminalError::NotFound => ApiError::new(404, "terminal_not_found"),
+        WebTerminalError::LimitExceeded(message) => ApiError::new(503, message),
+        WebTerminalError::Internal(error) => ApiError::internal(error),
+    }
 }
 
 fn api_segments(path: &str) -> Vec<&str> {

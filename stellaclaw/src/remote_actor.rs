@@ -1,10 +1,12 @@
 use std::{
     fmt, fs,
+    io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
+use base64::{engine::general_purpose, Engine as _};
 use serde::Serialize;
 use stellaclaw_core::session_actor::ToolRemoteMode;
 
@@ -45,6 +47,30 @@ pub struct WorkspaceListing {
     pub returned_entries: usize,
     pub truncated: bool,
     pub entries: Vec<WorkspaceEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceFile {
+    pub conversation_id: String,
+    pub mode: WorkspaceMode,
+    pub remote: Option<WorkspaceRemote>,
+    pub workspace_root: String,
+    pub path: String,
+    pub name: String,
+    pub size_bytes: u64,
+    pub modified_ms: Option<u128>,
+    pub offset: u64,
+    pub returned_bytes: usize,
+    pub truncated: bool,
+    pub encoding: WorkspaceFileEncoding,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceFileEncoding {
+    Utf8,
+    Base64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -160,6 +186,89 @@ pub fn list_workspace_entries(
         returned_entries,
         truncated,
         entries,
+    })
+}
+
+pub fn read_workspace_file(
+    workdir: &Path,
+    state: &ConversationState,
+    relative_path: &str,
+    offset: u64,
+    limit_bytes: usize,
+) -> std::result::Result<WorkspaceFile, RemoteActorError> {
+    let normalized = normalize_workspace_path(relative_path)?;
+    if normalized.as_os_str().is_empty() {
+        return Err(RemoteActorError::InvalidPath(
+            "workspace file path must not be empty".to_string(),
+        ));
+    }
+    let conversation_root = workdir.join("conversations").join(&state.conversation_id);
+    let workspace_root = ensure_workspace_for_remote_mode(
+        workdir,
+        &conversation_root,
+        &state.conversation_id,
+        &state.tool_remote_mode,
+    )?;
+    let target = workspace_root.join(&normalized);
+    let metadata = fs::metadata(&target).with_context(|| {
+        format!(
+            "failed to inspect workspace file {}",
+            display_workspace_path(&normalized)
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(RemoteActorError::InvalidPath(format!(
+            "workspace path {} is not a file",
+            display_workspace_path(&normalized)
+        )));
+    }
+
+    let file_size = metadata.len();
+    let mut file = fs::File::open(&target)
+        .with_context(|| format!("failed to open workspace file {}", target.display()))?;
+    let start = offset.min(file_size);
+    file.seek(SeekFrom::Start(start))
+        .with_context(|| format!("failed to seek workspace file {}", target.display()))?;
+    let read_limit = limit_bytes.max(1);
+    let mut data = vec![0_u8; read_limit];
+    let read = file
+        .read(&mut data)
+        .with_context(|| format!("failed to read workspace file {}", target.display()))?;
+    data.truncate(read);
+    let (encoding, data) = match String::from_utf8(data) {
+        Ok(text) => (WorkspaceFileEncoding::Utf8, text),
+        Err(error) => (
+            WorkspaceFileEncoding::Base64,
+            general_purpose::STANDARD.encode(error.into_bytes()),
+        ),
+    };
+
+    Ok(WorkspaceFile {
+        conversation_id: state.conversation_id.clone(),
+        mode: match state.tool_remote_mode {
+            ToolRemoteMode::Selectable => WorkspaceMode::Local,
+            ToolRemoteMode::FixedSsh { .. } => WorkspaceMode::FixedSsh,
+        },
+        remote: match &state.tool_remote_mode {
+            ToolRemoteMode::Selectable => None,
+            ToolRemoteMode::FixedSsh { host, cwd } => Some(WorkspaceRemote {
+                host: host.clone(),
+                cwd: cwd.clone(),
+            }),
+        },
+        workspace_root: workspace_root.display().to_string(),
+        path: path_to_api_string(&normalized),
+        name: normalized
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        size_bytes: file_size,
+        modified_ms: metadata.modified().ok().and_then(system_time_ms),
+        offset: start,
+        returned_bytes: read,
+        truncated: start.saturating_add(read as u64) < file_size,
+        encoding,
+        data,
     })
 }
 
