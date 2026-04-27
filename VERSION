@@ -1,5 +1,10 @@
-version: 1.12.1
+version: 1.12.2
 ---
+
+# 1.12.2
+
+- 修复 `ls` 跳过 shared 目录：
+  本地 `ls` 工具现在会把 workspace 顶层 `shared` symlink 作为目录展示并递归列出其中内容，保持其它 symlink 仍默认跳过，避免重新引入循环链接或慢挂载风险。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.12.1
 
