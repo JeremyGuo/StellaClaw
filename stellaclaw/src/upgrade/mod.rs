@@ -12,6 +12,7 @@ mod v0_4;
 mod v0_5;
 mod v0_6;
 mod v0_7;
+mod v0_8;
 
 pub const LEGACY_WORKDIR_VERSION: &str = "0.1";
 pub const WORKDIR_VERSION_0_2: &str = "0.2";
@@ -20,7 +21,8 @@ pub const WORKDIR_VERSION_0_4: &str = "0.4";
 pub const WORKDIR_VERSION_0_5: &str = "0.5";
 pub const WORKDIR_VERSION_0_6: &str = "0.6";
 pub const WORKDIR_VERSION_0_7: &str = "0.7";
-pub const LATEST_WORKDIR_VERSION: &str = "0.8";
+pub const WORKDIR_VERSION_0_8: &str = "0.8";
+pub const LATEST_WORKDIR_VERSION: &str = "0.9";
 pub const PARTYCLAW_LATEST_WORKDIR_VERSION: &str = "0.39";
 
 const WORKDIR_VERSION_FILE: &str = "STELLA_VERSION";
@@ -39,7 +41,7 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
     let legacy_version_path = workdir.join(LEGACY_WORKDIR_VERSION_FILE);
     let mut current = read_workdir_version(&version_path, &legacy_version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 8] = [
+    let upgraders: [&dyn WorkdirUpgrader; 9] = [
         &v0_1::LegacyUpgrade,
         &v0_1::PartyClawUpgrade,
         &v0_2::ChatMessageReasoningUpgrade,
@@ -48,6 +50,7 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
         &v0_5::TokenUsageCostUpgrade,
         &v0_6::CronScriptUpgrade,
         &v0_7::CronScriptFieldRenameUpgrade,
+        &v0_8::RuntimeCacheDirectoryUpgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -93,6 +96,7 @@ fn read_version_file(version_path: &Path) -> Result<&'static str> {
         WORKDIR_VERSION_0_5 => Ok(WORKDIR_VERSION_0_5),
         WORKDIR_VERSION_0_6 => Ok(WORKDIR_VERSION_0_6),
         WORKDIR_VERSION_0_7 => Ok(WORKDIR_VERSION_0_7),
+        WORKDIR_VERSION_0_8 => Ok(WORKDIR_VERSION_0_8),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }

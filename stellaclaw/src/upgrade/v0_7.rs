@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use super::{WorkdirUpgrader, LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_7};
+use super::{WorkdirUpgrader, WORKDIR_VERSION_0_7, WORKDIR_VERSION_0_8};
 use crate::config::StellaclawConfig;
 
 pub struct CronScriptFieldRenameUpgrade;
@@ -14,7 +14,7 @@ impl WorkdirUpgrader for CronScriptFieldRenameUpgrade {
     }
 
     fn to_version(&self) -> &'static str {
-        LATEST_WORKDIR_VERSION
+        WORKDIR_VERSION_0_8
     }
 
     fn upgrade(&self, workdir: &Path, _config: &StellaclawConfig) -> Result<()> {

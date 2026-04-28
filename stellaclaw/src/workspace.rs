@@ -146,17 +146,10 @@ fn ensure_sshfs_workspace(
     create_mountpoint_directory(&mountpoint)?;
 
     let target = format!("{host}:{remote_path}");
-    let output = Command::new("sshfs")
-        .arg(&target)
-        .arg(&mountpoint)
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("reconnect")
-        .arg("-o")
-        .arg("ServerAliveInterval=15")
-        .arg("-o")
-        .arg("ServerAliveCountMax=3")
+    let mut command = Command::new("sshfs");
+    command.arg(&target).arg(&mountpoint);
+    add_sshfs_mount_options(&mut command);
+    let output = command
         .output()
         .with_context(|| format!("failed to run sshfs for {target}"))?;
     if !output.status.success() {
@@ -167,6 +160,27 @@ fn ensure_sshfs_workspace(
         ));
     }
     Ok(mountpoint)
+}
+
+fn add_sshfs_mount_options(command: &mut Command) {
+    for option in [
+        "BatchMode=yes",
+        "reconnect",
+        "ServerAliveInterval=15",
+        "ServerAliveCountMax=3",
+        "dir_cache=yes",
+        "dcache_timeout=60",
+        "dcache_stat_timeout=60",
+        "dcache_link_timeout=60",
+        "dcache_dir_timeout=60",
+        "entry_timeout=60",
+        "attr_timeout=60",
+        "negative_timeout=5",
+        "auto_cache",
+        "remember=60",
+    ] {
+        command.arg("-o").arg(option);
+    }
 }
 
 fn validate_sshfs_binding(host: &str, remote_path: &str) -> Result<()> {
@@ -457,10 +471,10 @@ fn create_directory_link(target: &Path, link_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ensure_workspace_seed, passwordless_ssh_login_check_command, sshfs_workspace_root,
-        trimmed_output_preview, validate_sshfs_binding,
+        add_sshfs_mount_options, ensure_workspace_seed, passwordless_ssh_login_check_command,
+        sshfs_workspace_root, trimmed_output_preview, validate_sshfs_binding,
     };
-    use std::path::Path;
+    use std::{path::Path, process::Command};
 
     #[test]
     fn sshfs_workspace_uses_prefixed_conversation_directory() {
@@ -529,10 +543,31 @@ mod tests {
     }
 
     #[test]
+    fn sshfs_mount_options_enable_local_caches() {
+        let mut command = Command::new("sshfs");
+        add_sshfs_mount_options(&mut command);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert!(has_mount_option(&args, "dir_cache=yes"));
+        assert!(has_mount_option(&args, "dcache_timeout=60"));
+        assert!(has_mount_option(&args, "attr_timeout=60"));
+        assert!(has_mount_option(&args, "auto_cache"));
+        assert!(has_mount_option(&args, "remember=60"));
+    }
+
+    #[test]
     fn command_output_preview_is_trimmed_and_bounded() {
         let output = format!("  {}  ", "x".repeat(700));
         let preview = trimmed_output_preview(output.as_bytes());
         assert_eq!(preview.chars().count(), 603);
         assert!(preview.ends_with("..."));
+    }
+
+    fn has_mount_option(args: &[String], option: &str) -> bool {
+        args.windows(2)
+            .any(|pair| pair[0] == "-o" && pair[1] == option)
     }
 }

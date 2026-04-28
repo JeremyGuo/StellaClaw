@@ -1,5 +1,10 @@
-version: 1.15.5
+version: 1.15.6
 ---
+
+# 1.15.6
+
+- 优化 Web channel Remote 模式消息历史性能：
+  sshfs mount 现在启用目录、属性、entry 和 FUSE auto cache，降低 remote workspace 上频繁 `stat` / `readdir` 的往返成本；Web messages 渲染不再为每条消息重复 ensure remote workspace，而是每次请求只计算一次 workspace/shared 路径，并避免在历史列表路径触发 ssh/sshfs/mountpoint 检查。新增按 conversation 分目录的 runtime cache manager，图片缩略图写入 `rundir/cache/conversations/<conversation_id>/thumbnails/`，后续命中直接读取本地缓存。本次 `workdir` schema 更新到 `0.9`，`config` schema 不变。
 
 # 1.15.5
 
