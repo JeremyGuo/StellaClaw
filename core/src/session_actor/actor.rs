@@ -62,6 +62,7 @@ pub struct SessionActor {
     compressor: Option<SessionCompressor>,
     token_estimator: Option<TokenEstimator>,
     pending_continuation: Option<PendingContinuation>,
+    last_provider_request_started_at: Option<Instant>,
     last_agent_returned_at: Option<Instant>,
     last_completed_turn_number: u64,
     last_idle_compaction_turn_number: u64,
@@ -171,6 +172,7 @@ impl SessionActor {
             compressor: None,
             token_estimator: None,
             pending_continuation: None,
+            last_provider_request_started_at: None,
             last_agent_returned_at: None,
             last_completed_turn_number: 0,
             last_idle_compaction_turn_number: 0,
@@ -931,6 +933,7 @@ impl SessionActor {
                         let request = ProviderRequest::new(&provider_history)
                             .with_system_prompt(Some(system_prompt.as_str()))
                             .with_tools(tools);
+                        self.last_provider_request_started_at = Some(Instant::now());
                         self.provider.send(request)
                     };
                     match send_result {
@@ -1399,9 +1402,11 @@ impl SessionActor {
             return None;
         }
 
-        let returned_at = self.last_agent_returned_at?;
+        let cache_touched_at = self
+            .last_provider_request_started_at
+            .or(self.last_agent_returned_at)?;
         let threshold = idle_compaction_threshold(&self.model_config)?;
-        let elapsed = returned_at.elapsed();
+        let elapsed = cache_touched_at.elapsed();
         Some(threshold.saturating_sub(elapsed))
     }
 
@@ -3922,7 +3927,8 @@ mod tests {
         assert_eq!(actor.history().len(), 2);
         assert!(!message_text_for_test(&actor.history()[0]).contains(COMPRESSION_MARKER));
 
-        actor.last_agent_returned_at = Some(Instant::now() - Duration::from_secs(271));
+        actor.last_provider_request_started_at = Some(Instant::now() - Duration::from_secs(271));
+        actor.last_agent_returned_at = Some(Instant::now());
         let compacted = actor
             .try_run_idle_compaction()
             .expect("idle compaction should not fail");

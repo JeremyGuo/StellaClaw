@@ -1,5 +1,10 @@
-version: 1.14.0
+version: 1.14.1
 ---
+
+# 1.14.1
+
+- 修复 idle compaction 触发时间：
+  SessionActor 现在用上一轮 provider 请求开始时间估算 Claude prompt cache 剩余窗口，避免按 turn 完全返回时间倒计时导致长输出后 idle compaction 晚于 5 分钟 cache TTL。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.14.0
 
