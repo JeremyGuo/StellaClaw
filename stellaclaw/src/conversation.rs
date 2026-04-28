@@ -100,6 +100,8 @@ const TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(4);
 pub struct ConversationState {
     pub version: u32,
     pub conversation_id: String,
+    #[serde(default)]
+    pub nickname: String,
     pub channel_id: String,
     pub platform_chat_id: String,
     pub session_profile: SessionProfile,
@@ -293,12 +295,17 @@ pub fn load_or_create_conversation_state(
     if path.exists() {
         let raw = fs::read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
-        return serde_json::from_str(&raw)
-            .with_context(|| format!("failed to parse {}", path.display()));
+        let mut state: ConversationState = serde_json::from_str(&raw)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+        if state.nickname.trim().is_empty() {
+            state.nickname = state.conversation_id.clone();
+        }
+        return Ok(state);
     }
     Ok(ConversationState {
         version: 1,
         conversation_id: conversation_id.to_string(),
+        nickname: conversation_id.to_string(),
         channel_id: channel_id.to_string(),
         platform_chat_id: platform_chat_id.to_string(),
         session_profile: config

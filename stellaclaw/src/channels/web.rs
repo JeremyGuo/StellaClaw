@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use stellaclaw_core::{
     model_config::{ModelCapability, ProviderType},
-    session_actor::{ChatMessage, ChatMessageItem, ChatRole, FileItem},
+    session_actor::{ChatMessage, ChatMessageItem, ChatRole, FileItem, TokenUsage},
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -184,6 +184,9 @@ impl WebChannel {
             ("GET", ["models"]) => self.list_models(),
             ("GET", ["conversations"]) => self.list_conversations(&request.query),
             ("POST", ["conversations"]) => self.create_conversation(&request.body, id_manager),
+            ("PATCH", ["conversations", conversation_id]) => {
+                self.update_conversation(conversation_id, &request.body)
+            }
             ("GET", ["conversations", conversation_id, "messages"]) => {
                 self.list_messages(conversation_id, &request.query)
             }
@@ -342,15 +345,34 @@ impl WebChannel {
             state.session_profile.main_model = ModelSelection::alias(model);
             state.model_selection_pending = false;
         }
+        if let Some(nickname) = request.nickname {
+            state.nickname = normalize_conversation_nickname(&state.conversation_id, &nickname);
+        }
         persist_conversation_state(&self.workdir, &state).map_err(ApiError::internal)?;
 
         Ok(json_response(
             201,
             json!({
                 "conversation_id": conversation_id,
+                "nickname": state.nickname,
                 "channel_id": self.id,
                 "platform_chat_id": platform_chat_id,
                 "model_selection_pending": state.model_selection_pending,
+            }),
+        ))
+    }
+
+    fn update_conversation(&self, conversation_id: &str, body: &[u8]) -> ApiResult<HttpResponse> {
+        let request: UpdateConversationRequest = parse_json(body)?;
+        let mut state = self.load_web_state(conversation_id)?;
+        if let Some(nickname) = request.nickname {
+            state.nickname = normalize_conversation_nickname(&state.conversation_id, &nickname);
+        }
+        persist_conversation_state(&self.workdir, &state).map_err(ApiError::internal)?;
+        Ok(json_response(
+            200,
+            json!({
+                "conversation": ConversationSummary::from_state(&state, &self.config),
             }),
         ))
     }
@@ -1074,6 +1096,13 @@ impl MessageRangeDirection {
 struct CreateConversationRequest {
     platform_chat_id: Option<String>,
     model: Option<String>,
+    nickname: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateConversationRequest {
+    #[serde(default)]
+    nickname: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1149,6 +1178,7 @@ struct MessageSkeleton {
     user_name: Option<String>,
     message_time: Option<String>,
     has_token_usage: bool,
+    token_usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1245,6 +1275,7 @@ impl WebAttachmentContext {
 #[derive(Debug, Serialize)]
 struct ConversationSummary {
     conversation_id: String,
+    nickname: String,
     platform_chat_id: String,
     model: String,
     model_selection_pending: bool,
@@ -1257,6 +1288,7 @@ impl ConversationSummary {
     fn from_state(state: &ConversationState, config: &StellaclawConfig) -> Self {
         Self {
             conversation_id: state.conversation_id.clone(),
+            nickname: conversation_nickname(state),
             platform_chat_id: state.platform_chat_id.clone(),
             model: state
                 .session_profile
@@ -1353,7 +1385,7 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
 fn write_http_response(stream: &mut TcpStream, response: HttpResponse) -> Result<()> {
     let reason = status_reason(response.status);
     let headers = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS\r\nConnection: close\r\n\r\n",
         response.status,
         reason,
         response.content_type,
@@ -1742,6 +1774,7 @@ fn message_skeleton(
         user_name: message.user_name.clone(),
         message_time: message.message_time.clone(),
         has_token_usage: message.token_usage.is_some(),
+        token_usage: message.token_usage.clone(),
     }
 }
 
@@ -2152,6 +2185,19 @@ fn generated_message_id() -> String {
     format!("web-message-{}", unix_millis())
 }
 
+fn normalize_conversation_nickname(conversation_id: &str, nickname: &str) -> String {
+    let trimmed = nickname.trim();
+    if trimmed.is_empty() {
+        conversation_id.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn conversation_nickname(state: &ConversationState) -> String {
+    normalize_conversation_nickname(&state.conversation_id, &state.nickname)
+}
+
 fn unix_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2210,7 +2256,9 @@ mod tests {
         config::{ModelSelection, SessionProfile},
         conversation::ConversationSessionBinding,
     };
-    use stellaclaw_core::session_actor::{ChatMessageItem, ContextItem, ToolRemoteMode};
+    use stellaclaw_core::session_actor::{
+        ChatMessageItem, ContextItem, TokenUsageCost, ToolRemoteMode,
+    };
 
     fn test_workdir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!(
@@ -2226,6 +2274,7 @@ mod tests {
         ConversationState {
             version: 1,
             conversation_id: conversation_id.to_string(),
+            nickname: conversation_id.to_string(),
             channel_id: "web-main".to_string(),
             platform_chat_id: "test-chat".to_string(),
             session_profile: SessionProfile {
@@ -2362,6 +2411,65 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[test]
+    fn web_message_payloads_include_token_usage() {
+        let workdir = test_workdir("token-usage");
+        let state = test_state("web-main-test-token-usage");
+        fs::create_dir_all(workdir.join("conversations").join(&state.conversation_id))
+            .expect("create conversation root");
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "done".to_string(),
+            })],
+        )
+        .with_token_usage(TokenUsage {
+            cache_read: 11,
+            cache_write: 12,
+            uncache_input: 13,
+            output: 14,
+            cost_usd: Some(TokenUsageCost {
+                cache_read: 0.001,
+                cache_write: 0.002,
+                uncache_input: 0.003,
+                output: 0.004,
+            }),
+        });
+
+        let context = test_attachment_context(&workdir, &state);
+        let page = message_page_payload(&state, &context, std::slice::from_ref(&message), 0, 50);
+        assert_eq!(page["messages"][0]["has_token_usage"], true);
+        assert_eq!(page["messages"][0]["token_usage"]["cache_read"], 11);
+        assert_eq!(page["messages"][0]["token_usage"]["cache_write"], 12);
+        assert_eq!(page["messages"][0]["token_usage"]["uncache_input"], 13);
+        assert_eq!(page["messages"][0]["token_usage"]["output"], 14);
+        assert_eq!(
+            page["messages"][0]["token_usage"]["cost_usd"]["output"],
+            0.004
+        );
+
+        let websocket =
+            websocket_messages_payload(&state, &context, std::slice::from_ref(&message), 0);
+        assert_eq!(websocket["messages"][0]["has_token_usage"], true);
+        assert_eq!(websocket["messages"][0]["token_usage"]["cache_read"], 11);
+        assert_eq!(
+            websocket["messages"][0]["token_usage"]["cost_usd"]["uncache_input"],
+            0.003
+        );
+
+        let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[test]
+    fn conversation_nickname_falls_back_to_conversation_id() {
+        let mut state = test_state("web-main-test-nickname");
+        state.nickname = " Project Alpha ".to_string();
+        assert_eq!(conversation_nickname(&state), "Project Alpha");
+
+        state.nickname.clear();
+        assert_eq!(conversation_nickname(&state), state.conversation_id);
     }
 
     #[test]

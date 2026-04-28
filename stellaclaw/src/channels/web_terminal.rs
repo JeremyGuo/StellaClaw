@@ -750,6 +750,7 @@ mod tests {
         ConversationState {
             version: 1,
             conversation_id: conversation_id.to_string(),
+            nickname: conversation_id.to_string(),
             channel_id: "web-main".to_string(),
             platform_chat_id: "test-chat".to_string(),
             session_profile: SessionProfile {

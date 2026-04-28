@@ -489,6 +489,7 @@ fn migrate_conversations_and_sessions(workdir: &Path, config: &StellaclawConfig)
         let conversation_state = ConversationState {
             version: 1,
             conversation_id: conversation_id.clone(),
+            nickname: conversation_id.clone(),
             channel_id: legacy.address.channel_id.clone(),
             platform_chat_id: legacy.address.conversation_id.clone(),
             session_profile: session_profile.clone(),

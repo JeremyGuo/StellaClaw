@@ -1,5 +1,13 @@
-version: 1.15.11
+version: 1.15.12
 ---
+
+# 1.15.12
+
+- 增加 Conversation nickname：
+  `ConversationState` 新增 `nickname` 持久化字段，新的 conversation 默认使用 `conversation_id` 作为 nickname；Web channel 的 conversation 列表和创建响应会返回该字段，并新增 `PATCH /api/conversations/:id` 支持只更新 nickname，不改变 `conversation_id` / `platform_chat_id` / session binding 等运行身份。旧 workdir 会在升级到 `0.10` 时为每个 `conversation.json` 写入默认 nickname。本次 `workdir` schema 更新到 `0.10`，`config` schema 不变。
+
+- 扩展 Web messages token usage 响应：
+  `GET /api/conversations/:id/messages`、`messages/after`、`messages/range` 和 WebSocket `type: "messages"` 推送现在会在每条 message skeleton 上直接返回完整 `token_usage`，同时保留 `has_token_usage` 兼容标记。本项不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.15.11
 
