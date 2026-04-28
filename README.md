@@ -281,6 +281,12 @@ Current Web channel endpoints:
 - `POST /api/conversations/{conversation_id}/terminals/{terminal_id}/input`
 - `POST /api/conversations/{conversation_id}/terminals/{terminal_id}/resize`
 
+Message detail responses include `rendered_text`, `attachments`, and
+`attachment_errors`. Assistant output tags such as
+`<attachment>report.png</attachment>` are resolved against the conversation
+workspace or `shared/`; the returned attachment `url` points at the workspace
+file API.
+
 For a release build, set:
 
 ```json

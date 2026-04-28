@@ -22,19 +22,20 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use crate::{
     config::{ModelSelection, StellaclawConfig},
     conversation::{
-        load_conversation_status_snapshot, load_or_create_conversation_state,
-        persist_conversation_state, render_chat_message, ConversationControl, ConversationState,
-        IncomingConversationMessage,
+        extract_attachment_references, load_conversation_status_snapshot,
+        load_or_create_conversation_state, persist_conversation_state, render_chat_message,
+        strip_attachment_tags, ConversationControl, ConversationState, IncomingConversationMessage,
     },
     conversation_id_manager::ConversationIdManager,
     logger::StellaclawLogger,
     remote_actor::{list_workspace_entries, read_workspace_file, RemoteActorError},
+    workspace::ensure_workspace_for_remote_mode,
 };
 
 use super::{
     types::{
-        IncomingDispatch, OutgoingDelivery, OutgoingProgressFeedback, OutgoingStatus,
-        ProcessingState,
+        IncomingDispatch, OutgoingAttachment, OutgoingAttachmentKind, OutgoingDelivery,
+        OutgoingProgressFeedback, OutgoingStatus, ProcessingState,
     },
     web_terminal::{
         output_limit, TerminalCreateRequest, TerminalInputRequest, TerminalManager,
@@ -387,10 +388,12 @@ impl WebChannel {
     ) -> ApiResult<HttpResponse> {
         let offset = query_usize(query, "offset", 0);
         let limit = query_usize(query, "limit", 50).min(200);
-        let messages = self.load_messages(conversation_id)?;
+        let state = self.load_web_state(conversation_id)?;
+        let messages = self.load_messages_for_state(&state)?;
+        let attachments = WebAttachmentContext::new(&self.workdir, &state);
         Ok(json_response(
             200,
-            message_page_payload(conversation_id, &messages, offset, limit),
+            message_page_payload(&state, &attachments, &messages, offset, limit),
         ))
     }
 
@@ -402,19 +405,30 @@ impl WebChannel {
     ) -> ApiResult<HttpResponse> {
         let index = parse_message_id(message_id)?;
         let limit = query_usize(query, "limit", 50).min(200);
-        let messages = self.load_messages(conversation_id)?;
+        let state = self.load_web_state(conversation_id)?;
+        let messages = self.load_messages_for_state(&state)?;
+        let attachments = WebAttachmentContext::new(&self.workdir, &state);
         Ok(json_response(
             200,
-            message_page_payload(conversation_id, &messages, index.saturating_add(1), limit),
+            message_page_payload(
+                &state,
+                &attachments,
+                &messages,
+                index.saturating_add(1),
+                limit,
+            ),
         ))
     }
 
     fn message_detail(&self, conversation_id: &str, message_id: &str) -> ApiResult<HttpResponse> {
         let index = parse_message_id(message_id)?;
-        let messages = self.load_messages(conversation_id)?;
+        let state = self.load_web_state(conversation_id)?;
+        let messages = self.load_messages_for_state(&state)?;
         let Some(message) = messages.get(index) else {
             return Err(ApiError::new(404, "message_not_found"));
         };
+        let attachments = WebAttachmentContext::new(&self.workdir, &state);
+        let rendered = render_web_message(message, &attachments);
         Ok(json_response(
             200,
             json!({
@@ -422,7 +436,9 @@ impl WebChannel {
                 "id": index.to_string(),
                 "index": index,
                 "message": message,
-                "rendered_text": render_chat_message(message),
+                "rendered_text": rendered.text,
+                "attachments": rendered.attachments,
+                "attachment_errors": rendered.attachment_errors,
             }),
         ))
     }
@@ -592,12 +608,11 @@ impl WebChannel {
         Ok(state)
     }
 
-    fn load_messages(&self, conversation_id: &str) -> ApiResult<Vec<ChatMessage>> {
-        let state = self.load_web_state(conversation_id)?;
+    fn load_messages_for_state(&self, state: &ConversationState) -> ApiResult<Vec<ChatMessage>> {
         let path = self
             .workdir
             .join("conversations")
-            .join(conversation_id)
+            .join(&state.conversation_id)
             .join(".log")
             .join("stellaclaw")
             .join(sanitize_session_id_for_log_path(
@@ -802,9 +817,60 @@ struct MessageSkeleton {
     index: usize,
     role: ChatRole,
     preview: String,
+    attachment_count: usize,
+    has_attachment_errors: bool,
     user_name: Option<String>,
     message_time: Option<String>,
     has_token_usage: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct WebMessageAttachment {
+    index: usize,
+    kind: &'static str,
+    path: String,
+    name: String,
+    size_bytes: u64,
+    url: String,
+}
+
+#[derive(Debug)]
+struct WebRenderedMessage {
+    text: String,
+    attachments: Vec<WebMessageAttachment>,
+    attachment_errors: Vec<String>,
+}
+
+struct WebAttachmentContext {
+    conversation_id: String,
+    workdir: PathBuf,
+    state: ConversationState,
+}
+
+impl WebAttachmentContext {
+    fn new(workdir: &Path, state: &ConversationState) -> Self {
+        Self {
+            conversation_id: state.conversation_id.clone(),
+            workdir: workdir.to_path_buf(),
+            state: state.clone(),
+        }
+    }
+
+    fn roots(&self) -> Result<(PathBuf, PathBuf), String> {
+        let conversation_root = self
+            .workdir
+            .join("conversations")
+            .join(&self.state.conversation_id);
+        let workspace_root = ensure_workspace_for_remote_mode(
+            &self.workdir,
+            &conversation_root,
+            &self.state.conversation_id,
+            &self.state.tool_remote_mode,
+        )
+        .map_err(|error| format!("{error:#}"))?;
+        let shared_root = self.workdir.join("rundir").join("shared");
+        Ok((workspace_root, shared_root))
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1004,6 +1070,18 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&output).to_string()
 }
 
+fn percent_encode_query_value(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
 }
@@ -1024,7 +1102,8 @@ fn status_reason(status: u16) -> &'static str {
 }
 
 fn message_page_payload(
-    conversation_id: &str,
+    state: &ConversationState,
+    attachments: &WebAttachmentContext,
     messages: &[ChatMessage],
     offset: usize,
     limit: usize,
@@ -1033,27 +1112,148 @@ fn message_page_payload(
     let start = offset.min(total);
     let end = start.saturating_add(limit).min(total);
     json!({
-        "conversation_id": conversation_id,
+        "conversation_id": &state.conversation_id,
         "offset": offset,
         "limit": limit,
         "total": total,
         "messages": messages[start..end]
             .iter()
             .enumerate()
-            .map(|(relative, message)| message_skeleton(start + relative, message))
+            .map(|(relative, message)| message_skeleton(start + relative, message, attachments))
             .collect::<Vec<_>>(),
     })
 }
 
-fn message_skeleton(index: usize, message: &ChatMessage) -> MessageSkeleton {
+fn message_skeleton(
+    index: usize,
+    message: &ChatMessage,
+    attachments: &WebAttachmentContext,
+) -> MessageSkeleton {
+    let rendered = render_web_message(message, attachments);
     MessageSkeleton {
         id: index.to_string(),
         index,
         role: message.role.clone(),
-        preview: preview_text(&render_chat_message(message)),
+        preview: preview_text(&rendered.text),
+        attachment_count: rendered.attachments.len(),
+        has_attachment_errors: !rendered.attachment_errors.is_empty(),
         user_name: message.user_name.clone(),
         message_time: message.message_time.clone(),
         has_token_usage: message.token_usage.is_some(),
+    }
+}
+
+fn render_web_message(message: &ChatMessage, context: &WebAttachmentContext) -> WebRenderedMessage {
+    let raw_text = render_chat_message(message);
+    if !raw_text.contains("<attachment>") {
+        return WebRenderedMessage {
+            text: raw_text,
+            attachments: Vec::new(),
+            attachment_errors: Vec::new(),
+        };
+    }
+
+    let (workspace_root, shared_root) = match context.roots() {
+        Ok(roots) => roots,
+        Err(error) => {
+            return WebRenderedMessage {
+                text: strip_attachment_tags(&raw_text).trim().to_string(),
+                attachments: Vec::new(),
+                attachment_errors: vec![error],
+            };
+        }
+    };
+    match extract_attachment_references(&raw_text, &workspace_root, &shared_root) {
+        Ok((text, attachments)) => WebRenderedMessage {
+            text,
+            attachments: attachments
+                .iter()
+                .enumerate()
+                .map(|(index, attachment)| {
+                    web_message_attachment(
+                        index,
+                        attachment,
+                        &context.conversation_id,
+                        &workspace_root,
+                        &shared_root,
+                    )
+                })
+                .collect(),
+            attachment_errors: Vec::new(),
+        },
+        Err(error) => WebRenderedMessage {
+            text: strip_attachment_tags(&raw_text).trim().to_string(),
+            attachments: Vec::new(),
+            attachment_errors: vec![format!("{error:#}")],
+        },
+    }
+}
+
+fn web_message_attachment(
+    index: usize,
+    attachment: &OutgoingAttachment,
+    conversation_id: &str,
+    workspace_root: &Path,
+    shared_root: &Path,
+) -> WebMessageAttachment {
+    let path = attachment_workspace_path(&attachment.path, workspace_root, shared_root)
+        .unwrap_or_else(|| attachment.path.display().to_string());
+    WebMessageAttachment {
+        index,
+        kind: outgoing_attachment_kind_name(attachment.kind),
+        name: attachment
+            .path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("attachment")
+            .to_string(),
+        size_bytes: fs::metadata(&attachment.path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0),
+        url: format!(
+            "/api/conversations/{}/workspace/file?path={}",
+            percent_encode_query_value(conversation_id),
+            percent_encode_query_value(&path)
+        ),
+        path,
+    }
+}
+
+fn attachment_workspace_path(
+    path: &Path,
+    workspace_root: &Path,
+    shared_root: &Path,
+) -> Option<String> {
+    let canonical = path.canonicalize().ok()?;
+    let workspace_root = workspace_root.canonicalize().ok()?;
+    if let Ok(relative) = canonical.strip_prefix(&workspace_root) {
+        return Some(path_to_api_string(relative));
+    }
+    let shared_root = shared_root.canonicalize().ok()?;
+    canonical
+        .strip_prefix(&shared_root)
+        .ok()
+        .map(|relative| format!("shared/{}", path_to_api_string(relative)))
+}
+
+fn path_to_api_string(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => Some(value.to_string_lossy().to_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn outgoing_attachment_kind_name(kind: OutgoingAttachmentKind) -> &'static str {
+    match kind {
+        OutgoingAttachmentKind::Image => "image",
+        OutgoingAttachmentKind::Audio => "audio",
+        OutgoingAttachmentKind::Voice => "voice",
+        OutgoingAttachmentKind::Video => "video",
+        OutgoingAttachmentKind::Animation => "animation",
+        OutgoingAttachmentKind::Document => "document",
     }
 }
 
@@ -1176,6 +1376,46 @@ fn parse_web_remote_control(argument: &str) -> ConversationControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{collections::BTreeMap, fs};
+
+    use crate::{
+        config::{ModelSelection, SessionProfile},
+        conversation::ConversationSessionBinding,
+    };
+    use stellaclaw_core::session_actor::{ChatMessageItem, ContextItem, ToolRemoteMode};
+
+    fn test_workdir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "stellaclaw-web-{name}-{}-{}",
+            std::process::id(),
+            unix_millis()
+        ));
+        fs::create_dir_all(&path).expect("create temp workdir");
+        path
+    }
+
+    fn test_state(conversation_id: &str) -> ConversationState {
+        ConversationState {
+            version: 1,
+            conversation_id: conversation_id.to_string(),
+            channel_id: "web-main".to_string(),
+            platform_chat_id: "test-chat".to_string(),
+            session_profile: SessionProfile {
+                main_model: ModelSelection::alias("main"),
+            },
+            model_selection_pending: false,
+            tool_remote_mode: ToolRemoteMode::Selectable,
+            sandbox: None,
+            reasoning_effort: None,
+            session_binding: ConversationSessionBinding {
+                foreground_session_id: format!("{conversation_id}.foreground"),
+                next_background_index: 1,
+                next_subagent_index: 1,
+                background_sessions: BTreeMap::new(),
+                subagent_sessions: BTreeMap::new(),
+            },
+        }
+    }
 
     #[test]
     fn parses_api_segments() {
@@ -1208,5 +1448,71 @@ mod tests {
             parse_web_control("/remote off"),
             Some(ConversationControl::DisableRemote)
         ));
+    }
+
+    #[test]
+    fn web_message_rendering_extracts_attachment_metadata() {
+        let workdir = test_workdir("attachment");
+        let state = test_state("web-main-test-attachment");
+        let conversation_root = workdir.join("conversations").join(&state.conversation_id);
+        fs::create_dir_all(&conversation_root).expect("create conversation root");
+        fs::write(conversation_root.join("report.txt"), "hello").expect("write attachment");
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "done\n<attachment>report.txt</attachment>".to_string(),
+            })],
+        );
+
+        let context = WebAttachmentContext::new(&workdir, &state);
+        let rendered = render_web_message(&message, &context);
+
+        assert_eq!(rendered.text, "done");
+        assert!(rendered.attachment_errors.is_empty());
+        assert_eq!(rendered.attachments.len(), 1);
+        assert_eq!(rendered.attachments[0].kind, "document");
+        assert_eq!(rendered.attachments[0].path, "report.txt");
+        assert_eq!(rendered.attachments[0].name, "report.txt");
+        assert_eq!(rendered.attachments[0].size_bytes, 5);
+        assert_eq!(
+            rendered.attachments[0].url,
+            "/api/conversations/web-main-test-attachment/workspace/file?path=report.txt"
+        );
+
+        let skeleton = message_skeleton(7, &message, &context);
+        assert_eq!(skeleton.preview, "done");
+        assert_eq!(skeleton.attachment_count, 1);
+        assert!(!skeleton.has_attachment_errors);
+
+        let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[test]
+    fn web_message_rendering_reports_attachment_errors_without_raw_tags() {
+        let workdir = test_workdir("attachment-missing");
+        let state = test_state("web-main-test-attachment-missing");
+        fs::create_dir_all(workdir.join("conversations").join(&state.conversation_id))
+            .expect("create conversation root");
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "done\n<attachment>missing.txt</attachment>".to_string(),
+            })],
+        );
+
+        let context = WebAttachmentContext::new(&workdir, &state);
+        let rendered = render_web_message(&message, &context);
+
+        assert_eq!(rendered.text, "done\nmissing.txt");
+        assert!(rendered.attachments.is_empty());
+        assert_eq!(rendered.attachment_errors.len(), 1);
+        assert!(!rendered.text.contains("<attachment>"));
+
+        let skeleton = message_skeleton(7, &message, &context);
+        assert_eq!(skeleton.preview, "done\nmissing.txt");
+        assert_eq!(skeleton.attachment_count, 0);
+        assert!(skeleton.has_attachment_errors);
+
+        let _ = fs::remove_dir_all(workdir);
     }
 }

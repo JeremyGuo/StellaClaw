@@ -5,7 +5,7 @@ use stellaclaw_core::session_actor::{ChatMessage, ChatMessageItem, FileItem, Too
 
 use crate::channels::types::{OutgoingAttachment, OutgoingAttachmentKind};
 
-pub(super) fn extract_attachment_references(
+pub(crate) fn extract_attachment_references(
     text: &str,
     workspace_root: &Path,
     shared_root: &Path,
@@ -47,7 +47,7 @@ pub(super) fn extract_attachment_references(
     Ok((clean.trim().to_string(), attachments))
 }
 
-pub(super) fn strip_attachment_tags(text: &str) -> String {
+pub(crate) fn strip_attachment_tags(text: &str) -> String {
     const START: &str = "<attachment>";
     const END: &str = "</attachment>";
 

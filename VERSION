@@ -1,5 +1,10 @@
-version: 1.15.1
+version: 1.15.2
 ---
+
+# 1.15.2
+
+- 修复 Web channel 的 `<attachment>` 消息展示：
+  Web messages API 现在会在消息列表和详情中解析 assistant 输出里的 `<attachment>...</attachment>` 标签，返回去掉标签后的 `preview` / `rendered_text`，并在消息详情中附带可通过 workspace file API 读取的附件 metadata；附件解析失败不会让消息 API 整体失败，而是返回 `attachment_errors` 供前端展示。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.15.1
 
