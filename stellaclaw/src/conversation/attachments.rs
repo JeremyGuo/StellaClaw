@@ -5,15 +5,33 @@ use stellaclaw_core::session_actor::{ChatMessage, ChatMessageItem, FileItem, Too
 
 use crate::channels::types::{OutgoingAttachment, OutgoingAttachmentKind};
 
+pub(crate) struct AttachmentExtraction {
+    pub clean_text: String,
+    pub marked_text: String,
+    pub attachments: Vec<OutgoingAttachment>,
+}
+
 pub(crate) fn extract_attachment_references(
     text: &str,
     workspace_root: &Path,
     shared_root: &Path,
 ) -> Result<(String, Vec<OutgoingAttachment>)> {
+    let extracted =
+        extract_attachment_references_with_markers(text, workspace_root, shared_root, 0)?;
+    Ok((extracted.clean_text, extracted.attachments))
+}
+
+pub(crate) fn extract_attachment_references_with_markers(
+    text: &str,
+    workspace_root: &Path,
+    shared_root: &Path,
+    base_attachment_index: usize,
+) -> Result<AttachmentExtraction> {
     const START: &str = "<attachment>";
     const END: &str = "</attachment>";
 
     let mut clean = String::with_capacity(text.len());
+    let mut marked = String::with_capacity(text.len());
     let mut attachments = Vec::new();
     let mut cursor = 0usize;
 
@@ -22,29 +40,47 @@ pub(crate) fn extract_attachment_references(
         if is_inside_fenced_code_block(text, start) {
             let start_end = start + START.len();
             clean.push_str(&text[cursor..start_end]);
+            marked.push_str(&text[cursor..start_end]);
             cursor = start_end;
             continue;
         }
         clean.push_str(&text[cursor..start]);
+        marked.push_str(&text[cursor..start]);
         let path_start = start + START.len();
         let Some(end_rel) = text[path_start..].find(END) else {
             clean.push_str(&text[start..]);
-            return Ok((clean.trim().to_string(), attachments));
+            marked.push_str(&text[start..]);
+            return Ok(AttachmentExtraction {
+                clean_text: clean.trim().to_string(),
+                marked_text: marked.trim().to_string(),
+                attachments,
+            });
         };
         let path_end = path_start + end_rel;
         let path_text = text[path_start..path_end].trim();
         if !path_text.is_empty() {
+            let marker = attachment_marker(base_attachment_index + attachments.len());
             attachments.push(resolve_outgoing_attachment(
                 workspace_root,
                 shared_root,
                 path_text,
             )?);
+            marked.push_str(&marker);
         }
         cursor = path_end + END.len();
     }
 
     clean.push_str(&text[cursor..]);
-    Ok((clean.trim().to_string(), attachments))
+    marked.push_str(&text[cursor..]);
+    Ok(AttachmentExtraction {
+        clean_text: clean.trim().to_string(),
+        marked_text: marked.trim().to_string(),
+        attachments,
+    })
+}
+
+pub(crate) fn attachment_marker(index: usize) -> String {
+    format!("[[attachment:{index}]]")
 }
 
 pub(crate) fn strip_attachment_tags(text: &str) -> String {

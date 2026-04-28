@@ -52,7 +52,10 @@ mod skill_sync;
 mod status;
 
 pub use attachments::render_chat_message;
-pub(crate) use attachments::{extract_attachment_references, strip_attachment_tags};
+pub(crate) use attachments::{
+    attachment_marker, extract_attachment_references, extract_attachment_references_with_markers,
+    strip_attachment_tags,
+};
 use cron_script::{parse_script_stdout, run_script_command, CronScriptMessage, CronScriptTarget};
 pub(crate) use skill_sync::push_configured_skill_sync_on_startup;
 use skill_sync::{

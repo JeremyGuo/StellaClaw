@@ -1,5 +1,16 @@
-version: 1.15.12
+version: 1.15.13
 ---
+
+# 1.15.13
+
+- 优化 Web channel 图片附件展示：
+  Web messages payload 保持原 `text` 干净文本不变，新增 `text_with_attachment_markers`，并在从 `<attachment>...</attachment>` 提取出的附件上返回对应 `marker`，例如 `[[attachment:0]]`，方便前端把图片按原文位置插回去做图文混排；结构化 `items[].text` 和 tool result context 也提供对应 marker 文本。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 调整 Web 图片缩略图缓存策略：
+  Web channel 图片 thumbnail 不再固定压到 360px，而是优先保留最长边 960px，并按目标 256KB 逐步降低 JPEG 质量和尺寸；旧缩略图缓存 key 已更新，避免继续复用过度压缩的旧缓存。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 精简 Brave 图片搜索结果：
+  Brave image search provider 不再额外拼接 `answer` 文本，只返回结构化 `query`、`citations` 和 `results`，减少工具结果 token 占用。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.15.12
 

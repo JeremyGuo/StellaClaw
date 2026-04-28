@@ -114,45 +114,8 @@ pub fn parse_brave_image_search_response(value: &Value, query: &str, max_results
         .iter()
         .filter_map(|result| result.get("page_url").cloned())
         .collect::<Vec<_>>();
-    let answer = if results.is_empty() {
-        "No image results returned.".to_string()
-    } else {
-        results
-            .iter()
-            .enumerate()
-            .map(|(index, result)| {
-                let title = result
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Untitled image");
-                let page_url = result.get("page_url").and_then(Value::as_str).unwrap_or("");
-                let image_url = result
-                    .get("image_url")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let thumbnail_url = result
-                    .get("thumbnail_url")
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-
-                let mut lines = vec![format!("{}. {}", index + 1, title)];
-                if !page_url.is_empty() {
-                    lines.push(format!("Page URL: {page_url}"));
-                }
-                if !image_url.is_empty() {
-                    lines.push(format!("Image URL: {image_url}"));
-                }
-                if !thumbnail_url.is_empty() {
-                    lines.push(format!("Thumbnail URL: {thumbnail_url}"));
-                }
-                lines.join("\n")
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    };
     json!({
         "query": query,
-        "answer": answer,
         "citations": citations,
         "results": results,
     })
@@ -324,10 +287,7 @@ mod tests {
             result["results"][0]["thumbnail_url"],
             "https://imgs.search.brave.com/thumb"
         );
-        assert!(result["answer"]
-            .as_str()
-            .unwrap()
-            .contains("Image URL: https://example.com/rust-logo.png"));
+        assert!(result.get("answer").is_none());
     }
 
     fn test_model_config(url: String) -> ModelConfig {

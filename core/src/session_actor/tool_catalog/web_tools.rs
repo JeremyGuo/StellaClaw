@@ -96,7 +96,7 @@ fn web_search_description(options: WebSearchOptions) -> String {
         format!(" This session does not support: {unsupported}.")
     };
     format!(
-        "Search using the configured provider and return an answer plus citations. Supported result types: {}. Set at most one of image=true, video=true, or news=true; omit them for normal web results.{} If interrupted by a newer user message or timeout observation, this tool cancels the in-flight search result and returns immediately.",
+        "Search using the configured provider and return structured results plus citations. Supported result types: {}. Set at most one of image=true, video=true, or news=true; omit them for normal web results.{} If interrupted by a newer user message or timeout observation, this tool cancels the in-flight search result and returns immediately.",
         supported.join(", "),
         unsupported
     )

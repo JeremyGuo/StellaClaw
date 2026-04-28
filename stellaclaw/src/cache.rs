@@ -7,7 +7,9 @@ use std::{
 };
 
 use base64::{engine::general_purpose, Engine as _};
-use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, GenericImageView, Rgb, RgbImage};
+use image::{
+    codecs::jpeg::JpegEncoder, imageops::FilterType, DynamicImage, GenericImageView, Rgb, RgbImage,
+};
 use serde::{Deserialize, Serialize};
 
 const RUNDIR: &str = "rundir";
@@ -15,9 +17,12 @@ const CACHE_DIR: &str = "cache";
 const CONVERSATIONS_DIR: &str = "conversations";
 const THUMBNAILS_DIR: &str = "thumbnails";
 const THUMBNAIL_MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
-const THUMBNAIL_MAX_DIMENSION: u32 = 360;
-const THUMBNAIL_JPEG_QUALITY: u8 = 72;
-const THUMBNAIL_VERSION: &str = "web-thumbnail-v1";
+const THUMBNAIL_TARGET_BYTES: usize = 256 * 1024;
+const THUMBNAIL_MAX_DIMENSION: u32 = 960;
+const THUMBNAIL_MIN_DIMENSION: u32 = 360;
+const THUMBNAIL_START_JPEG_QUALITY: u8 = 86;
+const THUMBNAIL_MIN_JPEG_QUALITY: u8 = 54;
+const THUMBNAIL_VERSION: &str = "web-thumbnail-v2";
 
 #[derive(Debug, Clone)]
 pub struct CacheManager {
@@ -87,31 +92,7 @@ impl CacheManager {
 
         let image = image::ImageReader::open(source_path).ok()?.decode().ok()?;
         let (original_width, original_height) = image.dimensions();
-        let resized = image.resize(
-            THUMBNAIL_MAX_DIMENSION,
-            THUMBNAIL_MAX_DIMENSION,
-            FilterType::Triangle,
-        );
-        let rgba = resized.to_rgba8();
-        let mut rgb = RgbImage::new(rgba.width(), rgba.height());
-        for (x, y, pixel) in rgba.enumerate_pixels() {
-            let alpha = pixel[3] as u16;
-            let inv_alpha = 255_u16.saturating_sub(alpha);
-            let blend = |channel: u8| -> u8 {
-                (((channel as u16 * alpha) + (255_u16 * inv_alpha)) / 255) as u8
-            };
-            rgb.put_pixel(
-                x,
-                y,
-                Rgb([blend(pixel[0]), blend(pixel[1]), blend(pixel[2])]),
-            );
-        }
-
-        let mut encoded = Cursor::new(Vec::new());
-        JpegEncoder::new_with_quality(&mut encoded, THUMBNAIL_JPEG_QUALITY)
-            .encode_image(&rgb)
-            .ok()?;
-        let bytes = encoded.into_inner();
+        let (rgb, bytes) = encode_thumbnail_by_size(&image)?;
         let metadata = ThumbnailMetadata {
             media_type: "image/jpeg".to_string(),
             width: rgb.width(),
@@ -137,6 +118,65 @@ impl CacheManager {
             .join(sanitize_cache_component(conversation_id))
             .join(THUMBNAILS_DIR)
     }
+}
+
+fn encode_thumbnail_by_size(image: &DynamicImage) -> Option<(RgbImage, Vec<u8>)> {
+    let mut max_dimension = THUMBNAIL_MAX_DIMENSION.max(1);
+    loop {
+        let rgb = resize_and_flatten_image(image, max_dimension);
+        let mut quality = THUMBNAIL_START_JPEG_QUALITY;
+        loop {
+            let bytes = encode_jpeg(&rgb, quality)?;
+            if bytes.len() <= THUMBNAIL_TARGET_BYTES
+                || (quality <= THUMBNAIL_MIN_JPEG_QUALITY
+                    && max_dimension <= THUMBNAIL_MIN_DIMENSION)
+            {
+                return Some((rgb, bytes));
+            }
+            if quality <= THUMBNAIL_MIN_JPEG_QUALITY {
+                break;
+            }
+            quality = quality.saturating_sub(8).max(THUMBNAIL_MIN_JPEG_QUALITY);
+        }
+
+        if max_dimension <= THUMBNAIL_MIN_DIMENSION {
+            let bytes = encode_jpeg(&rgb, THUMBNAIL_MIN_JPEG_QUALITY)?;
+            return Some((rgb, bytes));
+        }
+        max_dimension = ((max_dimension as f32) * 0.8).round() as u32;
+        max_dimension = max_dimension.max(THUMBNAIL_MIN_DIMENSION);
+    }
+}
+
+fn resize_and_flatten_image(image: &DynamicImage, max_dimension: u32) -> RgbImage {
+    let resized = if image.width() > max_dimension || image.height() > max_dimension {
+        image.resize(max_dimension, max_dimension, FilterType::Triangle)
+    } else {
+        image.clone()
+    };
+    let rgba = resized.to_rgba8();
+    let mut rgb = RgbImage::new(rgba.width(), rgba.height());
+    for (x, y, pixel) in rgba.enumerate_pixels() {
+        let alpha = pixel[3] as u16;
+        let inv_alpha = 255_u16.saturating_sub(alpha);
+        let blend = |channel: u8| -> u8 {
+            (((channel as u16 * alpha) + (255_u16 * inv_alpha)) / 255) as u8
+        };
+        rgb.put_pixel(
+            x,
+            y,
+            Rgb([blend(pixel[0]), blend(pixel[1]), blend(pixel[2])]),
+        );
+    }
+    rgb
+}
+
+fn encode_jpeg(image: &RgbImage, quality: u8) -> Option<Vec<u8>> {
+    let mut encoded = Cursor::new(Vec::new());
+    JpegEncoder::new_with_quality(&mut encoded, quality)
+        .encode_image(image)
+        .ok()?;
+    Some(encoded.into_inner())
 }
 
 fn read_cached_thumbnail(image_path: &Path, metadata_path: &Path) -> Option<CachedImagePreview> {
@@ -211,8 +251,9 @@ mod tests {
 
         assert_eq!(first.original_width, 800);
         assert_eq!(first.original_height, 600);
-        assert_eq!(first.thumbnail.width, 360);
-        assert_eq!(first.thumbnail.height, 270);
+        assert_eq!(first.thumbnail.width, 800);
+        assert_eq!(first.thumbnail.height, 600);
+        assert!(first.thumbnail.size_bytes <= THUMBNAIL_TARGET_BYTES);
         assert_eq!(first.thumbnail.data_base64, second.thumbnail.data_base64);
         assert_eq!(
             first.thumbnail.data_base64,

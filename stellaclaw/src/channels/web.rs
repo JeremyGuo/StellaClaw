@@ -25,9 +25,10 @@ use crate::{
     cache::{CacheManager, CachedThumbnail},
     config::{ModelSelection, StellaclawConfig},
     conversation::{
-        extract_attachment_references, load_conversation_status_snapshot,
-        load_or_create_conversation_state, persist_conversation_state, strip_attachment_tags,
-        ConversationControl, ConversationState, IncomingConversationMessage,
+        attachment_marker, extract_attachment_references_with_markers,
+        load_conversation_status_snapshot, load_or_create_conversation_state,
+        persist_conversation_state, strip_attachment_tags, ConversationControl, ConversationState,
+        IncomingConversationMessage,
     },
     conversation_id_manager::ConversationIdManager,
     logger::StellaclawLogger,
@@ -1170,6 +1171,7 @@ struct MessageSkeleton {
     index: usize,
     role: ChatRole,
     text: String,
+    text_with_attachment_markers: String,
     preview: String,
     items: Vec<WebMessageItem>,
     attachments: Vec<WebMessageAttachment>,
@@ -1194,6 +1196,7 @@ struct WebMessageAttachment {
     height: Option<u32>,
     size_bytes: Option<u64>,
     url: String,
+    marker: Option<String>,
     thumbnail: Option<CachedThumbnail>,
 }
 
@@ -1203,6 +1206,7 @@ enum WebMessageItem {
     Text {
         index: usize,
         text: String,
+        text_with_attachment_markers: String,
     },
     File {
         index: usize,
@@ -1219,6 +1223,7 @@ enum WebMessageItem {
         tool_call_id: String,
         tool_name: String,
         context: Option<String>,
+        context_with_attachment_markers: Option<String>,
         file_attachment_index: Option<usize>,
     },
 }
@@ -1226,9 +1231,15 @@ enum WebMessageItem {
 #[derive(Debug)]
 struct WebRenderedMessage {
     text: String,
+    text_with_attachment_markers: String,
     items: Vec<WebMessageItem>,
     attachments: Vec<WebMessageAttachment>,
     attachment_errors: Vec<String>,
+}
+
+struct WebRenderedTextPart {
+    text: String,
+    text_with_attachment_markers: String,
 }
 
 struct WebAttachmentContext {
@@ -1766,6 +1777,7 @@ fn message_skeleton(
         index,
         role: message.role.clone(),
         text: rendered.text.clone(),
+        text_with_attachment_markers: rendered.text_with_attachment_markers.clone(),
         preview: preview_text(&rendered.text),
         items: rendered.items,
         attachment_count: rendered.attachments.len(),
@@ -1784,6 +1796,7 @@ fn render_web_message(
     roots: &WebAttachmentRoots,
 ) -> WebRenderedMessage {
     let mut parts = Vec::new();
+    let mut marked_parts = Vec::new();
     let mut items = Vec::new();
     let mut attachments = Vec::new();
     let mut attachment_errors = Vec::new();
@@ -1792,18 +1805,20 @@ fn render_web_message(
         match item {
             ChatMessageItem::Reasoning(_) => {}
             ChatMessageItem::Context(context_item) => {
-                let text = render_web_text_part(
+                let part = render_web_text_part(
                     &context_item.text,
                     context,
                     roots,
                     &mut attachments,
                     &mut attachment_errors,
                 );
-                if !text.is_empty() {
-                    parts.push(text.clone());
+                if !part.text.is_empty() || !part.text_with_attachment_markers.is_empty() {
+                    parts.push(part.text.clone());
+                    marked_parts.push(part.text_with_attachment_markers.clone());
                     items.push(WebMessageItem::Text {
                         index: item_index,
-                        text,
+                        text: part.text,
+                        text_with_attachment_markers: part.text_with_attachment_markers,
                     });
                 }
             }
@@ -1828,23 +1843,27 @@ fn render_web_message(
                 arguments: parse_tool_arguments(&tool_call.arguments.text),
             }),
             ChatMessageItem::ToolResult(tool_result) => {
+                let mut context_with_attachment_markers = None;
                 let context_text = tool_result
                     .result
                     .context
                     .as_ref()
                     .and_then(|context_item| {
-                        let text = render_web_text_part(
+                        let part = render_web_text_part(
                             &context_item.text,
                             context,
                             roots,
                             &mut attachments,
                             &mut attachment_errors,
                         );
-                        if text.is_empty() {
+                        if part.text.is_empty() && part.text_with_attachment_markers.is_empty() {
                             None
                         } else {
-                            parts.push(text.clone());
-                            Some(text)
+                            parts.push(part.text.clone());
+                            marked_parts.push(part.text_with_attachment_markers.clone());
+                            context_with_attachment_markers =
+                                Some(part.text_with_attachment_markers);
+                            Some(part.text)
                         }
                     });
                 let file_attachment_index = if let Some(file) = &tool_result.result.file {
@@ -1865,6 +1884,7 @@ fn render_web_message(
                     tool_call_id: tool_result.tool_call_id.clone(),
                     tool_name: tool_result.tool_name.clone(),
                     context: context_text,
+                    context_with_attachment_markers,
                     file_attachment_index,
                 });
             }
@@ -1873,6 +1893,7 @@ fn render_web_message(
 
     WebRenderedMessage {
         text: parts.join("\n\n"),
+        text_with_attachment_markers: marked_parts.join("\n\n"),
         items,
         attachments,
         attachment_errors,
@@ -1885,28 +1906,45 @@ fn render_web_text_part(
     roots: &WebAttachmentRoots,
     attachments: &mut Vec<WebMessageAttachment>,
     attachment_errors: &mut Vec<String>,
-) -> String {
+) -> WebRenderedTextPart {
     if !raw_text.contains("<attachment>") {
-        return raw_text.to_string();
+        return WebRenderedTextPart {
+            text: raw_text.to_string(),
+            text_with_attachment_markers: raw_text.to_string(),
+        };
     }
 
-    match extract_attachment_references(raw_text, &roots.workspace_root, &roots.shared_root) {
-        Ok((text, resolved)) => {
-            for attachment in resolved {
+    let base_attachment_index = attachments.len();
+    match extract_attachment_references_with_markers(
+        raw_text,
+        &roots.workspace_root,
+        &roots.shared_root,
+        base_attachment_index,
+    ) {
+        Ok(extracted) => {
+            for (relative_index, attachment) in extracted.attachments.into_iter().enumerate() {
+                let attachment_index = attachments.len();
                 attachments.push(web_outgoing_attachment(
-                    attachments.len(),
+                    attachment_index,
                     "attachment_tag",
+                    Some(attachment_marker(base_attachment_index + relative_index)),
                     &attachment,
                     context,
                     roots,
                 ));
             }
-            text
+            WebRenderedTextPart {
+                text: extracted.clean_text,
+                text_with_attachment_markers: extracted.marked_text,
+            }
         }
         Err(error) => {
             let clean = strip_attachment_tags(raw_text).trim().to_string();
             attachment_errors.push(format!("{error:#}"));
-            clean
+            WebRenderedTextPart {
+                text: clean.clone(),
+                text_with_attachment_markers: clean,
+            }
         }
     }
 }
@@ -1918,6 +1956,7 @@ fn parse_tool_arguments(raw_text: &str) -> Value {
 fn web_outgoing_attachment(
     index: usize,
     source: &'static str,
+    marker: Option<String>,
     attachment: &OutgoingAttachment,
     context: &WebAttachmentContext,
     roots: &WebAttachmentRoots,
@@ -1957,6 +1996,7 @@ fn web_outgoing_attachment(
             percent_encode_query_value(&context.conversation_id),
             percent_encode_query_value(&path)
         ),
+        marker,
         thumbnail: image_preview.map(|preview| preview.thumbnail),
         path,
     }
@@ -2026,6 +2066,7 @@ fn web_file_item_attachment(
         }),
         size_bytes,
         url,
+        marker: None,
         thumbnail: image_preview.map(|preview| preview.thumbnail),
     }
 }
@@ -2346,10 +2387,15 @@ mod tests {
         let rendered = render_web_message(&message, &context, &roots);
 
         assert_eq!(rendered.text, "done");
+        assert_eq!(
+            rendered.text_with_attachment_markers,
+            "done\n[[attachment:0]]"
+        );
         assert_eq!(rendered.items.len(), 1);
         assert!(matches!(
             &rendered.items[0],
-            WebMessageItem::Text { text, .. } if text == "done"
+            WebMessageItem::Text { text, text_with_attachment_markers, .. }
+                if text == "done" && text_with_attachment_markers == "done\n[[attachment:0]]"
         ));
         assert!(rendered.attachment_errors.is_empty());
         assert_eq!(rendered.attachments.len(), 1);
@@ -2357,6 +2403,10 @@ mod tests {
         assert_eq!(rendered.attachments[0].path, "report.txt");
         assert_eq!(rendered.attachments[0].name, "report.txt");
         assert_eq!(rendered.attachments[0].source, "attachment_tag");
+        assert_eq!(
+            rendered.attachments[0].marker.as_deref(),
+            Some("[[attachment:0]]")
+        );
         assert_eq!(rendered.attachments[0].size_bytes, Some(5));
         assert_eq!(
             rendered.attachments[0].url,
@@ -2366,6 +2416,10 @@ mod tests {
         let skeleton = message_skeleton(7, &message, &context, &roots);
         assert_eq!(skeleton.preview, "done");
         assert_eq!(skeleton.text, "done");
+        assert_eq!(
+            skeleton.text_with_attachment_markers,
+            "done\n[[attachment:0]]"
+        );
         assert_eq!(skeleton.items.len(), 1);
         assert_eq!(skeleton.attachment_count, 1);
         assert_eq!(skeleton.attachments.len(), 1);
@@ -2574,9 +2628,17 @@ mod tests {
         let rendered = render_web_message(&message, &context, &roots);
 
         assert_eq!(rendered.text, "photo");
+        assert_eq!(
+            rendered.text_with_attachment_markers,
+            "photo\n[[attachment:0]]"
+        );
         assert!(rendered.attachment_errors.is_empty());
         assert_eq!(rendered.attachments.len(), 1);
         assert_eq!(rendered.attachments[0].source, "attachment_tag");
+        assert_eq!(
+            rendered.attachments[0].marker.as_deref(),
+            Some("[[attachment:0]]")
+        );
         assert_eq!(rendered.attachments[0].kind, "image");
         assert_eq!(rendered.attachments[0].path, "photo.png");
         assert_eq!(rendered.attachments[0].width, Some(800));
@@ -2586,15 +2648,28 @@ mod tests {
             .as_ref()
             .expect("image attachment should include thumbnail");
         assert_eq!(thumbnail.media_type, "image/jpeg");
-        assert_eq!(thumbnail.width, 360);
-        assert_eq!(thumbnail.height, 270);
+        assert_eq!(thumbnail.width, 800);
+        assert_eq!(thumbnail.height, 600);
         assert!(!thumbnail.data_base64.is_empty());
+        assert!(thumbnail.size_bytes <= 256 * 1024);
         assert!(thumbnail.data_url.starts_with("data:image/jpeg;base64,"));
 
         let payload = message_page_payload(&state, &context, &[message], 0, 50);
         assert_eq!(
             payload["messages"][0]["attachments"][0]["source"],
             "attachment_tag"
+        );
+        assert_eq!(
+            payload["messages"][0]["text_with_attachment_markers"],
+            "photo\n[[attachment:0]]"
+        );
+        assert_eq!(
+            payload["messages"][0]["attachments"][0]["marker"],
+            "[[attachment:0]]"
+        );
+        assert_eq!(
+            payload["messages"][0]["items"][0]["text_with_attachment_markers"],
+            "photo\n[[attachment:0]]"
         );
         assert!(
             payload["messages"][0]["attachments"][0]["thumbnail"]["data_base64"]
