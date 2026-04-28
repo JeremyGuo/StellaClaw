@@ -55,6 +55,11 @@ const state = {
   websocketReconnectTimer: null,
   sessionActivity: '',
   sessionActivityClearTimer: null,
+  sessionProgress: null,
+  channelEvents: [],
+  metadataPopover: null,
+  tokenUsagePopover: null,
+  conversationMenu: null,
   refreshEpoch: 0,
   isRefreshing: false,
   lastRefreshAt: null,
@@ -75,6 +80,7 @@ const elements = {
   toggleContextButton: $('#toggleContextButton'),
   toggleFileButton: $('#toggleFileButton'),
   toggleTerminalButton: $('#toggleTerminalButton'),
+  toggleSidebarButton: $('#toggleSidebarButton'),
   newConversationButton: $('#newConversationButton'),
   serverStatusButton: $('#serverStatusButton'),
   serverPopover: $('#serverPopover'),
@@ -301,12 +307,14 @@ function messageListSignature(messages) {
       user_name: message.user_name,
       message_time: message.message_time,
       text: message.text,
+      text_with_attachment_markers: message.text_with_attachment_markers,
       preview: message.preview,
       items: message.items,
       attachments: message.attachments,
       attachment_count: message.attachment_count,
       has_attachment_errors: message.has_attachment_errors,
-      has_token_usage: message.has_token_usage
+      has_token_usage: message.has_token_usage,
+      token_usage: message.token_usage
     }))
   );
 }
@@ -345,12 +353,12 @@ function clearTerminalPoll() {
 function visibleMessages() {
   const key = selectedKey();
   if (!key) {
-    return state.messages;
+    return attachRuntimeMetadataToUserMessages(state.messages);
   }
-  return [
+  return attachRuntimeMetadataToUserMessages([
     ...state.messages,
     ...state.optimisticMessages.filter((message) => message.conversationKey === key)
-  ];
+  ]);
 }
 
 function isSyntheticMediaContextMessage(message) {
@@ -358,6 +366,75 @@ function isSyntheticMediaContextMessage(message) {
     return false;
   }
   return safeText(message?.preview).trim() === 'Tool returned media files. Use the attached files as current context.';
+}
+
+function firstTextItem(message) {
+  const item = messageItems(message).find((entry) => entry.type === 'text');
+  return safeText(item?.text || message?.text || message?.preview).trim();
+}
+
+function runtimeMetadataInfo(message) {
+  if (roleClass(message?.role) !== 'user' || messageHasItemType(message, ['file', 'tool_call', 'tool_result'])) {
+    return null;
+  }
+  const text = firstTextItem(message);
+  const markers = [
+    {
+      prefix: '[Incoming User Metadata]',
+      kind: 'incoming',
+      label: '用户元数据',
+      className: 'incoming'
+    },
+    {
+      prefix: '[Runtime Prompt Updates]',
+      kind: 'prompt',
+      label: 'Prompt 更新',
+      className: 'prompt'
+    },
+    {
+      prefix: '[Runtime Skill Updates]',
+      kind: 'skill',
+      label: 'Skill 更新',
+      className: 'skill'
+    },
+    {
+      prefix: '[Legacy system message]',
+      kind: 'legacy',
+      label: 'Legacy System',
+      className: 'legacy'
+    }
+  ];
+  const marker = markers.find((item) => text.startsWith(item.prefix));
+  if (!marker) {
+    return null;
+  }
+  return {
+    ...marker,
+    text,
+    messageId: safeText(message.id)
+  };
+}
+
+function attachRuntimeMetadataToUserMessages(messages) {
+  const result = [];
+  let pending = [];
+  for (const message of messages) {
+    const metadata = runtimeMetadataInfo(message);
+    if (metadata) {
+      pending.push(metadata);
+      continue;
+    }
+    if (pending.length > 0 && roleClass(message?.role) === 'user') {
+      result.push({
+        ...message,
+        runtimeMetadata: [...(message.runtimeMetadata || []), ...pending]
+      });
+      pending = [];
+      continue;
+    }
+    result.push(message);
+  }
+  return result;
 }
 
 function messageItems(message) {
@@ -462,20 +539,128 @@ function setSessionActivity(text, options = {}) {
   }
 }
 
+function parseProgressFeedbackText(text) {
+  const lines = safeText(text).split('\n').map((line) => line.trim()).filter(Boolean);
+  const result = {
+    title: lines[0]?.replace(/^[^\p{L}\p{N}]+/u, '') || '正在执行',
+    model: '',
+    phase: '',
+    tip: '',
+    plan: []
+  };
+  let inPlan = false;
+  for (const line of lines.slice(1)) {
+    if (line === '计划') {
+      inPlan = true;
+      continue;
+    }
+    if (inPlan) {
+      const match = line.match(/^([☐◐☑])\s+(.+)$/u);
+      if (match) {
+        result.plan.push({ marker: match[1], text: match[2] });
+      } else if (line) {
+        result.plan.push({ marker: '', text: line });
+      }
+      continue;
+    }
+    if (line.includes('模型：')) {
+      result.model = line.split('模型：').pop().trim();
+    } else if (line.includes('阶段：')) {
+      result.phase = line.split('阶段：').pop().trim();
+    } else if (line.includes('状态：')) {
+      result.phase = line.split('状态：').pop().trim();
+    } else if (line.includes('发送新消息可打断')) {
+      result.tip = line.replace(/^[^\p{L}\p{N}/]+/u, '').trim();
+    }
+  }
+  return result;
+}
+
+function parseRunningToolPhase(phase) {
+  const text = safeText(phase).trim();
+  if (!text) {
+    return null;
+  }
+  const batch = text.match(/^running tool batch\s+[^:]+:\s*(.+)$/i);
+  const summary = (batch ? batch[1] : text).split(/\s*;\s*/).find(Boolean)?.trim() || '';
+  const match = summary.match(/^([A-Za-z_][\w.-]*)(?:\s+([\s\S]+))?$/);
+  if (!match) {
+    return null;
+  }
+  const name = match[1];
+  const hint = safeText(match[2]).trim();
+  if (!hint) {
+    return { name, payload: {} };
+  }
+  const payloadKey = name === 'shell' || name === 'exec' || name === 'exec_command' ? 'command' : 'input';
+  return { name, payload: { [payloadKey]: hint } };
+}
+
+function openToolCallsFromMessages() {
+  const open = new Map();
+  for (const message of state.messages) {
+    for (const item of messageItems(message)) {
+      if (item.type === 'tool_call') {
+        open.set(item.tool_call_id || `${item.tool_name}:${item.index}`, item);
+      } else if (item.type === 'tool_result') {
+        open.delete(item.tool_call_id || `${item.tool_name}:${item.index}`);
+      }
+    }
+  }
+  return [...open.values()];
+}
+
+function runningToolForProgress(parsed) {
+  const openCalls = openToolCallsFromMessages();
+  if (openCalls.length > 0) {
+    const item = openCalls.at(-1);
+    return {
+      name: item.tool_name || 'tool',
+      payload: item.arguments || {}
+    };
+  }
+  return parseRunningToolPhase(parsed?.phase);
+}
+
 function displayProgressText(text) {
   const value = safeText(text).trim();
   if (!value) {
     return '正在处理';
   }
+  const structured = parseProgressFeedbackText(value);
+  const runningTool = runningToolForProgress(structured);
+  if (runningTool) {
+    return `正在调用 ${runningTool.name}`;
+  }
+  if (structured.phase) {
+    return structured.phase;
+  }
   const batch = value.match(/^running tool batch\s+[^:]+:\s*(.+)$/i);
   if (batch) {
     return `正在执行 ${batch[1]}`;
   }
-  return value;
+  return structured.title || value.split('\n').find(Boolean) || '正在处理';
 }
 
 function handleProcessingEvent(payload) {
   if (payload.state === 'typing') {
+    if (!state.sessionProgress || state.sessionProgress.conversationKey !== selectedKey()) {
+      state.sessionProgress = {
+        conversationKey: selectedKey(),
+        turnId: '',
+        important: false,
+        rawText: '⚙️ 正在执行\n🧠 状态：思考中...',
+        parsed: {
+          title: '正在执行',
+          model: selectedStatus()?.model || '',
+          phase: '思考中...',
+          tip: '',
+          plan: []
+        },
+        updatedAt: Date.now()
+      };
+      renderMessagesPreservingViewport();
+    }
     setSessionActivity('正在思考');
   } else if (payload.state === 'idle') {
     setSessionActivity('');
@@ -485,14 +670,53 @@ function handleProcessingEvent(payload) {
 function handleProgressFeedbackEvent(payload) {
   const text = displayProgressText(payload.text);
   if (payload.final_state === 'done') {
+    if (state.sessionProgress?.conversationKey === selectedKey()) {
+      state.sessionProgress = {
+        ...state.sessionProgress,
+        rawText: safeText(payload.text),
+        parsed: {
+          ...parseProgressFeedbackText(payload.text),
+          phase: '执行完毕'
+        },
+        updatedAt: Date.now()
+      };
+      setTimeout(() => {
+        if (state.sessionProgress?.parsed?.phase === '执行完毕') {
+          state.sessionProgress = null;
+          renderMessagesPreservingViewport();
+        }
+      }, 1600);
+    }
     setSessionActivity('已完成', { clearAfterMs: 1400 });
+    renderMessagesPreservingViewport();
     return;
   }
   if (payload.final_state === 'failed') {
+    state.sessionProgress = {
+      conversationKey: selectedKey(),
+      turnId: safeText(payload.turn_id),
+      important: Boolean(payload.important),
+      rawText: safeText(payload.text),
+      parsed: {
+        ...parseProgressFeedbackText(payload.text),
+        phase: '执行失败'
+      },
+      updatedAt: Date.now()
+    };
     setSessionActivity('执行失败', { clearAfterMs: 2400 });
+    renderMessagesPreservingViewport();
     return;
   }
+  state.sessionProgress = {
+    conversationKey: selectedKey(),
+    turnId: safeText(payload.turn_id),
+    important: Boolean(payload.important),
+    rawText: safeText(payload.text),
+    parsed: parseProgressFeedbackText(payload.text),
+    updatedAt: Date.now()
+  };
   setSessionActivity(text);
+  renderMessagesPreservingViewport();
 }
 
 function handleStatusEvent(serverId, conversationId, payload) {
@@ -502,6 +726,38 @@ function handleStatusEvent(serverId, conversationId, payload) {
     renderHeader();
     renderContext();
   }
+}
+
+function normalizeChannelError(payload) {
+  const error = payload?.error && typeof payload.error === 'object' ? payload.error : payload;
+  return {
+    id: createId('channel-error'),
+    conversationKey: selectedKey(),
+    createdAt: Date.now(),
+    type: 'error',
+    scope: safeText(error.scope || payload.scope || 'runtime'),
+    severity: safeText(error.severity || payload.severity || 'error'),
+    code: safeText(error.code || payload.code || 'error'),
+    message: safeText(error.message || payload.message || payload.error || '未知错误'),
+    detail: error.detail ?? payload.detail ?? null,
+    canContinue: Boolean(error.can_continue ?? payload.can_continue),
+    suggestedAction: safeText(error.suggested_action || payload.suggested_action || '')
+  };
+}
+
+function addChannelEvent(event) {
+  state.channelEvents = [...state.channelEvents, event]
+    .filter((item) => item.conversationKey === selectedKey())
+    .slice(-12);
+}
+
+function handleChannelErrorEvent(payload) {
+  const event = normalizeChannelError(payload);
+  addChannelEvent(event);
+  const label = event.severity === 'warning' ? '警告' : event.severity === 'info' ? '提示' : '错误';
+  setSessionActivity(`${label}: ${event.message}`, { clearAfterMs: event.severity === 'error' ? 4200 : 2600 });
+  showToast(event.message);
+  renderMessagesPreservingViewport();
 }
 
 function updateSessionActivityFromMessages(messages) {
@@ -581,6 +837,10 @@ function handleWebsocketPayload(serverId, conversationId, payload) {
   }
   if (payload.type === 'status') {
     handleStatusEvent(serverId, conversationId, payload);
+    return;
+  }
+  if (payload.type === 'error') {
+    handleChannelErrorEvent(payload);
     return;
   }
   if (payload.type === 'messages') {
@@ -813,6 +1073,36 @@ function attachmentThumbnailUrl(attachment) {
   return safeText(attachment?.thumbnail?.data_url);
 }
 
+function attachmentMarkerIndexes(value) {
+  const indexes = new Set();
+  const text = safeText(value);
+  const pattern = /\[\[attachment:(\d+)]]/g;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    indexes.add(Number(match[1]));
+  }
+  return indexes;
+}
+
+function messageAttachmentMarkerText(message, detail) {
+  const parts = [];
+  const explicit = detail?.text_with_attachment_markers || message?.text_with_attachment_markers;
+  if (explicit) {
+    parts.push(explicit);
+  }
+  const items = Array.isArray(detail?.items) ? detail.items : Array.isArray(message?.items) ? message.items : [];
+  items.forEach((item) => {
+    if (item?.text_with_attachment_markers) {
+      parts.push(item.text_with_attachment_markers);
+    }
+  });
+  return parts.join('\n');
+}
+
+function messageInlineAttachmentIndexes(message, detail) {
+  return attachmentMarkerIndexes(messageAttachmentMarkerText(message, detail));
+}
+
 function messageNeedsFullDetail(message) {
   return (
     (Number(message?.attachment_count || 0) > 0 && (!Array.isArray(message?.attachments) || message.attachments.length === 0)) ||
@@ -863,6 +1153,9 @@ function shouldHideFileBarForPreview() {
 }
 
 function sidebarResponsiveWidth() {
+  if (state.settings?.sidebarCollapsed) {
+    return 54;
+  }
   const width = window.innerWidth || 0;
   const stored = state.layout.sidebar;
   if (width && state.fileBarOpen && width < 1800) {
@@ -918,7 +1211,12 @@ function normalizeWorkspacePath(value) {
 
 function displayConversationName(serverId, conversation) {
   const key = conversationKey(serverId, conversation.conversation_id);
-  return state.settings.conversationNames[key] || conversation.platform_chat_id || conversation.conversation_id;
+  return (
+    safeText(conversation.nickname).trim() ||
+    state.settings.conversationNames[key] ||
+    conversation.platform_chat_id ||
+    conversation.conversation_id
+  );
 }
 
 function displayConversationModel(conversation, status) {
@@ -933,6 +1231,7 @@ function ensureLocalSettings() {
   state.settings.conversationNames ||= {};
   state.settings.hiddenConversations ||= {};
   state.settings.invalidModelAliases ||= {};
+  state.settings.sidebarCollapsed = Boolean(state.settings.sidebarCollapsed);
 }
 
 function isConversationHidden(serverId, conversationId) {
@@ -1021,6 +1320,56 @@ function statusUsageTotals(status) {
   totals.totalTokens = totals.cacheRead + totals.cacheWrite + totals.input + totals.output;
   totals.cacheHit = totals.cacheRead + totals.input > 0 ? totals.cacheRead / (totals.cacheRead + totals.input) : 0;
   return totals;
+}
+
+function emptyTokenUsage() {
+  return {
+    cacheRead: 0,
+    cacheWrite: 0,
+    input: 0,
+    output: 0,
+    totalTokens: 0,
+    cost: 0
+  };
+}
+
+function normalizeTokenUsage(source) {
+  const usage =
+    source?.token_usage ||
+    source?.message?.token_usage ||
+    source?.usage ||
+    source?.tokens ||
+    source?.response_usage ||
+    null;
+  if (!usage || typeof usage !== 'object' || Array.isArray(usage)) {
+    return emptyTokenUsage();
+  }
+  const cacheRead = Number(usage.cache_read ?? usage.cacheRead ?? usage.cached_input_tokens ?? usage.cache_read_tokens ?? 0);
+  const cacheWrite = Number(usage.cache_write ?? usage.cacheWrite ?? usage.cache_write_tokens ?? 0);
+  const input = Number(usage.input ?? usage.input_tokens ?? usage.prompt_tokens ?? usage.uncache_input ?? 0);
+  const output = Number(usage.output ?? usage.output_tokens ?? usage.completion_tokens ?? 0);
+  const totalTokens = Number(usage.total ?? usage.total_tokens ?? 0) || cacheRead + cacheWrite + input + output;
+  const costValue = usage.cost;
+  const cost =
+    typeof costValue === 'object' && costValue
+      ? Object.values(costValue).reduce((sum, value) => sum + Number(value || 0), 0)
+      : Number(costValue || usage.cost_usd || 0);
+  return {
+    cacheRead,
+    cacheWrite,
+    input,
+    output,
+    totalTokens,
+    cost
+  };
+}
+
+function messageTokenUsage(message, detail = state.messageDetails.get(message?.id)) {
+  const detailUsage = normalizeTokenUsage(detail);
+  if (detailUsage.totalTokens > 0 || detailUsage.cost > 0) {
+    return detailUsage;
+  }
+  return normalizeTokenUsage(message);
 }
 
 function safeLinkHref(value) {
@@ -1274,6 +1623,41 @@ function renderToolCard(kind, name, payload) {
   `;
 }
 
+function renderAttachmentMarker(index, attachments) {
+  const attachment = attachments?.[index];
+  if (!attachment) {
+    return '';
+  }
+  return renderMessageAttachmentItem(attachment);
+}
+
+function renderMarkdownWithAttachmentMarkers(value, attachments = []) {
+  const text = safeText(value);
+  if (!text.includes('[[attachment:')) {
+    return renderMarkdownWithToolBlocks(text);
+  }
+  const parts = [];
+  const pattern = /\[\[attachment:(\d+)]]/g;
+  let cursor = 0;
+  let match;
+  while ((match = pattern.exec(text)) !== null) {
+    const before = text.slice(cursor, match.index);
+    if (before.trim()) {
+      parts.push(renderMarkdownWithToolBlocks(before));
+    }
+    const attachmentHtml = renderAttachmentMarker(Number(match[1]), attachments);
+    if (attachmentHtml) {
+      parts.push(`<div class="message-inline-attachment">${attachmentHtml}</div>`);
+    }
+    cursor = match.index + match[0].length;
+  }
+  const rest = text.slice(cursor);
+  if (rest.trim()) {
+    parts.push(renderMarkdownWithToolBlocks(rest));
+  }
+  return parts.join('');
+}
+
 function renderMarkdownWithToolBlocks(value) {
   const text = safeText(value);
   const pattern = /\[tool_(call|result)\s+([^\]\n]+)\]\s*([\s\S]*?)(?=\n{2,}\S|\n\[tool_(?:call|result)\s+|$)/g;
@@ -1295,7 +1679,7 @@ function renderMarkdownWithToolBlocks(value) {
   return parts.join('');
 }
 
-function renderMarkdownMessage(value) {
+function renderMarkdownMessage(value, attachments = []) {
   const text = safeText(value).trim();
   if (!text) {
     return '<span class="message-empty">空消息</span>';
@@ -1306,17 +1690,25 @@ function renderMarkdownMessage(value) {
       if (block.startsWith('```') && block.endsWith('```')) {
         return markdownToHtml(block);
       }
-      return renderMarkdownWithToolBlocks(block);
+      return renderMarkdownWithAttachmentMarkers(block, attachments);
     })
     .join('');
 }
 
 function renderStructuredMessageContent(message, detail, options = {}) {
   const items = Array.isArray(detail?.items) ? detail.items : Array.isArray(message?.items) ? message.items : [];
-  if (items.length === 0) {
-    return renderMarkdownMessage(detail?.rendered_text || message?.text || message?.preview || '');
-  }
   const attachments = detail?.attachments || message?.attachments || [];
+  if (items.length === 0) {
+    return renderMarkdownMessage(
+      detail?.text_with_attachment_markers ||
+        message?.text_with_attachment_markers ||
+        detail?.rendered_text ||
+        message?.text ||
+        message?.preview ||
+        '',
+      attachments
+    );
+  }
   const key = selectedKey();
   const parts = items
     .map((item) => {
@@ -1324,7 +1716,7 @@ function renderStructuredMessageContent(message, detail, options = {}) {
         if (options.plainSyntheticSummary) {
           return `<span class="synthetic-message-summary">${escapeHtml(item.text || '')}</span>`;
         }
-        return renderMarkdownMessage(item.text || '');
+        return renderMarkdownMessage(item.text_with_attachment_markers || item.text || '', attachments);
       }
       if (item.type === 'file') {
         if (options.hideFiles) {
@@ -1336,14 +1728,25 @@ function renderStructuredMessageContent(message, detail, options = {}) {
         return renderToolCard('call', item.tool_name || 'tool', formatToolPayload(item.arguments));
       }
       if (item.type === 'tool_result') {
-        const payload = item.context || (item.file_attachment_index !== undefined ? JSON.stringify({ file_attachment_index: item.file_attachment_index }) : '');
+        const payload =
+          item.context_with_attachment_markers ||
+          item.context ||
+          (item.file_attachment_index !== undefined ? JSON.stringify({ file_attachment_index: item.file_attachment_index }) : '');
         return renderToolCard('result', item.tool_name || 'tool', payload);
       }
       return '';
     })
     .filter(Boolean);
   if (parts.length === 0) {
-    return renderMarkdownMessage(detail?.rendered_text || message?.text || message?.preview || '');
+    return renderMarkdownMessage(
+      detail?.text_with_attachment_markers ||
+        message?.text_with_attachment_markers ||
+        detail?.rendered_text ||
+        message?.text ||
+        message?.preview ||
+        '',
+      attachments
+    );
   }
   return parts.join('');
 }
@@ -1415,6 +1818,13 @@ function saveLayoutSettings() {
 }
 
 function applyLayoutSettings() {
+  const collapsed = Boolean(state.settings?.sidebarCollapsed);
+  document.body.classList.toggle('sidebar-collapsed', collapsed);
+  if (elements.toggleSidebarButton) {
+    elements.toggleSidebarButton.title = collapsed ? '显示 Conversation 列表' : '隐藏 Conversation 列表';
+    elements.toggleSidebarButton.setAttribute('aria-label', elements.toggleSidebarButton.title);
+    elements.toggleSidebarButton.setAttribute('aria-pressed', collapsed ? 'true' : 'false');
+  }
   document.querySelector('.app-shell')?.style.setProperty('--sidebar-width', `${sidebarResponsiveWidth()}px`);
   const workbench = document.querySelector('.workbench');
   workbench?.style.setProperty('--inspector-size', `${panelResponsiveWidth(state.layout.context, 240, 620)}px`);
@@ -1514,6 +1924,8 @@ async function selectConversation(serverId, conversationId) {
   state.messageDetailsLoading.clear();
   state.expandedMessages.clear();
   state.expandedExecutionGroups.clear();
+  state.channelEvents = state.channelEvents.filter((event) => event.conversationKey === conversationKey(serverId, conversationId));
+  state.sessionProgress = null;
   state.activePreviewMessageId = null;
   state.activePreviewFilePath = null;
   state.activeTerminalId = null;
@@ -1769,14 +2181,14 @@ function appendFileLimitQuery(path, limitBytes) {
 async function toggleMessage(messageId) {
   const message = state.messages.find((item) => item.id === messageId);
   const isSynthetic = isSyntheticMediaContextMessage(message);
-  state.activePreviewMessageId = messageId;
-  state.activePreviewFilePath = null;
+  if (!isSynthetic) {
+    return;
+  }
   if (isSynthetic && state.expandedMessages.has(messageId)) {
     state.expandedMessages.delete(messageId);
   } else if (isSynthetic) {
     state.expandedMessages.add(messageId);
   }
-  updateMessageSelectionState();
   updateMessageArticle(messageId);
 }
 
@@ -1794,17 +2206,15 @@ async function selectWorkspaceFile(path) {
 
 async function createConversation(serverId, localName) {
   const platform_chat_id = createId('stellacode');
+  const nickname = localName.trim();
   const response = await api(serverId, '/api/conversations', {
     method: 'POST',
     body: {
-      platform_chat_id
+      platform_chat_id,
+      ...(nickname ? { nickname } : {})
     }
   });
   const conversationId = response.data.conversation_id;
-  if (localName.trim()) {
-    state.settings.conversationNames[conversationKey(serverId, conversationId)] = localName.trim();
-    saveSettingsSoon();
-  }
   closeModal();
   await refreshServer(serverId);
   await selectConversation(serverId, conversationId);
@@ -1988,21 +2398,32 @@ function pollActiveConversation() {
   state.activePoll = setTimeout(tick, delays[0]);
 }
 
-function renameConversation(serverId, conversation) {
+async function renameConversation(serverId, conversation) {
   const current = displayConversationName(serverId, conversation);
   const name = window.prompt('会话名称', current);
   if (name === null) {
     return;
   }
+  const nickname = name.trim() || conversation.conversation_id;
   const key = conversationKey(serverId, conversation.conversation_id);
-  if (name.trim()) {
-    state.settings.conversationNames[key] = name.trim();
-  } else {
+  try {
+    const response = await api(serverId, `/api/conversations/${conversation.conversation_id}`, {
+      method: 'PATCH',
+      body: { nickname }
+    });
+    const updated = response.data?.conversation;
+    const list = state.conversations.get(serverId) || [];
+    state.conversations.set(
+      serverId,
+      list.map((item) => (item.conversation_id === conversation.conversation_id ? { ...item, ...updated } : item))
+    );
     delete state.settings.conversationNames[key];
+    saveSettingsSoon();
+    renderSidebar();
+    renderHeader();
+  } catch (error) {
+    showToast(error.message);
   }
-  saveSettingsSoon();
-  renderSidebar();
-  renderHeader();
 }
 
 function visibleConversationRows() {
@@ -2051,6 +2472,38 @@ function hideConversation(serverId, conversation) {
   renderSidebar();
 }
 
+function closeConversationMenu() {
+  state.conversationMenu?.remove();
+  state.conversationMenu = null;
+}
+
+function showConversationMenu(event, serverId, conversation) {
+  closeConversationMenu();
+  const menu = document.createElement('div');
+  menu.className = 'conversation-menu';
+  menu.setAttribute('role', 'menu');
+  menu.innerHTML = `
+    <button type="button" role="menuitem" data-action="rename">重命名</button>
+    <button type="button" role="menuitem" class="danger" data-action="delete">删除</button>
+  `;
+  document.body.append(menu);
+  const rect = menu.getBoundingClientRect();
+  const left = Math.min(Math.max(8, event.clientX), window.innerWidth - rect.width - 8);
+  const top = Math.min(Math.max(8, event.clientY), window.innerHeight - rect.height - 8);
+  menu.style.left = `${left}px`;
+  menu.style.top = `${top}px`;
+  menu.querySelector('[data-action="rename"]')?.addEventListener('click', () => {
+    closeConversationMenu();
+    renameConversation(serverId, conversation).catch((error) => showToast(error.message));
+  });
+  menu.querySelector('[data-action="delete"]')?.addEventListener('click', () => {
+    closeConversationMenu();
+    hideConversation(serverId, conversation);
+  });
+  menu.addEventListener('click', (menuEvent) => menuEvent.stopPropagation());
+  state.conversationMenu = menu;
+}
+
 function renderSidebar() {
   const fragment = document.createDocumentFragment();
   const rows = visibleConversationRows();
@@ -2075,10 +2528,11 @@ function renderSidebar() {
       <span class="conversation-age">${escapeHtml(displayConversationModel(conversation, status))}</span>
     `;
     row.addEventListener('click', () => selectConversation(server.id, conversation.conversation_id));
-    row.addEventListener('dblclick', () => renameConversation(server.id, conversation));
+    row.addEventListener('dblclick', () => renameConversation(server.id, conversation).catch((error) => showToast(error.message)));
     row.addEventListener('contextmenu', (event) => {
       event.preventDefault();
-      hideConversation(server.id, conversation);
+      event.stopPropagation();
+      showConversationMenu(event, server.id, conversation);
     });
     fragment.append(row);
   }
@@ -2135,10 +2589,15 @@ function renderMessageAttachments(message, detail, options = {}) {
     return '';
   }
   const key = selectedKey();
+  const inlineAttachmentIndexes = messageInlineAttachmentIndexes(message, detail);
   const items = attachments
+    .filter((attachment, index) => !inlineAttachmentIndexes.has(index) && !inlineAttachmentIndexes.has(Number(attachment?.index)))
     .map((attachment) => renderMessageAttachmentItem(attachment, key))
     .join('');
   const errorItems = errors.map((error) => `<div class="message-attachment-error">${escapeHtml(error)}</div>`).join('');
+  if (!items && !errorItems) {
+    return '';
+  }
   return `<div class="message-attachments">${items}${errorItems}</div>`;
 }
 
@@ -2292,9 +2751,9 @@ function renderExecutionMessageDetail(message) {
   });
   const attachmentsHtml = messageHasItemType(message, ['file']) ? '' : renderMessageAttachments(message, detail);
   return `
-    <section class="execution-detail-message">
+    <section class="execution-detail-item">
       <div class="execution-detail-meta">${escapeHtml(message.user_name || message.role || 'assistant')}</div>
-      <div class="execution-detail-body">${bodyHtml}${attachmentsHtml}</div>
+      <div class="execution-detail-body">${bodyHtml}${attachmentsHtml}${renderTokenUsageSummary(message)}</div>
     </section>
   `;
 }
@@ -2318,17 +2777,29 @@ function createExecutionGroup(messages, nextMessage) {
     ${expanded ? `<div class="execution-details">${messages.map(renderExecutionMessageDetail).join('')}</div>` : ''}
   `;
   element.querySelector('.execution-summary')?.addEventListener('click', () => {
+    const current = elements.messageList.querySelector(`[data-execution-group-id="${CSS.escape(groupId)}"]`);
     if (state.expandedExecutionGroups.has(groupId)) {
       state.expandedExecutionGroups.delete(groupId);
     } else {
       state.expandedExecutionGroups.add(groupId);
     }
-    renderMessages({ preserveScroll: true });
+    const replacement = createExecutionGroup(messages, nextMessage);
+    current?.replaceWith(replacement);
+    hydrateMessageAttachments();
   });
   element.querySelectorAll('[data-workspace-file]').forEach((button) => {
     button.addEventListener('click', (event) => {
       event.stopPropagation();
       selectWorkspaceFile(button.dataset.workspaceFile || '').catch((error) => showToast(error.message));
+    });
+  });
+  element.querySelectorAll('[data-token-usage]').forEach((button) => {
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      const message = messages.find((item) => item.id === button.dataset.tokenMessageId);
+      if (message) {
+        showTokenUsagePopover(button, message);
+      }
     });
   });
   return element;
@@ -2341,16 +2812,214 @@ function createAssistantFinalDivider() {
   return divider;
 }
 
+function renderSessionProgressCard() {
+  const progress = state.sessionProgress;
+  if (!progress || progress.conversationKey !== selectedKey()) {
+    return null;
+  }
+  const parsed = progress.parsed || {};
+  const element = document.createElement('section');
+  element.className = 'session-progress-card';
+  const runningTool = runningToolForProgress(parsed);
+  const toolHtml = runningTool
+    ? `<div class="session-progress-tool">${renderToolCard('call', runningTool.name, formatToolPayload(runningTool.payload))}</div>`
+    : '';
+  const plan = Array.isArray(parsed.plan) ? parsed.plan : [];
+  const planHtml = plan.length
+    ? `<div class="session-progress-plan">${plan
+        .map((item) => {
+          const markerClass = item.marker === '☑' ? 'done' : item.marker === '◐' ? 'active' : '';
+          return `<div class="session-progress-step ${markerClass}">
+            <span>${escapeHtml(item.marker || '•')}</span>
+            <span>${escapeHtml(item.text)}</span>
+          </div>`;
+        })
+        .join('')}</div>`
+    : '';
+  element.innerHTML = `
+    <div class="session-progress-head">
+      <span class="session-progress-dot"></span>
+      <span>${escapeHtml(parsed.title || '正在执行')}</span>
+      ${parsed.model ? `<code>${escapeHtml(parsed.model)}</code>` : ''}
+    </div>
+    ${runningTool ? '' : parsed.phase ? `<div class="session-progress-phase">${escapeHtml(parsed.phase)}</div>` : ''}
+    ${toolHtml}
+    ${planHtml}
+  `;
+  return element;
+}
+
+function renderChannelEventCard(event) {
+  const element = document.createElement('section');
+  element.className = `channel-event ${event.severity || 'error'}`;
+  const detailText = event.detail ? JSON.stringify(event.detail, null, 2) : '';
+  const detailHtml = detailText
+    ? `<details class="channel-event-detail">
+        <summary>详情</summary>
+        <pre><code>${escapeHtml(detailText)}</code></pre>
+      </details>`
+    : '';
+  element.innerHTML = `
+    <div class="channel-event-head">
+      <span>${escapeHtml(event.severity === 'warning' ? '警告' : event.severity === 'info' ? '提示' : '错误')}</span>
+      <code>${escapeHtml(event.code || event.scope || 'error')}</code>
+    </div>
+    <div class="channel-event-message">${escapeHtml(event.message)}</div>
+    ${event.suggestedAction ? `<div class="channel-event-action">${escapeHtml(event.suggestedAction)}</div>` : ''}
+    ${detailHtml}
+  `;
+  return element;
+}
+
+function visibleChannelEvents() {
+  const key = selectedKey();
+  if (!key) {
+    return [];
+  }
+  return state.channelEvents.filter((event) => event.conversationKey === key);
+}
+
+function renderRuntimeMetadataDots(message) {
+  const items = Array.isArray(message.runtimeMetadata) ? message.runtimeMetadata : [];
+  if (items.length === 0) {
+    return '';
+  }
+  return `
+    <div class="message-metadata-dots" aria-label="消息上下文">
+      ${items
+        .map(
+          (item, index) => `
+            <button
+              class="message-metadata-dot ${escapeHtml(item.className || 'metadata')}"
+              type="button"
+              title="${escapeHtml(item.label)}"
+              aria-label="${escapeHtml(item.label)}"
+              data-metadata-index="${index}"
+            ></button>
+          `
+        )
+        .join('')}
+    </div>
+  `;
+}
+
+function showRuntimeMetadataPopover(anchor, message, metadataIndex) {
+  closeMetadataPopover();
+  closeTokenUsagePopover();
+  const items = Array.isArray(message.runtimeMetadata) ? message.runtimeMetadata : [];
+  const item = items[metadataIndex];
+  if (!item) {
+    return;
+  }
+  const popover = document.createElement('div');
+  popover.className = 'metadata-popover';
+  popover.innerHTML = `
+    <div class="metadata-popover-head">
+      <span class="message-metadata-dot ${escapeHtml(item.className || 'metadata')}"></span>
+      <strong>${escapeHtml(item.label)}</strong>
+    </div>
+    <pre>${escapeHtml(item.text)}</pre>
+  `;
+  document.body.append(popover);
+  const anchorRect = anchor.getBoundingClientRect();
+  const popoverRect = popover.getBoundingClientRect();
+  const left = Math.min(Math.max(12, anchorRect.left), window.innerWidth - popoverRect.width - 12);
+  const top = Math.min(anchorRect.bottom + 8, window.innerHeight - popoverRect.height - 12);
+  popover.style.left = `${left}px`;
+  popover.style.top = `${Math.max(12, top)}px`;
+  state.metadataPopover = popover;
+  window.setTimeout(() => {
+    document.addEventListener('click', closeMetadataPopover, { once: true });
+  }, 0);
+}
+
+function closeMetadataPopover() {
+  state.metadataPopover?.remove();
+  state.metadataPopover = null;
+}
+
+function closeTokenUsagePopover() {
+  state.tokenUsagePopover?.remove();
+  state.tokenUsagePopover = null;
+}
+
+function renderTokenUsageSummary(message) {
+  if (roleClass(message.role) !== 'assistant') {
+    return '';
+  }
+  const usage = messageTokenUsage(message);
+  const active = usage.totalTokens > 0 || usage.cost > 0;
+  return `
+    <button class="message-token-usage${active ? ' has-usage' : ''}" type="button" data-token-usage data-token-message-id="${escapeHtml(message.id || '')}" title="Token Usage">
+      <span class="token-usage-dot" aria-hidden="true"></span>
+      <span>${escapeHtml(formatCompactNumber(usage.totalTokens))} tokens</span>
+    </button>
+  `;
+}
+
+function renderTokenUsagePopoverBody(message) {
+  const usage = messageTokenUsage(message);
+  const loading = state.messageDetailsLoading.has(message.id);
+  return `
+    <div class="token-usage-popover-head">
+      <strong>Token Usage</strong>
+      ${loading ? '<span>正在载入...</span>' : ''}
+    </div>
+    <div class="token-usage-grid">
+      <span>Cache Read</span><strong>${escapeHtml(formatCompactNumber(usage.cacheRead))}</strong>
+      <span>Cache Write</span><strong>${escapeHtml(formatCompactNumber(usage.cacheWrite))}</strong>
+      <span>Input</span><strong>${escapeHtml(formatCompactNumber(usage.input))}</strong>
+      <span>Output</span><strong>${escapeHtml(formatCompactNumber(usage.output))}</strong>
+      <span>Total</span><strong>${escapeHtml(formatCompactNumber(usage.totalTokens))}</strong>
+      <span>Cost</span><strong>${escapeHtml(formatCost(usage.cost))}</strong>
+    </div>
+  `;
+}
+
+function positionPopover(popover, anchor) {
+  const anchorRect = anchor.getBoundingClientRect();
+  const popoverRect = popover.getBoundingClientRect();
+  const left = Math.min(Math.max(12, anchorRect.right - popoverRect.width), window.innerWidth - popoverRect.width - 12);
+  const top = Math.min(anchorRect.bottom + 8, window.innerHeight - popoverRect.height - 12);
+  popover.style.left = `${left}px`;
+  popover.style.top = `${Math.max(12, top)}px`;
+}
+
+function showTokenUsagePopover(anchor, message) {
+  closeMetadataPopover();
+  closeTokenUsagePopover();
+  const popover = document.createElement('div');
+  popover.className = 'token-usage-popover';
+  popover.dataset.messageId = message.id;
+  popover.innerHTML = renderTokenUsagePopoverBody(message);
+  document.body.append(popover);
+  positionPopover(popover, anchor);
+  state.tokenUsagePopover = popover;
+  window.setTimeout(() => {
+    document.addEventListener('click', closeTokenUsagePopover, { once: true });
+  }, 0);
+  if (!state.messageDetails.has(message.id) && !state.messageDetailsLoading.has(message.id)) {
+    fetchMessageDetail(message.id)
+      .then(() => {
+        if (state.tokenUsagePopover?.dataset.messageId === message.id) {
+          state.tokenUsagePopover.innerHTML = renderTokenUsagePopoverBody(message);
+          positionPopover(state.tokenUsagePopover, anchor);
+        }
+      })
+      .catch((error) => showToast(error.message));
+  }
+}
+
 function createMessageArticle(message, index, messages, options = {}) {
   const expanded = state.expandedMessages.has(message.id);
   const detail = state.messageDetails.get(message.id);
   const article = document.createElement('article');
-  const activePreview = state.activePreviewMessageId === message.id;
   const previous = messages[index - 1];
   const sameSideAsPrevious = !options.forceSeparate && previous && roleClass(previous.role) === roleClass(message.role);
+  const executionFrame = isExecutionMessage(message);
   article.className = `message ${roleClass(message.role)}${expanded ? ' expanded' : ''}${
-    activePreview ? ' active-preview' : ''
-  }${message.pending ? ' pending' : ''}${sameSideAsPrevious ? ' compact' : ''}`;
+    message.pending ? ' pending' : ''
+  }${sameSideAsPrevious ? ' compact' : ''}${executionFrame ? ' execution-frame' : ''}`;
   article.dataset.messageId = message.id;
   const syntheticCollapsed = isSyntheticMediaContextMessage(message) && !expanded;
   const hasStructuredFileItems = (detail?.items || message.items || []).some((item) => item.type === 'file');
@@ -2366,12 +3035,14 @@ function createMessageArticle(message, index, messages, options = {}) {
       : '';
   article.innerHTML = `
     <div class="message-bubble" role="button" tabindex="0">
+      ${renderRuntimeMetadataDots(message)}
       <span class="message-meta">${escapeHtml(message.user_name || message.role || 'assistant')} ${
         message.message_time ? `· ${escapeHtml(formatRelative(message.message_time))}` : ''
       }</span>
       <div class="message-text">${bodyHtml}</div>
       ${attachmentsHtml}
       ${actionsHtml}
+      ${renderTokenUsageSummary(message)}
     </div>
   `;
   bindMessageArticle(article, message);
@@ -2400,11 +3071,27 @@ function bindMessageArticle(article, message) {
       selectWorkspaceFile(button.dataset.workspaceFile || '').catch((error) => showToast(error.message));
     });
   });
-  bubble.addEventListener('click', () => toggleMessage(message.id));
+  bubble.querySelectorAll('[data-metadata-index]').forEach((button) => {
+    button.addEventListener('click', (event) => {
+      event.stopPropagation();
+      showRuntimeMetadataPopover(button, message, Number(button.dataset.metadataIndex || 0));
+    });
+  });
+  bubble.querySelector('[data-token-usage]')?.addEventListener('click', (event) => {
+    event.stopPropagation();
+    showTokenUsagePopover(event.currentTarget, message);
+  });
+  bubble.addEventListener('click', (event) => {
+    if (isSyntheticMediaContextMessage(message)) {
+      toggleMessage(message.id);
+    }
+  });
   bubble.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault();
-      toggleMessage(message.id);
+      if (isSyntheticMediaContextMessage(message)) {
+        toggleMessage(message.id);
+      }
     }
   });
 }
@@ -2435,7 +3122,9 @@ function renderMessages(options = {}) {
     return;
   }
   const messages = visibleMessages();
-  if (messages.length === 0) {
+  const channelEvents = visibleChannelEvents();
+  const progressCard = renderSessionProgressCard();
+  if (messages.length === 0 && channelEvents.length === 0 && !progressCard) {
     const status = selectedStatus();
     const conversation = currentConversation();
     const pendingModel = status?.model_selection_pending || conversation?.model_selection_pending;
@@ -2474,7 +3163,6 @@ function renderMessages(options = {}) {
       const nextMessage = messages[cursor];
       if (isFinalAssistantMessage(nextMessage)) {
         fragment.append(createExecutionGroup(group, nextMessage));
-        fragment.append(createAssistantFinalDivider());
         forceSeparateNext = true;
       } else {
         for (let groupIndex = 0; groupIndex < group.length; groupIndex += 1) {
@@ -2486,6 +3174,12 @@ function renderMessages(options = {}) {
     }
     fragment.append(createMessageArticle(message, index, messages, { forceSeparate: forceSeparateNext }));
     forceSeparateNext = false;
+  }
+  if (progressCard) {
+    fragment.append(progressCard);
+  }
+  for (const event of channelEvents) {
+    fragment.append(renderChannelEventCard(event));
   }
   elements.messageList.replaceChildren(fragment);
   const shouldKeepBottom = !preserveScroll && (stickToBottom || wasNearBottom || messages.length !== state.messages.length);
@@ -2679,8 +3373,19 @@ function renderFilesContext() {
     `;
     return;
   }
-  target.innerHTML = renderWorkspaceCard(selectedStatus());
+  const previewHtml = selectedFileTabs().length > 0
+    ? `<section class="file-preview-stack">${renderFilePreviewShell()}</section>`
+    : '';
+  target.innerHTML = `
+    <div class="file-panel-layout${previewHtml ? ' has-preview' : ''}">
+      <div class="file-tree-pane">${renderWorkspaceCard(selectedStatus())}</div>
+      ${previewHtml}
+    </div>
+  `;
   bindWorkspaceActions();
+  if (previewHtml) {
+    bindEditorActions(target);
+  }
 }
 
 function usageBar(label, value, total) {
@@ -3015,11 +3720,11 @@ function renderFileBody(path, preview, loading, error) {
   `;
 }
 
-function renderFileDetailContext() {
+function renderFilePreviewShell() {
   const key = selectedKey();
   const path = normalizeWorkspacePath(state.activePreviewFilePath);
   if (!path) {
-    elements.contextContent.innerHTML = `
+    return `
       <section class="editor-shell">
         ${renderEditorTabs()}
         <div class="context-empty">
@@ -3028,8 +3733,6 @@ function renderFileDetailContext() {
         </div>
       </section>
     `;
-    bindEditorActions();
-    return;
   }
   const preview = workspaceFilePreview(key, path);
   const error = workspaceFileError(key, path);
@@ -3042,7 +3745,7 @@ function renderFileDetailContext() {
       : 'file preview';
   const mode = currentFileViewMode(path);
   const canPreview = isMarkdownFile(path);
-  elements.contextContent.innerHTML = `
+  return `
     <section class="editor-shell">
       ${renderEditorTabs()}
       <div class="editor-toolbar">
@@ -3064,23 +3767,27 @@ function renderFileDetailContext() {
       </div>
     </section>
   `;
-  bindEditorActions();
 }
 
-function bindEditorActions() {
-  elements.contextContent.querySelectorAll('[data-editor-tab]').forEach((button) => {
+function renderFileDetailContext() {
+  elements.contextContent.innerHTML = renderFilePreviewShell();
+  bindEditorActions(elements.contextContent);
+}
+
+function bindEditorActions(root = elements.contextContent) {
+  root.querySelectorAll('[data-editor-tab]').forEach((button) => {
     button.addEventListener('click', () => {
       state.activePreviewFilePath = normalizeWorkspacePath(button.dataset.editorTab || '');
       renderContext();
     });
   });
-  elements.contextContent.querySelectorAll('[data-editor-close]').forEach((button) => {
+  root.querySelectorAll('[data-editor-close]').forEach((button) => {
     button.addEventListener('click', (event) => {
       event.stopPropagation();
       closeFileTab(button.dataset.editorClose || '');
     });
   });
-  elements.contextContent.querySelectorAll('[data-file-mode]').forEach((button) => {
+  root.querySelectorAll('[data-file-mode]').forEach((button) => {
     button.addEventListener('click', () => {
       setFileViewMode(state.activePreviewFilePath, button.dataset.fileMode || 'source');
       renderContext();
@@ -3711,6 +4418,9 @@ function bindLayoutResizers() {
       const move = (moveEvent) => {
         const workbench = start.workbench;
         if (type === 'sidebar') {
+          if (state.settings?.sidebarCollapsed) {
+            return;
+          }
           state.layout.sidebar = clampNumber(start.sidebar + moveEvent.clientX - start.x, 220, 420);
         } else if (type === 'context' && workbench) {
           const rightEdge = workbench.right - (state.fileBarOpen ? state.layout.file : 0);
@@ -3747,6 +4457,7 @@ async function init() {
   state.settings = await window.stellacode.loadSettings();
   ensureLocalSettings();
   state.activeServerId = state.settings.activeServerId;
+  applyLayoutSettings();
   bindEvents();
   renderSidebar();
   renderHeader();
@@ -3757,6 +4468,12 @@ async function init() {
 
 function bindEvents() {
   bindLayoutResizers();
+  elements.toggleSidebarButton.addEventListener('click', () => {
+    closeConversationMenu();
+    state.settings.sidebarCollapsed = !state.settings.sidebarCollapsed;
+    applyLayoutSettings();
+    saveSettingsSoon();
+  });
   elements.newConversationButton.addEventListener('click', openNewConversationModal);
   elements.settingsButton.addEventListener('click', openSettingsModal);
   elements.refreshButton.addEventListener('click', async () => {
@@ -3833,7 +4550,14 @@ function bindEvents() {
     refreshWorkspace(currentWorkspacePath(), { setActive: false }).catch(() => {});
   });
   window.addEventListener('resize', () => {
+    closeConversationMenu();
     applyLayoutSettings();
+  });
+  document.addEventListener('click', closeConversationMenu);
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      closeConversationMenu();
+    }
   });
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible' && state.selected) {
