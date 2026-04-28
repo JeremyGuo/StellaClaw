@@ -446,6 +446,7 @@ impl WebChannel {
                 "index": index,
                 "message": message,
                 "rendered_text": rendered.text,
+                "items": rendered.items,
                 "attachments": rendered.attachments,
                 "attachment_errors": rendered.attachment_errors,
             }),
@@ -825,7 +826,9 @@ struct MessageSkeleton {
     id: String,
     index: usize,
     role: ChatRole,
+    text: String,
     preview: String,
+    items: Vec<WebMessageItem>,
     attachments: Vec<WebMessageAttachment>,
     attachment_count: usize,
     has_attachment_errors: bool,
@@ -850,9 +853,36 @@ struct WebMessageAttachment {
     thumbnail: Option<CachedThumbnail>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum WebMessageItem {
+    Text {
+        index: usize,
+        text: String,
+    },
+    File {
+        index: usize,
+        attachment_index: usize,
+    },
+    ToolCall {
+        index: usize,
+        tool_call_id: String,
+        tool_name: String,
+        arguments: Value,
+    },
+    ToolResult {
+        index: usize,
+        tool_call_id: String,
+        tool_name: String,
+        context: Option<String>,
+        file_attachment_index: Option<usize>,
+    },
+}
+
 #[derive(Debug)]
 struct WebRenderedMessage {
     text: String,
+    items: Vec<WebMessageItem>,
     attachments: Vec<WebMessageAttachment>,
     attachment_errors: Vec<String>,
 }
@@ -1161,7 +1191,9 @@ fn message_skeleton(
         id: index.to_string(),
         index,
         role: message.role.clone(),
+        text: rendered.text.clone(),
         preview: preview_text(&rendered.text),
+        items: rendered.items,
         attachment_count: rendered.attachments.len(),
         attachments: rendered.attachments,
         has_attachment_errors: !rendered.attachment_errors.is_empty(),
@@ -1177,87 +1209,114 @@ fn render_web_message(
     roots: &WebAttachmentRoots,
 ) -> WebRenderedMessage {
     let mut parts = Vec::new();
+    let mut items = Vec::new();
     let mut attachments = Vec::new();
     let mut attachment_errors = Vec::new();
 
-    for item in &message.data {
+    for (item_index, item) in message.data.iter().enumerate() {
         match item {
             ChatMessageItem::Reasoning(_) => {}
-            ChatMessageItem::Context(context_item) => push_web_text_part(
-                &context_item.text,
-                context,
-                roots,
-                &mut parts,
-                &mut attachments,
-                &mut attachment_errors,
-            ),
-            ChatMessageItem::File(file) => attachments.push(web_file_item_attachment(
-                attachments.len(),
-                "message_file",
-                file,
-                context,
-                roots,
-            )),
-            ChatMessageItem::ToolCall(tool_call) => {
-                parts.push(format!(
-                    "[tool_call {}] {}",
-                    tool_call.tool_name, tool_call.arguments.text
-                ));
-            }
-            ChatMessageItem::ToolResult(tool_result) => {
-                let mut line = format!("[tool_result {}]", tool_result.tool_name);
-                if let Some(context_item) = &tool_result.result.context {
-                    line.push('\n');
-                    line.push_str(&context_item.text);
-                }
-                push_web_text_part(
-                    &line,
+            ChatMessageItem::Context(context_item) => {
+                let text = render_web_text_part(
+                    &context_item.text,
                     context,
                     roots,
-                    &mut parts,
                     &mut attachments,
                     &mut attachment_errors,
                 );
-                if let Some(file) = &tool_result.result.file {
+                if !text.is_empty() {
+                    parts.push(text.clone());
+                    items.push(WebMessageItem::Text {
+                        index: item_index,
+                        text,
+                    });
+                }
+            }
+            ChatMessageItem::File(file) => {
+                let attachment_index = attachments.len();
+                attachments.push(web_file_item_attachment(
+                    attachment_index,
+                    "message_file",
+                    file,
+                    context,
+                    roots,
+                ));
+                items.push(WebMessageItem::File {
+                    index: item_index,
+                    attachment_index,
+                });
+            }
+            ChatMessageItem::ToolCall(tool_call) => items.push(WebMessageItem::ToolCall {
+                index: item_index,
+                tool_call_id: tool_call.tool_call_id.clone(),
+                tool_name: tool_call.tool_name.clone(),
+                arguments: parse_tool_arguments(&tool_call.arguments.text),
+            }),
+            ChatMessageItem::ToolResult(tool_result) => {
+                let context_text = tool_result
+                    .result
+                    .context
+                    .as_ref()
+                    .and_then(|context_item| {
+                        let text = render_web_text_part(
+                            &context_item.text,
+                            context,
+                            roots,
+                            &mut attachments,
+                            &mut attachment_errors,
+                        );
+                        if text.is_empty() {
+                            None
+                        } else {
+                            parts.push(text.clone());
+                            Some(text)
+                        }
+                    });
+                let file_attachment_index = if let Some(file) = &tool_result.result.file {
+                    let attachment_index = attachments.len();
                     attachments.push(web_file_item_attachment(
-                        attachments.len(),
+                        attachment_index,
                         "tool_result_file",
                         file,
                         context,
                         roots,
                     ));
-                }
+                    Some(attachment_index)
+                } else {
+                    None
+                };
+                items.push(WebMessageItem::ToolResult {
+                    index: item_index,
+                    tool_call_id: tool_result.tool_call_id.clone(),
+                    tool_name: tool_result.tool_name.clone(),
+                    context: context_text,
+                    file_attachment_index,
+                });
             }
         }
     }
 
     WebRenderedMessage {
         text: parts.join("\n\n"),
+        items,
         attachments,
         attachment_errors,
     }
 }
 
-fn push_web_text_part(
+fn render_web_text_part(
     raw_text: &str,
     context: &WebAttachmentContext,
     roots: &WebAttachmentRoots,
-    parts: &mut Vec<String>,
     attachments: &mut Vec<WebMessageAttachment>,
     attachment_errors: &mut Vec<String>,
-) {
+) -> String {
     if !raw_text.contains("<attachment>") {
-        if !raw_text.is_empty() {
-            parts.push(raw_text.to_string());
-        }
-        return;
+        return raw_text.to_string();
     }
 
     match extract_attachment_references(raw_text, &roots.workspace_root, &roots.shared_root) {
         Ok((text, resolved)) => {
-            if !text.is_empty() {
-                parts.push(text);
-            }
             for attachment in resolved {
                 attachments.push(web_outgoing_attachment(
                     attachments.len(),
@@ -1267,15 +1326,18 @@ fn push_web_text_part(
                     roots,
                 ));
             }
+            text
         }
         Err(error) => {
             let clean = strip_attachment_tags(raw_text).trim().to_string();
-            if !clean.is_empty() {
-                parts.push(clean);
-            }
             attachment_errors.push(format!("{error:#}"));
+            clean
         }
     }
+}
+
+fn parse_tool_arguments(raw_text: &str) -> Value {
+    serde_json::from_str(raw_text).unwrap_or_else(|_| Value::String(raw_text.to_string()))
 }
 
 fn web_outgoing_attachment(
@@ -1672,6 +1734,11 @@ mod tests {
         let rendered = render_web_message(&message, &context, &roots);
 
         assert_eq!(rendered.text, "done");
+        assert_eq!(rendered.items.len(), 1);
+        assert!(matches!(
+            &rendered.items[0],
+            WebMessageItem::Text { text, .. } if text == "done"
+        ));
         assert!(rendered.attachment_errors.is_empty());
         assert_eq!(rendered.attachments.len(), 1);
         assert_eq!(rendered.attachments[0].kind, "document");
@@ -1686,9 +1753,50 @@ mod tests {
 
         let skeleton = message_skeleton(7, &message, &context, &roots);
         assert_eq!(skeleton.preview, "done");
+        assert_eq!(skeleton.text, "done");
+        assert_eq!(skeleton.items.len(), 1);
         assert_eq!(skeleton.attachment_count, 1);
         assert_eq!(skeleton.attachments.len(), 1);
         assert!(!skeleton.has_attachment_errors);
+
+        let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[test]
+    fn web_message_skeleton_returns_tool_calls_as_structured_items() {
+        let workdir = test_workdir("tool-call-items");
+        let state = test_state("web-main-test-tool-call-items");
+        fs::create_dir_all(workdir.join("conversations").join(&state.conversation_id))
+            .expect("create conversation root");
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::ToolCall(
+                stellaclaw_core::session_actor::ToolCallItem {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "shell".to_string(),
+                    arguments: ContextItem {
+                        text: r#"{"cmd":"ls -la","timeout_seconds":5}"#.to_string(),
+                    },
+                },
+            )],
+        );
+
+        let context = test_attachment_context(&workdir, &state);
+        let payload = message_page_payload(&state, &context, &[message], 0, 50);
+
+        assert_eq!(payload["messages"][0]["preview"], "");
+        assert_eq!(payload["messages"][0]["text"], "");
+        assert_eq!(payload["messages"][0]["items"][0]["type"], "tool_call");
+        assert_eq!(payload["messages"][0]["items"][0]["tool_call_id"], "call_1");
+        assert_eq!(payload["messages"][0]["items"][0]["tool_name"], "shell");
+        assert_eq!(
+            payload["messages"][0]["items"][0]["arguments"]["cmd"],
+            "ls -la"
+        );
+        assert_eq!(
+            payload["messages"][0]["items"][0]["arguments"]["timeout_seconds"],
+            5
+        );
 
         let _ = fs::remove_dir_all(workdir);
     }
@@ -1892,10 +2000,20 @@ mod tests {
         let roots = context.roots();
         let rendered = render_web_message(&message, &context, &roots);
 
-        assert_eq!(
-            rendered.text,
-            "[tool_result file_download_wait]\ndownloaded"
-        );
+        assert_eq!(rendered.text, "downloaded");
+        assert_eq!(rendered.items.len(), 1);
+        assert!(matches!(
+            &rendered.items[0],
+            WebMessageItem::ToolResult {
+                tool_call_id,
+                tool_name,
+                context: Some(context),
+                file_attachment_index: Some(0),
+                ..
+            } if tool_call_id == "call_1"
+                && tool_name == "file_download_wait"
+                && context == "downloaded"
+        ));
         assert!(rendered.attachment_errors.is_empty());
         assert_eq!(rendered.attachments.len(), 1);
         assert_eq!(rendered.attachments[0].source, "tool_result_file");

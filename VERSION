@@ -1,5 +1,10 @@
-version: 1.15.7
+version: 1.15.8
 ---
+
+# 1.15.8
+
+- 重构 Web messages 结构化内容响应：
+  `GET /api/conversations/:id/messages` 和单条消息详情现在返回 `items` 数组，用 JSON 区分 `text`、`file`、`tool_call` 和 `tool_result`；tool call 参数会按 JSON 解析后放入 `items[].arguments`，不再拼进 `preview` 字符串。`preview` / `text` 只保留 rendered text 内容，附件继续通过 `attachments` 返回。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.15.7
 
