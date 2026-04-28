@@ -22,10 +22,12 @@ function defaultSettings() {
         baseUrl: 'http://127.0.0.1:3111',
         targetUrl: 'http://127.0.0.1:3111',
         sshHost: '',
-        token: ''
+        token: 'local-web-token'
       }
     ],
-    conversationNames: {}
+    conversationNames: {},
+    hiddenConversations: {},
+    invalidModelAliases: {}
   };
 }
 
@@ -54,6 +56,14 @@ function normalizeSettings(value) {
     conversationNames:
       value?.conversationNames && typeof value.conversationNames === 'object'
         ? value.conversationNames
+        : {},
+    hiddenConversations:
+      value?.hiddenConversations && typeof value.hiddenConversations === 'object'
+        ? value.hiddenConversations
+        : {},
+    invalidModelAliases:
+      value?.invalidModelAliases && typeof value.invalidModelAliases === 'object'
+        ? value.invalidModelAliases
         : {}
   };
 }
@@ -248,6 +258,18 @@ async function requestServer(_event, payload) {
   };
 }
 
+async function serverConnectionInfo(_event, serverId) {
+  const settings = await readSettings();
+  const server = settings.servers.find((item) => item.id === serverId);
+  if (!server) {
+    throw new Error(`Unknown server: ${serverId}`);
+  }
+  return {
+    baseUrl: await resolveServerBaseUrl(server),
+    token: server.token
+  };
+}
+
 function stopTunnel(serverId) {
   const tunnel = tunnels.get(serverId);
   if (!tunnel) {
@@ -268,6 +290,7 @@ app.whenReady().then(() => {
   ipcMain.handle('settings:load', readSettings);
   ipcMain.handle('settings:save', (_event, settings) => writeSettings(settings));
   ipcMain.handle('server:request', requestServer);
+  ipcMain.handle('server:connectionInfo', serverConnectionInfo);
   ipcMain.handle('server:stopTunnel', (_event, serverId) => stopTunnel(serverId));
 
   createWindow();

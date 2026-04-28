@@ -522,6 +522,8 @@ fn spawn_terminal_session(
         }
     };
     command.env("TERM", "xterm-256color");
+    command.env("COLORTERM", "truecolor");
+    command.env("TERM_PROGRAM", "Stellacode");
 
     let child = pair
         .slave
@@ -696,7 +698,11 @@ fn resolve_remote_cwd(base: Option<&str>, relative: Option<&str>) -> String {
 }
 
 fn remote_shell_command(cwd: &str, shell: &str) -> String {
-    format!("cd {} && exec {} -l", shell_quote(cwd), shell)
+    format!(
+        "export TERM=xterm-256color COLORTERM=truecolor TERM_PROGRAM=Stellacode; cd {} && exec {} -l",
+        shell_quote(cwd),
+        shell
+    )
 }
 
 fn shell_quote(value: &str) -> String {

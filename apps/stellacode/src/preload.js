@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld('stellacode', {
   loadSettings: () => ipcRenderer.invoke('settings:load'),
   saveSettings: (settings) => ipcRenderer.invoke('settings:save', settings),
   request: (payload) => ipcRenderer.invoke('server:request', payload),
+  connectionInfo: (serverId) => ipcRenderer.invoke('server:connectionInfo', serverId),
   stopTunnel: (serverId) => ipcRenderer.invoke('server:stopTunnel', serverId),
   platform: process.platform
 });
