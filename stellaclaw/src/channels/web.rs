@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use stellaclaw_core::{
     model_config::{ModelCapability, ProviderType},
-    session_actor::{ChatMessage, ChatRole, FileItem},
+    session_actor::{ChatMessage, ChatMessageItem, ChatRole, FileItem},
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -827,10 +827,15 @@ struct MessageSkeleton {
 #[derive(Debug, Serialize)]
 struct WebMessageAttachment {
     index: usize,
+    source: &'static str,
     kind: &'static str,
     path: String,
+    uri: String,
     name: String,
-    size_bytes: u64,
+    media_type: Option<String>,
+    width: Option<u32>,
+    height: Option<u32>,
+    size_bytes: Option<u64>,
     url: String,
 }
 
@@ -1144,18 +1149,10 @@ fn message_skeleton(
 }
 
 fn render_web_message(message: &ChatMessage, context: &WebAttachmentContext) -> WebRenderedMessage {
-    let raw_text = render_chat_message(message);
-    if !raw_text.contains("<attachment>") {
-        return WebRenderedMessage {
-            text: raw_text,
-            attachments: Vec::new(),
-            attachment_errors: Vec::new(),
-        };
-    }
-
     let (workspace_root, shared_root) = match context.roots() {
         Ok(roots) => roots,
         Err(error) => {
+            let raw_text = render_chat_message(message);
             return WebRenderedMessage {
                 text: strip_attachment_tags(&raw_text).trim().to_string(),
                 attachments: Vec::new(),
@@ -1163,34 +1160,118 @@ fn render_web_message(message: &ChatMessage, context: &WebAttachmentContext) -> 
             };
         }
     };
-    match extract_attachment_references(&raw_text, &workspace_root, &shared_root) {
-        Ok((text, attachments)) => WebRenderedMessage {
-            text,
-            attachments: attachments
-                .iter()
-                .enumerate()
-                .map(|(index, attachment)| {
-                    web_message_attachment(
-                        index,
-                        attachment,
+
+    let mut parts = Vec::new();
+    let mut attachments = Vec::new();
+    let mut attachment_errors = Vec::new();
+
+    for item in &message.data {
+        match item {
+            ChatMessageItem::Reasoning(_) => {}
+            ChatMessageItem::Context(context_item) => push_web_text_part(
+                &context_item.text,
+                context,
+                &workspace_root,
+                &shared_root,
+                &mut parts,
+                &mut attachments,
+                &mut attachment_errors,
+            ),
+            ChatMessageItem::File(file) => attachments.push(web_file_item_attachment(
+                attachments.len(),
+                "message_file",
+                file,
+                &context.conversation_id,
+                &workspace_root,
+                &shared_root,
+            )),
+            ChatMessageItem::ToolCall(tool_call) => {
+                parts.push(format!(
+                    "[tool_call {}] {}",
+                    tool_call.tool_name, tool_call.arguments.text
+                ));
+            }
+            ChatMessageItem::ToolResult(tool_result) => {
+                let mut line = format!("[tool_result {}]", tool_result.tool_name);
+                if let Some(context_item) = &tool_result.result.context {
+                    line.push('\n');
+                    line.push_str(&context_item.text);
+                }
+                push_web_text_part(
+                    &line,
+                    context,
+                    &workspace_root,
+                    &shared_root,
+                    &mut parts,
+                    &mut attachments,
+                    &mut attachment_errors,
+                );
+                if let Some(file) = &tool_result.result.file {
+                    attachments.push(web_file_item_attachment(
+                        attachments.len(),
+                        "tool_result_file",
+                        file,
                         &context.conversation_id,
                         &workspace_root,
                         &shared_root,
-                    )
-                })
-                .collect(),
-            attachment_errors: Vec::new(),
-        },
-        Err(error) => WebRenderedMessage {
-            text: strip_attachment_tags(&raw_text).trim().to_string(),
-            attachments: Vec::new(),
-            attachment_errors: vec![format!("{error:#}")],
-        },
+                    ));
+                }
+            }
+        }
+    }
+
+    WebRenderedMessage {
+        text: parts.join("\n\n"),
+        attachments,
+        attachment_errors,
     }
 }
 
-fn web_message_attachment(
+fn push_web_text_part(
+    raw_text: &str,
+    context: &WebAttachmentContext,
+    workspace_root: &Path,
+    shared_root: &Path,
+    parts: &mut Vec<String>,
+    attachments: &mut Vec<WebMessageAttachment>,
+    attachment_errors: &mut Vec<String>,
+) {
+    if !raw_text.contains("<attachment>") {
+        if !raw_text.is_empty() {
+            parts.push(raw_text.to_string());
+        }
+        return;
+    }
+
+    match extract_attachment_references(raw_text, workspace_root, shared_root) {
+        Ok((text, resolved)) => {
+            if !text.is_empty() {
+                parts.push(text);
+            }
+            for attachment in resolved {
+                attachments.push(web_outgoing_attachment(
+                    attachments.len(),
+                    "attachment_tag",
+                    &attachment,
+                    &context.conversation_id,
+                    workspace_root,
+                    shared_root,
+                ));
+            }
+        }
+        Err(error) => {
+            let clean = strip_attachment_tags(raw_text).trim().to_string();
+            if !clean.is_empty() {
+                parts.push(clean);
+            }
+            attachment_errors.push(format!("{error:#}"));
+        }
+    }
+}
+
+fn web_outgoing_attachment(
     index: usize,
+    source: &'static str,
     attachment: &OutgoingAttachment,
     conversation_id: &str,
     workspace_root: &Path,
@@ -1198,8 +1279,12 @@ fn web_message_attachment(
 ) -> WebMessageAttachment {
     let path = attachment_workspace_path(&attachment.path, workspace_root, shared_root)
         .unwrap_or_else(|| attachment.path.display().to_string());
+    let size_bytes = fs::metadata(&attachment.path)
+        .map(|metadata| metadata.len())
+        .ok();
     WebMessageAttachment {
         index,
+        source,
         kind: outgoing_attachment_kind_name(attachment.kind),
         name: attachment
             .path
@@ -1207,15 +1292,69 @@ fn web_message_attachment(
             .and_then(|value| value.to_str())
             .unwrap_or("attachment")
             .to_string(),
-        size_bytes: fs::metadata(&attachment.path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0),
+        uri: format!("file://{}", attachment.path.display()),
+        media_type: None,
+        width: None,
+        height: None,
+        size_bytes,
         url: format!(
             "/api/conversations/{}/workspace/file?path={}",
             percent_encode_query_value(conversation_id),
             percent_encode_query_value(&path)
         ),
         path,
+    }
+}
+
+fn web_file_item_attachment(
+    index: usize,
+    source: &'static str,
+    file: &FileItem,
+    conversation_id: &str,
+    workspace_root: &Path,
+    shared_root: &Path,
+) -> WebMessageAttachment {
+    let local_path = local_path_from_file_item(file);
+    let workspace_path = local_path
+        .as_deref()
+        .and_then(|path| attachment_workspace_path(path, workspace_root, shared_root));
+    let path = workspace_path.clone().unwrap_or_else(|| file.uri.clone());
+    let url = workspace_path
+        .as_ref()
+        .map(|path| {
+            format!(
+                "/api/conversations/{}/workspace/file?path={}",
+                percent_encode_query_value(conversation_id),
+                percent_encode_query_value(path)
+            )
+        })
+        .unwrap_or_default();
+    let size_bytes = local_path
+        .as_deref()
+        .and_then(|path| fs::metadata(path).ok())
+        .map(|metadata| metadata.len());
+    WebMessageAttachment {
+        index,
+        source,
+        kind: file_attachment_kind_name(file),
+        path,
+        uri: file.uri.clone(),
+        name: file
+            .name
+            .clone()
+            .or_else(|| {
+                local_path
+                    .as_deref()
+                    .and_then(|path| path.file_name())
+                    .and_then(|value| value.to_str())
+                    .map(ToString::to_string)
+            })
+            .unwrap_or_else(|| "attachment".to_string()),
+        media_type: file.media_type.clone(),
+        width: file.width,
+        height: file.height,
+        size_bytes,
+        url,
     }
 }
 
@@ -1236,6 +1375,14 @@ fn attachment_workspace_path(
         .map(|relative| format!("shared/{}", path_to_api_string(relative)))
 }
 
+fn local_path_from_file_item(file: &FileItem) -> Option<PathBuf> {
+    if let Some(path) = file.uri.strip_prefix("file://") {
+        return Some(PathBuf::from(percent_decode(path)));
+    }
+    let path = Path::new(&file.uri);
+    path.is_absolute().then(|| path.to_path_buf())
+}
+
 fn path_to_api_string(path: &Path) -> String {
     path.components()
         .filter_map(|component| match component {
@@ -1254,6 +1401,40 @@ fn outgoing_attachment_kind_name(kind: OutgoingAttachmentKind) -> &'static str {
         OutgoingAttachmentKind::Video => "video",
         OutgoingAttachmentKind::Animation => "animation",
         OutgoingAttachmentKind::Document => "document",
+    }
+}
+
+fn file_attachment_kind_name(file: &FileItem) -> &'static str {
+    let media_type = file.media_type.as_deref().unwrap_or_default();
+    if media_type.starts_with("image/") {
+        return "image";
+    }
+    if media_type.starts_with("audio/") {
+        return "audio";
+    }
+    if media_type.starts_with("video/") {
+        return "video";
+    }
+    local_path_from_file_item(file)
+        .as_deref()
+        .map(infer_web_attachment_kind_from_path)
+        .unwrap_or("document")
+}
+
+fn infer_web_attachment_kind_from_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" | "jpg" | "jpeg" | "webp" => "image",
+        "gif" => "animation",
+        "mp3" | "wav" => "audio",
+        "ogg" => "voice",
+        "mp4" | "mov" | "mkv" => "video",
+        _ => "document",
     }
 }
 
@@ -1473,7 +1654,8 @@ mod tests {
         assert_eq!(rendered.attachments[0].kind, "document");
         assert_eq!(rendered.attachments[0].path, "report.txt");
         assert_eq!(rendered.attachments[0].name, "report.txt");
-        assert_eq!(rendered.attachments[0].size_bytes, 5);
+        assert_eq!(rendered.attachments[0].source, "attachment_tag");
+        assert_eq!(rendered.attachments[0].size_bytes, Some(5));
         assert_eq!(
             rendered.attachments[0].url,
             "/api/conversations/web-main-test-attachment/workspace/file?path=report.txt"
@@ -1512,6 +1694,111 @@ mod tests {
         assert_eq!(skeleton.preview, "done\nmissing.txt");
         assert_eq!(skeleton.attachment_count, 0);
         assert!(skeleton.has_attachment_errors);
+
+        let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[test]
+    fn web_message_rendering_includes_structured_file_items() {
+        let workdir = test_workdir("structured-file");
+        let state = test_state("web-main-test-structured-file");
+        let conversation_root = workdir.join("conversations").join(&state.conversation_id);
+        fs::create_dir_all(&conversation_root).expect("create conversation root");
+        let file_path = conversation_root.join("image.png");
+        fs::write(&file_path, "png bytes").expect("write attachment");
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![
+                ChatMessageItem::Context(ContextItem {
+                    text: "here".to_string(),
+                }),
+                ChatMessageItem::File(FileItem {
+                    uri: format!("file://{}", file_path.display()),
+                    name: Some("image.png".to_string()),
+                    media_type: Some("image/png".to_string()),
+                    width: Some(640),
+                    height: Some(480),
+                    state: None,
+                }),
+            ],
+        );
+
+        let context = WebAttachmentContext::new(&workdir, &state);
+        let rendered = render_web_message(&message, &context);
+
+        assert_eq!(rendered.text, "here");
+        assert!(rendered.attachment_errors.is_empty());
+        assert_eq!(rendered.attachments.len(), 1);
+        assert_eq!(rendered.attachments[0].source, "message_file");
+        assert_eq!(rendered.attachments[0].kind, "image");
+        assert_eq!(rendered.attachments[0].path, "image.png");
+        assert_eq!(
+            rendered.attachments[0].uri,
+            format!("file://{}", file_path.display())
+        );
+        assert_eq!(
+            rendered.attachments[0].media_type.as_deref(),
+            Some("image/png")
+        );
+        assert_eq!(rendered.attachments[0].width, Some(640));
+        assert_eq!(rendered.attachments[0].height, Some(480));
+        assert_eq!(rendered.attachments[0].size_bytes, Some(9));
+        assert_eq!(
+            rendered.attachments[0].url,
+            "/api/conversations/web-main-test-structured-file/workspace/file?path=image.png"
+        );
+
+        let skeleton = message_skeleton(7, &message, &context);
+        assert_eq!(skeleton.preview, "here");
+        assert_eq!(skeleton.attachment_count, 1);
+
+        let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[test]
+    fn web_message_rendering_includes_tool_result_files() {
+        let workdir = test_workdir("tool-result-file");
+        let state = test_state("web-main-test-tool-result-file");
+        let conversation_root = workdir.join("conversations").join(&state.conversation_id);
+        fs::create_dir_all(&conversation_root).expect("create conversation root");
+        let file_path = conversation_root.join("result.txt");
+        fs::write(&file_path, "result bytes").expect("write attachment");
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::ToolResult(
+                stellaclaw_core::session_actor::ToolResultItem {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "file_download_wait".to_string(),
+                    result: stellaclaw_core::session_actor::ToolResultContent {
+                        context: Some(ContextItem {
+                            text: "downloaded".to_string(),
+                        }),
+                        file: Some(FileItem {
+                            uri: format!("file://{}", file_path.display()),
+                            name: Some("result.txt".to_string()),
+                            media_type: Some("text/plain".to_string()),
+                            width: None,
+                            height: None,
+                            state: None,
+                        }),
+                    },
+                },
+            )],
+        );
+
+        let context = WebAttachmentContext::new(&workdir, &state);
+        let rendered = render_web_message(&message, &context);
+
+        assert_eq!(
+            rendered.text,
+            "[tool_result file_download_wait]\ndownloaded"
+        );
+        assert!(rendered.attachment_errors.is_empty());
+        assert_eq!(rendered.attachments.len(), 1);
+        assert_eq!(rendered.attachments[0].source, "tool_result_file");
+        assert_eq!(rendered.attachments[0].kind, "document");
+        assert_eq!(rendered.attachments[0].path, "result.txt");
+        assert_eq!(rendered.attachments[0].size_bytes, Some(12));
 
         let _ = fs::remove_dir_all(workdir);
     }

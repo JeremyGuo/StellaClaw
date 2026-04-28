@@ -1,5 +1,10 @@
-version: 1.15.2
+version: 1.15.3
 ---
+
+# 1.15.3
+
+- 补全 Web channel 结构化附件展示：
+  Web messages API 现在会直接遍历 `ChatMessage.data` 动态生成附件 response；除了继续兼容 `Context` 文本中的 `<attachment>...</attachment>` 标签，也会把结构化 `ChatMessageItem::File` 和 `ToolResult.result.file` 转成 `attachments` metadata。JSON-RPC 和 session JSONL 中的原始 `ChatMessage` 不需要迁移；只要历史消息本身保留了结构化 file item，Web response 会自动显示对应附件。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.15.2
 
