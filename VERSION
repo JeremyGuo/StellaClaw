@@ -1,5 +1,10 @@
-version: 1.15.6
+version: 1.15.7
 ---
+
+# 1.15.7
+
+- 调整 Web messages 文本返回：
+  `GET /api/conversations/:id/messages` 的 `preview` 字段现在保留完整 rendered text，不再按 240 字符截断；图片附件继续使用已有 thumbnail/cache 机制。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.15.6
 

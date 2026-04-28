@@ -1466,12 +1466,7 @@ fn infer_web_attachment_kind_from_path(path: &Path) -> &'static str {
 }
 
 fn preview_text(text: &str) -> String {
-    const LIMIT: usize = 240;
-    let mut preview = text.trim().chars().take(LIMIT).collect::<String>();
-    if text.trim().chars().count() > LIMIT {
-        preview.push_str("...");
-    }
-    preview
+    text.trim().to_string()
 }
 
 fn read_messages_jsonl(path: &Path) -> Result<Vec<ChatMessage>> {
@@ -1694,6 +1689,28 @@ mod tests {
         assert_eq!(skeleton.attachment_count, 1);
         assert_eq!(skeleton.attachments.len(), 1);
         assert!(!skeleton.has_attachment_errors);
+
+        let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[test]
+    fn web_message_skeleton_keeps_full_text_preview() {
+        let workdir = test_workdir("full-preview");
+        let state = test_state("web-main-test-full-preview");
+        fs::create_dir_all(workdir.join("conversations").join(&state.conversation_id))
+            .expect("create conversation root");
+        let text = "0123456789".repeat(40);
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Context(ContextItem { text: text.clone() })],
+        );
+
+        let context = test_attachment_context(&workdir, &state);
+        let roots = context.roots();
+        let skeleton = message_skeleton(7, &message, &context, &roots);
+
+        assert_eq!(skeleton.preview, text);
+        assert!(!skeleton.preview.ends_with("..."));
 
         let _ = fs::remove_dir_all(workdir);
     }
