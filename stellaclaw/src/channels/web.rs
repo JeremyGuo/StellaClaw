@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
-    io::{Read, Write},
+    io::{Cursor, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -10,7 +10,9 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose, Engine as _};
 use crossbeam_channel::Sender;
+use image::{codecs::jpeg::JpegEncoder, imageops::FilterType, GenericImageView, Rgb, RgbImage};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use stellaclaw_core::{
@@ -48,6 +50,9 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_WORKSPACE_FILE_LIMIT_BYTES: usize = 1024 * 1024;
 const MAX_WORKSPACE_FILE_LIMIT_BYTES: usize = 5 * 1024 * 1024;
+const THUMBNAIL_MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+const THUMBNAIL_MAX_DIMENSION: u32 = 360;
+const THUMBNAIL_JPEG_QUALITY: u8 = 72;
 
 pub struct WebChannel {
     id: String,
@@ -817,6 +822,7 @@ struct MessageSkeleton {
     index: usize,
     role: ChatRole,
     preview: String,
+    attachments: Vec<WebMessageAttachment>,
     attachment_count: usize,
     has_attachment_errors: bool,
     user_name: Option<String>,
@@ -837,6 +843,17 @@ struct WebMessageAttachment {
     height: Option<u32>,
     size_bytes: Option<u64>,
     url: String,
+    thumbnail: Option<WebAttachmentThumbnail>,
+}
+
+#[derive(Debug, Serialize)]
+struct WebAttachmentThumbnail {
+    media_type: &'static str,
+    data_base64: String,
+    data_url: String,
+    width: u32,
+    height: u32,
+    size_bytes: usize,
 }
 
 #[derive(Debug)]
@@ -1141,6 +1158,7 @@ fn message_skeleton(
         role: message.role.clone(),
         preview: preview_text(&rendered.text),
         attachment_count: rendered.attachments.len(),
+        attachments: rendered.attachments,
         has_attachment_errors: !rendered.attachment_errors.is_empty(),
         user_name: message.user_name.clone(),
         message_time: message.message_time.clone(),
@@ -1282,10 +1300,14 @@ fn web_outgoing_attachment(
     let size_bytes = fs::metadata(&attachment.path)
         .map(|metadata| metadata.len())
         .ok();
+    let kind = outgoing_attachment_kind_name(attachment.kind);
+    let image_preview = (kind == "image")
+        .then(|| image_attachment_preview(&attachment.path))
+        .flatten();
     WebMessageAttachment {
         index,
         source,
-        kind: outgoing_attachment_kind_name(attachment.kind),
+        kind,
         name: attachment
             .path
             .file_name()
@@ -1294,14 +1316,17 @@ fn web_outgoing_attachment(
             .to_string(),
         uri: format!("file://{}", attachment.path.display()),
         media_type: None,
-        width: None,
-        height: None,
+        width: image_preview.as_ref().map(|preview| preview.original_width),
+        height: image_preview
+            .as_ref()
+            .map(|preview| preview.original_height),
         size_bytes,
         url: format!(
             "/api/conversations/{}/workspace/file?path={}",
             percent_encode_query_value(conversation_id),
             percent_encode_query_value(&path)
         ),
+        thumbnail: image_preview.map(|preview| preview.thumbnail),
         path,
     }
 }
@@ -1333,10 +1358,14 @@ fn web_file_item_attachment(
         .as_deref()
         .and_then(|path| fs::metadata(path).ok())
         .map(|metadata| metadata.len());
+    let kind = file_attachment_kind_name(file);
+    let image_preview = (kind == "image")
+        .then(|| local_path.as_deref().and_then(image_attachment_preview))
+        .flatten();
     WebMessageAttachment {
         index,
         source,
-        kind: file_attachment_kind_name(file),
+        kind,
         path,
         uri: file.uri.clone(),
         name: file
@@ -1351,11 +1380,72 @@ fn web_file_item_attachment(
             })
             .unwrap_or_else(|| "attachment".to_string()),
         media_type: file.media_type.clone(),
-        width: file.width,
-        height: file.height,
+        width: file
+            .width
+            .or_else(|| image_preview.as_ref().map(|preview| preview.original_width)),
+        height: file.height.or_else(|| {
+            image_preview
+                .as_ref()
+                .map(|preview| preview.original_height)
+        }),
         size_bytes,
         url,
+        thumbnail: image_preview.map(|preview| preview.thumbnail),
     }
+}
+
+struct ImageAttachmentPreview {
+    original_width: u32,
+    original_height: u32,
+    thumbnail: WebAttachmentThumbnail,
+}
+
+fn image_attachment_preview(path: &Path) -> Option<ImageAttachmentPreview> {
+    let source_size = fs::metadata(path).ok()?.len();
+    if source_size > THUMBNAIL_MAX_SOURCE_BYTES {
+        return None;
+    }
+
+    let image = image::ImageReader::open(path).ok()?.decode().ok()?;
+    let (original_width, original_height) = image.dimensions();
+    let resized = image.resize(
+        THUMBNAIL_MAX_DIMENSION,
+        THUMBNAIL_MAX_DIMENSION,
+        FilterType::Triangle,
+    );
+    let rgba = resized.to_rgba8();
+    let mut rgb = RgbImage::new(rgba.width(), rgba.height());
+    for (x, y, pixel) in rgba.enumerate_pixels() {
+        let alpha = pixel[3] as u16;
+        let inv_alpha = 255_u16.saturating_sub(alpha);
+        let blend = |channel: u8| -> u8 {
+            (((channel as u16 * alpha) + (255_u16 * inv_alpha)) / 255) as u8
+        };
+        rgb.put_pixel(
+            x,
+            y,
+            Rgb([blend(pixel[0]), blend(pixel[1]), blend(pixel[2])]),
+        );
+    }
+
+    let mut encoded = Cursor::new(Vec::new());
+    JpegEncoder::new_with_quality(&mut encoded, THUMBNAIL_JPEG_QUALITY)
+        .encode_image(&rgb)
+        .ok()?;
+    let bytes = encoded.into_inner();
+    let data_base64 = general_purpose::STANDARD.encode(&bytes);
+    Some(ImageAttachmentPreview {
+        original_width,
+        original_height,
+        thumbnail: WebAttachmentThumbnail {
+            media_type: "image/jpeg",
+            data_url: format!("data:image/jpeg;base64,{data_base64}"),
+            data_base64,
+            width: rgb.width(),
+            height: rgb.height(),
+            size_bytes: bytes.len(),
+        },
+    })
 }
 
 fn attachment_workspace_path(
@@ -1664,7 +1754,60 @@ mod tests {
         let skeleton = message_skeleton(7, &message, &context);
         assert_eq!(skeleton.preview, "done");
         assert_eq!(skeleton.attachment_count, 1);
+        assert_eq!(skeleton.attachments.len(), 1);
         assert!(!skeleton.has_attachment_errors);
+
+        let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[test]
+    fn web_message_rendering_inlines_image_attachment_thumbnail() {
+        let workdir = test_workdir("attachment-image-thumbnail");
+        let state = test_state("web-main-test-attachment-image-thumbnail");
+        let conversation_root = workdir.join("conversations").join(&state.conversation_id);
+        fs::create_dir_all(&conversation_root).expect("create conversation root");
+        let image_path = conversation_root.join("photo.png");
+        write_test_image(&image_path);
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "photo\n<attachment>photo.png</attachment>".to_string(),
+            })],
+        );
+
+        let context = WebAttachmentContext::new(&workdir, &state);
+        let rendered = render_web_message(&message, &context);
+
+        assert_eq!(rendered.text, "photo");
+        assert!(rendered.attachment_errors.is_empty());
+        assert_eq!(rendered.attachments.len(), 1);
+        assert_eq!(rendered.attachments[0].source, "attachment_tag");
+        assert_eq!(rendered.attachments[0].kind, "image");
+        assert_eq!(rendered.attachments[0].path, "photo.png");
+        assert_eq!(rendered.attachments[0].width, Some(800));
+        assert_eq!(rendered.attachments[0].height, Some(600));
+        let thumbnail = rendered.attachments[0]
+            .thumbnail
+            .as_ref()
+            .expect("image attachment should include thumbnail");
+        assert_eq!(thumbnail.media_type, "image/jpeg");
+        assert_eq!(thumbnail.width, 360);
+        assert_eq!(thumbnail.height, 270);
+        assert!(!thumbnail.data_base64.is_empty());
+        assert!(thumbnail.data_url.starts_with("data:image/jpeg;base64,"));
+
+        let payload = message_page_payload(&state, &context, &[message], 0, 50);
+        assert_eq!(
+            payload["messages"][0]["attachments"][0]["source"],
+            "attachment_tag"
+        );
+        assert!(
+            payload["messages"][0]["attachments"][0]["thumbnail"]["data_base64"]
+                .as_str()
+                .unwrap()
+                .len()
+                > 10
+        );
 
         let _ = fs::remove_dir_all(workdir);
     }
@@ -1705,7 +1848,7 @@ mod tests {
         let conversation_root = workdir.join("conversations").join(&state.conversation_id);
         fs::create_dir_all(&conversation_root).expect("create conversation root");
         let file_path = conversation_root.join("image.png");
-        fs::write(&file_path, "png bytes").expect("write attachment");
+        write_test_image(&file_path);
         let message = ChatMessage::new(
             ChatRole::Assistant,
             vec![
@@ -1742,7 +1885,8 @@ mod tests {
         );
         assert_eq!(rendered.attachments[0].width, Some(640));
         assert_eq!(rendered.attachments[0].height, Some(480));
-        assert_eq!(rendered.attachments[0].size_bytes, Some(9));
+        assert!(rendered.attachments[0].size_bytes.unwrap_or_default() > 0);
+        assert!(rendered.attachments[0].thumbnail.is_some());
         assert_eq!(
             rendered.attachments[0].url,
             "/api/conversations/web-main-test-structured-file/workspace/file?path=image.png"
@@ -1801,5 +1945,10 @@ mod tests {
         assert_eq!(rendered.attachments[0].size_bytes, Some(12));
 
         let _ = fs::remove_dir_all(workdir);
+    }
+
+    fn write_test_image(path: &Path) {
+        let image = image::RgbImage::from_pixel(800, 600, image::Rgb([80, 120, 200]));
+        image.save(path).expect("write test image");
     }
 }

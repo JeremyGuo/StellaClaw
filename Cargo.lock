@@ -2186,6 +2186,7 @@ dependencies = [
  "chrono-tz",
  "cron",
  "crossbeam-channel",
+ "image",
  "portable-pty",
  "pulldown-cmark",
  "reqwest",

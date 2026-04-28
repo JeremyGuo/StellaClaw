@@ -1,5 +1,10 @@
-version: 1.15.4
+version: 1.15.5
 ---
+
+# 1.15.5
+
+- 扩展 Web messages 附件响应：
+  `GET /api/conversations/:id/messages` 的每条消息现在会直接返回附件 metadata，不再只给 `attachment_count`；图片附件会生成压缩 JPEG 缩略图并以内联 base64 返回，同时继续保留 workspace `path` / `url` 供前端读取完整文件。附件 metadata 继续用 `source` 区分 `<attachment>` 标签、结构化 `ChatMessageItem::File` 和 `ToolResult.result.file`。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.15.4
 
