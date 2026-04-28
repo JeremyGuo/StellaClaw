@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
-use crossbeam_channel::Sender;
+use crossbeam_channel::{unbounded, RecvTimeoutError, Sender};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
@@ -38,7 +38,7 @@ use crate::{
 use super::{
     types::{
         IncomingDispatch, OutgoingAttachment, OutgoingAttachmentKind, OutgoingDelivery,
-        OutgoingProgressFeedback, OutgoingStatus, ProcessingState,
+        OutgoingProgressFeedback, OutgoingStatus, ProcessingState, ProgressFeedbackFinalState,
     },
     web_terminal::{
         output_limit, TerminalCreateRequest, TerminalInputRequest, TerminalManager,
@@ -65,6 +65,13 @@ pub struct WebChannel {
     logger: Arc<StellaclawLogger>,
     terminal_manager: Arc<TerminalManager>,
     cache_manager: Arc<CacheManager>,
+    websocket_subscribers: Arc<Mutex<HashMap<String, Vec<WebSocketSubscriber>>>>,
+}
+
+#[derive(Clone)]
+struct WebSocketSubscriber {
+    conversation_id: String,
+    sender: Sender<Value>,
 }
 
 impl WebChannel {
@@ -87,6 +94,7 @@ impl WebChannel {
             logger,
             terminal_manager: Arc::new(TerminalManager::new()),
             cache_manager,
+            websocket_subscribers: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -564,6 +572,8 @@ impl WebChannel {
         let mut session_id = state.session_binding.foreground_session_id.clone();
         let mut messages = self.load_messages_for_state(&state).map_err(api_anyhow)?;
         let mut next_index = messages.len();
+        let (event_tx, event_rx) = unbounded();
+        self.register_websocket_subscriber(&state, event_tx);
         write_websocket_json(
             &mut stream,
             &websocket_subscription_ack(&state, next_index, "subscribed"),
@@ -571,7 +581,16 @@ impl WebChannel {
         let mut last_heartbeat = Instant::now();
 
         loop {
-            thread::sleep(WEBSOCKET_POLL_INTERVAL);
+            match event_rx.recv_timeout(WEBSOCKET_POLL_INTERVAL) {
+                Ok(event) => {
+                    write_websocket_json(&mut stream, &event)?;
+                    while let Ok(queued) = event_rx.try_recv() {
+                        write_websocket_json(&mut stream, &queued)?;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {}
+            }
             if last_heartbeat.elapsed() >= WEBSOCKET_HEARTBEAT_INTERVAL {
                 write_websocket_frame(&mut stream, 0x9, &[])?;
                 last_heartbeat = Instant::now();
@@ -599,6 +618,40 @@ impl WebChannel {
             let payload = websocket_messages_payload(&state, &attachments, &messages, next_index);
             next_index = messages.len();
             write_websocket_json(&mut stream, &payload)?;
+        }
+    }
+
+    fn register_websocket_subscriber(&self, state: &ConversationState, sender: Sender<Value>) {
+        let subscriber = WebSocketSubscriber {
+            conversation_id: state.conversation_id.clone(),
+            sender,
+        };
+        self.websocket_subscribers
+            .lock()
+            .expect("websocket subscriber registry lock poisoned")
+            .entry(state.platform_chat_id.clone())
+            .or_default()
+            .push(subscriber);
+    }
+
+    fn publish_websocket_event(&self, platform_chat_id: &str, event: Value) {
+        let mut remove_key = false;
+        let mut subscribers = self
+            .websocket_subscribers
+            .lock()
+            .expect("websocket subscriber registry lock poisoned");
+        let Some(entries) = subscribers.get_mut(platform_chat_id) else {
+            return;
+        };
+        entries.retain(|subscriber| {
+            let event = websocket_event_for_subscriber(&event, platform_chat_id, subscriber);
+            subscriber.sender.send(event).is_ok()
+        });
+        if entries.is_empty() {
+            remove_key = true;
+        }
+        if remove_key {
+            subscribers.remove(platform_chat_id);
         }
     }
 
@@ -812,6 +865,15 @@ impl Channel for WebChannel {
                 "conversation_id": status.conversation_id,
             }),
         );
+        self.publish_websocket_event(
+            &status.platform_chat_id,
+            json!({
+                "type": "status",
+                "subscription": "foreground_session_events",
+                "conversation_id": &status.conversation_id,
+                "status": status,
+            }),
+        );
         Ok(())
     }
 
@@ -822,6 +884,14 @@ impl Channel for WebChannel {
                 "channel_id": self.id,
                 "platform_chat_id": platform_chat_id,
                 "state": format!("{state:?}"),
+            }),
+        );
+        self.publish_websocket_event(
+            platform_chat_id,
+            json!({
+                "type": "processing",
+                "subscription": "foreground_session_events",
+                "state": processing_state_name(state),
             }),
         );
         Ok(())
@@ -835,6 +905,17 @@ impl Channel for WebChannel {
                 "platform_chat_id": feedback.platform_chat_id,
                 "turn_id": feedback.turn_id,
                 "final_state": feedback.final_state.map(|state| format!("{state:?}")),
+            }),
+        );
+        self.publish_websocket_event(
+            &feedback.platform_chat_id,
+            json!({
+                "type": "progress_feedback",
+                "subscription": "foreground_session_events",
+                "turn_id": &feedback.turn_id,
+                "text": &feedback.text,
+                "final_state": feedback.final_state.map(progress_final_state_name),
+                "important": feedback.important,
             }),
         );
         Ok(())
@@ -1354,6 +1435,21 @@ fn write_websocket_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> 
 
 fn parse_websocket_subscribe(raw: &str) -> Result<WebSocketSubscribeRequest> {
     serde_json::from_str(raw).context("failed to parse websocket subscribe message")
+}
+
+fn websocket_event_for_subscriber(
+    event: &Value,
+    platform_chat_id: &str,
+    subscriber: &WebSocketSubscriber,
+) -> Value {
+    let mut event = event.clone();
+    if let Value::Object(map) = &mut event {
+        map.entry("conversation_id".to_string())
+            .or_insert_with(|| Value::String(subscriber.conversation_id.clone()));
+        map.entry("platform_chat_id".to_string())
+            .or_insert_with(|| Value::String(platform_chat_id.to_string()));
+    }
+    event
 }
 
 fn json_response(status: u16, value: Value) -> HttpResponse {
@@ -1905,6 +2001,20 @@ fn outgoing_attachment_kind_name(kind: OutgoingAttachmentKind) -> &'static str {
         OutgoingAttachmentKind::Video => "video",
         OutgoingAttachmentKind::Animation => "animation",
         OutgoingAttachmentKind::Document => "document",
+    }
+}
+
+fn processing_state_name(state: ProcessingState) -> &'static str {
+    match state {
+        ProcessingState::Idle => "idle",
+        ProcessingState::Typing => "typing",
+    }
+}
+
+fn progress_final_state_name(state: ProgressFeedbackFinalState) -> &'static str {
+    match state {
+        ProgressFeedbackFinalState::Done => "done",
+        ProgressFeedbackFinalState::Failed => "failed",
     }
 }
 

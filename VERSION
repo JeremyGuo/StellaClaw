@@ -1,5 +1,10 @@
-version: 1.15.9
+version: 1.15.10
 ---
+
+# 1.15.10
+
+- 补齐 WebSocket foreground 订阅的实时非消息事件：
+  `GET /api/ws` 的 foreground subscription 现在除了继续推送新增 `messages`，也会把 WebChannel 收到的 `processing`、`progress_feedback` 和 `status` 事件推给已订阅该 conversation 的连接；工具 batch 开始执行时 core 已发出 progress event，前端此前收不到是因为 WebChannel 只轮询持久化 ChatMessage，没有转发这些非持久化 outgoing events。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.15.9
 
