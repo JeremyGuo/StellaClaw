@@ -1146,11 +1146,7 @@ impl SessionActor {
             }),
         );
         self.mark_loaded_skills_from_message(&tool_message, active.turn_number)?;
-        let synthetic_media_message = synthetic_media_message_from_tool_results(&tool_message);
         self.append_history_message("tool_result", tool_message)?;
-        if let Some(message) = synthetic_media_message {
-            self.append_history_message("tool_media_context", message)?;
-        }
         if active.interrupt == Some(ToolBatchInterrupt::SupersededByUserMessage) {
             self.log_info(
                 "tool_batch_superseded_by_user_message",
@@ -2015,27 +2011,6 @@ fn is_tool_protocol_closed_suffix(messages: &[ChatMessage]) -> bool {
         }
     }
     open.is_empty()
-}
-
-fn synthetic_media_message_from_tool_results(message: &ChatMessage) -> Option<ChatMessage> {
-    let mut files = Vec::new();
-    for item in &message.data {
-        let ChatMessageItem::ToolResult(tool_result) = item else {
-            continue;
-        };
-        if let Some(file) = &tool_result.result.file {
-            files.push(ChatMessageItem::File(file.clone()));
-        }
-    }
-    if files.is_empty() {
-        return None;
-    }
-
-    let mut data = vec![ChatMessageItem::Context(ContextItem {
-        text: "Tool returned media files. Use the attached files as current context.".to_string(),
-    })];
-    data.extend(files);
-    Some(ChatMessage::new(ChatRole::User, data))
 }
 
 fn render_incoming_user_metadata_notice(message: &ChatMessage) -> Option<String> {
@@ -3110,7 +3085,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_file_is_added_as_synthetic_user_media_context() {
+    fn tool_result_file_does_not_add_synthetic_user_media_context() {
         let _cwd = temp_cwd("actor-media-context");
         let (inbox, mailbox) = test_inbox();
         let session_id = test_session_id("session_media_context");
@@ -3167,14 +3142,15 @@ mod tests {
 
         actor.run_until_idle(6).expect("actor should run");
 
-        assert_eq!(actor.history().len(), 5);
+        assert_eq!(actor.history().len(), 4);
         assert!(matches!(
-            actor.history()[3].data[1],
-            ChatMessageItem::File(_)
+            actor.history()[2].data[0],
+            ChatMessageItem::ToolResult(_)
         ));
+        assert_eq!(actor.history()[3].role, ChatRole::Assistant);
         let seen_requests = provider.seen_requests.lock().unwrap();
         assert_eq!(seen_requests.len(), 2);
-        assert_eq!(seen_requests[1].message_count, 4);
+        assert_eq!(seen_requests[1].message_count, 3);
     }
 
     #[test]

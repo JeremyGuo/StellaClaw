@@ -1,5 +1,10 @@
-version: 1.15.3
+version: 1.15.4
 ---
+
+# 1.15.4
+
+- 调整 tool result 媒体上下文行为：
+  SessionActor 不再在 `ToolResult.result.file` 后自动追加 synthetic `role="user"` media context message；生成或加载出的文件只保留在原始 tool result 中，模型如需后续复用应显式调用 `image_load` 等工具。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.15.3
 
