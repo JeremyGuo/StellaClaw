@@ -2034,10 +2034,7 @@ fn render_incoming_user_metadata_notice(message: &ChatMessage) -> Option<String>
     if !has_metadata {
         return None;
     }
-    lines.push(
-        "Treat this metadata as context for the immediately following user message only."
-            .to_string(),
-    );
+    lines.push("For the next user message only.".to_string());
     Some(lines.join("\n"))
 }
 

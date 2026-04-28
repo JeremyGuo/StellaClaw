@@ -1,5 +1,10 @@
-version: 1.15.10
+version: 1.15.11
 ---
+
+# 1.15.11
+
+- 引入 Conversation 到 Channel 之间的统一 `ChannelEvent` 输出层：
+  现有 delivery、processing、progress feedback 和 status 现在都通过 `OutgoingDispatch::Event` 分发，后续 Telegram/Web 可在同一个事件并集上分别投影。新增结构化 `Error` channel event，由 `ConversationRuntime` 把 turn failed、runtime crashed、control rejected、模型/remote/sandbox 切换失败和附件解析失败归一化为带 `scope`、`severity`、`code`、`message`、`detail`、`can_continue` 和 `suggested_action` 的事件；Telegram 继续渲染为短文本，WebSocket 会推送 `type: "error"` 的结构化 JSON。顺便缩短 incoming user metadata synthetic notice 文案。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.15.10
 

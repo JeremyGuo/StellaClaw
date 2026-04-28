@@ -25,8 +25,8 @@ use crate::{
 use super::{
     types::{
         IncomingDispatch, OutgoingAttachment, OutgoingAttachmentKind, OutgoingDelivery,
-        OutgoingOptions, OutgoingProgressFeedback, OutgoingStatus, OutgoingUsageSummary,
-        OutgoingUsageTotals, ProcessingState, ProgressFeedbackFinalState,
+        OutgoingError, OutgoingOptions, OutgoingProgressFeedback, OutgoingStatus,
+        OutgoingUsageSummary, OutgoingUsageTotals, ProcessingState, ProgressFeedbackFinalState,
     },
     Channel,
 };
@@ -967,6 +967,19 @@ impl Channel for TelegramChannel {
 
     fn send_status(&self, status: &OutgoingStatus) -> Result<()> {
         self.send_text(&status.platform_chat_id, &render_status_text(status), None)
+    }
+
+    fn send_error(&self, error: &OutgoingError) -> Result<()> {
+        let mut text = error.message.clone();
+        if let Some(action) = error
+            .suggested_action
+            .as_deref()
+            .filter(|action| !action.trim().is_empty())
+        {
+            text.push('\n');
+            text.push_str(action);
+        }
+        self.send_text(&error.platform_chat_id, &text, None)
     }
 
     fn spawn_ingress(

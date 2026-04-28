@@ -166,80 +166,22 @@ fn run_outgoing_loop(
 ) -> Result<()> {
     while let Ok(dispatch) = rx.recv() {
         match dispatch {
-            OutgoingDispatch::Delivery(delivery) => {
-                let Some(channel) = channels.get(&delivery.channel_id) else {
+            OutgoingDispatch::Event(event) => {
+                let channel_id = event.channel_id().to_string();
+                let platform_chat_id = event.platform_chat_id().to_string();
+                let Some(channel) = channels.get(&channel_id) else {
                     logger.warn(
-                        "outgoing_delivery_failed",
-                        serde_json::json!({"channel_id": delivery.channel_id, "error": "unknown channel"}),
+                        "outgoing_event_failed",
+                        serde_json::json!({"channel_id": channel_id, "error": "unknown channel"}),
                     );
                     continue;
                 };
-                if let Err(error) = channel.send_delivery(&delivery) {
+                if let Err(error) = channel.send_event(&event) {
                     logger.warn(
-                        "outgoing_delivery_failed",
+                        "outgoing_event_failed",
                         serde_json::json!({
-                            "channel_id": delivery.channel_id,
-                            "platform_chat_id": delivery.platform_chat_id,
-                            "error": format!("{error:#}"),
-                        }),
-                    );
-                }
-            }
-            OutgoingDispatch::Processing(processing) => {
-                let Some(channel) = channels.get(&processing.channel_id) else {
-                    logger.warn(
-                        "outgoing_processing_failed",
-                        serde_json::json!({"channel_id": processing.channel_id, "error": "unknown channel"}),
-                    );
-                    continue;
-                };
-                if let Err(error) =
-                    channel.set_processing(&processing.platform_chat_id, processing.state)
-                {
-                    logger.warn(
-                        "outgoing_processing_failed",
-                        serde_json::json!({
-                            "channel_id": processing.channel_id,
-                            "platform_chat_id": processing.platform_chat_id,
-                            "error": format!("{error:#}"),
-                        }),
-                    );
-                }
-            }
-            OutgoingDispatch::ProgressFeedback(feedback) => {
-                let Some(channel) = channels.get(&feedback.channel_id) else {
-                    logger.warn(
-                        "outgoing_progress_failed",
-                        serde_json::json!({"channel_id": feedback.channel_id, "error": "unknown channel"}),
-                    );
-                    continue;
-                };
-                if let Err(error) = channel.update_progress_feedback(&feedback) {
-                    logger.warn(
-                        "outgoing_progress_failed",
-                        serde_json::json!({
-                            "channel_id": feedback.channel_id,
-                            "platform_chat_id": feedback.platform_chat_id,
-                            "turn_id": feedback.turn_id,
-                            "error": format!("{error:#}"),
-                        }),
-                    );
-                }
-            }
-            OutgoingDispatch::Status(status) => {
-                let Some(channel) = channels.get(&status.channel_id) else {
-                    logger.warn(
-                        "outgoing_status_failed",
-                        serde_json::json!({"channel_id": status.channel_id, "error": "unknown channel"}),
-                    );
-                    continue;
-                };
-                if let Err(error) = channel.send_status(&status) {
-                    logger.warn(
-                        "outgoing_status_failed",
-                        serde_json::json!({
-                            "channel_id": status.channel_id,
-                            "platform_chat_id": status.platform_chat_id,
+                            "channel_id": channel_id,
+                            "platform_chat_id": platform_chat_id,
                             "error": format!("{error:#}"),
                         }),
                     );

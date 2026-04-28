@@ -22,7 +22,8 @@ use stellaclaw_core::{
 
 use crate::{
     channels::types::{
-        OutgoingAttachment, OutgoingDelivery, OutgoingDispatch, OutgoingOption, OutgoingOptions,
+        ChannelEvent, OutgoingAttachment, OutgoingDelivery, OutgoingDispatch, OutgoingError,
+        OutgoingErrorScope, OutgoingErrorSeverity, OutgoingOption, OutgoingOptions,
         OutgoingProcessing, OutgoingProgressFeedback, OutgoingStatus, ProcessingState,
         ProgressFeedbackFinalState,
     },
@@ -542,7 +543,15 @@ impl ConversationRuntime {
                     match self.switch_main_model(model_name) {
                         Ok(()) => return Ok(true),
                         Err(error) => {
-                            self.send_delivery_from_text(format!("模型切换失败: {error}"))?;
+                            self.send_channel_error(
+                                OutgoingErrorScope::Configuration,
+                                OutgoingErrorSeverity::Error,
+                                "model_switch_failed",
+                                format!("模型切换失败: {error}"),
+                                Some(json!({"error": format!("{error:#}")})),
+                                false,
+                                None,
+                            )?;
                             return Ok(false);
                         }
                     }
@@ -596,7 +605,15 @@ impl ConversationRuntime {
                 match self.switch_main_model(&model_name) {
                     Ok(()) => return Ok(true),
                     Err(error) => {
-                        self.send_delivery_from_text(format!("模型切换失败: {error}"))?;
+                        self.send_channel_error(
+                            OutgoingErrorScope::Configuration,
+                            OutgoingErrorSeverity::Error,
+                            "model_switch_failed",
+                            format!("模型切换失败: {error}"),
+                            Some(json!({"model_name": model_name, "error": format!("{error:#}")})),
+                            false,
+                            None,
+                        )?;
                         return Ok(false);
                     }
                 }
@@ -609,7 +626,15 @@ impl ConversationRuntime {
                 match self.set_remote_mode(host, path) {
                     Ok(()) => return Ok(true),
                     Err(error) => {
-                        self.send_delivery_from_text(format!("远程 workspace 切换失败: {error}"))?;
+                        self.send_channel_error(
+                            OutgoingErrorScope::RemoteWorkspace,
+                            OutgoingErrorSeverity::Error,
+                            "remote_workspace_switch_failed",
+                            format!("远程 workspace 切换失败: {error}"),
+                            Some(json!({"error": format!("{error:#}")})),
+                            false,
+                            None,
+                        )?;
                         return Ok(false);
                     }
                 }
@@ -617,7 +642,15 @@ impl ConversationRuntime {
             Some(ConversationControl::DisableRemote) => match self.disable_remote_mode() {
                 Ok(()) => return Ok(true),
                 Err(error) => {
-                    self.send_delivery_from_text(format!("关闭远程 workspace 失败: {error}"))?;
+                    self.send_channel_error(
+                        OutgoingErrorScope::RemoteWorkspace,
+                        OutgoingErrorSeverity::Error,
+                        "remote_workspace_disable_failed",
+                        format!("关闭远程 workspace 失败: {error}"),
+                        Some(json!({"error": format!("{error:#}")})),
+                        false,
+                        None,
+                    )?;
                     return Ok(false);
                 }
             },
@@ -634,7 +667,15 @@ impl ConversationRuntime {
             Some(ConversationControl::SetSandbox { mode }) => match self.set_sandbox_mode(mode) {
                 Ok(()) => return Ok(true),
                 Err(error) => {
-                    self.send_delivery_from_text(format!("沙盒模式切换失败: {error}"))?;
+                    self.send_channel_error(
+                        OutgoingErrorScope::Sandbox,
+                        OutgoingErrorSeverity::Error,
+                        "sandbox_switch_failed",
+                        format!("沙盒模式切换失败: {error}"),
+                        Some(json!({"error": format!("{error:#}")})),
+                        false,
+                        None,
+                    )?;
                     return Ok(false);
                 }
             },
@@ -823,7 +864,15 @@ impl ConversationRuntime {
                     && payload.get("type").and_then(serde_json::Value::as_str)
                         == Some("compact_now")
                 {
-                    self.send_delivery_from_text(format!("无法执行 /compact: {reason}"))?;
+                    self.send_channel_error(
+                        OutgoingErrorScope::Control,
+                        OutgoingErrorSeverity::Warning,
+                        "control_rejected",
+                        format!("无法执行 /compact: {reason}"),
+                        Some(json!({"reason": reason, "payload": payload})),
+                        false,
+                        None,
+                    )?;
                 }
                 Ok(false)
             }
@@ -842,8 +891,14 @@ impl ConversationRuntime {
                         "error_detail": error_detail,
                     }),
                 );
-                self.send_delivery_from_text(
-                    "Session runtime crashed. 发送 /continue 可尝试继续。".to_string(),
+                self.send_channel_error(
+                    OutgoingErrorScope::Runtime,
+                    OutgoingErrorSeverity::Error,
+                    "session_runtime_crashed",
+                    "Session runtime crashed.",
+                    Some(json!({"error": error, "error_detail": error_detail})),
+                    true,
+                    Some("发送 /continue 可尝试继续。".to_string()),
                 )?;
                 Ok(false)
             }
@@ -935,15 +990,24 @@ impl ConversationRuntime {
                     ProgressFeedbackFinalState::Failed,
                     Some(&visible_error),
                 )?;
-                let suffix = if can_continue {
-                    "\n发送 /continue 继续，或 /cancel 取消当前回合。"
-                } else {
-                    ""
-                };
-                self.send_delivery_from_text(format!("本轮失败: {visible_error}{suffix}"))?;
+                self.send_channel_error(
+                    OutgoingErrorScope::Turn,
+                    OutgoingErrorSeverity::Error,
+                    "turn_failed",
+                    format!("本轮失败: {visible_error}"),
+                    Some(json!({
+                        "error": error,
+                        "error_detail": error_detail,
+                        "session_type": format!("{session_type:?}"),
+                    })),
+                    can_continue,
+                    can_continue
+                        .then(|| "发送 /continue 继续，或 /cancel 取消当前回合。".to_string()),
+                )?;
                 Ok(false)
             }
             SessionType::Background => {
+                let detail_agent_id = agent_id.clone();
                 if let Some(agent_id) = agent_id {
                     if let Some(runtime) = self.background.get_mut(&agent_id) {
                         runtime.record.status = ManagedSessionStatus::Failed;
@@ -959,7 +1023,19 @@ impl ConversationRuntime {
                         record.last_error = Some(visible_error.clone());
                     }
                 }
-                self.send_delivery_from_text(format!("后台任务失败: {visible_error}"))?;
+                self.send_channel_error(
+                    OutgoingErrorScope::BackgroundSession,
+                    OutgoingErrorSeverity::Error,
+                    "background_session_failed",
+                    format!("后台任务失败: {visible_error}"),
+                    Some(json!({
+                        "agent_id": detail_agent_id,
+                        "error": error,
+                        "error_detail": error_detail,
+                    })),
+                    can_continue,
+                    None,
+                )?;
                 Ok(true)
             }
             SessionType::Subagent => {
@@ -1567,6 +1643,15 @@ impl ConversationRuntime {
                     "outgoing_attachment_resolution_failed",
                     json!({"error": format!("{error:#}")}),
                 );
+                self.send_channel_error(
+                    OutgoingErrorScope::Attachment,
+                    OutgoingErrorSeverity::Warning,
+                    "attachment_resolution_failed",
+                    format!("附件发送失败: {error}"),
+                    Some(json!({"error": format!("{error:#}")})),
+                    false,
+                    None,
+                )?;
                 (fallback, Vec::new())
             }
         };
@@ -1583,23 +1668,55 @@ impl ConversationRuntime {
         options: Option<OutgoingOptions>,
     ) -> Result<()> {
         self.outgoing_tx
-            .send(OutgoingDispatch::Delivery(OutgoingDelivery {
-                channel_id: self.state.channel_id.clone(),
-                platform_chat_id: self.state.platform_chat_id.clone(),
-                text,
-                attachments,
-                options,
-            }))
+            .send(OutgoingDispatch::Event(ChannelEvent::Delivery(
+                OutgoingDelivery {
+                    channel_id: self.state.channel_id.clone(),
+                    platform_chat_id: self.state.platform_chat_id.clone(),
+                    text,
+                    attachments,
+                    options,
+                },
+            )))
             .map_err(|_| anyhow!("outgoing delivery channel closed"))
+    }
+
+    fn send_channel_error(
+        &self,
+        scope: OutgoingErrorScope,
+        severity: OutgoingErrorSeverity,
+        code: impl Into<String>,
+        message: impl Into<String>,
+        detail: Option<Value>,
+        can_continue: bool,
+        suggested_action: Option<String>,
+    ) -> Result<()> {
+        self.outgoing_tx
+            .send(OutgoingDispatch::Event(ChannelEvent::Error(
+                OutgoingError {
+                    channel_id: self.state.channel_id.clone(),
+                    platform_chat_id: self.state.platform_chat_id.clone(),
+                    conversation_id: self.state.conversation_id.clone(),
+                    scope,
+                    severity,
+                    code: code.into(),
+                    message: message.into(),
+                    detail,
+                    can_continue,
+                    suggested_action,
+                },
+            )))
+            .map_err(|_| anyhow!("outgoing event channel closed"))
     }
 
     fn send_processing_state(&self, state: ProcessingState) -> Result<()> {
         self.outgoing_tx
-            .send(OutgoingDispatch::Processing(OutgoingProcessing {
-                channel_id: self.state.channel_id.clone(),
-                platform_chat_id: self.state.platform_chat_id.clone(),
-                state,
-            }))
+            .send(OutgoingDispatch::Event(ChannelEvent::Processing(
+                OutgoingProcessing {
+                    channel_id: self.state.channel_id.clone(),
+                    platform_chat_id: self.state.platform_chat_id.clone(),
+                    state,
+                },
+            )))
             .map_err(|_| anyhow!("outgoing processing channel closed"))
     }
 
@@ -1611,7 +1728,7 @@ impl ConversationRuntime {
         important: bool,
     ) -> Result<()> {
         self.outgoing_tx
-            .send(OutgoingDispatch::ProgressFeedback(
+            .send(OutgoingDispatch::Event(ChannelEvent::ProgressFeedback(
                 OutgoingProgressFeedback {
                     channel_id: self.state.channel_id.clone(),
                     platform_chat_id: self.state.platform_chat_id.clone(),
@@ -1620,7 +1737,7 @@ impl ConversationRuntime {
                     final_state,
                     important,
                 },
-            ))
+            )))
             .map_err(|_| anyhow!("outgoing progress channel closed"))
     }
 
@@ -1952,7 +2069,7 @@ impl ConversationRuntime {
             &self.config,
         )?;
         self.outgoing_tx
-            .send(OutgoingDispatch::Status(status))
+            .send(OutgoingDispatch::Event(ChannelEvent::Status(status)))
             .map_err(|_| anyhow!("outgoing status channel closed"))
     }
 

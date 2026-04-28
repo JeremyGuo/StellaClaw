@@ -33,6 +33,37 @@
 - 在 channel 抽象之上，后续会补一层统一的 `RESTful API`，作为外部系统接入和管理面的稳定边界。
 - 更后续阶段，前端界面应优先基于这层 `RESTful API` 构建，而不是直接耦合内部运行时。
 
+### 1.1.1 Channel 输出事件边界
+
+`SessionEvent` 是 `SessionActor -> Conversation` 的内部执行事件，不应该直接等同于 Telegram/Web 的输出协议。Host 侧应在 `ConversationRuntime` 之后、具体 `Channel` 之前引入一层并集式 `ChannelEvent` / `OutgoingEvent`，由 `ConversationRuntime` 把 session、control、bridge、attachment、remote workspace 等内部结果归一化成 channel 可见语义，再由不同 channel 各自投影。
+
+这层事件的目标不是取最小交集，而是保留 Telegram 和 Web 都可能需要的完整语义：
+
+- `MessageAppended` / `Delivery`：用户可见消息、附件、选项等最终输出。
+- `TurnStarted` / `TurnProgress` / `TurnCompleted` / `TurnFailed`：前台或托管 session 的执行生命周期。
+- `ProcessingChanged`：typing / idle 这类轻量平台状态。
+- `StatusChanged`：conversation status、模型、remote、sandbox、usage 等状态快照。
+- `InteractiveOutput` / `OptionsRequested`：需要 channel 特殊渲染的交互输出。
+- `CompactCompleted` / `ControlRejected` / `RuntimeCrashed`：控制路径和运行时事件。
+- `ManagedSessionUpdated`：background / subagent 的状态变化。
+- `Error`：统一的结构化错误事件。
+
+结构化错误不应在 `ConversationRuntime` 里过早压成纯文本。建议由 `ConversationRuntime` 统一 normalise 成安全、可展示的错误事件：
+
+```rust
+ChannelEvent::Error {
+    scope,
+    severity,
+    code,
+    message,
+    detail,
+    can_continue,
+    suggested_action,
+}
+```
+
+其中 `message` 是默认可展示文本，`detail` 是可选调试信息。Telegram 可以把它渲染成短文本；Web 可以渲染成 timeline error、toast、可展开 detail 或操作按钮。Channel 不应直接拿裸内部错误决定安全性，内部错误仍先由 `ConversationRuntime` 归一化。
+
 ## 1.2 当前实现快照
 
 这一节记录已经落地的事实，用来避免 roadmap 和代码状态继续漂移。

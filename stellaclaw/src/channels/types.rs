@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::conversation::IncomingConversationMessage;
 
@@ -49,6 +50,45 @@ pub struct OutgoingDelivery {
     pub options: Option<OutgoingOptions>,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutgoingErrorScope {
+    Turn,
+    Runtime,
+    Control,
+    Configuration,
+    RemoteWorkspace,
+    Sandbox,
+    Attachment,
+    Delivery,
+    BackgroundSession,
+    Subagent,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutgoingErrorSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct OutgoingError {
+    pub channel_id: String,
+    pub platform_chat_id: String,
+    pub conversation_id: String,
+    pub scope: OutgoingErrorScope,
+    pub severity: OutgoingErrorSeverity,
+    pub code: String,
+    pub message: String,
+    pub detail: Option<Value>,
+    pub can_continue: bool,
+    pub suggested_action: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessingState {
     Idle,
@@ -76,6 +116,37 @@ pub struct OutgoingProgressFeedback {
     pub text: String,
     pub final_state: Option<ProgressFeedbackFinalState>,
     pub important: bool,
+}
+
+#[derive(Debug, Clone)]
+pub enum ChannelEvent {
+    Delivery(OutgoingDelivery),
+    Processing(OutgoingProcessing),
+    ProgressFeedback(OutgoingProgressFeedback),
+    Status(OutgoingStatus),
+    Error(OutgoingError),
+}
+
+impl ChannelEvent {
+    pub fn channel_id(&self) -> &str {
+        match self {
+            ChannelEvent::Delivery(delivery) => &delivery.channel_id,
+            ChannelEvent::Processing(processing) => &processing.channel_id,
+            ChannelEvent::ProgressFeedback(feedback) => &feedback.channel_id,
+            ChannelEvent::Status(status) => &status.channel_id,
+            ChannelEvent::Error(error) => &error.channel_id,
+        }
+    }
+
+    pub fn platform_chat_id(&self) -> &str {
+        match self {
+            ChannelEvent::Delivery(delivery) => &delivery.platform_chat_id,
+            ChannelEvent::Processing(processing) => &processing.platform_chat_id,
+            ChannelEvent::ProgressFeedback(feedback) => &feedback.platform_chat_id,
+            ChannelEvent::Status(status) => &status.platform_chat_id,
+            ChannelEvent::Error(error) => &error.platform_chat_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,8 +194,5 @@ pub struct OutgoingUsageCost {
 
 #[derive(Debug, Clone)]
 pub enum OutgoingDispatch {
-    Delivery(OutgoingDelivery),
-    Processing(OutgoingProcessing),
-    ProgressFeedback(OutgoingProgressFeedback),
-    Status(OutgoingStatus),
+    Event(ChannelEvent),
 }

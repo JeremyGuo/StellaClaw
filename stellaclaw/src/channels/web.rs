@@ -38,7 +38,8 @@ use crate::{
 use super::{
     types::{
         IncomingDispatch, OutgoingAttachment, OutgoingAttachmentKind, OutgoingDelivery,
-        OutgoingProgressFeedback, OutgoingStatus, ProcessingState, ProgressFeedbackFinalState,
+        OutgoingError, OutgoingProgressFeedback, OutgoingStatus, ProcessingState,
+        ProgressFeedbackFinalState,
     },
     web_terminal::{
         output_limit, TerminalCreateRequest, TerminalInputRequest, TerminalManager,
@@ -872,6 +873,36 @@ impl Channel for WebChannel {
                 "subscription": "foreground_session_events",
                 "conversation_id": &status.conversation_id,
                 "status": status,
+            }),
+        );
+        Ok(())
+    }
+
+    fn send_error(&self, error: &OutgoingError) -> Result<()> {
+        self.logger.warn(
+            "web_error_delivery",
+            json!({
+                "channel_id": error.channel_id,
+                "platform_chat_id": error.platform_chat_id,
+                "conversation_id": error.conversation_id,
+                "scope": error.scope,
+                "code": error.code,
+            }),
+        );
+        self.publish_websocket_event(
+            &error.platform_chat_id,
+            json!({
+                "type": "error",
+                "subscription": "foreground_session_events",
+                "conversation_id": &error.conversation_id,
+                "scope": &error.scope,
+                "severity": &error.severity,
+                "code": &error.code,
+                "message": &error.message,
+                "detail": &error.detail,
+                "can_continue": error.can_continue,
+                "suggested_action": &error.suggested_action,
+                "error": error,
             }),
         );
         Ok(())
