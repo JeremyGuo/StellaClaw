@@ -92,7 +92,10 @@ impl ClaudeCodeProvider {
                 ),
             );
         }
-        payload.insert("max_tokens".to_string(), json!(4096));
+        payload.insert(
+            "max_tokens".to_string(),
+            json!(model_config.effective_max_tokens()),
+        );
         let payload = Value::Object(payload);
 
         let body = serialize_json_request_body(model_config, "claude_code", &payload)?;
@@ -431,6 +434,7 @@ mod tests {
             api_key_env: "CLAUDE_CODE_API_KEY_TEST".to_string(),
             capabilities: vec![ModelCapability::Chat],
             token_max_context: 200_000,
+            max_tokens: 0,
             cache_timeout: 300,
             conn_timeout: 5,
             request_timeout: 600,
@@ -452,6 +456,7 @@ mod tests {
             .match_header("x-api-key", "test-key")
             .match_header("anthropic-version", "2023-06-01")
             .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "max_tokens": 200000,
                 "messages": [
                     {
                         "role": "user",
@@ -514,6 +519,47 @@ mod tests {
         );
         assert_eq!(response.token_usage.unwrap().cache_read, 3);
         assert!(matches!(response.data[1], ChatMessageItem::ToolCall(_)));
+    }
+
+    #[test]
+    fn sends_configured_claude_max_tokens_when_set() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/v1/messages")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "max_tokens": 8192,
+                "messages": []
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{
+                    "id": "msg_123",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "ok"}
+                    ],
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1
+                    }
+                }"#,
+            )
+            .create();
+
+        std::env::set_var("CLAUDE_CODE_API_KEY_TEST", "test-key");
+
+        let provider = ClaudeCodeProvider::new();
+        let mut model_config = test_model_config(format!("{}/v1/messages", server.url()));
+        model_config.max_tokens = 8192;
+        let messages = Vec::new();
+
+        provider
+            .send(&model_config, ProviderRequest::new(&messages))
+            .expect("provider should return message");
+
+        mock.assert();
     }
 
     #[test]

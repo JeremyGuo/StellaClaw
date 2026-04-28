@@ -1,5 +1,5 @@
 {
-  "version": "0.10",
+  "version": "0.11",
   "agent_server": {
     "path": "target/debug/agent_server"
   },
@@ -16,6 +16,7 @@
         "audio_in"
       ],
       "token_max_context": 1048576,
+      "max_tokens": 0,
       "cache_timeout": 300,
       "conn_timeout": 2,
       "request_timeout": 600,
@@ -60,6 +61,7 @@
         "web_search"
       ],
       "token_max_context": 32768,
+      "max_tokens": 0,
       "cache_timeout": 300,
       "conn_timeout": 2,
       "request_timeout": 600,
@@ -76,6 +78,7 @@
         "web_search"
       ],
       "token_max_context": 32768,
+      "max_tokens": 0,
       "cache_timeout": 300,
       "conn_timeout": 2,
       "request_timeout": 600,
@@ -92,6 +95,7 @@
         "web_search"
       ],
       "token_max_context": 32768,
+      "max_tokens": 0,
       "cache_timeout": 300,
       "conn_timeout": 2,
       "request_timeout": 600,
@@ -108,6 +112,7 @@
         "web_search"
       ],
       "token_max_context": 32768,
+      "max_tokens": 0,
       "cache_timeout": 300,
       "conn_timeout": 2,
       "request_timeout": 600,

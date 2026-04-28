@@ -88,6 +88,8 @@ pub struct ModelConfig {
     pub api_key_env: String,
     pub capabilities: Vec<ModelCapability>,
     pub token_max_context: u64,
+    #[serde(default)]
+    pub max_tokens: u64,
     pub cache_timeout: u64,
     #[serde(default = "default_conn_timeout")]
     pub conn_timeout: u64,
@@ -128,6 +130,14 @@ impl ModelConfig {
         self.max_request_size.max(1)
     }
 
+    pub fn effective_max_tokens(&self) -> u64 {
+        if self.max_tokens > 0 {
+            self.max_tokens
+        } else {
+            self.token_max_context.max(1)
+        }
+    }
+
     pub fn uses_huggingface_token_estimator(&self) -> bool {
         matches!(self.token_estimator_type, TokenEstimatorType::HuggingFace)
     }
@@ -162,6 +172,7 @@ mod tests {
                 ModelCapability::WebSearch,
             ],
             token_max_context: 128_000,
+            max_tokens: 0,
             cache_timeout: 300,
             conn_timeout: 30,
             request_timeout: 600,
@@ -204,6 +215,7 @@ mod tests {
         assert_eq!(json["model_name"], "openai/gpt-4o-mini");
         assert_eq!(json["capabilities"][0], "chat");
         assert_eq!(json["token_max_context"], 128000);
+        assert_eq!(json["max_tokens"], 0);
         assert_eq!(json["conn_timeout"], 30);
         assert_eq!(json["request_timeout"], 600);
         assert_eq!(json["maxRequestSize"], 31457280);
@@ -243,6 +255,7 @@ mod tests {
             api_key_env: "OPENROUTER_API_KEY".to_string(),
             capabilities: vec![ModelCapability::Chat],
             token_max_context: 200_000,
+            max_tokens: 0,
             cache_timeout: 120,
             conn_timeout: 10,
             request_timeout: 600,
@@ -278,6 +291,8 @@ mod tests {
         assert_eq!(config.conn_timeout, 2);
         assert_eq!(config.request_timeout, 600);
         assert_eq!(config.max_request_size, 30 * 1024 * 1024);
+        assert_eq!(config.max_tokens, 0);
+        assert_eq!(config.effective_max_tokens(), 128000);
         assert_eq!(config.conn_timeout_secs(), 2);
         assert_eq!(config.request_timeout_secs(), 600);
         assert_eq!(config.max_request_size_bytes(), 30 * 1024 * 1024);
@@ -292,6 +307,7 @@ mod tests {
             "api_key_env": "OPENROUTER_API_KEY",
             "capabilities": ["chat"],
             "token_max_context": 128000,
+            "max_tokens": 8192,
             "cache_timeout": 300,
             "conn_timeout": 2,
             "request_timeout": 600,
@@ -302,6 +318,8 @@ mod tests {
         .expect("model config should accept camelCase maxRequestSize");
 
         assert_eq!(config.max_request_size, 1234);
+        assert_eq!(config.max_tokens, 8192);
+        assert_eq!(config.effective_max_tokens(), 8192);
     }
 
     #[test]

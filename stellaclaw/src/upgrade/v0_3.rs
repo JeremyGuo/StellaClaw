@@ -246,6 +246,7 @@ mod tests {
             api_key_env: "OPENROUTER_API_KEY".to_string(),
             capabilities: vec![ModelCapability::Chat, ModelCapability::ImageIn],
             token_max_context: 200_000,
+            max_tokens: 0,
             cache_timeout: 300,
             conn_timeout: 30,
             request_timeout: 600,

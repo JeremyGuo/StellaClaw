@@ -419,6 +419,7 @@ mod tests {
                 ModelCapability::ImageOut,
             ],
             token_max_context: 128_000,
+            max_tokens: 0,
             cache_timeout: 300,
             conn_timeout: 5,
             request_timeout: 600,

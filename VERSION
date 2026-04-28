@@ -1,5 +1,10 @@
-version: 1.13.1
+version: 1.14.0
 ---
+
+# 1.14.0
+
+- 允许模型配置控制 provider 输出上限：
+  `ModelConfig` 新增 `max_tokens`，默认值为 `0`，表示请求时使用该模型配置的 `token_max_context` 作为输出上限；Claude provider 不再把 Messages 请求的 `max_tokens` 写死为 `4096`，而是始终发送 New API 原生 Claude 接口要求的必填 `max_tokens` 字段。`config` schema 更新到 `0.11`，`workdir` schema 不变。
 
 # 1.13.1
 

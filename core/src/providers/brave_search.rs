@@ -276,6 +276,7 @@ mod tests {
             api_key_env: "BRAVE_SEARCH_API_KEY_TEST".to_string(),
             capabilities: vec![ModelCapability::WebSearch],
             token_max_context: 0,
+            max_tokens: 0,
             cache_timeout: 0,
             conn_timeout: 5,
             request_timeout: 600,
