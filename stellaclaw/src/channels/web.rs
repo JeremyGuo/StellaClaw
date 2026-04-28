@@ -481,12 +481,12 @@ impl WebChannel {
     }
 
     fn list_terminals(&self, conversation_id: &str) -> ApiResult<HttpResponse> {
-        self.load_web_state(conversation_id)?;
+        let state = self.load_web_state(conversation_id)?;
         Ok(json_response(
             200,
             json!({
                 "conversation_id": conversation_id,
-                "terminals": self.terminal_manager.list(conversation_id),
+                "terminals": self.terminal_manager.list(&state),
             }),
         ))
     }
@@ -502,10 +502,10 @@ impl WebChannel {
     }
 
     fn get_terminal(&self, conversation_id: &str, terminal_id: &str) -> ApiResult<HttpResponse> {
-        self.load_web_state(conversation_id)?;
+        let state = self.load_web_state(conversation_id)?;
         let terminal = self
             .terminal_manager
-            .get(conversation_id, terminal_id)
+            .get(&state, terminal_id)
             .map_err(terminal_api_error)?;
         Ok(json_response(200, json!(terminal)))
     }
@@ -516,7 +516,7 @@ impl WebChannel {
         terminal_id: &str,
         query: &HashMap<String, String>,
     ) -> ApiResult<HttpResponse> {
-        self.load_web_state(conversation_id)?;
+        let state = self.load_web_state(conversation_id)?;
         let offset = query
             .get("offset")
             .and_then(|value| value.parse::<u64>().ok())
@@ -528,7 +528,7 @@ impl WebChannel {
         );
         let output = self
             .terminal_manager
-            .output(conversation_id, terminal_id, offset, limit)
+            .output(&state, terminal_id, offset, limit)
             .map_err(terminal_api_error)?;
         Ok(json_response(200, json!(output)))
     }
@@ -539,11 +539,11 @@ impl WebChannel {
         terminal_id: &str,
         body: &[u8],
     ) -> ApiResult<HttpResponse> {
-        self.load_web_state(conversation_id)?;
+        let state = self.load_web_state(conversation_id)?;
         let request: TerminalInputRequest = parse_json(body)?;
         let terminal = self
             .terminal_manager
-            .input(conversation_id, terminal_id, &request.data)
+            .input(&state, terminal_id, &request.data)
             .map_err(terminal_api_error)?;
         Ok(json_response(202, json!(terminal)))
     }
@@ -554,11 +554,11 @@ impl WebChannel {
         terminal_id: &str,
         body: &[u8],
     ) -> ApiResult<HttpResponse> {
-        self.load_web_state(conversation_id)?;
+        let state = self.load_web_state(conversation_id)?;
         let request: TerminalResizeRequest = parse_json(body)?;
         let terminal = self
             .terminal_manager
-            .resize(conversation_id, terminal_id, request)
+            .resize(&state, terminal_id, request)
             .map_err(terminal_api_error)?;
         Ok(json_response(200, json!(terminal)))
     }
@@ -568,10 +568,10 @@ impl WebChannel {
         conversation_id: &str,
         terminal_id: &str,
     ) -> ApiResult<HttpResponse> {
-        self.load_web_state(conversation_id)?;
+        let state = self.load_web_state(conversation_id)?;
         let terminal = self
             .terminal_manager
-            .terminate(conversation_id, terminal_id)
+            .terminate(&state, terminal_id)
             .map_err(terminal_api_error)?;
         Ok(json_response(200, json!(terminal)))
     }

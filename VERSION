@@ -1,5 +1,10 @@
-version: 1.15.0
+version: 1.15.1
 ---
+
+# 1.15.1
+
+- 收紧 Web channel terminal API 语义：
+  新建 PTY 时显式设置 `TERM=xterm-256color` 并继续支持 `cols` / `rows`；terminal 输入保持原样写入，不自动追加换行；输出继续按 offset 返回 PTY 输出的 UTF-8 文本视图和 `next_offset`，不清理 ANSI；resize 继续直连 PTY resize。Terminal 会话仍由 Web channel 在内存中按 conversation 管理，刷新或切换 conversation 不会重建 shell；当 conversation 的 Remote Mode 改变时，会清理该 conversation 下已有 terminal，让前端重新创建匹配新模式的 PTY。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.15.0
 

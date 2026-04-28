@@ -273,6 +273,13 @@ Current Web channel endpoints:
 - `POST /api/conversations/{conversation_id}/messages`
 - `GET /api/conversations/{conversation_id}/messages/after/{message_id}?limit=50`
 - `GET /api/conversations/{conversation_id}/status`
+- `GET /api/conversations/{conversation_id}/terminals`
+- `POST /api/conversations/{conversation_id}/terminals`
+- `GET /api/conversations/{conversation_id}/terminals/{terminal_id}`
+- `DELETE /api/conversations/{conversation_id}/terminals/{terminal_id}`
+- `GET /api/conversations/{conversation_id}/terminals/{terminal_id}/output?offset=0&limit_bytes=65536`
+- `POST /api/conversations/{conversation_id}/terminals/{terminal_id}/input`
+- `POST /api/conversations/{conversation_id}/terminals/{terminal_id}/resize`
 
 For a release build, set:
 
