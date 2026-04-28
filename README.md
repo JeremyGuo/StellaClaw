@@ -265,6 +265,7 @@ The Web channel exposes JSON APIs under `/api/` and accepts
 
 Current Web channel endpoints:
 
+- `GET /api/models`
 - `GET /api/conversations?offset=0&limit=50`
 - `POST /api/conversations`
 - `GET /api/conversations/{conversation_id}/messages?offset=0&limit=50`

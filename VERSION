@@ -1,5 +1,10 @@
-version: 1.14.1
+version: 1.15.0
 ---
+
+# 1.15.0
+
+- 增加 Web channel 模型列表 API：
+  新增 `GET /api/models`，返回当前 Web channel 可用于 foreground agent 选择的模型列表，字段包含 alias、模型名、provider 类型、能力和 token 上限；列表与 `available_agent_models` 白名单及 `POST /api/conversations` 的模型校验保持一致。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.14.1
 

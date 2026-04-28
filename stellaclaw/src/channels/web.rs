@@ -13,7 +13,10 @@ use anyhow::{anyhow, Context, Result};
 use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use stellaclaw_core::session_actor::{ChatMessage, ChatRole, FileItem};
+use stellaclaw_core::{
+    model_config::{ModelCapability, ProviderType},
+    session_actor::{ChatMessage, ChatRole, FileItem},
+};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
@@ -154,6 +157,7 @@ impl WebChannel {
     ) -> ApiResult<HttpResponse> {
         let segments = api_segments(&request.path);
         match (request.method.as_str(), segments.as_slice()) {
+            ("GET", ["models"]) => self.list_models(),
             ("GET", ["conversations"]) => self.list_conversations(&request.query),
             ("POST", ["conversations"]) => self.create_conversation(&request.body, id_manager),
             ("GET", ["conversations", conversation_id, "messages"]) => {
@@ -200,6 +204,10 @@ impl WebChannel {
             }
             _ => Err(ApiError::new(404, "not_found")),
         }
+    }
+
+    fn list_models(&self) -> ApiResult<HttpResponse> {
+        Ok(json_response(200, model_listing_payload(&self.config)))
     }
 
     fn list_conversations(&self, query: &HashMap<String, String>) -> ApiResult<HttpResponse> {
@@ -764,6 +772,31 @@ impl From<WebFileItem> for FileItem {
 }
 
 #[derive(Debug, Serialize)]
+struct WebModelSummary {
+    alias: String,
+    model_name: String,
+    provider_type: ProviderType,
+    capabilities: Vec<ModelCapability>,
+    token_max_context: u64,
+    max_tokens: u64,
+    effective_max_tokens: u64,
+}
+
+impl WebModelSummary {
+    fn new(alias: &str, model: &stellaclaw_core::model_config::ModelConfig) -> Self {
+        Self {
+            alias: alias.to_string(),
+            model_name: model.model_name.clone(),
+            provider_type: model.provider_type.clone(),
+            capabilities: model.capabilities.clone(),
+            token_max_context: model.token_max_context,
+            max_tokens: model.max_tokens,
+            effective_max_tokens: model.effective_max_tokens(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
 struct MessageSkeleton {
     id: String,
     index: usize,
@@ -800,6 +833,19 @@ impl ConversationSummary {
             total_subagents: state.session_binding.subagent_sessions.len(),
         }
     }
+}
+
+fn model_listing_payload(config: &StellaclawConfig) -> Value {
+    let models = config
+        .available_agent_models()
+        .into_iter()
+        .map(|(alias, model)| WebModelSummary::new(alias, model))
+        .collect::<Vec<_>>();
+    json!({
+        "default_model": config.initial_main_model_name(),
+        "total": models.len(),
+        "models": models,
+    })
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
