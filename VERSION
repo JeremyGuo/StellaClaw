@@ -1,5 +1,10 @@
-version: 1.15.8
+version: 1.15.9
 ---
+
+# 1.15.9
+
+- 扩展 Web channel 消息实时和历史读取能力：
+  新增 `GET /api/ws` WebSocket 入口，客户端首条消息发送 `{"type":"subscribe_foreground","conversation_id":"..."}` 后会收到 foreground session 的 `subscription_ack`，其中包含握手时的 `current_message_id` / `next_message_id`；之后该连接会推送新增 foreground messages 的结构化 `messages` 事件。新增 `GET /api/conversations/:id/messages/range?anchor_id=<id>&direction=before|after&limit=<n>&include_anchor=true|false`，用于从某条消息 ID 往前或往后拉取窗口。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.15.8
 

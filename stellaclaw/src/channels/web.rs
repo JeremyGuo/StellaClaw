@@ -2,17 +2,19 @@ use std::{
     collections::HashMap,
     fs,
     io::{Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{Shutdown, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose, Engine as _};
 use crossbeam_channel::Sender;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha1::{Digest, Sha1};
 use stellaclaw_core::{
     model_config::{ModelCapability, ProviderType},
     session_actor::{ChatMessage, ChatMessageItem, ChatRole, FileItem},
@@ -49,6 +51,10 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_WORKSPACE_FILE_LIMIT_BYTES: usize = 1024 * 1024;
 const MAX_WORKSPACE_FILE_LIMIT_BYTES: usize = 5 * 1024 * 1024;
+const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const WEBSOCKET_MAX_FRAME_BYTES: usize = 64 * 1024;
+const WEBSOCKET_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 
 pub struct WebChannel {
     id: String,
@@ -129,6 +135,9 @@ impl WebChannel {
         id_manager: Arc<Mutex<ConversationIdManager>>,
     ) -> Result<()> {
         let request = read_http_request(&mut stream)?;
+        if request.is_websocket_upgrade() {
+            return self.handle_websocket_stream(stream, request);
+        }
         let response = self.handle_request(request, dispatch_tx, id_manager);
         write_http_response(&mut stream, response)
     }
@@ -171,6 +180,9 @@ impl WebChannel {
             }
             ("GET", ["conversations", conversation_id, "messages", "after", message_id]) => {
                 self.list_messages_after(conversation_id, message_id, &request.query)
+            }
+            ("GET", ["conversations", conversation_id, "messages", "range"]) => {
+                self.list_messages_range(conversation_id, &request.query)
             }
             ("GET", ["conversations", conversation_id, "messages", message_id]) => {
                 self.message_detail(conversation_id, message_id)
@@ -427,6 +439,47 @@ impl WebChannel {
         ))
     }
 
+    fn list_messages_range(
+        &self,
+        conversation_id: &str,
+        query: &HashMap<String, String>,
+    ) -> ApiResult<HttpResponse> {
+        let anchor_id = query
+            .get("anchor_id")
+            .or_else(|| query.get("message_id"))
+            .ok_or_else(|| ApiError::new(400, "anchor_id is required"))?;
+        let anchor = parse_message_id(anchor_id)?;
+        let direction = query
+            .get("direction")
+            .map(|value| MessageRangeDirection::parse(value))
+            .transpose()?
+            .unwrap_or(MessageRangeDirection::Before);
+        let include_anchor = query_bool(query, "include_anchor", true);
+        let limit = query_usize(query, "limit", 50).min(200);
+        let state = self.load_web_state(conversation_id)?;
+        let messages = self.load_messages_for_state(&state)?;
+        if anchor >= messages.len() {
+            return Err(ApiError::new(404, "message_not_found"));
+        }
+        let (start, end) =
+            message_range_bounds(messages.len(), anchor, direction, include_anchor, limit);
+        let attachments =
+            WebAttachmentContext::new(&self.workdir, &state, self.cache_manager.clone());
+        Ok(json_response(
+            200,
+            message_range_payload(
+                &state,
+                &attachments,
+                &messages,
+                anchor,
+                direction,
+                include_anchor,
+                start,
+                end,
+            ),
+        ))
+    }
+
     fn message_detail(&self, conversation_id: &str, message_id: &str) -> ApiResult<HttpResponse> {
         let index = parse_message_id(message_id)?;
         let state = self.load_web_state(conversation_id)?;
@@ -451,6 +504,102 @@ impl WebChannel {
                 "attachment_errors": rendered.attachment_errors,
             }),
         ))
+    }
+
+    fn handle_websocket_stream(&self, mut stream: TcpStream, request: HttpRequest) -> Result<()> {
+        if !request.path.starts_with("/api/") && request.path != "/api" {
+            write_http_response(&mut stream, json_error(404, "not_found"))?;
+            return Ok(());
+        }
+        if !self.authorized(&request) && !self.websocket_query_authorized(&request) {
+            write_http_response(&mut stream, json_error(401, "unauthorized"))?;
+            return Ok(());
+        }
+        let segments = api_segments(&request.path);
+        if segments.as_slice() != ["ws"] {
+            write_http_response(&mut stream, json_error(404, "not_found"))?;
+            return Ok(());
+        }
+        let Some(key) = request.headers.get("sec-websocket-key") else {
+            write_http_response(&mut stream, json_error(400, "missing sec-websocket-key"))?;
+            return Ok(());
+        };
+        write_websocket_handshake(&mut stream, key)?;
+        self.run_websocket_subscription(stream)
+    }
+
+    fn websocket_query_authorized(&self, request: &HttpRequest) -> bool {
+        request
+            .query
+            .get("token")
+            .is_some_and(|token| token == &self.token)
+    }
+
+    fn run_websocket_subscription(&self, mut stream: TcpStream) -> Result<()> {
+        let subscribe = loop {
+            match read_websocket_frame(&mut stream)? {
+                WebSocketFrame::Text(text) => break parse_websocket_subscribe(&text)?,
+                WebSocketFrame::Ping(payload) => write_websocket_frame(&mut stream, 0xA, &payload)?,
+                WebSocketFrame::Close => return Ok(()),
+                WebSocketFrame::Binary | WebSocketFrame::Pong => {}
+            }
+        };
+        if subscribe
+            .kind
+            .as_deref()
+            .is_some_and(|kind| kind != "subscribe_foreground")
+        {
+            let error = json!({
+                "type": "error",
+                "error": "unsupported_subscription",
+            });
+            write_websocket_json(&mut stream, &error)?;
+            write_websocket_close(&mut stream)?;
+            return Ok(());
+        }
+
+        let mut state = self
+            .load_web_state(&subscribe.conversation_id)
+            .map_err(api_anyhow)?;
+        let mut session_id = state.session_binding.foreground_session_id.clone();
+        let mut messages = self.load_messages_for_state(&state).map_err(api_anyhow)?;
+        let mut next_index = messages.len();
+        write_websocket_json(
+            &mut stream,
+            &websocket_subscription_ack(&state, next_index, "subscribed"),
+        )?;
+        let mut last_heartbeat = Instant::now();
+
+        loop {
+            thread::sleep(WEBSOCKET_POLL_INTERVAL);
+            if last_heartbeat.elapsed() >= WEBSOCKET_HEARTBEAT_INTERVAL {
+                write_websocket_frame(&mut stream, 0x9, &[])?;
+                last_heartbeat = Instant::now();
+            }
+            state = self
+                .load_web_state(&subscribe.conversation_id)
+                .map_err(api_anyhow)?;
+            if state.session_binding.foreground_session_id != session_id {
+                session_id = state.session_binding.foreground_session_id.clone();
+                messages = self.load_messages_for_state(&state).map_err(api_anyhow)?;
+                next_index = messages.len();
+                write_websocket_json(
+                    &mut stream,
+                    &websocket_subscription_ack(&state, next_index, "session_changed"),
+                )?;
+                continue;
+            }
+
+            messages = self.load_messages_for_state(&state).map_err(api_anyhow)?;
+            if messages.len() <= next_index {
+                continue;
+            }
+            let attachments =
+                WebAttachmentContext::new(&self.workdir, &state, self.cache_manager.clone());
+            let payload = websocket_messages_payload(&state, &attachments, &messages, next_index);
+            next_index = messages.len();
+            write_websocket_json(&mut stream, &payload)?;
+        }
     }
 
     fn conversation_status(&self, conversation_id: &str) -> ApiResult<HttpResponse> {
@@ -719,6 +868,17 @@ struct HttpRequest {
     body: Vec<u8>,
 }
 
+impl HttpRequest {
+    fn is_websocket_upgrade(&self) -> bool {
+        self.method == "GET"
+            && self
+                .headers
+                .get("upgrade")
+                .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+            && self.headers.get("sec-websocket-key").is_some()
+    }
+}
+
 struct HttpResponse {
     status: u16,
     content_type: &'static str,
@@ -753,6 +913,48 @@ impl ApiError {
 
     fn internal(error: impl std::fmt::Display) -> Self {
         Self::new(500, error.to_string())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WebSocketSubscribeRequest {
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    conversation_id: String,
+}
+
+#[derive(Debug)]
+enum WebSocketFrame {
+    Text(String),
+    Binary,
+    Ping(Vec<u8>),
+    Pong,
+    Close,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MessageRangeDirection {
+    Before,
+    After,
+}
+
+impl MessageRangeDirection {
+    fn parse(value: &str) -> ApiResult<Self> {
+        match value {
+            "before" | "backward" | "backwards" => Ok(Self::Before),
+            "after" | "forward" | "forwards" => Ok(Self::After),
+            _ => Err(ApiError::new(
+                400,
+                "direction must be before/backward or after/forward",
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Before => "before",
+            Self::After => "after",
+        }
     }
 }
 
@@ -1053,6 +1255,107 @@ fn write_http_response(stream: &mut TcpStream, response: HttpResponse) -> Result
         .context("failed to write response body")
 }
 
+fn write_websocket_handshake(stream: &mut TcpStream, key: &str) -> Result<()> {
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(WEBSOCKET_GUID.as_bytes());
+    let accept = general_purpose::STANDARD.encode(hasher.finalize());
+    let response = format!(
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+    );
+    stream
+        .write_all(response.as_bytes())
+        .context("failed to write websocket handshake")
+}
+
+fn read_websocket_frame(stream: &mut TcpStream) -> Result<WebSocketFrame> {
+    let mut header = [0_u8; 2];
+    stream
+        .read_exact(&mut header)
+        .context("failed to read websocket frame header")?;
+    let opcode = header[0] & 0x0f;
+    let masked = header[1] & 0x80 != 0;
+    let mut len = u64::from(header[1] & 0x7f);
+    if len == 126 {
+        let mut extended = [0_u8; 2];
+        stream
+            .read_exact(&mut extended)
+            .context("failed to read websocket extended length")?;
+        len = u64::from(u16::from_be_bytes(extended));
+    } else if len == 127 {
+        let mut extended = [0_u8; 8];
+        stream
+            .read_exact(&mut extended)
+            .context("failed to read websocket extended length")?;
+        len = u64::from_be_bytes(extended);
+    }
+    let len_usize =
+        usize::try_from(len).map_err(|_| anyhow!("websocket frame length overflows usize"))?;
+    if len_usize > WEBSOCKET_MAX_FRAME_BYTES {
+        return Err(anyhow!(
+            "websocket frame exceeds {WEBSOCKET_MAX_FRAME_BYTES} bytes"
+        ));
+    }
+    let mut mask = [0_u8; 4];
+    if masked {
+        stream
+            .read_exact(&mut mask)
+            .context("failed to read websocket mask")?;
+    }
+    let mut payload = vec![0_u8; len_usize];
+    stream
+        .read_exact(&mut payload)
+        .context("failed to read websocket payload")?;
+    if masked {
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % 4];
+        }
+    }
+    match opcode {
+        0x1 => Ok(WebSocketFrame::Text(
+            String::from_utf8(payload).context("websocket text frame is not UTF-8")?,
+        )),
+        0x2 => Ok(WebSocketFrame::Binary),
+        0x8 => Ok(WebSocketFrame::Close),
+        0x9 => Ok(WebSocketFrame::Ping(payload)),
+        0xA => Ok(WebSocketFrame::Pong),
+        _ => Err(anyhow!("unsupported websocket opcode {opcode}")),
+    }
+}
+
+fn write_websocket_json(stream: &mut TcpStream, value: &Value) -> Result<()> {
+    let payload = serde_json::to_vec(value).context("failed to serialize websocket message")?;
+    write_websocket_frame(stream, 0x1, &payload)
+}
+
+fn write_websocket_close(stream: &mut TcpStream) -> Result<()> {
+    write_websocket_frame(stream, 0x8, &[])?;
+    let _ = stream.shutdown(Shutdown::Both);
+    Ok(())
+}
+
+fn write_websocket_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> Result<()> {
+    let mut frame = Vec::with_capacity(payload.len() + 10);
+    frame.push(0x80 | (opcode & 0x0f));
+    if payload.len() <= 125 {
+        frame.push(payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push(126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(payload);
+    stream
+        .write_all(&frame)
+        .context("failed to write websocket frame")
+}
+
+fn parse_websocket_subscribe(raw: &str) -> Result<WebSocketSubscribeRequest> {
+    serde_json::from_str(raw).context("failed to parse websocket subscribe message")
+}
+
 fn json_response(status: u16, value: Value) -> HttpResponse {
     HttpResponse {
         status,
@@ -1063,6 +1366,10 @@ fn json_response(status: u16, value: Value) -> HttpResponse {
 
 fn json_error(status: u16, message: &str) -> HttpResponse {
     json_response(status, json!({"error": message}))
+}
+
+fn api_anyhow(error: ApiError) -> anyhow::Error {
+    anyhow!("{} {}", error.status, error.message)
 }
 
 fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> ApiResult<T> {
@@ -1178,6 +1485,114 @@ fn message_page_payload(
             .map(|(relative, message)| message_skeleton(start + relative, message, attachments, &roots))
             .collect::<Vec<_>>(),
     })
+}
+
+fn message_range_payload(
+    state: &ConversationState,
+    attachments: &WebAttachmentContext,
+    messages: &[ChatMessage],
+    anchor: usize,
+    direction: MessageRangeDirection,
+    include_anchor: bool,
+    start: usize,
+    end: usize,
+) -> Value {
+    let roots = attachments.roots();
+    json!({
+        "conversation_id": &state.conversation_id,
+        "anchor_id": anchor.to_string(),
+        "anchor_index": anchor,
+        "direction": direction.as_str(),
+        "include_anchor": include_anchor,
+        "offset": start,
+        "limit": end.saturating_sub(start),
+        "start_index": start,
+        "end_index": end,
+        "total": messages.len(),
+        "has_more_before": start > 0,
+        "has_more_after": end < messages.len(),
+        "messages": messages[start..end]
+            .iter()
+            .enumerate()
+            .map(|(relative, message)| message_skeleton(start + relative, message, attachments, &roots))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn websocket_subscription_ack(
+    state: &ConversationState,
+    next_message_index: usize,
+    reason: &'static str,
+) -> Value {
+    let current_message_id = next_message_index
+        .checked_sub(1)
+        .map(|index| index.to_string());
+    json!({
+        "type": "subscription_ack",
+        "subscription": "foreground_session_messages",
+        "reason": reason,
+        "conversation_id": &state.conversation_id,
+        "session_id": &state.session_binding.foreground_session_id,
+        "current_message_id": current_message_id,
+        "next_message_id": next_message_index.to_string(),
+        "total": next_message_index,
+    })
+}
+
+fn websocket_messages_payload(
+    state: &ConversationState,
+    attachments: &WebAttachmentContext,
+    messages: &[ChatMessage],
+    start: usize,
+) -> Value {
+    let total = messages.len();
+    let end = total;
+    let roots = attachments.roots();
+    json!({
+        "type": "messages",
+        "subscription": "foreground_session_messages",
+        "conversation_id": &state.conversation_id,
+        "session_id": &state.session_binding.foreground_session_id,
+        "offset": start,
+        "start_index": start,
+        "end_index": end,
+        "total": total,
+        "messages": messages[start..end]
+            .iter()
+            .enumerate()
+            .map(|(relative, message)| message_skeleton(start + relative, message, attachments, &roots))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn message_range_bounds(
+    total: usize,
+    anchor: usize,
+    direction: MessageRangeDirection,
+    include_anchor: bool,
+    limit: usize,
+) -> (usize, usize) {
+    if limit == 0 || total == 0 {
+        return (0, 0);
+    }
+    match direction {
+        MessageRangeDirection::Before => {
+            let end = if include_anchor {
+                anchor.saturating_add(1).min(total)
+            } else {
+                anchor.min(total)
+            };
+            (end.saturating_sub(limit), end)
+        }
+        MessageRangeDirection::After => {
+            let start = if include_anchor {
+                anchor.min(total)
+            } else {
+                anchor.saturating_add(1).min(total)
+            };
+            (start, start.saturating_add(limit).min(total))
+        }
+    }
 }
 
 fn message_skeleton(
@@ -1551,6 +1966,13 @@ fn query_usize(query: &HashMap<String, String>, name: &str, default: usize) -> u
         .unwrap_or(default)
 }
 
+fn query_bool(query: &HashMap<String, String>, name: &str, default: bool) -> bool {
+    query
+        .get(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(default)
+}
+
 fn parse_message_id(message_id: &str) -> ApiResult<usize> {
     message_id
         .parse::<usize>()
@@ -1799,6 +2221,66 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[test]
+    fn web_message_range_payload_returns_backward_window() {
+        let workdir = test_workdir("message-range");
+        let state = test_state("web-main-test-message-range");
+        fs::create_dir_all(workdir.join("conversations").join(&state.conversation_id))
+            .expect("create conversation root");
+        let messages = (0..5)
+            .map(|index| {
+                ChatMessage::new(
+                    ChatRole::Assistant,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: format!("message {index}"),
+                    })],
+                )
+            })
+            .collect::<Vec<_>>();
+        let (start, end) =
+            message_range_bounds(messages.len(), 3, MessageRangeDirection::Before, true, 2);
+        let context = test_attachment_context(&workdir, &state);
+        let payload = message_range_payload(
+            &state,
+            &context,
+            &messages,
+            3,
+            MessageRangeDirection::Before,
+            true,
+            start,
+            end,
+        );
+
+        assert_eq!(payload["anchor_id"], "3");
+        assert_eq!(payload["direction"], "before");
+        assert_eq!(payload["start_index"], 2);
+        assert_eq!(payload["end_index"], 4);
+        assert_eq!(payload["has_more_before"], true);
+        assert_eq!(payload["has_more_after"], true);
+        assert_eq!(payload["messages"][0]["id"], "2");
+        assert_eq!(payload["messages"][1]["id"], "3");
+        assert_eq!(payload["messages"][1]["text"], "message 3");
+
+        let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[test]
+    fn websocket_ack_reports_current_and_next_message_ids() {
+        let state = test_state("web-main-test-ws-ack");
+        let payload = websocket_subscription_ack(&state, 3, "subscribed");
+
+        assert_eq!(payload["type"], "subscription_ack");
+        assert_eq!(payload["subscription"], "foreground_session_messages");
+        assert_eq!(payload["reason"], "subscribed");
+        assert_eq!(payload["current_message_id"], "2");
+        assert_eq!(payload["next_message_id"], "3");
+        assert_eq!(payload["session_id"], "web-main-test-ws-ack.foreground");
+
+        let empty = websocket_subscription_ack(&state, 0, "subscribed");
+        assert!(empty["current_message_id"].is_null());
+        assert_eq!(empty["next_message_id"], "0");
     }
 
     #[test]

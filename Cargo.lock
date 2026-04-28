@@ -2192,6 +2192,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha1",
  "stellaclaw_core",
  "time",
 ]
