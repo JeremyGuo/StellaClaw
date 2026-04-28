@@ -6,6 +6,7 @@ const path = require('node:path');
 
 const SETTINGS_FILE = 'settings.json';
 const SSH_READY_DELAY_MS = 900;
+const SERVER_REQUEST_TIMEOUT_MS = 90_000;
 
 let mainWindow;
 const tunnels = new Map();
@@ -110,6 +111,21 @@ function joinApiUrl(baseUrl, apiPath) {
   return new URL(relative, base).toString();
 }
 
+function shouldRetryRequest(method, status) {
+  if (String(method || 'GET').toUpperCase() !== 'GET') {
+    return false;
+  }
+  return status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function retryDelayMs(attempt) {
+  return [250, 700, 1500][Math.min(attempt, 2)];
+}
+
+async function sleep(ms) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function findFreePort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -192,7 +208,27 @@ async function requestServer(_event, payload) {
     options.body = JSON.stringify(payload.body);
   }
 
-  const response = await fetch(joinApiUrl(baseUrl, payload.path), options);
+  const url = joinApiUrl(baseUrl, payload.path);
+  let response;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), SERVER_REQUEST_TIMEOUT_MS);
+    try {
+      response = await fetch(url, { ...options, signal: controller.signal });
+    } catch (error) {
+      if (String(options.method || 'GET').toUpperCase() !== 'GET' || attempt === 2) {
+        throw error;
+      }
+      await sleep(retryDelayMs(attempt));
+      continue;
+    } finally {
+      clearTimeout(timeout);
+    }
+    if (!shouldRetryRequest(options.method, response.status) || attempt === 2) {
+      break;
+    }
+    await sleep(retryDelayMs(attempt));
+  }
   const text = await response.text();
   let data = null;
   if (text.trim()) {

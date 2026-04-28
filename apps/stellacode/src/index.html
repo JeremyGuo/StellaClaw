@@ -16,11 +16,11 @@
         <div class="window-spacer"></div>
         <div class="primary-actions">
           <button id="newConversationButton" class="nav-action" type="button">
-            <span class="action-icon">+</span>
+            <span class="action-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></span>
             <span>新对话</span>
           </button>
           <button id="serverStatusButton" class="nav-action" type="button">
-            <span class="action-icon">⌁</span>
+            <span class="action-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 7.5h14v9H5Z"/><path d="M8 16.5v2M16 16.5v2M9 11h.01M12 11h.01"/></svg></span>
             <span>服务器</span>
           </button>
         </div>
@@ -29,53 +29,65 @@
         <div id="conversationList" class="conversation-list"></div>
         <div class="sidebar-footer">
           <button id="settingsButton" class="nav-action" type="button">
-            <span class="action-icon">⚙</span>
+            <span class="action-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"/><path d="M19 12a7.3 7.3 0 0 0-.08-1l2.08-1.6-2-3.46-2.46 1a7.6 7.6 0 0 0-1.72-1L14.5 3h-5l-.32 2.94a7.6 7.6 0 0 0-1.72 1l-2.46-1-2 3.46L5.08 11a7.3 7.3 0 0 0 0 2L3 14.6l2 3.46 2.46-1a7.6 7.6 0 0 0 1.72 1L9.5 21h5l.32-2.94a7.6 7.6 0 0 0 1.72-1l2.46 1 2-3.46L18.92 13c.05-.33.08-.66.08-1Z"/></svg></span>
             <span>设置</span>
           </button>
         </div>
       </aside>
 
-      <main class="chat-panel">
-        <header class="chat-header">
-          <div>
-            <div id="conversationTitle" class="conversation-title">Stellacode</div>
-            <div id="conversationSubtitle" class="conversation-subtitle">选择或创建一个 Conversation</div>
-          </div>
-          <div class="header-actions">
-            <button id="toggleContextButton" class="icon-button" type="button" title="打开详情">◰</button>
-            <button id="refreshButton" class="icon-button" type="button" title="刷新当前会话">↻</button>
-          </div>
-        </header>
-
-        <section id="messageList" class="message-list" aria-live="polite"></section>
-
-        <footer class="composer-wrap">
-          <div class="composer">
-            <button id="attachButton" class="composer-icon" type="button" title="添加上下文">+</button>
-            <textarea
-              id="composerInput"
-              rows="1"
-              placeholder="要求后续变更"
-            ></textarea>
-            <div class="composer-tools">
-              <span id="composerModePill" class="mode-pill">本地</span>
+      <section class="workbench">
+        <main class="chat-panel">
+          <header class="chat-header">
+            <div>
+              <div id="conversationTitle" class="conversation-title">Stellacode</div>
+              <div id="conversationSubtitle" class="conversation-subtitle">选择或创建一个 Conversation</div>
             </div>
-            <button id="sendButton" class="send-button" type="button" title="发送">↑</button>
-          </div>
-          <div id="composerHint" class="composer-hint">本地模式</div>
-        </footer>
-      </main>
+            <div class="header-actions">
+              <button id="toggleTerminalButton" class="icon-button" type="button" title="打开终端"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5h16v13H4Z"/><path d="m8 9 3 3-3 3"/><path d="M13 15h4"/></svg></button>
+              <button id="toggleFileButton" class="icon-button" type="button" title="打开文件"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 7.5a2 2 0 0 1 2-2h4.2l2 2H18a2.5 2.5 0 0 1 2.5 2.5v6.5a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2Z"/></svg></button>
+              <button id="toggleContextButton" class="icon-button" type="button" title="打开详情"></button>
+              <button id="refreshButton" class="icon-button" type="button" title="刷新当前会话"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 4v6h-6"/></svg></button>
+            </div>
+          </header>
 
-      <aside class="context-panel">
-        <header class="context-header">
-          <div class="context-tabs">
-            <button class="context-tab active" type="button" data-context-tab="overview">概览</button>
-            <button class="context-tab" type="button" data-context-tab="detail">详情</button>
-          </div>
-          <button id="collapseContextButton" class="icon-button" type="button" title="收起详情">◱</button>
-        </header>
-        <section id="contextContent" class="context-content"></section>
-      </aside>
+          <section id="messageList" class="message-list" aria-live="polite"></section>
+
+          <footer class="composer-wrap">
+            <div class="composer">
+              <button id="attachButton" class="composer-icon" type="button" title="添加上下文"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button>
+              <textarea
+                id="composerInput"
+                rows="1"
+                placeholder="Ask Stellacode to change, inspect, or explain..."
+              ></textarea>
+              <div class="composer-tools">
+                <span id="composerModePill" class="mode-pill">本地</span>
+              </div>
+              <button id="sendButton" class="send-button" type="button" title="发送"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5"/><path d="m6 11 6-6 6 6"/></svg></button>
+            </div>
+            <div id="composerHint" class="composer-hint">本地模式</div>
+          </footer>
+        </main>
+
+        <aside class="context-panel">
+          <header class="context-header">
+            <div class="context-tabs">
+              <button class="context-tab active" type="button" data-context-tab="overview">概览</button>
+              <button class="context-tab" type="button" data-context-tab="detail">详情</button>
+            </div>
+            <button id="collapseContextButton" class="icon-button" type="button" title="收起详情"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5h16v13H4Z"/><path d="M15 5.5v13"/><path d="m13 9-3 3 3 3"/></svg></button>
+          </header>
+          <section id="contextContent" class="context-content"></section>
+        </aside>
+
+        <aside class="file-panel">
+          <section id="fileContent" class="context-content file-content"></section>
+        </aside>
+
+        <section class="terminal-dock">
+          <section id="terminalContent" class="terminal-content"></section>
+        </section>
+      </section>
     </div>
 
     <div id="modalLayer" class="modal-layer hidden"></div>

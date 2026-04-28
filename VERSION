@@ -1,5 +1,10 @@
-version: 1.13.0
+version: 1.13.1
 ---
+
+# 1.13.1
+
+- 调整 Stellacode 桌面体验：
+  Stellacode 界面参考 Codex Desktop 的 Electron 视觉语言，重做侧栏、主聊天 surface、composer、消息气泡、详情栏、弹窗和深浅色 token；FileTree 拆成独立文件页，按 Codex 文件面板形态增加标题计数、筛选框、路径分组、SVG 图标、文件类型 badge 和真实层级缩进，并支持选中文件后在详情栏读取预览；新增右侧 Terminal 页，接入 Web channel terminal API 创建终端、轮询输出和发送 stdin；右侧面板开合、tab 切换、文件树展开和消息进入增加过渡动画。发送消息时新增本地乐观消息、会话切换过期响应丢弃、前台聚焦刷新、渐进式轮询，以及 Web API GET 请求的短退避重试。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.13.0
 
