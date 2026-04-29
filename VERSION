@@ -1,5 +1,19 @@
-version: 1.16.0
+version: 1.16.1
 ---
+
+# 1.16.1
+
+- 修复输入法回车误发消息：
+  composer 和 rename modal 的 Enter keydown 现在检查 `event.isComposing`，IME 组合输入中的回车不再触发发送或确认。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 优化面板宽度拖拽范围：
+  侧栏拖拽范围从 220–420 放宽到 180–520，详情栏从 260–620 到 220–800，文件栏从 280–680 到 220–800，终端从 180–560 到 120–800，适配大屏显示器。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复终端 UTF-8 边界截断：
+  terminal output 读取现在在 chunk 边界回退到 UTF-8 字符对齐位置，避免 `from_utf8_lossy` 把被切断的多字节序列替换为 `�`。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 优化终端轮询响应速度：
+  terminal poll 改为自适应间隔：有新数据时 32ms、空闲时 120ms、失焦时 700ms，改善交互延迟感。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.16.0
 

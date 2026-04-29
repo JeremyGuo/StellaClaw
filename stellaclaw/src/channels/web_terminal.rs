@@ -409,10 +409,39 @@ impl TerminalSession {
             .min(output.bytes.len().max(1));
         let start = offset.max(output.start_offset);
         let available_start = start.saturating_sub(output.start_offset) as usize;
-        let available_end = available_start
+        let mut available_end = available_start
             .saturating_add(limit)
             .min(output.bytes.len());
-        let data = if available_start < output.bytes.len() {
+        // Avoid splitting a multi-byte UTF-8 sequence at the boundary.
+        // Walk back up to 3 bytes to find a char-aligned cut point.
+        if available_end < output.bytes.len() {
+            let mut retreat = 0;
+            while retreat < 4 && available_end > available_start {
+                let byte = output.bytes[available_end - 1];
+                if byte < 0x80 || byte >= 0xC0 {
+                    // ASCII or the start of a multi-byte sequence.
+                    // Check if this start byte's full sequence fits.
+                    if byte >= 0xC0 {
+                        let seq_len = match byte {
+                            0xC0..=0xDF => 2,
+                            0xE0..=0xEF => 3,
+                            0xF0..=0xF7 => 4,
+                            _ => 1,
+                        };
+                        let seq_start = available_end - 1;
+                        if seq_start + seq_len > available_end {
+                            // Incomplete sequence at end — exclude it.
+                            available_end -= 1;
+                        }
+                    }
+                    break;
+                }
+                // Continuation byte (0x80..0xBF) — keep retreating.
+                available_end -= 1;
+                retreat += 1;
+            }
+        }
+        let data = if available_start < output.bytes.len() && available_start < available_end {
             String::from_utf8_lossy(&output.bytes[available_start..available_end]).to_string()
         } else {
             String::new()

@@ -2645,7 +2645,7 @@ async function renameConversation(serverId, conversation) {
     }
     $('#renameConversationConfirm')?.addEventListener('click', doRename);
     input?.addEventListener('keydown', (event) => {
-      if (event.key === 'Enter') {
+      if (event.key === 'Enter' && !event.isComposing) {
         event.preventDefault();
         doRename();
       }
@@ -4420,19 +4420,25 @@ function startTerminalPoll() {
       clearTerminalPoll();
       return;
     }
+    let hasNewData = false;
     try {
       slowTick += 1;
       if (slowTick === 1 || slowTick % 10 === 0) {
         await refreshTerminals();
       }
+      const prevLen = (state.terminalOutput.get(terminalOutputKey(activeTerminal() || {})) || '').length;
       await readTerminalOutput();
+      const curLen = (state.terminalOutput.get(terminalOutputKey(activeTerminal() || {})) || '').length;
+      hasNewData = curLen !== prevLen;
       renderTerminalContext();
     } catch (error) {
       showToast(error.message);
     }
-    state.terminalPoll = setTimeout(tick, document.hasFocus() ? 180 : 700);
+    // Adaptive: poll faster when receiving data, slower when idle.
+    const interval = !document.hasFocus() ? 700 : hasNewData ? 32 : 120;
+    state.terminalPoll = setTimeout(tick, interval);
   };
-  state.terminalPoll = setTimeout(tick, 80);
+  state.terminalPoll = setTimeout(tick, 32);
 }
 
 async function sendTerminalInput(value, options = {}) {
@@ -4788,14 +4794,14 @@ function bindLayoutResizers() {
           if (state.settings?.sidebarCollapsed) {
             return;
           }
-          state.layout.sidebar = clampNumber(start.sidebar + moveEvent.clientX - start.x, 220, 420);
+          state.layout.sidebar = clampNumber(start.sidebar + moveEvent.clientX - start.x, 180, 520);
         } else if (type === 'context' && workbench) {
           const rightEdge = workbench.right - (state.fileBarOpen ? state.layout.file : 0);
-          state.layout.context = clampNumber(rightEdge - moveEvent.clientX, 260, 620);
+          state.layout.context = clampNumber(rightEdge - moveEvent.clientX, 220, 800);
         } else if (type === 'file' && workbench) {
-          state.layout.file = clampNumber(workbench.right - moveEvent.clientX, 280, 680);
+          state.layout.file = clampNumber(workbench.right - moveEvent.clientX, 220, 800);
         } else if (type === 'terminal' && workbench) {
-          state.layout.terminal = clampNumber(workbench.bottom - moveEvent.clientY, 180, 560);
+          state.layout.terminal = clampNumber(workbench.bottom - moveEvent.clientY, 120, 800);
         }
         applyLayoutSettings();
       };
@@ -4904,7 +4910,7 @@ function bindEvents() {
   });
   elements.composerInput.addEventListener('input', autosizeComposer);
   elements.composerInput.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' && !event.shiftKey) {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
       sendMessage();
     }
