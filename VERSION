@@ -547,3 +547,4 @@ version: 1.16.2
 - 项目发布版本使用 SemVer，从 `1.0.0` 开始编号。
 - 根 `VERSION` 的 `version:` 字段是当前项目发布版本。
 - `config` schema version 和 `workdir` schema version 独立维护，不要求和项目发布版本相同。
+
