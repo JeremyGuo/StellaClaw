@@ -63,7 +63,9 @@ const state = {
   refreshEpoch: 0,
   isRefreshing: false,
   lastRefreshAt: null,
-  saveTimer: null
+  saveTimer: null,
+  composerDrafts: new Map(),
+  conversationActivity: new Map()   // key -> 'working' | 'idle' | 'error'
 };
 
 const elements = {
@@ -76,6 +78,7 @@ const elements = {
   composerModePill: $('#composerModePill'),
   sendButton: $('#sendButton'),
   attachButton: $('#attachButton'),
+  commandButton: $('#commandButton'),
   refreshButton: $('#refreshButton'),
   toggleContextButton: $('#toggleContextButton'),
   toggleFileButton: $('#toggleFileButton'),
@@ -643,7 +646,9 @@ function displayProgressText(text) {
 }
 
 function handleProcessingEvent(payload) {
+  const key = selectedKey();
   if (payload.state === 'typing') {
+    if (key) state.conversationActivity.set(key, 'working');
     if (!state.sessionProgress || state.sessionProgress.conversationKey !== selectedKey()) {
       state.sessionProgress = {
         conversationKey: selectedKey(),
@@ -662,8 +667,11 @@ function handleProcessingEvent(payload) {
       renderMessagesPreservingViewport();
     }
     setSessionActivity('正在思考');
+    renderSidebar();
   } else if (payload.state === 'idle') {
+    if (key) state.conversationActivity.set(key, 'idle');
     setSessionActivity('');
+    renderSidebar();
   }
 }
 
@@ -764,6 +772,11 @@ function addChannelEvent(event) {
 function handleChannelErrorEvent(payload) {
   const event = normalizeChannelError(payload);
   addChannelEvent(event);
+  if (event.severity === 'error') {
+    const key = selectedKey();
+    if (key) state.conversationActivity.set(key, 'error');
+    renderSidebar();
+  }
   const label = event.severity === 'warning' ? '警告' : event.severity === 'info' ? '提示' : '错误';
   setSessionActivity(`${label}: ${event.message}`, { clearAfterMs: event.severity === 'error' ? 4200 : 2600 });
   showToast(event.message);
@@ -2103,7 +2116,21 @@ async function selectConversation(serverId, conversationId) {
   clearTerminalPoll();
   disposeXtermSessions();
   state.refreshEpoch += 1;
+  // Save current composer draft before switching.
+  if (state.selected) {
+    const prevKey = conversationKey(state.selected.serverId, state.selected.conversationId);
+    const draft = elements.composerInput.value || '';
+    if (draft.trim()) {
+      state.composerDrafts.set(prevKey, draft);
+    } else {
+      state.composerDrafts.delete(prevKey);
+    }
+  }
   state.selected = { serverId, conversationId };
+  // Restore draft for newly selected conversation.
+  const newKey = conversationKey(serverId, conversationId);
+  elements.composerInput.value = state.composerDrafts.get(newKey) || '';
+  autosizeComposer();
   state.activeServerId = serverId;
   state.settings.activeServerId = serverId;
   const key = selectedKey();
@@ -2518,6 +2545,8 @@ async function sendMessage() {
   }
   elements.composerInput.value = '';
   autosizeComposer();
+  // Clear saved draft after sending.
+  state.composerDrafts.delete(conversationKey(serverId, conversationId));
   elements.sendButton.disabled = true;
   const { serverId, conversationId } = state.selected;
   const localKey = conversationKey(serverId, conversationId);
@@ -2740,17 +2769,24 @@ function renderSidebar() {
     const status = state.statuses.get(conversationKey(server.id, conversation.conversation_id));
     const selected =
       state.selected?.serverId === server.id && state.selected?.conversationId === conversation.conversation_id;
+    const activityKey = conversationKey(server.id, conversation.conversation_id);
+    const activity = state.conversationActivity.get(activityKey) || 'idle';
     const row = document.createElement('button');
     row.type = 'button';
     row.className = `conversation-row${selected ? ' selected' : ''}${isRemoteStatus(status) ? ' remote' : ''}`;
     row.dataset.serverId = server.id;
     row.dataset.conversationId = conversation.conversation_id;
+    const activityDot = activity === 'working'
+      ? '<span class="conv-status-dot working" title="Working"></span>'
+      : activity === 'error'
+        ? '<span class="conv-status-dot error" title="Error"></span>'
+        : '';
     const remoteMeta = isRemoteStatus(status)
       ? `<span class="remote-meta">${escapeHtml(status.remote)} · ${escapeHtml(compactPath(status.workspace))}</span>`
       : `<span class="remote-meta">${escapeHtml(server.name)}</span>`;
     row.innerHTML = `
       <span class="conversation-main">
-        <span class="conversation-name">${escapeHtml(displayConversationName(server.id, conversation))}</span>
+        ${activityDot}<span class="conversation-name">${escapeHtml(displayConversationName(server.id, conversation))}</span>
         ${remoteMeta}
       </span>
       <span class="conversation-age">${escapeHtml(displayConversationModel(conversation, status))}</span>
@@ -3852,8 +3888,16 @@ function showWorkspaceContextMenu(x, y, path, isDir) {
   menu.className = 'workspace-context-menu';
   menu.style.left = `${x}px`;
   menu.style.top = `${y}px`;
+  // Determine workspace root for absolute path.
+  const key = selectedKey();
+  const listing = state.workspaceListings.get(key);
+  const status = currentStatus();
+  const workspaceRoot = listing?.workspace_root || status?.workspace || '';
+  const absolutePath = workspaceRoot && path ? `${workspaceRoot.replace(/\/$/, '')}/${path}` : path;
   menu.innerHTML = `
-    <button type="button" data-action="download">${isDir ? '下载目录 (tar.gz)' : '下载文件 (tar.gz)'}</button>
+    <button type="button" data-action="copy-relative">Copy Relative Path</button>
+    <button type="button" data-action="copy-absolute">Copy Absolute Path</button>
+    <button type="button" data-action="download">${isDir ? 'Download (tar.gz)' : 'Download (tar.gz)'}</button>
   `;
   document.body.append(menu);
   // Adjust if menu overflows viewport
@@ -3861,6 +3905,14 @@ function showWorkspaceContextMenu(x, y, path, isDir) {
     const rect = menu.getBoundingClientRect();
     if (rect.right > window.innerWidth) menu.style.left = `${window.innerWidth - rect.width - 8}px`;
     if (rect.bottom > window.innerHeight) menu.style.top = `${window.innerHeight - rect.height - 8}px`;
+  });
+  menu.querySelector('[data-action="copy-relative"]')?.addEventListener('click', () => {
+    dismissWorkspaceContextMenu();
+    navigator.clipboard.writeText(path).then(() => showToast('Copied relative path')).catch(() => {});
+  });
+  menu.querySelector('[data-action="copy-absolute"]')?.addEventListener('click', () => {
+    dismissWorkspaceContextMenu();
+    navigator.clipboard.writeText(absolutePath).then(() => showToast('Copied absolute path')).catch(() => {});
   });
   menu.querySelector('[data-action="download"]')?.addEventListener('click', () => {
     dismissWorkspaceContextMenu();
@@ -3918,23 +3970,27 @@ function bindWorkspaceDragDrop(container) {
 
 async function collectDroppedFiles(dataTransferItems) {
   const entries = [];
-  const items = [];
+  const fsEntries = [];
+  const plainFiles = [];
+  // Capture all entries synchronously before any async work (DataTransferItem is invalidated after event).
   for (let i = 0; i < dataTransferItems.length; i++) {
     const item = dataTransferItems[i];
     if (item.kind === 'file') {
       const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
       if (entry) {
-        items.push(entry);
+        fsEntries.push(entry);
       } else {
         const file = item.getAsFile();
-        if (file) {
-          const data = await file.arrayBuffer();
-          entries.push({ relativePath: file.name, data, isDirectory: false });
-        }
+        if (file) plainFiles.push(file);
       }
     }
   }
-  for (const entry of items) {
+  // Now process asynchronously.
+  for (const file of plainFiles) {
+    const data = await file.arrayBuffer();
+    entries.push({ relativePath: file.name, data, isDirectory: false });
+  }
+  for (const entry of fsEntries) {
     await traverseEntry(entry, '', entries);
   }
   return entries;
@@ -4923,6 +4979,73 @@ function autosizeComposer() {
 }
 
 
+
+
+// ---- Command menu ----
+const COMMANDS = [
+  { command: '/model', label: 'Switch Model', description: 'Change the AI model' },
+  { command: '/remote', label: 'Remote Mode', description: 'Set SSH remote host' },
+  { command: '/remote off', label: 'Disable Remote', description: 'Switch to local mode' },
+  { command: '/continue', label: 'Continue', description: 'Resume interrupted generation' },
+  { command: '/cancel', label: 'Cancel', description: 'Stop current generation' },
+  { command: '/compact', label: 'Compact', description: 'Compress conversation context' },
+  { command: '/status', label: 'Status', description: 'Show conversation status' }
+];
+
+function showCommandMenu(anchor) {
+  dismissCommandMenu();
+  const menu = document.createElement('div');
+  menu.className = 'command-menu';
+  menu.innerHTML = COMMANDS.map((cmd) =>
+    '<button type="button" class="command-menu-item" data-command="' + escapeHtml(cmd.command) + '">' +
+    '<span class="command-menu-cmd">' + escapeHtml(cmd.command) + '</span>' +
+    '<span class="command-menu-desc">' + escapeHtml(cmd.description) + '</span>' +
+    '</button>'
+  ).join('');
+  // Position above the anchor button.
+  const rect = anchor.getBoundingClientRect();
+  menu.style.left = rect.left + 'px';
+  menu.style.bottom = (window.innerHeight - rect.top + 6) + 'px';
+  document.body.append(menu);
+  // Adjust if menu overflows left.
+  requestAnimationFrame(function() {
+    var menuRect = menu.getBoundingClientRect();
+    if (menuRect.right > window.innerWidth) {
+      menu.style.left = (window.innerWidth - menuRect.width - 8) + 'px';
+    }
+    if (menuRect.left < 0) {
+      menu.style.left = '8px';
+    }
+  });
+  menu.querySelectorAll('.command-menu-item').forEach(function(btn) {
+    btn.addEventListener('click', function() {
+      var cmd = btn.dataset.command;
+      dismissCommandMenu();
+      if (cmd === '/model') {
+        openModelPicker();
+      } else {
+        elements.composerInput.value = cmd;
+        autosizeComposer();
+        elements.composerInput.focus();
+        if (cmd !== '/remote') {
+          sendMessage();
+        }
+      }
+    });
+  });
+  setTimeout(function() {
+    document.addEventListener('click', dismissCommandMenu, { once: true });
+  }, 0);
+  state._commandMenu = menu;
+}
+
+function dismissCommandMenu() {
+  if (state._commandMenu) {
+    state._commandMenu.remove();
+    state._commandMenu = null;
+  }
+}
+
 // ---- Auto-updater UI ----
 function setupUpdaterUI() {
   const updater = window.stellacode?.updater;
@@ -5049,6 +5172,10 @@ function bindEvents() {
   });
   elements.sendButton.addEventListener('click', sendMessage);
   elements.attachButton.addEventListener('click', () => showToast('文件上下文会跟随后端 API 一起接入。'));
+  elements.commandButton.addEventListener('click', (event) => {
+    event.stopPropagation();
+    showCommandMenu(event.currentTarget);
+  });
   elements.messageList.addEventListener('scroll', () => {
     if (elements.messageList.scrollTop < 80) {
       loadOlderMessages();
