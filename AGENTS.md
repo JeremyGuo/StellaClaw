@@ -95,3 +95,7 @@
 - 如果上一个版本已经有非 draft release，新版本 changelog 只记录本次增量。
 - 如果上一个版本没有成功发布，不要让 changelog 断档；把未发布版本的小节内容合并进当前新版本小节，再发布当前版本。
 - 推送后继续检查当前版本的 CI / Release workflow，确认 tag 和 GitHub Release 最终创建成功。
+
+## 服务重启约定
+
+本仓库的 `stellaclaw` 服务可能正在运行当前 conversation 自身。重启时建议使用 `nohup bash -c 'sleep 10 && kill <old_pid> && sleep 2 && /path/to/stellaclaw --config ... --workdir ...' &` 的延迟方式，然后**立即结束当前对话**，避免重启过程中自身进程被 kill 导致会话中断或状态不一致。

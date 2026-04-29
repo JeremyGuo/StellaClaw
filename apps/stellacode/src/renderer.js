@@ -2024,6 +2024,7 @@ function applyLayoutSettings() {
     elements.toggleSidebarButton.setAttribute('aria-pressed', collapsed ? 'true' : 'false');
   }
   document.querySelector('.app-shell')?.style.setProperty('--sidebar-width', `${sidebarResponsiveWidth()}px`);
+  document.documentElement.style.setProperty('--sidebar-width', `${sidebarResponsiveWidth()}px`);
   const workbench = document.querySelector('.workbench');
   workbench?.style.setProperty('--inspector-size', `${panelResponsiveWidth(state.layout.context, 240, 620)}px`);
   workbench?.style.setProperty('--file-size', `${panelResponsiveWidth(state.layout.file, 260, 680)}px`);

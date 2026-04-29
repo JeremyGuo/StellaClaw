@@ -341,7 +341,7 @@ body.terminal-open .terminal-resizer {
 .sidebar-toggle {
   position: fixed;
   top: 28px;
-  left: 122px;
+  left: calc(var(--sidebar-width, 260px) - 32px);
   z-index: 500;
   display: inline-grid;
   width: 24px;
@@ -354,7 +354,7 @@ body.terminal-open .terminal-resizer {
   background: transparent;
   cursor: pointer;
   -webkit-app-region: no-drag;
-  transition: background 150ms ease, color 150ms ease;
+  transition: background 150ms ease, color 150ms ease, left 180ms ease;
 }
 
 .sidebar-toggle:hover {
@@ -1706,6 +1706,31 @@ body.is-refreshing #refreshButton {
   border-radius: 0;
   background: transparent;
   font-size: inherit;
+}
+
+.message-text pre,
+.preview-card pre {
+  margin: 8px 0;
+  overflow: auto;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--panel-2), #000 3%);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre;
+  word-wrap: normal;
+}
+
+.message-text pre code,
+.preview-card pre code {
+  padding: 0;
+  border-radius: 0;
+  background: transparent;
+  font-size: inherit;
+  white-space: pre;
 }
 
 .code-card,
