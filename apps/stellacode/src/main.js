@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog } = require('electron');
 const childProcess = require('node:child_process');
 const fs = require('node:fs/promises');
 const net = require('node:net');
@@ -286,12 +286,100 @@ function stopAllTunnels() {
   }
 }
 
+async function uploadWorkspaceFile(_event, payload) {
+  const settings = await readSettings();
+  const server = settings.servers.find((item) => item.id === payload.serverId);
+  if (!server) {
+    throw new Error(`Unknown server: ${payload.serverId}`);
+  }
+  const baseUrl = await resolveServerBaseUrl(server);
+  const url = joinApiUrl(
+    baseUrl,
+    `/api/conversations/${payload.conversationId}/workspace/upload?path=${encodeURIComponent(payload.path || '')}`
+  );
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SERVER_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${server.token}`,
+        'Content-Type': 'application/gzip'
+      },
+      body: Buffer.from(payload.data),
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      let message = `${response.status} ${response.statusText}`;
+      try {
+        const json = JSON.parse(text);
+        message = json.error || json.message || message;
+      } catch {}
+      throw new Error(message);
+    }
+    return await response.json();
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function downloadWorkspaceFile(_event, payload) {
+  const settings = await readSettings();
+  const server = settings.servers.find((item) => item.id === payload.serverId);
+  if (!server) {
+    throw new Error(`Unknown server: ${payload.serverId}`);
+  }
+  const baseUrl = await resolveServerBaseUrl(server);
+  const url = joinApiUrl(
+    baseUrl,
+    `/api/conversations/${payload.conversationId}/workspace/download?path=${encodeURIComponent(payload.path)}`
+  );
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SERVER_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${server.token}`,
+        Accept: 'application/gzip'
+      },
+      signal: controller.signal
+    });
+    if (!response.ok) {
+      const text = await response.text();
+      let message = `${response.status} ${response.statusText}`;
+      try {
+        const json = JSON.parse(text);
+        message = json.error || json.message || message;
+      } catch {}
+      throw new Error(message);
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const fileName = payload.suggestedName || `${path.basename(payload.path) || 'workspace'}.tar.gz`;
+    const win = BrowserWindow.getFocusedWindow();
+    const result = await dialog.showSaveDialog(win, {
+      defaultPath: fileName,
+      filters: [{ name: 'tar.gz archive', extensions: ['tar.gz'] }]
+    });
+    if (result.canceled || !result.filePath) {
+      return { saved: false };
+    }
+    await fs.writeFile(result.filePath, buffer);
+    return { saved: true, filePath: result.filePath, size: buffer.length };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 app.whenReady().then(() => {
   ipcMain.handle('settings:load', readSettings);
   ipcMain.handle('settings:save', (_event, settings) => writeSettings(settings));
   ipcMain.handle('server:request', requestServer);
   ipcMain.handle('server:connectionInfo', serverConnectionInfo);
   ipcMain.handle('server:stopTunnel', (_event, serverId) => stopTunnel(serverId));
+  ipcMain.handle('workspace:upload', uploadWorkspaceFile);
+  ipcMain.handle('workspace:download', downloadWorkspaceFile);
 
   createWindow();
 

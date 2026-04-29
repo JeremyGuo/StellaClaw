@@ -31,3 +31,11 @@ learnable_materials/
 
 .codex
 tmp/
+
+# Runtime workspace artifacts
+.skill/
+.stellaclaw/
+.skill_memory
+shared
+STELLACLAW.md
+MEMORY_DESIGN.md

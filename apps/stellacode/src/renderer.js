@@ -721,7 +721,17 @@ function handleProgressFeedbackEvent(payload) {
 
 function handleStatusEvent(serverId, conversationId, payload) {
   if (payload.status && typeof payload.status === 'object') {
-    state.statuses.set(conversationKey(serverId, conversationId), payload.status);
+    const key = conversationKey(serverId, conversationId);
+    const previous = state.statuses.get(key);
+    const workspaceChanged =
+      previous &&
+      (safeText(previous.remote) !== safeText(payload.status.remote) ||
+        safeText(previous.workspace) !== safeText(payload.status.workspace));
+    state.statuses.set(key, payload.status);
+    if (workspaceChanged && selectedConnectionMatches(serverId, conversationId)) {
+      invalidateWorkspaceCache(key);
+      refreshWorkspace().catch(() => {});
+    }
     renderSidebar();
     renderHeader();
     renderContext();
@@ -1005,6 +1015,184 @@ function workspaceCacheKey(key, path) {
 
 function workspaceFileCacheKey(key, path) {
   return `${key}::file::${normalizeWorkspacePath(path)}`;
+}
+
+function invalidateWorkspaceCache(key) {
+  const prefix = `${key}::`;
+  for (const cacheKey of [...state.workspaceListings.keys()]) {
+    if (cacheKey.startsWith(prefix)) {
+      state.workspaceListings.delete(cacheKey);
+    }
+  }
+  for (const cacheKey of [...state.workspaceErrors.keys()]) {
+    if (cacheKey.startsWith(prefix)) {
+      state.workspaceErrors.delete(cacheKey);
+    }
+  }
+  for (const cacheKey of [...state.workspaceFilePreviews.keys()]) {
+    if (cacheKey.startsWith(prefix)) {
+      state.workspaceFilePreviews.delete(cacheKey);
+    }
+  }
+  for (const cacheKey of [...state.workspaceFileErrors.keys()]) {
+    if (cacheKey.startsWith(prefix)) {
+      state.workspaceFileErrors.delete(cacheKey);
+    }
+  }
+}
+
+async function uploadFilesToWorkspace(files, targetDir) {
+  if (!state.selected || files.length === 0) {
+    return;
+  }
+  const { serverId, conversationId } = state.selected;
+  const key = selectedKey();
+  const normalized = normalizeWorkspacePath(targetDir);
+  setSessionActivity(`正在上传 ${files.length} 个文件...`);
+  try {
+    const tarModule = await import('https://cdn.jsdelivr.net/npm/tar-js@0.3.0/+esm').catch(() => null);
+    // Use a simple approach: pack files into tar, gzip, and send.
+    // Since we're in Electron, we can use a simpler method via IPC.
+    const archiveData = await packFilesToTarGz(files);
+    if (archiveData.byteLength > 10 * 1024 * 1024) {
+      showToast('上传文件过大（压缩后超过 10MB 限制）');
+      return;
+    }
+    await window.stellacode.uploadWorkspace({
+      serverId,
+      conversationId,
+      path: normalized,
+      data: Array.from(new Uint8Array(archiveData))
+    });
+    invalidateWorkspaceCache(key);
+    await refreshWorkspace(normalized, { expand: true, setActive: true });
+    setSessionActivity(`上传完成`, { clearAfterMs: 2000 });
+  } catch (error) {
+    showToast(`上传失败: ${error.message}`);
+    setSessionActivity('上传失败', { clearAfterMs: 2000 });
+  }
+}
+
+async function packFilesToTarGz(fileEntries) {
+  // fileEntries: array of { relativePath: string, data: ArrayBuffer }
+  // Build a minimal tar archive and gzip it.
+  const blocks = [];
+  for (const entry of fileEntries) {
+    const nameBytes = new TextEncoder().encode(entry.relativePath);
+    if (nameBytes.length > 99) {
+      // Use extended header for long names (PAX)
+      const paxContent = new TextEncoder().encode(`path=${entry.relativePath}\n`);
+      const paxSize = paxContent.length;
+      const paxHeader = createTarHeader('PaxHeader', paxSize, '0', 'x');
+      blocks.push(paxHeader);
+      blocks.push(padToBlock(paxContent));
+    }
+    const data = new Uint8Array(entry.data);
+    const header = createTarHeader(
+      entry.relativePath.length > 99 ? entry.relativePath.slice(0, 99) : entry.relativePath,
+      data.length,
+      entry.isDirectory ? '5' : '0',
+      entry.isDirectory ? '5' : '0'
+    );
+    blocks.push(header);
+    if (data.length > 0) {
+      blocks.push(padToBlock(data));
+    }
+  }
+  // End-of-archive marker: two 512-byte zero blocks
+  blocks.push(new Uint8Array(1024));
+  const tarData = concatenateBuffers(blocks);
+  // Gzip using CompressionStream (available in modern Chromium/Electron)
+  const cs = new CompressionStream('gzip');
+  const writer = cs.writable.getWriter();
+  writer.write(tarData);
+  writer.close();
+  const reader = cs.readable.getReader();
+  const chunks = [];
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  return concatenateBuffers(chunks).buffer;
+}
+
+function createTarHeader(name, size, fileType, typeFlag) {
+  const header = new Uint8Array(512);
+  const enc = new TextEncoder();
+  // name (0-99)
+  const nameBytes = enc.encode(name.slice(0, 99));
+  header.set(nameBytes, 0);
+  // mode (100-107)
+  header.set(enc.encode('0000755\0'), 100);
+  // uid (108-115)
+  header.set(enc.encode('0001000\0'), 108);
+  // gid (116-123)
+  header.set(enc.encode('0001000\0'), 116);
+  // size (124-135)
+  header.set(enc.encode(size.toString(8).padStart(11, '0') + '\0'), 124);
+  // mtime (136-147)
+  const mtime = Math.floor(Date.now() / 1000);
+  header.set(enc.encode(mtime.toString(8).padStart(11, '0') + '\0'), 136);
+  // typeflag (156)
+  header[156] = enc.encode(typeFlag || '0')[0];
+  // magic (257-262)
+  header.set(enc.encode('ustar\0'), 257);
+  // version (263-264)
+  header.set(enc.encode('00'), 263);
+  // checksum (148-155) - compute
+  header.set(enc.encode('        '), 148); // 8 spaces placeholder
+  let checksum = 0;
+  for (let i = 0; i < 512; i++) {
+    checksum += header[i];
+  }
+  header.set(enc.encode(checksum.toString(8).padStart(6, '0') + '\0 '), 148);
+  return header;
+}
+
+function padToBlock(data) {
+  const remainder = data.length % 512;
+  if (remainder === 0) return data;
+  const padded = new Uint8Array(data.length + (512 - remainder));
+  padded.set(data);
+  return padded;
+}
+
+function concatenateBuffers(arrays) {
+  let total = 0;
+  for (const arr of arrays) total += arr.length;
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const arr of arrays) {
+    result.set(arr, offset);
+    offset += arr.length;
+  }
+  return result;
+}
+
+async function downloadWorkspaceEntry(path) {
+  if (!state.selected) {
+    return;
+  }
+  const { serverId, conversationId } = state.selected;
+  setSessionActivity('正在下载...');
+  try {
+    const basename = normalizeWorkspacePath(path).split('/').pop() || 'workspace';
+    const result = await window.stellacode.downloadWorkspace({
+      serverId,
+      conversationId,
+      path: normalizeWorkspacePath(path),
+      suggestedName: `${basename}.tar.gz`
+    });
+    if (result.saved) {
+      setSessionActivity(`已保存到 ${result.filePath}`, { clearAfterMs: 3000 });
+    } else {
+      setSessionActivity('下载已取消', { clearAfterMs: 1500 });
+    }
+  } catch (error) {
+    showToast(`下载失败: ${error.message}`);
+    setSessionActivity('下载失败', { clearAfterMs: 2000 });
+  }
 }
 
 function workspaceListing(key, path) {
@@ -1765,7 +1953,17 @@ function refreshConversationStatusLater(serverId, conversationId, refreshEpoch) 
       if (refreshEpoch !== state.refreshEpoch || state.selected?.conversationId !== conversationId) {
         return;
       }
-      state.statuses.set(conversationKey(serverId, conversationId), status.data);
+      const key = conversationKey(serverId, conversationId);
+      const previous = state.statuses.get(key);
+      const workspaceChanged =
+        previous &&
+        (safeText(previous.remote) !== safeText(status.data.remote) ||
+          safeText(previous.workspace) !== safeText(status.data.workspace));
+      state.statuses.set(key, status.data);
+      if (workspaceChanged && selectedConnectionMatches(serverId, conversationId)) {
+        invalidateWorkspaceCache(key);
+        refreshWorkspace().catch(() => {});
+      }
       renderSidebar();
       renderHeader();
       renderContext();
@@ -2400,30 +2598,59 @@ function pollActiveConversation() {
 
 async function renameConversation(serverId, conversation) {
   const current = displayConversationName(serverId, conversation);
-  const name = window.prompt('会话名称', current);
-  if (name === null) {
-    return;
-  }
-  const nickname = name.trim() || conversation.conversation_id;
-  const key = conversationKey(serverId, conversation.conversation_id);
-  try {
-    const response = await api(serverId, `/api/conversations/${conversation.conversation_id}`, {
-      method: 'PATCH',
-      body: { nickname }
+  return new Promise((resolve) => {
+    openModal(`
+      <div class="modal-card small">
+        <div class="modal-head">
+          <h2>重命名会话</h2>
+          <button class="icon-button" type="button" data-close-modal>×</button>
+        </div>
+        <label class="field-label modal-field">
+          会话名称
+          <input id="renameConversationInput" type="text" value="${escapeHtml(current)}" />
+        </label>
+        <div class="modal-actions">
+          <button id="renameConversationConfirm" class="primary-button" type="button">确定</button>
+        </div>
+      </div>
+    `);
+    const input = $('#renameConversationInput');
+    if (input) {
+      input.select();
+    }
+    async function doRename() {
+      const name = input ? input.value : current;
+      const nickname = name.trim() || conversation.conversation_id;
+      const key = conversationKey(serverId, conversation.conversation_id);
+      closeModal();
+      try {
+        const response = await api(serverId, `/api/conversations/${conversation.conversation_id}`, {
+          method: 'PATCH',
+          body: { nickname }
+        });
+        const updated = response.data?.conversation;
+        const list = state.conversations.get(serverId) || [];
+        state.conversations.set(
+          serverId,
+          list.map((item) => (item.conversation_id === conversation.conversation_id ? { ...item, ...updated } : item))
+        );
+        delete state.settings.conversationNames[key];
+        saveSettingsSoon();
+        renderSidebar();
+        renderHeader();
+      } catch (error) {
+        showToast(error.message);
+      }
+      resolve();
+    }
+    $('#renameConversationConfirm')?.addEventListener('click', doRename);
+    input?.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        doRename();
+      }
     });
-    const updated = response.data?.conversation;
-    const list = state.conversations.get(serverId) || [];
-    state.conversations.set(
-      serverId,
-      list.map((item) => (item.conversation_id === conversation.conversation_id ? { ...item, ...updated } : item))
-    );
-    delete state.settings.conversationNames[key];
-    saveSettingsSoon();
-    renderSidebar();
-    renderHeader();
-  } catch (error) {
-    showToast(error.message);
-  }
+  });
 }
 
 function visibleConversationRows() {
@@ -3599,6 +3826,146 @@ function bindWorkspaceActions() {
   root.querySelector('[data-workspace-refresh]')?.addEventListener('click', () => {
     refreshWorkspace(currentWorkspacePath(), { expand: true, setActive: true }).catch((error) => showToast(error.message));
   });
+
+  // Right-click context menu on workspace entries
+  root.querySelectorAll('[data-workspace-toggle], [data-workspace-file]').forEach((button) => {
+    button.addEventListener('contextmenu', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const path = button.dataset.workspaceToggle || button.dataset.workspaceFile || '';
+      const isDir = button.dataset.workspaceToggle !== undefined;
+      showWorkspaceContextMenu(event.clientX, event.clientY, path, isDir);
+    });
+  });
+
+  // Drag-and-drop upload on workspace page
+  const workspacePage = root.querySelector('.workspace-page');
+  if (workspacePage) {
+    bindWorkspaceDragDrop(workspacePage);
+  }
+}
+
+function showWorkspaceContextMenu(x, y, path, isDir) {
+  dismissWorkspaceContextMenu();
+  const menu = document.createElement('div');
+  menu.className = 'workspace-context-menu';
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+  menu.innerHTML = `
+    <button type="button" data-action="download">${isDir ? '下载目录 (tar.gz)' : '下载文件 (tar.gz)'}</button>
+  `;
+  document.body.append(menu);
+  // Adjust if menu overflows viewport
+  requestAnimationFrame(() => {
+    const rect = menu.getBoundingClientRect();
+    if (rect.right > window.innerWidth) menu.style.left = `${window.innerWidth - rect.width - 8}px`;
+    if (rect.bottom > window.innerHeight) menu.style.top = `${window.innerHeight - rect.height - 8}px`;
+  });
+  menu.querySelector('[data-action="download"]')?.addEventListener('click', () => {
+    dismissWorkspaceContextMenu();
+    downloadWorkspaceEntry(path).catch((error) => showToast(error.message));
+  });
+  const dismiss = (event) => {
+    if (!menu.contains(event.target)) {
+      dismissWorkspaceContextMenu();
+    }
+  };
+  setTimeout(() => document.addEventListener('click', dismiss, { once: true }), 0);
+  state._workspaceContextMenu = menu;
+}
+
+function dismissWorkspaceContextMenu() {
+  if (state._workspaceContextMenu) {
+    state._workspaceContextMenu.remove();
+    state._workspaceContextMenu = null;
+  }
+}
+
+function bindWorkspaceDragDrop(container) {
+  let dragCounter = 0;
+  container.addEventListener('dragenter', (event) => {
+    event.preventDefault();
+    dragCounter++;
+    container.classList.add('drag-over');
+  });
+  container.addEventListener('dragleave', (event) => {
+    event.preventDefault();
+    dragCounter--;
+    if (dragCounter <= 0) {
+      dragCounter = 0;
+      container.classList.remove('drag-over');
+    }
+  });
+  container.addEventListener('dragover', (event) => {
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+  });
+  container.addEventListener('drop', (event) => {
+    event.preventDefault();
+    dragCounter = 0;
+    container.classList.remove('drag-over');
+    const items = event.dataTransfer?.items;
+    if (!items || items.length === 0) return;
+    const targetDir = currentWorkspacePath();
+    collectDroppedFiles(items).then((fileEntries) => {
+      if (fileEntries.length > 0) {
+        uploadFilesToWorkspace(fileEntries, targetDir).catch((error) => showToast(error.message));
+      }
+    });
+  });
+}
+
+async function collectDroppedFiles(dataTransferItems) {
+  const entries = [];
+  const items = [];
+  for (let i = 0; i < dataTransferItems.length; i++) {
+    const item = dataTransferItems[i];
+    if (item.kind === 'file') {
+      const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+      if (entry) {
+        items.push(entry);
+      } else {
+        const file = item.getAsFile();
+        if (file) {
+          const data = await file.arrayBuffer();
+          entries.push({ relativePath: file.name, data, isDirectory: false });
+        }
+      }
+    }
+  }
+  for (const entry of items) {
+    await traverseEntry(entry, '', entries);
+  }
+  return entries;
+}
+
+async function traverseEntry(entry, parentPath, results) {
+  const fullPath = parentPath ? `${parentPath}/${entry.name}` : entry.name;
+  if (entry.isFile) {
+    const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+    const data = await file.arrayBuffer();
+    results.push({ relativePath: fullPath, data, isDirectory: false });
+  } else if (entry.isDirectory) {
+    results.push({ relativePath: fullPath + '/', data: new ArrayBuffer(0), isDirectory: true });
+    const reader = entry.createReader();
+    const children = await new Promise((resolve, reject) => {
+      const all = [];
+      function readBatch() {
+        reader.readEntries((batch) => {
+          if (batch.length === 0) {
+            resolve(all);
+          } else {
+            all.push(...batch);
+            readBatch();
+          }
+        }, reject);
+      }
+      readBatch();
+    });
+    for (const child of children) {
+      await traverseEntry(child, fullPath, results);
+    }
+  }
 }
 
 function renderDetailContext() {

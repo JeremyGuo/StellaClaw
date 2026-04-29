@@ -32,7 +32,10 @@ use crate::{
     },
     conversation_id_manager::ConversationIdManager,
     logger::StellaclawLogger,
-    remote_actor::{list_workspace_entries, read_workspace_file, RemoteActorError},
+    remote_actor::{
+        download_workspace_archive, list_workspace_entries, read_workspace_file,
+        upload_workspace_archive, write_workspace_file, RemoteActorError,
+    },
     workspace::sshfs_workspace_root,
 };
 
@@ -50,7 +53,7 @@ use super::{
 };
 
 const MAX_HEADER_BYTES: usize = 64 * 1024;
-const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_BODY_BYTES: usize = 11 * 1024 * 1024;
 const DEFAULT_WORKSPACE_FILE_LIMIT_BYTES: usize = 1024 * 1024;
 const MAX_WORKSPACE_FILE_LIMIT_BYTES: usize = 5 * 1024 * 1024;
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -211,6 +214,12 @@ impl WebChannel {
             }
             ("GET", ["conversations", conversation_id, "workspace", "file"]) => {
                 self.conversation_workspace_file(conversation_id, &request.query)
+            }
+            ("POST", ["conversations", conversation_id, "workspace", "upload"]) => {
+                self.conversation_workspace_upload(conversation_id, &request.query, &request.body)
+            }
+            ("GET", ["conversations", conversation_id, "workspace", "download"]) => {
+                self.conversation_workspace_download(conversation_id, &request.query)
             }
             ("GET", ["conversations", conversation_id, "terminals"]) => {
                 self.list_terminals(conversation_id)
@@ -730,6 +739,53 @@ impl WebChannel {
             },
         )?;
         Ok(json_response(200, json!(file)))
+    }
+
+    fn conversation_workspace_upload(
+        &self,
+        conversation_id: &str,
+        query: &HashMap<String, String>,
+        body: &[u8],
+    ) -> ApiResult<HttpResponse> {
+        let state = self.load_web_state(conversation_id)?;
+        let dir = query
+            .get("path")
+            .map(String::as_str)
+            .unwrap_or("");
+        let count = upload_workspace_archive(&self.workdir, &state, dir, body).map_err(
+            |error| match error {
+                RemoteActorError::InvalidPath(message) => ApiError::new(400, message),
+                RemoteActorError::Internal(error) => ApiError::internal(error),
+            },
+        )?;
+        Ok(json_response(
+            200,
+            json!({"conversation_id": conversation_id, "path": dir, "entries_extracted": count}),
+        ))
+    }
+
+    fn conversation_workspace_download(
+        &self,
+        conversation_id: &str,
+        query: &HashMap<String, String>,
+    ) -> ApiResult<HttpResponse> {
+        let state = self.load_web_state(conversation_id)?;
+        let path = query
+            .get("path")
+            .map(String::as_str)
+            .ok_or_else(|| ApiError::new(400, "workspace path is required for download"))?;
+        let paths = vec![path];
+        let archive = download_workspace_archive(&self.workdir, &state, &paths).map_err(
+            |error| match error {
+                RemoteActorError::InvalidPath(message) => ApiError::new(400, message),
+                RemoteActorError::Internal(error) => ApiError::internal(error),
+            },
+        )?;
+        Ok(HttpResponse {
+            status: 200,
+            content_type: "application/gzip",
+            body: archive,
+        })
     }
 
     fn list_terminals(&self, conversation_id: &str) -> ApiResult<HttpResponse> {

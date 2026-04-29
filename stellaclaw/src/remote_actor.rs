@@ -1,12 +1,13 @@
 use std::{
     fmt, fs,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
 use base64::{engine::general_purpose, Engine as _};
+use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use serde::Serialize;
 use stellaclaw_core::session_actor::ToolRemoteMode;
 
@@ -270,6 +271,167 @@ pub fn read_workspace_file(
         encoding,
         data,
     })
+}
+
+/// Maximum compressed upload size: 10 MiB.
+const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
+
+/// Write a single file into the workspace.
+pub fn write_workspace_file(
+    workdir: &Path,
+    state: &ConversationState,
+    relative_path: &str,
+    data: &[u8],
+) -> std::result::Result<(), RemoteActorError> {
+    let normalized = normalize_workspace_path(relative_path)?;
+    if normalized.as_os_str().is_empty() {
+        return Err(RemoteActorError::InvalidPath(
+            "workspace file path must not be empty".to_string(),
+        ));
+    }
+    let conversation_root = workdir.join("conversations").join(&state.conversation_id);
+    let workspace_root = ensure_workspace_for_remote_mode(
+        workdir,
+        &conversation_root,
+        &state.conversation_id,
+        &state.tool_remote_mode,
+    )?;
+    let target = workspace_root.join(&normalized);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create parent for {}", target.display())
+        })?;
+    }
+    fs::write(&target, data)
+        .with_context(|| format!("failed to write workspace file {}", target.display()))?;
+    Ok(())
+}
+
+/// Upload a tar.gz archive and extract it into the workspace directory at `relative_dir`.
+pub fn upload_workspace_archive(
+    workdir: &Path,
+    state: &ConversationState,
+    relative_dir: &str,
+    archive_data: &[u8],
+) -> std::result::Result<usize, RemoteActorError> {
+    if archive_data.len() > MAX_UPLOAD_BYTES {
+        return Err(RemoteActorError::InvalidPath(format!(
+            "upload exceeds {} byte limit (got {} bytes)",
+            MAX_UPLOAD_BYTES,
+            archive_data.len()
+        )));
+    }
+    let normalized = normalize_workspace_path(relative_dir)?;
+    let conversation_root = workdir.join("conversations").join(&state.conversation_id);
+    let workspace_root = ensure_workspace_for_remote_mode(
+        workdir,
+        &conversation_root,
+        &state.conversation_id,
+        &state.tool_remote_mode,
+    )?;
+    let target_dir = workspace_root.join(&normalized);
+    fs::create_dir_all(&target_dir)
+        .with_context(|| format!("failed to create {}", target_dir.display()))?;
+
+    let decoder = GzDecoder::new(archive_data);
+    let mut archive = tar::Archive::new(decoder);
+    archive.set_overwrite(true);
+    let mut count = 0_usize;
+    for entry in archive
+        .entries()
+        .with_context(|| "failed to read tar entries")?
+    {
+        let mut entry = entry.with_context(|| "failed to read tar entry")?;
+        let entry_path = entry
+            .path()
+            .with_context(|| "failed to read entry path")?
+            .into_owned();
+        // Security: reject absolute paths and parent directory traversal.
+        if entry_path.is_absolute() {
+            continue;
+        }
+        let has_parent_traversal = entry_path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir));
+        if has_parent_traversal {
+            continue;
+        }
+        entry
+            .unpack_in(&target_dir)
+            .with_context(|| format!("failed to unpack {}", entry_path.display()))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Download one or more workspace paths as a tar.gz archive.
+/// Returns the compressed bytes.
+pub fn download_workspace_archive(
+    workdir: &Path,
+    state: &ConversationState,
+    relative_paths: &[&str],
+) -> std::result::Result<Vec<u8>, RemoteActorError> {
+    if relative_paths.is_empty() {
+        return Err(RemoteActorError::InvalidPath(
+            "at least one path is required for download".to_string(),
+        ));
+    }
+    let conversation_root = workdir.join("conversations").join(&state.conversation_id);
+    let workspace_root = ensure_workspace_for_remote_mode(
+        workdir,
+        &conversation_root,
+        &state.conversation_id,
+        &state.tool_remote_mode,
+    )?;
+
+    let mut output = Vec::new();
+    {
+        let encoder = GzEncoder::new(&mut output, Compression::fast());
+        let mut builder = tar::Builder::new(encoder);
+        for relative_path in relative_paths {
+            let normalized = normalize_workspace_path(relative_path)?;
+            let target = workspace_root.join(&normalized);
+            let metadata = fs::metadata(&target).with_context(|| {
+                format!(
+                    "failed to inspect workspace path {}",
+                    display_workspace_path(&normalized)
+                )
+            })?;
+            let archive_name = if normalized.as_os_str().is_empty() {
+                PathBuf::from("workspace")
+            } else {
+                normalized.clone()
+            };
+            if metadata.is_dir() {
+                builder
+                    .append_dir_all(&archive_name, &target)
+                    .with_context(|| {
+                        format!("failed to archive directory {}", target.display())
+                    })?;
+            } else if metadata.is_file() {
+                let mut file = fs::File::open(&target).with_context(|| {
+                    format!("failed to open {}", target.display())
+                })?;
+                builder
+                    .append_file(&archive_name, &mut file)
+                    .with_context(|| {
+                        format!("failed to archive file {}", target.display())
+                    })?;
+            }
+        }
+        builder
+            .finish()
+            .with_context(|| "failed to finalize tar archive")?;
+    }
+
+    if output.len() > MAX_UPLOAD_BYTES {
+        return Err(RemoteActorError::InvalidPath(format!(
+            "download archive exceeds {} byte limit (got {} bytes)",
+            MAX_UPLOAD_BYTES,
+            output.len()
+        )));
+    }
+    Ok(output)
 }
 
 fn normalize_workspace_path(value: &str) -> std::result::Result<PathBuf, RemoteActorError> {

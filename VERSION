@@ -1,5 +1,16 @@
-version: 1.15.13
+version: 1.16.0
 ---
+
+# 1.16.0
+
+- 增加 Stellacode workspace 文件上传/下载功能：
+  后端新增 `POST /api/conversations/{id}/workspace/upload?path=` 和 `GET /api/conversations/{id}/workspace/download?path=`，分别接收/返回 tar.gz 格式的压缩包，压缩后限制 10MB；上传时自动解包到目标目录，安全检查拒绝绝对路径和父目录穿越；下载支持单文件和整个目录。前端文件面板支持拖拽文件/文件夹上传到当前目录，以及右键菜单下载文件或目录（弹出原生保存对话框）。新增 `tar` 和 `flate2` Rust 依赖，HTTP body 上限从 2MB 提升到 11MB。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Stellacode remote 模式切换后文件面板不刷新的问题：
+  后端 `set_remote_mode` 和 `disable_remote_mode` 完成后现在会推送 `status` 事件；前端收到 status 更新时检测 `remote` 或 `workspace` 字段变化，如果变了就清除对应 conversation 的 workspace listing 和文件预览缓存并重新请求。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Stellacode conversation 重命名在 Electron 中不可用的问题：
+  `window.prompt()` 在 Electron BrowserWindow 中不支持，改为使用项目现有的 modal 弹窗基础设施，支持输入框、Enter 确认和 × 取消。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.15.13
 

@@ -2175,6 +2175,7 @@ impl ConversationRuntime {
             self.conversation_root.display(),
             self.workspace_root.display()
         ))?;
+        self.send_status()?;
         Ok(())
     }
 
@@ -2241,6 +2242,7 @@ impl ConversationRuntime {
             "已关闭远程 workspace，当前 workspace 为 `{}`。",
             self.workspace_root.display()
         ))?;
+        self.send_status()?;
         Ok(())
     }
 
