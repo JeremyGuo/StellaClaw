@@ -1,5 +1,10 @@
-version: 1.16.2
+version: 1.16.3
 ---
+
+# 1.16.3
+
+- sshfs watchdog 守护线程：
+  FixedSsh remote mode 的 conversation 现在会启动一个后台守护线程，每 20 秒用带超时的子进程探活 sshfs mountpoint。如果 mountpoint 无响应，watchdog 设置 flag，主循环检测到后立即：关闭所有 agent_server 进程、向用户发送错误消息和 ChannelEvent::Error、lazy unmount 坏的 sshfs、退出 conversation 线程。后续用户发送任意消息时 dispatcher 会重新 spawn conversation 线程并自动重挂 sshfs。同时将 `is_mountpoint()` 和 `sshfs_workspace_is_usable()` 改为带超时子进程实现，避免在 FUSE 僵尸 mount 上永久阻塞。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.16.2
 

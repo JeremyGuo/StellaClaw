@@ -2,7 +2,10 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::{mpsc, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -41,8 +44,8 @@ use crate::{
     sandbox::bubblewrap_support_error,
     session_client::AgentServerClient,
     workspace::{
-        ensure_workspace_for_remote_mode, ensure_workspace_seed, sshfs_workspace_root,
-        unmount_sshfs_workspace,
+        ensure_workspace_for_remote_mode, ensure_workspace_seed, sshfs_health_check,
+        sshfs_workspace_root, unmount_sshfs_workspace,
     },
 };
 
@@ -214,6 +217,35 @@ pub fn spawn_conversation(
     tx
 }
 
+const SSHFS_WATCHDOG_INTERVAL: Duration = Duration::from_secs(20);
+const SSHFS_WATCHDOG_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn sshfs_watchdog_loop(
+    mountpoint: &Path,
+    failed: &AtomicBool,
+    logger: &StellaclawLogger,
+    conversation_id: &str,
+) {
+    loop {
+        thread::sleep(SSHFS_WATCHDOG_INTERVAL);
+        if failed.load(Ordering::Relaxed) {
+            // Already flagged; nothing more to do.
+            return;
+        }
+        if !sshfs_health_check(mountpoint, SSHFS_WATCHDOG_PROBE_TIMEOUT) {
+            logger.warn(
+                "sshfs_watchdog_failed",
+                json!({
+                    "conversation_id": conversation_id,
+                    "mountpoint": mountpoint.display().to_string(),
+                }),
+            );
+            failed.store(true, Ordering::SeqCst);
+            return;
+        }
+    }
+}
+
 fn run_conversation(
     workdir: PathBuf,
     state: ConversationState,
@@ -255,6 +287,38 @@ fn run_conversation(
     runtime.persist_state()?;
 
     loop {
+        // Check if the sshfs watchdog has flagged a failure.
+        if runtime.sshfs_failed.load(Ordering::Relaxed) {
+            runtime.logger.warn(
+                "sshfs_watchdog_conversation_stopping",
+                json!({
+                    "conversation_id": runtime.state.conversation_id,
+                    "workspace_root": runtime.workspace_root.display().to_string(),
+                }),
+            );
+            let mountpoint = runtime.workspace_root.display().to_string();
+            let sshfs_error_msg = format!(
+                "Remote workspace ({mountpoint}) is unresponsive. \
+                 Session stopped.\n\
+                 Send any message to attempt automatic recovery.",
+            );
+            let _ = runtime.send_channel_error(
+                OutgoingErrorScope::RemoteWorkspace,
+                OutgoingErrorSeverity::Error,
+                "sshfs_unresponsive",
+                sshfs_error_msg.clone(),
+                Some(json!({"mountpoint": mountpoint})),
+                false,
+                None,
+            );
+            let _ = runtime.send_delivery_from_text(sshfs_error_msg);
+            // Attempt lazy unmount so the next conversation start can remount
+            // cleanly.
+            let _ = unmount_sshfs_workspace(&runtime.workdir, &runtime.state.conversation_id);
+            runtime.shutdown();
+            break;
+        }
+
         let mut changed = false;
         while runtime.pump_session_events()? {
             changed = true;
@@ -381,6 +445,10 @@ struct ConversationRuntime {
     subagents: BTreeMap<String, ManagedSessionRuntime>,
     foreground_progress: Option<ActiveForegroundProgress>,
     session_plans: BTreeMap<String, TaskPlanView>,
+    /// Set to `true` by the sshfs watchdog thread when the mount becomes
+    /// unresponsive.  The main conversation loop checks this flag each
+    /// iteration and tears down the conversation when it fires.
+    sshfs_failed: Arc<AtomicBool>,
 }
 
 struct ForegroundSessionRuntime {
@@ -503,6 +571,22 @@ impl ConversationRuntime {
             );
         }
 
+        let sshfs_failed = Arc::new(AtomicBool::new(false));
+
+        // Spawn an sshfs watchdog thread for FixedSsh conversations.
+        if matches!(state.tool_remote_mode, ToolRemoteMode::FixedSsh { .. }) {
+            let flag = sshfs_failed.clone();
+            let check_path = workspace_root.clone();
+            let watchdog_logger = logger.clone();
+            let conv_id = state.conversation_id.clone();
+            thread::Builder::new()
+                .name(format!("sshfs-watchdog-{conv_id}"))
+                .spawn(move || {
+                    sshfs_watchdog_loop(&check_path, &flag, &watchdog_logger, &conv_id);
+                })
+                .context("failed to spawn sshfs watchdog thread")?;
+        }
+
         Ok(Self {
             workdir,
             conversation_root,
@@ -519,6 +603,7 @@ impl ConversationRuntime {
             subagents,
             foreground_progress: None,
             session_plans: BTreeMap::new(),
+            sshfs_failed,
         })
     }
 

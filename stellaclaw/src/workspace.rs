@@ -2,6 +2,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -268,13 +269,19 @@ fn ensure_sshfs_available() -> Result<()> {
 }
 
 fn is_mountpoint(path: &Path) -> bool {
-    if Command::new("mountpoint")
-        .arg("-q")
+    use std::process::Stdio;
+    // Use timeout to avoid blocking on dead FUSE mounts.
+    let Ok(output) = Command::new("timeout")
+        .args(["3", "mountpoint", "-q"])
         .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
-    {
+    else {
+        return false;
+    };
+    if output.success() {
         return true;
     }
     let Ok(canonical) = path.canonicalize() else {
@@ -307,9 +314,29 @@ fn create_mountpoint_directory(path: &Path) -> Result<()> {
 }
 
 fn sshfs_workspace_is_usable(path: &Path) -> bool {
-    match fs::read_dir(path) {
-        Ok(_) => true,
-        Err(error) => !is_disconnected_transport_error(&error),
+    sshfs_health_check(path, Duration::from_secs(5))
+}
+
+/// Check whether an sshfs mountpoint is responsive by running `stat` with a
+/// timeout.  Returns `true` when the mountpoint responds within the deadline,
+/// `false` otherwise.  This must never block on a dead FUSE mount.
+pub fn sshfs_health_check(path: &Path, timeout: Duration) -> bool {
+    use std::process::Stdio;
+    let timeout_secs = timeout.as_secs().max(1).to_string();
+    let Ok(mut child) = Command::new("timeout")
+        .arg(&timeout_secs)
+        .arg("stat")
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    match child.wait() {
+        Ok(status) => status.success(),
+        Err(_) => false,
     }
 }
 
