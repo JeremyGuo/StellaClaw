@@ -4043,6 +4043,10 @@ function renderEditorTabs() {
 function highlightedCode(value, path) {
   const escaped = escapeHtml(value || '');
   const ext = fileExtension(path);
+  // JSON gets dedicated highlighting to avoid regex conflicts with URLs.
+  if (ext === 'json' || ext === 'jsonc') {
+    return highlightJSON(escaped);
+  }
   const keywordPattern =
     ext === 'rs'
       ? /\b(fn|let|mut|pub|struct|enum|impl|trait|use|mod|match|if|else|for|while|loop|return|async|await|Result|Option|Some|None|Ok|Err)\b/g
@@ -4051,11 +4055,65 @@ function highlightedCode(value, path) {
         : ext === 'css'
           ? /\b(display|position|grid|flex|color|background|border|padding|margin|width|height|min|max|overflow|font|transform|transition)\b/g
           : /\b(const|let|var|function|return|if|else|for|while|class|import|export|from|async|await|new|try|catch|throw|true|false|null|undefined)\b/g;
-  return escaped
-    .replace(/(&quot;.*?&quot;|&#039;.*?&#039;|`.*?`)/g, '<span class="code-string">$1</span>')
-    .replace(/(\/\/.*?$|#.*?$)/gm, '<span class="code-comment">$1</span>')
-    .replace(keywordPattern, '<span class="code-keyword">$1</span>')
-    .replace(/\b(\d+(?:\.\d+)?)\b/g, '<span class="code-number">$1</span>');
+  // Tokenize: extract strings and comments first to protect them from keyword/number replacement.
+  const tokens = [];
+  const stringOrComment = /(&quot;(?:[^&]|&(?!quot;))*?&quot;|&#039;(?:[^&]|&(?!#039;))*?&#039;|`[^`]*`|\/\/.*?$|#.*?$)/gm;
+  let lastIndex = 0;
+  let m;
+  while ((m = stringOrComment.exec(escaped)) !== null) {
+    if (m.index > lastIndex) {
+      tokens.push({ type: 'code', text: escaped.slice(lastIndex, m.index) });
+    }
+    const matched = m[1];
+    if (matched.startsWith('//') || matched.startsWith('#')) {
+      tokens.push({ type: 'comment', text: matched });
+    } else {
+      tokens.push({ type: 'string', text: matched });
+    }
+    lastIndex = m.index + m[0].length;
+  }
+  if (lastIndex < escaped.length) {
+    tokens.push({ type: 'code', text: escaped.slice(lastIndex) });
+  }
+  return tokens.map(tok => {
+    if (tok.type === 'string') return `<span class="code-string">${tok.text}</span>`;
+    if (tok.type === 'comment') return `<span class="code-comment">${tok.text}</span>`;
+    return tok.text
+      .replace(keywordPattern, '<span class="code-keyword">$1</span>')
+      .replace(/\b(\d+(?:\.\d+)?)\b/g, '<span class="code-number">$1</span>');
+  }).join('');
+}
+
+function highlightJSON(escaped) {
+  // Token-based JSON highlighting: strings, keys, numbers, booleans/null.
+  const tokens = [];
+  // Match JSON strings (which are &quot;...&quot; after escapeHtml).
+  const pattern = /(&quot;(?:[^&]|&(?!quot;))*?&quot;)|(\b(?:true|false|null)\b)|(\b-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b)/g;
+  let lastIndex = 0;
+  let m;
+  while ((m = pattern.exec(escaped)) !== null) {
+    if (m.index > lastIndex) {
+      tokens.push(escaped.slice(lastIndex, m.index));
+    }
+    if (m[1]) {
+      // Check if this string is a key (followed by optional whitespace + colon).
+      const after = escaped.slice(m.index + m[0].length);
+      if (/^\s*:/.test(after)) {
+        tokens.push(`<span class="code-keyword">${m[1]}</span>`);
+      } else {
+        tokens.push(`<span class="code-string">${m[1]}</span>`);
+      }
+    } else if (m[2]) {
+      tokens.push(`<span class="code-number">${m[2]}</span>`);
+    } else if (m[3]) {
+      tokens.push(`<span class="code-number">${m[3]}</span>`);
+    }
+    lastIndex = m.index + m[0].length;
+  }
+  if (lastIndex < escaped.length) {
+    tokens.push(escaped.slice(lastIndex));
+  }
+  return tokens.join('');
 }
 
 function renderFileBody(path, preview, loading, error) {
