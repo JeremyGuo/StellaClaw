@@ -748,10 +748,7 @@ impl WebChannel {
         body: &[u8],
     ) -> ApiResult<HttpResponse> {
         let state = self.load_web_state(conversation_id)?;
-        let dir = query
-            .get("path")
-            .map(String::as_str)
-            .unwrap_or("");
+        let dir = query.get("path").map(String::as_str).unwrap_or("");
         let count = upload_workspace_archive(&self.workdir, &state, dir, body).map_err(
             |error| match error {
                 RemoteActorError::InvalidPath(message) => ApiError::new(400, message),

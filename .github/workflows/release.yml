@@ -65,7 +65,7 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-  build:
+  build-server:
     needs: prepare
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
@@ -100,10 +100,65 @@ jobs:
           name: stellaclaw-linux-x86_64
           path: stellaclaw-${{ needs.prepare.outputs.version }}-linux-x86_64.tar.gz
 
+  build-stellacode:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-13
+            platform: mac
+            args: "--x64"
+          - os: macos-latest
+            platform: mac
+            args: "--arm64"
+          - os: windows-latest
+            platform: win
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: apps/stellacode
+    steps:
+      - name: Checkout triggering commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.head_sha }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: apps/stellacode/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Stellacode (${{ matrix.platform }})
+        run: npx electron-builder --${{ matrix.platform }} ${{ matrix.args || '' }} --publish never
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Stellacode artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: stellacode-${{ matrix.os }}
+          path: |
+            apps/stellacode/dist/*.exe
+            apps/stellacode/dist/*.dmg
+            apps/stellacode/dist/*.zip
+            apps/stellacode/dist/*.AppImage
+            apps/stellacode/dist/*.tar.gz
+          if-no-files-found: warn
+
   publish:
     needs:
       - prepare
-      - build
+      - build-server
+      - build-stellacode
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -130,7 +185,8 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          find release-artifacts -type f -name '*.tar.gz' -exec cp {} dist/ \;
+          find release-artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' \) -exec cp {} dist/ \;
+          ls -lh dist/
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
@@ -139,4 +195,4 @@ jobs:
           name: ${{ needs.prepare.outputs.tag }}
           target_commitish: ${{ needs.prepare.outputs.head_sha }}
           body: ${{ needs.prepare.outputs.notes }}
-          files: dist/*.tar.gz
+          files: dist/*

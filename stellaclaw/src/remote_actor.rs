@@ -298,9 +298,8 @@ pub fn write_workspace_file(
     )?;
     let target = workspace_root.join(&normalized);
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("failed to create parent for {}", target.display())
-        })?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create parent for {}", target.display()))?;
     }
     fs::write(&target, data)
         .with_context(|| format!("failed to write workspace file {}", target.display()))?;
@@ -405,18 +404,13 @@ pub fn download_workspace_archive(
             if metadata.is_dir() {
                 builder
                     .append_dir_all(&archive_name, &target)
-                    .with_context(|| {
-                        format!("failed to archive directory {}", target.display())
-                    })?;
+                    .with_context(|| format!("failed to archive directory {}", target.display()))?;
             } else if metadata.is_file() {
-                let mut file = fs::File::open(&target).with_context(|| {
-                    format!("failed to open {}", target.display())
-                })?;
+                let mut file = fs::File::open(&target)
+                    .with_context(|| format!("failed to open {}", target.display()))?;
                 builder
                     .append_file(&archive_name, &mut file)
-                    .with_context(|| {
-                        format!("failed to archive file {}", target.display())
-                    })?;
+                    .with_context(|| format!("failed to archive file {}", target.display()))?;
             }
         }
         builder

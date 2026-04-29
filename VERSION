@@ -1,5 +1,10 @@
-version: 1.16.1
+version: 1.16.2
 ---
+
+# 1.16.2
+
+- 修复终端颜色和响应体验：
+  终端 output 改为增量写入 xterm.js，不再每次 poll 全量 sync 累积 buffer，消除闪屏和重复渲染；poll 循环中直接把增量数据写入 xterm session，renderTerminalContext 不再干预已有 xterm session 的输出。添加 WebGL renderer addon 提升渲染性能，scrollback 从 5000 提升到 10000，字号从 12 调到 13，光标样式改为 bar。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.16.1
 

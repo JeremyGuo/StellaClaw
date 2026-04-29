@@ -4257,6 +4257,8 @@ async function resizeTerminal(terminalId, cols, rows) {
 }
 
 function syncXtermOutput(session, output) {
+  // Called with the full accumulated output for fallback rendering.
+  // For xterm sessions, prefer writeXtermIncremental() during poll.
   const text = safeText(output);
   if (text.length < session.writtenLength) {
     session.terminal.reset();
@@ -4269,19 +4271,27 @@ function syncXtermOutput(session, output) {
   }
 }
 
+function writeXtermIncremental(session, incrementalData) {
+  if (!incrementalData) return;
+  session.terminal.write(incrementalData);
+  session.writtenLength += incrementalData.length;
+}
+
 function createXtermSession(host, terminal, output) {
   const TerminalCtor = window.Terminal?.Terminal || window.Terminal;
   const FitAddonCtor = window.FitAddon?.FitAddon || window.FitAddon;
+  const WebglAddonCtor = window.WebglAddon?.WebglAddon || window.WebglAddon;
   if (!TerminalCtor || !FitAddonCtor) {
     return null;
   }
   const xterm = new TerminalCtor({
     allowTransparency: true,
     cursorBlink: true,
+    cursorStyle: 'bar',
     fontFamily: '"SFMono-Regular", "Cascadia Code", "Roboto Mono", ui-monospace, monospace',
-    fontSize: 12,
-    lineHeight: 1.2,
-    scrollback: 5000,
+    fontSize: 13,
+    lineHeight: 1.15,
+    scrollback: 10000,
     theme: {
       background: 'rgba(8, 9, 8, 0.72)',
       foreground: '#e9e9e3',
@@ -4308,6 +4318,15 @@ function createXtermSession(host, terminal, output) {
   const fitAddon = new FitAddonCtor();
   xterm.loadAddon(fitAddon);
   xterm.open(host);
+  // Try loading WebGL renderer for better performance.
+  if (WebglAddonCtor) {
+    try {
+      const webglAddon = new WebglAddonCtor();
+      xterm.loadAddon(webglAddon);
+    } catch {
+      // WebGL not available; fall back to canvas renderer.
+    }
+  }
   const session = {
     terminal: xterm,
     fitAddon,
@@ -4382,11 +4401,11 @@ async function createTerminal() {
 
 async function readTerminalOutput() {
   if (!state.selected) {
-    return;
+    return null;
   }
   const terminal = activeTerminal();
   if (!terminal) {
-    return;
+    return null;
   }
   const { serverId, conversationId } = state.selected;
   const key = terminalKey();
@@ -4398,7 +4417,9 @@ async function readTerminalOutput() {
   );
   const output = response.data;
   const previous = state.terminalOutput.get(outputKey) || '';
+  let incrementalData = '';
   if (output?.data) {
+    incrementalData = output.data;
     const nextText = output.dropped_bytes > 0 ? output.data : `${previous}${output.data}`;
     state.terminalOutput.set(outputKey, nextText.slice(-524288));
   }
@@ -4406,6 +4427,7 @@ async function readTerminalOutput() {
     updateTerminalSummary({ ...terminal, running: output.running, next_offset: output.next_offset });
   }
   state.terminalOffsets.set(outputKey, output?.next_offset ?? offset);
+  return { incrementalData, dropped: (output?.dropped_bytes || 0) > 0 };
 }
 
 function startTerminalPoll() {
@@ -4426,10 +4448,25 @@ function startTerminalPoll() {
       if (slowTick === 1 || slowTick % 10 === 0) {
         await refreshTerminals();
       }
-      const prevLen = (state.terminalOutput.get(terminalOutputKey(activeTerminal() || {})) || '').length;
-      await readTerminalOutput();
-      const curLen = (state.terminalOutput.get(terminalOutputKey(activeTerminal() || {})) || '').length;
-      hasNewData = curLen !== prevLen;
+      const result = await readTerminalOutput();
+      const incremental = result?.incrementalData || '';
+      hasNewData = incremental.length > 0;
+      // Write incremental data directly to xterm if session exists.
+      const session = activeXtermSession();
+      if (session && hasNewData) {
+        if (result.dropped) {
+          // Buffer was truncated server-side; reset and write fresh.
+          session.terminal.reset();
+          session.writtenLength = 0;
+          const terminal = activeTerminal();
+          const outputKey = terminal ? terminalOutputKey(terminal) : '';
+          const fullOutput = outputKey ? state.terminalOutput.get(outputKey) || '' : '';
+          session.terminal.write(fullOutput);
+          session.writtenLength = fullOutput.length;
+        } else {
+          writeXtermIncremental(session, incremental);
+        }
+      }
       renderTerminalContext();
     } catch (error) {
       showToast(error.message);
@@ -4544,7 +4581,9 @@ function renderTerminalContext() {
       subtitle.textContent = `${terminal.cwd} · ${terminal.running ? 'running' : 'exited'}`;
     }
     const session = state.xtermSessions.get(outputKey);
-    session ? syncXtermOutput(session, output) : setupTerminalFrame(target, terminal, output);
+    if (!session) {
+      setupTerminalFrame(target, terminal, output);
+    }
     fitActiveXterm();
     return;
   }
