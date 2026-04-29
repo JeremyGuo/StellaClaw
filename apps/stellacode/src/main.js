@@ -1,4 +1,5 @@
 const { app, BrowserWindow, ipcMain, dialog } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const childProcess = require('node:child_process');
 const fs = require('node:fs/promises');
 const net = require('node:net');
@@ -372,6 +373,59 @@ async function downloadWorkspaceFile(_event, payload) {
   }
 }
 
+// ── Auto-updater ──────────────────────────────────────────────────────
+const UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
+let updateCheckTimer = null;
+
+function setupAutoUpdater() {
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on('update-available', (info) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('updater:update-available', {
+        version: info.version,
+        releaseDate: info.releaseDate
+      });
+    }
+  });
+
+  autoUpdater.on('update-not-available', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('updater:update-not-available');
+    }
+  });
+
+  autoUpdater.on('download-progress', (progress) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('updater:download-progress', {
+        percent: progress.percent,
+        bytesPerSecond: progress.bytesPerSecond,
+        transferred: progress.transferred,
+        total: progress.total
+      });
+    }
+  });
+
+  autoUpdater.on('update-downloaded', (info) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('updater:update-downloaded', {
+        version: info.version
+      });
+    }
+  });
+
+  autoUpdater.on('error', (error) => {
+    console.warn('Auto-updater error:', error?.message || error);
+  });
+
+  // Check now, then every 10 minutes.
+  autoUpdater.checkForUpdates().catch(() => {});
+  updateCheckTimer = setInterval(() => {
+    autoUpdater.checkForUpdates().catch(() => {});
+  }, UPDATE_CHECK_INTERVAL_MS);
+}
+
 app.whenReady().then(() => {
   ipcMain.handle('settings:load', readSettings);
   ipcMain.handle('settings:save', (_event, settings) => writeSettings(settings));
@@ -381,7 +435,15 @@ app.whenReady().then(() => {
   ipcMain.handle('workspace:upload', uploadWorkspaceFile);
   ipcMain.handle('workspace:download', downloadWorkspaceFile);
 
+  // Updater IPC
+  ipcMain.handle('updater:check', () => autoUpdater.checkForUpdates().catch(() => null));
+  ipcMain.handle('updater:download', () => autoUpdater.downloadUpdate().catch(() => null));
+  ipcMain.handle('updater:install', () => {
+    autoUpdater.quitAndInstall(false, true);
+  });
+
   createWindow();
+  setupAutoUpdater();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {

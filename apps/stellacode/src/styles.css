@@ -3050,3 +3050,78 @@ button.workspace-tree-row:hover {
   outline-offset: -4px;
   background: rgba(88, 166, 255, 0.04);
 }
+
+
+/* ── Update banner ─────────────────────────────────────────────────── */
+.update-banner {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.4;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.35);
+  animation: update-banner-in 280ms ease;
+}
+
+@keyframes update-banner-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.update-banner-text {
+  flex: 1;
+  min-width: 0;
+}
+
+.update-banner-text strong {
+  color: var(--accent, #58a6ff);
+}
+
+.update-banner-progress {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+
+.update-banner-btn {
+  padding: 5px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 150ms ease;
+  white-space: nowrap;
+}
+
+.update-banner-btn:hover {
+  background: var(--panel-hover);
+}
+
+.update-banner-btn.install-btn,
+.update-banner-btn.download-btn {
+  background: var(--accent, #58a6ff);
+  color: #000;
+  border-color: transparent;
+  font-weight: 600;
+}
+
+.update-banner-btn.install-btn:hover,
+.update-banner-btn.download-btn:hover {
+  background: color-mix(in srgb, var(--accent, #58a6ff), #fff 15%);
+}

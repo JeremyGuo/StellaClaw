@@ -4922,6 +4922,67 @@ function autosizeComposer() {
   elements.composerInput.style.height = `${Math.min(Math.max(elements.composerInput.scrollHeight, 58), 150)}px`;
 }
 
+
+// ---- Auto-updater UI ----
+function setupUpdaterUI() {
+  const updater = window.stellacode?.updater;
+  if (!updater) return;
+
+  let banner = null;
+
+  function ensureBanner() {
+    if (banner && document.body.contains(banner)) return banner;
+    banner = document.createElement('div');
+    banner.className = 'update-banner';
+    document.body.appendChild(banner);
+    return banner;
+  }
+
+  function removeBanner() {
+    if (banner) {
+      banner.remove();
+      banner = null;
+    }
+  }
+
+  updater.onUpdateAvailable((info) => {
+    const b = ensureBanner();
+    const ver = escapeHtml(info.version);
+    b.innerHTML = '<span class="update-banner-text">New version <strong>v' + ver + '</strong> available</span>' +
+      '<button class="update-banner-btn download-btn">Download</button>' +
+      '<button class="update-banner-btn dismiss-btn">Later</button>';
+    b.querySelector('.download-btn').addEventListener('click', () => {
+      updater.download();
+      b.innerHTML = '<span class="update-banner-text">Downloading update...</span><span class="update-banner-progress"></span>';
+    });
+    b.querySelector('.dismiss-btn').addEventListener('click', removeBanner);
+  });
+
+  updater.onDownloadProgress((progress) => {
+    if (!banner) return;
+    const progressEl = banner.querySelector('.update-banner-progress');
+    if (progressEl) {
+      progressEl.textContent = ' ' + Math.round(progress.percent) + '%';
+    }
+  });
+
+  updater.onUpdateDownloaded((info) => {
+    const b = ensureBanner();
+    const ver = escapeHtml(info.version);
+    b.innerHTML = '<span class="update-banner-text">v' + ver + ' ready to install</span>' +
+      '<button class="update-banner-btn install-btn">Install & Restart</button>' +
+      '<button class="update-banner-btn dismiss-btn">Later</button>';
+    b.querySelector('.install-btn').addEventListener('click', () => {
+      updater.install();
+    });
+    b.querySelector('.dismiss-btn').addEventListener('click', removeBanner);
+  });
+
+  updater.onUpdateNotAvailable(() => {
+    // Silent - no banner needed.
+  });
+}
+
 async function init() {
   loadLayoutSettings();
   applyLayoutSettings();
@@ -4930,6 +4991,7 @@ async function init() {
   state.activeServerId = state.settings.activeServerId;
   applyLayoutSettings();
   bindEvents();
+  setupUpdaterUI();
   renderSidebar();
   renderHeader();
   renderMessages();
