@@ -109,9 +109,6 @@ jobs:
         include:
           - os: ubuntu-latest
             platform: linux
-          - os: macos-13
-            platform: mac
-            args: "--x64"
           - os: macos-latest
             platform: mac
             args: "--arm64"
