@@ -134,6 +134,13 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Sync version from VERSION file
+        shell: bash
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          echo "Setting Stellacode package version to ${VERSION}"
+          npm version "${VERSION}" --no-git-tag-version --allow-same-version
+
       - name: Build Stellacode (${{ matrix.platform }})
         run: npx electron-builder --${{ matrix.platform }} ${{ matrix.args || '' }} --publish never
         env:
@@ -149,6 +156,8 @@ jobs:
             apps/stellacode/dist/*.zip
             apps/stellacode/dist/*.AppImage
             apps/stellacode/dist/*.tar.gz
+            apps/stellacode/dist/*.yml
+            apps/stellacode/dist/*.blockmap
           if-no-files-found: warn
 
   publish:
@@ -182,7 +191,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          find release-artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' \) -exec cp {} dist/ \;
+          find release-artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.yml' -o -name '*.blockmap' \) -exec cp {} dist/ \;
           ls -lh dist/
 
       - name: Publish GitHub release

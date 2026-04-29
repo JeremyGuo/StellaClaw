@@ -452,7 +452,13 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('before-quit', stopAllTunnels);
+app.on('before-quit', () => {
+  stopAllTunnels();
+  if (updateCheckTimer) {
+    clearInterval(updateCheckTimer);
+    updateCheckTimer = null;
+  }
+});
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
