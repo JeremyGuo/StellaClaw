@@ -23,7 +23,9 @@ const MIN_ROWS: u16 = 5;
 const MAX_COLS: u16 = 400;
 const MAX_ROWS: u16 = 120;
 const MAX_OUTPUT_BUFFER_BYTES: usize = 2 * 1024 * 1024;
+#[cfg(test)]
 const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 256 * 1024;
+#[cfg(test)]
 const MAX_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
 const MAX_TERMINALS_PER_CONVERSATION: usize = 8;
 const MAX_TERMINALS_TOTAL: usize = 128;
@@ -77,6 +79,7 @@ pub struct TerminalRemote {
     pub cwd: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Serialize)]
 pub struct TerminalOutput {
     pub terminal_id: String,
@@ -278,6 +281,7 @@ impl TerminalManager {
         Ok(summary)
     }
 
+    #[cfg(test)]
     pub fn output(
         &self,
         state: &ConversationState,
@@ -289,6 +293,7 @@ impl TerminalManager {
         Ok(session.output(offset, limit_bytes))
     }
 
+    #[cfg(test)]
     pub fn input(
         &self,
         state: &ConversationState,
@@ -498,6 +503,7 @@ impl TerminalSession {
         }
     }
 
+    #[cfg(test)]
     fn output(&self, offset: u64, limit_bytes: usize) -> TerminalOutput {
         let output = self.output.lock().expect("terminal output lock poisoned");
         let limit = limit_bytes

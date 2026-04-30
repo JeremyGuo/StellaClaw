@@ -44,7 +44,7 @@ use super::{
     types::{
         IncomingDispatch, IncomingMessageDispatch, OutgoingAttachment, OutgoingAttachmentKind,
         OutgoingDelivery, OutgoingError, OutgoingProgressFeedback, OutgoingStatus, ProcessingState,
-        ProgressFeedbackFinalState, TurnProgressPhase,
+        ProgressFeedbackFinalState,
     },
     web_terminal::{
         TerminalAttach, TerminalCreateRequest, TerminalManager, TerminalReplay,
@@ -3140,7 +3140,8 @@ mod tests {
 
     use crate::{
         channels::types::{
-            TurnProgress, TurnProgressPlan, TurnProgressPlanItem, TurnProgressPlanItemStatus,
+            TurnProgress, TurnProgressPhase, TurnProgressPlan, TurnProgressPlanItem,
+            TurnProgressPlanItemStatus,
         },
         config::{ModelSelection, SessionProfile},
         conversation::ConversationSessionBinding,
