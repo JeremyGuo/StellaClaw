@@ -1,7 +1,7 @@
-version: 1.18.1
+version: 1.18.2
 ---
 
-# 1.18.1
+# 1.18.2
 
 - 抽象 Stellacode 2 标题栏系统控制区布局：
   Electron preload 现在向前端暴露平台相关的 chrome metrics，前端通过 CSS 变量决定左侧 toolbar、drag safe area 和标题区域的 inset。macOS 继续避让 traffic lights，Windows/Linux 左侧 toolbar 默认贴近窗口左边缘，后续其它平台只需调整 metrics，不需要改 React 布局。本次不改变 `config` schema，不改变 `workdir` schema。
@@ -29,6 +29,9 @@ version: 1.18.1
 
 - 将 Stellacode 2 Conversation 已读和列表更新移到 Web channel：
   Web channel 现在提供 conversation seen API，并在 conversation summary 中返回 `last_seen_message_id`；Stellacode 2 前端不再把已读位置写入 Electron 本地 settings，而是向后端标记已读。新增 `/api/conversations/stream` WebSocket：连接时只推一次 `conversation_snapshot` 初始快照，后续使用轻量事件 `conversation_processing`、`conversation_turn_completed`、`conversation_seen` 和 `conversation_upserted` 同步运行态、新消息、已读和摘要变化，左侧列表不再依赖客户端定时轮询。本次 seen 状态保存在 WebChannel 进程内，暂不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 1.18.x CI 格式化失败：
+  对 Web channel conversation stream 相关 Rust 代码执行 `cargo fmt --all`，确保 GitHub CI 的格式检查通过。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.18.0
 

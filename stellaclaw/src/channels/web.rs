@@ -355,7 +355,11 @@ impl WebChannel {
         ))
     }
 
-    fn mark_conversation_seen(&self, conversation_id: &str, body: &[u8]) -> ApiResult<HttpResponse> {
+    fn mark_conversation_seen(
+        &self,
+        conversation_id: &str,
+        body: &[u8],
+    ) -> ApiResult<HttpResponse> {
         self.load_web_state(conversation_id)?;
         let request: MarkConversationSeenRequest = parse_json(body)?;
         let seen = ConversationSeen {
@@ -786,7 +790,9 @@ impl WebChannel {
     }
 
     fn publish_conversation_processing(&self, platform_chat_id: &str, state: ProcessingState) {
-        let Ok(Some(conversation_state)) = self.conversation_state_for_platform_chat(platform_chat_id) else {
+        let Ok(Some(conversation_state)) =
+            self.conversation_state_for_platform_chat(platform_chat_id)
+        else {
             return;
         };
         self.publish_conversation_stream_event(json!({
@@ -1971,7 +1977,10 @@ impl ConversationSummary {
     }
 }
 
-fn conversation_message_summary(workdir: &Path, state: &ConversationState) -> ConversationMessageSummary {
+fn conversation_message_summary(
+    workdir: &Path,
+    state: &ConversationState,
+) -> ConversationMessageSummary {
     let path = workdir
         .join("conversations")
         .join(&state.conversation_id)
@@ -1995,7 +2004,12 @@ fn conversation_message_summary(workdir: &Path, state: &ConversationState) -> Co
             summary.last_message_id = value
                 .get("id")
                 .or_else(|| value.get("message_id"))
-                .and_then(|value| value.as_str().map(str::to_string).or_else(|| value.as_u64().map(|id| id.to_string())));
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|| value.as_u64().map(|id| id.to_string()))
+                });
             summary.last_message_time = value
                 .get("message_time")
                 .and_then(Value::as_str)
