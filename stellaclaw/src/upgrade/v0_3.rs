@@ -5,7 +5,7 @@ use serde_json::Value;
 use stellaclaw_core::model_config::ModelConfig;
 
 use super::{WorkdirUpgrader, WORKDIR_VERSION_0_3, WORKDIR_VERSION_0_4};
-use crate::config::StellaclawConfig;
+use crate::{config::StellaclawConfig, workspace::is_sshfs_workspace_entry_name};
 
 pub struct ModelSelectionUpgrade;
 
@@ -29,6 +29,13 @@ impl WorkdirUpgrader for ModelSelectionUpgrade {
         {
             let entry = entry
                 .with_context(|| format!("failed to enumerate {}", conversations_root.display()))?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(is_sshfs_workspace_entry_name)
+            {
+                continue;
+            }
             let path = entry.path().join("conversation.json");
             if path.is_file() {
                 upgrade_conversation_state(&path, config)?;

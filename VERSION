@@ -1,5 +1,13 @@
-version: 1.16.4
+version: 1.16.5
 ---
+
+# 1.16.5
+
+- 修复 Web conversation 列表卡死：
+  Web channel 枚举 `conversations/` 时现在会跳过 `sshfs-*` workspace mount 目录，避免远程 FUSE mount 无响应时因为探测 `conversation.json` 阻塞整个请求；workdir upgrade 中扫描 conversation 目录的迁移步骤也同步跳过这些 mount。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 兼容 Web token usage 字段展示：
+  Web messages 和 message detail 的 `token_usage` 现在除保留 `uncache_input` 外，也返回等价的 `input` 与总量 `total`，避免前端或旧客户端只识别 `input` 时把切换模型后的大段非缓存输入误显示为 0。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.16.4
 

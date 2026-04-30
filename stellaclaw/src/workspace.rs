@@ -83,6 +83,10 @@ pub fn sshfs_workspace_root(workdir: &Path, conversation_id: &str) -> PathBuf {
         .join(format!("sshfs-{conversation_id}"))
 }
 
+pub fn is_sshfs_workspace_entry_name(name: &str) -> bool {
+    name.starts_with("sshfs-")
+}
+
 pub fn unmount_sshfs_workspace(workdir: &Path, conversation_id: &str) -> Result<()> {
     let mountpoint = sshfs_workspace_root(workdir, conversation_id);
     if !is_mountpoint(&mountpoint) {
@@ -498,8 +502,9 @@ fn create_directory_link(target: &Path, link_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        add_sshfs_mount_options, ensure_workspace_seed, passwordless_ssh_login_check_command,
-        sshfs_workspace_root, trimmed_output_preview, validate_sshfs_binding,
+        add_sshfs_mount_options, ensure_workspace_seed, is_sshfs_workspace_entry_name,
+        passwordless_ssh_login_check_command, sshfs_workspace_root, trimmed_output_preview,
+        validate_sshfs_binding,
     };
     use std::{path::Path, process::Command};
 
@@ -511,6 +516,14 @@ mod tests {
                 .join("conversations")
                 .join("sshfs-telegram-main-000001")
         );
+    }
+
+    #[test]
+    fn sshfs_workspace_entry_names_are_detected_by_prefix() {
+        assert!(is_sshfs_workspace_entry_name("sshfs-web-main-000001"));
+        assert!(is_sshfs_workspace_entry_name("sshfs-telegram-main-000001"));
+        assert!(!is_sshfs_workspace_entry_name("web-main-000001"));
+        assert!(!is_sshfs_workspace_entry_name("telegram-main-000001"));
     }
 
     #[test]

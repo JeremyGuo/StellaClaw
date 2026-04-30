@@ -34,9 +34,9 @@ use crate::{
     logger::StellaclawLogger,
     remote_actor::{
         download_workspace_archive, list_workspace_entries, read_workspace_file,
-        upload_workspace_archive, write_workspace_file, RemoteActorError,
+        upload_workspace_archive, RemoteActorError,
     },
-    workspace::sshfs_workspace_root,
+    workspace::{is_sshfs_workspace_entry_name, sshfs_workspace_root},
 };
 
 use super::{
@@ -258,6 +258,13 @@ impl WebChannel {
         if root.exists() {
             for entry in fs::read_dir(&root).map_err(ApiError::internal)? {
                 let entry = entry.map_err(ApiError::internal)?;
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(is_sshfs_workspace_entry_name)
+                {
+                    continue;
+                }
                 let path = entry.path().join("conversation.json");
                 if !path.exists() {
                     continue;
@@ -539,6 +546,7 @@ impl WebChannel {
                 "id": index.to_string(),
                 "index": index,
                 "message": message,
+                "token_usage": message.token_usage.as_ref().map(WebTokenUsage::from),
                 "rendered_text": rendered.text,
                 "items": rendered.items,
                 "attachments": rendered.attachments,
@@ -1233,7 +1241,37 @@ struct MessageSkeleton {
     user_name: Option<String>,
     message_time: Option<String>,
     has_token_usage: bool,
-    token_usage: Option<TokenUsage>,
+    token_usage: Option<WebTokenUsage>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct WebTokenUsage {
+    cache_read: u64,
+    cache_write: u64,
+    uncache_input: u64,
+    input: u64,
+    output: u64,
+    total: u64,
+    cost_usd: Option<stellaclaw_core::session_actor::TokenUsageCost>,
+}
+
+impl From<&TokenUsage> for WebTokenUsage {
+    fn from(value: &TokenUsage) -> Self {
+        let total = value
+            .cache_read
+            .saturating_add(value.cache_write)
+            .saturating_add(value.uncache_input)
+            .saturating_add(value.output);
+        Self {
+            cache_read: value.cache_read,
+            cache_write: value.cache_write,
+            uncache_input: value.uncache_input,
+            input: value.uncache_input,
+            output: value.output,
+            total,
+            cost_usd: value.cost_usd.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1839,7 +1877,7 @@ fn message_skeleton(
         user_name: message.user_name.clone(),
         message_time: message.message_time.clone(),
         has_token_usage: message.token_usage.is_some(),
-        token_usage: message.token_usage.clone(),
+        token_usage: message.token_usage.as_ref().map(WebTokenUsage::from),
     }
 }
 
@@ -2549,7 +2587,9 @@ mod tests {
         assert_eq!(page["messages"][0]["token_usage"]["cache_read"], 11);
         assert_eq!(page["messages"][0]["token_usage"]["cache_write"], 12);
         assert_eq!(page["messages"][0]["token_usage"]["uncache_input"], 13);
+        assert_eq!(page["messages"][0]["token_usage"]["input"], 13);
         assert_eq!(page["messages"][0]["token_usage"]["output"], 14);
+        assert_eq!(page["messages"][0]["token_usage"]["total"], 50);
         assert_eq!(
             page["messages"][0]["token_usage"]["cost_usd"]["output"],
             0.004
@@ -2559,6 +2599,8 @@ mod tests {
             websocket_messages_payload(&state, &context, std::slice::from_ref(&message), 0);
         assert_eq!(websocket["messages"][0]["has_token_usage"], true);
         assert_eq!(websocket["messages"][0]["token_usage"]["cache_read"], 11);
+        assert_eq!(websocket["messages"][0]["token_usage"]["input"], 13);
+        assert_eq!(websocket["messages"][0]["token_usage"]["total"], 50);
         assert_eq!(
             websocket["messages"][0]["token_usage"]["cost_usd"]["uncache_input"],
             0.003
