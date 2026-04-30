@@ -2047,16 +2047,11 @@ fn conversation_message_summary(
         last_line = line;
     }
     if !last_line.is_empty() {
+        summary.last_message_id = summary
+            .message_count
+            .checked_sub(1)
+            .map(|index| index.to_string());
         if let Ok(value) = serde_json::from_str::<Value>(last_line) {
-            summary.last_message_id = value
-                .get("id")
-                .or_else(|| value.get("message_id"))
-                .and_then(|value| {
-                    value
-                        .as_str()
-                        .map(str::to_string)
-                        .or_else(|| value.as_u64().map(|id| id.to_string()))
-                });
             summary.last_message_time = value
                 .get("message_time")
                 .and_then(Value::as_str)
@@ -3293,6 +3288,41 @@ mod tests {
             parse_web_control("/remote off"),
             Some(ConversationControl::DisableRemote)
         ));
+    }
+
+    #[test]
+    fn conversation_message_summary_uses_message_index_as_id() {
+        let workdir = test_workdir("message-summary-index");
+        let state = test_state("web-main-000001");
+        let message_dir = workdir
+            .join("conversations")
+            .join(&state.conversation_id)
+            .join(".log")
+            .join("stellaclaw")
+            .join(sanitize_session_id_for_log_path(
+                &state.session_binding.foreground_session_id,
+            ));
+        fs::create_dir_all(&message_dir).expect("create message log dir");
+        fs::write(
+            message_dir.join("all_messages.jsonl"),
+            concat!(
+                r#"{"role":"user","data":[]}"#,
+                "\n",
+                r#"{"role":"assistant","message_time":"2026-04-30T15:30:46Z","data":[]}"#,
+                "\n",
+            ),
+        )
+        .expect("write message log");
+
+        let summary = conversation_message_summary(&workdir, &state);
+
+        assert_eq!(summary.message_count, 2);
+        assert_eq!(summary.last_message_id.as_deref(), Some("1"));
+        assert_eq!(
+            summary.last_message_time.as_deref(),
+            Some("2026-04-30T15:30:46Z")
+        );
+        let _ = fs::remove_dir_all(workdir);
     }
 
     #[test]

@@ -6,6 +6,9 @@ version: 1.18.5
 - 收敛 Stellacode 2 系统通知触发源：
   系统通知现在和左侧未读红点使用同一个 `conversation_turn_completed` 事实源，只在非当前 conversation 一轮完成且 `last_message_id > last_seen_message_id` 时触发；移除前端基于 running -> idle 状态变化推断完成的通知逻辑，避免运行态变化和新消息语义不一致。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 修复 Web conversation 完成事件缺失：
+  Web conversation 的消息 API 使用消息数组下标作为 `message_id`，但列表摘要曾错误地尝试从 `all_messages.jsonl` 的消息 JSON 中读取不存在的 `id/message_id` 字段，导致 `conversation_turn_completed` 找不到 `last_message_id` 后提前返回。现在摘要直接使用最后一条消息的数组下标作为 `last_message_id`，保证一轮完成后能稳定推送 completion 事件。本次不改变 `config` schema，不改变 `workdir` schema。
+
 # 1.18.4
 
 - 收敛 Stellacode 2 conversation stream 状态机：
