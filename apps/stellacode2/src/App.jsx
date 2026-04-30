@@ -447,13 +447,14 @@ function App() {
     };
   }, []);
 
-  const layoutValues = conversationLayout || settings?.layout || {};
-  const sidebarWidth = sidebarMode === 'collapsed' ? SIDEBAR_COLLAPSED : clamp(layoutValues.sidebar, 220, 520) || SIDEBAR_EXPANDED;
-  const overviewPanelWidth = clamp(layoutValues.inspector, 320, 760) || 420;
-  const workspacePanelWidth = clamp(layoutValues.file, WORKSPACE_PANEL_MIN, WORKSPACE_PANEL_MAX) || 360;
-  const previewPanelWidth = clamp(layoutValues.preview, 320, 820) || 480;
-  const terminalHeight = clamp(layoutValues.terminal, TERMINAL_HEIGHT_MIN, TERMINAL_HEIGHT_MAX) || 240;
-  const terminalListWidth = clamp(layoutValues.terminalList, TERMINAL_LIST_MIN, TERMINAL_LIST_MAX) || 210;
+  const globalLayoutValues = settings?.layout || {};
+  const conversationLayoutValues = conversationLayout || globalLayoutValues;
+  const sidebarWidth = sidebarMode === 'collapsed' ? SIDEBAR_COLLAPSED : clamp(globalLayoutValues.sidebar, 220, 520) || SIDEBAR_EXPANDED;
+  const overviewPanelWidth = clamp(conversationLayoutValues.inspector, 320, 760) || 420;
+  const workspacePanelWidth = clamp(conversationLayoutValues.file, WORKSPACE_PANEL_MIN, WORKSPACE_PANEL_MAX) || 360;
+  const previewPanelWidth = clamp(conversationLayoutValues.preview, 320, 820) || 480;
+  const terminalHeight = clamp(conversationLayoutValues.terminal, TERMINAL_HEIGHT_MIN, TERMINAL_HEIGHT_MAX) || 240;
+  const terminalListWidth = clamp(conversationLayoutValues.terminalList, TERMINAL_LIST_MIN, TERMINAL_LIST_MAX) || 210;
   const previewPanelRight = workspacePanelOpen ? workspacePanelWidth : 0;
   const overviewPanelRight = previewPanelRight + (previewPanelOpen ? previewPanelWidth : 0);
   const rightContentInset = (overviewPanelOpen ? overviewPanelWidth : 0) + (workspacePanelOpen ? workspacePanelWidth : 0) + (previewPanelOpen ? previewPanelWidth : 0);
@@ -1425,14 +1426,12 @@ function App() {
           { id: 'waiting-response', title: commandState.title, detail: commandState.detail, state: 'running' }
         ]);
       }
-      if (!websocketRef.current || websocketRef.current.readyState !== WebSocket.OPEN) {
-        const anchorId = previousLastServerId || lastServerMessageId(messagesRef.current);
-        const incoming = anchorId
-          ? await loadMessages(selected.serverId, selected.conversationId, {
-            offset: Number(anchorId) + 1,
-            limit: 80
-          })
-          : await loadMessages(selected.serverId, selected.conversationId);
+      if (!commandState.control) {
+        const offset = previousLastServerId ? Number(previousLastServerId) + 1 : 0;
+        const incoming = await loadMessages(selected.serverId, selected.conversationId, {
+          offset,
+          limit: 80
+        });
         if (websocketKeyRef.current === key) {
           setMessages((current) => {
             const next = mergeMessages(current, incoming);

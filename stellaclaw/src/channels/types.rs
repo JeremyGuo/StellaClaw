@@ -66,6 +66,16 @@ pub struct OutgoingDelivery {
     pub options: Option<OutgoingOptions>,
 }
 
+#[derive(Debug, Clone)]
+pub struct OutgoingMessageAppended {
+    pub channel_id: String,
+    pub platform_chat_id: String,
+    pub conversation_id: String,
+    pub session_id: String,
+    pub index: usize,
+    pub message: ChatMessage,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -183,6 +193,7 @@ pub struct OutgoingConversationUpdated {
 #[derive(Debug, Clone)]
 pub enum ChannelEvent {
     Delivery(OutgoingDelivery),
+    MessageAppended(OutgoingMessageAppended),
     Processing(OutgoingProcessing),
     ProgressFeedback(OutgoingProgressFeedback),
     ConversationUpdated(OutgoingConversationUpdated),
@@ -194,6 +205,7 @@ impl ChannelEvent {
     pub fn channel_id(&self) -> &str {
         match self {
             ChannelEvent::Delivery(delivery) => &delivery.channel_id,
+            ChannelEvent::MessageAppended(appended) => &appended.channel_id,
             ChannelEvent::Processing(processing) => &processing.channel_id,
             ChannelEvent::ProgressFeedback(feedback) => &feedback.channel_id,
             ChannelEvent::ConversationUpdated(updated) => &updated.channel_id,
@@ -205,6 +217,7 @@ impl ChannelEvent {
     pub fn platform_chat_id(&self) -> &str {
         match self {
             ChannelEvent::Delivery(delivery) => &delivery.platform_chat_id,
+            ChannelEvent::MessageAppended(appended) => &appended.platform_chat_id,
             ChannelEvent::Processing(processing) => &processing.platform_chat_id,
             ChannelEvent::ProgressFeedback(feedback) => &feedback.platform_chat_id,
             ChannelEvent::ConversationUpdated(updated) => &updated.platform_chat_id,

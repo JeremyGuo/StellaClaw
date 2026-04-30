@@ -26,10 +26,11 @@ use stellaclaw_core::{
 use crate::{
     channels::types::{
         ChannelEvent, OutgoingAttachment, OutgoingConversationUpdated, OutgoingDelivery,
-        OutgoingDispatch, OutgoingError, OutgoingErrorScope, OutgoingErrorSeverity, OutgoingOption,
-        OutgoingOptions, OutgoingProcessing, OutgoingProgressFeedback, OutgoingStatus,
-        ProcessingState, ProgressFeedbackFinalState, TurnProgress, TurnProgressPhase,
-        TurnProgressPlan, TurnProgressPlanItem, TurnProgressPlanItemStatus,
+        OutgoingDispatch, OutgoingError, OutgoingErrorScope, OutgoingErrorSeverity,
+        OutgoingMessageAppended, OutgoingOption, OutgoingOptions, OutgoingProcessing,
+        OutgoingProgressFeedback, OutgoingStatus, ProcessingState, ProgressFeedbackFinalState,
+        TurnProgress, TurnProgressPhase, TurnProgressPlan, TurnProgressPlanItem,
+        TurnProgressPlanItemStatus,
     },
     config::{
         ModelSelection, SandboxConfig, SandboxMode, SessionDefaults, SessionProfile,
@@ -891,6 +892,22 @@ impl ConversationRuntime {
         event: SessionEvent,
     ) -> Result<bool> {
         match event {
+            SessionEvent::MessageAppended { index, message } => {
+                self.logger.info(
+                    "message_appended",
+                    json!({
+                        "session_type": format!("{session_type:?}"),
+                        "agent_id": agent_id,
+                        "index": index,
+                        "role": message.role,
+                        "items": message.data.len(),
+                    }),
+                );
+                if session_type == SessionType::Foreground {
+                    self.send_foreground_message_appended(index, message)?;
+                }
+                Ok(false)
+            }
             SessionEvent::TurnStarted { turn_id } => {
                 self.clear_session_plan(agent_id.as_deref(), session_type);
                 self.logger.info(
@@ -1795,6 +1812,21 @@ impl ConversationRuntime {
                 },
             )))
             .map_err(|_| anyhow!("outgoing delivery channel closed"))
+    }
+
+    fn send_foreground_message_appended(&self, index: usize, message: ChatMessage) -> Result<()> {
+        self.outgoing_tx
+            .send(OutgoingDispatch::Event(ChannelEvent::MessageAppended(
+                OutgoingMessageAppended {
+                    channel_id: self.state.channel_id.clone(),
+                    platform_chat_id: self.state.platform_chat_id.clone(),
+                    conversation_id: self.state.conversation_id.clone(),
+                    session_id: self.state.session_binding.foreground_session_id.clone(),
+                    index,
+                    message,
+                },
+            )))
+            .map_err(|_| anyhow!("outgoing message appended channel closed"))
     }
 
     fn send_delivery(

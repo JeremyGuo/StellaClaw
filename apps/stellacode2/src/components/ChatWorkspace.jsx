@@ -45,7 +45,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const newestSeenIndexRef = useRef(-1);
   const currentActivity = (runningActivities || []).at(-1) || null;
   const currentPlan = normalizeActivityPlan(currentActivity?.plan);
-  const progressVisible = Boolean(currentPlan);
+  const progressVisible = Boolean(currentActivity);
 
   useLayoutEffect(() => {
     const node = progressRef.current;
@@ -437,11 +437,23 @@ export function LiveActivityStack({ activities, progressRef }) {
   if (!activities?.length) return null;
   const current = activities.at(-1) || {};
   const plan = normalizeActivityPlan(current.plan);
-  if (!plan) return null;
   return (
-    <section className="session-progress-card" aria-live="polite" ref={progressRef}>
-      <ActivityPlanPanel plan={plan} />
+    <section className={`session-progress-card${plan ? '' : ' compact'}`} aria-live="polite" ref={progressRef}>
+      {plan ? <ActivityPlanPanel plan={plan} /> : <ActivityStatus activity={current} />}
     </section>
+  );
+}
+
+function ActivityStatus({ activity }) {
+  const state = String(activity?.state || 'running').toLowerCase();
+  const title = String(activity?.title || (state === 'failed' ? '执行失败' : state === 'done' ? '已完成' : '处理中')).trim();
+  const detail = String(activity?.detail || activity?.activity || activity?.model || '').trim();
+  return (
+    <div className={`session-progress-head ${state}`}>
+      <i className="session-progress-dot" aria-hidden="true" />
+      <span>{title}</span>
+      {detail && <code>{detail}</code>}
+    </div>
   );
 }
 

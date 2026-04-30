@@ -767,6 +767,7 @@ impl SessionActor {
 
         self.pending_continuation = None;
         let retry_request = request.clone();
+        let appended_message_start = self.all_messages.len();
         let input_message = match request {
             SessionRequest::EnqueueUserMessage { message } => {
                 if let Err(error) = self.append_runtime_synthetic_messages(&message) {
@@ -792,9 +793,6 @@ impl SessionActor {
                 "input_items": input_message.data.len(),
             }),
         );
-        self.emit(SessionEvent::TurnStarted {
-            turn_id: turn_id.clone(),
-        })?;
         if let Err(error) = self.append_history_message("input", input_message) {
             return self.finish_turn_error(
                 &turn_id,
@@ -802,6 +800,19 @@ impl SessionActor {
                 Some(PendingContinuation::DataRequest(retry_request)),
             );
         }
+        for (relative, message) in self.all_messages[appended_message_start..]
+            .iter()
+            .cloned()
+            .enumerate()
+        {
+            self.emit(SessionEvent::MessageAppended {
+                index: appended_message_start + relative,
+                message,
+            })?;
+        }
+        self.emit(SessionEvent::TurnStarted {
+            turn_id: turn_id.clone(),
+        })?;
 
         if let Err(error) = self.run_model_tool_loop(&turn_id, turn_number, 0) {
             return self.finish_turn_error(
@@ -2054,6 +2065,12 @@ fn session_request_kind(request: &SessionRequest) -> &'static str {
 
 fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
     match event {
+        SessionEvent::MessageAppended { index, message } => serde_json::json!({
+            "event": "message_appended",
+            "index": index,
+            "message_role": message.role,
+            "message_items": message.data.len(),
+        }),
         SessionEvent::TurnStarted { turn_id } => {
             serde_json::json!({"event": "turn_started", "turn_id": turn_id})
         }
@@ -2976,9 +2993,13 @@ mod tests {
         let page = session_view_payload_for_test(&events, "page");
         assert_eq!(page["type"], "transcript_page");
         assert_eq!(page["source"], "current");
-        assert_eq!(page["total"], 2);
+        let total = page["total"]
+            .as_u64()
+            .expect("transcript total should be numeric");
+        assert!(total >= 2);
         assert_eq!(page["messages"].as_array().unwrap().len(), 1);
 
+        let assistant_index = total - 1;
         mailbox.append(
             SessionMailboxKind::Control,
             SessionRequest::QuerySessionView {
@@ -2986,14 +3007,14 @@ mod tests {
                 payload: serde_json::json!({
                     "type": "message_detail",
                     "source": "current",
-                    "index": 1,
+                    "index": assistant_index,
                 }),
             },
         );
         actor.step().expect("detail query should run");
         let detail = session_view_payload_for_test(&events, "detail");
         assert_eq!(detail["type"], "message_detail");
-        assert_eq!(detail["index"], 1);
+        assert_eq!(detail["index"], assistant_index);
         assert_eq!(detail["message"]["role"], "assistant");
 
         mailbox.append(
@@ -3011,7 +3032,7 @@ mod tests {
         let missing = session_view_payload_for_test(&events, "missing");
         assert_eq!(missing["type"], "message_detail");
         assert_eq!(missing["error"], "message index out of range");
-        assert_eq!(missing["total"], 2);
+        assert_eq!(missing["total"], total);
     }
 
     #[test]

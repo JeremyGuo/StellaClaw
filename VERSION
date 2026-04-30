@@ -30,6 +30,15 @@ version: 1.18.9
 - 统一 WebSocket 路径语义：
   Foreground WebSocket 从通用 `/api/ws` + 首帧 `subscribe_foreground` 改为 `/api/conversations/{conversation_id}/foreground/ws` 直接连接；conversation stream、foreground stream 和 terminal stream 的事件 payload 不再携带冗余 `subscription` 字段。Foreground `subscription_ack` 现在除了当前/下一个 message id，也会带上当前活跃 turn 的最近一次结构化 `turn_progress`，方便 Stellacode 2 重连后立即恢复进度展示。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 修复 Stellacode 2 侧栏二次拖拽回跳：
+  Conversation 级 layout 不再覆盖全局 sidebar 宽度，左侧 Conversation Bar 的宽度始终从全局 `settings.layout.sidebar` 读取，避免选中 conversation 时第二次拖拽先回到默认宽度再开始调整。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Runtime Skill Updates 辅助消息展示：
+  Stellacode 2 现在会把 `[Runtime Skill Updates]` 和 `[Runtime Prompt Updates]` 一样识别为辅助 user message，并折叠到下一条用户消息上的小圆点中，避免运行时技能元数据刷新内容直接占据聊天流。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Stellacode 2 发送消息乱序和思考中状态不可见：
+  Core session 在用户输入和运行时辅助消息写入历史后会发出结构化 `message_appended` 事件，Web Channel 将 foreground session 的 append 事件投影成 foreground WebSocket `messages` 增量，前端用服务端 echo 替换乐观消息，避免 assistant 消息先于用户消息显示。Stellacode 2 发送成功后也会按 offset/limit 补拉新增消息作为兜底，并渲染没有 plan 的运行态 activity，确保“等待响应 / 思考中”能及时显示。本次不改变 `config` schema，不改变 `workdir` schema。
+
 # 1.18.8
 
 - 增加 Web Channel / Stellacode 2 API 静态文档页：

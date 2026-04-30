@@ -43,8 +43,8 @@ use crate::{
 use super::{
     types::{
         IncomingDispatch, IncomingMessageDispatch, OutgoingAttachment, OutgoingAttachmentKind,
-        OutgoingDelivery, OutgoingError, OutgoingProgressFeedback, OutgoingStatus, ProcessingState,
-        ProgressFeedbackFinalState,
+        OutgoingDelivery, OutgoingError, OutgoingMessageAppended, OutgoingProgressFeedback,
+        OutgoingStatus, ProcessingState, ProgressFeedbackFinalState,
     },
     web_terminal::{
         TerminalAttach, TerminalCreateRequest, TerminalManager, TerminalReplay,
@@ -1393,40 +1393,35 @@ impl Channel for WebChannel {
         let Some(message) = delivery.message.as_ref() else {
             return Ok(());
         };
-        let Some(state) = self
-            .conversation_state_for_platform_chat(&delivery.platform_chat_id)
-            .map_err(api_anyhow)?
-        else {
-            return Ok(());
-        };
-        if state.conversation_id != delivery.conversation_id {
-            return Ok(());
-        }
-        if delivery
-            .session_id
-            .as_deref()
-            .is_some_and(|session_id| session_id != state.session_binding.foreground_session_id)
-        {
-            return Ok(());
-        }
-        let log_path = message_log_path(&self.workdir, &state);
-        let total = count_message_lines(&log_path)?;
-        let Some(index) = total.checked_sub(1) else {
-            return Ok(());
-        };
-        let attachments =
-            WebAttachmentContext::new(&self.workdir, &state, self.cache_manager.clone());
-        let page = MessagePage {
-            start: index,
-            end: index + 1,
-            total,
-            messages: vec![message.clone()],
-        };
-        self.publish_websocket_event(
+        self.publish_foreground_message(
             &delivery.platform_chat_id,
-            websocket_messages_payload(&state, &attachments, &page),
+            &delivery.conversation_id,
+            delivery.session_id.as_deref(),
+            None,
+            message,
+        )
+    }
+
+    fn message_appended(&self, appended: &OutgoingMessageAppended) -> Result<()> {
+        self.logger.info(
+            "web_message_appended",
+            json!({
+                "channel_id": appended.channel_id,
+                "platform_chat_id": appended.platform_chat_id,
+                "conversation_id": appended.conversation_id,
+                "session_id": appended.session_id,
+                "index": appended.index,
+                "role": appended.message.role,
+                "items": appended.message.data.len(),
+            }),
         );
-        Ok(())
+        self.publish_foreground_message(
+            &appended.platform_chat_id,
+            &appended.conversation_id,
+            Some(&appended.session_id),
+            Some(appended.index),
+            &appended.message,
+        )
     }
 
     fn send_status(&self, status: &OutgoingStatus) -> Result<()> {
@@ -1550,6 +1545,50 @@ impl Channel for WebChannel {
                 );
             }
         });
+    }
+}
+
+impl WebChannel {
+    fn publish_foreground_message(
+        &self,
+        platform_chat_id: &str,
+        conversation_id: &str,
+        session_id: Option<&str>,
+        message_index: Option<usize>,
+        message: &ChatMessage,
+    ) -> Result<()> {
+        let Some(state) = self
+            .conversation_state_for_platform_chat(platform_chat_id)
+            .map_err(api_anyhow)?
+        else {
+            return Ok(());
+        };
+        if state.conversation_id != conversation_id {
+            return Ok(());
+        }
+        if session_id
+            .is_some_and(|session_id| session_id != state.session_binding.foreground_session_id)
+        {
+            return Ok(());
+        }
+        let log_path = message_log_path(&self.workdir, &state);
+        let total = count_message_lines(&log_path)?;
+        let Some(index) = message_index.or_else(|| total.checked_sub(1)) else {
+            return Ok(());
+        };
+        let attachments =
+            WebAttachmentContext::new(&self.workdir, &state, self.cache_manager.clone());
+        let page = MessagePage {
+            start: index,
+            end: index + 1,
+            total,
+            messages: vec![message.clone()],
+        };
+        self.publish_websocket_event(
+            platform_chat_id,
+            websocket_messages_payload(&state, &attachments, &page),
+        );
+        Ok(())
     }
 }
 

@@ -1503,6 +1503,10 @@ button {
     0 -12px 34px color-mix(in srgb, #000, transparent 92%);
 }
 
+.session-progress-card.compact {
+  padding: 10px 14px;
+}
+
 .session-progress-head {
   display: flex;
   min-width: 0;
@@ -1515,6 +1519,10 @@ button {
 
 .session-progress-head code {
   margin-left: auto;
+  min-width: 0;
+  max-width: min(52%, 360px);
+  overflow: hidden;
+  text-overflow: ellipsis;
   padding: 1px 6px;
   border-radius: 999px;
   color: var(--muted);
@@ -1533,6 +1541,18 @@ button {
   background: var(--accent);
   box-shadow: 0 0 0 5px var(--accent-soft);
   animation: live-dot-pulse 1.6s ease-in-out infinite;
+}
+
+.session-progress-head.done .session-progress-dot {
+  background: var(--green);
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--green), transparent 82%);
+  animation: none;
+}
+
+.session-progress-head.failed .session-progress-dot {
+  background: var(--danger);
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--danger), transparent 82%);
+  animation: none;
 }
 
 .session-progress-step {

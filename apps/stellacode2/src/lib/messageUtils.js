@@ -16,7 +16,7 @@ export function messageKey(message, index) {
 export function isAuxiliaryUserMessage(message) {
   if (String(message?.role || '').toLowerCase() !== 'user') return false;
   const text = messageText(message).trim();
-  return /^\[(Incoming User Metadata|Runtime Prompt Updates|System Context|Developer Context|Tool Context)]/i.test(text);
+  return /^\[(Incoming User Metadata|Runtime Prompt Updates|Runtime Skill Updates|System Context|Developer Context|Tool Context)]/i.test(text);
 }
 
 export function messageItems(message) {

@@ -12,8 +12,8 @@ mod web_terminal;
 
 pub use telegram::TelegramChannel;
 pub use types::{
-    ChannelEvent, IncomingDispatch, OutgoingDelivery, OutgoingError, OutgoingProgressFeedback,
-    OutgoingStatus, ProcessingState,
+    ChannelEvent, IncomingDispatch, OutgoingDelivery, OutgoingError, OutgoingMessageAppended,
+    OutgoingProgressFeedback, OutgoingStatus, ProcessingState,
 };
 pub use web::WebChannel;
 
@@ -24,6 +24,7 @@ pub trait Channel: Send + Sync {
     fn send_event(&self, event: &ChannelEvent) -> Result<()> {
         match event {
             ChannelEvent::Delivery(delivery) => self.send_delivery(delivery),
+            ChannelEvent::MessageAppended(appended) => self.message_appended(appended),
             ChannelEvent::Processing(processing) => {
                 self.set_processing(&processing.platform_chat_id, processing.state)
             }
@@ -60,6 +61,9 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
     fn update_progress_feedback(&self, _feedback: &OutgoingProgressFeedback) -> Result<()> {
+        Ok(())
+    }
+    fn message_appended(&self, _appended: &OutgoingMessageAppended) -> Result<()> {
         Ok(())
     }
     fn conversation_updated(&self, _platform_chat_id: &str, _conversation_id: &str) -> Result<()> {
