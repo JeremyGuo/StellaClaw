@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Notification } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const childProcess = require('node:child_process');
 const fs = require('node:fs/promises');
@@ -30,7 +30,8 @@ function defaultSettings() {
       inspector: 340,
       file: 360,
       preview: 480,
-      terminal: 240
+      terminal: 240,
+      terminalList: 210
     },
     servers: [
       {
@@ -44,7 +45,9 @@ function defaultSettings() {
       }
     ],
     conversationNames: {},
-    hiddenConversations: {}
+    hiddenConversations: {},
+    conversationUi: {},
+    conversationRead: {}
   };
 }
 
@@ -77,7 +80,8 @@ function normalizeSettings(value) {
       inspector: Number(layout.inspector) || fallback.layout.inspector,
       file: Number(layout.file) || fallback.layout.file,
       preview: Number(layout.preview) || fallback.layout.preview,
-      terminal: Number(layout.terminal) || fallback.layout.terminal
+      terminal: Number(layout.terminal) || fallback.layout.terminal,
+      terminalList: Number(layout.terminalList) || fallback.layout.terminalList
     },
     servers: normalizedServers.length ? normalizedServers : fallback.servers,
     conversationNames:
@@ -87,6 +91,14 @@ function normalizeSettings(value) {
     hiddenConversations:
       value?.hiddenConversations && typeof value.hiddenConversations === 'object'
         ? value.hiddenConversations
+        : {},
+    conversationUi:
+      value?.conversationUi && typeof value.conversationUi === 'object'
+        ? value.conversationUi
+        : {},
+    conversationRead:
+      value?.conversationRead && typeof value.conversationRead === 'object'
+        ? value.conversationRead
         : {}
   };
 }
@@ -315,6 +327,22 @@ function bufferFromIpcBinary(value) {
 
 async function gzipBinary(_event, payload) {
   return zlib.gzipSync(bufferFromIpcBinary(payload));
+}
+
+function showNotification(_event, payload = {}) {
+  if (!Notification.isSupported()) {
+    return { shown: false, reason: 'unsupported' };
+  }
+  const title = String(payload.title || 'Stellacode');
+  const body = String(payload.body || '');
+  const notification = new Notification({
+    title,
+    body,
+    icon: appIconPath(),
+    silent: Boolean(payload.silent)
+  });
+  notification.show();
+  return { shown: true };
 }
 
 function parseTarEntries(buffer) {
@@ -564,6 +592,7 @@ app.whenReady().then(() => {
   ipcMain.handle('server:request', requestServer);
   ipcMain.handle('server:connectionInfo', serverConnectionInfo);
   ipcMain.handle('binary:gzip', gzipBinary);
+  ipcMain.handle('app:notify', showNotification);
   ipcMain.handle('workspace:upload', uploadWorkspaceFile);
   ipcMain.handle('workspace:download', downloadWorkspaceFile);
   ipcMain.handle('updater:status', () => updaterState);

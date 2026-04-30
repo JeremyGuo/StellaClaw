@@ -22,6 +22,9 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const renderedMessages = useMemo(() => displayMessages(messages), [messages]);
   const activitySignature = useMemo(() => liveActivitySignature(runningActivities || []), [runningActivities]);
   const oldestMessageKey = useMemo(() => firstMessageId(messages) || messages[0]?.id || messages[0]?.index || '', [messages]);
+  const modeLabel = typeof mode === 'string' ? mode : mode?.label || '本地';
+  const modeTone = typeof mode === 'string' ? '' : mode?.tone || 'local';
+  const modeTitle = typeof mode === 'string' ? mode : mode?.title || modeLabel;
   const [typingKeys, setTypingKeys] = useState(() => new Set());
   const [commandPanel, setCommandPanel] = useState('commands');
   const [models, setModels] = useState([]);
@@ -368,7 +371,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
                 </Popover.Content>
               </Popover.Portal>
             </Popover.Root>
-            <span className="mode-pill">{mode}</span>
+            <span className={`mode-pill ${modeTone}`} title={modeTitle}>{modeLabel}</span>
             <button className="send-button" type="button" disabled={modelSelectionPending || !draft.trim() || sending} onClick={submitDraft}>
               <Send size={18} />
             </button>

@@ -30,6 +30,27 @@ export async function loadConversations(serverId) {
   return response.data?.conversations || [];
 }
 
+export async function loadConversationSeen(serverId) {
+  const response = await api(serverId, '/api/conversations/seen');
+  return response.data?.seen || {};
+}
+
+export async function markConversationSeen(serverId, conversationId, lastSeenMessageId) {
+  const response = await api(serverId, `/api/conversations/${conversationId}/seen`, {
+    method: 'POST',
+    body: { last_seen_message_id: String(lastSeenMessageId) }
+  });
+  return response.data?.seen || null;
+}
+
+export async function conversationStreamUrl(serverId) {
+  const info = await connectionInfo(serverId);
+  const url = new URL('/api/conversations/stream', info.baseUrl);
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.searchParams.set('token', info.token || '');
+  return url.toString();
+}
+
 export async function createConversation(serverId, options = {}) {
   const body = {};
   const nickname = String(options.nickname || '').trim();
@@ -113,4 +134,36 @@ export async function loadWorkspaceFile(serverId, conversationId, path, limitByt
     `/api/conversations/${conversationId}/workspace/file?path=${encodeURIComponent(path || '')}&offset=0&limit_bytes=${encodeURIComponent(limitBytes)}`
   );
   return response.data;
+}
+
+export async function listTerminals(serverId, conversationId) {
+  const response = await api(serverId, `/api/conversations/${conversationId}/terminals`);
+  return response.data?.terminals || [];
+}
+
+export async function createTerminal(serverId, conversationId, options = {}) {
+  const response = await api(serverId, `/api/conversations/${conversationId}/terminals`, {
+    method: 'POST',
+    body: options
+  });
+  return response.data;
+}
+
+export async function terminateTerminal(serverId, conversationId, terminalId) {
+  const response = await api(serverId, `/api/conversations/${conversationId}/terminals/${terminalId}`, {
+    method: 'DELETE'
+  });
+  return response.data;
+}
+
+export async function terminalStreamUrl(serverId, conversationId, terminalId, offset = 0) {
+  const info = await connectionInfo(serverId);
+  const url = new URL(
+    `/api/conversations/${encodeURIComponent(conversationId)}/terminals/${encodeURIComponent(terminalId)}/stream`,
+    info.baseUrl
+  );
+  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  url.searchParams.set('token', info.token || '');
+  url.searchParams.set('offset', String(Math.max(0, Number(offset) || 0)));
+  return url.toString();
 }

@@ -1,13 +1,15 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import 'highlight.js/styles/github-dark.css';
 import './styles.css';
 import {
   conversationKey,
   connectionInfo,
+  conversationStreamUrl,
   createConversation,
   deleteConversation,
   displayConversationName,
+  markConversationSeen,
   loadConversations,
   loadMessageRange,
   loadMessages,
@@ -37,7 +39,92 @@ const SIDEBAR_EXPANDED = 286;
 const SIDEBAR_COLLAPSED = 0;
 const WORKSPACE_PANEL_MIN = 340;
 const WORKSPACE_PANEL_MAX = 620;
+const TERMINAL_HEIGHT_MIN = 160;
+const TERMINAL_HEIGHT_MAX = 620;
+const TERMINAL_LIST_MIN = 180;
+const TERMINAL_LIST_MAX = 360;
 const MAX_UPLOAD_COMPRESSED_BYTES = 10 * 1024 * 1024;
+
+function setPxVariable(element, name, value) {
+  if (!Number.isFinite(value)) return;
+  element.style.setProperty(name, `${value}px`);
+}
+
+function applyChromeMetrics(metrics) {
+  if (!metrics || typeof document === 'undefined') return;
+  const root = document.documentElement;
+  root.dataset.platform = metrics.platform || 'unknown';
+  setPxVariable(root, '--window-controls-left-safe-area', metrics.leftSafeArea);
+  setPxVariable(root, '--chrome-left-toolbar-offset', metrics.leftToolbarOffset);
+  setPxVariable(root, '--chrome-title-left-offset', metrics.titleLeftOffset);
+  setPxVariable(root, '--chrome-right-toolbar-offset', metrics.rightToolbarOffset);
+  setPxVariable(root, '--chrome-title-right-offset', metrics.titleRightOffset);
+  setPxVariable(root, '--chrome-title-right-offset-with-update', metrics.titleRightOffsetWithUpdate);
+}
+
+function composerModeInfo(status) {
+  const remote = String(status?.remote || status?.tool_remote_mode || '').trim();
+  const fixedRemote = remote.match(/^fixed ssh `([^`]*)` `([^`]*)`/);
+  if (fixedRemote) {
+    const host = fixedRemote[1];
+    const cwd = fixedRemote[2];
+    return {
+      label: '远程',
+      tone: 'remote',
+      title: cwd ? `工具运行在 ${host}:${cwd}` : `工具运行在 ${host}`
+    };
+  }
+  if (remote && remote !== 'selectable') {
+    return { label: '远程', tone: 'remote', title: remote };
+  }
+  return {
+    label: '本地',
+    tone: 'local',
+    title: '工具在当前 Stellaclaw 工作区执行'
+  };
+}
+
+function measuredTerminalListMin(root) {
+  const header = root?.querySelector('.terminal-list-header');
+  const title = header?.querySelector('.terminal-title');
+  const actions = header?.querySelector('.terminal-actions');
+  if (!header || !title || !actions) return TERMINAL_LIST_MIN;
+  const headerStyle = window.getComputedStyle(header);
+  const padding = Number.parseFloat(headerStyle.paddingLeft || '0')
+    + Number.parseFloat(headerStyle.paddingRight || '0');
+  const gap = Number.parseFloat(headerStyle.columnGap || headerStyle.gap || '0');
+  const measured = Math.ceil(title.scrollWidth + actions.scrollWidth + padding + gap + 8);
+  return clamp(measured, TERMINAL_LIST_MIN, TERMINAL_LIST_MAX);
+}
+
+function layoutSnapshotFromValues(values = {}) {
+  return {
+    inspector: clamp(values.inspector, 320, 760) || 420,
+    file: clamp(values.file, WORKSPACE_PANEL_MIN, WORKSPACE_PANEL_MAX) || 360,
+    preview: clamp(values.preview, 320, 820) || 480,
+    terminal: clamp(values.terminal, TERMINAL_HEIGHT_MIN, TERMINAL_HEIGHT_MAX) || 240,
+    terminalList: clamp(values.terminalList, TERMINAL_LIST_MIN, TERMINAL_LIST_MAX) || 210
+  };
+}
+
+function fileTabSnapshot(file) {
+  const path = normalizeWorkspacePath(file?.path);
+  if (!path) return null;
+  return {
+    path,
+    name: file?.name || fileNameFromPath(path),
+    kind: file?.kind || workspaceFileKind(path)
+  };
+}
+
+function isConversationRunning(conversation, status) {
+  const processing = String(conversation?.processing_state || status?.processing_state || '').toLowerCase();
+  return Boolean(conversation?.running)
+    || processing === 'typing'
+    || processing === 'running'
+    || Number(status?.running_background || 0) > 0
+    || Number(status?.running_subagents || 0) > 0;
+}
 
 function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -209,6 +296,7 @@ function App() {
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
+  const [conversationLayout, setConversationLayout] = useState(null);
   const [newConversationOpen, setNewConversationOpen] = useState(false);
   const [creatingConversation, setCreatingConversation] = useState(false);
   const [draft, setDraft] = useState('');
@@ -221,10 +309,20 @@ function App() {
   const websocketKeyRef = useRef('');
   const seenUsageMessagesRef = useRef(new Map());
   const loadingOlderRef = useRef(false);
+  const layoutDraftRef = useRef(null);
+  const restoringUiRef = useRef(false);
+  const uiSaveTimerRef = useRef(null);
+  const readSaveTimersRef = useRef(new Map());
+  const conversationRunningRef = useRef(new Map());
+  const conversationRunningReadyRef = useRef(false);
 
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  useLayoutEffect(() => {
+    applyChromeMetrics(window.stellacode2?.chromeMetrics?.());
+  }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = settings?.themeMode || 'system';
@@ -251,10 +349,13 @@ function App() {
     };
   }, []);
 
-  const sidebarWidth = sidebarMode === 'collapsed' ? SIDEBAR_COLLAPSED : clamp(settings?.layout?.sidebar, 220, 520) || SIDEBAR_EXPANDED;
-  const overviewPanelWidth = clamp(settings?.layout?.inspector, 320, 760) || 420;
-  const workspacePanelWidth = clamp(settings?.layout?.file, WORKSPACE_PANEL_MIN, WORKSPACE_PANEL_MAX) || 360;
-  const previewPanelWidth = clamp(settings?.layout?.preview, 320, 820) || 480;
+  const layoutValues = conversationLayout || settings?.layout || {};
+  const sidebarWidth = sidebarMode === 'collapsed' ? SIDEBAR_COLLAPSED : clamp(layoutValues.sidebar, 220, 520) || SIDEBAR_EXPANDED;
+  const overviewPanelWidth = clamp(layoutValues.inspector, 320, 760) || 420;
+  const workspacePanelWidth = clamp(layoutValues.file, WORKSPACE_PANEL_MIN, WORKSPACE_PANEL_MAX) || 360;
+  const previewPanelWidth = clamp(layoutValues.preview, 320, 820) || 480;
+  const terminalHeight = clamp(layoutValues.terminal, TERMINAL_HEIGHT_MIN, TERMINAL_HEIGHT_MAX) || 240;
+  const terminalListWidth = clamp(layoutValues.terminalList, TERMINAL_LIST_MIN, TERMINAL_LIST_MAX) || 210;
   const previewPanelRight = workspacePanelOpen ? workspacePanelWidth : 0;
   const overviewPanelRight = previewPanelRight + (previewPanelOpen ? previewPanelWidth : 0);
   const rightContentInset = (overviewPanelOpen ? overviewPanelWidth : 0) + (workspacePanelOpen ? workspacePanelWidth : 0) + (previewPanelOpen ? previewPanelWidth : 0);
@@ -264,6 +365,11 @@ function App() {
   );
   const selectedKey = selected ? conversationKey(selected.serverId, selected.conversationId) : '';
   const selectedStatus = selected ? statuses.get(selectedKey) : null;
+  const settingsReady = Boolean(settings);
+  const composerMode = useMemo(
+    () => composerModeInfo(selectedStatus),
+    [selectedStatus]
+  );
   const selectedUsage = useMemo(
     () => statusUsageTotals(selectedStatus, selectedKey ? statusDeltas.get(selectedKey) : null),
     [selectedStatus, selectedKey, statusDeltas]
@@ -295,8 +401,59 @@ function App() {
 
   const saveSettings = useCallback(async (next) => {
     const saved = await window.stellacode2.saveSettings(next);
-    setSettings(saved);
-    return saved;
+    const merged = {
+      ...saved,
+      layout: next?.layout ? { ...(saved.layout || {}), ...(next.layout || {}) } : saved.layout,
+      conversationUi: next?.conversationUi ? { ...(saved.conversationUi || {}), ...(next.conversationUi || {}) } : saved.conversationUi
+    };
+    setSettings(merged);
+    return merged;
+  }, []);
+
+  const queueConversationUiSave = useCallback((key, snapshot) => {
+    if (!key || !snapshot) return;
+    setSettings((current) => {
+      if (!current) return current;
+      const next = {
+        ...current,
+        conversationUi: {
+          ...(current.conversationUi || {}),
+          [key]: snapshot
+        }
+      };
+      window.clearTimeout(uiSaveTimerRef.current);
+      uiSaveTimerRef.current = window.setTimeout(() => {
+        window.stellacode2.saveSettings(next).catch(() => {});
+      }, 260);
+      return next;
+    });
+  }, []);
+
+  const markConversationRead = useCallback((key, lastMessageId) => {
+    const seen = Number(lastMessageId);
+    if (!key || !Number.isFinite(seen)) return;
+    const [serverId, conversationId] = key.split(':');
+    if (!serverId || !conversationId) return;
+    setConversations((current) => current.map((conversation) => (
+      conversation.conversation_id === conversationId
+        ? { ...conversation, last_seen_message_id: String(Math.max(seen, Number(conversation.last_seen_message_id || -1))) }
+        : conversation
+    )));
+    const existing = readSaveTimersRef.current.get(key);
+    if (existing) window.clearTimeout(existing);
+    const timer = window.setTimeout(() => {
+      readSaveTimersRef.current.delete(key);
+      markConversationSeen(serverId, conversationId, seen).catch(() => {});
+    }, 180);
+    readSaveTimersRef.current.set(key, timer);
+  }, []);
+
+  useEffect(() => () => {
+    window.clearTimeout(uiSaveTimerRef.current);
+    for (const timer of readSaveTimersRef.current.values()) {
+      window.clearTimeout(timer);
+    }
+    readSaveTimersRef.current.clear();
   }, []);
 
   const refreshConversations = useCallback(async (serverId, sourceSettings = null) => {
@@ -314,6 +471,135 @@ function App() {
       setLoading(false);
     }
   }, []);
+
+  useEffect(() => {
+    if (!activeServerId || !settingsReady) return undefined;
+    let disposed = false;
+    let reconnectTimer = null;
+    let streamSocket = null;
+    const applyConversationList = (list) => {
+      if (!Array.isArray(list) || disposed) return;
+      const hidden = settings?.hiddenConversations || {};
+      const visibleList = list.filter((conversation) => !hidden[conversationKey(activeServerId, conversation.conversation_id)]);
+      setConversations(visibleList);
+      if (!selectedRef.current && visibleList[0]) {
+        setSelected({ serverId: activeServerId, conversationId: visibleList[0].conversation_id });
+      }
+    };
+    const connect = async () => {
+      try {
+        const url = await conversationStreamUrl(activeServerId);
+        if (disposed) return;
+        const socket = new WebSocket(url);
+        streamSocket = socket;
+        socket.addEventListener('message', (event) => {
+          let payload;
+          try {
+            payload = JSON.parse(event.data);
+          } catch {
+            return;
+          }
+          if (payload.type === 'conversation_snapshot') {
+            applyConversationList(payload.conversations || []);
+          } else if (payload.type === 'conversation_upserted' && payload.conversation) {
+            setConversations((current) => {
+              const nextConversation = payload.conversation;
+              const hidden = settings?.hiddenConversations || {};
+              if (hidden[conversationKey(activeServerId, nextConversation.conversation_id)]) {
+                return current.filter((conversation) => conversation.conversation_id !== nextConversation.conversation_id);
+              }
+              const exists = current.some((conversation) => conversation.conversation_id === nextConversation.conversation_id);
+              if (!exists) return [...current, nextConversation].sort((left, right) => left.conversation_id.localeCompare(right.conversation_id));
+              return current.map((conversation) => (
+                conversation.conversation_id === nextConversation.conversation_id
+                  ? { ...conversation, ...nextConversation }
+                  : conversation
+              ));
+            });
+          } else if (payload.type === 'conversation_processing' && payload.conversation_id) {
+            setConversations((current) => current.map((conversation) => (
+              conversation.conversation_id === payload.conversation_id
+                ? {
+                  ...conversation,
+                  processing_state: payload.processing_state || conversation.processing_state,
+                  running: Boolean(payload.running)
+                }
+                : conversation
+            )));
+          } else if (payload.type === 'conversation_turn_completed' && payload.conversation_id) {
+            setConversations((current) => current.map((conversation) => {
+              if (conversation.conversation_id !== payload.conversation_id) return conversation;
+              return {
+                ...conversation,
+                ...(payload.conversation || {}),
+                processing_state: 'idle',
+                running: false,
+                message_count: payload.message_count ?? payload.conversation?.message_count ?? conversation.message_count,
+                last_message_id: payload.last_message_id ?? payload.conversation?.last_message_id ?? conversation.last_message_id,
+                last_message_time: payload.last_message_time ?? payload.conversation?.last_message_time ?? conversation.last_message_time,
+                last_seen_message_id: payload.last_seen_message_id ?? payload.conversation?.last_seen_message_id ?? conversation.last_seen_message_id,
+                last_seen_at: payload.last_seen_at ?? payload.conversation?.last_seen_at ?? conversation.last_seen_at
+              };
+            }));
+          } else if (payload.type === 'conversation_seen' && payload.conversation_id && payload.seen) {
+            setConversations((current) => current.map((conversation) => (
+              conversation.conversation_id === payload.conversation_id
+                ? {
+                  ...conversation,
+                  last_seen_message_id: payload.seen.last_seen_message_id,
+                  last_seen_at: payload.seen.updated_at
+                }
+                : conversation
+            )));
+          }
+        });
+        socket.addEventListener('close', () => {
+          if (disposed) return;
+          reconnectTimer = window.setTimeout(connect, 1600);
+        });
+        socket.addEventListener('error', () => {});
+      } catch {
+        if (disposed) return;
+        reconnectTimer = window.setTimeout(connect, 2400);
+      }
+    };
+    connect();
+    return () => {
+      disposed = true;
+      if (reconnectTimer) window.clearTimeout(reconnectTimer);
+      if (streamSocket && streamSocket.readyState <= WebSocket.OPEN) streamSocket.close();
+    };
+  }, [activeServerId, settingsReady, settings?.hiddenConversations]);
+
+  useEffect(() => {
+    if (!settingsReady || !activeServerId) return;
+    const next = new Map(conversationRunningRef.current);
+    const visibleKeys = new Set();
+    for (const conversation of conversations) {
+      const key = conversationKey(activeServerId, conversation.conversation_id);
+      visibleKeys.add(key);
+      const status = statuses.get(key);
+      const running = isConversationRunning(conversation, status);
+      const previous = conversationRunningRef.current.get(key);
+      if (conversationRunningReadyRef.current && previous === true && running === false) {
+        window.stellacode2?.notify?.({
+          title: 'Stellacode',
+          body: `${displayConversationName(settings, activeServerId, conversation)} 已运行完成`
+        }).catch(() => {});
+      }
+      next.set(key, running);
+    }
+    for (const key of next.keys()) {
+      if (!visibleKeys.has(key) && key.startsWith(`${activeServerId}:`)) next.delete(key);
+    }
+    conversationRunningRef.current = next;
+    conversationRunningReadyRef.current = true;
+  }, [conversations, statuses, activeServerId, settingsReady, settings]);
+
+  useEffect(() => {
+    if (!selectedKey || !activeConversation?.last_message_id) return;
+    markConversationRead(selectedKey, activeConversation.last_message_id);
+  }, [selectedKey, activeConversation?.last_message_id, markConversationRead]);
 
   const saveSettingsFromDialog = useCallback(async (next) => {
     setSettingsSaving(true);
@@ -438,15 +724,128 @@ function App() {
   }, [selected, workspaceListings]);
 
   useEffect(() => {
+    if (!selected || !settings) {
+      setWorkspaceListings(new Map());
+      setWorkspaceExpanded(new Set(['']));
+      setWorkspaceError('');
+      setOpenFiles([]);
+      setActiveFilePath('');
+      setConversationLayout(null);
+      return undefined;
+    }
+    const key = conversationKey(selected.serverId, selected.conversationId);
+    const savedUi = settings.conversationUi?.[key] || {};
+    const savedPanels = savedUi.panels || {};
+    const savedLayout = layoutSnapshotFromValues({ ...(settings.layout || {}), ...(savedUi.layout || {}) });
+    const savedFiles = Array.isArray(savedUi.openFiles)
+      ? savedUi.openFiles.map(fileTabSnapshot).filter(Boolean).slice(0, 12)
+      : [];
+    const savedActivePath = savedFiles.some((file) => file.path === savedUi.activeFilePath)
+      ? savedUi.activeFilePath
+      : savedFiles[0]?.path || '';
+    let disposed = false;
+    restoringUiRef.current = true;
+    setConversationLayout(savedLayout);
+    setOverviewPanelOpen(Boolean(savedPanels.overview));
+    setWorkspacePanelOpen(Boolean(savedPanels.workspace));
+    setPreviewPanelOpen(Boolean(savedPanels.preview) || savedFiles.length > 0);
+    setTerminalOpen(Boolean(savedPanels.terminal));
     setWorkspaceListings(new Map());
     setWorkspaceExpanded(new Set(['']));
     setWorkspaceError('');
-    setOpenFiles([]);
-    setActiveFilePath('');
-    if (selected) {
-      fetchWorkspacePath('', { force: true }).catch(() => {});
-    }
-  }, [selected?.serverId, selected?.conversationId]);
+    setOpenFiles(savedFiles.map((file) => ({ ...file, loading: true })));
+    setActiveFilePath(savedActivePath);
+    queueMicrotask(() => {
+      restoringUiRef.current = false;
+    });
+    setWorkspaceLoading((current) => new Set(current).add(''));
+    loadWorkspace(selected.serverId, selected.conversationId, '', 500)
+      .then((listing) => {
+        if (disposed) return;
+        setWorkspaceListings((current) => new Map(current).set('', listing));
+      })
+      .catch((error) => {
+        if (!disposed) setWorkspaceError(error?.message || '读取工作区失败');
+      })
+      .finally(() => {
+        if (disposed) return;
+        setWorkspaceLoading((current) => {
+          const next = new Set(current);
+          next.delete('');
+          return next;
+        });
+      });
+    savedFiles.forEach((file) => {
+      loadWorkspaceFile(selected.serverId, selected.conversationId, file.path)
+        .then((loaded) => {
+          if (disposed) return;
+          const kind = workspaceFileKind(file.path);
+          const data = loaded?.encoding === 'base64' && kind === 'image'
+            ? `data:${imageMimeType(file.path)};base64,${loaded.data || ''}`
+            : loaded?.data || '';
+          setOpenFiles((current) => current.map((item) => (
+            item.path === file.path
+              ? {
+                ...item,
+                ...loaded,
+                kind,
+                language: fileExtension(file.path),
+                content: loaded?.encoding === 'utf8' ? loaded.data || '' : '',
+                data_url: kind === 'image' ? data : '',
+                loading: false
+              }
+              : item
+          )));
+        })
+        .catch((error) => {
+          if (disposed) return;
+          setOpenFiles((current) => current.map((item) => (
+            item.path === file.path ? { ...item, loading: false, error: error?.message || '读取文件失败' } : item
+          )));
+        });
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [selected?.serverId, selected?.conversationId, settingsReady]);
+
+  useEffect(() => {
+    if (!selectedKey || !settings || restoringUiRef.current) return;
+    const files = openFiles.map(fileTabSnapshot).filter(Boolean);
+    const snapshot = {
+      panels: {
+        overview: overviewPanelOpen,
+        workspace: workspacePanelOpen,
+        preview: previewPanelOpen,
+        terminal: terminalOpen
+      },
+      layout: layoutSnapshotFromValues({
+        inspector: overviewPanelWidth,
+        file: workspacePanelWidth,
+        preview: previewPanelWidth,
+        terminal: terminalHeight,
+        terminalList: terminalListWidth
+      }),
+      openFiles: files,
+      activeFilePath: files.some((file) => file.path === activeFilePath) ? activeFilePath : ''
+    };
+    queueConversationUiSave(selectedKey, snapshot);
+  }, [
+    selectedKey,
+    settingsReady,
+    overviewPanelOpen,
+    workspacePanelOpen,
+    previewPanelOpen,
+    terminalOpen,
+    overviewPanelWidth,
+    workspacePanelWidth,
+    previewPanelWidth,
+    terminalHeight,
+    terminalListWidth,
+    openFiles,
+    activeFilePath,
+    queueConversationUiSave
+  ]);
 
   const toggleWorkspaceDirectory = useCallback((path) => {
     const normalized = normalizeWorkspacePath(path);
@@ -610,6 +1009,18 @@ function App() {
         messagesRef.current = next;
         return next;
       });
+      const latestId = incoming.reduce((max, message) => {
+        const id = Number(message?.id ?? message?.message_id);
+        return Number.isFinite(id) ? Math.max(max, id) : max;
+      }, -1);
+      if (latestId >= 0) {
+        setConversations((current) => current.map((conversation) => (
+          conversation.conversation_id === selected.conversationId
+            ? { ...conversation, last_message_id: String(latestId), message_count: Math.max(Number(conversation.message_count || 0), latestId + 1) }
+            : conversation
+        )));
+        markConversationRead(key, latestId);
+      }
       const activity = activityFromMessages(incoming);
       if (activity) setSessionActivity(activity);
       if (incoming.some((message) => isFinalAssistantMessage(message))) {
@@ -679,6 +1090,15 @@ function App() {
           } else if (payload.type === 'messages') {
             applyIncomingMessages(payload.messages || []);
           } else if (payload.type === 'processing') {
+            setConversations((current) => current.map((conversation) => (
+              conversation.conversation_id === selected.conversationId
+                ? {
+                  ...conversation,
+                  processing_state: payload.state,
+                  running: payload.state === 'typing'
+                }
+                : conversation
+            )));
             if (payload.state === 'typing') {
               setSessionActivity('正在思考');
               updateRunningActivities((current) => [
@@ -767,7 +1187,7 @@ function App() {
       if (websocketKeyRef.current === key) websocketKeyRef.current = '';
       closeSocket();
     };
-  }, [selected]);
+  }, [selected, markConversationRead]);
 
   const toggleSidebar = () => {
     const nextMode = sidebarMode === 'collapsed' ? 'expanded' : 'collapsed';
@@ -781,17 +1201,25 @@ function App() {
     if (!settings) return;
     event.preventDefault();
     const root = event.currentTarget.closest('.app-root');
+    root?.classList.add('layout-resizing');
     const scroll = root?.querySelector('.message-scroll');
     const bottomOffset = scroll ? scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight : 0;
     const startX = event.clientX;
+    const startY = event.clientY;
+    const terminalListMin = kind === 'terminalList'
+      ? measuredTerminalListMin(root)
+      : TERMINAL_LIST_MIN;
     const startLayout = {
       ...(settings.layout || {}),
       sidebar: sidebarWidth,
       inspector: overviewPanelWidth,
       file: workspacePanelWidth,
-      preview: previewPanelWidth
+      preview: previewPanelWidth,
+      terminal: terminalHeight,
+      terminalList: terminalListWidth
     };
     let latestLayout = startLayout;
+    layoutDraftRef.current = startLayout;
     let raf = 0;
     const applyLayoutVars = () => {
       if (!root) return;
@@ -807,6 +1235,8 @@ function App() {
       root.style.setProperty('--workspace-panel-width', `${latestLayout.file}px`);
       root.style.setProperty('--preview-panel-width', `${latestLayout.preview}px`);
       root.style.setProperty('--preview-panel-right', `${previewRight}px`);
+      root.style.setProperty('--terminal-height-live', `${latestLayout.terminal}px`);
+      root.style.setProperty('--terminal-list-width-live', `${latestLayout.terminalList}px`);
       root.style.setProperty('--content-right', `${contentRight}px`);
       if (scroll) {
         scroll.scrollTop = scroll.scrollHeight - scroll.clientHeight - bottomOffset;
@@ -818,6 +1248,17 @@ function App() {
         latestLayout = {
           ...latestLayout,
           sidebar: clamp(startLayout.sidebar + delta, 220, 520)
+        };
+      } else if (kind === 'terminal' && terminalOpen) {
+        const deltaY = moveEvent.clientY - startY;
+        latestLayout = {
+          ...latestLayout,
+          terminal: clamp(startLayout.terminal - deltaY, TERMINAL_HEIGHT_MIN, TERMINAL_HEIGHT_MAX)
+        };
+      } else if (kind === 'terminalList' && terminalOpen) {
+        latestLayout = {
+          ...latestLayout,
+          terminalList: clamp(startLayout.terminalList + delta, terminalListMin, TERMINAL_LIST_MAX)
         };
       } else if (kind === 'workspace' && workspacePanelOpen) {
         latestLayout = {
@@ -838,6 +1279,7 @@ function App() {
       if (!raf) {
         raf = window.requestAnimationFrame(() => {
           raf = 0;
+          layoutDraftRef.current = latestLayout;
           applyLayoutVars();
         });
       }
@@ -851,8 +1293,20 @@ function App() {
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', finish);
       window.removeEventListener('pointercancel', finish);
-      setSettings((prev) => prev ? { ...prev, layout: { ...(prev.layout || {}), ...latestLayout } } : prev);
-      saveSettings({ ...settings, layout: { ...(settings.layout || {}), ...latestLayout } }).catch(() => {});
+      if (selectedKey && kind !== 'sidebar') {
+        setConversationLayout(latestLayout);
+      } else {
+        setSettings((prev) => prev ? { ...prev, layout: { ...(prev.layout || {}), ...latestLayout } } : prev);
+      }
+      layoutDraftRef.current = null;
+      window.requestAnimationFrame(() => {
+        root?.style.removeProperty('--terminal-height-live');
+        root?.style.removeProperty('--terminal-list-width-live');
+        root?.classList.remove('layout-resizing');
+      });
+      if (!selectedKey || kind === 'sidebar') {
+        saveSettings({ ...settings, layout: { ...(settings.layout || {}), ...latestLayout } }).catch(() => {});
+      }
     };
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', finish);
@@ -1021,6 +1475,8 @@ function App() {
         '--workspace-panel-width': `${workspacePanelWidth}px`,
         '--preview-panel-width': `${previewPanelWidth}px`,
         '--preview-panel-right': `${previewPanelRight}px`,
+        '--terminal-height': `${terminalHeight}px`,
+        '--terminal-list-width': `${terminalListWidth}px`,
         '--content-right': `${rightContentInset}px`
       }}
     >
@@ -1073,7 +1529,7 @@ function App() {
           messagesReady={messagesReady}
           draft={draft}
           setDraft={setDraft}
-          mode={selectedStatus?.tool_remote_mode ? 'Remote' : '本地'}
+          mode={composerMode}
           hasOlder={hasOlderMessages(messages)}
           onLoadOlder={loadOlderMessages}
           onSend={sendMessage}
@@ -1146,7 +1602,13 @@ function App() {
           onPointerDown={(event) => resizeLayout('preview', event)}
         />
       )}
-      <TerminalDock open={terminalOpen} />
+      <TerminalDock
+        open={terminalOpen}
+        serverId={selected?.serverId || ''}
+        conversationId={selected?.conversationId || ''}
+        onResizeHeight={(event) => resizeLayout('terminal', event)}
+        onResizeList={(event) => resizeLayout('terminalList', event)}
+      />
       <NewConversationDialog
         open={newConversationOpen}
         servers={settings?.servers || []}

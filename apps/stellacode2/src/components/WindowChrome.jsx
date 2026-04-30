@@ -1,4 +1,4 @@
-import { Download, FileSearch, Folder, MessageSquarePlus, Monitor, MoreHorizontal, PanelLeft, TerminalSquare, Upload } from 'lucide-react';
+import { Download, FileSearch, Folder, MessageSquarePlus, Monitor, PanelLeft, TerminalSquare, Upload } from 'lucide-react';
 import * as Popover from '@radix-ui/react-popover';
 
 export function WindowChrome({
@@ -36,9 +36,6 @@ export function WindowChrome({
           <strong>{title}</strong>
           <span>{subtitle}</span>
         </div>
-        <button className="chrome-button more-button" type="button" title="更多">
-          <MoreHorizontal size={18} />
-        </button>
       </div>
       <div className="right-toolbar">
         {updateReady && (

@@ -1,3 +1,4 @@
+import { Component } from 'react';
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import remarkGfm from 'remark-gfm';
@@ -46,7 +47,9 @@ export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile
           ) : activeFile?.error ? (
             <div className="panel-placeholder">{activeFile.error}</div>
           ) : activeFile ? (
-            <FilePreview file={activeFile} />
+            <PreviewErrorBoundary resetKey={activeFile.path}>
+              <FilePreview file={activeFile} />
+            </PreviewErrorBoundary>
           ) : (
             <div className="panel-placeholder">打开一个文件查看预览</div>
           )}
@@ -54,6 +57,31 @@ export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile
       </section>
     </aside>
   );
+}
+
+class PreviewErrorBoundary extends Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null, resetKey: props.resetKey };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  static getDerivedStateFromProps(props, state) {
+    if (props.resetKey !== state.resetKey) {
+      return { error: null, resetKey: props.resetKey };
+    }
+    return null;
+  }
+
+  render() {
+    if (this.state.error) {
+      return <div className="panel-placeholder">预览失败：{this.state.error?.message || '文件渲染异常'}</div>;
+    }
+    return this.props.children;
+  }
 }
 
 function FilePreview({ file }) {
@@ -81,6 +109,14 @@ function FilePreview({ file }) {
   }
   return (
     <CodePreview code={source} language={file.language || ext} />
+  );
+}
+
+function MarkdownBlock({ text }) {
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+      {String(text || '')}
+    </ReactMarkdown>
   );
 }
 

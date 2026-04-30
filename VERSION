@@ -1,5 +1,34 @@
-version: 1.18.0
+version: 1.18.1
 ---
+
+# 1.18.1
+
+- 抽象 Stellacode 2 标题栏系统控制区布局：
+  Electron preload 现在向前端暴露平台相关的 chrome metrics，前端通过 CSS 变量决定左侧 toolbar、drag safe area 和标题区域的 inset。macOS 继续避让 traffic lights，Windows/Linux 左侧 toolbar 默认贴近窗口左边缘，后续其它平台只需调整 metrics，不需要改 React 布局。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 简化 Stellacode 2 标题栏：
+  移除标题右侧未使用的“更多”三点按钮，减少标题区域视觉噪音。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Stellacode 2 设置页按钮换行：
+  设置页 section header 的操作按钮现在保持不换行且不被说明文字挤压，避免“添加”等短按钮被压成两行。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修正 Stellacode 2 输入框执行位置标识：
+  发送按钮旁边的“本地 / 远程”标识现在只根据当前 conversation 的 remote mode 派生：fixed SSH remote 显示为远程，其它情况显示为本地。SSH Proxy 或非 loopback Direct URL 只代表客户端连接 Stellaclaw 的方式，不再影响单个 conversation 的执行位置标识。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Stellacode 2 Markdown 文件预览崩溃：
+  文件预览面板现在补齐 Markdown 渲染组件，并给预览区域增加局部错误边界；点击 `.stellaclaw/USER.md` 等 Markdown 文件时不再因为未定义组件导致整个 renderer 黑屏，单个文件预览异常也会限制在预览面板内。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 接入 Stellacode 2 低延迟 Terminal Dock：
+  前端现在使用 `@xterm/xterm` 渲染终端，并通过后端 terminal WebSocket stream 的二进制帧直接传输 PTY 输入输出；Terminal Dock 支持按 conversation 自动创建终端、列出并切换多个 terminal 会话、关闭当前会话、实时 resize，并保留 REST 生命周期接口作为管理通道。Terminal Dock 高度和左侧会话列表宽度都可拖拽调整并保存到本地布局设置。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 增加 Stellacode 2 Conversation 级 UI 状态恢复：
+  Electron 本地 settings 现在记录每个 conversation 的 UI 状态，包括 Overview / Workspace / Preview / Terminal 面板开关、各面板尺寸、Terminal 尺寸和左侧列表宽度，以及 Preview 中打开的文件和当前 active tab。切换 conversation 时会自动恢复对应布局，并按路径重新读取已打开文件内容。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 增加 Stellacode 2 Conversation 新消息提示：
+  Web channel 会在 conversation 列表摘要中带上前台 processing 状态和最新消息 id；左侧 Conversation 列表用右上角红点提示有未读新消息，当前打开的 conversation 会自动标记为已读。前端仍会检测可见 conversation 从运行态变为 idle，并通过 Electron 触发系统通知。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 将 Stellacode 2 Conversation 已读和列表更新移到 Web channel：
+  Web channel 现在提供 conversation seen API，并在 conversation summary 中返回 `last_seen_message_id`；Stellacode 2 前端不再把已读位置写入 Electron 本地 settings，而是向后端标记已读。新增 `/api/conversations/stream` WebSocket：连接时只推一次 `conversation_snapshot` 初始快照，后续使用轻量事件 `conversation_processing`、`conversation_turn_completed`、`conversation_seen` 和 `conversation_upserted` 同步运行态、新消息、已读和摘要变化，左侧列表不再依赖客户端定时轮询。本次 seen 状态保存在 WebChannel 进程内，暂不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.18.0
 

@@ -1,4 +1,5 @@
 use std::{
+    cmp::Ordering,
     collections::HashMap,
     fs,
     io::{Read, Write},
@@ -73,6 +74,9 @@ pub struct WebChannel {
     terminal_manager: Arc<TerminalManager>,
     cache_manager: Arc<CacheManager>,
     websocket_subscribers: Arc<Mutex<HashMap<String, Vec<WebSocketSubscriber>>>>,
+    conversation_stream_subscribers: Arc<Mutex<Vec<Sender<Value>>>>,
+    processing_states: Arc<Mutex<HashMap<String, ProcessingState>>>,
+    seen_states: Arc<Mutex<HashMap<String, ConversationSeen>>>,
 }
 
 #[derive(Clone)]
@@ -102,6 +106,9 @@ impl WebChannel {
             terminal_manager: Arc::new(TerminalManager::new()),
             cache_manager,
             websocket_subscribers: Arc::new(Mutex::new(HashMap::new())),
+            conversation_stream_subscribers: Arc::new(Mutex::new(Vec::new())),
+            processing_states: Arc::new(Mutex::new(HashMap::new())),
+            seen_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -189,9 +196,13 @@ impl WebChannel {
         match (request.method.as_str(), segments.as_slice()) {
             ("GET", ["models"]) => self.list_models(),
             ("GET", ["conversations"]) => self.list_conversations(&request.query),
+            ("GET", ["conversations", "seen"]) => self.list_conversation_seen(),
             ("POST", ["conversations"]) => self.create_conversation(&request.body, id_manager),
             ("PATCH", ["conversations", conversation_id]) => {
                 self.update_conversation(conversation_id, &request.body)
+            }
+            ("POST", ["conversations", conversation_id, "seen"]) => {
+                self.mark_conversation_seen(conversation_id, &request.body)
             }
             ("GET", ["conversations", conversation_id, "messages"]) => {
                 self.list_messages(conversation_id, &request.query)
@@ -255,6 +266,23 @@ impl WebChannel {
     fn list_conversations(&self, query: &HashMap<String, String>) -> ApiResult<HttpResponse> {
         let offset = query_usize(query, "offset", 0);
         let limit = query_usize(query, "limit", 50).min(200);
+        let conversations = self.conversation_summaries()?;
+        let total = conversations.len();
+        let start = offset.min(total);
+        let end = start.saturating_add(limit).min(total);
+        Ok(json_response(
+            200,
+            json!({
+                "channel_id": self.id,
+                "offset": offset,
+                "limit": limit,
+                "total": total,
+                "conversations": &conversations[start..end],
+            }),
+        ))
+    }
+
+    fn conversation_summaries(&self) -> ApiResult<Vec<ConversationSummary>> {
         let mut conversations = Vec::new();
         let root = self.workdir.join("conversations");
         if root.exists() {
@@ -292,22 +320,64 @@ impl WebChannel {
                     }
                 };
                 if state.channel_id == self.id {
-                    conversations.push(ConversationSummary::from_state(&state, &self.config));
+                    let processing_state = self
+                        .processing_states
+                        .lock()
+                        .ok()
+                        .and_then(|states| states.get(&state.platform_chat_id).copied())
+                        .unwrap_or(ProcessingState::Idle);
+                    let message_summary = conversation_message_summary(&self.workdir, &state);
+                    conversations.push(ConversationSummary::from_state(
+                        &state,
+                        &self.config,
+                        processing_state,
+                        message_summary,
+                        self.conversation_seen(&state.conversation_id),
+                    ));
                 }
             }
         }
         conversations.sort_by(|left, right| left.conversation_id.cmp(&right.conversation_id));
-        let total = conversations.len();
-        let start = offset.min(total);
-        let end = start.saturating_add(limit).min(total);
+        Ok(conversations)
+    }
+
+    fn list_conversation_seen(&self) -> ApiResult<HttpResponse> {
+        let seen = self
+            .seen_states
+            .lock()
+            .map_err(|_| ApiError::new(500, "conversation seen lock poisoned"))?;
         Ok(json_response(
             200,
             json!({
                 "channel_id": self.id,
-                "offset": offset,
-                "limit": limit,
-                "total": total,
-                "conversations": &conversations[start..end],
+                "seen": &*seen,
+            }),
+        ))
+    }
+
+    fn mark_conversation_seen(&self, conversation_id: &str, body: &[u8]) -> ApiResult<HttpResponse> {
+        self.load_web_state(conversation_id)?;
+        let request: MarkConversationSeenRequest = parse_json(body)?;
+        let seen = ConversationSeen {
+            last_seen_message_id: request.last_seen_message_id,
+            updated_at: now_rfc3339(),
+        };
+        self.seen_states
+            .lock()
+            .map_err(|_| ApiError::new(500, "conversation seen lock poisoned"))?
+            .insert(conversation_id.to_string(), seen.clone());
+        self.publish_conversation_stream_event(json!({
+            "type": "conversation_seen",
+            "subscription": "conversation_list",
+            "channel_id": self.id,
+            "conversation_id": conversation_id,
+            "seen": &seen,
+        }));
+        Ok(json_response(
+            200,
+            json!({
+                "conversation_id": conversation_id,
+                "seen": seen,
             }),
         ))
     }
@@ -368,6 +438,7 @@ impl WebChannel {
             state.nickname = normalize_conversation_nickname(&state.conversation_id, &nickname);
         }
         persist_conversation_state(&self.workdir, &state).map_err(ApiError::internal)?;
+        self.publish_conversation_upserted(&state);
 
         Ok(json_response(
             201,
@@ -388,10 +459,24 @@ impl WebChannel {
             state.nickname = normalize_conversation_nickname(&state.conversation_id, &nickname);
         }
         persist_conversation_state(&self.workdir, &state).map_err(ApiError::internal)?;
+        let processing_state = self
+            .processing_states
+            .lock()
+            .ok()
+            .and_then(|states| states.get(&state.platform_chat_id).copied())
+            .unwrap_or(ProcessingState::Idle);
+        let summary = ConversationSummary::from_state(
+            &state,
+            &self.config,
+            processing_state,
+            conversation_message_summary(&self.workdir, &state),
+            self.conversation_seen(&state.conversation_id),
+        );
+        self.publish_conversation_upserted(&state);
         Ok(json_response(
             200,
             json!({
-                "conversation": ConversationSummary::from_state(&state, &self.config),
+                "conversation": summary,
             }),
         ))
     }
@@ -576,6 +661,10 @@ impl WebChannel {
                 write_websocket_handshake(&mut stream, key)?;
                 self.run_websocket_subscription(stream)
             }
+            ["conversations", "stream"] => {
+                write_websocket_handshake(&mut stream, key)?;
+                self.run_conversation_stream(stream)
+            }
             ["conversations", conversation_id, "terminals", terminal_id, "stream"] => {
                 let state = match self.load_web_state(conversation_id) {
                     Ok(state) => state,
@@ -609,6 +698,158 @@ impl WebChannel {
                 Ok(())
             }
         }
+    }
+
+    fn run_conversation_stream(&self, mut stream: TcpStream) -> Result<()> {
+        let (event_tx, event_rx) = unbounded();
+        self.register_conversation_stream_subscriber(event_tx);
+        let mut last_signature = String::new();
+        self.write_conversation_snapshot_if_changed(&mut stream, &mut last_signature, true)?;
+        let mut last_heartbeat = Instant::now();
+
+        loop {
+            match event_rx.recv_timeout(WEBSOCKET_POLL_INTERVAL) {
+                Ok(event) => {
+                    write_websocket_json(&mut stream, &event)?;
+                    while let Ok(queued) = event_rx.try_recv() {
+                        write_websocket_json(&mut stream, &queued)?;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {}
+            }
+            if last_heartbeat.elapsed() >= WEBSOCKET_HEARTBEAT_INTERVAL {
+                write_websocket_frame(&mut stream, 0x9, &[])?;
+                last_heartbeat = Instant::now();
+            }
+        }
+    }
+
+    fn write_conversation_snapshot_if_changed(
+        &self,
+        stream: &mut TcpStream,
+        last_signature: &mut String,
+        force: bool,
+    ) -> Result<()> {
+        let conversations = self.conversation_summaries().map_err(api_anyhow)?;
+        let signature = serde_json::to_string(&conversations).unwrap_or_default();
+        if !force && signature == *last_signature {
+            return Ok(());
+        }
+        *last_signature = signature;
+        write_websocket_json(
+            stream,
+            &json!({
+                "type": "conversation_snapshot",
+                "subscription": "conversation_list",
+                "channel_id": self.id,
+                "conversations": conversations,
+            }),
+        )
+    }
+
+    fn register_conversation_stream_subscriber(&self, sender: Sender<Value>) {
+        self.conversation_stream_subscribers
+            .lock()
+            .expect("conversation stream subscriber registry lock poisoned")
+            .push(sender);
+    }
+
+    fn publish_conversation_upserted(&self, state: &ConversationState) {
+        let processing_state = self
+            .processing_states
+            .lock()
+            .ok()
+            .and_then(|states| states.get(&state.platform_chat_id).copied())
+            .unwrap_or(ProcessingState::Idle);
+        let summary = ConversationSummary::from_state(
+            state,
+            &self.config,
+            processing_state,
+            conversation_message_summary(&self.workdir, state),
+            self.conversation_seen(&state.conversation_id),
+        );
+        self.publish_conversation_stream_event(json!({
+            "type": "conversation_upserted",
+            "subscription": "conversation_list",
+            "channel_id": self.id,
+            "conversation_id": &state.conversation_id,
+            "conversation": summary,
+        }));
+    }
+
+    fn publish_conversation_upserted_for_platform_chat(&self, platform_chat_id: &str) {
+        let Ok(Some(state)) = self.conversation_state_for_platform_chat(platform_chat_id) else {
+            return;
+        };
+        self.publish_conversation_upserted(&state);
+    }
+
+    fn publish_conversation_processing(&self, platform_chat_id: &str, state: ProcessingState) {
+        let Ok(Some(conversation_state)) = self.conversation_state_for_platform_chat(platform_chat_id) else {
+            return;
+        };
+        self.publish_conversation_stream_event(json!({
+            "type": "conversation_processing",
+            "subscription": "conversation_list",
+            "channel_id": self.id,
+            "conversation_id": &conversation_state.conversation_id,
+            "platform_chat_id": platform_chat_id,
+            "processing_state": processing_state_name(state),
+            "running": state != ProcessingState::Idle,
+        }));
+    }
+
+    fn publish_conversation_stream_event(&self, event: Value) {
+        let mut subscribers = self
+            .conversation_stream_subscribers
+            .lock()
+            .expect("conversation stream subscriber registry lock poisoned");
+        subscribers.retain(|sender| sender.send(event.clone()).is_ok());
+    }
+
+    fn publish_conversation_turn_completed(
+        &self,
+        platform_chat_id: &str,
+        turn_id: Option<&str>,
+        final_state: Option<ProgressFeedbackFinalState>,
+    ) {
+        let Ok(Some(state)) = self.conversation_state_for_platform_chat(platform_chat_id) else {
+            return;
+        };
+        let message_summary = conversation_message_summary(&self.workdir, &state);
+        let Some(last_message_id) = message_summary.last_message_id.clone() else {
+            return;
+        };
+        let seen = self.conversation_seen(&state.conversation_id);
+        let unread = seen
+            .as_ref()
+            .and_then(|seen| compare_message_ids(&last_message_id, &seen.last_seen_message_id))
+            .map(|ordering| ordering.is_gt())
+            .unwrap_or(true);
+        let summary = ConversationSummary::from_state(
+            &state,
+            &self.config,
+            ProcessingState::Idle,
+            message_summary.clone(),
+            seen.clone(),
+        );
+        self.publish_conversation_stream_event(json!({
+            "type": "conversation_turn_completed",
+            "subscription": "conversation_list",
+            "channel_id": self.id,
+            "conversation_id": &state.conversation_id,
+            "platform_chat_id": &state.platform_chat_id,
+            "turn_id": turn_id,
+            "final_state": final_state.map(progress_final_state_name),
+            "message_count": message_summary.message_count,
+            "last_message_id": last_message_id,
+            "last_message_time": message_summary.last_message_time,
+            "last_seen_message_id": seen.as_ref().map(|seen| seen.last_seen_message_id.clone()),
+            "last_seen_at": seen.map(|seen| seen.updated_at),
+            "unread": unread,
+            "conversation": summary,
+        }));
     }
 
     fn websocket_query_authorized(&self, request: &HttpRequest) -> bool {
@@ -728,6 +969,61 @@ impl WebChannel {
         if remove_key {
             subscribers.remove(platform_chat_id);
         }
+    }
+
+    fn conversation_seen(&self, conversation_id: &str) -> Option<ConversationSeen> {
+        self.seen_states
+            .lock()
+            .ok()
+            .and_then(|seen| seen.get(conversation_id).cloned())
+    }
+
+    fn conversation_state_for_platform_chat(
+        &self,
+        platform_chat_id: &str,
+    ) -> ApiResult<Option<ConversationState>> {
+        let root = self.workdir.join("conversations");
+        if !root.exists() {
+            return Ok(None);
+        }
+        for entry in fs::read_dir(&root).map_err(ApiError::internal)? {
+            let entry = entry.map_err(ApiError::internal)?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(is_sshfs_workspace_entry_name)
+            {
+                continue;
+            }
+            let path = entry.path().join("conversation.json");
+            if !path.exists() {
+                continue;
+            }
+            let raw = match fs::read_to_string(&path) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    self.logger.warn(
+                        "web_conversation_state_read_failed",
+                        json!({"path": path.display().to_string(), "error": error.to_string()}),
+                    );
+                    continue;
+                }
+            };
+            let state: ConversationState = match serde_json::from_str(&raw) {
+                Ok(state) => state,
+                Err(error) => {
+                    self.logger.warn(
+                        "web_conversation_state_parse_failed",
+                        json!({"path": path.display().to_string(), "error": error.to_string()}),
+                    );
+                    continue;
+                }
+            };
+            if state.channel_id == self.id && state.platform_chat_id == platform_chat_id {
+                return Ok(Some(state));
+            }
+        }
+        Ok(None)
     }
 
     fn run_terminal_websocket_stream(
@@ -1141,6 +1437,7 @@ impl Channel for WebChannel {
                 "status": status,
             }),
         );
+        self.publish_conversation_upserted_for_platform_chat(&status.platform_chat_id);
         Ok(())
     }
 
@@ -1175,6 +1472,13 @@ impl Channel for WebChannel {
     }
 
     fn set_processing(&self, platform_chat_id: &str, state: ProcessingState) -> Result<()> {
+        if let Ok(mut states) = self.processing_states.lock() {
+            if state == ProcessingState::Idle {
+                states.remove(platform_chat_id);
+            } else {
+                states.insert(platform_chat_id.to_string(), state);
+            }
+        }
         self.logger.info(
             "web_processing",
             json!({
@@ -1191,6 +1495,7 @@ impl Channel for WebChannel {
                 "state": processing_state_name(state),
             }),
         );
+        self.publish_conversation_processing(platform_chat_id, state);
         Ok(())
     }
 
@@ -1227,6 +1532,13 @@ impl Channel for WebChannel {
             &feedback.platform_chat_id,
             turn_progress_payload(feedback, &text),
         );
+        if feedback.final_state.is_some() {
+            self.publish_conversation_turn_completed(
+                &feedback.platform_chat_id,
+                Some(&feedback.turn_id),
+                feedback.final_state,
+            );
+        }
         Ok(())
     }
 
@@ -1394,6 +1706,11 @@ struct SendMessageRequest {
     text: Option<String>,
     #[serde(default)]
     files: Option<Vec<WebFileItem>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MarkConversationSeenRequest {
+    last_seen_message_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1601,10 +1918,36 @@ struct ConversationSummary {
     foreground_session_id: String,
     total_background: usize,
     total_subagents: usize,
+    processing_state: String,
+    running: bool,
+    message_count: usize,
+    last_message_id: Option<String>,
+    last_message_time: Option<String>,
+    last_seen_message_id: Option<String>,
+    last_seen_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ConversationMessageSummary {
+    message_count: usize,
+    last_message_id: Option<String>,
+    last_message_time: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct ConversationSeen {
+    last_seen_message_id: String,
+    updated_at: String,
 }
 
 impl ConversationSummary {
-    fn from_state(state: &ConversationState, config: &StellaclawConfig) -> Self {
+    fn from_state(
+        state: &ConversationState,
+        config: &StellaclawConfig,
+        processing_state: ProcessingState,
+        message_summary: ConversationMessageSummary,
+        seen: Option<ConversationSeen>,
+    ) -> Self {
         Self {
             conversation_id: state.conversation_id.clone(),
             nickname: conversation_nickname(state),
@@ -1617,8 +1960,55 @@ impl ConversationSummary {
             foreground_session_id: state.session_binding.foreground_session_id.clone(),
             total_background: state.session_binding.background_sessions.len(),
             total_subagents: state.session_binding.subagent_sessions.len(),
+            processing_state: processing_state_name(processing_state).to_string(),
+            running: processing_state != ProcessingState::Idle,
+            message_count: message_summary.message_count,
+            last_message_id: message_summary.last_message_id,
+            last_message_time: message_summary.last_message_time,
+            last_seen_message_id: seen.as_ref().map(|seen| seen.last_seen_message_id.clone()),
+            last_seen_at: seen.map(|seen| seen.updated_at),
         }
     }
+}
+
+fn conversation_message_summary(workdir: &Path, state: &ConversationState) -> ConversationMessageSummary {
+    let path = workdir
+        .join("conversations")
+        .join(&state.conversation_id)
+        .join(".log")
+        .join("stellaclaw")
+        .join(sanitize_session_id_for_log_path(
+            &state.session_binding.foreground_session_id,
+        ))
+        .join("all_messages.jsonl");
+    let Ok(raw) = fs::read_to_string(path) else {
+        return ConversationMessageSummary::default();
+    };
+    let mut summary = ConversationMessageSummary::default();
+    let mut last_line = "";
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        summary.message_count = summary.message_count.saturating_add(1);
+        last_line = line;
+    }
+    if !last_line.is_empty() {
+        if let Ok(value) = serde_json::from_str::<Value>(last_line) {
+            summary.last_message_id = value
+                .get("id")
+                .or_else(|| value.get("message_id"))
+                .and_then(|value| value.as_str().map(str::to_string).or_else(|| value.as_u64().map(|id| id.to_string())));
+            summary.last_message_time = value
+                .get("message_time")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
+    }
+    summary
+}
+
+fn compare_message_ids(left: &str, right: &str) -> Option<Ordering> {
+    let left = left.parse::<u64>().ok()?;
+    let right = right.parse::<u64>().ok()?;
+    Some(left.cmp(&right))
 }
 
 fn model_listing_payload(config: &StellaclawConfig) -> Value {
