@@ -1,5 +1,10 @@
-version: 1.16.7
+version: 1.16.8
 ---
+
+# 1.16.8
+
+- 修复模型选择后聊天面板仍停留在选择界面：
+  Web status 快照当前不包含 `model_selection_pending` 字段，前端刷新 status 后侧栏可以显示模型，但聊天面板仍会回退到旧 conversation summary 的 pending 状态。现在 `/model <name>` 成功刷新 status 后会同步清除本地 conversation summary 的 `model_selection_pending` 并更新模型名，确保中间 ChatWorkspace 退出模型选择 gate。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.16.7
 

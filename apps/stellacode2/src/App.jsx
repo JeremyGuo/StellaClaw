@@ -68,6 +68,12 @@ function shouldRetryControlStatus(commandState, status) {
   return commandState?.name === '/model' && Boolean(status?.model_selection_pending);
 }
 
+function clearConversationModelSelectionPending(conversation) {
+  return conversation
+    ? { ...conversation, model_selection_pending: false }
+    : conversation;
+}
+
 function App() {
   const [settings, setSettings] = useState(null);
   const [sidebarMode, setSidebarMode] = useState('expanded');
@@ -815,6 +821,16 @@ function App() {
             const status = await loadStatus(selected.serverId, selected.conversationId);
             if (websocketKeyRef.current !== key) return;
             setStatuses((prev) => new Map(prev).set(key, status));
+            if (commandState.name === '/model') {
+              setConversations((current) => current.map((conversation) => (
+                conversation.conversation_id === selected.conversationId
+                  ? clearConversationModelSelectionPending({
+                      ...conversation,
+                      model: status?.model || conversation.model
+                    })
+                  : conversation
+              )));
+            }
             seenUsageMessagesRef.current.set(key, new Set());
             setStatusDeltas((current) => {
               const next = new Map(current);
