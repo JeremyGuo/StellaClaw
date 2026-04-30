@@ -648,10 +648,11 @@ export function ToolProcessGroup({ group }) {
   const firstName = useMemo(() => firstToolNameForMessage(messages[0]), [messages]);
   const summary = useMemo(() => toolGroupSummary(cards, messages, firstName), [cards, messages, firstName]);
   const done = useMemo(() => Boolean(group.nextMessage) || toolCardsAreComplete(cards), [cards, group.nextMessage]);
+  const shouldAutoCollapse = Boolean(group.nextMessage);
   const elapsed = '';
   useEffect(() => {
-    setOpen(!done);
-  }, [done]);
+    setOpen(!shouldAutoCollapse);
+  }, [shouldAutoCollapse]);
   return (
     <details className="tool-process-group" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary>

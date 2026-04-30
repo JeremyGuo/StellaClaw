@@ -1,5 +1,10 @@
-version: 1.18.11
+version: 1.18.12
 ---
+
+# 1.18.12
+
+- 修复 Stellacode 2 工具执行过程聊天区闪烁：
+  工具组的完成态和自动折叠条件分离，收到 tool result 后仍会展示完成状态，但不会在最终 assistant 回复出现前反复折叠/展开，避免连续工具调用过程中聊天内容像被清空后重渲染。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.18.11
 
