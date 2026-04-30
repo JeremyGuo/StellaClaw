@@ -647,7 +647,7 @@ export function ToolProcessGroup({ group }) {
   const cards = useMemo(() => expandedRows.flatMap((row) => row.toolCards), [expandedRows]);
   const firstName = useMemo(() => firstToolNameForMessage(messages[0]), [messages]);
   const summary = useMemo(() => toolGroupSummary(cards, messages, firstName), [cards, messages, firstName]);
-  const done = Boolean(group.nextMessage);
+  const done = useMemo(() => Boolean(group.nextMessage) || toolCardsAreComplete(cards), [cards, group.nextMessage]);
   const elapsed = '';
   useEffect(() => {
     setOpen(!done);
@@ -685,6 +685,22 @@ export function ToolProcessGroup({ group }) {
       )}
     </details>
   );
+}
+
+function toolCardsAreComplete(cards) {
+  if (!cards.length) return false;
+  const open = new Set();
+  let hasResult = false;
+  cards.forEach((card, index) => {
+    const id = String(card.id || `${card.name || 'tool'}-${index}`);
+    if (card.kind === 'call') {
+      open.add(id);
+    } else if (card.kind === 'result') {
+      hasResult = true;
+      open.delete(id);
+    }
+  });
+  return hasResult && (open.size === 0 || cards.at(-1)?.kind === 'result');
 }
 
 export function MessageBody({ message, typewriter = false, onTypewriterDone }) {

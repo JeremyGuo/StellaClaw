@@ -1,5 +1,10 @@
-version: 1.18.10
+version: 1.18.11
 ---
+
+# 1.18.11
+
+- 修复 Stellacode 2 工具调用过程不进入聊天流：
+  Core session 现在会在 `model_response` 和 `tool_result` 写入历史后发出结构化 `message_appended` 事件，Web foreground stream 会把工具开始和工具结束都作为 `messages` 增量推给前端；Stellacode 2 工具组也会在收到对应 tool result 后切换到完成态，不再必须等最终 assistant 回复出现才结束 running 展示。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.18.10
 

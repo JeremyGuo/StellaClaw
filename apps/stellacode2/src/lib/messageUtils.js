@@ -66,6 +66,7 @@ export function toolCardsForMessage(message) {
     return messageItems(message)
       .filter((item) => item?.type === 'tool_call' || item?.type === 'tool_result')
       .map((item) => ({
+        id: item.tool_call_id || '',
         kind: item.type === 'tool_result' ? 'result' : 'call',
         name: item.tool_name || 'tool',
         payload: item.type === 'tool_result'
@@ -90,6 +91,7 @@ export function splitMessageForDisplay(message) {
     const toolCards = items
       .filter((item) => item?.type === 'tool_call' || item?.type === 'tool_result')
       .map((item) => ({
+        id: item.tool_call_id || '',
         kind: item.type === 'tool_result' ? 'result' : 'call',
         name: item.tool_name || 'tool',
         payload: item.type === 'tool_result'

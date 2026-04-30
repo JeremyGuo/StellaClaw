@@ -980,7 +980,12 @@ impl SessionActor {
                     "tool_calls": tool_calls.iter().map(|tool| &tool.tool_name).collect::<Vec<_>>(),
                 }),
             );
-            self.append_history_message("model_response", model_message.clone())?;
+            let model_message_index =
+                self.append_history_message("model_response", model_message.clone())?;
+            self.emit(SessionEvent::MessageAppended {
+                index: model_message_index,
+                message: model_message.clone(),
+            })?;
 
             if tool_calls.is_empty() {
                 self.log_info(
@@ -1157,7 +1162,12 @@ impl SessionActor {
             }),
         );
         self.mark_loaded_skills_from_message(&tool_message, active.turn_number)?;
-        self.append_history_message("tool_result", tool_message)?;
+        let tool_message_index =
+            self.append_history_message("tool_result", tool_message.clone())?;
+        self.emit(SessionEvent::MessageAppended {
+            index: tool_message_index,
+            message: tool_message,
+        })?;
         if active.interrupt == Some(ToolBatchInterrupt::SupersededByUserMessage) {
             self.log_info(
                 "tool_batch_superseded_by_user_message",
@@ -1209,12 +1219,13 @@ impl SessionActor {
         &mut self,
         phase: &str,
         message: ChatMessage,
-    ) -> Result<(), SessionActorError> {
+    ) -> Result<usize, SessionActorError> {
+        let index = self.all_messages.len();
         let Some(compressor) = self.compressor.clone() else {
             self.all_messages.push(message.clone());
             self.history.push(message);
             self.persist_state_if_history_closed(phase)?;
-            return Ok(());
+            return Ok(index);
         };
 
         self.all_messages.push(message.clone());
@@ -1259,7 +1270,7 @@ impl SessionActor {
                 .promote_notified_components_to_system_snapshot();
         }
         self.persist_state_if_history_closed(phase)?;
-        Ok(())
+        Ok(index)
     }
 
     fn append_runtime_synthetic_messages(
