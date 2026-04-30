@@ -1,5 +1,10 @@
-version: 1.16.6
+version: 1.16.7
 ---
+
+# 1.16.7
+
+- 修复新建 Web conversation 选择模型后仍显示 pending：
+  前端发送 `/model <name>` 后现在会短轮询当前 conversation status，避免 Web message API 的 202 投递响应早于 conversation 状态持久化时读到旧的 `model_selection_pending=true`；模型展示也改为在已有 status 快照时优先信任 status 的 pending 状态，不再被旧 conversation summary 覆盖。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.16.6
 
