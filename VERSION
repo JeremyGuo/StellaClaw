@@ -1,5 +1,10 @@
-version: 1.17.3
+version: 1.18.0
 ---
+
+# 1.18.0
+
+- 增加 Web channel terminal WebSocket 实时流：
+  保留现有 terminal REST 生命周期和 fallback output 接口，新增 `GET /api/conversations/{conversation_id}/terminals/{terminal_id}/stream` WebSocket attach。终端输出继续按 raw bytes 写入 ring buffer，WebSocket Binary frame 直接传 PTY stdout/stderr bytes，client Binary frame 直接写入 stdin；Text frame 只处理 `attach`、`resize` 和 `ping` 控制 JSON。支持按 offset replay/resume，offset 太旧时返回 `dropped` 控制事件并从当前 buffer 起点继续；慢客户端会被 detach，避免阻塞 PTY reader。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.17.3
 

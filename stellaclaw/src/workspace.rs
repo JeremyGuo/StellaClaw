@@ -344,13 +344,6 @@ pub fn sshfs_health_check(path: &Path, timeout: Duration) -> bool {
     }
 }
 
-fn is_disconnected_transport_error(error: &std::io::Error) -> bool {
-    error.raw_os_error() == Some(107)
-        || error
-            .to_string()
-            .contains("Transport endpoint is not connected")
-}
-
 fn next_backup_path(path: &Path) -> Result<PathBuf> {
     let parent = path
         .parent()

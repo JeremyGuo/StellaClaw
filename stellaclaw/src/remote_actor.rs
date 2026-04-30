@@ -1,6 +1,6 @@
 use std::{
     fmt, fs,
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -275,36 +275,6 @@ pub fn read_workspace_file(
 
 /// Maximum compressed upload size: 10 MiB.
 const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
-
-/// Write a single file into the workspace.
-pub fn write_workspace_file(
-    workdir: &Path,
-    state: &ConversationState,
-    relative_path: &str,
-    data: &[u8],
-) -> std::result::Result<(), RemoteActorError> {
-    let normalized = normalize_workspace_path(relative_path)?;
-    if normalized.as_os_str().is_empty() {
-        return Err(RemoteActorError::InvalidPath(
-            "workspace file path must not be empty".to_string(),
-        ));
-    }
-    let conversation_root = workdir.join("conversations").join(&state.conversation_id);
-    let workspace_root = ensure_workspace_for_remote_mode(
-        workdir,
-        &conversation_root,
-        &state.conversation_id,
-        &state.tool_remote_mode,
-    )?;
-    let target = workspace_root.join(&normalized);
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create parent for {}", target.display()))?;
-    }
-    fs::write(&target, data)
-        .with_context(|| format!("failed to write workspace file {}", target.display()))?;
-    Ok(())
-}
 
 /// Upload a tar.gz archive and extract it into the workspace directory at `relative_dir`.
 pub fn upload_workspace_archive(

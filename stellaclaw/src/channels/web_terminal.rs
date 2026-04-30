@@ -9,6 +9,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context};
+use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use stellaclaw_core::session_actor::ToolRemoteMode;
@@ -26,6 +27,8 @@ const DEFAULT_OUTPUT_LIMIT_BYTES: usize = 256 * 1024;
 const MAX_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
 const MAX_TERMINALS_PER_CONVERSATION: usize = 8;
 const MAX_TERMINALS_TOTAL: usize = 128;
+const TERMINAL_STREAM_CHANNEL_CAPACITY: usize = 256;
+const TERMINAL_STREAM_REPLAY_CHUNK_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct TerminalCreateRequest {
@@ -91,6 +94,28 @@ pub struct TerminalOutput {
     pub running: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct TerminalOutputChunk {
+    pub bytes: Vec<u8>,
+}
+
+pub struct TerminalReplay {
+    pub terminal_id: String,
+    pub requested_offset: u64,
+    pub replay_start_offset: u64,
+    pub buffer_start_offset: u64,
+    pub next_offset: u64,
+    pub dropped_bytes: u64,
+    pub chunks: Vec<TerminalOutputChunk>,
+    pub running: bool,
+}
+
+pub struct TerminalAttach {
+    pub replay: TerminalReplay,
+    pub receiver: Receiver<TerminalOutputChunk>,
+    pub subscriber_id: Option<u64>,
+}
+
 #[derive(Debug)]
 pub enum WebTerminalError {
     InvalidRequest(String),
@@ -143,6 +168,7 @@ struct TerminalSession {
     writer: Mutex<Box<dyn Write + Send>>,
     child: Arc<Mutex<Box<dyn portable_pty::Child + Send>>>,
     output: Arc<Mutex<OutputBuffer>>,
+    output_subscribers: Arc<Mutex<OutputSubscribers>>,
     status: Arc<Mutex<TerminalStatus>>,
 }
 
@@ -170,6 +196,18 @@ struct OutputBuffer {
     start_offset: u64,
     next_offset: u64,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct OutputSubscribers {
+    next_id: u64,
+    entries: Vec<OutputSubscriber>,
+}
+
+#[derive(Debug)]
+struct OutputSubscriber {
+    id: u64,
+    sender: Sender<TerminalOutputChunk>,
 }
 
 impl TerminalManager {
@@ -262,6 +300,15 @@ impl TerminalManager {
         terminal_id: &str,
         data: &str,
     ) -> Result<TerminalSummary, WebTerminalError> {
+        self.input_bytes(state, terminal_id, data.as_bytes())
+    }
+
+    pub fn input_bytes(
+        &self,
+        state: &ConversationState,
+        terminal_id: &str,
+        data: &[u8],
+    ) -> Result<TerminalSummary, WebTerminalError> {
         let session = self.lookup(state, terminal_id)?;
         if !session.is_running() {
             return Err(WebTerminalError::InvalidRequest(
@@ -272,7 +319,7 @@ impl TerminalManager {
             .writer
             .lock()
             .map_err(|_| WebTerminalError::Internal(anyhow!("terminal writer lock poisoned")))?
-            .write_all(data.as_bytes())
+            .write_all(data)
             .context("failed to write terminal input")?;
         session.touch();
         Ok(session.summary())
@@ -322,6 +369,37 @@ impl TerminalManager {
             inner.sessions.remove(terminal_id);
         }
         Ok(summary)
+    }
+
+    pub fn replay(
+        &self,
+        state: &ConversationState,
+        terminal_id: &str,
+        offset: u64,
+    ) -> Result<TerminalReplay, WebTerminalError> {
+        let session = self.lookup(state, terminal_id)?;
+        Ok(session.replay(offset))
+    }
+
+    pub fn attach(
+        &self,
+        state: &ConversationState,
+        terminal_id: &str,
+        offset: u64,
+    ) -> Result<TerminalAttach, WebTerminalError> {
+        let session = self.lookup(state, terminal_id)?;
+        Ok(session.attach(offset))
+    }
+
+    pub fn detach(
+        &self,
+        state: &ConversationState,
+        terminal_id: &str,
+        subscriber_id: u64,
+    ) -> Result<(), WebTerminalError> {
+        let session = self.lookup(state, terminal_id)?;
+        session.detach(subscriber_id);
+        Ok(())
     }
 
     fn lookup(
@@ -460,6 +538,44 @@ impl TerminalSession {
         }
     }
 
+    fn replay(&self, offset: u64) -> TerminalReplay {
+        let status = self.status.lock().expect("terminal status lock poisoned");
+        let output = self.output.lock().expect("terminal output lock poisoned");
+        replay_from_output(&self.terminal_id, offset, &output, status.running)
+    }
+
+    fn attach(&self, offset: u64) -> TerminalAttach {
+        let (sender, receiver) = bounded(TERMINAL_STREAM_CHANNEL_CAPACITY);
+        let status = self.status.lock().expect("terminal status lock poisoned");
+        let output = self.output.lock().expect("terminal output lock poisoned");
+        let replay = replay_from_output(&self.terminal_id, offset, &output, status.running);
+        let subscriber_id = if status.running {
+            let mut subscribers = self
+                .output_subscribers
+                .lock()
+                .expect("terminal output subscriber lock poisoned");
+            let id = subscribers.next_id;
+            subscribers.next_id = subscribers.next_id.saturating_add(1);
+            subscribers.entries.push(OutputSubscriber { id, sender });
+            Some(id)
+        } else {
+            None
+        };
+        TerminalAttach {
+            replay,
+            receiver,
+            subscriber_id,
+        }
+    }
+
+    fn detach(&self, subscriber_id: u64) {
+        if let Ok(mut subscribers) = self.output_subscribers.lock() {
+            subscribers
+                .entries
+                .retain(|subscriber| subscriber.id != subscriber_id);
+        }
+    }
+
     fn is_running(&self) -> bool {
         self.status
             .lock()
@@ -479,6 +595,50 @@ impl TerminalSession {
             status.updated_ms = unix_millis();
         }
     }
+}
+
+fn replay_from_output(
+    terminal_id: &str,
+    offset: u64,
+    output: &OutputBuffer,
+    running: bool,
+) -> TerminalReplay {
+    let replay_start_offset = offset.max(output.start_offset);
+    let start_index = replay_start_offset.saturating_sub(output.start_offset) as usize;
+    let start_index = start_index.min(output.bytes.len());
+    let mut chunks = Vec::new();
+    let mut index = start_index;
+    while index < output.bytes.len() {
+        let end = index
+            .saturating_add(TERMINAL_STREAM_REPLAY_CHUNK_BYTES)
+            .min(output.bytes.len());
+        chunks.push(TerminalOutputChunk {
+            bytes: output.bytes[index..end].to_vec(),
+        });
+        index = end;
+    }
+    TerminalReplay {
+        terminal_id: terminal_id.to_string(),
+        requested_offset: offset,
+        replay_start_offset,
+        buffer_start_offset: output.start_offset,
+        next_offset: output.next_offset,
+        dropped_bytes: output.start_offset.saturating_sub(offset),
+        chunks,
+        running,
+    }
+}
+
+fn publish_output_chunk(subscribers: &Arc<Mutex<OutputSubscribers>>, chunk: TerminalOutputChunk) {
+    let Ok(mut subscribers) = subscribers.lock() else {
+        return;
+    };
+    subscribers.entries.retain(
+        |subscriber| match subscriber.sender.try_send(chunk.clone()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+        },
+    );
 }
 
 impl OutputBuffer {
@@ -582,6 +742,7 @@ fn spawn_terminal_session(
         writer: Mutex::new(writer),
         child: Arc::new(Mutex::new(child)),
         output: Arc::new(Mutex::new(OutputBuffer::default())),
+        output_subscribers: Arc::new(Mutex::new(OutputSubscribers::default())),
         status: Arc::new(Mutex::new(TerminalStatus {
             running: true,
             created_ms: now,
@@ -590,6 +751,7 @@ fn spawn_terminal_session(
     };
 
     let output = session.output.clone();
+    let output_subscribers = session.output_subscribers.clone();
     let status = session.status.clone();
     let child = session.child.clone();
     thread::spawn(move || {
@@ -598,16 +760,31 @@ fn spawn_terminal_session(
             match reader.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
+                    let mut chunk = None;
                     if let Ok(mut output) = output.lock() {
                         output.append(&buffer[..read]);
+                        chunk = Some(TerminalOutputChunk {
+                            bytes: buffer[..read].to_vec(),
+                        });
+                    }
+                    if let Some(chunk) = chunk {
+                        publish_output_chunk(&output_subscribers, chunk);
                     }
                     if let Ok(mut status) = status.lock() {
                         status.updated_ms = unix_millis();
                     }
                 }
                 Err(error) => {
+                    let message = format!("\r\n[terminal read error: {error}]\r\n");
+                    let mut chunk = None;
                     if let Ok(mut output) = output.lock() {
-                        output.append(format!("\r\n[terminal read error: {error}]\r\n").as_bytes());
+                        output.append(message.as_bytes());
+                        chunk = Some(TerminalOutputChunk {
+                            bytes: message.into_bytes(),
+                        });
+                    }
+                    if let Some(chunk) = chunk {
+                        publish_output_chunk(&output_subscribers, chunk);
                     }
                     break;
                 }
@@ -619,6 +796,9 @@ fn spawn_terminal_session(
         if let Ok(mut status) = status.lock() {
             status.running = false;
             status.updated_ms = unix_millis();
+        }
+        if let Ok(mut subscribers) = output_subscribers.lock() {
+            subscribers.entries.clear();
         }
     });
 
@@ -899,6 +1079,80 @@ mod tests {
             Err(WebTerminalError::NotFound)
         ));
 
+        let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[test]
+    fn terminal_attach_streams_raw_bytes_and_replays_by_offset() {
+        let workdir = test_workdir("stream-attach");
+        let state = test_state("web-main-test-stream-attach", ToolRemoteMode::Selectable);
+        fs::create_dir_all(workdir.join("conversations").join(&state.conversation_id))
+            .expect("create conversation root");
+        let manager = TerminalManager::new();
+        let terminal = manager
+            .create(
+                &workdir,
+                &state,
+                TerminalCreateRequest {
+                    shell: Some("/bin/sh".to_string()),
+                    cwd: None,
+                    cols: None,
+                    rows: None,
+                },
+            )
+            .expect("create terminal");
+        let attach = manager
+            .attach(&state, &terminal.terminal_id, terminal.next_offset)
+            .expect("attach terminal");
+        let subscriber_id = attach.subscriber_id.expect("running subscriber");
+
+        manager
+            .input_bytes(
+                &state,
+                &terminal.terminal_id,
+                b"printf 'raw-stream-ok\\n'\n",
+            )
+            .expect("write bytes");
+        let mut streamed = Vec::new();
+        for _ in 0..50 {
+            if let Ok(chunk) = attach.receiver.recv_timeout(Duration::from_millis(20)) {
+                streamed.extend_from_slice(&chunk.bytes);
+                if streamed
+                    .windows(b"raw-stream-ok".len())
+                    .any(|window| window == b"raw-stream-ok")
+                {
+                    break;
+                }
+            }
+        }
+        assert!(
+            streamed
+                .windows(b"raw-stream-ok".len())
+                .any(|window| window == b"raw-stream-ok"),
+            "{}",
+            String::from_utf8_lossy(&streamed)
+        );
+
+        let replay = manager
+            .replay(&state, &terminal.terminal_id, terminal.next_offset)
+            .expect("replay terminal");
+        let replayed = replay
+            .chunks
+            .iter()
+            .flat_map(|chunk| chunk.bytes.iter().copied())
+            .collect::<Vec<_>>();
+        assert!(
+            replayed
+                .windows(b"raw-stream-ok".len())
+                .any(|window| window == b"raw-stream-ok"),
+            "{}",
+            String::from_utf8_lossy(&replayed)
+        );
+
+        manager
+            .detach(&state, &terminal.terminal_id, subscriber_id)
+            .expect("detach terminal");
+        let _ = manager.terminate(&state, &terminal.terminal_id);
         let _ = fs::remove_dir_all(workdir);
     }
 }

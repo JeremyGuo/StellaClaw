@@ -11,7 +11,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
-use crossbeam_channel::{unbounded, RecvTimeoutError, Sender};
+use crossbeam_channel::{bounded, unbounded, RecvTimeoutError, Sender};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
@@ -46,8 +46,8 @@ use super::{
         ProgressFeedbackFinalState, TurnProgressPhase,
     },
     web_terminal::{
-        output_limit, TerminalCreateRequest, TerminalInputRequest, TerminalManager,
-        TerminalResizeRequest, WebTerminalError,
+        output_limit, TerminalAttach, TerminalCreateRequest, TerminalInputRequest, TerminalManager,
+        TerminalReplay, TerminalResizeRequest, WebTerminalError,
     },
     Channel,
 };
@@ -60,6 +60,8 @@ const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const WEBSOCKET_MAX_FRAME_BYTES: usize = 64 * 1024;
 const WEBSOCKET_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
+const TERMINAL_WEBSOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const TERMINAL_WEBSOCKET_EVENT_CAPACITY: usize = 256;
 
 pub struct WebChannel {
     id: String,
@@ -565,16 +567,48 @@ impl WebChannel {
             return Ok(());
         }
         let segments = api_segments(&request.path);
-        if segments.as_slice() != ["ws"] {
-            write_http_response(&mut stream, json_error(404, "not_found"))?;
-            return Ok(());
-        }
         let Some(key) = request.headers.get("sec-websocket-key") else {
             write_http_response(&mut stream, json_error(400, "missing sec-websocket-key"))?;
             return Ok(());
         };
-        write_websocket_handshake(&mut stream, key)?;
-        self.run_websocket_subscription(stream)
+        match segments.as_slice() {
+            ["ws"] => {
+                write_websocket_handshake(&mut stream, key)?;
+                self.run_websocket_subscription(stream)
+            }
+            ["conversations", conversation_id, "terminals", terminal_id, "stream"] => {
+                let state = match self.load_web_state(conversation_id) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        write_http_response(&mut stream, json_error(error.status, &error.message))?;
+                        return Ok(());
+                    }
+                };
+                let terminal = match self.terminal_manager.get(&state, terminal_id) {
+                    Ok(terminal) => terminal,
+                    Err(error) => {
+                        let error = terminal_api_error(error);
+                        write_http_response(&mut stream, json_error(error.status, &error.message))?;
+                        return Ok(());
+                    }
+                };
+                let offset = request
+                    .query
+                    .get("offset")
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(terminal.next_offset);
+                write_websocket_handshake(&mut stream, key)?;
+                let attach = self
+                    .terminal_manager
+                    .attach(&state, terminal_id, offset)
+                    .map_err(|error| anyhow!("{}", terminal_api_error(error).message))?;
+                self.run_terminal_websocket_stream(stream, state, terminal_id.to_string(), attach)
+            }
+            _ => {
+                write_http_response(&mut stream, json_error(404, "not_found"))?;
+                Ok(())
+            }
+        }
     }
 
     fn websocket_query_authorized(&self, request: &HttpRequest) -> bool {
@@ -590,7 +624,7 @@ impl WebChannel {
                 WebSocketFrame::Text(text) => break parse_websocket_subscribe(&text)?,
                 WebSocketFrame::Ping(payload) => write_websocket_frame(&mut stream, 0xA, &payload)?,
                 WebSocketFrame::Close => return Ok(()),
-                WebSocketFrame::Binary | WebSocketFrame::Pong => {}
+                WebSocketFrame::Binary(_) | WebSocketFrame::Pong => {}
             }
         };
         if subscribe
@@ -694,6 +728,154 @@ impl WebChannel {
         if remove_key {
             subscribers.remove(platform_chat_id);
         }
+    }
+
+    fn run_terminal_websocket_stream(
+        &self,
+        mut stream: TcpStream,
+        state: ConversationState,
+        terminal_id: String,
+        attach: TerminalAttach,
+    ) -> Result<()> {
+        let _ = stream.set_write_timeout(Some(TERMINAL_WEBSOCKET_WRITE_TIMEOUT));
+        write_terminal_replay(&mut stream, &attach.replay)?;
+        if !attach.replay.running {
+            write_websocket_json(
+                &mut stream,
+                &json!({
+                    "type": "exit",
+                    "terminal_id": &terminal_id,
+                }),
+            )?;
+            write_websocket_close(&mut stream)?;
+            return Ok(());
+        }
+
+        let subscriber_id = attach.subscriber_id;
+        let output_rx = attach.receiver;
+        let (client_tx, client_rx) = bounded(TERMINAL_WEBSOCKET_EVENT_CAPACITY);
+        let mut read_stream = stream
+            .try_clone()
+            .context("failed to clone terminal websocket stream")?;
+        thread::spawn(move || loop {
+            let event = match read_websocket_frame(&mut read_stream) {
+                Ok(WebSocketFrame::Text(text)) => parse_terminal_websocket_control(&text)
+                    .unwrap_or_else(|error| TerminalWebSocketEvent::Error(error.to_string())),
+                Ok(WebSocketFrame::Binary(payload)) => TerminalWebSocketEvent::Input(payload),
+                Ok(WebSocketFrame::Ping(payload)) => TerminalWebSocketEvent::WsPing(payload),
+                Ok(WebSocketFrame::Pong) => continue,
+                Ok(WebSocketFrame::Close) => TerminalWebSocketEvent::Close,
+                Err(_) => TerminalWebSocketEvent::Close,
+            };
+            let should_stop = matches!(event, TerminalWebSocketEvent::Close);
+            if client_tx.send(event).is_err() || should_stop {
+                break;
+            }
+        });
+
+        let heartbeat = crossbeam_channel::tick(WEBSOCKET_HEARTBEAT_INTERVAL);
+        let result = loop {
+            crossbeam_channel::select! {
+                recv(output_rx) -> message => {
+                    match message {
+                        Ok(chunk) => {
+                            if let Err(error) = write_websocket_frame(&mut stream, 0x2, &chunk.bytes) {
+                                break Err(error);
+                            }
+                        }
+                        Err(_) => {
+                            let running = self
+                                .terminal_manager
+                                .get(&state, &terminal_id)
+                                .map(|summary| summary.running)
+                                .unwrap_or(false);
+                            let event = if running {
+                                json!({
+                                    "type": "detached",
+                                    "terminal_id": &terminal_id,
+                                    "reason": "slow_client",
+                                })
+                            } else {
+                                json!({
+                                    "type": "exit",
+                                    "terminal_id": &terminal_id,
+                                })
+                            };
+                            let _ = write_websocket_json(&mut stream, &event);
+                            let _ = write_websocket_close(&mut stream);
+                            break Ok(());
+                        }
+                    }
+                }
+                recv(client_rx) -> message => {
+                    match message {
+                        Ok(TerminalWebSocketEvent::Input(bytes)) => {
+                            if let Err(error) = self.terminal_manager.input_bytes(&state, &terminal_id, &bytes) {
+                                let _ = write_terminal_websocket_error(&mut stream, error);
+                                let _ = write_websocket_close(&mut stream);
+                                break Ok(());
+                            }
+                        }
+                        Ok(TerminalWebSocketEvent::Resize(request)) => {
+                            if let Err(error) = self.terminal_manager.resize(&state, &terminal_id, request) {
+                                let _ = write_terminal_websocket_error(&mut stream, error);
+                                let _ = write_websocket_close(&mut stream);
+                                break Ok(());
+                            }
+                        }
+                        Ok(TerminalWebSocketEvent::Attach(offset)) => {
+                            match self.terminal_manager.replay(&state, &terminal_id, offset) {
+                                Ok(replay) => {
+                                    if let Err(error) = write_terminal_replay(&mut stream, &replay) {
+                                        break Err(error);
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = write_terminal_websocket_error(&mut stream, error);
+                                    let _ = write_websocket_close(&mut stream);
+                                    break Ok(());
+                                }
+                            }
+                        }
+                        Ok(TerminalWebSocketEvent::JsonPing) => {
+                            if let Err(error) = write_websocket_json(&mut stream, &json!({"type": "pong"})) {
+                                break Err(error);
+                            }
+                        }
+                        Ok(TerminalWebSocketEvent::WsPing(payload)) => {
+                            if let Err(error) = write_websocket_frame(&mut stream, 0xA, &payload) {
+                                break Err(error);
+                            }
+                        }
+                        Ok(TerminalWebSocketEvent::Close) | Err(_) => {
+                            let _ = write_websocket_close(&mut stream);
+                            break Ok(());
+                        }
+                        Ok(TerminalWebSocketEvent::Error(message)) => {
+                            let _ = write_websocket_json(
+                                &mut stream,
+                                &json!({
+                                    "type": "error",
+                                    "error": "invalid_terminal_stream_frame",
+                                    "message": message,
+                                }),
+                            );
+                        }
+                    }
+                }
+                recv(heartbeat) -> _ => {
+                    if let Err(error) = write_websocket_frame(&mut stream, 0x9, &[]) {
+                        break Err(error);
+                    }
+                }
+            }
+        };
+        if let Some(subscriber_id) = subscriber_id {
+            let _ = self
+                .terminal_manager
+                .detach(&state, &terminal_id, subscriber_id);
+        }
+        result
     }
 
     fn conversation_status(&self, conversation_id: &str) -> ApiResult<HttpResponse> {
@@ -1131,10 +1313,33 @@ struct WebSocketSubscribeRequest {
     conversation_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct TerminalWebSocketControl {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    offset: Option<u64>,
+    #[serde(default)]
+    cols: Option<u16>,
+    #[serde(default)]
+    rows: Option<u16>,
+}
+
+#[derive(Debug)]
+enum TerminalWebSocketEvent {
+    Input(Vec<u8>),
+    Resize(TerminalResizeRequest),
+    Attach(u64),
+    JsonPing,
+    WsPing(Vec<u8>),
+    Close,
+    Error(String),
+}
+
 #[derive(Debug)]
 enum WebSocketFrame {
     Text(String),
-    Binary,
+    Binary(Vec<u8>),
     Ping(Vec<u8>),
     Pong,
     Close,
@@ -1573,7 +1778,7 @@ fn read_websocket_frame(stream: &mut TcpStream) -> Result<WebSocketFrame> {
         0x1 => Ok(WebSocketFrame::Text(
             String::from_utf8(payload).context("websocket text frame is not UTF-8")?,
         )),
-        0x2 => Ok(WebSocketFrame::Binary),
+        0x2 => Ok(WebSocketFrame::Binary(payload)),
         0x8 => Ok(WebSocketFrame::Close),
         0x9 => Ok(WebSocketFrame::Ping(payload)),
         0xA => Ok(WebSocketFrame::Pong),
@@ -1612,6 +1817,74 @@ fn write_websocket_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> 
 
 fn parse_websocket_subscribe(raw: &str) -> Result<WebSocketSubscribeRequest> {
     serde_json::from_str(raw).context("failed to parse websocket subscribe message")
+}
+
+fn parse_terminal_websocket_control(raw: &str) -> Result<TerminalWebSocketEvent> {
+    let control: TerminalWebSocketControl =
+        serde_json::from_str(raw).context("failed to parse terminal websocket control message")?;
+    match control.kind.as_str() {
+        "resize" => {
+            let cols = control
+                .cols
+                .ok_or_else(|| anyhow!("terminal resize control is missing cols"))?;
+            let rows = control
+                .rows
+                .ok_or_else(|| anyhow!("terminal resize control is missing rows"))?;
+            Ok(TerminalWebSocketEvent::Resize(TerminalResizeRequest {
+                cols,
+                rows,
+            }))
+        }
+        "attach" => Ok(TerminalWebSocketEvent::Attach(
+            control.offset.unwrap_or_default(),
+        )),
+        "ping" => Ok(TerminalWebSocketEvent::JsonPing),
+        other => Err(anyhow!(
+            "unsupported terminal websocket control type {other}"
+        )),
+    }
+}
+
+fn write_terminal_replay(stream: &mut TcpStream, replay: &TerminalReplay) -> Result<()> {
+    write_websocket_json(
+        stream,
+        &json!({
+            "type": "attached",
+            "terminal_id": &replay.terminal_id,
+            "offset": replay.requested_offset,
+            "replay_start_offset": replay.replay_start_offset,
+            "buffer_start_offset": replay.buffer_start_offset,
+            "next_offset": replay.next_offset,
+            "running": replay.running,
+        }),
+    )?;
+    if replay.dropped_bytes > 0 {
+        write_websocket_json(
+            stream,
+            &json!({
+                "type": "dropped",
+                "terminal_id": &replay.terminal_id,
+                "buffer_start_offset": replay.buffer_start_offset,
+                "dropped_bytes": replay.dropped_bytes,
+            }),
+        )?;
+    }
+    for chunk in &replay.chunks {
+        write_websocket_frame(stream, 0x2, &chunk.bytes)?;
+    }
+    Ok(())
+}
+
+fn write_terminal_websocket_error(stream: &mut TcpStream, error: WebTerminalError) -> Result<()> {
+    let api_error = terminal_api_error(error);
+    write_websocket_json(
+        stream,
+        &json!({
+            "type": "error",
+            "error": api_error.message,
+            "status": api_error.status,
+        }),
+    )
 }
 
 fn websocket_event_for_subscriber(
@@ -2530,6 +2803,28 @@ mod tests {
             parse_web_control("/remote off"),
             Some(ConversationControl::DisableRemote)
         ));
+    }
+
+    #[test]
+    fn parses_terminal_websocket_control_frames() {
+        assert!(matches!(
+            parse_terminal_websocket_control(r#"{"type":"attach","offset":123}"#)
+                .expect("parse attach"),
+            TerminalWebSocketEvent::Attach(123)
+        ));
+        assert!(matches!(
+            parse_terminal_websocket_control(r#"{"type":"resize","cols":120,"rows":32}"#)
+                .expect("parse resize"),
+            TerminalWebSocketEvent::Resize(TerminalResizeRequest {
+                cols: 120,
+                rows: 32
+            })
+        ));
+        assert!(matches!(
+            parse_terminal_websocket_control(r#"{"type":"ping"}"#).expect("parse ping"),
+            TerminalWebSocketEvent::JsonPing
+        ));
+        assert!(parse_terminal_websocket_control(r#"{"type":"resize","cols":120}"#).is_err());
     }
 
     #[test]
