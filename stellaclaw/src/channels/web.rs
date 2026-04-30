@@ -1912,8 +1912,6 @@ fn render_web_message(
                         if part.text.is_empty() && part.text_with_attachment_markers.is_empty() {
                             None
                         } else {
-                            parts.push(part.text.clone());
-                            marked_parts.push(part.text_with_attachment_markers.clone());
                             context_with_attachment_markers =
                                 Some(part.text_with_attachment_markers);
                             Some(part.text)
@@ -2859,7 +2857,8 @@ mod tests {
         let roots = context.roots();
         let rendered = render_web_message(&message, &context, &roots);
 
-        assert_eq!(rendered.text, "downloaded");
+        assert_eq!(rendered.text, "");
+        assert_eq!(rendered.text_with_attachment_markers, "");
         assert_eq!(rendered.items.len(), 1);
         assert!(matches!(
             &rendered.items[0],
@@ -2867,11 +2866,13 @@ mod tests {
                 tool_call_id,
                 tool_name,
                 context: Some(context),
+                context_with_attachment_markers: Some(context_with_attachment_markers),
                 file_attachment_index: Some(0),
                 ..
             } if tool_call_id == "call_1"
                 && tool_name == "file_download_wait"
                 && context == "downloaded"
+                && context_with_attachment_markers == "downloaded"
         ));
         assert!(rendered.attachment_errors.is_empty());
         assert_eq!(rendered.attachments.len(), 1);
@@ -2879,6 +2880,13 @@ mod tests {
         assert_eq!(rendered.attachments[0].kind, "document");
         assert_eq!(rendered.attachments[0].path, "result.txt");
         assert_eq!(rendered.attachments[0].size_bytes, Some(12));
+
+        let skeleton = message_skeleton(7, &message, &context, &roots);
+        assert_eq!(skeleton.preview, "");
+        assert_eq!(skeleton.text, "");
+        assert_eq!(skeleton.text_with_attachment_markers, "");
+        assert_eq!(skeleton.items.len(), 1);
+        assert_eq!(skeleton.attachment_count, 1);
 
         let _ = fs::remove_dir_all(workdir);
     }
