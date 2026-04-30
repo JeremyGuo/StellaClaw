@@ -32,6 +32,8 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const [modelsError, setModelsError] = useState('');
   const progressRef = useRef(null);
   const composerRef = useRef(null);
+  const composingRef = useRef(false);
+  const compositionEndedAtRef = useRef(0);
   const scrollRef = useRef(null);
   const previousCountRef = useRef(0);
   const loadingOlderRef = useRef(false);
@@ -208,6 +210,17 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     onSend?.(draft);
   };
 
+  const isImeComposingEnter = (event) => {
+    if (event.key !== 'Enter') return false;
+    const nativeEvent = event.nativeEvent || {};
+    const recentlyEnded = Date.now() - compositionEndedAtRef.current < 80;
+    return composingRef.current
+      || event.isComposing
+      || nativeEvent.isComposing
+      || nativeEvent.keyCode === 229
+      || recentlyEnded;
+  };
+
   const openModelOptions = async () => {
     setCommandPanel('models');
     setModelsError('');
@@ -287,8 +300,18 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             disabled={modelSelectionPending}
+            onCompositionStart={() => {
+              composingRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              composingRef.current = false;
+              compositionEndedAtRef.current = Date.now();
+            }}
             onKeyDown={(event) => {
-              if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+              if (event.key === 'Enter' && !event.shiftKey && isImeComposingEnter(event)) {
+                return;
+              }
+              if (event.key === 'Enter' && !event.shiftKey) {
                 event.preventDefault();
                 submitDraft();
               }

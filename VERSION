@@ -6,6 +6,9 @@ version: 1.18.8
 - 增加 Web Channel / Stellacode 2 API 静态文档页：
   在 `docs/web-channel-api.html` 中整理 REST、WebSocket、workspace、terminal、Electron 转发与 GitHub Pages 部署方式，并记录当前交互设计中的冗余/歧义点（例如前端本地隐藏 conversation 与未实现的服务端 DELETE、列表状态与 foreground 状态事实源边界、terminal REST 与 WebSocket 数据面分工）。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 修复 Stellacode 2 输入法回车误发送：
+  Chat composer 现在显式跟踪 IME composition 状态，并在 composition end 后短时间屏蔽 Enter，兼容 Windows 和部分输入法在 Enter keydown 时 `isComposing` 已经变回 false 的情况；发送失败时会把原 draft 恢复到输入框，避免误发送后内容状态不一致。本次不改变 `config` schema，不改变 `workdir` schema。
+
 # 1.18.7
 
 - 修复 Windows 标题栏系统按钮不可见：

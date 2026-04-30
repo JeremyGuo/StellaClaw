@@ -1436,6 +1436,7 @@ function App() {
     const value = String(text || '').trim();
     if (!value || !selected || sending) return;
     const key = conversationKey(selected.serverId, selected.conversationId);
+    const previousDraft = draft;
     const commandState = slashCommandState(value);
     const previousLastServerId = lastServerMessageId(messagesRef.current);
     const optimistic = {
@@ -1530,6 +1531,7 @@ function App() {
       }
     } catch (error) {
       if (websocketKeyRef.current === key) {
+        setDraft((current) => current || previousDraft);
         setSessionActivity(error?.message || '发送失败');
         updateRunningActivities(() => [
           { id: 'send-error', title: '发送失败', detail: error?.message || '发送失败', state: 'failed' }
@@ -1545,7 +1547,7 @@ function App() {
     } finally {
       if (websocketKeyRef.current === key) setSending(false);
     }
-  }, [selected, sending]);
+  }, [draft, selected, sending]);
 
   const title = activeConversation
     ? displayConversationName(settings, selected.serverId, activeConversation)
