@@ -471,6 +471,13 @@ function createWindow() {
     title: 'Stellacode 2',
     icon: appIconPath(),
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
+    titleBarOverlay: process.platform === 'darwin'
+      ? false
+      : {
+          color: '#00000000',
+          symbolColor: '#6f766f',
+          height: 54
+        },
     trafficLightPosition: { x: 18, y: 18 },
     backgroundColor: '#151515',
     webPreferences: {

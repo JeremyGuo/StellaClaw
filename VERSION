@@ -1,5 +1,10 @@
-version: 1.18.6
+version: 1.18.7
 ---
+
+# 1.18.7
+
+- 修复 Windows 标题栏系统按钮不可见：
+  Stellacode 2 在 Windows/Linux 上启用 Electron title bar overlay，并把自定义右侧工具栏整体左移避开系统最小化、最大化和关闭按钮区域，避免隐藏标题栏后看不到窗口关闭按钮。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.18.6
 

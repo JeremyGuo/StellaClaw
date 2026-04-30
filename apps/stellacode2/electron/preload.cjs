@@ -12,14 +12,25 @@ function chromeMetrics() {
       titleRightOffsetWithUpdate: 252
     };
   }
+  if (process.platform === 'win32') {
+    return {
+      platform: 'win32',
+      leftSafeArea: 0,
+      leftToolbarOffset: 12,
+      titleLeftOffset: 154,
+      rightToolbarOffset: 150,
+      titleRightOffset: 314,
+      titleRightOffsetWithUpdate: 390
+    };
+  }
   return {
     platform: process.platform,
     leftSafeArea: 0,
     leftToolbarOffset: 12,
     titleLeftOffset: 154,
-    rightToolbarOffset: 12,
-    titleRightOffset: 176,
-    titleRightOffsetWithUpdate: 252
+    rightToolbarOffset: 150,
+    titleRightOffset: 314,
+    titleRightOffsetWithUpdate: 390
   };
 }
 
