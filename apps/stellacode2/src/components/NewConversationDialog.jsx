@@ -22,6 +22,9 @@ export function NewConversationDialog({ open, servers = [], activeServerId, crea
     if (!selectedServer || creating) return;
     onCreate?.({ serverId: selectedServer.id, nickname });
   };
+  const serverAddress = selectedServer?.connectionMode === 'ssh_proxy'
+    ? `${selectedServer.sshHost || 'SSH Host / Alias'} -> ${selectedServer.targetUrl || selectedServer.baseUrl || 'Target URL'}`
+    : selectedServer?.baseUrl;
 
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
@@ -54,7 +57,7 @@ export function NewConversationDialog({ open, servers = [], activeServerId, crea
             </label>
             <div className="server-preview">
               <strong>{selectedServer?.name || '未配置服务器'}</strong>
-              <span>{selectedServer?.baseUrl}</span>
+              <span>{serverAddress}</span>
             </div>
             <div className="dialog-actions">
               <Dialog.Close className="secondary-button" type="button">取消</Dialog.Close>

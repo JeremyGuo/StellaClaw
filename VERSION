@@ -1,5 +1,16 @@
-version: 1.17.2
+version: 1.17.3
 ---
+
+# 1.17.3
+
+- 恢复 Stellacode 2 SSH Proxy 服务器模式：
+  设置页重新提供 Direct / SSH Proxy 连接模式。SSH Proxy 会先通过 `ssh -L` 连接到配置的 SSH Host，再从目标机器网络访问 Target URL，并把本地转发地址供 Stellacode 使用；切换或删除服务器配置时会关闭不再匹配的 SSH tunnel。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 增加 Stellacode 2 手动检查更新入口：
+  设置页“更新”现在提供“检查更新”按钮，并展示当前 updater 状态；打包版本仍会自动后台检查和下载，开发环境继续禁用检查。下载完成后可以从设置页“重启并安装”，也可以使用标题栏 `Update` 按钮。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 调整 Stellacode 2 应用图标与 SSH Proxy 文案：
+  macOS 打包图标现在保留透明安全边距，避免 Dock 中视觉尺寸偏大；SSH Proxy 设置明确支持填写 `~/.ssh/config` 中的 Host alias，例如 `remote_server`。SSH tunnel 启动时不再因为 alias 里无关的 forward 失败而提前退出，并会等待本地转发端口可连接后再返回，最长等待 10 秒以兼容较慢的 SSH 登录。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.17.2
 

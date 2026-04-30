@@ -2910,6 +2910,17 @@ button {
   line-height: 1.55;
 }
 
+.update-settings-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.update-status-line {
+  font-size: 12px;
+}
+
 .about-list {
   display: grid;
   grid-template-columns: 72px minmax(0, 1fr);

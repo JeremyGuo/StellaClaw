@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld('stellacode2', {
   downloadWorkspace: (payload) => ipcRenderer.invoke('workspace:download', payload),
   updater: {
     status: () => ipcRenderer.invoke('updater:status'),
+    check: () => ipcRenderer.invoke('updater:check'),
     install: () => ipcRenderer.invoke('updater:install'),
     onStatus: (callback) => {
       const listener = (_event, status) => callback(status);
