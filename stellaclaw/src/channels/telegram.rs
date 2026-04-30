@@ -27,6 +27,7 @@ use super::{
         IncomingDispatch, OutgoingAttachment, OutgoingAttachmentKind, OutgoingDelivery,
         OutgoingError, OutgoingOptions, OutgoingProgressFeedback, OutgoingStatus,
         OutgoingUsageSummary, OutgoingUsageTotals, ProcessingState, ProgressFeedbackFinalState,
+        TurnProgressPhase, TurnProgressPlanItemStatus,
     },
     Channel,
 };
@@ -848,6 +849,84 @@ impl TelegramChannel {
     }
 }
 
+fn telegram_progress_text(feedback: &OutgoingProgressFeedback) -> String {
+    let progress = &feedback.progress;
+    let mut text = match progress.phase {
+        TurnProgressPhase::Thinking => format!(
+            "⚙️ 正在执行\n🤖 模型：{}\n🧠 状态：{}",
+            progress.model, progress.activity
+        ),
+        TurnProgressPhase::Working => format!(
+            "⚙️ 正在执行\n🤖 模型：{}\n📌 阶段：{}",
+            progress.model, progress.activity
+        ),
+        TurnProgressPhase::Done => {
+            format!("✅ 已完成\n🤖 模型：{}", progress.model)
+        }
+        TurnProgressPhase::Failed => {
+            let mut text = format!("❌ 本轮失败\n🤖 模型：{}", progress.model);
+            if let Some(error) = progress
+                .error
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                text.push_str("\n📌 ");
+                text.push_str(error);
+            }
+            text
+        }
+    };
+    if let Some(hint) = progress
+        .hint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        text.push_str("\n\n💡 ");
+        text.push_str(hint);
+    }
+    append_telegram_progress_plan(&mut text, feedback);
+    text
+}
+
+fn append_telegram_progress_plan(text: &mut String, feedback: &OutgoingProgressFeedback) {
+    let Some(plan) = &feedback.progress.plan else {
+        return;
+    };
+    if plan.explanation.is_none() && plan.items.is_empty() {
+        return;
+    }
+    text.push_str("\n\n计划");
+    if let Some(explanation) = plan
+        .explanation
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        text.push('\n');
+        text.push_str(explanation);
+    }
+    for item in &plan.items {
+        let step = item.step.trim();
+        if step.is_empty() {
+            continue;
+        }
+        text.push('\n');
+        text.push_str(telegram_progress_plan_status_marker(item.status));
+        text.push(' ');
+        text.push_str(step);
+    }
+}
+
+fn telegram_progress_plan_status_marker(status: TurnProgressPlanItemStatus) -> &'static str {
+    match status {
+        TurnProgressPlanItemStatus::Pending => "☐",
+        TurnProgressPlanItemStatus::InProgress => "◐",
+        TurnProgressPlanItemStatus::Completed => "☑",
+    }
+}
+
 impl Channel for TelegramChannel {
     fn id(&self) -> &str {
         &self.id
@@ -868,11 +947,12 @@ impl Channel for TelegramChannel {
 
     fn update_progress_feedback(&self, feedback: &OutgoingProgressFeedback) -> Result<()> {
         let key = Self::progress_message_key(&feedback.platform_chat_id, &feedback.turn_id);
+        let text = telegram_progress_text(feedback);
         if feedback.final_state == Some(ProgressFeedbackFinalState::Done) {
             let existing = self.progress_messages.lock().unwrap().remove(&key);
             if let Some(existing) = existing {
                 let elapsed = Instant::now().duration_since(existing.started_at);
-                let summary = format!("{}\n⏱️ 用时：{}", feedback.text, format_duration(elapsed));
+                let summary = format!("{}\n⏱️ 用时：{}", text, format_duration(elapsed));
                 if let Err(error) = self.edit_progress_text(
                     &feedback.platform_chat_id,
                     existing.message_id,
@@ -888,7 +968,7 @@ impl Channel for TelegramChannel {
         let is_final = feedback.final_state.is_some();
         let existing = self.progress_messages.lock().unwrap().get(&key).cloned();
         let Some(existing) = existing else {
-            let message_id = self.send_progress_text(&feedback.platform_chat_id, &feedback.text)?;
+            let message_id = self.send_progress_text(&feedback.platform_chat_id, &text)?;
             if is_final {
                 return Ok(());
             }
@@ -896,7 +976,7 @@ impl Channel for TelegramChannel {
                 key,
                 TelegramProgressMessage {
                     message_id,
-                    last_text: feedback.text.clone(),
+                    last_text: text,
                     last_update: now,
                     started_at: now,
                 },
@@ -904,7 +984,7 @@ impl Channel for TelegramChannel {
             return Ok(());
         };
 
-        if existing.last_text == feedback.text && !is_final {
+        if existing.last_text == text && !is_final {
             return Ok(());
         }
         if !feedback.important
@@ -914,11 +994,9 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        if let Err(error) = self.edit_progress_text(
-            &feedback.platform_chat_id,
-            existing.message_id,
-            &feedback.text,
-        ) {
+        if let Err(error) =
+            self.edit_progress_text(&feedback.platform_chat_id, existing.message_id, &text)
+        {
             eprintln!("telegram progress edit failed: {error:#}");
             if is_final {
                 self.progress_messages.lock().unwrap().remove(&key);
@@ -933,7 +1011,7 @@ impl Channel for TelegramChannel {
                 key,
                 TelegramProgressMessage {
                     message_id: existing.message_id,
-                    last_text: feedback.text.clone(),
+                    last_text: text,
                     last_update: now,
                     started_at: existing.started_at,
                 },

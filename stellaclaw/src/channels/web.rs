@@ -43,7 +43,7 @@ use super::{
     types::{
         IncomingDispatch, OutgoingAttachment, OutgoingAttachmentKind, OutgoingDelivery,
         OutgoingError, OutgoingProgressFeedback, OutgoingStatus, ProcessingState,
-        ProgressFeedbackFinalState,
+        ProgressFeedbackFinalState, TurnProgressPhase,
     },
     web_terminal::{
         output_limit, TerminalCreateRequest, TerminalInputRequest, TerminalManager,
@@ -1013,12 +1013,14 @@ impl Channel for WebChannel {
     }
 
     fn update_progress_feedback(&self, feedback: &OutgoingProgressFeedback) -> Result<()> {
+        let text = web_progress_text(feedback);
         self.logger.info(
             "web_progress",
             json!({
                 "channel_id": feedback.channel_id,
                 "platform_chat_id": feedback.platform_chat_id,
                 "turn_id": feedback.turn_id,
+                "phase": feedback.progress.phase,
                 "final_state": feedback.final_state.map(|state| format!("{state:?}")),
             }),
         );
@@ -1028,10 +1030,20 @@ impl Channel for WebChannel {
                 "type": "progress_feedback",
                 "subscription": "foreground_session_events",
                 "turn_id": &feedback.turn_id,
-                "text": &feedback.text,
+                "text": text,
+                "phase": feedback.progress.phase,
+                "model": &feedback.progress.model,
+                "activity": &feedback.progress.activity,
+                "hint": &feedback.progress.hint,
+                "plan": &feedback.progress.plan,
+                "error": &feedback.progress.error,
                 "final_state": feedback.final_state.map(progress_final_state_name),
                 "important": feedback.important,
             }),
+        );
+        self.publish_websocket_event(
+            &feedback.platform_chat_id,
+            turn_progress_payload(feedback, &text),
         );
         Ok(())
     }
@@ -2205,6 +2217,66 @@ fn processing_state_name(state: ProcessingState) -> &'static str {
     }
 }
 
+fn turn_progress_payload(feedback: &OutgoingProgressFeedback, text: &str) -> Value {
+    json!({
+        "type": "turn_progress",
+        "subscription": "foreground_session_events",
+        "turn_id": &feedback.turn_id,
+        "phase": feedback.progress.phase,
+        "model": &feedback.progress.model,
+        "activity": &feedback.progress.activity,
+        "hint": &feedback.progress.hint,
+        "plan": &feedback.progress.plan,
+        "error": &feedback.progress.error,
+        "progress": &feedback.progress,
+        "text": text,
+        "final_state": feedback.final_state.map(progress_final_state_name),
+        "important": feedback.important,
+    })
+}
+
+fn web_progress_text(feedback: &OutgoingProgressFeedback) -> String {
+    let progress = &feedback.progress;
+    let mut text = match progress.phase {
+        TurnProgressPhase::Thinking => {
+            format!(
+                "正在执行\n模型：{}\n状态：{}",
+                progress.model, progress.activity
+            )
+        }
+        TurnProgressPhase::Working => {
+            format!(
+                "正在执行\n模型：{}\n阶段：{}",
+                progress.model, progress.activity
+            )
+        }
+        TurnProgressPhase::Done => format!("已完成\n模型：{}", progress.model),
+        TurnProgressPhase::Failed => {
+            let mut text = format!("本轮失败\n模型：{}", progress.model);
+            if let Some(error) = progress
+                .error
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                text.push_str("\n");
+                text.push_str(error);
+            }
+            text
+        }
+    };
+    if let Some(hint) = progress
+        .hint
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        text.push_str("\n\n");
+        text.push_str(hint);
+    }
+    text
+}
+
 fn progress_final_state_name(state: ProgressFeedbackFinalState) -> &'static str {
     match state {
         ProgressFeedbackFinalState::Done => "done",
@@ -2383,6 +2455,9 @@ mod tests {
     use std::{collections::BTreeMap, fs};
 
     use crate::{
+        channels::types::{
+            TurnProgress, TurnProgressPlan, TurnProgressPlanItem, TurnProgressPlanItemStatus,
+        },
         config::{ModelSelection, SessionProfile},
         conversation::ConversationSessionBinding,
     };
@@ -2455,6 +2530,49 @@ mod tests {
             parse_web_control("/remote off"),
             Some(ConversationControl::DisableRemote)
         ));
+    }
+
+    #[test]
+    fn turn_progress_payload_is_structured() {
+        let feedback = OutgoingProgressFeedback {
+            channel_id: "web-main".to_string(),
+            platform_chat_id: "test-chat".to_string(),
+            turn_id: "turn-1".to_string(),
+            progress: TurnProgress {
+                phase: TurnProgressPhase::Working,
+                model: "gpt-5.5".to_string(),
+                activity: "读取代码".to_string(),
+                hint: Some("发送新消息可打断".to_string()),
+                plan: Some(TurnProgressPlan {
+                    explanation: Some("先确认链路".to_string()),
+                    items: vec![TurnProgressPlanItem {
+                        step: "检查 ChannelEvent".to_string(),
+                        status: TurnProgressPlanItemStatus::InProgress,
+                    }],
+                }),
+                error: None,
+            },
+            final_state: None,
+            important: true,
+        };
+
+        let text = web_progress_text(&feedback);
+        let payload = turn_progress_payload(&feedback, &text);
+
+        assert_eq!(payload["type"], "turn_progress");
+        assert_eq!(payload["subscription"], "foreground_session_events");
+        assert_eq!(payload["turn_id"], "turn-1");
+        assert_eq!(payload["phase"], "working");
+        assert_eq!(payload["model"], "gpt-5.5");
+        assert_eq!(payload["activity"], "读取代码");
+        assert_eq!(payload["hint"], "发送新消息可打断");
+        assert_eq!(payload["final_state"], serde_json::Value::Null);
+        assert_eq!(payload["important"], true);
+        assert_eq!(payload["plan"]["items"][0]["status"], "in_progress");
+        assert_eq!(payload["progress"]["phase"], "working");
+        assert!(payload["text"]
+            .as_str()
+            .is_some_and(|value| value.contains("读取代码")));
     }
 
     #[test]

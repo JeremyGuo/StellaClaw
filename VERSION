@@ -1,5 +1,10 @@
-version: 1.16.8
+version: 1.17.0
 ---
+
+# 1.17.0
+
+- 结构化前台 turn progress：
+  `ChannelEvent::ProgressFeedback` 现在携带结构化 `TurnProgress`，包括 `phase`、`model`、`activity`、`hint`、`plan` 和 `error`。Conversation 层不再提前生成 Telegram 风格 emoji 文案，Telegram/Web 各自按 channel 投影；WebSocket 新增 `type: "turn_progress"` 事件并保留旧 `progress_feedback` 兼容事件，兼容事件也带结构化 `plan`，但 `text` 不再夹带 plan 内容。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.16.8
 

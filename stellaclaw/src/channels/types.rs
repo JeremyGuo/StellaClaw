@@ -108,12 +108,51 @@ pub enum ProgressFeedbackFinalState {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnProgressPhase {
+    Thinking,
+    Working,
+    Done,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnProgressPlanItemStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnProgressPlanItem {
+    pub step: String,
+    pub status: TurnProgressPlanItemStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnProgressPlan {
+    pub explanation: Option<String>,
+    pub items: Vec<TurnProgressPlanItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnProgress {
+    pub phase: TurnProgressPhase,
+    pub model: String,
+    pub activity: String,
+    pub hint: Option<String>,
+    pub plan: Option<TurnProgressPlan>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct OutgoingProgressFeedback {
     pub channel_id: String,
     pub platform_chat_id: String,
     pub turn_id: String,
-    pub text: String,
+    pub progress: TurnProgress,
     pub final_state: Option<ProgressFeedbackFinalState>,
     pub important: bool,
 }

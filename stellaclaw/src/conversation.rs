@@ -28,7 +28,8 @@ use crate::{
         ChannelEvent, OutgoingAttachment, OutgoingDelivery, OutgoingDispatch, OutgoingError,
         OutgoingErrorScope, OutgoingErrorSeverity, OutgoingOption, OutgoingOptions,
         OutgoingProcessing, OutgoingProgressFeedback, OutgoingStatus, ProcessingState,
-        ProgressFeedbackFinalState,
+        ProgressFeedbackFinalState, TurnProgress, TurnProgressPhase, TurnProgressPlan,
+        TurnProgressPlanItem, TurnProgressPlanItemStatus,
     },
     config::{
         ModelSelection, SandboxConfig, SandboxMode, SessionDefaults, SessionProfile,
@@ -1818,7 +1819,7 @@ impl ConversationRuntime {
     fn send_progress_feedback(
         &self,
         turn_id: String,
-        text: String,
+        progress: TurnProgress,
         final_state: Option<ProgressFeedbackFinalState>,
         important: bool,
     ) -> Result<()> {
@@ -1828,7 +1829,7 @@ impl ConversationRuntime {
                     channel_id: self.state.channel_id.clone(),
                     platform_chat_id: self.state.platform_chat_id.clone(),
                     turn_id,
-                    text,
+                    progress,
                     final_state,
                     important,
                 },
@@ -1852,7 +1853,7 @@ impl ConversationRuntime {
         self.send_processing_state(ProcessingState::Typing)?;
         self.send_progress_feedback(
             progress_turn_id,
-            progress_text_thinking(&model_name, None),
+            progress_thinking(&model_name, None),
             None,
             true,
         )
@@ -1874,7 +1875,7 @@ impl ConversationRuntime {
         let plan = self.current_session_plan(None, SessionType::Foreground);
         self.send_progress_feedback(
             progress.turn_id.clone(),
-            progress_text_update(&model_name, progress.activity.as_deref(), plan),
+            progress_update(&model_name, progress.activity.as_deref(), plan),
             None,
             important,
         )
@@ -1890,11 +1891,11 @@ impl ConversationRuntime {
         };
         let model_name = self.current_main_model_name();
         self.send_processing_state(ProcessingState::Idle)?;
-        let text = match final_state {
-            ProgressFeedbackFinalState::Done => progress_text_done(&model_name),
-            ProgressFeedbackFinalState::Failed => progress_text_failed(&model_name, error),
+        let turn_progress = match final_state {
+            ProgressFeedbackFinalState::Done => progress_done(&model_name),
+            ProgressFeedbackFinalState::Failed => progress_failed(&model_name, error),
         };
-        self.send_progress_feedback(progress.turn_id, text, Some(final_state), true)
+        self.send_progress_feedback(progress.turn_id, turn_progress, Some(final_state), true)
     }
 
     fn pump_processing_keepalive(&mut self) -> Result<()> {
@@ -2425,65 +2426,69 @@ impl ConversationRuntime {
     }
 }
 
-fn progress_text_thinking(model_key: &str, plan: Option<&TaskPlanView>) -> String {
-    let mut text = format!(
-        "⚙️ 正在执行\n🤖 模型：{}\n🧠 状态：思考中...\n\n💡 发送新消息可打断；/continue 可继续最近中断的回合。",
-        model_key
-    );
-    append_task_plan(&mut text, plan);
-    text
+const TURN_PROGRESS_HINT: &str = "发送新消息可打断；/continue 可继续最近中断的回合。";
+
+fn progress_thinking(model_key: &str, plan: Option<&TaskPlanView>) -> TurnProgress {
+    TurnProgress {
+        phase: TurnProgressPhase::Thinking,
+        model: model_key.to_string(),
+        activity: "思考中".to_string(),
+        hint: Some(TURN_PROGRESS_HINT.to_string()),
+        plan: turn_progress_plan(plan),
+        error: None,
+    }
 }
 
-fn progress_text_update(
+fn progress_update(
     model_key: &str,
     activity: Option<&str>,
     plan: Option<&TaskPlanView>,
-) -> String {
+) -> TurnProgress {
     let Some(activity) = activity.map(str::trim).filter(|value| !value.is_empty()) else {
-        return progress_text_thinking(model_key, plan);
+        return progress_thinking(model_key, plan);
     };
-    let mut text = format!(
-        "⚙️ 正在执行\n🤖 模型：{}\n📌 阶段：{}\n\n💡 发送新消息可打断；/continue 可继续最近中断的回合。",
-        model_key, activity
-    );
-    append_task_plan(&mut text, plan);
-    text
+    TurnProgress {
+        phase: TurnProgressPhase::Working,
+        model: model_key.to_string(),
+        activity: activity.to_string(),
+        hint: Some(TURN_PROGRESS_HINT.to_string()),
+        plan: turn_progress_plan(plan),
+        error: None,
+    }
 }
 
-fn append_task_plan(text: &mut String, plan: Option<&TaskPlanView>) {
+fn turn_progress_plan(plan: Option<&TaskPlanView>) -> Option<TurnProgressPlan> {
     let Some(plan) = plan else {
-        return;
+        return None;
     };
     if plan.explanation.is_none() && plan.plan.is_empty() {
-        return;
+        return None;
     }
-    text.push_str("\n\n计划");
-    if let Some(explanation) = plan
+    let explanation = plan
         .explanation
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-    {
-        text.push_str("\n");
-        text.push_str(explanation);
-    }
+        .map(ToString::to_string);
+    let mut items = Vec::new();
     for item in &plan.plan {
         let step = item.step.trim();
         if step.is_empty() {
             continue;
         }
-        text.push_str("\n");
-        text.push_str(task_plan_status_marker(item.status));
-        text.push(' ');
-        text.push_str(step);
+        items.push(TurnProgressPlanItem {
+            step: step.to_string(),
+            status: turn_progress_plan_item_status(item.status),
+        });
     }
+    Some(TurnProgressPlan { explanation, items })
 }
 
-fn task_plan_status_marker(status: TaskPlanItemStatus) -> &'static str {
+fn turn_progress_plan_item_status(status: TaskPlanItemStatus) -> TurnProgressPlanItemStatus {
     match status {
-        TaskPlanItemStatus::Pending => "☐",
-        TaskPlanItemStatus::InProgress => "◐",
-        TaskPlanItemStatus::Completed => "☑",
+        TaskPlanItemStatus::Pending => TurnProgressPlanItemStatus::Pending,
+        TaskPlanItemStatus::InProgress => TurnProgressPlanItemStatus::InProgress,
+        TaskPlanItemStatus::Completed => TurnProgressPlanItemStatus::Completed,
     }
 }
 
@@ -2514,15 +2519,30 @@ fn parse_task_plan_view(payload: &Value) -> Result<TaskPlanView> {
     Ok(plan)
 }
 
-fn progress_text_done(model_key: &str) -> String {
-    format!("✅ 已完成\n🤖 模型：{model_key}")
+fn progress_done(model_key: &str) -> TurnProgress {
+    TurnProgress {
+        phase: TurnProgressPhase::Done,
+        model: model_key.to_string(),
+        activity: "已完成".to_string(),
+        hint: None,
+        plan: None,
+        error: None,
+    }
 }
 
-fn progress_text_failed(model_key: &str, error: Option<&str>) -> String {
-    let Some(error) = error.map(str::trim).filter(|value| !value.is_empty()) else {
-        return format!("❌ 本轮失败\n🤖 模型：{model_key}");
-    };
-    format!("❌ 本轮失败\n🤖 模型：{model_key}\n📌 {error}")
+fn progress_failed(model_key: &str, error: Option<&str>) -> TurnProgress {
+    let error = error
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    TurnProgress {
+        phase: TurnProgressPhase::Failed,
+        model: model_key.to_string(),
+        activity: "本轮失败".to_string(),
+        hint: None,
+        plan: None,
+        error,
+    }
 }
 
 fn start_foreground_session(
