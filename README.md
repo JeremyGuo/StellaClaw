@@ -2,9 +2,9 @@
 
 # Stellaclaw
 
-**A Rust-native agent server for long-running, multi-channel AI conversations.**
+**A Rust-native agent host for long-running, multi-channel AI work.**
 
-Agents as durable services, not disposable prompts.
+Durable conversations. Isolated execution. Recoverable agents.
 
 [Roadmap](ROAD_MAP.md) · [Version History](VERSION) · [Example Config](example_config.json)
 
@@ -14,14 +14,26 @@ Agents as durable services, not disposable prompts.
 
 ## What Is Stellaclaw?
 
-Stellaclaw is the next-generation runtime for ClawParty: a self-hosted agent server that runs continuously, receives messages from external channels, and drives LLM sessions with durable state, tools, skills, workspaces, and crash recovery.
+Stellaclaw is the next-generation runtime for ClawParty: a self-hosted agent system that stays online, receives messages from external channels, and drives LLM sessions with durable state, tools, skills, workspaces, and crash recovery.
 
-The current implementation is intentionally split into two runtime layers:
+One of its product advantages is the three-hop work path enabled by Stellacode and Remote mode:
+
+```text
+Stellacode / Channel Host -> Stellaclaw Server -> Remote Workspace Server
+```
+
+Stellacode, Telegram, and Web clients provide the user-facing host surface. Stellaclaw runs as the durable agent server that owns conversations, routing, sessions, delivery, and recovery. Remote mode can then bind a conversation to another server's workspace, terminal, and filesystem through SSH/sshfs, so the agent can work where the project actually lives.
+
+That gives Stellaclaw a practical deployment advantage: users get a local desktop or channel experience, the central agent service stays durable, and heavy project work can happen on a separate remote machine without moving the conversation state out of the host.
+
+The current Rust implementation is split across these runtime layers:
 
 | Layer | Binary / Crate | Owns |
 |---|---|---|
-| Host | `stellaclaw` | Channels, conversations, workdirs, Telegram UI, config, routing, delivery, runtime skill persistence. |
-| Session execution | `agent_server` + `stellaclaw_core` | SessionActor state machine, provider calls, tool batches, compaction, session history, runtime metadata. |
+| Client and channel surface | `apps/stellacode`, Telegram, Web API | User interaction, desktop workspace browsing, terminal UI, attachments, delivery. |
+| Host server | `stellaclaw` | Channels, conversations, workdirs, Telegram/Web surfaces, config, routing, delivery, runtime skill persistence. |
+| Agent server | `agent_server` + `stellaclaw_core` | SessionActor state machine, provider/tool loop, compaction, session history, runtime metadata. |
+| Remote workspace server | SSH/sshfs target | Optional fixed or selectable remote workspace, remote shell, project files, execution root. |
 
 In one line:
 
@@ -30,17 +42,29 @@ Conversation = durable boundary + router
 SessionActor = execution boundary + state machine
 ```
 
-This shape keeps platform concerns out of the model loop and keeps session execution recoverable, testable, and easy to isolate.
+This keeps platform concerns out of the model loop, keeps remote workspace concerns out of the client, and gives each conversation a recoverable execution boundary.
+
+---
+
+## Highlights
+
+- **Host -> server -> server workflow**: Stellacode or another channel talks to the Stellaclaw server, while Remote mode lets that conversation operate on a second server's workspace.
+- **Durable conversations**: conversation state, session state, runtime skills, workspaces, and migration markers live in the workdir instead of in memory-only chat loops.
+- **Multi-channel by design**: Telegram is production-usable today, while the Web channel and REST-style APIs provide the next integration surface.
+- **Recoverable execution**: unfinished turns, crashed runtimes, provider failures, and long tool batches are handled as session lifecycle events instead of silent state loss.
+- **Remote-aware Stellacode**: workspace browsing, file upload/download, terminal sessions, and agent tools can follow the conversation's local or remote execution mode.
+- **Runtime skills**: `SKILL.md` directories can be loaded, created, updated, deleted, persisted, and synced from the running host.
 
 ---
 
 ## Current Status
 
-Stellaclaw is already usable as a Telegram-backed agent host.
+Stellaclaw is already usable as a Telegram-backed agent host and includes a growing Web channel for desktop and external integrations.
 
 Implemented today:
 
 - Telegram channel with inbound messages, attachments, typing indicator, progress panel, and final success/failure delivery.
+- Web channel APIs for conversations, messages, status, workspace browsing, uploads/downloads, terminals, and foreground WebSocket updates.
 - Per-conversation model switching, sandbox switching, remote workspace switching, status query, cancel, and continue.
 - `agent_server` subprocess boundary using stdin/stdout line-delimited JSON-RPC.
 - SessionActor control/data mailboxes, turn loop, tool batch executor, idle compaction, crash recovery, and unfinished-turn continuation.
@@ -53,7 +77,6 @@ Implemented today:
 
 Planned next surfaces:
 
-- Web channel.
 - RESTful API for external systems and admin UI.
 - Richer host management and observability.
 
@@ -65,7 +88,12 @@ See [ROAD_MAP.md](ROAD_MAP.md) for the full architecture direction.
 
 ```mermaid
 flowchart LR
-    User[User or external platform]
+    User[User]
+
+    subgraph Surface[Client and channel surface]
+        Stellacode[Stellacode desktop]
+        Channel[Telegram or Web API]
+    end
 
     subgraph Host[Host process: stellaclaw]
         Ingress[Channel ingress]
@@ -77,14 +105,23 @@ flowchart LR
 
     IPC{stdio JSON-RPC}
 
-    subgraph Runtime[Session process: agent_server]
+    subgraph Runtime[Agent server process: agent_server]
         Rpc[Session RPC thread]
         Actor[SessionActor]
         Tools[ToolBatchExecutor]
         SStore[(Session state)]
     end
 
-    User --> Ingress
+    subgraph Remote[Optional remote workspace server]
+        RemoteFs[Project filesystem]
+        RemoteShell[Remote shell]
+        RemoteRoot[Execution root]
+    end
+
+    User --> Stellacode
+    User --> Channel
+    Stellacode --> Ingress
+    Channel --> Ingress
     Ingress --> Conv
     Conv --> CStore
     Conv --> WStore
@@ -93,6 +130,9 @@ flowchart LR
     Rpc --> Actor
     Actor --> Tools
     Tools --> Actor
+    Tools -. Remote mode .-> RemoteFs
+    Tools -. Remote mode .-> RemoteShell
+    Conv -. Remote binding .-> RemoteRoot
     Actor --> SStore
     Actor --> Rpc
     Rpc --> IPC
@@ -106,8 +146,23 @@ flowchart LR
 - Channel code stays platform-specific and user-facing.
 - Conversation code owns durable routing decisions and workspace materialization.
 - SessionActor owns the model/tool loop and session history.
-- Provider requests and tools can evolve without turning Telegram or future Web code into session internals.
+- Remote workspace behavior can evolve without turning Stellacode, Telegram, or Web code into session internals.
 - A crashed or restarted service can resume from persisted conversation/session state.
+- The client/channel surface, durable host server, internal agent server, and optional remote workspace server each stay at clear boundaries.
+
+### Remote Mode: SSHFS Workspace Illusion
+
+Remote mode is designed to make the agent behave as if it is working inside the remote project, while Stellaclaw still keeps the durable conversation and session state on the host server.
+
+![SSHFS remote workspace illusion](docs/assets/remote-sshfs-illusion.svg)
+
+In fixed Remote mode, file tools operate on the sshfs-mounted workspace path, so reads, writes, search, patches, uploads, and downloads look local to the agent. Interactive terminals avoid running through the FUSE mount for command execution; they connect with SSH and start in the configured remote cwd. The conversation binding records which remote workspace is active, while session history and recovery metadata stay in the Stellaclaw workdir.
+
+That is the illusion: the agent receives a normal workspace path, but the bytes and shell are backed by a remote server.
+
+![Two-hop remote access through Stellacode and Web Channel](docs/assets/remote-web-two-hop.svg)
+
+With the Web Channel, Stellacode can connect to a Stellaclaw server that is itself remote from the user's laptop. Remote mode can then jump again from that Stellaclaw server into another remote project server. The active work is resumable because the conversation and session state are persisted by Stellaclaw, while the actual repository remains on the remote machine where builds, tests, terminals, and file edits should happen.
 
 ---
 
@@ -242,7 +297,7 @@ Start from [example_config.json](example_config.json).
 
 Important fields:
 
-- `version`: current config schema version, currently `0.6`.
+- `version`: current config schema version, currently `0.11`.
 - `agent_server.path`: path to the `agent_server` binary.
 - `models`: named model configs.
 - `skill_sync`: optional runtime skill git sync targets.
@@ -336,8 +391,8 @@ Stellaclaw deliberately has separate version tracks:
 | File / Field | Meaning |
 |---|---|
 | Root `VERSION` | Project release version and changelog. Starts at `1.0.0`. |
-| Config JSON `version` | Config schema version. Currently `0.6`. |
-| Workdir `STELLA_VERSION` | Workdir schema version. Currently `0.6`. |
+| Config JSON `version` | Config schema version. Currently `0.11`. |
+| Workdir `STELLA_VERSION` | Workdir schema version. Currently `0.10`. |
 | Legacy workdir `VERSION` | PartyClaw compatibility input, not the project release version. |
 
 Before bumping the root `VERSION`, check whether the previous GitHub Release exists. If it does not, merge the unpublished changelog into the next release notes so release history does not skip user-visible changes.
@@ -366,9 +421,10 @@ Release artifacts include:
 
 ```text
 .
-├── agent_server/     # Minimal session process wrapper around stellaclaw_core
+├── agent_server/     # Session process wrapper around stellaclaw_core
 ├── core/             # SessionActor, providers, tool catalog, tool executor
-├── stellaclaw/       # Host process, Telegram channel, config, workdir upgrade
+├── docs/assets/      # README diagrams and documentation assets
+├── stellaclaw/       # Host process, channels, config, workdir upgrade
 ├── ROAD_MAP.md       # Architecture roadmap and implementation notes
 ├── VERSION           # Project release version and changelog
 └── example_config.json

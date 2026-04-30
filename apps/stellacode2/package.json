@@ -1,0 +1,30 @@
+{
+  "name": "stellacode2",
+  "version": "0.1.0",
+  "private": true,
+  "description": "React/Electron Stellaclaw client shell.",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "start": "node scripts/start-electron.cjs",
+    "dev": "vite --host 127.0.0.1",
+    "build": "vite build",
+    "check": "node --check electron/main.cjs && node --check electron/preload.cjs && node --check scripts/start-electron.cjs && vite build"
+  },
+  "dependencies": {
+    "@radix-ui/react-context-menu": "^2.2.16",
+    "@radix-ui/react-dialog": "^1.1.15",
+    "@radix-ui/react-dropdown-menu": "^2.1.16",
+    "@radix-ui/react-popover": "^1.1.15",
+    "@radix-ui/react-tooltip": "^1.2.8",
+    "@vitejs/plugin-react": "^5.2.0",
+    "electron": "^41.3.0",
+    "highlight.js": "^11.11.1",
+    "lucide-react": "^0.555.0",
+    "react": "^19.2.1",
+    "react-dom": "^19.2.1",
+    "react-markdown": "^10.1.0",
+    "rehype-highlight": "^7.0.2",
+    "remark-gfm": "^4.0.1",
+    "vite": "^7.3.2"
+  }
+}

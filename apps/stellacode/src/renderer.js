@@ -1,6 +1,9 @@
 const $ = (selector) => document.querySelector(selector);
 const INITIAL_MESSAGE_LIMIT = 40;
 const MESSAGE_PAGE_LIMIT = 40;
+const MAX_UPLOAD_COMPRESSED_BYTES = 10 * 1024 * 1024;
+const MAX_UPLOAD_UNCOMPRESSED_BYTES = 80 * 1024 * 1024;
+const MAX_UPLOAD_FILE_COUNT = 300;
 
 const state = {
   settings: null,
@@ -163,6 +166,10 @@ const icons = {
     '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 7H7a4 4 0 0 0 0 8h2"/><path d="M15 7h2a4 4 0 0 1 0 8h-2"/><path d="M8 12h8"/></svg>',
   terminal:
     '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5h16v13H4Z"/><path d="m8 9 3 3-3 3"/><path d="M13 15h4"/></svg>',
+  copy:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 8h10v12H8Z"/><path d="M6 16H4V4h10v2"/></svg>',
+  download:
+    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v10"/><path d="m7 10 5 5 5-5"/><path d="M5 20h14"/></svg>',
   check:
     '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 12 4 4 10-10"/></svg>',
   panelOpen:
@@ -1054,6 +1061,23 @@ function invalidateWorkspaceCache(key) {
   }
 }
 
+function nextFrame() {
+  return new Promise((resolve) => requestAnimationFrame(resolve));
+}
+
+function uploadPayloadStats(files) {
+  return files.reduce(
+    (acc, file) => {
+      if (!file.isDirectory) {
+        acc.fileCount += 1;
+        acc.bytes += file.data?.byteLength || 0;
+      }
+      return acc;
+    },
+    { fileCount: 0, bytes: 0 }
+  );
+}
+
 async function uploadFilesToWorkspace(files, targetDir) {
   if (!state.selected || files.length === 0) {
     return;
@@ -1061,13 +1085,19 @@ async function uploadFilesToWorkspace(files, targetDir) {
   const { serverId, conversationId } = state.selected;
   const key = selectedKey();
   const normalized = normalizeWorkspacePath(targetDir);
-  setSessionActivity(`正在上传 ${files.length} 个文件...`);
+  const stats = uploadPayloadStats(files);
+  if (stats.fileCount > MAX_UPLOAD_FILE_COUNT) {
+    showToast(`一次最多上传 ${MAX_UPLOAD_FILE_COUNT} 个文件`);
+    return;
+  }
+  if (stats.bytes > MAX_UPLOAD_UNCOMPRESSED_BYTES) {
+    showToast(`上传文件过大（原始大小超过 ${formatBytes(MAX_UPLOAD_UNCOMPRESSED_BYTES)}）`);
+    return;
+  }
+  setSessionActivity(`正在上传 ${stats.fileCount || files.length} 个文件...`);
   try {
-    const tarModule = await import('https://cdn.jsdelivr.net/npm/tar-js@0.3.0/+esm').catch(() => null);
-    // Use a simple approach: pack files into tar, gzip, and send.
-    // Since we're in Electron, we can use a simpler method via IPC.
     const archiveData = await packFilesToTarGz(files);
-    if (archiveData.byteLength > 10 * 1024 * 1024) {
+    if (archiveData.byteLength > MAX_UPLOAD_COMPRESSED_BYTES) {
       showToast('上传文件过大（压缩后超过 10MB 限制）');
       return;
     }
@@ -1075,7 +1105,7 @@ async function uploadFilesToWorkspace(files, targetDir) {
       serverId,
       conversationId,
       path: normalized,
-      data: Array.from(new Uint8Array(archiveData))
+      data: archiveData
     });
     invalidateWorkspaceCache(key);
     await refreshWorkspace(normalized, { expand: true, setActive: true });
@@ -1090,7 +1120,8 @@ async function packFilesToTarGz(fileEntries) {
   // fileEntries: array of { relativePath: string, data: ArrayBuffer }
   // Build a minimal tar archive and gzip it.
   const blocks = [];
-  for (const entry of fileEntries) {
+  for (let index = 0; index < fileEntries.length; index += 1) {
+    const entry = fileEntries[index];
     const nameBytes = new TextEncoder().encode(entry.relativePath);
     if (nameBytes.length > 99) {
       // Use extended header for long names (PAX)
@@ -1111,6 +1142,9 @@ async function packFilesToTarGz(fileEntries) {
     if (data.length > 0) {
       blocks.push(padToBlock(data));
     }
+    if (index > 0 && index % 20 === 0) {
+      await nextFrame();
+    }
   }
   // End-of-archive marker: two 512-byte zero blocks
   blocks.push(new Uint8Array(1024));
@@ -1118,14 +1152,17 @@ async function packFilesToTarGz(fileEntries) {
   // Gzip using CompressionStream (available in modern Chromium/Electron)
   const cs = new CompressionStream('gzip');
   const writer = cs.writable.getWriter();
-  writer.write(tarData);
-  writer.close();
+  await writer.write(tarData);
+  await writer.close();
   const reader = cs.readable.getReader();
   const chunks = [];
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     chunks.push(value);
+    if (chunks.length % 8 === 0) {
+      await nextFrame();
+    }
   }
   return concatenateBuffers(chunks).buffer;
 }
@@ -2493,14 +2530,16 @@ async function openModelPicker() {
     return;
   }
   const rows = models
+    .filter((model) => modelAlias(model))
     .map(
       (model) => {
         const alias = modelAlias(model);
+        const displayName = typeof model === 'string' ? '' : model.model_name || model.name || '';
         return `
         <button class="choice-row" type="button" data-model-select="${escapeHtml(alias)}">
           <span>
             <strong>${escapeHtml(alias)}</strong>
-            <small>${escapeHtml(model.model_name || '')}</small>
+            <small>${escapeHtml(displayName)}</small>
           </span>
         </button>
       `;
@@ -2535,6 +2574,8 @@ async function sendMessage() {
   if (!state.selected) {
     return;
   }
+  const { serverId, conversationId } = state.selected;
+  const localKey = conversationKey(serverId, conversationId);
   const text = elements.composerInput.value.trim();
   if (!text) {
     return;
@@ -2546,10 +2587,8 @@ async function sendMessage() {
   elements.composerInput.value = '';
   autosizeComposer();
   // Clear saved draft after sending.
-  state.composerDrafts.delete(conversationKey(serverId, conversationId));
+  state.composerDrafts.delete(localKey);
   elements.sendButton.disabled = true;
-  const { serverId, conversationId } = state.selected;
-  const localKey = conversationKey(serverId, conversationId);
   const status = state.statuses.get(localKey);
   const conversation = currentConversation();
   const isControlCommand = text.startsWith('/');
@@ -2734,8 +2773,13 @@ function closeConversationMenu() {
   state.conversationMenu = null;
 }
 
-function showConversationMenu(event, serverId, conversation) {
+function closeFloatingMenus() {
   closeConversationMenu();
+  dismissWorkspaceContextMenu();
+}
+
+function showConversationMenu(event, serverId, conversation) {
+  closeFloatingMenus();
   const menu = document.createElement('div');
   menu.className = 'conversation-menu';
   menu.setAttribute('role', 'menu');
@@ -3519,12 +3563,24 @@ function preferredModelFor(serverId) {
 }
 
 function modelAlias(model) {
-  return safeText(model?.alias || model?.name).trim();
+  if (typeof model === 'string') {
+    return safeText(model).trim();
+  }
+  return safeText(model?.alias || model?.name || model?.model || model?.model_name).trim();
 }
 
 async function fetchModels(serverId) {
   const response = await api(serverId, '/api/models');
-  return response.data?.models || [];
+  if (Array.isArray(response.data)) {
+    return response.data;
+  }
+  if (Array.isArray(response.data?.models)) {
+    return response.data.models;
+  }
+  if (Array.isArray(response.data?.data?.models)) {
+    return response.data.data.models;
+  }
+  return [];
 }
 
 function renderContext() {
@@ -3646,7 +3702,7 @@ function renderFilesContext() {
       ${previewHtml}
     </div>
   `;
-  bindWorkspaceActions();
+  bindWorkspaceActions(target);
   if (previewHtml) {
     bindEditorActions(target);
   }
@@ -3805,7 +3861,7 @@ function renderWorkspaceCard(status) {
         <input id="workspaceFilterInput" type="search" value="${escapeHtml(state.workspaceFilter)}" placeholder="筛选文件..." />
       </label>
       <div class="workspace-root-group">
-        <div class="workspace-root-row">
+        <div class="workspace-root-row" data-workspace-root>
           <span class="workspace-root-chevron">${icons.chevronDown}</span>
           <span>${escapeHtml(rootLabel || 'workspace')}</span>
         </div>
@@ -3840,8 +3896,10 @@ function toggleWorkspaceDirectory(path) {
   return refreshWorkspace(normalized, { expand: true, setActive: true });
 }
 
-function bindWorkspaceActions() {
-  const root = elements.fileContent || elements.contextContent;
+function bindWorkspaceActions(root = elements.fileContent || elements.contextContent) {
+  if (!root) {
+    return;
+  }
   root.querySelector('#workspaceFilterInput')?.addEventListener('input', (event) => {
     const cursor = event.target.selectionStart;
     state.workspaceFilter = event.target.value;
@@ -3864,67 +3922,105 @@ function bindWorkspaceActions() {
     refreshWorkspace(currentWorkspacePath(), { expand: true, setActive: true }).catch((error) => showToast(error.message));
   });
 
-  // Right-click context menu on workspace entries
-  root.querySelectorAll('[data-workspace-toggle], [data-workspace-file]').forEach((button) => {
-    button.addEventListener('contextmenu', (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      const path = button.dataset.workspaceToggle || button.dataset.workspaceFile || '';
-      const isDir = button.dataset.workspaceToggle !== undefined;
-      showWorkspaceContextMenu(event.clientX, event.clientY, path, isDir);
-    });
-  });
-
   // Drag-and-drop upload on workspace page
   const workspacePage = root.querySelector('.workspace-page');
   if (workspacePage) {
+    workspacePage.addEventListener('contextmenu', handleWorkspacePageContextMenu);
     bindWorkspaceDragDrop(workspacePage);
   }
 }
 
+function workspaceContextTargetFromEvent(event, root) {
+  const target = event.target instanceof Element ? event.target : null;
+  const pathElements = typeof event.composedPath === 'function' ? event.composedPath() : [];
+  const row = pathElements.find((node) => (
+    node instanceof Element
+    && root.contains(node)
+    && (node.matches('[data-workspace-toggle]')
+      || node.matches('[data-workspace-file]')
+      || node.matches('[data-workspace-root]'))
+  )) || target.closest('[data-workspace-toggle], [data-workspace-file], [data-workspace-root]');
+  if (row && root.contains(row)) {
+    if (row.dataset.workspaceRoot !== undefined) {
+      return { path: '', isDir: true };
+    }
+    return {
+      path: row.dataset.workspaceToggle || row.dataset.workspaceFile || '',
+      isDir: row.dataset.workspaceToggle !== undefined
+    };
+  }
+  if (target && root.contains(target)) {
+    return { path: currentWorkspacePath(), isDir: true };
+  }
+  return null;
+}
+
+function handleWorkspacePageContextMenu(event) {
+  const target = workspaceContextTargetFromEvent(event, event.currentTarget);
+  if (!target) {
+    return;
+  }
+  event.preventDefault();
+  event.stopPropagation();
+  showWorkspaceContextMenu(event.clientX, event.clientY, target.path, target.isDir).catch((error) => showToast(error.message));
+}
+
 function showWorkspaceContextMenu(x, y, path, isDir) {
+  closeConversationMenu();
   dismissWorkspaceContextMenu();
-  const menu = document.createElement('div');
-  menu.className = 'workspace-context-menu';
-  menu.style.left = `${x}px`;
-  menu.style.top = `${y}px`;
-  // Determine workspace root for absolute path.
   const key = selectedKey();
   const listing = state.workspaceListings.get(key);
-  const status = currentStatus();
+  const status = selectedStatus();
   const workspaceRoot = listing?.workspace_root || status?.workspace || '';
   const absolutePath = workspaceRoot && path ? `${workspaceRoot.replace(/\/$/, '')}/${path}` : path;
+  const menu = document.createElement('div');
+  menu.className = 'workspace-context-menu';
+  menu.setAttribute('role', 'menu');
   menu.innerHTML = `
-    <button type="button" data-action="copy-relative">Copy Relative Path</button>
-    <button type="button" data-action="copy-absolute">Copy Absolute Path</button>
-    <button type="button" data-action="download">${isDir ? 'Download (tar.gz)' : 'Download (tar.gz)'}</button>
+    <button type="button" role="menuitem" data-action="copy-relative">
+      <span class="workspace-menu-icon">${icons.copy}</span>
+      <span>复制相对路径</span>
+    </button>
+    <button type="button" role="menuitem" data-action="copy-absolute">
+      <span class="workspace-menu-icon">${icons.copy}</span>
+      <span>复制绝对路径</span>
+    </button>
+    <div class="workspace-menu-separator"></div>
+    <button type="button" role="menuitem" data-action="download">
+      <span class="workspace-menu-icon">${icons.download}</span>
+      <span>${isDir ? '下载目录' : '下载文件'}</span>
+    </button>
   `;
   document.body.append(menu);
-  // Adjust if menu overflows viewport
-  requestAnimationFrame(() => {
-    const rect = menu.getBoundingClientRect();
-    if (rect.right > window.innerWidth) menu.style.left = `${window.innerWidth - rect.width - 8}px`;
-    if (rect.bottom > window.innerHeight) menu.style.top = `${window.innerHeight - rect.height - 8}px`;
-  });
+  const rect = menu.getBoundingClientRect();
+  menu.style.left = `${Math.min(Math.max(8, x), window.innerWidth - rect.width - 8)}px`;
+  menu.style.top = `${Math.min(Math.max(8, y), window.innerHeight - rect.height - 8)}px`;
   menu.querySelector('[data-action="copy-relative"]')?.addEventListener('click', () => {
     dismissWorkspaceContextMenu();
-    navigator.clipboard.writeText(path).then(() => showToast('Copied relative path')).catch(() => {});
+    navigator.clipboard.writeText(path).then(() => showToast('已复制相对路径')).catch((error) => showToast(error.message));
   });
   menu.querySelector('[data-action="copy-absolute"]')?.addEventListener('click', () => {
     dismissWorkspaceContextMenu();
-    navigator.clipboard.writeText(absolutePath).then(() => showToast('Copied absolute path')).catch(() => {});
+    navigator.clipboard.writeText(absolutePath).then(() => showToast('已复制绝对路径')).catch((error) => showToast(error.message));
   });
   menu.querySelector('[data-action="download"]')?.addEventListener('click', () => {
     dismissWorkspaceContextMenu();
     downloadWorkspaceEntry(path).catch((error) => showToast(error.message));
   });
-  const dismiss = (event) => {
-    if (!menu.contains(event.target)) {
-      dismissWorkspaceContextMenu();
-    }
-  };
-  setTimeout(() => document.addEventListener('click', dismiss, { once: true }), 0);
+  menu.addEventListener('click', (event) => event.stopPropagation());
+  menu.addEventListener('mousedown', (event) => event.stopPropagation());
+  menu.addEventListener('contextmenu', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
   state._workspaceContextMenu = menu;
+}
+
+function handleDocumentClick(event) {
+  if (state._workspaceContextMenu?.contains(event.target)) {
+    return;
+  }
+  closeFloatingMenus();
 }
 
 function dismissWorkspaceContextMenu() {
@@ -3960,11 +4056,13 @@ function bindWorkspaceDragDrop(container) {
     const items = event.dataTransfer?.items;
     if (!items || items.length === 0) return;
     const targetDir = currentWorkspacePath();
-    collectDroppedFiles(items).then((fileEntries) => {
-      if (fileEntries.length > 0) {
-        uploadFilesToWorkspace(fileEntries, targetDir).catch((error) => showToast(error.message));
-      }
-    });
+    collectDroppedFiles(items)
+      .then((fileEntries) => {
+        if (fileEntries.length > 0) {
+          uploadFilesToWorkspace(fileEntries, targetDir).catch((error) => showToast(error.message));
+        }
+      })
+      .catch((error) => showToast(error.message));
   });
 }
 
@@ -3972,6 +4070,7 @@ async function collectDroppedFiles(dataTransferItems) {
   const entries = [];
   const fsEntries = [];
   const plainFiles = [];
+  const stats = { fileCount: 0, bytes: 0 };
   // Capture all entries synchronously before any async work (DataTransferItem is invalidated after event).
   for (let i = 0; i < dataTransferItems.length; i++) {
     const item = dataTransferItems[i];
@@ -3987,21 +4086,40 @@ async function collectDroppedFiles(dataTransferItems) {
   }
   // Now process asynchronously.
   for (const file of plainFiles) {
+    trackUploadFile(stats, file);
     const data = await file.arrayBuffer();
     entries.push({ relativePath: file.name, data, isDirectory: false });
+    if (entries.length % 20 === 0) {
+      await nextFrame();
+    }
   }
   for (const entry of fsEntries) {
-    await traverseEntry(entry, '', entries);
+    await traverseEntry(entry, '', entries, stats);
   }
   return entries;
 }
 
-async function traverseEntry(entry, parentPath, results) {
+function trackUploadFile(stats, file) {
+  stats.fileCount += 1;
+  stats.bytes += file.size || 0;
+  if (stats.fileCount > MAX_UPLOAD_FILE_COUNT) {
+    throw new Error(`一次最多上传 ${MAX_UPLOAD_FILE_COUNT} 个文件`);
+  }
+  if (stats.bytes > MAX_UPLOAD_UNCOMPRESSED_BYTES) {
+    throw new Error(`上传文件过大（原始大小超过 ${formatBytes(MAX_UPLOAD_UNCOMPRESSED_BYTES)}）`);
+  }
+}
+
+async function traverseEntry(entry, parentPath, results, stats) {
   const fullPath = parentPath ? `${parentPath}/${entry.name}` : entry.name;
   if (entry.isFile) {
     const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+    trackUploadFile(stats, file);
     const data = await file.arrayBuffer();
     results.push({ relativePath: fullPath, data, isDirectory: false });
+    if (results.length % 20 === 0) {
+      await nextFrame();
+    }
   } else if (entry.isDirectory) {
     results.push({ relativePath: fullPath + '/', data: new ArrayBuffer(0), isDirectory: true });
     const reader = entry.createReader();
@@ -4020,7 +4138,7 @@ async function traverseEntry(entry, parentPath, results) {
       readBatch();
     });
     for (const child of children) {
-      await traverseEntry(child, fullPath, results);
+      await traverseEntry(child, fullPath, results, stats);
     }
   }
 }
@@ -5210,13 +5328,13 @@ function bindEvents() {
     refreshWorkspace(currentWorkspacePath(), { setActive: false }).catch(() => {});
   });
   window.addEventListener('resize', () => {
-    closeConversationMenu();
+    closeFloatingMenus();
     applyLayoutSettings();
   });
-  document.addEventListener('click', closeConversationMenu);
+  document.addEventListener('click', handleDocumentClick);
   document.addEventListener('keydown', (event) => {
     if (event.key === 'Escape') {
-      closeConversationMenu();
+      closeFloatingMenus();
     }
   });
   document.addEventListener('visibilitychange', () => {

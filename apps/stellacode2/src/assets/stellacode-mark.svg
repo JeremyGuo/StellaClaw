@@ -1,0 +1,8 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Stellacode">
+  <rect x="8" y="8" width="48" height="48" rx="13" fill="#0F2A24"/>
+  <rect x="8" y="8" width="48" height="48" rx="13" stroke="#54D6A4" stroke-width="3"/>
+  <path d="M35.9 12.8 20.2 33.9h10.7l-2.7 17.3 15.9-21.7H33.9l2-16.7Z" fill="#7CFFD0"/>
+  <path d="M18.4 20.2h-3.8v27.2h11.1" stroke="#54D6A4" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity=".72"/>
+  <path d="M45.6 20.2h3.8v27.2H38.3" stroke="#54D6A4" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" opacity=".72"/>
+  <circle cx="47.8" cy="16.8" r="2.2" fill="#FF9D54"/>
+</svg>

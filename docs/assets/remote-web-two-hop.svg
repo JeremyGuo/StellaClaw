@@ -1,0 +1,52 @@
+<svg role="img" aria-label="Two-hop remote access through Stellacode and Web Channel" viewBox="0 0 980 360" width="980" height="360" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"/>
+    </marker>
+    <style>
+      .panel { fill: #f8fafc; stroke: #94a3b8; stroke-width: 1.5; rx: 12; }
+      .client { fill: #f5f3ff; stroke: #7c3aed; }
+      .server { fill: #ecfeff; stroke: #0891b2; }
+      .remote { fill: #f0fdf4; stroke: #16a34a; }
+      .title { font: 700 18px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .label { font: 500 14px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+      .small { font: 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .code { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #334155; }
+      .flow { stroke: #0f766e; stroke-width: 2.4; fill: none; marker-end: url(#arrow); }
+      .pause { stroke: #64748b; stroke-width: 1.8; fill: none; stroke-dasharray: 5 5; }
+    </style>
+  </defs>
+
+  <rect x="30" y="55" width="240" height="220" class="panel client"/>
+  <text x="55" y="92" class="title">User machine</text>
+  <text x="55" y="122" class="label">Stellacode desktop</text>
+  <text x="55" y="146" class="small">Chat, files, terminal UI</text>
+  <text x="55" y="170" class="small">No project clone required</text>
+
+  <rect x="370" y="35" width="250" height="270" class="panel server"/>
+  <text x="395" y="72" class="title">Stellaclaw server</text>
+  <text x="395" y="104" class="label">Web Channel API</text>
+  <text x="395" y="128" class="code">/api/conversations</text>
+  <text x="395" y="152" class="code">/api/ws</text>
+  <text x="395" y="184" class="label">Durable workdir</text>
+  <text x="395" y="208" class="small">conversation, session, skills</text>
+  <text x="395" y="232" class="small">resume after disconnect</text>
+
+  <rect x="710" y="55" width="240" height="220" class="panel remote"/>
+  <text x="735" y="92" class="title">Remote server</text>
+  <text x="735" y="122" class="label">Project workspace</text>
+  <text x="735" y="146" class="code">sshfs + ssh terminal</text>
+  <text x="735" y="170" class="small">builds, tests, edits</text>
+  <text x="735" y="194" class="small">work continues in place</text>
+
+  <path d="M270 145 C315 145 325 105 370 105" class="flow"/>
+  <path d="M620 145 C665 145 665 145 710 145" class="flow"/>
+  <path d="M620 210 C662 242 668 244 710 210" class="flow"/>
+  <path d="M150 275 C220 330 405 335 495 305" class="pause"/>
+  <path d="M495 305 C585 335 760 330 830 275" class="pause"/>
+
+  <text x="291" y="92" class="small">Hop 1: HTTPS/WebSocket</text>
+  <text x="640" y="132" class="small">Hop 2: SSHFS</text>
+  <text x="640" y="235" class="small">Hop 2: SSH shell</text>
+  <text x="318" y="330" class="small">Start, disconnect, reconnect, and continue from durable state</text>
+</svg>

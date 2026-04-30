@@ -1,9 +1,9 @@
-const { app, BrowserWindow, ipcMain, dialog } = require('electron');
-const { autoUpdater } = require('electron-updater');
+const { app, BrowserWindow, dialog, ipcMain } = require('electron');
 const childProcess = require('node:child_process');
 const fs = require('node:fs/promises');
 const net = require('node:net');
 const path = require('node:path');
+const zlib = require('node:zlib');
 
 const SETTINGS_FILE = 'settings.json';
 const SSH_READY_DELAY_MS = 900;
@@ -15,6 +15,15 @@ const tunnels = new Map();
 function defaultSettings() {
   return {
     activeServerId: 'local',
+    sidebarMode: 'expanded',
+    themeMode: 'system',
+    layout: {
+      sidebar: 286,
+      inspector: 340,
+      file: 360,
+      preview: 480,
+      terminal: 240
+    },
     servers: [
       {
         id: 'local',
@@ -27,9 +36,7 @@ function defaultSettings() {
       }
     ],
     conversationNames: {},
-    hiddenConversations: {},
-    invalidModelAliases: {},
-    sidebarCollapsed: false
+    hiddenConversations: {}
   };
 }
 
@@ -49,11 +56,21 @@ function normalizeSettings(value) {
     sshHost: String(server.sshHost || ''),
     token: String(server.token || '')
   }));
+  const layout = value?.layout && typeof value.layout === 'object' ? value.layout : {};
   return {
     activeServerId:
       value?.activeServerId && normalizedServers.some((server) => server.id === value.activeServerId)
         ? value.activeServerId
         : normalizedServers[0]?.id || fallback.activeServerId,
+    sidebarMode: value?.sidebarMode === 'collapsed' ? 'collapsed' : 'expanded',
+    themeMode: ['system', 'light', 'dark'].includes(value?.themeMode) ? value.themeMode : fallback.themeMode,
+    layout: {
+      sidebar: Number(layout.sidebar) || fallback.layout.sidebar,
+      inspector: Number(layout.inspector) || fallback.layout.inspector,
+      file: Number(layout.file) || fallback.layout.file,
+      preview: Number(layout.preview) || fallback.layout.preview,
+      terminal: Number(layout.terminal) || fallback.layout.terminal
+    },
     servers: normalizedServers.length ? normalizedServers : fallback.servers,
     conversationNames:
       value?.conversationNames && typeof value.conversationNames === 'object'
@@ -62,12 +79,7 @@ function normalizeSettings(value) {
     hiddenConversations:
       value?.hiddenConversations && typeof value.hiddenConversations === 'object'
         ? value.hiddenConversations
-        : {},
-    invalidModelAliases:
-      value?.invalidModelAliases && typeof value.invalidModelAliases === 'object'
-        ? value.invalidModelAliases
-        : {},
-    sidebarCollapsed: Boolean(value?.sidebarCollapsed)
+        : {}
   };
 }
 
@@ -90,49 +102,14 @@ async function writeSettings(settings) {
   return normalized;
 }
 
-function createWindow() {
-  mainWindow = new BrowserWindow({
-    width: 1440,
-    height: 920,
-    minWidth: 1040,
-    minHeight: 720,
-    title: 'Stellacode',
-    titleBarStyle: 'hiddenInset',
-    trafficLightPosition: { x: 18, y: 18 },
-    backgroundColor: '#111315',
-    webPreferences: {
-      preload: path.join(__dirname, 'preload.js'),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: false
-    }
-  });
-
-  mainWindow.loadFile(path.join(__dirname, 'index.html'));
-}
-
 function normalizeBaseUrl(value) {
-  const url = new URL(value);
-  url.hash = '';
-  url.search = '';
-  return url.toString().replace(/\/$/, '');
+  return String(value || '').replace(/\/$/, '');
 }
 
-function joinApiUrl(baseUrl, apiPath) {
-  const base = `${normalizeBaseUrl(baseUrl)}/`;
-  const relative = String(apiPath || '').replace(/^\/+/, '');
-  return new URL(relative, base).toString();
-}
-
-function shouldRetryRequest(method, status) {
-  if (String(method || 'GET').toUpperCase() !== 'GET') {
-    return false;
-  }
-  return status === 408 || status === 425 || status === 429 || (status >= 500 && status <= 599);
-}
-
-function retryDelayMs(attempt) {
-  return [250, 700, 1500][Math.min(attempt, 2)];
+function joinApiUrl(baseUrl, requestPath) {
+  const cleanBase = normalizeBaseUrl(baseUrl);
+  const cleanPath = String(requestPath || '').startsWith('/') ? requestPath : `/${requestPath}`;
+  return `${cleanBase}${cleanPath}`;
 }
 
 async function sleep(ms) {
@@ -167,7 +144,7 @@ async function resolveServerBaseUrl(server) {
   const port = await findFreePort();
   const targetPort = target.port || (target.protocol === 'https:' ? '443' : '80');
   const bind = `127.0.0.1:${port}:${target.hostname}:${targetPort}`;
-  const args = [
+  const process = childProcess.spawn('ssh', [
     '-N',
     '-L',
     bind,
@@ -178,8 +155,7 @@ async function resolveServerBaseUrl(server) {
     '-o',
     'ServerAliveCountMax=2',
     server.sshHost
-  ];
-  const process = childProcess.spawn('ssh', args, {
+  ], {
     stdio: 'ignore',
     detached: false
   });
@@ -189,12 +165,10 @@ async function resolveServerBaseUrl(server) {
     earlyExit = true;
     tunnels.delete(server.id);
   });
-
-  await new Promise((resolve) => setTimeout(resolve, SSH_READY_DELAY_MS));
-  if (earlyExit) {
-    throw new Error('SSH tunnel exited before it became ready.');
+  await sleep(SSH_READY_DELAY_MS);
+  if (earlyExit || process.killed) {
+    throw new Error(`Failed to open SSH tunnel through ${server.sshHost}`);
   }
-
   const basePath = target.pathname && target.pathname !== '/' ? target.pathname.replace(/\/$/, '') : '';
   const baseUrl = `${target.protocol}//127.0.0.1:${port}${basePath}`;
   tunnels.set(server.id, { process, baseUrl });
@@ -221,44 +195,26 @@ async function requestServer(_event, payload) {
     options.body = JSON.stringify(payload.body);
   }
 
-  const url = joinApiUrl(baseUrl, payload.path);
-  let response;
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), SERVER_REQUEST_TIMEOUT_MS);
-    try {
-      response = await fetch(url, { ...options, signal: controller.signal });
-    } catch (error) {
-      if (String(options.method || 'GET').toUpperCase() !== 'GET' || attempt === 2) {
-        throw error;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SERVER_REQUEST_TIMEOUT_MS);
+  try {
+    const response = await fetch(joinApiUrl(baseUrl, payload.path), { ...options, signal: controller.signal });
+    const text = await response.text();
+    let data = null;
+    if (text.trim()) {
+      try {
+        data = JSON.parse(text);
+      } catch {
+        data = { text };
       }
-      await sleep(retryDelayMs(attempt));
-      continue;
-    } finally {
-      clearTimeout(timeout);
     }
-    if (!shouldRetryRequest(options.method, response.status) || attempt === 2) {
-      break;
+    if (!response.ok) {
+      throw new Error(data?.error || data?.message || `${response.status} ${response.statusText}`);
     }
-    await sleep(retryDelayMs(attempt));
+    return { status: response.status, data };
+  } finally {
+    clearTimeout(timeout);
   }
-  const text = await response.text();
-  let data = null;
-  if (text.trim()) {
-    try {
-      data = JSON.parse(text);
-    } catch {
-      data = { text };
-    }
-  }
-  if (!response.ok) {
-    const message = data?.error || data?.message || `${response.status} ${response.statusText}`;
-    throw new Error(message);
-  }
-  return {
-    status: response.status,
-    data
-  };
 }
 
 async function serverConnectionInfo(_event, serverId) {
@@ -273,71 +229,75 @@ async function serverConnectionInfo(_event, serverId) {
   };
 }
 
-function stopTunnel(serverId) {
-  const tunnel = tunnels.get(serverId);
-  if (!tunnel) {
-    return false;
-  }
-  tunnel.process.kill('SIGTERM');
-  tunnels.delete(serverId);
-  return true;
-}
-
-function stopAllTunnels() {
-  for (const serverId of tunnels.keys()) {
-    stopTunnel(serverId);
-  }
-}
-
 function bufferFromIpcBinary(value) {
-  if (Buffer.isBuffer(value)) {
-    return value;
+  if (Buffer.isBuffer(value)) return value;
+  if (value instanceof ArrayBuffer) return Buffer.from(value);
+  if (ArrayBuffer.isView(value)) return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+  if (Array.isArray(value)) return Buffer.from(value);
+  throw new Error('Invalid binary payload.');
+}
+
+async function gzipBinary(_event, payload) {
+  return zlib.gzipSync(bufferFromIpcBinary(payload));
+}
+
+function parseTarEntries(buffer) {
+  const entries = [];
+  let offset = 0;
+  let paxPath = '';
+  while (offset + 512 <= buffer.length) {
+    const header = buffer.subarray(offset, offset + 512);
+    if (header.every((byte) => byte === 0)) break;
+    const name = header.toString('utf8', 0, 100).replace(/\0.*$/, '');
+    const sizeRaw = header.toString('utf8', 124, 136).replace(/\0.*$/, '').trim();
+    const size = Number.parseInt(sizeRaw || '0', 8) || 0;
+    const type = String.fromCharCode(header[156] || 48);
+    offset += 512;
+    const data = buffer.subarray(offset, offset + size);
+    offset += Math.ceil(size / 512) * 512;
+    if (type === 'x') {
+      const text = data.toString('utf8');
+      const match = text.match(/path=([^\n]+)/);
+      paxPath = match?.[1] || '';
+      continue;
+    }
+    entries.push({
+      name: paxPath || name,
+      type,
+      data: Buffer.from(data)
+    });
+    paxPath = '';
   }
-  if (value instanceof ArrayBuffer) {
-    return Buffer.from(value);
-  }
-  if (ArrayBuffer.isView(value)) {
-    return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
-  }
-  if (Array.isArray(value)) {
-    return Buffer.from(value);
-  }
-  throw new Error('Invalid upload payload.');
+  return entries;
 }
 
 async function uploadWorkspaceFile(_event, payload) {
   const settings = await readSettings();
   const server = settings.servers.find((item) => item.id === payload.serverId);
-  if (!server) {
-    throw new Error(`Unknown server: ${payload.serverId}`);
-  }
+  if (!server) throw new Error(`Unknown server: ${payload.serverId}`);
   const baseUrl = await resolveServerBaseUrl(server);
-  const url = joinApiUrl(
-    baseUrl,
-    `/api/conversations/${payload.conversationId}/workspace/upload?path=${encodeURIComponent(payload.path || '')}`
-  );
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SERVER_REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch(url, {
+    const response = await fetch(joinApiUrl(
+      baseUrl,
+      `/api/conversations/${payload.conversationId}/workspace/upload?path=${encodeURIComponent(payload.path || '')}`
+    ), {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${server.token}`,
-        'Content-Type': 'application/gzip'
+        'Content-Type': 'application/gzip',
+        Accept: 'application/json'
       },
       body: bufferFromIpcBinary(payload.data),
       signal: controller.signal
     });
+    const text = await response.text();
+    const data = text.trim() ? JSON.parse(text) : {};
     if (!response.ok) {
-      const text = await response.text();
-      let message = `${response.status} ${response.statusText}`;
-      try {
-        const json = JSON.parse(text);
-        message = json.error || json.message || message;
-      } catch {}
-      throw new Error(message);
+      throw new Error(data?.error || data?.message || `${response.status} ${response.statusText}`);
     }
-    return await response.json();
+    return data;
   } finally {
     clearTimeout(timeout);
   }
@@ -346,18 +306,15 @@ async function uploadWorkspaceFile(_event, payload) {
 async function downloadWorkspaceFile(_event, payload) {
   const settings = await readSettings();
   const server = settings.servers.find((item) => item.id === payload.serverId);
-  if (!server) {
-    throw new Error(`Unknown server: ${payload.serverId}`);
-  }
+  if (!server) throw new Error(`Unknown server: ${payload.serverId}`);
   const baseUrl = await resolveServerBaseUrl(server);
-  const url = joinApiUrl(
-    baseUrl,
-    `/api/conversations/${payload.conversationId}/workspace/download?path=${encodeURIComponent(payload.path)}`
-  );
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SERVER_REQUEST_TIMEOUT_MS);
   try {
-    const response = await fetch(url, {
+    const response = await fetch(joinApiUrl(
+      baseUrl,
+      `/api/conversations/${payload.conversationId}/workspace/download?path=${encodeURIComponent(payload.path || '')}`
+    ), {
       method: 'GET',
       headers: {
         Authorization: `Bearer ${server.token}`,
@@ -374,74 +331,65 @@ async function downloadWorkspaceFile(_event, payload) {
       } catch {}
       throw new Error(message);
     }
-    const buffer = Buffer.from(await response.arrayBuffer());
-    const fileName = payload.suggestedName || `${path.basename(payload.path) || 'workspace'}.tar.gz`;
+    const archive = Buffer.from(await response.arrayBuffer());
+    const basename = payload.suggestedName || path.basename(payload.path || '') || 'workspace';
+    let saveName = payload.kind === 'file' ? basename : `${basename}.tar.gz`;
+    let saveBuffer = archive;
+    let filters = [{ name: 'Archive', extensions: ['tar.gz'] }];
+    if (payload.kind === 'file') {
+      const entries = parseTarEntries(zlib.gunzipSync(archive)).filter((entry) => entry.type !== '5');
+      const first = entries[0];
+      if (first) {
+        saveName = path.basename(first.name || basename);
+        saveBuffer = first.data;
+        filters = [];
+      }
+    }
     const win = BrowserWindow.getFocusedWindow();
     const result = await dialog.showSaveDialog(win, {
-      defaultPath: fileName,
-      filters: [{ name: 'tar.gz archive', extensions: ['tar.gz'] }]
+      defaultPath: saveName,
+      filters
     });
-    if (result.canceled || !result.filePath) {
-      return { saved: false };
-    }
-    await fs.writeFile(result.filePath, buffer);
-    return { saved: true, filePath: result.filePath, size: buffer.length };
+    if (result.canceled || !result.filePath) return { saved: false };
+    await fs.writeFile(result.filePath, saveBuffer);
+    return { saved: true, filePath: result.filePath, size: saveBuffer.length };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-// ── Auto-updater ──────────────────────────────────────────────────────
-const UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000; // 10 minutes
-let updateCheckTimer = null;
-
-function setupAutoUpdater() {
-  autoUpdater.autoDownload = false;
-  autoUpdater.autoInstallOnAppQuit = true;
-
-  autoUpdater.on('update-available', (info) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('updater:update-available', {
-        version: info.version,
-        releaseDate: info.releaseDate
-      });
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1440,
+    height: 920,
+    minWidth: 960,
+    minHeight: 680,
+    title: 'Stellacode 2',
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
+    trafficLightPosition: { x: 18, y: 18 },
+    backgroundColor: '#151515',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false
     }
   });
 
-  autoUpdater.on('update-not-available', () => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('updater:update-not-available');
+  if (process.env.VITE_DEV_SERVER_URL) {
+    mainWindow.loadURL(process.env.VITE_DEV_SERVER_URL);
+  } else {
+    mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
+  }
+
+  mainWindow.webContents.on('console-message', (_event, details) => {
+    if (details.level >= 2) {
+      console.error(`[renderer:${details.level}] ${details.message} (${details.sourceId}:${details.lineNumber})`);
     }
   });
-
-  autoUpdater.on('download-progress', (progress) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('updater:download-progress', {
-        percent: progress.percent,
-        bytesPerSecond: progress.bytesPerSecond,
-        transferred: progress.transferred,
-        total: progress.total
-      });
-    }
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    console.error('[renderer-gone]', details);
   });
-
-  autoUpdater.on('update-downloaded', (info) => {
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('updater:update-downloaded', {
-        version: info.version
-      });
-    }
-  });
-
-  autoUpdater.on('error', (error) => {
-    console.warn('Auto-updater error:', error?.message || error);
-  });
-
-  // Check now, then every 10 minutes.
-  autoUpdater.checkForUpdates().catch(() => {});
-  updateCheckTimer = setInterval(() => {
-    autoUpdater.checkForUpdates().catch(() => {});
-  }, UPDATE_CHECK_INTERVAL_MS);
 }
 
 app.whenReady().then(() => {
@@ -449,37 +397,23 @@ app.whenReady().then(() => {
   ipcMain.handle('settings:save', (_event, settings) => writeSettings(settings));
   ipcMain.handle('server:request', requestServer);
   ipcMain.handle('server:connectionInfo', serverConnectionInfo);
-  ipcMain.handle('server:stopTunnel', (_event, serverId) => stopTunnel(serverId));
+  ipcMain.handle('binary:gzip', gzipBinary);
   ipcMain.handle('workspace:upload', uploadWorkspaceFile);
   ipcMain.handle('workspace:download', downloadWorkspaceFile);
-
-  // Updater IPC
-  ipcMain.handle('updater:check', () => autoUpdater.checkForUpdates().catch(() => null));
-  ipcMain.handle('updater:download', () => autoUpdater.downloadUpdate().catch(() => null));
-  ipcMain.handle('updater:install', () => {
-    autoUpdater.quitAndInstall(false, true);
-  });
-
   createWindow();
-  setupAutoUpdater();
-
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
-    }
-  });
-});
-
-app.on('before-quit', () => {
-  stopAllTunnels();
-  if (updateCheckTimer) {
-    clearInterval(updateCheckTimer);
-    updateCheckTimer = null;
-  }
 });
 
 app.on('window-all-closed', () => {
+  for (const tunnel of tunnels.values()) {
+    tunnel.process.kill('SIGTERM');
+  }
   if (process.platform !== 'darwin') {
     app.quit();
+  }
+});
+
+app.on('activate', () => {
+  if (BrowserWindow.getAllWindows().length === 0) {
+    createWindow();
   }
 });

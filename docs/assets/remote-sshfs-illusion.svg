@@ -1,0 +1,67 @@
+<svg role="img" aria-label="SSHFS remote workspace illusion" viewBox="0 0 980 390" width="980" height="390" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2563eb"/>
+    </marker>
+    <style>
+      .box { fill: #f8fafc; stroke: #94a3b8; stroke-width: 1.5; rx: 12; }
+      .host { fill: #eff6ff; stroke: #2563eb; }
+      .remote { fill: #f0fdf4; stroke: #16a34a; }
+      .state { fill: #fff7ed; stroke: #ea580c; }
+      .title { font: 700 18px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #0f172a; }
+      .label { font: 500 14px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #334155; }
+      .small { font: 12px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #475569; }
+      .code { font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #334155; }
+      .line { stroke: #2563eb; stroke-width: 2.2; fill: none; marker-end: url(#arrow); }
+      .ssh { stroke: #16a34a; stroke-width: 2.2; fill: none; marker-end: url(#arrow); stroke-dasharray: 7 5; }
+      .local { stroke: #ea580c; stroke-width: 2; fill: none; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect x="28" y="35" width="410" height="310" class="box host"/>
+  <text x="52" y="72" class="title">Stellaclaw host server</text>
+  <text x="52" y="99" class="small">Owns durable conversation state and session state</text>
+
+  <rect x="58" y="125" width="160" height="72" class="box"/>
+  <text x="78" y="154" class="label">Conversation</text>
+  <text x="78" y="176" class="small">remote binding</text>
+
+  <rect x="248" y="125" width="160" height="72" class="box"/>
+  <text x="270" y="154" class="label">Agent server</text>
+  <text x="270" y="176" class="small">model/tool loop</text>
+
+  <rect x="58" y="235" width="160" height="72" class="box state"/>
+  <text x="78" y="264" class="label">Local state</text>
+  <text x="78" y="286" class="code">session.json / logs</text>
+
+  <rect x="248" y="235" width="160" height="72" class="box"/>
+  <text x="270" y="264" class="label">Mounted workspace</text>
+  <text x="270" y="286" class="code">workdir/.../workspace</text>
+
+  <rect x="550" y="35" width="400" height="310" class="box remote"/>
+  <text x="574" y="72" class="title">Remote workspace server</text>
+  <text x="574" y="99" class="small">Owns the real project files and execution root</text>
+
+  <rect x="585" y="132" width="145" height="72" class="box"/>
+  <text x="607" y="161" class="label">Project files</text>
+  <text x="607" y="183" class="code">/repo/app</text>
+
+  <rect x="770" y="132" width="145" height="72" class="box"/>
+  <text x="792" y="161" class="label">Remote shell</text>
+  <text x="792" y="183" class="code">ssh -tt host</text>
+
+  <rect x="665" y="242" width="145" height="72" class="box"/>
+  <text x="686" y="271" class="label">Execution root</text>
+  <text x="686" y="293" class="code">configured cwd</text>
+
+  <path d="M218 161 H248" class="line"/>
+  <path d="M328 197 V235" class="line"/>
+  <path d="M138 197 V235" class="local"/>
+  <path d="M408 271 C475 268 510 170 585 168" class="ssh"/>
+  <path d="M408 271 C500 305 580 285 665 278" class="ssh"/>
+  <path d="M408 161 C515 112 675 104 770 158" class="ssh"/>
+
+  <text x="450" y="160" class="small">sshfs projects remote files</text>
+  <text x="455" y="292" class="small">tools see a local path</text>
+  <text x="595" y="226" class="small">shell runs on remote when fixed Remote mode is active</text>
+</svg>

@@ -6,6 +6,9 @@ version: 1.16.4
 - 收窄 Web message skeleton 顶层文本语义：
   `MessageSkeleton.text`、`text_with_attachment_markers` 和 `preview` 现在只聚合普通 `Context` 文本，不再把 `ToolResult.context` 合并到顶层正文；tool result 的内容继续保留在对应 `items[].context` / `items[].context_with_attachment_markers` 中，避免前端 fallback 渲染顶层文本时把工具结果重复当正文展示。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 美化 README 并突出 Stellacode + Remote mode 支撑的 Host -> Server -> Server 工作流：
+  README 开头现在更明确说明 Stellacode/Telegram/Web 作为用户侧 host surface，Stellaclaw 作为 durable agent server，Remote mode 可把 conversation 绑定到第二台 server 的 workspace、terminal 和 execution root；同步补充 highlights、Web channel 当前能力、架构图中的 remote workspace server 边界，并新增 SSHFS workspace illusion 和 Web Channel 两跳远程接入的 SVG 讲解图，说明 agent 如何像在远端工作、用户如何随时开始/中断/继续。本次不改变 `config` schema，不改变 `workdir` schema。
+
 # 1.16.3
 
 - sshfs watchdog 守护线程：
@@ -557,4 +560,3 @@ version: 1.16.4
 - 项目发布版本使用 SemVer，从 `1.0.0` 开始编号。
 - 根 `VERSION` 的 `version:` 字段是当前项目发布版本。
 - `config` schema version 和 `workdir` schema version 独立维护，不要求和项目发布版本相同。
-
