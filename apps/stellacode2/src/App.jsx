@@ -39,6 +39,27 @@ const WORKSPACE_PANEL_MIN = 340;
 const WORKSPACE_PANEL_MAX = 620;
 const MAX_UPLOAD_COMPRESSED_BYTES = 10 * 1024 * 1024;
 
+function slashCommandState(value) {
+  const command = String(value || '').trim();
+  const name = command.split(/\s+/, 1)[0]?.toLowerCase() || '';
+  if (name === '/model') {
+    return { control: true, title: '切换模型', detail: '模型切换命令已发送' };
+  }
+  if (name === '/remote') {
+    return { control: true, title: '切换远程模式', detail: '远程模式命令已发送' };
+  }
+  if (name === '/cancel') {
+    return { control: true, title: '取消执行', detail: '取消命令已发送' };
+  }
+  if (name === '/compact') {
+    return { control: true, title: '压缩上下文', detail: '压缩命令已发送' };
+  }
+  if (name === '/status') {
+    return { control: true, title: '读取状态', detail: '状态命令已发送' };
+  }
+  return { control: false, title: '等待响应', detail: '消息已送达，等待模型开始处理' };
+}
+
 function App() {
   const [settings, setSettings] = useState(null);
   const [sidebarMode, setSidebarMode] = useState('expanded');
@@ -744,6 +765,7 @@ function App() {
     const value = String(text || '').trim();
     if (!value || !selected || sending) return;
     const key = conversationKey(selected.serverId, selected.conversationId);
+    const commandState = slashCommandState(value);
     const previousLastServerId = lastServerMessageId(messagesRef.current);
     const optimistic = {
       id: `local-${Date.now()}`,
@@ -769,11 +791,42 @@ function App() {
     try {
       await postConversationMessage(selected.serverId, selected.conversationId, value);
       if (websocketKeyRef.current !== key) return;
-      setSessionActivity('已发送，等待响应');
-      updateRunningActivities((current) => [
-        ...current.filter((item) => item.id !== 'sending'),
-        { id: 'waiting-response', title: '等待响应', detail: '消息已送达，等待模型开始处理', state: 'running' }
-      ]);
+      setMessages((current) => {
+        const next = commandState.control
+          ? current.filter((message) => message.id !== optimistic.id)
+          : current.map((message) => (
+              message.id === optimistic.id ? { ...message, pending: false } : message
+            ));
+        messagesRef.current = next;
+        return next;
+      });
+      if (commandState.control) {
+        loadStatus(selected.serverId, selected.conversationId)
+          .then((status) => {
+            if (websocketKeyRef.current !== key) return;
+            setStatuses((prev) => new Map(prev).set(key, status));
+            seenUsageMessagesRef.current.set(key, new Set());
+            setStatusDeltas((current) => {
+              const next = new Map(current);
+              next.delete(key);
+              return next;
+            });
+          })
+          .catch(() => {});
+        setSessionActivity(commandState.detail);
+        updateRunningActivities(() => [
+          { id: 'command-sent', title: commandState.title, detail: commandState.detail, state: 'done' }
+        ]);
+        window.setTimeout(() => {
+          if (websocketKeyRef.current === key) setRunningActivities([]);
+        }, 900);
+      } else {
+        setSessionActivity('已发送，等待响应');
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== 'sending'),
+          { id: 'waiting-response', title: commandState.title, detail: commandState.detail, state: 'running' }
+        ]);
+      }
       if (!websocketRef.current || websocketRef.current.readyState !== WebSocket.OPEN) {
         const anchorId = previousLastServerId || lastServerMessageId(messagesRef.current);
         const incoming = anchorId

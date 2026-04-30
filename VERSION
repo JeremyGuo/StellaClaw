@@ -1,5 +1,10 @@
-version: 1.16.5
+version: 1.16.6
 ---
+
+# 1.16.6
+
+- 修复 Stellacode 控制命令的本地乐观消息残留：
+  Web 前端发送 `/model <name>` 等控制命令成功后现在会移除本地 optimistic user 气泡，并主动刷新当前 conversation status，避免模型切换命令长期停留在最新用户消息位置，也避免在后端未额外推送 status 时模型选择界面继续显示。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.16.5
 
