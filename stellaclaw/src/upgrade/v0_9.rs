@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use super::{WorkdirUpgrader, LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_9};
+use super::{WorkdirUpgrader, WORKDIR_VERSION_0_10, WORKDIR_VERSION_0_9};
 use crate::{config::StellaclawConfig, workspace::is_sshfs_workspace_entry_name};
 
 pub struct ConversationNicknameUpgrade;
@@ -14,7 +14,7 @@ impl WorkdirUpgrader for ConversationNicknameUpgrade {
     }
 
     fn to_version(&self) -> &'static str {
-        LATEST_WORKDIR_VERSION
+        WORKDIR_VERSION_0_10
     }
 
     fn upgrade(&self, workdir: &Path, _config: &StellaclawConfig) -> Result<()> {

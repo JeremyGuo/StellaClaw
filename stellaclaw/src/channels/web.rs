@@ -63,6 +63,7 @@ const WEBSOCKET_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const WEBSOCKET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const TERMINAL_WEBSOCKET_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const TERMINAL_WEBSOCKET_EVENT_CAPACITY: usize = 256;
+const WEB_CHANNEL_STATE_FILE: &str = "web_state.json";
 
 pub struct WebChannel {
     id: String,
@@ -96,6 +97,14 @@ impl WebChannel {
     ) -> Self {
         let cache_manager = Arc::new(CacheManager::new(workdir.clone()));
         let _ = cache_manager.ensure_layout();
+        let channel_state_dir = web_channel_state_dir(&workdir, &id);
+        if let Err(error) = fs::create_dir_all(&channel_state_dir) {
+            logger.warn(
+                "web_channel_state_dir_create_failed",
+                json!({"channel_id": &id, "path": channel_state_dir.display().to_string(), "error": error.to_string()}),
+            );
+        }
+        let seen_states = load_web_channel_state(&workdir, &id, &logger).seen;
         Self {
             id,
             bind_addr,
@@ -108,7 +117,7 @@ impl WebChannel {
             websocket_subscribers: Arc::new(Mutex::new(HashMap::new())),
             conversation_stream_subscribers: Arc::new(Mutex::new(Vec::new())),
             processing_states: Arc::new(Mutex::new(HashMap::new())),
-            seen_states: Arc::new(Mutex::new(HashMap::new())),
+            seen_states: Arc::new(Mutex::new(seen_states)),
         }
     }
 
@@ -362,14 +371,31 @@ impl WebChannel {
     ) -> ApiResult<HttpResponse> {
         self.load_web_state(conversation_id)?;
         let request: MarkConversationSeenRequest = parse_json(body)?;
-        let seen = ConversationSeen {
-            last_seen_message_id: request.last_seen_message_id,
-            updated_at: now_rfc3339(),
+        let (seen, snapshot) = {
+            let mut seen_states = self
+                .seen_states
+                .lock()
+                .map_err(|_| ApiError::new(500, "conversation seen lock poisoned"))?;
+            let existing = seen_states.get(conversation_id).cloned();
+            let seen = match existing {
+                Some(existing)
+                    if compare_message_ids(
+                        &existing.last_seen_message_id,
+                        &request.last_seen_message_id,
+                    )
+                    .is_some_and(|ordering| !ordering.is_lt()) =>
+                {
+                    existing
+                }
+                _ => ConversationSeen {
+                    last_seen_message_id: request.last_seen_message_id,
+                    updated_at: now_rfc3339(),
+                },
+            };
+            seen_states.insert(conversation_id.to_string(), seen.clone());
+            (seen, seen_states.clone())
         };
-        self.seen_states
-            .lock()
-            .map_err(|_| ApiError::new(500, "conversation seen lock poisoned"))?
-            .insert(conversation_id.to_string(), seen.clone());
+        self.persist_seen_states(&snapshot)?;
         self.publish_conversation_stream_event(json!({
             "type": "conversation_seen",
             "subscription": "conversation_list",
@@ -384,6 +410,21 @@ impl WebChannel {
                 "seen": seen,
             }),
         ))
+    }
+
+    fn persist_seen_states(&self, seen: &HashMap<String, ConversationSeen>) -> ApiResult<()> {
+        let state = WebChannelState { seen: seen.clone() };
+        let path = self.web_channel_state_path();
+        let parent = path
+            .parent()
+            .ok_or_else(|| ApiError::new(500, "invalid web channel state path"))?;
+        fs::create_dir_all(parent).map_err(ApiError::internal)?;
+        let raw = serde_json::to_string_pretty(&state).map_err(ApiError::internal)?;
+        fs::write(&path, raw).map_err(ApiError::internal)
+    }
+
+    fn web_channel_state_path(&self) -> PathBuf {
+        web_channel_state_dir(&self.workdir, &self.id).join(WEB_CHANNEL_STATE_FILE)
     }
 
     fn authorized(&self, request: &HttpRequest) -> bool {
@@ -1940,10 +1981,16 @@ struct ConversationMessageSummary {
     last_message_time: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ConversationSeen {
     last_seen_message_id: String,
     updated_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct WebChannelState {
+    #[serde(default)]
+    seen: HashMap<String, ConversationSeen>,
 }
 
 impl ConversationSummary {
@@ -2023,6 +2070,45 @@ fn compare_message_ids(left: &str, right: &str) -> Option<Ordering> {
     let left = left.parse::<u64>().ok()?;
     let right = right.parse::<u64>().ok()?;
     Some(left.cmp(&right))
+}
+
+fn web_channel_state_dir(workdir: &Path, channel_id: &str) -> PathBuf {
+    workdir
+        .join(".log")
+        .join("stellaclaw")
+        .join("channels")
+        .join(channel_id)
+}
+
+fn load_web_channel_state(
+    workdir: &Path,
+    channel_id: &str,
+    logger: &StellaclawLogger,
+) -> WebChannelState {
+    let path = web_channel_state_dir(workdir, channel_id).join(WEB_CHANNEL_STATE_FILE);
+    if !path.exists() {
+        return WebChannelState::default();
+    }
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) => {
+            logger.warn(
+                "web_channel_state_read_failed",
+                json!({"channel_id": channel_id, "path": path.display().to_string(), "error": error.to_string()}),
+            );
+            return WebChannelState::default();
+        }
+    };
+    match serde_json::from_str(&raw) {
+        Ok(state) => state,
+        Err(error) => {
+            logger.warn(
+                "web_channel_state_parse_failed",
+                json!({"channel_id": channel_id, "path": path.display().to_string(), "error": error.to_string()}),
+            );
+            WebChannelState::default()
+        }
+    }
 }
 
 fn model_listing_payload(config: &StellaclawConfig) -> Value {

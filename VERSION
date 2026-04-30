@@ -1,5 +1,13 @@
-version: 1.18.3
+version: 1.18.4
 ---
+
+# 1.18.4
+
+- 收敛 Stellacode 2 conversation stream 状态机：
+  前端现在通过统一的 stream event reducer 处理 `conversation_snapshot`、`conversation_upserted`、`conversation_processing`、`conversation_turn_completed` 和 `conversation_seen`，并在同一入口保证 `last_seen_message_id` 单调递增、最新消息摘要不被旧事件回退，避免未读红点逻辑继续分散在多个 handler 中。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 持久化 Web channel 已读状态：
+  Web channel 现在把 conversation seen 状态保存到 `.log/stellaclaw/channels/<channel_id>/web_state.json`，服务重启后仍能恢复已读位置；`POST /seen` 在后端也会按最大消息 id 合并，防止较旧的已读上报覆盖较新的已读状态。本次不改变 `config` schema，`workdir` schema 升级到 `0.11`。
 
 # 1.18.3
 

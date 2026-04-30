@@ -6,6 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use crate::config::StellaclawConfig;
 
 mod v0_1;
+mod v0_10;
 mod v0_2;
 mod v0_3;
 mod v0_4;
@@ -24,7 +25,8 @@ pub const WORKDIR_VERSION_0_6: &str = "0.6";
 pub const WORKDIR_VERSION_0_7: &str = "0.7";
 pub const WORKDIR_VERSION_0_8: &str = "0.8";
 pub const WORKDIR_VERSION_0_9: &str = "0.9";
-pub const LATEST_WORKDIR_VERSION: &str = "0.10";
+pub const WORKDIR_VERSION_0_10: &str = "0.10";
+pub const LATEST_WORKDIR_VERSION: &str = "0.11";
 pub const PARTYCLAW_LATEST_WORKDIR_VERSION: &str = "0.39";
 
 const WORKDIR_VERSION_FILE: &str = "STELLA_VERSION";
@@ -43,7 +45,7 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
     let legacy_version_path = workdir.join(LEGACY_WORKDIR_VERSION_FILE);
     let mut current = read_workdir_version(&version_path, &legacy_version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 10] = [
+    let upgraders: [&dyn WorkdirUpgrader; 11] = [
         &v0_1::LegacyUpgrade,
         &v0_1::PartyClawUpgrade,
         &v0_2::ChatMessageReasoningUpgrade,
@@ -54,6 +56,7 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
         &v0_7::CronScriptFieldRenameUpgrade,
         &v0_8::RuntimeCacheDirectoryUpgrade,
         &v0_9::ConversationNicknameUpgrade,
+        &v0_10::ChannelStateDirectoryUpgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -101,6 +104,7 @@ fn read_version_file(version_path: &Path) -> Result<&'static str> {
         WORKDIR_VERSION_0_7 => Ok(WORKDIR_VERSION_0_7),
         WORKDIR_VERSION_0_8 => Ok(WORKDIR_VERSION_0_8),
         WORKDIR_VERSION_0_9 => Ok(WORKDIR_VERSION_0_9),
+        WORKDIR_VERSION_0_10 => Ok(WORKDIR_VERSION_0_10),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }

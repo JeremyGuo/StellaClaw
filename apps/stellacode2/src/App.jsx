@@ -135,18 +135,114 @@ function maxMessageId(...values) {
   return max >= 0 ? String(max) : undefined;
 }
 
-function mergeConversationSeen(incoming, existing) {
-  const seen = maxMessageId(incoming?.last_seen_message_id, existing?.last_seen_message_id);
-  if (!seen) return incoming;
+function compareMessageIds(left, right) {
+  const leftNumber = Number(left);
+  const rightNumber = Number(right);
+  if (!Number.isFinite(leftNumber) && !Number.isFinite(rightNumber)) return 0;
+  if (!Number.isFinite(leftNumber)) return -1;
+  if (!Number.isFinite(rightNumber)) return 1;
+  return leftNumber === rightNumber ? 0 : leftNumber > rightNumber ? 1 : -1;
+}
+
+function mergeConversationSummary(existing, incoming) {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  const incomingHasNewerMessage = compareMessageIds(incoming.last_message_id, existing.last_message_id) >= 0;
+  const seen = maxMessageId(existing.last_seen_message_id, incoming.last_seen_message_id);
   const incomingSeen = Number(incoming?.last_seen_message_id);
   const existingSeen = Number(existing?.last_seen_message_id);
-  return {
+  const merged = {
+    ...existing,
     ...incoming,
+    last_message_id: incomingHasNewerMessage
+      ? incoming.last_message_id ?? existing.last_message_id
+      : existing.last_message_id,
+    last_message_time: incomingHasNewerMessage
+      ? incoming.last_message_time ?? existing.last_message_time
+      : existing.last_message_time,
+    message_count: incomingHasNewerMessage
+      ? incoming.message_count ?? existing.message_count
+      : existing.message_count
+  };
+  if (!seen) return merged;
+  return {
+    ...merged,
     last_seen_message_id: seen,
     last_seen_at: Number.isFinite(incomingSeen) && (!Number.isFinite(existingSeen) || incomingSeen >= existingSeen)
       ? incoming?.last_seen_at
       : existing?.last_seen_at
   };
+}
+
+function applyConversationStreamEvent(current, payload, { serverId, hiddenConversations = {} } = {}) {
+  const hidden = (conversation) => hiddenConversations[conversationKey(serverId, conversation.conversation_id)];
+  const sort = (list) => [...list].sort((left, right) => left.conversation_id.localeCompare(right.conversation_id));
+  const upsert = (list, incoming) => {
+    if (!incoming?.conversation_id) return list;
+    if (hidden(incoming)) {
+      return list.filter((conversation) => conversation.conversation_id !== incoming.conversation_id);
+    }
+    const exists = list.some((conversation) => conversation.conversation_id === incoming.conversation_id);
+    if (!exists) return sort([...list, incoming]);
+    return list.map((conversation) => (
+      conversation.conversation_id === incoming.conversation_id
+        ? mergeConversationSummary(conversation, incoming)
+        : conversation
+    ));
+  };
+
+  if (payload.type === 'conversation_snapshot') {
+    const existingById = new Map(current.map((conversation) => [conversation.conversation_id, conversation]));
+    return (payload.conversations || [])
+      .filter((conversation) => !hidden(conversation))
+      .map((conversation) => mergeConversationSummary(existingById.get(conversation.conversation_id), conversation));
+  }
+
+  if (payload.type === 'conversation_upserted') {
+    return upsert(current, payload.conversation);
+  }
+
+  if (payload.type === 'conversation_processing' && payload.conversation_id) {
+    return current.map((conversation) => (
+      conversation.conversation_id === payload.conversation_id
+        ? {
+          ...conversation,
+          processing_state: payload.processing_state || conversation.processing_state,
+          running: Boolean(payload.running)
+        }
+        : conversation
+    ));
+  }
+
+  if (payload.type === 'conversation_turn_completed' && payload.conversation_id) {
+    const incoming = {
+      ...(payload.conversation || {}),
+      conversation_id: payload.conversation_id,
+      platform_chat_id: payload.platform_chat_id || payload.conversation?.platform_chat_id,
+      processing_state: 'idle',
+      running: false,
+      message_count: payload.message_count ?? payload.conversation?.message_count,
+      last_message_id: payload.last_message_id ?? payload.conversation?.last_message_id,
+      last_message_time: payload.last_message_time ?? payload.conversation?.last_message_time,
+      last_seen_message_id: payload.last_seen_message_id ?? payload.conversation?.last_seen_message_id,
+      last_seen_at: payload.last_seen_at ?? payload.conversation?.last_seen_at
+    };
+    return upsert(current, incoming);
+  }
+
+  if (payload.type === 'conversation_seen' && payload.conversation_id && payload.seen) {
+    return current.map((conversation) => (
+      conversation.conversation_id === payload.conversation_id
+        ? mergeConversationSummary(conversation, {
+          conversation_id: payload.conversation_id,
+          last_seen_message_id: payload.seen.last_seen_message_id,
+          last_seen_at: payload.seen.updated_at
+        })
+        : conversation
+    ));
+  }
+
+  return current;
 }
 
 function sleep(ms) {
@@ -458,7 +554,10 @@ function App() {
     const key = conversationKey(serverId, conversationId);
     setConversations((current) => current.map((conversation) => (
       conversation.conversation_id === conversationId
-        ? { ...conversation, last_seen_message_id: String(Math.max(seen, Number(conversation.last_seen_message_id || -1))) }
+        ? mergeConversationSummary(conversation, {
+          conversation_id: conversationId,
+          last_seen_message_id: String(seen)
+        })
         : conversation
     )));
     const existing = readSaveTimersRef.current.get(key);
@@ -499,19 +598,9 @@ function App() {
     let disposed = false;
     let reconnectTimer = null;
     let streamSocket = null;
-    const applyConversationList = (list) => {
-      if (!Array.isArray(list) || disposed) return;
-      const hidden = settings?.hiddenConversations || {};
-      setConversations((current) => {
-        const existingById = new Map(current.map((conversation) => [conversation.conversation_id, conversation]));
-        return list
-          .filter((conversation) => !hidden[conversationKey(activeServerId, conversation.conversation_id)])
-          .map((conversation) => mergeConversationSeen(conversation, existingById.get(conversation.conversation_id)));
-      });
-      const visibleList = list.filter((conversation) => !hidden[conversationKey(activeServerId, conversation.conversation_id)]);
-      if (!selectedRef.current && visibleList[0]) {
-        setSelected({ serverId: activeServerId, conversationId: visibleList[0].conversation_id });
-      }
+    const streamContext = {
+      serverId: activeServerId,
+      hiddenConversations: settings?.hiddenConversations || {}
     };
     const connect = async () => {
       try {
@@ -526,58 +615,15 @@ function App() {
           } catch {
             return;
           }
-          if (payload.type === 'conversation_snapshot') {
-            applyConversationList(payload.conversations || []);
-          } else if (payload.type === 'conversation_upserted' && payload.conversation) {
-            setConversations((current) => {
-              const nextConversation = payload.conversation;
-              const hidden = settings?.hiddenConversations || {};
-              if (hidden[conversationKey(activeServerId, nextConversation.conversation_id)]) {
-                return current.filter((conversation) => conversation.conversation_id !== nextConversation.conversation_id);
-              }
-              const exists = current.some((conversation) => conversation.conversation_id === nextConversation.conversation_id);
-              if (!exists) return [...current, nextConversation].sort((left, right) => left.conversation_id.localeCompare(right.conversation_id));
-              return current.map((conversation) => (
-                conversation.conversation_id === nextConversation.conversation_id
-                  ? mergeConversationSeen({ ...conversation, ...nextConversation }, conversation)
-                  : conversation
-              ));
-            });
-          } else if (payload.type === 'conversation_processing' && payload.conversation_id) {
-            setConversations((current) => current.map((conversation) => (
-              conversation.conversation_id === payload.conversation_id
-                ? {
-                  ...conversation,
-                  processing_state: payload.processing_state || conversation.processing_state,
-                  running: Boolean(payload.running)
-                }
-                : conversation
-            )));
-          } else if (payload.type === 'conversation_turn_completed' && payload.conversation_id) {
-            setConversations((current) => current.map((conversation) => {
-              if (conversation.conversation_id !== payload.conversation_id) return conversation;
-              return {
-                ...conversation,
-                ...(payload.conversation || {}),
-                processing_state: 'idle',
-                running: false,
-                message_count: payload.message_count ?? payload.conversation?.message_count ?? conversation.message_count,
-                last_message_id: payload.last_message_id ?? payload.conversation?.last_message_id ?? conversation.last_message_id,
-                last_message_time: payload.last_message_time ?? payload.conversation?.last_message_time ?? conversation.last_message_time,
-                last_seen_message_id: maxMessageId(payload.last_seen_message_id, payload.conversation?.last_seen_message_id, conversation.last_seen_message_id),
-                last_seen_at: payload.last_seen_at ?? payload.conversation?.last_seen_at ?? conversation.last_seen_at
-              };
-            }));
-          } else if (payload.type === 'conversation_seen' && payload.conversation_id && payload.seen) {
-            setConversations((current) => current.map((conversation) => (
-              conversation.conversation_id === payload.conversation_id
-                ? {
-                  ...conversation,
-                  last_seen_message_id: payload.seen.last_seen_message_id,
-                  last_seen_at: payload.seen.updated_at
-                }
-                : conversation
-            )));
+          setConversations((current) => applyConversationStreamEvent(current, payload, streamContext));
+          if (!selectedRef.current) {
+            const fallbackConversation = payload.type === 'conversation_snapshot'
+              ? (payload.conversations || [])
+                .find((conversation) => !streamContext.hiddenConversations[conversationKey(activeServerId, conversation.conversation_id)])
+              : payload.conversation;
+            if (fallbackConversation?.conversation_id) {
+              setSelected({ serverId: activeServerId, conversationId: fallbackConversation.conversation_id });
+            }
           }
         });
         socket.addEventListener('close', () => {
