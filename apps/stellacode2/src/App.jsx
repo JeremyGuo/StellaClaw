@@ -635,8 +635,8 @@ function App() {
             const isVisibleActive = isActive && appForegroundRef.current;
             if (selectedConversation && completed && !isVisibleActive && hasUnreadConversation(completed)) {
               window.stellacode2?.notify?.({
-                title: 'Stellacode',
-                body: `${displayConversationName(completed)} 有新消息`
+                title: displayConversationName(completed),
+                body: '新回复已完成'
               }).catch(() => {});
             }
           }
