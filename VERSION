@@ -1,5 +1,16 @@
-version: 1.17.0
+version: 1.17.1
 ---
+
+# 1.17.1
+
+- 适配结构化 turn progress 的前端计划展示：
+  Stellacode Web 前端现在同时监听新的 `turn_progress` 事件和兼容的 `progress_feedback` 事件，计划面板读取 `TurnProgressPlan.items` 结构化字段，并继续兼容旧的 `plan` 字段与文本计划回退。底部计划面板保持当前回合计划状态，不再被普通 progress 刷掉；工具流仍在聊天区 compact row 中展示，新增工具行、进度行和计划行使用淡入动画。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 接入 Stellacode 2 自动更新：
+  React/Electron 版 Stellacode 现在通过 `electron-updater` 在后台自动检查并下载 GitHub Release 更新，下载完成后在标题栏右侧按钮组左边显示蓝色 `Update` 按钮，点击后重启并安装。Release workflow 现在构建 `apps/stellacode2` 并上传安装包、`latest*.yml` 和 blockmap，供客户端自动更新读取。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 简化 Stellacode 2 服务器设置：
+  设置页服务器配置现在只展示名称、Base URL 和 Token；SSH 场景改为用户自行建立隧道后填写本机可访问的转发地址，不再在客户端内维护 SSH Proxy / Target URL 字段。设置页版本号改为读取 Electron `app.getVersion()`，开发环境提示不会检查更新。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.17.0
 

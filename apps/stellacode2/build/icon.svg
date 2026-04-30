@@ -1,0 +1,7 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Stellacode">
+  <rect width="1024" height="1024" rx="232" fill="#111816"/>
+  <path d="M343 377 214 512l129 135" stroke="#6EE7B7" stroke-width="68" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M681 377 810 512 681 647" stroke="#6EE7B7" stroke-width="68" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M562 282 459 742" stroke="#F8FAFC" stroke-width="68" stroke-linecap="round"/>
+  <circle cx="512" cy="512" r="424" stroke="#26342F" stroke-width="32"/>
+</svg>

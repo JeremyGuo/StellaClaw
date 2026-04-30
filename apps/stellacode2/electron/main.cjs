@@ -1,16 +1,20 @@
 const { app, BrowserWindow, dialog, ipcMain } = require('electron');
-const childProcess = require('node:child_process');
+const { autoUpdater } = require('electron-updater');
 const fs = require('node:fs/promises');
-const net = require('node:net');
 const path = require('node:path');
 const zlib = require('node:zlib');
 
 const SETTINGS_FILE = 'settings.json';
-const SSH_READY_DELAY_MS = 900;
 const SERVER_REQUEST_TIMEOUT_MS = 90_000;
+const UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000;
 
 let mainWindow;
-const tunnels = new Map();
+let updateCheckTimer = null;
+let updaterState = { state: app.isPackaged ? 'idle' : 'disabled' };
+
+function appIconPath() {
+  return path.join(__dirname, '..', 'build', 'icon.png');
+}
 
 function defaultSettings() {
   return {
@@ -28,10 +32,7 @@ function defaultSettings() {
       {
         id: 'local',
         name: 'Local Stellaclaw',
-        connectionMode: 'direct',
         baseUrl: 'http://127.0.0.1:3111',
-        targetUrl: 'http://127.0.0.1:3111',
-        sshHost: '',
         token: 'local-web-token'
       }
     ],
@@ -50,10 +51,7 @@ function normalizeSettings(value) {
   const normalizedServers = servers.map((server, index) => ({
     id: String(server.id || `server-${index + 1}`),
     name: String(server.name || server.id || `Server ${index + 1}`),
-    connectionMode: server.connectionMode === 'ssh_proxy' ? 'ssh_proxy' : 'direct',
     baseUrl: String(server.baseUrl || 'http://127.0.0.1:3111'),
-    targetUrl: String(server.targetUrl || server.baseUrl || 'http://127.0.0.1:3111'),
-    sshHost: String(server.sshHost || ''),
     token: String(server.token || '')
   }));
   const layout = value?.layout && typeof value.layout === 'object' ? value.layout : {};
@@ -112,67 +110,8 @@ function joinApiUrl(baseUrl, requestPath) {
   return `${cleanBase}${cleanPath}`;
 }
 
-async function sleep(ms) {
-  await new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function findFreePort() {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.unref();
-    server.on('error', reject);
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address();
-      server.close(() => resolve(address.port));
-    });
-  });
-}
-
 async function resolveServerBaseUrl(server) {
-  if (server.connectionMode !== 'ssh_proxy') {
-    return normalizeBaseUrl(server.baseUrl);
-  }
-  if (!server.sshHost.trim()) {
-    throw new Error('SSH proxy server is missing sshHost.');
-  }
-  const target = new URL(server.targetUrl || server.baseUrl);
-  const existing = tunnels.get(server.id);
-  if (existing && !existing.process.killed) {
-    return existing.baseUrl;
-  }
-
-  const port = await findFreePort();
-  const targetPort = target.port || (target.protocol === 'https:' ? '443' : '80');
-  const bind = `127.0.0.1:${port}:${target.hostname}:${targetPort}`;
-  const process = childProcess.spawn('ssh', [
-    '-N',
-    '-L',
-    bind,
-    '-o',
-    'ExitOnForwardFailure=yes',
-    '-o',
-    'ServerAliveInterval=20',
-    '-o',
-    'ServerAliveCountMax=2',
-    server.sshHost
-  ], {
-    stdio: 'ignore',
-    detached: false
-  });
-
-  let earlyExit = false;
-  process.once('exit', () => {
-    earlyExit = true;
-    tunnels.delete(server.id);
-  });
-  await sleep(SSH_READY_DELAY_MS);
-  if (earlyExit || process.killed) {
-    throw new Error(`Failed to open SSH tunnel through ${server.sshHost}`);
-  }
-  const basePath = target.pathname && target.pathname !== '/' ? target.pathname.replace(/\/$/, '') : '';
-  const baseUrl = `${target.protocol}//127.0.0.1:${port}${basePath}`;
-  tunnels.set(server.id, { process, baseUrl });
-  return baseUrl;
+  return normalizeBaseUrl(server.baseUrl);
 }
 
 async function requestServer(_event, payload) {
@@ -365,6 +304,7 @@ function createWindow() {
     minWidth: 960,
     minHeight: 680,
     title: 'Stellacode 2',
+    icon: appIconPath(),
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
     trafficLightPosition: { x: 18, y: 18 },
     backgroundColor: '#151515',
@@ -392,20 +332,97 @@ function createWindow() {
   });
 }
 
+function publishUpdaterState(patch) {
+  updaterState = { ...updaterState, ...patch };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('updater:status', updaterState);
+  }
+}
+
+function setupAutoUpdater() {
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  autoUpdater.on('checking-for-update', () => {
+    if (updaterState.state === 'downloaded') return;
+    publishUpdaterState({ state: 'checking' });
+  });
+  autoUpdater.on('update-available', (info) => {
+    publishUpdaterState({
+      state: 'downloading',
+      version: info.version,
+      releaseDate: info.releaseDate,
+      percent: 0
+    });
+  });
+  autoUpdater.on('update-not-available', () => {
+    if (updaterState.state === 'downloaded') return;
+    publishUpdaterState({ state: 'idle', percent: 0 });
+  });
+  autoUpdater.on('download-progress', (progress) => {
+    publishUpdaterState({
+      state: 'downloading',
+      percent: progress.percent,
+      bytesPerSecond: progress.bytesPerSecond,
+      transferred: progress.transferred,
+      total: progress.total
+    });
+  });
+  autoUpdater.on('update-downloaded', (info) => {
+    publishUpdaterState({
+      state: 'downloaded',
+      version: info.version,
+      percent: 100
+    });
+  });
+  autoUpdater.on('error', (error) => {
+    console.warn('Auto-updater error:', error?.message || error);
+    if (updaterState.state === 'downloaded') return;
+    publishUpdaterState({
+      state: 'error',
+      error: error?.message || String(error)
+    });
+  });
+
+  if (!app.isPackaged) {
+    publishUpdaterState({ state: 'disabled' });
+    return;
+  }
+
+  autoUpdater.checkForUpdates().catch(() => {});
+  updateCheckTimer = setInterval(() => {
+    if (updaterState.state === 'downloaded') return;
+    autoUpdater.checkForUpdates().catch(() => {});
+  }, UPDATE_CHECK_INTERVAL_MS);
+}
+
 app.whenReady().then(() => {
+  if (process.platform === 'darwin') {
+    app.dock.setIcon(appIconPath());
+  }
   ipcMain.handle('settings:load', readSettings);
   ipcMain.handle('settings:save', (_event, settings) => writeSettings(settings));
+  ipcMain.handle('app:version', () => app.getVersion());
   ipcMain.handle('server:request', requestServer);
   ipcMain.handle('server:connectionInfo', serverConnectionInfo);
   ipcMain.handle('binary:gzip', gzipBinary);
   ipcMain.handle('workspace:upload', uploadWorkspaceFile);
   ipcMain.handle('workspace:download', downloadWorkspaceFile);
+  ipcMain.handle('updater:status', () => updaterState);
+  ipcMain.handle('updater:install', () => {
+    if (updaterState.state === 'downloaded') {
+      autoUpdater.quitAndInstall(false, true);
+    }
+    return updaterState;
+  });
   createWindow();
+  setupAutoUpdater();
 });
 
 app.on('window-all-closed', () => {
-  for (const tunnel of tunnels.values()) {
-    tunnel.process.kill('SIGTERM');
+  if (updateCheckTimer) {
+    clearInterval(updateCheckTimer);
+    updateCheckTimer = null;
   }
   if (process.platform !== 'darwin') {
     app.quit();

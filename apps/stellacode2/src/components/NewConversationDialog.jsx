@@ -54,7 +54,7 @@ export function NewConversationDialog({ open, servers = [], activeServerId, crea
             </label>
             <div className="server-preview">
               <strong>{selectedServer?.name || '未配置服务器'}</strong>
-              <span>{selectedServer?.connectionMode === 'ssh_proxy' ? selectedServer.targetUrl : selectedServer?.baseUrl}</span>
+              <span>{selectedServer?.baseUrl}</span>
             </div>
             <div className="dialog-actions">
               <Dialog.Close className="secondary-button" type="button">取消</Dialog.Close>

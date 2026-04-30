@@ -11,13 +11,15 @@ export function WindowChrome({
   overviewPanelOpen,
   workspacePanelOpen,
   previewPanelOpen,
+  updateReady = false,
   onToggleOverview,
   onToggleWorkspace,
   onTogglePreview,
-  onToggleTerminal
+  onToggleTerminal,
+  onInstallUpdate
 }) {
   return (
-    <header className="window-chrome">
+    <header className={`window-chrome${updateReady ? ' update-ready' : ''}`}>
       <div className="platform-safe-area" />
       <div className="left-toolbar">
         <button className="chrome-button" type="button" onClick={onToggleSidebar} title={sidebarMode === 'collapsed' ? '显示 Conversation Bar' : '隐藏 Conversation Bar'}>
@@ -39,6 +41,11 @@ export function WindowChrome({
         </button>
       </div>
       <div className="right-toolbar">
+        {updateReady && (
+          <button className="chrome-update-button" type="button" onClick={onInstallUpdate} title="安装更新并重启">
+            Update
+          </button>
+        )}
         <TransferButton transfers={transfers} />
         <button className="chrome-button" type="button" onClick={onToggleTerminal} title="终端">
           <TerminalSquare size={18} />

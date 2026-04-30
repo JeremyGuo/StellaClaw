@@ -29,7 +29,7 @@ import { NewConversationDialog } from './components/NewConversationDialog';
 import { SettingsDialog } from './components/SettingsDialog';
 import { clamp, formatBytes, formatModel, statusUsageTotals } from './lib/format';
 import { fileExtension, fileNameFromPath, imageMimeType } from './lib/fileUtils';
-import { activityFromMessages, addUsageTotals, firstMessageId, hasOlderMessages, isFinalAssistantMessage, lastMessageId, lastServerMessageId, liveActivitiesFromMessages, liveActivitySignature, mergeMessages, shortText, usageDeltaFromMessages, websocketUrl } from './lib/messageUtils';
+import { activityFromMessages, addUsageTotals, firstMessageId, hasOlderMessages, isFinalAssistantMessage, lastMessageId, lastServerMessageId, liveActivitySignature, mergeMessages, shortText, usageDeltaFromMessages, websocketUrl } from './lib/messageUtils';
 import { collectDroppedFiles, packFilesToTarGz, uploadPayloadStats } from './lib/uploadArchive';
 import { normalizeWorkspacePath, parentWorkspacePath, workspaceEntryKind, workspaceFileKind } from './lib/workspaceUtils';
 
@@ -74,6 +74,115 @@ function clearConversationModelSelectionPending(conversation) {
     : conversation;
 }
 
+function normalizePlan(rawPlan) {
+  const items = Array.isArray(rawPlan)
+    ? rawPlan
+    : Array.isArray(rawPlan?.plan)
+      ? rawPlan.plan
+      : Array.isArray(rawPlan?.items)
+        ? rawPlan.items
+        : [];
+  const plan = items
+    .map(normalizePlanItem)
+    .filter((item) => item.step);
+  const explanation = String(rawPlan?.explanation || rawPlan?.summary || '').trim();
+  return (explanation || plan.length) ? { explanation, plan } : null;
+}
+
+function normalizePlanItem(item) {
+  const rawStep = String(item?.step || item?.text || item?.title || '').trim();
+  const marker = rawStep.match(/^\[(x|~|\s*)]\s*/i)?.[1]?.toLowerCase();
+  const markerStatus = marker === 'x'
+    ? 'completed'
+    : marker === '~'
+      ? 'in_progress'
+      : marker !== undefined
+        ? 'pending'
+        : '';
+  const rawStatus = normalizePlanStatus(String(item?.status || item?.state || '').trim().toLowerCase());
+  const status = markerStatus && (!rawStatus || rawStatus === 'pending')
+    ? markerStatus
+    : rawStatus || markerStatus || 'pending';
+  return {
+    step: rawStep.replace(/^\[(?:x|~|\s*)]\s*/i, '').trim(),
+    status
+  };
+}
+
+function normalizePlanStatus(status) {
+  if (status === 'completed' || status === 'done' || status === 'success') return 'completed';
+  if (status === 'in_progress' || status === 'running' || status === 'active') return 'in_progress';
+  if (status === 'pending' || status === 'todo') return 'pending';
+  return '';
+}
+
+function planFromProgressText(text) {
+  const value = String(text || '');
+  const [, rawPlan = ''] = value.split(/\n\n计划\n?/);
+  if (!rawPlan.trim()) return null;
+  const plan = rawPlan
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const marker = line.slice(0, 1);
+      const status = marker === '☑' ? 'completed' : marker === '◐' ? 'in_progress' : 'pending';
+      return { status, step: line.replace(/^[☐◐☑]\s*/, '').trim() };
+    })
+    .filter((item) => item.step);
+  return plan.length ? { explanation: '', plan } : null;
+}
+
+function progressActivityFromText(text) {
+  const value = String(text || '').split(/\n\n计划\n?/)[0] || '';
+  const stage = value.match(/(?:阶段|状态)：\s*([^\n]+)/)?.[1];
+  if (stage) return stage.replace(/[.。]+$/, '').trim();
+  if (/已完成/.test(value)) return '已完成';
+  if (/失败/.test(value)) return '执行失败';
+  return '';
+}
+
+function normalizeProgressFeedback(payload) {
+  const source = payload.progress || payload.event || payload;
+  const finalState = source.final_state || source.finalState || payload.final_state || payload.finalState || '';
+  const phase = source.phase || payload.phase || '';
+  const state = finalState === 'failed' || phase === 'failed'
+    ? 'failed'
+    : finalState === 'done' || phase === 'done'
+      ? 'done'
+      : 'running';
+  const plan = normalizePlan(source.plan || source.task_plan || source.taskPlan || payload.plan)
+    || planFromProgressText(source.text || payload.text);
+  const activity = String(
+    source.activity
+    || source.stage
+    || source.phase
+    || source.status
+    || progressActivityFromText(source.text || payload.text)
+    || (state === 'done' ? '已完成' : state === 'failed' ? '执行失败' : '思考中')
+  ).trim();
+  const model = String(source.model || source.model_name || source.modelName || '').trim();
+  return {
+    id: `progress-${source.turn_id || source.turnId || payload.turn_id || 'current'}`,
+    title: state === 'failed' ? '执行失败' : state === 'done' ? '执行完毕' : '思考中',
+    detail: activity,
+    activity,
+    model,
+    plan,
+    state
+  };
+}
+
+function mergeProgressActivity(current, progress) {
+  const existing = current.find((item) => item.id === progress.id);
+  return {
+    ...existing,
+    ...progress,
+    plan: progress.plan || existing?.plan || null,
+    model: progress.model || existing?.model || ''
+  };
+}
+
 function App() {
   const [settings, setSettings] = useState(null);
   const [sidebarMode, setSidebarMode] = useState('expanded');
@@ -96,6 +205,7 @@ function App() {
   const [workspaceLoading, setWorkspaceLoading] = useState(() => new Set());
   const [workspaceError, setWorkspaceError] = useState('');
   const [transfers, setTransfers] = useState([]);
+  const [updaterStatus, setUpdaterStatus] = useState({ state: 'idle' });
   const [terminalOpen, setTerminalOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSaving, setSettingsSaving] = useState(false);
@@ -124,6 +234,23 @@ function App() {
     selectedRef.current = selected;
   }, [selected]);
 
+  useEffect(() => {
+    const updater = window.stellacode2?.updater;
+    if (!updater) return undefined;
+    let disposed = false;
+    const applyStatus = (status) => {
+      if (!disposed && status) {
+        setUpdaterStatus(status);
+      }
+    };
+    updater.status?.().then(applyStatus).catch(() => {});
+    const unsubscribe = updater.onStatus?.(applyStatus);
+    return () => {
+      disposed = true;
+      unsubscribe?.();
+    };
+  }, []);
+
   const sidebarWidth = sidebarMode === 'collapsed' ? SIDEBAR_COLLAPSED : clamp(settings?.layout?.sidebar, 220, 520) || SIDEBAR_EXPANDED;
   const overviewPanelWidth = clamp(settings?.layout?.inspector, 320, 760) || 420;
   const workspacePanelWidth = clamp(settings?.layout?.file, WORKSPACE_PANEL_MIN, WORKSPACE_PANEL_MAX) || 360;
@@ -141,6 +268,7 @@ function App() {
     () => statusUsageTotals(selectedStatus, selectedKey ? statusDeltas.get(selectedKey) : null),
     [selectedStatus, selectedKey, statusDeltas]
   );
+  const updateReady = updaterStatus?.state === 'downloaded';
 
   const upsertTransfer = useCallback((id, patch) => {
     setTransfers((current) => {
@@ -164,17 +292,6 @@ function App() {
       return liveActivitySignature(next) === liveActivitySignature(current) ? current : next;
     });
   }, []);
-
-  const appendRunningActivities = useCallback((incoming) => {
-    if (!incoming.length) return;
-    updateRunningActivities((current) => {
-      const byId = new Map(current.map((item) => [item.id, item]));
-      for (const item of incoming) {
-        byId.set(item.id, item);
-      }
-      return Array.from(byId.values());
-    });
-  }, [updateRunningActivities]);
 
   const saveSettings = useCallback(async (next) => {
     const saved = await window.stellacode2.saveSettings(next);
@@ -495,7 +612,6 @@ function App() {
       });
       const activity = activityFromMessages(incoming);
       if (activity) setSessionActivity(activity);
-      appendRunningActivities(liveActivitiesFromMessages(incoming));
       if (incoming.some((message) => isFinalAssistantMessage(message))) {
         setTimeout(() => {
           if (!disposed && websocketKeyRef.current === key) {
@@ -567,23 +683,25 @@ function App() {
               setSessionActivity('正在思考');
               updateRunningActivities((current) => [
                 ...current.filter((item) => item.id !== 'thinking'),
-                { id: 'thinking', title: '思考中', detail: '模型正在组织下一步操作', state: 'running' }
+                {
+                  id: 'thinking',
+                  title: '思考中',
+                  detail: '模型正在组织下一步操作',
+                  state: 'running',
+                  plan: current.findLast((item) => item.plan)?.plan || null,
+                  model: current.findLast((item) => item.model)?.model || ''
+                }
               ]);
             } else {
               setSessionActivity('');
-              setRunningActivities([]);
             }
-          } else if (payload.type === 'progress_feedback') {
-            setSessionActivity(payload.final_state === 'done' ? '已完成' : (payload.text || '正在处理'));
-            if (payload.final_state === 'done' || payload.final_state === 'failed') {
+          } else if (payload.type === 'progress_feedback' || payload.type === 'turn_progress') {
+            const progress = normalizeProgressFeedback(payload);
+            setSessionActivity(progress.state === 'done' ? '已完成' : progress.detail || progress.title);
+            if (progress.state === 'done' || progress.state === 'failed') {
               updateRunningActivities((current) => [
-                ...current.filter((item) => item.id !== `progress-${payload.turn_id || 'current'}`),
-                {
-                  id: `progress-${payload.turn_id || 'current'}`,
-                  title: payload.final_state === 'failed' ? '执行失败' : '执行完毕',
-                  detail: shortText(payload.text || ''),
-                  state: payload.final_state === 'failed' ? 'failed' : 'done'
-                }
+                ...current.filter((item) => item.id !== progress.id && item.id !== 'thinking'),
+                mergeProgressActivity(current, progress)
               ]);
               setTimeout(() => {
                 if (!disposed && websocketKeyRef.current === key) {
@@ -592,13 +710,8 @@ function App() {
               }, 900);
             } else {
               updateRunningActivities((current) => [
-                ...current.filter((item) => item.id !== `progress-${payload.turn_id || 'current'}`),
-                {
-                  id: `progress-${payload.turn_id || 'current'}`,
-                  title: '正在处理',
-                  detail: shortText(payload.text || '等待模型状态更新'),
-                  state: 'running'
-                }
+                ...current.filter((item) => item.id !== progress.id && item.id !== 'thinking'),
+                mergeProgressActivity(current, progress)
               ]);
             }
           } else if (payload.type === 'status' && payload.status) {
@@ -923,10 +1036,12 @@ function App() {
         overviewPanelOpen={overviewPanelOpen}
         workspacePanelOpen={workspacePanelOpen}
         previewPanelOpen={previewPanelOpen}
+        updateReady={updateReady}
         onToggleOverview={() => setOverviewPanelOpen((value) => !value)}
         onToggleWorkspace={() => setWorkspacePanelOpen((value) => !value)}
         onTogglePreview={() => setPreviewPanelOpen((value) => !value)}
         onToggleTerminal={() => setTerminalOpen((value) => !value)}
+        onInstallUpdate={() => window.stellacode2?.updater?.install?.()}
       />
       <ConversationBar
         settings={settings}

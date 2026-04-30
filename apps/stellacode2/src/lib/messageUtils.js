@@ -366,7 +366,7 @@ export function displayMessages(messages) {
         cursor += 1;
       }
       const nextMessage = source[cursor];
-      result.push({ type: 'toolGroup', id: `tools-${group.map((item, i) => messageKey(item, i)).join(':')}`, messages: group, nextMessage });
+      result.push({ type: 'toolGroup', id: `tools-${messageKey(group[0], index)}`, messages: group, nextMessage });
       forceSeparateNext = Boolean(isFinalAssistantMessage(nextMessage));
       index = cursor - 1;
       continue;

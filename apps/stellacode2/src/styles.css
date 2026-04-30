@@ -305,7 +305,7 @@ button {
   z-index: 2;
   top: 0;
   left: max(var(--sidebar-width), 190px);
-  right: 176px;
+  right: 252px;
   display: flex;
   height: var(--topbar-height);
   min-width: 0;
@@ -314,6 +314,10 @@ button {
   padding-left: 16px;
   transition: left 190ms cubic-bezier(.2, .8, .2, 1);
   -webkit-app-region: no-drag;
+}
+
+.window-chrome:not(.update-ready) .title-track {
+  right: 176px;
 }
 
 .transfer-spinner {
@@ -506,6 +510,30 @@ button {
   align-items: center;
   gap: 6px;
   -webkit-app-region: no-drag;
+}
+
+.chrome-update-button {
+  height: 28px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 9px;
+  color: #fff;
+  background: #2563eb;
+  font-size: 12px;
+  font-weight: 750;
+  letter-spacing: 0;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  box-shadow: 0 9px 18px color-mix(in srgb, #2563eb, transparent 80%);
+  transition: background 140ms ease, transform 140ms ease;
+}
+
+.chrome-update-button:hover {
+  background: #1d4ed8;
+}
+
+.chrome-update-button:active {
+  transform: scale(0.97);
 }
 
 .conversation-bar {
@@ -715,7 +743,7 @@ button {
 .message-scroll {
   overflow-x: hidden;
   overflow-y: auto;
-  padding: 30px max(24px, calc((100% - 920px) / 2)) 180px;
+  padding: 30px max(24px, calc((100% - 920px) / 2)) calc(var(--composer-wrap-height, 156px) + var(--progress-height, 0px) - 28px);
 }
 
 .empty-chat {
@@ -1253,43 +1281,6 @@ button {
   padding: 0 0 14px;
 }
 
-.tool-file-list {
-  display: grid;
-  gap: 3px;
-  padding: 1px 0 4px;
-}
-
-.tool-file-row {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  gap: 8px;
-  color: var(--muted);
-  font-size: 13px;
-  line-height: 1.45;
-}
-
-.tool-file-row span {
-  flex: 0 0 auto;
-}
-
-.tool-file-row code {
-  min-width: 0;
-  overflow: hidden;
-  padding: 0;
-  background: transparent;
-  color: var(--link);
-  font-family: inherit;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.tool-file-row em {
-  flex: 0 0 auto;
-  color: var(--green);
-  font-style: normal;
-}
-
 .tool-note {
   min-width: 0;
   color: var(--text);
@@ -1303,6 +1294,7 @@ button {
   border-radius: 7px;
   background: transparent;
   overflow: hidden;
+  animation: live-activity-enter 180ms ease-out both;
 }
 
 .tool-inline-card + .tool-inline-card {
@@ -1351,8 +1343,9 @@ button {
 }
 
 .tool-inline-card summary code {
-  flex: 0 1 auto;
-  min-width: 0;
+  flex: 0 0 auto;
+  min-width: 5.5ch;
+  max-width: 18ch;
   overflow: hidden;
   padding: 2px 7px;
   border-radius: 6px;
@@ -1475,15 +1468,24 @@ button {
 
 .session-progress-card {
   display: grid;
-  width: 100%;
-  max-width: var(--chat-column-width);
+  position: absolute;
+  right: max(92px, calc((100% - var(--chat-column-width)) / 2 + 74px));
+  bottom: calc(var(--composer-card-height, 126px) + 18px);
+  left: max(92px, calc((100% - var(--chat-column-width)) / 2 + 74px));
   gap: 5px;
-  margin: 0 auto 20px;
-  padding: 8px 0 0;
-  border-top: 1px solid var(--border);
+  z-index: 14;
+  max-height: min(42vh, 360px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding: 12px 14px 10px;
+  border: 1px solid var(--border-strong);
+  border-bottom: 0;
+  border-radius: 16px 16px 0 0;
   color: var(--muted);
-  background: transparent;
-  animation: live-activity-enter 150ms ease-out;
+  background: color-mix(in srgb, var(--panel-2), #000 4%);
+  box-shadow:
+    0 1px 0 color-mix(in srgb, var(--panel-2), #000 4%),
+    0 -12px 34px color-mix(in srgb, #000, transparent 92%);
 }
 
 .session-progress-head {
@@ -1551,6 +1553,129 @@ button {
   color: var(--danger);
 }
 
+.activity-plan-panel {
+  min-width: 0;
+  margin: 2px 0 4px;
+  border: 0;
+  color: var(--muted);
+}
+
+.activity-plan-panel > summary {
+  display: flex;
+  min-width: 0;
+  min-height: 26px;
+  align-items: center;
+  gap: 8px;
+  list-style: none;
+  cursor: pointer;
+}
+
+.activity-plan-panel > summary::-webkit-details-marker {
+  display: none;
+}
+
+.activity-plan-panel > summary::before {
+  content: "›";
+  color: var(--accent);
+  font-size: 15px;
+  line-height: 1;
+  transition: transform 140ms ease;
+}
+
+.activity-plan-panel[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.activity-plan-panel > summary span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.activity-plan-panel > summary code {
+  min-width: 0;
+  overflow: hidden;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--tool-chip-bg);
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-plan-body {
+  display: grid;
+  gap: 5px;
+  padding: 2px 0 5px 23px;
+}
+
+.activity-plan-body p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.activity-plan-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 16px auto minmax(0, 1fr);
+  gap: 6px;
+  align-items: center;
+  color: var(--faint);
+  font-size: 12.5px;
+  line-height: 1.45;
+  animation: live-activity-enter 180ms ease-out both;
+}
+
+.activity-plan-row span {
+  display: inline-grid;
+  width: 14px;
+  height: 14px;
+  place-items: center;
+  border: 2px solid var(--faint);
+  border-radius: 999px;
+  color: transparent;
+  font-size: 10px;
+  line-height: 1;
+  text-align: center;
+}
+
+.activity-plan-row strong {
+  color: var(--muted);
+  font-weight: 650;
+}
+
+.activity-plan-row em {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-style: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-plan-row.completed em {
+  color: var(--muted);
+  text-decoration: line-through;
+}
+
+.activity-plan-row.completed span {
+  border-color: var(--green);
+  color: var(--green);
+  background: color-mix(in srgb, var(--green), transparent 88%);
+}
+
+.activity-plan-row.running span {
+  border-color: var(--accent);
+  border-right-color: color-mix(in srgb, var(--accent), transparent 78%);
+  color: transparent;
+  background: color-mix(in srgb, var(--accent), transparent 90%);
+}
+
 .floating-popover {
   z-index: 1200;
   max-width: min(520px, calc(100vw - 32px));
@@ -1607,6 +1732,16 @@ button {
   transform: translateX(-50%);
 }
 
+.composer-wrap.with-progress .composer {
+  min-height: 96px;
+  grid-template-rows: minmax(40px, auto) 34px;
+  padding-top: 16px;
+}
+
+.composer-wrap.with-progress .composer textarea {
+  min-height: 40px;
+}
+
 @keyframes live-activity-enter {
   from {
     opacity: 0;
@@ -1634,7 +1769,7 @@ button {
   min-height: 126px;
   grid-template-rows: minmax(64px, auto) 34px;
   gap: 8px;
-  padding: 13px 14px;
+  padding: 18px 20px 15px;
   border: 1px solid var(--border-strong);
   border-radius: 20px;
   background: color-mix(in srgb, var(--panel-2), #000 4%);
@@ -1659,7 +1794,7 @@ button {
 .composer-row {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
 }
 
 .composer-icon,

@@ -117,7 +117,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     defaults:
       run:
-        working-directory: apps/stellacode
+        working-directory: apps/stellacode2
     steps:
       - name: Checkout triggering commit
         uses: actions/checkout@v4
@@ -129,7 +129,7 @@ jobs:
         with:
           node-version: '20'
           cache: 'npm'
-          cache-dependency-path: apps/stellacode/package-lock.json
+          cache-dependency-path: apps/stellacode2/package-lock.json
 
       - name: Install dependencies
         run: npm ci
@@ -138,26 +138,26 @@ jobs:
         shell: bash
         run: |
           VERSION="${{ needs.prepare.outputs.version }}"
-          echo "Setting Stellacode package version to ${VERSION}"
+          echo "Setting Stellacode 2 package version to ${VERSION}"
           npm version "${VERSION}" --no-git-tag-version --allow-same-version
 
-      - name: Build Stellacode (${{ matrix.platform }})
-        run: npx electron-builder --${{ matrix.platform }} ${{ matrix.args || '' }} --publish never
+      - name: Build Stellacode 2 (${{ matrix.platform }})
+        run: npm run build && npx electron-builder --${{ matrix.platform }} ${{ matrix.args || '' }} --publish never
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Stellacode artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: stellacode-${{ matrix.os }}
+          name: stellacode2-${{ matrix.os }}
           path: |
-            apps/stellacode/dist/*.exe
-            apps/stellacode/dist/*.dmg
-            apps/stellacode/dist/*.zip
-            apps/stellacode/dist/*.AppImage
-            apps/stellacode/dist/*.tar.gz
-            apps/stellacode/dist/*.yml
-            apps/stellacode/dist/*.blockmap
+            apps/stellacode2/release/*.exe
+            apps/stellacode2/release/*.dmg
+            apps/stellacode2/release/*.zip
+            apps/stellacode2/release/*.AppImage
+            apps/stellacode2/release/*.tar.gz
+            apps/stellacode2/release/*.yml
+            apps/stellacode2/release/*.blockmap
           if-no-files-found: warn
 
   publish:

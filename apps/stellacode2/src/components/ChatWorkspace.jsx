@@ -27,6 +27,8 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const [models, setModels] = useState([]);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsError, setModelsError] = useState('');
+  const progressRef = useRef(null);
+  const composerRef = useRef(null);
   const scrollRef = useRef(null);
   const previousCountRef = useRef(0);
   const loadingOlderRef = useRef(false);
@@ -36,6 +38,41 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const typedMessagesRef = useRef(new Set());
   const typewriterHydratedRef = useRef(false);
   const newestSeenIndexRef = useRef(-1);
+  const currentActivity = (runningActivities || []).at(-1) || null;
+  const currentPlan = normalizeActivityPlan(currentActivity?.plan);
+  const progressVisible = Boolean(currentPlan);
+
+  useLayoutEffect(() => {
+    const node = progressRef.current;
+    if (!node || !progressVisible) {
+      scrollRef.current?.style.setProperty('--progress-height', '0px');
+      return undefined;
+    }
+    const update = () => {
+      scrollRef.current?.style.setProperty('--progress-height', `${Math.ceil(node.getBoundingClientRect().height)}px`);
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [activitySignature, progressVisible]);
+
+  useLayoutEffect(() => {
+    const node = composerRef.current;
+    if (!node) return undefined;
+    const update = () => {
+      const root = node.closest('.chat-workspace');
+      const composer = node.querySelector('.composer');
+      root?.style.setProperty('--composer-wrap-height', `${Math.ceil(node.getBoundingClientRect().height)}px`);
+      if (composer) {
+        root?.style.setProperty('--composer-card-height', `${Math.ceil(composer.getBoundingClientRect().height)}px`);
+      }
+    };
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
 
   useEffect(() => {
     if (modelSelectionPending) {
@@ -64,7 +101,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       });
     }
     previousCountRef.current = renderedMessages.length;
-  }, [renderedMessages.length, activitySignature]);
+  }, [renderedMessages.length, messages.length, activitySignature]);
 
   useEffect(() => {
     knownMessagesRef.current = new Set();
@@ -239,9 +276,9 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
               )
           ))
         )}
-        <LiveActivityStack activities={runningActivities} />
       </div>
-      <footer className="composer-wrap">
+      <LiveActivityStack activities={runningActivities} progressRef={progressRef} />
+      <footer className={`composer-wrap${progressVisible ? ' with-progress' : ''}`} ref={composerRef}>
         <div className="composer">
           <textarea
             value={draft}
@@ -370,23 +407,98 @@ function ModelSelectionGate({ models, loading, error, onReload, onChoose }) {
   );
 }
 
-export function LiveActivityStack({ activities }) {
+export function LiveActivityStack({ activities, progressRef }) {
   if (!activities?.length) return null;
+  const current = activities.at(-1) || {};
+  const plan = normalizeActivityPlan(current.plan);
+  if (!plan) return null;
   return (
-    <section className="session-progress-card" aria-live="polite">
-      <div className="session-progress-head">
-        <span className="session-progress-dot" />
-        <span>{activities.at(-1)?.title || '正在处理'}</span>
-        <code>{activities.length} 项</code>
-      </div>
-      {activities.map((activity) => (
-        <div key={activity.id} className={`session-progress-step ${activity.state || 'running'}`}>
-          <span>{activity.state === 'done' ? '✓' : activity.state === 'failed' ? '!' : '•'}</span>
-          <span>{activity.detail || activity.title}</span>
-        </div>
-      ))}
+    <section className="session-progress-card" aria-live="polite" ref={progressRef}>
+      <ActivityPlanPanel plan={plan} />
     </section>
   );
+}
+
+function normalizeActivityPlan(rawPlan) {
+  const items = Array.isArray(rawPlan)
+    ? rawPlan
+    : Array.isArray(rawPlan?.items)
+      ? rawPlan.items
+      : Array.isArray(rawPlan?.plan)
+        ? rawPlan.plan
+        : [];
+  if (!items.length && !rawPlan?.explanation) return null;
+  const normalized = items
+    .map(normalizePlanItem)
+    .filter((item) => item.step);
+  const completed = normalized.filter((item) => item.status === 'completed' || item.status === 'done').length;
+  return {
+    explanation: String(rawPlan?.explanation || '').trim(),
+    items: normalized,
+    completed,
+    total: normalized.length
+  };
+}
+
+function normalizePlanItem(item) {
+  const rawStep = String(item?.step || item?.text || item?.title || '').trim();
+  const marker = rawStep.match(/^\[(x|~|\s*)]\s*/i)?.[1]?.toLowerCase();
+  const markerStatus = marker === 'x'
+    ? 'completed'
+    : marker === '~'
+      ? 'in_progress'
+      : marker !== undefined
+        ? 'pending'
+        : '';
+  const rawStatus = String(item?.status || item?.state || '').toLowerCase();
+  const normalizedStatus = normalizePlanStatus(rawStatus);
+  const status = markerStatus && (!normalizedStatus || normalizedStatus === 'pending')
+    ? markerStatus
+    : normalizedStatus || markerStatus || 'pending';
+  return {
+    step: rawStep.replace(/^\[(?:x|~|\s*)]\s*/i, '').trim(),
+    status
+  };
+}
+
+function normalizePlanStatus(status) {
+  if (status === 'completed' || status === 'done' || status === 'success') return 'completed';
+  if (status === 'in_progress' || status === 'running' || status === 'active') return 'in_progress';
+  if (status === 'pending' || status === 'todo') return 'pending';
+  return '';
+}
+
+function ActivityPlanPanel({ plan }) {
+  return (
+    <details className="activity-plan-panel" open>
+      <summary>
+        <span>计划</span>
+        <code>共 {plan.total} 项，已完成 {plan.completed} 项</code>
+      </summary>
+      <div className="activity-plan-body">
+        {plan.explanation && <p>{plan.explanation}</p>}
+        {plan.items.map((item, index) => (
+          <div className={`activity-plan-row ${planStatusClass(item.status)}`} key={`${item.step}-${index}`}>
+            <span>{planStatusMark(item.status)}</span>
+            <strong>{index + 1}.</strong>
+            <em>{item.step}</em>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}
+
+function planStatusClass(status) {
+  if (status === 'completed' || status === 'done') return 'completed';
+  if (status === 'in_progress' || status === 'running') return 'running';
+  return 'pending';
+}
+
+function planStatusMark(status) {
+  if (status === 'completed' || status === 'done') return '✓';
+  if (status === 'in_progress' || status === 'running') return '◌';
+  return '○';
 }
 
 export function MessageArticle({ message, typewriter = false, onTypewriterDone }) {
@@ -482,21 +594,6 @@ export function InlineTokenUsage({ usage }) {
   );
 }
 
-function emptyTokenUsage() {
-  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0, cost: 0 };
-}
-
-function addTokenUsage(left, right) {
-  return {
-    input: Number(left?.input || 0) + Number(right?.input || 0),
-    output: Number(left?.output || 0) + Number(right?.output || 0),
-    cacheRead: Number(left?.cacheRead || 0) + Number(right?.cacheRead || 0),
-    cacheWrite: Number(left?.cacheWrite || 0) + Number(right?.cacheWrite || 0),
-    cost: Number(left?.cost || 0) + Number(right?.cost || 0),
-    total: Number(left?.total || 0) + Number(right?.total || 0)
-  };
-}
-
 export function ToolProcessGroup({ group }) {
   const [open, setOpen] = useState(false);
   const messages = group.messages || [];
@@ -510,37 +607,20 @@ export function ToolProcessGroup({ group }) {
     };
   }), [messages]);
   const cards = useMemo(() => expandedRows.flatMap((row) => row.toolCards), [expandedRows]);
-  const groupUsage = useMemo(() => expandedRows.reduce((total, row) => addTokenUsage(total, row.usage), emptyTokenUsage()), [expandedRows]);
-  const lastCardKey = useMemo(() => {
-    for (let rowIndex = expandedRows.length - 1; rowIndex >= 0; rowIndex -= 1) {
-      const row = expandedRows[rowIndex];
-      if (row.toolCards.length) return `${row.id}-${row.toolCards.length - 1}`;
-    }
-    return '';
-  }, [expandedRows]);
   const firstName = useMemo(() => firstToolNameForMessage(messages[0]), [messages]);
   const summary = useMemo(() => toolGroupSummary(cards, messages, firstName), [cards, messages, firstName]);
   const done = Boolean(group.nextMessage);
   const elapsed = '';
+  useEffect(() => {
+    setOpen(!done);
+  }, [done]);
   return (
     <details className="tool-process-group" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary>
         <span>{done ? summary.doneTitle : summary.runningTitle}{elapsed}</span>
-        <em>{summary.countLabel}</em>
       </summary>
       {open && (
         <div className="tool-process-body">
-          {summary.fileRows.length > 0 && (
-            <div className="tool-file-list">
-              {summary.fileRows.map((row, index) => (
-                <div className="tool-file-row" key={`${row.path}-${index}`}>
-                  <span>{row.action}</span>
-                  <code>{row.path}</code>
-                  {row.diff && <em>{row.diff}</em>}
-                </div>
-              ))}
-            </div>
-          )}
           {expandedRows.map((row) => {
             const attachments = row.textMessage ? [...(row.textMessage.attachments || []), ...(row.textMessage.files || [])] : [];
             const text = row.textMessage ? messageText(row.textMessage) : '';
@@ -548,6 +628,7 @@ export function ToolProcessGroup({ group }) {
               <Fragment key={row.id}>
                 {text && <MarkdownContent className="tool-note" text={text} attachments={attachments} />}
                 {row.toolCards.map((card, index) => {
+                  const showRowUsage = index === row.toolCards.length - 1;
                   const cardKey = `${row.id}-${index}`;
                   return (
                     <ToolInlineCard
@@ -555,7 +636,7 @@ export function ToolProcessGroup({ group }) {
                       kind={card.kind}
                       name={card.name}
                       payload={card.payload}
-                      usage={cardKey === lastCardKey ? groupUsage : null}
+                      usage={showRowUsage ? row.usage : null}
                     />
                   );
                 })}
@@ -858,14 +939,14 @@ function toolGroupSummary(cards, messages, fallbackName) {
         : readLike ? '文件'
           : fallbackName || '工具';
   const doneTitle = editLike && fileRows.length
-    ? `已编辑 ${fileRows.length} 个文件`
+    ? '已编辑文件'
     : searchLike
-      ? `已搜索 ${messages.length} 次`
+      ? '已搜索'
       : shellLike
         ? `已运行 ${fallbackName || '命令'}`
         : `已处理 · ${baseName}`;
   const runningTitle = editLike && fileRows.length
-    ? `正在编辑 ${fileRows.length} 个文件`
+    ? '正在编辑文件'
     : searchLike
       ? `正在搜索`
       : shellLike
@@ -874,7 +955,6 @@ function toolGroupSummary(cards, messages, fallbackName) {
   return {
     doneTitle,
     runningTitle,
-    countLabel: `${cards.length || messages.length} 项`,
     fileRows
   };
 }

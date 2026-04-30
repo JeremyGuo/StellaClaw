@@ -1,17 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 
-const APP_VERSION = '0.1.0';
 const AUTHOR = 'Stellacode contributors';
 
 function blankServer(index) {
   return {
     id: `server-${index}`,
     name: `Server ${index}`,
-    connectionMode: 'direct',
     baseUrl: 'http://127.0.0.1:3111',
-    targetUrl: 'http://127.0.0.1:3111',
-    sshHost: '',
     token: ''
   };
 }
@@ -19,10 +15,18 @@ function blankServer(index) {
 export function SettingsDialog({ open, settings, saving, onOpenChange, onSave }) {
   const [tab, setTab] = useState('appearance');
   const [draft, setDraft] = useState(settings);
+  const [appVersion, setAppVersion] = useState('');
 
   useEffect(() => {
     if (open) setDraft(settings);
   }, [open, settings]);
+
+  useEffect(() => {
+    if (!open) return;
+    window.stellacode2?.appVersion?.()
+      .then((version) => setAppVersion(version || ''))
+      .catch(() => {});
+  }, [open]);
 
   const servers = useMemo(() => draft?.servers || [], [draft]);
 
@@ -110,7 +114,7 @@ export function SettingsDialog({ open, settings, saving, onOpenChange, onSave })
                   <div className="settings-section-head">
                     <div>
                       <strong>上游服务器</strong>
-                      <span>支持本地直连和 SSH 代理转发。</span>
+                      <span>填写已经可以从本机访问的 Stellaclaw 地址；SSH 隧道请在外部建立后填本地转发地址。</span>
                     </div>
                     <button className="secondary-button" type="button" onClick={addServer}>添加</button>
                   </div>
@@ -133,31 +137,12 @@ export function SettingsDialog({ open, settings, saving, onOpenChange, onSave })
                         </div>
                         <div className="form-grid">
                           <label className="form-field">
-                            <span>ID</span>
-                            <input value={server.id} onChange={(event) => updateServer(server.id, { id: event.target.value.trim() })} />
-                          </label>
-                          <label className="form-field">
                             <span>名称</span>
                             <input value={server.name || ''} onChange={(event) => updateServer(server.id, { name: event.target.value })} />
                           </label>
                           <label className="form-field">
-                            <span>连接模式</span>
-                            <select value={server.connectionMode || 'direct'} onChange={(event) => updateServer(server.id, { connectionMode: event.target.value })}>
-                              <option value="direct">Direct</option>
-                              <option value="ssh_proxy">SSH Proxy</option>
-                            </select>
-                          </label>
-                          <label className="form-field">
                             <span>Base URL</span>
                             <input value={server.baseUrl || ''} onChange={(event) => updateServer(server.id, { baseUrl: event.target.value })} />
-                          </label>
-                          <label className="form-field">
-                            <span>Target URL</span>
-                            <input value={server.targetUrl || ''} onChange={(event) => updateServer(server.id, { targetUrl: event.target.value })} />
-                          </label>
-                          <label className="form-field">
-                            <span>SSH Host</span>
-                            <input value={server.sshHost || ''} onChange={(event) => updateServer(server.id, { sshHost: event.target.value })} placeholder="user@host" />
                           </label>
                           <label className="form-field wide">
                             <span>Token</span>
@@ -172,15 +157,14 @@ export function SettingsDialog({ open, settings, saving, onOpenChange, onSave })
               {tab === 'update' && (
                 <div className="settings-card">
                   <strong>更新</strong>
-                  <p>当前版本 {APP_VERSION}。这个界面先保留为客户端更新入口，后续可以接入自动检查更新或下载发布包。</p>
-                  <button className="secondary-button" type="button" onClick={() => window.location.reload()}>重新加载 UI</button>
+                  <p>当前版本 {appVersion || '未知'}。打包版本会在后台自动检查和下载更新；开发环境不会检查更新。下载完成后，标题栏右上角会出现 Update 按钮。</p>
                 </div>
               )}
               {tab === 'about' && (
                 <div className="settings-card">
                   <strong>Stellacode 2</strong>
                   <dl className="about-list">
-                    <dt>版本</dt><dd>{APP_VERSION}</dd>
+                    <dt>版本</dt><dd>{appVersion || '未知'}</dd>
                     <dt>作者</dt><dd>{AUTHOR}</dd>
                     <dt>运行时</dt><dd>Electron · React</dd>
                   </dl>

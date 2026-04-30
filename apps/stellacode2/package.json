@@ -3,12 +3,21 @@
   "version": "0.1.0",
   "private": true,
   "description": "React/Electron Stellaclaw client shell.",
+  "author": "Jeremy Guo",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JeremyGuo/ClawParty.git"
+  },
   "main": "electron/main.cjs",
   "scripts": {
     "start": "node scripts/start-electron.cjs",
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
-    "check": "node --check electron/main.cjs && node --check electron/preload.cjs && node --check scripts/start-electron.cjs && vite build"
+    "check": "node --check electron/main.cjs && node --check electron/preload.cjs && node --check scripts/start-electron.cjs && vite build",
+    "dist": "npm run build && electron-builder --publish never",
+    "dist:win": "npm run build && electron-builder --win --publish never",
+    "dist:mac": "npm run build && electron-builder --mac --publish never",
+    "dist:linux": "npm run build && electron-builder --linux --publish never"
   },
   "dependencies": {
     "@radix-ui/react-context-menu": "^2.2.16",
@@ -17,7 +26,7 @@
     "@radix-ui/react-popover": "^1.1.15",
     "@radix-ui/react-tooltip": "^1.2.8",
     "@vitejs/plugin-react": "^5.2.0",
-    "electron": "^41.3.0",
+    "electron-updater": "^6.8.3",
     "highlight.js": "^11.11.1",
     "lucide-react": "^0.555.0",
     "react": "^19.2.1",
@@ -26,5 +35,74 @@
     "rehype-highlight": "^7.0.2",
     "remark-gfm": "^4.0.1",
     "vite": "^7.3.2"
+  },
+  "devDependencies": {
+    "electron": "^41.3.0",
+    "electron-builder": "^26.8.1"
+  },
+  "build": {
+    "appId": "com.stellaclaw.stellacode",
+    "productName": "Stellacode",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "build/icon.png",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "icon": "build/icon.icns",
+      "category": "public.app-category.developer-tools"
+    },
+    "linux": {
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "tar.gz",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png",
+      "category": "Development"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "publish": {
+      "provider": "github",
+      "owner": "JeremyGuo",
+      "repo": "ClawParty"
+    }
   }
 }
