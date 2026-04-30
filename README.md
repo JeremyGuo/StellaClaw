@@ -6,7 +6,7 @@
 
 Durable conversations. Isolated execution. Recoverable agents.
 
-[Roadmap](ROAD_MAP.md) · [Version History](VERSION) · [Example Config](example_config.json)
+[中文 README](README_zh.md) · [Roadmap](ROAD_MAP.md) · [Version History](VERSION) · [Example Config](example_config.json)
 
 </div>
 
@@ -16,13 +16,27 @@ Durable conversations. Isolated execution. Recoverable agents.
 
 Stellaclaw is the next-generation runtime for ClawParty: a self-hosted agent system that stays online, receives messages from external channels, and drives LLM sessions with durable state, tools, skills, workspaces, and crash recovery.
 
+Stellaclaw is multi-channel by design. Stellacode is the desktop surface; Telegram groups can act as lightweight conversation surfaces; and the Web API can power other clients. They all share the same Stellaclaw backend, durable conversations, session runtime, provider configuration, and workspace model.
+
+Stellacode lets you open the same agent workspace from any computer: the UI runs locally, but the files, terminal, tool calls, and code changes belong to the Stellaclaw server workspace that the conversation is connected to.
+
+![Stellacode desktop connected to a server workspace](docs/assets/stellacode.png)
+
+That makes Stellacode similar in spirit to VS Code Server, but centered on long-running agents instead of manual remote editing. The repository lives where the server can access it; the agent works there; the user can supervise, interrupt, inspect files, open terminals, and take over from anywhere.
+
+Telegram is a first-class surface too. Creating different Telegram groups gives you quick separate conversations for different tasks or roles, while they still share the same backend service.
+
+![Telegram groups backed by the same Stellaclaw server](docs/assets/telegram.png)
+
+Each conversation can independently choose its model, sandbox policy, and remote execution binding. Remote mode can make a conversation behave as if it is running directly on another server that Stellaclaw can access over SSH, which is how Stellaclaw supports SSH Remote workflows without making the client own remote execution.
+
 One of its product advantages is the three-hop work path enabled by Stellacode and Remote mode:
 
 ```text
 Stellacode / Channel Host -> Stellaclaw Server -> Remote Workspace Server
 ```
 
-Stellacode, Telegram, and Web clients provide the user-facing host surface. Stellaclaw runs as the durable agent server that owns conversations, routing, sessions, delivery, and recovery. Remote mode can then bind a conversation to another server's workspace, terminal, and filesystem through SSH/sshfs, so the agent can work where the project actually lives.
+Stellacode, Telegram groups, and Web clients provide the user-facing host surface. Stellaclaw runs as the durable agent server that owns conversations, routing, sessions, delivery, and recovery. Remote mode can then bind a conversation to another server's workspace, terminal, and filesystem through SSH/sshfs, so the agent can work where the project actually lives.
 
 That gives Stellaclaw a practical deployment advantage: users get a local desktop or channel experience, the central agent service stays durable, and heavy project work can happen on a separate remote machine without moving the conversation state out of the host.
 
@@ -30,7 +44,7 @@ The current Rust implementation is split across these runtime layers:
 
 | Layer | Binary / Crate | Owns |
 |---|---|---|
-| Client and channel surface | `apps/stellacode`, Telegram, Web API | User interaction, desktop workspace browsing, terminal UI, attachments, delivery. |
+| Client and channel surface | `apps/stellacode2`, Telegram, Web API | User interaction, desktop workspace browsing, terminal UI, attachments, delivery. |
 | Host server | `stellaclaw` | Channels, conversations, workdirs, Telegram/Web surfaces, config, routing, delivery, runtime skill persistence. |
 | Agent server | `agent_server` + `stellaclaw_core` | SessionActor state machine, provider/tool loop, compaction, session history, runtime metadata. |
 | Remote workspace server | SSH/sshfs target | Optional fixed or selectable remote workspace, remote shell, project files, execution root. |
@@ -48,10 +62,13 @@ This keeps platform concerns out of the model loop, keeps remote workspace conce
 
 ## Highlights
 
-- **Host -> server -> server workflow**: Stellacode or another channel talks to the Stellaclaw server, while Remote mode lets that conversation operate on a second server's workspace.
+- **Host -> server -> server workflow**: Stellacode, Telegram, or another channel talks to the Stellaclaw server, while Remote mode lets that conversation operate on a second server's workspace.
+- **Multiple surfaces, one backend**: desktop, Telegram groups, and Web API clients share the same durable Stellaclaw backend and conversation runtime.
+- **Per-conversation control**: each conversation can independently choose model, sandbox policy, and remote execution binding.
 - **Durable conversations**: conversation state, session state, runtime skills, workspaces, and migration markers live in the workdir instead of in memory-only chat loops.
-- **Multi-channel by design**: Telegram is production-usable today, while the Web channel and REST-style APIs provide the next integration surface.
+- **Multi-channel by design**: Telegram is production-usable today, including group-based conversations for separate tasks; the Web channel and REST-style APIs provide the desktop and integration surface.
 - **Recoverable execution**: unfinished turns, crashed runtimes, provider failures, and long tool batches are handled as session lifecycle events instead of silent state loss.
+- **Server-backed Stellacode workspace**: every laptop sees the same conversation UI, while files, terminals, tools, and agent edits operate in the workspace available to the Stellaclaw server.
 - **Remote-aware Stellacode**: workspace browsing, file upload/download, terminal sessions, and agent tools can follow the conversation's local or remote execution mode.
 - **Runtime skills**: `SKILL.md` directories can be loaded, created, updated, deleted, persisted, and synced from the running host.
 
@@ -63,7 +80,7 @@ Stellaclaw is already usable as a Telegram-backed agent host and includes a grow
 
 Implemented today:
 
-- Telegram channel with inbound messages, attachments, typing indicator, progress panel, and final success/failure delivery.
+- Telegram channel with inbound messages, group-based conversations, attachments, typing indicator, progress panel, and final success/failure delivery.
 - Web channel APIs for conversations, messages, status, workspace browsing, uploads/downloads, terminals, and foreground WebSocket updates.
 - Per-conversation model switching, sandbox switching, remote workspace switching, status query, cancel, and continue.
 - `agent_server` subprocess boundary using stdin/stdout line-delimited JSON-RPC.
