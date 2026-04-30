@@ -1,5 +1,10 @@
-version: 1.17.1
+version: 1.17.2
 ---
+
+# 1.17.2
+
+- 修复 Stellacode 2 Windows 打包启动黑屏：
+  Vite 构建现在使用相对资源路径，避免 Electron 通过 `file://` 加载 `dist/index.html` 时把 `/assets/...` 解析成文件系统根目录下的资源，导致 Windows packaged app 无法加载 renderer bundle。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.17.1
 
