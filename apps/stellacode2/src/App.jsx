@@ -126,6 +126,29 @@ function isConversationRunning(conversation, status) {
     || Number(status?.running_subagents || 0) > 0;
 }
 
+function maxMessageId(...values) {
+  let max = -1;
+  for (const value of values) {
+    const number = Number(value);
+    if (Number.isFinite(number)) max = Math.max(max, number);
+  }
+  return max >= 0 ? String(max) : undefined;
+}
+
+function mergeConversationSeen(incoming, existing) {
+  const seen = maxMessageId(incoming?.last_seen_message_id, existing?.last_seen_message_id);
+  if (!seen) return incoming;
+  const incomingSeen = Number(incoming?.last_seen_message_id);
+  const existingSeen = Number(existing?.last_seen_message_id);
+  return {
+    ...incoming,
+    last_seen_message_id: seen,
+    last_seen_at: Number.isFinite(incomingSeen) && (!Number.isFinite(existingSeen) || incomingSeen >= existingSeen)
+      ? incoming?.last_seen_at
+      : existing?.last_seen_at
+  };
+}
+
 function sleep(ms) {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
@@ -429,11 +452,10 @@ function App() {
     });
   }, []);
 
-  const markConversationRead = useCallback((key, lastMessageId) => {
+  const markConversationRead = useCallback((serverId, conversationId, lastMessageId) => {
     const seen = Number(lastMessageId);
-    if (!key || !Number.isFinite(seen)) return;
-    const [serverId, conversationId] = key.split(':');
-    if (!serverId || !conversationId) return;
+    if (!serverId || !conversationId || !Number.isFinite(seen)) return;
+    const key = conversationKey(serverId, conversationId);
     setConversations((current) => current.map((conversation) => (
       conversation.conversation_id === conversationId
         ? { ...conversation, last_seen_message_id: String(Math.max(seen, Number(conversation.last_seen_message_id || -1))) }
@@ -480,8 +502,13 @@ function App() {
     const applyConversationList = (list) => {
       if (!Array.isArray(list) || disposed) return;
       const hidden = settings?.hiddenConversations || {};
+      setConversations((current) => {
+        const existingById = new Map(current.map((conversation) => [conversation.conversation_id, conversation]));
+        return list
+          .filter((conversation) => !hidden[conversationKey(activeServerId, conversation.conversation_id)])
+          .map((conversation) => mergeConversationSeen(conversation, existingById.get(conversation.conversation_id)));
+      });
       const visibleList = list.filter((conversation) => !hidden[conversationKey(activeServerId, conversation.conversation_id)]);
-      setConversations(visibleList);
       if (!selectedRef.current && visibleList[0]) {
         setSelected({ serverId: activeServerId, conversationId: visibleList[0].conversation_id });
       }
@@ -512,7 +539,7 @@ function App() {
               if (!exists) return [...current, nextConversation].sort((left, right) => left.conversation_id.localeCompare(right.conversation_id));
               return current.map((conversation) => (
                 conversation.conversation_id === nextConversation.conversation_id
-                  ? { ...conversation, ...nextConversation }
+                  ? mergeConversationSeen({ ...conversation, ...nextConversation }, conversation)
                   : conversation
               ));
             });
@@ -537,7 +564,7 @@ function App() {
                 message_count: payload.message_count ?? payload.conversation?.message_count ?? conversation.message_count,
                 last_message_id: payload.last_message_id ?? payload.conversation?.last_message_id ?? conversation.last_message_id,
                 last_message_time: payload.last_message_time ?? payload.conversation?.last_message_time ?? conversation.last_message_time,
-                last_seen_message_id: payload.last_seen_message_id ?? payload.conversation?.last_seen_message_id ?? conversation.last_seen_message_id,
+                last_seen_message_id: maxMessageId(payload.last_seen_message_id, payload.conversation?.last_seen_message_id, conversation.last_seen_message_id),
                 last_seen_at: payload.last_seen_at ?? payload.conversation?.last_seen_at ?? conversation.last_seen_at
               };
             }));
@@ -598,8 +625,8 @@ function App() {
 
   useEffect(() => {
     if (!selectedKey || !activeConversation?.last_message_id) return;
-    markConversationRead(selectedKey, activeConversation.last_message_id);
-  }, [selectedKey, activeConversation?.last_message_id, markConversationRead]);
+    markConversationRead(selected.serverId, selected.conversationId, activeConversation.last_message_id);
+  }, [selected, selectedKey, activeConversation?.last_message_id, markConversationRead]);
 
   const saveSettingsFromDialog = useCallback(async (next) => {
     setSettingsSaving(true);
@@ -1019,7 +1046,7 @@ function App() {
             ? { ...conversation, last_message_id: String(latestId), message_count: Math.max(Number(conversation.message_count || 0), latestId + 1) }
             : conversation
         )));
-        markConversationRead(key, latestId);
+        markConversationRead(selected.serverId, selected.conversationId, latestId);
       }
       const activity = activityFromMessages(incoming);
       if (activity) setSessionActivity(activity);
