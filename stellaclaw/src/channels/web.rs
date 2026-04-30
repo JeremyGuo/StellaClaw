@@ -2,7 +2,7 @@ use std::{
     cmp::Ordering,
     collections::HashMap,
     fs,
-    io::{Read, Write},
+    io::{BufRead, BufReader, ErrorKind, Read, Write},
     net::{Shutdown, TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -586,12 +586,13 @@ impl WebChannel {
         let offset = query_usize(query, "offset", 0);
         let limit = query_usize(query, "limit", 50).min(200);
         let state = self.load_web_state(conversation_id)?;
-        let messages = self.load_messages_for_state(&state)?;
+        let page = read_message_page(&message_log_path(&self.workdir, &state), offset, limit)
+            .map_err(ApiError::internal)?;
         let attachments =
             WebAttachmentContext::new(&self.workdir, &state, self.cache_manager.clone());
         Ok(json_response(
             200,
-            message_page_payload(&state, &attachments, &messages, offset, limit),
+            message_page_payload(&state, &attachments, &page, offset, limit),
         ))
     }
 
@@ -604,18 +605,14 @@ impl WebChannel {
         let index = parse_message_id(message_id)?;
         let limit = query_usize(query, "limit", 50).min(200);
         let state = self.load_web_state(conversation_id)?;
-        let messages = self.load_messages_for_state(&state)?;
+        let offset = index.saturating_add(1);
+        let page = read_message_page(&message_log_path(&self.workdir, &state), offset, limit)
+            .map_err(ApiError::internal)?;
         let attachments =
             WebAttachmentContext::new(&self.workdir, &state, self.cache_manager.clone());
         Ok(json_response(
             200,
-            message_page_payload(
-                &state,
-                &attachments,
-                &messages,
-                index.saturating_add(1),
-                limit,
-            ),
+            message_page_payload(&state, &attachments, &page, offset, limit),
         ))
     }
 
@@ -637,12 +634,14 @@ impl WebChannel {
         let include_anchor = query_bool(query, "include_anchor", true);
         let limit = query_usize(query, "limit", 50).min(200);
         let state = self.load_web_state(conversation_id)?;
-        let messages = self.load_messages_for_state(&state)?;
-        if anchor >= messages.len() {
+        let path = message_log_path(&self.workdir, &state);
+        let total = count_message_lines(&path).map_err(ApiError::internal)?;
+        if anchor >= total {
             return Err(ApiError::new(404, "message_not_found"));
         }
-        let (start, end) =
-            message_range_bounds(messages.len(), anchor, direction, include_anchor, limit);
+        let (start, end) = message_range_bounds(total, anchor, direction, include_anchor, limit);
+        let page = read_message_page(&path, start, end.saturating_sub(start))
+            .map_err(ApiError::internal)?;
         let attachments =
             WebAttachmentContext::new(&self.workdir, &state, self.cache_manager.clone());
         Ok(json_response(
@@ -650,12 +649,10 @@ impl WebChannel {
             message_range_payload(
                 &state,
                 &attachments,
-                &messages,
+                &page,
                 anchor,
                 direction,
                 include_anchor,
-                start,
-                end,
             ),
         ))
     }
@@ -663,14 +660,15 @@ impl WebChannel {
     fn message_detail(&self, conversation_id: &str, message_id: &str) -> ApiResult<HttpResponse> {
         let index = parse_message_id(message_id)?;
         let state = self.load_web_state(conversation_id)?;
-        let messages = self.load_messages_for_state(&state)?;
-        let Some(message) = messages.get(index) else {
+        let Some(message) = read_message_at(&message_log_path(&self.workdir, &state), index)
+            .map_err(ApiError::internal)?
+        else {
             return Err(ApiError::new(404, "message_not_found"));
         };
         let attachments =
             WebAttachmentContext::new(&self.workdir, &state, self.cache_manager.clone());
         let roots = attachments.roots();
-        let rendered = render_web_message(message, &attachments, &roots);
+        let rendered = render_web_message(&message, &attachments, &roots);
         Ok(json_response(
             200,
             json!({
@@ -933,8 +931,9 @@ impl WebChannel {
             .load_web_state(&subscribe.conversation_id)
             .map_err(api_anyhow)?;
         let mut session_id = state.session_binding.foreground_session_id.clone();
-        let mut messages = self.load_messages_for_state(&state).map_err(api_anyhow)?;
-        let mut next_index = messages.len();
+        let mut log_path = message_log_path(&self.workdir, &state);
+        let mut next_index = count_message_lines(&log_path)?;
+        let mut log_len = message_log_len(&log_path);
         let (event_tx, event_rx) = unbounded();
         self.register_websocket_subscriber(&state, event_tx);
         write_websocket_json(
@@ -963,8 +962,9 @@ impl WebChannel {
                 .map_err(api_anyhow)?;
             if state.session_binding.foreground_session_id != session_id {
                 session_id = state.session_binding.foreground_session_id.clone();
-                messages = self.load_messages_for_state(&state).map_err(api_anyhow)?;
-                next_index = messages.len();
+                log_path = message_log_path(&self.workdir, &state);
+                next_index = count_message_lines(&log_path)?;
+                log_len = message_log_len(&log_path);
                 write_websocket_json(
                     &mut stream,
                     &websocket_subscription_ack(&state, next_index, "session_changed"),
@@ -972,14 +972,19 @@ impl WebChannel {
                 continue;
             }
 
-            messages = self.load_messages_for_state(&state).map_err(api_anyhow)?;
-            if messages.len() <= next_index {
+            let next_log_len = message_log_len(&log_path);
+            if next_log_len <= log_len {
+                continue;
+            }
+            log_len = next_log_len;
+            let page = read_message_page(&log_path, next_index, usize::MAX)?;
+            if page.end <= next_index {
                 continue;
             }
             let attachments =
                 WebAttachmentContext::new(&self.workdir, &state, self.cache_manager.clone());
-            let payload = websocket_messages_payload(&state, &attachments, &messages, next_index);
-            next_index = messages.len();
+            let payload = websocket_messages_payload(&state, &attachments, &page);
+            next_index = page.end;
             write_websocket_json(&mut stream, &payload)?;
         }
     }
@@ -1428,23 +1433,6 @@ impl WebChannel {
             return Err(ApiError::new(404, "conversation_not_found"));
         }
         Ok(state)
-    }
-
-    fn load_messages_for_state(&self, state: &ConversationState) -> ApiResult<Vec<ChatMessage>> {
-        let path = self
-            .workdir
-            .join("conversations")
-            .join(&state.conversation_id)
-            .join(".log")
-            .join("stellaclaw")
-            .join(sanitize_session_id_for_log_path(
-                &state.session_binding.foreground_session_id,
-            ))
-            .join("all_messages.jsonl");
-        if !path.exists() {
-            return Ok(Vec::new());
-        }
-        read_messages_jsonl(&path).map_err(ApiError::internal)
     }
 }
 
@@ -1981,6 +1969,14 @@ struct ConversationMessageSummary {
     last_message_time: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct MessagePage {
+    start: usize,
+    end: usize,
+    total: usize,
+    messages: Vec<ChatMessage>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ConversationSeen {
     last_seen_message_id: String,
@@ -2028,21 +2024,16 @@ fn conversation_message_summary(
     workdir: &Path,
     state: &ConversationState,
 ) -> ConversationMessageSummary {
-    let path = workdir
-        .join("conversations")
-        .join(&state.conversation_id)
-        .join(".log")
-        .join("stellaclaw")
-        .join(sanitize_session_id_for_log_path(
-            &state.session_binding.foreground_session_id,
-        ))
-        .join("all_messages.jsonl");
-    let Ok(raw) = fs::read_to_string(path) else {
+    let path = message_log_path(workdir, state);
+    let Ok(Some(reader)) = open_message_reader(&path) else {
         return ConversationMessageSummary::default();
     };
     let mut summary = ConversationMessageSummary::default();
-    let mut last_line = "";
-    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+    let mut last_line = String::new();
+    for line in reader.lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
         summary.message_count = summary.message_count.saturating_add(1);
         last_line = line;
     }
@@ -2051,7 +2042,7 @@ fn conversation_message_summary(
             .message_count
             .checked_sub(1)
             .map(|index| index.to_string());
-        if let Ok(value) = serde_json::from_str::<Value>(last_line) {
+        if let Ok(value) = serde_json::from_str::<Value>(&last_line) {
             summary.last_message_time = value
                 .get("message_time")
                 .and_then(Value::as_str)
@@ -2497,23 +2488,20 @@ fn status_reason(status: u16) -> &'static str {
 fn message_page_payload(
     state: &ConversationState,
     attachments: &WebAttachmentContext,
-    messages: &[ChatMessage],
+    page: &MessagePage,
     offset: usize,
     limit: usize,
 ) -> Value {
-    let total = messages.len();
-    let start = offset.min(total);
-    let end = start.saturating_add(limit).min(total);
     let roots = attachments.roots();
     json!({
         "conversation_id": &state.conversation_id,
         "offset": offset,
         "limit": limit,
-        "total": total,
-        "messages": messages[start..end]
+        "total": page.total,
+        "messages": page.messages
             .iter()
             .enumerate()
-            .map(|(relative, message)| message_skeleton(start + relative, message, attachments, &roots))
+            .map(|(relative, message)| message_skeleton(page.start + relative, message, attachments, &roots))
             .collect::<Vec<_>>(),
     })
 }
@@ -2521,12 +2509,10 @@ fn message_page_payload(
 fn message_range_payload(
     state: &ConversationState,
     attachments: &WebAttachmentContext,
-    messages: &[ChatMessage],
+    page: &MessagePage,
     anchor: usize,
     direction: MessageRangeDirection,
     include_anchor: bool,
-    start: usize,
-    end: usize,
 ) -> Value {
     let roots = attachments.roots();
     json!({
@@ -2535,17 +2521,17 @@ fn message_range_payload(
         "anchor_index": anchor,
         "direction": direction.as_str(),
         "include_anchor": include_anchor,
-        "offset": start,
-        "limit": end.saturating_sub(start),
-        "start_index": start,
-        "end_index": end,
-        "total": messages.len(),
-        "has_more_before": start > 0,
-        "has_more_after": end < messages.len(),
-        "messages": messages[start..end]
+        "offset": page.start,
+        "limit": page.end.saturating_sub(page.start),
+        "start_index": page.start,
+        "end_index": page.end,
+        "total": page.total,
+        "has_more_before": page.start > 0,
+        "has_more_after": page.end < page.total,
+        "messages": page.messages
             .iter()
             .enumerate()
-            .map(|(relative, message)| message_skeleton(start + relative, message, attachments, &roots))
+            .map(|(relative, message)| message_skeleton(page.start + relative, message, attachments, &roots))
             .collect::<Vec<_>>(),
     })
 }
@@ -2573,25 +2559,22 @@ fn websocket_subscription_ack(
 fn websocket_messages_payload(
     state: &ConversationState,
     attachments: &WebAttachmentContext,
-    messages: &[ChatMessage],
-    start: usize,
+    page: &MessagePage,
 ) -> Value {
-    let total = messages.len();
-    let end = total;
     let roots = attachments.roots();
     json!({
         "type": "messages",
         "subscription": "foreground_session_messages",
         "conversation_id": &state.conversation_id,
         "session_id": &state.session_binding.foreground_session_id,
-        "offset": start,
-        "start_index": start,
-        "end_index": end,
-        "total": total,
-        "messages": messages[start..end]
+        "offset": page.start,
+        "start_index": page.start,
+        "end_index": page.end,
+        "total": page.total,
+        "messages": page.messages
             .iter()
             .enumerate()
-            .map(|(relative, message)| message_skeleton(start + relative, message, attachments, &roots))
+            .map(|(relative, message)| message_skeleton(page.start + relative, message, attachments, &roots))
             .collect::<Vec<_>>(),
     })
 }
@@ -3080,17 +3063,96 @@ fn preview_text(text: &str) -> String {
     text.trim().to_string()
 }
 
-fn read_messages_jsonl(path: &Path) -> Result<Vec<ChatMessage>> {
-    let raw =
-        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+fn message_log_path(workdir: &Path, state: &ConversationState) -> PathBuf {
+    workdir
+        .join("conversations")
+        .join(&state.conversation_id)
+        .join(".log")
+        .join("stellaclaw")
+        .join(sanitize_session_id_for_log_path(
+            &state.session_binding.foreground_session_id,
+        ))
+        .join("all_messages.jsonl")
+}
+
+fn open_message_reader(path: &Path) -> Result<Option<BufReader<fs::File>>> {
+    match fs::File::open(path) {
+        Ok(file) => Ok(Some(BufReader::new(file))),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to open {}", path.display())),
+    }
+}
+
+fn message_log_len(path: &Path) -> u64 {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn count_message_lines(path: &Path) -> Result<usize> {
+    let Some(reader) = open_message_reader(path)? else {
+        return Ok(0);
+    };
+    let mut count = 0usize;
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("failed to read {}", path.display()))?;
+        if !line.trim().is_empty() {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+fn read_message_page(path: &Path, offset: usize, limit: usize) -> Result<MessagePage> {
+    let Some(reader) = open_message_reader(path)? else {
+        return Ok(MessagePage::default());
+    };
+    let mut total = 0usize;
     let mut messages = Vec::new();
-    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+    let end_limit = offset.saturating_add(limit);
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("failed to read {}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let index = total;
+        total = total.saturating_add(1);
+        if index < offset || index >= end_limit {
+            continue;
+        }
         messages.push(
-            serde_json::from_str::<ChatMessage>(line)
+            serde_json::from_str::<ChatMessage>(&line)
                 .with_context(|| format!("failed to parse {}", path.display()))?,
         );
     }
-    Ok(messages)
+    let start = offset.min(total);
+    let end = start.saturating_add(messages.len()).min(total);
+    Ok(MessagePage {
+        start,
+        end,
+        total,
+        messages,
+    })
+}
+
+fn read_message_at(path: &Path, index: usize) -> Result<Option<ChatMessage>> {
+    let Some(reader) = open_message_reader(path)? else {
+        return Ok(None);
+    };
+    let mut current = 0usize;
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("failed to read {}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if current == index {
+            return serde_json::from_str::<ChatMessage>(&line)
+                .map(Some)
+                .with_context(|| format!("failed to parse {}", path.display()));
+        }
+        current = current.saturating_add(1);
+    }
+    Ok(None)
 }
 
 fn query_usize(query: &HashMap<String, String>, name: &str, default: usize) -> usize {
@@ -3470,7 +3532,13 @@ mod tests {
         );
 
         let context = test_attachment_context(&workdir, &state);
-        let payload = message_page_payload(&state, &context, &[message], 0, 50);
+        let page = MessagePage {
+            start: 0,
+            end: 1,
+            total: 1,
+            messages: vec![message],
+        };
+        let payload = message_page_payload(&state, &context, &page, 0, 50);
 
         assert_eq!(payload["messages"][0]["preview"], "");
         assert_eq!(payload["messages"][0]["text"], "");
@@ -3515,7 +3583,13 @@ mod tests {
         });
 
         let context = test_attachment_context(&workdir, &state);
-        let page = message_page_payload(&state, &context, std::slice::from_ref(&message), 0, 50);
+        let message_page = MessagePage {
+            start: 0,
+            end: 1,
+            total: 1,
+            messages: vec![message.clone()],
+        };
+        let page = message_page_payload(&state, &context, &message_page, 0, 50);
         assert_eq!(page["messages"][0]["has_token_usage"], true);
         assert_eq!(page["messages"][0]["token_usage"]["cache_read"], 11);
         assert_eq!(page["messages"][0]["token_usage"]["cache_write"], 12);
@@ -3528,8 +3602,7 @@ mod tests {
             0.004
         );
 
-        let websocket =
-            websocket_messages_payload(&state, &context, std::slice::from_ref(&message), 0);
+        let websocket = websocket_messages_payload(&state, &context, &message_page);
         assert_eq!(websocket["messages"][0]["has_token_usage"], true);
         assert_eq!(websocket["messages"][0]["token_usage"]["cache_read"], 11);
         assert_eq!(websocket["messages"][0]["token_usage"]["input"], 13);
@@ -3571,15 +3644,19 @@ mod tests {
         let (start, end) =
             message_range_bounds(messages.len(), 3, MessageRangeDirection::Before, true, 2);
         let context = test_attachment_context(&workdir, &state);
+        let page = MessagePage {
+            start,
+            end,
+            total: messages.len(),
+            messages: messages[start..end].to_vec(),
+        };
         let payload = message_range_payload(
             &state,
             &context,
-            &messages,
+            &page,
             3,
             MessageRangeDirection::Before,
             true,
-            start,
-            end,
         );
 
         assert_eq!(payload["anchor_id"], "3");
@@ -3680,7 +3757,13 @@ mod tests {
         assert!(thumbnail.size_bytes <= 256 * 1024);
         assert!(thumbnail.data_url.starts_with("data:image/jpeg;base64,"));
 
-        let payload = message_page_payload(&state, &context, &[message], 0, 50);
+        let page = MessagePage {
+            start: 0,
+            end: 1,
+            total: 1,
+            messages: vec![message],
+        };
+        let payload = message_page_payload(&state, &context, &page, 0, 50);
         assert_eq!(
             payload["messages"][0]["attachments"][0]["source"],
             "attachment_tag"

@@ -1,5 +1,13 @@
-version: 1.18.5
+version: 1.18.6
 ---
+
+# 1.18.6
+
+- 按需读取 Web conversation 消息日志：
+  Web channel 的消息列表、range、detail、foreground WebSocket 增量推送和 conversation summary 不再把 `all_messages.jsonl` 完整读入内存；列表/range/detail 只解析需要返回的消息范围，WebSocket 在文件长度未变化时不扫描日志，conversation summary 改为流式扫描最后一条消息。Status usage 统计也改为流式读取 JSONL。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修正自动已读的前台条件：
+  Stellacode 2 只有在窗口可见且处于 focus 状态时，才会自动把当前 conversation 标记为已读；窗口在后台时即使当前选中了该 conversation，也不会消费新消息，并且当前 conversation 在后台完成一轮时仍会按未读消息触发系统通知。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.18.5
 

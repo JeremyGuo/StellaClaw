@@ -1,4 +1,8 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    io::{BufRead, BufReader, ErrorKind},
+    path::Path,
+};
 
 use anyhow::Result;
 use stellaclaw_core::session_actor::{ChatMessage, TokenUsage, TokenUsageCost, ToolRemoteMode};
@@ -137,13 +141,16 @@ fn session_usage_totals(workspace_root: &Path, session_id: &str) -> UsageTotals 
         .join("stellaclaw")
         .join(sanitize_session_id_for_log_path(session_id))
         .join("all_messages.jsonl");
-    let Ok(raw) = fs::read_to_string(path) else {
+    let Ok(Some(reader)) = open_jsonl_reader(&path) else {
         return UsageTotals::default();
     };
 
     let mut totals = UsageTotals::default();
-    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(message) = serde_json::from_str::<ChatMessage>(line) else {
+    for line in reader.lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(message) = serde_json::from_str::<ChatMessage>(&line) else {
             continue;
         };
         if let Some(usage) = &message.token_usage {
@@ -158,13 +165,16 @@ fn media_tool_usage_totals(workspace_root: &Path) -> UsageTotals {
         .join(".log")
         .join("stellaclaw")
         .join("tool_usage.jsonl");
-    let Ok(raw) = fs::read_to_string(path) else {
+    let Ok(Some(reader)) = open_jsonl_reader(&path) else {
         return UsageTotals::default();
     };
 
     let mut totals = UsageTotals::default();
-    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+    for line in reader.lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
         let Some(token_usage) = value.get("token_usage") else {
@@ -176,6 +186,14 @@ fn media_tool_usage_totals(workspace_root: &Path) -> UsageTotals {
         totals.add_token_usage(&usage);
     }
     totals
+}
+
+fn open_jsonl_reader(path: &Path) -> Result<Option<BufReader<fs::File>>, std::io::Error> {
+    match fs::File::open(path) {
+        Ok(file) => Ok(Some(BufReader::new(file))),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn sandbox_mode_label(mode: &crate::config::SandboxMode) -> &'static str {

@@ -416,8 +416,14 @@ function App() {
   const [draft, setDraft] = useState('');
   const [openFiles, setOpenFiles] = useState([]);
   const [activeFilePath, setActiveFilePath] = useState('');
+  const [appForeground, setAppForeground] = useState(() => (
+    typeof document === 'undefined'
+      ? true
+      : document.visibilityState === 'visible' && document.hasFocus()
+  ));
   const messagesRef = useRef([]);
   const conversationsRef = useRef([]);
+  const appForegroundRef = useRef(appForeground);
   const selectedRef = useRef(null);
   const websocketRef = useRef(null);
   const websocketReconnectRef = useRef(null);
@@ -437,8 +443,27 @@ function App() {
     conversationsRef.current = conversations;
   }, [conversations]);
 
+  useEffect(() => {
+    appForegroundRef.current = appForeground;
+  }, [appForeground]);
+
   useLayoutEffect(() => {
     applyChromeMetrics(window.stellacode2?.chromeMetrics?.());
+  }, []);
+
+  useEffect(() => {
+    const updateForeground = () => {
+      setAppForeground(document.visibilityState === 'visible' && document.hasFocus());
+    };
+    updateForeground();
+    window.addEventListener('focus', updateForeground);
+    window.addEventListener('blur', updateForeground);
+    document.addEventListener('visibilitychange', updateForeground);
+    return () => {
+      window.removeEventListener('focus', updateForeground);
+      window.removeEventListener('blur', updateForeground);
+      document.removeEventListener('visibilitychange', updateForeground);
+    };
   }, []);
 
   useEffect(() => {
@@ -548,6 +573,7 @@ function App() {
 
   const markConversationRead = useCallback((serverId, conversationId, lastMessageId) => {
     const seen = Number(lastMessageId);
+    if (!appForegroundRef.current) return;
     if (!serverId || !conversationId || !Number.isFinite(seen)) return;
     const key = conversationKey(serverId, conversationId);
     const nextConversations = conversationsRef.current.map((conversation) => (
@@ -632,7 +658,8 @@ function App() {
             const selectedConversation = selectedRef.current;
             const isActive = selectedConversation?.serverId === activeServerId
               && selectedConversation?.conversationId === payload.conversation_id;
-            if (selectedConversation && completed && !isActive && hasUnreadConversation(completed)) {
+            const isVisibleActive = isActive && appForegroundRef.current;
+            if (selectedConversation && completed && !isVisibleActive && hasUnreadConversation(completed)) {
               window.stellacode2?.notify?.({
                 title: 'Stellacode',
                 body: `${displayConversationName(settings, activeServerId, completed)} 有新消息`
@@ -659,9 +686,10 @@ function App() {
   }, [activeServerId, settingsReady, settings?.hiddenConversations]);
 
   useEffect(() => {
+    if (!appForeground) return;
     if (!selectedKey || !activeConversation?.last_message_id) return;
     markConversationRead(selected.serverId, selected.conversationId, activeConversation.last_message_id);
-  }, [selected, selectedKey, activeConversation?.last_message_id, markConversationRead]);
+  }, [appForeground, selected, selectedKey, activeConversation?.last_message_id, markConversationRead]);
 
   const saveSettingsFromDialog = useCallback(async (next) => {
     setSettingsSaving(true);
