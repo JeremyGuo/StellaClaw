@@ -1,5 +1,10 @@
-version: 1.18.4
+version: 1.18.5
 ---
+
+# 1.18.5
+
+- 收敛 Stellacode 2 系统通知触发源：
+  系统通知现在和左侧未读红点使用同一个 `conversation_turn_completed` 事实源，只在非当前 conversation 一轮完成且 `last_message_id > last_seen_message_id` 时触发；移除前端基于 running -> idle 状态变化推断完成的通知逻辑，避免运行态变化和新消息语义不一致。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.18.4
 

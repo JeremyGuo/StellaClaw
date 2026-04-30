@@ -117,15 +117,6 @@ function fileTabSnapshot(file) {
   };
 }
 
-function isConversationRunning(conversation, status) {
-  const processing = String(conversation?.processing_state || status?.processing_state || '').toLowerCase();
-  return Boolean(conversation?.running)
-    || processing === 'typing'
-    || processing === 'running'
-    || Number(status?.running_background || 0) > 0
-    || Number(status?.running_subagents || 0) > 0;
-}
-
 function maxMessageId(...values) {
   let max = -1;
   for (const value of values) {
@@ -243,6 +234,10 @@ function applyConversationStreamEvent(current, payload, { serverId, hiddenConver
   }
 
   return current;
+}
+
+function hasUnreadConversation(conversation) {
+  return compareMessageIds(conversation?.last_message_id, conversation?.last_seen_message_id) > 0;
 }
 
 function sleep(ms) {
@@ -422,6 +417,7 @@ function App() {
   const [openFiles, setOpenFiles] = useState([]);
   const [activeFilePath, setActiveFilePath] = useState('');
   const messagesRef = useRef([]);
+  const conversationsRef = useRef([]);
   const selectedRef = useRef(null);
   const websocketRef = useRef(null);
   const websocketReconnectRef = useRef(null);
@@ -432,12 +428,14 @@ function App() {
   const restoringUiRef = useRef(false);
   const uiSaveTimerRef = useRef(null);
   const readSaveTimersRef = useRef(new Map());
-  const conversationRunningRef = useRef(new Map());
-  const conversationRunningReadyRef = useRef(false);
 
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  useEffect(() => {
+    conversationsRef.current = conversations;
+  }, [conversations]);
 
   useLayoutEffect(() => {
     applyChromeMetrics(window.stellacode2?.chromeMetrics?.());
@@ -552,14 +550,16 @@ function App() {
     const seen = Number(lastMessageId);
     if (!serverId || !conversationId || !Number.isFinite(seen)) return;
     const key = conversationKey(serverId, conversationId);
-    setConversations((current) => current.map((conversation) => (
+    const nextConversations = conversationsRef.current.map((conversation) => (
       conversation.conversation_id === conversationId
         ? mergeConversationSummary(conversation, {
           conversation_id: conversationId,
           last_seen_message_id: String(seen)
         })
         : conversation
-    )));
+    ));
+    conversationsRef.current = nextConversations;
+    setConversations(nextConversations);
     const existing = readSaveTimersRef.current.get(key);
     if (existing) window.clearTimeout(existing);
     const timer = window.setTimeout(() => {
@@ -615,7 +615,9 @@ function App() {
           } catch {
             return;
           }
-          setConversations((current) => applyConversationStreamEvent(current, payload, streamContext));
+          const nextConversations = applyConversationStreamEvent(conversationsRef.current, payload, streamContext);
+          conversationsRef.current = nextConversations;
+          setConversations(nextConversations);
           if (!selectedRef.current) {
             const fallbackConversation = payload.type === 'conversation_snapshot'
               ? (payload.conversations || [])
@@ -623,6 +625,18 @@ function App() {
               : payload.conversation;
             if (fallbackConversation?.conversation_id) {
               setSelected({ serverId: activeServerId, conversationId: fallbackConversation.conversation_id });
+            }
+          }
+          if (payload.type === 'conversation_turn_completed' && payload.conversation_id) {
+            const completed = nextConversations.find((conversation) => conversation.conversation_id === payload.conversation_id);
+            const selectedConversation = selectedRef.current;
+            const isActive = selectedConversation?.serverId === activeServerId
+              && selectedConversation?.conversationId === payload.conversation_id;
+            if (selectedConversation && completed && !isActive && hasUnreadConversation(completed)) {
+              window.stellacode2?.notify?.({
+                title: 'Stellacode',
+                body: `${displayConversationName(settings, activeServerId, completed)} 有新消息`
+              }).catch(() => {});
             }
           }
         });
@@ -643,31 +657,6 @@ function App() {
       if (streamSocket && streamSocket.readyState <= WebSocket.OPEN) streamSocket.close();
     };
   }, [activeServerId, settingsReady, settings?.hiddenConversations]);
-
-  useEffect(() => {
-    if (!settingsReady || !activeServerId) return;
-    const next = new Map(conversationRunningRef.current);
-    const visibleKeys = new Set();
-    for (const conversation of conversations) {
-      const key = conversationKey(activeServerId, conversation.conversation_id);
-      visibleKeys.add(key);
-      const status = statuses.get(key);
-      const running = isConversationRunning(conversation, status);
-      const previous = conversationRunningRef.current.get(key);
-      if (conversationRunningReadyRef.current && previous === true && running === false) {
-        window.stellacode2?.notify?.({
-          title: 'Stellacode',
-          body: `${displayConversationName(settings, activeServerId, conversation)} 已运行完成`
-        }).catch(() => {});
-      }
-      next.set(key, running);
-    }
-    for (const key of next.keys()) {
-      if (!visibleKeys.has(key) && key.startsWith(`${activeServerId}:`)) next.delete(key);
-    }
-    conversationRunningRef.current = next;
-    conversationRunningReadyRef.current = true;
-  }, [conversations, statuses, activeServerId, settingsReady, settings]);
 
   useEffect(() => {
     if (!selectedKey || !activeConversation?.last_message_id) return;
