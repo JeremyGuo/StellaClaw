@@ -11,7 +11,6 @@ import {
   displayConversationName,
   markConversationSeen,
   loadConversations,
-  loadMessageRange,
   loadMessages,
   loadModels,
   loadStatus,
@@ -165,14 +164,10 @@ function mergeConversationSummary(existing, incoming) {
   };
 }
 
-function applyConversationStreamEvent(current, payload, { serverId, hiddenConversations = {} } = {}) {
-  const hidden = (conversation) => hiddenConversations[conversationKey(serverId, conversation.conversation_id)];
+function applyConversationStreamEvent(current, payload) {
   const sort = (list) => [...list].sort((left, right) => left.conversation_id.localeCompare(right.conversation_id));
   const upsert = (list, incoming) => {
     if (!incoming?.conversation_id) return list;
-    if (hidden(incoming)) {
-      return list.filter((conversation) => conversation.conversation_id !== incoming.conversation_id);
-    }
     const exists = list.some((conversation) => conversation.conversation_id === incoming.conversation_id);
     if (!exists) return sort([...list, incoming]);
     return list.map((conversation) => (
@@ -185,12 +180,15 @@ function applyConversationStreamEvent(current, payload, { serverId, hiddenConver
   if (payload.type === 'conversation_snapshot') {
     const existingById = new Map(current.map((conversation) => [conversation.conversation_id, conversation]));
     return (payload.conversations || [])
-      .filter((conversation) => !hidden(conversation))
       .map((conversation) => mergeConversationSummary(existingById.get(conversation.conversation_id), conversation));
   }
 
   if (payload.type === 'conversation_upserted') {
     return upsert(current, payload.conversation);
+  }
+
+  if (payload.type === 'conversation_deleted' && payload.conversation_id) {
+    return current.filter((conversation) => conversation.conversation_id !== payload.conversation_id);
   }
 
   if (payload.type === 'conversation_processing' && payload.conversation_id) {
@@ -240,10 +238,6 @@ function hasUnreadConversation(conversation) {
   return compareMessageIds(conversation?.last_message_id, conversation?.last_seen_message_id) > 0;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
-}
-
 function slashCommandState(value) {
   const command = String(value || '').trim();
   const name = command.split(/\s+/, 1)[0]?.toLowerCase() || '';
@@ -263,16 +257,6 @@ function slashCommandState(value) {
     return { control: true, name, title: '读取状态', detail: '状态命令已发送' };
   }
   return { control: false, name, title: '等待响应', detail: '消息已送达，等待模型开始处理' };
-}
-
-function shouldRetryControlStatus(commandState, status) {
-  return commandState?.name === '/model' && Boolean(status?.model_selection_pending);
-}
-
-function clearConversationModelSelectionPending(conversation) {
-  return conversation
-    ? { ...conversation, model_selection_pending: false }
-    : conversation;
 }
 
 function normalizePlan(rawPlan) {
@@ -317,32 +301,6 @@ function normalizePlanStatus(status) {
   return '';
 }
 
-function planFromProgressText(text) {
-  const value = String(text || '');
-  const [, rawPlan = ''] = value.split(/\n\n计划\n?/);
-  if (!rawPlan.trim()) return null;
-  const plan = rawPlan
-    .split('\n')
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => {
-      const marker = line.slice(0, 1);
-      const status = marker === '☑' ? 'completed' : marker === '◐' ? 'in_progress' : 'pending';
-      return { status, step: line.replace(/^[☐◐☑]\s*/, '').trim() };
-    })
-    .filter((item) => item.step);
-  return plan.length ? { explanation: '', plan } : null;
-}
-
-function progressActivityFromText(text) {
-  const value = String(text || '').split(/\n\n计划\n?/)[0] || '';
-  const stage = value.match(/(?:阶段|状态)：\s*([^\n]+)/)?.[1];
-  if (stage) return stage.replace(/[.。]+$/, '').trim();
-  if (/已完成/.test(value)) return '已完成';
-  if (/失败/.test(value)) return '执行失败';
-  return '';
-}
-
 function normalizeProgressFeedback(payload) {
   const source = payload.progress || payload.event || payload;
   const finalState = source.final_state || source.finalState || payload.final_state || payload.finalState || '';
@@ -352,14 +310,12 @@ function normalizeProgressFeedback(payload) {
     : finalState === 'done' || phase === 'done'
       ? 'done'
       : 'running';
-  const plan = normalizePlan(source.plan || source.task_plan || source.taskPlan || payload.plan)
-    || planFromProgressText(source.text || payload.text);
+  const plan = normalizePlan(source.plan || source.task_plan || source.taskPlan || payload.plan);
   const activity = String(
     source.activity
     || source.stage
     || source.phase
     || source.status
-    || progressActivityFromText(source.text || payload.text)
     || (state === 'done' ? '已完成' : state === 'failed' ? '执行失败' : '思考中')
   ).trim();
   const model = String(source.model || source.model_name || source.modelName || '').trim();
@@ -507,10 +463,26 @@ function App() {
   );
   const selectedKey = selected ? conversationKey(selected.serverId, selected.conversationId) : '';
   const selectedStatus = selected ? statuses.get(selectedKey) : null;
+  const selectedConversationStatus = useMemo(() => ({
+    ...(selectedStatus || {}),
+    ...(activeConversation ? {
+      model: activeConversation.model,
+      model_selection_pending: activeConversation.model_selection_pending,
+      reasoning: activeConversation.reasoning,
+      sandbox: activeConversation.sandbox,
+      sandbox_source: activeConversation.sandbox_source,
+      remote: activeConversation.remote,
+      workspace: activeConversation.workspace,
+      running_background: activeConversation.running_background,
+      total_background: activeConversation.total_background,
+      running_subagents: activeConversation.running_subagents,
+      total_subagents: activeConversation.total_subagents
+    } : {})
+  }), [selectedStatus, activeConversation]);
   const settingsReady = Boolean(settings);
   const composerMode = useMemo(
-    () => composerModeInfo(selectedStatus),
-    [selectedStatus]
+    () => composerModeInfo(selectedConversationStatus),
+    [selectedConversationStatus]
   );
   const selectedUsage = useMemo(
     () => statusUsageTotals(selectedStatus, selectedKey ? statusDeltas.get(selectedKey) : null),
@@ -603,16 +575,14 @@ function App() {
     readSaveTimersRef.current.clear();
   }, []);
 
-  const refreshConversations = useCallback(async (serverId, sourceSettings = null) => {
+  const refreshConversations = useCallback(async (serverId) => {
     if (!serverId) return;
     setLoading(true);
     try {
       const list = await loadConversations(serverId);
-      const hidden = sourceSettings?.hiddenConversations || {};
-      const visibleList = list.filter((conversation) => !hidden[conversationKey(serverId, conversation.conversation_id)]);
-      setConversations(visibleList);
-      if (!selectedRef.current && visibleList[0]) {
-        setSelected({ serverId, conversationId: visibleList[0].conversation_id });
+      setConversations(list);
+      if (!selectedRef.current && list[0]) {
+        setSelected({ serverId, conversationId: list[0].conversation_id });
       }
     } finally {
       setLoading(false);
@@ -624,10 +594,6 @@ function App() {
     let disposed = false;
     let reconnectTimer = null;
     let streamSocket = null;
-    const streamContext = {
-      serverId: activeServerId,
-      hiddenConversations: settings?.hiddenConversations || {}
-    };
     const connect = async () => {
       try {
         const url = await conversationStreamUrl(activeServerId);
@@ -641,13 +607,20 @@ function App() {
           } catch {
             return;
           }
-          const nextConversations = applyConversationStreamEvent(conversationsRef.current, payload, streamContext);
+          const nextConversations = applyConversationStreamEvent(conversationsRef.current, payload);
           conversationsRef.current = nextConversations;
           setConversations(nextConversations);
+          if (
+            payload.type === 'conversation_deleted'
+            && selectedRef.current?.serverId === activeServerId
+            && selectedRef.current?.conversationId === payload.conversation_id
+          ) {
+            const next = nextConversations[0];
+            setSelected(next ? { serverId: activeServerId, conversationId: next.conversation_id } : null);
+          }
           if (!selectedRef.current) {
             const fallbackConversation = payload.type === 'conversation_snapshot'
-              ? (payload.conversations || [])
-                .find((conversation) => !streamContext.hiddenConversations[conversationKey(activeServerId, conversation.conversation_id)])
+              ? (payload.conversations || [])[0]
               : payload.conversation;
             if (fallbackConversation?.conversation_id) {
               setSelected({ serverId: activeServerId, conversationId: fallbackConversation.conversation_id });
@@ -662,7 +635,7 @@ function App() {
             if (selectedConversation && completed && !isVisibleActive && hasUnreadConversation(completed)) {
               window.stellacode2?.notify?.({
                 title: 'Stellacode',
-                body: `${displayConversationName(settings, activeServerId, completed)} 有新消息`
+                body: `${displayConversationName(completed)} 有新消息`
               }).catch(() => {});
             }
           }
@@ -683,7 +656,7 @@ function App() {
       if (reconnectTimer) window.clearTimeout(reconnectTimer);
       if (streamSocket && streamSocket.readyState <= WebSocket.OPEN) streamSocket.close();
     };
-  }, [activeServerId, settingsReady, settings?.hiddenConversations]);
+  }, [activeServerId, settingsReady]);
 
   useEffect(() => {
     if (!appForeground) return;
@@ -701,7 +674,7 @@ function App() {
       }
       setActiveServerId(saved.activeServerId);
       setSettingsOpen(false);
-      await refreshConversations(saved.activeServerId, saved);
+      await refreshConversations(saved.activeServerId);
     } catch (error) {
       window.alert(error?.message || '保存设置失败');
     } finally {
@@ -714,13 +687,13 @@ function App() {
       setSettings(loaded);
       setSidebarMode(loaded.sidebarMode || 'expanded');
       setActiveServerId(loaded.activeServerId);
-      refreshConversations(loaded.activeServerId, loaded);
+      refreshConversations(loaded.activeServerId);
     });
   }, [refreshConversations]);
 
   const renameSelectedConversation = useCallback(async (conversation) => {
     if (!activeServerId || !conversation) return;
-    const currentName = displayConversationName(settings, activeServerId, conversation);
+    const currentName = displayConversationName(conversation);
     const nextName = window.prompt('重命名 Conversation', currentName);
     if (nextName === null) return;
     const nickname = nextName.trim();
@@ -739,28 +712,21 @@ function App() {
 
   const deleteSelectedConversation = useCallback(async (conversation) => {
     if (!activeServerId || !conversation || !settings) return;
-    const title = displayConversationName(settings, activeServerId, conversation);
+    const title = displayConversationName(conversation);
     if (!window.confirm(`删除 Conversation「${title}」？`)) return;
-    const key = conversationKey(activeServerId, conversation.conversation_id);
-    const nextSettings = {
-      ...settings,
-      hiddenConversations: {
-        ...(settings.hiddenConversations || {}),
-        [key]: true
-      }
-    };
-    await saveSettings(nextSettings);
-    setConversations((current) => {
-      const next = current.filter((item) => item.conversation_id !== conversation.conversation_id);
-      if (selected?.conversationId === conversation.conversation_id) {
-        setSelected(next[0] ? { serverId: activeServerId, conversationId: next[0].conversation_id } : null);
-      }
-      return next;
-    });
-    deleteConversation(activeServerId, conversation.conversation_id).catch((error) => {
-      console.warn('server-side conversation delete is unavailable:', error);
-    });
-  }, [activeServerId, saveSettings, selected?.conversationId, settings]);
+    try {
+      await deleteConversation(activeServerId, conversation.conversation_id);
+      setConversations((current) => {
+        const next = current.filter((item) => item.conversation_id !== conversation.conversation_id);
+        if (selected?.conversationId === conversation.conversation_id) {
+          setSelected(next[0] ? { serverId: activeServerId, conversationId: next[0].conversation_id } : null);
+        }
+        return next;
+      });
+    } catch (error) {
+      window.alert(error?.message || '删除 Conversation 失败');
+    }
+  }, [activeServerId, selected?.conversationId, settings]);
 
   const createNewConversation = useCallback(async ({ serverId, nickname }) => {
     if (!serverId || creatingConversation) return;
@@ -769,14 +735,12 @@ function App() {
       const response = await createConversation(serverId, { nickname });
       const conversationId = response?.conversation_id;
       if (!conversationId) throw new Error('创建 Conversation 失败');
-      let nextSettings = settings;
       if (settings?.activeServerId !== serverId) {
-        nextSettings = await saveSettings({ ...(settings || {}), activeServerId: serverId });
+        await saveSettings({ ...(settings || {}), activeServerId: serverId });
         setActiveServerId(serverId);
       }
       const list = await loadConversations(serverId);
-      const hidden = nextSettings?.hiddenConversations || {};
-      setConversations(list.filter((conversation) => !hidden[conversationKey(serverId, conversation.conversation_id)]));
+      setConversations(list);
       setSelected({ serverId, conversationId });
       setNewConversationOpen(false);
       setOverviewPanelOpen(false);
@@ -1135,10 +1099,12 @@ function App() {
           setMessagesReady(true);
           return;
         }
-        const initial = await loadMessageRange(selected.serverId, selected.conversationId, currentId, {
-          direction: 'before',
-          includeAnchor: true,
-          limit: 40
+        const currentIndex = Math.max(0, Number(currentId) || 0);
+        const limit = 40;
+        const offset = Math.max(0, currentIndex - limit + 1);
+        const initial = await loadMessages(selected.serverId, selected.conversationId, {
+          offset,
+          limit
         });
         if (!disposed && websocketKeyRef.current === key) {
           messagesRef.current = initial;
@@ -1149,9 +1115,8 @@ function App() {
       }
       if (Number(nextId) > Number(lastId) + 1) {
         const gap = Math.min(200, Number(nextId) - Number(lastId) - 1);
-        const missing = await loadMessageRange(selected.serverId, selected.conversationId, lastId, {
-          direction: 'after',
-          includeAnchor: false,
+        const missing = await loadMessages(selected.serverId, selected.conversationId, {
+          offset: Number(lastId) + 1,
           limit: gap
         });
         applyIncomingMessages(missing);
@@ -1162,11 +1127,8 @@ function App() {
       try {
         const info = await connectionInfo(selected.serverId);
         if (disposed || websocketKeyRef.current !== key) return;
-        const socket = new WebSocket(websocketUrl(info.baseUrl, info.token));
+        const socket = new WebSocket(websocketUrl(info.baseUrl, info.token, selected.conversationId));
         websocketRef.current = socket;
-        socket.addEventListener('open', () => {
-          socket.send(JSON.stringify({ type: 'subscribe_foreground', conversation_id: selected.conversationId }));
-        });
         socket.addEventListener('message', (event) => {
           let payload;
           try {
@@ -1176,36 +1138,18 @@ function App() {
           }
           if (payload.type === 'subscription_ack') {
             setSessionActivity(payload.reason === 'session_changed' ? 'Session 已切换' : '实时连接已同步');
+            if (payload.turn_progress) {
+              const progress = normalizeProgressFeedback(payload.turn_progress);
+              setSessionActivity(progress.state === 'done' ? '已完成' : progress.detail || progress.title);
+              updateRunningActivities((current) => [
+                ...current.filter((item) => item.id !== progress.id && item.id !== 'thinking'),
+                mergeProgressActivity(current, progress)
+              ]);
+            }
             reconcileAck(payload).catch(() => {});
           } else if (payload.type === 'messages') {
             applyIncomingMessages(payload.messages || []);
-          } else if (payload.type === 'processing') {
-            setConversations((current) => current.map((conversation) => (
-              conversation.conversation_id === selected.conversationId
-                ? {
-                  ...conversation,
-                  processing_state: payload.state,
-                  running: payload.state === 'typing'
-                }
-                : conversation
-            )));
-            if (payload.state === 'typing') {
-              setSessionActivity('正在思考');
-              updateRunningActivities((current) => [
-                ...current.filter((item) => item.id !== 'thinking'),
-                {
-                  id: 'thinking',
-                  title: '思考中',
-                  detail: '模型正在组织下一步操作',
-                  state: 'running',
-                  plan: current.findLast((item) => item.plan)?.plan || null,
-                  model: current.findLast((item) => item.model)?.model || ''
-                }
-              ]);
-            } else {
-              setSessionActivity('');
-            }
-          } else if (payload.type === 'progress_feedback' || payload.type === 'turn_progress') {
+          } else if (payload.type === 'turn_progress') {
             const progress = normalizeProgressFeedback(payload);
             setSessionActivity(progress.state === 'done' ? '已完成' : progress.detail || progress.title);
             if (progress.state === 'done' || progress.state === 'failed') {
@@ -1224,14 +1168,6 @@ function App() {
                 mergeProgressActivity(current, progress)
               ]);
             }
-          } else if (payload.type === 'status' && payload.status) {
-            setStatuses((prev) => new Map(prev).set(key, payload.status));
-            seenUsageMessagesRef.current.set(key, new Set());
-            setStatusDeltas((current) => {
-              const next = new Map(current);
-              next.delete(key);
-              return next;
-            });
           } else if (payload.type === 'error') {
             setSessionActivity(payload.message || payload.error || '实时连接错误');
           }
@@ -1410,11 +1346,13 @@ function App() {
     if (!anchorId) return false;
     loadingOlderRef.current = true;
     try {
-      const older = await loadMessageRange(selected.serverId, selected.conversationId, anchorId, {
-        direction: 'before',
-        includeAnchor: false,
-        limit: 40
-      });
+      const anchorIndex = Math.max(0, Number(anchorId) || 0);
+      const offset = Math.max(0, anchorIndex - 40);
+      const limit = anchorIndex - offset;
+      const older = limit > 0 ? await loadMessages(selected.serverId, selected.conversationId, {
+        offset,
+        limit
+      }) : [];
       if (websocketKeyRef.current !== key || !older.length) return false;
       setMessages((current) => {
         const next = mergeMessages(current, older);
@@ -1473,31 +1411,6 @@ function App() {
         return next;
       });
       if (commandState.control) {
-        (async () => {
-          for (let attempt = 0; attempt < 12; attempt += 1) {
-            if (attempt > 0) await sleep(200);
-            const status = await loadStatus(selected.serverId, selected.conversationId);
-            if (websocketKeyRef.current !== key) return;
-            setStatuses((prev) => new Map(prev).set(key, status));
-            if (commandState.name === '/model') {
-              setConversations((current) => current.map((conversation) => (
-                conversation.conversation_id === selected.conversationId
-                  ? clearConversationModelSelectionPending({
-                      ...conversation,
-                      model: status?.model || conversation.model
-                    })
-                  : conversation
-              )));
-            }
-            seenUsageMessagesRef.current.set(key, new Set());
-            setStatusDeltas((current) => {
-              const next = new Map(current);
-              next.delete(key);
-              return next;
-            });
-            if (!shouldRetryControlStatus(commandState, status)) return;
-          }
-        })().catch(() => {});
         setSessionActivity(commandState.detail);
         updateRunningActivities(() => [
           { id: 'command-sent', title: commandState.title, detail: commandState.detail, state: 'done' }
@@ -1515,9 +1428,8 @@ function App() {
       if (!websocketRef.current || websocketRef.current.readyState !== WebSocket.OPEN) {
         const anchorId = previousLastServerId || lastServerMessageId(messagesRef.current);
         const incoming = anchorId
-          ? await loadMessageRange(selected.serverId, selected.conversationId, anchorId, {
-            direction: 'after',
-            includeAnchor: false,
+          ? await loadMessages(selected.serverId, selected.conversationId, {
+            offset: Number(anchorId) + 1,
             limit: 80
           })
           : await loadMessages(selected.serverId, selected.conversationId);
@@ -1550,10 +1462,10 @@ function App() {
   }, [draft, selected, sending]);
 
   const title = activeConversation
-    ? displayConversationName(settings, selected.serverId, activeConversation)
+    ? displayConversationName(activeConversation)
     : 'Stellacode';
   const subtitle = activeConversation
-    ? [activeConversation.nickname || activeConversation.platform_chat_id, formatModel(activeConversation, selectedStatus), sessionActivity].filter(Boolean).join(' · ')
+    ? [activeConversation.nickname || activeConversation.platform_chat_id, formatModel(activeConversation, selectedConversationStatus), sessionActivity].filter(Boolean).join(' · ')
     : '选择或创建一个 Conversation';
 
   return (
@@ -1592,7 +1504,6 @@ function App() {
         onInstallUpdate={() => window.stellacode2?.updater?.install?.()}
       />
       <ConversationBar
-        settings={settings}
         serverId={activeServerId}
         sidebarMode={sidebarMode}
         conversations={conversations}
@@ -1616,7 +1527,7 @@ function App() {
         <ChatWorkspace
           title={title}
           conversationKey={selected ? conversationKey(selected.serverId, selected.conversationId) : ''}
-          modelSelectionPending={selectedStatus?.model_selection_pending ?? Boolean(activeConversation?.model_selection_pending)}
+          modelSelectionPending={Boolean(activeConversation?.model_selection_pending ?? selectedConversationStatus?.model_selection_pending)}
           messages={messages}
           messagesReady={messagesReady}
           draft={draft}
@@ -1633,7 +1544,7 @@ function App() {
       <OverviewPanel
         open={overviewPanelOpen}
         conversation={activeConversation}
-        status={selectedStatus}
+        status={selectedConversationStatus}
         usage={selectedUsage}
         title={title}
       />
@@ -1644,7 +1555,7 @@ function App() {
         expanded={workspaceExpanded}
         loading={workspaceLoading}
         error={workspaceError}
-        status={selectedStatus}
+        status={selectedConversationStatus}
         activeFilePath={activeFilePath}
         onRefresh={() => fetchWorkspacePath('', { force: true }).catch(() => {})}
         onToggleDirectory={toggleWorkspaceDirectory}

@@ -43,11 +43,6 @@ pub struct TerminalCreateRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct TerminalInputRequest {
-    pub data: String,
-}
-
-#[derive(Debug, Deserialize)]
 pub struct TerminalResizeRequest {
     pub cols: u16,
     pub rows: u16,
@@ -369,6 +364,29 @@ impl TerminalManager {
             inner.sessions.remove(terminal_id);
         }
         Ok(summary)
+    }
+
+    pub fn terminate_conversation(&self, conversation_id: &str) -> usize {
+        let Ok(mut inner) = self.inner.lock() else {
+            return 0;
+        };
+        let terminal_ids = inner
+            .sessions
+            .iter()
+            .filter(|(_, session)| session.conversation_id == conversation_id)
+            .map(|(terminal_id, _)| terminal_id.clone())
+            .collect::<Vec<_>>();
+        let mut terminated = 0;
+        for terminal_id in terminal_ids {
+            if let Some(session) = inner.sessions.remove(&terminal_id) {
+                if session.is_running() {
+                    let _ = kill_terminal_session(&session);
+                }
+                session.finish();
+                terminated += 1;
+            }
+        }
+        terminated
     }
 
     pub fn replay(
@@ -920,12 +938,6 @@ fn shell_quote(value: &str) -> String {
 
 fn clamp_dimension(value: u16, min: u16, max: u16) -> u16 {
     value.clamp(min, max)
-}
-
-pub fn output_limit(value: Option<usize>) -> usize {
-    value
-        .unwrap_or(DEFAULT_OUTPUT_LIMIT_BYTES)
-        .clamp(1, MAX_OUTPUT_LIMIT_BYTES)
 }
 
 fn unix_millis() -> u128 {

@@ -1,9 +1,10 @@
 import { formatCompactNumber, formatCost } from '../lib/format';
 
 export function OverviewPanel({ open, conversation, status, usage, title }) {
-  const remote = isRemoteStatus(status);
-  const model = status?.model || conversation?.model || 'pending';
-  const sandbox = status?.sandbox || 'pending';
+  const remoteLabel = conversation?.remote || status?.remote || '';
+  const remote = isRemoteStatus(remoteLabel);
+  const model = conversation?.model || status?.model || 'pending';
+  const sandbox = conversation?.sandbox || status?.sandbox || 'pending';
   return (
     <aside className={`right-panel overview-panel${open ? ' open' : ''}`} aria-hidden={!open}>
       <header className="file-browser-header">
@@ -20,7 +21,7 @@ export function OverviewPanel({ open, conversation, status, usage, title }) {
             <section className="overview-hero">
               <span>{conversation.platform_chat_id || conversation.conversation_id}</span>
               <strong>{title}</strong>
-              <p><i className={`status-dot${remote ? ' remote' : ''}`} />{remote ? status.remote : 'local workspace'}</p>
+              <p><i className={`status-dot${remote ? ' remote' : ''}`} />{remote ? remoteLabel : 'local workspace'}</p>
             </section>
             <section className="overview-metrics">
               <div>
@@ -71,8 +72,8 @@ function UsageBar({ label, value, total }) {
   );
 }
 
-function isRemoteStatus(status) {
-  if (!status?.remote) return false;
-  const normalized = String(status.remote).toLowerCase();
+function isRemoteStatus(remote) {
+  if (!remote) return false;
+  const normalized = String(remote).toLowerCase();
   return !['selectable', 'disabled', 'local', 'none'].includes(normalized);
 }

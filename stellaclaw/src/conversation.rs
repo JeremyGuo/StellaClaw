@@ -25,11 +25,11 @@ use stellaclaw_core::{
 
 use crate::{
     channels::types::{
-        ChannelEvent, OutgoingAttachment, OutgoingDelivery, OutgoingDispatch, OutgoingError,
-        OutgoingErrorScope, OutgoingErrorSeverity, OutgoingOption, OutgoingOptions,
-        OutgoingProcessing, OutgoingProgressFeedback, OutgoingStatus, ProcessingState,
-        ProgressFeedbackFinalState, TurnProgress, TurnProgressPhase, TurnProgressPlan,
-        TurnProgressPlanItem, TurnProgressPlanItemStatus,
+        ChannelEvent, OutgoingAttachment, OutgoingConversationUpdated, OutgoingDelivery,
+        OutgoingDispatch, OutgoingError, OutgoingErrorScope, OutgoingErrorSeverity, OutgoingOption,
+        OutgoingOptions, OutgoingProcessing, OutgoingProgressFeedback, OutgoingStatus,
+        ProcessingState, ProgressFeedbackFinalState, TurnProgress, TurnProgressPhase,
+        TurnProgressPlan, TurnProgressPlanItem, TurnProgressPlanItemStatus,
     },
     config::{
         ModelSelection, SandboxConfig, SandboxMode, SessionDefaults, SessionProfile,
@@ -98,7 +98,13 @@ pub enum ConversationControl {
 #[derive(Debug, Clone)]
 pub enum ConversationCommand {
     Incoming(IncomingConversationMessage),
-    RunCronTask { task: CronTaskRecord },
+    RunCronTask {
+        task: CronTaskRecord,
+    },
+    Shutdown {
+        reason: &'static str,
+        ack_tx: Sender<()>,
+    },
 }
 
 const TYPING_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(4);
@@ -326,19 +332,31 @@ fn run_conversation(
         }
         runtime.pump_processing_keepalive()?;
         if changed {
-            runtime.persist_state()?;
+            runtime.persist_state_and_publish()?;
         }
 
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(ConversationCommand::Incoming(message)) => {
                 if runtime.handle_incoming(message)? {
-                    runtime.persist_state()?;
+                    runtime.persist_state_and_publish()?;
                 }
             }
             Ok(ConversationCommand::RunCronTask { task }) => {
                 if runtime.run_cron_task(task)? {
-                    runtime.persist_state()?;
+                    runtime.persist_state_and_publish()?;
                 }
+            }
+            Ok(ConversationCommand::Shutdown { reason, ack_tx }) => {
+                runtime.logger.info(
+                    "conversation_shutdown_requested",
+                    json!({
+                        "conversation_id": runtime.state.conversation_id,
+                        "reason": reason,
+                    }),
+                );
+                runtime.shutdown();
+                let _ = ack_tx.send(());
+                break;
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -613,6 +631,11 @@ impl ConversationRuntime {
         let raw = serde_json::to_string_pretty(&self.state)
             .context("failed to serialize conversation state")?;
         fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))
+    }
+
+    fn persist_state_and_publish(&self) -> Result<()> {
+        self.persist_state()?;
+        self.send_conversation_updated()
     }
 
     fn current_main_model(&self) -> Result<ModelConfig> {
@@ -1011,7 +1034,7 @@ impl ConversationRuntime {
         match session_type {
             SessionType::Foreground => {
                 self.finish_foreground_progress(ProgressFeedbackFinalState::Done, None)?;
-                self.send_delivery_from_text(render_chat_message(&message))?;
+                self.send_delivery_from_message(message)?;
                 Ok(false)
             }
             SessionType::Background => {
@@ -1757,6 +1780,23 @@ impl ConversationRuntime {
         self.send_delivery(clean_text, attachments, None)
     }
 
+    fn send_delivery_from_message(&self, message: ChatMessage) -> Result<()> {
+        self.outgoing_tx
+            .send(OutgoingDispatch::Event(ChannelEvent::Delivery(
+                OutgoingDelivery {
+                    channel_id: self.state.channel_id.clone(),
+                    platform_chat_id: self.state.platform_chat_id.clone(),
+                    conversation_id: self.state.conversation_id.clone(),
+                    session_id: Some(self.state.session_binding.foreground_session_id.clone()),
+                    message: Some(message),
+                    text: String::new(),
+                    attachments: Vec::new(),
+                    options: None,
+                },
+            )))
+            .map_err(|_| anyhow!("outgoing delivery channel closed"))
+    }
+
     fn send_delivery(
         &self,
         text: String,
@@ -1768,6 +1808,9 @@ impl ConversationRuntime {
                 OutgoingDelivery {
                     channel_id: self.state.channel_id.clone(),
                     platform_chat_id: self.state.platform_chat_id.clone(),
+                    conversation_id: self.state.conversation_id.clone(),
+                    session_id: None,
+                    message: None,
                     text,
                     attachments,
                     options,
@@ -1835,6 +1878,18 @@ impl ConversationRuntime {
                 },
             )))
             .map_err(|_| anyhow!("outgoing progress channel closed"))
+    }
+
+    fn send_conversation_updated(&self) -> Result<()> {
+        self.outgoing_tx
+            .send(OutgoingDispatch::Event(ChannelEvent::ConversationUpdated(
+                OutgoingConversationUpdated {
+                    channel_id: self.state.channel_id.clone(),
+                    platform_chat_id: self.state.platform_chat_id.clone(),
+                    conversation_id: self.state.conversation_id.clone(),
+                },
+            )))
+            .map_err(|_| anyhow!("outgoing conversation update channel closed"))
     }
 
     fn start_foreground_progress(&mut self, turn_id: String) -> Result<()> {

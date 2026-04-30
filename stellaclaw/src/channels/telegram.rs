@@ -17,15 +17,15 @@ use stellaclaw_core::session_actor::{FileItem, FileState};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
-    conversation::{ConversationControl, IncomingConversationMessage},
+    conversation::{render_chat_message, ConversationControl, IncomingConversationMessage},
     conversation_id_manager::ConversationIdManager,
     logger::StellaclawLogger,
 };
 
 use super::{
     types::{
-        IncomingDispatch, OutgoingAttachment, OutgoingAttachmentKind, OutgoingDelivery,
-        OutgoingError, OutgoingOptions, OutgoingProgressFeedback, OutgoingStatus,
+        IncomingDispatch, IncomingMessageDispatch, OutgoingAttachment, OutgoingAttachmentKind,
+        OutgoingDelivery, OutgoingError, OutgoingOptions, OutgoingProgressFeedback, OutgoingStatus,
         OutgoingUsageSummary, OutgoingUsageTotals, ProcessingState, ProgressFeedbackFinalState,
         TurnProgressPhase, TurnProgressPlanItemStatus,
     },
@@ -244,7 +244,7 @@ impl TelegramChannel {
         if control.is_none() && text.trim().is_empty() && files.is_empty() {
             return Ok(());
         }
-        let incoming = IncomingDispatch {
+        let incoming = IncomingDispatch::Message(IncomingMessageDispatch {
             channel_id: self.id.clone(),
             platform_chat_id: chat_id,
             conversation_id,
@@ -260,7 +260,7 @@ impl TelegramChannel {
                 files,
                 control,
             },
-        };
+        });
         dispatch_tx
             .send(incoming)
             .map_err(|_| anyhow!("dispatcher channel closed"))
@@ -306,7 +306,7 @@ impl TelegramChannel {
         if control.is_none() && text.trim().is_empty() && files.is_empty() {
             return Ok(());
         }
-        let incoming = IncomingDispatch {
+        let incoming = IncomingDispatch::Message(IncomingMessageDispatch {
             channel_id: self.id.clone(),
             platform_chat_id: chat_id,
             conversation_id,
@@ -322,7 +322,7 @@ impl TelegramChannel {
                 files,
                 control,
             },
-        };
+        });
         dispatch_tx
             .send(incoming)
             .map_err(|_| anyhow!("dispatcher channel closed"))
@@ -1022,8 +1022,14 @@ impl Channel for TelegramChannel {
 
     fn send_delivery(&self, delivery: &OutgoingDelivery) -> Result<()> {
         let options = delivery.options.as_ref();
+        let rendered_message = delivery.message.as_ref().map(render_chat_message);
         let text = if !delivery.text.trim().is_empty() {
             delivery.text.as_str()
+        } else if let Some(rendered) = rendered_message
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
+            rendered
         } else if let Some(options) = options {
             options.prompt.as_str()
         } else {

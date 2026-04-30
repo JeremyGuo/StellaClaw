@@ -28,6 +28,9 @@ pub trait Channel: Send + Sync {
                 self.set_processing(&processing.platform_chat_id, processing.state)
             }
             ChannelEvent::ProgressFeedback(feedback) => self.update_progress_feedback(feedback),
+            ChannelEvent::ConversationUpdated(updated) => {
+                self.conversation_updated(&updated.platform_chat_id, &updated.conversation_id)
+            }
             ChannelEvent::Status(status) => self.send_status(status),
             ChannelEvent::Error(error) => self.send_error(error),
         }
@@ -45,6 +48,9 @@ pub trait Channel: Send + Sync {
         self.send_delivery(&OutgoingDelivery {
             channel_id: error.channel_id.clone(),
             platform_chat_id: error.platform_chat_id.clone(),
+            conversation_id: error.conversation_id.clone(),
+            session_id: None,
+            message: None,
             text,
             attachments: Vec::new(),
             options: None,
@@ -54,6 +60,9 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
     fn update_progress_feedback(&self, _feedback: &OutgoingProgressFeedback) -> Result<()> {
+        Ok(())
+    }
+    fn conversation_updated(&self, _platform_chat_id: &str, _conversation_id: &str) -> Result<()> {
         Ok(())
     }
     fn spawn_ingress(

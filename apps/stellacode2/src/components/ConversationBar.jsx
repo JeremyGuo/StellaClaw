@@ -3,19 +3,15 @@ import * as ContextMenu from '@radix-ui/react-context-menu';
 import { conversationKey, displayConversationName } from '../lib/api';
 import { formatModel } from '../lib/format';
 
-function hasUnreadMessage(settings, key, conversation, active) {
+function hasUnreadMessage(conversation, active) {
   if (active) return false;
   const lastId = Number(conversation?.last_message_id);
   if (!Number.isFinite(lastId)) return false;
-  const seenId = Number(
-    conversation?.last_seen_message_id
-    ?? settings?.conversationRead?.[key]?.lastSeenMessageId
-    ?? -1
-  );
+  const seenId = Number(conversation?.last_seen_message_id ?? -1);
   return lastId > seenId;
 }
 
-export function ConversationBar({ settings, serverId, sidebarMode, conversations, statuses, selected, loading, onSelect, onOpenSettings, onRename, onDelete }) {
+export function ConversationBar({ serverId, sidebarMode, conversations, statuses, selected, loading, onSelect, onOpenSettings, onRename, onDelete }) {
   return (
     <aside className="conversation-bar">
       <div className="conversation-top-spacer" />
@@ -38,7 +34,7 @@ export function ConversationBar({ settings, serverId, sidebarMode, conversations
           const key = conversationKey(serverId, conversation.conversation_id);
           const active = selected?.conversationId === conversation.conversation_id;
           const status = statuses.get(key);
-          const unread = hasUnreadMessage(settings, key, conversation, active);
+          const unread = hasUnreadMessage(conversation, active);
           return (
             <ContextMenu.Root key={conversation.conversation_id}>
               <ContextMenu.Trigger asChild>
@@ -48,7 +44,7 @@ export function ConversationBar({ settings, serverId, sidebarMode, conversations
                   onClick={() => onSelect({ serverId, conversationId: conversation.conversation_id })}
                 >
                   {unread && <i className="conversation-unread-dot" aria-label="有新消息" />}
-                  <strong>{displayConversationName(settings, serverId, conversation)}</strong>
+                  <strong>{displayConversationName(conversation)}</strong>
                   <span>{conversation.nickname || conversation.platform_chat_id || 'Local Stellaclaw'}</span>
                   <em>{formatModel(conversation, status)}</em>
                 </button>

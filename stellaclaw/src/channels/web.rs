@@ -18,13 +18,13 @@ use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use stellaclaw_core::{
     model_config::{ModelCapability, ProviderType},
-    session_actor::{ChatMessage, ChatMessageItem, ChatRole, FileItem, TokenUsage},
+    session_actor::{ChatMessage, ChatMessageItem, ChatRole, FileItem, TokenUsage, ToolRemoteMode},
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     cache::{CacheManager, CachedThumbnail},
-    config::{ModelSelection, StellaclawConfig},
+    config::{ModelSelection, SandboxMode, StellaclawConfig},
     conversation::{
         attachment_marker, extract_attachment_references_with_markers,
         load_conversation_status_snapshot, load_or_create_conversation_state,
@@ -37,18 +37,18 @@ use crate::{
         download_workspace_archive, list_workspace_entries, read_workspace_file,
         upload_workspace_archive, RemoteActorError,
     },
-    workspace::{is_sshfs_workspace_entry_name, sshfs_workspace_root},
+    workspace::{is_sshfs_workspace_entry_name, sshfs_workspace_root, unmount_sshfs_workspace},
 };
 
 use super::{
     types::{
-        IncomingDispatch, OutgoingAttachment, OutgoingAttachmentKind, OutgoingDelivery,
-        OutgoingError, OutgoingProgressFeedback, OutgoingStatus, ProcessingState,
+        IncomingDispatch, IncomingMessageDispatch, OutgoingAttachment, OutgoingAttachmentKind,
+        OutgoingDelivery, OutgoingError, OutgoingProgressFeedback, OutgoingStatus, ProcessingState,
         ProgressFeedbackFinalState, TurnProgressPhase,
     },
     web_terminal::{
-        output_limit, TerminalAttach, TerminalCreateRequest, TerminalInputRequest, TerminalManager,
-        TerminalReplay, TerminalResizeRequest, WebTerminalError,
+        TerminalAttach, TerminalCreateRequest, TerminalManager, TerminalReplay,
+        TerminalResizeRequest, WebTerminalError,
     },
     Channel,
 };
@@ -77,6 +77,7 @@ pub struct WebChannel {
     websocket_subscribers: Arc<Mutex<HashMap<String, Vec<WebSocketSubscriber>>>>,
     conversation_stream_subscribers: Arc<Mutex<Vec<Sender<Value>>>>,
     processing_states: Arc<Mutex<HashMap<String, ProcessingState>>>,
+    active_turn_progress: Arc<Mutex<HashMap<String, Value>>>,
     seen_states: Arc<Mutex<HashMap<String, ConversationSeen>>>,
 }
 
@@ -117,6 +118,7 @@ impl WebChannel {
             websocket_subscribers: Arc::new(Mutex::new(HashMap::new())),
             conversation_stream_subscribers: Arc::new(Mutex::new(Vec::new())),
             processing_states: Arc::new(Mutex::new(HashMap::new())),
+            active_turn_progress: Arc::new(Mutex::new(HashMap::new())),
             seen_states: Arc::new(Mutex::new(seen_states)),
         }
     }
@@ -205,22 +207,18 @@ impl WebChannel {
         match (request.method.as_str(), segments.as_slice()) {
             ("GET", ["models"]) => self.list_models(),
             ("GET", ["conversations"]) => self.list_conversations(&request.query),
-            ("GET", ["conversations", "seen"]) => self.list_conversation_seen(),
             ("POST", ["conversations"]) => self.create_conversation(&request.body, id_manager),
             ("PATCH", ["conversations", conversation_id]) => {
                 self.update_conversation(conversation_id, &request.body)
+            }
+            ("DELETE", ["conversations", conversation_id]) => {
+                self.delete_conversation(conversation_id, dispatch_tx, id_manager)
             }
             ("POST", ["conversations", conversation_id, "seen"]) => {
                 self.mark_conversation_seen(conversation_id, &request.body)
             }
             ("GET", ["conversations", conversation_id, "messages"]) => {
                 self.list_messages(conversation_id, &request.query)
-            }
-            ("GET", ["conversations", conversation_id, "messages", "after", message_id]) => {
-                self.list_messages_after(conversation_id, message_id, &request.query)
-            }
-            ("GET", ["conversations", conversation_id, "messages", "range"]) => {
-                self.list_messages_range(conversation_id, &request.query)
             }
             ("GET", ["conversations", conversation_id, "messages", message_id]) => {
                 self.message_detail(conversation_id, message_id)
@@ -254,15 +252,6 @@ impl WebChannel {
             }
             ("DELETE", ["conversations", conversation_id, "terminals", terminal_id]) => {
                 self.terminate_terminal(conversation_id, terminal_id)
-            }
-            ("GET", ["conversations", conversation_id, "terminals", terminal_id, "output"]) => {
-                self.terminal_output(conversation_id, terminal_id, &request.query)
-            }
-            ("POST", ["conversations", conversation_id, "terminals", terminal_id, "input"]) => {
-                self.terminal_input(conversation_id, terminal_id, &request.body)
-            }
-            ("POST", ["conversations", conversation_id, "terminals", terminal_id, "resize"]) => {
-                self.resize_terminal(conversation_id, terminal_id, &request.body)
             }
             _ => Err(ApiError::new(404, "not_found")),
         }
@@ -337,6 +326,7 @@ impl WebChannel {
                         .unwrap_or(ProcessingState::Idle);
                     let message_summary = conversation_message_summary(&self.workdir, &state);
                     conversations.push(ConversationSummary::from_state(
+                        &self.workdir,
                         &state,
                         &self.config,
                         processing_state,
@@ -348,20 +338,6 @@ impl WebChannel {
         }
         conversations.sort_by(|left, right| left.conversation_id.cmp(&right.conversation_id));
         Ok(conversations)
-    }
-
-    fn list_conversation_seen(&self) -> ApiResult<HttpResponse> {
-        let seen = self
-            .seen_states
-            .lock()
-            .map_err(|_| ApiError::new(500, "conversation seen lock poisoned"))?;
-        Ok(json_response(
-            200,
-            json!({
-                "channel_id": self.id,
-                "seen": &*seen,
-            }),
-        ))
     }
 
     fn mark_conversation_seen(
@@ -398,7 +374,6 @@ impl WebChannel {
         self.persist_seen_states(&snapshot)?;
         self.publish_conversation_stream_event(json!({
             "type": "conversation_seen",
-            "subscription": "conversation_list",
             "channel_id": self.id,
             "conversation_id": conversation_id,
             "seen": &seen,
@@ -511,6 +486,7 @@ impl WebChannel {
             .and_then(|states| states.get(&state.platform_chat_id).copied())
             .unwrap_or(ProcessingState::Idle);
         let summary = ConversationSummary::from_state(
+            &self.workdir,
             &state,
             &self.config,
             processing_state,
@@ -522,6 +498,89 @@ impl WebChannel {
             200,
             json!({
                 "conversation": summary,
+            }),
+        ))
+    }
+
+    fn delete_conversation(
+        &self,
+        conversation_id: &str,
+        dispatch_tx: Sender<IncomingDispatch>,
+        id_manager: Arc<Mutex<ConversationIdManager>>,
+    ) -> ApiResult<HttpResponse> {
+        let state = self.load_web_state(conversation_id)?;
+        let (response_tx, response_rx) = bounded(1);
+        dispatch_tx
+            .send(IncomingDispatch::DeleteConversation {
+                channel_id: self.id.clone(),
+                platform_chat_id: state.platform_chat_id.clone(),
+                conversation_id: conversation_id.to_string(),
+                response_tx,
+            })
+            .map_err(|_| ApiError::new(503, "dispatcher is not available"))?;
+        response_rx
+            .recv_timeout(Duration::from_secs(6))
+            .map_err(|_| ApiError::new(503, "conversation shutdown timed out"))?
+            .map_err(|error| ApiError::new(500, error))?;
+
+        let terminated_terminals = self
+            .terminal_manager
+            .terminate_conversation(conversation_id);
+        if matches!(&state.tool_remote_mode, ToolRemoteMode::FixedSsh { .. }) {
+            unmount_sshfs_workspace(&self.workdir, conversation_id).map_err(ApiError::internal)?;
+            let sshfs_root = sshfs_workspace_root(&self.workdir, conversation_id);
+            if sshfs_root.exists() {
+                let _ = fs::remove_dir(&sshfs_root);
+            }
+        }
+
+        let conversation_root = self.workdir.join("conversations").join(conversation_id);
+        fs::remove_dir_all(&conversation_root).map_err(ApiError::internal)?;
+
+        let removed_seen = {
+            let mut seen_states = self
+                .seen_states
+                .lock()
+                .map_err(|_| ApiError::new(500, "conversation seen lock poisoned"))?;
+            let removed = seen_states.remove(conversation_id).is_some();
+            let snapshot = removed.then(|| seen_states.clone());
+            (removed, snapshot)
+        };
+        if let (true, Some(snapshot)) = removed_seen {
+            self.persist_seen_states(&snapshot)?;
+        }
+        id_manager
+            .lock()
+            .map_err(|_| ApiError::new(500, "conversation id manager lock poisoned"))?
+            .remove_mapping(&self.id, &state.platform_chat_id)
+            .map_err(|error| ApiError::new(500, error))?;
+        if let Ok(mut subscribers) = self.websocket_subscribers.lock() {
+            subscribers.remove(&state.platform_chat_id);
+        }
+        if let Ok(mut progress) = self.active_turn_progress.lock() {
+            progress.remove(&state.platform_chat_id);
+        }
+        self.publish_conversation_stream_event(json!({
+            "type": "conversation_deleted",
+            "channel_id": self.id,
+            "conversation_id": conversation_id,
+            "platform_chat_id": &state.platform_chat_id,
+        }));
+        self.logger.info(
+            "web_conversation_deleted",
+            json!({
+                "channel_id": self.id,
+                "conversation_id": conversation_id,
+                "platform_chat_id": &state.platform_chat_id,
+                "terminated_terminals": terminated_terminals,
+            }),
+        );
+        Ok(json_response(
+            200,
+            json!({
+                "conversation_id": conversation_id,
+                "deleted": true,
+                "terminated_terminals": terminated_terminals,
             }),
         ))
     }
@@ -552,7 +611,7 @@ impl WebChannel {
             .starts_with('/')
             .then(|| parse_web_control(text.trim()))
             .flatten();
-        let incoming = IncomingDispatch {
+        let incoming = IncomingDispatch::Message(IncomingMessageDispatch {
             channel_id: self.id.clone(),
             platform_chat_id: state.platform_chat_id.clone(),
             conversation_id: conversation_id.to_string(),
@@ -564,7 +623,7 @@ impl WebChannel {
                 files,
                 control,
             },
-        };
+        });
         dispatch_tx
             .send(incoming)
             .map_err(|_| ApiError::new(503, "dispatcher is not available"))?;
@@ -593,67 +652,6 @@ impl WebChannel {
         Ok(json_response(
             200,
             message_page_payload(&state, &attachments, &page, offset, limit),
-        ))
-    }
-
-    fn list_messages_after(
-        &self,
-        conversation_id: &str,
-        message_id: &str,
-        query: &HashMap<String, String>,
-    ) -> ApiResult<HttpResponse> {
-        let index = parse_message_id(message_id)?;
-        let limit = query_usize(query, "limit", 50).min(200);
-        let state = self.load_web_state(conversation_id)?;
-        let offset = index.saturating_add(1);
-        let page = read_message_page(&message_log_path(&self.workdir, &state), offset, limit)
-            .map_err(ApiError::internal)?;
-        let attachments =
-            WebAttachmentContext::new(&self.workdir, &state, self.cache_manager.clone());
-        Ok(json_response(
-            200,
-            message_page_payload(&state, &attachments, &page, offset, limit),
-        ))
-    }
-
-    fn list_messages_range(
-        &self,
-        conversation_id: &str,
-        query: &HashMap<String, String>,
-    ) -> ApiResult<HttpResponse> {
-        let anchor_id = query
-            .get("anchor_id")
-            .or_else(|| query.get("message_id"))
-            .ok_or_else(|| ApiError::new(400, "anchor_id is required"))?;
-        let anchor = parse_message_id(anchor_id)?;
-        let direction = query
-            .get("direction")
-            .map(|value| MessageRangeDirection::parse(value))
-            .transpose()?
-            .unwrap_or(MessageRangeDirection::Before);
-        let include_anchor = query_bool(query, "include_anchor", true);
-        let limit = query_usize(query, "limit", 50).min(200);
-        let state = self.load_web_state(conversation_id)?;
-        let path = message_log_path(&self.workdir, &state);
-        let total = count_message_lines(&path).map_err(ApiError::internal)?;
-        if anchor >= total {
-            return Err(ApiError::new(404, "message_not_found"));
-        }
-        let (start, end) = message_range_bounds(total, anchor, direction, include_anchor, limit);
-        let page = read_message_page(&path, start, end.saturating_sub(start))
-            .map_err(ApiError::internal)?;
-        let attachments =
-            WebAttachmentContext::new(&self.workdir, &state, self.cache_manager.clone());
-        Ok(json_response(
-            200,
-            message_range_payload(
-                &state,
-                &attachments,
-                &page,
-                anchor,
-                direction,
-                include_anchor,
-            ),
         ))
     }
 
@@ -700,13 +698,20 @@ impl WebChannel {
             return Ok(());
         };
         match segments.as_slice() {
-            ["ws"] => {
-                write_websocket_handshake(&mut stream, key)?;
-                self.run_websocket_subscription(stream)
-            }
             ["conversations", "stream"] => {
                 write_websocket_handshake(&mut stream, key)?;
                 self.run_conversation_stream(stream)
+            }
+            ["conversations", conversation_id, "foreground", "ws"] => {
+                let state = match self.load_web_state(conversation_id) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        write_http_response(&mut stream, json_error(error.status, &error.message))?;
+                        return Ok(());
+                    }
+                };
+                write_websocket_handshake(&mut stream, key)?;
+                self.run_foreground_websocket_stream(stream, state)
             }
             ["conversations", conversation_id, "terminals", terminal_id, "stream"] => {
                 let state = match self.load_web_state(conversation_id) {
@@ -784,7 +789,6 @@ impl WebChannel {
             stream,
             &json!({
                 "type": "conversation_snapshot",
-                "subscription": "conversation_list",
                 "channel_id": self.id,
                 "conversations": conversations,
             }),
@@ -806,6 +810,7 @@ impl WebChannel {
             .and_then(|states| states.get(&state.platform_chat_id).copied())
             .unwrap_or(ProcessingState::Idle);
         let summary = ConversationSummary::from_state(
+            &self.workdir,
             state,
             &self.config,
             processing_state,
@@ -814,7 +819,6 @@ impl WebChannel {
         );
         self.publish_conversation_stream_event(json!({
             "type": "conversation_upserted",
-            "subscription": "conversation_list",
             "channel_id": self.id,
             "conversation_id": &state.conversation_id,
             "conversation": summary,
@@ -836,7 +840,6 @@ impl WebChannel {
         };
         self.publish_conversation_stream_event(json!({
             "type": "conversation_processing",
-            "subscription": "conversation_list",
             "channel_id": self.id,
             "conversation_id": &conversation_state.conversation_id,
             "platform_chat_id": platform_chat_id,
@@ -873,6 +876,7 @@ impl WebChannel {
             .map(|ordering| ordering.is_gt())
             .unwrap_or(true);
         let summary = ConversationSummary::from_state(
+            &self.workdir,
             &state,
             &self.config,
             ProcessingState::Idle,
@@ -881,7 +885,6 @@ impl WebChannel {
         );
         self.publish_conversation_stream_event(json!({
             "type": "conversation_turn_completed",
-            "subscription": "conversation_list",
             "channel_id": self.id,
             "conversation_id": &state.conversation_id,
             "platform_chat_id": &state.platform_chat_id,
@@ -904,41 +907,25 @@ impl WebChannel {
             .is_some_and(|token| token == &self.token)
     }
 
-    fn run_websocket_subscription(&self, mut stream: TcpStream) -> Result<()> {
-        let subscribe = loop {
-            match read_websocket_frame(&mut stream)? {
-                WebSocketFrame::Text(text) => break parse_websocket_subscribe(&text)?,
-                WebSocketFrame::Ping(payload) => write_websocket_frame(&mut stream, 0xA, &payload)?,
-                WebSocketFrame::Close => return Ok(()),
-                WebSocketFrame::Binary(_) | WebSocketFrame::Pong => {}
-            }
-        };
-        if subscribe
-            .kind
-            .as_deref()
-            .is_some_and(|kind| kind != "subscribe_foreground")
-        {
-            let error = json!({
-                "type": "error",
-                "error": "unsupported_subscription",
-            });
-            write_websocket_json(&mut stream, &error)?;
-            write_websocket_close(&mut stream)?;
-            return Ok(());
-        }
-
-        let mut state = self
-            .load_web_state(&subscribe.conversation_id)
-            .map_err(api_anyhow)?;
+    fn run_foreground_websocket_stream(
+        &self,
+        mut stream: TcpStream,
+        mut state: ConversationState,
+    ) -> Result<()> {
+        let conversation_id = state.conversation_id.clone();
         let mut session_id = state.session_binding.foreground_session_id.clone();
         let mut log_path = message_log_path(&self.workdir, &state);
         let mut next_index = count_message_lines(&log_path)?;
-        let mut log_len = message_log_len(&log_path);
         let (event_tx, event_rx) = unbounded();
         self.register_websocket_subscriber(&state, event_tx);
         write_websocket_json(
             &mut stream,
-            &websocket_subscription_ack(&state, next_index, "subscribed"),
+            &websocket_subscription_ack(
+                &state,
+                next_index,
+                "subscribed",
+                self.active_turn_progress_for_state(&state),
+            ),
         )?;
         let mut last_heartbeat = Instant::now();
 
@@ -957,35 +944,22 @@ impl WebChannel {
                 write_websocket_frame(&mut stream, 0x9, &[])?;
                 last_heartbeat = Instant::now();
             }
-            state = self
-                .load_web_state(&subscribe.conversation_id)
-                .map_err(api_anyhow)?;
+            state = self.load_web_state(&conversation_id).map_err(api_anyhow)?;
             if state.session_binding.foreground_session_id != session_id {
                 session_id = state.session_binding.foreground_session_id.clone();
                 log_path = message_log_path(&self.workdir, &state);
                 next_index = count_message_lines(&log_path)?;
-                log_len = message_log_len(&log_path);
                 write_websocket_json(
                     &mut stream,
-                    &websocket_subscription_ack(&state, next_index, "session_changed"),
+                    &websocket_subscription_ack(
+                        &state,
+                        next_index,
+                        "session_changed",
+                        self.active_turn_progress_for_state(&state),
+                    ),
                 )?;
                 continue;
             }
-
-            let next_log_len = message_log_len(&log_path);
-            if next_log_len <= log_len {
-                continue;
-            }
-            log_len = next_log_len;
-            let page = read_message_page(&log_path, next_index, usize::MAX)?;
-            if page.end <= next_index {
-                continue;
-            }
-            let attachments =
-                WebAttachmentContext::new(&self.workdir, &state, self.cache_manager.clone());
-            let payload = websocket_messages_payload(&state, &attachments, &page);
-            next_index = page.end;
-            write_websocket_json(&mut stream, &payload)?;
         }
     }
 
@@ -1021,6 +995,21 @@ impl WebChannel {
         if remove_key {
             subscribers.remove(platform_chat_id);
         }
+    }
+
+    fn active_turn_progress_for_state(&self, state: &ConversationState) -> Option<Value> {
+        let mut value = self
+            .active_turn_progress
+            .lock()
+            .ok()
+            .and_then(|progress| progress.get(&state.platform_chat_id).cloned())?;
+        if let Value::Object(map) = &mut value {
+            map.entry("conversation_id".to_string())
+                .or_insert_with(|| Value::String(state.conversation_id.clone()));
+            map.entry("platform_chat_id".to_string())
+                .or_insert_with(|| Value::String(state.platform_chat_id.clone()));
+        }
+        Some(value)
     }
 
     fn conversation_seen(&self, conversation_id: &str) -> Option<ConversationSeen> {
@@ -1353,59 +1342,6 @@ impl WebChannel {
         Ok(json_response(200, json!(terminal)))
     }
 
-    fn terminal_output(
-        &self,
-        conversation_id: &str,
-        terminal_id: &str,
-        query: &HashMap<String, String>,
-    ) -> ApiResult<HttpResponse> {
-        let state = self.load_web_state(conversation_id)?;
-        let offset = query
-            .get("offset")
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(0);
-        let limit = output_limit(
-            query
-                .get("limit_bytes")
-                .and_then(|value| value.parse().ok()),
-        );
-        let output = self
-            .terminal_manager
-            .output(&state, terminal_id, offset, limit)
-            .map_err(terminal_api_error)?;
-        Ok(json_response(200, json!(output)))
-    }
-
-    fn terminal_input(
-        &self,
-        conversation_id: &str,
-        terminal_id: &str,
-        body: &[u8],
-    ) -> ApiResult<HttpResponse> {
-        let state = self.load_web_state(conversation_id)?;
-        let request: TerminalInputRequest = parse_json(body)?;
-        let terminal = self
-            .terminal_manager
-            .input(&state, terminal_id, &request.data)
-            .map_err(terminal_api_error)?;
-        Ok(json_response(202, json!(terminal)))
-    }
-
-    fn resize_terminal(
-        &self,
-        conversation_id: &str,
-        terminal_id: &str,
-        body: &[u8],
-    ) -> ApiResult<HttpResponse> {
-        let state = self.load_web_state(conversation_id)?;
-        let request: TerminalResizeRequest = parse_json(body)?;
-        let terminal = self
-            .terminal_manager
-            .resize(&state, terminal_id, request)
-            .map_err(terminal_api_error)?;
-        Ok(json_response(200, json!(terminal)))
-    }
-
     fn terminate_terminal(
         &self,
         conversation_id: &str,
@@ -1447,9 +1383,48 @@ impl Channel for WebChannel {
             json!({
                 "channel_id": delivery.channel_id,
                 "platform_chat_id": delivery.platform_chat_id,
+                "conversation_id": delivery.conversation_id,
+                "session_id": delivery.session_id,
                 "text_len": delivery.text.len(),
                 "attachment_count": delivery.attachments.len(),
+                "has_message": delivery.message.is_some(),
             }),
+        );
+        let Some(message) = delivery.message.as_ref() else {
+            return Ok(());
+        };
+        let Some(state) = self
+            .conversation_state_for_platform_chat(&delivery.platform_chat_id)
+            .map_err(api_anyhow)?
+        else {
+            return Ok(());
+        };
+        if state.conversation_id != delivery.conversation_id {
+            return Ok(());
+        }
+        if delivery
+            .session_id
+            .as_deref()
+            .is_some_and(|session_id| session_id != state.session_binding.foreground_session_id)
+        {
+            return Ok(());
+        }
+        let log_path = message_log_path(&self.workdir, &state);
+        let total = count_message_lines(&log_path)?;
+        let Some(index) = total.checked_sub(1) else {
+            return Ok(());
+        };
+        let attachments =
+            WebAttachmentContext::new(&self.workdir, &state, self.cache_manager.clone());
+        let page = MessagePage {
+            start: index,
+            end: index + 1,
+            total,
+            messages: vec![message.clone()],
+        };
+        self.publish_websocket_event(
+            &delivery.platform_chat_id,
+            websocket_messages_payload(&state, &attachments, &page),
         );
         Ok(())
     }
@@ -1461,15 +1436,6 @@ impl Channel for WebChannel {
                 "channel_id": status.channel_id,
                 "platform_chat_id": status.platform_chat_id,
                 "conversation_id": status.conversation_id,
-            }),
-        );
-        self.publish_websocket_event(
-            &status.platform_chat_id,
-            json!({
-                "type": "status",
-                "subscription": "foreground_session_events",
-                "conversation_id": &status.conversation_id,
-                "status": status,
             }),
         );
         self.publish_conversation_upserted_for_platform_chat(&status.platform_chat_id);
@@ -1491,7 +1457,6 @@ impl Channel for WebChannel {
             &error.platform_chat_id,
             json!({
                 "type": "error",
-                "subscription": "foreground_session_events",
                 "conversation_id": &error.conversation_id,
                 "scope": &error.scope,
                 "severity": &error.severity,
@@ -1522,20 +1487,11 @@ impl Channel for WebChannel {
                 "state": format!("{state:?}"),
             }),
         );
-        self.publish_websocket_event(
-            platform_chat_id,
-            json!({
-                "type": "processing",
-                "subscription": "foreground_session_events",
-                "state": processing_state_name(state),
-            }),
-        );
         self.publish_conversation_processing(platform_chat_id, state);
         Ok(())
     }
 
     fn update_progress_feedback(&self, feedback: &OutgoingProgressFeedback) -> Result<()> {
-        let text = web_progress_text(feedback);
         self.logger.info(
             "web_progress",
             json!({
@@ -1546,27 +1502,15 @@ impl Channel for WebChannel {
                 "final_state": feedback.final_state.map(|state| format!("{state:?}")),
             }),
         );
-        self.publish_websocket_event(
-            &feedback.platform_chat_id,
-            json!({
-                "type": "progress_feedback",
-                "subscription": "foreground_session_events",
-                "turn_id": &feedback.turn_id,
-                "text": text,
-                "phase": feedback.progress.phase,
-                "model": &feedback.progress.model,
-                "activity": &feedback.progress.activity,
-                "hint": &feedback.progress.hint,
-                "plan": &feedback.progress.plan,
-                "error": &feedback.progress.error,
-                "final_state": feedback.final_state.map(progress_final_state_name),
-                "important": feedback.important,
-            }),
-        );
-        self.publish_websocket_event(
-            &feedback.platform_chat_id,
-            turn_progress_payload(feedback, &text),
-        );
+        let payload = turn_progress_payload(feedback);
+        if let Ok(mut progress) = self.active_turn_progress.lock() {
+            if feedback.final_state.is_some() {
+                progress.remove(&feedback.platform_chat_id);
+            } else {
+                progress.insert(feedback.platform_chat_id.clone(), payload.clone());
+            }
+        }
+        self.publish_websocket_event(&feedback.platform_chat_id, payload);
         if feedback.final_state.is_some() {
             self.publish_conversation_turn_completed(
                 &feedback.platform_chat_id,
@@ -1574,6 +1518,19 @@ impl Channel for WebChannel {
                 feedback.final_state,
             );
         }
+        Ok(())
+    }
+
+    fn conversation_updated(&self, platform_chat_id: &str, conversation_id: &str) -> Result<()> {
+        self.logger.info(
+            "web_conversation_updated",
+            json!({
+                "channel_id": self.id,
+                "platform_chat_id": platform_chat_id,
+                "conversation_id": conversation_id,
+            }),
+        );
+        self.publish_conversation_upserted_for_platform_chat(platform_chat_id);
         Ok(())
     }
 
@@ -1654,13 +1611,6 @@ impl ApiError {
 }
 
 #[derive(Debug, Deserialize)]
-struct WebSocketSubscribeRequest {
-    #[serde(default, rename = "type")]
-    kind: Option<String>,
-    conversation_id: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct TerminalWebSocketControl {
     #[serde(rename = "type")]
     kind: String,
@@ -1690,32 +1640,6 @@ enum WebSocketFrame {
     Ping(Vec<u8>),
     Pong,
     Close,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MessageRangeDirection {
-    Before,
-    After,
-}
-
-impl MessageRangeDirection {
-    fn parse(value: &str) -> ApiResult<Self> {
-        match value {
-            "before" | "backward" | "backwards" => Ok(Self::Before),
-            "after" | "forward" | "forwards" => Ok(Self::After),
-            _ => Err(ApiError::new(
-                400,
-                "direction must be before/backward or after/forward",
-            )),
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Before => "before",
-            Self::After => "after",
-        }
-    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1950,6 +1874,11 @@ struct ConversationSummary {
     platform_chat_id: String,
     model: String,
     model_selection_pending: bool,
+    reasoning: String,
+    sandbox: String,
+    sandbox_source: String,
+    remote: String,
+    workspace: String,
     foreground_session_id: String,
     total_background: usize,
     total_subagents: usize,
@@ -1991,6 +1920,7 @@ struct WebChannelState {
 
 impl ConversationSummary {
     fn from_state(
+        workdir: &Path,
         state: &ConversationState,
         config: &StellaclawConfig,
         processing_state: ProcessingState,
@@ -2006,6 +1936,22 @@ impl ConversationSummary {
                 .main_model
                 .display_name(&config.models),
             model_selection_pending: state.model_selection_pending,
+            reasoning: state
+                .reasoning_effort
+                .as_deref()
+                .unwrap_or("model default")
+                .to_string(),
+            sandbox: conversation_sandbox_name(state, config).to_string(),
+            sandbox_source: if state.sandbox.is_some() {
+                "conversation"
+            } else {
+                "default"
+            }
+            .to_string(),
+            remote: conversation_remote_name(state),
+            workspace: conversation_workspace_root(workdir, state)
+                .display()
+                .to_string(),
             foreground_session_id: state.session_binding.foreground_session_id.clone(),
             total_background: state.session_binding.background_sessions.len(),
             total_subagents: state.session_binding.subagent_sessions.len(),
@@ -2017,6 +1963,30 @@ impl ConversationSummary {
             last_seen_message_id: seen.as_ref().map(|seen| seen.last_seen_message_id.clone()),
             last_seen_at: seen.map(|seen| seen.updated_at),
         }
+    }
+}
+
+fn conversation_sandbox_name(state: &ConversationState, config: &StellaclawConfig) -> &'static str {
+    let sandbox = state.sandbox.as_ref().unwrap_or(&config.sandbox);
+    match sandbox.mode {
+        SandboxMode::Bubblewrap => "bubblewrap",
+        SandboxMode::Subprocess => "subprocess",
+    }
+}
+
+fn conversation_remote_name(state: &ConversationState) -> String {
+    match &state.tool_remote_mode {
+        ToolRemoteMode::Selectable => "selectable".to_string(),
+        ToolRemoteMode::FixedSsh { host, cwd } => {
+            format!("fixed ssh `{host}` `{}`", cwd.as_deref().unwrap_or(""))
+        }
+    }
+}
+
+fn conversation_workspace_root(workdir: &Path, state: &ConversationState) -> PathBuf {
+    match &state.tool_remote_mode {
+        ToolRemoteMode::Selectable => workdir.join("conversations").join(&state.conversation_id),
+        ToolRemoteMode::FixedSsh { .. } => sshfs_workspace_root(workdir, &state.conversation_id),
     }
 }
 
@@ -2291,10 +2261,6 @@ fn write_websocket_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> 
         .context("failed to write websocket frame")
 }
 
-fn parse_websocket_subscribe(raw: &str) -> Result<WebSocketSubscribeRequest> {
-    serde_json::from_str(raw).context("failed to parse websocket subscribe message")
-}
-
 fn parse_terminal_websocket_control(raw: &str) -> Result<TerminalWebSocketEvent> {
     let control: TerminalWebSocketControl =
         serde_json::from_str(raw).context("failed to parse terminal websocket control message")?;
@@ -2506,53 +2472,24 @@ fn message_page_payload(
     })
 }
 
-fn message_range_payload(
-    state: &ConversationState,
-    attachments: &WebAttachmentContext,
-    page: &MessagePage,
-    anchor: usize,
-    direction: MessageRangeDirection,
-    include_anchor: bool,
-) -> Value {
-    let roots = attachments.roots();
-    json!({
-        "conversation_id": &state.conversation_id,
-        "anchor_id": anchor.to_string(),
-        "anchor_index": anchor,
-        "direction": direction.as_str(),
-        "include_anchor": include_anchor,
-        "offset": page.start,
-        "limit": page.end.saturating_sub(page.start),
-        "start_index": page.start,
-        "end_index": page.end,
-        "total": page.total,
-        "has_more_before": page.start > 0,
-        "has_more_after": page.end < page.total,
-        "messages": page.messages
-            .iter()
-            .enumerate()
-            .map(|(relative, message)| message_skeleton(page.start + relative, message, attachments, &roots))
-            .collect::<Vec<_>>(),
-    })
-}
-
 fn websocket_subscription_ack(
     state: &ConversationState,
     next_message_index: usize,
     reason: &'static str,
+    turn_progress: Option<Value>,
 ) -> Value {
     let current_message_id = next_message_index
         .checked_sub(1)
         .map(|index| index.to_string());
     json!({
         "type": "subscription_ack",
-        "subscription": "foreground_session_messages",
         "reason": reason,
         "conversation_id": &state.conversation_id,
         "session_id": &state.session_binding.foreground_session_id,
         "current_message_id": current_message_id,
         "next_message_id": next_message_index.to_string(),
         "total": next_message_index,
+        "turn_progress": turn_progress,
     })
 }
 
@@ -2564,7 +2501,6 @@ fn websocket_messages_payload(
     let roots = attachments.roots();
     json!({
         "type": "messages",
-        "subscription": "foreground_session_messages",
         "conversation_id": &state.conversation_id,
         "session_id": &state.session_binding.foreground_session_id,
         "offset": page.start,
@@ -2577,36 +2513,6 @@ fn websocket_messages_payload(
             .map(|(relative, message)| message_skeleton(page.start + relative, message, attachments, &roots))
             .collect::<Vec<_>>(),
     })
-}
-
-fn message_range_bounds(
-    total: usize,
-    anchor: usize,
-    direction: MessageRangeDirection,
-    include_anchor: bool,
-    limit: usize,
-) -> (usize, usize) {
-    if limit == 0 || total == 0 {
-        return (0, 0);
-    }
-    match direction {
-        MessageRangeDirection::Before => {
-            let end = if include_anchor {
-                anchor.saturating_add(1).min(total)
-            } else {
-                anchor.min(total)
-            };
-            (end.saturating_sub(limit), end)
-        }
-        MessageRangeDirection::After => {
-            let start = if include_anchor {
-                anchor.min(total)
-            } else {
-                anchor.saturating_add(1).min(total)
-            };
-            (start, start.saturating_add(limit).min(total))
-        }
-    }
 }
 
 fn message_skeleton(
@@ -2917,9 +2823,24 @@ fn attachment_workspace_path(path: &Path, roots: &WebAttachmentRoots) -> Option<
     if let Ok(relative) = path.strip_prefix(&roots.workspace_root) {
         return Some(path_to_api_string(relative));
     }
-    path.strip_prefix(&roots.shared_root)
-        .ok()
-        .map(|relative| format!("shared/{}", path_to_api_string(relative)))
+    if let (Ok(canonical_path), Ok(canonical_workspace)) =
+        (path.canonicalize(), roots.workspace_root.canonicalize())
+    {
+        if let Ok(relative) = canonical_path.strip_prefix(canonical_workspace) {
+            return Some(path_to_api_string(relative));
+        }
+    }
+    if let Ok(relative) = path.strip_prefix(&roots.shared_root) {
+        return Some(format!("shared/{}", path_to_api_string(relative)));
+    }
+    if let (Ok(canonical_path), Ok(canonical_shared)) =
+        (path.canonicalize(), roots.shared_root.canonicalize())
+    {
+        if let Ok(relative) = canonical_path.strip_prefix(canonical_shared) {
+            return Some(format!("shared/{}", path_to_api_string(relative)));
+        }
+    }
+    None
 }
 
 fn local_path_from_file_item(file: &FileItem) -> Option<PathBuf> {
@@ -2958,10 +2879,9 @@ fn processing_state_name(state: ProcessingState) -> &'static str {
     }
 }
 
-fn turn_progress_payload(feedback: &OutgoingProgressFeedback, text: &str) -> Value {
+fn turn_progress_payload(feedback: &OutgoingProgressFeedback) -> Value {
     json!({
         "type": "turn_progress",
-        "subscription": "foreground_session_events",
         "turn_id": &feedback.turn_id,
         "phase": feedback.progress.phase,
         "model": &feedback.progress.model,
@@ -2970,52 +2890,9 @@ fn turn_progress_payload(feedback: &OutgoingProgressFeedback, text: &str) -> Val
         "plan": &feedback.progress.plan,
         "error": &feedback.progress.error,
         "progress": &feedback.progress,
-        "text": text,
         "final_state": feedback.final_state.map(progress_final_state_name),
         "important": feedback.important,
     })
-}
-
-fn web_progress_text(feedback: &OutgoingProgressFeedback) -> String {
-    let progress = &feedback.progress;
-    let mut text = match progress.phase {
-        TurnProgressPhase::Thinking => {
-            format!(
-                "正在执行\n模型：{}\n状态：{}",
-                progress.model, progress.activity
-            )
-        }
-        TurnProgressPhase::Working => {
-            format!(
-                "正在执行\n模型：{}\n阶段：{}",
-                progress.model, progress.activity
-            )
-        }
-        TurnProgressPhase::Done => format!("已完成\n模型：{}", progress.model),
-        TurnProgressPhase::Failed => {
-            let mut text = format!("本轮失败\n模型：{}", progress.model);
-            if let Some(error) = progress
-                .error
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                text.push_str("\n");
-                text.push_str(error);
-            }
-            text
-        }
-    };
-    if let Some(hint) = progress
-        .hint
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        text.push_str("\n\n");
-        text.push_str(hint);
-    }
-    text
 }
 
 fn progress_final_state_name(state: ProgressFeedbackFinalState) -> &'static str {
@@ -3081,12 +2958,6 @@ fn open_message_reader(path: &Path) -> Result<Option<BufReader<fs::File>>> {
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| format!("failed to open {}", path.display())),
     }
-}
-
-fn message_log_len(path: &Path) -> u64 {
-    fs::metadata(path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0)
 }
 
 fn count_message_lines(path: &Path) -> Result<usize> {
@@ -3159,13 +3030,6 @@ fn query_usize(query: &HashMap<String, String>, name: &str, default: usize) -> u
     query
         .get(name)
         .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(default)
-}
-
-fn query_bool(query: &HashMap<String, String>, name: &str, default: bool) -> bool {
-    query
-        .get(name)
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
         .unwrap_or(default)
 }
 
@@ -3433,11 +3297,10 @@ mod tests {
             important: true,
         };
 
-        let text = web_progress_text(&feedback);
-        let payload = turn_progress_payload(&feedback, &text);
+        let payload = turn_progress_payload(&feedback);
 
         assert_eq!(payload["type"], "turn_progress");
-        assert_eq!(payload["subscription"], "foreground_session_events");
+        assert!(payload.get("subscription").is_none());
         assert_eq!(payload["turn_id"], "turn-1");
         assert_eq!(payload["phase"], "working");
         assert_eq!(payload["model"], "gpt-5.5");
@@ -3447,9 +3310,7 @@ mod tests {
         assert_eq!(payload["important"], true);
         assert_eq!(payload["plan"]["items"][0]["status"], "in_progress");
         assert_eq!(payload["progress"]["phase"], "working");
-        assert!(payload["text"]
-            .as_str()
-            .is_some_and(|value| value.contains("读取代码")));
+        assert!(payload.get("text").is_none());
     }
 
     #[test]
@@ -3626,67 +3487,27 @@ mod tests {
     }
 
     #[test]
-    fn web_message_range_payload_returns_backward_window() {
-        let workdir = test_workdir("message-range");
-        let state = test_state("web-main-test-message-range");
-        fs::create_dir_all(workdir.join("conversations").join(&state.conversation_id))
-            .expect("create conversation root");
-        let messages = (0..5)
-            .map(|index| {
-                ChatMessage::new(
-                    ChatRole::Assistant,
-                    vec![ChatMessageItem::Context(ContextItem {
-                        text: format!("message {index}"),
-                    })],
-                )
-            })
-            .collect::<Vec<_>>();
-        let (start, end) =
-            message_range_bounds(messages.len(), 3, MessageRangeDirection::Before, true, 2);
-        let context = test_attachment_context(&workdir, &state);
-        let page = MessagePage {
-            start,
-            end,
-            total: messages.len(),
-            messages: messages[start..end].to_vec(),
-        };
-        let payload = message_range_payload(
-            &state,
-            &context,
-            &page,
-            3,
-            MessageRangeDirection::Before,
-            true,
-        );
-
-        assert_eq!(payload["anchor_id"], "3");
-        assert_eq!(payload["direction"], "before");
-        assert_eq!(payload["start_index"], 2);
-        assert_eq!(payload["end_index"], 4);
-        assert_eq!(payload["has_more_before"], true);
-        assert_eq!(payload["has_more_after"], true);
-        assert_eq!(payload["messages"][0]["id"], "2");
-        assert_eq!(payload["messages"][1]["id"], "3");
-        assert_eq!(payload["messages"][1]["text"], "message 3");
-
-        let _ = fs::remove_dir_all(workdir);
-    }
-
-    #[test]
     fn websocket_ack_reports_current_and_next_message_ids() {
         let state = test_state("web-main-test-ws-ack");
-        let payload = websocket_subscription_ack(&state, 3, "subscribed");
+        let payload = websocket_subscription_ack(
+            &state,
+            3,
+            "subscribed",
+            Some(json!({"type": "turn_progress", "turn_id": "turn-1"})),
+        );
 
         assert_eq!(payload["type"], "subscription_ack");
-        assert_eq!(payload["subscription"], "foreground_session_messages");
+        assert!(payload.get("subscription").is_none());
         assert_eq!(payload["reason"], "subscribed");
         assert_eq!(payload["current_message_id"], "2");
         assert_eq!(payload["next_message_id"], "3");
         assert_eq!(payload["session_id"], "web-main-test-ws-ack.foreground");
+        assert_eq!(payload["turn_progress"]["turn_id"], "turn-1");
 
-        let empty = websocket_subscription_ack(&state, 0, "subscribed");
+        let empty = websocket_subscription_ack(&state, 0, "subscribed", None);
         assert!(empty["current_message_id"].is_null());
         assert_eq!(empty["next_message_id"], "0");
+        assert!(empty["turn_progress"].is_null());
     }
 
     #[test]

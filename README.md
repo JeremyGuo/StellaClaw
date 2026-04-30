@@ -340,18 +340,15 @@ Current Web channel endpoints:
 - `GET /api/models`
 - `GET /api/conversations?offset=0&limit=50`
 - `POST /api/conversations`
+- `DELETE /api/conversations/{conversation_id}`
 - `GET /api/conversations/{conversation_id}/messages?offset=0&limit=50`
 - `GET /api/conversations/{conversation_id}/messages/{message_id}`
 - `POST /api/conversations/{conversation_id}/messages`
-- `GET /api/conversations/{conversation_id}/messages/after/{message_id}?limit=50`
 - `GET /api/conversations/{conversation_id}/status`
 - `GET /api/conversations/{conversation_id}/terminals`
 - `POST /api/conversations/{conversation_id}/terminals`
 - `GET /api/conversations/{conversation_id}/terminals/{terminal_id}`
 - `DELETE /api/conversations/{conversation_id}/terminals/{terminal_id}`
-- `GET /api/conversations/{conversation_id}/terminals/{terminal_id}/output?offset=0&limit_bytes=65536`
-- `POST /api/conversations/{conversation_id}/terminals/{terminal_id}/input`
-- `POST /api/conversations/{conversation_id}/terminals/{terminal_id}/resize`
 
 Message detail responses include `rendered_text`, `attachments`, and
 `attachment_errors`. Structured `ChatMessageItem::File`,

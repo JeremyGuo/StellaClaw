@@ -44,10 +44,7 @@ function defaultSettings() {
         token: 'local-web-token'
       }
     ],
-    conversationNames: {},
-    hiddenConversations: {},
-    conversationUi: {},
-    conversationRead: {}
+    conversationUi: {}
   };
 }
 
@@ -84,21 +81,9 @@ function normalizeSettings(value) {
       terminalList: Number(layout.terminalList) || fallback.layout.terminalList
     },
     servers: normalizedServers.length ? normalizedServers : fallback.servers,
-    conversationNames:
-      value?.conversationNames && typeof value.conversationNames === 'object'
-        ? value.conversationNames
-        : {},
-    hiddenConversations:
-      value?.hiddenConversations && typeof value.hiddenConversations === 'object'
-        ? value.hiddenConversations
-        : {},
     conversationUi:
       value?.conversationUi && typeof value.conversationUi === 'object'
         ? value.conversationUi
-        : {},
-    conversationRead:
-      value?.conversationRead && typeof value.conversationRead === 'object'
-        ? value.conversationRead
         : {}
   };
 }

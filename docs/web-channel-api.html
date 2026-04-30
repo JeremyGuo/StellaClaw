@@ -283,11 +283,11 @@
       <section id="summary">
         <h2>结论</h2>
         <div class="callout ok">
-          当前 Web Channel 设计整体可用：REST 负责快照/管理/二进制传输，WebSocket 负责 conversation list、foreground session 和 terminal 的实时数据面。真正需要收敛的是语义边界，而不是立即重构所有接口。
+          当前 Web Channel 设计整体可用：REST 负责快照/管理/二进制传输，WebSocket 负责 conversation list、foreground session 和 terminal 的实时数据面。状态事实源已进一步收敛：列表和 conversation 级状态只消费 conversation stream，当前会话 foreground stream 只承载消息、turn progress 和错误。
         </div>
         <div class="grid">
-          <div class="card"><strong>推荐事实源</strong><span>左侧列表使用 <code>/api/conversations/stream</code>；当前会话消息使用 <code>/api/ws</code>；终端实时 IO 使用 terminal stream。</span></div>
-          <div class="card"><strong>最大歧义</strong><span>Stellacode 2 调用 <code>DELETE /api/conversations/{id}</code>，但后端未实现；当前实际是本地隐藏，不是服务端删除。</span></div>
+          <div class="card"><strong>推荐事实源</strong><span>左侧列表和 conversation 级状态使用 <code>/api/conversations/stream</code>；当前会话消息和 turn progress 使用 <code>/api/conversations/{id}/foreground/ws</code>；终端实时 IO 使用 terminal stream。</span></div>
+          <div class="card"><strong>删除语义</strong><span><code>DELETE /api/conversations/{id}</code> 已由后端实现；会停止活跃 runtime、删除本地 conversation 目录并从列表流广播删除事件。</span></div>
           <div class="card"><strong>文档部署</strong><span>本页是纯静态 HTML，可直接用 GitHub Pages 从 <code>docs/</code> 目录部署。</span></div>
         </div>
       </section>
@@ -308,7 +308,7 @@ Electron main
 Stellaclaw Web Channel
   ├─ REST: /api/models, /api/conversations/*, workspace, terminal lifecycle
   ├─ WS: /api/conversations/stream          (conversation list facts)
-  ├─ WS: /api/ws                            (selected foreground session)
+  ├─ WS: /api/conversations/{id}/foreground/ws
   └─ WS: /api/conversations/{id}/terminals/{terminal_id}/stream</code></pre>
         <p><strong>关键边界：</strong>SSH Proxy 只是 Stellacode 连接 Stellaclaw 的方式；conversation 的工具执行位置由 <code>status.remote</code> / <code>tool_remote_mode</code> 决定，二者不要混用。</p>
       </section>
@@ -320,33 +320,33 @@ Stellaclaw Web Channel
           <tbody>
             <tr>
               <td><code>DELETE /api/conversations/{id}</code></td>
-              <td>Stellacode 2 有 <code>deleteConversation()</code> 调用，但 Web Channel router 未实现该路由。</td>
-              <td>用户以为是服务端删除；实际前端先写 <code>hiddenConversations</code> 本地隐藏，再吞掉 404。</td>
-              <td><strong>短期：</strong>前端 API 改名为 <code>hideConversation</code>。<strong>长期：</strong>如需要真删除，再实现后端 DELETE 并明确是否删除 workspace/log/session。</td>
+              <td>Web Channel router 已实现该路由；Stellacode 2 现在等待服务端删除成功后再更新本地列表。</td>
+              <td>删除会移除本地 conversation 目录、消息日志、session 状态、local workspace、已读状态和 cron 任务；fixed SSH 只卸载并移除本地 sshfs mountpoint，不删除远端目录。</td>
+              <td>保留为真实服务端删除语义；如后续需要“隐藏但不删除”，应新增单独 hide/archive 接口。</td>
             </tr>
             <tr>
               <td>Conversation 状态事实源</td>
-              <td><code>/status</code>、conversation summary、<code>/api/ws</code> status event、processing event 都携带部分状态。</td>
-              <td>列表、详情、运行态可能被不同事件覆盖，产生 running/idle 闪烁或旧状态回退。</td>
-              <td>约定：列表只信 <code>/api/conversations/stream</code>；当前详情只信 <code>/status</code> 和 foreground WS status；processing 只表达“前台是否正在处理”。</td>
+              <td><code>/status</code> 仍是按需快照接口；conversation summary 与 conversation stream 承载列表和 conversation 级状态；foreground stream 不再推 status / processing。</td>
+              <td>若新客户端重新从 foreground stream 推断列表状态，仍可能产生 running/idle 闪烁或旧状态回退。</td>
+              <td>列表与非消息级信息只信 <code>/api/conversations/stream</code>；当前聊天区只信 foreground <code>messages</code> / <code>turn_progress</code> / <code>error</code>。</td>
             </tr>
             <tr>
               <td>消息分页接口</td>
-              <td>同时存在 <code>messages?offset</code>、<code>messages/after/{id}</code>、<code>messages/range</code>。</td>
-              <td>客户端容易在 gap repair、初始加载、历史加载中选择不一致的分页语义。</td>
-              <td>以 <code>messages/range</code> 作为规范接口；<code>after</code> 是快捷兼容接口；<code>offset</code> 用于简单列表。</td>
+              <td>只保留 <code>messages?offset&amp;limit</code>。WebSocket ack 和 message skeleton 都使用数组下标作为 message id。</td>
+              <td>客户端需要自己根据 <code>current_message_id</code>、已持有首尾 message id 和 <code>offset/limit</code> 计算补齐窗口。</td>
+              <td>不再提供 <code>messages/after/{id}</code> 或 <code>messages/range</code>，避免 gap repair、初始加载、历史加载出现多套分页语义。</td>
             </tr>
             <tr>
               <td>Terminal REST 与 WS</td>
-              <td>REST 支持 output/input/resize；WS 同时支持 binary input、resize、attach。</td>
-              <td>数据面双写可能导致顺序、offset、resize 生效时机不清楚。</td>
-              <td>REST 仅作为 lifecycle/fallback/debug；实时终端只用 WS。文档中明确 Binary frame 是主数据面。</td>
+              <td>REST 只保留 terminal lifecycle；output/input/resize 统一走 terminal stream。</td>
+              <td>数据面只剩一套，offset、input 顺序和 resize 生效时机都由 WS 维护。</td>
+              <td>继续避免重新增加 REST output/input/resize fallback。</td>
             </tr>
             <tr>
-              <td>两个 WebSocket subscription 风格</td>
-              <td><code>/api/conversations/stream</code> 连接即推 snapshot；<code>/api/ws</code> 连接后还需发送 <code>subscribe_foreground</code>。</td>
-              <td>新客户端容易误以为所有 WS 都需要或都不需要首帧订阅。</td>
-              <td>保留但文档化；后续可新增 <code>/api/conversations/{id}/events</code> 作为显式路径，逐步替代通用 <code>/api/ws</code>。</td>
+              <td>WebSocket subscription 风格</td>
+              <td>conversation list、foreground session 和 terminal 都使用路径表达订阅目标，连接后无需首帧订阅。</td>
+              <td>路径和 event type 已经表达来源；payload 不再携带冗余 <code>subscription</code> 字段。</td>
+              <td>新增 WS 时继续优先用路径语义，不要恢复通用 WS + 首帧订阅。</td>
             </tr>
             <tr>
               <td>认证方式</td>
@@ -378,7 +378,7 @@ Accept: application/json</code></pre>
             <strong>WebSocket</strong>
             <p>浏览器无法稳定设置自定义 Authorization header，因此使用 query token：</p>
             <pre><code>ws://host:port/api/conversations/stream?token=&lt;web_token&gt;
-ws://host:port/api/ws?token=&lt;web_token&gt;</code></pre>
+ws://host:port/api/conversations/{id}/foreground/ws?token=&lt;web_token&gt;</code></pre>
           </div>
         </div>
         <p>所有非 <code>/api/</code> 路径都会返回 <code>404 not_found</code>。预检 <code>OPTIONS</code> 返回 <code>204</code>。</p>
@@ -401,9 +401,8 @@ ws://host:port/api/ws?token=&lt;web_token&gt;</code></pre>
             <tr><td><span class="method">GET</span></td><td><code>/api/conversations</code></td><td>Query: <code>offset=0</code>, <code>limit&lt;=200</code></td><td>分页列出 conversation summary。</td></tr>
             <tr><td><span class="method post">POST</span></td><td><code>/api/conversations</code></td><td>Body: <code>{ platform_chat_id?, model?, nickname? }</code></td><td>创建或加载 conversation。</td></tr>
             <tr><td><span class="method patch">PATCH</span></td><td><code>/api/conversations/{conversation_id}</code></td><td>Body: <code>{ nickname? }</code></td><td>更新 nickname。</td></tr>
-            <tr><td><span class="method">GET</span></td><td><code>/api/conversations/seen</code></td><td>无</td><td>读取 Web Channel 持久化已读状态。</td></tr>
             <tr><td><span class="method post">POST</span></td><td><code>/api/conversations/{conversation_id}/seen</code></td><td>Body: <code>{ last_seen_message_id }</code></td><td>标记已读；后端按最大 message id 单调合并。</td></tr>
-            <tr><td><span class="method delete">DELETE</span></td><td><code>/api/conversations/{conversation_id}</code></td><td>—</td><td><strong>当前未实现。</strong>Stellacode 2 只做本地隐藏。</td></tr>
+            <tr><td><span class="method delete">DELETE</span></td><td><code>/api/conversations/{conversation_id}</code></td><td>—</td><td>删除 conversation；停止活跃 runtime，清理本地 conversation 目录、已读状态、终端和 cron 任务，并向 list stream 广播 <code>conversation_deleted</code>。</td></tr>
           </tbody>
         </table>
 
@@ -411,9 +410,7 @@ ws://host:port/api/ws?token=&lt;web_token&gt;</code></pre>
         <table>
           <thead><tr><th>Method</th><th>Path</th><th>参数/Body</th><th>用途</th></tr></thead>
           <tbody>
-            <tr><td><span class="method">GET</span></td><td><code>/api/conversations/{id}/messages</code></td><td>Query: <code>offset=0</code>, <code>limit&lt;=200</code>, <code>order=asc</code>（客户端传入但服务端主要按 offset/limit）</td><td>读取消息页。</td></tr>
-            <tr><td><span class="method">GET</span></td><td><code>/api/conversations/{id}/messages/after/{message_id}</code></td><td>Query: <code>limit&lt;=200</code></td><td>读取某条之后的消息；适合 gap repair。</td></tr>
-            <tr><td><span class="method">GET</span></td><td><code>/api/conversations/{id}/messages/range</code></td><td>Query: <code>anchor_id</code>, <code>direction=before|after</code>, <code>include_anchor=true|false</code>, <code>limit&lt;=200</code></td><td>规范分页接口；建议新客户端优先使用。</td></tr>
+            <tr><td><span class="method">GET</span></td><td><code>/api/conversations/{id}/messages</code></td><td>Query: <code>offset=0</code>, <code>limit&lt;=200</code></td><td>读取固定窗口消息页；客户端根据 message id 自行计算 offset。</td></tr>
             <tr><td><span class="method">GET</span></td><td><code>/api/conversations/{id}/messages/{message_id}</code></td><td>无</td><td>读取消息详情、原始 message、渲染 items 与 attachments。</td></tr>
             <tr><td><span class="method post">POST</span></td><td><code>/api/conversations/{id}/messages</code></td><td>Body: <code>{ remote_message_id?, user_name?, text?, files? }</code></td><td>投递用户消息或 slash command；返回 <code>202 accepted</code>。</td></tr>
           </tbody>
@@ -439,9 +436,6 @@ ws://host:port/api/ws?token=&lt;web_token&gt;</code></pre>
             <tr><td><span class="method post">POST</span></td><td><code>/api/conversations/{id}/terminals</code></td><td>Body: <code>{ shell?, cwd?, cols?, rows? }</code></td><td>创建 terminal，返回 <code>TerminalSummary</code>。</td></tr>
             <tr><td><span class="method">GET</span></td><td><code>/api/conversations/{id}/terminals/{terminal_id}</code></td><td>无</td><td>读取 terminal summary。</td></tr>
             <tr><td><span class="method delete">DELETE</span></td><td><code>/api/conversations/{id}/terminals/{terminal_id}</code></td><td>无</td><td>终止 terminal。</td></tr>
-            <tr><td><span class="method">GET</span></td><td><code>/api/conversations/{id}/terminals/{terminal_id}/output</code></td><td>Query: <code>offset</code>, <code>limit_bytes</code></td><td>REST fallback 输出读取。</td></tr>
-            <tr><td><span class="method post">POST</span></td><td><code>/api/conversations/{id}/terminals/{terminal_id}/input</code></td><td>Body: <code>{ data }</code></td><td>REST fallback 输入。</td></tr>
-            <tr><td><span class="method post">POST</span></td><td><code>/api/conversations/{id}/terminals/{terminal_id}/resize</code></td><td>Body: <code>{ cols, rows }</code></td><td>REST fallback resize。</td></tr>
           </tbody>
         </table>
       </section>
@@ -456,31 +450,26 @@ ws://host:port/api/ws?token=&lt;web_token&gt;</code></pre>
           </tbody>
         </table>
         <pre><code>// initial
-{ "type": "conversation_snapshot", "subscription": "conversation_list", "channel_id": "web", "conversations": [...] }
+{ "type": "conversation_snapshot", "channel_id": "web", "conversations": [...] }
 
 // later
-{ "type": "conversation_upserted", "conversation_id": "web-main-000001", "conversation": {...} }
+{ "type": "conversation_upserted", "conversation_id": "web-main-000001", "conversation": {...} } // create/rename/model/remote/sandbox/session summary change
 { "type": "conversation_processing", "conversation_id": "...", "processing_state": "typing", "running": true }
 { "type": "conversation_turn_completed", "conversation_id": "...", "last_message_id": "42", "unread": true, "conversation": {...} }
-{ "type": "conversation_seen", "conversation_id": "...", "seen": { "last_seen_message_id": "42", "updated_at": "..." } }</code></pre>
+{ "type": "conversation_seen", "conversation_id": "...", "seen": { "last_seen_message_id": "42", "updated_at": "..." } }
+{ "type": "conversation_deleted", "conversation_id": "..." }</code></pre>
 
         <h3>Foreground session stream</h3>
         <table>
           <thead><tr><th>Kind</th><th>Path</th><th>Handshake</th><th>用途</th></tr></thead>
           <tbody>
-            <tr><td><span class="method ws">WS</span></td><td><code>/api/ws?token=...</code></td><td>客户端首帧发送 <code>{ type: "subscribe_foreground", conversation_id }</code></td><td>当前打开 conversation 的消息、进度、状态和错误。</td></tr>
+            <tr><td><span class="method ws">WS</span></td><td><code>/api/conversations/{id}/foreground/ws?token=...</code></td><td>连接后无需发送订阅消息</td><td>当前打开 conversation 的消息、turn progress 和错误。</td></tr>
           </tbody>
         </table>
-        <pre><code>// client -> server
-{ "type": "subscribe_foreground", "conversation_id": "web-main-000001" }
-
-// server -> client
-{ "type": "subscription_ack", "reason": "subscribed", "next_message_id": "12", "current_message_id": "11" }
+        <pre><code>// server -> client
+{ "type": "subscription_ack", "reason": "subscribed", "next_message_id": "12", "current_message_id": "11", "turn_progress": null }
 { "type": "messages", "conversation_id": "...", "messages": [...] }
-{ "type": "processing", "subscription": "foreground_session_events", "state": "typing" }
-{ "type": "progress_feedback", "turn_id": "...", "phase": "running", "activity": "...", "plan": [...] }
-{ "type": "turn_progress", "turn_id": "...", "state": "running|done|failed", ... }
-{ "type": "status", "status": {...} }
+{ "type": "turn_progress", "turn_id": "...", "phase": "thinking|working|done|failed", "activity": "...", "plan": {...}, "progress": {...} }
 { "type": "error", "severity": "error", "message": "...", "can_continue": true }</code></pre>
 
         <h3>Terminal stream</h3>
@@ -491,7 +480,7 @@ ws://host:port/api/ws?token=&lt;web_token&gt;</code></pre>
           </tbody>
         </table>
         <pre><code>// server -> client Text replay metadata
-{ "type": "replay", "terminal_id": "...", "requested_offset": 0, "replay_start_offset": 0, "next_offset": 1024, "running": true }
+{ "type": "attached", "terminal_id": "...", "offset": 0, "replay_start_offset": 0, "next_offset": 1024, "running": true }
 { "type": "dropped", "dropped_bytes": 4096, "buffer_start_offset": 4096 }
 { "type": "exit", "terminal_id": "..." }
 { "type": "detached", "terminal_id": "...", "reason": "slow_client" }
@@ -517,6 +506,11 @@ ws://host:port/api/ws?token=&lt;web_token&gt;</code></pre>
   "platform_chat_id": "web-...",
   "model": "opus-4.6",
   "model_selection_pending": false,
+  "reasoning": "model default",
+  "sandbox": "bubblewrap|subprocess",
+  "sandbox_source": "default|conversation",
+  "remote": "selectable|fixed ssh `host` `/repo`",
+  "workspace": "/path/to/workspace",
   "foreground_session_id": "...",
   "total_background": 0,
   "total_subagents": 0,
@@ -572,9 +566,9 @@ ws://host:port/api/ws?token=&lt;web_token&gt;</code></pre>
         <ul>
           <li><code>apps/stellacode2/src/lib/api.js</code> 是 renderer 侧 Web Channel API wrapper。</li>
           <li><code>apps/stellacode2/electron/main.cjs</code> 负责 server settings、Direct/SSH Proxy、请求超时、workspace 二进制上传下载、系统通知、更新。</li>
-          <li><code>App.jsx</code> 维护两个长连接：conversation list stream 和当前 foreground session stream。</li>
+          <li><code>App.jsx</code> 维护两个长连接：conversation list stream 和当前 foreground session stream；前者承载 conversation 级事实，后者只承载当前消息、turn progress 和错误。</li>
           <li>workspace upload/download 不走通用 <code>api()</code> wrapper，因为需要 gzip binary body、tar 解析和 native save dialog。</li>
-          <li>terminal dock 优先使用 terminal WebSocket；REST output/input/resize 是 fallback/debug 管理通道。</li>
+          <li>terminal dock 使用 terminal WebSocket 承载 PTY output/input/resize；REST 只保留 terminal 生命周期管理。</li>
         </ul>
         <div class="callout warning">
           如果后续引入第三方 Web client，建议先实现同样的三条事实源分工：list stream 管侧栏，foreground stream 管当前聊天，terminal stream 管 PTY；不要再增加轮询状态推断。

@@ -204,7 +204,7 @@ fn run_dispatcher_loop(
     let mut conversations: HashMap<String, Sender<ConversationCommand>> = HashMap::new();
     loop {
         match incoming_rx.recv_timeout(std::time::Duration::from_secs(1)) {
-            Ok(dispatch) => {
+            Ok(IncomingDispatch::Message(dispatch)) => {
                 if let Err(error) = send_conversation_command(
                     &mut conversations,
                     &workdir,
@@ -228,6 +228,27 @@ fn run_dispatcher_loop(
                         }),
                     );
                 }
+            }
+            Ok(IncomingDispatch::DeleteConversation {
+                channel_id,
+                platform_chat_id,
+                conversation_id,
+                response_tx,
+            }) => {
+                let result = shutdown_active_conversation(
+                    &mut conversations,
+                    &conversation_id,
+                    &channel_id,
+                    &platform_chat_id,
+                    &logger,
+                )
+                .and_then(|_| {
+                    cron_manager
+                        .remove_tasks_for_conversation(&conversation_id)
+                        .map(|_| ())
+                })
+                .map_err(|error| format!("{error:#}"));
+                let _ = response_tx.send(result);
             }
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -271,6 +292,42 @@ fn run_dispatcher_loop(
             }
         }
     }
+    Ok(())
+}
+
+fn shutdown_active_conversation(
+    conversations: &mut HashMap<String, Sender<ConversationCommand>>,
+    conversation_id: &str,
+    channel_id: &str,
+    platform_chat_id: &str,
+    logger: &Arc<StellaclawLogger>,
+) -> Result<()> {
+    let Some(sender) = conversations.remove(conversation_id) else {
+        return Ok(());
+    };
+    let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+    if sender
+        .send(ConversationCommand::Shutdown {
+            reason: "conversation deleted",
+            ack_tx,
+        })
+        .is_err()
+    {
+        return Ok(());
+    }
+    ack_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .with_context(|| {
+            format!("timed out waiting for conversation {conversation_id} to stop before delete")
+        })?;
+    logger.info(
+        "conversation_shutdown_for_delete",
+        serde_json::json!({
+            "conversation_id": conversation_id,
+            "channel_id": channel_id,
+            "platform_chat_id": platform_chat_id,
+        }),
+    );
     Ok(())
 }
 

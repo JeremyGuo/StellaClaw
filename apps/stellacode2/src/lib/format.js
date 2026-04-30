@@ -3,13 +3,11 @@ export function clamp(value, min, max) {
 }
 
 export function formatModel(conversation, status) {
-  const modelSelectionPending = status
-    ? status.model_selection_pending
-    : conversation?.model_selection_pending;
+  const modelSelectionPending = conversation?.model_selection_pending ?? status?.model_selection_pending;
   if (modelSelectionPending) {
     return 'pending';
   }
-  return status?.model || conversation?.model || '';
+  return conversation?.model || status?.model || '';
 }
 
 export function modelAlias(model) {

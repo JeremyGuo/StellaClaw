@@ -57,6 +57,19 @@ impl ConversationIdManager {
         Ok(conversation_id)
     }
 
+    pub fn remove_mapping(
+        &mut self,
+        channel_id: &str,
+        platform_chat_id: &str,
+    ) -> Result<Option<String>, String> {
+        let key = format!("{channel_id}::{platform_chat_id}");
+        let removed = self.store.mappings.remove(&key);
+        if removed.is_some() {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
     fn save(&self) -> Result<(), String> {
         let raw = serde_json::to_string_pretty(&self.store)
             .map_err(|error| format!("failed to serialize conversation id store: {error}"))?;

@@ -27,7 +27,7 @@
   <text x="395" y="72" class="title">Stellaclaw server</text>
   <text x="395" y="104" class="label">Web Channel API</text>
   <text x="395" y="128" class="code">/api/conversations</text>
-  <text x="395" y="152" class="code">/api/ws</text>
+  <text x="395" y="152" class="code">/foreground/ws</text>
   <text x="395" y="184" class="label">Durable workdir</text>
   <text x="395" y="208" class="small">conversation, session, skills</text>
   <text x="395" y="232" class="small">resume after disconnect</text>

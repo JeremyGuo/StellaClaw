@@ -304,6 +304,33 @@ impl CronManager {
         Ok(removed)
     }
 
+    pub fn remove_tasks_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<CronTaskRecord>> {
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| anyhow!("cron store lock poisoned"))?;
+        let ids = store
+            .tasks
+            .iter()
+            .filter(|(_, task)| task.conversation_id == conversation_id)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let mut removed = Vec::new();
+        for id in ids {
+            if let Some(task) = store.tasks.remove(&id) {
+                removed.push(task);
+            }
+        }
+        drop(store);
+        if !removed.is_empty() {
+            self.save()?;
+        }
+        Ok(removed)
+    }
+
     pub fn collect_due_tasks(&self, now: DateTime<Utc>) -> Result<Vec<CronTaskRecord>> {
         let mut store = self
             .store

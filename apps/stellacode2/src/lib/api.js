@@ -2,11 +2,9 @@ export function conversationKey(serverId, conversationId) {
   return `${serverId}:${conversationId}`;
 }
 
-export function displayConversationName(settings, serverId, conversation) {
-  const key = conversationKey(serverId, conversation.conversation_id);
+export function displayConversationName(conversation) {
   return (
     (conversation.nickname || '').trim()
-    || settings?.conversationNames?.[key]
     || conversation.platform_chat_id
     || conversation.conversation_id
   );
@@ -28,11 +26,6 @@ export async function connectionInfo(serverId) {
 export async function loadConversations(serverId) {
   const response = await api(serverId, '/api/conversations?limit=80');
   return response.data?.conversations || [];
-}
-
-export async function loadConversationSeen(serverId) {
-  const response = await api(serverId, '/api/conversations/seen');
-  return response.data?.seen || {};
 }
 
 export async function markConversationSeen(serverId, conversationId, lastSeenMessageId) {
@@ -76,26 +69,12 @@ export async function deleteConversation(serverId, conversationId) {
   });
 }
 
-export async function loadMessages(serverId, conversationId) {
-  const response = await api(serverId, `/api/conversations/${conversationId}/messages?limit=40&order=asc`);
-  return response.data?.messages || [];
-}
-
-export async function loadMessagesAfter(serverId, conversationId, messageId, limit = 80) {
+export async function loadMessages(serverId, conversationId, options = {}) {
+  const offset = Math.max(0, Number(options.offset || 0));
+  const limit = Math.max(1, Math.min(200, Number(options.limit || 40)));
   const response = await api(
     serverId,
-    `/api/conversations/${conversationId}/messages/after/${encodeURIComponent(messageId)}?limit=${encodeURIComponent(limit)}`
-  );
-  return response.data?.messages || [];
-}
-
-export async function loadMessageRange(serverId, conversationId, anchorId, options = {}) {
-  const direction = options.direction || 'after';
-  const includeAnchor = options.includeAnchor ? 'true' : 'false';
-  const limit = options.limit || 120;
-  const response = await api(
-    serverId,
-    `/api/conversations/${conversationId}/messages/range?anchor_id=${encodeURIComponent(anchorId)}&direction=${encodeURIComponent(direction)}&include_anchor=${includeAnchor}&limit=${encodeURIComponent(limit)}`
+    `/api/conversations/${conversationId}/messages?offset=${encodeURIComponent(offset)}&limit=${encodeURIComponent(limit)}`
   );
   return response.data?.messages || [];
 }

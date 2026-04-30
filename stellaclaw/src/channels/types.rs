@@ -1,12 +1,25 @@
 use std::path::PathBuf;
 
+use crossbeam_channel::Sender;
 use serde::Serialize;
 use serde_json::Value;
+use stellaclaw_core::session_actor::ChatMessage;
 
 use crate::conversation::IncomingConversationMessage;
 
 #[derive(Debug, Clone)]
-pub struct IncomingDispatch {
+pub enum IncomingDispatch {
+    Message(IncomingMessageDispatch),
+    DeleteConversation {
+        channel_id: String,
+        platform_chat_id: String,
+        conversation_id: String,
+        response_tx: Sender<Result<(), String>>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct IncomingMessageDispatch {
     pub channel_id: String,
     pub platform_chat_id: String,
     pub conversation_id: String,
@@ -45,6 +58,9 @@ pub struct OutgoingOptions {
 pub struct OutgoingDelivery {
     pub channel_id: String,
     pub platform_chat_id: String,
+    pub conversation_id: String,
+    pub session_id: Option<String>,
+    pub message: Option<ChatMessage>,
     pub text: String,
     pub attachments: Vec<OutgoingAttachment>,
     pub options: Option<OutgoingOptions>,
@@ -158,10 +174,18 @@ pub struct OutgoingProgressFeedback {
 }
 
 #[derive(Debug, Clone)]
+pub struct OutgoingConversationUpdated {
+    pub channel_id: String,
+    pub platform_chat_id: String,
+    pub conversation_id: String,
+}
+
+#[derive(Debug, Clone)]
 pub enum ChannelEvent {
     Delivery(OutgoingDelivery),
     Processing(OutgoingProcessing),
     ProgressFeedback(OutgoingProgressFeedback),
+    ConversationUpdated(OutgoingConversationUpdated),
     Status(OutgoingStatus),
     Error(OutgoingError),
 }
@@ -172,6 +196,7 @@ impl ChannelEvent {
             ChannelEvent::Delivery(delivery) => &delivery.channel_id,
             ChannelEvent::Processing(processing) => &processing.channel_id,
             ChannelEvent::ProgressFeedback(feedback) => &feedback.channel_id,
+            ChannelEvent::ConversationUpdated(updated) => &updated.channel_id,
             ChannelEvent::Status(status) => &status.channel_id,
             ChannelEvent::Error(error) => &error.channel_id,
         }
@@ -182,6 +207,7 @@ impl ChannelEvent {
             ChannelEvent::Delivery(delivery) => &delivery.platform_chat_id,
             ChannelEvent::Processing(processing) => &processing.platform_chat_id,
             ChannelEvent::ProgressFeedback(feedback) => &feedback.platform_chat_id,
+            ChannelEvent::ConversationUpdated(updated) => &updated.platform_chat_id,
             ChannelEvent::Status(status) => &status.platform_chat_id,
             ChannelEvent::Error(error) => &error.platform_chat_id,
         }

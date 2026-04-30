@@ -1,5 +1,34 @@
-version: 1.18.8
+version: 1.18.9
 ---
+
+# 1.18.9
+
+- 实现 Web Channel 服务端删除 conversation：
+  后端新增 `DELETE /api/conversations/{conversation_id}`，会先通过 host dispatcher 停止活跃 conversation runtime，再删除本地 conversation 目录、消息日志、session 状态、local workspace、Web 已读状态和关联 cron 任务，并广播 `conversation_deleted` 列表流事件；fixed SSH remote 只卸载并清理本地 sshfs mountpoint，不删除远端目录。Stellacode 2 删除操作现在等待服务端成功后再更新列表，不再用本地 `hiddenConversations` 伪装服务端删除。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 收敛 Stellacode 2 状态事实源：
+  前端不再用 foreground session WebSocket 的 `processing` 事件直接修改左侧 conversation 列表运行态；侧栏只消费 `/api/conversations/stream` 的 summary / processing / completion / seen / deleted 事件，当前聊天区详情继续消费 `/status` 和 `/api/ws` foreground 事件，避免列表状态被不同来源反复覆盖。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 收敛 Web Channel 消息分页和进度事件：
+  Web Channel 删除 `messages/after/{id}` 和 `messages/range` 路由，只保留 `GET /api/conversations/{conversation_id}/messages?offset=&limit=`；Stellacode 2 根据 WebSocket ack 的 `current_message_id` 和本地已持有消息 id 自行计算 offset，不再通过多套分页接口补齐窗口。Foreground WebSocket 也只保留结构化 `turn_progress` 事件，不再发送 Web Channel 渲染过的 `progress_feedback` 文案事件，前端直接根据结构化 `TurnProgress` 决定展示。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 收敛 foreground WebSocket 事件边界：
+  `OutgoingDelivery` 现在可以携带结构化 `ChatMessage` 和 foreground `session_id`；TelegramChannel 自行渲染消息文本，WebChannel 直接把结构化 delivery 投影成 foreground `messages` 事件，不再通过轮询 `all_messages.jsonl` 发现新增消息。Foreground WebSocket 不再发送 `processing` 和 `status` 事件；conversation 级 running/status summary 统一走 `/api/conversations/stream`，状态详情仍可按需通过 REST 读取。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 通过 conversation stream 同步 conversation 级变化：
+  Conversation 持久化模型、remote、sandbox、managed session 等状态变化后会发送 `ConversationUpdated` channel event，WebChannel 投影成 `/api/conversations/stream` 的 `conversation_upserted`；Stellacode 2 发送 `/model` 等控制命令后不再轮询 `/status` 等待变化，当前模型显示优先使用 conversation stream summary。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Web 附件路径在 macOS 临时目录下回退为绝对路径：
+  Web message attachment 渲染在计算 workspace/shared 相对路径时会同时尝试 canonical path，避免 `/var` 与 `/private/var` 这类系统路径别名导致 attachment `path` 和下载 URL 变成绝对本地路径。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 删除旧版 Stellacode Electron 客户端：
+  移除已被 Stellacode 2 替代的 `apps/stellacode` 目录，避免旧客户端继续引用已收敛/删除的 Web Channel API。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 继续清理 Web Channel 冗余接口：
+  移除 terminal REST output/input/resize 数据面，只保留 terminal 生命周期 REST 接口，实时 PTY output/input/resize 统一走 terminal WebSocket；移除读取全量已读状态的 `GET /api/conversations/seen`，已读读取统一来自 conversation summary 和 `/api/conversations/stream`，Stellacode 2 也不再在 Electron settings 中保留 `conversationNames`、`hiddenConversations`、`conversationRead` 这类 conversation 事实源。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 统一 WebSocket 路径语义：
+  Foreground WebSocket 从通用 `/api/ws` + 首帧 `subscribe_foreground` 改为 `/api/conversations/{conversation_id}/foreground/ws` 直接连接；conversation stream、foreground stream 和 terminal stream 的事件 payload 不再携带冗余 `subscription` 字段。Foreground `subscription_ack` 现在除了当前/下一个 message id，也会带上当前活跃 turn 的最近一次结构化 `turn_progress`，方便 Stellacode 2 重连后立即恢复进度展示。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.18.8
 
