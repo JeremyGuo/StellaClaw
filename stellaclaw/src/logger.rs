@@ -15,6 +15,24 @@ pub struct StellaclawLogger {
 }
 
 impl StellaclawLogger {
+    /// Open a logger under root/.stellaclaw/log/ (for conversation-level logs).
+    pub fn open_under_stellaclaw(root: &Path, name: &str) -> Result<Self, String> {
+        let dir = root.join(".stellaclaw").join("log");
+        fs::create_dir_all(&dir)
+            .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
+        let path = dir.join(name);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| format!("failed to open {}: {error}", path.display()))?;
+        Ok(Self {
+            file: Mutex::new(file),
+            mirror_stdout: stdout_logging_enabled(),
+        })
+    }
+
+    /// Open a logger under root/.log/stellaclaw/ (for host-level logs).
     pub fn open_under(root: &Path, name: &str) -> Result<Self, String> {
         let dir = root.join(".log").join("stellaclaw");
         fs::create_dir_all(&dir)

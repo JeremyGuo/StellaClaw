@@ -269,7 +269,7 @@ fn run_conversation(
         .with_context(|| format!("failed to create {}", conversation_root.display()))?;
     ensure_workspace_seed(&workdir, &conversation_root)?;
     let logger = Arc::new(
-        StellaclawLogger::open_under(&conversation_root, "conversation.log")
+        StellaclawLogger::open_under_stellaclaw(&conversation_root, "conversation.log")
             .map_err(anyhow::Error::msg)?,
     );
     logger.info(
