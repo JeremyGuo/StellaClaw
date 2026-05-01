@@ -97,3 +97,13 @@ stellaclaw: telegram channel telegram-main requires bot_token or env TELEGRAM_BO
 [2026-05-02 00:15:43]   workdir: /home/liuhao/clawparty_workdir
 [2026-05-02 00:15:43] New stellaclaw started (PID: 88859)
 [2026-05-02 00:15:46] New process is running. Restart complete.
+[2026-05-02 00:45:54] === Graceful restart started ===
+[2026-05-02 00:45:54] Stopping old stellaclaw (PID: 88859) ...
+[2026-05-02 00:45:54] Stopping old stellaclaw (PID: 88884) ...
+[2026-05-02 00:45:54] All old processes exited after 1s
+[2026-05-02 00:45:54] Loaded .env
+[2026-05-02 00:45:54] Starting new stellaclaw ...
+[2026-05-02 00:45:54]   config: /home/liuhao/ClawParty/deploy_prod.json
+[2026-05-02 00:45:54]   workdir: /home/liuhao/clawparty_workdir
+[2026-05-02 00:45:54] New stellaclaw started (PID: 99120)
+[2026-05-02 00:45:57] New process is running. Restart complete.

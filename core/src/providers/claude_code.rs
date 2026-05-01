@@ -7,7 +7,8 @@ use serde_json::{json, Map, Value};
 use crate::{
     model_config::{ModelConfig, RetryMode},
     session_actor::{
-        ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, ReasoningItem, ToolCallItem,
+        normalize_messages_for_model, ChatMessage, ChatMessageItem, ChatRole, ContextItem,
+        FileItem, ReasoningItem, ToolCallItem,
     },
 };
 
@@ -66,7 +67,7 @@ impl ClaudeCodeProvider {
             Value::String(model_config.model_name.clone()),
         );
         let (messages, message_cache_control_applied) =
-            build_claude_messages(request.messages, cache_control.as_ref());
+            build_claude_messages(request.messages, cache_control.as_ref(), model_config);
         payload.insert("messages".to_string(), Value::Array(messages));
         if let Some(system_prompt) = request.system_prompt {
             if !system_prompt.trim().is_empty() {
@@ -181,6 +182,7 @@ impl ProviderBackend for ClaudeCodeProvider {
 fn build_claude_messages(
     messages: &[ChatMessage],
     cache_control: Option<&Value>,
+    model_config: &ModelConfig,
 ) -> (Vec<Value>, bool) {
     let mut converted = Vec::new();
 
@@ -212,6 +214,14 @@ fn build_claude_messages(
             converted.push(json!({
                 "role": "user",
                 "content": tool_results,
+            }));
+        }
+
+        let tool_result_images = claude_tool_result_image_blocks(message, model_config);
+        if !tool_result_images.is_empty() {
+            converted.push(json!({
+                "role": "user",
+                "content": tool_result_images,
             }));
         }
     }
@@ -385,6 +395,31 @@ fn claude_tool_result_blocks(message: &ChatMessage) -> Vec<Value> {
             }
         })
         .collect()
+}
+
+fn claude_tool_result_image_blocks(
+    message: &ChatMessage,
+    model_config: &ModelConfig,
+) -> Vec<Value> {
+    let mut blocks = Vec::new();
+    for item in &message.data {
+        let ChatMessageItem::ToolResult(tool_result) = item else {
+            continue;
+        };
+        let Some(file) = tool_result.result.file.as_ref() else {
+            continue;
+        };
+        if !is_image_file(file) || file.state.is_some() {
+            continue;
+        }
+        let fake = ChatMessage::new(ChatRole::User, vec![ChatMessageItem::File(file.clone())]);
+        for normalized in normalize_messages_for_model(&[fake], model_config) {
+            for block in claude_content_blocks(&normalized) {
+                blocks.push(block);
+            }
+        }
+    }
+    blocks
 }
 
 fn tool_result_text(tool_result: &crate::session_actor::ToolResultItem) -> String {

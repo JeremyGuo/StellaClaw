@@ -7,7 +7,8 @@ use serde_json::{json, Map, Value};
 use crate::{
     model_config::{ModelCapability, ModelConfig, RetryMode},
     session_actor::{
-        ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, ReasoningItem, ToolCallItem,
+        normalize_messages_for_model, ChatMessage, ChatMessageItem, ChatRole, ContextItem,
+        FileItem, ReasoningItem, ToolCallItem,
     },
 };
 
@@ -80,7 +81,7 @@ impl OpenRouterResponsesProvider {
         );
         payload.insert(
             "input".to_string(),
-            Value::Array(build_responses_input(request.messages)),
+            Value::Array(build_responses_input(request.messages, model_config)),
         );
         if let Some(system_prompt) = request.system_prompt {
             if !system_prompt.trim().is_empty() {
@@ -289,7 +290,7 @@ impl ProviderBackend for OpenRouterResponsesProvider {
     }
 }
 
-fn build_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
+fn build_responses_input(messages: &[ChatMessage], model_config: &ModelConfig) -> Vec<Value> {
     let mut input = Vec::new();
 
     for message in messages {
@@ -304,6 +305,7 @@ fn build_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
                     }));
                 }
                 append_responses_tool_outputs(&mut input, message);
+                append_tool_result_image_messages(&mut input, message, model_config);
             }
             ChatRole::Assistant => {
                 let content = assistant_responses_content(message);
@@ -325,6 +327,7 @@ fn build_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
                     }
                 }
                 append_responses_tool_outputs(&mut input, message);
+                append_tool_result_image_messages(&mut input, message, model_config);
             }
         }
     }
@@ -479,6 +482,35 @@ fn append_responses_tool_outputs(target: &mut Vec<Value>, message: &ChatMessage)
                 "call_id": tool_result.tool_call_id,
                 "output": tool_result_text(tool_result),
             }));
+        }
+    }
+}
+
+fn append_tool_result_image_messages(
+    target: &mut Vec<Value>,
+    message: &ChatMessage,
+    model_config: &ModelConfig,
+) {
+    for item in &message.data {
+        let ChatMessageItem::ToolResult(tool_result) = item else {
+            continue;
+        };
+        let Some(file) = tool_result.result.file.as_ref() else {
+            continue;
+        };
+        if !is_image_file(file) || file.state.is_some() {
+            continue;
+        }
+        let fake = ChatMessage::new(ChatRole::User, vec![ChatMessageItem::File(file.clone())]);
+        for normalized in normalize_messages_for_model(&[fake], model_config) {
+            let content = user_responses_content(&normalized);
+            if !content.is_empty() {
+                target.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": content,
+                }));
+            }
         }
     }
 }
@@ -908,7 +940,10 @@ mod tests {
             })],
         )];
 
-        let input = build_responses_input(&messages);
+        let input = build_responses_input(
+            &messages,
+            &test_model_config("https://example.test/v1/responses".to_string()),
+        );
 
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["type"], "function_call_output");

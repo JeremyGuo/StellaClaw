@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
     thread,
@@ -35,7 +35,20 @@ pub fn ensure_workspace_for_remote_mode(
             let workspace = if is_localhost_ssh_host(host) {
                 ensure_local_workspace(workdir, conversation_id, remote_path)?
             } else {
-                ensure_sshfs_workspace(workdir, conversation_id, host, remote_path)?
+                let ws = ensure_sshfs_workspace(workdir, conversation_id, host, remote_path)?;
+                // If the mount is disconnected, remount and retry.
+                match ws.metadata() {
+                    Ok(_) => ws,
+                    Err(error) => {
+                        let error: anyhow::Error = error.into();
+                        if is_disconnected_mount_error(&error) {
+                            let _ = unmount_sshfs_workspace(workdir, conversation_id);
+                            ensure_sshfs_workspace(workdir, conversation_id, host, remote_path)?
+                        } else {
+                            return Err(error);
+                        }
+                    }
+                }
             };
             ensure_workspace_seed(workdir, conversation_root)?;
             Ok(workspace)
@@ -623,6 +636,17 @@ fn create_mountpoint_directory(path: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
         Err(error) => Err(error).with_context(|| format!("failed to create {}", path.display())),
     }
+}
+
+fn is_disconnected_mount_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.raw_os_error() == Some(107))
+            || cause
+                .to_string()
+                .contains("Transport endpoint is not connected")
+    })
 }
 
 fn next_backup_path(path: &Path) -> Result<PathBuf> {
