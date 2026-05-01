@@ -198,7 +198,11 @@ mod tests {
         fs::write(root.join(".stellaclaw/IDENTITY.md"), "identity: old").unwrap();
         fs::write(root.join(".stellaclaw/USER.md"), "tier: old").unwrap();
         fs::write(root.join("STELLACLAW.md"), "memory: old").unwrap();
-        fs::write(root.join(".stellaclaw/skill/demo/SKILL.md"), "# Demo\n\nskills: old").unwrap();
+        fs::write(
+            root.join(".stellaclaw/skill/demo/SKILL.md"),
+            "# Demo\n\nskills: old",
+        )
+        .unwrap();
         state
             .initialize_from_workspace(
                 &root,
@@ -210,7 +214,11 @@ mod tests {
         fs::write(root.join(".stellaclaw/IDENTITY.md"), "identity: new").unwrap();
         fs::write(root.join(".stellaclaw/USER.md"), "tier: new").unwrap();
         fs::write(root.join("STELLACLAW.md"), "memory: new").unwrap();
-        fs::write(root.join(".stellaclaw/skill/demo/SKILL.md"), "# Demo\n\nskills: new").unwrap();
+        fs::write(
+            root.join(".stellaclaw/skill/demo/SKILL.md"),
+            "# Demo\n\nskills: new",
+        )
+        .unwrap();
         state
             .observe_for_user_turn_from_workspace(
                 &root,

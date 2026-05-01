@@ -3258,8 +3258,11 @@ mod tests {
         fs::create_dir_all(".stellaclaw").expect("metadata dir should exist");
         fs::create_dir_all(".stellaclaw/skill/demo").expect("skill dir should exist");
         fs::write(".stellaclaw/USER.md", "tier: old").expect("user metadata should seed");
-        fs::write(".stellaclaw/skill/demo/SKILL.md", "# Demo\n\nold desc\n\nold body")
-            .expect("skill should seed");
+        fs::write(
+            ".stellaclaw/skill/demo/SKILL.md",
+            "# Demo\n\nold desc\n\nold body",
+        )
+        .expect("skill should seed");
         let (inbox, mailbox) = test_inbox();
         let events = Arc::new(MemoryEventSink::default());
         let provider = Arc::new(ScriptedProvider::new(vec![ChatMessage::new(
@@ -3285,8 +3288,11 @@ mod tests {
         actor.step().expect("initial should apply");
 
         fs::write(".stellaclaw/USER.md", "tier: new").expect("user metadata should update");
-        fs::write(".stellaclaw/skill/demo/SKILL.md", "# Demo\n\nnew desc\n\nold body")
-            .expect("skill should update");
+        fs::write(
+            ".stellaclaw/skill/demo/SKILL.md",
+            "# Demo\n\nnew desc\n\nold body",
+        )
+        .expect("skill should update");
         mailbox.append(
             SessionMailboxKind::Data,
             SessionRequest::EnqueueUserMessage {

@@ -1544,7 +1544,11 @@ impl ConversationRuntime {
 
         let runtime_skill_root = self.workdir.join("rundir").join(".skill");
         let runtime_skill_path = runtime_skill_root.join(skill_name);
-        let staged_skill_path = self.workspace_root.join(".stellaclaw").join("skill").join(skill_name);
+        let staged_skill_path = self
+            .workspace_root
+            .join(".stellaclaw")
+            .join("skill")
+            .join(skill_name);
 
         match mode {
             SkillPersistMode::Create => {

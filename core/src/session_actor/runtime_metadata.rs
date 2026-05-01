@@ -813,7 +813,11 @@ mod tests {
     fn reports_loaded_skill_content_change() {
         let root = temp_root();
         fs::create_dir_all(root.join(".stellaclaw/skill/demo")).unwrap();
-        fs::write(root.join(".stellaclaw/skill/demo/SKILL.md"), "# Demo\n\nold body").unwrap();
+        fs::write(
+            root.join(".stellaclaw/skill/demo/SKILL.md"),
+            "# Demo\n\nold body",
+        )
+        .unwrap();
 
         let mut state = RuntimeMetadataState::default();
         state
@@ -821,7 +825,11 @@ mod tests {
             .expect("initial metadata should load");
         state.mark_loaded_skills(&["demo".to_string()], 1);
 
-        fs::write(root.join(".stellaclaw/skill/demo/SKILL.md"), "# Demo\n\nnew body").unwrap();
+        fs::write(
+            root.join(".stellaclaw/skill/demo/SKILL.md"),
+            "# Demo\n\nnew body",
+        )
+        .unwrap();
         let notices = state
             .observe_for_user_turn_from_workspace(&root, &root, String::new())
             .expect("changed metadata should load");

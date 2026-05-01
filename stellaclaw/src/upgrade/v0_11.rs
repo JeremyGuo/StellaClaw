@@ -20,12 +20,16 @@ impl WorkdirUpgrader for StellaclawWorkdirDirectoryUpgrade {
     fn upgrade(&self, workdir: &Path, _config: &StellaclawConfig) -> Result<()> {
         let old_root = workdir.join(".log").join("stellaclaw");
         let new_root = workdir.join(".stellaclaw");
-        fs::create_dir_all(&new_root).with_context(|| {
-            format!("failed to create {}", new_root.display())
-        })?;
+        fs::create_dir_all(&new_root)
+            .with_context(|| format!("failed to create {}", new_root.display()))?;
 
         // Move individual files and directories from .log/stellaclaw/ → .stellaclaw/
-        for entry_name in ["host.log", "conversation_ids.json", "cron_tasks.json", "channels"] {
+        for entry_name in [
+            "host.log",
+            "conversation_ids.json",
+            "cron_tasks.json",
+            "channels",
+        ] {
             let old_path = old_root.join(entry_name);
             let new_path = new_root.join(entry_name);
             if !old_path.exists() {
@@ -79,14 +83,15 @@ mod tests {
         let old_dir = root.join(".log").join("stellaclaw");
         fs::create_dir_all(old_dir.join("channels").join("web-main"))
             .expect("old channels dir should exist");
-        fs::write(old_dir.join("host.log"), "log data")
-            .expect("host.log should exist");
+        fs::write(old_dir.join("host.log"), "log data").expect("host.log should exist");
         fs::write(old_dir.join("conversation_ids.json"), "{}")
             .expect("conversation_ids.json should exist");
-        fs::write(old_dir.join("cron_tasks.json"), "{}")
-            .expect("cron_tasks.json should exist");
+        fs::write(old_dir.join("cron_tasks.json"), "{}").expect("cron_tasks.json should exist");
         fs::write(
-            old_dir.join("channels").join("web-main").join("web_state.json"),
+            old_dir
+                .join("channels")
+                .join("web-main")
+                .join("web_state.json"),
             "{}",
         )
         .expect("web_state.json should exist");
@@ -100,7 +105,11 @@ mod tests {
         assert!(new_dir.join("host.log").is_file());
         assert!(new_dir.join("conversation_ids.json").is_file());
         assert!(new_dir.join("cron_tasks.json").is_file());
-        assert!(new_dir.join("channels").join("web-main").join("web_state.json").is_file());
+        assert!(new_dir
+            .join("channels")
+            .join("web-main")
+            .join("web_state.json")
+            .is_file());
 
         // Old directories should be cleaned up.
         assert!(!root.join(".log").exists());

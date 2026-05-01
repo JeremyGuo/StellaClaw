@@ -461,7 +461,10 @@ fn save_full_tool_result(
     tool_call_id: &str,
     text: &str,
 ) -> Option<String> {
-    let dir = workspace_root.join(".stellaclaw").join("output").join("tool_results");
+    let dir = workspace_root
+        .join(".stellaclaw")
+        .join("output")
+        .join("tool_results");
     fs::create_dir_all(&dir).ok()?;
     let file_name = format!(
         "{}-{}-{}.txt",

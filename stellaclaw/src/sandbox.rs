@@ -130,8 +130,8 @@ fn build_bubblewrap_command(
     // hierarchy, so discover_runtime_root would fail on workspace_root.
     // session_root is always under workdir/conversations/ and resolves
     // correctly.
-    if let Some(runtime_root) = discover_runtime_root(&session_root)
-        .or_else(|| discover_runtime_root(&workspace_root))
+    if let Some(runtime_root) =
+        discover_runtime_root(&session_root).or_else(|| discover_runtime_root(&workspace_root))
     {
         bind_path(&mut command, &runtime_root, false)?;
     }
@@ -213,8 +213,8 @@ fn build_bubblewrap_shell_command(
     if session_root != workspace_root {
         bind_path(&mut command, &session_root, false)?;
     }
-    if let Some(runtime_root) = discover_runtime_root(&session_root)
-        .or_else(|| discover_runtime_root(&workspace_root))
+    if let Some(runtime_root) =
+        discover_runtime_root(&session_root).or_else(|| discover_runtime_root(&workspace_root))
     {
         bind_path(&mut command, &runtime_root, false)?;
     }

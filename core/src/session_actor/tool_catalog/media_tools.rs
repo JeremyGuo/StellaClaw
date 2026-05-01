@@ -744,7 +744,10 @@ fn remote_file_item_from_path(
     media_kind: &str,
 ) -> Result<FileItem, LocalToolError> {
     let file_name = remote_file_name(path);
-    let local_dir = data_root.join(".stellaclaw").join("output").join("remote-media");
+    let local_dir = data_root
+        .join(".stellaclaw")
+        .join("output")
+        .join("remote-media");
     fs::create_dir_all(&local_dir).map_err(|error| {
         LocalToolError::Io(format!("failed to create {}: {error}", local_dir.display()))
     })?;

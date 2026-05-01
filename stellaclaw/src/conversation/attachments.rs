@@ -304,7 +304,9 @@ mod tests {
     fn shared_attachment_path_accepts_unix_and_windows_separators() {
         // New .stellaclaw/stellaclaw_shared/ paths.
         assert!(is_shared_attachment_path(".stellaclaw/stellaclaw_shared"));
-        assert!(is_shared_attachment_path(".stellaclaw/stellaclaw_shared/foo.pdf"));
+        assert!(is_shared_attachment_path(
+            ".stellaclaw/stellaclaw_shared/foo.pdf"
+        ));
         assert!(!is_shared_attachment_path(".stellaclaw/stellaclaw_shared/"));
         // Legacy shared/ paths for backward compatibility.
         assert!(is_shared_attachment_path("shared"));

@@ -205,8 +205,14 @@ mod tests {
 
         let result = ls_local(&Map::new(), &workspace).expect("ls should succeed");
         let text = result.as_str().expect("ls result should be text");
-        assert!(!text.contains("stellaclaw_shared"), "stellaclaw_shared should be hidden: {text}");
-        assert!(!text.contains("marker.txt"), "marker.txt inside .stellaclaw should be hidden: {text}");
+        assert!(
+            !text.contains("stellaclaw_shared"),
+            "stellaclaw_shared should be hidden: {text}"
+        );
+        assert!(
+            !text.contains("marker.txt"),
+            "marker.txt inside .stellaclaw should be hidden: {text}"
+        );
 
         std::fs::remove_dir_all(&root).expect("temp dir should be cleaned");
     }

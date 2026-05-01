@@ -193,7 +193,10 @@ pub fn unmount_sshfs_workspace(workdir: &Path, conversation_id: &str) -> Result<
     let mountpoint = sshfs_workspace_root(workdir, conversation_id);
 
     // If the workspace is a symlink (localhost workspace), just remove the link.
-    if mountpoint.symlink_metadata().map_or(false, |m| m.file_type().is_symlink()) {
+    if mountpoint
+        .symlink_metadata()
+        .map_or(false, |m| m.file_type().is_symlink())
+    {
         fs::remove_file(&mountpoint)
             .with_context(|| format!("failed to remove symlink {}", mountpoint.display()))?;
         return Ok(());
@@ -508,7 +511,12 @@ fn record_sshfs_pid(workdir: &Path, conversation_id: &str, mountpoint: &Path) {
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     // Take the last PID (most recently started sshfs for this mount).
-    if let Some(pid_str) = stdout.lines().last().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(pid_str) = stdout
+        .lines()
+        .last()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         let pid_file = sshfs_pid_path(workdir, conversation_id);
         let _ = fs::write(&pid_file, pid_str);
     }
@@ -527,9 +535,7 @@ fn kill_tracked_sshfs_process(workdir: &Path, conversation_id: &str) {
     }
     // SIGKILL the sshfs daemon so the FUSE mount becomes immediately dead
     // (returns ENOTCONN) rather than hanging.
-    let _ = Command::new("kill")
-        .args(["-9", pid_str])
-        .status();
+    let _ = Command::new("kill").args(["-9", pid_str]).status();
     // Give the kernel a moment to process the signal.
     thread::sleep(Duration::from_millis(100));
 }

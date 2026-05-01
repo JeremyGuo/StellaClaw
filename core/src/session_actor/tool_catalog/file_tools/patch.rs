@@ -24,10 +24,16 @@ pub(super) fn execute_patch_tool(
     }
 
     let result = match context.execution_target(arguments)? {
-        ExecutionTarget::Local => apply_patch_local(arguments, context.workspace_root, context.data_root)?,
-        ExecutionTarget::RemoteSsh { host, cwd } => {
-            apply_patch_remote(arguments, context.workspace_root, context.data_root, &host, cwd.as_deref())?
+        ExecutionTarget::Local => {
+            apply_patch_local(arguments, context.workspace_root, context.data_root)?
         }
+        ExecutionTarget::RemoteSsh { host, cwd } => apply_patch_remote(
+            arguments,
+            context.workspace_root,
+            context.data_root,
+            &host,
+            cwd.as_deref(),
+        )?,
     };
     Ok(Some(result))
 }

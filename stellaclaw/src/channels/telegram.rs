@@ -94,10 +94,7 @@ impl TelegramChannel {
         admin_user_ids: Vec<i64>,
         workdir: &Path,
     ) -> Result<Self> {
-        let dir = workdir
-            .join(".stellaclaw")
-            .join("channels")
-            .join(&id);
+        let dir = workdir.join(".stellaclaw").join("channels").join(&id);
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
         let security_path = dir.join("security.json");
         let security = if security_path.exists() {
