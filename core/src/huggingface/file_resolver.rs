@@ -110,10 +110,13 @@ impl HuggingFaceFileResolver {
 }
 
 fn default_local_cache_dir() -> Result<PathBuf, ResolveModelFileError> {
-    let working_directory =
-        std::env::current_dir().map_err(ResolveModelFileError::CurrentDirectory)?;
-    Ok(working_directory
-        .join(".cache")
+    let base = match std::env::var_os("STELLACLAW_DATA_ROOT") {
+        Some(value) => PathBuf::from(value),
+        None => std::env::current_dir().map_err(ResolveModelFileError::CurrentDirectory)?,
+    };
+    Ok(base
+        .join(".stellaclaw")
+        .join("cache")
         .join("huggingface")
         .join("hub"))
 }

@@ -398,6 +398,9 @@ impl SessionActor {
                             &self
                                 .workspace_root()
                                 .map_err(SessionActorError::RuntimeMetadata)?,
+                            &self
+                                .data_root()
+                                .map_err(SessionActorError::RuntimeMetadata)?,
                             remote_aliases_prompt_for_mode(&initial.tool_remote_mode),
                         )
                         .map_err(SessionActorError::RuntimeMetadata)?;
@@ -1283,6 +1286,9 @@ impl SessionActor {
                 &self
                     .workspace_root()
                     .map_err(SessionActorError::RuntimeMetadata)?,
+                &self
+                    .data_root()
+                    .map_err(SessionActorError::RuntimeMetadata)?,
                 self.initial
                     .as_ref()
                     .map(|initial| remote_aliases_prompt_for_mode(&initial.tool_remote_mode))
@@ -1339,6 +1345,9 @@ impl SessionActor {
                 .initialize_from_workspace(
                     &self
                         .workspace_root()
+                        .map_err(SessionActorError::RuntimeMetadata)?,
+                    &self
+                        .data_root()
                         .map_err(SessionActorError::RuntimeMetadata)?,
                     remote_aliases_prompt_for_mode(&incoming_initial.tool_remote_mode),
                 )
@@ -1615,6 +1624,13 @@ impl SessionActor {
 
     fn workspace_root(&self) -> Result<PathBuf, String> {
         env::current_dir().map_err(|error| format!("failed to resolve cwd: {error}"))
+    }
+
+    fn data_root(&self) -> Result<PathBuf, String> {
+        match env::var_os("STELLACLAW_DATA_ROOT") {
+            Some(value) => Ok(PathBuf::from(value)),
+            None => self.workspace_root(),
+        }
     }
 }
 
@@ -3239,9 +3255,9 @@ mod tests {
     fn injects_runtime_metadata_updates_before_user_message() {
         let _cwd = temp_cwd("actor-runtime-meta");
         fs::create_dir_all(".stellaclaw").expect("metadata dir should exist");
-        fs::create_dir_all(".skill/demo").expect("skill dir should exist");
+        fs::create_dir_all(".stellaclaw/skill/demo").expect("skill dir should exist");
         fs::write(".stellaclaw/USER.md", "tier: old").expect("user metadata should seed");
-        fs::write(".skill/demo/SKILL.md", "# Demo\n\nold desc\n\nold body")
+        fs::write(".stellaclaw/skill/demo/SKILL.md", "# Demo\n\nold desc\n\nold body")
             .expect("skill should seed");
         let (inbox, mailbox) = test_inbox();
         let events = Arc::new(MemoryEventSink::default());
@@ -3268,7 +3284,7 @@ mod tests {
         actor.step().expect("initial should apply");
 
         fs::write(".stellaclaw/USER.md", "tier: new").expect("user metadata should update");
-        fs::write(".skill/demo/SKILL.md", "# Demo\n\nnew desc\n\nold body")
+        fs::write(".stellaclaw/skill/demo/SKILL.md", "# Demo\n\nnew desc\n\nold body")
             .expect("skill should update");
         mailbox.append(
             SessionMailboxKind::Data,
@@ -3538,8 +3554,8 @@ mod tests {
 
         let state_path = std::env::current_dir()
             .unwrap()
-            .join(".log")
-            .join("stellaclaw")
+            .join(".stellaclaw")
+            .join("log")
             .join(&session_id)
             .join("session.json");
         let state_before_release: SessionActorPersistedState = serde_json::from_str(

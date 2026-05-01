@@ -602,7 +602,7 @@ pub(super) fn sync_skill_to_conversation_workspaces(
         {
             continue;
         }
-        let skill_root = entry.path().join(".skill");
+        let skill_root = entry.path().join(".stellaclaw").join("skill");
         if !skill_root.is_dir() {
             continue;
         }

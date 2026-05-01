@@ -35,6 +35,7 @@ const DEFAULT_TRUNCATED_TOOL_RESULT_PREVIEW_CHARS: usize = 80_000;
 
 pub struct LocalToolBatchExecutor {
     workspace_root: PathBuf,
+    data_root: PathBuf,
     remote_mode: ToolRemoteMode,
     conversation_bridge: Option<Arc<dyn ConversationBridge + Send + Sync>>,
     running_batches: Mutex<HashMap<String, RunningToolBatch>>,
@@ -42,8 +43,14 @@ pub struct LocalToolBatchExecutor {
 
 impl LocalToolBatchExecutor {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        let workspace_root = workspace_root.into();
+        let data_root = match std::env::var_os("STELLACLAW_DATA_ROOT") {
+            Some(value) => PathBuf::from(value),
+            None => workspace_root.clone(),
+        };
         Self {
-            workspace_root: workspace_root.into(),
+            workspace_root,
+            data_root,
             remote_mode: ToolRemoteMode::Selectable,
             conversation_bridge: None,
             running_batches: Mutex::new(HashMap::new()),
@@ -72,6 +79,7 @@ impl LocalToolBatchExecutor {
         let cancel_token = ToolCancellationToken::default();
         let runner = ToolBatchRunner {
             workspace_root: self.workspace_root.clone(),
+            data_root: self.data_root.clone(),
             remote_mode: self.remote_mode.clone(),
             conversation_bridge: self.conversation_bridge.clone(),
             cancel_token: cancel_token.clone(),
@@ -98,6 +106,7 @@ impl LocalToolBatchExecutor {
     fn context(&self) -> ToolExecutionContext<'_> {
         ToolExecutionContext {
             workspace_root: &self.workspace_root,
+            data_root: &self.data_root,
             remote_mode: &self.remote_mode,
             cancel_token: ToolCancellationToken::default(),
         }
@@ -111,6 +120,7 @@ struct RunningToolBatch {
 
 struct ToolBatchRunner {
     workspace_root: PathBuf,
+    data_root: PathBuf,
     remote_mode: ToolRemoteMode,
     conversation_bridge: Option<Arc<dyn ConversationBridge + Send + Sync>>,
     cancel_token: ToolCancellationToken,
@@ -151,6 +161,7 @@ impl ToolBatchRunner {
         let (result_tx, result_rx) = mpsc::channel();
         let runner = ToolOperationRunner {
             workspace_root: self.workspace_root.clone(),
+            data_root: self.data_root.clone(),
             remote_mode: self.remote_mode.clone(),
             conversation_bridge: self.conversation_bridge.clone(),
             cancel_token: self.cancel_token.clone(),
@@ -220,6 +231,7 @@ fn finish_disconnected_operation(
 
 struct ToolOperationRunner {
     workspace_root: PathBuf,
+    data_root: PathBuf,
     remote_mode: ToolRemoteMode,
     conversation_bridge: Option<Arc<dyn ConversationBridge + Send + Sync>>,
     cancel_token: ToolCancellationToken,
@@ -367,6 +379,7 @@ impl ToolOperationRunner {
     fn context(&self) -> ToolExecutionContext<'_> {
         ToolExecutionContext {
             workspace_root: &self.workspace_root,
+            data_root: &self.data_root,
             remote_mode: &self.remote_mode,
             cancel_token: self.cancel_token.clone(),
         }
@@ -382,7 +395,7 @@ impl ToolOperationRunner {
         }
 
         let saved_path = save_full_tool_result(
-            &self.workspace_root,
+            &self.data_root,
             &result.tool_name,
             &result.tool_call_id,
             &context.text,
@@ -448,7 +461,7 @@ fn save_full_tool_result(
     tool_call_id: &str,
     text: &str,
 ) -> Option<String> {
-    let dir = workspace_root.join(".output").join("tool_results");
+    let dir = workspace_root.join(".stellaclaw").join("output").join("tool_results");
     fs::create_dir_all(&dir).ok()?;
     let file_name = format!(
         "{}-{}-{}.txt",

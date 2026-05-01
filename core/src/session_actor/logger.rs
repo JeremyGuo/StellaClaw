@@ -23,8 +23,8 @@ impl SessionActorLogger {
         let safe_session_id = sanitize_session_id(session_id);
         let dir = root
             .as_ref()
-            .join(".log")
-            .join("stellaclaw")
+            .join(".stellaclaw")
+            .join("log")
             .join(safe_session_id);
         std::fs::create_dir_all(&dir)
             .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
@@ -123,8 +123,8 @@ mod tests {
         logger.info("demo_event", serde_json::json!({"ok": true}));
 
         let log_path = root
-            .join(".log")
-            .join("stellaclaw")
+            .join(".stellaclaw")
+            .join("log")
             .join("session_1")
             .join("actor.log");
         assert_eq!(logger.path(), log_path.as_path());

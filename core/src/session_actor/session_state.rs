@@ -36,8 +36,8 @@ impl SessionStateStore {
     pub(crate) fn open_under(root: impl AsRef<Path>, session_id: &str) -> Result<Self, String> {
         let dir = root
             .as_ref()
-            .join(".log")
-            .join("stellaclaw")
+            .join(".stellaclaw")
+            .join("log")
             .join(sanitize_session_id(session_id));
         fs::create_dir_all(&dir)
             .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
@@ -208,10 +208,10 @@ mod tests {
 
         assert_eq!(loaded.next_turn_id, 2);
         assert!(root
-            .join(".log/stellaclaw/session_1/all_messages.jsonl")
+            .join(".stellaclaw/log/session_1/all_messages.jsonl")
             .exists());
         assert!(root
-            .join(".log/stellaclaw/session_1/current_messages.jsonl")
+            .join(".stellaclaw/log/session_1/current_messages.jsonl")
             .exists());
     }
 

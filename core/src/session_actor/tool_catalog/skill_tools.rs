@@ -15,7 +15,7 @@ pub fn skill_tool_definitions(
 
     tools.push(ToolDefinition::new(
         "skill_load",
-        "Load the SKILL.md instructions for a named skill from the current workspace .skill directory. Use exact skill names that currently exist under .skill/.",
+        "Load the SKILL.md instructions for a named skill from the current workspace .stellaclaw/skill directory. Use exact skill names that currently exist under .stellaclaw/skill/.",
         object_schema(
             properties([("skill_name", json!({"type": "string"}))]),
             &["skill_name"],
@@ -27,7 +27,7 @@ pub fn skill_tool_definitions(
     if enable_skill_persistence_tools {
         tools.push(ToolDefinition::new(
             "skill_create",
-            "Persist a staged skill directory from .skill/<skill_name>/ in the current workspace into the runtime skills store as a new skill. Validate SKILL.md and fail with the validation reason if invalid.",
+            "Persist a staged skill directory from .stellaclaw/skill/<skill_name>/ in the current workspace into the runtime skills store as a new skill. Validate SKILL.md and fail with the validation reason if invalid.",
             object_schema(
                 properties([("skill_name", json!({"type": "string"}))]),
                 &["skill_name"],
@@ -39,7 +39,7 @@ pub fn skill_tool_definitions(
         ));
         tools.push(ToolDefinition::new(
             "skill_update",
-            "Persist a staged skill directory from .skill/<skill_name>/ in the current workspace into the runtime skills store as an update to an existing skill. Validate SKILL.md and fail with the validation reason if invalid.",
+            "Persist a staged skill directory from .stellaclaw/skill/<skill_name>/ in the current workspace into the runtime skills store as an update to an existing skill. Validate SKILL.md and fail with the validation reason if invalid.",
             object_schema(
                 properties([("skill_name", json!({"type": "string"}))]),
                 &["skill_name"],
@@ -51,7 +51,7 @@ pub fn skill_tool_definitions(
         ));
         tools.push(ToolDefinition::new(
             "skill_delete",
-            "Persist deletion of an existing skill by removing .skill/<skill_name>/ from the runtime skills store and active local workspaces.",
+            "Persist deletion of an existing skill by removing .stellaclaw/skill/<skill_name>/ from the runtime skills store and active local workspaces.",
             object_schema(
                 properties([("skill_name", json!({"type": "string"}))]),
                 &["skill_name"],

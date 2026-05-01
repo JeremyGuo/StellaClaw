@@ -36,7 +36,7 @@ use crate::{
 };
 
 static MEDIA_JOBS: OnceLock<Mutex<HashMap<String, MediaJob>>> = OnceLock::new();
-const TOOL_USAGE_LOG_PATH: &str = ".log/stellaclaw/tool_usage.jsonl";
+const TOOL_USAGE_LOG_PATH: &str = ".stellaclaw/log/tool_usage.jsonl";
 
 struct MediaJob {
     status: Arc<Mutex<MediaJobStatus>>,
@@ -323,7 +323,7 @@ fn analysis_tool(
         model_config.clone(),
         prompt,
         vec![file],
-        tool_usage_log_path(context.workspace_root),
+        tool_usage_log_path(context.data_root),
     );
     initial_job_result(
         tool_name,
@@ -353,7 +353,7 @@ fn image_generation_tool(
         model_config.clone(),
         prompt,
         images,
-        tool_usage_log_path(context.workspace_root),
+        tool_usage_log_path(context.data_root),
     );
     initial_job_result(
         tool_name,
@@ -626,8 +626,8 @@ fn provider_message_to_tool_result(message: ChatMessage) -> ToolResultContent {
     }
 }
 
-fn tool_usage_log_path(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(TOOL_USAGE_LOG_PATH)
+fn tool_usage_log_path(data_root: &Path) -> PathBuf {
+    data_root.join(TOOL_USAGE_LOG_PATH)
 }
 
 fn append_tool_usage(
@@ -696,7 +696,7 @@ fn file_item_from_path(
     if matches!(context.remote_mode, super::ToolRemoteMode::Selectable) {
         if let ExecutionTarget::RemoteSsh { host, cwd } = context.execution_target(arguments)? {
             return remote_file_item_from_path(
-                context.workspace_root,
+                context.data_root,
                 &host,
                 cwd.as_deref(),
                 &path,
@@ -737,14 +737,14 @@ fn local_file_item_from_path(path: &Path, media_kind: &str) -> Result<FileItem, 
 }
 
 fn remote_file_item_from_path(
-    workspace_root: &Path,
+    data_root: &Path,
     host: &str,
     cwd: Option<&str>,
     path: &str,
     media_kind: &str,
 ) -> Result<FileItem, LocalToolError> {
     let file_name = remote_file_name(path);
-    let local_dir = workspace_root.join(".output").join("remote-media");
+    let local_dir = data_root.join(".stellaclaw").join("output").join("remote-media");
     fs::create_dir_all(&local_dir).map_err(|error| {
         LocalToolError::Io(format!("failed to create {}: {error}", local_dir.display()))
     })?;
@@ -1241,6 +1241,7 @@ mod tests {
         static REMOTE_MODE: ToolRemoteMode = ToolRemoteMode::Selectable;
         ToolExecutionContext {
             workspace_root: root,
+            data_root: root,
             remote_mode: &REMOTE_MODE,
             cancel_token,
         }

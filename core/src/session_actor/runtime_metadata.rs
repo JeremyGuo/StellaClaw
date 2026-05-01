@@ -18,7 +18,7 @@ pub(crate) const USER_META_PROMPT_COMPONENT: &str = "user_meta";
 const USER_META_PATH: &str = ".stellaclaw/USER.md";
 const IDENTITY_PATH: &str = ".stellaclaw/IDENTITY.md";
 const STELLACLAW_MEMORY_PATH: &str = "STELLACLAW.md";
-const SKILL_ROOT: &str = ".skill";
+const SKILL_ROOT: &str = ".stellaclaw/skill";
 const SKILL_ENTRY_FILE: &str = "SKILL.md";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -73,9 +73,10 @@ impl RuntimeMetadataState {
     pub(crate) fn initialize_from_workspace(
         &mut self,
         workspace_root: &Path,
+        data_root: &Path,
         remote_aliases_prompt: String,
     ) -> Result<(), String> {
-        let metadata = load_workspace_runtime_metadata(workspace_root)?;
+        let metadata = load_workspace_runtime_metadata(workspace_root, data_root)?;
         initialize_component(
             &mut self.prompt_components,
             IDENTITY_PROMPT_COMPONENT,
@@ -118,9 +119,10 @@ impl RuntimeMetadataState {
     pub(crate) fn observe_for_user_turn_from_workspace(
         &mut self,
         workspace_root: &Path,
+        data_root: &Path,
         remote_aliases_prompt: String,
     ) -> Result<Vec<String>, String> {
-        let metadata = load_workspace_runtime_metadata(workspace_root)?;
+        let metadata = load_workspace_runtime_metadata(workspace_root, data_root)?;
         let mut prompt_notices = Vec::new();
         observe_component(
             &mut self.prompt_components,
@@ -272,12 +274,13 @@ enum SkillChangeNotice {
 
 pub(crate) fn load_workspace_runtime_metadata(
     workspace_root: &Path,
+    data_root: &Path,
 ) -> Result<WorkspaceRuntimeMetadata, String> {
     Ok(WorkspaceRuntimeMetadata {
-        identity: read_optional_workspace_file(workspace_root, IDENTITY_PATH)?,
+        identity: read_optional_workspace_file(data_root, IDENTITY_PATH)?,
         stellaclaw_memory: read_optional_workspace_file(workspace_root, STELLACLAW_MEMORY_PATH)?,
-        user_meta: read_optional_workspace_file(workspace_root, USER_META_PATH)?,
-        skills: load_workspace_skills(workspace_root)?,
+        user_meta: read_optional_workspace_file(data_root, USER_META_PATH)?,
+        skills: load_workspace_skills(data_root)?,
         skills_metadata: String::new(),
     })
     .map(|mut metadata| {
@@ -787,19 +790,19 @@ mod tests {
 
         let mut state = RuntimeMetadataState::default();
         state
-            .initialize_from_workspace(&root, String::new())
+            .initialize_from_workspace(&root, &root, String::new())
             .expect("initial metadata should load");
 
         fs::write(root.join(".stellaclaw/USER.md"), "tier: enterprise").unwrap();
         let notices = state
-            .observe_for_user_turn_from_workspace(&root, String::new())
+            .observe_for_user_turn_from_workspace(&root, &root, String::new())
             .expect("changed metadata should load");
         assert_eq!(notices.len(), 1);
         assert!(notices[0].contains("[Runtime Prompt Updates]"));
         assert!(notices[0].contains("tier: enterprise"));
 
         assert!(state
-            .observe_for_user_turn_from_workspace(&root, String::new())
+            .observe_for_user_turn_from_workspace(&root, &root, String::new())
             .expect("metadata should still load")
             .is_empty());
 
@@ -809,18 +812,18 @@ mod tests {
     #[test]
     fn reports_loaded_skill_content_change() {
         let root = temp_root();
-        fs::create_dir_all(root.join(".skill/demo")).unwrap();
-        fs::write(root.join(".skill/demo/SKILL.md"), "# Demo\n\nold body").unwrap();
+        fs::create_dir_all(root.join(".stellaclaw/skill/demo")).unwrap();
+        fs::write(root.join(".stellaclaw/skill/demo/SKILL.md"), "# Demo\n\nold body").unwrap();
 
         let mut state = RuntimeMetadataState::default();
         state
-            .initialize_from_workspace(&root, String::new())
+            .initialize_from_workspace(&root, &root, String::new())
             .expect("initial metadata should load");
         state.mark_loaded_skills(&["demo".to_string()], 1);
 
-        fs::write(root.join(".skill/demo/SKILL.md"), "# Demo\n\nnew body").unwrap();
+        fs::write(root.join(".stellaclaw/skill/demo/SKILL.md"), "# Demo\n\nnew body").unwrap();
         let notices = state
-            .observe_for_user_turn_from_workspace(&root, String::new())
+            .observe_for_user_turn_from_workspace(&root, &root, String::new())
             .expect("changed metadata should load");
         assert!(notices
             .iter()
@@ -850,14 +853,14 @@ mod tests {
     #[test]
     fn renders_skills_metadata_from_workspace_skills() {
         let root = temp_root();
-        fs::create_dir_all(root.join(".skill/example")).unwrap();
+        fs::create_dir_all(root.join(".stellaclaw/skill/example")).unwrap();
         fs::write(
-            root.join(".skill/example/SKILL.md"),
+            root.join(".stellaclaw/skill/example/SKILL.md"),
             "# Example\n\nDo the important thing.",
         )
         .unwrap();
 
-        let metadata = load_workspace_runtime_metadata(&root).expect("metadata should load");
+        let metadata = load_workspace_runtime_metadata(&root, &root).expect("metadata should load");
 
         assert_eq!(metadata.skills.len(), 1);
         assert_eq!(metadata.skills[0].name, "example");
@@ -872,14 +875,14 @@ mod tests {
     #[test]
     fn renders_skills_metadata_from_yaml_frontmatter_description() {
         let root = temp_root();
-        fs::create_dir_all(root.join(".skill/example")).unwrap();
+        fs::create_dir_all(root.join(".stellaclaw/skill/example")).unwrap();
         fs::write(
-            root.join(".skill/example/SKILL.md"),
+            root.join(".stellaclaw/skill/example/SKILL.md"),
             "---\nname: example\ndescription: >\n  Do the important thing\n  with care.\n---\n\n# Example\n\nBody.",
         )
         .unwrap();
 
-        let metadata = load_workspace_runtime_metadata(&root).expect("metadata should load");
+        let metadata = load_workspace_runtime_metadata(&root, &root).expect("metadata should load");
 
         assert_eq!(metadata.skills.len(), 1);
         assert_eq!(
@@ -901,12 +904,12 @@ mod tests {
 
         let mut state = RuntimeMetadataState::default();
         state
-            .initialize_from_workspace(&root, String::new())
+            .initialize_from_workspace(&root, &root, String::new())
             .expect("initial metadata should load");
 
         fs::write(root.join("STELLACLAW.md"), "new durable note").unwrap();
         let notices = state
-            .observe_for_user_turn_from_workspace(&root, String::new())
+            .observe_for_user_turn_from_workspace(&root, &root, String::new())
             .expect("updated metadata should load");
 
         assert!(notices.is_empty());

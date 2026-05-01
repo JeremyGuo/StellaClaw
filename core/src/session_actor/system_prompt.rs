@@ -61,7 +61,7 @@ fn common_prompt() -> &'static str {
      to send files or images back to the user, append one or more tags in this exact format: \
      <attachment>relative/path/from/workspace_root</attachment>. Each path must be relative to the \
      current workspace root. This attachment syntax is supported in both the final assistant reply \
-     and user_tell text. The workspace may contain shared/; that directory is shared across \
+     and user_tell text. The workspace may contain .stellaclaw/stellaclaw_shared/; that directory is shared across \
      conversations in this Stellaclaw workdir and is appropriate for reusable artifacts. If \
      STELLACLAW_SOFTWARE_DIR is set in the tool environment, that path is the configured shared \
      software directory for reusable binaries, checkouts, caches, or other tool installations."
@@ -194,13 +194,14 @@ mod tests {
         let mut state = RuntimeMetadataState::default();
         let root = temp_root();
         fs::create_dir_all(root.join(".stellaclaw")).unwrap();
-        fs::create_dir_all(root.join(".skill/demo")).unwrap();
+        fs::create_dir_all(root.join(".stellaclaw/skill/demo")).unwrap();
         fs::write(root.join(".stellaclaw/IDENTITY.md"), "identity: old").unwrap();
         fs::write(root.join(".stellaclaw/USER.md"), "tier: old").unwrap();
         fs::write(root.join("STELLACLAW.md"), "memory: old").unwrap();
-        fs::write(root.join(".skill/demo/SKILL.md"), "# Demo\n\nskills: old").unwrap();
+        fs::write(root.join(".stellaclaw/skill/demo/SKILL.md"), "# Demo\n\nskills: old").unwrap();
         state
             .initialize_from_workspace(
+                &root,
                 &root,
                 "Available SSH remote aliases from ~/.ssh/config:\n- `old-host`".to_string(),
             )
@@ -209,9 +210,10 @@ mod tests {
         fs::write(root.join(".stellaclaw/IDENTITY.md"), "identity: new").unwrap();
         fs::write(root.join(".stellaclaw/USER.md"), "tier: new").unwrap();
         fs::write(root.join("STELLACLAW.md"), "memory: new").unwrap();
-        fs::write(root.join(".skill/demo/SKILL.md"), "# Demo\n\nskills: new").unwrap();
+        fs::write(root.join(".stellaclaw/skill/demo/SKILL.md"), "# Demo\n\nskills: new").unwrap();
         state
             .observe_for_user_turn_from_workspace(
+                &root,
                 &root,
                 "Available SSH remote aliases from ~/.ssh/config:\n- `new-host`".to_string(),
             )
@@ -251,6 +253,7 @@ mod tests {
         let root = temp_root();
         state
             .initialize_from_workspace(
+                &root,
                 &root,
                 remote_aliases_prompt_for_mode(&ToolRemoteMode::Selectable),
             )

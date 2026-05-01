@@ -36,6 +36,7 @@ pub fn build_agent_server_command(
             let mut command = Command::new(binary_path);
             command.current_dir(current_dir);
             command.env("STELLACLAW_SESSION_ROOT", session_root);
+            command.env("STELLACLAW_DATA_ROOT", session_root);
             if let Some(software_dir) = configured_software_dir(sandbox) {
                 command.env("STELLACLAW_SOFTWARE_DIR", software_dir);
             }
@@ -59,6 +60,7 @@ pub fn build_workspace_shell_command(
             command.arg("-lc").arg(script);
             command.current_dir(current_dir);
             command.env("STELLACLAW_SESSION_ROOT", session_root);
+            command.env("STELLACLAW_DATA_ROOT", session_root);
             if let Some(software_dir) = configured_software_dir(sandbox) {
                 command.env("STELLACLAW_SOFTWARE_DIR", software_dir);
             }
@@ -139,6 +141,11 @@ fn build_bubblewrap_command(
         "STELLACLAW_SESSION_ROOT",
         session_root_env.as_str(),
     ]);
+    command.args([
+        "--setenv",
+        "STELLACLAW_DATA_ROOT",
+        session_root_env.as_str(),
+    ]);
     if let Some(software_dir) = configured_software_dir(sandbox) {
         let software_dir = software_dir
             .canonicalize()
@@ -215,6 +222,11 @@ fn build_bubblewrap_shell_command(
     command.args([
         "--setenv",
         "STELLACLAW_SESSION_ROOT",
+        session_root_env.as_str(),
+    ]);
+    command.args([
+        "--setenv",
+        "STELLACLAW_DATA_ROOT",
         session_root_env.as_str(),
     ]);
     if let Some(software_dir) = configured_software_dir(sandbox) {

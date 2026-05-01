@@ -150,8 +150,9 @@ fn start_shell_command(
     }
 
     let out_path = context
-        .workspace_root
-        .join(".output")
+        .data_root
+        .join(".stellaclaw")
+        .join("output")
         .join("shell")
         .join(session_id)
         .join(nonce());

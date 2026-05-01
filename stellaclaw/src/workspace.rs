@@ -10,11 +10,10 @@ use anyhow::{anyhow, Context, Result};
 use stellaclaw_core::session_actor::ToolRemoteMode;
 
 const RUNDIR: &str = "rundir";
-const SHARED_DIR: &str = "shared";
-const PROFILE_DIR: &str = ".stellaclaw";
-const SKILL_DIR: &str = ".skill";
+const STELLACLAW_DIR: &str = ".stellaclaw";
+const SHARED_DIR: &str = "stellaclaw_shared";
+const SKILL_DIR: &str = "skill";
 const SHARED_SKILL_MEMORY_DIR: &str = "skill_memory";
-const WORKSPACE_SKILL_MEMORY_DIR: &str = ".skill_memory";
 
 pub fn ensure_workspace_for_remote_mode(
     workdir: &Path,
@@ -38,17 +37,19 @@ pub fn ensure_workspace_for_remote_mode(
             } else {
                 ensure_sshfs_workspace(workdir, conversation_id, host, remote_path)?
             };
-            ensure_workspace_seed(workdir, &workspace)?;
+            ensure_workspace_seed(workdir, conversation_root)?;
             Ok(workspace)
         }
     }
 }
 
-pub fn ensure_workspace_seed(workdir: &Path, conversation_root: &Path) -> Result<()> {
+pub fn ensure_workspace_seed(workdir: &Path, data_root: &Path) -> Result<()> {
+    migrate_legacy_workspace_layout(data_root);
+
     let runtime_root = workdir.join(RUNDIR);
-    let runtime_shared = runtime_root.join(SHARED_DIR);
-    let runtime_profile = runtime_root.join(PROFILE_DIR);
-    let runtime_skill = runtime_root.join(SKILL_DIR);
+    let runtime_shared = runtime_root.join("shared");
+    let runtime_profile = runtime_root.join(STELLACLAW_DIR);
+    let runtime_skill = runtime_root.join(".skill");
     let runtime_skill_memory = runtime_root.join(SHARED_SKILL_MEMORY_DIR);
 
     fs::create_dir_all(&runtime_shared)
@@ -60,10 +61,12 @@ pub fn ensure_workspace_seed(workdir: &Path, conversation_root: &Path) -> Result
     fs::create_dir_all(&runtime_skill_memory)
         .with_context(|| format!("failed to create {}", runtime_skill_memory.display()))?;
 
-    let workspace_profile = conversation_root.join(PROFILE_DIR);
-    let workspace_skill = conversation_root.join(SKILL_DIR);
-    let workspace_skill_memory = conversation_root.join(WORKSPACE_SKILL_MEMORY_DIR);
-    fs::create_dir_all(&workspace_profile)
+    let stellaclaw_dir = data_root.join(STELLACLAW_DIR);
+    let workspace_profile = &stellaclaw_dir;
+    let workspace_skill = stellaclaw_dir.join(SKILL_DIR);
+    let workspace_shared = stellaclaw_dir.join(SHARED_DIR);
+    let workspace_skill_memory = stellaclaw_dir.join(SHARED_SKILL_MEMORY_DIR);
+    fs::create_dir_all(workspace_profile)
         .with_context(|| format!("failed to create {}", workspace_profile.display()))?;
     fs::create_dir_all(&workspace_skill)
         .with_context(|| format!("failed to create {}", workspace_skill.display()))?;
@@ -78,8 +81,63 @@ pub fn ensure_workspace_seed(workdir: &Path, conversation_root: &Path) -> Result
     )?;
     ensure_skill_seed(&runtime_skill, &workspace_skill)?;
     ensure_shared_link(&runtime_skill_memory, &workspace_skill_memory)?;
-    ensure_shared_link(&runtime_shared, &conversation_root.join(SHARED_DIR))?;
+    ensure_shared_link(&runtime_shared, &workspace_shared)?;
     Ok(())
+}
+
+/// Migrate legacy workspace layout to the new .stellaclaw/ structure.
+fn migrate_legacy_workspace_layout(data_root: &Path) {
+    let stellaclaw_dir = data_root.join(STELLACLAW_DIR);
+
+    // .skill/ -> .stellaclaw/skill/
+    let old_skill = data_root.join(".skill");
+    let new_skill = stellaclaw_dir.join(SKILL_DIR);
+    if old_skill.exists() && !new_skill.exists() {
+        let _ = fs::create_dir_all(&stellaclaw_dir);
+        let _ = fs::rename(&old_skill, &new_skill);
+    }
+
+    // shared -> .stellaclaw/stellaclaw_shared
+    let old_shared = data_root.join("shared");
+    let new_shared = stellaclaw_dir.join(SHARED_DIR);
+    if old_shared.symlink_metadata().is_ok() && !new_shared.exists() {
+        let _ = fs::create_dir_all(&stellaclaw_dir);
+        let _ = fs::rename(&old_shared, &new_shared);
+    }
+
+    // .skill_memory -> .stellaclaw/skill_memory
+    let old_skill_memory = data_root.join(".skill_memory");
+    let new_skill_memory = stellaclaw_dir.join(SHARED_SKILL_MEMORY_DIR);
+    if old_skill_memory.symlink_metadata().is_ok() && !new_skill_memory.exists() {
+        let _ = fs::create_dir_all(&stellaclaw_dir);
+        let _ = fs::rename(&old_skill_memory, &new_skill_memory);
+    }
+
+    // .output/ -> .stellaclaw/output/
+    let old_output = data_root.join(".output");
+    let new_output = stellaclaw_dir.join("output");
+    if old_output.exists() && !new_output.exists() {
+        let _ = fs::create_dir_all(&stellaclaw_dir);
+        let _ = fs::rename(&old_output, &new_output);
+    }
+
+    // .cache/ -> .stellaclaw/cache/
+    let old_cache = data_root.join(".cache");
+    let new_cache = stellaclaw_dir.join("cache");
+    if old_cache.exists() && !new_cache.exists() {
+        let _ = fs::create_dir_all(&stellaclaw_dir);
+        let _ = fs::rename(&old_cache, &new_cache);
+    }
+
+    // .log/stellaclaw/ -> .stellaclaw/log/
+    let old_log = data_root.join(".log").join("stellaclaw");
+    let new_log = stellaclaw_dir.join("log");
+    if old_log.exists() && !new_log.exists() {
+        let _ = fs::create_dir_all(&stellaclaw_dir);
+        let _ = fs::rename(&old_log, &new_log);
+        // Clean up empty .log/ parent
+        let _ = fs::remove_dir(data_root.join(".log"));
+    }
 }
 
 pub fn sshfs_workspace_root(workdir: &Path, conversation_id: &str) -> PathBuf {
@@ -728,12 +786,23 @@ mod tests {
 
         ensure_workspace_seed(&root, &conversation_a).expect("first workspace should seed");
         ensure_workspace_seed(&root, &conversation_b).expect("second workspace should seed");
-        std::fs::write(conversation_a.join("shared").join("marker.txt"), "shared")
-            .expect("shared file should be writable");
+        std::fs::write(
+            conversation_a
+                .join(".stellaclaw")
+                .join("stellaclaw_shared")
+                .join("marker.txt"),
+            "shared",
+        )
+        .expect("shared file should be writable");
 
         assert_eq!(
-            std::fs::read_to_string(conversation_b.join("shared").join("marker.txt"))
-                .expect("shared file should be visible from other workspace"),
+            std::fs::read_to_string(
+                conversation_b
+                    .join(".stellaclaw")
+                    .join("stellaclaw_shared")
+                    .join("marker.txt")
+            )
+            .expect("shared file should be visible from other workspace"),
             "shared"
         );
         std::fs::remove_dir_all(&root).expect("temp dir should be cleaned");

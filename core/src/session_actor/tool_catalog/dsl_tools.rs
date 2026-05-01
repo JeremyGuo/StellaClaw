@@ -131,8 +131,9 @@ fn dsl_start(
     let code = string_arg(arguments, "code")?;
     let dsl_id = format!("dsl_{}", nonce());
     let out_path = context
-        .workspace_root
-        .join(".output")
+        .data_root
+        .join(".stellaclaw")
+        .join("output")
         .join("dsl")
         .join(&dsl_id);
     fs::create_dir_all(&out_path).map_err(|error| {

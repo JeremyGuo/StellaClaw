@@ -24,9 +24,9 @@ pub(super) fn execute_patch_tool(
     }
 
     let result = match context.execution_target(arguments)? {
-        ExecutionTarget::Local => apply_patch_local(arguments, context.workspace_root)?,
+        ExecutionTarget::Local => apply_patch_local(arguments, context.workspace_root, context.data_root)?,
         ExecutionTarget::RemoteSsh { host, cwd } => {
-            apply_patch_remote(arguments, context.workspace_root, &host, cwd.as_deref())?
+            apply_patch_remote(arguments, context.workspace_root, context.data_root, &host, cwd.as_deref())?
         }
     };
     Ok(Some(result))
@@ -35,6 +35,7 @@ pub(super) fn execute_patch_tool(
 fn apply_patch_local(
     arguments: &Map<String, Value>,
     workspace_root: &std::path::Path,
+    data_root: &std::path::Path,
 ) -> Result<Value, LocalToolError> {
     let patch = string_arg(arguments, "patch")?;
     let strip = usize_arg_with_default(arguments, "strip", 0)?;
@@ -42,7 +43,7 @@ fn apply_patch_local(
     let check = bool_arg_with_default(arguments, "check", false)?;
     let max_output_chars =
         clamp_tool_output_chars(usize_arg_with_default(arguments, "max_output_chars", 1000)?);
-    let out_path = make_patch_output_dir(workspace_root)?;
+    let out_path = make_patch_output_dir(data_root)?;
 
     let mut command = Command::new("git");
     command
@@ -79,7 +80,8 @@ fn apply_patch_local(
 
 fn apply_patch_remote(
     arguments: &Map<String, Value>,
-    workspace_root: &std::path::Path,
+    _workspace_root: &std::path::Path,
+    data_root: &std::path::Path,
     host: &str,
     cwd: Option<&str>,
 ) -> Result<Value, LocalToolError> {
@@ -112,7 +114,7 @@ fn apply_patch_remote(
         None => remote_command,
     };
     let output = run_remote_command_with_stdin(host, &remote_command, patch.as_bytes())?;
-    let out_path = make_patch_output_dir(workspace_root)?;
+    let out_path = make_patch_output_dir(data_root)?;
     patch_result(output, out_path, Some(host), max_output_chars)
 }
 
@@ -161,9 +163,10 @@ fn patch_result(
     Ok(Value::Object(result))
 }
 
-fn make_patch_output_dir(workspace_root: &std::path::Path) -> Result<PathBuf, LocalToolError> {
-    let out_path = workspace_root
-        .join(".output")
+fn make_patch_output_dir(data_root: &std::path::Path) -> Result<PathBuf, LocalToolError> {
+    let out_path = data_root
+        .join(".stellaclaw")
+        .join("output")
         .join("apply_patch")
         .join(nonce());
     fs::create_dir_all(&out_path).map_err(|error| {
