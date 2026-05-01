@@ -97,7 +97,7 @@ pub struct CronManager {
 
 impl CronManager {
     pub fn load_under(workdir: &Path) -> Result<Self> {
-        let dir = workdir.join(".log").join("stellaclaw");
+        let dir = workdir.join(".stellaclaw");
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
         let path = dir.join("cron_tasks.json");
         let store = if path.exists() {

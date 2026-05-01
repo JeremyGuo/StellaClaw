@@ -32,9 +32,9 @@ impl StellaclawLogger {
         })
     }
 
-    /// Open a logger under root/.log/stellaclaw/ (for host-level logs).
+    /// Open a logger under root/.stellaclaw/ (for host/workdir-level logs).
     pub fn open_under(root: &Path, name: &str) -> Result<Self, String> {
-        let dir = root.join(".log").join("stellaclaw");
+        let dir = root.join(".stellaclaw");
         fs::create_dir_all(&dir)
             .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
         let path = dir.join(name);

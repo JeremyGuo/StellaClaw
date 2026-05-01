@@ -92,8 +92,7 @@ impl TelegramChannel {
         workdir: &Path,
     ) -> Result<Self> {
         let dir = workdir
-            .join(".log")
-            .join("stellaclaw")
+            .join(".stellaclaw")
             .join("channels")
             .join(&id);
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;

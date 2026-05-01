@@ -21,7 +21,7 @@ pub struct ConversationIdManager {
 
 impl ConversationIdManager {
     pub fn load_under(workdir: &Path) -> Result<Self, String> {
-        let dir = workdir.join(".log").join("stellaclaw");
+        let dir = workdir.join(".stellaclaw");
         fs::create_dir_all(&dir)
             .map_err(|error| format!("failed to create {}: {error}", dir.display()))?;
         let path = dir.join("conversation_ids.json");

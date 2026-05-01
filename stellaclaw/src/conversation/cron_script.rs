@@ -49,8 +49,8 @@ pub(super) fn run_script_command(
         .map(Duration::from_secs_f64)
         .unwrap_or(DEFAULT_CRON_SCRIPT_TIMEOUT);
     let output_root = conversation_root
-        .join(".log")
-        .join("stellaclaw")
+        .join(".stellaclaw")
+        .join("log")
         .join("cron_script")
         .join(&task.id)
         .join(format!(

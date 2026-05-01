@@ -2069,8 +2069,7 @@ fn compare_message_ids(left: &str, right: &str) -> Option<Ordering> {
 
 fn web_channel_state_dir(workdir: &Path, channel_id: &str) -> PathBuf {
     workdir
-        .join(".log")
-        .join("stellaclaw")
+        .join(".stellaclaw")
         .join("channels")
         .join(channel_id)
 }
