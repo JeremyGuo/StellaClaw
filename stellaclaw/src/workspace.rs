@@ -132,9 +132,35 @@ fn migrate_legacy_workspace_layout(data_root: &Path) {
     // .log/stellaclaw/ -> .stellaclaw/log/
     let old_log = data_root.join(".log").join("stellaclaw");
     let new_log = stellaclaw_dir.join("log");
-    if old_log.exists() && !new_log.exists() {
+    if old_log.exists() {
         let _ = fs::create_dir_all(&stellaclaw_dir);
-        let _ = fs::rename(&old_log, &new_log);
+        if !new_log.exists() {
+            let _ = fs::rename(&old_log, &new_log);
+        } else {
+            // new_log was already created (e.g. by the conversation logger).
+            // Move remaining old files into the new directory, then remove old.
+            if let Ok(entries) = fs::read_dir(&old_log) {
+                for entry in entries.flatten() {
+                    let new_dest = new_log.join(entry.file_name());
+                    if !new_dest.exists() {
+                        let _ = fs::rename(entry.path(), new_dest);
+                    } else if entry.path().is_file() {
+                        // Prepend old content for log files.
+                        if let Ok(old_data) = fs::read(entry.path()) {
+                            if !old_data.is_empty() {
+                                if let Ok(new_data) = fs::read(&new_dest) {
+                                    let mut merged = old_data;
+                                    merged.extend_from_slice(&new_data);
+                                    let _ = fs::write(&new_dest, merged);
+                                }
+                            }
+                        }
+                        let _ = fs::remove_file(entry.path());
+                    }
+                }
+            }
+            let _ = fs::remove_dir_all(&old_log);
+        }
         // Clean up empty .log/ parent
         let _ = fs::remove_dir(data_root.join(".log"));
     }

@@ -28,12 +28,28 @@ impl WorkdirUpgrader for StellaclawWorkdirDirectoryUpgrade {
         for entry_name in ["host.log", "conversation_ids.json", "cron_tasks.json", "channels"] {
             let old_path = old_root.join(entry_name);
             let new_path = new_root.join(entry_name);
-            if old_path.exists() && !new_path.exists() {
+            if !old_path.exists() {
+                continue;
+            }
+            if !new_path.exists() {
                 if let Err(error) = fs::rename(&old_path, &new_path) {
                     eprintln!(
                         "stellaclaw: warning: failed to migrate {}: {error}",
                         old_path.display()
                     );
+                }
+            } else if old_path.is_file() {
+                // New file was already created (e.g. host.log opened before upgrade).
+                // Prepend old content before the new data, then remove the old file.
+                if let Ok(old_data) = fs::read(&old_path) {
+                    if !old_data.is_empty() {
+                        if let Ok(new_data) = fs::read(&new_path) {
+                            let mut merged = old_data;
+                            merged.extend_from_slice(&new_data);
+                            let _ = fs::write(&new_path, merged);
+                        }
+                    }
+                    let _ = fs::remove_file(&old_path);
                 }
             }
         }
