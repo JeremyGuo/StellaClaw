@@ -135,10 +135,10 @@ pub(super) fn conversation_status_snapshot(
     })
 }
 
-fn session_usage_totals(workspace_root: &Path, session_id: &str) -> UsageTotals {
-    let path = workspace_root
-        .join(".log")
-        .join("stellaclaw")
+fn session_usage_totals(session_root: &Path, session_id: &str) -> UsageTotals {
+    let path = session_root
+        .join(".stellaclaw")
+        .join("log")
         .join(sanitize_session_id_for_log_path(session_id))
         .join("all_messages.jsonl");
     let Ok(Some(reader)) = open_jsonl_reader(&path) else {
@@ -162,8 +162,8 @@ fn session_usage_totals(workspace_root: &Path, session_id: &str) -> UsageTotals 
 
 fn media_tool_usage_totals(workspace_root: &Path) -> UsageTotals {
     let path = workspace_root
-        .join(".log")
-        .join("stellaclaw")
+        .join(".stellaclaw")
+        .join("log")
         .join("tool_usage.jsonl");
     let Ok(Some(reader)) = open_jsonl_reader(&path) else {
         return UsageTotals::default();
@@ -239,5 +239,58 @@ fn sanitize_session_id_for_log_path(session_id: &str) -> String {
         "session".to_string()
     } else {
         safe
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs::{self, File},
+        io::Write,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    use stellaclaw_core::session_actor::{ChatMessage, ChatMessageItem, ChatRole, ContextItem};
+
+    fn temp_root(name: &str) -> std::path::PathBuf {
+        let id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("stellaclaw-status-{name}-{id}"))
+    }
+
+    #[test]
+    fn session_usage_reads_stellaclaw_log_directory() {
+        let root = temp_root("session-usage");
+        let message_path = root
+            .join(".stellaclaw")
+            .join("log")
+            .join("foreground")
+            .join("all_messages.jsonl");
+        fs::create_dir_all(message_path.parent().unwrap()).unwrap();
+        let mut message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "hello".to_string(),
+            })],
+        );
+        message.token_usage = Some(TokenUsage {
+            cache_read: 1,
+            cache_write: 2,
+            uncache_input: 3,
+            output: 4,
+            cost_usd: None,
+        });
+        let mut file = File::create(&message_path).unwrap();
+        writeln!(file, "{}", serde_json::to_string(&message).unwrap()).unwrap();
+
+        let totals = session_usage_totals(&root, "foreground");
+        assert_eq!(totals.cache_read, 1);
+        assert_eq!(totals.cache_write, 2);
+        assert_eq!(totals.uncache_input, 3);
+        assert_eq!(totals.output, 4);
+
+        let _ = fs::remove_dir_all(root);
     }
 }

@@ -181,7 +181,7 @@ mod tests {
     use serde_json::Map;
 
     #[test]
-    fn ls_includes_top_level_shared_symlink() {
+    fn ls_hides_stellaclaw_directory_from_listing() {
         let root =
             std::env::temp_dir().join(format!("stellaclaw-ls-shared-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -192,17 +192,21 @@ mod tests {
         std::fs::write(shared_target.join("marker.txt"), "shared")
             .expect("shared file should be written");
 
+        let stellaclaw_dir = workspace.join(".stellaclaw");
+        std::fs::create_dir_all(&stellaclaw_dir).expect("stellaclaw dir should be created");
+
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&shared_target, workspace.join("shared"))
+        std::os::unix::fs::symlink(&shared_target, stellaclaw_dir.join("stellaclaw_shared"))
             .expect("shared symlink should be created");
+
         #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&shared_target, workspace.join("shared"))
+        std::os::windows::fs::symlink_dir(&shared_target, stellaclaw_dir.join("stellaclaw_shared"))
             .expect("shared symlink should be created");
 
         let result = ls_local(&Map::new(), &workspace).expect("ls should succeed");
         let text = result.as_str().expect("ls result should be text");
-        assert!(text.contains("- shared/"), "{text}");
-        assert!(text.contains("- marker.txt"), "{text}");
+        assert!(!text.contains("stellaclaw_shared"), "stellaclaw_shared should be hidden: {text}");
+        assert!(!text.contains("marker.txt"), "marker.txt inside .stellaclaw should be hidden: {text}");
 
         std::fs::remove_dir_all(&root).expect("temp dir should be cleaned");
     }

@@ -56,7 +56,10 @@ impl OutputPersistor {
 }
 
 fn build_output_file_path(media_type: &str) -> Result<PathBuf, OutputPersistorError> {
-    let cwd = std::env::current_dir().map_err(OutputPersistorError::CurrentDirectory)?;
+    let base = match std::env::var_os("STELLACLAW_DATA_ROOT") {
+        Some(value) => PathBuf::from(value),
+        None => std::env::current_dir().map_err(OutputPersistorError::CurrentDirectory)?,
+    };
     let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
     let date = now
         .format(DATE_FORMAT)
@@ -66,8 +69,9 @@ fn build_output_file_path(media_type: &str) -> Result<PathBuf, OutputPersistorEr
         .map_err(OutputPersistorError::FormatTimestamp)?;
     let extension = media_type_to_extension(media_type);
 
-    Ok(cwd
-        .join(".output")
+    Ok(base
+        .join(".stellaclaw")
+        .join("output")
         .join(date)
         .join(format!("output.{time}.{extension}")))
 }

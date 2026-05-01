@@ -131,13 +131,24 @@ fn is_inside_fenced_code_block(text: &str, byte_index: usize) -> bool {
 }
 
 fn is_shared_attachment_path(path_text: &str) -> bool {
-    path_text == "shared"
-        || path_text
-            .strip_prefix("shared/")
-            .is_some_and(|relative| !relative.trim().is_empty())
-        || path_text
-            .strip_prefix("shared\\")
-            .is_some_and(|relative| !relative.trim().is_empty())
+    // Exact directory references (no trailing separator).
+    if path_text == ".stellaclaw/stellaclaw_shared" || path_text == "shared" {
+        return true;
+    }
+    // Prefix with content after the separator.
+    for prefix in [
+        ".stellaclaw/stellaclaw_shared/",
+        ".stellaclaw/stellaclaw_shared\\",
+        "shared/",
+        "shared\\",
+    ] {
+        if let Some(relative) = path_text.strip_prefix(prefix) {
+            if !relative.trim().is_empty() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn resolve_outgoing_attachment(
@@ -291,6 +302,11 @@ mod tests {
 
     #[test]
     fn shared_attachment_path_accepts_unix_and_windows_separators() {
+        // New .stellaclaw/stellaclaw_shared/ paths.
+        assert!(is_shared_attachment_path(".stellaclaw/stellaclaw_shared"));
+        assert!(is_shared_attachment_path(".stellaclaw/stellaclaw_shared/foo.pdf"));
+        assert!(!is_shared_attachment_path(".stellaclaw/stellaclaw_shared/"));
+        // Legacy shared/ paths for backward compatibility.
         assert!(is_shared_attachment_path("shared"));
         assert!(is_shared_attachment_path("shared/foo.pdf"));
         assert!(is_shared_attachment_path("shared\\foo.pdf"));

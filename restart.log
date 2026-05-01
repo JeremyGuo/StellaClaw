@@ -68,3 +68,22 @@ warning: `stellaclaw` (bin "stellaclaw") generated 3 warnings (run `cargo fix --
 [2026-04-29 17:29:37] New process is running. Restart complete.
 [2026-05-01 14:13:46] === Graceful restart started ===
 [2026-05-01 14:13:46] Stopping old stellaclaw (PID: 13391) ...
+[2026-05-01 20:41:25] === Graceful restart started ===
+[2026-05-01 20:41:26] Stopping old stellaclaw (PID: 19258) ...
+[2026-05-01 22:30:56] restarting stellaclaw
+  binary: /home/liuhao/ClawParty/target/release/stellaclaw
+  config: /home/liuhao/ClawParty/deploy_prod.json
+  workdir: /home/liuhao/clawparty_workdir
+  old_pids: 63389
+/tmp/codex-ssh-cb360ea56170480fa1af790279a7233b.sh.lf: line 37: kill: (63389) - No such process
+[2026-05-01 22:30:58] started stellaclaw pid=69323
+stellaclaw: telegram channel telegram-main requires bot_token or env TELEGRAM_BOT_TOKEN
+[2026-05-01 22:32:04] === Graceful restart started ===
+[2026-05-01 22:32:04] Stopping old stellaclaw (PID: 69329) ...
+[2026-05-01 22:32:04] All old processes exited after 1s
+[2026-05-01 22:32:04] Loaded .env
+[2026-05-01 22:32:04] Starting new stellaclaw ...
+[2026-05-01 22:32:04]   config: /home/liuhao/ClawParty/deploy_prod.json
+[2026-05-01 22:32:04]   workdir: /home/liuhao/clawparty_workdir
+[2026-05-01 22:32:04] New stellaclaw started (PID: 69737)
+[2026-05-01 22:32:07] New process is running. Restart complete.

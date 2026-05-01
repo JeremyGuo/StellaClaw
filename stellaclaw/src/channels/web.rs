@@ -2983,8 +2983,8 @@ fn message_log_path(workdir: &Path, state: &ConversationState) -> PathBuf {
     workdir
         .join("conversations")
         .join(&state.conversation_id)
-        .join(".log")
-        .join("stellaclaw")
+        .join(".stellaclaw")
+        .join("log")
         .join(sanitize_session_id_for_log_path(
             &state.session_binding.foreground_session_id,
         ))
@@ -3175,6 +3175,25 @@ fn parse_web_remote_control(argument: &str) -> ConversationControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_log_path_uses_stellaclaw_log_directory() {
+        let workdir = test_workdir("message-log-path");
+        let state = test_state("web-main-test-message-log-path");
+
+        assert_eq!(
+            message_log_path(&workdir, &state),
+            workdir
+                .join("conversations")
+                .join(&state.conversation_id)
+                .join(".stellaclaw")
+                .join("log")
+                .join(&state.session_binding.foreground_session_id)
+                .join("all_messages.jsonl")
+        );
+
+        let _ = fs::remove_dir_all(workdir);
+    }
     use std::{collections::BTreeMap, fs};
 
     use crate::{
@@ -3263,8 +3282,8 @@ mod tests {
         let message_dir = workdir
             .join("conversations")
             .join(&state.conversation_id)
-            .join(".log")
-            .join("stellaclaw")
+            .join(".stellaclaw")
+            .join("log")
             .join(sanitize_session_id_for_log_path(
                 &state.session_binding.foreground_session_id,
             ));
