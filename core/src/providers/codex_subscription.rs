@@ -21,8 +21,8 @@ use url::Url;
 use crate::{
     model_config::{ModelConfig, RetryMode},
     session_actor::{
-        ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, ReasoningItem, ToolCallItem,
-        ToolDefinition,
+        normalize_messages_for_model, ChatMessage, ChatMessageItem, ChatRole, ContextItem,
+        FileItem, ReasoningItem, ToolCallItem, ToolDefinition,
     },
 };
 
@@ -125,7 +125,7 @@ impl CodexSubscriptionProvider {
         );
         payload.insert(
             "input".to_string(),
-            Value::Array(build_responses_input(request.messages)?),
+            Value::Array(build_responses_input(request.messages, model_config)?),
         );
         if let Some(system_prompt) = request.system_prompt {
             if !system_prompt.trim().is_empty() {
@@ -1046,7 +1046,10 @@ fn merge_streamed_response_output(response: &mut Value, accumulator: StreamAccum
     response_object.insert("output".to_string(), Value::Array(merged_output));
 }
 
-fn build_responses_input(messages: &[ChatMessage]) -> Result<Vec<Value>, ProviderError> {
+fn build_responses_input(
+    messages: &[ChatMessage],
+    model_config: &ModelConfig,
+) -> Result<Vec<Value>, ProviderError> {
     let mut input = Vec::new();
 
     for message in messages {
@@ -1061,28 +1064,13 @@ fn build_responses_input(messages: &[ChatMessage]) -> Result<Vec<Value>, Provide
                     }));
                 }
                 append_responses_tool_outputs(&mut input, message);
+                append_tool_result_image_messages(&mut input, message, model_config)?;
             }
             ChatRole::Assistant => {
                 append_codex_reasoning_items(&mut input, message);
-                let content = assistant_responses_content(message);
-                if !content.is_empty() {
-                    input.push(json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": content,
-                    }));
-                }
-                for item in &message.data {
-                    if let ChatMessageItem::ToolCall(tool_call) = item {
-                        input.push(json!({
-                            "type": "function_call",
-                            "name": tool_call.tool_name,
-                            "arguments": tool_call.arguments.text,
-                            "call_id": tool_call.tool_call_id,
-                        }));
-                    }
-                }
+                append_assistant_response_items(&mut input, message, model_config)?;
                 append_responses_tool_outputs(&mut input, message);
+                append_tool_result_image_messages(&mut input, message, model_config)?;
             }
         }
     }
@@ -1223,7 +1211,11 @@ fn user_responses_content(message: &ChatMessage) -> Result<Vec<Value>, ProviderE
     Ok(content)
 }
 
-fn assistant_responses_content(message: &ChatMessage) -> Vec<Value> {
+fn append_assistant_response_items(
+    target: &mut Vec<Value>,
+    message: &ChatMessage,
+    model_config: &ModelConfig,
+) -> Result<(), ProviderError> {
     let mut content = Vec::new();
 
     for item in &message.data {
@@ -1234,19 +1226,111 @@ fn assistant_responses_content(message: &ChatMessage) -> Vec<Value> {
                     "text": context.text,
                 }));
             }
+            ChatMessageItem::File(file) if is_image_file(file) && file.state.is_none() => {
+                if model_config.supports(crate::model_config::ModelCapability::ImageIn) {
+                    append_assistant_message_if_needed(target, &mut content);
+                    match image_generation_call_from_file(file)? {
+                        Some(item) => target.push(item),
+                        None => content.push(json!({
+                            "type": "output_text",
+                            "text": file.uri,
+                        })),
+                    }
+                } else {
+                    content.push(json!({
+                        "type": "output_text",
+                        "text": file_reference_text(file),
+                    }));
+                }
+            }
             ChatMessageItem::File(file) => {
                 content.push(json!({
                     "type": "output_text",
                     "text": file.uri,
                 }));
             }
-            ChatMessageItem::Reasoning(_)
-            | ChatMessageItem::ToolCall(_)
-            | ChatMessageItem::ToolResult(_) => {}
+            ChatMessageItem::ToolCall(tool_call) => {
+                append_assistant_message_if_needed(target, &mut content);
+                target.push(json!({
+                    "type": "function_call",
+                    "name": tool_call.tool_name,
+                    "arguments": tool_call.arguments.text,
+                    "call_id": tool_call.tool_call_id,
+                }));
+            }
+            ChatMessageItem::Reasoning(_) | ChatMessageItem::ToolResult(_) => {}
         }
     }
 
-    content
+    append_assistant_message_if_needed(target, &mut content);
+    Ok(())
+}
+
+fn append_assistant_message_if_needed(target: &mut Vec<Value>, content: &mut Vec<Value>) {
+    if content.is_empty() {
+        return;
+    }
+    target.push(json!({
+        "type": "message",
+        "role": "assistant",
+        "content": std::mem::take(content),
+    }));
+}
+
+fn image_generation_call_from_file(file: &FileItem) -> Result<Option<Value>, ProviderError> {
+    let Some(result) = image_generation_result_from_file(file)? else {
+        return Ok(None);
+    };
+    Ok(Some(json!({
+        "type": "image_generation_call",
+        "id": synthetic_image_generation_id(file),
+        "status": "completed",
+        "result": result,
+    })))
+}
+
+fn image_generation_result_from_file(file: &FileItem) -> Result<Option<String>, ProviderError> {
+    if file.uri.starts_with("data:") {
+        let Some((metadata, payload)) = file.uri.split_once(',') else {
+            return Ok(None);
+        };
+        if metadata.contains(";base64") {
+            return Ok(Some(payload.to_string()));
+        }
+        return Ok(None);
+    }
+    let Some(path) = local_file_path(&file.uri) else {
+        return Ok(None);
+    };
+    let bytes = fs::read(&path).map_err(|error| {
+        ProviderError::InvalidResponse(format!(
+            "failed to read assistant image output {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+    ))
+}
+
+fn synthetic_image_generation_id(file: &FileItem) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for byte in file.uri.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("ig_stellaclaw_{hash:016x}")
+}
+
+fn file_reference_text(file: &FileItem) -> String {
+    format!(
+        "[Image output omitted]\nuri: {}\nname: {}\nmedia_type: {}",
+        file.uri,
+        file.name.as_deref().unwrap_or("<unknown>"),
+        file.media_type.as_deref().unwrap_or("<unknown>")
+    )
 }
 
 fn append_responses_tool_outputs(target: &mut Vec<Value>, message: &ChatMessage) {
@@ -1259,6 +1343,36 @@ fn append_responses_tool_outputs(target: &mut Vec<Value>, message: &ChatMessage)
             }));
         }
     }
+}
+
+fn append_tool_result_image_messages(
+    target: &mut Vec<Value>,
+    message: &ChatMessage,
+    model_config: &ModelConfig,
+) -> Result<(), ProviderError> {
+    for item in &message.data {
+        let ChatMessageItem::ToolResult(tool_result) = item else {
+            continue;
+        };
+        let Some(file) = tool_result.result.file.as_ref() else {
+            continue;
+        };
+        if !is_image_file(file) || file.state.is_some() {
+            continue;
+        }
+        let fake = ChatMessage::new(ChatRole::User, vec![ChatMessageItem::File(file.clone())]);
+        for normalized in normalize_messages_for_model(&[fake], model_config) {
+            let content = user_responses_content(&normalized)?;
+            if !content.is_empty() {
+                target.push(json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": content,
+                }));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn responses_file_item(file: &FileItem) -> Result<Value, ProviderError> {
@@ -1520,8 +1634,11 @@ fn value_to_arguments_string(value: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model_config::{ModelCapability, ProviderType, RetryMode, TokenEstimatorType};
-    use crate::session_actor::{ToolBackend, ToolExecutionMode};
+    use crate::model_config::{
+        MediaInputConfig, MediaInputTransport, ModelCapability, MultimodalInputConfig,
+        ProviderType, RetryMode, TokenEstimatorType,
+    };
+    use crate::session_actor::{ToolBackend, ToolExecutionMode, ToolResultContent, ToolResultItem};
     use std::path::PathBuf;
 
     #[test]
@@ -1807,6 +1924,96 @@ mod tests {
     }
 
     #[test]
+    fn assistant_image_output_replays_as_image_generation_call_when_images_supported() {
+        let mut config = test_model_config();
+        config.capabilities.push(ModelCapability::ImageIn);
+        let messages = vec![ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::File(FileItem {
+                uri: "data:image/png;base64,QUJD".to_string(),
+                name: Some("generated.png".to_string()),
+                media_type: Some("image/png".to_string()),
+                width: None,
+                height: None,
+                state: None,
+            })],
+        )];
+
+        let input = build_responses_input(&messages, &config).expect("input should build");
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "image_generation_call");
+        assert_eq!(input[0]["status"], "completed");
+        assert_eq!(input[0]["result"], "QUJD");
+        assert!(input[0]["id"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("ig_stellaclaw_")));
+    }
+
+    #[test]
+    fn assistant_image_output_becomes_text_when_images_unsupported() {
+        let messages = vec![ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::File(FileItem {
+                uri: "data:image/png;base64,QUJD".to_string(),
+                name: Some("generated.png".to_string()),
+                media_type: Some("image/png".to_string()),
+                width: None,
+                height: None,
+                state: None,
+            })],
+        )];
+
+        let input =
+            build_responses_input(&messages, &test_model_config()).expect("input should build");
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "assistant");
+        assert!(input[0]["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Image output omitted")));
+    }
+
+    #[test]
+    fn tool_result_image_is_replayed_as_user_image_after_tool_output() {
+        let config = image_in_model_config();
+        let messages = vec![ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::ToolResult(ToolResultItem {
+                tool_call_id: "call_1".to_string(),
+                tool_name: "image_load".to_string(),
+                result: ToolResultContent {
+                    context: Some(ContextItem {
+                        text: "loaded image".to_string(),
+                    }),
+                    file: Some(FileItem {
+                        uri: "data:image/png;base64,QUJD".to_string(),
+                        name: Some("loaded.png".to_string()),
+                        media_type: Some("image/png".to_string()),
+                        width: None,
+                        height: None,
+                        state: None,
+                    }),
+                },
+            })],
+        )];
+
+        let input = build_responses_input(&messages, &config).expect("input should build");
+
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(input[0]["call_id"], "call_1");
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][0]["type"], "input_image");
+        assert_eq!(
+            input[1]["content"][0]["image_url"],
+            "data:image/png;base64,QUJD"
+        );
+    }
+
+    #[test]
     fn encrypted_reasoning_without_summary_is_not_exposed_as_text() {
         let item = serde_json::json!({
             "type": "reasoning",
@@ -1838,7 +2045,8 @@ mod tests {
 
         let provider = CodexSubscriptionProvider::new();
         let normalized = provider.normalize_messages_for_provider(&test_model_config(), &messages);
-        let input = build_responses_input(&normalized).expect("input should build");
+        let input =
+            build_responses_input(&normalized, &test_model_config()).expect("input should build");
 
         assert_eq!(input[0]["type"], "reasoning");
         assert_eq!(input[0]["encrypted_content"], "encrypted-state");
@@ -1940,5 +2148,21 @@ mod tests {
             multimodal_input: None,
             token_estimator_url: None,
         }
+    }
+
+    fn image_in_model_config() -> ModelConfig {
+        let mut config = test_model_config();
+        config.capabilities.push(ModelCapability::ImageIn);
+        config.multimodal_input = Some(MultimodalInputConfig {
+            image: Some(MediaInputConfig {
+                transport: MediaInputTransport::FileReference,
+                supported_media_types: vec!["image/png".to_string()],
+                max_width: None,
+                max_height: None,
+            }),
+            pdf: None,
+            audio: None,
+        });
+        config
     }
 }

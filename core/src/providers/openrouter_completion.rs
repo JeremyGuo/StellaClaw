@@ -13,7 +13,8 @@ use serde_json::Value;
 use crate::{
     model_config::{ModelCapability, ModelConfig, RetryMode},
     session_actor::{
-        ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, TokenUsage, ToolCallItem,
+        normalize_messages_for_model, ChatMessage, ChatMessageItem, ChatRole, ContextItem,
+        FileItem, TokenUsage, ToolCallItem,
     },
 };
 
@@ -84,7 +85,7 @@ impl OpenRouterCompletionProvider {
 
         let request = OpenRouterChatCompletionRequest {
             model: model_config.model_name.clone(),
-            messages: build_openrouter_messages(request),
+            messages: build_openrouter_messages(request, model_config),
             tools: request
                 .tools
                 .iter()
@@ -581,7 +582,10 @@ fn parse_openrouter_stream(
     })
 }
 
-fn build_openrouter_messages(request: &ProviderRequest<'_>) -> Vec<OpenRouterRequestMessage> {
+fn build_openrouter_messages(
+    request: &ProviderRequest<'_>,
+    model_config: &ModelConfig,
+) -> Vec<OpenRouterRequestMessage> {
     let mut messages = Vec::new();
     if let Some(system_prompt) = request.system_prompt {
         if !system_prompt.trim().is_empty() {
@@ -591,8 +595,32 @@ fn build_openrouter_messages(request: &ProviderRequest<'_>) -> Vec<OpenRouterReq
 
     for message in request.messages {
         messages.extend(OpenRouterRequestMessage::from_chat_message(message));
+        messages.extend(tool_result_image_messages(message, model_config));
     }
 
+    messages
+}
+
+fn tool_result_image_messages(
+    message: &ChatMessage,
+    model_config: &ModelConfig,
+) -> Vec<OpenRouterRequestMessage> {
+    let mut messages = Vec::new();
+    for item in &message.data {
+        let ChatMessageItem::ToolResult(tool_result) = item else {
+            continue;
+        };
+        let Some(file) = tool_result.result.file.as_ref() else {
+            continue;
+        };
+        if !is_image_file(file) || file.state.is_some() {
+            continue;
+        }
+        let fake = ChatMessage::new(ChatRole::User, vec![ChatMessageItem::File(file.clone())]);
+        for normalized in normalize_messages_for_model(&[fake], model_config) {
+            messages.extend(OpenRouterRequestMessage::from_chat_message(&normalized));
+        }
+    }
     messages
 }
 
