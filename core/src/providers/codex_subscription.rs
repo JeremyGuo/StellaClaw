@@ -1230,7 +1230,10 @@ fn append_assistant_response_items(
                 if model_config.supports(crate::model_config::ModelCapability::ImageIn) {
                     append_assistant_message_if_needed(target, &mut content);
                     match image_generation_call_from_file(file)? {
-                        Some(item) => target.push(item),
+                        Some(item) => {
+                            target.push(item);
+                            append_assistant_image_visual_context(target, file, model_config)?;
+                        }
                         None => content.push(json!({
                             "type": "output_text",
                             "text": file.uri,
@@ -1275,6 +1278,33 @@ fn append_assistant_message_if_needed(target: &mut Vec<Value>, content: &mut Vec
         "role": "assistant",
         "content": std::mem::take(content),
     }));
+}
+
+fn append_assistant_image_visual_context(
+    target: &mut Vec<Value>,
+    file: &FileItem,
+    model_config: &ModelConfig,
+) -> Result<(), ProviderError> {
+    let fake = ChatMessage::new(
+        ChatRole::User,
+        vec![
+            ChatMessageItem::Context(ContextItem {
+                text: "The preceding assistant message generated this image; it is replayed here as visual context.".to_string(),
+            }),
+            ChatMessageItem::File(file.clone()),
+        ],
+    );
+    for normalized in normalize_messages_for_model(&[fake], model_config) {
+        let content = user_responses_content(&normalized)?;
+        if !content.is_empty() {
+            target.push(json!({
+                "type": "message",
+                "role": "user",
+                "content": content,
+            }));
+        }
+    }
+    Ok(())
 }
 
 fn image_generation_call_from_file(file: &FileItem) -> Result<Option<Value>, ProviderError> {
@@ -1925,8 +1955,7 @@ mod tests {
 
     #[test]
     fn assistant_image_output_replays_as_image_generation_call_when_images_supported() {
-        let mut config = test_model_config();
-        config.capabilities.push(ModelCapability::ImageIn);
+        let config = image_in_model_config();
         let messages = vec![ChatMessage::new(
             ChatRole::Assistant,
             vec![ChatMessageItem::File(FileItem {
@@ -1941,13 +1970,17 @@ mod tests {
 
         let input = build_responses_input(&messages, &config).expect("input should build");
 
-        assert_eq!(input.len(), 1);
+        assert_eq!(input.len(), 2);
         assert_eq!(input[0]["type"], "image_generation_call");
         assert_eq!(input[0]["status"], "completed");
         assert_eq!(input[0]["result"], "QUJD");
         assert!(input[0]["id"]
             .as_str()
             .is_some_and(|id| id.starts_with("ig_stellaclaw_")));
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][0]["type"], "input_text");
+        assert_eq!(input[1]["content"][1]["type"], "input_image");
     }
 
     #[test]

@@ -1,5 +1,10 @@
-version: 1.21.1
+version: 1.21.2
 ---
+
+# 1.21.2
+
+- 修复 Codex subscription 回放 assistant 图片输出后仍无法视觉理解的问题：
+  assistant 顶层图片现在仍会回放为 top-level `image_generation_call` 保留生成历史，同时紧跟一条临时 `role=user` 图片上下文消息，让 Codex 以 `input_image` 形式真正看到图片像素。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.21.1
 
