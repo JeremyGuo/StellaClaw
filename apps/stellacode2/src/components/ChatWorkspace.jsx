@@ -10,12 +10,21 @@ import { displayMessages, firstMessageId, firstToolNameForMessage, liveActivityS
 
 const COMMANDS = [
   { command: '/model', label: '切换模型', description: '选择当前 Conversation 使用的模型', options: 'models' },
+  { command: '/reasoning', label: '推理强度', description: '调整当前 Conversation 的 reasoning effort', options: 'reasoning' },
   { command: '/remote', label: '远程模式', description: '设置 SSH host 和工作目录', insert: '/remote ' },
   { command: '/remote off', label: '关闭远程', description: '切回本地工具执行', send: true },
   { command: '/continue', label: '继续', description: '继续最近中断的回合', send: true },
   { command: '/cancel', label: '取消', description: '停止当前正在处理的回合', send: true },
   { command: '/compact', label: '压缩上下文', description: '压缩当前对话上下文', send: true },
   { command: '/status', label: '状态', description: '显示当前会话状态', send: true }
+];
+
+const REASONING_EFFORTS = [
+  { value: 'low', label: 'Low', description: '使用较低 reasoning effort' },
+  { value: 'medium', label: 'Medium', description: '使用中等 reasoning effort' },
+  { value: 'high', label: 'High', description: '使用较高 reasoning effort' },
+  { value: 'xhigh', label: 'XHigh', description: '使用最高 reasoning effort' },
+  { value: 'default', label: 'Default', description: '恢复模型默认 reasoning effort' }
 ];
 
 export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, draft, setDraft, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, runningActivities }) {
@@ -241,6 +250,10 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       openModelOptions();
       return;
     }
+    if (command.options === 'reasoning') {
+      setCommandPanel('reasoning');
+      return;
+    }
     if (command.send) {
       onSend?.(command.command);
       return;
@@ -252,6 +265,10 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     const alias = modelAlias(model);
     if (!alias) return;
     onSend?.(`/model ${alias}`);
+  };
+
+  const chooseReasoning = (effort) => {
+    onSend?.(`/reasoning ${effort}`);
   };
 
   return (
@@ -362,11 +379,30 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
                         </div>
                       )}
                     </div>
+                  ) : commandPanel === 'reasoning' ? (
+                    <div className="command-panel">
+                      <div className="command-popover-head">
+                        <button className="command-back" type="button" onClick={() => setCommandPanel('commands')}>‹</button>
+                        <strong>选择推理强度</strong>
+                      </div>
+                      <div className="command-list">
+                        {REASONING_EFFORTS.map((effort) => (
+                          <Popover.Close asChild key={effort.value}>
+                            <button className="command-row model-row" type="button" onClick={() => chooseReasoning(effort.value)}>
+                              <span>
+                                <strong>{effort.label}</strong>
+                                <small>{effort.description}</small>
+                              </span>
+                            </button>
+                          </Popover.Close>
+                        ))}
+                      </div>
+                    </div>
                   ) : (
                     <div className="command-panel">
                       <div className="command-list">
                         {COMMANDS.map((command) => (
-                          command.options === 'models' ? (
+                          command.options === 'models' || command.options === 'reasoning' ? (
                             <button key={command.command} className="command-row" type="button" onClick={() => chooseCommand(command)}>
                               <code>{command.command}</code>
                               <span>
@@ -710,7 +746,19 @@ export function MessageBody({ message, typewriter = false, onTypewriterDone }) {
   const files = Array.isArray(message?.files) ? message.files : [];
   const allAttachments = [...attachments, ...files];
   const inlineIndexes = markerIndexes(text);
-  const trailingAttachments = allAttachments.filter((attachment, index) => !inlineIndexes.has(index) && !inlineIndexes.has(Number(attachment?.index)));
+  const structuredAttachmentIndexes = new Set(
+    (Array.isArray(message?.items) ? message.items : [])
+      .filter((item) => item?.type === 'file' && item.attachment_index !== undefined)
+      .map((item) => Number(item.attachment_index))
+      .filter((index) => Number.isFinite(index))
+  );
+  const trailingAttachments = allAttachments.filter((attachment, index) => {
+    const attachmentIndex = Number(attachment?.index);
+    return !inlineIndexes.has(index)
+      && !inlineIndexes.has(attachmentIndex)
+      && !structuredAttachmentIndexes.has(index)
+      && !structuredAttachmentIndexes.has(attachmentIndex);
+  });
   return (
     <div className="message-body">
       {typewriter && text ? (

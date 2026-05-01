@@ -1,5 +1,13 @@
-version: 1.19.0
+version: 1.20.0
 ---
+
+# 1.20.0
+
+- 增加 conversation 级 reasoning effort 控制命令：
+  Web 和 Telegram channel 支持 `/reasoning` 查看当前配置，支持 `/reasoning low|medium|high|xhigh|default` 调整当前 conversation 的 reasoning effort；切换后会重启 foreground session，使后续模型请求使用新的 conversation override。Stellacode 2 命令面板同步加入 reasoning effort 命令。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Stellacode 2 原生图片生成结果重复展示：
+  Web REST message 中结构化 `FileItem` 已经通过 message item 渲染为附件卡片，前端不再把同一个 attachment 追加渲染为尾部附件，避免单个 assistant file item 在聊天区显示成两张图片。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.19.0
 

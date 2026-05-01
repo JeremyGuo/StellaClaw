@@ -28,8 +28,8 @@ use crate::{
     conversation::{
         attachment_marker, extract_attachment_references_with_markers,
         load_conversation_status_snapshot, load_or_create_conversation_state,
-        persist_conversation_state, strip_attachment_tags, ConversationControl, ConversationState,
-        IncomingConversationMessage,
+        parse_reasoning_control_argument, persist_conversation_state, strip_attachment_tags,
+        ConversationControl, ConversationState, IncomingConversationMessage,
     },
     conversation_id_manager::ConversationIdManager,
     logger::StellaclawLogger,
@@ -3146,6 +3146,7 @@ fn parse_web_control(text: &str) -> Option<ConversationControl> {
         "/model" => Some(ConversationControl::SwitchModel {
             model_name: argument.to_string(),
         }),
+        "/reasoning" => Some(parse_reasoning_control_argument(argument)),
         "/remote" if argument.is_empty() => Some(ConversationControl::ShowRemote),
         "/remote" if argument.eq_ignore_ascii_case("off") => {
             Some(ConversationControl::DisableRemote)
@@ -3242,6 +3243,18 @@ mod tests {
         assert!(matches!(
             parse_web_control("/compact"),
             Some(ConversationControl::Compact)
+        ));
+        assert!(matches!(
+            parse_web_control("/reasoning"),
+            Some(ConversationControl::ShowReasoning)
+        ));
+        assert!(matches!(
+            parse_web_control("/reasoning high"),
+            Some(ConversationControl::SetReasoning { effort: Some(effort) }) if effort == "high"
+        ));
+        assert!(matches!(
+            parse_web_control("/reasoning default"),
+            Some(ConversationControl::SetReasoning { effort: None })
         ));
         assert!(matches!(
             parse_web_control("/remote demo-host ~/repo"),
