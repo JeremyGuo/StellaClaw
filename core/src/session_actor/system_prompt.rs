@@ -22,6 +22,7 @@ pub(crate) fn system_prompt_for_initial(
         remote_prompt(&initial.tool_remote_mode),
     ];
     sections.extend(snapshot_sections(initial, runtime_metadata_state));
+    sections.push(tool_efficiency_prompt(&initial.session_type).to_string());
     sections.join("\n\n")
 }
 
@@ -80,6 +81,41 @@ fn background_prompt() -> &'static str {
 fn subagent_prompt() -> &'static str {
     "Session kind: subagent. You are delegated a bounded task. Stay inside the requested scope, \
      report concrete findings or changed files, and avoid taking ownership of unrelated work."
+}
+
+fn tool_efficiency_prompt(session_type: &SessionType) -> &'static str {
+    match session_type {
+        SessionType::Foreground | SessionType::Background => {
+            "Check that all the required parameters for each tool call are provided or can \
+             reasonably be inferred from context. IF there are no relevant tools or there are \
+             missing values for required parameters, ask the user to supply these values; otherwise \
+             proceed with the tool calls. If the user provides a specific value for a parameter \
+             (for example provided in quotes), make sure to use that value EXACTLY. DO NOT make up \
+             values for or ask about optional parameters.\n\n\
+             If you intend to call multiple tools and there are no dependencies between the calls, \
+             make all of the independent calls in the same tool-call batch (same assistant turn), otherwise \
+             you MUST wait for previous calls to finish first to determine the dependent values \
+             (do NOT use placeholders or guess missing parameters).\n\n\
+             For multi-step tasks that require more than 3 sequential tool operations and can be \
+             clearly scoped (e.g. explore a codebase module, run benchmarks, set up a dependency), \
+             prefer subagent_start to keep the main conversation context lean. Do NOT batch tool \
+             calls that could cause irreversible damage if an earlier step produces unexpected \
+             results (destructive shell commands, production deploys, database mutations); use \
+             subagent_start for those instead so that intermediate results can be inspected."
+        }
+        SessionType::Subagent => {
+            "Check that all the required parameters for each tool call are provided or can \
+             reasonably be inferred from context. IF there are no relevant tools or there are \
+             missing values for required parameters, ask the user to supply these values; otherwise \
+             proceed with the tool calls. If the user provides a specific value for a parameter \
+             (for example provided in quotes), make sure to use that value EXACTLY. DO NOT make up \
+             values for or ask about optional parameters.\n\n\
+             If you intend to call multiple tools and there are no dependencies between the calls, \
+             make all of the independent calls in the same tool-call batch (same assistant turn), otherwise \
+             you MUST wait for previous calls to finish first to determine the dependent values \
+             (do NOT use placeholders or guess missing parameters)."
+        }
+    }
 }
 
 fn remote_prompt(remote_mode: &ToolRemoteMode) -> String {
