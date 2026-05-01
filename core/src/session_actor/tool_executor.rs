@@ -142,7 +142,9 @@ impl ToolBatchRunner {
             match self.execute_operation_interruptibly(operation.clone()) {
                 Ok(result) => results.push(result),
                 Err(OperationOutcome::ToolError(error)) => {
-                    results.push(tool_error_result(operation, error))
+                    results.push(tool_error_result(operation, error));
+                    results.extend(skipped_results(&batch.operations[index + 1..]));
+                    break;
                 }
                 Err(OperationOutcome::Interrupted) => {
                     results.extend(interrupted_results(&batch.operations[index..]));
@@ -622,6 +624,18 @@ fn interrupted_results(operations: &[ToolExecutionOp]) -> Vec<ToolResultItem> {
             tool_error_result(
                 operation,
                 "tool batch interrupted before this tool completed".to_string(),
+            )
+        })
+        .collect()
+}
+
+fn skipped_results(operations: &[ToolExecutionOp]) -> Vec<ToolResultItem> {
+    operations
+        .iter()
+        .map(|operation| {
+            tool_error_result(
+                operation,
+                "tool skipped: a preceding tool in this batch failed".to_string(),
             )
         })
         .collect()
