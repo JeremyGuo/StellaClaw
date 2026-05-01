@@ -1399,6 +1399,11 @@ fn append_image_reference(
         data.push(ChatMessageItem::File(
             output_persistor.persist_image_data_url(reference)?,
         ));
+    } else if is_probable_base64_image(reference) {
+        let data_url = format!("data:image/png;base64,{reference}");
+        data.push(ChatMessageItem::File(
+            output_persistor.persist_image_data_url(&data_url)?,
+        ));
     } else {
         data.push(ChatMessageItem::File(FileItem {
             uri: reference.to_string(),
@@ -1411,6 +1416,21 @@ fn append_image_reference(
     }
 
     Ok(())
+}
+
+fn is_probable_base64_image(reference: &str) -> bool {
+    let trimmed = reference.trim();
+    !trimmed.is_empty()
+        && !trimmed.contains("://")
+        && trimmed.len() % 4 == 0
+        && trimmed.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || ch == '+'
+                || ch == '/'
+                || ch == '='
+                || ch == '\n'
+                || ch == '\r'
+        })
 }
 
 fn image_reference_from_item(item: &Value) -> Option<String> {

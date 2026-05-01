@@ -1,5 +1,29 @@
-version: 1.18.12
+version: 1.21.0
 ---
+
+# 1.21.0
+
+- 收紧 system prompt 中 `shared/` 目录的使用边界：
+  system prompt 现在明确要求只有在用户要求，或用户明确说明产物需要共享给其他 agent / conversation 时，才使用 workspace 下的 `shared/` 目录；普通会话产物继续留在当前 workspace。本次不改变 `config` schema，不改变 `workdir` schema。
+
+# 1.20.0
+
+- 增加 conversation 级 reasoning effort 控制命令：
+  Web 和 Telegram channel 支持 `/reasoning` 查看当前配置，支持 `/reasoning low|medium|high|xhigh|default` 调整当前 conversation 的 reasoning effort；切换后会重启 foreground session，使后续模型请求使用新的 conversation override。Stellacode 2 命令面板同步加入 reasoning effort 命令。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Stellacode 2 原生图片生成结果重复展示：
+  Web REST message 中结构化 `FileItem` 已经通过 message item 渲染为附件卡片，前端不再把同一个 attachment 追加渲染为尾部附件，避免单个 assistant file item 在聊天区显示成两张图片。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 fixed SSH workspace 下媒体加载卡死：
+  `image_load`、`pdf_load`、`audio_load` 在 fixed SSH 模式下不再通过 sshfs mount 读取媒体文件，而是直接通过 SSH 从远端路径拷贝到本地 session 输出目录后再加载；sshfs watchdog 的探活命令也不再依赖外部 `timeout` 等待不可中断的 FUSE `stat`。本次不改变 `config` schema，不改变 `workdir` schema。
+
+# 1.19.0
+
+- 增加 Codex subscription 自身图片生成能力：
+  当会话的 `image_generation_tool_model` 选择当前 Codex subscription 模型且模型具备 `image_out` capability 时，工具目录会暴露 Responses 原生 `image_generation` builtin，而不是本地 function tool；Codex 返回的 `image_generation_call` 会 materialize 为 assistant `FileItem`，并补齐裸 base64 图片落盘。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Web Channel foreground WebSocket 重复展示最终 assistant 消息：
+  Foreground session 的持久化消息已经通过 `message_appended` 事件推给 Web 客户端；WebChannel 不再同时把携带结构化 `ChatMessage` 的 `OutgoingDelivery` 再投影为一条 `messages` 增量，避免图片生成等带附件回复在 Stellacode 2 中显示两份。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.18.12
 

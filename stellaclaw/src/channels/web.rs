@@ -28,8 +28,8 @@ use crate::{
     conversation::{
         attachment_marker, extract_attachment_references_with_markers,
         load_conversation_status_snapshot, load_or_create_conversation_state,
-        persist_conversation_state, strip_attachment_tags, ConversationControl, ConversationState,
-        IncomingConversationMessage,
+        parse_reasoning_control_argument, persist_conversation_state, strip_attachment_tags,
+        ConversationControl, ConversationState, IncomingConversationMessage,
     },
     conversation_id_manager::ConversationIdManager,
     logger::StellaclawLogger,
@@ -1390,16 +1390,14 @@ impl Channel for WebChannel {
                 "has_message": delivery.message.is_some(),
             }),
         );
-        let Some(message) = delivery.message.as_ref() else {
+        // Foreground web clients receive persisted session messages through
+        // `message_appended`. `OutgoingDelivery` with a structured message is
+        // still emitted for non-web channels (Telegram, etc.); publishing it
+        // here as well duplicates the same message/attachments in the Web UI.
+        if delivery.message.is_some() {
             return Ok(());
-        };
-        self.publish_foreground_message(
-            &delivery.platform_chat_id,
-            &delivery.conversation_id,
-            delivery.session_id.as_deref(),
-            None,
-            message,
-        )
+        }
+        Ok(())
     }
 
     fn message_appended(&self, appended: &OutgoingMessageAppended) -> Result<()> {
@@ -3147,6 +3145,7 @@ fn parse_web_control(text: &str) -> Option<ConversationControl> {
         "/model" => Some(ConversationControl::SwitchModel {
             model_name: argument.to_string(),
         }),
+        "/reasoning" => Some(parse_reasoning_control_argument(argument)),
         "/remote" if argument.is_empty() => Some(ConversationControl::ShowRemote),
         "/remote" if argument.eq_ignore_ascii_case("off") => {
             Some(ConversationControl::DisableRemote)
@@ -3262,6 +3261,18 @@ mod tests {
         assert!(matches!(
             parse_web_control("/compact"),
             Some(ConversationControl::Compact)
+        ));
+        assert!(matches!(
+            parse_web_control("/reasoning"),
+            Some(ConversationControl::ShowReasoning)
+        ));
+        assert!(matches!(
+            parse_web_control("/reasoning high"),
+            Some(ConversationControl::SetReasoning { effort: Some(effort) }) if effort == "high"
+        ));
+        assert!(matches!(
+            parse_web_control("/reasoning default"),
+            Some(ConversationControl::SetReasoning { effort: None })
         ));
         assert!(matches!(
             parse_web_control("/remote demo-host ~/repo"),

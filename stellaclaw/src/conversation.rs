@@ -87,6 +87,9 @@ pub enum ConversationControl {
     ShowStatus,
     ShowModel,
     SwitchModel { model_name: String },
+    ShowReasoning,
+    SetReasoning { effort: Option<String> },
+    InvalidReasoning { reason: String },
     ShowRemote,
     SetRemote { host: String, path: String },
     DisableRemote,
@@ -94,6 +97,24 @@ pub enum ConversationControl {
     ShowSandbox,
     SetSandbox { mode: Option<SandboxMode> },
     InvalidSandbox { reason: String },
+}
+
+pub(crate) fn parse_reasoning_control_argument(argument: &str) -> ConversationControl {
+    let argument = argument.trim();
+    if argument.is_empty() {
+        return ConversationControl::ShowReasoning;
+    }
+    match argument.to_ascii_lowercase().as_str() {
+        "default" | "model" | "model_default" | "model-default" | "global" => {
+            ConversationControl::SetReasoning { effort: None }
+        }
+        "minimal" | "low" | "medium" | "high" | "xhigh" => ConversationControl::SetReasoning {
+            effort: Some(argument.to_ascii_lowercase()),
+        },
+        _ => ConversationControl::InvalidReasoning {
+            reason: format!("未知 reasoning effort `{argument}`。"),
+        },
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -689,6 +710,9 @@ impl ConversationRuntime {
                     | ConversationControl::SetRemote { .. }
                     | ConversationControl::DisableRemote
                     | ConversationControl::InvalidRemote { .. }
+                    | ConversationControl::ShowReasoning
+                    | ConversationControl::SetReasoning { .. }
+                    | ConversationControl::InvalidReasoning { .. }
                     | ConversationControl::ShowSandbox
                     | ConversationControl::SetSandbox { .. }
                     | ConversationControl::InvalidSandbox { .. },
@@ -743,6 +767,33 @@ impl ConversationRuntime {
                         return Ok(false);
                     }
                 }
+            }
+            Some(ConversationControl::ShowReasoning) => {
+                self.send_reasoning_status()?;
+                return Ok(false);
+            }
+            Some(ConversationControl::SetReasoning { effort }) => {
+                match self.set_reasoning_effort(effort) {
+                    Ok(()) => return Ok(true),
+                    Err(error) => {
+                        self.send_channel_error(
+                            OutgoingErrorScope::Configuration,
+                            OutgoingErrorSeverity::Error,
+                            "reasoning_effort_switch_failed",
+                            format!("reasoning effort 切换失败: {error}"),
+                            Some(json!({"error": format!("{error:#}")})),
+                            false,
+                            None,
+                        )?;
+                        return Ok(false);
+                    }
+                }
+            }
+            Some(ConversationControl::InvalidReasoning { reason }) => {
+                self.send_delivery_from_text(format!(
+                    "{reason}\n用法: `/reasoning`，`/reasoning low`，`/reasoning medium`，`/reasoning high`，`/reasoning xhigh`，`/reasoning default`。"
+                ))?;
+                return Ok(false);
             }
             Some(ConversationControl::ShowRemote) => {
                 self.send_remote_status()?;
@@ -2262,6 +2313,17 @@ impl ConversationRuntime {
             .map_err(|_| anyhow!("outgoing status channel closed"))
     }
 
+    fn send_reasoning_status(&self) -> Result<()> {
+        let current = self
+            .state
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or("model default");
+        self.send_delivery_from_text(format!(
+            "当前 reasoning effort: `{current}`。\n用法: `/reasoning low`，`/reasoning medium`，`/reasoning high`，`/reasoning xhigh`，`/reasoning default`。"
+        ))
+    }
+
     fn send_remote_status(&self) -> Result<()> {
         let text = match &self.state.tool_remote_mode {
             ToolRemoteMode::Selectable => {
@@ -2397,6 +2459,37 @@ impl ConversationRuntime {
                 " (default config)"
             }
         ))?;
+        Ok(())
+    }
+
+    fn set_reasoning_effort(&mut self, effort: Option<String>) -> Result<()> {
+        let old_label = self
+            .state
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or("model default")
+            .to_string();
+        let new_effort = effort
+            .map(|value| value.trim().to_ascii_lowercase())
+            .filter(|value| !value.is_empty());
+        if let Some(effort) = new_effort.as_deref() {
+            match parse_reasoning_control_argument(effort) {
+                ConversationControl::SetReasoning { effort: Some(_) } => {}
+                _ => return Err(anyhow!("unknown reasoning effort {effort}")),
+            }
+        }
+        let new_label = new_effort.as_deref().unwrap_or("model default").to_string();
+        if self.state.reasoning_effort == new_effort {
+            self.send_reasoning_status()?;
+            return Ok(());
+        }
+
+        self.state.reasoning_effort = new_effort;
+        self.restart_foreground_session()?;
+        self.send_delivery_from_text(format!(
+            "已切换 reasoning effort: `{old_label}` -> `{new_label}`。"
+        ))?;
+        self.send_status()?;
         Ok(())
     }
 
@@ -2738,63 +2831,61 @@ fn start_session_process(
     initial.tool_remote_mode = tool_remote_mode.clone();
     initial.compression_threshold_tokens = defaults.compression_threshold_tokens;
     initial.compression_retain_recent_tokens = defaults.compression_retain_recent_tokens;
+    let effective_model = effective_model_config(model_config, reasoning_effort);
     initial.image_tool_model = resolve_tool_model_target(
         "image_tool_model",
         defaults.image_tool_model.as_ref(),
         models,
-        model_config,
+        &effective_model,
     )?;
     initial.pdf_tool_model = resolve_tool_model_target(
         "pdf_tool_model",
         defaults.pdf_tool_model.as_ref(),
         models,
-        model_config,
+        &effective_model,
     )?;
     initial.audio_tool_model = resolve_tool_model_target(
         "audio_tool_model",
         defaults.audio_tool_model.as_ref(),
         models,
-        model_config,
+        &effective_model,
     )?;
     initial.image_generation_tool_model = resolve_tool_model_target(
         "image_generation_tool_model",
         defaults.image_generation_tool_model.as_ref(),
         models,
-        model_config,
+        &effective_model,
     )?;
     initial.search_tool_model = resolve_tool_model_target_with_capability(
         "search_tool_model",
         defaults.search_tool_model.as_ref(),
         models,
-        model_config,
+        &effective_model,
         ModelCapability::WebSearch,
     )?;
     initial.search_image_tool_model = resolve_tool_model_target_with_capability(
         "search_image_tool_model",
         defaults.search_image_tool_model.as_ref(),
         models,
-        model_config,
+        &effective_model,
         ModelCapability::WebSearch,
     )?;
     initial.search_video_tool_model = resolve_tool_model_target_with_capability(
         "search_video_tool_model",
         defaults.search_video_tool_model.as_ref(),
         models,
-        model_config,
+        &effective_model,
         ModelCapability::WebSearch,
     )?;
     initial.search_news_tool_model = resolve_tool_model_target_with_capability(
         "search_news_tool_model",
         defaults.search_news_tool_model.as_ref(),
         models,
-        model_config,
+        &effective_model,
         ModelCapability::WebSearch,
     )?;
     client
-        .initialize(
-            &effective_model_config(model_config, reasoning_effort),
-            &initial,
-        )
+        .initialize(&effective_model, &initial)
         .map_err(anyhow::Error::msg)?;
     Ok((client, events))
 }

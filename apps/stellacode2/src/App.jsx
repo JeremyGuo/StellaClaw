@@ -247,6 +247,9 @@ function slashCommandState(value) {
   if (name === '/remote') {
     return { control: true, name, title: '切换远程模式', detail: '远程模式命令已发送' };
   }
+  if (name === '/reasoning') {
+    return { control: true, name, title: '切换推理强度', detail: 'reasoning effort 命令已发送' };
+  }
   if (name === '/cancel') {
     return { control: true, name, title: '取消执行', detail: '取消命令已发送' };
   }

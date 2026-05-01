@@ -17,7 +17,10 @@ use stellaclaw_core::session_actor::{FileItem, FileState};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
-    conversation::{render_chat_message, ConversationControl, IncomingConversationMessage},
+    conversation::{
+        parse_reasoning_control_argument, render_chat_message, ConversationControl,
+        IncomingConversationMessage,
+    },
     conversation_id_manager::ConversationIdManager,
     logger::StellaclawLogger,
 };
@@ -1315,6 +1318,7 @@ fn parse_conversation_control(text: &str) -> Option<ConversationControl> {
         "/model" => Some(ConversationControl::SwitchModel {
             model_name: argument.to_string(),
         }),
+        "/reasoning" => Some(parse_reasoning_control_argument(argument)),
         "/remote" if argument.is_empty() => Some(ConversationControl::ShowRemote),
         "/remote" if argument.eq_ignore_ascii_case("off") => {
             Some(ConversationControl::DisableRemote)
@@ -3094,6 +3098,18 @@ mod tests {
         assert!(matches!(
             parse_conversation_control("/compact"),
             Some(ConversationControl::Compact)
+        ));
+        assert!(matches!(
+            parse_conversation_control("/reasoning"),
+            Some(ConversationControl::ShowReasoning)
+        ));
+        assert!(matches!(
+            parse_conversation_control("/reasoning high"),
+            Some(ConversationControl::SetReasoning { effort: Some(effort) }) if effort == "high"
+        ));
+        assert!(matches!(
+            parse_conversation_control("/reasoning default"),
+            Some(ConversationControl::SetReasoning { effort: None })
         ));
         assert!(matches!(
             parse_conversation_control("/sandbox"),
