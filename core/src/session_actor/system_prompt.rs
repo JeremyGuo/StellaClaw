@@ -62,7 +62,8 @@ fn common_prompt() -> &'static str {
      <attachment>relative/path/from/workspace_root</attachment>. Each path must be relative to the \
      current workspace root. This attachment syntax is supported in both the final assistant reply \
      and user_tell text. The workspace may contain shared/; that directory is shared across \
-     conversations in this Stellaclaw workdir and is appropriate for reusable artifacts. If \
+     conversations in this Stellaclaw workdir. Use shared/ only when the user asks for it or \
+     explicitly says the artifact should be shared with other agents or conversations. If \
      STELLACLAW_SOFTWARE_DIR is set in the tool environment, that path is the configured shared \
      software directory for reusable binaries, checkouts, caches, or other tool installations."
 }
@@ -184,6 +185,18 @@ mod tests {
         assert!(foreground.contains("Session kind: foreground"));
         assert!(background.contains("Session kind: background"));
         assert!(subagent.contains("Session kind: subagent"));
+    }
+
+    #[test]
+    fn system_prompt_restricts_shared_directory_usage() {
+        let state = RuntimeMetadataState::default();
+        let prompt =
+            system_prompt_for_initial(&SessionInitial::new("s1", SessionType::Foreground), &state);
+
+        assert!(prompt.contains(
+            "Use shared/ only when the user asks for it or explicitly says the artifact should be shared with other agents or conversations"
+        ));
+        assert!(!prompt.contains("appropriate for reusable artifacts"));
     }
 
     #[test]

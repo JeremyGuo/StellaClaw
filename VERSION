@@ -1,5 +1,10 @@
-version: 1.20.0
+version: 1.21.0
 ---
+
+# 1.21.0
+
+- 收紧 system prompt 中 `shared/` 目录的使用边界：
+  system prompt 现在明确要求只有在用户要求，或用户明确说明产物需要共享给其他 agent / conversation 时，才使用 workspace 下的 `shared/` 目录；普通会话产物继续留在当前 workspace。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.20.0
 
