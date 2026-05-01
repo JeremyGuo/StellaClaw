@@ -1,5 +1,13 @@
-version: 1.18.12
+version: 1.19.0
 ---
+
+# 1.19.0
+
+- 增加 Codex subscription 自身图片生成能力：
+  当会话的 `image_generation_tool_model` 选择当前 Codex subscription 模型且模型具备 `image_out` capability 时，工具目录会暴露 Responses 原生 `image_generation` builtin，而不是本地 function tool；Codex 返回的 `image_generation_call` 会 materialize 为 assistant `FileItem`，并补齐裸 base64 图片落盘。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Web Channel foreground WebSocket 重复展示最终 assistant 消息：
+  Foreground session 的持久化消息已经通过 `message_appended` 事件推给 Web 客户端；WebChannel 不再同时把携带结构化 `ChatMessage` 的 `OutgoingDelivery` 再投影为一条 `messages` 增量，避免图片生成等带附件回复在 Stellacode 2 中显示两份。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.18.12
 

@@ -42,7 +42,7 @@ pub use tool_batch::{
 pub use tool_catalog::{
     builtin_tool_catalog, download_tool_definitions, file_tool_definitions, host_tool_definitions,
     media_tool_definitions, process_tool_definitions, skill_tool_definitions, web_tool_definitions,
-    BuiltinToolCatalogOptions, HostToolScope, ProviderBackedToolKind, ToolBackend, ToolCatalog,
-    ToolCatalogError, ToolDefinition, ToolExecutionMode,
+    BuiltinToolCatalogOptions, HostToolScope, ProviderBackedToolKind, ProviderNativeToolKind,
+    ToolBackend, ToolCatalog, ToolCatalogError, ToolDefinition, ToolExecutionMode,
 };
 pub use tool_executor::LocalToolBatchExecutor;

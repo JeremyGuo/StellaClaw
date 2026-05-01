@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 
-use crate::model_config::{ModelCapability, ModelConfig};
+use crate::model_config::{ModelCapability, ModelConfig, ProviderType};
 
 pub use super::ToolRemoteMode;
 use super::{SessionInitial, SessionType};
@@ -49,11 +49,18 @@ pub enum ProviderBackedToolKind {
     ImageGeneration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderNativeToolKind {
+    ImageGeneration,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ToolBackend {
     Local,
     ProviderBacked { kind: ProviderBackedToolKind },
+    ProviderNative { kind: ProviderNativeToolKind },
     ConversationBridge { action: String },
 }
 
@@ -95,12 +102,20 @@ impl ToolDefinition {
     }
 
     pub fn responses_tool_schema(&self) -> Value {
-        json!({
-            "type": "function",
-            "name": self.name,
-            "description": self.description_with_execution_mode(),
-            "parameters": self.parameters,
-        })
+        match &self.backend {
+            ToolBackend::ProviderNative {
+                kind: ProviderNativeToolKind::ImageGeneration,
+            } => json!({
+                "type": "image_generation",
+                "output_format": "png",
+            }),
+            _ => json!({
+                "type": "function",
+                "name": self.name,
+                "description": self.description_with_execution_mode(),
+                "parameters": self.parameters,
+            }),
+        }
     }
 
     pub fn claude_tool_schema(&self) -> Value {
@@ -145,7 +160,12 @@ impl ToolCatalog {
             enable_native_image_load: model_config.supports(ModelCapability::ImageIn),
             enable_native_pdf_load: model_config.supports(ModelCapability::PdfIn),
             enable_native_audio_load: model_config.supports(ModelCapability::AudioIn),
-            enable_provider_image_generation: model_config.supports(ModelCapability::ImageOut),
+            enable_native_image_generation: model_config.provider_type
+                == ProviderType::CodexSubscription
+                && model_config.supports(ModelCapability::ImageOut),
+            enable_provider_image_generation: model_config.provider_type
+                != ProviderType::CodexSubscription
+                && model_config.supports(ModelCapability::ImageOut),
             ..BuiltinToolCatalogOptions::default()
         };
 
@@ -165,7 +185,12 @@ impl ToolCatalog {
             enable_native_image_load: model_config.supports(ModelCapability::ImageIn),
             enable_native_pdf_load: model_config.supports(ModelCapability::PdfIn),
             enable_native_audio_load: model_config.supports(ModelCapability::AudioIn),
-            enable_provider_image_generation: model_config.supports(ModelCapability::ImageOut),
+            enable_native_image_generation: model_config.provider_type
+                == ProviderType::CodexSubscription
+                && model_config.supports(ModelCapability::ImageOut),
+            enable_provider_image_generation: model_config.provider_type
+                != ProviderType::CodexSubscription
+                && model_config.supports(ModelCapability::ImageOut),
             host_tool_scope: Some(HostToolScope::from(session_type)),
             ..BuiltinToolCatalogOptions::default()
         };
@@ -215,8 +240,12 @@ impl ToolCatalog {
                 && pdf_tool.model_supports(ModelCapability::PdfIn),
             enable_provider_audio_analysis: !audio_tool.self_model
                 && audio_tool.model_supports(ModelCapability::AudioIn),
-            enable_provider_image_generation: generation_tool
-                .model_supports(ModelCapability::ImageOut),
+            enable_native_image_generation: generation_tool.self_model
+                && generation_tool.model_config.provider_type == ProviderType::CodexSubscription
+                && generation_tool.model_supports(ModelCapability::ImageOut),
+            enable_provider_image_generation: (!generation_tool.self_model
+                || generation_tool.model_config.provider_type != ProviderType::CodexSubscription)
+                && generation_tool.model_supports(ModelCapability::ImageOut),
             enable_skill_persistence_tools: true,
             host_tool_scope: Some(HostToolScope::from(initial.session_type)),
             ..BuiltinToolCatalogOptions::default()
@@ -309,6 +338,7 @@ pub struct BuiltinToolCatalogOptions {
     pub enable_provider_image_analysis: bool,
     pub enable_provider_pdf_analysis: bool,
     pub enable_provider_audio_analysis: bool,
+    pub enable_native_image_generation: bool,
     pub enable_provider_image_generation: bool,
     pub skill_names: Vec<String>,
     pub enable_skill_persistence_tools: bool,
@@ -326,6 +356,7 @@ impl Default for BuiltinToolCatalogOptions {
             enable_provider_image_analysis: false,
             enable_provider_pdf_analysis: false,
             enable_provider_audio_analysis: false,
+            enable_native_image_generation: false,
             enable_provider_image_generation: false,
             skill_names: Vec::new(),
             enable_skill_persistence_tools: false,

@@ -1064,6 +1064,7 @@ impl SessionActor {
                     ToolBackend::ProviderBacked { kind } => self
                         .build_provider_backed_operation(tool_call.clone(), *kind)
                         .unwrap_or(ToolExecutionOp::LocalTool(tool_call)),
+                    ToolBackend::ProviderNative { .. } => ToolExecutionOp::LocalTool(tool_call),
                     ToolBackend::Local if tool_call.tool_name == "web_search" => self
                         .build_web_search_operation(tool_call.clone())
                         .unwrap_or(ToolExecutionOp::LocalTool(tool_call)),

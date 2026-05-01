@@ -1390,16 +1390,14 @@ impl Channel for WebChannel {
                 "has_message": delivery.message.is_some(),
             }),
         );
-        let Some(message) = delivery.message.as_ref() else {
+        // Foreground web clients receive persisted session messages through
+        // `message_appended`. `OutgoingDelivery` with a structured message is
+        // still emitted for non-web channels (Telegram, etc.); publishing it
+        // here as well duplicates the same message/attachments in the Web UI.
+        if delivery.message.is_some() {
             return Ok(());
-        };
-        self.publish_foreground_message(
-            &delivery.platform_chat_id,
-            &delivery.conversation_id,
-            delivery.session_id.as_deref(),
-            None,
-            message,
-        )
+        }
+        Ok(())
     }
 
     fn message_appended(&self, appended: &OutgoingMessageAppended) -> Result<()> {

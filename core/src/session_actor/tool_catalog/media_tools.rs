@@ -17,8 +17,8 @@ use serde_json::{json, Map, Value};
 
 use super::{
     schema::{add_images_property, add_remote_property, object_schema, properties},
-    BuiltinToolCatalogOptions, ProviderBackedToolKind, ToolBackend, ToolDefinition,
-    ToolExecutionMode,
+    BuiltinToolCatalogOptions, ProviderBackedToolKind, ProviderNativeToolKind, ToolBackend,
+    ToolDefinition, ToolExecutionMode,
 };
 use crate::{
     model_config::ModelConfig,
@@ -134,7 +134,17 @@ pub fn media_tool_definitions(options: &BuiltinToolCatalogOptions) -> Vec<ToolDe
         ));
     }
 
-    if options.enable_provider_image_generation {
+    if options.enable_native_image_generation {
+        tools.push(ToolDefinition::new(
+            "image_generation",
+            "Generate an image using the current provider's native image generation capability.",
+            object_schema(Map::new(), &[]),
+            ToolExecutionMode::Interruptible,
+            ToolBackend::ProviderNative {
+                kind: ProviderNativeToolKind::ImageGeneration,
+            },
+        ));
+    } else if options.enable_provider_image_generation {
         let mut schema_properties = properties([("prompt", json!({"type": "string"}))]);
         add_images_property(&mut schema_properties, true);
         schema_properties.insert("generation_id".to_string(), json!({"type": "string"}));
