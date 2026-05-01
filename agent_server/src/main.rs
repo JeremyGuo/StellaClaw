@@ -128,6 +128,9 @@ fn initialize(params: Value, output: Arc<JsonRpcOutput>) -> Result<AgentRuntime,
         .map_err(|error| format!("invalid initialize params: {error}"))?;
     let workspace_root =
         std::env::current_dir().map_err(|error| format!("failed to resolve cwd: {error}"))?;
+    let output_root = std::env::var_os("STELLACLAW_SESSION_ROOT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| workspace_root.clone());
 
     let (inbox, sender) = SessionActorInbox::channel();
     let event_sink = Arc::new(StdoutEventSink {
@@ -137,6 +140,7 @@ fn initialize(params: Value, output: Arc<JsonRpcOutput>) -> Result<AgentRuntime,
     let bridge = rpc_thread.conversation_bridge();
     let tool_executor = Arc::new(
         LocalToolBatchExecutor::new(workspace_root)
+            .with_output_root(output_root)
             .with_remote_mode(params.initial.tool_remote_mode.clone())
             .with_conversation_bridge(Arc::new(bridge)),
     );

@@ -57,6 +57,7 @@ pub(super) enum LocalToolError {
 
 pub(super) struct ToolExecutionContext<'a> {
     pub workspace_root: &'a Path,
+    pub output_root: &'a Path,
     pub remote_mode: &'a ToolRemoteMode,
     pub cancel_token: ToolCancellationToken,
 }

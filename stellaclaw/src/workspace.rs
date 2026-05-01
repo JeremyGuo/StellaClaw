@@ -2,7 +2,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -274,30 +274,26 @@ fn ensure_sshfs_available() -> Result<()> {
 
 fn is_mountpoint(path: &Path) -> bool {
     use std::process::Stdio;
-    // Use timeout to avoid blocking on dead FUSE mounts.
-    let Ok(output) = Command::new("timeout")
-        .args(["3", "mountpoint", "-q"])
+    let mut command = Command::new("mountpoint");
+    command
+        .arg("-q")
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    else {
-        return false;
-    };
-    if output.success() {
+        .stderr(Stdio::null());
+    if matches!(
+        command_status_with_timeout(command, Duration::from_secs(3)),
+        Some(true)
+    ) {
         return true;
     }
-    let Ok(canonical) = path.canonicalize() else {
-        return false;
-    };
     let Ok(output) = Command::new("mount").output() else {
         return false;
     };
     if !output.status.success() {
         return false;
     }
-    let needle = format!(" on {} ", canonical.display());
+    let needle = format!(" on {} ", path.display());
     String::from_utf8_lossy(&output.stdout)
         .lines()
         .any(|line| line.contains(&needle))
@@ -326,21 +322,32 @@ fn sshfs_workspace_is_usable(path: &Path) -> bool {
 /// `false` otherwise.  This must never block on a dead FUSE mount.
 pub fn sshfs_health_check(path: &Path, timeout: Duration) -> bool {
     use std::process::Stdio;
-    let timeout_secs = timeout.as_secs().max(1).to_string();
-    let Ok(mut child) = Command::new("timeout")
-        .arg(&timeout_secs)
-        .arg("stat")
+    let mut command = Command::new("stat");
+    command
         .arg(path)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return false;
+        .stderr(Stdio::null());
+    matches!(command_status_with_timeout(command, timeout), Some(true))
+}
+
+fn command_status_with_timeout(mut command: Command, timeout: Duration) -> Option<bool> {
+    let Ok(mut child) = command.spawn() else {
+        return None;
     };
-    match child.wait() {
-        Ok(status) => status.success(),
-        Err(_) => false,
+    let deadline = Instant::now() + timeout.max(Duration::from_millis(1));
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.success()),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                return Some(false);
+            }
+            Err(_) => return None,
+        }
     }
 }
 

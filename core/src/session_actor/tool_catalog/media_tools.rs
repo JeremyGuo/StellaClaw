@@ -703,16 +703,16 @@ fn file_item_from_path(
     media_kind: &str,
 ) -> Result<FileItem, LocalToolError> {
     let path = string_arg(arguments, "path")?;
-    if matches!(context.remote_mode, super::ToolRemoteMode::Selectable) {
-        if let ExecutionTarget::RemoteSsh { host, cwd } = context.execution_target(arguments)? {
-            return remote_file_item_from_path(
-                context.workspace_root,
-                &host,
-                cwd.as_deref(),
-                &path,
-                media_kind,
-            );
-        }
+    if let ExecutionTarget::RemoteSsh { host, cwd } = context.execution_target(arguments)? {
+        let remote_path =
+            normalize_remote_media_path(context.workspace_root, cwd.as_deref(), &path);
+        return remote_file_item_from_path(
+            context.output_root,
+            &host,
+            cwd.as_deref(),
+            &remote_path,
+            media_kind,
+        );
     }
     let path = resolve_local_path(context.workspace_root, &path);
     local_file_item_from_path(&path, media_kind)
@@ -747,14 +747,14 @@ fn local_file_item_from_path(path: &Path, media_kind: &str) -> Result<FileItem, 
 }
 
 fn remote_file_item_from_path(
-    workspace_root: &Path,
+    output_root: &Path,
     host: &str,
     cwd: Option<&str>,
     path: &str,
     media_kind: &str,
 ) -> Result<FileItem, LocalToolError> {
     let file_name = remote_file_name(path);
-    let local_dir = workspace_root.join(".output").join("remote-media");
+    let local_dir = output_root.join(".output").join("remote-media");
     fs::create_dir_all(&local_dir).map_err(|error| {
         LocalToolError::Io(format!("failed to create {}: {error}", local_dir.display()))
     })?;
@@ -781,6 +781,42 @@ fn remote_file_item_from_path(
         LocalToolError::Io(format!("failed to write {}: {error}", local_path.display()))
     })?;
     local_file_item_from_path(&local_path, media_kind)
+}
+
+fn normalize_remote_media_path(workspace_root: &Path, cwd: Option<&str>, path: &str) -> String {
+    let trimmed = path.trim();
+    let input = Path::new(trimmed);
+    if input.is_absolute() {
+        if let Ok(relative) = input.strip_prefix(workspace_root) {
+            return path_to_remote_arg(relative);
+        }
+    }
+
+    if let Some(cwd) = cwd.and_then(|cwd| {
+        let cwd = cwd.trim();
+        (!cwd.is_empty()).then_some(cwd)
+    }) {
+        let cwd_path = Path::new(cwd);
+        if cwd_path.is_absolute() {
+            if let Ok(workspace_suffix) = workspace_root.strip_prefix(cwd_path) {
+                if !workspace_suffix.as_os_str().is_empty() {
+                    if let Ok(relative) = input.strip_prefix(workspace_suffix) {
+                        return path_to_remote_arg(relative);
+                    }
+                }
+            }
+        }
+    }
+
+    trimmed.to_string()
+}
+
+fn path_to_remote_arg(path: &Path) -> String {
+    if path.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        path.to_string_lossy().to_string()
+    }
 }
 
 fn remote_media_read_command(cwd: Option<&str>, path: &str) -> String {
@@ -1251,9 +1287,39 @@ mod tests {
         static REMOTE_MODE: ToolRemoteMode = ToolRemoteMode::Selectable;
         ToolExecutionContext {
             workspace_root: root,
+            output_root: root,
             remote_mode: &REMOTE_MODE,
             cancel_token,
         }
+    }
+
+    #[test]
+    fn remote_media_path_normalization_strips_workspace_mount_prefix() {
+        let workspace = Path::new(
+            "/home/jeremyguo/services/ClawParty2.0/deploy_telegram_local/conversations/sshfs-web-main-000004",
+        );
+        let cwd = Some("/home/jeremyguo/services/ClawParty2.0");
+
+        assert_eq!(
+            normalize_remote_media_path(
+                workspace,
+                cwd,
+                "/home/jeremyguo/services/ClawParty2.0/deploy_telegram_local/conversations/sshfs-web-main-000004/.output/2026-05-01/output.png",
+            ),
+            ".output/2026-05-01/output.png"
+        );
+        assert_eq!(
+            normalize_remote_media_path(
+                workspace,
+                cwd,
+                "deploy_telegram_local/conversations/sshfs-web-main-000004/.output/2026-05-01/output.png",
+            ),
+            ".output/2026-05-01/output.png"
+        );
+        assert_eq!(
+            normalize_remote_media_path(workspace, cwd, ".output/2026-05-01/output.png"),
+            ".output/2026-05-01/output.png"
+        );
     }
 
     fn test_model_config(url: String) -> ModelConfig {

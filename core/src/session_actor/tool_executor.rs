@@ -35,6 +35,7 @@ const DEFAULT_TRUNCATED_TOOL_RESULT_PREVIEW_CHARS: usize = 80_000;
 
 pub struct LocalToolBatchExecutor {
     workspace_root: PathBuf,
+    output_root: PathBuf,
     remote_mode: ToolRemoteMode,
     conversation_bridge: Option<Arc<dyn ConversationBridge + Send + Sync>>,
     running_batches: Mutex<HashMap<String, RunningToolBatch>>,
@@ -42,12 +43,19 @@ pub struct LocalToolBatchExecutor {
 
 impl LocalToolBatchExecutor {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        let workspace_root = workspace_root.into();
         Self {
-            workspace_root: workspace_root.into(),
+            output_root: workspace_root.clone(),
+            workspace_root,
             remote_mode: ToolRemoteMode::Selectable,
             conversation_bridge: None,
             running_batches: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub fn with_output_root(mut self, output_root: impl Into<PathBuf>) -> Self {
+        self.output_root = output_root.into();
+        self
     }
 
     pub fn with_remote_mode(mut self, remote_mode: ToolRemoteMode) -> Self {
@@ -72,6 +80,7 @@ impl LocalToolBatchExecutor {
         let cancel_token = ToolCancellationToken::default();
         let runner = ToolBatchRunner {
             workspace_root: self.workspace_root.clone(),
+            output_root: self.output_root.clone(),
             remote_mode: self.remote_mode.clone(),
             conversation_bridge: self.conversation_bridge.clone(),
             cancel_token: cancel_token.clone(),
@@ -98,6 +107,7 @@ impl LocalToolBatchExecutor {
     fn context(&self) -> ToolExecutionContext<'_> {
         ToolExecutionContext {
             workspace_root: &self.workspace_root,
+            output_root: &self.output_root,
             remote_mode: &self.remote_mode,
             cancel_token: ToolCancellationToken::default(),
         }
@@ -111,6 +121,7 @@ struct RunningToolBatch {
 
 struct ToolBatchRunner {
     workspace_root: PathBuf,
+    output_root: PathBuf,
     remote_mode: ToolRemoteMode,
     conversation_bridge: Option<Arc<dyn ConversationBridge + Send + Sync>>,
     cancel_token: ToolCancellationToken,
@@ -151,6 +162,7 @@ impl ToolBatchRunner {
         let (result_tx, result_rx) = mpsc::channel();
         let runner = ToolOperationRunner {
             workspace_root: self.workspace_root.clone(),
+            output_root: self.output_root.clone(),
             remote_mode: self.remote_mode.clone(),
             conversation_bridge: self.conversation_bridge.clone(),
             cancel_token: self.cancel_token.clone(),
@@ -220,6 +232,7 @@ fn finish_disconnected_operation(
 
 struct ToolOperationRunner {
     workspace_root: PathBuf,
+    output_root: PathBuf,
     remote_mode: ToolRemoteMode,
     conversation_bridge: Option<Arc<dyn ConversationBridge + Send + Sync>>,
     cancel_token: ToolCancellationToken,
@@ -367,6 +380,7 @@ impl ToolOperationRunner {
     fn context(&self) -> ToolExecutionContext<'_> {
         ToolExecutionContext {
             workspace_root: &self.workspace_root,
+            output_root: &self.output_root,
             remote_mode: &self.remote_mode,
             cancel_token: self.cancel_token.clone(),
         }
