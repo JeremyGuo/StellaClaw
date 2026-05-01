@@ -1,5 +1,10 @@
-version: 1.21.2
+version: 1.21.3
 ---
+
+# 1.21.3
+
+- 修复 fixed SSH workspace 在 sshfs 刚断开时会让 conversation 线程启动失败的问题：
+  启动阶段如果挂载探活后紧接着创建 workspace seed 遇到 `Transport endpoint is not connected`，现在会 lazy unmount、重新挂载并重试一次，避免前端消息停在“等待模型开始处理”。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.21.2
 

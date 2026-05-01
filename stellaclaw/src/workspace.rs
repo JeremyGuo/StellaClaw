@@ -1,5 +1,5 @@
 use std::{
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -33,8 +33,17 @@ pub fn ensure_workspace_for_remote_mode(
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| anyhow!("remote workspace path must not be empty"))?;
             let workspace = ensure_sshfs_workspace(workdir, conversation_id, host, remote_path)?;
-            ensure_workspace_seed(workdir, &workspace)?;
-            Ok(workspace)
+            match ensure_workspace_seed(workdir, &workspace) {
+                Ok(()) => Ok(workspace),
+                Err(error) if is_disconnected_mount_error(&error) => {
+                    let _ = unmount_sshfs_workspace(workdir, conversation_id);
+                    let workspace =
+                        ensure_sshfs_workspace(workdir, conversation_id, host, remote_path)?;
+                    ensure_workspace_seed(workdir, &workspace)?;
+                    Ok(workspace)
+                }
+                Err(error) => Err(error),
+            }
         }
     }
 }
@@ -349,6 +358,17 @@ fn command_status_with_timeout(mut command: Command, timeout: Duration) -> Optio
             Err(_) => return None,
         }
     }
+}
+
+fn is_disconnected_mount_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|error| error.raw_os_error() == Some(107))
+            || cause
+                .to_string()
+                .contains("Transport endpoint is not connected")
+    })
 }
 
 fn next_backup_path(path: &Path) -> Result<PathBuf> {
