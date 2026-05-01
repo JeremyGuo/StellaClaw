@@ -594,7 +594,13 @@ impl ConversationRuntime {
         let sshfs_failed = Arc::new(AtomicBool::new(false));
 
         // Spawn an sshfs watchdog thread for FixedSsh conversations.
-        if matches!(state.tool_remote_mode, ToolRemoteMode::FixedSsh { .. }) {
+        // Skip the watchdog for localhost workspaces (symlinks, not FUSE mounts).
+        let is_symlink_workspace = workspace_root
+            .symlink_metadata()
+            .map_or(false, |m| m.file_type().is_symlink());
+        if matches!(state.tool_remote_mode, ToolRemoteMode::FixedSsh { .. })
+            && !is_symlink_workspace
+        {
             let flag = sshfs_failed.clone();
             let check_path = workspace_root.clone();
             let watchdog_logger = logger.clone();

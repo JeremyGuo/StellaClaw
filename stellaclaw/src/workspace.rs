@@ -2,7 +2,8 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    time::Duration,
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -32,7 +33,11 @@ pub fn ensure_workspace_for_remote_mode(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| anyhow!("remote workspace path must not be empty"))?;
-            let workspace = ensure_sshfs_workspace(workdir, conversation_id, host, remote_path)?;
+            let workspace = if is_localhost_ssh_host(host) {
+                ensure_local_workspace(workdir, conversation_id, remote_path)?
+            } else {
+                ensure_sshfs_workspace(workdir, conversation_id, host, remote_path)?
+            };
             ensure_workspace_seed(workdir, &workspace)?;
             Ok(workspace)
         }
@@ -89,15 +94,19 @@ pub fn is_sshfs_workspace_entry_name(name: &str) -> bool {
 
 pub fn unmount_sshfs_workspace(workdir: &Path, conversation_id: &str) -> Result<()> {
     let mountpoint = sshfs_workspace_root(workdir, conversation_id);
-    if !is_mountpoint(&mountpoint) {
+
+    // If the workspace is a symlink (localhost workspace), just remove the link.
+    if mountpoint.symlink_metadata().map_or(false, |m| m.file_type().is_symlink()) {
+        fs::remove_file(&mountpoint)
+            .with_context(|| format!("failed to remove symlink {}", mountpoint.display()))?;
         return Ok(());
     }
 
-    let status = Command::new("fusermount")
-        .arg("-u")
-        .arg(&mountpoint)
-        .status();
-    if status.map(|status| status.success()).unwrap_or(false) {
+    // Kill tracked sshfs process before attempting unmount so the FUSE daemon
+    // is gone and the kernel releases the mount immediately.
+    kill_tracked_sshfs_process(workdir, conversation_id);
+
+    if !is_mountpoint(&mountpoint) {
         return Ok(());
     }
 
@@ -119,6 +128,102 @@ pub fn unmount_sshfs_workspace(workdir: &Path, conversation_id: &str) -> Result<
         mountpoint.display()
     ))
 }
+
+// ---------------------------------------------------------------------------
+// Localhost detection and local workspace (symlink-based)
+// ---------------------------------------------------------------------------
+
+/// Check whether an SSH host alias resolves to the local machine by running
+/// `ssh -G <host>` and inspecting the resolved `hostname` field.  Returns
+/// `true` for `localhost`, `127.0.0.1`, `::1`, and any alias that resolves to
+/// one of these.
+fn is_localhost_ssh_host(host: &str) -> bool {
+    use std::process::Stdio;
+    let Ok(output) = Command::new("ssh")
+        .args(["-G", host])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix("hostname ") {
+            let value = value.trim();
+            return matches!(value, "localhost" | "127.0.0.1" | "::1");
+        }
+    }
+    false
+}
+
+/// For localhost targets we create a symlink instead of an sshfs mount.  This
+/// avoids the FUSE layer entirely: no recursive mount loops, no zombie sshfs
+/// daemons, no D-state kernel hangs.
+fn ensure_local_workspace(
+    workdir: &Path,
+    conversation_id: &str,
+    remote_path: &str,
+) -> Result<PathBuf> {
+    let target = PathBuf::from(remote_path);
+    if !target.is_absolute() {
+        return Err(anyhow!(
+            "localhost remote path must be absolute, got: {remote_path}"
+        ));
+    }
+    if !target.exists() {
+        return Err(anyhow!(
+            "localhost remote path does not exist: {remote_path}"
+        ));
+    }
+
+    let link_path = sshfs_workspace_root(workdir, conversation_id);
+
+    // If the symlink already points to the right place, reuse it.
+    if let Ok(existing_target) = fs::read_link(&link_path) {
+        if existing_target == target {
+            return Ok(link_path);
+        }
+        // Wrong target — remove and recreate.
+        let _ = fs::remove_file(&link_path);
+    }
+
+    // If there's a stale mount or directory, clean it up first.
+    if link_path.exists() || link_path.symlink_metadata().is_ok() {
+        let _ = unmount_sshfs_workspace(workdir, conversation_id);
+        if link_path.exists() {
+            let _ = fs::remove_dir_all(&link_path);
+        }
+    }
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &link_path).with_context(|| {
+        format!(
+            "failed to create symlink {} -> {}",
+            link_path.display(),
+            target.display()
+        )
+    })?;
+
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&target, &link_path).with_context(|| {
+        format!(
+            "failed to create symlink {} -> {}",
+            link_path.display(),
+            target.display()
+        )
+    })?;
+
+    Ok(link_path)
+}
+
+// ---------------------------------------------------------------------------
+// sshfs workspace (remote hosts)
+// ---------------------------------------------------------------------------
 
 fn ensure_sshfs_workspace(
     workdir: &Path,
@@ -164,6 +269,10 @@ fn ensure_sshfs_workspace(
             String::from_utf8_lossy(&output.stderr)
         ));
     }
+
+    // Record the sshfs PID so we can kill it during cleanup.
+    record_sshfs_pid(workdir, conversation_id, &mountpoint);
+
     Ok(mountpoint)
 }
 
@@ -272,22 +381,81 @@ fn ensure_sshfs_available() -> Result<()> {
     ))
 }
 
-fn is_mountpoint(path: &Path) -> bool {
+// ---------------------------------------------------------------------------
+// sshfs PID tracking
+// ---------------------------------------------------------------------------
+
+/// Path to the file that stores the sshfs daemon PID for a conversation.
+fn sshfs_pid_path(workdir: &Path, conversation_id: &str) -> PathBuf {
+    workdir
+        .join("conversations")
+        .join(conversation_id)
+        .join(".sshfs_pid")
+}
+
+/// After a successful sshfs mount, find the sshfs process that owns the
+/// mountpoint and record its PID.
+fn record_sshfs_pid(workdir: &Path, conversation_id: &str, mountpoint: &Path) {
     use std::process::Stdio;
-    // Use timeout to avoid blocking on dead FUSE mounts.
-    let Ok(output) = Command::new("timeout")
-        .args(["3", "mountpoint", "-q"])
-        .arg(path)
+    // `pgrep -f` with the mountpoint path to find the sshfs process.
+    let Ok(output) = Command::new("pgrep")
+        .args(["-f", &format!("sshfs.*{}", mountpoint.display())])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .output()
     else {
-        return false;
+        return;
     };
-    if output.success() {
+    if !output.status.success() {
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Take the last PID (most recently started sshfs for this mount).
+    if let Some(pid_str) = stdout.lines().last().map(str::trim).filter(|s| !s.is_empty()) {
+        let pid_file = sshfs_pid_path(workdir, conversation_id);
+        let _ = fs::write(&pid_file, pid_str);
+    }
+}
+
+/// Kill a previously tracked sshfs daemon.  Best-effort; failures are ignored.
+fn kill_tracked_sshfs_process(workdir: &Path, conversation_id: &str) {
+    let pid_file = sshfs_pid_path(workdir, conversation_id);
+    let Ok(pid_str) = fs::read_to_string(&pid_file) else {
+        return;
+    };
+    let _ = fs::remove_file(&pid_file);
+    let pid_str = pid_str.trim();
+    if pid_str.is_empty() {
+        return;
+    }
+    // SIGKILL the sshfs daemon so the FUSE mount becomes immediately dead
+    // (returns ENOTCONN) rather than hanging.
+    let _ = Command::new("kill")
+        .args(["-9", pid_str])
+        .status();
+    // Give the kernel a moment to process the signal.
+    thread::sleep(Duration::from_millis(100));
+}
+
+// ---------------------------------------------------------------------------
+// Mountpoint and health checks (non-blocking)
+// ---------------------------------------------------------------------------
+
+/// Check whether a path is a FUSE/mount point.  Uses `timeout` to avoid
+/// blocking on dead FUSE mounts, and polls with `try_wait` to guarantee this
+/// function always returns within the deadline.
+fn is_mountpoint(path: &Path) -> bool {
+    // Fast path: if the path doesn't exist at all, it's not a mountpoint.
+    // Use symlink_metadata to avoid following into broken FUSE mounts.
+    if fs::symlink_metadata(path).is_err() {
+        return false;
+    }
+
+    if run_with_timeout(&["mountpoint", "-q"], path, Duration::from_secs(3)) == Some(true) {
         return true;
     }
+
+    // Fallback: parse `mount` output (does not touch the mountpoint itself).
     let Ok(canonical) = path.canonicalize() else {
         return false;
     };
@@ -303,6 +471,62 @@ fn is_mountpoint(path: &Path) -> bool {
         .any(|line| line.contains(&needle))
 }
 
+fn sshfs_workspace_is_usable(path: &Path) -> bool {
+    sshfs_health_check(path, Duration::from_secs(5))
+}
+
+/// Check whether an sshfs mountpoint is responsive by running `stat` with a
+/// timeout.  Returns `true` when the mountpoint responds within the deadline,
+/// `false` otherwise.
+///
+/// This function is guaranteed to return within `timeout + 1s` even when the
+/// FUSE mount is dead and processes enter uninterruptible sleep.
+pub fn sshfs_health_check(path: &Path, timeout: Duration) -> bool {
+    run_with_timeout(&["stat"], path, timeout) == Some(true)
+}
+
+/// Run `[args..., path]` as a child process with a deadline.  Returns
+/// `Some(true)` on success, `Some(false)` on non-zero exit, `None` on timeout
+/// or error.
+///
+/// Unlike the previous approach of `timeout(1) <cmd>` + `child.wait()`, this
+/// uses `child.try_wait()` polling.  If the child is stuck in D-state (which
+/// makes even `timeout`'s SIGKILL ineffective), we stop waiting and return
+/// `None`.  The stuck process is orphaned but harmless — it will be reaped
+/// when the FUSE mount is eventually cleaned up.
+fn run_with_timeout(args: &[&str], path: &Path, timeout: Duration) -> Option<bool> {
+    use std::process::Stdio;
+    let mut child = Command::new(args[0])
+        .args(&args[1..])
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.success()),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    // Timed out.  Try to kill, but don't wait — the process
+                    // may be in D-state and immune to signals.
+                    let _ = child.kill();
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 fn directory_has_entries(path: &Path) -> Result<bool> {
     let mut entries =
         fs::read_dir(path).with_context(|| format!("failed to read {}", path.display()))?;
@@ -314,33 +538,6 @@ fn create_mountpoint_directory(path: &Path) -> Result<()> {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
         Err(error) => Err(error).with_context(|| format!("failed to create {}", path.display())),
-    }
-}
-
-fn sshfs_workspace_is_usable(path: &Path) -> bool {
-    sshfs_health_check(path, Duration::from_secs(5))
-}
-
-/// Check whether an sshfs mountpoint is responsive by running `stat` with a
-/// timeout.  Returns `true` when the mountpoint responds within the deadline,
-/// `false` otherwise.  This must never block on a dead FUSE mount.
-pub fn sshfs_health_check(path: &Path, timeout: Duration) -> bool {
-    use std::process::Stdio;
-    let timeout_secs = timeout.as_secs().max(1).to_string();
-    let Ok(mut child) = Command::new("timeout")
-        .arg(&timeout_secs)
-        .arg("stat")
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return false;
-    };
-    match child.wait() {
-        Ok(status) => status.success(),
-        Err(_) => false,
     }
 }
 

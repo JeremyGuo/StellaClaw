@@ -122,7 +122,15 @@ fn build_bubblewrap_command(
     if session_root != workspace_root {
         bind_path(&mut command, &session_root, false)?;
     }
-    if let Some(runtime_root) = discover_runtime_root(&workspace_root) {
+    // Try session_root first for runtime root discovery.  When the
+    // workspace is a symlink (localhost remote mode), canonicalize()
+    // resolves to the real target directory which is outside the workdir
+    // hierarchy, so discover_runtime_root would fail on workspace_root.
+    // session_root is always under workdir/conversations/ and resolves
+    // correctly.
+    if let Some(runtime_root) = discover_runtime_root(&session_root)
+        .or_else(|| discover_runtime_root(&workspace_root))
+    {
         bind_path(&mut command, &runtime_root, false)?;
     }
     let session_root_env = session_root.to_string_lossy().to_string();
@@ -198,7 +206,9 @@ fn build_bubblewrap_shell_command(
     if session_root != workspace_root {
         bind_path(&mut command, &session_root, false)?;
     }
-    if let Some(runtime_root) = discover_runtime_root(&workspace_root) {
+    if let Some(runtime_root) = discover_runtime_root(&session_root)
+        .or_else(|| discover_runtime_root(&workspace_root))
+    {
         bind_path(&mut command, &runtime_root, false)?;
     }
     let session_root_env = session_root.to_string_lossy().to_string();
