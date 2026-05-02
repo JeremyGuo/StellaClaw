@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import remarkGfm from 'remark-gfm';
@@ -6,7 +6,7 @@ import { FileText, Plus, Send, TerminalSquare } from 'lucide-react';
 import * as Popover from '@radix-ui/react-popover';
 import { attachmentName, attachmentUrl, isImageAttachment, messageText } from '../lib/fileUtils';
 import { formatBytes, formatTokens, modelAlias, modelDisplayName } from '../lib/format';
-import { displayMessages, firstMessageId, firstToolNameForMessage, liveActivitySignature, markerIndexes, messageIndex, messageKey, shouldTypewriterMessage, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
+import { displayMessages, firstMessageId, firstToolNameForMessage, liveActivitySignature, markerIndexes, messageKey, shouldTypewriterMessage, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
 
 const COMMANDS = [
   { command: '/model', label: '切换模型', description: '选择当前 Conversation 使用的模型', options: 'models' },
@@ -27,7 +27,12 @@ const REASONING_EFFORTS = [
   { value: 'default', label: 'Default', description: '恢复模型默认 reasoning effort' }
 ];
 
-export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, draft, setDraft, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, runningActivities }) {
+function serverMessageIndex(message) {
+  const index = Number(message?.index ?? message?.id);
+  return Number.isFinite(index) ? index : -1;
+}
+
+export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, runningActivities }) {
   const renderedMessages = useMemo(() => displayMessages(messages), [messages]);
   const activitySignature = useMemo(() => liveActivitySignature(runningActivities || []), [runningActivities]);
   const oldestMessageKey = useMemo(() => firstMessageId(messages) || messages[0]?.id || messages[0]?.index || '', [messages]);
@@ -39,10 +44,13 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const [models, setModels] = useState([]);
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsError, setModelsError] = useState('');
+  const [draft, setDraft] = useState('');
   const progressRef = useRef(null);
   const composerRef = useRef(null);
   const composingRef = useRef(false);
-  const compositionEndedAtRef = useRef(0);
+  const lastComposingEnterAtRef = useRef(0);
+  const lastEnterKeyUpAtRef = useRef(0);
+  const suppressNextEnterRef = useRef(false);
   const scrollRef = useRef(null);
   const previousCountRef = useRef(0);
   const loadingOlderRef = useRef(false);
@@ -122,12 +130,13 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     typedMessagesRef.current = new Set();
     typewriterHydratedRef.current = false;
     newestSeenIndexRef.current = -1;
+    setDraft('');
     setTypingKeys(new Set());
   }, [activeMessageScope]);
 
   useEffect(() => {
     const known = knownMessagesRef.current;
-    const maxIndex = messages.reduce((max, message) => Math.max(max, messageIndex(message)), -1);
+    const maxIndex = messages.reduce((max, message) => Math.max(max, serverMessageIndex(message)), -1);
     if (!messagesReady || !typewriterHydratedRef.current) {
       messages.forEach((message, index) => {
         const key = messageKey(message, index);
@@ -148,7 +157,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       const signature = `${key}:${messageText(message)}`;
       const isNew = !known.has(key);
       known.add(key);
-      const isAppendedCurrentMessage = messageIndex(message) > previousNewestIndex;
+      const isAppendedCurrentMessage = serverMessageIndex(message) > previousNewestIndex;
       if (isNew && isAppendedCurrentMessage && shouldTypewriterMessage(message) && !typedMessagesRef.current.has(signature)) {
         typedMessagesRef.current.add(signature);
         nextTyping.push(key);
@@ -214,20 +223,23 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     }
   };
 
-  const submitDraft = () => {
+  const submitDraft = async () => {
     if (!draft.trim() || sending) return;
-    onSend?.(draft);
+    const value = draft;
+    setDraft('');
+    const sent = await onSend?.(value);
+    if (sent === false) {
+      setDraft((current) => current || value);
+    }
   };
 
   const isImeComposingEnter = (event) => {
     if (event.key !== 'Enter') return false;
     const nativeEvent = event.nativeEvent || {};
-    const recentlyEnded = Date.now() - compositionEndedAtRef.current < 80;
     return composingRef.current
       || event.isComposing
       || nativeEvent.isComposing
-      || nativeEvent.keyCode === 229
-      || recentlyEnded;
+      || nativeEvent.keyCode === 229;
   };
 
   const openModelOptions = async () => {
@@ -290,9 +302,9 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
         ) : (
           renderedMessages.map((message, index) => (
             message.type === 'toolGroup'
-              ? <ToolProcessGroup key={message.id} group={message} />
+              ? <MemoToolProcessGroup key={message.id} group={message} />
               : (
-                <MessageArticle
+                <MemoMessageArticle
                   key={messageKey(message, index)}
                   message={message}
                   typewriter={typingKeys.has(messageKey(message, index))}
@@ -322,15 +334,32 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
             }}
             onCompositionEnd={() => {
               composingRef.current = false;
-              compositionEndedAtRef.current = Date.now();
+              if (lastComposingEnterAtRef.current > lastEnterKeyUpAtRef.current) {
+                suppressNextEnterRef.current = true;
+                window.setTimeout(() => {
+                  suppressNextEnterRef.current = false;
+                }, 160);
+              }
             }}
             onKeyDown={(event) => {
               if (event.key === 'Enter' && !event.shiftKey && isImeComposingEnter(event)) {
+                lastComposingEnterAtRef.current = Date.now();
+                return;
+              }
+              if (event.key === 'Enter' && !event.shiftKey && suppressNextEnterRef.current) {
+                suppressNextEnterRef.current = false;
+                event.preventDefault();
                 return;
               }
               if (event.key === 'Enter' && !event.shiftKey) {
                 event.preventDefault();
-                submitDraft();
+                submitDraft().catch(() => {});
+              }
+            }}
+            onKeyUp={(event) => {
+              if (event.key === 'Enter') {
+                lastEnterKeyUpAtRef.current = Date.now();
+                suppressNextEnterRef.current = false;
               }
             }}
             placeholder={modelSelectionPending ? '请先选择模型' : 'Ask Stellacode to change, inspect, or explain...'}
@@ -431,7 +460,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
               </Popover.Portal>
             </Popover.Root>
             <span className={`mode-pill ${modeTone}`} title={modeTitle}>{modeLabel}</span>
-            <button className="send-button" type="button" disabled={modelSelectionPending || !draft.trim() || sending} onClick={submitDraft}>
+            <button className="send-button" type="button" disabled={modelSelectionPending || !draft.trim() || sending} onClick={() => submitDraft().catch(() => {})}>
               <Send size={18} />
             </button>
           </div>
@@ -596,6 +625,12 @@ export function MessageArticle({ message, typewriter = false, onTypewriterDone }
   );
 }
 
+const MemoMessageArticle = memo(MessageArticle, (previous, next) => {
+  if (previous.message !== next.message || previous.typewriter !== next.typewriter) return false;
+  if (previous.typewriter || next.typewriter) return previous.onTypewriterDone === next.onTypewriterDone;
+  return true;
+});
+
 export function AuxiliaryDots({ messages }) {
   return (
     <div className="aux-dots">
@@ -723,6 +758,8 @@ export function ToolProcessGroup({ group }) {
     </details>
   );
 }
+
+const MemoToolProcessGroup = memo(ToolProcessGroup);
 
 function toolCardsAreComplete(cards) {
   if (!cards.length) return false;

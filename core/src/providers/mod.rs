@@ -13,13 +13,15 @@ mod openrouter_responses;
 mod output_persistor;
 mod pricing;
 
-use std::error::Error as StdError;
+use std::{error::Error as StdError, time::Duration};
 
+#[cfg(not(test))]
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    model_config::{ModelConfig, ProviderType},
+    model_config::{ModelConfig, ProviderType, RetryMode},
     session_actor::{ChatMessage, ToolDefinition},
 };
 
@@ -63,6 +65,8 @@ pub trait Provider {
     }
 
     fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError>;
+
+    fn before_retry(&self, _error: &ProviderError) {}
 }
 
 pub(crate) trait ProviderBackend: Send + Sync {
@@ -87,6 +91,8 @@ pub(crate) trait ProviderBackend: Send + Sync {
         model_config: &ModelConfig,
         request: ProviderRequest<'_>,
     ) -> Result<ChatMessage, ProviderError>;
+
+    fn before_retry(&self, _model_config: &ModelConfig, _error: &ProviderError) {}
 }
 
 struct ModelBoundProvider {
@@ -114,6 +120,88 @@ impl Provider for ModelBoundProvider {
 
     fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
         self.backend.send(&self.model_config, request)
+    }
+
+    fn before_retry(&self, error: &ProviderError) {
+        self.backend.before_retry(&self.model_config, error);
+    }
+}
+
+pub struct ProviderRetryEvent<'a> {
+    pub retry: u64,
+    pub max_retries: u64,
+    pub delay: Duration,
+    pub error: &'a ProviderError,
+}
+
+pub fn send_provider_request_with_retry<F>(
+    provider: &(dyn Provider + Send + Sync),
+    request: ProviderRequest<'_>,
+    mut on_retry: F,
+) -> Result<ChatMessage, ProviderError>
+where
+    F: FnMut(ProviderRetryEvent<'_>),
+{
+    let mut retries_used = 0_u64;
+    loop {
+        match provider.send(request.clone()) {
+            Ok(response) => return Ok(response),
+            Err(error) if error.is_transient() => {
+                let Some(delay) = transient_provider_retry_delay(
+                    &provider.model_config().retry_mode,
+                    retries_used,
+                ) else {
+                    return Err(error);
+                };
+                retries_used = retries_used.saturating_add(1);
+                provider.before_retry(&error);
+                on_retry(ProviderRetryEvent {
+                    retry: retries_used,
+                    max_retries: retry_mode_max_retries(&provider.model_config().retry_mode),
+                    delay,
+                    error: &error,
+                });
+                if !delay.is_zero() {
+                    std::thread::sleep(delay);
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+pub fn retry_mode_max_retries(retry_mode: &RetryMode) -> u64 {
+    match retry_mode {
+        RetryMode::Once => 0,
+        RetryMode::RandomInterval { max_retries, .. } => *max_retries,
+    }
+}
+
+fn transient_provider_retry_delay(retry_mode: &RetryMode, retries_used: u64) -> Option<Duration> {
+    match retry_mode {
+        RetryMode::Once => None,
+        RetryMode::RandomInterval {
+            max_interval_secs,
+            max_retries,
+        } => {
+            if retries_used >= *max_retries {
+                return None;
+            }
+            #[cfg(test)]
+            {
+                let _ = max_interval_secs;
+                Some(Duration::ZERO)
+            }
+            #[cfg(not(test))]
+            {
+                let sleep_secs = if *max_interval_secs == 0 {
+                    0
+                } else {
+                    rand::rng().random_range(1..=*max_interval_secs)
+                };
+                Some(Duration::from_secs(sleep_secs))
+            }
+        }
     }
 }
 

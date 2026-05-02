@@ -23,7 +23,8 @@ mod unix_impl {
     };
 
     use crate::providers::{
-        provider_from_model_config, Provider, ProviderError, ProviderErrorReport, ProviderRequest,
+        provider_from_model_config, send_provider_request_with_retry, Provider, ProviderError,
+        ProviderErrorReport, ProviderRequest,
     };
 
     static FORK_SERVER: OnceLock<Arc<ProviderRequestForkServer>> = OnceLock::new();
@@ -855,9 +856,12 @@ mod unix_impl {
                     request_id,
                     request,
                 } => {
-                    let result = provider
-                        .send(request.as_provider_request())
-                        .map_err(ProviderErrorReport::from_provider_error);
+                    let result = send_provider_request_with_retry(
+                        provider.as_ref(),
+                        request.as_provider_request(),
+                        |_| {},
+                    )
+                    .map_err(ProviderErrorReport::from_provider_error);
                     let _ = write_worker_event(
                         &mut writer,
                         ProviderWorkerEvent::Completed { request_id, result },
@@ -1080,7 +1084,11 @@ mod portable_impl {
             let thread_request_id = request_id.clone();
             thread::spawn(move || {
                 let provider = provider_from_model_config(model_config);
-                let result = provider.send(request.as_provider_request());
+                let result = send_provider_request_with_retry(
+                    provider.as_ref(),
+                    request.as_provider_request(),
+                    |_| {},
+                );
                 let Some(running) = pending
                     .lock()
                     .expect("mutex poisoned")

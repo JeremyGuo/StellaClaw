@@ -46,6 +46,15 @@ pub enum RetryMode {
     },
 }
 
+impl Default for RetryMode {
+    fn default() -> Self {
+        Self::RandomInterval {
+            max_interval_secs: 1,
+            max_retries: 5,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MultimodalEstimatorConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,6 +110,7 @@ pub struct ModelConfig {
         alias = "max_request_size"
     )]
     pub max_request_size: u64,
+    #[serde(default)]
     pub retry_mode: RetryMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<serde_json::Value>,
@@ -283,7 +293,6 @@ mod tests {
             "capabilities": ["chat"],
             "token_max_context": 128000,
             "cache_timeout": 300,
-            "retry_mode": "once",
             "token_estimator_type": "local"
         }))
         .expect("model config should deserialize with timeout defaults");
@@ -291,6 +300,13 @@ mod tests {
         assert_eq!(config.conn_timeout, 2);
         assert_eq!(config.request_timeout, 600);
         assert_eq!(config.max_request_size, 30 * 1024 * 1024);
+        assert_eq!(
+            config.retry_mode,
+            RetryMode::RandomInterval {
+                max_interval_secs: 1,
+                max_retries: 5,
+            }
+        );
         assert_eq!(config.max_tokens, 0);
         assert_eq!(config.effective_max_tokens(), 128000);
         assert_eq!(config.conn_timeout_secs(), 2);

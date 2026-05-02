@@ -3,12 +3,10 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     path::PathBuf,
     sync::Mutex,
-    thread::sleep,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::Engine as _;
-use rand::Rng;
 use reqwest::{blocking::Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -19,7 +17,7 @@ use tungstenite::{
 use url::Url;
 
 use crate::{
-    model_config::{ModelConfig, RetryMode},
+    model_config::ModelConfig,
     session_actor::{
         normalize_messages_for_model, ChatMessage, ChatMessageItem, ChatRole, ContextItem,
         FileItem, ReasoningItem, ToolCallItem, ToolDefinition,
@@ -236,10 +234,6 @@ impl CodexSubscriptionProvider {
         let mut cached = self.socket.lock().expect("mutex poisoned");
         *cached = None;
     }
-
-    fn should_retry(error: &ProviderError) -> bool {
-        matches!(error, ProviderError::WebSocket(_))
-    }
 }
 
 impl Default for CodexSubscriptionProvider {
@@ -288,32 +282,12 @@ impl ProviderBackend for CodexSubscriptionProvider {
         model_config: &ModelConfig,
         request: ProviderRequest<'_>,
     ) -> Result<ChatMessage, ProviderError> {
-        let mut retries_used = 0_u64;
+        self.send_once(model_config, &request)
+    }
 
-        loop {
-            match self.send_once(model_config, &request) {
-                Ok(response) => return Ok(response),
-                Err(error) if Self::should_retry(&error) => match &model_config.retry_mode {
-                    RetryMode::Once => return Err(error),
-                    RetryMode::RandomInterval {
-                        max_interval_secs,
-                        max_retries,
-                    } => {
-                        if retries_used >= *max_retries {
-                            return Err(error);
-                        }
-                        retries_used = retries_used.saturating_add(1);
-
-                        let sleep_secs = if *max_interval_secs == 0 {
-                            0
-                        } else {
-                            rand::rng().random_range(0..=*max_interval_secs)
-                        };
-                        sleep(Duration::from_secs(sleep_secs));
-                    }
-                },
-                Err(error) => return Err(error),
-            }
+    fn before_retry(&self, _model_config: &ModelConfig, error: &ProviderError) {
+        if matches!(error, ProviderError::WebSocket(_)) {
+            self.clear_socket();
         }
     }
 }

@@ -1,5 +1,13 @@
-version: 1.21.12
+version: 1.22.0
 ---
+
+# 1.22.0
+
+- 收敛 provider transient retry 策略：
+  provider 内部不再各自按 `retry_mode` 重试聊天请求，统一由 shared retry helper 按 `ModelConfig.retry_mode` 处理 `Request`、WebSocket、subprocess、429、5xx、rate limited、provider unavailable 等 transient error；`SessionActor` 会记录 `provider_request_retrying` 日志，Codex subscription 在重试前仅负责清理 cached socket。`retry_mode` 省略时默认使用 `random_interval { max_interval_secs: 1, max_retries: 5 }`，示例配置同步更新。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Stellacode 2 长对话输入卡顿、打字机回归和 IME Enter 行为：
+  Composer draft 下放到聊天组件本地状态，历史消息和工具组渲染增加 memo / offscreen skip，避免每次键入都重渲染整页 Markdown；打字机新消息判断不再被本地 optimistic message 的非数字 id 阻断；IME 只屏蔽同一次 composition Enter 产生的后续 keydown，并阻止它插入换行，快速二次按 Enter 仍会发送。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.21.12
 

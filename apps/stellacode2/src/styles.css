@@ -835,6 +835,8 @@ button {
   max-width: var(--chat-column-width);
   margin: 0 auto 24px;
   overflow-wrap: anywhere;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 180px;
 }
 
 .message.force-separate {
@@ -1244,6 +1246,8 @@ button {
   margin: 0 auto 16px;
   border-top: 1px solid var(--border);
   color: var(--muted);
+  content-visibility: auto;
+  contain-intrinsic-size: auto 120px;
 }
 
 .tool-process-group > summary {

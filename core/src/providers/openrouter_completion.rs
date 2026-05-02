@@ -5,13 +5,12 @@ use std::{
     time::Duration,
 };
 
-use rand::Rng;
 use reqwest::{blocking::Client, header::ACCEPT_ENCODING, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    model_config::{ModelCapability, ModelConfig, RetryMode},
+    model_config::{ModelCapability, ModelConfig},
     session_actor::{
         normalize_messages_for_model, ChatMessage, ChatMessageItem, ChatRole, ContextItem,
         FileItem, TokenUsage, ToolCallItem,
@@ -162,25 +161,6 @@ impl OpenRouterCompletionProvider {
 
         convert_openrouter_response(response_body, model_config, &self.output_persistor)
     }
-
-    fn should_retry(error: &ProviderError) -> bool {
-        match error {
-            ProviderError::Request(_) => true,
-            ProviderError::HttpStatus { status, .. } => {
-                *status == StatusCode::TOO_MANY_REQUESTS.as_u16() || *status >= 500
-            }
-            ProviderError::MissingApiKeyEnv(_)
-            | ProviderError::BuildHttpClient(_)
-            | ProviderError::DecodeResponse(_)
-            | ProviderError::DecodeJson(_)
-            | ProviderError::InvalidResponse(_)
-            | ProviderError::ProviderFailure { .. }
-            | ProviderError::WebSocket(_)
-            | ProviderError::PersistOutput(_)
-            | ProviderError::EmptyChoices
-            | ProviderError::Subprocess(_) => false,
-        }
-    }
 }
 
 fn preview_body(body: &str) -> String {
@@ -252,33 +232,7 @@ impl ProviderBackend for OpenRouterCompletionProvider {
         model_config: &ModelConfig,
         request: ProviderRequest<'_>,
     ) -> Result<ChatMessage, ProviderError> {
-        let mut retries_used = 0_u64;
-
-        loop {
-            match self.send_once(model_config, &request) {
-                Ok(response) => return Ok(response),
-                Err(error) if Self::should_retry(&error) => match &model_config.retry_mode {
-                    RetryMode::Once => return Err(error),
-                    RetryMode::RandomInterval {
-                        max_interval_secs,
-                        max_retries,
-                    } => {
-                        if retries_used >= *max_retries {
-                            return Err(error);
-                        }
-                        retries_used = retries_used.saturating_add(1);
-
-                        let sleep_secs = if *max_interval_secs == 0 {
-                            0
-                        } else {
-                            rand::rng().random_range(0..=*max_interval_secs)
-                        };
-                        std::thread::sleep(Duration::from_secs(sleep_secs));
-                    }
-                },
-                Err(error) => return Err(error),
-            }
-        }
+        self.send_once(model_config, &request)
     }
 }
 
@@ -776,7 +730,7 @@ fn convert_openrouter_response(
 mod tests {
     use super::*;
     use crate::{
-        model_config::{ModelCapability, ProviderType, TokenEstimatorType},
+        model_config::{ModelCapability, ProviderType, RetryMode, TokenEstimatorType},
         session_actor::ChatMessageItem,
         test_support::temp_cwd,
     };

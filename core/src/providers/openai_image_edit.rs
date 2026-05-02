@@ -1,17 +1,15 @@
 use std::{collections::HashMap, fs, path::PathBuf, sync::Mutex, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
-use rand::Rng;
 use reqwest::{
     blocking::{multipart, Client},
     header::ACCEPT_ENCODING,
-    StatusCode,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::{
-    model_config::{ModelConfig, RetryMode},
+    model_config::ModelConfig,
     session_actor::{ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem},
 };
 
@@ -146,16 +144,6 @@ impl OpenAiImageEditProvider {
             .map_err(ProviderError::DecodeJson)?;
         convert_image_response(response, token_usage, &self.output_persistor)
     }
-
-    fn should_retry(error: &ProviderError) -> bool {
-        match error {
-            ProviderError::Request(_) => true,
-            ProviderError::HttpStatus { status, .. } => {
-                *status == StatusCode::TOO_MANY_REQUESTS.as_u16() || *status >= 500
-            }
-            _ => false,
-        }
-    }
 }
 
 impl ProviderBackend for OpenAiImageEditProvider {
@@ -164,33 +152,7 @@ impl ProviderBackend for OpenAiImageEditProvider {
         model_config: &ModelConfig,
         request: ProviderRequest<'_>,
     ) -> Result<ChatMessage, ProviderError> {
-        let mut retries_used = 0_u64;
-
-        loop {
-            match self.send_once(model_config, &request) {
-                Ok(response) => return Ok(response),
-                Err(error) if Self::should_retry(&error) => match &model_config.retry_mode {
-                    RetryMode::Once => return Err(error),
-                    RetryMode::RandomInterval {
-                        max_interval_secs,
-                        max_retries,
-                    } => {
-                        if retries_used >= *max_retries {
-                            return Err(error);
-                        }
-                        retries_used = retries_used.saturating_add(1);
-
-                        let sleep_secs = if *max_interval_secs == 0 {
-                            0
-                        } else {
-                            rand::rng().random_range(0..=*max_interval_secs)
-                        };
-                        std::thread::sleep(Duration::from_secs(sleep_secs));
-                    }
-                },
-                Err(error) => return Err(error),
-            }
-        }
+        self.send_once(model_config, &request)
     }
 }
 
@@ -402,7 +364,7 @@ fn image_error_message(error: &serde_json::Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::{
-        model_config::{ModelCapability, ProviderType, TokenEstimatorType},
+        model_config::{ModelCapability, ProviderType, RetryMode, TokenEstimatorType},
         session_actor::ChatMessage,
         test_support::temp_cwd,
     };

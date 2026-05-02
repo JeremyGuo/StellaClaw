@@ -372,7 +372,6 @@ function App() {
   const [conversationLayout, setConversationLayout] = useState(null);
   const [newConversationOpen, setNewConversationOpen] = useState(false);
   const [creatingConversation, setCreatingConversation] = useState(false);
-  const [draft, setDraft] = useState('');
   const [openFiles, setOpenFiles] = useState([]);
   const [activeFilePath, setActiveFilePath] = useState('');
   const [appForeground, setAppForeground] = useState(() => (
@@ -1376,9 +1375,8 @@ function App() {
 
   const sendMessage = useCallback(async (text) => {
     const value = String(text || '').trim();
-    if (!value || !selected || sending) return;
+    if (!value || !selected || sending) return false;
     const key = conversationKey(selected.serverId, selected.conversationId);
-    const previousDraft = draft;
     const commandState = slashCommandState(value);
     const previousLastServerId = lastServerMessageId(messagesRef.current);
     const optimistic = {
@@ -1391,7 +1389,6 @@ function App() {
       _optimistic: true,
       pending: true
     };
-    setDraft('');
     setSending(true);
     setSessionActivity('正在发送');
     updateRunningActivities(() => [
@@ -1404,7 +1401,7 @@ function App() {
     });
     try {
       await postConversationMessage(selected.serverId, selected.conversationId, value);
-      if (websocketKeyRef.current !== key) return;
+      if (websocketKeyRef.current !== key) return false;
       setMessages((current) => {
         const next = commandState.control
           ? current.filter((message) => message.id !== optimistic.id)
@@ -1443,9 +1440,9 @@ function App() {
           });
         }
       }
+      return true;
     } catch (error) {
       if (websocketKeyRef.current === key) {
-        setDraft((current) => current || previousDraft);
         setSessionActivity(error?.message || '发送失败');
         updateRunningActivities(() => [
           { id: 'send-error', title: '发送失败', detail: error?.message || '发送失败', state: 'failed' }
@@ -1458,10 +1455,11 @@ function App() {
           return next;
         });
       }
+      return false;
     } finally {
       if (websocketKeyRef.current === key) setSending(false);
     }
-  }, [draft, selected, sending]);
+  }, [selected, sending]);
 
   const title = activeConversation
     ? displayConversationName(activeConversation)
@@ -1532,8 +1530,6 @@ function App() {
           modelSelectionPending={Boolean(activeConversation?.model_selection_pending ?? selectedConversationStatus?.model_selection_pending)}
           messages={messages}
           messagesReady={messagesReady}
-          draft={draft}
-          setDraft={setDraft}
           mode={composerMode}
           hasOlder={hasOlderMessages(messages)}
           onLoadOlder={loadOlderMessages}

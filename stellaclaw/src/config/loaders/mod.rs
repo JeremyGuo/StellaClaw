@@ -152,7 +152,7 @@ mod tests {
                   "token_max_context": 262144,
                   "cache_timeout": 300,
                   "conn_timeout": 300,
-                  "retry_mode": "once",
+                  "retry_mode": {"random_interval": {"max_interval_secs": 1, "max_retries": 5}},
                   "token_estimator_type": "local"
                 },
                 "search": {
@@ -164,7 +164,7 @@ mod tests {
                   "token_max_context": 32768,
                   "cache_timeout": 300,
                   "conn_timeout": 30,
-                  "retry_mode": "once",
+                  "retry_mode": {"random_interval": {"max_interval_secs": 1, "max_retries": 5}},
                   "token_estimator_type": "local"
                 }
               },
@@ -178,7 +178,7 @@ mod tests {
                   "token_max_context": 32768,
                   "cache_timeout": 300,
                   "conn_timeout": 30,
-                  "retry_mode": "once",
+                  "retry_mode": {"random_interval": {"max_interval_secs": 1, "max_retries": 5}},
                   "token_estimator_type": "local"
                 }
               },

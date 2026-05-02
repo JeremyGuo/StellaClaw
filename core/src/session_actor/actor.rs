@@ -13,7 +13,8 @@ use crate::{
     huggingface::HuggingFaceFileResolver,
     model_config::ModelConfig,
     providers::{
-        request_too_large_text, Provider, ProviderError, ProviderFailureKind, ProviderRequest,
+        request_too_large_text, send_provider_request_with_retry, Provider, ProviderError,
+        ProviderFailureKind, ProviderRequest,
     },
     session_actor::tool_catalog::ToolBackend,
 };
@@ -34,9 +35,6 @@ const DEFAULT_MAX_MODEL_STEPS_PER_TURN: usize = 200;
 const ACTIVE_COMPRESSION_THRESHOLD_RATIO: f64 = 0.9;
 const IDLE_COMPACTION_MIN_RATIO: f64 = 0.4;
 const REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS: usize = 8;
-const TRANSIENT_PROVIDER_MAX_RETRIES: usize = 5;
-#[cfg(not(test))]
-const TRANSIENT_PROVIDER_RETRY_BASE_DELAY_MS: u64 = 250;
 const DEFAULT_RETAIN_RECENT_PERCENT: u64 = 18;
 
 pub struct SessionActor {
@@ -909,7 +907,6 @@ impl SessionActor {
                 .ok_or(SessionActorError::MissingInitial)?;
             let model_message = {
                 let mut request_too_large_attempts = 0usize;
-                let mut transient_provider_retries = 0usize;
                 loop {
                     let normalized_history =
                         normalize_messages_for_model(&self.history, &self.model_config);
@@ -951,8 +948,21 @@ impl SessionActor {
                         let request = ProviderRequest::new(&provider_history)
                             .with_system_prompt(Some(system_prompt.as_str()))
                             .with_tools(tools);
+                        let provider = Arc::clone(&self.provider);
                         self.last_provider_request_started_at = Some(Instant::now());
-                        self.provider.send(request)
+                        send_provider_request_with_retry(provider.as_ref(), request, |event| {
+                            self.log_info(
+                                "provider_request_retrying",
+                                serde_json::json!({
+                                    "turn_id": turn_id,
+                                    "step_index": step_index,
+                                    "retry": event.retry,
+                                    "max_retries": event.max_retries,
+                                    "delay_ms": event.delay.as_millis(),
+                                    "error": event.error.to_string(),
+                                }),
+                            );
+                        })
                     };
                     match send_result {
                         Ok(message) => break message,
@@ -971,26 +981,6 @@ impl SessionActor {
                                 continue;
                             }
                             return Err(SessionActorError::from_provider_error(error));
-                        }
-                        Err(error)
-                            if error.is_transient()
-                                && transient_provider_retries < TRANSIENT_PROVIDER_MAX_RETRIES =>
-                        {
-                            transient_provider_retries += 1;
-                            let delay = transient_provider_retry_delay(transient_provider_retries);
-                            self.log_info(
-                                "provider_request_retrying",
-                                serde_json::json!({
-                                    "turn_id": turn_id,
-                                    "step_index": step_index,
-                                    "retry": transient_provider_retries,
-                                    "max_retries": TRANSIENT_PROVIDER_MAX_RETRIES,
-                                    "delay_ms": delay.as_millis(),
-                                    "error": error.to_string(),
-                                }),
-                            );
-                            std::thread::sleep(delay);
-                            continue;
                         }
                         Err(error) => return Err(SessionActorError::from_provider_error(error)),
                     }
@@ -2222,19 +2212,6 @@ fn usize_field(payload: &serde_json::Value, key: &str, default: usize) -> usize 
         .unwrap_or(default)
 }
 
-fn transient_provider_retry_delay(retry: usize) -> Duration {
-    #[cfg(test)]
-    {
-        let _ = retry;
-        Duration::ZERO
-    }
-    #[cfg(not(test))]
-    {
-        let multiplier = retry.clamp(1, TRANSIENT_PROVIDER_MAX_RETRIES) as u64;
-        Duration::from_millis(TRANSIENT_PROVIDER_RETRY_BASE_DELAY_MS.saturating_mul(multiplier))
-    }
-}
-
 fn invalid_source_payload(source: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "error",
@@ -2400,9 +2377,14 @@ mod tests {
     }
 
     impl TransientThenOkProvider {
-        fn new(failures: usize) -> Self {
+        fn new(failures: usize, max_retries: u64) -> Self {
+            let mut model_config = test_model_config();
+            model_config.retry_mode = RetryMode::RandomInterval {
+                max_interval_secs: 1,
+                max_retries,
+            };
             Self {
-                model_config: test_model_config(),
+                model_config,
                 failures_remaining: Mutex::new(failures),
                 calls: Mutex::new(0),
             }
@@ -2420,7 +2402,7 @@ mod tests {
             if *failures_remaining > 0 {
                 *failures_remaining -= 1;
                 return Err(ProviderError::WebSocket(
-                    "An error occurred while processing your request".to_string(),
+                    "temporary websocket failure".to_string(),
                 ));
             }
             Ok(ChatMessage::new(
@@ -2819,63 +2801,7 @@ mod tests {
     }
 
     #[test]
-    fn transient_provider_errors_retry_five_times_before_turn_fails() {
-        let _cwd = temp_cwd("actor-transient-provider-retry-fails");
-        let (inbox, mailbox) = test_inbox();
-        mailbox.append(
-            SessionMailboxKind::Control,
-            SessionRequest::Initial {
-                initial: SessionInitial::new(
-                    test_session_id("session_transient_retry_fails"),
-                    super::super::SessionType::Foreground,
-                ),
-            },
-        );
-        mailbox.append(
-            SessionMailboxKind::Data,
-            SessionRequest::EnqueueUserMessage {
-                message: ChatMessage::new(
-                    ChatRole::User,
-                    vec![ChatMessageItem::Context(ContextItem {
-                        text: "hello".to_string(),
-                    })],
-                ),
-            },
-        );
-        let events = Arc::new(MemoryEventSink::default());
-        let provider = Arc::new(TransientThenOkProvider::new(
-            TRANSIENT_PROVIDER_MAX_RETRIES + 1,
-        ));
-        let tools = Arc::new(EchoToolExecutor::new());
-        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
-        let mut actor = SessionActor::new(
-            test_model_config(),
-            provider.clone(),
-            tools,
-            inbox,
-            events.clone(),
-            catalog,
-        );
-
-        actor
-            .run_until_idle(8)
-            .expect("actor should stay alive after recoverable failure");
-
-        assert_eq!(
-            *provider.calls.lock().unwrap(),
-            TRANSIENT_PROVIDER_MAX_RETRIES + 1
-        );
-        assert!(matches!(
-            events.events.lock().unwrap().last(),
-            Some(SessionEvent::TurnFailed {
-                can_continue: true,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn transient_provider_errors_recover_within_retry_budget() {
+    fn transient_provider_errors_retry_using_model_retry_mode() {
         let _cwd = temp_cwd("actor-transient-provider-retry-recovers");
         let (inbox, mailbox) = test_inbox();
         mailbox.append(
@@ -2899,7 +2825,7 @@ mod tests {
             },
         );
         let events = Arc::new(MemoryEventSink::default());
-        let provider = Arc::new(TransientThenOkProvider::new(TRANSIENT_PROVIDER_MAX_RETRIES));
+        let provider = Arc::new(TransientThenOkProvider::new(2, 2));
         let tools = Arc::new(EchoToolExecutor::new());
         let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
         let mut actor = SessionActor::new(
@@ -2913,10 +2839,7 @@ mod tests {
 
         actor.run_until_idle(8).expect("actor should recover");
 
-        assert_eq!(
-            *provider.calls.lock().unwrap(),
-            TRANSIENT_PROVIDER_MAX_RETRIES + 1
-        );
+        assert_eq!(*provider.calls.lock().unwrap(), 3);
         assert!(matches!(
             events.events.lock().unwrap().last(),
             Some(SessionEvent::TurnCompleted { .. })
@@ -2925,6 +2848,57 @@ mod tests {
             message_text_for_test(actor.history().last().unwrap()),
             "recovered after transient errors"
         );
+    }
+
+    #[test]
+    fn transient_provider_errors_stop_after_retry_budget() {
+        let _cwd = temp_cwd("actor-transient-provider-retry-fails");
+        let (inbox, mailbox) = test_inbox();
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial {
+                initial: SessionInitial::new(
+                    test_session_id("session_transient_retry_fails"),
+                    super::super::SessionType::Foreground,
+                ),
+            },
+        );
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "hello".to_string(),
+                    })],
+                ),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(TransientThenOkProvider::new(3, 2));
+        let tools = Arc::new(EchoToolExecutor::new());
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
+        let mut actor = SessionActor::new(
+            test_model_config(),
+            provider.clone(),
+            tools,
+            inbox,
+            events.clone(),
+            catalog,
+        );
+
+        actor
+            .run_until_idle(8)
+            .expect("actor should stay alive after recoverable failure");
+
+        assert_eq!(*provider.calls.lock().unwrap(), 3);
+        assert!(matches!(
+            events.events.lock().unwrap().last(),
+            Some(SessionEvent::TurnFailed {
+                can_continue: true,
+                ..
+            })
+        ));
     }
 
     #[test]

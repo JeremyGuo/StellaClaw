@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::{
     model_config::ModelConfig,
-    providers::{Provider, ProviderRequest},
+    providers::{send_provider_request_with_retry, Provider, ProviderRequest},
 };
 
 use super::{
@@ -283,9 +283,12 @@ impl SessionCompressor {
             })],
         ));
 
-        let summary = provider
-            .send(ProviderRequest::new(&request_messages).with_system_prompt(system_prompt))
-            .map_err(|error| CompressionError::Provider(error.to_string()))?;
+        let summary = send_provider_request_with_retry(
+            provider,
+            ProviderRequest::new(&request_messages).with_system_prompt(system_prompt),
+            |_| {},
+        )
+        .map_err(|error| CompressionError::Provider(error.to_string()))?;
         let summary_text = message_text(&summary);
         if summary_text.trim().is_empty() {
             return Err(CompressionError::EmptySummary);
