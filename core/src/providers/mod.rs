@@ -226,6 +226,26 @@ impl ProviderError {
         Self::Request(error_chain_message(&error))
     }
 
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Request(_) | Self::WebSocket(_) | Self::Subprocess(_) => true,
+            Self::HttpStatus { status, .. } => *status == 429 || (500..=599).contains(status),
+            Self::ProviderFailure { kind, .. } => matches!(
+                kind,
+                ProviderFailureKind::RateLimited
+                    | ProviderFailureKind::ProviderUnavailable
+                    | ProviderFailureKind::Unknown
+            ),
+            Self::MissingApiKeyEnv(_)
+            | Self::BuildHttpClient(_)
+            | Self::DecodeResponse(_)
+            | Self::DecodeJson(_)
+            | Self::InvalidResponse(_)
+            | Self::PersistOutput(_)
+            | Self::EmptyChoices => false,
+        }
+    }
+
     pub fn is_request_too_large(&self) -> bool {
         match self {
             Self::ProviderFailure {

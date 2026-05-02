@@ -1,5 +1,10 @@
-version: 1.21.11
+version: 1.21.12
 ---
+
+# 1.21.12
+
+- 修复 provider 侧瞬时错误导致 turn 直接失败的问题：
+  Core session actor 现在会对 websocket、网络请求、429、5xx、provider unavailable 等 transient provider error 在框架层自动重试最多 5 次，并记录 `provider_request_retrying` 日志；超过重试预算后仍按可恢复 turn failure 处理。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.21.11
 
