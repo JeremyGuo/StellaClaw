@@ -1,5 +1,10 @@
-version: 1.21.7
+version: 1.21.8
 ---
+
+# 1.21.8
+
+- 重写 Codex subscription 消息翻译文档：
+  `codex_subscription.md` 现在先完整说明 `ChatMessage` 格式，再用多组 user / assistant / tool call / tool result / assistant image / reasoning 示例展示如何转换成 Codex Responses `input` 消息。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.21.7
 
