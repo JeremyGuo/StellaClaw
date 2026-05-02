@@ -1,5 +1,10 @@
-version: 1.21.6
+version: 1.21.7
 ---
+
+# 1.21.7
+
+- 扩充 `ChatMessage` 文档的期望转换规则：
+  `chat_message.md` 现在补充说明用户输入、assistant 文本、provider tool call、runtime tool result、assistant 生成文件和 provider reasoning 应如何转换成正确的 `ChatMessage`，尤其明确 `ToolResultContent.context` 与 `ToolResultContent.file` 的使用边界。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.21.6
 

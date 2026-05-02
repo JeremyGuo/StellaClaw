@@ -268,6 +268,201 @@ Fields:
 
 Either or both may be present. Both fields are omitted during serialization when absent.
 
+## Expected Conversions
+
+This section describes the expected way runtime events and provider protocol objects should be converted into `ChatMessage`. The goal is to keep persisted history provider-neutral and let provider translators handle protocol-specific replay.
+
+### User Input
+
+Plain user input should become one `role=user` message:
+
+```json
+{
+  "role": "user",
+  "user_name": "Stellacode",
+  "message_time": "2026-05-02T12:00:00Z",
+  "data": [
+    {
+      "type": "context",
+      "payload": { "text": "帮我生成一个巴黎" }
+    }
+  ]
+}
+```
+
+Attachments supplied by the user should be added as `File` items in the same message when they are part of the same user turn:
+
+```json
+{
+  "type": "file",
+  "payload": {
+    "uri": "file:///workspace/input.png",
+    "name": "input.png",
+    "media_type": "image/png"
+  }
+}
+```
+
+### Assistant Text
+
+Assistant natural-language output should become one `role=assistant` message with `Context` items:
+
+```json
+{
+  "role": "assistant",
+  "data": [
+    {
+      "type": "context",
+      "payload": { "text": "已经生成。" }
+    }
+  ]
+}
+```
+
+Provider token usage, when available, belongs on `token_usage`, not in `data`.
+
+### Assistant Tool Call
+
+When a provider asks to run a tool, the provider-specific tool/function call object should become a `ToolCall` item in an assistant message:
+
+```json
+{
+  "role": "assistant",
+  "data": [
+    {
+      "type": "tool_call",
+      "payload": {
+        "tool_call_id": "call_abc",
+        "tool_name": "image_generation",
+        "arguments": {
+          "text": "{\"prompt\":\"Paris at sunset with the Eiffel Tower\"}"
+        }
+      }
+    }
+  ]
+}
+```
+
+Rules:
+
+- Preserve the provider/tool call id exactly when the provider supplies one.
+- Store arguments as the raw JSON argument string in `arguments.text`.
+- Do not pre-execute or flatten the tool call into assistant text.
+
+### Tool Result
+
+When the runtime finishes a tool call, the result should become a `ToolResult` item with the same `tool_call_id` and `tool_name`.
+
+Text-only tool result:
+
+```json
+{
+  "role": "assistant",
+  "data": [
+    {
+      "type": "tool_result",
+      "payload": {
+        "tool_call_id": "call_abc",
+        "tool_name": "read_file",
+        "result": {
+          "context": {
+            "text": "file contents..."
+          }
+        }
+      }
+    }
+  ]
+}
+```
+
+File-only tool result:
+
+```json
+{
+  "role": "assistant",
+  "data": [
+    {
+      "type": "tool_result",
+      "payload": {
+        "tool_call_id": "call_abc",
+        "tool_name": "image_load",
+        "result": {
+          "file": {
+            "uri": "file:///workspace/.output/loaded.png",
+            "name": "loaded.png",
+            "media_type": "image/png",
+            "width": 1024,
+            "height": 768
+          }
+        }
+      }
+    }
+  ]
+}
+```
+
+Tool result with both text and file:
+
+```json
+{
+  "type": "tool_result",
+  "payload": {
+    "tool_call_id": "call_abc",
+    "tool_name": "image_generation",
+    "result": {
+      "context": {
+        "text": "{\"status\":\"completed\",\"generation_id\":\"image_generation_123\"}"
+      },
+      "file": {
+        "uri": "file:///workspace/.output/generated.png",
+        "name": "generated.png",
+        "media_type": "image/png"
+      }
+    }
+  }
+}
+```
+
+Rules:
+
+- `ToolResult.tool_call_id` must match the corresponding `ToolCall.tool_call_id`.
+- `ToolResult.tool_name` should match the original tool name.
+- Put human/model-readable textual output in `result.context.text`.
+- Put the primary output artifact in `result.file`.
+- If a tool produces multiple files, either choose the primary file for `result.file` and mention the rest in `context`, or emit additional messages/items according to the caller's explicit multi-file policy. Do not hide extra files in provider-specific JSON without a stable convention.
+- If the tool failed before producing a file, store the error text in `context`.
+- If the file object exists but cannot be loaded or normalized, use `FileState::Crashed { reason }` on the `FileItem`.
+
+Provider translators are responsible for converting `ToolResult` to provider-native tool output messages. If a tool result includes an image, a provider may also append a synthetic user-side image message at request time so a multimodal model can inspect the file. That synthetic message is not part of persisted history.
+
+### Assistant-Generated File
+
+When a provider itself returns an image or file as assistant output, persist it as a normal assistant `File` item, not as a fake `ToolResult`:
+
+```json
+{
+  "role": "assistant",
+  "data": [
+    {
+      "type": "file",
+      "payload": {
+        "uri": "file:///workspace/.output/paris.png",
+        "name": "paris.png",
+        "media_type": "image/png"
+      }
+    }
+  ]
+}
+```
+
+Provider translators may later replay this assistant file in provider-specific ways. For example, Codex subscription currently translates assistant image history into a temporary user message containing `[Generated by Assistant]` and `input_image`.
+
+### Provider Reasoning
+
+Provider reasoning should become `Reasoning`, not `Context`, unless it is intentionally exposed to the user as normal assistant text.
+
+Codex encrypted reasoning should populate `codex_encrypted_content` so Codex can replay it. Plain fallback summaries may go in `text` or `codex_summary` depending on provider semantics.
+
 ## Example JSON
 
 ```json
