@@ -396,20 +396,19 @@ fn connect_codex_websocket(
             .map_err(|error| ProviderError::WebSocket(error.to_string()))?,
     );
 
-    let (mut socket, _) = if let Some(proxy_stream) =
-        connect_via_https_proxy(&websocket_url, model_config)?
-    {
-        tungstenite::client_tls_with_config(request, proxy_stream, None, None).map_err(
-            |error| match error {
-                tungstenite::HandshakeError::Failure(f) => map_websocket_connect_error(f),
-                tungstenite::HandshakeError::Interrupted(_) => {
-                    ProviderError::WebSocket("websocket handshake interrupted".to_string())
-                }
-            },
-        )?
-    } else {
-        connect(request).map_err(map_websocket_connect_error)?
-    };
+    let (mut socket, _) =
+        if let Some(proxy_stream) = connect_via_https_proxy(&websocket_url, model_config)? {
+            tungstenite::client_tls_with_config(request, proxy_stream, None, None).map_err(
+                |error| match error {
+                    tungstenite::HandshakeError::Failure(f) => map_websocket_connect_error(f),
+                    tungstenite::HandshakeError::Interrupted(_) => {
+                        ProviderError::WebSocket("websocket handshake interrupted".to_string())
+                    }
+                },
+            )?
+        } else {
+            connect(request).map_err(map_websocket_connect_error)?
+        };
     set_socket_timeout(
         &mut socket,
         Duration::from_secs(model_config.request_timeout_secs()),
