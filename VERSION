@@ -1,5 +1,10 @@
-version: 1.21.8
+version: 1.21.9
 ---
+
+# 1.21.9
+
+- 澄清 Codex subscription 文档里的用户图片输入形态：
+  `codex_subscription.md` 现在明确真实用户上传图片通常先 materialize 成本地文件，并以 `file://` `FileItem` 持久化；Codex 请求中的 `data:` URL 是 request-time media normalization 的传输形态。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.21.8
 

@@ -84,6 +84,21 @@ File or media reference.
 
 `name`, `media_type`, `width`, `height`, and `state` are optional. `state` currently only supports `crashed`.
 
+For real user uploads, the preferred persisted shape is a materialized local file reference:
+
+```json
+{
+  "type": "file",
+  "payload": {
+    "uri": "file:///workspace/attachments/incoming/photo.png",
+    "name": "photo.png",
+    "media_type": "image/png"
+  }
+}
+```
+
+`data:` URLs are still valid `FileItem.uri` values, but they are better treated as transport/intermediate form. For Codex requests, local `file://` inputs are commonly read and converted to inline data URLs during request-time media normalization.
+
 #### `Reasoning`
 
 Reasoning metadata.
@@ -178,7 +193,7 @@ Input `ChatMessage`:
     {
       "type": "file",
       "payload": {
-        "uri": "data:image/png;base64,AAA...",
+        "uri": "file:///workspace/attachments/incoming/input.png",
         "name": "input.png",
         "media_type": "image/png"
       }
@@ -187,7 +202,7 @@ Input `ChatMessage`:
 }
 ```
 
-Codex Responses `input` when `image_in` is supported:
+Codex Responses `input` when `image_in` is supported and the model's media input transport is inline base64:
 
 ```json
 [
@@ -208,7 +223,9 @@ Codex Responses `input` when `image_in` is supported:
 ]
 ```
 
-If `image_in` is not supported, shared normalization converts the file into a text reference before Codex translation, so the provider sees only text-like `Context` items.
+The persisted `ChatMessage` keeps the stable `file://` URI. The data URL above is produced during request-time normalization by reading the local file.
+
+If the model's media input transport is file reference, the image URL may remain the original `file://...` URI. If `image_in` is not supported, shared normalization converts the file into a text reference before Codex translation, so the provider sees only text-like `Context` items.
 
 ### User Message With Non-Image File
 
