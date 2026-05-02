@@ -1,5 +1,10 @@
-version: 1.21.4
+version: 1.21.5
 ---
+
+# 1.21.5
+
+- 增加 provider 消息翻译文档：
+  在 `core/src/providers/` 下为各 provider 补充 `<provider>.md`，说明不同 `ChatMessage` item、角色和模型 capability 下会如何转换成对应 provider 请求消息。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.21.4
 
