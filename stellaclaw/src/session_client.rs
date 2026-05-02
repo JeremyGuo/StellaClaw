@@ -8,6 +8,7 @@ use std::{
         mpsc, Arc, Mutex,
     },
     thread,
+    time::Duration,
 };
 
 use serde::Deserialize;
@@ -18,6 +19,8 @@ use stellaclaw_core::{
 };
 
 use crate::{config::SandboxConfig, sandbox::build_agent_server_command};
+
+const AGENT_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct AgentServerClient {
     child: Child,
@@ -128,9 +131,21 @@ impl AgentServerClient {
                 .map_err(|error| format!("failed to flush request: {error}"))?;
         }
 
-        response_rx
-            .recv()
-            .map_err(|_| "agent_server response stream closed".to_string())?
+        match response_rx.recv_timeout(AGENT_SERVER_REQUEST_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.remove(&id);
+                }
+                Err(format!(
+                    "agent_server request `{method}` timed out after {}s",
+                    AGENT_SERVER_REQUEST_TIMEOUT.as_secs()
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("agent_server response stream closed".to_string())
+            }
+        }
     }
 }
 

@@ -1258,6 +1258,16 @@ impl ConversationRuntime {
         session_type: SessionType,
         request: ConversationBridgeRequest,
     ) -> Result<()> {
+        self.logger.info(
+            "host_coordination_requested",
+            json!({
+                "agent_id": &agent_id,
+                "session_type": format!("{session_type:?}"),
+                "request_id": &request.request_id,
+                "action": &request.action,
+                "tool_name": &request.tool_name,
+            }),
+        );
         let tool_result = match self.handle_bridge_action(agent_id.clone(), session_type, &request)
         {
             Ok(result) => result,
@@ -1265,15 +1275,66 @@ impl ConversationRuntime {
                 bridge_result(&request, json!({"error": format!("{error:#}")}).to_string())
             }
         };
+        self.logger.info(
+            "host_coordination_action_completed",
+            json!({
+                "agent_id": &agent_id,
+                "session_type": format!("{session_type:?}"),
+                "request_id": &request.request_id,
+                "action": &request.action,
+                "tool_name": &request.tool_name,
+                "tool_call_id": &request.tool_call_id,
+            }),
+        );
         let response = ConversationBridgeResponse {
             request_id: request.request_id.clone(),
             tool_call_id: request.tool_call_id.clone(),
             tool_name: request.tool_name.clone(),
             result: tool_result,
         };
-        self.client_for_session(agent_id.as_deref(), session_type)?
+        self.logger.info(
+            "host_coordination_resolve_started",
+            json!({
+                "agent_id": &agent_id,
+                "session_type": format!("{session_type:?}"),
+                "request_id": &response.request_id,
+                "tool_name": &response.tool_name,
+                "tool_call_id": &response.tool_call_id,
+            }),
+        );
+        match self
+            .client_for_session(agent_id.as_deref(), session_type)?
             .send_session_request(&SessionRequest::ResolveHostCoordination { response })
-            .map_err(anyhow::Error::msg)
+        {
+            Ok(()) => {
+                self.logger.info(
+                    "host_coordination_resolved",
+                    json!({
+                        "agent_id": &agent_id,
+                        "session_type": format!("{session_type:?}"),
+                        "request_id": &request.request_id,
+                        "action": &request.action,
+                        "tool_name": &request.tool_name,
+                    }),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                let error = error.to_string();
+                self.logger.warn(
+                    "host_coordination_resolution_failed",
+                    json!({
+                        "agent_id": &agent_id,
+                        "session_type": format!("{session_type:?}"),
+                        "request_id": &request.request_id,
+                        "action": &request.action,
+                        "tool_name": &request.tool_name,
+                        "error": error,
+                    }),
+                );
+                Ok(())
+            }
+        }
     }
 
     fn handle_bridge_action(
