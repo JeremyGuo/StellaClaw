@@ -1,5 +1,10 @@
-version: 1.21.5
+version: 1.21.6
 ---
+
+# 1.21.6
+
+- 增加 `ChatMessage` 数据结构文档：
+  在 `core/src/session_actor/chat_message.md` 中说明 `ChatMessage`、各类 `ChatMessageItem`、token usage、file state 和 tool result 字段的语义及序列化形态。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.21.5
 
