@@ -1,6 +1,6 @@
 use std::{
     fs,
-    net::TcpStream,
+    net::{TcpStream, ToSocketAddrs},
     path::PathBuf,
     sync::Mutex,
     thread::sleep,
@@ -396,7 +396,20 @@ fn connect_codex_websocket(
             .map_err(|error| ProviderError::WebSocket(error.to_string()))?,
     );
 
-    let (mut socket, _) = connect(request).map_err(map_websocket_connect_error)?;
+    let (mut socket, _) = if let Some(proxy_stream) =
+        connect_via_https_proxy(&websocket_url, model_config)?
+    {
+        tungstenite::client_tls_with_config(request, proxy_stream, None, None).map_err(
+            |error| match error {
+                tungstenite::HandshakeError::Failure(f) => map_websocket_connect_error(f),
+                tungstenite::HandshakeError::Interrupted(_) => {
+                    ProviderError::WebSocket("websocket handshake interrupted".to_string())
+                }
+            },
+        )?
+    } else {
+        connect(request).map_err(map_websocket_connect_error)?
+    };
     set_socket_timeout(
         &mut socket,
         Duration::from_secs(model_config.request_timeout_secs()),
@@ -569,6 +582,136 @@ fn build_websocket_url(http_url: &str) -> Result<Url, ProviderError> {
         }
     }
     Ok(url)
+}
+
+/// Detect `HTTPS_PROXY` / `https_proxy` and establish an HTTP CONNECT tunnel to the
+/// WebSocket target host.  Returns `Ok(None)` when no proxy is configured so the
+/// caller can fall back to a direct connection.
+fn connect_via_https_proxy(
+    target_url: &Url,
+    model_config: &ModelConfig,
+) -> Result<Option<TcpStream>, ProviderError> {
+    let proxy_url = std::env::var("HTTPS_PROXY")
+        .or_else(|_| std::env::var("https_proxy"))
+        .or_else(|_| std::env::var("ALL_PROXY"))
+        .or_else(|_| std::env::var("all_proxy"));
+    let proxy_url = match proxy_url {
+        Ok(url) if !url.is_empty() => url,
+        _ => return Ok(None),
+    };
+
+    let target_host = target_url
+        .host_str()
+        .ok_or_else(|| ProviderError::WebSocket("websocket url has no host".to_string()))?;
+    let target_port = target_url.port_or_known_default().unwrap_or(443);
+
+    // Check NO_PROXY
+    if is_no_proxy(target_host) {
+        return Ok(None);
+    }
+
+    // Parse proxy URL — supports http://host:port and socks5://host:port (treat as HTTP CONNECT)
+    let proxy_parsed = Url::parse(&proxy_url).map_err(|error| {
+        ProviderError::WebSocket(format!("invalid proxy URL {proxy_url}: {error}"))
+    })?;
+    let proxy_host = proxy_parsed
+        .host_str()
+        .ok_or_else(|| ProviderError::WebSocket(format!("proxy URL has no host: {proxy_url}")))?;
+    let proxy_port = proxy_parsed.port().unwrap_or(match proxy_parsed.scheme() {
+        "socks5" | "socks5h" => 1080,
+        _ => 8080,
+    });
+
+    let conn_timeout = Duration::from_secs(model_config.conn_timeout_secs());
+    let proxy_addr = format!("{proxy_host}:{proxy_port}");
+    let addrs: Vec<std::net::SocketAddr> = proxy_addr
+        .to_socket_addrs()
+        .map_err(|error| {
+            ProviderError::WebSocket(format!("failed to resolve proxy {proxy_addr}: {error}"))
+        })?
+        .collect();
+
+    let mut stream = None;
+    for addr in &addrs {
+        match TcpStream::connect_timeout(addr, conn_timeout) {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(_) => continue,
+        }
+    }
+    let mut stream = stream.ok_or_else(|| {
+        ProviderError::WebSocket(format!("failed to connect to proxy {proxy_addr}"))
+    })?;
+    stream
+        .set_nodelay(true)
+        .map_err(|error| ProviderError::WebSocket(error.to_string()))?;
+
+    // Send HTTP CONNECT request
+    let connect_request = format!(
+        "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n\r\n"
+    );
+    use std::io::Write;
+    stream
+        .write_all(connect_request.as_bytes())
+        .map_err(|error| {
+            ProviderError::WebSocket(format!("failed to send CONNECT to proxy: {error}"))
+        })?;
+
+    // Read the HTTP response status line
+    use std::io::{BufRead, BufReader};
+    stream
+        .set_read_timeout(Some(conn_timeout))
+        .map_err(|error| ProviderError::WebSocket(error.to_string()))?;
+    let mut reader = BufReader::new(stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).map_err(|error| {
+        ProviderError::WebSocket(format!("failed to read proxy CONNECT response: {error}"))
+    })?;
+    if !status_line.contains("200") {
+        return Err(ProviderError::WebSocket(format!(
+            "proxy CONNECT failed: {status_line}"
+        )));
+    }
+    // Consume remaining headers
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).map_err(|error| {
+            ProviderError::WebSocket(format!(
+                "failed to read proxy CONNECT response headers: {error}"
+            ))
+        })?;
+        if line.trim().is_empty() {
+            break;
+        }
+    }
+
+    let stream = reader.into_inner();
+    // Clear read timeout — the caller will set appropriate timeouts
+    stream
+        .set_read_timeout(None)
+        .map_err(|error| ProviderError::WebSocket(error.to_string()))?;
+    Ok(Some(stream))
+}
+
+fn is_no_proxy(host: &str) -> bool {
+    let no_proxy = std::env::var("NO_PROXY")
+        .or_else(|_| std::env::var("no_proxy"))
+        .unwrap_or_default();
+    if no_proxy.trim() == "*" {
+        return true;
+    }
+    for entry in no_proxy.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if host == entry || host.ends_with(&format!(".{entry}")) {
+            return true;
+        }
+    }
+    false
 }
 
 fn set_socket_timeout(
