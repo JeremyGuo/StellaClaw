@@ -594,18 +594,19 @@ impl WebChannel {
         let state = self.load_web_state(conversation_id)?;
         let request: SendMessageRequest = parse_json(body)?;
         let text = request.text.unwrap_or_default();
-        let files = request
-            .files
-            .unwrap_or_default()
-            .into_iter()
-            .map(Into::into)
-            .collect::<Vec<_>>();
-        if text.trim().is_empty() && files.is_empty() {
-            return Err(ApiError::new(400, "message requires text or files"));
-        }
         let remote_message_id = request
             .remote_message_id
             .unwrap_or_else(generated_message_id);
+        let files = materialize_web_file_items(
+            &self.workdir,
+            conversation_id,
+            &remote_message_id,
+            request.files.unwrap_or_default(),
+        )
+        .map_err(ApiError::internal)?;
+        if text.trim().is_empty() && files.is_empty() {
+            return Err(ApiError::new(400, "message requires text or files"));
+        }
         let control = text
             .trim()
             .starts_with('/')
@@ -1720,14 +1721,181 @@ struct WebFileItem {
 
 impl From<WebFileItem> for FileItem {
     fn from(value: WebFileItem) -> Self {
+        let media_type = clean_media_type(value.media_type)
+            .or_else(|| infer_file_item_media_type(&value.name, &value.uri));
         FileItem {
             uri: value.uri,
-            media_type: value.media_type,
+            media_type,
             name: value.name,
             width: None,
             height: None,
             state: None,
         }
+    }
+}
+
+fn materialize_web_file_items(
+    workdir: &Path,
+    conversation_id: &str,
+    remote_message_id: &str,
+    files: Vec<WebFileItem>,
+) -> Result<Vec<FileItem>> {
+    let mut materialized = Vec::with_capacity(files.len());
+    for (index, file) in files.into_iter().enumerate() {
+        if file.uri.starts_with("data:") {
+            materialized.push(materialize_web_data_file(
+                workdir,
+                conversation_id,
+                remote_message_id,
+                index,
+                file,
+            )?);
+        } else {
+            materialized.push(file.into());
+        }
+    }
+    Ok(materialized)
+}
+
+fn materialize_web_data_file(
+    workdir: &Path,
+    conversation_id: &str,
+    remote_message_id: &str,
+    index: usize,
+    file: WebFileItem,
+) -> Result<FileItem> {
+    let (data_media_type, payload) = parse_base64_data_url(&file.uri)?;
+    let media_type = clean_media_type(file.media_type.clone())
+        .or(data_media_type)
+        .or_else(|| infer_file_item_media_type(&file.name, ""));
+    let bytes = general_purpose::STANDARD
+        .decode(payload)
+        .context("failed to decode web message data URL file")?;
+    let dir = workdir
+        .join("conversations")
+        .join(conversation_id)
+        .join("attachments")
+        .join("incoming");
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let name = file.name.unwrap_or_else(|| {
+        format!(
+            "attachment-{}.{}",
+            index + 1,
+            extension_for_media_type(media_type.as_deref())
+        )
+    });
+    let filename = format!(
+        "{}-{}-{}",
+        sanitize_filename_component(remote_message_id),
+        index + 1,
+        sanitize_filename_component(&name)
+    );
+    let path = dir.join(filename);
+    fs::write(&path, bytes).with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(FileItem {
+        uri: format!("file://{}", path.display()),
+        name: path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(ToOwned::to_owned),
+        media_type,
+        width: None,
+        height: None,
+        state: None,
+    })
+}
+
+fn clean_media_type(media_type: Option<String>) -> Option<String> {
+    media_type
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_base64_data_url(uri: &str) -> Result<(Option<String>, &str)> {
+    let (metadata, payload) = uri
+        .split_once(',')
+        .ok_or_else(|| anyhow!("malformed data URL file item"))?;
+    let metadata = metadata
+        .strip_prefix("data:")
+        .ok_or_else(|| anyhow!("malformed data URL file item"))?;
+    if !metadata.split(';').any(|part| part == "base64") {
+        return Err(anyhow!("data URL file item must be base64 encoded"));
+    }
+    let media_type = metadata
+        .split(';')
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    Ok((media_type, payload))
+}
+
+fn infer_file_item_media_type(name: &Option<String>, uri: &str) -> Option<String> {
+    name.as_deref()
+        .and_then(infer_media_type_from_path_text)
+        .or_else(|| infer_media_type_from_path_text(uri))
+}
+
+fn infer_media_type_from_path_text(value: &str) -> Option<String> {
+    let path = value.split('?').next().unwrap_or(value);
+    match Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => Some("image/png".to_string()),
+        "jpg" | "jpeg" => Some("image/jpeg".to_string()),
+        "webp" => Some("image/webp".to_string()),
+        "gif" => Some("image/gif".to_string()),
+        "pdf" => Some("application/pdf".to_string()),
+        "mp3" => Some("audio/mpeg".to_string()),
+        "ogg" => Some("audio/ogg".to_string()),
+        "wav" => Some("audio/wav".to_string()),
+        "m4a" => Some("audio/mp4".to_string()),
+        "flac" => Some("audio/flac".to_string()),
+        "mp4" => Some("video/mp4".to_string()),
+        "mov" => Some("video/quicktime".to_string()),
+        "txt" => Some("text/plain".to_string()),
+        _ => None,
+    }
+}
+
+fn extension_for_media_type(media_type: Option<&str>) -> &'static str {
+    match media_type.unwrap_or_default() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "application/pdf" => "pdf",
+        "audio/mpeg" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/wav" => "wav",
+        "audio/mp4" => "m4a",
+        "audio/flac" => "flac",
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        "text/plain" => "txt",
+        _ => "bin",
+    }
+}
+
+fn sanitize_filename_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let trimmed = sanitized.trim_matches('_');
+    if trimmed.is_empty() {
+        "file".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -3192,6 +3360,50 @@ mod tests {
 
         let _ = fs::remove_dir_all(workdir);
     }
+
+    #[test]
+    fn web_data_url_file_items_are_materialized_before_chat_storage() {
+        let workdir = test_workdir("materialize-data-url");
+        let files = materialize_web_file_items(
+            &workdir,
+            "web-main-test-materialize",
+            "web-message-1",
+            vec![WebFileItem {
+                uri: "data:image/png;base64,aGVsbG8=".to_string(),
+                media_type: None,
+                name: Some("photo.png".to_string()),
+            }],
+        )
+        .expect("data url should materialize");
+
+        assert_eq!(files.len(), 1);
+        let file = &files[0];
+        assert!(file.uri.starts_with("file://"));
+        assert!(file.uri.contains("attachments/incoming"));
+        assert_eq!(file.media_type.as_deref(), Some("image/png"));
+        assert!(file
+            .name
+            .as_deref()
+            .is_some_and(|name| name.ends_with("photo.png")));
+        let path = PathBuf::from(file.uri.strip_prefix("file://").unwrap());
+        assert_eq!(fs::read(path).expect("materialized bytes"), b"hello");
+
+        let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[test]
+    fn web_file_items_infer_media_type_for_materialized_paths() {
+        let file: FileItem = WebFileItem {
+            uri: "file:///workspace/report.pdf".to_string(),
+            media_type: None,
+            name: None,
+        }
+        .into();
+
+        assert_eq!(file.media_type.as_deref(), Some("application/pdf"));
+        assert_eq!(file.uri, "file:///workspace/report.pdf");
+    }
+
     use std::{collections::BTreeMap, fs};
 
     use crate::{

@@ -34,6 +34,14 @@
 - core 内部的成本计算应集中在独立的价格管理模块中，例如 `PriceManager`，provider 只传入 `ModelConfig` 和 `TokenUsage` 获取成本，避免把 pricing JSON、字段名或计算公式散落到各个 provider 实现里。
 - pricing 单位使用 USD / 1M tokens，字段为 `cache_read`、`cache_write`、`input`、`output`。
 
+## ChatMessage / FileItem 约定
+
+- 修改 conversation history、provider 消息翻译、工具结果、用户附件、assistant 生成文件相关逻辑时，必须遵守 [core/src/session_actor/chat_message.md](core/src/session_actor/chat_message.md) 和 [core/src/session_actor/file_item.md](core/src/session_actor/file_item.md)。
+- `ChatMessage` 是 provider-neutral 的持久化历史；不要把 provider-specific 的 `input_image`、`input_file`、multipart 字段、Responses item 等直接存进 `ChatMessage`。
+- `ChatMessageItem::File` / `ToolResultContent.file` 必须使用标准 `FileItem` payload。用户上传、工具产物、assistant 生成文件优先 materialize 成稳定 `file://` URI；`data:` URL 主要作为 request-time normalization / transport 形态，避免把大 base64 长期写入 JSONL 历史。
+- 新增写入 `FileItem` 的代码时，应尽量补齐 `name`、精确 `media_type`，图片应尽量补齐 `width` / `height`；文件不可用时保留 `FileItem` 并设置 `FileState::Crashed { reason }`，不要静默丢弃。
+- provider 需要 base64、URL、file id 或 multipart 时，应在发送请求前由 media normalizer / provider translator 从 `FileItem` 派生，不改变持久化的 `ChatMessage` 形态。
+
 ## 文档约定
 
 - `ROAD_MAP.md` 负责方向、边界和阶段性目标。

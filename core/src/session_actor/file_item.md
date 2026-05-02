@@ -174,7 +174,7 @@ Example:
 }
 ```
 
-If a frontend sends a `FileItem` directly through REST, it should already refer to a materialized or otherwise retrievable file. The server should not assume every incoming `uri` is already durable unless the channel contract says so.
+If a frontend sends a `FileItem` directly through REST, it should already refer to a materialized or otherwise retrievable file. The Web channel materializes incoming `data:` file items under `attachments/incoming` before enqueueing the user `ChatMessage`; other URI schemes must be durable according to the channel contract.
 
 ### Tool Results
 

@@ -1,5 +1,10 @@
-version: 1.21.10
+version: 1.21.11
 ---
+
+# 1.21.11
+
+- 执行并固化 `ChatMessage` / `FileItem` 标准：
+  Web REST message 入口现在会把 incoming `data:` file item materialize 到 conversation `attachments/incoming` 后再以 `file://` 写入用户 `ChatMessage`，并为文件路径补充可推断的 `media_type`。`AGENTS.md` 新增 ChatMessage / FileItem 约定，要求后续相关实现遵守 `chat_message.md` 与 `file_item.md`。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.21.10
 
