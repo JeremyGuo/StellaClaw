@@ -197,6 +197,8 @@ Provider behavior depends on model capabilities and media config:
 - unsupported media is usually converted into a textual file reference
 - assistant-generated files may be replayed as provider-specific output history or synthetic visual context
 
+See `core/src/session_actor/file_item.md` for the standard payload rules for each modality, URI scheme, and source type.
+
 ### `FileState`
 
 ```rust

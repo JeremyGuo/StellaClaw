@@ -1,5 +1,10 @@
-version: 1.21.9
+version: 1.21.10
 ---
+
+# 1.21.10
+
+- 增加 `FileItem` payload 标准文档：
+  `core/src/session_actor/file_item.md` 现在规定 `ChatMessageItem::File` / `ToolResultContent.file` 的 URI、MIME、模态、materialize、request-time normalization、crashed state 等约定，并在 `chat_message.md` 中引用。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.21.9
 
