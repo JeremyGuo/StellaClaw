@@ -314,9 +314,13 @@ private sealed interface ChatTimelineItem {
 private fun buildChatTimeline(messages: List<ChatMessage>): List<ChatTimelineItem> {
     val output = mutableListOf<ChatTimelineItem>()
     val pendingTools = mutableListOf<ChatMessage>()
-    fun flushPendingTools() {
+    fun flushPendingTools(fold: Boolean = true) {
         if (pendingTools.isEmpty()) return
-        output += ChatTimelineItem.ToolSummary(pendingTools.toList())
+        if (fold) {
+            output += ChatTimelineItem.ToolSummary(pendingTools.toList())
+        } else {
+            output += pendingTools.map { ChatTimelineItem.Message(it) }
+        }
         pendingTools.clear()
     }
 
@@ -329,7 +333,9 @@ private fun buildChatTimeline(messages: List<ChatMessage>): List<ChatTimelineIte
             }
         }
     }
-    flushPendingTools()
+    // Only fold tool-only runs once a following non-tool message closes the chain.
+    // A trailing tool run means the assistant turn is still in progress, so keep each tool message visible.
+    flushPendingTools(fold = false)
     return output
 }
 

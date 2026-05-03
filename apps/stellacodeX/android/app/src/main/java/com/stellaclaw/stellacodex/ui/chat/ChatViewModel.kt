@@ -59,10 +59,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var reconnectAttempt: Int = 0
     private var reconnectEnabled: Boolean = false
     private var latestProfile: ConnectionProfile? = null
+    private var loadRequestSeq: Long = 0
 
     fun load(conversationId: String) {
         if (conversationId.isBlank()) return
         if (state.value.conversationId == conversationId && webSocket != null) return
+        val requestSeq = ++loadRequestSeq
+        cacheCurrentConversation()
         closeRealtime(allowReconnect = false)
         mutableState.update {
             it.copy(
@@ -71,12 +74,33 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 messages = emptyList(),
                 loadedOffset = 0,
                 totalMessages = 0,
+                isLoading = true,
                 realtimeState = "Connecting realtime...",
                 progressTitle = null,
                 progressDetail = null,
             )
         }
-        refresh(connectRealtimeAfterLoad = true)
+        viewModelScope.launch {
+            val profile = store.profile.first()
+            if (requestSeq != loadRequestSeq || state.value.conversationId != conversationId) return@launch
+            latestProfile = profile
+            val cached = ConversationRuntimeCache.get(profile, conversationId)
+            if (cached != null) {
+                mutableState.update {
+                    it.copy(
+                        displayName = cached.displayName.ifBlank { conversationId },
+                        isLoading = false,
+                        messages = cached.messages,
+                        loadedOffset = cached.loadedOffset,
+                        totalMessages = cached.totalMessages,
+                        error = null,
+                    )
+                }
+                connectRealtime(profile, conversationId)
+            } else {
+                refresh(connectRealtimeAfterLoad = true)
+            }
+        }
     }
 
     fun onDraftChanged(value: String) {
@@ -133,6 +157,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun refresh(connectRealtimeAfterLoad: Boolean = false, showLoading: Boolean = true) {
         val conversationId = state.value.conversationId
         if (conversationId.isBlank()) return
+        val requestSeq = loadRequestSeq
         viewModelScope.launch {
             if (showLoading) {
                 mutableState.update { it.copy(isLoading = true, error = null) }
@@ -144,6 +169,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             updateConversationTitle(profile, conversationId)
             when (val result = loadLatestVisibleMessages(profile, conversationId)) {
                 is AppResult.Ok -> {
+                    if (requestSeq != loadRequestSeq || state.value.conversationId != conversationId) return@launch
                     mutableState.update {
                         it.copy(
                             isLoading = false,
@@ -153,11 +179,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             error = null,
                         )
                     }
+                    cacheCurrentConversation()
                     if (connectRealtimeAfterLoad) {
                         connectRealtime(profile, conversationId)
                     }
                 }
                 is AppResult.Err -> {
+                    if (requestSeq != loadRequestSeq || state.value.conversationId != conversationId) return@launch
                     mutableState.update {
                         it.copy(
                             isLoading = false,
@@ -257,14 +285,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             mutableState.update { it.copy(isLoadingEarlier = true, error = null) }
             val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
             when (val result = loadEarlierVisibleMessages(profile, conversationId, snapshot.loadedOffset)) {
-                is AppResult.Ok -> mutableState.update {
-                    it.copy(
-                        isLoadingEarlier = false,
-                        messages = mergeMessages(result.value.messages, it.messages),
-                        loadedOffset = result.value.offset,
-                        totalMessages = result.value.total,
-                        error = null,
-                    )
+                is AppResult.Ok -> {
+                    mutableState.update {
+                        it.copy(
+                            isLoadingEarlier = false,
+                            messages = mergeMessages(result.value.messages, it.messages),
+                            loadedOffset = result.value.offset,
+                            totalMessages = result.value.total,
+                            error = null,
+                        )
+                    }
+                    cacheCurrentConversation()
                 }
                 is AppResult.Err -> mutableState.update {
                     it.copy(isLoadingEarlier = false, error = result.error.userMessage())
@@ -302,6 +333,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 messages = it.messages + optimistic,
             )
         }
+        cacheCurrentConversation()
         viewModelScope.launch {
             val profile: ConnectionProfile = store.profile.first()
             latestProfile = profile
@@ -319,6 +351,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             },
                         )
                     }
+                    cacheCurrentConversation()
                     delay(350)
                     refresh()
                 }
@@ -402,23 +435,40 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         mutableState.update { current ->
             current.copy(messages = mergeMessages(current.messages, incoming))
         }
+        cacheCurrentConversation()
+    }
+
+    private fun cacheCurrentConversation() {
+        val profile = latestProfile ?: return
+        val snapshot = state.value
+        if (snapshot.conversationId.isBlank()) return
+        ConversationRuntimeCache.put(
+            profile = profile,
+            conversationId = snapshot.conversationId,
+            snapshot = CachedChatSnapshot(
+                displayName = snapshot.displayName,
+                messages = snapshot.messages,
+                loadedOffset = snapshot.loadedOffset,
+                totalMessages = snapshot.totalMessages,
+            ),
+        )
     }
 
     private fun List<ChatMessage>.visibleTimelineItemCount(): Int {
         var count = 0
-        var hasPendingToolGroup = false
+        var pendingToolMessageCount = 0
         for (message in filterNot { it.isRuntimeMetadataMessage() }) {
             if (message.isToolOnlyMessage()) {
-                hasPendingToolGroup = true
+                pendingToolMessageCount += 1
             } else {
-                if (hasPendingToolGroup) {
+                if (pendingToolMessageCount > 0) {
                     count += 1
-                    hasPendingToolGroup = false
+                    pendingToolMessageCount = 0
                 }
                 count += 1
             }
         }
-        if (hasPendingToolGroup) count += 1
+        count += pendingToolMessageCount
         return count
     }
 
@@ -528,6 +578,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     } else if (updateStatusWhenIdle) {
                         mutableState.update { it.copy(totalMessages = page.total, realtimeState = "Realtime synced") }
                     }
+                    cacheCurrentConversation()
                 }
                 is AppResult.Err -> if (updateStatusWhenIdle) {
                     mutableState.update { it.copy(realtimeState = "Realtime sync failed: ${result.error.userMessage()}") }
@@ -572,6 +623,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             realtimeState = "Realtime synced",
                         )
                     }
+                    cacheCurrentConversation()
                 }
                 is AppResult.Err -> mutableState.update {
                     it.copy(realtimeState = "Realtime sync gap failed: ${result.error.userMessage()}")
@@ -649,6 +701,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             realtimeState = "Realtime connected · ${page.offset + messages.size}/${page.total}",
                         )
                     }
+                    cacheCurrentConversation()
                 }
                 "turn_progress" -> handleProgress(payload)
                 "error" -> mutableState.update {
@@ -701,6 +754,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     override fun onCleared() {
+        cacheCurrentConversation()
         closeRealtime(allowReconnect = false)
         super.onCleared()
     }
