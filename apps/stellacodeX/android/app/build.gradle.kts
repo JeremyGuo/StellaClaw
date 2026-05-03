@@ -13,8 +13,8 @@ android {
         applicationId = "com.stellaclaw.stellacodex"
         minSdk = 28
         targetSdk = 35
-        versionCode = 39
-        versionName = "0.1.24"
+        versionCode = 40
+        versionName = "0.1.25-rc.1"
     }
 
     signingConfigs {

@@ -8,6 +8,7 @@ use std::{
 
 use crossbeam_channel::{select, Receiver, Sender};
 use thiserror::Error;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     huggingface::HuggingFaceFileResolver,
@@ -986,6 +987,8 @@ impl SessionActor {
                     }
                 }
             };
+            let mut model_message = model_message;
+            stamp_assistant_message_time(&mut model_message);
 
             let tool_calls = collect_tool_calls(&model_message);
             self.log_info(
@@ -1171,9 +1174,10 @@ impl SessionActor {
         self.tool_executor
             .finish(&active.handle.batch_id)
             .map_err(|error| SessionActorError::Tool(error.to_string()))?;
-        let tool_message = completion
+        let mut tool_message = completion
             .result
             .map_err(|error| SessionActorError::Tool(error.to_string()))?;
+        stamp_assistant_message_time(&mut tool_message);
         self.log_info(
             "tool_batch_completed",
             serde_json::json!({
@@ -2049,6 +2053,18 @@ fn current_time_millis() -> u128 {
         .unwrap_or_default()
 }
 
+fn now_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn stamp_assistant_message_time(message: &mut ChatMessage) {
+    if message.role == ChatRole::Assistant && message.message_time.is_none() {
+        message.message_time = Some(now_rfc3339());
+    }
+}
+
 fn is_tool_protocol_closed_suffix(messages: &[ChatMessage]) -> bool {
     let mut open = std::collections::BTreeSet::new();
     for message in messages {
@@ -2786,6 +2802,7 @@ mod tests {
         assert_eq!(step, SessionActorStep::Idle);
         assert_eq!(actor.initial().unwrap().session_id, session_id);
         assert_eq!(actor.history().len(), 2);
+        assert!(actor.history()[1].message_time.is_some());
         assert!(matches!(
             events.events.lock().unwrap().last(),
             Some(SessionEvent::TurnCompleted { .. })
