@@ -15,6 +15,7 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
@@ -48,6 +49,9 @@ import com.stellaclaw.stellacodex.domain.model.ChatMessage
 import com.stellaclaw.stellacodex.domain.model.MessageAttachment
 import com.stellaclaw.stellacodex.domain.model.MessageItem
 import com.stellaclaw.stellacodex.domain.model.MessageLocalState
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -401,7 +405,9 @@ private fun MessageCard(
                 Text(text = roleLabel, style = MaterialTheme.typography.labelMedium)
                 Text(text = "#${message.index}", style = MaterialTheme.typography.labelSmall)
             }
-            MessageBody(text = displayText)
+            SelectionContainer {
+                MessageBody(text = displayText)
+            }
             if (message.items.any { it is MessageItem.ToolCall || it is MessageItem.ToolResult }) {
                 ToolItemList(items = message.items)
             }
@@ -414,7 +420,7 @@ private fun MessageCard(
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 message.messageTime?.let { time ->
-                    Text(text = time, style = MaterialTheme.typography.labelSmall)
+                    Text(text = formatLocalMinute(time), style = MaterialTheme.typography.labelSmall)
                 }
                 when (message.localState) {
                     MessageLocalState.Sending -> Text(
@@ -590,11 +596,13 @@ private fun ToolCard(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         } else {
-            Text(
-                text = body.take(8_000),
-                style = MaterialTheme.typography.bodySmall,
-                fontFamily = FontFamily.Monospace,
-            )
+            SelectionContainer {
+                Text(
+                    text = body.take(8_000),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
         }
     }
 }
@@ -753,6 +761,14 @@ private fun formatBytes(value: Long): String {
         "${String.format("%.1f", size)}${units[unit]}"
     }
 }
+
+private fun formatLocalMinute(value: String): String = runCatching {
+    Instant.parse(value)
+        .atZone(ZoneId.systemDefault())
+        .format(LocalMinuteFormatter)
+}.getOrElse { value.take(16) }
+
+private val LocalMinuteFormatter: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
 
 @Composable
 private fun Composer(
