@@ -160,11 +160,60 @@ jobs:
             apps/stellacode2/release/*.blockmap
           if-no-files-found: warn
 
+  build-stellacodex-android:
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/stellacodeX/android
+    steps:
+      - name: Checkout triggering commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.head_sha }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Install Android SDK packages
+        run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+
+      - name: Build StellacodeX Android debug APK
+        shell: bash
+        run: |
+          gradle --no-daemon :app:assembleDebug
+          version_name="$(python3 - <<'PY'
+          import re
+          text = open('app/build.gradle.kts', encoding='utf-8').read()
+          match = re.search(r'versionName\s*=\s*"([^"]+)"', text)
+          print(match.group(1) if match else 'dev')
+          PY
+          )"
+          mkdir -p release
+          cp app/build/outputs/apk/debug/app-debug.apk "release/stellacodex-android-debug-v${version_name}.apk"
+
+      - name: Upload StellacodeX Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stellacodex-android-debug
+          path: apps/stellacodeX/android/release/*.apk
+
   publish:
     needs:
       - prepare
       - build-server
       - build-stellacode
+      - build-stellacodex-android
     if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -191,7 +240,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist
-          find release-artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.yml' -o -name '*.blockmap' \) -exec cp {} dist/ \;
+          find release-artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' -o -name '*.dmg' -o -name '*.AppImage' -o -name '*.apk' -o -name '*.yml' -o -name '*.blockmap' \) -exec cp {} dist/ \;
           ls -lh dist/
 
       - name: Publish GitHub release

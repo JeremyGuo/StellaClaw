@@ -1,5 +1,10 @@
-version: 1.22.2
+version: 1.22.3
 ---
+
+# 1.22.3
+
+- 将 StellacodeX Android APK 纳入 GitHub Release 自动发布：
+  Release workflow 现在会构建 `apps/stellacodeX/android` debug APK，并把 `stellacodex-android-debug-v<versionName>.apk` 作为 release asset 上传；同时继续忽略本地 Android 构建产物和 `restart.log`。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.22.2
 
