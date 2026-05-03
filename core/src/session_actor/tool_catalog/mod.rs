@@ -544,6 +544,53 @@ mod tests {
     }
 
     #[test]
+    fn codex_subscription_image_out_exposes_native_image_generation_tool() {
+        let config = ModelConfig {
+            provider_type: ProviderType::CodexSubscription,
+            model_name: "gpt-5.5".to_string(),
+            url: "https://chatgpt.com/backend-api/codex/responses".to_string(),
+            api_key_env: "CHATGPT_ACCESS_TOKEN".to_string(),
+            capabilities: vec![
+                ModelCapability::Chat,
+                ModelCapability::ImageIn,
+                ModelCapability::ImageOut,
+            ],
+            token_max_context: 262_144,
+            max_tokens: 0,
+            cache_timeout: 300,
+            conn_timeout: 10,
+            request_timeout: 600,
+            max_request_size: 30 * 1024 * 1024,
+            retry_mode: RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: None,
+            token_estimator_url: None,
+        };
+
+        let catalog = ToolCatalog::from_model_config(&config).expect("catalog should build");
+        let image_generation = catalog
+            .get("image_generation")
+            .expect("native image_generation should be exposed");
+
+        assert_eq!(
+            image_generation.backend,
+            ToolBackend::ProviderNative {
+                kind: ProviderNativeToolKind::ImageGeneration
+            }
+        );
+        assert_eq!(
+            image_generation.responses_tool_schema(),
+            json!({
+                "type": "image_generation",
+                "output_format": "png",
+            })
+        );
+        assert!(!catalog.contains("image_generation_stop"));
+    }
+
+    #[test]
     fn initial_external_media_models_expose_analysis_tools_instead_of_load_tools() {
         let primary = ModelConfig {
             provider_type: ProviderType::OpenRouterCompletion,

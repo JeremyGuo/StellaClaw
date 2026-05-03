@@ -1,5 +1,10 @@
-version: 1.23.3
+version: 1.23.4
 ---
+
+# 1.23.4
+
+- 修复 Codex subscription 原生图片生成工具未挂入请求的问题：
+  当当前 Codex subscription 模型支持 `image_out` 且图片生成工具目标为当前模型时，工具 catalog 现在会注册 provider-native `image_generation`，并在 Responses payload 中发送 `{ "type": "image_generation", "output_format": "png" }`；该路径不引入本地 image generation function tool，也不暴露 `image_generation_stop`。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.23.3
 

@@ -17,8 +17,8 @@ use serde_json::{json, Map, Value};
 
 use super::{
     schema::{add_images_property, add_remote_property, object_schema, properties},
-    BuiltinToolCatalogOptions, ProviderBackedToolKind, ToolBackend, ToolConcurrency,
-    ToolDefinition, ToolExecutionMode,
+    BuiltinToolCatalogOptions, ProviderBackedToolKind, ProviderNativeToolKind, ToolBackend,
+    ToolConcurrency, ToolDefinition, ToolExecutionMode,
 };
 use crate::{
     model_config::ModelConfig,
@@ -131,6 +131,18 @@ pub fn media_tool_definitions(options: &BuiltinToolCatalogOptions) -> Vec<ToolDe
             "audio_stop",
             "audio_id",
             "Stop a running audio_analysis job.",
+        ));
+    }
+
+    if options.enable_native_image_generation {
+        tools.push(ToolDefinition::new(
+            "image_generation",
+            "Generate an image using the current model's native image generation tool.",
+            object_schema(Map::new(), &[]),
+            ToolExecutionMode::Immediate,
+            ToolBackend::ProviderNative {
+                kind: ProviderNativeToolKind::ImageGeneration,
+            },
         ));
     }
 
