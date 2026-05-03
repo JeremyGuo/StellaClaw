@@ -7,6 +7,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.stellaclaw.stellacodex.core.result.AppResult
 import com.stellaclaw.stellacodex.core.result.userMessage
+import com.stellaclaw.stellacodex.data.api.MessagePage
 import com.stellaclaw.stellacodex.data.api.StellaclawApi
 import com.stellaclaw.stellacodex.data.dto.MessagesResponseDto
 import com.stellaclaw.stellacodex.data.log.AppLogStore
@@ -140,12 +141,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val profile = store.profile.first()
             latestProfile = profile
             updateConversationTitle(profile, conversationId)
-            when (val result = api.loadLatestMessages(profile, conversationId)) {
+            when (val result = loadLatestVisibleMessages(profile, conversationId)) {
                 is AppResult.Ok -> {
                     mutableState.update {
                         it.copy(
                             isLoading = false,
-                            messages = mergeMessages(it.messages, result.value.messages).takeLast(LatestMessageLimit),
+                            messages = mergeMessages(it.messages, result.value.messages),
                             loadedOffset = result.value.offset,
                             totalMessages = result.value.total,
                             error = null,
@@ -171,6 +172,82 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private suspend fun loadLatestVisibleMessages(
+        profile: ConnectionProfile,
+        conversationId: String,
+    ): AppResult<MessagePage> {
+        val firstPage = when (val result = api.loadMessagePage(profile, conversationId, offset = 0, limit = 1)) {
+            is AppResult.Err -> return result
+            is AppResult.Ok -> result.value
+        }
+        val total = firstPage.total
+        if (total == 0) return AppResult.Ok(firstPage)
+
+        var nextEnd = total
+        var loadedOffset = total
+        var loadedMessages = emptyList<ChatMessage>()
+        while (nextEnd > 0 && loadedMessages.visibleMessageCount() < VisibleMessageTarget) {
+            val nextOffset = (nextEnd - MessagePageFetchLimit).coerceAtLeast(0)
+            val page = when (val result = api.loadMessagePage(
+                profile = profile,
+                conversationId = conversationId,
+                offset = nextOffset,
+                limit = nextEnd - nextOffset,
+            )) {
+                is AppResult.Err -> return result
+                is AppResult.Ok -> result.value
+            }
+            loadedMessages = mergeMessages(page.messages, loadedMessages)
+            loadedOffset = page.offset
+            nextEnd = nextOffset
+            if (page.messages.isEmpty()) break
+        }
+        return AppResult.Ok(
+            MessagePage(
+                offset = loadedOffset,
+                limit = loadedMessages.size,
+                total = total,
+                messages = loadedMessages,
+            ),
+        )
+    }
+
+    private suspend fun loadEarlierVisibleMessages(
+        profile: ConnectionProfile,
+        conversationId: String,
+        startOffset: Int,
+    ): AppResult<MessagePage> {
+        var nextEnd = startOffset
+        var loadedOffset = startOffset
+        var loadedMessages = emptyList<ChatMessage>()
+        var total = state.value.totalMessages
+        while (nextEnd > 0 && loadedMessages.visibleMessageCount() < VisibleMessageTarget) {
+            val nextOffset = (nextEnd - MessagePageFetchLimit).coerceAtLeast(0)
+            val page = when (val result = api.loadMessagePage(
+                profile = profile,
+                conversationId = conversationId,
+                offset = nextOffset,
+                limit = nextEnd - nextOffset,
+            )) {
+                is AppResult.Err -> return result
+                is AppResult.Ok -> result.value
+            }
+            loadedMessages = mergeMessages(page.messages, loadedMessages)
+            loadedOffset = page.offset
+            total = page.total
+            nextEnd = nextOffset
+            if (page.messages.isEmpty()) break
+        }
+        return AppResult.Ok(
+            MessagePage(
+                offset = loadedOffset,
+                limit = loadedMessages.size,
+                total = total,
+                messages = loadedMessages,
+            ),
+        )
+    }
+
     fun loadEarlier() {
         val snapshot = state.value
         val conversationId = snapshot.conversationId
@@ -178,9 +255,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             mutableState.update { it.copy(isLoadingEarlier = true, error = null) }
             val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
-            val nextOffset = (snapshot.loadedOffset - EarlierMessageLimit).coerceAtLeast(0)
-            val limit = snapshot.loadedOffset - nextOffset
-            when (val result = api.loadMessagePage(profile, conversationId, offset = nextOffset, limit = limit)) {
+            when (val result = loadEarlierVisibleMessages(profile, conversationId, snapshot.loadedOffset)) {
                 is AppResult.Ok -> mutableState.update {
                     it.copy(
                         isLoadingEarlier = false,
@@ -328,6 +403,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun List<ChatMessage>.visibleMessageCount(): Int = count { !it.isRuntimeMetadataMessage() }
+
+    private fun ChatMessage.isRuntimeMetadataMessage(): Boolean {
+        val body = text.ifBlank { preview }.trimStart()
+        return body.startsWith("[Incoming User Metadata]") ||
+            body.startsWith("[Incoming Assistant Metadata]") ||
+            body.startsWith("[Incoming System Metadata]")
+    }
+
     private fun mergeMessages(existing: List<ChatMessage>, incoming: List<ChatMessage>): List<ChatMessage> {
         val syncedIncoming = incoming.map { it.copy(localState = MessageLocalState.Synced) }
         val byId = linkedMapOf<String, ChatMessage>()
@@ -382,7 +466,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             val snapshot = state.value
             val lastLocalId = lastServerMessageIndex(snapshot.messages)
             val request = if (lastLocalId == null) {
-                0 to LatestMessageLimit
+                0 to MessagePageFetchLimit
             } else {
                 (lastLocalId + 1) to 200
             }
@@ -391,8 +475,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     val page = result.value
                     val shouldLoadLatest = lastLocalId == null && page.total > page.messages.size
                     if (shouldLoadLatest) {
-                        val latestOffset = (page.total - LatestMessageLimit).coerceAtLeast(0)
-                        when (val latest = api.loadMessagePage(profile, conversationId, offset = latestOffset, limit = LatestMessageLimit)) {
+                        val latestOffset = (page.total - MessagePageFetchLimit).coerceAtLeast(0)
+                        when (val latest = api.loadMessagePage(profile, conversationId, offset = latestOffset, limit = MessagePageFetchLimit)) {
                             is AppResult.Ok -> mutableState.update {
                                 it.copy(
                                     messages = mergeMessages(it.messages, latest.value.messages),
@@ -444,8 +528,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 lastLocalId == null -> {
                     val latestIndex = currentMessageId ?: nextMessageId.minus(1)
                     if (latestIndex < 0) null else {
-                        val offset = (latestIndex - LatestMessageLimit + 1).coerceAtLeast(0)
-                        offset to LatestMessageLimit
+                        val offset = (latestIndex - MessagePageFetchLimit + 1).coerceAtLeast(0)
+                        offset to MessagePageFetchLimit
                     }
                 }
                 nextMessageId > lastLocalId + 1 -> {
@@ -650,8 +734,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private companion object {
-        const val LatestMessageLimit = 100
-        const val EarlierMessageLimit = 100
+        const val VisibleMessageTarget = 100
+        const val MessagePageFetchLimit = 100
     }
 }
 

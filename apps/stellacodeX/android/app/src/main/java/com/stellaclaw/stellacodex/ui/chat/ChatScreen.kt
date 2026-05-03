@@ -69,6 +69,7 @@ fun ChatScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     var initialBottomPlaced by remember(conversationId) { mutableStateOf(false) }
+    var earlierLoadAnchor by remember(conversationId) { mutableStateOf<ScrollAnchor?>(null) }
     val visibleMessages = remember(state.messages) { state.messages.filterNot(ChatMessage::isRuntimeMetadataMessage) }
     val timeline = remember(visibleMessages) { buildChatTimeline(visibleMessages) }
 
@@ -78,13 +79,24 @@ fun ChatScreen(
     }
 
     LaunchedEffect(timeline.lastOrNull()?.key) {
-        if (timeline.isNotEmpty()) {
+        if (timeline.isNotEmpty() && earlierLoadAnchor == null) {
             if (!initialBottomPlaced) {
                 listState.scrollToItem(timeline.lastIndex)
                 initialBottomPlaced = true
             } else {
                 listState.animateScrollToItem(timeline.lastIndex)
             }
+        }
+    }
+
+    LaunchedEffect(timeline, state.isLoadingEarlier, earlierLoadAnchor) {
+        val anchor = earlierLoadAnchor ?: return@LaunchedEffect
+        if (!state.isLoadingEarlier && timeline.isNotEmpty()) {
+            val index = timeline.indexOfFirst { it.key == anchor.key }
+            if (index >= 0) {
+                listState.scrollToItem(index, anchor.scrollOffset)
+            }
+            earlierLoadAnchor = null
         }
     }
 
@@ -102,6 +114,10 @@ fun ChatScreen(
             !state.isLoadingEarlier &&
             !state.isLoading
         ) {
+            val anchorItem = timeline.getOrNull(listState.firstVisibleItemIndex)
+            if (anchorItem != null) {
+                earlierLoadAnchor = ScrollAnchor(anchorItem.key, listState.firstVisibleItemScrollOffset)
+            }
             viewModel.loadEarlier()
         }
     }
@@ -274,6 +290,11 @@ private fun MessageList(
         }
     }
 }
+
+private data class ScrollAnchor(
+    val key: String,
+    val scrollOffset: Int,
+)
 
 private sealed interface ChatTimelineItem {
     val key: String
