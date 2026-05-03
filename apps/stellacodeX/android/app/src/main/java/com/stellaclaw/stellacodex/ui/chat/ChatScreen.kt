@@ -18,6 +18,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
@@ -399,6 +400,7 @@ private fun MessageCard(
     previews: Map<String, AttachmentPreviewUiState>,
     onPreviewAttachment: (MessageAttachment) -> Unit,
 ) {
+    val isUserMessage = message.role.equals("user", ignoreCase = true)
     val roleLabel = when (message.role.lowercase()) {
         "user" -> message.userName?.takeIf { it.isNotBlank() } ?: "User"
         "assistant" -> "Assistant"
@@ -411,71 +413,83 @@ private fun MessageCard(
     val displayText = message.text.ifBlank {
         toolExplanations.joinToString("\n\n").ifBlank { message.preview }
     }
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = if (isUserMessage) Arrangement.End else Arrangement.Start,
+    ) {
+        Card(
+            modifier = if (isUserMessage) Modifier.fillMaxWidth(0.86f) else Modifier.fillMaxWidth(),
+            colors = if (isUserMessage) {
+                CardDefaults.cardColors(containerColor = Color(0xFFE3F2FD))
+            } else {
+                CardDefaults.cardColors()
+            },
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                Text(text = roleLabel, style = MaterialTheme.typography.labelMedium)
-                Text(text = "#${message.index}", style = MaterialTheme.typography.labelSmall)
-            }
-            if (displayText.isNotBlank()) {
-                SelectionContainer {
-                    MessageBody(text = displayText)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(text = roleLabel, style = MaterialTheme.typography.labelMedium)
+                    Text(text = "#${message.index}", style = MaterialTheme.typography.labelSmall)
                 }
-            }
-            if (message.items.any { it is MessageItem.ToolCall || it is MessageItem.ToolResult }) {
-                ToolItemList(items = message.items)
-            }
-            if (message.attachments.isNotEmpty()) {
-                AttachmentList(
-                    attachments = message.attachments,
-                    previews = previews,
-                    onPreviewAttachment = onPreviewAttachment,
-                )
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                message.messageTime?.let { time ->
-                    Text(text = formatLocalMinute(time), style = MaterialTheme.typography.labelSmall)
+                if (displayText.isNotBlank()) {
+                    SelectionContainer {
+                        MessageBody(text = displayText)
+                    }
                 }
-                when (message.localState) {
-                    MessageLocalState.Sending -> Text(
-                        text = "sending...",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.primary,
-                    )
-                    MessageLocalState.Failed -> Text(
-                        text = "send failed",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                    MessageLocalState.Synced -> Unit
+                if (message.items.any { it is MessageItem.ToolCall || it is MessageItem.ToolResult }) {
+                    ToolItemList(items = message.items)
                 }
-                if (message.attachmentCount > 0) {
-                    Text(
-                        text = "${message.attachmentCount} attachments",
-                        style = MaterialTheme.typography.labelSmall,
+                if (message.attachments.isNotEmpty()) {
+                    AttachmentList(
+                        attachments = message.attachments,
+                        previews = previews,
+                        onPreviewAttachment = onPreviewAttachment,
                     )
                 }
-                if (message.hasAttachmentErrors) {
-                    Text(
-                        text = "attachment errors",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.error,
-                    )
-                }
-                if (message.tokenUsage != null) {
-                    val usage = message.tokenUsage
-                    Text(
-                        text = "tokens ${usage.total} (${usage.input} in / ${usage.output} out)",
-                        style = MaterialTheme.typography.labelSmall,
-                    )
-                } else if (message.hasTokenUsage) {
-                    Text(text = "usage", style = MaterialTheme.typography.labelSmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    message.messageTime?.let { time ->
+                        Text(text = formatLocalMinute(time), style = MaterialTheme.typography.labelSmall)
+                    }
+                    when (message.localState) {
+                        MessageLocalState.Sending -> Text(
+                            text = "sending...",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                        )
+                        MessageLocalState.Failed -> Text(
+                            text = "send failed",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                        MessageLocalState.Synced -> Unit
+                    }
+                    if (message.attachmentCount > 0) {
+                        Text(
+                            text = "${message.attachmentCount} attachments",
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    }
+                    if (message.hasAttachmentErrors) {
+                        Text(
+                            text = "attachment errors",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                    if (message.tokenUsage != null) {
+                        val usage = message.tokenUsage
+                        Text(
+                            text = "tokens ${usage.total} (${usage.input} in / ${usage.output} out)",
+                            style = MaterialTheme.typography.labelSmall,
+                        )
+                    } else if (message.hasTokenUsage) {
+                        Text(text = "usage", style = MaterialTheme.typography.labelSmall)
+                    }
                 }
             }
         }
