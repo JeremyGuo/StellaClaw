@@ -313,30 +313,22 @@ private sealed interface ChatTimelineItem {
 private fun buildChatTimeline(messages: List<ChatMessage>): List<ChatTimelineItem> {
     val output = mutableListOf<ChatTimelineItem>()
     val pendingTools = mutableListOf<ChatMessage>()
-    fun flushPendingTools(expanded: Boolean) {
+    fun flushPendingTools() {
         if (pendingTools.isEmpty()) return
-        if (expanded) {
-            output += pendingTools.map(ChatTimelineItem::Message)
-        } else {
-            output += ChatTimelineItem.ToolSummary(pendingTools.toList())
-        }
+        output += ChatTimelineItem.ToolSummary(pendingTools.toList())
         pendingTools.clear()
     }
 
     messages.forEach { message ->
         when {
             message.isToolOnlyMessage() -> pendingTools += message
-            message.isAssistantFinalMessage() && pendingTools.isNotEmpty() -> {
-                flushPendingTools(expanded = false)
-                output += ChatTimelineItem.Message(message)
-            }
             else -> {
-                flushPendingTools(expanded = true)
+                flushPendingTools()
                 output += ChatTimelineItem.Message(message)
             }
         }
     }
-    flushPendingTools(expanded = true)
+    flushPendingTools()
     return output
 }
 
@@ -352,9 +344,6 @@ private fun ChatMessage.isToolOnlyMessage(): Boolean =
         text.isBlank() &&
         attachments.isEmpty() &&
         items.any { it is MessageItem.ToolCall || it is MessageItem.ToolResult }
-
-private fun ChatMessage.isAssistantFinalMessage(): Boolean =
-    role.equals("assistant", ignoreCase = true) && text.isNotBlank()
 
 @Composable
 private fun ToolSummaryCard(summary: ChatTimelineItem.ToolSummary) {
