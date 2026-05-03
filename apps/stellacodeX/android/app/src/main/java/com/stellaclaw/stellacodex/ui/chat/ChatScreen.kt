@@ -399,7 +399,7 @@ private fun MessageCard(
         .filterIsInstance<MessageItem.ToolCall>()
         .mapNotNull { it.explanation?.trim()?.takeIf(String::isNotEmpty) }
     val displayText = message.text.ifBlank {
-        toolExplanations.joinToString("\n\n").ifBlank { message.preview.ifBlank { "[empty message]" } }
+        toolExplanations.joinToString("\n\n").ifBlank { message.preview }
     }
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
@@ -413,8 +413,10 @@ private fun MessageCard(
                 Text(text = roleLabel, style = MaterialTheme.typography.labelMedium)
                 Text(text = "#${message.index}", style = MaterialTheme.typography.labelSmall)
             }
-            SelectionContainer {
-                MessageBody(text = displayText)
+            if (displayText.isNotBlank()) {
+                SelectionContainer {
+                    MessageBody(text = displayText)
+                }
             }
             if (message.items.any { it is MessageItem.ToolCall || it is MessageItem.ToolResult }) {
                 ToolItemList(items = message.items)
@@ -597,13 +599,7 @@ private fun ToolCard(
                 color = MaterialTheme.colorScheme.primary,
             )
         }
-        if (!expanded) {
-            Text(
-                text = "Collapsed · tap to inspect",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        } else {
+        if (expanded) {
             SelectionContainer {
                 Text(
                     text = body.take(8_000),
