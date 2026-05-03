@@ -8,6 +8,7 @@ import com.jcraft.jsch.Session
 import com.stellaclaw.stellacodex.domain.model.ConnectionProfile
 import java.io.File
 import java.util.Properties
+import java.util.concurrent.TimeUnit
 
 class ApkUpdateDownloader {
     fun download(
@@ -19,10 +20,13 @@ class ApkUpdateDownloader {
         require(profile.sshHost.isNotBlank() && profile.sshUser.isNotBlank()) {
             "SSH host and user are required for app update downloads"
         }
-        val targetFile = context.cacheDir
-            .resolve("apk")
+        val targetFile = apkCacheDir(context)
             .also { it.mkdirs() }
             .resolve("stellacodex-${channel.wireName}.apk")
+        if (targetFile.exists()) {
+            targetFile.delete()
+            onProgress("Removed old ${targetFile.name} before download")
+        }
         val session = openSession(profile, onProgress)
         try {
             val sftp = session.openChannel("sftp") as ChannelSftp
@@ -84,6 +88,26 @@ class ApkUpdateDownloader {
         onProgress("Connecting SSH ${profile.sshUser}@${profile.sshHost}:$port")
         session.connect(10_000)
         return session
+    }
+    companion object {
+        private val MaxCacheAgeMillis = TimeUnit.DAYS.toMillis(7)
+
+        fun cleanupOldApks(context: Context, onCleanup: (String) -> Unit = {}) {
+            val now = System.currentTimeMillis()
+            val dir = apkCacheDir(context)
+            if (!dir.exists()) return
+            dir.listFiles { file -> file.isFile && file.extension.equals("apk", ignoreCase = true) }
+                ?.forEach { file ->
+                    if (now - file.lastModified() > MaxCacheAgeMillis) {
+                        val name = file.name
+                        if (file.delete()) {
+                            onCleanup("Removed old cached APK $name")
+                        }
+                    }
+                }
+        }
+
+        private fun apkCacheDir(context: Context): File = context.cacheDir.resolve("apk")
     }
 }
 
