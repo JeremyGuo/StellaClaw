@@ -8,4 +8,5 @@ sealed class AppRoute(val route: String) {
     }
     data object Workspace : AppRoute("conversations/{conversationId}/workspace?path={path}")
     data object Settings : AppRoute("settings")
+    data object Logs : AppRoute("logs")
 }

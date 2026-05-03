@@ -1,5 +1,10 @@
-version: 1.23.0
+version: 1.23.1
 ---
+
+# 1.23.1
+
+- 增加 StellacodeX Android 调试日志界面：
+  会话列表新增 `Logs` 入口，日志文本可选择、可一键复制、可清空，并持久保留最近 600 行。Android realtime WebSocket 连接、订阅 ack、消息帧、close/failure、重连调度和异常帧现在都会写入本地日志，便于定位打开会话后持续 reconnecting 但界面看不到错误的问题。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.23.0
 

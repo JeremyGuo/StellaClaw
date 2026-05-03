@@ -7,6 +7,7 @@ import androidx.navigation.compose.rememberNavController
 import com.stellaclaw.stellacodex.ui.chat.ChatScreen
 import com.stellaclaw.stellacodex.ui.connections.ConnectionsScreen
 import com.stellaclaw.stellacodex.ui.conversations.ConversationListScreen
+import com.stellaclaw.stellacodex.ui.logs.LogsScreen
 import com.stellaclaw.stellacodex.ui.settings.SettingsScreen
 import com.stellaclaw.stellacodex.ui.workspace.WorkspaceScreen
 
@@ -27,6 +28,7 @@ fun AppNavGraph() {
             ConversationListScreen(
                 onOpenConversation = { id -> navController.navigate(AppRoute.Chat.create(id)) },
                 onOpenSettings = { navController.navigate(AppRoute.Settings.route) },
+                onOpenLogs = { navController.navigate(AppRoute.Logs.route) },
             )
         }
         composable(AppRoute.Chat.route) { backStackEntry ->
@@ -47,6 +49,9 @@ fun AppNavGraph() {
         }
         composable(AppRoute.Settings.route) {
             SettingsScreen(onBack = { navController.popBackStack() })
+        }
+        composable(AppRoute.Logs.route) {
+            LogsScreen(onBack = { navController.popBackStack() })
         }
     }
 }

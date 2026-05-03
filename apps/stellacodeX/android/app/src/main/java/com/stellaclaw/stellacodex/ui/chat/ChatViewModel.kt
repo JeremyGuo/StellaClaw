@@ -9,6 +9,7 @@ import com.stellaclaw.stellacodex.core.result.AppResult
 import com.stellaclaw.stellacodex.core.result.userMessage
 import com.stellaclaw.stellacodex.data.api.StellaclawApi
 import com.stellaclaw.stellacodex.data.dto.MessagesResponseDto
+import com.stellaclaw.stellacodex.data.log.AppLogStore
 import com.stellaclaw.stellacodex.data.mapper.toDomain
 import com.stellaclaw.stellacodex.data.store.ConnectionProfileStore
 import com.stellaclaw.stellacodex.data.store.connectionDataStore
@@ -235,15 +236,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         reconnectEnabled = true
         latestProfile = profile
         reconnectJob?.cancel()
+        logRealtime("connect requested conversation=$conversationId mode=${profile.connectionMode}")
         when (val result = api.foregroundWebSocketRequest(profile, conversationId)) {
             is AppResult.Ok -> {
                 realtimeConversationId = conversationId
                 startRealtimeBackfill(conversationId)
                 webSocket?.cancel()
-                webSocket = api.client.newWebSocket(result.value, ChatWebSocketListener(conversationId))
+                val request = result.value
+                logRealtime("opening websocket conversation=$conversationId url=${request.url.scheme}://${request.url.host}:${request.url.port}${request.url.encodedPath}?token=<redacted>")
+                webSocket = api.client.newWebSocket(request, ChatWebSocketListener(conversationId))
             }
             is AppResult.Err -> {
-                mutableState.update { it.copy(realtimeState = result.error.userMessage()) }
+                val message = result.error.userMessage()
+                logRealtime("websocket request failed conversation=$conversationId error=$message")
+                mutableState.update { it.copy(realtimeState = message) }
                 scheduleReconnect(conversationId)
             }
         }
@@ -254,6 +260,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         reconnectJob?.cancel()
         val delayMillis = min(30_000L, 1_000L * (1 shl min(reconnectAttempt, 5)))
         reconnectAttempt += 1
+        logRealtime("schedule reconnect conversation=$conversationId delay=${delayMillis}ms attempt=$reconnectAttempt")
         mutableState.update { it.copy(realtimeState = "Realtime reconnecting in ${delayMillis / 1000}s") }
         reconnectJob = viewModelScope.launch {
             delay(delayMillis)
@@ -269,6 +276,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         reconnectEnabled = allowReconnect
         reconnectJob?.cancel()
         reconnectJob = null
+        logRealtime("close websocket allowReconnect=$allowReconnect conversation=$realtimeConversationId")
         if (!allowReconnect) {
             realtimeSyncJob?.cancel()
             realtimeSyncJob = null
@@ -454,6 +462,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         return if (unit == 0) "${value}B" else "${String.format("%.1f", size)}${units[unit]}"
     }
 
+    private fun logRealtime(message: String) {
+        AppLogStore.append(getApplication(), "realtime", message)
+    }
+
     private fun handleWebSocketText(conversationId: String, text: String) {
         if (conversationId != realtimeConversationId) return
         try {
@@ -461,6 +473,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             when (payload["type"]?.jsonPrimitive?.content) {
                 "subscription_ack" -> {
                     val reason = payload["reason"]?.jsonPrimitive?.content.orEmpty()
+                    logRealtime("subscription_ack conversation=$conversationId reason=$reason")
                     reconnectAttempt = 0
                     mutableState.update {
                         it.copy(
@@ -483,6 +496,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 "messages" -> {
                     val page = json.decodeFromString<MessagesResponseDto>(text)
                     val messages = page.messages.map { it.toDomain() }
+                    logRealtime("messages frame conversation=$conversationId count=${messages.size} offset=${page.offset} total=${page.total}")
                     applyIncomingMessages(messages)
                     reconnectAttempt = 0
                     mutableState.update {
@@ -502,10 +516,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
             }
-        } catch (_: SerializationException) {
-            // Ignore malformed realtime frames; manual Refresh remains available.
-        } catch (_: IllegalArgumentException) {
-            // Ignore unexpected payload shapes.
+        } catch (error: SerializationException) {
+            logRealtime("malformed frame conversation=$conversationId error=${error.message.orEmpty()} text=${text.take(240)}")
+        } catch (error: IllegalArgumentException) {
+            logRealtime("unexpected frame conversation=$conversationId error=${error.message.orEmpty()} text=${text.take(240)}")
         }
     }
 
@@ -563,6 +577,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     ) : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
             reconnectAttempt = 0
+            logRealtime("onOpen conversation=$conversationId http=${response.code} ${response.message}")
             mutableState.update { it.copy(realtimeState = "Realtime connected") }
         }
 
@@ -571,21 +586,27 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-            mutableState.update { it.copy(realtimeState = websocketCloseMessage("Realtime closing", code, reason)) }
+            val message = websocketCloseMessage("Realtime closing", code, reason)
+            logRealtime("onClosing conversation=$conversationId $message")
+            mutableState.update { it.copy(realtimeState = message) }
             webSocket.close(code, reason)
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             if (conversationId == realtimeConversationId && reconnectEnabled) {
-                mutableState.update { it.copy(realtimeState = websocketCloseMessage("Realtime closed", code, reason)) }
+                val message = websocketCloseMessage("Realtime closed", code, reason)
+                logRealtime("onClosed conversation=$conversationId $message")
+                mutableState.update { it.copy(realtimeState = message) }
                 scheduleReconnect(conversationId)
             }
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             if (conversationId == realtimeConversationId && reconnectEnabled) {
+                val message = realtimeFailureMessage(t, response)
+                logRealtime("onFailure conversation=$conversationId $message")
                 mutableState.update {
-                    it.copy(realtimeState = "Realtime error: ${realtimeFailureMessage(t, response)}")
+                    it.copy(realtimeState = "Realtime error: $message")
                 }
                 scheduleReconnect(conversationId)
             }

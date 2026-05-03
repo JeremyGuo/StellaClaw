@@ -37,6 +37,7 @@ import com.stellaclaw.stellacodex.domain.model.ConversationSummary
 fun ConversationListScreen(
     onOpenConversation: (String) -> Unit,
     onOpenSettings: () -> Unit,
+    onOpenLogs: () -> Unit,
 ) {
     val application = LocalContext.current.applicationContext as Application
     val viewModel: ConversationListViewModel = viewModel(
@@ -70,6 +71,7 @@ fun ConversationListScreen(
                         enabled = !state.isCreating,
                     ) { Text(if (state.isCreating) "Creating" else "New") }
                     TextButton(onClick = viewModel::refresh) { Text("Refresh") }
+                    TextButton(onClick = onOpenLogs) { Text("Logs") }
                     TextButton(onClick = onOpenSettings) { Text("Settings") }
                 },
             )
