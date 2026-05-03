@@ -1,5 +1,13 @@
-version: 1.23.2
+version: 1.23.3
 ---
+
+# 1.23.3
+
+- 发布 StellacodeX Android `0.1.24` 稳定版：
+  将 Android 客户端从 `0.1.24-rc.13` 提升为稳定版本，包含近期聊天体验修复：消息可选择复制、本地时间显示、隐藏 runtime metadata、工具消息分组折叠、分页和滚动锚点修正、按真实聊天项加载历史、用户名显示/发送配置，以及用户消息右侧气泡样式。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 发布 Stellacode 2 桌面客户端更新：
+  Server settings 新增可配置 `Username`，默认 `workspace-user`；普通聊天消息的 `user_name` 使用该用户身份，不再硬编码客户端名 `Stellacode`，为后续多用户共享 conversation 做准备。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.23.2
 
