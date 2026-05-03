@@ -548,6 +548,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         super.onCleared()
     }
 
+    private fun websocketCloseMessage(prefix: String, code: Int, reason: String): String =
+        if (reason.isBlank()) "$prefix: $code" else "$prefix: $code · $reason"
+
+    private fun realtimeFailureMessage(error: Throwable, response: Response?): String {
+        val errorName = error::class.simpleName ?: "Error"
+        val message = error.message.orEmpty().ifBlank { "unknown" }
+        val status = response?.let { " · HTTP ${it.code}${it.message.ifBlank { "" }.let { value -> if (value.isBlank()) "" else " ${value}" }}" }.orEmpty()
+        return "$errorName: $message$status"
+    }
+
     private inner class ChatWebSocketListener(
         private val conversationId: String,
     ) : WebSocketListener() {
@@ -561,11 +571,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+            mutableState.update { it.copy(realtimeState = websocketCloseMessage("Realtime closing", code, reason)) }
             webSocket.close(code, reason)
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
             if (conversationId == realtimeConversationId && reconnectEnabled) {
+                mutableState.update { it.copy(realtimeState = websocketCloseMessage("Realtime closed", code, reason)) }
                 scheduleReconnect(conversationId)
             }
         }
@@ -573,7 +585,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             if (conversationId == realtimeConversationId && reconnectEnabled) {
                 mutableState.update {
-                    it.copy(realtimeState = "Realtime error: ${t.message.orEmpty().ifBlank { "unknown" }}")
+                    it.copy(realtimeState = "Realtime error: ${realtimeFailureMessage(t, response)}")
                 }
                 scheduleReconnect(conversationId)
             }

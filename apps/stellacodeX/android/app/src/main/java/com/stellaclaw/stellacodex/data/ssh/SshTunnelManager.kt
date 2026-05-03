@@ -65,6 +65,8 @@ class SshTunnelManager {
         )
         session.setConfig("StrictHostKeyChecking", "no")
         session.setConfig("PreferredAuthentications", "publickey,password,keyboard-interactive")
+        session.serverAliveInterval = 15_000
+        session.serverAliveCountMax = 3
         session.setConfig("signature.ed25519", "com.jcraft.jsch.bc.SignatureEd25519")
         session.setConfig("signature.ed448", "com.jcraft.jsch.bc.SignatureEd448")
         session.setConfig(

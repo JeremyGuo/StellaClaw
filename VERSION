@@ -1,5 +1,10 @@
-version: 1.22.7
+version: 1.22.8
 ---
+
+# 1.22.8
+
+- 增强 StellacodeX Android realtime 长连接保活与诊断：
+  OkHttp WebSocket 增加 15 秒主动 ping；SSH Proxy tunnel 增加 JSch server alive keepalive；WebSocket close/failure 状态显示 close code、异常类型、异常消息和 HTTP 状态，便于定位一直 reconnecting 的原因。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.22.7
 
