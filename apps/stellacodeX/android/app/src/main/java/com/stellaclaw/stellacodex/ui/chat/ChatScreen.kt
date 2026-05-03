@@ -28,6 +28,9 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -61,14 +64,21 @@ fun ChatScreen(
     )
     val state by viewModel.state.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
+    var initialBottomPlaced by remember(conversationId) { mutableStateOf(false) }
 
     LaunchedEffect(conversationId) {
+        initialBottomPlaced = false
         viewModel.load(conversationId)
     }
 
     LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.id) {
         if (state.messages.isNotEmpty()) {
-            listState.animateScrollToItem(state.messages.lastIndex)
+            if (!initialBottomPlaced) {
+                listState.scrollToItem(state.messages.lastIndex)
+                initialBottomPlaced = true
+            } else {
+                listState.animateScrollToItem(state.messages.lastIndex)
+            }
         }
     }
 
@@ -421,23 +431,44 @@ private fun ToolCard(
     body: String,
     isResult: Boolean,
 ) {
+    var expanded by remember(title, body) { mutableStateOf(false) }
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .background(if (isResult) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.tertiaryContainer)
+            .clickable { expanded = !expanded }
             .padding(10.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Text(
-            text = title,
-            style = MaterialTheme.typography.labelMedium,
-            fontWeight = FontWeight.SemiBold,
-        )
-        Text(
-            text = body.take(8_000),
-            style = MaterialTheme.typography.bodySmall,
-            fontFamily = FontFamily.Monospace,
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(
+                text = if (expanded) "Hide" else "Show",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+        }
+        if (!expanded) {
+            Text(
+                text = "Collapsed · tap to inspect",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else {
+            Text(
+                text = body.take(8_000),
+                style = MaterialTheme.typography.bodySmall,
+                fontFamily = FontFamily.Monospace,
+            )
+        }
     }
 }
 

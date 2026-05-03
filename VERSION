@@ -1,5 +1,10 @@
-version: 1.22.5
+version: 1.22.6
 ---
+
+# 1.22.6
+
+- 优化 StellacodeX Android 聊天阅读体验：
+  Assistant tool call / tool result 卡片默认折叠，点击后再展开查看 payload；进入会话后初始消息列表直接定位到底部，不再播放从顶部滚到底部的大量滚动动画，后续新增消息仍保持自动滚动。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.22.5
 
