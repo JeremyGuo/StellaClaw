@@ -65,19 +65,20 @@ fun ChatScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     var initialBottomPlaced by remember(conversationId) { mutableStateOf(false) }
+    val timeline = remember(state.messages) { buildChatTimeline(state.messages) }
 
     LaunchedEffect(conversationId) {
         initialBottomPlaced = false
         viewModel.load(conversationId)
     }
 
-    LaunchedEffect(state.messages.size, state.messages.lastOrNull()?.id) {
-        if (state.messages.isNotEmpty()) {
+    LaunchedEffect(timeline.size, timeline.lastOrNull()?.key) {
+        if (timeline.isNotEmpty()) {
             if (!initialBottomPlaced) {
-                listState.scrollToItem(state.messages.lastIndex)
+                listState.scrollToItem(timeline.lastIndex)
                 initialBottomPlaced = true
             } else {
-                listState.animateScrollToItem(state.messages.lastIndex)
+                listState.animateScrollToItem(timeline.lastIndex)
             }
         }
     }
@@ -124,7 +125,7 @@ fun ChatScreen(
                 state.isLoading && state.messages.isEmpty() -> LoadingMessages()
                 state.messages.isEmpty() -> EmptyMessages()
                 else -> MessageList(
-                    messages = state.messages,
+                    timeline = timeline,
                     listState = listState,
                     previews = state.attachmentPreviews,
                     onPreviewAttachment = viewModel::previewAttachment,
@@ -229,7 +230,7 @@ private fun EmptyMessages() {
 
 @Composable
 private fun MessageList(
-    messages: List<ChatMessage>,
+    timeline: List<ChatTimelineItem>,
     listState: LazyListState,
     previews: Map<String, AttachmentPreviewUiState>,
     onPreviewAttachment: (MessageAttachment) -> Unit,
@@ -240,12 +241,116 @@ private fun MessageList(
         state = listState,
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        items(messages, key = { it.id }) { message ->
-            MessageCard(
-                message = message,
-                previews = previews,
-                onPreviewAttachment = onPreviewAttachment,
+        items(timeline, key = { it.key }) { item ->
+            when (item) {
+                is ChatTimelineItem.Message -> MessageCard(
+                    message = item.message,
+                    previews = previews,
+                    onPreviewAttachment = onPreviewAttachment,
+                )
+                is ChatTimelineItem.ToolSummary -> ToolSummaryCard(summary = item)
+            }
+        }
+    }
+}
+
+private sealed interface ChatTimelineItem {
+    val key: String
+
+    data class Message(val message: ChatMessage) : ChatTimelineItem {
+        override val key: String = "message:${message.id}"
+    }
+
+    data class ToolSummary(val messages: List<ChatMessage>) : ChatTimelineItem {
+        override val key: String = "tools:${messages.first().id}:${messages.last().id}"
+        val toolCallCount: Int = messages.sumOf { message -> message.items.count { it is MessageItem.ToolCall } }
+        val toolResultCount: Int = messages.sumOf { message -> message.items.count { it is MessageItem.ToolResult } }
+    }
+}
+
+private fun buildChatTimeline(messages: List<ChatMessage>): List<ChatTimelineItem> {
+    val output = mutableListOf<ChatTimelineItem>()
+    val pendingTools = mutableListOf<ChatMessage>()
+    fun flushPendingTools(expanded: Boolean) {
+        if (pendingTools.isEmpty()) return
+        if (expanded) {
+            output += pendingTools.map(ChatTimelineItem::Message)
+        } else {
+            output += ChatTimelineItem.ToolSummary(pendingTools.toList())
+        }
+        pendingTools.clear()
+    }
+
+    messages.forEach { message ->
+        when {
+            message.isToolOnlyMessage() -> pendingTools += message
+            message.isAssistantFinalMessage() && pendingTools.isNotEmpty() -> {
+                flushPendingTools(expanded = false)
+                output += ChatTimelineItem.Message(message)
+            }
+            else -> {
+                flushPendingTools(expanded = true)
+                output += ChatTimelineItem.Message(message)
+            }
+        }
+    }
+    flushPendingTools(expanded = true)
+    return output
+}
+
+private fun ChatMessage.isToolOnlyMessage(): Boolean =
+    role.equals("assistant", ignoreCase = true) &&
+        text.isBlank() &&
+        attachments.isEmpty() &&
+        items.any { it is MessageItem.ToolCall || it is MessageItem.ToolResult }
+
+private fun ChatMessage.isAssistantFinalMessage(): Boolean =
+    role.equals("assistant", ignoreCase = true) && text.isNotBlank()
+
+@Composable
+private fun ToolSummaryCard(summary: ChatTimelineItem.ToolSummary) {
+    var expanded by remember(summary.key) { mutableStateOf(false) }
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { expanded = !expanded }
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "Tools · ran ${summary.toolCallCount} commands",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = if (expanded) "Hide list" else "Show list",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+            Text(
+                text = "${summary.messages.size} tool messages · ${summary.toolResultCount} results",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            if (expanded) {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    summary.messages.forEach { message ->
+                        Text(
+                            text = "#${message.index}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        ToolItemList(items = message.items)
+                    }
+                }
+            }
         }
     }
 }
