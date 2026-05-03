@@ -1,5 +1,10 @@
-version: 1.22.4
+version: 1.22.5
 ---
+
+# 1.22.5
+
+- 增强 StellacodeX Android 会话内实时同步：
+  Android WebSocket URL 现在和 Stellacode 2 一样附带 `token` query 作为认证兜底，同时保留 Authorization header；聊天页恢复可见 realtime/progress 状态，并增加轻量 backfill 同步兜底，按最后已同步 message id 拉取缺失消息，避免 WebSocket push 丢失时只能手动刷新。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.22.4
 

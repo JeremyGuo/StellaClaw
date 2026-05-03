@@ -98,6 +98,12 @@ fun ChatScreen(
                     style = MaterialTheme.typography.bodyMedium,
                 )
             }
+            RealtimeStatus(
+                realtimeState = state.realtimeState,
+                progressTitle = state.progressTitle,
+                progressDetail = state.progressDetail,
+                progressImportant = state.progressImportant,
+            )
             HistoryStatus(
                 loadedOffset = state.loadedOffset,
                 loadedCount = state.messages.size,

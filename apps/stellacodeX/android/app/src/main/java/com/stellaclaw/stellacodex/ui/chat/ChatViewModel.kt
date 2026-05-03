@@ -51,6 +51,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var webSocket: WebSocket? = null
     private var realtimeConversationId: String = ""
     private var reconnectJob: Job? = null
+    private var realtimeSyncJob: Job? = null
+    private var realtimeSyncInFlight: Boolean = false
     private var reconnectAttempt: Int = 0
     private var reconnectEnabled: Boolean = false
     private var latestProfile: ConnectionProfile? = null
@@ -236,6 +238,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         when (val result = api.foregroundWebSocketRequest(profile, conversationId)) {
             is AppResult.Ok -> {
                 realtimeConversationId = conversationId
+                startRealtimeBackfill(conversationId)
                 webSocket?.cancel()
                 webSocket = api.client.newWebSocket(result.value, ChatWebSocketListener(conversationId))
             }
@@ -266,6 +269,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         reconnectEnabled = allowReconnect
         reconnectJob?.cancel()
         reconnectJob = null
+        if (!allowReconnect) {
+            realtimeSyncJob?.cancel()
+            realtimeSyncJob = null
+            realtimeSyncInFlight = false
+        }
         webSocket?.close(1000, "conversation changed")
         webSocket = null
         if (!allowReconnect) {
@@ -307,6 +315,77 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         .firstOrNull { it.localState == MessageLocalState.Synced && it.id.toIntOrNull() != null }
         ?.id
         ?.toIntOrNull()
+
+    private fun startRealtimeBackfill(conversationId: String) {
+        realtimeSyncJob?.cancel()
+        realtimeSyncJob = viewModelScope.launch {
+            while (state.value.conversationId == conversationId && reconnectEnabled) {
+                delay(2_000)
+                val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
+                syncMissingMessages(conversationId, profile, updateStatusWhenIdle = false)
+            }
+        }
+    }
+
+    private suspend fun syncMissingMessages(
+        conversationId: String,
+        profile: ConnectionProfile,
+        updateStatusWhenIdle: Boolean,
+    ) {
+        if (realtimeSyncInFlight || state.value.conversationId != conversationId) return
+        realtimeSyncInFlight = true
+        try {
+            val snapshot = state.value
+            val lastLocalId = lastServerMessageIndex(snapshot.messages)
+            val request = if (lastLocalId == null) {
+                0 to LatestMessageLimit
+            } else {
+                (lastLocalId + 1) to 200
+            }
+            when (val result = api.loadMessagePage(profile, conversationId, offset = request.first, limit = request.second)) {
+                is AppResult.Ok -> {
+                    val page = result.value
+                    val shouldLoadLatest = lastLocalId == null && page.total > page.messages.size
+                    if (shouldLoadLatest) {
+                        val latestOffset = (page.total - LatestMessageLimit).coerceAtLeast(0)
+                        when (val latest = api.loadMessagePage(profile, conversationId, offset = latestOffset, limit = LatestMessageLimit)) {
+                            is AppResult.Ok -> mutableState.update {
+                                it.copy(
+                                    messages = trimToLatestMessages(mergeMessages(it.messages, latest.value.messages)),
+                                    loadedOffset = latest.value.offset,
+                                    totalMessages = latest.value.total,
+                                    error = null,
+                                    realtimeState = "Realtime synced",
+                                )
+                            }
+                            is AppResult.Err -> Unit
+                        }
+                    } else if (page.messages.isNotEmpty() || page.total != snapshot.totalMessages) {
+                        mutableState.update {
+                            it.copy(
+                                messages = trimToLatestMessages(mergeMessages(it.messages, page.messages)),
+                                loadedOffset = if (page.messages.isNotEmpty()) page.offset else it.loadedOffset,
+                                totalMessages = page.total,
+                                error = null,
+                                realtimeState = if (page.messages.isNotEmpty()) {
+                                    "Realtime synced · ${page.offset + page.messages.size}/${page.total}"
+                                } else {
+                                    it.realtimeState
+                                },
+                            )
+                        }
+                    } else if (updateStatusWhenIdle) {
+                        mutableState.update { it.copy(totalMessages = page.total, realtimeState = "Realtime synced") }
+                    }
+                }
+                is AppResult.Err -> if (updateStatusWhenIdle) {
+                    mutableState.update { it.copy(realtimeState = "Realtime sync failed: ${result.error.userMessage()}") }
+                }
+            }
+        } finally {
+            realtimeSyncInFlight = false
+        }
+    }
 
     private fun handleSubscriptionAck(conversationId: String, payload: JsonObject) {
         val currentMessageId = (payload["current_message_id"] as? JsonPrimitive)?.content?.toIntOrNull()
@@ -396,6 +475,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         handleProgress(payload["turn_progress"] as JsonObject)
                     }
                     handleSubscriptionAck(conversationId, payload)
+                    viewModelScope.launch {
+                        val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
+                        syncMissingMessages(conversationId, profile, updateStatusWhenIdle = true)
+                    }
                 }
                 "messages" -> {
                     val page = json.decodeFromString<MessagesResponseDto>(text)

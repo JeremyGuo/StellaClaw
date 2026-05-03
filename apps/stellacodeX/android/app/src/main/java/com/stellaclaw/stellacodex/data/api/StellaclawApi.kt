@@ -188,7 +188,10 @@ class StellaclawApi(
                     "http" -> "ws"
                     else -> return@withContext AppResult.Err(AppError.Network("Unsupported WebSocket scheme"))
                 }
-                val url = httpUrl.newBuilder().scheme(scheme).build()
+                val url = httpUrl.newBuilder()
+                    .scheme(scheme)
+                    .addQueryParameter("token", profile.token.trim())
+                    .build()
                 AppResult.Ok(
                     Request.Builder()
                         .url(url)
