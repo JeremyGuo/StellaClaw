@@ -2223,6 +2223,12 @@ fn conversation_message_summary(
                 .and_then(Value::as_str)
                 .map(str::to_string);
         }
+        if summary.last_message_time.is_none() {
+            summary.last_message_time = fs::metadata(&path)
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(system_time_rfc3339);
+        }
     }
     summary
 }
@@ -3299,6 +3305,10 @@ fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn system_time_rfc3339(system_time: SystemTime) -> Option<String> {
+    OffsetDateTime::from(system_time).format(&Rfc3339).ok()
 }
 
 fn parse_web_control(text: &str) -> Option<ConversationControl> {

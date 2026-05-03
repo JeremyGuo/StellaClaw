@@ -39,3 +39,12 @@ tmp/
 shared
 STELLACLAW.md
 MEMORY_DESIGN.md
+
+# Runtime logs
+restart.log
+
+# Android / Gradle
+**/.gradle/
+**/build/
+**/local.properties
+apps/stellacodeX/**/dist/

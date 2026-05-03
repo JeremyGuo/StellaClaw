@@ -275,6 +275,8 @@ pub fn read_workspace_file(
 
 /// Maximum compressed upload size: 10 MiB.
 const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
+/// Maximum compressed download archive size: 50 MiB.
+const MAX_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
 
 /// Upload a tar.gz archive and extract it into the workspace directory at `relative_dir`.
 pub fn upload_workspace_archive(
@@ -388,10 +390,10 @@ pub fn download_workspace_archive(
             .with_context(|| "failed to finalize tar archive")?;
     }
 
-    if output.len() > MAX_UPLOAD_BYTES {
+    if output.len() > MAX_DOWNLOAD_BYTES {
         return Err(RemoteActorError::InvalidPath(format!(
             "download archive exceeds {} byte limit (got {} bytes)",
-            MAX_UPLOAD_BYTES,
+            MAX_DOWNLOAD_BYTES,
             output.len()
         )));
     }

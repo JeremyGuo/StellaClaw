@@ -1,5 +1,15 @@
-version: 1.22.0
+version: 1.22.2
 ---
+
+# 1.22.2
+
+- 修复 Stellacode 2 workspace 下载较大文件失败的问题：
+  Web workspace download 的压缩归档上限从复用 10 MiB 上传限制改为独立 50 MiB 下载限制，上传限制仍保持 10 MiB；避免下载 Android debug APK 等较大二进制产物时报 `download archive exceeds 10485760 byte limit`。本次不改变 `config` schema，不改变 `workdir` schema。
+
+# 1.22.1
+
+- 初始化 StellacodeX Android 原生客户端：
+  `apps/stellacodeX/android` 现在包含原生 Android Gradle/Compose 客户端，支持连接配置、会话列表、创建会话、聊天收发、WebSocket 实时同步、最新 30 条历史加载、轻量 Markdown/代码块、附件预览和工具调用/结果展示；构建产物不纳入 git 跟踪。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.22.0
 
@@ -10,11 +20,6 @@ version: 1.22.0
   Composer draft 下放到聊天组件本地状态，历史消息和工具组渲染增加 memo / offscreen skip，避免每次键入都重渲染整页 Markdown；打字机新消息判断不再被本地 optimistic message 的非数字 id 阻断；IME 只屏蔽同一次 composition Enter 产生的后续 keydown，并阻止它插入换行，快速二次按 Enter 仍会发送。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.21.12
-
-- 修复 provider 侧瞬时错误导致 turn 直接失败的问题：
-  Core session actor 现在会对 websocket、网络请求、429、5xx、provider unavailable 等 transient provider error 在框架层自动重试最多 5 次，并记录 `provider_request_retrying` 日志；超过重试预算后仍按可恢复 turn failure 处理。本次不改变 `config` schema，不改变 `workdir` schema。
-
-# 1.21.11
 
 - 执行并固化 `ChatMessage` / `FileItem` 标准：
   Web REST message 入口现在会把 incoming `data:` file item materialize 到 conversation `attachments/incoming` 后再以 `file://` 写入用户 `ChatMessage`，并为文件路径补充可推断的 `media_type`。`AGENTS.md` 新增 ChatMessage / FileItem 约定，要求后续相关实现遵守 `chat_message.md` 与 `file_item.md`。本次不改变 `config` schema，不改变 `workdir` schema。
