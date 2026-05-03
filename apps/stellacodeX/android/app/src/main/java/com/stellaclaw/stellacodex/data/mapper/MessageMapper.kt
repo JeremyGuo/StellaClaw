@@ -62,6 +62,7 @@ private fun JsonObject.toMessageItem(): MessageItem? {
             toolCallId = string("tool_call_id").orEmpty(),
             toolName = string("tool_name").orEmpty(),
             arguments = get("arguments")?.compactJson().orEmpty(),
+            explanation = string("explanation") ?: (get("arguments") as? JsonObject)?.string("explanation"),
         )
         "tool_result" -> MessageItem.ToolResult(
             index = index,

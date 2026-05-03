@@ -262,6 +262,12 @@ private fun MessageCard(
         "system" -> "System"
         else -> message.role.ifBlank { "Message" }
     }
+    val toolExplanations = message.items
+        .filterIsInstance<MessageItem.ToolCall>()
+        .mapNotNull { it.explanation?.trim()?.takeIf(String::isNotEmpty) }
+    val displayText = message.text.ifBlank {
+        toolExplanations.joinToString("\n\n").ifBlank { message.preview.ifBlank { "[empty message]" } }
+    }
     Card(modifier = Modifier.fillMaxWidth()) {
         Column(
             modifier = Modifier.padding(12.dp),
@@ -274,7 +280,7 @@ private fun MessageCard(
                 Text(text = roleLabel, style = MaterialTheme.typography.labelMedium)
                 Text(text = "#${message.index}", style = MaterialTheme.typography.labelSmall)
             }
-            MessageBody(text = message.text.ifBlank { message.preview.ifBlank { "[empty message]" } })
+            MessageBody(text = displayText)
             if (message.items.any { it is MessageItem.ToolCall || it is MessageItem.ToolResult }) {
                 ToolItemList(items = message.items)
             }

@@ -1,5 +1,10 @@
-version: 1.22.6
+version: 1.22.7
 ---
+
+# 1.22.7
+
+- 显示 StellacodeX Android tool call explanation：
+  Android 聊天消息现在会从 tool call payload 中提取模型返回的 `explanation`，并在 Assistant 消息正文区域显示；tool call / tool result 详细 payload 仍默认折叠，点击后展开。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.22.6
 

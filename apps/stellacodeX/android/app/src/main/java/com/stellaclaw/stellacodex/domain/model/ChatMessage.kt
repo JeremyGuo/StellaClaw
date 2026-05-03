@@ -44,6 +44,7 @@ sealed interface MessageItem {
         val toolCallId: String,
         val toolName: String,
         val arguments: String,
+        val explanation: String?,
     ) : MessageItem
 
     data class ToolResult(
