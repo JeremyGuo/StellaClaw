@@ -72,7 +72,7 @@ fun ChatScreen(
         viewModel.load(conversationId)
     }
 
-    LaunchedEffect(timeline.size, timeline.lastOrNull()?.key) {
+    LaunchedEffect(timeline.lastOrNull()?.key) {
         if (timeline.isNotEmpty()) {
             if (!initialBottomPlaced) {
                 listState.scrollToItem(timeline.lastIndex)
@@ -83,10 +83,28 @@ fun ChatScreen(
         }
     }
 
+    LaunchedEffect(
+        listState.firstVisibleItemIndex,
+        state.loadedOffset,
+        state.isLoadingEarlier,
+        state.isLoading,
+        timeline.isNotEmpty(),
+    ) {
+        if (initialBottomPlaced &&
+            timeline.isNotEmpty() &&
+            listState.firstVisibleItemIndex == 0 &&
+            state.loadedOffset > 0 &&
+            !state.isLoadingEarlier &&
+            !state.isLoading
+        ) {
+            viewModel.loadEarlier()
+        }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(conversationId.ifBlank { "Conversation" }) },
+                title = { Text(state.displayName.ifBlank { conversationId.ifBlank { "Conversation" } }) },
                 navigationIcon = { TextButton(onClick = onBack) { Text("Back") } },
                 actions = {
                     TextButton(onClick = viewModel::refresh) { Text("Refresh") }
@@ -115,16 +133,11 @@ fun ChatScreen(
                 progressDetail = state.progressDetail,
                 progressImportant = state.progressImportant,
             )
-            HistoryStatus(
-                loadedOffset = state.loadedOffset,
-                loadedCount = state.messages.size,
-                totalMessages = state.totalMessages,
-            )
-
             when {
                 state.isLoading && state.messages.isEmpty() -> LoadingMessages()
                 state.messages.isEmpty() -> EmptyMessages()
                 else -> MessageList(
+                    isLoadingEarlier = state.isLoadingEarlier,
                     timeline = timeline,
                     listState = listState,
                     previews = state.attachmentPreviews,
@@ -183,22 +196,6 @@ private fun RealtimeStatus(
 }
 
 @Composable
-private fun HistoryStatus(
-    loadedOffset: Int,
-    loadedCount: Int,
-    totalMessages: Int,
-) {
-    if (totalMessages <= 0 || loadedCount <= 0) return
-    val start = loadedOffset + 1
-    val end = loadedOffset + loadedCount
-    Text(
-        text = "Showing latest messages $start-$end of $totalMessages",
-        style = MaterialTheme.typography.labelSmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-    )
-}
-
-@Composable
 private fun LoadingMessages() {
     Row(
         modifier = Modifier
@@ -230,6 +227,7 @@ private fun EmptyMessages() {
 
 @Composable
 private fun MessageList(
+    isLoadingEarlier: Boolean,
     timeline: List<ChatTimelineItem>,
     listState: LazyListState,
     previews: Map<String, AttachmentPreviewUiState>,
@@ -241,6 +239,24 @@ private fun MessageList(
         state = listState,
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
+        if (isLoadingEarlier) {
+            item(key = "loading-earlier") {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    CircularProgressIndicator()
+                    Text(
+                        text = "Loading earlier messages...",
+                        modifier = Modifier.padding(start = 12.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                    )
+                }
+            }
+        }
         items(timeline, key = { it.key }) { item ->
             when (item) {
                 is ChatTimelineItem.Message -> MessageCard(

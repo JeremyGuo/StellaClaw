@@ -65,7 +65,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         mutableState.update {
             it.copy(
                 conversationId = conversationId,
+                displayName = conversationId,
                 messages = emptyList(),
+                loadedOffset = 0,
+                totalMessages = 0,
                 realtimeState = "Connecting realtime...",
                 progressTitle = null,
                 progressDetail = null,
@@ -136,12 +139,13 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             }
             val profile = store.profile.first()
             latestProfile = profile
+            updateConversationTitle(profile, conversationId)
             when (val result = api.loadLatestMessages(profile, conversationId)) {
                 is AppResult.Ok -> {
                     mutableState.update {
                         it.copy(
                             isLoading = false,
-                            messages = trimToLatestMessages(mergeMessages(it.messages, result.value.messages)),
+                            messages = mergeMessages(it.messages, result.value.messages).takeLast(LatestMessageLimit),
                             loadedOffset = result.value.offset,
                             totalMessages = result.value.total,
                             error = null,
@@ -162,6 +166,32 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     if (connectRealtimeAfterLoad) {
                         connectRealtime(profile, conversationId)
                     }
+                }
+            }
+        }
+    }
+
+    fun loadEarlier() {
+        val snapshot = state.value
+        val conversationId = snapshot.conversationId
+        if (conversationId.isBlank() || snapshot.loadedOffset <= 0 || snapshot.isLoadingEarlier) return
+        viewModelScope.launch {
+            mutableState.update { it.copy(isLoadingEarlier = true, error = null) }
+            val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
+            val nextOffset = (snapshot.loadedOffset - EarlierMessageLimit).coerceAtLeast(0)
+            val limit = snapshot.loadedOffset - nextOffset
+            when (val result = api.loadMessagePage(profile, conversationId, offset = nextOffset, limit = limit)) {
+                is AppResult.Ok -> mutableState.update {
+                    it.copy(
+                        isLoadingEarlier = false,
+                        messages = mergeMessages(result.value.messages, it.messages),
+                        loadedOffset = result.value.offset,
+                        totalMessages = result.value.total,
+                        error = null,
+                    )
+                }
+                is AppResult.Err -> mutableState.update {
+                    it.copy(isLoadingEarlier = false, error = result.error.userMessage())
                 }
             }
         }
@@ -293,7 +323,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private fun applyIncomingMessages(incoming: List<ChatMessage>) {
         if (incoming.isEmpty()) return
         mutableState.update { current ->
-            current.copy(messages = trimToLatestMessages(mergeMessages(current.messages, incoming)))
+            current.copy(messages = mergeMessages(current.messages, incoming))
         }
     }
 
@@ -309,13 +339,18 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         return byId.values.sortedWith(compareBy<ChatMessage> { it.index }.thenBy { it.id })
     }
 
-    private fun trimToLatestMessages(messages: List<ChatMessage>, maxSynced: Int = LatestMessageLimit): List<ChatMessage> {
-        val synced = messages
-            .filter { it.localState == MessageLocalState.Synced }
-            .sortedWith(compareBy<ChatMessage> { it.index }.thenBy { it.id })
-            .takeLast(maxSynced)
-        val local = messages.filter { it.localState != MessageLocalState.Synced }
-        return (synced + local).sortedWith(compareBy<ChatMessage> { it.index }.thenBy { it.id })
+    private suspend fun updateConversationTitle(profile: ConnectionProfile, conversationId: String) {
+        when (val result = api.loadConversations(profile, limit = 200)) {
+            is AppResult.Ok -> {
+                val displayName = result.value
+                    .firstOrNull { it.conversationId == conversationId }
+                    ?.displayName
+                    ?.takeIf { it.isNotBlank() }
+                    ?: conversationId
+                mutableState.update { it.copy(displayName = displayName) }
+            }
+            is AppResult.Err -> Unit
+        }
     }
 
     private fun lastServerMessageIndex(messages: List<ChatMessage>): Int? = messages
@@ -359,7 +394,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         when (val latest = api.loadMessagePage(profile, conversationId, offset = latestOffset, limit = LatestMessageLimit)) {
                             is AppResult.Ok -> mutableState.update {
                                 it.copy(
-                                    messages = trimToLatestMessages(mergeMessages(it.messages, latest.value.messages)),
+                                    messages = mergeMessages(it.messages, latest.value.messages),
                                     loadedOffset = latest.value.offset,
                                     totalMessages = latest.value.total,
                                     error = null,
@@ -371,8 +406,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     } else if (page.messages.isNotEmpty() || page.total != snapshot.totalMessages) {
                         mutableState.update {
                             it.copy(
-                                messages = trimToLatestMessages(mergeMessages(it.messages, page.messages)),
-                                loadedOffset = if (page.messages.isNotEmpty()) page.offset else it.loadedOffset,
+                                messages = mergeMessages(it.messages, page.messages),
+                                loadedOffset = if (page.messages.isNotEmpty()) min(it.loadedOffset, page.offset) else it.loadedOffset,
                                 totalMessages = page.total,
                                 error = null,
                                 realtimeState = if (page.messages.isNotEmpty()) {
@@ -422,8 +457,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 is AppResult.Ok -> {
                     mutableState.update {
                         it.copy(
-                            messages = trimToLatestMessages(mergeMessages(it.messages, result.value.messages)),
-                            loadedOffset = result.value.offset,
+                            messages = mergeMessages(it.messages, result.value.messages),
+                            loadedOffset = min(it.loadedOffset, result.value.offset),
                             totalMessages = result.value.total,
                             error = null,
                             realtimeState = "Realtime synced",
@@ -615,12 +650,15 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private companion object {
         const val LatestMessageLimit = 30
+        const val EarlierMessageLimit = 50
     }
 }
 
 data class ChatUiState(
     val conversationId: String = "",
+    val displayName: String = "",
     val isLoading: Boolean = false,
+    val isLoadingEarlier: Boolean = false,
     val isSending: Boolean = false,
     val messages: List<ChatMessage> = emptyList(),
     val loadedOffset: Int = 0,
