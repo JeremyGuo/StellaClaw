@@ -63,9 +63,9 @@ fun ConnectionsScreen(onContinue: () -> Unit) {
                 .padding(24.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Text("Connect to Stellaclaw", style = MaterialTheme.typography.headlineSmall)
+            Text("Connect to StellacodeX", style = MaterialTheme.typography.headlineSmall)
             Text(
-                text = "Use SSH proxy when the Web channel only listens on the server's 127.0.0.1:3111, matching Stellacode2's tunnel mode.",
+                text = "Client name: StellacodeX. Username is sent as Speaker metadata so the assistant can distinguish people in shared conversations.",
                 style = MaterialTheme.typography.bodyMedium,
             )
 
@@ -108,6 +108,15 @@ fun ConnectionsScreen(onContinue: () -> Unit) {
                     viewModel = viewModel,
                 )
             }
+
+            OutlinedTextField(
+                value = state.userName,
+                onValueChange = viewModel::onUserNameChanged,
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Username") },
+                placeholder = { Text("workspace-user") },
+                singleLine = true,
+            )
 
             OutlinedTextField(
                 value = state.token,

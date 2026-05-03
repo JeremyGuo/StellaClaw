@@ -115,7 +115,7 @@ class StellaclawApi(
     ): AppResult<Unit> = post(
         profile = profile,
         path = "/api/conversations/$conversationId/messages",
-        body = json.encodeToString(SendMessageRequestDto(userName = "Stellacode", text = text)),
+        body = json.encodeToString(SendMessageRequestDto(userName = profile.userName.ifBlank { "workspace-user" }, text = text)),
     ) { responseBody ->
         json.decodeFromString<SendMessageResponseDto>(responseBody)
         Unit

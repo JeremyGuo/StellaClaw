@@ -202,13 +202,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val text = current.draft.trim()
         if (current.conversationId.isBlank() || text.isEmpty() || current.isSending) return
         val localId = "local-${System.currentTimeMillis()}"
+        val senderName = latestProfile?.userName?.ifBlank { "workspace-user" } ?: "workspace-user"
         val optimistic = ChatMessage(
             id = localId,
             index = nextLocalIndex(current.messages),
             role = "user",
             text = text,
             preview = text,
-            userName = "Stellacode",
+            userName = senderName,
             messageTime = Instant.now().toString(),
             attachmentCount = 0,
             attachments = emptyList(),

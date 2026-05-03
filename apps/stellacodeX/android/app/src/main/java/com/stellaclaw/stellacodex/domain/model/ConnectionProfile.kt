@@ -22,6 +22,7 @@ data class ConnectionProfile(
     val sshPrivateKey: String,
     val sshPassphrase: String,
     val token: String,
+    val userName: String,
 ) {
     val effectiveTargetUrl: String
         get() = targetUrl.ifBlank { baseUrl }

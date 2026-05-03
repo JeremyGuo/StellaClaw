@@ -26,12 +26,13 @@ class ConnectionProfileStore(
             sshPrivateKey = preferences[SshPrivateKeyKey].orEmpty(),
             sshPassphrase = preferences[SshPassphraseKey].orEmpty(),
             token = preferences[TokenKey].orEmpty(),
+            userName = preferences[UserNameKey].orEmpty().ifBlank { "workspace-user" },
         )
     }
 
     suspend fun save(profile: ConnectionProfile) {
         dataStore.edit { preferences ->
-            preferences[NameKey] = profile.name.trim().ifBlank { "Stellaclaw" }
+            preferences[NameKey] = profile.name.trim().ifBlank { "StellacodeX" }
             preferences[ConnectionModeKey] = profile.connectionMode.wireName
             preferences[BaseUrlKey] = profile.baseUrl.trim().trimEnd('/')
             preferences[TargetUrlKey] = profile.effectiveTargetUrl.trim().trimEnd('/')
@@ -42,6 +43,7 @@ class ConnectionProfileStore(
             preferences[SshPrivateKeyKey] = profile.sshPrivateKey.trim()
             preferences[SshPassphraseKey] = profile.sshPassphrase
             preferences[TokenKey] = profile.token.trim()
+            preferences[UserNameKey] = profile.userName.trim().ifBlank { "workspace-user" }
         }
     }
 
@@ -57,5 +59,6 @@ class ConnectionProfileStore(
         val SshPrivateKeyKey = stringPreferencesKey("ssh_private_key")
         val SshPassphraseKey = stringPreferencesKey("ssh_passphrase")
         val TokenKey = stringPreferencesKey("token")
+        val UserNameKey = stringPreferencesKey("user_name")
     }
 }

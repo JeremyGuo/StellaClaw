@@ -40,6 +40,7 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
                         sshPrivateKey = profile.sshPrivateKey,
                         sshPassphrase = profile.sshPassphrase,
                         token = profile.token,
+                        userName = profile.userName,
                         hasSavedProfile = profile.isConfigured,
                     )
                 }
@@ -58,6 +59,7 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
     fun onSshPrivateKeyChanged(value: String) = updateForm { it.copy(sshPrivateKey = value) }
     fun onSshPassphraseChanged(value: String) = updateForm { it.copy(sshPassphrase = value) }
     fun onTokenChanged(value: String) = updateForm { it.copy(token = value) }
+    fun onUserNameChanged(value: String) = updateForm { it.copy(userName = value) }
 
     private fun updateForm(update: (ConnectionUiState) -> ConnectionUiState) {
         mutableState.update { update(it).copy(error = null, successMessage = null) }
@@ -104,7 +106,7 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
     }
 
     private fun ConnectionUiState.toProfile(): ConnectionProfile = ConnectionProfile(
-        name = name.ifBlank { "Stellaclaw" },
+        name = name.ifBlank { "StellacodeX" },
         connectionMode = connectionMode,
         baseUrl = baseUrl,
         targetUrl = targetUrl,
@@ -115,11 +117,12 @@ class ConnectionViewModel(application: Application) : AndroidViewModel(applicati
         sshPrivateKey = sshPrivateKey,
         sshPassphrase = sshPassphrase,
         token = token,
+        userName = userName,
     )
 }
 
 data class ConnectionUiState(
-    val name: String = "Stellaclaw",
+    val name: String = "StellacodeX",
     val connectionMode: ConnectionMode = ConnectionMode.SshProxy,
     val baseUrl: String = "http://127.0.0.1:3111",
     val targetUrl: String = "http://127.0.0.1:3111",
@@ -130,6 +133,7 @@ data class ConnectionUiState(
     val sshPrivateKey: String = "",
     val sshPassphrase: String = "",
     val token: String = "",
+    val userName: String = "workspace-user",
     val hasSavedProfile: Boolean = false,
     val isValidating: Boolean = false,
     val models: List<ModelInfo> = emptyList(),
