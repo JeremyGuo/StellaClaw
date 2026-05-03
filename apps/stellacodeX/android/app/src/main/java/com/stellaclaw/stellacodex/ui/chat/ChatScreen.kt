@@ -390,7 +390,7 @@ private fun MessageCard(
     onPreviewAttachment: (MessageAttachment) -> Unit,
 ) {
     val roleLabel = when (message.role.lowercase()) {
-        "user" -> message.userName ?: "You"
+        "user" -> message.userName?.takeIf { it.isNotBlank() } ?: "User"
         "assistant" -> "Assistant"
         "system" -> "System"
         else -> message.role.ifBlank { "Message" }
