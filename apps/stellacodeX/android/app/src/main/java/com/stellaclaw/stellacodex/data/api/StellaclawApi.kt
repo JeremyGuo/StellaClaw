@@ -183,18 +183,17 @@ class StellaclawApi(
                     .plus("/api/conversations/$conversationId/foreground/ws")
                     .toHttpUrlOrNull()
                     ?: return@withContext AppResult.Err(AppError.Network("Invalid WebSocket URL"))
-                val scheme = when (httpUrl.scheme) {
-                    "https" -> "wss"
-                    "http" -> "ws"
-                    else -> return@withContext AppResult.Err(AppError.Network("Unsupported WebSocket scheme"))
-                }
-                val url = httpUrl.newBuilder()
-                    .scheme(scheme)
+                val httpUrlWithToken = httpUrl.newBuilder()
                     .addQueryParameter("token", profile.token.trim())
                     .build()
+                val wsUrl = when (httpUrlWithToken.scheme) {
+                    "https" -> httpUrlWithToken.toString().replaceFirst("https://", "wss://")
+                    "http" -> httpUrlWithToken.toString().replaceFirst("http://", "ws://")
+                    else -> return@withContext AppResult.Err(AppError.Network("Unsupported WebSocket scheme"))
+                }
                 AppResult.Ok(
                     Request.Builder()
-                        .url(url)
+                        .url(wsUrl)
                         .header("Authorization", "Bearer ${profile.token.trim()}")
                         .build(),
                 )
