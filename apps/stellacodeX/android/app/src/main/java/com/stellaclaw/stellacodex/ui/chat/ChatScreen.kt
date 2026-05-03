@@ -69,7 +69,8 @@ fun ChatScreen(
     val state by viewModel.state.collectAsStateWithLifecycle()
     val listState = rememberLazyListState()
     var initialBottomPlaced by remember(conversationId) { mutableStateOf(false) }
-    val timeline = remember(state.messages) { buildChatTimeline(state.messages) }
+    val visibleMessages = remember(state.messages) { state.messages.filterNot(ChatMessage::isRuntimeMetadataMessage) }
+    val timeline = remember(visibleMessages) { buildChatTimeline(visibleMessages) }
 
     LaunchedEffect(conversationId) {
         initialBottomPlaced = false
@@ -139,7 +140,7 @@ fun ChatScreen(
             )
             when {
                 state.isLoading && state.messages.isEmpty() -> LoadingMessages()
-                state.messages.isEmpty() -> EmptyMessages()
+                visibleMessages.isEmpty() -> EmptyMessages()
                 else -> MessageList(
                     isLoadingEarlier = state.isLoadingEarlier,
                     timeline = timeline,
@@ -316,6 +317,13 @@ private fun buildChatTimeline(messages: List<ChatMessage>): List<ChatTimelineIte
     }
     flushPendingTools(expanded = true)
     return output
+}
+
+private fun ChatMessage.isRuntimeMetadataMessage(): Boolean {
+    val body = text.ifBlank { preview }.trimStart()
+    return body.startsWith("[Incoming User Metadata]") ||
+        body.startsWith("[Incoming Assistant Metadata]") ||
+        body.startsWith("[Incoming System Metadata]")
 }
 
 private fun ChatMessage.isToolOnlyMessage(): Boolean =

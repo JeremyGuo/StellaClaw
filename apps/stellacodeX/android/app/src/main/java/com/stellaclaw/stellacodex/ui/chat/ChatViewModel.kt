@@ -649,8 +649,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private companion object {
-        const val LatestMessageLimit = 30
-        const val EarlierMessageLimit = 50
+        const val LatestMessageLimit = 100
+        const val EarlierMessageLimit = 100
     }
 }
 
