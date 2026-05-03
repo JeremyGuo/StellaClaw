@@ -17,6 +17,7 @@ import com.stellaclaw.stellacodex.data.store.connectionDataStore
 import com.stellaclaw.stellacodex.domain.model.ChatMessage
 import com.stellaclaw.stellacodex.domain.model.ConnectionProfile
 import com.stellaclaw.stellacodex.domain.model.MessageAttachment
+import com.stellaclaw.stellacodex.domain.model.MessageItem
 import com.stellaclaw.stellacodex.domain.model.MessageLocalState
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -186,7 +187,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         var nextEnd = total
         var loadedOffset = total
         var loadedMessages = emptyList<ChatMessage>()
-        while (nextEnd > 0 && loadedMessages.visibleMessageCount() < VisibleMessageTarget) {
+        while (nextEnd > 0 && loadedMessages.visibleTimelineItemCount() < VisibleTimelineItemTarget) {
             val nextOffset = (nextEnd - MessagePageFetchLimit).coerceAtLeast(0)
             val page = when (val result = api.loadMessagePage(
                 profile = profile,
@@ -221,7 +222,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         var loadedOffset = startOffset
         var loadedMessages = emptyList<ChatMessage>()
         var total = state.value.totalMessages
-        while (nextEnd > 0 && loadedMessages.visibleMessageCount() < VisibleMessageTarget) {
+        while (nextEnd > 0 && loadedMessages.visibleTimelineItemCount() < VisibleTimelineItemTarget) {
             val nextOffset = (nextEnd - MessagePageFetchLimit).coerceAtLeast(0)
             val page = when (val result = api.loadMessagePage(
                 profile = profile,
@@ -403,7 +404,29 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun List<ChatMessage>.visibleMessageCount(): Int = count { !it.isRuntimeMetadataMessage() }
+    private fun List<ChatMessage>.visibleTimelineItemCount(): Int {
+        var count = 0
+        var hasPendingToolGroup = false
+        for (message in filterNot { it.isRuntimeMetadataMessage() }) {
+            if (message.isToolOnlyMessage()) {
+                hasPendingToolGroup = true
+            } else {
+                if (hasPendingToolGroup) {
+                    count += 1
+                    hasPendingToolGroup = false
+                }
+                count += 1
+            }
+        }
+        if (hasPendingToolGroup) count += 1
+        return count
+    }
+
+    private fun ChatMessage.isToolOnlyMessage(): Boolean =
+        role.equals("assistant", ignoreCase = true) &&
+            text.isBlank() &&
+            attachments.isEmpty() &&
+            items.any { it is MessageItem.ToolCall || it is MessageItem.ToolResult }
 
     private fun ChatMessage.isRuntimeMetadataMessage(): Boolean {
         val body = text.ifBlank { preview }.trimStart()
@@ -734,8 +757,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private companion object {
-        const val VisibleMessageTarget = 100
-        const val MessagePageFetchLimit = 100
+        const val VisibleTimelineItemTarget = 20
+        const val MessagePageFetchLimit = 20
     }
 }
 
