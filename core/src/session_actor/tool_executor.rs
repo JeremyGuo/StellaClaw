@@ -2,9 +2,9 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    sync::{mpsc, Arc, Mutex},
+    sync::{mpsc, Arc, Mutex, RwLock},
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossbeam_channel::Sender;
@@ -24,8 +24,8 @@ use super::{
         ToolExecutionContext,
     },
     ChatMessage, ContextItem, ConversationBridge, ToolBatch, ToolBatchCompletion, ToolBatchError,
-    ToolBatchExecutor, ToolBatchHandle, ToolExecutionOp, ToolRemoteMode, ToolResultContent,
-    ToolResultItem,
+    ToolBatchExecutor, ToolBatchHandle, ToolBatchOperation, ToolConcurrency, ToolExecutionOp,
+    ToolRemoteMode, ToolResultContent, ToolResultItem,
 };
 
 const TOOL_INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -83,6 +83,7 @@ impl LocalToolBatchExecutor {
             remote_mode: self.remote_mode.clone(),
             conversation_bridge: self.conversation_bridge.clone(),
             cancel_token: cancel_token.clone(),
+            operation_lock: Arc::new(RwLock::new(())),
         };
         let join_handle = thread::spawn(move || {
             let result = runner
@@ -124,6 +125,7 @@ struct ToolBatchRunner {
     remote_mode: ToolRemoteMode,
     conversation_bridge: Option<Arc<dyn ConversationBridge + Send + Sync>>,
     cancel_token: ToolCancellationToken,
+    operation_lock: Arc<RwLock<()>>,
 }
 
 impl ToolBatchRunner {
@@ -133,24 +135,37 @@ impl ToolBatchRunner {
         }
 
         let mut results = Vec::with_capacity(batch.operations.len());
-        for (index, operation) in batch.operations.iter().enumerate() {
+        let mut index = 0;
+        while index < batch.operations.len() {
             if self.is_interrupted() {
                 results.extend(interrupted_results(&batch.operations[index..]));
                 break;
             }
 
-            match self.execute_operation_interruptibly(operation.clone()) {
-                Ok(result) => results.push(result),
-                Err(OperationOutcome::ToolError(error)) => {
-                    results.push(tool_error_result(operation, error));
-                    results.extend(skipped_results(&batch.operations[index + 1..]));
-                    break;
+            if batch.operations[index].concurrency == ToolConcurrency::Serial {
+                match self.execute_operation_interruptibly(batch.operations[index].clone()) {
+                    Ok(result) => results.push(result),
+                    Err(OperationOutcome::ToolError(error)) => {
+                        results.push(tool_error_result(&batch.operations[index], error));
+                    }
+                    Err(OperationOutcome::Interrupted) => {
+                        results.extend(interrupted_results(&batch.operations[index..]));
+                        break;
+                    }
                 }
-                Err(OperationOutcome::Interrupted) => {
-                    results.extend(interrupted_results(&batch.operations[index..]));
-                    break;
-                }
+                index += 1;
+                continue;
             }
+
+            let parallel_end = next_serial_operation_index(&batch.operations, index);
+            let outcome = self
+                .execute_parallel_operations_interruptibly(&batch.operations[index..parallel_end]);
+            results.extend(outcome.results);
+            if outcome.interrupted {
+                results.extend(interrupted_results(&batch.operations[parallel_end..]));
+                break;
+            }
+            index = parallel_end;
         }
 
         Ok(batch.into_result_message(results))
@@ -158,20 +173,13 @@ impl ToolBatchRunner {
 
     fn execute_operation_interruptibly(
         &self,
-        operation: ToolExecutionOp,
+        scheduled: ToolBatchOperation,
     ) -> Result<ToolResultItem, OperationOutcome> {
         let (result_tx, result_rx) = mpsc::channel();
-        let runner = ToolOperationRunner {
-            workspace_root: self.workspace_root.clone(),
-            data_root: self.data_root.clone(),
-            remote_mode: self.remote_mode.clone(),
-            conversation_bridge: self.conversation_bridge.clone(),
-            cancel_token: self.cancel_token.clone(),
-        };
+        let runner = self.operation_runner();
+        let operation_lock = self.operation_lock.clone();
         let join_handle = thread::spawn(move || {
-            let result = runner
-                .execute_operation(&operation)
-                .map_err(|error| error.to_string());
+            let result = execute_scheduled_operation(runner, scheduled, operation_lock);
             let _ = result_tx.send(result);
         });
 
@@ -190,8 +198,191 @@ impl ToolBatchRunner {
         }
     }
 
+    fn execute_parallel_operations_interruptibly(
+        &self,
+        operations: &[ToolBatchOperation],
+    ) -> ParallelSegmentOutcome {
+        let (result_tx, result_rx) = mpsc::channel();
+        let mut join_handles = Vec::with_capacity(operations.len());
+        for (index, scheduled) in operations.iter().cloned().enumerate() {
+            let result_tx = result_tx.clone();
+            let runner = self.operation_runner();
+            let operation_lock = self.operation_lock.clone();
+            join_handles.push(Some(thread::spawn(move || {
+                let result = execute_scheduled_operation(runner, scheduled, operation_lock);
+                let _ = result_tx.send((index, result));
+            })));
+        }
+        drop(result_tx);
+
+        let mut results: Vec<Option<ToolResultItem>> =
+            (0..operations.len()).map(|_| None).collect();
+        let mut completed = 0usize;
+        let mut interrupted = false;
+
+        while completed < operations.len() {
+            if self.is_interrupted() {
+                let grace_deadline = Instant::now() + TOOL_COOPERATIVE_INTERRUPT_GRACE;
+                while completed < operations.len() && Instant::now() < grace_deadline {
+                    let timeout = grace_deadline.saturating_duration_since(Instant::now());
+                    if timeout.is_zero() {
+                        break;
+                    }
+                    match result_rx.recv_timeout(timeout.min(TOOL_INTERRUPT_POLL_INTERVAL)) {
+                        Ok((result_index, result)) => {
+                            collect_parallel_result(
+                                operations,
+                                &mut join_handles,
+                                &mut results,
+                                result_index,
+                                result,
+                            );
+                            completed += 1;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                interrupted = true;
+                break;
+            }
+
+            match result_rx.recv_timeout(TOOL_INTERRUPT_POLL_INTERVAL) {
+                Ok((result_index, result)) => {
+                    collect_parallel_result(
+                        operations,
+                        &mut join_handles,
+                        &mut results,
+                        result_index,
+                        result,
+                    );
+                    completed += 1;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    collect_disconnected_parallel_results(
+                        operations,
+                        &mut join_handles,
+                        &mut results,
+                    );
+                    break;
+                }
+            }
+        }
+
+        if interrupted {
+            for (index, result) in results.iter_mut().enumerate() {
+                if result.is_none() {
+                    *result = Some(tool_error_result(
+                        &operations[index],
+                        "tool batch interrupted before this tool completed".to_string(),
+                    ));
+                }
+            }
+        }
+
+        ParallelSegmentOutcome {
+            results: results
+                .into_iter()
+                .enumerate()
+                .map(|(index, result)| {
+                    result.unwrap_or_else(|| {
+                        tool_error_result(&operations[index], "tool stopped".to_string())
+                    })
+                })
+                .collect(),
+            interrupted,
+        }
+    }
+
+    fn operation_runner(&self) -> ToolOperationRunner {
+        ToolOperationRunner {
+            workspace_root: self.workspace_root.clone(),
+            data_root: self.data_root.clone(),
+            remote_mode: self.remote_mode.clone(),
+            conversation_bridge: self.conversation_bridge.clone(),
+            cancel_token: self.cancel_token.clone(),
+        }
+    }
+
     fn is_interrupted(&self) -> bool {
         self.cancel_token.is_cancelled()
+    }
+}
+
+struct ParallelSegmentOutcome {
+    results: Vec<ToolResultItem>,
+    interrupted: bool,
+}
+
+fn next_serial_operation_index(operations: &[ToolBatchOperation], start: usize) -> usize {
+    operations[start..]
+        .iter()
+        .position(|operation| operation.concurrency == ToolConcurrency::Serial)
+        .map(|offset| start + offset)
+        .unwrap_or(operations.len())
+        .max(start + 1)
+}
+
+fn execute_scheduled_operation(
+    runner: ToolOperationRunner,
+    scheduled: ToolBatchOperation,
+    operation_lock: Arc<RwLock<()>>,
+) -> Result<ToolResultItem, String> {
+    match scheduled.concurrency {
+        ToolConcurrency::Parallel => {
+            let _guard = operation_lock
+                .read()
+                .map_err(|_| "tool execution lock poisoned".to_string())?;
+            runner
+                .execute_operation(&scheduled.operation)
+                .map_err(|error| error.to_string())
+        }
+        ToolConcurrency::Serial => {
+            let _guard = operation_lock
+                .write()
+                .map_err(|_| "tool execution lock poisoned".to_string())?;
+            runner
+                .execute_operation(&scheduled.operation)
+                .map_err(|error| error.to_string())
+        }
+    }
+}
+
+fn collect_parallel_result(
+    operations: &[ToolBatchOperation],
+    join_handles: &mut [Option<JoinHandle<()>>],
+    results: &mut [Option<ToolResultItem>],
+    index: usize,
+    result: Result<ToolResultItem, String>,
+) {
+    let joined = join_handles
+        .get_mut(index)
+        .and_then(Option::take)
+        .map(|handle| handle.join());
+    let result = match joined {
+        Some(Ok(())) => result.unwrap_or_else(|error| tool_error_result(&operations[index], error)),
+        Some(Err(_)) => tool_error_result(&operations[index], "tool panicked".to_string()),
+        None => result.unwrap_or_else(|error| tool_error_result(&operations[index], error)),
+    };
+    results[index] = Some(result);
+}
+
+fn collect_disconnected_parallel_results(
+    operations: &[ToolBatchOperation],
+    join_handles: &mut [Option<JoinHandle<()>>],
+    results: &mut [Option<ToolResultItem>],
+) {
+    for index in 0..operations.len() {
+        if results[index].is_some() {
+            continue;
+        }
+        let result = match join_handles[index].take().map(|handle| handle.join()) {
+            Some(Ok(())) => tool_error_result(&operations[index], "tool stopped".to_string()),
+            Some(Err(_)) => tool_error_result(&operations[index], "tool panicked".to_string()),
+            None => tool_error_result(&operations[index], "tool stopped".to_string()),
+        };
+        results[index] = Some(result);
     }
 }
 
@@ -586,8 +777,8 @@ impl ToolBatchExecutor for LocalToolBatchExecutor {
     }
 }
 
-fn tool_error_result(operation: &ToolExecutionOp, error: String) -> ToolResultItem {
-    let (tool_call_id, tool_name) = match operation {
+fn tool_error_result(operation: &ToolBatchOperation, error: String) -> ToolResultItem {
+    let (tool_call_id, tool_name) = match &operation.operation {
         ToolExecutionOp::LocalTool(tool_call) => {
             (tool_call.tool_call_id.clone(), tool_call.tool_name.clone())
         }
@@ -617,25 +808,13 @@ fn tool_error_result(operation: &ToolExecutionOp, error: String) -> ToolResultIt
     }
 }
 
-fn interrupted_results(operations: &[ToolExecutionOp]) -> Vec<ToolResultItem> {
+fn interrupted_results(operations: &[ToolBatchOperation]) -> Vec<ToolResultItem> {
     operations
         .iter()
         .map(|operation| {
             tool_error_result(
                 operation,
                 "tool batch interrupted before this tool completed".to_string(),
-            )
-        })
-        .collect()
-}
-
-fn skipped_results(operations: &[ToolExecutionOp]) -> Vec<ToolResultItem> {
-    operations
-        .iter()
-        .map(|operation| {
-            tool_error_result(
-                operation,
-                "tool skipped: a preceding tool in this batch failed".to_string(),
             )
         })
         .collect()
@@ -852,6 +1031,66 @@ mod tests {
             fs::read_to_string(workspace.join("patch.txt")).unwrap(),
             "new\n"
         );
+
+        fs::write(workspace.join("codex_patch.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        let codex_patch = r#"*** Begin Patch
+*** Update File: codex_patch.txt
+@@
+ alpha
+-beta
++delta
+ gamma
+*** Add File: added.txt
++created
+*** End Patch
+"#;
+        let codex_patch_batch = ToolBatch::new(
+            "batch_codex_patch",
+            vec![tool_call(
+                "apply_patch",
+                json!({"patch": codex_patch, "format": "codex"}),
+            )],
+        );
+
+        let message = start_and_wait(&executor, codex_patch_batch);
+
+        assert!(result_text(&message, 0).contains("\"format\": \"codex\""));
+        assert!(result_text(&message, 0).contains("\"files_changed\""));
+        assert_eq!(
+            fs::read_to_string(workspace.join("codex_patch.txt")).unwrap(),
+            "alpha\ndelta\ngamma\n"
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("added.txt")).unwrap(),
+            "created\n"
+        );
+
+        fs::write(workspace.join("move_me.txt"), "one\ntwo\n").unwrap();
+        fs::write(workspace.join("delete_me.txt"), "remove\n").unwrap();
+        let codex_patch_auto = r#"*** Begin Patch
+*** Update File: move_me.txt
+*** Move to: moved.txt
+@@
+ one
+-two
++three
+*** Delete File: delete_me.txt
+*** End Patch
+"#;
+        let codex_patch_auto_batch = ToolBatch::new(
+            "batch_codex_patch_auto",
+            vec![tool_call("apply_patch", json!({"patch": codex_patch_auto}))],
+        );
+
+        let message = start_and_wait(&executor, codex_patch_auto_batch);
+
+        assert!(result_text(&message, 0).contains("\"format\": \"codex\""));
+        assert!(!workspace.join("move_me.txt").exists());
+        assert!(!workspace.join("delete_me.txt").exists());
+        assert_eq!(
+            fs::read_to_string(workspace.join("moved.txt")).unwrap(),
+            "one\nthree\n"
+        );
     }
 
     #[test]
@@ -955,23 +1194,24 @@ mod tests {
             ToolBatch::new(
                 "batch_shell",
                 vec![tool_call(
-                    "shell",
-                    json!({"session_id": "test_shell", "command": "printf hello", "wait_ms": 1000}),
+                    "shell_exec",
+                    json!({"shell_id": "test_shell", "command": "printf hello", "yield_time_ms": 1000}),
                 )],
             ),
         );
 
-        assert!(result_text(&message, 0).contains("\"running\": false"));
-        assert!(result_text(&message, 0).contains("hello"));
-        assert!(!result_text(&message, 0).contains("\"stderr\":"));
+        let text = result_text(&message, 0);
+        assert!(text.contains("\"running\": false"), "{text}");
+        assert!(text.contains("hello"), "{text}");
+        assert!(!text.contains("\"stderr\":"), "{text}");
 
         let message = start_and_wait(
             &executor,
             ToolBatch::new(
                 "batch_shell_running",
                 vec![tool_call(
-                    "shell",
-                    json!({"session_id": "sleep_shell", "command": "sleep 5", "wait_ms": 1}),
+                    "shell_exec",
+                    json!({"shell_id": "sleep_shell", "command": "sleep 5", "yield_time_ms": 250}),
                 )],
             ),
         );
@@ -981,34 +1221,31 @@ mod tests {
             &executor,
             ToolBatch::new(
                 "batch_shell_close",
-                vec![tool_call(
-                    "shell_close",
-                    json!({"session_id": "sleep_shell"}),
-                )],
+                vec![tool_call("shell_close", json!({"shell_id": "sleep_shell"}))],
             ),
         );
         assert!(result_text(&message, 0).contains("\"closed\": true"));
     }
 
     #[test]
-    fn shell_reports_missing_command_without_generated_unknown_session() {
+    fn shell_exec_reports_missing_command() {
         let workspace = temp_workspace();
         let executor = LocalToolBatchExecutor::new(&workspace);
         let message = start_and_wait(
             &executor,
             ToolBatch::new(
                 "batch_shell_missing_command",
-                vec![tool_call("shell", json!({}))],
+                vec![tool_call("shell_exec", json!({}))],
             ),
         );
 
         let text = result_text(&message, 0);
-        assert!(text.contains("missing command"));
+        assert!(text.contains("missing string argument command"));
         assert!(!text.contains("unknown shell session"));
     }
 
     #[test]
-    fn shell_truncates_agent_visible_output_but_keeps_artifacts() {
+    fn shell_truncates_agent_visible_output() {
         let workspace = temp_workspace();
         let executor = LocalToolBatchExecutor::new(&workspace);
         let message = start_and_wait(
@@ -1016,11 +1253,11 @@ mod tests {
             ToolBatch::new(
                 "batch_shell_truncated",
                 vec![tool_call(
-                    "shell",
+                    "shell_exec",
                     json!({
-                        "session_id": "truncated_shell",
+                        "shell_id": "truncated_shell",
                         "command": "python3 -c \"print('x' * 4000)\"",
-                        "wait_ms": 1000,
+                        "yield_time_ms": 1000,
                         "max_output_chars": 80
                     }),
                 )],
@@ -1028,8 +1265,8 @@ mod tests {
         );
 
         let text = result_text(&message, 0);
-        assert!(text.contains("\"stdout_truncated\": true"));
-        assert!(text.contains("\"out_path\":"));
+        assert!(text.contains("\"output_truncated\": true"));
+        assert!(text.contains("\"original_chars\""));
     }
 
     #[test]
@@ -1039,11 +1276,11 @@ mod tests {
         let batch = ToolBatch::new(
             "batch_shell_interrupt",
             vec![tool_call(
-                "shell",
+                "shell_exec",
                 json!({
-                    "session_id": "interrupt_shell",
+                    "shell_id": "interrupt_shell",
                     "command": "sleep 5",
-                    "wait_ms": 10_000
+                    "yield_time_ms": 10_000
                 }),
             )],
         );
@@ -1068,7 +1305,7 @@ mod tests {
 
         let text = result_text(&message, 0);
         assert!(text.contains("\"running\": true"));
-        assert!(text.contains("\"session_id\": \"interrupt_shell\""));
+        assert!(text.contains("\"shell_id\": \"interrupt_shell\""));
         assert!(!text.contains("tool batch interrupted"));
 
         let message = start_and_wait(
@@ -1077,7 +1314,7 @@ mod tests {
                 "batch_shell_interrupt_close",
                 vec![tool_call(
                     "shell_close",
-                    json!({"session_id": "interrupt_shell"}),
+                    json!({"shell_id": "interrupt_shell"}),
                 )],
             ),
         );
@@ -1256,6 +1493,115 @@ mod tests {
 
         assert_eq!(request_rx.recv().unwrap().tool_name, "user_tell");
         assert_eq!(message.data.len(), 1);
+    }
+
+    #[test]
+    fn parallel_batch_operations_start_without_waiting_for_each_other() {
+        let workspace = temp_workspace();
+        let (request_tx, request_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        let bridge = Arc::new(BlockingBridge {
+            request_tx,
+            response_rx: Mutex::new(response_rx),
+        });
+        let executor = LocalToolBatchExecutor::new(&workspace).with_conversation_bridge(bridge);
+        let batch = ToolBatch::new_scheduled(
+            "batch_parallel_bridge",
+            vec![
+                ToolBatchOperation::new(
+                    ToolExecutionOp::ConversationBridge(ConversationBridgeRequest {
+                        request_id: "req_parallel_1".to_string(),
+                        tool_call_id: "call_parallel_1".to_string(),
+                        tool_name: "user_tell".to_string(),
+                        action: "user_tell".to_string(),
+                        payload: json!({"text": "one"}),
+                    }),
+                    ToolConcurrency::Parallel,
+                ),
+                ToolBatchOperation::new(
+                    ToolExecutionOp::ConversationBridge(ConversationBridgeRequest {
+                        request_id: "req_parallel_2".to_string(),
+                        tool_call_id: "call_parallel_2".to_string(),
+                        tool_name: "user_tell".to_string(),
+                        action: "user_tell".to_string(),
+                        payload: json!({"text": "two"}),
+                    }),
+                    ToolConcurrency::Parallel,
+                ),
+            ],
+        );
+
+        let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+        let handle = executor
+            .start(batch, completion_tx)
+            .expect("batch should start");
+        let first = request_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first parallel request should start");
+        let second = request_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("second parallel request should start before first completes");
+        let mut request_ids = vec![first.request_id.clone(), second.request_id.clone()];
+        request_ids.sort_unstable();
+        assert_eq!(request_ids, vec!["req_parallel_1", "req_parallel_2"]);
+
+        for request in [first, second] {
+            response_tx
+                .send(ConversationBridgeResponse {
+                    request_id: request.request_id,
+                    tool_call_id: request.tool_call_id.clone(),
+                    tool_name: request.tool_name.clone(),
+                    result: ToolResultItem {
+                        tool_call_id: request.tool_call_id,
+                        tool_name: request.tool_name,
+                        result: ToolResultContent {
+                            context: Some(ContextItem {
+                                text: "sent".to_string(),
+                            }),
+                            file: None,
+                        },
+                    },
+                })
+                .unwrap();
+        }
+
+        let completion = completion_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("parallel batch should complete");
+        assert_eq!(completion.batch_id, handle.batch_id);
+        executor
+            .finish(&completion.batch_id)
+            .expect("parallel batch should finish");
+        let message = completion.result.expect("parallel batch result");
+        assert_eq!(message.data.len(), 2);
+    }
+
+    #[test]
+    fn failed_tool_does_not_skip_later_batch_operations() {
+        let workspace = temp_workspace();
+        let executor = LocalToolBatchExecutor::new(&workspace);
+        let batch = ToolBatch::new(
+            "batch_error_isolated",
+            vec![
+                tool_call("not_a_real_tool", json!({})),
+                tool_call(
+                    "file_write",
+                    json!({"file_path": "after_error.txt", "content": "still ran"}),
+                ),
+                tool_call("file_read", json!({"file_path": "after_error.txt"})),
+            ],
+        );
+
+        let message = start_and_wait(&executor, batch);
+
+        assert_eq!(message.data.len(), 3);
+        assert!(result_text(&message, 0).contains("unsupported tool"));
+        assert!(result_text(&message, 1).contains("\"bytes_written\": 9"));
+        assert!(result_text(&message, 2).contains("still ran"));
+        assert_eq!(
+            fs::read_to_string(workspace.join("after_error.txt")).unwrap(),
+            "still ran"
+        );
     }
 
     #[test]

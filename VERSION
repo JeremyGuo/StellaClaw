@@ -1,5 +1,25 @@
-version: 1.22.8
+version: 1.23.0
 ---
+
+# 1.23.0
+
+- 增加 tool batch 内的并行/串行调度：
+  工具定义现在带有执行并发属性，并会在模型可见 description 中明确标注 parallel 或 serial；批处理执行器会并发运行连续的 parallel 工具，遇到 serial 工具时按原始顺序独占执行。文件写入、文本编辑、apply_patch、全部 shell 工具、下载启动/取消、媒体 stop、Host bridge 状态变更和 skill 持久化等工具标为 serial，读文件、搜索、列表、web/media 查询等保持 parallel。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 batch 内工具失败互相影响的问题：
+  单个工具返回 `LocalToolError` 或 panic 时只生成该工具自己的 error result，不再跳过同一 batch 后续工具；interrupt 语义仍会把未完成工具标为 interrupted。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 增加并维护 Codex 工具差异设计文档：
+  新增 [CODEX_TOOL_DIFF.md](CODEX_TOOL_DIFF.md)，记录当前 shell / 文件编辑工具与 Codex unified exec / apply_patch 的实现差异；已落地且不再构成差异的旧方案说明会从该文档中移除，只保留当前实现状态和未实现清单。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 优化 `apply_patch` patch 格式：
+  `apply_patch` 现在支持 `format=auto|codex|unified`；本地 workspace 可直接使用 Codex 风格的 `*** Begin Patch` / `*** End Patch` envelope 表达 add/delete/update/move 文件操作，并在写入前做路径和上下文校验。统一 diff 路径继续走 `git apply`，SSH remote 暂保持 unified diff。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修正 Shell 工具优化方案文档：
+  [CODEX_TOOL_DIFF.md](CODEX_TOOL_DIFF.md) 中的 shell 路线改为 `shell_exec` 主入口和长期 shell handle 优先，明确 `export`、`cd`、venv activate 等状态应保存在可复用 shell 进程里；`shell_open` 收敛为内部能力，不暴露 mode 参数，默认使用长期 shell。同时补充 Codex unified exec 的等待、deadline、退出 token、post-exit 收尾、空输入观察、`yield_time_ms` 范围、输出截断、`shell_exec` 前清空 pending buffer、截断后中间内容获取边界、per process 的 PTY snapshot 判定，以及 shell_id 对 remote 的绑定规则。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 重构模型可见 Shell 工具：
+  移除旧 `shell` 工具，新增 `shell_exec`、`shell_observe`、`shell_write_stdin` 和 `shell_close`。`shell_exec` 默认创建或复用长期 PTY shell，保留 `export`、`cd`、venv activate 等 shell 状态；新命令写入前会清空 pending output buffer，并通过 sentinel 判断命令完成和 exit code。`remote` 只在创建/选择 shell 时参与绑定，后续带 `shell_id` 的调用自动复用同一执行位置；输出按 `max_output_chars` 做 Codex 风格中间截断。Shell runtime 现在维护 terminal screen state，解析 SGR 颜色、光标移动、清屏、回车覆盖和 alternate screen：普通 plain text / 彩色日志继续返回 stripped `output`，屏幕型 TUI 输出返回 `terminal_snapshot.visible_text`。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.22.8
 

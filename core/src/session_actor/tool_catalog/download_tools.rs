@@ -17,7 +17,7 @@ use serde_json::{json, Map, Value};
 
 use super::{
     schema::{add_remote_property, object_schema, properties},
-    ToolBackend, ToolDefinition, ToolExecutionMode, ToolRemoteMode,
+    ToolBackend, ToolConcurrency, ToolDefinition, ToolExecutionMode, ToolRemoteMode,
 };
 use crate::session_actor::tool_runtime::{
     bool_arg_with_default, f64_arg_with_default, resolve_local_path, shell_quote, string_arg,
@@ -105,7 +105,8 @@ pub fn download_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefini
             ),
             ToolExecutionMode::Interruptible,
             ToolBackend::Local,
-        ),
+        )
+        .with_concurrency(ToolConcurrency::Serial),
         ToolDefinition::new(
             "file_download_cancel",
             "Cancel a previously started download by download_id.",
@@ -115,7 +116,8 @@ pub fn download_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefini
             ),
             ToolExecutionMode::Immediate,
             ToolBackend::Local,
-        ),
+        )
+        .with_concurrency(ToolConcurrency::Serial),
     ]
 }
 

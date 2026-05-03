@@ -37,12 +37,12 @@ pub use token_estimator::{
 pub use tool_batch::{
     ConversationBridge, ConversationBridgeRequest, ConversationBridgeResponse, SearchToolModels,
     ToolBatch, ToolBatchCompletion, ToolBatchError, ToolBatchExecutor, ToolBatchHandle,
-    ToolExecutionOp,
+    ToolBatchOperation, ToolExecutionOp,
 };
 pub use tool_catalog::{
     builtin_tool_catalog, download_tool_definitions, file_tool_definitions, host_tool_definitions,
     media_tool_definitions, process_tool_definitions, skill_tool_definitions, web_tool_definitions,
     BuiltinToolCatalogOptions, HostToolScope, ProviderBackedToolKind, ProviderNativeToolKind,
-    ToolBackend, ToolCatalog, ToolCatalogError, ToolDefinition, ToolExecutionMode,
+    ToolBackend, ToolCatalog, ToolCatalogError, ToolConcurrency, ToolDefinition, ToolExecutionMode,
 };
 pub use tool_executor::LocalToolBatchExecutor;

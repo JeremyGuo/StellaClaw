@@ -27,8 +27,8 @@ use super::{
     system_prompt_for_initial, ChatMessage, ChatMessageItem, ChatRole, CompressionError,
     CompressionReport, ContextItem, ConversationBridgeRequest, SessionCompressor,
     SessionErrorDetail, SessionEvent, SessionInitial, SessionMailbox, SessionMailboxKind,
-    SessionRequest, TokenEstimator, ToolBatch, ToolBatchCompletion, ToolBatchExecutor, ToolCatalog,
-    ToolExecutionOp,
+    SessionRequest, TokenEstimator, ToolBatch, ToolBatchCompletion, ToolBatchExecutor,
+    ToolBatchOperation, ToolCatalog, ToolExecutionOp,
 };
 
 const DEFAULT_MAX_MODEL_STEPS_PER_TURN: usize = 200;
@@ -1064,35 +1064,38 @@ impl SessionActor {
         let mut operations = Vec::with_capacity(tool_calls.len());
 
         for tool_call in tool_calls {
-            let operation = match self.tool_catalog.get(&tool_call.tool_name) {
-                Some(definition) => match &definition.backend {
-                    ToolBackend::ConversationBridge { action } => {
-                        ToolExecutionOp::ConversationBridge(ConversationBridgeRequest {
-                            request_id: format!("{}_{}", batch_id, tool_call.tool_call_id),
-                            tool_call_id: tool_call.tool_call_id.clone(),
-                            tool_name: tool_call.tool_name.clone(),
-                            action: action.clone(),
-                            payload: parse_tool_arguments(&tool_call.arguments.text),
-                        })
-                    }
-                    ToolBackend::Local if tool_call.tool_name == "skill_load" => self
-                        .build_skill_load_operation(tool_call.clone())
-                        .unwrap_or(ToolExecutionOp::LocalTool(tool_call)),
-                    ToolBackend::ProviderBacked { kind } => self
-                        .build_provider_backed_operation(tool_call.clone(), *kind)
-                        .unwrap_or(ToolExecutionOp::LocalTool(tool_call)),
-                    ToolBackend::ProviderNative { .. } => ToolExecutionOp::LocalTool(tool_call),
-                    ToolBackend::Local if tool_call.tool_name == "web_search" => self
-                        .build_web_search_operation(tool_call.clone())
-                        .unwrap_or(ToolExecutionOp::LocalTool(tool_call)),
-                    ToolBackend::Local => ToolExecutionOp::LocalTool(tool_call),
-                },
-                None => ToolExecutionOp::LocalTool(tool_call),
+            let scheduled = match self.tool_catalog.get(&tool_call.tool_name) {
+                Some(definition) => {
+                    let operation = match &definition.backend {
+                        ToolBackend::ConversationBridge { action } => {
+                            ToolExecutionOp::ConversationBridge(ConversationBridgeRequest {
+                                request_id: format!("{}_{}", batch_id, tool_call.tool_call_id),
+                                tool_call_id: tool_call.tool_call_id.clone(),
+                                tool_name: tool_call.tool_name.clone(),
+                                action: action.clone(),
+                                payload: parse_tool_arguments(&tool_call.arguments.text),
+                            })
+                        }
+                        ToolBackend::Local if tool_call.tool_name == "skill_load" => self
+                            .build_skill_load_operation(tool_call.clone())
+                            .unwrap_or(ToolExecutionOp::LocalTool(tool_call)),
+                        ToolBackend::ProviderBacked { kind } => self
+                            .build_provider_backed_operation(tool_call.clone(), *kind)
+                            .unwrap_or(ToolExecutionOp::LocalTool(tool_call)),
+                        ToolBackend::ProviderNative { .. } => ToolExecutionOp::LocalTool(tool_call),
+                        ToolBackend::Local if tool_call.tool_name == "web_search" => self
+                            .build_web_search_operation(tool_call.clone())
+                            .unwrap_or(ToolExecutionOp::LocalTool(tool_call)),
+                        ToolBackend::Local => ToolExecutionOp::LocalTool(tool_call),
+                    };
+                    ToolBatchOperation::new(operation, definition.concurrency)
+                }
+                None => ToolExecutionOp::LocalTool(tool_call).into(),
             };
-            operations.push(operation);
+            operations.push(scheduled);
         }
 
-        Ok(ToolBatch::new(batch_id, operations))
+        Ok(ToolBatch::new_scheduled(batch_id, operations))
     }
 
     fn build_web_search_operation(
@@ -3284,7 +3287,7 @@ mod tests {
         let batches = tools.batches.lock().unwrap();
         assert_eq!(batches.len(), 1);
         assert!(matches!(
-            batches[0].operations[0],
+            batches[0].operations[0].operation,
             ToolExecutionOp::ConversationBridge(_)
         ));
     }

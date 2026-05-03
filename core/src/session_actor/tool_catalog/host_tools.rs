@@ -3,7 +3,7 @@ use serde_json::json;
 
 use super::{
     schema::{object_schema, properties},
-    ToolBackend, ToolDefinition, ToolExecutionMode,
+    ToolBackend, ToolConcurrency, ToolDefinition, ToolExecutionMode,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -296,4 +296,5 @@ fn bridge_tool(
             action: name.to_string(),
         },
     )
+    .with_concurrency(ToolConcurrency::Serial)
 }

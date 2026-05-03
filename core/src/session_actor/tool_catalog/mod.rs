@@ -40,6 +40,14 @@ pub enum ToolExecutionMode {
     Interruptible,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolConcurrency {
+    #[default]
+    Parallel,
+    Serial,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderBackedToolKind {
@@ -70,6 +78,7 @@ pub struct ToolDefinition {
     pub description: String,
     pub parameters: Value,
     pub execution_mode: ToolExecutionMode,
+    pub concurrency: ToolConcurrency,
     pub backend: ToolBackend,
 }
 
@@ -86,8 +95,14 @@ impl ToolDefinition {
             description: description.into(),
             parameters,
             execution_mode,
+            concurrency: ToolConcurrency::Parallel,
             backend,
         }
+    }
+
+    pub fn with_concurrency(mut self, concurrency: ToolConcurrency) -> Self {
+        self.concurrency = concurrency;
+        self
     }
 
     pub fn openai_tool_schema(&self) -> Value {
@@ -127,7 +142,7 @@ impl ToolDefinition {
     }
 
     fn description_with_execution_mode(&self) -> String {
-        let guidance = match self.execution_mode {
+        let execution_guidance = match self.execution_mode {
             ToolExecutionMode::Immediate => {
                 "Execution mode: immediate. This tool returns promptly and still runs through the ToolBatchExecutor thread."
             }
@@ -135,8 +150,19 @@ impl ToolDefinition {
                 "Execution mode: interruptible. This tool may wait, but the ToolBatchExecutor can interrupt the current batch and return a stable result."
             }
         };
+        let concurrency_guidance = match self.concurrency {
+            ToolConcurrency::Parallel => {
+                "Execution concurrency: parallel. The batch executor may run this tool at the same time as other parallel tools in the same tool-call batch."
+            }
+            ToolConcurrency::Serial => {
+                "Execution concurrency: serial. The batch executor runs this tool exclusively relative to other tools in the same tool-call batch."
+            }
+        };
 
-        format!("{guidance} {}", self.description)
+        format!(
+            "{execution_guidance} {concurrency_guidance} {}",
+            self.description
+        )
     }
 }
 
@@ -433,7 +459,11 @@ mod tests {
         .expect("catalog should build");
 
         assert!(catalog.contains("file_read"));
-        assert!(catalog.contains("shell"));
+        assert!(!catalog.contains("shell"));
+        assert!(catalog.contains("shell_exec"));
+        assert!(catalog.contains("shell_observe"));
+        assert!(catalog.contains("shell_write_stdin"));
+        assert!(catalog.contains("shell_close"));
         assert!(catalog.contains("file_download_start"));
         assert!(!catalog.contains("dsl_start"));
         assert!(catalog.contains("web_search"));
@@ -458,9 +488,13 @@ mod tests {
         let ls = catalog.get("ls").unwrap();
         assert_eq!(ls.parameters["required"], json!([]));
 
-        let shell = catalog.get("shell").unwrap();
+        let shell = catalog.get("shell_exec").unwrap();
         assert_eq!(shell.execution_mode, ToolExecutionMode::Interruptible);
-        assert!(shell.parameters["properties"].get("wait_ms").is_some());
+        assert!(shell.parameters["properties"]
+            .get("yield_time_ms")
+            .is_some());
+        assert!(shell.parameters["properties"].get("remote").is_some());
+        assert!(shell.parameters["properties"].get("session_id").is_none());
 
         let image_generation = catalog.get("image_generation").unwrap();
         assert_eq!(
@@ -698,6 +732,19 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Execution mode: immediate"));
+        assert!(file_read["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Execution concurrency: parallel"));
+
+        let file_write = schemas
+            .iter()
+            .find(|tool| tool["function"]["name"] == "file_write")
+            .expect("file_write schema should be exported");
+        assert!(file_write["function"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("Execution concurrency: serial"));
     }
 
     #[test]
@@ -790,7 +837,7 @@ mod tests {
 
         let file_read = catalog.get("file_read").unwrap();
         assert!(file_read.parameters["properties"].get("remote").is_none());
-        let shell = catalog.get("shell").unwrap();
+        let shell = catalog.get("shell_exec").unwrap();
         assert!(shell.parameters["properties"].get("remote").is_none());
         let download = catalog.get("file_download_start").unwrap();
         assert!(download.parameters["properties"].get("remote").is_none());

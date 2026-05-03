@@ -9,7 +9,7 @@ use serde_json::{json, Map, Value};
 
 use super::{
     schema::{file_tool_schema, properties},
-    ToolBackend, ToolDefinition, ToolExecutionMode, ToolRemoteMode,
+    ToolBackend, ToolConcurrency, ToolDefinition, ToolExecutionMode, ToolRemoteMode,
 };
 use crate::session_actor::tool_runtime::{LocalToolError, ToolExecutionContext};
 
@@ -48,7 +48,8 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
             ),
             ToolExecutionMode::Immediate,
             ToolBackend::Local,
-        ),
+        )
+        .with_concurrency(ToolConcurrency::Serial),
         ToolDefinition::new(
             "glob",
             "Fast file pattern matching tool. Supports glob patterns like **/*.rs and src/**/*.ts. Omit path or pass an empty string to search from the current workspace directory. Skips slow remote mounts such as sshfs/NFS by default.",
@@ -106,13 +107,18 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
             ),
             ToolExecutionMode::Immediate,
             ToolBackend::Local,
-        ),
+        )
+        .with_concurrency(ToolConcurrency::Serial),
         ToolDefinition::new(
             "apply_patch",
-            "Apply a unified diff patch inside the workspace using git apply. The patch must be a valid unified diff. Returned stdout/stderr are capped by max_output_chars; full stdout/stderr are saved under out_path.",
+            "Apply a patch inside the workspace. Supports format=auto, format=codex, or format=unified. Codex format uses an envelope with *** Begin Patch / *** End Patch and file sections such as *** Add File, *** Delete File, and *** Update File, returning files_changed. Unified format is passed to git apply; returned stdout/stderr are capped by max_output_chars. Full artifacts are saved under out_path.",
             file_tool_schema(
                 properties([
                     ("patch", json!({"type": "string"})),
+                    (
+                        "format",
+                        json!({"type": "string", "enum": ["auto", "codex", "unified"]}),
+                    ),
                     ("strip", json!({"type": "integer"})),
                     ("reverse", json!({"type": "boolean"})),
                     ("check", json!({"type": "boolean"})),
@@ -126,7 +132,8 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
             ),
             ToolExecutionMode::Immediate,
             ToolBackend::Local,
-        ),
+        )
+        .with_concurrency(ToolConcurrency::Serial),
     ]
 }
 

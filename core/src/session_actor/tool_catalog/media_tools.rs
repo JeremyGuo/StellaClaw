@@ -17,8 +17,8 @@ use serde_json::{json, Map, Value};
 
 use super::{
     schema::{add_images_property, add_remote_property, object_schema, properties},
-    BuiltinToolCatalogOptions, ProviderBackedToolKind, ToolBackend, ToolDefinition,
-    ToolExecutionMode,
+    BuiltinToolCatalogOptions, ProviderBackedToolKind, ToolBackend, ToolConcurrency,
+    ToolDefinition, ToolExecutionMode,
 };
 use crate::{
     model_config::ModelConfig,
@@ -217,6 +217,7 @@ fn stop_tool_definition(name: &str, id_field: &str, description: &str) -> ToolDe
         ToolExecutionMode::Immediate,
         ToolBackend::Local,
     )
+    .with_concurrency(ToolConcurrency::Serial)
 }
 
 pub(crate) fn execute_media_tool(

@@ -7,13 +7,13 @@ use crate::model_config::ModelConfig;
 
 use super::{
     ChatMessage, ChatMessageItem, ChatRole, ProviderBackedToolKind, SessionSkillObservation,
-    ToolCallItem, ToolResultItem,
+    ToolCallItem, ToolConcurrency, ToolResultItem,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolBatch {
     pub batch_id: String,
-    pub operations: Vec<ToolExecutionOp>,
+    pub operations: Vec<ToolBatchOperation>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -32,6 +32,13 @@ impl ToolBatch {
     pub fn new(batch_id: impl Into<String>, operations: Vec<ToolExecutionOp>) -> Self {
         Self {
             batch_id: batch_id.into(),
+            operations: operations.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn new_scheduled(batch_id: impl Into<String>, operations: Vec<ToolBatchOperation>) -> Self {
+        Self {
+            batch_id: batch_id.into(),
             operations,
         }
     }
@@ -44,7 +51,7 @@ impl ToolBatch {
         let labels = self
             .operations
             .iter()
-            .map(ToolExecutionOp::progress_label)
+            .map(ToolBatchOperation::progress_label)
             .collect::<Vec<_>>();
         let mut summary = labels
             .iter()
@@ -70,6 +77,35 @@ impl ToolBatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolBatchOperation {
+    pub operation: ToolExecutionOp,
+    pub concurrency: ToolConcurrency,
+}
+
+impl ToolBatchOperation {
+    pub fn new(operation: ToolExecutionOp, concurrency: ToolConcurrency) -> Self {
+        Self {
+            operation,
+            concurrency,
+        }
+    }
+
+    pub fn progress_label(&self) -> String {
+        self.operation.progress_label()
+    }
+}
+
+impl From<ToolExecutionOp> for ToolBatchOperation {
+    fn from(operation: ToolExecutionOp) -> Self {
+        let concurrency = operation.default_concurrency();
+        Self {
+            operation,
+            concurrency,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToolExecutionOp {
     LocalTool(ToolCallItem),
     SkillLoad {
@@ -89,6 +125,31 @@ pub enum ToolExecutionOp {
 }
 
 impl ToolExecutionOp {
+    pub fn default_concurrency(&self) -> ToolConcurrency {
+        match self {
+            Self::LocalTool(tool_call) => match tool_call.tool_name.as_str() {
+                "file_write"
+                | "edit"
+                | "apply_patch"
+                | "shell_exec"
+                | "shell_observe"
+                | "shell_write_stdin"
+                | "shell_close"
+                | "file_download_start"
+                | "file_download_cancel"
+                | "image_stop"
+                | "pdf_stop"
+                | "audio_stop"
+                | "image_generation_stop" => ToolConcurrency::Serial,
+                _ => ToolConcurrency::Parallel,
+            },
+            Self::SkillLoad { .. } | Self::ProviderBacked { .. } | Self::WebSearch { .. } => {
+                ToolConcurrency::Parallel
+            }
+            Self::ConversationBridge(_) => ToolConcurrency::Serial,
+        }
+    }
+
     pub fn progress_label(&self) -> String {
         match self {
             Self::LocalTool(tool_call)
@@ -273,7 +334,7 @@ mod tests {
 
         assert_eq!(batch.operations.len(), 1);
         assert!(matches!(
-            &batch.operations[0],
+            &batch.operations[0].operation,
             ToolExecutionOp::ConversationBridge(_)
         ));
     }
