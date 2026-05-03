@@ -1,5 +1,10 @@
-version: 1.23.1
+version: 1.23.2
 ---
+
+# 1.23.2
+
+- 增加 StellacodeX Android 应用内 APK 更新入口：
+  Settings 中新增 App updates，可通过当前 SSH profile 从服务器固定路径下载并安装 `test` 或 `stable` APK。测试版固定路径为 `/home/liuhao/ClawParty/apps/stellacodeX/android/dist/stellacodex-android-test.apk`，稳定版固定路径为 `/home/liuhao/ClawParty/apps/stellacodeX/android/dist/stellacodex-android-stable.apk`；下载和安装流程会写入 Logs，APK 通过 FileProvider 交给系统安装器。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.23.1
 
