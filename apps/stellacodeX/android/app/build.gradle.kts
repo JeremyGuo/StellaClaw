@@ -17,8 +17,21 @@ android {
         versionName = "0.1.16"
     }
 
+    signingConfigs {
+        create("stellacodexRelease") {
+            storeFile = file("../signing/stellacodex-dev-release.jks")
+            storePassword = "stellacodex"
+            keyAlias = "stellacodex"
+            keyPassword = "stellacodex"
+        }
+    }
+
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("stellacodexRelease")
+        }
         release {
+            signingConfig = signingConfigs.getByName("stellacodexRelease")
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),

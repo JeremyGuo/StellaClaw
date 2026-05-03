@@ -1,5 +1,10 @@
-version: 1.22.3
+version: 1.22.4
 ---
+
+# 1.22.4
+
+- 稳定 StellacodeX Android 安装包签名与命名：
+  Android debug / release variant 现在使用仓库内固定的 StellacodeX dev release signing key，GitHub Release 改为构建 signed release APK，并上传 `stellacodex-android-v<versionName>.apk`，文件名不再带 `debug`。已安装旧 debug keystore 包仍需卸载一次，后续同包名升级可直接覆盖安装。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.22.3
 

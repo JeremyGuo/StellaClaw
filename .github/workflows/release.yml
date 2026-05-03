@@ -188,10 +188,10 @@ jobs:
       - name: Install Android SDK packages
         run: sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
 
-      - name: Build StellacodeX Android debug APK
+      - name: Build StellacodeX Android APK
         shell: bash
         run: |
-          gradle --no-daemon :app:assembleDebug
+          gradle --no-daemon :app:assembleRelease
           version_name="$(python3 - <<'PY'
           import re
           text = open('app/build.gradle.kts', encoding='utf-8').read()
@@ -200,12 +200,12 @@ jobs:
           PY
           )"
           mkdir -p release
-          cp app/build/outputs/apk/debug/app-debug.apk "release/stellacodex-android-debug-v${version_name}.apk"
+          cp app/build/outputs/apk/release/app-release.apk "release/stellacodex-android-v${version_name}.apk"
 
       - name: Upload StellacodeX Android artifact
         uses: actions/upload-artifact@v4
         with:
-          name: stellacodex-android-debug
+          name: stellacodex-android
           path: apps/stellacodeX/android/release/*.apk
 
   publish:
