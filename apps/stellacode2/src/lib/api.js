@@ -79,11 +79,11 @@ export async function loadMessages(serverId, conversationId, options = {}) {
   return response.data?.messages || [];
 }
 
-export async function postConversationMessage(serverId, conversationId, text) {
+export async function postConversationMessage(serverId, conversationId, text, userName = 'workspace-user') {
   return api(serverId, `/api/conversations/${conversationId}/messages`, {
     method: 'POST',
     body: {
-      user_name: 'Stellacode',
+      user_name: String(userName || '').trim() || 'workspace-user',
       text
     }
   });

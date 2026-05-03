@@ -26,7 +26,8 @@ function blankServer(index) {
     baseUrl: 'http://127.0.0.1:3111',
     targetUrl: 'http://127.0.0.1:3111',
     sshHost: '',
-    token: ''
+    token: '',
+    userName: 'workspace-user'
   };
 }
 
@@ -228,6 +229,14 @@ export function SettingsDialog({ open, settings, saving, onOpenChange, onSave })
                               <input value={server.baseUrl || ''} onChange={(event) => updateServer(server.id, { baseUrl: event.target.value })} />
                             </label>
                           )}
+                          <label className="form-field">
+                            <span>Username</span>
+                            <input
+                              value={server.userName || 'workspace-user'}
+                              onChange={(event) => updateServer(server.id, { userName: event.target.value })}
+                              placeholder="workspace-user"
+                            />
+                          </label>
                           <label className="form-field wide">
                             <span>Token</span>
                             <input value={server.token || ''} onChange={(event) => updateServer(server.id, { token: event.target.value })} />

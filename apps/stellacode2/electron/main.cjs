@@ -41,7 +41,8 @@ function defaultSettings() {
         baseUrl: 'http://127.0.0.1:3111',
         targetUrl: 'http://127.0.0.1:3111',
         sshHost: '',
-        token: 'local-web-token'
+        token: 'local-web-token',
+        userName: 'workspace-user'
       }
     ],
     conversationUi: {}
@@ -62,7 +63,8 @@ function normalizeSettings(value) {
     baseUrl: String(server.baseUrl || 'http://127.0.0.1:3111'),
     targetUrl: String(server.targetUrl || server.baseUrl || 'http://127.0.0.1:3111'),
     sshHost: String(server.sshHost || ''),
-    token: String(server.token || '')
+    token: String(server.token || ''),
+    userName: String(server.userName || 'workspace-user').trim() || 'workspace-user'
   }));
   const layout = value?.layout && typeof value.layout === 'object' ? value.layout : {};
   return {

@@ -482,6 +482,11 @@ function App() {
       total_subagents: activeConversation.total_subagents
     } : {})
   }), [selectedStatus, activeConversation]);
+  const activeServer = useMemo(
+    () => (settings?.servers || []).find((server) => server.id === activeServerId) || null,
+    [settings?.servers, activeServerId]
+  );
+  const activeUserName = String(activeServer?.userName || '').trim() || 'workspace-user';
   const settingsReady = Boolean(settings);
   const composerMode = useMemo(
     () => composerModeInfo(selectedConversationStatus),
@@ -1382,7 +1387,7 @@ function App() {
     const optimistic = {
       id: `local-${Date.now()}`,
       role: 'user',
-      user_name: 'Stellacode',
+      user_name: activeUserName,
       text: value,
       preview: value,
       message_time: new Date().toISOString(),
@@ -1400,7 +1405,7 @@ function App() {
       return next;
     });
     try {
-      await postConversationMessage(selected.serverId, selected.conversationId, value);
+      await postConversationMessage(selected.serverId, selected.conversationId, value, activeUserName);
       if (websocketKeyRef.current !== key) return false;
       setMessages((current) => {
         const next = commandState.control
@@ -1459,7 +1464,7 @@ function App() {
     } finally {
       if (websocketKeyRef.current === key) setSending(false);
     }
-  }, [selected, sending]);
+  }, [selected, sending, activeUserName]);
 
   const title = activeConversation
     ? displayConversationName(activeConversation)
