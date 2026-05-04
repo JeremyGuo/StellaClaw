@@ -8,7 +8,7 @@ import com.stellaclaw.stellacodex.data.update.ApkUpdateDownloader
 import com.stellaclaw.stellacodex.ui.navigation.AppNavGraph
 
 @Composable
-fun StellacodeXApp() {
+fun StellacodeXApp(requestedConversationId: String? = null) {
     val context = LocalContext.current.applicationContext
     LaunchedEffect(Unit) {
         AppLogStore.initialize(context)
@@ -16,5 +16,5 @@ fun StellacodeXApp() {
             AppLogStore.append(context, "update", message)
         }
     }
-    AppNavGraph()
+    AppNavGraph(requestedConversationId = requestedConversationId)
 }

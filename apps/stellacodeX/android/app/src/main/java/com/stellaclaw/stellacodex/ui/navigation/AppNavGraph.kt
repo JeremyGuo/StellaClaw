@@ -1,6 +1,7 @@
 package com.stellaclaw.stellacodex.ui.navigation
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
@@ -12,8 +13,16 @@ import com.stellaclaw.stellacodex.ui.settings.SettingsScreen
 import com.stellaclaw.stellacodex.ui.workspace.WorkspaceScreen
 
 @Composable
-fun AppNavGraph() {
+fun AppNavGraph(requestedConversationId: String? = null) {
     val navController = rememberNavController()
+
+    LaunchedEffect(requestedConversationId) {
+        val conversationId = requestedConversationId?.takeIf { it.isNotBlank() } ?: return@LaunchedEffect
+        navController.navigate(AppRoute.Chat.create(conversationId)) {
+            launchSingleTop = true
+            popUpTo(AppRoute.Connections.route) { inclusive = false }
+        }
+    }
 
     NavHost(
         navController = navController,
