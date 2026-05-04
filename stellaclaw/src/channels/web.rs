@@ -626,7 +626,8 @@ impl WebChannel {
                 remote_message_id: remote_message_id.clone(),
                 user_name: request.user_name,
                 message_time: Some(
-                    normalized_client_message_time(request.message_time).unwrap_or_else(now_rfc3339),
+                    normalized_client_message_time(request.message_time)
+                        .unwrap_or_else(now_rfc3339),
                 ),
                 text: (!text.is_empty()).then_some(text),
                 files,
