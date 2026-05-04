@@ -65,6 +65,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var reconnectEnabled: Boolean = false
     private var latestProfile: ConnectionProfile? = null
     private var loadRequestSeq: Long = 0
+    private var sawActiveTurnProgress: Boolean = false
+    private var lastNotifiedCompletionKey: String? = null
 
     fun load(conversationId: String) {
         if (conversationId.isBlank()) return
@@ -818,6 +820,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             else -> phase?.replaceFirstChar { it.uppercase() } ?: "Working"
         }
         val detail = listOfNotNull(activity, hint).joinToString(" · ").ifBlank { null }
+        if (finalState == null) {
+            sawActiveTurnProgress = true
+        }
         mutableState.update {
             it.copy(
                 progressTitle = title,
@@ -827,9 +832,29 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         if (finalState == "done" || finalState == "failed") {
+            val shouldNotify = finalState == "done" && sawActiveTurnProgress
+            val completionKey = "${state.value.conversationId}:${lastServerMessageIndex(state.value.messages) ?: -1}:$finalState"
+            sawActiveTurnProgress = false
             viewModelScope.launch {
                 delay(500)
-                refresh()
+                val conversationId = state.value.conversationId
+                val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
+                syncMissingMessages(conversationId, profile, updateStatusWhenIdle = true)
+                if (shouldNotify && lastNotifiedCompletionKey != completionKey) {
+                    lastNotifiedCompletionKey = completionKey
+                    val snapshot = state.value
+                    val latestAssistant = snapshot.messages.lastOrNull { message ->
+                        message.role.equals("assistant", ignoreCase = true) &&
+                            !message.isToolOnlyMessage() &&
+                            !message.isRuntimeMetadataMessage()
+                    }
+                    AgentNotificationCenter.notifyAgentDone(
+                        context = getApplication<Application>(),
+                        conversationId = snapshot.conversationId,
+                        title = "Agent finished",
+                        detail = latestAssistant?.text?.ifBlank { latestAssistant.preview }?.take(160),
+                    )
+                }
                 delay(1200)
                 mutableState.update { it.copy(progressTitle = null, progressDetail = null, progressImportant = false) }
             }

@@ -1,6 +1,8 @@
 package com.stellaclaw.stellacodex.ui.chat
 
+import android.Manifest
 import android.app.Application
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -84,6 +86,15 @@ fun ChatScreen(
     var earlierLoadAnchor by remember(conversationId) { mutableStateOf<ScrollAnchor?>(null) }
     val visibleMessages = remember(state.messages) { state.messages.filterNot(ChatMessage::isRuntimeMetadataMessage) }
     val timeline = remember(visibleMessages) { buildChatTimeline(visibleMessages) }
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { }
+
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !AgentNotificationCenter.canNotify(application)) {
+            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }
 
     LaunchedEffect(conversationId) {
         initialBottomPlaced = false
