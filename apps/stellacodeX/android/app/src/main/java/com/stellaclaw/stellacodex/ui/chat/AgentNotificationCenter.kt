@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.RingtoneManager
 import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -16,7 +17,7 @@ import com.stellaclaw.stellacodex.R
 import kotlin.math.absoluteValue
 
 object AgentNotificationCenter {
-    private const val ChannelId = "agent_done"
+    private const val ChannelId = "agent_done_heads_up"
 
     fun canNotify(context: Context): Boolean =
         Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
@@ -48,7 +49,10 @@ object AgentNotificationCenter {
             .setStyle(NotificationCompat.BigTextStyle().bigText(detail ?: "Agent finished replying"))
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setDefaults(NotificationCompat.DEFAULT_ALL)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
             .build()
         return try {
             NotificationManagerCompat.from(context).notify(conversationId.hashCode().absoluteValue, notification)
@@ -78,10 +82,17 @@ object AgentNotificationCenter {
         manager.createNotificationChannel(
             NotificationChannel(
                 ChannelId,
-                "Agent completion",
-                NotificationManager.IMPORTANCE_DEFAULT,
+                "Agent completion alerts",
+                NotificationManager.IMPORTANCE_HIGH,
             ).apply {
-                description = "Notifies when an agent finishes replying"
+                description = "Shows a heads-up alert when an agent finishes replying"
+                enableVibration(true)
+                setSound(
+                    RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION),
+                    android.media.AudioAttributes.Builder()
+                        .setUsage(android.media.AudioAttributes.USAGE_NOTIFICATION)
+                        .build(),
+                )
             },
         )
     }
