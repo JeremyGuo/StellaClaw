@@ -12,6 +12,7 @@ import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import com.stellaclaw.stellacodex.core.result.AppResult
 import com.stellaclaw.stellacodex.data.api.StellaclawApi
+import com.stellaclaw.stellacodex.data.log.AppLogStore
 import com.stellaclaw.stellacodex.data.store.ConnectionProfileStore
 import com.stellaclaw.stellacodex.data.store.connectionDataStore
 import com.stellaclaw.stellacodex.domain.model.ChatMessage
@@ -30,40 +31,48 @@ class AgentCompletionPollWorker(
         val conversationId = inputData.getString(KeyConversationId)?.takeIf { it.isNotBlank() }
             ?: return Result.failure()
         val baselineIndex = inputData.getInt(KeyBaselineIndex, -1)
-        val remainingPolls = inputData.getInt(KeyRemainingPolls, DefaultPolls)
-        if (remainingPolls <= 0) return Result.success()
+        val remainingAttempts = MaxAttempts - runAttemptCount
+        if (remainingAttempts <= 0) {
+            log("give up conversation=$conversationId baseline=$baselineIndex")
+            return Result.success()
+        }
 
+        log("poll conversation=$conversationId baseline=$baselineIndex attempt=$runAttemptCount")
         val profile = store.profile.first()
-        return when (val result = api.loadLatestMessages(profile, conversationId, limit = 20)) {
-            is AppResult.Err -> Result.retry()
+        return when (val result = api.loadLatestMessages(profile, conversationId, limit = 30)) {
+            is AppResult.Err -> {
+                log("poll failed conversation=$conversationId error=${result.error}")
+                Result.retry()
+            }
             is AppResult.Ok -> {
                 val latestAssistant = result.value.messages
                     .filter { it.index > baselineIndex }
                     .lastOrNull { message -> message.isFinalAssistantMessage() }
                 if (latestAssistant != null) {
                     val detail = latestAssistant.text.ifBlank { latestAssistant.preview }.take(160).ifBlank { null }
-                    AgentNotificationCenter.notifyAgentDone(
+                    val notified = AgentNotificationCenter.notifyAgentDone(
                         context = applicationContext,
                         conversationId = conversationId,
                         title = "Agent finished",
                         detail = detail,
                         completionKey = "$conversationId:${latestAssistant.index}",
                     )
-                    WorkManager.getInstance(applicationContext).cancelUniqueWork(uniqueName(conversationId))
-                    Result.success()
+                    log("completion found conversation=$conversationId index=${latestAssistant.index} notified=$notified")
+                    if (notified) {
+                        Result.success()
+                    } else {
+                        Result.retry()
+                    }
                 } else {
-                    enqueue(
-                        context = applicationContext,
-                        conversationId = conversationId,
-                        baselineIndex = baselineIndex,
-                        remainingPolls = remainingPolls - 1,
-                        initialDelayMinutes = PollDelayMinutes,
-                        replace = true,
-                    )
-                    Result.success()
+                    log("no completion yet conversation=$conversationId latestTotal=${result.value.total} remainingAttempts=$remainingAttempts")
+                    Result.retry()
                 }
             }
         }
+    }
+
+    private fun log(message: String) {
+        AppLogStore.append(applicationContext, "agent-poll", message)
     }
 
     private fun ChatMessage.isFinalAssistantMessage(): Boolean =
@@ -87,9 +96,8 @@ class AgentCompletionPollWorker(
     companion object {
         private const val KeyConversationId = "conversation_id"
         private const val KeyBaselineIndex = "baseline_index"
-        private const val KeyRemainingPolls = "remaining_polls"
-        private const val DefaultPolls = 30
-        private const val PollDelayMinutes = 1L
+        private const val MaxAttempts = 30
+        private const val InitialDelaySeconds = 15L
 
         fun schedule(context: Context, conversationId: String, baselineIndex: Int) {
             if (conversationId.isBlank()) return
@@ -97,8 +105,7 @@ class AgentCompletionPollWorker(
                 context = context,
                 conversationId = conversationId,
                 baselineIndex = baselineIndex,
-                remainingPolls = DefaultPolls,
-                initialDelayMinutes = PollDelayMinutes,
+                initialDelaySeconds = InitialDelaySeconds,
                 replace = true,
             )
         }
@@ -112,8 +119,7 @@ class AgentCompletionPollWorker(
             context: Context,
             conversationId: String,
             baselineIndex: Int,
-            remainingPolls: Int,
-            initialDelayMinutes: Long,
+            initialDelaySeconds: Long,
             replace: Boolean,
         ) {
             val request = OneTimeWorkRequestBuilder<AgentCompletionPollWorker>()
@@ -122,13 +128,12 @@ class AgentCompletionPollWorker(
                         .setRequiredNetworkType(NetworkType.CONNECTED)
                         .build(),
                 )
-                .setInitialDelay(initialDelayMinutes, TimeUnit.MINUTES)
-                .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 1, TimeUnit.MINUTES)
+                .setInitialDelay(initialDelaySeconds, TimeUnit.SECONDS)
+                .setBackoffCriteria(BackoffPolicy.LINEAR, 1, TimeUnit.MINUTES)
                 .setInputData(
                     workDataOf(
                         KeyConversationId to conversationId,
                         KeyBaselineIndex to baselineIndex,
-                        KeyRemainingPolls to remainingPolls,
                     ),
                 )
                 .build()

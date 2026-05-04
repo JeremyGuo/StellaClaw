@@ -28,9 +28,9 @@ object AgentNotificationCenter {
         title: String,
         detail: String?,
         completionKey: String? = null,
-    ) {
-        if (!canNotify(context)) return
-        if (completionKey != null && !markNotificationPending(context, completionKey)) return
+    ): Boolean {
+        if (!canNotify(context)) return false
+        if (completionKey != null && isAlreadyNotified(context, completionKey)) return true
         ensureChannel(context)
         val intent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -50,14 +50,25 @@ object AgentNotificationCenter {
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .build()
-        NotificationManagerCompat.from(context).notify(conversationId.hashCode().absoluteValue, notification)
+        return try {
+            NotificationManagerCompat.from(context).notify(conversationId.hashCode().absoluteValue, notification)
+            completionKey?.let { markNotified(context, it) }
+            true
+        } catch (_: SecurityException) {
+            false
+        }
     }
 
-    private fun markNotificationPending(context: Context, completionKey: String): Boolean {
+    private fun isAlreadyNotified(context: Context, completionKey: String): Boolean {
         val prefs = context.getSharedPreferences("agent_notifications", Context.MODE_PRIVATE)
-        if (prefs.getString("last_completion_key", null) == completionKey) return false
-        prefs.edit().putString("last_completion_key", completionKey).apply()
-        return true
+        return prefs.getString("last_completion_key", null) == completionKey
+    }
+
+    private fun markNotified(context: Context, completionKey: String) {
+        context.getSharedPreferences("agent_notifications", Context.MODE_PRIVATE)
+            .edit()
+            .putString("last_completion_key", completionKey)
+            .apply()
     }
 
     private fun ensureChannel(context: Context) {
