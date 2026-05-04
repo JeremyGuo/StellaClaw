@@ -38,11 +38,12 @@ function updateStatusText(status) {
   const state = status?.state || 'idle';
   const channel = status?.channel || 'stable';
   if (state === 'checking') return `正在检查 ${channel} 更新...`;
-  if (state === 'downloading') return status.message || `正在通过 SSH 下载 ${channel} 安装包...`;
-  if (state === 'downloaded') return status.message || `${channel} 安装包已下载。`;
+  if (state === 'downloading') return status.message || `正在通过 SSH 下载 ${channel} 更新压缩包...`;
+  if (state === 'installing') return status.message || `正在解压覆盖安装 ${channel} 更新...`;
+  if (state === 'downloaded') return status.message || `${channel} 更新压缩包已下载。`;
   if (state === 'error') return `更新失败：${status.error || '未知错误'}`;
   if (status?.message) return status.message;
-  return '通过当前 SSH Profile 从固定路径拉取 test 或 stable 安装包。';
+  return '通过当前 SSH Profile 从固定路径拉取 test 或 stable 更新压缩包，解压覆盖当前安装目录后重启。';
 }
 
 function blankServer(index) {
@@ -387,7 +388,7 @@ export function SettingsDialog({ open, settings, saving, onOpenChange, onSave })
               {tab === 'update' && (
                 <div className="settings-card">
                   <strong>更新</strong>
-                  <p>当前版本 {appVersion || '未知'}。优先保留 GitHub Release 自动更新；也可以通过当前 SSH Profile 从固定路径拉取 test 或 stable 安装包。</p>
+                  <p>当前版本 {appVersion || '未知'}。优先保留 GitHub Release 自动更新；也可以通过当前 SSH Profile 从固定路径拉取 test 或 stable 更新压缩包，解压覆盖当前安装目录后重启。</p>
                   <div className="update-settings-actions">
                     <button className="secondary-button" type="button" onClick={checkGithubUpdate} disabled={githubDisabled}>
                       {githubBusy ? 'GitHub 检查中...' : '检查 GitHub 更新'}
@@ -407,10 +408,10 @@ export function SettingsDialog({ open, settings, saving, onOpenChange, onSave })
                       检查 SSH stable
                     </button>
                     <button className="secondary-button" type="button" onClick={installTest} disabled={updateDisabled}>
-                      安装 latest SSH test
+                      覆盖安装 SSH test
                     </button>
                     <button className="primary-button" type="button" onClick={installStable} disabled={updateDisabled}>
-                      安装 latest SSH stable
+                      覆盖安装 SSH stable
                     </button>
                   </div>
                   {sshUpdaterStatus?.remotePath && <p className="update-status-line">SSH 远程路径：{sshUpdaterStatus.remotePath}</p>}

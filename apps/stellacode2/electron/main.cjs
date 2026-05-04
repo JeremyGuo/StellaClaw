@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, Notification, shell } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Notification } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const childProcess = require('node:child_process');
 const fs = require('node:fs/promises');
@@ -29,15 +29,14 @@ function packageJsonPath() {
   return path.join(__dirname, '..', 'package.json');
 }
 
-function updateArtifactExtension() {
-  if (process.platform === 'win32') return '.exe';
-  if (process.platform === 'darwin') return '.dmg';
-  return '.AppImage';
+function updateArchiveExtension() {
+  if (process.platform === 'linux') return '.tar.gz';
+  return '.zip';
 }
 
 function updateRemoteName(channel) {
   const normalized = normalizeUpdateChannel(channel);
-  return `stellacode2-${process.platform}-${process.arch}-${normalized}${updateArtifactExtension()}`;
+  return `stellacode2-${process.platform}-${process.arch}-${normalized}${updateArchiveExtension()}`;
 }
 
 function updateRemotePath(channel) {
@@ -58,6 +57,19 @@ function updateChannelLabel(channel) {
 
 function localUpdatePath(channel) {
   return path.join(app.getPath('userData'), 'updates', updateRemoteName(channel));
+}
+
+function installRootPath() {
+  if (process.platform === 'darwin') {
+    const appIndex = process.execPath.indexOf('.app/Contents/MacOS/');
+    if (appIndex > 0) return process.execPath.slice(0, appIndex + 4);
+  }
+  return path.dirname(process.execPath);
+}
+
+function appRelaunchPath() {
+  if (process.platform === 'darwin') return installRootPath();
+  return process.execPath;
 }
 
 function defaultSettings() {
@@ -660,6 +672,69 @@ function shellSingleQuote(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
+function escapePowerShellString(value) {
+  return String(value).replace(/'/g, "''");
+}
+
+function spawnDetached(command, args, options = {}) {
+  const child = childProcess.spawn(command, args, {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+    ...options
+  });
+  child.unref();
+}
+
+function scheduleArchiveOverwriteInstall(archivePath) {
+  const destination = installRootPath();
+  const relaunch = appRelaunchPath();
+  if (!app.isPackaged) {
+    throw new Error('SSH archive overwrite install is only available in packaged builds.');
+  }
+  if (process.platform === 'win32') {
+    const script = [
+      'Start-Sleep -Seconds 2',
+      `$archive='${escapePowerShellString(archivePath)}'`,
+      `$dest='${escapePowerShellString(destination)}'`,
+      `$launch='${escapePowerShellString(relaunch)}'`,
+      '$tmp=Join-Path ([System.IO.Path]::GetTempPath()) ("stellacode2-update-" + [Guid]::NewGuid().ToString())',
+      'New-Item -ItemType Directory -Force -Path $tmp | Out-Null',
+      'Expand-Archive -LiteralPath $archive -DestinationPath $tmp -Force',
+      '$items=Get-ChildItem -LiteralPath $tmp -Force',
+      'if ($items.Count -eq 1 -and $items[0].PSIsContainer) { $src=$items[0].FullName } else { $src=$tmp }',
+      'Copy-Item -Path (Join-Path $src "*") -Destination $dest -Recurse -Force',
+      'Start-Process -FilePath $launch',
+      'Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue'
+    ].join('; ');
+    spawnDetached('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', script]);
+  } else {
+    const isTarGz = archivePath.endsWith('.tar.gz');
+    const extractCommand = isTarGz
+      ? `tar -xzf ${shellSingleQuote(archivePath)} -C "$tmp"`
+      : `unzip -oq ${shellSingleQuote(archivePath)} -d "$tmp"`;
+    const relaunchCommand = process.platform === 'darwin'
+      ? `open ${shellSingleQuote(relaunch)}`
+      : `${shellSingleQuote(relaunch)} >/dev/null 2>&1 &`;
+    const script = [
+      'set -e',
+      'sleep 2',
+      'tmp="$(mktemp -d)"',
+      `dest=${shellSingleQuote(destination)}`,
+      extractCommand,
+      'src="$tmp"',
+      'count="$(find "$tmp" -mindepth 1 -maxdepth 1 | wc -l | tr -d " ")"',
+      'first="$(find "$tmp" -mindepth 1 -maxdepth 1 | head -n 1)"',
+      'if [ "$count" = "1" ] && [ -d "$first" ]; then src="$first"; fi',
+      'cp -a "$src"/. "$dest"/',
+      relaunchCommand,
+      'rm -rf "$tmp"'
+    ].join('\n');
+    spawnDetached('sh', ['-lc', script]);
+  }
+  app.quit();
+}
+
 async function appVersionInfo() {
   try {
     const raw = await fs.readFile(packageJsonPath(), 'utf8');
@@ -731,7 +806,7 @@ async function checkSshUpdate(channel = 'stable') {
       remote,
       message: remote
         ? `${updateChannelLabel(normalized)} ${remote.versionName || 'unknown'} (${remote.versionCode || 0}) is available on SSH.`
-        : `${updateChannelLabel(normalized)} manifest unavailable; installer can still be pulled from fixed path.`
+        : `${updateChannelLabel(normalized)} manifest unavailable; archive can still be pulled from fixed path.`
     });
   } catch (error) {
     publishSshUpdaterState({ state: 'error', channel: normalized, error: error?.message || String(error) });
@@ -742,11 +817,10 @@ async function checkSshUpdate(channel = 'stable') {
 async function installSshUpdate(channel = 'stable') {
   const normalized = normalizeUpdateChannel(channel || sshUpdaterState.channel);
   if (sshUpdaterState.state === 'downloaded' && sshUpdaterState.filePath && (!channel || sshUpdaterState.channel === normalized)) {
-    const openError = await shell.openPath(sshUpdaterState.filePath);
-    if (openError) publishSshUpdaterState({ state: 'error', channel: sshUpdaterState.channel, error: openError });
+    scheduleArchiveOverwriteInstall(sshUpdaterState.filePath);
     return sshUpdaterState;
   }
-  if (sshUpdaterState.state === 'downloading') return sshUpdaterState;
+  if (sshUpdaterState.state === 'downloading' || sshUpdaterState.state === 'installing') return sshUpdaterState;
   publishSshUpdaterState({ state: 'checking', channel: normalized, error: '', percent: 0 });
   try {
     const settings = await readSettings();
@@ -768,7 +842,7 @@ async function installSshUpdate(channel = 'stable') {
       remote,
       totalBytes,
       percent: 0,
-      message: `Downloading ${updateChannelLabel(normalized)} installer from ${updateRemotePath(normalized)}`
+      message: `Downloading ${updateChannelLabel(normalized)} archive from ${updateRemotePath(normalized)}`
     });
     await runProcess('scp', [`${server.sshHost.trim()}:${updateRemotePath(normalized)}`, targetPath]);
     if (process.platform !== 'win32') await fs.chmod(targetPath, 0o755).catch(() => {});
@@ -780,11 +854,10 @@ async function installSshUpdate(channel = 'stable') {
       filePath: targetPath,
       totalBytes,
       percent: 100,
-      message: `Downloaded ${updateChannelLabel(normalized)} installer. Opening installer...`
+      message: `Downloaded ${updateChannelLabel(normalized)} archive. Scheduling overwrite install and restart...`
     });
-    const openError = await shell.openPath(targetPath);
-    if (openError) throw new Error(openError);
-    publishSshUpdaterState({ state: 'downloaded', channel: normalized, filePath: targetPath, percent: 100, message: 'Installer opened.' });
+    publishSshUpdaterState({ state: 'installing', channel: normalized, filePath: targetPath, percent: 100, message: 'Installing archive over current app and restarting...' });
+    scheduleArchiveOverwriteInstall(targetPath);
   } catch (error) {
     publishSshUpdaterState({ state: 'error', channel: normalized, error: error?.message || String(error) });
   }

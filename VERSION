@@ -1,5 +1,10 @@
-version: 1.24.1
+version: 1.24.2
 ---
+
+# 1.24.2
+
+- 调整 Stellacode 2 SSH 更新通道为解压覆盖安装：
+  SSH test/stable 固定路径现在拉取平台压缩包而不是安装器，Windows/macOS 使用 `.zip`，Linux 使用 `.tar.gz`；客户端下载后会在退出当前进程后解压到临时目录、覆盖当前安装目录并重新启动，临时目录正常完成后自动删除。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.24.1
 
