@@ -40,8 +40,10 @@ object NetworkMonitor {
         val manager = context.applicationContext.getSystemService(ConnectivityManager::class.java) ?: return
         connectivityManager = manager
         mutableState.value = if (manager.activeNetworkHasInternet()) NetworkState.Available else NetworkState.Unavailable
-        manager.registerDefaultNetworkCallback(callback)
-        started = true
+        val registered = runCatching {
+            manager.registerDefaultNetworkCallback(callback)
+        }.isSuccess
+        started = registered
     }
 
     @Synchronized
@@ -56,9 +58,9 @@ object NetworkMonitor {
 
     private fun hasUsableNetwork(): Boolean = connectivityManager?.activeNetworkHasInternet() == true
 
-    private fun ConnectivityManager.activeNetworkHasInternet(): Boolean {
-        val network = activeNetwork ?: return false
-        val capabilities = getNetworkCapabilities(network) ?: return false
-        return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-    }
+    private fun ConnectivityManager.activeNetworkHasInternet(): Boolean = runCatching {
+        val network = activeNetwork ?: return@runCatching false
+        val capabilities = getNetworkCapabilities(network) ?: return@runCatching false
+        capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }.getOrDefault(false)
 }
