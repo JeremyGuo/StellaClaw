@@ -98,6 +98,7 @@ fun ChatScreen(
 
     LaunchedEffect(conversationId) {
         initialBottomPlaced = false
+        AgentNotificationCenter.dismissConversation(application, conversationId)
         viewModel.load(conversationId)
     }
 

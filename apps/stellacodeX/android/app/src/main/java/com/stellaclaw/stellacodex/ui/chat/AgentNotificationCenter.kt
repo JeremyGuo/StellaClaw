@@ -23,6 +23,10 @@ object AgentNotificationCenter {
         Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 
+    fun dismissConversation(context: Context, conversationId: String) {
+        NotificationManagerCompat.from(context).cancel(notificationId(conversationId))
+    }
+
     fun notifyAgentDone(
         context: Context,
         conversationId: String,
@@ -39,7 +43,7 @@ object AgentNotificationCenter {
         }
         val pendingIntent = PendingIntent.getActivity(
             context,
-            conversationId.hashCode().absoluteValue,
+            notificationId(conversationId),
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
@@ -56,13 +60,15 @@ object AgentNotificationCenter {
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .build()
         return try {
-            NotificationManagerCompat.from(context).notify(conversationId.hashCode().absoluteValue, notification)
+            NotificationManagerCompat.from(context).notify(notificationId(conversationId), notification)
             completionKey?.let { markNotified(context, it) }
             true
         } catch (_: SecurityException) {
             false
         }
     }
+
+    private fun notificationId(conversationId: String): Int = conversationId.hashCode().absoluteValue
 
     private fun isAlreadyNotified(context: Context, completionKey: String): Boolean {
         val prefs = context.getSharedPreferences("agent_notifications", Context.MODE_PRIVATE)
