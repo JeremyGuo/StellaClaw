@@ -15,6 +15,8 @@ import com.stellaclaw.stellacodex.R
 import com.stellaclaw.stellacodex.core.result.AppResult
 import com.stellaclaw.stellacodex.data.api.StellaclawApi
 import com.stellaclaw.stellacodex.data.log.AppLogStore
+import com.stellaclaw.stellacodex.data.network.NetworkMonitor
+import com.stellaclaw.stellacodex.data.network.NetworkState
 import com.stellaclaw.stellacodex.data.store.ConnectionProfileStore
 import com.stellaclaw.stellacodex.data.store.connectionDataStore
 import com.stellaclaw.stellacodex.domain.model.ChatMessage
@@ -36,13 +38,23 @@ class AgentCompletionService : Service() {
     private val api = StellaclawApi()
     private lateinit var store: ConnectionProfileStore
     private var pollJob: Job? = null
+    private var consecutiveFailures = 0
     private val watches = linkedMapOf<String, Watch>()
 
     override fun onCreate() {
         super.onCreate()
         store = ConnectionProfileStore(applicationContext.connectionDataStore)
+        NetworkMonitor.start(applicationContext)
         ensureRunningChannel()
         watches.putAll(loadWatches())
+        serviceScope.launch {
+            NetworkMonitor.state.collect { state ->
+                if (state == NetworkState.Available && watches.isNotEmpty()) {
+                    log("network restored; poll immediately")
+                    pollOnce()
+                }
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -86,18 +98,25 @@ class AgentCompletionService : Service() {
         if (pollJob?.isActive == true) return
         pollJob = serviceScope.launch {
             while (isActive) {
-                pollOnce()
-                delay(PollDelayMillis)
+                val success = pollOnce()
+                consecutiveFailures = if (success) 0 else consecutiveFailures + 1
+                delay(nextPollDelayMillis(success))
             }
         }
     }
 
-    private suspend fun pollOnce() {
+    private suspend fun pollOnce(): Boolean {
+        if (!NetworkMonitor.isAvailable()) {
+            log("poll skipped while offline")
+            updateRunningNotification("Offline · will resume when network returns")
+            return false
+        }
         val profile = store.profile.first()
         val summaries = when (val result = api.loadConversations(profile, limit = 200)) {
             is AppResult.Err -> {
                 log("summary poll failed error=${result.error}")
-                return
+                updateRunningNotification("Network unstable · retrying in ${nextPollDelayMillis(false) / 1000}s")
+                return false
             }
             is AppResult.Ok -> result.value
         }
@@ -105,7 +124,7 @@ class AgentCompletionService : Service() {
         if (watches.isEmpty()) {
             log("no running conversations; stop service")
             stopSelf()
-            return
+            return true
         }
         updateRunningNotification()
         val runningById = summaries.associateBy { it.conversationId }
@@ -113,9 +132,18 @@ class AgentCompletionService : Service() {
         watches.values.toList().forEach { watch ->
             val summary = runningById[watch.conversationId]
             if (summary == null) {
-                completed += watch.conversationId
-                log("drop missing conversation=${watch.conversationId}")
+                val nextMissingCount = watch.missingCount + 1
+                if (nextMissingCount >= 3) {
+                    completed += watch.conversationId
+                    log("drop missing conversation=${watch.conversationId} missing_count=$nextMissingCount")
+                } else {
+                    watches[watch.conversationId] = watch.copy(missingCount = nextMissingCount)
+                    log("conversation temporarily missing conversation=${watch.conversationId} missing_count=$nextMissingCount")
+                }
                 return@forEach
+            }
+            if (watch.missingCount > 0) {
+                watches[watch.conversationId] = watch.copy(missingCount = 0)
             }
             val latestAssistant = loadLatestFinalAssistant(watch)
             if (latestAssistant != null) {
@@ -131,6 +159,18 @@ class AgentCompletionService : Service() {
         completed.forEach { watches.remove(it) }
         if (completed.isNotEmpty()) saveWatches()
         if (watches.isEmpty()) stopSelf()
+        return true
+    }
+
+    private fun nextPollDelayMillis(success: Boolean): Long = if (success) {
+        PollDelayMillis
+    } else {
+        when (consecutiveFailures) {
+            0 -> 5_000L
+            1 -> 15_000L
+            2 -> 30_000L
+            else -> PollDelayMillis
+        }
     }
 
     private fun addRunningConversations(summaries: List<ConversationSummary>) {
@@ -166,9 +206,9 @@ class AgentCompletionService : Service() {
         log("completion conversation=$conversationId index=${latestAssistant.index} notified=$notified")
     }
 
-    private fun updateRunningNotification() {
+    private fun updateRunningNotification(textOverride: String? = null) {
         val count = watches.size
-        val text = if (count == 1) "Watching 1 agent conversation" else "Watching $count agent conversations"
+        val text = textOverride ?: if (count == 1) "Watching 1 agent conversation" else "Watching $count agent conversations"
         getSystemService(NotificationManager::class.java).notify(NotificationId, runningNotification(text))
     }
 
@@ -254,6 +294,7 @@ class AgentCompletionService : Service() {
     private data class Watch(
         val conversationId: String,
         val baselineIndex: Int,
+        val missingCount: Int = 0,
     )
 
     companion object {

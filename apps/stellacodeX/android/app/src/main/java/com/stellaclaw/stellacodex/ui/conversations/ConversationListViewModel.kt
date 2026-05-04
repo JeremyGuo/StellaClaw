@@ -6,6 +6,8 @@ import androidx.lifecycle.viewModelScope
 import com.stellaclaw.stellacodex.core.result.AppResult
 import com.stellaclaw.stellacodex.core.result.userMessage
 import com.stellaclaw.stellacodex.data.api.StellaclawApi
+import com.stellaclaw.stellacodex.data.network.NetworkMonitor
+import com.stellaclaw.stellacodex.data.network.NetworkState
 import com.stellaclaw.stellacodex.data.store.ConnectionProfileStore
 import com.stellaclaw.stellacodex.data.store.connectionDataStore
 import com.stellaclaw.stellacodex.domain.model.ConnectionProfile
@@ -25,12 +27,24 @@ class ConversationListViewModel(application: Application) : AndroidViewModel(app
     val state: StateFlow<ConversationListUiState> = mutableState.asStateFlow()
 
     init {
+        NetworkMonitor.start(application)
         refresh()
+        viewModelScope.launch {
+            NetworkMonitor.state.collect { networkState ->
+                if (networkState == NetworkState.Available && state.value.error != null) {
+                    refresh(showLoading = false)
+                }
+            }
+        }
     }
 
-    fun refresh() {
+    fun refresh(showLoading: Boolean = true) {
         viewModelScope.launch {
-            mutableState.update { it.copy(isLoading = true, error = null) }
+            if (showLoading) {
+                mutableState.update { it.copy(isLoading = true, error = null) }
+            } else {
+                mutableState.update { it.copy(error = null) }
+            }
             val profile = store.profile.first()
             if (!profile.isConfigured) {
                 mutableState.update {

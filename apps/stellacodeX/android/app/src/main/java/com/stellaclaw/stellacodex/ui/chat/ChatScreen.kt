@@ -195,6 +195,7 @@ fun ChatScreen(
                     listState = listState,
                     previews = state.attachmentPreviews,
                     onPreviewAttachment = viewModel::previewAttachment,
+                    onRetrySend = viewModel::retrySend,
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -288,6 +289,7 @@ private fun MessageList(
     listState: LazyListState,
     previews: Map<String, AttachmentPreviewUiState>,
     onPreviewAttachment: (MessageAttachment) -> Unit,
+    onRetrySend: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     LazyColumn(
@@ -319,6 +321,7 @@ private fun MessageList(
                     message = item.message,
                     previews = previews,
                     onPreviewAttachment = onPreviewAttachment,
+                    onRetrySend = onRetrySend,
                 )
                 is ChatTimelineItem.ToolSummary -> ToolSummaryCard(summary = item)
             }
@@ -439,6 +442,7 @@ private fun MessageCard(
     message: ChatMessage,
     previews: Map<String, AttachmentPreviewUiState>,
     onPreviewAttachment: (MessageAttachment) -> Unit,
+    onRetrySend: (String) -> Unit,
 ) {
     val isUserMessage = message.role.equals("user", ignoreCase = true)
     val roleLabel = when (message.role.lowercase()) {
@@ -501,11 +505,16 @@ private fun MessageCard(
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.primary,
                         )
-                        MessageLocalState.Failed -> Text(
-                            text = "send failed",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.error,
-                        )
+                        MessageLocalState.Failed -> {
+                            Text(
+                                text = "send failed",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                            TextButton(onClick = { onRetrySend(message.id) }) {
+                                Text("Retry")
+                            }
+                        }
                         MessageLocalState.Synced -> Unit
                     }
                     if (message.attachmentCount > 0) {

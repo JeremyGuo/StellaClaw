@@ -13,7 +13,7 @@ class SshTunnelManager {
     private var activeTunnel: ActiveTunnel? = null
 
     @Synchronized
-    fun resolveBaseUrl(profile: ConnectionProfile): String {
+    fun resolveBaseUrl(profile: ConnectionProfile, forceRefresh: Boolean = false): String {
         val target = URI(profile.effectiveTargetUrl.trim())
         val signature = listOf(
             profile.sshHost.trim(),
@@ -23,7 +23,7 @@ class SshTunnelManager {
         ).joinToString("|")
 
         activeTunnel?.let { tunnel ->
-            if (tunnel.signature == signature && tunnel.session.isConnected) {
+            if (!forceRefresh && tunnel.signature == signature && tunnel.session.isConnected) {
                 return tunnel.baseUrl
             }
             tunnel.close()
@@ -102,6 +102,12 @@ class SshTunnelManager {
         val tunnel = ActiveTunnel(session, baseUrl, signature)
         activeTunnel = tunnel
         return baseUrl
+    }
+
+    @Synchronized
+    fun invalidate() {
+        activeTunnel?.close()
+        activeTunnel = null
     }
 
     @Synchronized

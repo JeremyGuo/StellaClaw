@@ -57,6 +57,7 @@ data class SendMessageRequestDto(
     @SerialName("user_name") val userName: String,
     val text: String,
     val files: List<SendMessageFileDto> = emptyList(),
+    @SerialName("remote_message_id") val remoteMessageId: String? = null,
 )
 
 @Serializable
