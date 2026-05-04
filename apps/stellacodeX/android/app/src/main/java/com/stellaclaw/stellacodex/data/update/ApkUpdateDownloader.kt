@@ -5,6 +5,7 @@ import com.jcraft.jsch.ChannelSftp
 import com.jcraft.jsch.JSch
 import com.jcraft.jsch.JSchException
 import com.jcraft.jsch.Session
+import com.jcraft.jsch.SftpProgressMonitor
 import com.stellaclaw.stellacodex.domain.model.ConnectionProfile
 import java.io.File
 import java.util.Properties
@@ -15,7 +16,7 @@ class ApkUpdateDownloader {
         context: Context,
         profile: ConnectionProfile,
         channel: ApkReleaseChannel,
-        onProgress: (String) -> Unit,
+        onProgress: (ApkDownloadProgress) -> Unit,
     ): File {
         require(profile.sshHost.isNotBlank() && profile.sshUser.isNotBlank()) {
             "SSH host and user are required for app update downloads"
@@ -25,21 +26,38 @@ class ApkUpdateDownloader {
             .resolve("stellacodex-${channel.wireName}.apk")
         if (targetFile.exists()) {
             targetFile.delete()
-            onProgress("Removed old ${targetFile.name} before download")
+            onProgress(ApkDownloadProgress(message = "Removed old ${targetFile.name} before download"))
         }
         val session = openSession(profile, onProgress)
         try {
             val sftp = session.openChannel("sftp") as ChannelSftp
             sftp.connect(10_000)
             try {
-                onProgress("Downloading ${channel.label} APK from ${channel.remotePath}")
+                val totalBytes = runCatching { sftp.lstat(channel.remotePath).size }.getOrDefault(-1L)
+                onProgress(
+                    ApkDownloadProgress(
+                        message = "Downloading ${channel.label} APK from ${channel.remotePath}",
+                        bytesDownloaded = 0L,
+                        totalBytes = totalBytes,
+                    ),
+                )
                 targetFile.outputStream().use { output ->
-                    sftp.get(channel.remotePath, output)
+                    sftp.get(
+                        channel.remotePath,
+                        output,
+                        ApkSftpProgressMonitor(totalBytes, onProgress),
+                    )
                 }
                 if (targetFile.length() <= 0L) {
                     error("Downloaded APK is empty")
                 }
-                onProgress("Downloaded ${targetFile.length()} bytes to ${targetFile.name}")
+                onProgress(
+                    ApkDownloadProgress(
+                        message = "Downloaded ${formatBytes(targetFile.length())} to ${targetFile.name}",
+                        bytesDownloaded = targetFile.length(),
+                        totalBytes = totalBytes,
+                    ),
+                )
                 return targetFile
             } finally {
                 sftp.disconnect()
@@ -49,7 +67,7 @@ class ApkUpdateDownloader {
         }
     }
 
-    private fun openSession(profile: ConnectionProfile, onProgress: (String) -> Unit): Session {
+    private fun openSession(profile: ConnectionProfile, onProgress: (ApkDownloadProgress) -> Unit): Session {
         val jsch = JSch()
         val privateKey = normalizePrivateKey(profile.sshPrivateKey)
         if (privateKey.isNotBlank()) {
@@ -85,7 +103,7 @@ class ApkUpdateDownloader {
         )
         session.serverAliveInterval = 15_000
         session.serverAliveCountMax = 3
-        onProgress("Connecting SSH ${profile.sshUser}@${profile.sshHost}:$port")
+        onProgress(ApkDownloadProgress(message = "Connecting SSH ${profile.sshUser}@${profile.sshHost}:$port"))
         session.connect(10_000)
         return session
     }
@@ -111,6 +129,18 @@ class ApkUpdateDownloader {
     }
 }
 
+data class ApkDownloadProgress(
+    val message: String,
+    val bytesDownloaded: Long? = null,
+    val totalBytes: Long? = null,
+) {
+    val fraction: Float? = if (bytesDownloaded != null && totalBytes != null && totalBytes > 0L) {
+        (bytesDownloaded.toDouble() / totalBytes.toDouble()).coerceIn(0.0, 1.0).toFloat()
+    } else {
+        null
+    }
+}
+
 enum class ApkReleaseChannel(
     val wireName: String,
     val label: String,
@@ -133,3 +163,54 @@ private fun normalizePrivateKey(value: String): String = value
     .replace("\r\n", "\n")
     .replace("\r", "\n")
     .replace("\\n", "\n")
+
+private class ApkSftpProgressMonitor(
+    private val totalBytes: Long,
+    private val onProgress: (ApkDownloadProgress) -> Unit,
+) : SftpProgressMonitor {
+    private var downloaded = 0L
+    private var lastReportAt = 0L
+
+    override fun init(op: Int, src: String?, dest: String?, max: Long) {
+        downloaded = 0L
+        report(force = true)
+    }
+
+    override fun count(count: Long): Boolean {
+        downloaded += count
+        report(force = false)
+        return true
+    }
+
+    override fun end() {
+        report(force = true)
+    }
+
+    private fun report(force: Boolean) {
+        val now = System.currentTimeMillis()
+        if (!force && now - lastReportAt < 300L) return
+        lastReportAt = now
+        val percent = if (totalBytes > 0L) {
+            " (${((downloaded.toDouble() / totalBytes.toDouble()) * 100).coerceIn(0.0, 100.0).toInt()}%)"
+        } else {
+            ""
+        }
+        val totalText = if (totalBytes > 0L) " / ${formatBytes(totalBytes)}" else ""
+        onProgress(
+            ApkDownloadProgress(
+                message = "Downloading ${formatBytes(downloaded)}$totalText$percent",
+                bytesDownloaded = downloaded,
+                totalBytes = totalBytes,
+            ),
+        )
+    }
+}
+
+private fun formatBytes(bytes: Long): String {
+    if (bytes < 1024L) return "$bytes B"
+    val kib = bytes / 1024.0
+    if (kib < 1024.0) return "%.1f KiB".format(kib)
+    val mib = kib / 1024.0
+    if (mib < 1024.0) return "%.1f MiB".format(mib)
+    return "%.1f GiB".format(mib / 1024.0)
+}

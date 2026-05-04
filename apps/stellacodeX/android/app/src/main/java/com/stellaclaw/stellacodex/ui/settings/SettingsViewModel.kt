@@ -34,7 +34,16 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     private fun downloadAndInstall(channel: ApkReleaseChannel) {
         if (state.value.isDownloading) return
-        mutableState.update { it.copy(isDownloading = true, status = "Preparing ${channel.label} update...", error = null) }
+        mutableState.update {
+            it.copy(
+                isDownloading = true,
+                status = "Preparing ${channel.label} update...",
+                error = null,
+                downloadProgress = null,
+                downloadedBytes = null,
+                totalBytes = null,
+            )
+        }
         viewModelScope.launch {
             val app = getApplication<Application>()
             try {
@@ -54,9 +63,16 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                 }
                 val profile = store.profile.first()
                 val apk = withContext(Dispatchers.IO) {
-                    downloader.download(app, profile, channel) { message ->
-                        AppLogStore.append(app, "update", message)
-                        mutableState.update { it.copy(status = message) }
+                    downloader.download(app, profile, channel) { progress ->
+                        AppLogStore.append(app, "update", progress.message)
+                        mutableState.update {
+                            it.copy(
+                                status = progress.message,
+                                downloadProgress = progress.fraction,
+                                downloadedBytes = progress.bytesDownloaded,
+                                totalBytes = progress.totalBytes?.takeIf { total -> total > 0L },
+                            )
+                        }
                     }
                 }
                 AppLogStore.append(app, "update", "Launching installer for ${apk.name}")
@@ -66,11 +82,24 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 app.startActivity(intent)
-                mutableState.update { it.copy(isDownloading = false, status = "Installer opened for ${channel.label} APK.") }
+                mutableState.update {
+                    it.copy(
+                        isDownloading = false,
+                        status = "Installer opened for ${channel.label} APK.",
+                        downloadProgress = 1f,
+                    )
+                }
             } catch (error: Exception) {
                 val message = error.message.orEmpty().ifBlank { error::class.simpleName ?: "update failed" }
                 AppLogStore.append(app, "update", "${channel.label} update failed: $message")
-                mutableState.update { it.copy(isDownloading = false, error = message, status = "Update failed") }
+                mutableState.update {
+                    it.copy(
+                        isDownloading = false,
+                        error = message,
+                        status = "Update failed",
+                        downloadProgress = null,
+                    )
+                }
             }
         }
     }
@@ -80,4 +109,7 @@ data class SettingsUiState(
     val isDownloading: Boolean = false,
     val status: String = "",
     val error: String? = null,
+    val downloadProgress: Float? = null,
+    val downloadedBytes: Long? = null,
+    val totalBytes: Long? = null,
 )
