@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.stellaclaw.stellacodex.MainActivity
@@ -38,6 +39,7 @@ class AgentCompletionService : Service() {
     private val api = StellaclawApi()
     private lateinit var store: ConnectionProfileStore
     private var pollJob: Job? = null
+    private var wakeLock: PowerManager.WakeLock? = null
     private var consecutiveFailures = 0
     private val watches = linkedMapOf<String, Watch>()
 
@@ -46,6 +48,7 @@ class AgentCompletionService : Service() {
         store = ConnectionProfileStore(applicationContext.connectionDataStore)
         NetworkMonitor.start(applicationContext)
         ensureRunningChannel()
+        acquireWakeLock()
         watches.putAll(loadWatches())
         serviceScope.launch {
             NetworkMonitor.state.collect { state ->
@@ -68,8 +71,8 @@ class AgentCompletionService : Service() {
                     watches.remove(conversationId)
                 }
                 saveWatches()
-                if (watches.isEmpty()) stopSelf()
-                return START_NOT_STICKY
+                updateRunningNotification()
+                return START_STICKY
             }
             ActionWatch -> {
                 val conversationId = intent.getStringExtra(ExtraConversationId).orEmpty()
@@ -97,6 +100,7 @@ class AgentCompletionService : Service() {
 
     override fun onDestroy() {
         pollJob?.cancel()
+        releaseWakeLock()
         serviceJob.cancel()
         super.onDestroy()
     }
@@ -131,8 +135,8 @@ class AgentCompletionService : Service() {
         }
         addRunningConversations(summaries)
         if (watches.isEmpty()) {
-            log("no running conversations; stop service")
-            stopSelf()
+            log("no active watches; keep resident service alive")
+            updateRunningNotification("Resident monitor active · no running agents")
             return true
         }
         updateRunningNotification()
@@ -190,7 +194,7 @@ class AgentCompletionService : Service() {
         }
         completed.forEach { watches.remove(it) }
         saveWatches()
-        if (watches.isEmpty()) stopSelf()
+        updateRunningNotification()
         return true
     }
 
@@ -259,7 +263,11 @@ class AgentCompletionService : Service() {
 
     private fun updateRunningNotification(textOverride: String? = null) {
         val count = watches.size
-        val text = textOverride ?: if (count == 1) "Watching 1 agent conversation" else "Watching $count agent conversations"
+        val text = textOverride ?: when (count) {
+            0 -> "Resident monitor active · no running agents"
+            1 -> "Watching 1 agent conversation"
+            else -> "Watching $count agent conversations"
+        }
         runCatching {
             getSystemService(NotificationManager::class.java).notify(NotificationId, runningNotification(text))
         }.onFailure { error ->
@@ -302,6 +310,32 @@ class AgentCompletionService : Service() {
                 description = "Keeps agent completion polling active while agents are running"
             },
         )
+    }
+
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        runCatching {
+            val powerManager = getSystemService(PowerManager::class.java)
+            wakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "StellacodeX:AgentCompletionMonitor",
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+            log("partial wake lock acquired")
+        }.onFailure { error ->
+            log("wake lock acquire failed ${error::class.java.simpleName}: ${error.message.orEmpty()}")
+        }
+    }
+
+    private fun releaseWakeLock() {
+        runCatching {
+            wakeLock?.takeIf { it.isHeld }?.release()
+        }.onFailure { error ->
+            log("wake lock release failed ${error::class.java.simpleName}: ${error.message.orEmpty()}")
+        }
+        wakeLock = null
     }
 
     private fun loadWatches(): Map<String, Watch> {
