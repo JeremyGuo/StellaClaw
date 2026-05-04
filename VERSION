@@ -1,5 +1,10 @@
-version: 1.24.0
+version: 1.24.1
 ---
+
+# 1.24.1
+
+- 修复 Stellacode 2 GitHub 自动更新安装包资产路径：
+  Electron builder 现在固定生成与 `latest.yml` 一致的安装包文件名 `Stellacode-Setup-<version>.<ext>`，并将桌面客户端发布配置指向当前 `JeremyGuo/StellaClaw` 仓库，避免 Windows 自动更新请求 `Stellacode-Setup-<version>.exe` 时命中 404。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.24.0
 

@@ -8,7 +8,7 @@
   "author": "Jeremy Guo",
   "repository": {
     "type": "git",
-    "url": "https://github.com/JeremyGuo/ClawParty.git"
+    "url": "https://github.com/JeremyGuo/StellaClaw.git"
   },
   "main": "electron/main.cjs",
   "scripts": {
@@ -50,6 +50,7 @@
     "directories": {
       "output": "release"
     },
+    "artifactName": "${productName}-Setup-${version}.${ext}",
     "files": [
       "dist/**/*",
       "electron/**/*",
@@ -106,7 +107,7 @@
     "publish": {
       "provider": "github",
       "owner": "JeremyGuo",
-      "repo": "ClawParty"
+      "repo": "StellaClaw"
     }
   }
 }
