@@ -396,7 +396,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                     cacheCurrentConversation()
-                    AgentCompletionPollWorker.schedule(
+                    AgentCompletionService.start(
                         context = getApplication<Application>(),
                         conversationId = current.conversationId,
                         baselineIndex = baselineIndex,
@@ -827,7 +827,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val detail = listOfNotNull(activity, hint).joinToString(" · ").ifBlank { null }
         if (finalState == null) {
             sawActiveTurnProgress = true
-            AgentCompletionPollWorker.schedule(
+            AgentCompletionService.start(
                 context = getApplication<Application>(),
                 conversationId = state.value.conversationId,
                 baselineIndex = lastServerMessageIndex(state.value.messages) ?: -1,
@@ -864,7 +864,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         detail = latestAssistant?.text?.ifBlank { latestAssistant.preview }?.take(160),
                         completionKey = completionKey,
                     )
-                    AgentCompletionPollWorker.cancel(getApplication<Application>(), conversationId)
+                    AgentCompletionService.stop(getApplication<Application>(), conversationId)
                 }
                 delay(1200)
                 mutableState.update { it.copy(progressTitle = null, progressDetail = null, progressImportant = false) }
