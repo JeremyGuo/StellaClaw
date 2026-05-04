@@ -55,6 +55,7 @@ data class MarkConversationSeenRequestDto(
 @Serializable
 data class SendMessageRequestDto(
     @SerialName("user_name") val userName: String,
+    @SerialName("message_time") val messageTime: String? = null,
     val text: String,
     val files: List<SendMessageFileDto> = emptyList(),
     @SerialName("remote_message_id") val remoteMessageId: String? = null,

@@ -1359,6 +1359,8 @@ impl SessionActor {
     ) -> Result<(), SessionActorError> {
         self.history = saved.current_messages;
         self.all_messages = saved.all_messages;
+        stamp_missing_assistant_message_times(&mut self.history);
+        stamp_missing_assistant_message_times(&mut self.all_messages);
         self.next_turn_id = saved.next_turn_id.max(1);
         self.next_batch_id = saved.next_batch_id.max(1);
         self.runtime_metadata_state = saved.runtime_metadata_state;
@@ -2062,6 +2064,12 @@ fn now_rfc3339() -> String {
 fn stamp_assistant_message_time(message: &mut ChatMessage) {
     if message.role == ChatRole::Assistant && message.message_time.is_none() {
         message.message_time = Some(now_rfc3339());
+    }
+}
+
+fn stamp_missing_assistant_message_times(messages: &mut [ChatMessage]) {
+    for message in messages {
+        stamp_assistant_message_time(message);
     }
 }
 

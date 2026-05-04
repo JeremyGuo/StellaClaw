@@ -30,6 +30,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.time.Instant
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 import kotlin.random.Random
@@ -130,12 +131,14 @@ class StellaclawApi(
         text: String,
         files: List<SendMessageFileDto> = emptyList(),
         remoteMessageId: String? = null,
+        messageTime: String = Instant.now().toString(),
     ): AppResult<Unit> = post(
         profile = profile,
         path = "/api/conversations/$conversationId/messages",
         body = json.encodeToString(
             SendMessageRequestDto(
                 userName = profile.userName.ifBlank { "workspace-user" },
+                messageTime = messageTime,
                 text = text,
                 files = files,
                 remoteMessageId = remoteMessageId,

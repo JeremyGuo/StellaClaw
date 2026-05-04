@@ -625,7 +625,9 @@ impl WebChannel {
             message: IncomingConversationMessage {
                 remote_message_id: remote_message_id.clone(),
                 user_name: request.user_name,
-                message_time: Some(now_rfc3339()),
+                message_time: Some(
+                    normalized_client_message_time(request.message_time).unwrap_or_else(now_rfc3339),
+                ),
                 text: (!text.is_empty()).then_some(text),
                 files,
                 control,
@@ -1756,6 +1758,8 @@ struct SendMessageRequest {
     remote_message_id: Option<String>,
     #[serde(default)]
     user_name: Option<String>,
+    #[serde(default)]
+    message_time: Option<String>,
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
@@ -3386,6 +3390,16 @@ fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn normalized_client_message_time(message_time: Option<String>) -> Option<String> {
+    let value = message_time?.trim().to_string();
+    if value.is_empty() {
+        return None;
+    }
+    OffsetDateTime::parse(&value, &Rfc3339)
+        .ok()
+        .and_then(|time| time.format(&Rfc3339).ok())
 }
 
 fn system_time_rfc3339(system_time: SystemTime) -> Option<String> {

@@ -398,6 +398,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val baselineIndex = lastServerMessageIndex(current.messages) ?: -1
         val remoteMessageId = "android-${UUID.randomUUID()}"
         val localId = remoteMessageId
+        val clientMessageTime = Instant.now().toString()
         val senderName = latestProfile?.userName?.ifBlank { "workspace-user" } ?: "workspace-user"
         val optimistic = ChatMessage(
             id = localId,
@@ -406,7 +407,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             text = text,
             preview = text,
             userName = senderName,
-            messageTime = Instant.now().toString(),
+            messageTime = clientMessageTime,
             attachmentCount = attachments.size,
             attachments = emptyList(),
             items = emptyList(),
@@ -440,7 +441,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 return@launch
             }
-            when (val result = api.sendMessage(profile, current.conversationId, text, files, remoteMessageId = remoteMessageId)) {
+            when (val result = api.sendMessage(
+                profile,
+                current.conversationId,
+                text,
+                files,
+                remoteMessageId = remoteMessageId,
+                messageTime = clientMessageTime,
+            )) {
                 is AppResult.Ok -> {
                     pendingSends.remove(localId)
                     mutableState.update { state ->
@@ -472,6 +480,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         text = text,
                         files = files,
                         baselineIndex = baselineIndex,
+                        messageTime = clientMessageTime,
                     )
                     mutableState.update { state ->
                         state.copy(
@@ -524,6 +533,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             text = pending.text,
             files = pending.files,
             remoteMessageId = pending.remoteMessageId,
+            messageTime = pending.messageTime,
         )) {
             is AppResult.Ok -> {
                 pendingSends.remove(pending.localId)
@@ -686,18 +696,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun mergeMessages(existing: List<ChatMessage>, incoming: List<ChatMessage>): List<ChatMessage> {
-        val existingById = existing.associateBy { it.id }
-        val receivedAt = Instant.now().toString()
         val syncedIncoming = incoming.map { remote ->
-            val preservedTime = existingById[remote.id]?.messageTime
-            val clientReceivedTime = remote.role
-                .takeIf { it.equals("assistant", ignoreCase = true) }
-                ?.takeIf { remote.messageTime.isNullOrBlank() }
-                ?.let { preservedTime ?: receivedAt }
-            remote.copy(
-                localState = MessageLocalState.Synced,
-                messageTime = remote.messageTime ?: clientReceivedTime,
-            )
+            remote.copy(localState = MessageLocalState.Synced)
         }
         val byId = linkedMapOf<String, ChatMessage>()
         existing.filterNot { local ->
@@ -1209,4 +1209,5 @@ private data class PendingSend(
     val text: String,
     val files: List<SendMessageFileDto>,
     val baselineIndex: Int,
+    val messageTime: String,
 )
