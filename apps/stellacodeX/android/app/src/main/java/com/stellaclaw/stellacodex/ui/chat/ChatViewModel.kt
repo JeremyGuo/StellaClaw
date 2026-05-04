@@ -27,6 +27,7 @@ import com.stellaclaw.stellacodex.domain.model.ConnectionProfile
 import com.stellaclaw.stellacodex.domain.model.MessageAttachment
 import com.stellaclaw.stellacodex.domain.model.MessageItem
 import com.stellaclaw.stellacodex.domain.model.MessageLocalState
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -61,6 +62,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private val mutableState = MutableStateFlow(ChatUiState())
     val state: StateFlow<ChatUiState> = mutableState.asStateFlow()
+    private val coroutineErrorHandler = CoroutineExceptionHandler { _, throwable ->
+        logDebug("coroutine failure ${throwable::class.java.simpleName}: ${throwable.message.orEmpty()}")
+        mutableState.update { it.copy(isLoading = false, isSending = false, error = throwable.message ?: "Unexpected app error") }
+    }
     private var webSocket: WebSocket? = null
     private var realtimeConversationId: String = ""
     private var reconnectJob: Job? = null
@@ -77,8 +82,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private val pendingSends = linkedMapOf<String, PendingSend>()
 
     init {
+        AppLogStore.append(application, "chat", "ChatViewModel.init")
         NetworkMonitor.start(application)
-        viewModelScope.launch {
+        viewModelScope.launch(coroutineErrorHandler) {
             NetworkMonitor.state.collect { networkState ->
                 handleNetworkState(networkState)
             }
@@ -87,6 +93,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun handleNetworkState(networkState: NetworkState) {
         val conversationId = state.value.conversationId
+        logDebug("network state=$networkState conversation=${conversationId.take(12)}")
         when (networkState) {
             NetworkState.Available -> {
                 val profile = latestProfile
@@ -95,7 +102,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 if (conversationId.isNotBlank()) {
                     mutableState.update { it.copy(realtimeState = "Network restored; syncing...") }
-                    viewModelScope.launch {
+                    viewModelScope.launch(coroutineErrorHandler) {
                         val activeProfile = profile ?: store.profile.first().also { latestProfile = it }
                         if (webSocket == null && reconnectEnabled) {
                             connectRealtime(activeProfile, conversationId, forceRefreshTunnel = true)
@@ -116,6 +123,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun load(conversationId: String) {
         if (conversationId.isBlank()) return
+        logDebug("load conversation=${conversationId.take(12)}")
         if (state.value.conversationId == conversationId && webSocket != null) return
         val requestSeq = ++loadRequestSeq
         cacheCurrentConversation()
@@ -133,7 +141,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 progressDetail = null,
             )
         }
-        viewModelScope.launch {
+        viewModelScope.launch(coroutineErrorHandler) {
             val profile = store.profile.first()
             if (requestSeq != loadRequestSeq || state.value.conversationId != conversationId) return@launch
             latestProfile = profile
@@ -187,7 +195,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val key = attachment.previewKey()
         val current = state.value.attachmentPreviews[key]
         if (current?.isLoading == true || current?.hasContent == true) return
-        viewModelScope.launch {
+        viewModelScope.launch(coroutineErrorHandler) {
             mutableState.update {
                 it.copy(
                     attachmentPreviews = it.attachmentPreviews + (key to AttachmentPreviewUiState(isLoading = true)),
@@ -234,7 +242,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val conversationId = state.value.conversationId
         if (conversationId.isBlank()) return
         val requestSeq = loadRequestSeq
-        viewModelScope.launch {
+        viewModelScope.launch(coroutineErrorHandler) {
             if (showLoading) {
                 mutableState.update { it.copy(isLoading = true, error = null) }
             } else {
@@ -358,7 +366,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val snapshot = state.value
         val conversationId = snapshot.conversationId
         if (conversationId.isBlank() || snapshot.loadedOffset <= 0 || snapshot.isLoadingEarlier) return
-        viewModelScope.launch {
+        viewModelScope.launch(coroutineErrorHandler) {
             mutableState.update { it.copy(isLoadingEarlier = true, error = null) }
             val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
             when (val result = loadEarlierVisibleMessages(profile, conversationId, snapshot.loadedOffset)) {
@@ -385,6 +393,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val current = state.value
         val text = current.draft.trim()
         val attachments = current.pendingAttachments
+        logDebug("send requested conversation=${current.conversationId.take(12)} text_chars=${text.length} attachments=${attachments.size}")
         if (current.conversationId.isBlank() || (text.isEmpty() && attachments.isEmpty()) || current.isSending) return
         val baselineIndex = lastServerMessageIndex(current.messages) ?: -1
         val remoteMessageId = "android-${UUID.randomUUID()}"
@@ -415,7 +424,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             )
         }
         cacheCurrentConversation()
-        viewModelScope.launch {
+        viewModelScope.launch(coroutineErrorHandler) {
             val profile: ConnectionProfile = store.profile.first()
             latestProfile = profile
             val files = try {
@@ -485,7 +494,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun retrySend(localId: String) {
         val pending = pendingSends[localId] ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(coroutineErrorHandler) {
             val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
             sendPending(profile, pending)
         }
@@ -721,7 +730,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (previous == null || current == null || current >= previous) {
             pendingSeen[conversationId] = lastSeenMessageId
         }
-        viewModelScope.launch {
+        viewModelScope.launch(coroutineErrorHandler) {
             flushPendingSeen(profile)
         }
     }
@@ -754,8 +763,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         if (syncJob?.isActive == true) {
             pendingSyncReason = reason
+            logDebug("sync queued conversation=${conversationId.take(12)} reason=$reason")
             return
         }
+        logDebug("sync requested conversation=${conversationId.take(12)} reason=$reason")
         syncJob = viewModelScope.launch {
             syncMissingMessages(conversationId, profile, updateStatusWhenIdle = updateStatusWhenIdle)
             val nextReason = pendingSyncReason
@@ -843,7 +854,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val nextMessageId = (payload["next_message_id"] as? JsonPrimitive)?.content?.toIntOrNull()
             ?: (payload["total"] as? JsonPrimitive)?.intOrNull
             ?: return
-        viewModelScope.launch {
+        viewModelScope.launch(coroutineErrorHandler) {
             if (state.value.conversationId != conversationId || conversationId != realtimeConversationId) return@launch
             val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
             val lastLocalId = lastServerMessageIndex(state.value.messages)
@@ -947,7 +958,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun logRealtime(message: String) {
-        AppLogStore.append(getApplication(), "realtime", message)
+        logDebug("realtime: $message")
+    }
+
+    private fun logDebug(message: String) {
+        AppLogStore.append(getApplication(), "chat", message)
     }
 
     private fun handleWebSocketText(conversationId: String, text: String) {
@@ -972,7 +987,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         handleProgress(payload["turn_progress"] as JsonObject)
                     }
                     handleSubscriptionAck(conversationId, payload)
-                    viewModelScope.launch {
+                    viewModelScope.launch(coroutineErrorHandler) {
                         val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
                         requestSync(conversationId, profile, SyncReason.WebSocketAck, updateStatusWhenIdle = true)
                     }
@@ -1044,7 +1059,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         if (finalState == "done" || finalState == "failed") {
             val shouldNotify = finalState == "done" && sawActiveTurnProgress
             sawActiveTurnProgress = false
-            viewModelScope.launch {
+            viewModelScope.launch(coroutineErrorHandler) {
                 delay(500)
                 val conversationId = state.value.conversationId
                 val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
@@ -1095,7 +1110,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             reconnectAttempt = 0
             logRealtime("onOpen conversation=$conversationId http=${response.code} ${response.message}")
             mutableState.update { it.copy(realtimeState = "Realtime connected") }
-            viewModelScope.launch {
+            viewModelScope.launch(coroutineErrorHandler) {
                 val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
                 requestSync(conversationId, profile, SyncReason.Reconnected, updateStatusWhenIdle = true)
             }

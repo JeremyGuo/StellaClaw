@@ -51,7 +51,8 @@ class AgentCompletionService : Service() {
             NetworkMonitor.state.collect { state ->
                 if (state == NetworkState.Available && watches.isNotEmpty()) {
                     log("network restored; poll immediately")
-                    pollOnce()
+                    runCatching { pollOnce() }
+                        .onFailure { error -> log("network-resume poll failed ${error::class.java.simpleName}: ${error.message.orEmpty()}") }
                 }
             }
         }
@@ -81,7 +82,13 @@ class AgentCompletionService : Service() {
             }
             else -> Unit
         }
-        startForeground(NotificationId, runningNotification("Checking agent conversations"))
+        runCatching {
+            startForeground(NotificationId, runningNotification("Checking agent conversations"))
+        }.onFailure { error ->
+            log("startForeground failed ${error::class.java.simpleName}: ${error.message.orEmpty()}")
+            stopSelf()
+            return START_NOT_STICKY
+        }
         ensurePollLoop()
         return START_STICKY
     }
@@ -98,7 +105,9 @@ class AgentCompletionService : Service() {
         if (pollJob?.isActive == true) return
         pollJob = serviceScope.launch {
             while (isActive) {
-                val success = pollOnce()
+                val success = runCatching { pollOnce() }
+                    .onFailure { error -> log("poll loop failure ${error::class.java.simpleName}: ${error.message.orEmpty()}") }
+                    .getOrDefault(false)
                 consecutiveFailures = if (success) 0 else consecutiveFailures + 1
                 delay(nextPollDelayMillis(success))
             }
@@ -209,7 +218,11 @@ class AgentCompletionService : Service() {
     private fun updateRunningNotification(textOverride: String? = null) {
         val count = watches.size
         val text = textOverride ?: if (count == 1) "Watching 1 agent conversation" else "Watching $count agent conversations"
-        getSystemService(NotificationManager::class.java).notify(NotificationId, runningNotification(text))
+        runCatching {
+            getSystemService(NotificationManager::class.java).notify(NotificationId, runningNotification(text))
+        }.onFailure { error ->
+            log("update running notification failed ${error::class.java.simpleName}: ${error.message.orEmpty()}")
+        }
     }
 
     private fun runningNotification(text: String) = NotificationCompat.Builder(this, RunningChannelId)
@@ -309,7 +322,11 @@ class AgentCompletionService : Service() {
         private const val PrefsWatches = "watches"
 
         fun start(context: Context) {
-            ContextCompat.startForegroundService(context, Intent(context, AgentCompletionService::class.java))
+            runCatching {
+                ContextCompat.startForegroundService(context, Intent(context, AgentCompletionService::class.java))
+            }.onFailure { error ->
+                AppLogStore.append(context, "agent-service", "start service failed ${error::class.java.simpleName}: ${error.message.orEmpty()}")
+            }
         }
 
         fun watch(context: Context, conversationId: String, baselineIndex: Int) {
@@ -319,7 +336,11 @@ class AgentCompletionService : Service() {
                 putExtra(ExtraConversationId, conversationId)
                 putExtra(ExtraBaselineIndex, baselineIndex)
             }
-            ContextCompat.startForegroundService(context, intent)
+            runCatching {
+                ContextCompat.startForegroundService(context, intent)
+            }.onFailure { error ->
+                AppLogStore.append(context, "agent-service", "watch start failed conversation=$conversationId ${error::class.java.simpleName}: ${error.message.orEmpty()}")
+            }
         }
 
         fun stop(context: Context, conversationId: String) {
@@ -327,7 +348,11 @@ class AgentCompletionService : Service() {
                 action = ActionStop
                 putExtra(ExtraConversationId, conversationId)
             }
-            context.startService(intent)
+            runCatching {
+                context.startService(intent)
+            }.onFailure { error ->
+                AppLogStore.append(context, "agent-service", "stop service failed conversation=$conversationId ${error::class.java.simpleName}: ${error.message.orEmpty()}")
+            }
         }
     }
 }

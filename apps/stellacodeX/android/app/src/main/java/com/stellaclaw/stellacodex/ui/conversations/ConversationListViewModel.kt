@@ -6,12 +6,14 @@ import androidx.lifecycle.viewModelScope
 import com.stellaclaw.stellacodex.core.result.AppResult
 import com.stellaclaw.stellacodex.core.result.userMessage
 import com.stellaclaw.stellacodex.data.api.StellaclawApi
+import com.stellaclaw.stellacodex.data.log.AppLogStore
 import com.stellaclaw.stellacodex.data.network.NetworkMonitor
 import com.stellaclaw.stellacodex.data.network.NetworkState
 import com.stellaclaw.stellacodex.data.store.ConnectionProfileStore
 import com.stellaclaw.stellacodex.data.store.connectionDataStore
 import com.stellaclaw.stellacodex.domain.model.ConnectionProfile
 import com.stellaclaw.stellacodex.domain.model.ConversationSummary
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -25,13 +27,19 @@ class ConversationListViewModel(application: Application) : AndroidViewModel(app
 
     private val mutableState = MutableStateFlow(ConversationListUiState())
     val state: StateFlow<ConversationListUiState> = mutableState.asStateFlow()
+    private val coroutineErrorHandler = CoroutineExceptionHandler { _, throwable ->
+        log("coroutine failure ${throwable::class.java.simpleName}: ${throwable.message.orEmpty()}")
+        mutableState.update { it.copy(isLoading = false, isCreating = false, error = throwable.message ?: "Unexpected app error") }
+    }
 
     init {
+        log("ConversationListViewModel.init")
         NetworkMonitor.start(application)
         refresh()
-        viewModelScope.launch {
+        viewModelScope.launch(coroutineErrorHandler) {
             NetworkMonitor.state.collect { networkState ->
                 if (networkState == NetworkState.Available && state.value.error != null) {
+                    log("network restored; refresh conversations after previous error")
                     refresh(showLoading = false)
                 }
             }
@@ -39,7 +47,8 @@ class ConversationListViewModel(application: Application) : AndroidViewModel(app
     }
 
     fun refresh(showLoading: Boolean = true) {
-        viewModelScope.launch {
+        log("refresh showLoading=$showLoading")
+        viewModelScope.launch(coroutineErrorHandler) {
             if (showLoading) {
                 mutableState.update { it.copy(isLoading = true, error = null) }
             } else {
@@ -77,8 +86,9 @@ class ConversationListViewModel(application: Application) : AndroidViewModel(app
     }
 
     fun createConversation() {
+        log("create conversation requested")
         if (state.value.isCreating) return
-        viewModelScope.launch {
+        viewModelScope.launch(coroutineErrorHandler) {
             mutableState.update { it.copy(isCreating = true, error = null) }
             val profile = store.profile.first()
             if (!profile.isConfigured) {
@@ -115,6 +125,10 @@ class ConversationListViewModel(application: Application) : AndroidViewModel(app
     }
 
     private fun ConnectionProfile.displayName(): String = name.ifBlank { sshHost.ifBlank { baseUrl.ifBlank { "Stellaclaw" } } }
+
+    private fun log(message: String) {
+        AppLogStore.append(getApplication(), "conversations", message)
+    }
 }
 
 data class ConversationListUiState(
