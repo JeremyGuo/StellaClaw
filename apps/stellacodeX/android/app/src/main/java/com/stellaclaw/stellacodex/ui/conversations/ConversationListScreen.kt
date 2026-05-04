@@ -5,41 +5,48 @@ import android.app.Application
 import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Article
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Article
-import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -50,8 +57,19 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.stellaclaw.stellacodex.domain.model.ConversationSummary
 import com.stellaclaw.stellacodex.ui.chat.AgentNotificationCenter
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
-@OptIn(ExperimentalMaterial3Api::class)
+private val ListBackground = Color(0xFFF4F4F7)
+private val ListSurface = Color(0xF6FFFFFF)
+private val ListBorder = Color(0x1A000000)
+private val ListMutedText = Color(0xFF8E8E93)
+private val OnlineGreen = Color(0xFF30D681)
+private val UnreadRed = Color(0xFFFF453A)
+private val AvatarBlue = Color(0xFF0A95FF)
+private val AvatarPurple = Color(0xFF7A45FF)
+
 @Composable
 fun ConversationListScreen(
     onOpenConversation: (String) -> Unit,
@@ -92,43 +110,20 @@ fun ConversationListScreen(
         onOpenConversation(conversationId)
     }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = {
-                    Column {
-                        Text("Conversations")
-                        Text(
-                            text = state.activeConnectionName,
-                            style = MaterialTheme.typography.labelSmall,
-                        )
-                    }
-                },
-                actions = {
-                    IconButton(
-                        onClick = viewModel::createConversation,
-                        enabled = !state.isCreating,
-                    ) {
-                        Icon(Icons.Filled.Add, contentDescription = if (state.isCreating) "Creating" else "New conversation")
-                    }
-                    IconButton(onClick = viewModel::refresh) {
-                        Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
-                    }
-                    IconButton(onClick = onOpenLogs) {
-                        Icon(Icons.Filled.Article, contentDescription = "Logs")
-                    }
-                    IconButton(onClick = onOpenSettings) {
-                        Icon(Icons.Filled.Settings, contentDescription = "Settings")
-                    }
-                },
-            )
-        },
-    ) { padding ->
+    Scaffold(containerColor = ListBackground) { padding ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(padding),
+                .padding(padding)
+                .background(ListBackground),
         ) {
+            ConversationListHeader(
+                connectionName = state.activeConnectionName,
+                isCreating = state.isCreating,
+                onCreate = viewModel::createConversation,
+                onOpenSettings = onOpenSettings,
+                onOpenLogs = onOpenLogs,
+            )
             when {
                 state.isLoading -> LoadingState()
                 state.error != null -> ErrorState(
@@ -150,17 +145,84 @@ fun ConversationListScreen(
 }
 
 @Composable
+private fun ConversationListHeader(
+    connectionName: String,
+    isCreating: Boolean,
+    onCreate: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onOpenLogs: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 22.dp, vertical = 18.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Surface(
+                modifier = Modifier.size(58.dp),
+                shape = CircleShape,
+                color = AvatarPurple,
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(Icons.Filled.AutoAwesome, contentDescription = null, tint = Color.White)
+                }
+            }
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    text = "StellaClaw",
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                    Box(
+                        modifier = Modifier
+                            .size(12.dp)
+                            .clip(CircleShape)
+                            .background(OnlineGreen),
+                    )
+                    Text("在线 - $connectionName ›", style = MaterialTheme.typography.bodyLarge)
+                }
+            }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onOpenLogs) {
+                Icon(Icons.Filled.Article, contentDescription = "Logs")
+            }
+            IconButton(onClick = onOpenSettings) {
+                Icon(Icons.Filled.Settings, contentDescription = "Settings")
+            }
+            IconButton(onClick = onCreate, enabled = !isCreating) {
+                Icon(
+                    Icons.Filled.Add,
+                    contentDescription = if (isCreating) "Creating" else "New conversation",
+                    modifier = Modifier.size(36.dp),
+                    tint = Color(0xFF111111),
+                )
+            }
+        }
+    }
+}
+
+@Composable
 private fun ConversationList(
     conversations: List<ConversationSummary>,
     onOpenConversation: (String) -> Unit,
 ) {
-    LazyColumn(modifier = Modifier.fillMaxSize()) {
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        contentPadding = PaddingValues(horizontal = 18.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp),
+    ) {
         items(conversations, key = { it.conversationId }) { conversation ->
             ConversationRow(
                 conversation = conversation,
                 onClick = { onOpenConversation(conversation.conversationId) },
             )
-            HorizontalDivider()
         }
     }
 }
@@ -217,50 +279,84 @@ private fun ConversationRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
-            .padding(16.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
+            .clickable(onClick = onClick),
+        horizontalArrangement = Arrangement.spacedBy(16.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
+        ConversationAvatar(conversation)
         Column(
             modifier = Modifier.weight(1f),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
-            Text(text = conversation.displayName, style = MaterialTheme.typography.titleMedium)
-            Text(text = conversation.conversationId, style = MaterialTheme.typography.bodySmall)
-            if (conversation.model.isNotBlank()) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 Text(
-                    text = "model: ${conversation.model}" + if (conversation.modelSelectionPending) " · selection pending" else "",
-                    style = MaterialTheme.typography.labelSmall,
+                    text = conversation.displayName.ifBlank { conversation.conversationId },
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = formatConversationTime(conversation.lastMessageTime),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = ListMutedText.copy(alpha = 0.65f),
+                    maxLines = 1,
                 )
             }
-            Text(
-                text = listOf(
-                    conversation.reasoning.takeIf { it.isNotBlank() }?.let { "reasoning: $it" },
-                    conversation.sandbox.takeIf { it.isNotBlank() }?.let { "sandbox: $it" },
-                    conversation.remote.takeIf { it.isNotBlank() }?.let { "remote: $it" },
-                ).filterNotNull().joinToString(" · "),
-                style = MaterialTheme.typography.labelSmall,
-            )
-            if (conversation.workspace.isNotBlank()) {
-                Text(text = "workspace: ${conversation.workspace}", style = MaterialTheme.typography.labelSmall)
-            }
-            if (conversation.totalBackground > 0 || conversation.totalSubagents > 0) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 Text(
-                    text = "sessions: ${conversation.totalBackground} background · ${conversation.totalSubagents} subagents",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = MaterialTheme.colorScheme.primary,
+                    text = conversationPreview(conversation),
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.titleMedium,
+                    color = ListMutedText,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                 )
-            }
-            conversation.lastMessageTime?.let { time ->
-                Text(text = time, style = MaterialTheme.typography.labelSmall)
+                ConversationStatusIndicator(conversation = conversation)
             }
         }
-        Column(horizontalAlignment = Alignment.End) {
-            ConversationStatusIndicator(conversation = conversation)
-            Text(
-                text = "${conversation.messageCount} msgs",
-                style = MaterialTheme.typography.labelSmall,
-            )
+    }
+}
+
+@Composable
+private fun ConversationAvatar(conversation: ConversationSummary) {
+    Box(modifier = Modifier.size(74.dp), contentAlignment = Alignment.TopEnd) {
+        Surface(
+            modifier = Modifier
+                .size(68.dp)
+                .align(Alignment.CenterStart),
+            shape = RoundedCornerShape(20.dp),
+            color = avatarColor(conversation.conversationId),
+            border = BorderStroke(1.dp, Color.White.copy(alpha = 0.7f)),
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Text(
+                    text = avatarText(conversation.displayName.ifBlank { conversation.conversationId }),
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                )
+            }
+        }
+        if (conversation.hasUnread) {
+            Surface(
+                modifier = Modifier.size(26.dp),
+                shape = CircleShape,
+                color = UnreadRed,
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Text("•", color = Color.White, fontWeight = FontWeight.Bold)
+                }
+            }
         }
     }
 }
@@ -268,19 +364,46 @@ private fun ConversationRow(
 @Composable
 private fun ConversationStatusIndicator(conversation: ConversationSummary) {
     Box(
-        modifier = Modifier.size(24.dp),
+        modifier = Modifier.size(26.dp),
         contentAlignment = Alignment.Center,
     ) {
         when {
             conversation.running -> CircularProgressIndicator(
                 modifier = Modifier.size(18.dp),
                 strokeWidth = 2.dp,
+                color = OnlineGreen,
             )
             conversation.hasUnread -> Box(
                 modifier = Modifier
                     .size(10.dp)
-                    .background(MaterialTheme.colorScheme.primary, CircleShape),
+                    .background(UnreadRed, CircleShape),
             )
         }
     }
 }
+
+private fun conversationPreview(conversation: ConversationSummary): String = when {
+    conversation.running -> "Assistant 正在处理 · ${conversation.processingState}"
+    conversation.modelSelectionPending -> "请选择模型后继续"
+    conversation.messageCount > 0 -> "${conversation.messageCount} 条消息 · ${conversation.model.ifBlank { "default model" }}"
+    else -> "新的会话，点击开始聊天"
+}
+
+private fun avatarText(value: String): String = value.trim().take(1).ifBlank { "S" }.uppercase()
+
+private fun avatarColor(seed: String): Color {
+    val colors = listOf(AvatarBlue, AvatarPurple, Color(0xFF20C997), Color(0xFFFF9F0A), Color(0xFF5856D6))
+    val index = seed.fold(0) { acc, c -> acc + c.code }.let { kotlin.math.abs(it) % colors.size }
+    return colors[index]
+}
+
+private fun formatConversationTime(value: String?): String {
+    if (value.isNullOrBlank()) return ""
+    return runCatching {
+        Instant.parse(value)
+            .atZone(ZoneId.systemDefault())
+            .format(ConversationTimeFormatter)
+    }.getOrElse { value.take(16) }
+}
+
+private val ConversationTimeFormatter: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")

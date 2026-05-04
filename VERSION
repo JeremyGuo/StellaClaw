@@ -1,5 +1,13 @@
-version: 1.23.5
+version: 1.24.0
 ---
+
+# 1.24.0
+
+- 发布 Stellacode 2 桌面客户端显示与更新体验改进：
+  Settings 新增显示字号和整体 UI 缩放配置，终端字号跟随显示设置，高 DPI / resize 场景会刷新窗口 chrome metrics；更新页保留 GitHub Release 自动更新通道，并新增可选 SSH 固定路径通道，可通过当前 SSH profile 拉取 test 或 stable 安装包。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 发布 StellacodeX Android 聊天与会话列表体验改进：
+  优化聊天页滚动、输入和会话列表展示细节，补齐聊天 ViewModel 状态处理。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.23.5
 

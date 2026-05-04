@@ -24,6 +24,7 @@ import com.stellaclaw.stellacodex.data.store.connectionDataStore
 import com.stellaclaw.stellacodex.domain.model.ChatMessage
 import com.stellaclaw.stellacodex.domain.model.ConnectionMode
 import com.stellaclaw.stellacodex.domain.model.ConnectionProfile
+import com.stellaclaw.stellacodex.domain.model.ConversationSummary
 import com.stellaclaw.stellacodex.domain.model.MessageAttachment
 import com.stellaclaw.stellacodex.domain.model.MessageItem
 import com.stellaclaw.stellacodex.domain.model.MessageLocalState
@@ -712,12 +713,12 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun updateConversationTitle(profile: ConnectionProfile, conversationId: String) {
         when (val result = api.loadConversations(profile, limit = 200)) {
             is AppResult.Ok -> {
-                val displayName = result.value
-                    .firstOrNull { it.conversationId == conversationId }
+                val summary = result.value.firstOrNull { it.conversationId == conversationId }
+                val displayName = summary
                     ?.displayName
-                    ?.takeIf { it.isNotBlank() }
+                    ?.takeIf(String::isNotBlank)
                     ?: conversationId
-                mutableState.update { it.copy(displayName = displayName) }
+                mutableState.update { it.copy(displayName = displayName, conversationSummary = summary) }
             }
             is AppResult.Err -> Unit
         }
@@ -1172,6 +1173,7 @@ data class ChatUiState(
     val progressDetail: String? = null,
     val progressImportant: Boolean = false,
     val attachmentPreviews: Map<String, AttachmentPreviewUiState> = emptyMap(),
+    val conversationSummary: ConversationSummary? = null,
 )
 
 data class PendingAttachmentUiState(

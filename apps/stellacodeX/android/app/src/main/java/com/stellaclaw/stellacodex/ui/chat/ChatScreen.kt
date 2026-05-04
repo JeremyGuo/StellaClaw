@@ -8,38 +8,53 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
-import androidx.compose.material3.TopAppBar
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.AttachFile
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Code
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Folder
-import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.MoreHoriz
+import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -48,24 +63,37 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.stellaclaw.stellacodex.domain.model.ChatMessage
+import com.stellaclaw.stellacodex.domain.model.ConversationSummary
 import com.stellaclaw.stellacodex.domain.model.MessageAttachment
 import com.stellaclaw.stellacodex.domain.model.MessageItem
 import com.stellaclaw.stellacodex.domain.model.MessageLocalState
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+
+private val ChatBackground = Color(0xFFF4F4F7)
+private val FrostedSurface = Color(0xF6FFFFFF)
+private val FrostedBorder = Color(0x1A000000)
+private val MutedText = Color(0xFF8E8E93)
+private val UserBubble = Color(0xFF0A95FF)
+private val UserBubbleText = Color.White
+private val AssistantAccent = Color(0xFF7A45FF)
+private val AssistantAccent2 = Color(0xFF2C7BFF)
+private val CodeHeaderText = Color(0xFF8A8F98)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -84,6 +112,7 @@ fun ChatScreen(
     val listState = rememberLazyListState()
     var initialBottomPlaced by remember(conversationId) { mutableStateOf(false) }
     var earlierLoadAnchor by remember(conversationId) { mutableStateOf<ScrollAnchor?>(null) }
+    var showDetails by remember(conversationId) { mutableStateOf(false) }
     val visibleMessages = remember(state.messages) { state.messages.filterNot(ChatMessage::isRuntimeMetadataMessage) }
     val timeline = remember(visibleMessages) { buildChatTimeline(visibleMessages) }
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
@@ -147,22 +176,15 @@ fun ChatScreen(
     }
 
     Scaffold(
+        containerColor = ChatBackground,
         topBar = {
-            TopAppBar(
-                title = { Text(state.displayName.ifBlank { conversationId.ifBlank { "Conversation" } }) },
-                navigationIcon = {
-                    IconButton(onClick = onBack) {
-                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
-                    }
-                },
-                actions = {
-                    IconButton(onClick = viewModel::refresh) {
-                        Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
-                    }
-                    IconButton(onClick = { onOpenWorkspace(conversationId) }) {
-                        Icon(Icons.Filled.Folder, contentDescription = "Files")
-                    }
-                },
+            ChatHeader(
+                title = state.displayName.ifBlank { conversationId.ifBlank { "Conversation" } },
+                subtitle = state.realtimeState.ifBlank { "Conversation stream" },
+                onBack = onBack,
+                onRefresh = viewModel::refresh,
+                onOpenWorkspace = { onOpenWorkspace(conversationId) },
+                onShowDetails = { showDetails = true },
             )
         },
     ) { padding ->
@@ -170,8 +192,9 @@ fun ChatScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+                .background(ChatBackground)
+                .padding(horizontal = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             state.error?.let { message ->
                 Text(
@@ -180,12 +203,6 @@ fun ChatScreen(
                     style = MaterialTheme.typography.bodyMedium,
                 )
             }
-            RealtimeStatus(
-                realtimeState = state.realtimeState,
-                progressTitle = state.progressTitle,
-                progressDetail = state.progressDetail,
-                progressImportant = state.progressImportant,
-            )
             when {
                 state.isLoading && state.messages.isEmpty() -> LoadingMessages()
                 visibleMessages.isEmpty() -> EmptyMessages()
@@ -200,6 +217,13 @@ fun ChatScreen(
                 )
             }
 
+            RealtimeStatus(
+                realtimeState = state.realtimeState,
+                progressTitle = state.progressTitle,
+                progressDetail = state.progressDetail,
+                progressImportant = state.progressImportant,
+            )
+
             Composer(
                 draft = state.draft,
                 pendingAttachments = state.pendingAttachments,
@@ -211,6 +235,155 @@ fun ChatScreen(
             )
         }
     }
+    if (showDetails) {
+        ConversationDetailsDialog(
+            conversationId = conversationId,
+            totalMessages = state.totalMessages,
+            realtimeState = state.realtimeState,
+            summary = state.conversationSummary,
+            onDismiss = { showDetails = false },
+        )
+    }
+}
+
+@Composable
+private fun ChatHeader(
+    title: String,
+    subtitle: String,
+    onBack: () -> Unit,
+    onRefresh: () -> Unit,
+    onOpenWorkspace: () -> Unit,
+    onShowDetails: () -> Unit,
+) {
+    Surface(
+        color = ChatBackground,
+        tonalElevation = 0.dp,
+        shadowElevation = 0.dp,
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            GlassIconButton(onClick = onBack) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+            }
+            Surface(
+                modifier = Modifier.weight(1f),
+                shape = RoundedCornerShape(28.dp),
+                color = FrostedSurface,
+                border = BorderStroke(1.dp, FrostedBorder),
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 9.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                ) {
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MutedText,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+            }
+            Surface(
+                shape = RoundedCornerShape(28.dp),
+                color = FrostedSurface,
+                border = BorderStroke(1.dp, FrostedBorder),
+            ) {
+                Row(modifier = Modifier.padding(horizontal = 4.dp, vertical = 4.dp)) {
+                    IconButton(onClick = onOpenWorkspace) {
+                        Icon(Icons.Filled.Folder, contentDescription = "Files")
+                    }
+                    IconButton(onClick = onRefresh) {
+                        Icon(Icons.Filled.Terminal, contentDescription = "Refresh stream")
+                    }
+                    IconButton(onClick = onShowDetails) {
+                        Icon(Icons.Filled.Info, contentDescription = "Conversation details")
+                    }
+                    IconButton(onClick = onRefresh) {
+                        Icon(Icons.Filled.MoreHoriz, contentDescription = "More")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun GlassIconButton(
+    onClick: () -> Unit,
+    content: @Composable () -> Unit,
+) {
+    Surface(
+        modifier = Modifier.size(52.dp),
+        shape = CircleShape,
+        color = FrostedSurface,
+        border = BorderStroke(1.dp, FrostedBorder),
+        onClick = onClick,
+    ) {
+        Box(contentAlignment = Alignment.Center) { content() }
+    }
+}
+
+@Composable
+private fun ConversationDetailsDialog(
+    conversationId: String,
+    totalMessages: Int,
+    realtimeState: String,
+    summary: ConversationSummary?,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("关闭") }
+        },
+        title = { Text("会话详情", fontWeight = FontWeight.Bold) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                DetailLine("名称", summary?.displayName?.takeIf(String::isNotBlank) ?: conversationId)
+                DetailLine("会话 ID", conversationId)
+                DetailLine("模型", summary?.model?.takeIf(String::isNotBlank) ?: "未知")
+                if (summary?.modelSelectionPending == true) {
+                    DetailLine("模型状态", "等待选择")
+                }
+                DetailLine("消息", "${summary?.messageCount ?: totalMessages} msgs")
+                DetailLine("实时", realtimeState.ifBlank { "Conversation stream" })
+                summary?.reasoning?.takeIf(String::isNotBlank)?.let { DetailLine("Reasoning", it) }
+                summary?.sandbox?.takeIf(String::isNotBlank)?.let { DetailLine("Sandbox", it) }
+                summary?.remote?.takeIf(String::isNotBlank)?.let { DetailLine("Remote", it) }
+                summary?.workspace?.takeIf(String::isNotBlank)?.let { DetailLine("Workspace", it) }
+                summary?.let {
+                    if (it.totalBackground > 0 || it.totalSubagents > 0) {
+                        DetailLine("Sessions", "${it.totalBackground} background · ${it.totalSubagents} subagents")
+                    }
+                    it.lastMessageTime?.let { time -> DetailLine("最近消息", time) }
+                    it.foregroundSessionId.takeIf(String::isNotBlank)?.let { session -> DetailLine("Foreground session", session) }
+                }
+            }
+        },
+        containerColor = FrostedSurface,
+        shape = RoundedCornerShape(24.dp),
+    )
+}
+
+@Composable
+private fun DetailLine(label: String, value: String) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Text(label, style = MaterialTheme.typography.labelMedium, color = MutedText)
+        Text(value, style = MaterialTheme.typography.bodyMedium)
+    }
 }
 
 @Composable
@@ -221,32 +394,48 @@ private fun RealtimeStatus(
     progressImportant: Boolean,
 ) {
     if (realtimeState.isBlank() && progressTitle == null) return
-    Card(modifier = Modifier.fillMaxWidth()) {
-        Column(
-            modifier = Modifier.padding(10.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 4.dp),
+        shape = RoundedCornerShape(18.dp),
+        color = FrostedSurface,
+        border = BorderStroke(1.dp, FrostedBorder),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            if (realtimeState.isNotBlank()) {
+            Icon(
+                Icons.Filled.Info,
+                contentDescription = null,
+                tint = MutedText,
+                modifier = Modifier.size(22.dp),
+            )
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                 Text(
-                    text = realtimeState,
-                    style = MaterialTheme.typography.labelMedium,
-                    color = if (realtimeState.contains("error", ignoreCase = true) ||
-                        realtimeState.contains("unavailable", ignoreCase = true)
-                    ) {
-                        MaterialTheme.colorScheme.error
-                    } else {
-                        MaterialTheme.colorScheme.primary
-                    },
+                    text = progressTitle?.let { if (progressImportant) "! $it" else it } ?: "Status",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
                 )
-            }
-            progressTitle?.let { title ->
-                Text(
-                    text = if (progressImportant) "! $title" else title,
-                    style = MaterialTheme.typography.bodyMedium,
-                )
-            }
-            progressDetail?.let { detail ->
-                Text(text = detail, style = MaterialTheme.typography.bodySmall)
+                val detail = listOfNotNull(
+                    realtimeState.takeIf { it.isNotBlank() },
+                    progressDetail?.takeIf { it.isNotBlank() },
+                ).joinToString(" · ")
+                if (detail.isNotBlank()) {
+                    Text(
+                        text = detail,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (detail.contains("error", ignoreCase = true) ||
+                            detail.contains("unavailable", ignoreCase = true)
+                        ) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MutedText
+                        },
+                    )
+                }
             }
         }
     }
@@ -295,7 +484,8 @@ private fun MessageList(
     LazyColumn(
         modifier = modifier.fillMaxWidth(),
         state = listState,
-        verticalArrangement = Arrangement.spacedBy(8.dp),
+        contentPadding = PaddingValues(vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(18.dp),
     ) {
         if (isLoadingEarlier) {
             item(key = "loading-earlier") {
@@ -460,85 +650,161 @@ private fun MessageCard(
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (isUserMessage) Arrangement.End else Arrangement.Start,
+        verticalAlignment = Alignment.Top,
     ) {
-        Card(
-            modifier = if (isUserMessage) Modifier.fillMaxWidth(0.86f) else Modifier.fillMaxWidth(),
-            colors = if (isUserMessage) {
-                CardDefaults.cardColors(containerColor = Color(0xFFE3F2FD))
-            } else {
-                CardDefaults.cardColors()
-            },
+        if (!isUserMessage) {
+            AssistantAvatar()
+            Spacer(modifier = Modifier.size(10.dp))
+        }
+        Column(
+            modifier = if (isUserMessage) Modifier.fillMaxWidth(0.82f) else Modifier.weight(1f),
+            horizontalAlignment = if (isUserMessage) Alignment.End else Alignment.Start,
+            verticalArrangement = Arrangement.spacedBy(5.dp),
         ) {
-            Column(
-                modifier = Modifier.padding(12.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp),
-            ) {
+            if (isUserMessage) {
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text(text = roleLabel, style = MaterialTheme.typography.labelMedium)
-                    Text(text = "#${message.index}", style = MaterialTheme.typography.labelSmall)
+                    Text(
+                        text = roleLabel,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MutedText,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Box(
+                        modifier = Modifier
+                            .size(6.dp)
+                            .clip(CircleShape)
+                            .background(MutedText),
+                    )
                 }
+                Surface(
+                    shape = RoundedCornerShape(22.dp),
+                    color = UserBubble,
+                ) {
+                    SelectionContainer {
+                        Text(
+                            text = displayText.ifBlank { " " },
+                            modifier = Modifier.padding(horizontal = 18.dp, vertical = 12.dp),
+                            style = MaterialTheme.typography.titleMedium,
+                            color = UserBubbleText,
+                        )
+                    }
+                }
+            } else {
+                Text(
+                    text = roleLabel,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MutedText,
+                )
                 if (displayText.isNotBlank()) {
                     SelectionContainer {
                         MessageBody(text = displayText)
                     }
                 }
-                if (message.items.any { it is MessageItem.ToolCall || it is MessageItem.ToolResult }) {
-                    ToolItemList(items = message.items)
-                }
-                if (message.attachments.isNotEmpty()) {
-                    AttachmentList(
-                        attachments = message.attachments,
-                        previews = previews,
-                        onPreviewAttachment = onPreviewAttachment,
+            }
+            if (message.items.any { it is MessageItem.ToolCall || it is MessageItem.ToolResult }) {
+                ToolItemList(items = message.items)
+            }
+            if (message.attachments.isNotEmpty()) {
+                AttachmentList(
+                    attachments = message.attachments,
+                    previews = previews,
+                    onPreviewAttachment = onPreviewAttachment,
+                )
+            }
+            MessageMetaRow(
+                message = message,
+                alignEnd = isUserMessage,
+                onRetrySend = onRetrySend,
+            )
+        }
+    }
+}
+
+@Composable
+private fun AssistantAvatar() {
+    Box(
+        modifier = Modifier
+            .size(46.dp)
+            .clip(CircleShape)
+            .background(AssistantAccent),
+        contentAlignment = Alignment.Center,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(46.dp)
+                .background(AssistantAccent2.copy(alpha = 0.45f)),
+        )
+        Icon(
+            Icons.Filled.AutoAwesome,
+            contentDescription = null,
+            tint = Color.White,
+            modifier = Modifier.size(26.dp),
+        )
+    }
+}
+
+@Composable
+private fun MessageMetaRow(
+    message: ChatMessage,
+    alignEnd: Boolean,
+    onRetrySend: (String) -> Unit,
+) {
+    val usage = message.tokenUsage
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = if (alignEnd) Arrangement.End else Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            message.messageTime?.let { time ->
+                Text(text = formatLocalMinute(time), style = MaterialTheme.typography.labelSmall, color = MutedText)
+            }
+            when (message.localState) {
+                MessageLocalState.Sending -> Text(
+                    text = "sending...",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+                MessageLocalState.Failed -> {
+                    Text(
+                        text = "send failed",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.error,
                     )
+                    TextButton(onClick = { onRetrySend(message.id) }) {
+                        Text("Retry")
+                    }
                 }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    message.messageTime?.let { time ->
-                        Text(text = formatLocalMinute(time), style = MaterialTheme.typography.labelSmall)
-                    }
-                    when (message.localState) {
-                        MessageLocalState.Sending -> Text(
-                            text = "sending...",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.primary,
-                        )
-                        MessageLocalState.Failed -> {
-                            Text(
-                                text = "send failed",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.error,
-                            )
-                            TextButton(onClick = { onRetrySend(message.id) }) {
-                                Text("Retry")
-                            }
-                        }
-                        MessageLocalState.Synced -> Unit
-                    }
-                    if (message.attachmentCount > 0) {
-                        Text(
-                            text = "${message.attachmentCount} attachments",
-                            style = MaterialTheme.typography.labelSmall,
-                        )
-                    }
-                    if (message.hasAttachmentErrors) {
-                        Text(
-                            text = "attachment errors",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.error,
-                        )
-                    }
-                    if (message.tokenUsage != null) {
-                        val usage = message.tokenUsage
-                        Text(
-                            text = "tokens ${usage.total} (${usage.input} in / ${usage.output} out)",
-                            style = MaterialTheme.typography.labelSmall,
-                        )
-                    } else if (message.hasTokenUsage) {
-                        Text(text = "usage", style = MaterialTheme.typography.labelSmall)
-                    }
+                MessageLocalState.Synced -> Unit
+            }
+        }
+        if (!alignEnd && (usage != null || message.hasTokenUsage)) {
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = FrostedSurface,
+                border = BorderStroke(1.dp, FrostedBorder),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(if (usage != null) Color(0xFF34C759) else Color(0xFFFF3B30)),
+                    )
+                    Text(
+                        text = usage?.let { "${formatCompactNumber(it.total)} tokens" } ?: "usage",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MutedText,
+                        fontWeight = FontWeight.Bold,
+                    )
                 }
             }
         }
@@ -596,26 +862,61 @@ private fun MarkdownText(text: String) {
 
 @Composable
 private fun CodeBlock(block: MarkdownBlock.Code) {
-    Column(
+    Surface(
         modifier = Modifier
             .fillMaxWidth()
-            .background(MaterialTheme.colorScheme.surfaceVariant)
-            .padding(10.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
+            .padding(vertical = 2.dp),
+        shape = RoundedCornerShape(14.dp),
+        color = FrostedSurface,
+        border = BorderStroke(1.dp, FrostedBorder),
     ) {
-        if (block.language.isNotBlank()) {
+        Column {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color.White.copy(alpha = 0.55f))
+                    .padding(horizontal = 12.dp, vertical = 9.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        Icons.Filled.Code,
+                        contentDescription = null,
+                        tint = CodeHeaderText,
+                        modifier = Modifier.size(20.dp),
+                    )
+                    Text(
+                        text = block.language.ifBlank { "text" },
+                        style = MaterialTheme.typography.titleSmall,
+                        color = CodeHeaderText,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        text = "${block.code.lines().size} lines",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = CodeHeaderText.copy(alpha = 0.65f),
+                    )
+                }
+                Row {
+                    Icon(Icons.Filled.ExpandLess, contentDescription = "Collapse", tint = CodeHeaderText)
+                    Icon(Icons.Filled.ContentCopy, contentDescription = "Copy", tint = CodeHeaderText)
+                }
+            }
             Text(
-                text = block.language,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary,
+                text = block.code.ifBlank { " " },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(Color(0xFFF0F0F4))
+                    .padding(12.dp),
+                style = MaterialTheme.typography.bodyLarge,
+                fontFamily = FontFamily.Monospace,
+                color = Color(0xFF101014),
             )
         }
-        Text(
-            text = block.code.ifBlank { " " },
-            style = MaterialTheme.typography.bodySmall,
-            fontFamily = FontFamily.Monospace,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
     }
 }
 
@@ -648,37 +949,56 @@ private fun ToolCard(
     isResult: Boolean,
 ) {
     var expanded by remember(title, body) { mutableStateOf(false) }
-    Column(
+    Surface(
         modifier = Modifier
             .fillMaxWidth()
-            .background(if (isResult) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.tertiaryContainer)
-            .clickable { expanded = !expanded }
-            .padding(10.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
+            .clickable { expanded = !expanded },
+        shape = RoundedCornerShape(14.dp),
+        color = FrostedSurface,
+        border = BorderStroke(1.dp, FrostedBorder),
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.SemiBold,
-            )
-            Text(
-                text = if (expanded) "Hide" else "Show",
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.primary,
-            )
-        }
-        if (expanded) {
-            SelectionContainer {
-                Text(
-                    text = body.take(8_000),
-                    style = MaterialTheme.typography.bodySmall,
-                    fontFamily = FontFamily.Monospace,
+        Column {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Icon(
+                        if (isResult) Icons.Filled.Code else Icons.Filled.Terminal,
+                        contentDescription = null,
+                        tint = CodeHeaderText,
+                    )
+                    Text(
+                        text = title,
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = CodeHeaderText,
+                    )
+                }
+                Icon(
+                    if (expanded) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                    contentDescription = if (expanded) "Hide" else "Show",
+                    tint = CodeHeaderText,
                 )
+            }
+            if (expanded) {
+                SelectionContainer {
+                    Text(
+                        text = body.take(8_000),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(Color(0xFFF0F0F4))
+                            .padding(12.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
             }
         }
     }
@@ -839,6 +1159,15 @@ private fun formatBytes(value: Long): String {
     }
 }
 
+private fun formatCompactNumber(value: Long): String = when {
+    value >= 1_000_000 -> "${String.format("%.1f", value / 1_000_000.0)}M"
+    value >= 1_000 -> {
+        val rounded = value / 1_000.0
+        if (rounded >= 100) "${(rounded).toInt()}K" else "${String.format("%.1f", rounded)}K"
+    }
+    else -> value.toString()
+}
+
 private fun formatLocalMinute(value: String): String = runCatching {
     Instant.parse(value)
         .atZone(ZoneId.systemDefault())
@@ -862,7 +1191,12 @@ private fun Composer(
     ) { uris -> onAddAttachments(uris) }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (pendingAttachments.isNotEmpty()) {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Surface(
+                shape = RoundedCornerShape(18.dp),
+                color = FrostedSurface,
+                border = BorderStroke(1.dp, FrostedBorder),
+            ) {
+            Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 pendingAttachments.forEach { attachment ->
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -886,32 +1220,63 @@ private fun Composer(
                     }
                 }
             }
+            }
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            IconButton(
-                onClick = { attachmentLauncher.launch("*/*") },
-                enabled = !isSending,
+            Surface(
+                modifier = Modifier.size(58.dp),
+                shape = CircleShape,
+                color = FrostedSurface,
+                border = BorderStroke(1.dp, FrostedBorder),
             ) {
-                Icon(Icons.Filled.AttachFile, contentDescription = "Attach files")
+                IconButton(
+                    onClick = { attachmentLauncher.launch("*/*") },
+                    enabled = !isSending,
+                ) {
+                    Icon(Icons.Filled.AttachFile, contentDescription = "Attach files", tint = Color(0xFF111111))
+                }
             }
             OutlinedTextField(
                 value = draft,
                 onValueChange = onDraftChanged,
                 modifier = Modifier.weight(1f),
-                placeholder = { Text("Message Stellaclaw") },
+                placeholder = { Text("消息", color = MutedText) },
                 minLines = 1,
                 maxLines = 4,
+                shape = RoundedCornerShape(28.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedContainerColor = FrostedSurface,
+                    unfocusedContainerColor = FrostedSurface,
+                    disabledContainerColor = FrostedSurface,
+                    focusedBorderColor = FrostedBorder,
+                    unfocusedBorderColor = FrostedBorder,
+                ),
             )
-            IconButton(
-                onClick = onSend,
-                enabled = (draft.isNotBlank() || pendingAttachments.isNotEmpty()) && !isSending,
+            Surface(
+                modifier = Modifier.size(58.dp),
+                shape = CircleShape,
+                color = if ((draft.isNotBlank() || pendingAttachments.isNotEmpty()) && !isSending) {
+                    Color(0xFF7A7A7A)
+                } else {
+                    Color(0x33808080)
+                },
             ) {
-                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = if (isSending) "Sending" else "Send")
+                IconButton(
+                    onClick = onSend,
+                    enabled = (draft.isNotBlank() || pendingAttachments.isNotEmpty()) && !isSending,
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.Send,
+                        contentDescription = if (isSending) "Sending" else "Send",
+                        tint = Color.White,
+                    )
+                }
             }
         }
+        Spacer(modifier = Modifier.height(6.dp))
     }
 }

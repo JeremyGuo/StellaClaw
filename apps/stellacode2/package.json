@@ -1,6 +1,8 @@
 {
   "name": "stellacode2",
   "version": "0.1.0",
+  "versionName": "0.1.0",
+  "versionCode": 1,
   "private": true,
   "description": "React/Electron Stellaclaw client shell.",
   "author": "Jeremy Guo",

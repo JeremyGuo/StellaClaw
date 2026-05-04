@@ -43,6 +43,10 @@ const TERMINAL_HEIGHT_MAX = 620;
 const TERMINAL_LIST_MIN = 180;
 const TERMINAL_LIST_MAX = 360;
 const MAX_UPLOAD_COMPRESSED_BYTES = 10 * 1024 * 1024;
+const MIN_DISPLAY_FONT_SIZE = 11;
+const MAX_DISPLAY_FONT_SIZE = 18;
+const MIN_UI_SCALE = 0.8;
+const MAX_UI_SCALE = 1.4;
 
 function setPxVariable(element, name, value) {
   if (!Number.isFinite(value)) return;
@@ -410,6 +414,42 @@ function App() {
   }, []);
 
   useEffect(() => {
+    let frame = 0;
+    let resolutionQuery = null;
+    let removeResolutionListener = null;
+    const refreshChromeMetrics = () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        frame = 0;
+        applyChromeMetrics(window.stellacode2?.chromeMetrics?.());
+      });
+    };
+    const bindResolutionListener = () => {
+      removeResolutionListener?.();
+      if (!window.matchMedia) return;
+      resolutionQuery = window.matchMedia(`(resolution: ${window.devicePixelRatio || 1}dppx)`);
+      const listener = () => {
+        refreshChromeMetrics();
+        bindResolutionListener();
+      };
+      resolutionQuery.addEventListener?.('change', listener);
+      removeResolutionListener = () => resolutionQuery?.removeEventListener?.('change', listener);
+    };
+    window.addEventListener('resize', refreshChromeMetrics);
+    bindResolutionListener();
+    return () => {
+      if (frame) window.cancelAnimationFrame(frame);
+      window.removeEventListener('resize', refreshChromeMetrics);
+      removeResolutionListener?.();
+    };
+  }, []);
+
+  useEffect(() => {
+    const scale = clamp(settings?.uiScale, MIN_UI_SCALE, MAX_UI_SCALE) || 1;
+    window.stellacode2?.setZoomFactor?.(scale).catch(() => {});
+  }, [settings?.uiScale]);
+
+  useEffect(() => {
     const updateForeground = () => {
       setAppForeground(document.visibilityState === 'visible' && document.hasFocus());
     };
@@ -464,6 +504,9 @@ function App() {
     () => conversations.find((item) => item.conversation_id === selected?.conversationId) || null,
     [conversations, selected]
   );
+  const displayFontSize = clamp(settings?.displayFontSize, MIN_DISPLAY_FONT_SIZE, MAX_DISPLAY_FONT_SIZE) || 12;
+  const uiScale = clamp(settings?.uiScale, MIN_UI_SCALE, MAX_UI_SCALE) || 1;
+  const terminalFontSize = clamp(displayFontSize + 1, 11, 22) || 13;
   const selectedKey = selected ? conversationKey(selected.serverId, selected.conversationId) : '';
   const selectedStatus = selected ? statuses.get(selectedKey) : null;
   const selectedConversationStatus = useMemo(() => ({
@@ -1486,6 +1529,8 @@ function App() {
         '--preview-panel-right': `${previewPanelRight}px`,
         '--terminal-height': `${terminalHeight}px`,
         '--terminal-list-width': `${terminalListWidth}px`,
+        '--app-font-size': `${displayFontSize}px`,
+        '--ui-scale': uiScale,
         '--content-right': `${rightContentInset}px`
       }}
     >
@@ -1612,6 +1657,7 @@ function App() {
         open={terminalOpen}
         serverId={selected?.serverId || ''}
         conversationId={selected?.conversationId || ''}
+        fontSize={terminalFontSize}
         onResizeHeight={(event) => resizeLayout('terminal', event)}
         onResizeList={(event) => resizeLayout('terminalList', event)}
       />

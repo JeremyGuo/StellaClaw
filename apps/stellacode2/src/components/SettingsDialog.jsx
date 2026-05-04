@@ -2,20 +2,47 @@ import { useEffect, useMemo, useState } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
 
 const AUTHOR = 'Stellacode contributors';
+const MIN_DISPLAY_FONT_SIZE = 11;
+const MAX_DISPLAY_FONT_SIZE = 18;
+const DEFAULT_DISPLAY_FONT_SIZE = 12;
+const MIN_UI_SCALE = 0.8;
+const MAX_UI_SCALE = 1.4;
+const DEFAULT_UI_SCALE = 1;
+
+function normalizeDisplayFontSize(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return DEFAULT_DISPLAY_FONT_SIZE;
+  return Math.min(MAX_DISPLAY_FONT_SIZE, Math.max(MIN_DISPLAY_FONT_SIZE, Math.round(number)));
+}
+
+function normalizeUiScale(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return DEFAULT_UI_SCALE;
+  return Math.min(MAX_UI_SCALE, Math.max(MIN_UI_SCALE, Math.round(number * 20) / 20));
+}
+
+function githubUpdateStatusText(status) {
+  const state = status?.state || 'idle';
+  if (state === 'disabled') return '开发环境不会检查 GitHub 更新。打包版本才会连接 GitHub Release。';
+  if (state === 'checking') return '正在检查 GitHub 更新...';
+  if (state === 'downloading') {
+    const percent = Number.isFinite(status?.percent) ? ` ${Math.round(status.percent)}%` : '';
+    return `发现 GitHub 新版本，正在下载${percent}。`;
+  }
+  if (state === 'downloaded') return `GitHub 新版本 ${status.version || ''} 已下载，可以重启安装。`;
+  if (state === 'error') return `GitHub 更新失败：${status.error || '未知错误'}`;
+  return 'GitHub 通道会在打包版本后台自动检查和下载更新，也可以手动检查。';
+}
 
 function updateStatusText(status) {
   const state = status?.state || 'idle';
-  if (state === 'disabled') return '开发环境不会检查更新。打包版本才会连接 GitHub Release。';
-  if (state === 'checking') return '正在检查更新...';
-  if (state === 'downloading') {
-    const percent = Number.isFinite(status?.percent) ? ` ${Math.round(status.percent)}%` : '';
-    return `发现新版本，正在下载${percent}。`;
-  }
-  if (state === 'downloaded') {
-    return `新版本 ${status.version || ''} 已下载，可以重启安装。`;
-  }
-  if (state === 'error') return `检查更新失败：${status.error || '未知错误'}`;
-  return '当前没有已下载更新。打包版本会继续在后台自动检查。';
+  const channel = status?.channel || 'stable';
+  if (state === 'checking') return `正在检查 ${channel} 更新...`;
+  if (state === 'downloading') return status.message || `正在通过 SSH 下载 ${channel} 安装包...`;
+  if (state === 'downloaded') return status.message || `${channel} 安装包已下载。`;
+  if (state === 'error') return `更新失败：${status.error || '未知错误'}`;
+  if (status?.message) return status.message;
+  return '通过当前 SSH Profile 从固定路径拉取 test 或 stable 安装包。';
 }
 
 function blankServer(index) {
@@ -35,7 +62,8 @@ export function SettingsDialog({ open, settings, saving, onOpenChange, onSave })
   const [tab, setTab] = useState('appearance');
   const [draft, setDraft] = useState(settings);
   const [appVersion, setAppVersion] = useState('');
-  const [updaterStatus, setUpdaterStatus] = useState({ state: 'idle' });
+  const [githubUpdaterStatus, setGithubUpdaterStatus] = useState({ state: 'idle' });
+  const [sshUpdaterStatus, setSshUpdaterStatus] = useState({ state: 'idle', channel: 'stable' });
 
   useEffect(() => {
     if (open) setDraft(settings);
@@ -51,20 +79,28 @@ export function SettingsDialog({ open, settings, saving, onOpenChange, onSave })
   useEffect(() => {
     if (!open) return undefined;
     const updater = window.stellacode2?.updater;
-    if (!updater) return undefined;
+    const sshUpdater = window.stellacode2?.sshUpdater;
     let disposed = false;
-    const applyStatus = (status) => {
-      if (!disposed && status) setUpdaterStatus(status);
+    const applyGithubStatus = (status) => {
+      if (!disposed && status) setGithubUpdaterStatus(status);
     };
-    updater.status?.().then(applyStatus).catch(() => {});
-    const unsubscribe = updater.onStatus?.(applyStatus);
+    const applySshStatus = (status) => {
+      if (!disposed && status) setSshUpdaterStatus(status);
+    };
+    updater?.status?.().then(applyGithubStatus).catch(() => {});
+    sshUpdater?.status?.().then(applySshStatus).catch(() => {});
+    const unsubscribeGithub = updater?.onStatus?.(applyGithubStatus);
+    const unsubscribeSsh = sshUpdater?.onStatus?.(applySshStatus);
     return () => {
       disposed = true;
-      unsubscribe?.();
+      unsubscribeGithub?.();
+      unsubscribeSsh?.();
     };
   }, [open]);
 
   const servers = useMemo(() => draft?.servers || [], [draft]);
+  const displayFontSize = normalizeDisplayFontSize(draft?.displayFontSize);
+  const uiScale = normalizeUiScale(draft?.uiScale);
 
   const updateServer = (serverId, patch) => {
     setDraft((current) => ({
@@ -101,28 +137,53 @@ export function SettingsDialog({ open, settings, saving, onOpenChange, onSave })
     onSave?.(draft);
   };
 
-  const checkForUpdate = () => {
+  const checkGithubUpdate = () => {
     window.stellacode2?.updater?.check?.()
       .then((status) => {
-        if (status) setUpdaterStatus(status);
+        if (status) setGithubUpdaterStatus(status);
       })
       .catch((error) => {
-        setUpdaterStatus({ state: 'error', error: error?.message || String(error) });
+        setGithubUpdaterStatus({ state: 'error', error: error?.message || String(error) });
       });
   };
 
-  const installUpdate = () => {
+  const installGithubUpdate = () => {
     window.stellacode2?.updater?.install?.()
       .then((status) => {
-        if (status) setUpdaterStatus(status);
+        if (status) setGithubUpdaterStatus(status);
       })
       .catch((error) => {
-        setUpdaterStatus({ state: 'error', error: error?.message || String(error) });
+        setGithubUpdaterStatus({ state: 'error', error: error?.message || String(error) });
       });
   };
 
-  const updateBusy = updaterStatus?.state === 'checking' || updaterStatus?.state === 'downloading';
-  const updateDisabled = updateBusy || updaterStatus?.state === 'disabled' || updaterStatus?.state === 'downloaded';
+  const checkForUpdate = (channel = 'stable') => {
+    window.stellacode2?.sshUpdater?.check?.(channel)
+      .then((status) => {
+        if (status) setSshUpdaterStatus(status);
+      })
+      .catch((error) => {
+        setSshUpdaterStatus({ state: 'error', error: error?.message || String(error), channel });
+      });
+  };
+
+  const installUpdate = (channel = 'stable') => {
+    window.stellacode2?.sshUpdater?.install?.(channel)
+      .then((status) => {
+        if (status) setSshUpdaterStatus(status);
+      })
+      .catch((error) => {
+        setSshUpdaterStatus({ state: 'error', error: error?.message || String(error), channel });
+      });
+  };
+
+  const installTest = () => installUpdate('test');
+  const installStable = () => installUpdate('stable');
+
+  const githubBusy = githubUpdaterStatus?.state === 'checking' || githubUpdaterStatus?.state === 'downloading';
+  const githubDisabled = githubBusy || githubUpdaterStatus?.state === 'disabled' || githubUpdaterStatus?.state === 'downloaded';
+  const updateBusy = sshUpdaterStatus?.state === 'checking' || sshUpdaterStatus?.state === 'downloading';
+  const updateDisabled = updateBusy;
 
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
@@ -165,6 +226,82 @@ export function SettingsDialog({ open, settings, saving, onOpenChange, onSave })
                         <small>{description}</small>
                       </button>
                     ))}
+                  </div>
+                  <div className="font-size-control">
+                    <div className="font-size-control-head">
+                      <div>
+                        <strong>整体缩放</strong>
+                        <span>按系统缩放之上再调整整个客户端 UI，适合高 DPI 或远程桌面环境。</span>
+                      </div>
+                      <em>{Math.round(uiScale * 100)}%</em>
+                    </div>
+                    <input
+                      type="range"
+                      min={MIN_UI_SCALE}
+                      max={MAX_UI_SCALE}
+                      step="0.05"
+                      value={uiScale}
+                      onChange={(event) => {
+                        const nextScale = normalizeUiScale(event.target.value);
+                        setDraft((current) => ({ ...current, uiScale: nextScale }));
+                      }}
+                    />
+                    <div className="font-size-presets" aria-label="整体缩放快捷选项">
+                      {[
+                        [0.85, '85%'],
+                        [1, '默认'],
+                        [1.1, '110%'],
+                        [1.25, '125%'],
+                        [1.4, '140%']
+                      ].map(([value, label]) => (
+                        <button
+                          key={value}
+                          className={uiScale === value ? 'active' : ''}
+                          type="button"
+                          onClick={() => setDraft((current) => ({ ...current, uiScale: value }))}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="font-size-control">
+                    <div className="font-size-control-head">
+                      <div>
+                        <strong>显示字号</strong>
+                        <span>调节客户端界面和聊天内容的基础字号。</span>
+                      </div>
+                      <em>{displayFontSize}px</em>
+                    </div>
+                    <input
+                      type="range"
+                      min={MIN_DISPLAY_FONT_SIZE}
+                      max={MAX_DISPLAY_FONT_SIZE}
+                      step="1"
+                      value={displayFontSize}
+                      onChange={(event) => {
+                        const nextSize = normalizeDisplayFontSize(event.target.value);
+                        setDraft((current) => ({ ...current, displayFontSize: nextSize }));
+                      }}
+                    />
+                    <div className="font-size-presets" aria-label="字号快捷选项">
+                      {[
+                        [11, '小'],
+                        [12, '默认'],
+                        [14, '舒适'],
+                        [16, '大'],
+                        [18, '特大']
+                      ].map(([value, label]) => (
+                        <button
+                          key={value}
+                          className={displayFontSize === value ? 'active' : ''}
+                          type="button"
+                          onClick={() => setDraft((current) => ({ ...current, displayFontSize: value }))}
+                        >
+                          {label}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 </div>
               )}
@@ -250,18 +387,34 @@ export function SettingsDialog({ open, settings, saving, onOpenChange, onSave })
               {tab === 'update' && (
                 <div className="settings-card">
                   <strong>更新</strong>
-                  <p>当前版本 {appVersion || '未知'}。打包版本会在后台自动检查和下载更新；也可以手动检查。下载完成后，标题栏右上角会出现 Update 按钮。</p>
+                  <p>当前版本 {appVersion || '未知'}。优先保留 GitHub Release 自动更新；也可以通过当前 SSH Profile 从固定路径拉取 test 或 stable 安装包。</p>
                   <div className="update-settings-actions">
-                    <button className="secondary-button" type="button" onClick={checkForUpdate} disabled={updateDisabled}>
-                      {updateBusy ? '正在检查...' : '检查更新'}
+                    <button className="secondary-button" type="button" onClick={checkGithubUpdate} disabled={githubDisabled}>
+                      {githubBusy ? 'GitHub 检查中...' : '检查 GitHub 更新'}
                     </button>
-                    {updaterStatus?.state === 'downloaded' && (
-                      <button className="primary-button" type="button" onClick={installUpdate}>
-                        重启并安装
+                    {githubUpdaterStatus?.state === 'downloaded' && (
+                      <button className="primary-button" type="button" onClick={installGithubUpdate}>
+                        重启并安装 GitHub 更新
                       </button>
                     )}
                   </div>
-                  <p className="update-status-line">{updateStatusText(updaterStatus)}</p>
+                  <p className="update-status-line">{githubUpdateStatusText(githubUpdaterStatus)}</p>
+                  <div className="update-settings-actions">
+                    <button className="secondary-button" type="button" onClick={() => checkForUpdate('test')} disabled={updateDisabled}>
+                      检查 SSH test
+                    </button>
+                    <button className="secondary-button" type="button" onClick={() => checkForUpdate('stable')} disabled={updateDisabled}>
+                      检查 SSH stable
+                    </button>
+                    <button className="secondary-button" type="button" onClick={installTest} disabled={updateDisabled}>
+                      安装 latest SSH test
+                    </button>
+                    <button className="primary-button" type="button" onClick={installStable} disabled={updateDisabled}>
+                      安装 latest SSH stable
+                    </button>
+                  </div>
+                  {sshUpdaterStatus?.remotePath && <p className="update-status-line">SSH 远程路径：{sshUpdaterStatus.remotePath}</p>}
+                  <p className="update-status-line">{updateStatusText(sshUpdaterStatus)}</p>
                 </div>
               )}
               {tab === 'about' && (

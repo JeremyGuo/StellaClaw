@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, Notification } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Notification, shell } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const childProcess = require('node:child_process');
 const fs = require('node:fs/promises');
@@ -10,14 +10,54 @@ const SETTINGS_FILE = 'settings.json';
 const SSH_READY_TIMEOUT_MS = 10_000;
 const SERVER_REQUEST_TIMEOUT_MS = 90_000;
 const UPDATE_CHECK_INTERVAL_MS = 10 * 60 * 1000;
+const MIN_DISPLAY_FONT_SIZE = 11;
+const MAX_DISPLAY_FONT_SIZE = 18;
+const MIN_UI_SCALE = 0.8;
+const MAX_UI_SCALE = 1.4;
 
 let mainWindow;
 let updateCheckTimer = null;
 let updaterState = { state: app.isPackaged ? 'idle' : 'disabled' };
+let sshUpdaterState = { state: 'idle', channel: 'stable' };
 const tunnels = new Map();
 
 function appIconPath() {
   return path.join(__dirname, '..', 'build', 'icon.png');
+}
+
+function packageJsonPath() {
+  return path.join(__dirname, '..', 'package.json');
+}
+
+function updateArtifactExtension() {
+  if (process.platform === 'win32') return '.exe';
+  if (process.platform === 'darwin') return '.dmg';
+  return '.AppImage';
+}
+
+function updateRemoteName(channel) {
+  const normalized = normalizeUpdateChannel(channel);
+  return `stellacode2-${process.platform}-${process.arch}-${normalized}${updateArtifactExtension()}`;
+}
+
+function updateRemotePath(channel) {
+  return `/home/liuhao/ClawParty/apps/stellacode2/release/${updateRemoteName(channel)}`;
+}
+
+function updateManifestPath(channel) {
+  return `${updateRemotePath(channel)}.json`;
+}
+
+function normalizeUpdateChannel(channel) {
+  return channel === 'test' ? 'test' : 'stable';
+}
+
+function updateChannelLabel(channel) {
+  return normalizeUpdateChannel(channel) === 'test' ? 'test' : 'stable';
+}
+
+function localUpdatePath(channel) {
+  return path.join(app.getPath('userData'), 'updates', updateRemoteName(channel));
 }
 
 function defaultSettings() {
@@ -25,6 +65,8 @@ function defaultSettings() {
     activeServerId: 'local',
     sidebarMode: 'expanded',
     themeMode: 'system',
+    displayFontSize: 12,
+    uiScale: 1,
     layout: {
       sidebar: 286,
       inspector: 340,
@@ -56,6 +98,17 @@ function settingsPath() {
 function normalizeSettings(value) {
   const fallback = defaultSettings();
   const servers = Array.isArray(value?.servers) ? value.servers : fallback.servers;
+  const displayFontSize = Number(value?.displayFontSize);
+  const uiScale = Number(value?.uiScale);
+  const normalizedUiScale = Number.isFinite(uiScale)
+    ? Math.min(MAX_UI_SCALE, Math.max(MIN_UI_SCALE, Math.round(uiScale * 20) / 20))
+    : fallback.uiScale;
+  const normalizedDisplayFontSize = Number.isFinite(displayFontSize)
+    ? Math.min(
+      MAX_DISPLAY_FONT_SIZE,
+      Math.max(MIN_DISPLAY_FONT_SIZE, Math.round(displayFontSize))
+    )
+    : fallback.displayFontSize;
   const normalizedServers = servers.map((server, index) => ({
     id: String(server.id || `server-${index + 1}`),
     name: String(server.name || server.id || `Server ${index + 1}`),
@@ -74,6 +127,8 @@ function normalizeSettings(value) {
         : normalizedServers[0]?.id || fallback.activeServerId,
     sidebarMode: value?.sidebarMode === 'collapsed' ? 'collapsed' : 'expanded',
     themeMode: ['system', 'light', 'dark'].includes(value?.themeMode) ? value.themeMode : fallback.themeMode,
+    displayFontSize: normalizedDisplayFontSize,
+    uiScale: normalizedUiScale,
     layout: {
       sidebar: Number(layout.sidebar) || fallback.layout.sidebar,
       inspector: Number(layout.inspector) || fallback.layout.inspector,
@@ -491,10 +546,26 @@ function createWindow() {
   });
 }
 
+function setRendererZoomFactor(event, value) {
+  const scale = Number(value);
+  const normalized = Number.isFinite(scale)
+    ? Math.min(MAX_UI_SCALE, Math.max(MIN_UI_SCALE, Math.round(scale * 20) / 20))
+    : 1;
+  event.sender.setZoomFactor(normalized);
+  return normalized;
+}
+
 function publishUpdaterState(patch) {
   updaterState = { ...updaterState, ...patch };
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('updater:status', updaterState);
+  }
+}
+
+function publishSshUpdaterState(patch) {
+  sshUpdaterState = { ...sshUpdaterState, ...patch };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('sshUpdater:status', sshUpdaterState);
   }
 }
 
@@ -511,10 +582,7 @@ async function checkForUpdatesNow() {
   } catch (error) {
     console.warn('Auto-updater check failed:', error?.message || error);
     if (updaterState.state !== 'downloaded') {
-      publishUpdaterState({
-        state: 'error',
-        error: error?.message || String(error)
-      });
+      publishUpdaterState({ state: 'error', error: error?.message || String(error) });
     }
   }
   return updaterState;
@@ -529,12 +597,7 @@ function setupAutoUpdater() {
     publishUpdaterState({ state: 'checking' });
   });
   autoUpdater.on('update-available', (info) => {
-    publishUpdaterState({
-      state: 'downloading',
-      version: info.version,
-      releaseDate: info.releaseDate,
-      percent: 0
-    });
+    publishUpdaterState({ state: 'downloading', version: info.version, releaseDate: info.releaseDate, percent: 0 });
   });
   autoUpdater.on('update-not-available', () => {
     if (updaterState.state === 'downloaded') return;
@@ -550,19 +613,12 @@ function setupAutoUpdater() {
     });
   });
   autoUpdater.on('update-downloaded', (info) => {
-    publishUpdaterState({
-      state: 'downloaded',
-      version: info.version,
-      percent: 100
-    });
+    publishUpdaterState({ state: 'downloaded', version: info.version, percent: 100 });
   });
   autoUpdater.on('error', (error) => {
     console.warn('Auto-updater error:', error?.message || error);
     if (updaterState.state === 'downloaded') return;
-    publishUpdaterState({
-      state: 'error',
-      error: error?.message || String(error)
-    });
+    publishUpdaterState({ state: 'error', error: error?.message || String(error) });
   });
 
   if (!app.isPackaged) {
@@ -576,13 +632,177 @@ function setupAutoUpdater() {
   }, UPDATE_CHECK_INTERVAL_MS);
 }
 
+function runProcess(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    const processHandle = childProcess.spawn(command, args, {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      ...options
+    });
+    let stdout = '';
+    let stderr = '';
+    processHandle.stdout?.setEncoding('utf8');
+    processHandle.stderr?.setEncoding('utf8');
+    processHandle.stdout?.on('data', (chunk) => { stdout += chunk; });
+    processHandle.stderr?.on('data', (chunk) => { stderr += chunk; });
+    processHandle.on('error', reject);
+    processHandle.on('close', (code, signal) => {
+      if (code === 0) {
+        resolve({ stdout, stderr });
+        return;
+      }
+      reject(new Error(stderr.trim() || `${command} exited with ${code ?? signal}`));
+    });
+  });
+}
+
+function shellSingleQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+async function appVersionInfo() {
+  try {
+    const raw = await fs.readFile(packageJsonPath(), 'utf8');
+    const pkg = JSON.parse(raw);
+    return {
+      versionName: String(pkg.versionName || pkg.version || app.getVersion()),
+      versionCode: Number(pkg.versionCode) || 0,
+      version: String(pkg.version || app.getVersion())
+    };
+  } catch {
+    return { versionName: app.getVersion(), versionCode: 0, version: app.getVersion() };
+  }
+}
+
+function selectUpdateServer(settings) {
+  const servers = Array.isArray(settings?.servers) ? settings.servers : [];
+  return servers.find((server) => server.id === settings?.activeServerId && server.sshHost)
+    || servers.find((server) => server.connectionMode === 'ssh_proxy' && server.sshHost)
+    || servers.find((server) => server.sshHost);
+}
+
+function parseRemoteManifest(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) return null;
+  const parsed = JSON.parse(trimmed);
+  return {
+    versionName: String(parsed.versionName || parsed.version || '').trim(),
+    versionCode: Number(parsed.versionCode) || 0,
+    notes: String(parsed.notes || '').trim()
+  };
+}
+
+async function readRemoteManifest(server, channel) {
+  try {
+    const result = await runProcess('ssh', [
+      server.sshHost.trim(),
+      `cat ${shellSingleQuote(updateManifestPath(channel))}`
+    ]);
+    return parseRemoteManifest(result.stdout);
+  } catch {
+    return null;
+  }
+}
+
+async function remoteFileSize(server, channel) {
+  const remotePath = updateRemotePath(channel);
+  const command = `if command -v stat >/dev/null 2>&1; then stat -c %s ${shellSingleQuote(remotePath)}; else wc -c < ${shellSingleQuote(remotePath)}; fi`;
+  const result = await runProcess('ssh', [server.sshHost.trim(), command]);
+  return Number(result.stdout.trim()) || null;
+}
+
+async function checkSshUpdate(channel = 'stable') {
+  const normalized = normalizeUpdateChannel(channel);
+  publishSshUpdaterState({ state: 'checking', channel: normalized, error: '', percent: 0 });
+  try {
+    const settings = await readSettings();
+    const server = selectUpdateServer(settings);
+    if (!server?.sshHost?.trim()) throw new Error('No SSH Host configured for update downloads.');
+    const [current, remote] = await Promise.all([
+      appVersionInfo(),
+      readRemoteManifest(server, normalized)
+    ]);
+    publishSshUpdaterState({
+      state: 'idle',
+      channel: normalized,
+      sshHost: server.sshHost.trim(),
+      remotePath: updateRemotePath(normalized),
+      current,
+      remote,
+      message: remote
+        ? `${updateChannelLabel(normalized)} ${remote.versionName || 'unknown'} (${remote.versionCode || 0}) is available on SSH.`
+        : `${updateChannelLabel(normalized)} manifest unavailable; installer can still be pulled from fixed path.`
+    });
+  } catch (error) {
+    publishSshUpdaterState({ state: 'error', channel: normalized, error: error?.message || String(error) });
+  }
+  return sshUpdaterState;
+}
+
+async function installSshUpdate(channel = 'stable') {
+  const normalized = normalizeUpdateChannel(channel || sshUpdaterState.channel);
+  if (sshUpdaterState.state === 'downloaded' && sshUpdaterState.filePath && (!channel || sshUpdaterState.channel === normalized)) {
+    const openError = await shell.openPath(sshUpdaterState.filePath);
+    if (openError) publishSshUpdaterState({ state: 'error', channel: sshUpdaterState.channel, error: openError });
+    return sshUpdaterState;
+  }
+  if (sshUpdaterState.state === 'downloading') return sshUpdaterState;
+  publishSshUpdaterState({ state: 'checking', channel: normalized, error: '', percent: 0 });
+  try {
+    const settings = await readSettings();
+    const server = selectUpdateServer(settings);
+    if (!server?.sshHost?.trim()) throw new Error('No SSH Host configured for update downloads.');
+    const [current, remote, totalBytes] = await Promise.all([
+      appVersionInfo(),
+      readRemoteManifest(server, normalized),
+      remoteFileSize(server, normalized)
+    ]);
+    const targetPath = localUpdatePath(normalized);
+    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    publishSshUpdaterState({
+      state: 'downloading',
+      channel: normalized,
+      sshHost: server.sshHost.trim(),
+      remotePath: updateRemotePath(normalized),
+      current,
+      remote,
+      totalBytes,
+      percent: 0,
+      message: `Downloading ${updateChannelLabel(normalized)} installer from ${updateRemotePath(normalized)}`
+    });
+    await runProcess('scp', [`${server.sshHost.trim()}:${updateRemotePath(normalized)}`, targetPath]);
+    if (process.platform !== 'win32') await fs.chmod(targetPath, 0o755).catch(() => {});
+    publishSshUpdaterState({
+      state: 'downloaded',
+      channel: normalized,
+      current,
+      remote,
+      filePath: targetPath,
+      totalBytes,
+      percent: 100,
+      message: `Downloaded ${updateChannelLabel(normalized)} installer. Opening installer...`
+    });
+    const openError = await shell.openPath(targetPath);
+    if (openError) throw new Error(openError);
+    publishSshUpdaterState({ state: 'downloaded', channel: normalized, filePath: targetPath, percent: 100, message: 'Installer opened.' });
+  } catch (error) {
+    publishSshUpdaterState({ state: 'error', channel: normalized, error: error?.message || String(error) });
+  }
+  return sshUpdaterState;
+}
+
 app.whenReady().then(() => {
   if (process.platform === 'darwin') {
     app.dock.setIcon(appIconPath());
   }
   ipcMain.handle('settings:load', readSettings);
   ipcMain.handle('settings:save', (_event, settings) => writeSettings(settings));
-  ipcMain.handle('app:version', () => app.getVersion());
+  ipcMain.handle('app:version', async () => {
+    const info = await appVersionInfo();
+    return info.versionName;
+  });
+  ipcMain.handle('app:versionInfo', appVersionInfo);
+  ipcMain.handle('app:setZoomFactor', setRendererZoomFactor);
   ipcMain.handle('server:request', requestServer);
   ipcMain.handle('server:connectionInfo', serverConnectionInfo);
   ipcMain.handle('binary:gzip', gzipBinary);
@@ -597,6 +817,9 @@ app.whenReady().then(() => {
     }
     return updaterState;
   });
+  ipcMain.handle('sshUpdater:status', () => sshUpdaterState);
+  ipcMain.handle('sshUpdater:check', (_event, channel) => checkSshUpdate(channel));
+  ipcMain.handle('sshUpdater:install', (_event, channel) => installSshUpdate(channel));
   createWindow();
   setupAutoUpdater();
 });

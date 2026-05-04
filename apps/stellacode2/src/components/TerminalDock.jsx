@@ -24,7 +24,8 @@ function sendJson(socket, payload) {
   return false;
 }
 
-export function TerminalDock({ open, serverId, conversationId, onResizeHeight, onResizeList }) {
+export function TerminalDock({ open, serverId, conversationId, fontSize = 13, onResizeHeight, onResizeList }) {
+  const terminalFontSize = Math.min(22, Math.max(11, Math.round(Number(fontSize) || 13)));
   const [terminals, setTerminals] = useState([]);
   const [activeTerminalId, setActiveTerminalId] = useState('');
   const [loading, setLoading] = useState(false);
@@ -161,7 +162,7 @@ export function TerminalDock({ open, serverId, conversationId, onResizeHeight, o
       cursorBlink: true,
       cursorStyle: 'block',
       fontFamily: '"SFMono-Regular", Menlo, Monaco, Consolas, "Liberation Mono", monospace',
-      fontSize: 13,
+      fontSize: terminalFontSize,
       lineHeight: 1.12,
       scrollback: 12000,
       theme: {
@@ -215,7 +216,7 @@ export function TerminalDock({ open, serverId, conversationId, onResizeHeight, o
       if (terminalRef.current === terminal) terminalRef.current = null;
       if (fitAddonRef.current === fitAddon) fitAddonRef.current = null;
     };
-  }, [open, activeTerminalId, sendInput, sendResize]);
+  }, [open, activeTerminalId, terminalFontSize, sendInput, sendResize]);
 
   useEffect(() => {
     if (!open || !serverId || !conversationId || !activeTerminalId || !terminalRef.current) {

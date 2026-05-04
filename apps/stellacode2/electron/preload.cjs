@@ -37,8 +37,10 @@ function chromeMetrics() {
 contextBridge.exposeInMainWorld('stellacode2', {
   chromeMetrics,
   appVersion: () => ipcRenderer.invoke('app:version'),
+  appVersionInfo: () => ipcRenderer.invoke('app:versionInfo'),
   loadSettings: () => ipcRenderer.invoke('settings:load'),
   saveSettings: (settings) => ipcRenderer.invoke('settings:save', settings),
+  setZoomFactor: (scale) => ipcRenderer.invoke('app:setZoomFactor', scale),
   connectionInfo: (serverId) => ipcRenderer.invoke('server:connectionInfo', serverId),
   request: (payload) => ipcRenderer.invoke('server:request', payload),
   notify: (payload) => ipcRenderer.invoke('app:notify', payload),
@@ -53,6 +55,16 @@ contextBridge.exposeInMainWorld('stellacode2', {
       const listener = (_event, status) => callback(status);
       ipcRenderer.on('updater:status', listener);
       return () => ipcRenderer.removeListener('updater:status', listener);
+    }
+  },
+  sshUpdater: {
+    status: () => ipcRenderer.invoke('sshUpdater:status'),
+    check: (channel) => ipcRenderer.invoke('sshUpdater:check', channel),
+    install: (channel) => ipcRenderer.invoke('sshUpdater:install', channel),
+    onStatus: (callback) => {
+      const listener = (_event, status) => callback(status);
+      ipcRenderer.on('sshUpdater:status', listener);
+      return () => ipcRenderer.removeListener('sshUpdater:status', listener);
     }
   }
 });
