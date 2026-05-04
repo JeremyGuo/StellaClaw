@@ -103,6 +103,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
                 connectRealtime(profile, conversationId)
+                markConversationSeen(profile, conversationId, cached.totalMessages)
             } else {
                 refresh(connectRealtimeAfterLoad = true)
             }
@@ -207,6 +208,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             error = null,
                         )
                     }
+                    markConversationSeen(profile, conversationId, result.value.total)
                     cacheCurrentConversation()
                     if (connectRealtimeAfterLoad) {
                         connectRealtime(profile, conversationId)
@@ -573,6 +575,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun markConversationSeen(profile: ConnectionProfile, conversationId: String, totalMessages: Int) {
+        val lastSeenMessageId = totalMessages.minus(1).takeIf { it >= 0 }?.toString() ?: return
+        viewModelScope.launch {
+            when (val result = api.markConversationSeen(profile, conversationId, lastSeenMessageId)) {
+                is AppResult.Ok -> Unit
+                is AppResult.Err -> logRealtime("mark seen failed conversation=$conversationId error=${result.error.userMessage()}")
+            }
+        }
+    }
+
     private fun lastServerMessageIndex(messages: List<ChatMessage>): Int? = messages
         .asReversed()
         .firstOrNull { it.localState == MessageLocalState.Synced && it.id.toIntOrNull() != null }
@@ -795,6 +807,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     val messages = page.messages.map { it.toDomain() }
                     logRealtime("messages frame conversation=$conversationId count=${messages.size} offset=${page.offset} total=${page.total}")
                     applyIncomingMessages(messages)
+                    latestProfile?.let { profile -> markConversationSeen(profile, conversationId, page.total) }
                     reconnectAttempt = 0
                     mutableState.update {
                         it.copy(

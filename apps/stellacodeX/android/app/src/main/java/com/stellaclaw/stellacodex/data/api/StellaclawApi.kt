@@ -5,6 +5,7 @@ import com.stellaclaw.stellacodex.core.result.AppResult
 import com.stellaclaw.stellacodex.data.dto.ConversationsResponseDto
 import com.stellaclaw.stellacodex.data.dto.CreateConversationRequestDto
 import com.stellaclaw.stellacodex.data.dto.CreateConversationResponseDto
+import com.stellaclaw.stellacodex.data.dto.MarkConversationSeenRequestDto
 import com.stellaclaw.stellacodex.data.dto.MessagesResponseDto
 import com.stellaclaw.stellacodex.data.dto.ModelsResponseDto
 import com.stellaclaw.stellacodex.data.dto.SendMessageFileDto
@@ -108,6 +109,16 @@ class StellaclawApi(
             }
         }
     }
+
+    suspend fun markConversationSeen(
+        profile: ConnectionProfile,
+        conversationId: String,
+        lastSeenMessageId: String,
+    ): AppResult<Unit> = post(
+        profile = profile,
+        path = "/api/conversations/$conversationId/seen",
+        body = json.encodeToString(MarkConversationSeenRequestDto(lastSeenMessageId = lastSeenMessageId)),
+    ) { Unit }
 
     suspend fun sendMessage(
         profile: ConnectionProfile,

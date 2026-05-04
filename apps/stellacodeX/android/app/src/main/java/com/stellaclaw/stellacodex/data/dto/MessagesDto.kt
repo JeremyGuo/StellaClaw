@@ -48,6 +48,11 @@ data class MessageTokenUsageDto(
 )
 
 @Serializable
+data class MarkConversationSeenRequestDto(
+    @SerialName("last_seen_message_id") val lastSeenMessageId: String,
+)
+
+@Serializable
 data class SendMessageRequestDto(
     @SerialName("user_name") val userName: String,
     val text: String,
