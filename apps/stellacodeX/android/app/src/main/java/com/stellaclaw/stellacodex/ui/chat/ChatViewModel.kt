@@ -536,7 +536,19 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun mergeMessages(existing: List<ChatMessage>, incoming: List<ChatMessage>): List<ChatMessage> {
-        val syncedIncoming = incoming.map { it.copy(localState = MessageLocalState.Synced) }
+        val existingById = existing.associateBy { it.id }
+        val receivedAt = Instant.now().toString()
+        val syncedIncoming = incoming.map { remote ->
+            val preservedTime = existingById[remote.id]?.messageTime
+            val clientReceivedTime = remote.role
+                .takeIf { it.equals("assistant", ignoreCase = true) }
+                ?.takeIf { remote.messageTime.isNullOrBlank() }
+                ?.let { preservedTime ?: receivedAt }
+            remote.copy(
+                localState = MessageLocalState.Synced,
+                messageTime = remote.messageTime ?: clientReceivedTime,
+            )
+        }
         val byId = linkedMapOf<String, ChatMessage>()
         existing.filterNot { local ->
             local.localState == MessageLocalState.Sending && syncedIncoming.any { remote ->

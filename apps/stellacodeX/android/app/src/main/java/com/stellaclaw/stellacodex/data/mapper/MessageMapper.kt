@@ -13,7 +13,6 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
-import java.time.Instant
 
 fun ChatMessageDto.toDomain(): ChatMessage = ChatMessage(
     id = id,
@@ -22,7 +21,7 @@ fun ChatMessageDto.toDomain(): ChatMessage = ChatMessage(
     text = text,
     preview = preview,
     userName = userName,
-    messageTime = messageTime ?: role.takeIf { it.equals("assistant", ignoreCase = true) }?.let { Instant.now().toString() },
+    messageTime = messageTime,
     attachmentCount = attachmentCount,
     attachments = attachments.map { it.toDomain() },
     items = items.mapNotNull { it.toMessageItem() },
