@@ -201,6 +201,41 @@ class StellaclawApi(
         AppResult.Err(AppError.Network("attachment fetch retry exhausted"))
     }
 
+    suspend fun conversationStreamRequest(
+        profile: ConnectionProfile,
+        forceRefreshTunnel: Boolean = false,
+    ): AppResult<Request> {
+        if (!profile.isConfigured) return AppResult.Err(AppError.MissingConnection)
+        return withContext(Dispatchers.IO) {
+            try {
+                val baseUrl = resolveBaseUrl(profile, forceRefreshTunnel)
+                val httpUrl = baseUrl
+                    .plus("/api/conversations/stream")
+                    .toHttpUrlOrNull()
+                    ?: return@withContext AppResult.Err(AppError.Network("Invalid conversation stream URL"))
+                val httpUrlWithToken = httpUrl.newBuilder()
+                    .addQueryParameter("token", profile.token.trim())
+                    .build()
+                val wsUrl = when (httpUrlWithToken.scheme) {
+                    "https" -> httpUrlWithToken.toString().replaceFirst("https://", "wss://")
+                    "http" -> httpUrlWithToken.toString().replaceFirst("http://", "ws://")
+                    else -> return@withContext AppResult.Err(AppError.Network("Unsupported WebSocket scheme"))
+                }
+                AppResult.Ok(
+                    Request.Builder()
+                        .url(wsUrl)
+                        .header("Authorization", "Bearer ${profile.token.trim()}")
+                        .build(),
+                )
+            } catch (error: IOException) {
+                if (profile.connectionMode == ConnectionMode.SshProxy) tunnelManager.invalidate()
+                AppResult.Err(AppError.Network(error.message.orEmpty()))
+            } catch (error: Exception) {
+                AppResult.Err(AppError.Unknown(error.message.orEmpty()))
+            }
+        }
+    }
+
     suspend fun foregroundWebSocketRequest(
         profile: ConnectionProfile,
         conversationId: String,
