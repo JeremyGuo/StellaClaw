@@ -3397,9 +3397,9 @@ fn normalized_client_message_time(message_time: Option<String>) -> Option<String
     if value.is_empty() {
         return None;
     }
-    OffsetDateTime::parse(&value, &Rfc3339)
+    chrono::DateTime::parse_from_rfc3339(&value)
         .ok()
-        .and_then(|time| time.format(&Rfc3339).ok())
+        .map(|time| time.to_rfc3339())
 }
 
 fn system_time_rfc3339(system_time: SystemTime) -> Option<String> {
