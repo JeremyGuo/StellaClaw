@@ -195,7 +195,7 @@ pub fn read_workspace_file(
     state: &ConversationState,
     relative_path: &str,
     offset: u64,
-    limit_bytes: usize,
+    limit_bytes: Option<usize>,
 ) -> std::result::Result<WorkspaceFile, RemoteActorError> {
     let normalized = normalize_workspace_path(relative_path)?;
     if normalized.as_os_str().is_empty() {
@@ -230,12 +230,19 @@ pub fn read_workspace_file(
     let start = offset.min(file_size);
     file.seek(SeekFrom::Start(start))
         .with_context(|| format!("failed to seek workspace file {}", target.display()))?;
-    let read_limit = limit_bytes.max(1);
-    let mut data = vec![0_u8; read_limit];
-    let read = file
-        .read(&mut data)
-        .with_context(|| format!("failed to read workspace file {}", target.display()))?;
-    data.truncate(read);
+    let mut data = Vec::new();
+    let read = if let Some(limit_bytes) = limit_bytes {
+        let read_limit = limit_bytes.max(1);
+        data.resize(read_limit, 0);
+        let read = file
+            .read(&mut data)
+            .with_context(|| format!("failed to read workspace file {}", target.display()))?;
+        data.truncate(read);
+        read
+    } else {
+        file.read_to_end(&mut data)
+            .with_context(|| format!("failed to read workspace file {}", target.display()))?
+    };
     let (encoding, data) = match String::from_utf8(data) {
         Ok(text) => (WorkspaceFileEncoding::Utf8, text),
         Err(error) => (
@@ -333,6 +340,89 @@ pub fn upload_workspace_archive(
         count += 1;
     }
     Ok(count)
+}
+
+pub fn delete_workspace_path(
+    workdir: &Path,
+    state: &ConversationState,
+    relative_path: &str,
+) -> std::result::Result<(), RemoteActorError> {
+    let normalized = normalize_workspace_path(relative_path)?;
+    if normalized.as_os_str().is_empty() {
+        return Err(RemoteActorError::InvalidPath(
+            "workspace path must not be empty".to_string(),
+        ));
+    }
+    let conversation_root = workdir.join("conversations").join(&state.conversation_id);
+    let workspace_root = ensure_workspace_for_remote_mode(
+        workdir,
+        &conversation_root,
+        &state.conversation_id,
+        &state.tool_remote_mode,
+    )?;
+    let target = workspace_root.join(&normalized);
+    let metadata = fs::symlink_metadata(&target).with_context(|| {
+        format!(
+            "failed to inspect workspace path {}",
+            display_workspace_path(&normalized)
+        )
+    })?;
+    if metadata.is_dir() {
+        fs::remove_dir_all(&target)
+            .with_context(|| format!("failed to delete directory {}", target.display()))?;
+    } else {
+        fs::remove_file(&target)
+            .with_context(|| format!("failed to delete file {}", target.display()))?;
+    }
+    Ok(())
+}
+
+pub fn move_workspace_path(
+    workdir: &Path,
+    state: &ConversationState,
+    from_path: &str,
+    to_path: &str,
+) -> std::result::Result<(), RemoteActorError> {
+    let from = normalize_workspace_path(from_path)?;
+    let to = normalize_workspace_path(to_path)?;
+    if from.as_os_str().is_empty() || to.as_os_str().is_empty() {
+        return Err(RemoteActorError::InvalidPath(
+            "workspace source and destination paths must not be empty".to_string(),
+        ));
+    }
+    let conversation_root = workdir.join("conversations").join(&state.conversation_id);
+    let workspace_root = ensure_workspace_for_remote_mode(
+        workdir,
+        &conversation_root,
+        &state.conversation_id,
+        &state.tool_remote_mode,
+    )?;
+    let source = workspace_root.join(&from);
+    let target = workspace_root.join(&to);
+    if !source.exists() {
+        return Err(RemoteActorError::InvalidPath(format!(
+            "workspace path {} does not exist",
+            display_workspace_path(&from)
+        )));
+    }
+    if target.exists() {
+        return Err(RemoteActorError::InvalidPath(format!(
+            "workspace path {} already exists",
+            display_workspace_path(&to)
+        )));
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::rename(&source, &target).with_context(|| {
+        format!(
+            "failed to move workspace path {} to {}",
+            display_workspace_path(&from),
+            display_workspace_path(&to)
+        )
+    })?;
+    Ok(())
 }
 
 /// Download one or more workspace paths as a tar.gz archive.

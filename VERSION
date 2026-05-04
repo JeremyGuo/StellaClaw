@@ -1,5 +1,13 @@
-version: 1.23.4
+version: 1.23.5
 ---
+
+# 1.23.5
+
+- 修复 Web workspace 图片预览被截断的问题：
+  `workspace/file` 现在支持图片文件通过 `full=true` 读取完整原图，不再受普通文件 25 MiB 预览上限影响；非图片文件仍走 bounded preview，由客户端负责在超大文件时提示用户改用下载/打开。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 增加 Web workspace 删除和重命名/移动接口：
+  Web channel 现在支持 `DELETE /api/conversations/{id}/workspace?path=...` 和 `PATCH /api/conversations/{id}/workspace`，用于原生客户端文件管理。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.23.4
 

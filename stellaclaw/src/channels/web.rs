@@ -34,8 +34,8 @@ use crate::{
     conversation_id_manager::ConversationIdManager,
     logger::StellaclawLogger,
     remote_actor::{
-        download_workspace_archive, list_workspace_entries, read_workspace_file,
-        upload_workspace_archive, RemoteActorError,
+        delete_workspace_path, download_workspace_archive, list_workspace_entries,
+        move_workspace_path, read_workspace_file, upload_workspace_archive, RemoteActorError,
     },
     workspace::{is_sshfs_workspace_entry_name, sshfs_workspace_root, unmount_sshfs_workspace},
 };
@@ -56,7 +56,7 @@ use super::{
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 11 * 1024 * 1024;
 const DEFAULT_WORKSPACE_FILE_LIMIT_BYTES: usize = 1024 * 1024;
-const MAX_WORKSPACE_FILE_LIMIT_BYTES: usize = 5 * 1024 * 1024;
+const MAX_WORKSPACE_FILE_PREVIEW_BYTES: usize = 25 * 1024 * 1024;
 const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const WEBSOCKET_MAX_FRAME_BYTES: usize = 64 * 1024;
 const WEBSOCKET_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -231,6 +231,12 @@ impl WebChannel {
             }
             ("GET", ["conversations", conversation_id, "workspace"]) => {
                 self.conversation_workspace(conversation_id, &request.query)
+            }
+            ("DELETE", ["conversations", conversation_id, "workspace"]) => {
+                self.conversation_workspace_delete(conversation_id, &request.query)
+            }
+            ("PATCH", ["conversations", conversation_id, "workspace"]) => {
+                self.conversation_workspace_move(conversation_id, &request.body)
             }
             ("GET", ["conversations", conversation_id, "workspace", "file"]) => {
                 self.conversation_workspace_file(conversation_id, &request.query)
@@ -1255,11 +1261,18 @@ impl WebChannel {
             .get("offset")
             .and_then(|value| value.parse::<u64>().ok())
             .unwrap_or(0);
-        let limit_bytes = query
-            .get("limit_bytes")
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_WORKSPACE_FILE_LIMIT_BYTES)
-            .clamp(1, MAX_WORKSPACE_FILE_LIMIT_BYTES);
+        let full_image = query_bool(query, "full") && is_image_workspace_path(path);
+        let limit_bytes = if full_image {
+            None
+        } else {
+            Some(
+                query
+                    .get("limit_bytes")
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(DEFAULT_WORKSPACE_FILE_LIMIT_BYTES)
+                    .clamp(1, MAX_WORKSPACE_FILE_PREVIEW_BYTES),
+            )
+        };
         let file = read_workspace_file(&self.workdir, &state, path, offset, limit_bytes).map_err(
             |error| match error {
                 RemoteActorError::InvalidPath(message) => ApiError::new(400, message),
@@ -1267,6 +1280,50 @@ impl WebChannel {
             },
         )?;
         Ok(json_response(200, json!(file)))
+    }
+
+    fn conversation_workspace_delete(
+        &self,
+        conversation_id: &str,
+        query: &HashMap<String, String>,
+    ) -> ApiResult<HttpResponse> {
+        let state = self.load_web_state(conversation_id)?;
+        let path = query
+            .get("path")
+            .map(String::as_str)
+            .ok_or_else(|| ApiError::new(400, "workspace path is required"))?;
+        delete_workspace_path(&self.workdir, &state, path).map_err(|error| match error {
+            RemoteActorError::InvalidPath(message) => ApiError::new(400, message),
+            RemoteActorError::Internal(error) => ApiError::internal(error),
+        })?;
+        Ok(json_response(
+            200,
+            json!({"conversation_id": conversation_id, "path": path, "deleted": true}),
+        ))
+    }
+
+    fn conversation_workspace_move(
+        &self,
+        conversation_id: &str,
+        body: &[u8],
+    ) -> ApiResult<HttpResponse> {
+        let state = self.load_web_state(conversation_id)?;
+        let request: MoveWorkspacePathRequest = parse_json(body)?;
+        move_workspace_path(&self.workdir, &state, &request.path, &request.new_path).map_err(
+            |error| match error {
+                RemoteActorError::InvalidPath(message) => ApiError::new(400, message),
+                RemoteActorError::Internal(error) => ApiError::internal(error),
+            },
+        )?;
+        Ok(json_response(
+            200,
+            json!({
+                "conversation_id": conversation_id,
+                "path": request.path,
+                "new_path": request.new_path,
+                "moved": true,
+            }),
+        ))
     }
 
     fn conversation_workspace_upload(
@@ -1703,6 +1760,12 @@ struct SendMessageRequest {
     text: Option<String>,
     #[serde(default)]
     files: Option<Vec<WebFileItem>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MoveWorkspacePathRequest {
+    path: String,
+    new_path: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3241,6 +3304,24 @@ fn query_usize(query: &HashMap<String, String>, name: &str, default: usize) -> u
         .get(name)
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
+}
+
+fn query_bool(query: &HashMap<String, String>, name: &str) -> bool {
+    query
+        .get(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+fn is_image_workspace_path(path: &str) -> bool {
+    let extension = Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::to_ascii_lowercase);
+    matches!(
+        extension.as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "heic" | "heif")
+    )
 }
 
 fn parse_message_id(message_id: &str) -> ApiResult<usize> {
