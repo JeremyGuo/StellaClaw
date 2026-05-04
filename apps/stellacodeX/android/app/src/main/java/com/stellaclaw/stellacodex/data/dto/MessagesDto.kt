@@ -51,6 +51,14 @@ data class MessageTokenUsageDto(
 data class SendMessageRequestDto(
     @SerialName("user_name") val userName: String,
     val text: String,
+    val files: List<SendMessageFileDto> = emptyList(),
+)
+
+@Serializable
+data class SendMessageFileDto(
+    val uri: String,
+    @SerialName("media_type") val mediaType: String? = null,
+    val name: String? = null,
 )
 
 @Serializable

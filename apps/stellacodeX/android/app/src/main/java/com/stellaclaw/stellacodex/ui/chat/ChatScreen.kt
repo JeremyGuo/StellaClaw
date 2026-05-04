@@ -1,6 +1,8 @@
 package com.stellaclaw.stellacodex.ui.chat
 
 import android.app.Application
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.Image
@@ -21,12 +23,21 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.AttachFile
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Folder
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -127,10 +138,18 @@ fun ChatScreen(
         topBar = {
             TopAppBar(
                 title = { Text(state.displayName.ifBlank { conversationId.ifBlank { "Conversation" } }) },
-                navigationIcon = { TextButton(onClick = onBack) { Text("Back") } },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
                 actions = {
-                    TextButton(onClick = viewModel::refresh) { Text("Refresh") }
-                    TextButton(onClick = { onOpenWorkspace(conversationId) }) { Text("Files") }
+                    IconButton(onClick = viewModel::refresh) {
+                        Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
+                    }
+                    IconButton(onClick = { onOpenWorkspace(conversationId) }) {
+                        Icon(Icons.Filled.Folder, contentDescription = "Files")
+                    }
                 },
             )
         },
@@ -170,8 +189,11 @@ fun ChatScreen(
 
             Composer(
                 draft = state.draft,
+                pendingAttachments = state.pendingAttachments,
                 isSending = state.isSending,
                 onDraftChanged = viewModel::onDraftChanged,
+                onAddAttachments = viewModel::addAttachments,
+                onRemoveAttachment = viewModel::removeAttachment,
                 onSend = viewModel::send,
             )
         }
@@ -807,28 +829,68 @@ private val LocalMinuteFormatter: DateTimeFormatter = DateTimeFormatter.ofPatter
 @Composable
 private fun Composer(
     draft: String,
+    pendingAttachments: List<PendingAttachmentUiState>,
     isSending: Boolean,
     onDraftChanged: (String) -> Unit,
+    onAddAttachments: (List<android.net.Uri>) -> Unit,
+    onRemoveAttachment: (String) -> Unit,
     onSend: () -> Unit,
 ) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        OutlinedTextField(
-            value = draft,
-            onValueChange = onDraftChanged,
-            modifier = Modifier.weight(1f),
-            placeholder = { Text("Message Stellaclaw") },
-            minLines = 1,
-            maxLines = 4,
-        )
-        Button(
-            onClick = onSend,
-            enabled = draft.isNotBlank() && !isSending,
+    val attachmentLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetMultipleContents(),
+    ) { uris -> onAddAttachments(uris) }
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        if (pendingAttachments.isNotEmpty()) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                pendingAttachments.forEach { attachment ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(text = attachment.name, style = MaterialTheme.typography.labelMedium)
+                            Text(
+                                text = listOfNotNull(
+                                    attachment.mediaType,
+                                    attachment.sizeBytes?.let(::formatBytes),
+                                ).joinToString(" · ").ifBlank { "attachment" },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        IconButton(onClick = { onRemoveAttachment(attachment.uri) }) {
+                            Icon(Icons.Filled.Close, contentDescription = "Remove attachment")
+                        }
+                    }
+                }
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text(if (isSending) "Sending" else "Send")
+            IconButton(
+                onClick = { attachmentLauncher.launch("*/*") },
+                enabled = !isSending,
+            ) {
+                Icon(Icons.Filled.AttachFile, contentDescription = "Attach files")
+            }
+            OutlinedTextField(
+                value = draft,
+                onValueChange = onDraftChanged,
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("Message Stellaclaw") },
+                minLines = 1,
+                maxLines = 4,
+            )
+            IconButton(
+                onClick = onSend,
+                enabled = (draft.isNotBlank() || pendingAttachments.isNotEmpty()) && !isSending,
+            ) {
+                Icon(Icons.AutoMirrored.Filled.Send, contentDescription = if (isSending) "Sending" else "Send")
+            }
         }
     }
 }

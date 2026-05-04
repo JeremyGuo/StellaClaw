@@ -7,6 +7,7 @@ import com.stellaclaw.stellacodex.data.dto.CreateConversationRequestDto
 import com.stellaclaw.stellacodex.data.dto.CreateConversationResponseDto
 import com.stellaclaw.stellacodex.data.dto.MessagesResponseDto
 import com.stellaclaw.stellacodex.data.dto.ModelsResponseDto
+import com.stellaclaw.stellacodex.data.dto.SendMessageFileDto
 import com.stellaclaw.stellacodex.data.dto.SendMessageRequestDto
 import com.stellaclaw.stellacodex.data.dto.SendMessageResponseDto
 import com.stellaclaw.stellacodex.data.mapper.toDomain
@@ -112,10 +113,17 @@ class StellaclawApi(
         profile: ConnectionProfile,
         conversationId: String,
         text: String,
+        files: List<SendMessageFileDto> = emptyList(),
     ): AppResult<Unit> = post(
         profile = profile,
         path = "/api/conversations/$conversationId/messages",
-        body = json.encodeToString(SendMessageRequestDto(userName = profile.userName.ifBlank { "workspace-user" }, text = text)),
+        body = json.encodeToString(
+            SendMessageRequestDto(
+                userName = profile.userName.ifBlank { "workspace-user" },
+                text = text,
+                files = files,
+            ),
+        ),
     ) { responseBody ->
         json.decodeFromString<SendMessageResponseDto>(responseBody)
         Unit

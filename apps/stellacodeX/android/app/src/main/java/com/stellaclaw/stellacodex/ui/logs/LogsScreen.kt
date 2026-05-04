@@ -12,11 +12,17 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
@@ -48,10 +54,18 @@ fun LogsScreen(onBack: () -> Unit) {
         topBar = {
             TopAppBar(
                 title = { Text("Debug Logs") },
-                navigationIcon = { TextButton(onClick = onBack) { Text("Back") } },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
                 actions = {
-                    TextButton(onClick = { clipboard.setText(AnnotatedString(text)) }) { Text("Copy") }
-                    TextButton(onClick = viewModel::clear) { Text("Clear") }
+                    IconButton(onClick = { clipboard.setText(AnnotatedString(text)) }) {
+                        Icon(Icons.Filled.ContentCopy, contentDescription = "Copy")
+                    }
+                    IconButton(onClick = viewModel::clear) {
+                        Icon(Icons.Filled.Delete, contentDescription = "Clear")
+                    }
                 },
             )
         },

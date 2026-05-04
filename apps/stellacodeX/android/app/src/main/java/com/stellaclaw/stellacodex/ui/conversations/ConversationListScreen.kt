@@ -14,11 +14,18 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Article
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -66,13 +73,21 @@ fun ConversationListScreen(
                     }
                 },
                 actions = {
-                    TextButton(
+                    IconButton(
                         onClick = viewModel::createConversation,
                         enabled = !state.isCreating,
-                    ) { Text(if (state.isCreating) "Creating" else "New") }
-                    TextButton(onClick = viewModel::refresh) { Text("Refresh") }
-                    TextButton(onClick = onOpenLogs) { Text("Logs") }
-                    TextButton(onClick = onOpenSettings) { Text("Settings") }
+                    ) {
+                        Icon(Icons.Filled.Add, contentDescription = if (state.isCreating) "Creating" else "New conversation")
+                    }
+                    IconButton(onClick = viewModel::refresh) {
+                        Icon(Icons.Filled.Refresh, contentDescription = "Refresh")
+                    }
+                    IconButton(onClick = onOpenLogs) {
+                        Icon(Icons.Filled.Article, contentDescription = "Logs")
+                    }
+                    IconButton(onClick = onOpenSettings) {
+                        Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                    }
                 },
             )
         },

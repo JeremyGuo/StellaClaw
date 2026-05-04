@@ -1,8 +1,12 @@
 package com.stellaclaw.stellacodex.ui.chat
 
 import android.app.Application
+import android.content.ContentResolver
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.net.Uri
+import android.provider.OpenableColumns
+import android.util.Base64
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.stellaclaw.stellacodex.core.result.AppResult
@@ -10,6 +14,7 @@ import com.stellaclaw.stellacodex.core.result.userMessage
 import com.stellaclaw.stellacodex.data.api.MessagePage
 import com.stellaclaw.stellacodex.data.api.StellaclawApi
 import com.stellaclaw.stellacodex.data.dto.MessagesResponseDto
+import com.stellaclaw.stellacodex.data.dto.SendMessageFileDto
 import com.stellaclaw.stellacodex.data.log.AppLogStore
 import com.stellaclaw.stellacodex.data.mapper.toDomain
 import com.stellaclaw.stellacodex.data.store.ConnectionProfileStore
@@ -105,6 +110,28 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onDraftChanged(value: String) {
         mutableState.update { it.copy(draft = value, error = null) }
+    }
+
+    fun addAttachments(uris: List<Uri>) {
+        if (uris.isEmpty()) return
+        val resolver = getApplication<Application>().contentResolver
+        val incoming = uris.map { uri -> pendingAttachmentFromUri(uri, resolver) }
+        mutableState.update { state ->
+            val existingUris = state.pendingAttachments.map { it.uri }.toSet()
+            val merged = state.pendingAttachments + incoming.filterNot { it.uri in existingUris }
+            val totalBytes = merged.sumOf { it.sizeBytes ?: 0L }
+            if (totalBytes > MaxAttachmentBytes) {
+                state.copy(error = "Attachments are limited to ${formatBytes(MaxAttachmentBytes)} total")
+            } else {
+                state.copy(pendingAttachments = merged, error = null)
+            }
+        }
+    }
+
+    fun removeAttachment(uri: String) {
+        mutableState.update {
+            it.copy(pendingAttachments = it.pendingAttachments.filterNot { attachment -> attachment.uri == uri })
+        }
     }
 
     fun previewAttachment(attachment: MessageAttachment) {
@@ -307,7 +334,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     fun send() {
         val current = state.value
         val text = current.draft.trim()
-        if (current.conversationId.isBlank() || text.isEmpty() || current.isSending) return
+        val attachments = current.pendingAttachments
+        if (current.conversationId.isBlank() || (text.isEmpty() && attachments.isEmpty()) || current.isSending) return
         val localId = "local-${System.currentTimeMillis()}"
         val senderName = latestProfile?.userName?.ifBlank { "workspace-user" } ?: "workspace-user"
         val optimistic = ChatMessage(
@@ -318,7 +346,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             preview = text,
             userName = senderName,
             messageTime = Instant.now().toString(),
-            attachmentCount = 0,
+            attachmentCount = attachments.size,
             attachments = emptyList(),
             items = emptyList(),
             hasAttachmentErrors = false,
@@ -328,6 +356,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         mutableState.update {
             it.copy(
                 draft = "",
+                pendingAttachments = emptyList(),
                 isSending = true,
                 error = null,
                 messages = it.messages + optimistic,
@@ -337,7 +366,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             val profile: ConnectionProfile = store.profile.first()
             latestProfile = profile
-            when (val result = api.sendMessage(profile, current.conversationId, text)) {
+            val files = try {
+                attachments.map { it.toSendFile() }
+            } catch (error: Exception) {
+                mutableState.update { state ->
+                    state.copy(
+                        isSending = false,
+                        error = "Failed to read attachment: ${error.message.orEmpty()}",
+                        pendingAttachments = attachments,
+                        messages = state.messages.filterNot { message -> message.id == localId },
+                    )
+                }
+                return@launch
+            }
+            when (val result = api.sendMessage(profile, current.conversationId, text, files)) {
                 is AppResult.Ok -> {
                     mutableState.update { state ->
                         state.copy(
@@ -359,6 +401,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     state.copy(
                         isSending = false,
                         error = result.error.userMessage(),
+                        pendingAttachments = attachments,
                         messages = state.messages.map { message ->
                             if (message.id == localId) {
                                 message.copy(localState = MessageLocalState.Failed)
@@ -646,6 +689,46 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             .any { lower.endsWith(it) }
     }
 
+    private fun PendingAttachmentUiState.toSendFile(): SendMessageFileDto {
+        val resolver = getApplication<Application>().contentResolver
+        val uriValue = Uri.parse(uri)
+        val bytes = resolver.openInputStream(uriValue)?.use { it.readBytes() }
+            ?: throw IllegalArgumentException("cannot open $name")
+        if (bytes.size > MaxAttachmentBytes) {
+            throw IllegalArgumentException("${name} is larger than ${formatBytes(MaxAttachmentBytes)}")
+        }
+        val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+        val media = mediaType ?: resolver.getType(uriValue) ?: "application/octet-stream"
+        return SendMessageFileDto(
+            uri = "data:$media;base64,$base64",
+            mediaType = media,
+            name = name,
+        )
+    }
+
+    private fun pendingAttachmentFromUri(uri: Uri, resolver: ContentResolver): PendingAttachmentUiState {
+        var name = uri.lastPathSegment?.substringAfterLast('/')?.ifBlank { null } ?: "attachment"
+        var size: Long? = null
+        resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+            if (cursor.moveToFirst()) {
+                val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (nameIndex >= 0) {
+                    name = cursor.getString(nameIndex)?.takeIf { it.isNotBlank() } ?: name
+                }
+                val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
+                if (sizeIndex >= 0 && !cursor.isNull(sizeIndex)) {
+                    size = cursor.getLong(sizeIndex)
+                }
+            }
+        }
+        return PendingAttachmentUiState(
+            uri = uri.toString(),
+            name = name,
+            mediaType = resolver.getType(uri),
+            sizeBytes = size,
+        )
+    }
+
     private fun formatBytes(value: Long): String {
         val units = listOf("B", "KB", "MB", "GB")
         var size = value.toDouble()
@@ -813,6 +896,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private companion object {
         const val VisibleTimelineItemTarget = 20
         const val MessagePageFetchLimit = 20
+        const val MaxAttachmentBytes = 8L * 1024L * 1024L
     }
 }
 
@@ -825,6 +909,7 @@ data class ChatUiState(
     val messages: List<ChatMessage> = emptyList(),
     val loadedOffset: Int = 0,
     val totalMessages: Int = 0,
+    val pendingAttachments: List<PendingAttachmentUiState> = emptyList(),
     val draft: String = "",
     val error: String? = null,
     val realtimeState: String = "",
@@ -832,6 +917,13 @@ data class ChatUiState(
     val progressDetail: String? = null,
     val progressImportant: Boolean = false,
     val attachmentPreviews: Map<String, AttachmentPreviewUiState> = emptyMap(),
+)
+
+data class PendingAttachmentUiState(
+    val uri: String,
+    val name: String,
+    val mediaType: String? = null,
+    val sizeBytes: Long? = null,
 )
 
 data class AttachmentPreviewUiState(
