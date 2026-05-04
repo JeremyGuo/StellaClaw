@@ -22,8 +22,15 @@ object AgentNotificationCenter {
         Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 
-    fun notifyAgentDone(context: Context, conversationId: String, title: String, detail: String?) {
+    fun notifyAgentDone(
+        context: Context,
+        conversationId: String,
+        title: String,
+        detail: String?,
+        completionKey: String? = null,
+    ) {
         if (!canNotify(context)) return
+        if (completionKey != null && !markNotificationPending(context, completionKey)) return
         ensureChannel(context)
         val intent = Intent(context, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
@@ -44,6 +51,13 @@ object AgentNotificationCenter {
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .build()
         NotificationManagerCompat.from(context).notify(conversationId.hashCode().absoluteValue, notification)
+    }
+
+    private fun markNotificationPending(context: Context, completionKey: String): Boolean {
+        val prefs = context.getSharedPreferences("agent_notifications", Context.MODE_PRIVATE)
+        if (prefs.getString("last_completion_key", null) == completionKey) return false
+        prefs.edit().putString("last_completion_key", completionKey).apply()
+        return true
     }
 
     private fun ensureChannel(context: Context) {

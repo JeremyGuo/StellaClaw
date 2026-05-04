@@ -66,7 +66,6 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     private var latestProfile: ConnectionProfile? = null
     private var loadRequestSeq: Long = 0
     private var sawActiveTurnProgress: Boolean = false
-    private var lastNotifiedCompletionKey: String? = null
 
     fun load(conversationId: String) {
         if (conversationId.isBlank()) return
@@ -338,6 +337,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val text = current.draft.trim()
         val attachments = current.pendingAttachments
         if (current.conversationId.isBlank() || (text.isEmpty() && attachments.isEmpty()) || current.isSending) return
+        val baselineIndex = lastServerMessageIndex(current.messages) ?: -1
         val localId = "local-${System.currentTimeMillis()}"
         val senderName = latestProfile?.userName?.ifBlank { "workspace-user" } ?: "workspace-user"
         val optimistic = ChatMessage(
@@ -396,6 +396,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                     cacheCurrentConversation()
+                    AgentCompletionPollWorker.schedule(
+                        context = getApplication<Application>(),
+                        conversationId = current.conversationId,
+                        baselineIndex = baselineIndex,
+                    )
                     delay(350)
                     refresh()
                 }
@@ -822,6 +827,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val detail = listOfNotNull(activity, hint).joinToString(" · ").ifBlank { null }
         if (finalState == null) {
             sawActiveTurnProgress = true
+            AgentCompletionPollWorker.schedule(
+                context = getApplication<Application>(),
+                conversationId = state.value.conversationId,
+                baselineIndex = lastServerMessageIndex(state.value.messages) ?: -1,
+            )
         }
         mutableState.update {
             it.copy(
@@ -833,27 +843,28 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         }
         if (finalState == "done" || finalState == "failed") {
             val shouldNotify = finalState == "done" && sawActiveTurnProgress
-            val completionKey = "${state.value.conversationId}:${lastServerMessageIndex(state.value.messages) ?: -1}:$finalState"
             sawActiveTurnProgress = false
             viewModelScope.launch {
                 delay(500)
                 val conversationId = state.value.conversationId
                 val profile = latestProfile ?: store.profile.first().also { latestProfile = it }
                 syncMissingMessages(conversationId, profile, updateStatusWhenIdle = true)
-                if (shouldNotify && lastNotifiedCompletionKey != completionKey) {
-                    lastNotifiedCompletionKey = completionKey
+                if (shouldNotify) {
                     val snapshot = state.value
                     val latestAssistant = snapshot.messages.lastOrNull { message ->
                         message.role.equals("assistant", ignoreCase = true) &&
                             !message.isToolOnlyMessage() &&
                             !message.isRuntimeMetadataMessage()
                     }
+                    val completionKey = latestAssistant?.let { "$conversationId:${it.index}" }
                     AgentNotificationCenter.notifyAgentDone(
                         context = getApplication<Application>(),
                         conversationId = snapshot.conversationId,
                         title = "Agent finished",
                         detail = latestAssistant?.text?.ifBlank { latestAssistant.preview }?.take(160),
+                        completionKey = completionKey,
                     )
+                    AgentCompletionPollWorker.cancel(getApplication<Application>(), conversationId)
                 }
                 delay(1200)
                 mutableState.update { it.copy(progressTitle = null, progressDetail = null, progressImportant = false) }
