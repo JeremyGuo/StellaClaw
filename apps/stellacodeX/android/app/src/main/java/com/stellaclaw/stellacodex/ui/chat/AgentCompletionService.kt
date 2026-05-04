@@ -18,6 +18,7 @@ import com.stellaclaw.stellacodex.data.log.AppLogStore
 import com.stellaclaw.stellacodex.data.store.ConnectionProfileStore
 import com.stellaclaw.stellacodex.data.store.connectionDataStore
 import com.stellaclaw.stellacodex.domain.model.ChatMessage
+import com.stellaclaw.stellacodex.domain.model.ConversationSummary
 import com.stellaclaw.stellacodex.domain.model.MessageItem
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -35,32 +36,42 @@ class AgentCompletionService : Service() {
     private val api = StellaclawApi()
     private lateinit var store: ConnectionProfileStore
     private var pollJob: Job? = null
-    private var activeConversationId: String = ""
-    private var activeBaselineIndex: Int = -1
+    private val watches = linkedMapOf<String, Watch>()
 
     override fun onCreate() {
         super.onCreate()
         store = ConnectionProfileStore(applicationContext.connectionDataStore)
         ensureRunningChannel()
+        watches.putAll(loadWatches())
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ActionStop) {
-            stopSelf()
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ActionStop -> {
+                val conversationId = intent.getStringExtra(ExtraConversationId).orEmpty()
+                if (conversationId.isBlank()) {
+                    watches.clear()
+                } else {
+                    watches.remove(conversationId)
+                }
+                saveWatches()
+                if (watches.isEmpty()) stopSelf()
+                return START_NOT_STICKY
+            }
+            ActionWatch -> {
+                val conversationId = intent.getStringExtra(ExtraConversationId).orEmpty()
+                val baselineIndex = intent.getIntExtra(ExtraBaselineIndex, -1)
+                if (conversationId.isNotBlank()) {
+                    watches[conversationId] = Watch(conversationId, baselineIndex)
+                    saveWatches()
+                    log("watch conversation=$conversationId baseline=$baselineIndex")
+                }
+            }
+            else -> Unit
         }
-        val conversationId = intent?.getStringExtra(ExtraConversationId)?.takeIf { it.isNotBlank() }
-            ?: return START_NOT_STICKY
-        val baselineIndex = intent.getIntExtra(ExtraBaselineIndex, -1)
-        activeConversationId = conversationId
-        activeBaselineIndex = baselineIndex
-        startForeground(NotificationId, runningNotification(conversationId))
-        log("service start conversation=$conversationId baseline=$baselineIndex")
-        pollJob?.cancel()
-        pollJob = serviceScope.launch {
-            pollUntilComplete(conversationId, baselineIndex)
-        }
-        return START_REDELIVER_INTENT
+        startForeground(NotificationId, runningNotification("Checking agent conversations"))
+        ensurePollLoop()
+        return START_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -71,56 +82,113 @@ class AgentCompletionService : Service() {
         super.onDestroy()
     }
 
-    private suspend fun pollUntilComplete(conversationId: String, baselineIndex: Int) {
-        repeat(MaxPolls) { attempt ->
-            if (!serviceScope.coroutineContext.isActive || activeConversationId != conversationId) return
-            if (attempt > 0) delay(PollDelayMillis)
-            log("service poll conversation=$conversationId baseline=$baselineIndex attempt=$attempt")
-            val profile = store.profile.first()
-            when (val result = api.loadLatestMessages(profile, conversationId, limit = 30)) {
-                is AppResult.Err -> log("service poll failed conversation=$conversationId error=${result.error}")
-                is AppResult.Ok -> {
-                    val latestAssistant = result.value.messages
-                        .filter { it.index > baselineIndex }
-                        .lastOrNull { it.isFinalAssistantMessage() }
-                    if (latestAssistant != null) {
-                        val detail = latestAssistant.text.ifBlank { latestAssistant.preview }.take(160).ifBlank { null }
-                        val notified = AgentNotificationCenter.notifyAgentDone(
-                            context = applicationContext,
-                            conversationId = conversationId,
-                            title = "Agent finished",
-                            detail = detail,
-                            completionKey = "$conversationId:${latestAssistant.index}",
-                        )
-                        log("service completion conversation=$conversationId index=${latestAssistant.index} notified=$notified")
-                        stopSelf()
-                        return
-                    }
-                    log("service no completion conversation=$conversationId latestTotal=${result.value.total}")
-                }
+    private fun ensurePollLoop() {
+        if (pollJob?.isActive == true) return
+        pollJob = serviceScope.launch {
+            while (isActive) {
+                pollOnce()
+                delay(PollDelayMillis)
             }
         }
-        log("service give up conversation=$conversationId baseline=$baselineIndex")
-        stopSelf()
     }
 
-    private fun runningNotification(conversationId: String) = NotificationCompat.Builder(this, RunningChannelId)
+    private suspend fun pollOnce() {
+        val profile = store.profile.first()
+        val summaries = when (val result = api.loadConversations(profile, limit = 200)) {
+            is AppResult.Err -> {
+                log("summary poll failed error=${result.error}")
+                return
+            }
+            is AppResult.Ok -> result.value
+        }
+        addRunningConversations(summaries)
+        if (watches.isEmpty()) {
+            log("no running conversations; stop service")
+            stopSelf()
+            return
+        }
+        updateRunningNotification()
+        val runningById = summaries.associateBy { it.conversationId }
+        val completed = mutableListOf<String>()
+        watches.values.toList().forEach { watch ->
+            val summary = runningById[watch.conversationId]
+            if (summary == null) {
+                completed += watch.conversationId
+                log("drop missing conversation=${watch.conversationId}")
+                return@forEach
+            }
+            val latestAssistant = loadLatestFinalAssistant(watch)
+            if (latestAssistant != null) {
+                notifyCompletion(watch.conversationId, latestAssistant)
+                completed += watch.conversationId
+            } else if (!summary.running) {
+                completed += watch.conversationId
+                log("conversation stopped without final assistant conversation=${watch.conversationId}")
+            } else {
+                log("still running conversation=${watch.conversationId} baseline=${watch.baselineIndex}")
+            }
+        }
+        completed.forEach { watches.remove(it) }
+        if (completed.isNotEmpty()) saveWatches()
+        if (watches.isEmpty()) stopSelf()
+    }
+
+    private fun addRunningConversations(summaries: List<ConversationSummary>) {
+        summaries.filter { it.running }.forEach { summary ->
+            if (watches.containsKey(summary.conversationId)) return@forEach
+            val baseline = summary.lastMessageId?.toIntOrNull() ?: (summary.messageCount - 1).coerceAtLeast(-1)
+            watches[summary.conversationId] = Watch(summary.conversationId, baseline)
+            log("auto-watch running conversation=${summary.conversationId} baseline=$baseline")
+        }
+        saveWatches()
+    }
+
+    private suspend fun loadLatestFinalAssistant(watch: Watch): ChatMessage? =
+        when (val result = api.loadLatestMessages(store.profile.first(), watch.conversationId, limit = 30)) {
+            is AppResult.Err -> {
+                log("message poll failed conversation=${watch.conversationId} error=${result.error}")
+                null
+            }
+            is AppResult.Ok -> result.value.messages
+                .filter { it.index > watch.baselineIndex }
+                .lastOrNull { it.isFinalAssistantMessage() }
+        }
+
+    private fun notifyCompletion(conversationId: String, latestAssistant: ChatMessage) {
+        val detail = latestAssistant.text.ifBlank { latestAssistant.preview }.take(160).ifBlank { null }
+        val notified = AgentNotificationCenter.notifyAgentDone(
+            context = applicationContext,
+            conversationId = conversationId,
+            title = "Agent finished",
+            detail = detail,
+            completionKey = "$conversationId:${latestAssistant.index}",
+        )
+        log("completion conversation=$conversationId index=${latestAssistant.index} notified=$notified")
+    }
+
+    private fun updateRunningNotification() {
+        val count = watches.size
+        val text = if (count == 1) "Watching 1 agent conversation" else "Watching $count agent conversations"
+        getSystemService(NotificationManager::class.java).notify(NotificationId, runningNotification(text))
+    }
+
+    private fun runningNotification(text: String) = NotificationCompat.Builder(this, RunningChannelId)
         .setSmallIcon(R.drawable.ic_launcher)
         .setContentTitle("Agent running")
-        .setContentText("Waiting for agent completion")
-        .setStyle(NotificationCompat.BigTextStyle().bigText("Watching $conversationId for the final assistant reply"))
-        .setContentIntent(openAppIntent(conversationId))
+        .setContentText(text)
+        .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+        .setContentIntent(openAppIntent())
         .setOngoing(true)
         .setPriority(NotificationCompat.PRIORITY_LOW)
         .build()
 
-    private fun openAppIntent(conversationId: String): PendingIntent {
+    private fun openAppIntent(): PendingIntent {
         val intent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
         }
         return PendingIntent.getActivity(
             this,
-            conversationId.hashCode().absoluteValue + 1,
+            NotificationId.absoluteValue + 1,
             intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
@@ -136,9 +204,29 @@ class AgentCompletionService : Service() {
                 "Agent running",
                 NotificationManager.IMPORTANCE_LOW,
             ).apply {
-                description = "Keeps agent completion polling active while an agent is running"
+                description = "Keeps agent completion polling active while agents are running"
             },
         )
+    }
+
+    private fun loadWatches(): Map<String, Watch> {
+        val prefs = getSharedPreferences(PrefsName, Context.MODE_PRIVATE)
+        return prefs.getStringSet(PrefsWatches, emptySet()).orEmpty()
+            .mapNotNull { encoded ->
+                val parts = encoded.split('|', limit = 2)
+                val conversationId = parts.getOrNull(0)?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                val baseline = parts.getOrNull(1)?.toIntOrNull() ?: -1
+                conversationId to Watch(conversationId, baseline)
+            }
+            .toMap()
+    }
+
+    private fun saveWatches() {
+        val encoded = watches.values.map { "${it.conversationId}|${it.baselineIndex}" }.toSet()
+        getSharedPreferences(PrefsName, Context.MODE_PRIVATE)
+            .edit()
+            .putStringSet(PrefsWatches, encoded)
+            .apply()
     }
 
     private fun log(message: String) {
@@ -163,19 +251,30 @@ class AgentCompletionService : Service() {
             attachments.isEmpty() &&
             items.any { it is MessageItem.ToolCall || it is MessageItem.ToolResult }
 
+    private data class Watch(
+        val conversationId: String,
+        val baselineIndex: Int,
+    )
+
     companion object {
         private const val RunningChannelId = "agent_running"
         private const val NotificationId = 1201
         private const val ExtraConversationId = "conversation_id"
         private const val ExtraBaselineIndex = "baseline_index"
+        private const val ActionWatch = "com.stellaclaw.stellacodex.action.WATCH_AGENT_CONVERSATION"
         private const val ActionStop = "com.stellaclaw.stellacodex.action.STOP_AGENT_COMPLETION_SERVICE"
-        private const val PollDelayMillis = 15_000L
-        private const val MaxPolls = 120
+        private const val PollDelayMillis = 60_000L
+        private const val PrefsName = "agent_completion_service"
+        private const val PrefsWatches = "watches"
 
-        fun start(context: Context, conversationId: String, baselineIndex: Int) {
+        fun start(context: Context) {
+            ContextCompat.startForegroundService(context, Intent(context, AgentCompletionService::class.java))
+        }
+
+        fun watch(context: Context, conversationId: String, baselineIndex: Int) {
             if (conversationId.isBlank()) return
-            AgentCompletionPollWorker.cancel(context, conversationId)
             val intent = Intent(context, AgentCompletionService::class.java).apply {
+                action = ActionWatch
                 putExtra(ExtraConversationId, conversationId)
                 putExtra(ExtraBaselineIndex, baselineIndex)
             }
@@ -183,9 +282,9 @@ class AgentCompletionService : Service() {
         }
 
         fun stop(context: Context, conversationId: String) {
-            AgentCompletionPollWorker.cancel(context, conversationId)
             val intent = Intent(context, AgentCompletionService::class.java).apply {
                 action = ActionStop
+                putExtra(ExtraConversationId, conversationId)
             }
             context.startService(intent)
         }

@@ -396,7 +396,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         )
                     }
                     cacheCurrentConversation()
-                    AgentCompletionService.start(
+                    AgentCompletionService.watch(
                         context = getApplication<Application>(),
                         conversationId = current.conversationId,
                         baselineIndex = baselineIndex,
@@ -827,7 +827,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val detail = listOfNotNull(activity, hint).joinToString(" · ").ifBlank { null }
         if (finalState == null) {
             sawActiveTurnProgress = true
-            AgentCompletionService.start(
+            AgentCompletionService.watch(
                 context = getApplication<Application>(),
                 conversationId = state.value.conversationId,
                 baselineIndex = lastServerMessageIndex(state.value.messages) ?: -1,
