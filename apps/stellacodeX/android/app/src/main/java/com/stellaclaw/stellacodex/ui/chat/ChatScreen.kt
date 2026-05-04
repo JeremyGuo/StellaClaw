@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyColumn
@@ -53,7 +54,6 @@ import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.MoreHoriz
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -145,7 +145,10 @@ fun ChatScreen(
     LaunchedEffect(timeline, state.isLoadingEarlier, earlierLoadAnchor) {
         val anchor = earlierLoadAnchor ?: return@LaunchedEffect
         if (!state.isLoadingEarlier && timeline.isNotEmpty()) {
-            val index = timeline.indexOfFirst { it.key == anchor.key }
+            val index = anchor.messageId
+                ?.let { messageId -> timeline.indexOfFirst { it.containsMessageId(messageId) } }
+                ?.takeIf { it >= 0 }
+                ?: timeline.indexOfFirst { it.key == anchor.key }
             if (index >= 0) {
                 listState.scrollToItem(index, anchor.scrollOffset)
             }
@@ -169,7 +172,11 @@ fun ChatScreen(
         ) {
             val anchorItem = timeline.getOrNull(listState.firstVisibleItemIndex)
             if (anchorItem != null) {
-                earlierLoadAnchor = ScrollAnchor(anchorItem.key, listState.firstVisibleItemScrollOffset)
+                earlierLoadAnchor = ScrollAnchor(
+                    key = anchorItem.key,
+                    messageId = anchorItem.anchorMessageId(),
+                    scrollOffset = listState.firstVisibleItemScrollOffset,
+                )
             }
             viewModel.loadEarlier()
         }
@@ -180,9 +187,7 @@ fun ChatScreen(
         topBar = {
             ChatHeader(
                 title = state.displayName.ifBlank { conversationId.ifBlank { "Conversation" } },
-                subtitle = state.realtimeState.ifBlank { "Conversation stream" },
                 onBack = onBack,
-                onRefresh = viewModel::refresh,
                 onOpenWorkspace = { onOpenWorkspace(conversationId) },
                 onShowDetails = { showDetails = true },
             )
@@ -249,9 +254,7 @@ fun ChatScreen(
 @Composable
 private fun ChatHeader(
     title: String,
-    subtitle: String,
     onBack: () -> Unit,
-    onRefresh: () -> Unit,
     onOpenWorkspace: () -> Unit,
     onShowDetails: () -> Unit,
 ) {
@@ -263,6 +266,7 @@ private fun ChatHeader(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                .statusBarsPadding()
                 .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -277,20 +281,13 @@ private fun ChatHeader(
                 border = BorderStroke(1.dp, FrostedBorder),
             ) {
                 Column(
-                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 9.dp),
+                    modifier = Modifier.padding(horizontal = 18.dp, vertical = 14.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     Text(
                         text = title,
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        text = subtitle,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MutedText,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
@@ -305,14 +302,8 @@ private fun ChatHeader(
                     IconButton(onClick = onOpenWorkspace) {
                         Icon(Icons.Filled.Folder, contentDescription = "Files")
                     }
-                    IconButton(onClick = onRefresh) {
-                        Icon(Icons.Filled.Terminal, contentDescription = "Refresh stream")
-                    }
                     IconButton(onClick = onShowDetails) {
                         Icon(Icons.Filled.Info, contentDescription = "Conversation details")
-                    }
-                    IconButton(onClick = onRefresh) {
-                        Icon(Icons.Filled.MoreHoriz, contentDescription = "More")
                     }
                 }
             }
@@ -521,6 +512,7 @@ private fun MessageList(
 
 private data class ScrollAnchor(
     val key: String,
+    val messageId: String?,
     val scrollOffset: Int,
 )
 
@@ -625,6 +617,16 @@ private fun ToolSummaryCard(summary: ChatTimelineItem.ToolSummary) {
             }
         }
     }
+}
+
+private fun ChatTimelineItem.anchorMessageId(): String? = when (this) {
+    is ChatTimelineItem.Message -> message.id
+    is ChatTimelineItem.ToolSummary -> messages.firstOrNull()?.id
+}
+
+private fun ChatTimelineItem.containsMessageId(messageId: String): Boolean = when (this) {
+    is ChatTimelineItem.Message -> message.id == messageId
+    is ChatTimelineItem.ToolSummary -> messages.any { it.id == messageId }
 }
 
 @Composable
