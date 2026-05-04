@@ -151,22 +151,45 @@ class AgentCompletionService : Service() {
                 }
                 return@forEach
             }
-            if (watch.missingCount > 0) {
+            if (watch.missingCount > 0 || watch.stoppedWithoutFinalCount > 0 || watch.notifyFailureCount > 0) {
                 watches[watch.conversationId] = watch.copy(missingCount = 0)
             }
-            val latestAssistant = loadLatestFinalAssistant(watch)
-            if (latestAssistant != null) {
-                notifyCompletion(watch.conversationId, latestAssistant)
-                completed += watch.conversationId
+            val latestAssistant = loadLatestFinalAssistant(profile, watch)
+            if (latestAssistant.message != null) {
+                val notified = notifyCompletion(watch.conversationId, latestAssistant.message)
+                if (notified) {
+                    completed += watch.conversationId
+                } else {
+                    val next = watch.copy(notifyFailureCount = watch.notifyFailureCount + 1, missingCount = 0)
+                    watches[watch.conversationId] = next
+                    val reason = AgentNotificationCenter.notificationBlockReason(applicationContext) ?: "notify returned false"
+                    log("completion notification deferred conversation=${watch.conversationId} index=${latestAssistant.message.index} failures=${next.notifyFailureCount} reason=$reason")
+                    updateRunningNotification("Agent finished · notification blocked: $reason")
+                }
+            } else if (latestAssistant.failed) {
+                log("message lookup failed; keep watching conversation=${watch.conversationId} running=${summary.running}")
             } else if (!summary.running) {
-                completed += watch.conversationId
-                log("conversation stopped without final assistant conversation=${watch.conversationId}")
+                val nextStoppedCount = watch.stoppedWithoutFinalCount + 1
+                if (nextStoppedCount >= StoppedWithoutFinalNotifyAttempts) {
+                    val notified = notifyGenericCompletion(watch.conversationId)
+                    if (notified) {
+                        completed += watch.conversationId
+                    } else {
+                        val reason = AgentNotificationCenter.notificationBlockReason(applicationContext) ?: "notify returned false"
+                        watches[watch.conversationId] = watch.copy(stoppedWithoutFinalCount = nextStoppedCount, notifyFailureCount = watch.notifyFailureCount + 1)
+                        log("generic completion notification deferred conversation=${watch.conversationId} attempts=$nextStoppedCount reason=$reason")
+                        updateRunningNotification("Agent finished · notification blocked: $reason")
+                    }
+                } else {
+                    watches[watch.conversationId] = watch.copy(stoppedWithoutFinalCount = nextStoppedCount, missingCount = 0)
+                    log("conversation stopped before final assistant visible conversation=${watch.conversationId} attempt=$nextStoppedCount")
+                }
             } else {
                 log("still running conversation=${watch.conversationId} baseline=${watch.baselineIndex}")
             }
         }
         completed.forEach { watches.remove(it) }
-        if (completed.isNotEmpty()) saveWatches()
+        saveWatches()
         if (watches.isEmpty()) stopSelf()
         return true
     }
@@ -192,18 +215,24 @@ class AgentCompletionService : Service() {
         saveWatches()
     }
 
-    private suspend fun loadLatestFinalAssistant(watch: Watch): ChatMessage? =
-        when (val result = api.loadLatestMessages(store.profile.first(), watch.conversationId, limit = 30)) {
+    private suspend fun loadLatestFinalAssistant(
+        profile: com.stellaclaw.stellacodex.domain.model.ConnectionProfile,
+        watch: Watch,
+    ): FinalAssistantCheck =
+        when (val result = api.loadLatestMessages(profile, watch.conversationId, limit = 80)) {
             is AppResult.Err -> {
                 log("message poll failed conversation=${watch.conversationId} error=${result.error}")
-                null
+                FinalAssistantCheck(message = null, failed = true)
             }
-            is AppResult.Ok -> result.value.messages
-                .filter { it.index > watch.baselineIndex }
-                .lastOrNull { it.isFinalAssistantMessage() }
+            is AppResult.Ok -> FinalAssistantCheck(
+                message = result.value.messages
+                    .filter { it.index > watch.baselineIndex }
+                    .lastOrNull { it.isFinalAssistantMessage() },
+                failed = false,
+            )
         }
 
-    private fun notifyCompletion(conversationId: String, latestAssistant: ChatMessage) {
+    private fun notifyCompletion(conversationId: String, latestAssistant: ChatMessage): Boolean {
         val detail = latestAssistant.text.ifBlank { latestAssistant.preview }.take(160).ifBlank { null }
         val notified = AgentNotificationCenter.notifyAgentDone(
             context = applicationContext,
@@ -213,6 +242,19 @@ class AgentCompletionService : Service() {
             completionKey = "$conversationId:${latestAssistant.index}",
         )
         log("completion conversation=$conversationId index=${latestAssistant.index} notified=$notified")
+        return notified
+    }
+
+    private fun notifyGenericCompletion(conversationId: String): Boolean {
+        val notified = AgentNotificationCenter.notifyAgentDone(
+            context = applicationContext,
+            conversationId = conversationId,
+            title = "Agent finished",
+            detail = "Agent finished replying",
+            completionKey = "$conversationId:generic-finished",
+        )
+        log("generic completion conversation=$conversationId notified=$notified")
+        return notified
     }
 
     private fun updateRunningNotification(textOverride: String? = null) {
@@ -266,16 +308,25 @@ class AgentCompletionService : Service() {
         val prefs = getSharedPreferences(PrefsName, Context.MODE_PRIVATE)
         return prefs.getStringSet(PrefsWatches, emptySet()).orEmpty()
             .mapNotNull { encoded ->
-                val parts = encoded.split('|', limit = 2)
+                val parts = encoded.split('|')
                 val conversationId = parts.getOrNull(0)?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
                 val baseline = parts.getOrNull(1)?.toIntOrNull() ?: -1
-                conversationId to Watch(conversationId, baseline)
+                val stoppedWithoutFinalCount = parts.getOrNull(2)?.toIntOrNull() ?: 0
+                val notifyFailureCount = parts.getOrNull(3)?.toIntOrNull() ?: 0
+                conversationId to Watch(
+                    conversationId = conversationId,
+                    baselineIndex = baseline,
+                    stoppedWithoutFinalCount = stoppedWithoutFinalCount,
+                    notifyFailureCount = notifyFailureCount,
+                )
             }
             .toMap()
     }
 
     private fun saveWatches() {
-        val encoded = watches.values.map { "${it.conversationId}|${it.baselineIndex}" }.toSet()
+        val encoded = watches.values.map {
+            "${it.conversationId}|${it.baselineIndex}|${it.stoppedWithoutFinalCount}|${it.notifyFailureCount}"
+        }.toSet()
         getSharedPreferences(PrefsName, Context.MODE_PRIVATE)
             .edit()
             .putStringSet(PrefsWatches, encoded)
@@ -308,6 +359,13 @@ class AgentCompletionService : Service() {
         val conversationId: String,
         val baselineIndex: Int,
         val missingCount: Int = 0,
+        val stoppedWithoutFinalCount: Int = 0,
+        val notifyFailureCount: Int = 0,
+    )
+
+    private data class FinalAssistantCheck(
+        val message: ChatMessage?,
+        val failed: Boolean,
     )
 
     companion object {
@@ -318,6 +376,7 @@ class AgentCompletionService : Service() {
         private const val ActionWatch = "com.stellaclaw.stellacodex.action.WATCH_AGENT_CONVERSATION"
         private const val ActionStop = "com.stellaclaw.stellacodex.action.STOP_AGENT_COMPLETION_SERVICE"
         private const val PollDelayMillis = 60_000L
+        private const val StoppedWithoutFinalNotifyAttempts = 3
         private const val PrefsName = "agent_completion_service"
         private const val PrefsWatches = "watches"
 

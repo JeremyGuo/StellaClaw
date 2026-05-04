@@ -19,9 +19,25 @@ import kotlin.math.absoluteValue
 object AgentNotificationCenter {
     private const val ChannelId = "agent_done_heads_up"
 
-    fun canNotify(context: Context): Boolean =
-        Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+    fun canNotify(context: Context): Boolean = notificationBlockReason(context) == null
+
+    fun notificationBlockReason(context: Context): String? {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            return "POST_NOTIFICATIONS permission not granted"
+        }
+        if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) {
+            return "notifications disabled for app"
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = context.getSystemService(NotificationManager::class.java).getNotificationChannel(ChannelId)
+            if (channel?.importance == NotificationManager.IMPORTANCE_NONE) {
+                return "agent completion notification channel disabled"
+            }
+        }
+        return null
+    }
 
     fun dismissConversation(context: Context, conversationId: String) {
         NotificationManagerCompat.from(context).cancel(notificationId(conversationId))
@@ -34,7 +50,7 @@ object AgentNotificationCenter {
         detail: String?,
         completionKey: String? = null,
     ): Boolean {
-        if (!canNotify(context)) return false
+        notificationBlockReason(context)?.let { return false }
         if (completionKey != null && isAlreadyNotified(context, completionKey)) return true
         ensureChannel(context)
         val intent = Intent(context, MainActivity::class.java).apply {
@@ -63,7 +79,9 @@ object AgentNotificationCenter {
             NotificationManagerCompat.from(context).notify(notificationId(conversationId), notification)
             completionKey?.let { markNotified(context, it) }
             true
-        } catch (_: SecurityException) {
+        } catch (error: SecurityException) {
+            false
+        } catch (_: RuntimeException) {
             false
         }
     }
