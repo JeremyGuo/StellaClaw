@@ -21,7 +21,10 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use channels::{
-    types::{IncomingDispatch, OutgoingDispatch},
+    types::{
+        ChannelEvent, IncomingDispatch, OutgoingDispatch, OutgoingError, OutgoingErrorScope,
+        OutgoingErrorSeverity,
+    },
     Channel, TelegramChannel, WebChannel,
 };
 use config::{ChannelConfig, StellaclawConfig};
@@ -227,6 +230,22 @@ fn run_dispatcher_loop(
                             "error": format!("{error:#}"),
                         }),
                     );
+                    let _ = outgoing_tx.send(OutgoingDispatch::Event(ChannelEvent::Error(
+                        OutgoingError {
+                            channel_id: dispatch.channel_id,
+                            platform_chat_id: dispatch.platform_chat_id,
+                            conversation_id: dispatch.conversation_id,
+                            scope: OutgoingErrorScope::Runtime,
+                            severity: OutgoingErrorSeverity::Error,
+                            code: "incoming_dispatch_failed".to_string(),
+                            message: "Message accepted by Web API, but the conversation runtime did not receive it.".to_string(),
+                            detail: Some(serde_json::json!({
+                                "error": format!("{error:#}"),
+                            })),
+                            can_continue: true,
+                            suggested_action: Some("Reload this conversation or restart the Stellaclaw service, then try sending again.".to_string()),
+                        },
+                    )));
                 }
             }
             Ok(IncomingDispatch::DeleteConversation {

@@ -1,5 +1,13 @@
-version: 1.24.2
+version: 1.25.0
 ---
+
+# 1.25.0
+
+- 初始化 StellaCodeX Apple 原生客户端：
+  新增 `apps/stellacodeX/apple` SwiftUI/Xcode 工程，支持 macOS 和 iOS 共享核心协议与平台化 UI，覆盖会话列表、聊天流、Markdown/工具/附件展示、SSH Proxy、模型与设置、文件浏览/预览、终端会话、图片/文件附件发送、主题/语言配置、启动图和应用图标等 Apple 客户端基础能力。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Web channel 消息投递失败不可见的问题：
+  `POST /api/conversations/{id}/messages` 成功进入队列后，如果 dispatcher 后续未能把消息投递到对应 conversation runtime，现在会通过现有 WebSocket `error` 事件回传到该 conversation；Apple 客户端收到 realtime error 时会在聊天流中展示系统错误，避免只出现本地乐观消息却看不到失败原因。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.24.2
 

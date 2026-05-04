@@ -37,6 +37,8 @@ tmp/
 .stellaclaw/
 .skill_memory
 shared
+!apps/stellacodeX/apple/StellaCodeX/StellaCodeX/Shared/
+!apps/stellacodeX/apple/StellaCodeX/StellaCodeX/Shared/**
 STELLACLAW.md
 MEMORY_DESIGN.md
 
@@ -48,3 +50,7 @@ restart.log
 **/build/
 **/local.properties
 apps/stellacodeX/**/dist/
+
+# Xcode user state
+**/xcuserdata/
+*.xcuserstate

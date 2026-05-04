@@ -1,0 +1,698 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A00100000000000000000007 /* Citadel in Frameworks */ = {isa = PBXBuildFile; productRef = A00100000000000000000004 /* Citadel */; };
+		A00100000000000000000008 /* NIO in Frameworks */ = {isa = PBXBuildFile; productRef = A00100000000000000000005 /* NIO */; };
+		A00100000000000000000009 /* NIOSSH in Frameworks */ = {isa = PBXBuildFile; productRef = A00100000000000000000006 /* NIOSSH */; };
+		A0010000000000000000000C /* Crypto in Frameworks */ = {isa = PBXBuildFile; productRef = A0010000000000000000000B /* Crypto */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		1064C1B32FA794E8000FD4DD /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1064C19D2FA794E5000FD4DD /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1064C1A42FA794E6000FD4DD;
+			remoteInfo = StellaCodeX;
+		};
+		1064C1BD2FA794E8000FD4DD /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 1064C19D2FA794E5000FD4DD /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 1064C1A42FA794E6000FD4DD;
+			remoteInfo = StellaCodeX;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXFileReference section */
+		1064C1A52FA794E6000FD4DD /* StellaCodeX.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = StellaCodeX.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		1064C1B22FA794E8000FD4DD /* StellaCodeXTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = StellaCodeXTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		1064C1BC2FA794E8000FD4DD /* StellaCodeXUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = StellaCodeXUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		A0010000000000000000000D /* Exceptions for "StellaCodeX" folder in "StellaCodeX" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			platformFiltersByRelativePath = {
+				LaunchScreen.storyboard = (ios, );
+			};
+			target = 1064C1A42FA794E6000FD4DD /* StellaCodeX */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
+/* Begin PBXFileSystemSynchronizedRootGroup section */
+		1064C1A72FA794E6000FD4DD /* StellaCodeX */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				A0010000000000000000000D /* Exceptions for "StellaCodeX" folder in "StellaCodeX" target */,
+			);
+			path = StellaCodeX;
+			sourceTree = "<group>";
+		};
+		1064C1B52FA794E8000FD4DD /* StellaCodeXTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = StellaCodeXTests;
+			sourceTree = "<group>";
+		};
+		1064C1BF2FA794E8000FD4DD /* StellaCodeXUITests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = StellaCodeXUITests;
+			sourceTree = "<group>";
+		};
+/* End PBXFileSystemSynchronizedRootGroup section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		1064C1A22FA794E6000FD4DD /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A00100000000000000000007 /* Citadel in Frameworks */,
+				A00100000000000000000008 /* NIO in Frameworks */,
+				A00100000000000000000009 /* NIOSSH in Frameworks */,
+				A0010000000000000000000C /* Crypto in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1064C1AF2FA794E8000FD4DD /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1064C1B92FA794E8000FD4DD /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		1064C19C2FA794E5000FD4DD = {
+			isa = PBXGroup;
+			children = (
+				1064C1A72FA794E6000FD4DD /* StellaCodeX */,
+				1064C1B52FA794E8000FD4DD /* StellaCodeXTests */,
+				1064C1BF2FA794E8000FD4DD /* StellaCodeXUITests */,
+				1064C1A62FA794E6000FD4DD /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		1064C1A62FA794E6000FD4DD /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				1064C1A52FA794E6000FD4DD /* StellaCodeX.app */,
+				1064C1B22FA794E8000FD4DD /* StellaCodeXTests.xctest */,
+				1064C1BC2FA794E8000FD4DD /* StellaCodeXUITests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		1064C1A42FA794E6000FD4DD /* StellaCodeX */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 1064C1C62FA794E8000FD4DD /* Build configuration list for PBXNativeTarget "StellaCodeX" */;
+			buildPhases = (
+				1064C1A12FA794E6000FD4DD /* Sources */,
+				1064C1A22FA794E6000FD4DD /* Frameworks */,
+				1064C1A32FA794E6000FD4DD /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			fileSystemSynchronizedGroups = (
+				1064C1A72FA794E6000FD4DD /* StellaCodeX */,
+			);
+			name = StellaCodeX;
+			packageProductDependencies = (
+				A00100000000000000000004 /* Citadel */,
+				A00100000000000000000005 /* NIO */,
+				A00100000000000000000006 /* NIOSSH */,
+				A0010000000000000000000B /* Crypto */,
+			);
+			productName = StellaCodeX;
+			productReference = 1064C1A52FA794E6000FD4DD /* StellaCodeX.app */;
+			productType = "com.apple.product-type.application";
+		};
+		1064C1B12FA794E8000FD4DD /* StellaCodeXTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 1064C1C92FA794E8000FD4DD /* Build configuration list for PBXNativeTarget "StellaCodeXTests" */;
+			buildPhases = (
+				1064C1AE2FA794E8000FD4DD /* Sources */,
+				1064C1AF2FA794E8000FD4DD /* Frameworks */,
+				1064C1B02FA794E8000FD4DD /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				1064C1B42FA794E8000FD4DD /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				1064C1B52FA794E8000FD4DD /* StellaCodeXTests */,
+			);
+			name = StellaCodeXTests;
+			packageProductDependencies = (
+			);
+			productName = StellaCodeXTests;
+			productReference = 1064C1B22FA794E8000FD4DD /* StellaCodeXTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+		1064C1BB2FA794E8000FD4DD /* StellaCodeXUITests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 1064C1CC2FA794E8000FD4DD /* Build configuration list for PBXNativeTarget "StellaCodeXUITests" */;
+			buildPhases = (
+				1064C1B82FA794E8000FD4DD /* Sources */,
+				1064C1B92FA794E8000FD4DD /* Frameworks */,
+				1064C1BA2FA794E8000FD4DD /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				1064C1BE2FA794E8000FD4DD /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				1064C1BF2FA794E8000FD4DD /* StellaCodeXUITests */,
+			);
+			name = StellaCodeXUITests;
+			packageProductDependencies = (
+			);
+			productName = StellaCodeXUITests;
+			productReference = 1064C1BC2FA794E8000FD4DD /* StellaCodeXUITests.xctest */;
+			productType = "com.apple.product-type.bundle.ui-testing";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		1064C19D2FA794E5000FD4DD /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 2640;
+				LastUpgradeCheck = 2640;
+				TargetAttributes = {
+					1064C1A42FA794E6000FD4DD = {
+						CreatedOnToolsVersion = 26.4.1;
+					};
+					1064C1B12FA794E8000FD4DD = {
+						CreatedOnToolsVersion = 26.4.1;
+						TestTargetID = 1064C1A42FA794E6000FD4DD;
+					};
+					1064C1BB2FA794E8000FD4DD = {
+						CreatedOnToolsVersion = 26.4.1;
+						TestTargetID = 1064C1A42FA794E6000FD4DD;
+					};
+				};
+			};
+			buildConfigurationList = 1064C1A02FA794E5000FD4DD /* Build configuration list for PBXProject "StellaCodeX" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				"zh-Hans",
+				ja,
+				Base,
+			);
+			mainGroup = 1064C19C2FA794E5000FD4DD;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				A00100000000000000000001 /* XCRemoteSwiftPackageReference "Citadel" */,
+				A00100000000000000000002 /* XCRemoteSwiftPackageReference "swift-nio" */,
+				A00100000000000000000003 /* XCRemoteSwiftPackageReference "swift-nio-ssh" */,
+				A0010000000000000000000A /* XCRemoteSwiftPackageReference "swift-crypto" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 1064C1A62FA794E6000FD4DD /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				1064C1A42FA794E6000FD4DD /* StellaCodeX */,
+				1064C1B12FA794E8000FD4DD /* StellaCodeXTests */,
+				1064C1BB2FA794E8000FD4DD /* StellaCodeXUITests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		1064C1A32FA794E6000FD4DD /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1064C1B02FA794E8000FD4DD /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1064C1BA2FA794E8000FD4DD /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		1064C1A12FA794E6000FD4DD /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1064C1AE2FA794E8000FD4DD /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		1064C1B82FA794E8000FD4DD /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		1064C1B42FA794E8000FD4DD /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 1064C1A42FA794E6000FD4DD /* StellaCodeX */;
+			targetProxy = 1064C1B32FA794E8000FD4DD /* PBXContainerItemProxy */;
+		};
+		1064C1BE2FA794E8000FD4DD /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 1064C1A42FA794E6000FD4DD /* StellaCodeX */;
+			targetProxy = 1064C1BD2FA794E8000FD4DD /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		1064C1C42FA794E8000FD4DD /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = auto;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		1064C1C52FA794E8000FD4DD /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				SDKROOT = auto;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
+		1064C1C72FA794E8000FD4DD /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = StellaCodeX/StellaCodeX.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = L278JX7PT7;
+				"ENABLE_APP_SANDBOX[sdk=macosx*]" = YES;
+				ENABLE_PREVIEWS = YES;
+				"ENABLE_USER_SELECTED_FILES[sdk=macosx*]" = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSCameraUsageDescription = "StellaCodeX uses the camera to attach photos to chat messages.";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "StellaCodeX saves image attachments to your photo library when requested.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "StellaCodeX uses the photo library to attach images and videos to chat messages.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				"INFOPLIST_KEY_UILaunchStoryboardName[sdk=iphoneos*]" = LaunchScreen;
+				"INFOPLIST_KEY_UILaunchStoryboardName[sdk=iphonesimulator*]" = LaunchScreen;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.junyiguo.StellaCodeX;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,6";
+			};
+			name = Debug;
+		};
+		1064C1C82FA794E8000FD4DD /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = StellaCodeX/StellaCodeX.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
+				CODE_SIGN_STYLE = Automatic;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = L278JX7PT7;
+				"ENABLE_APP_SANDBOX[sdk=macosx*]" = YES;
+				ENABLE_PREVIEWS = YES;
+				"ENABLE_USER_SELECTED_FILES[sdk=macosx*]" = readonly;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSCameraUsageDescription = "StellaCodeX uses the camera to attach photos to chat messages.";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "StellaCodeX saves image attachments to your photo library when requested.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "StellaCodeX uses the photo library to attach images and videos to chat messages.";
+				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
+				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
+				"INFOPLIST_KEY_UILaunchStoryboardName[sdk=iphoneos*]" = LaunchScreen;
+				"INFOPLIST_KEY_UILaunchStoryboardName[sdk=iphonesimulator*]" = LaunchScreen;
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.junyiguo.StellaCodeX;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2,6";
+			};
+			name = Release;
+		};
+		1064C1CA2FA794E8000FD4DD /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.4;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jeremyguo.StellaCodeXTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/StellaCodeX.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/StellaCodeX";
+			};
+			name = Debug;
+		};
+		1064C1CB2FA794E8000FD4DD /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.4;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jeremyguo.StellaCodeXTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/StellaCodeX.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/StellaCodeX";
+			};
+			name = Release;
+		};
+		1064C1CD2FA794E8000FD4DD /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jeremyguo.StellaCodeXUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = StellaCodeX;
+			};
+			name = Debug;
+		};
+		1064C1CE2FA794E8000FD4DD /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jeremyguo.StellaCodeXUITests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				STRING_CATALOG_GENERATE_SYMBOLS = NO;
+				SWIFT_APPROACHABLE_CONCURRENCY = YES;
+				SWIFT_EMIT_LOC_STRINGS = NO;
+				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
+				SWIFT_VERSION = 5.0;
+				TEST_TARGET_NAME = StellaCodeX;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		1064C1A02FA794E5000FD4DD /* Build configuration list for PBXProject "StellaCodeX" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1064C1C42FA794E8000FD4DD /* Debug */,
+				1064C1C52FA794E8000FD4DD /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		1064C1C62FA794E8000FD4DD /* Build configuration list for PBXNativeTarget "StellaCodeX" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1064C1C72FA794E8000FD4DD /* Debug */,
+				1064C1C82FA794E8000FD4DD /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		1064C1C92FA794E8000FD4DD /* Build configuration list for PBXNativeTarget "StellaCodeXTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1064C1CA2FA794E8000FD4DD /* Debug */,
+				1064C1CB2FA794E8000FD4DD /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		1064C1CC2FA794E8000FD4DD /* Build configuration list for PBXNativeTarget "StellaCodeXUITests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				1064C1CD2FA794E8000FD4DD /* Debug */,
+				1064C1CE2FA794E8000FD4DD /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		A00100000000000000000001 /* XCRemoteSwiftPackageReference "Citadel" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/orlandos-nl/Citadel.git";
+			requirement = {
+				kind = upToNextMinorVersion;
+				minimumVersion = 0.12.1;
+			};
+		};
+		A00100000000000000000002 /* XCRemoteSwiftPackageReference "swift-nio" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-nio.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.81.0;
+			};
+		};
+		A00100000000000000000003 /* XCRemoteSwiftPackageReference "swift-nio-ssh" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/Wellz26/swift-nio-ssh.git";
+			requirement = {
+				kind = upToNextMinorVersion;
+				minimumVersion = 0.3.4;
+			};
+		};
+		A0010000000000000000000A /* XCRemoteSwiftPackageReference "swift-crypto" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/apple/swift-crypto.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 3.15.1;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A00100000000000000000004 /* Citadel */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A00100000000000000000001 /* XCRemoteSwiftPackageReference "Citadel" */;
+			productName = Citadel;
+		};
+		A00100000000000000000005 /* NIO */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A00100000000000000000002 /* XCRemoteSwiftPackageReference "swift-nio" */;
+			productName = NIO;
+		};
+		A00100000000000000000006 /* NIOSSH */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A00100000000000000000003 /* XCRemoteSwiftPackageReference "swift-nio-ssh" */;
+			productName = NIOSSH;
+		};
+		A0010000000000000000000B /* Crypto */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A0010000000000000000000A /* XCRemoteSwiftPackageReference "swift-crypto" */;
+			productName = Crypto;
+		};
+/* End XCSwiftPackageProductDependency section */
+	};
+	rootObject = 1064C19D2FA794E5000FD4DD /* Project object */;
+}
