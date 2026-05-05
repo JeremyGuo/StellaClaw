@@ -1,5 +1,9 @@
-version: 1.25.0
+version: 1.25.1
 ---
+
+# 1.25.1
+
+- 修复了一个shell工具在RemoteSSH模式下的BUG。
 
 # 1.25.0
 

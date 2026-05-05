@@ -1267,14 +1267,14 @@ fn resolve_shell(
     let requested = optional_string(arguments, "shell")
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
-    let shell = match requested {
-        Some(shell) => shell,
+    let (shell, validate) = match requested {
+        Some(shell) => (shell, true),
         None => match binding {
-            ShellBinding::Local => env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
-            ShellBinding::RemoteSsh { .. } => "${SHELL:-sh}".to_string(),
+            ShellBinding::Local => (env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()), true),
+            ShellBinding::RemoteSsh { .. } => ("${SHELL:-sh}".to_string(), false),
         },
     };
-    if !valid_shell_name(&shell) {
+    if validate && !valid_shell_name(&shell) {
         return Err(LocalToolError::InvalidArguments(
             "shell must be a simple path or command name".to_string(),
         ));
