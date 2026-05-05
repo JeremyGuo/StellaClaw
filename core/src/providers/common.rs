@@ -212,8 +212,12 @@ fn supports_anthropic_prompt_cache(model_config: &ModelConfig) -> bool {
     match model_config.provider_type {
         ProviderType::OpenRouterCompletion | ProviderType::OpenRouterResponses => {
             model_config.model_name.starts_with("anthropic/claude-")
+                || model_config.model_name.starts_with("z-ai/glm-")
         }
-        ProviderType::ClaudeCode => model_config.model_name.starts_with("claude-"),
+        ProviderType::ClaudeCode => {
+            model_config.model_name.starts_with("claude-")
+                || model_config.model_name.starts_with("glm-")
+        }
         ProviderType::OpenAiImageEdit
         | ProviderType::CodexSubscription
         | ProviderType::BraveSearch

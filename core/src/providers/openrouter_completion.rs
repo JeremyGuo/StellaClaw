@@ -410,6 +410,14 @@ struct OpenRouterUsage {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<OpenRouterPromptTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenRouterPromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -702,10 +710,15 @@ fn convert_openrouter_response(
     }
 
     let token_usage = response.usage.map(|usage| {
+        let cached = usage
+            .prompt_tokens_details
+            .as_ref()
+            .map(|d| d.cached_tokens)
+            .unwrap_or(0);
         let mut token_usage = TokenUsage {
-            cache_read: 0,
+            cache_read: cached,
             cache_write: 0,
-            uncache_input: usage.prompt_tokens,
+            uncache_input: usage.prompt_tokens.saturating_sub(cached),
             output: usage.completion_tokens,
             cost_usd: None,
         };
