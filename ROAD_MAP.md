@@ -33,6 +33,14 @@
 - 在 channel 抽象之上，后续会补一层统一的 `RESTful API`，作为外部系统接入和管理面的稳定边界。
 - 更后续阶段，前端界面应优先基于这层 `RESTful API` 构建，而不是直接耦合内部运行时。
 
+### 1.1.0 StellacodeX 原生客户端边界
+
+- `apps/stellacodeX/*` 是 Stellaclaw Web channel 的原生客户端轨道；客户端只连接现有 Host Web Service，不在本地运行 `stellaclaw`、`agent_server` 或工具执行 runtime。
+- 原生客户端按平台拥有自己的 UI、OS 集成和发布流水线；`apps/stellacodeX/shared/` 只放协议契约、生成 schema、共享资产和 fixture，不放跨平台 UI 层。
+- Windows 客户端第一阶段采用 WinUI 3 / Windows App SDK 方向，功能语义对齐 `apps/stellacode2` 与已落地的 Apple/Android 客户端：server profiles、conversation list、message history/send、foreground WebSocket、conversation stream、workspace、terminal、status/actions 和 SSH Proxy。
+- Windows 发布方式先固定为 portable zip：在 Windows 构建机上产出可独立运行目录，压缩后分发；解压即可运行，不先引入 MSIX、安装器或自动更新。
+- 非 Windows 服务器可以承载 Stellaclaw 测试后端、协议 fixture、普通 .NET 代码检查和文档维护；WinUI 构建、窗口交互、Windows Credential/SSH/通知和 portable zip 验证必须在 Windows runner、Windows VM 或真实 Windows 机器上完成。
+
 ### 1.1.1 Channel 输出事件边界
 
 `SessionEvent` 是 `SessionActor -> Conversation` 的内部执行事件，不应该直接等同于 Telegram/Web 的输出协议。Host 侧应在 `ConversationRuntime` 之后、具体 `Channel` 之前引入一层并集式 `ChannelEvent` / `OutgoingEvent`，由 `ConversationRuntime` 把 session、control、bridge、attachment、remote workspace 等内部结果归一化成 channel 可见语义，再由不同 channel 各自投影。

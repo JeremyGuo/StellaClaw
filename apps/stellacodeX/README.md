@@ -11,7 +11,7 @@ apps/stellacodeX/
   android/   # Android native client placeholder/prototype.
   apple/     # Apple native client project for macOS and iOS.
   ios/       # Deprecated placeholder; Apple development moved to apple/.
-  windows/   # Windows native client placeholder.
+  windows/   # Windows native client: WinUI 3 direction with portable zip release path.
   linux/     # Linux native client placeholder.
   shared/    # Cross-platform protocol notes, API contracts, assets, and generated schemas.
 ```
