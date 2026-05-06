@@ -200,10 +200,32 @@ fn materialize_remote_key_paths(host: &str, cwd: &str, destination: &Path) -> Re
         shell_quote(cwd),
         shell_quote(&script),
     );
-    let output = run_ssh_with_timeout(host, &remote_command, REMOTE_COPY_TIMEOUT)?;
+    let tmp_root = destination
+        .join(".stellaclaw")
+        .join("upgrade_remote_key_paths_tmp")
+        .join(format!("{}", current_nanos()));
+    fs::create_dir_all(&tmp_root)
+        .with_context(|| format!("failed to create {}", tmp_root.display()))?;
+    let archive_path = tmp_root.join("key_paths.tar.gz");
+    if let Err(error) =
+        run_ssh_archive_to_path(host, &remote_command, &archive_path, REMOTE_COPY_TIMEOUT)
+    {
+        let _ = fs::remove_dir_all(&tmp_root);
+        return Err(error);
+    }
+    let archive_data = match fs::read(&archive_path) {
+        Ok(data) => data,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&tmp_root);
+            return Err(error)
+                .with_context(|| format!("failed to read {}", archive_path.display()));
+        }
+    };
     fs::create_dir_all(destination)
         .with_context(|| format!("failed to create {}", destination.display()))?;
-    materialize_key_paths_from_tar_gz(&output.stdout, destination)
+    let result = materialize_key_paths_from_tar_gz(&archive_data, destination);
+    let _ = fs::remove_dir_all(&tmp_root);
+    result
 }
 
 fn materialize_key_paths_from_tar_gz(data: &[u8], destination: &Path) -> Result<usize> {
@@ -380,11 +402,14 @@ fn validate_remote_host(host: &str) -> Result<()> {
     Ok(())
 }
 
-fn run_ssh_with_timeout(
+fn run_ssh_archive_to_path(
     host: &str,
     remote_command: &str,
+    archive_path: &Path,
     timeout: Duration,
-) -> Result<std::process::Output> {
+) -> Result<()> {
+    let archive_file = fs::File::create(archive_path)
+        .with_context(|| format!("failed to create {}", archive_path.display()))?;
     let mut child = Command::new("ssh")
         .arg("-o")
         .arg("BatchMode=yes")
@@ -394,7 +419,7 @@ fn run_ssh_with_timeout(
         .arg(host)
         .arg(remote_command)
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::from(archive_file))
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| "failed to spawn SSH for remote key-path materialization")?;
@@ -406,7 +431,7 @@ fn run_ssh_with_timeout(
                     .wait_with_output()
                     .with_context(|| "failed to collect SSH key-path materialization output")?;
                 if status.success() {
-                    return Ok(output);
+                    return Ok(());
                 }
                 return Err(anyhow!(
                     "SSH key-path materialization exited with {}; stderr: {}",
@@ -464,7 +489,6 @@ with tarfile.open(fileobj=sys.stdout.buffer, mode="w:gz", dereference=False) as 
     )
 }
 
-#[cfg(test)]
 fn current_nanos() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
