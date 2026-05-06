@@ -144,6 +144,28 @@ impl SessionRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskPlanView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+    #[serde(default)]
+    pub plan: Vec<TaskPlanItemView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskPlanItemView {
+    pub step: String,
+    pub status: TaskPlanItemStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPlanItemStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum SessionEvent {
@@ -153,9 +175,17 @@ pub enum SessionEvent {
     },
     TurnStarted {
         turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<TaskPlanView>,
     },
     Progress {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<TaskPlanView>,
+    },
+    PlanUpdated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<TaskPlanView>,
     },
     TurnCompleted {
         message: ChatMessage,

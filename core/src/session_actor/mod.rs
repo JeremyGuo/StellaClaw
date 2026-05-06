@@ -27,7 +27,8 @@ pub use runtime_metadata::SessionSkillObservation;
 pub use session_rpc::{
     ConversationTransport, SessionErrorDetail, SessionEvent, SessionInitial, SessionMailbox,
     SessionMailboxKind, SessionRequest, SessionRpcConversationBridge, SessionRpcError,
-    SessionRpcThread, SessionType, ToolRemoteMode,
+    SessionRpcThread, SessionType, TaskPlanItemStatus, TaskPlanItemView, TaskPlanView,
+    ToolRemoteMode,
 };
 pub(crate) use system_prompt::system_prompt_for_initial;
 pub use token_estimator::{

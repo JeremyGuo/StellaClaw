@@ -28,8 +28,8 @@ use super::{
     system_prompt_for_initial, ChatMessage, ChatMessageItem, ChatRole, CompressionError,
     CompressionReport, ContextItem, ConversationBridgeRequest, SessionCompressor,
     SessionErrorDetail, SessionEvent, SessionInitial, SessionMailbox, SessionMailboxKind,
-    SessionRequest, TokenEstimator, ToolBatch, ToolBatchCompletion, ToolBatchExecutor,
-    ToolBatchOperation, ToolCatalog, ToolExecutionOp,
+    SessionRequest, TaskPlanItemStatus, TaskPlanView, TokenEstimator, ToolBatch,
+    ToolBatchCompletion, ToolBatchExecutor, ToolBatchOperation, ToolCatalog, ToolExecutionOp,
 };
 
 const DEFAULT_MAX_MODEL_STEPS_PER_TURN: usize = 200;
@@ -37,6 +37,7 @@ const ACTIVE_COMPRESSION_THRESHOLD_RATIO: f64 = 0.9;
 const IDLE_COMPACTION_MIN_RATIO: f64 = 0.4;
 const REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS: usize = 8;
 const DEFAULT_RETAIN_RECENT_PERCENT: u64 = 18;
+const SESSION_PLAN_CONTEXT_MARKER: &str = "[StellaClaw Current Task Plan]";
 
 pub struct SessionActor {
     model_config: ModelConfig,
@@ -64,6 +65,7 @@ pub struct SessionActor {
     compressor: Option<SessionCompressor>,
     token_estimator: Option<TokenEstimator>,
     pending_continuation: Option<PendingContinuation>,
+    current_plan: Option<TaskPlanView>,
     last_provider_request_started_at: Option<Instant>,
     last_agent_returned_at: Option<Instant>,
     last_completed_turn_number: u64,
@@ -174,6 +176,7 @@ impl SessionActor {
             compressor: None,
             token_estimator: None,
             pending_continuation: None,
+            current_plan: None,
             last_provider_request_started_at: None,
             last_agent_returned_at: None,
             last_completed_turn_number: 0,
@@ -591,6 +594,7 @@ impl SessionActor {
 
         self.emit(SessionEvent::Progress {
             message: format!("interrupt requested for tool batch {batch_id}"),
+            plan: self.current_plan.clone(),
         })
     }
 
@@ -817,6 +821,7 @@ impl SessionActor {
         }
         self.emit(SessionEvent::TurnStarted {
             turn_id: turn_id.clone(),
+            plan: self.current_plan.clone(),
         })?;
 
         if let Err(error) = self.run_model_tool_loop(&turn_id, turn_number, 0) {
@@ -849,6 +854,7 @@ impl SessionActor {
         );
         self.emit(SessionEvent::TurnStarted {
             turn_id: turn_id.clone(),
+            plan: self.current_plan.clone(),
         })?;
 
         if let Err(error) = self.run_model_tool_loop(&turn_id, turn_number, 0) {
@@ -1015,6 +1021,7 @@ impl SessionActor {
                         "final_items": model_message.data.len(),
                     }),
                 );
+                self.clear_current_plan()?;
                 self.emit(SessionEvent::TurnCompleted {
                     message: model_message,
                 })?;
@@ -1035,6 +1042,7 @@ impl SessionActor {
             );
             self.emit(SessionEvent::Progress {
                 message: format!("running tool batch {}: {}", batch.batch_id, batch_progress),
+                plan: self.current_plan.clone(),
             })?;
 
             let handle = self
@@ -1067,6 +1075,9 @@ impl SessionActor {
         let mut operations = Vec::with_capacity(tool_calls.len());
 
         for tool_call in tool_calls {
+            if tool_call.tool_name == "update_plan" {
+                self.handle_update_plan_tool_call(&tool_call.arguments.text)?;
+            }
             let scheduled = match self.tool_catalog.get(&tool_call.tool_name) {
                 Some(definition) => {
                     let operation = match &definition.backend {
@@ -1115,6 +1126,23 @@ impl SessionActor {
                 news: initial.search_news_tool_model.clone(),
             },
         })
+    }
+
+    fn handle_update_plan_tool_call(&mut self, arguments: &str) -> Result<(), SessionActorError> {
+        let payload = parse_tool_arguments(arguments);
+        let plan = parse_task_plan_view(payload).map_err(SessionActorError::Tool)?;
+        self.current_plan = Some(plan.clone());
+        self.emit(SessionEvent::PlanUpdated { plan: Some(plan) })
+    }
+
+    fn clear_current_plan(&mut self) -> Result<(), SessionActorError> {
+        self.history
+            .retain(|message| !is_task_plan_context_message(message));
+        if self.current_plan.take().is_some() {
+            self.emit(SessionEvent::PlanUpdated { plan: None })?;
+        }
+        self.persist_state_if_history_closed("clear_plan")?;
+        Ok(())
     }
 
     fn build_provider_backed_operation(
@@ -1293,9 +1321,25 @@ impl SessionActor {
         if report.compressed {
             self.runtime_metadata_state
                 .promote_notified_components_to_system_snapshot();
+            self.append_current_plan_to_compressed_history();
         }
         self.persist_state_if_history_closed(phase)?;
         Ok(index)
+    }
+
+    fn append_current_plan_to_compressed_history(&mut self) {
+        let Some(plan) = self.current_plan.as_ref() else {
+            return;
+        };
+        let Some(text) = render_task_plan_context(plan) else {
+            return;
+        };
+        self.history
+            .retain(|message| !is_task_plan_context_message(message));
+        self.history.push(ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Context(ContextItem { text })],
+        ));
     }
 
     fn append_runtime_synthetic_messages(
@@ -1543,6 +1587,7 @@ impl SessionActor {
                 );
                 self.emit(SessionEvent::Progress {
                     message: format!("idle context compression failed: {error}"),
+                    plan: self.current_plan.clone(),
                 })?;
                 Ok(false)
             }
@@ -1592,6 +1637,7 @@ impl SessionActor {
             message: format!(
                 "警告：上游拒绝了本轮请求，原因是请求体过大。系统已从当前上下文中丢弃较早的 {prune_start} 条消息并自动重试；这代表发生了上下文数据丢失，应按 bug 处理并排查。"
             ),
+            plan: self.current_plan.clone(),
         })?;
         self.persist_state_if_history_closed("request_too_large_prune")?;
         Ok(true)
@@ -2140,11 +2186,25 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "message_role": message.role,
             "message_items": message.data.len(),
         }),
-        SessionEvent::TurnStarted { turn_id } => {
-            serde_json::json!({"event": "turn_started", "turn_id": turn_id})
+        SessionEvent::TurnStarted { turn_id, plan } => {
+            serde_json::json!({
+                "event": "turn_started",
+                "turn_id": turn_id,
+                "plan_items": plan.as_ref().map(|plan| plan.plan.len()).unwrap_or(0),
+            })
         }
-        SessionEvent::Progress { message } => {
-            serde_json::json!({"event": "progress", "message": message})
+        SessionEvent::Progress { message, plan } => {
+            serde_json::json!({
+                "event": "progress",
+                "message": message,
+                "plan_items": plan.as_ref().map(|plan| plan.plan.len()).unwrap_or(0),
+            })
+        }
+        SessionEvent::PlanUpdated { plan } => {
+            serde_json::json!({
+                "event": "plan_updated",
+                "plan_items": plan.as_ref().map(|plan| plan.plan.len()).unwrap_or(0),
+            })
         }
         SessionEvent::TurnCompleted { message } => serde_json::json!({
             "event": "turn_completed",
@@ -2203,6 +2263,67 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             serde_json::json!({"event": "runtime_crashed", "error": error, "error_detail": error_detail})
         }
     }
+}
+
+fn parse_task_plan_view(payload: serde_json::Value) -> Result<TaskPlanView, String> {
+    let mut plan: TaskPlanView = serde_json::from_value(payload)
+        .map_err(|error| format!("failed to parse update_plan payload: {error}"))?;
+    plan.explanation = plan
+        .explanation
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    for item in &mut plan.plan {
+        item.step = item.step.trim().to_string();
+        if item.step.is_empty() {
+            return Err("update_plan step must not be empty".to_string());
+        }
+    }
+    let in_progress_count = plan
+        .plan
+        .iter()
+        .filter(|item| matches!(item.status, TaskPlanItemStatus::InProgress))
+        .count();
+    if in_progress_count > 1 {
+        return Err("update_plan may include at most one in_progress step".to_string());
+    }
+    Ok(plan)
+}
+
+fn render_task_plan_context(plan: &TaskPlanView) -> Option<String> {
+    if plan.explanation.is_none() && plan.plan.is_empty() {
+        return None;
+    }
+    let mut text = String::from(SESSION_PLAN_CONTEXT_MARKER);
+    if let Some(explanation) = plan.explanation.as_deref() {
+        text.push_str("\n\n");
+        text.push_str(explanation);
+    }
+    if !plan.plan.is_empty() {
+        text.push_str("\n\n");
+        for item in &plan.plan {
+            text.push_str("- [");
+            text.push_str(match item.status {
+                TaskPlanItemStatus::Pending => "pending",
+                TaskPlanItemStatus::InProgress => "in_progress",
+                TaskPlanItemStatus::Completed => "completed",
+            });
+            text.push_str("] ");
+            text.push_str(item.step.trim());
+            text.push('\n');
+        }
+    }
+    Some(text.trim_end().to_string())
+}
+
+fn is_task_plan_context_message(message: &ChatMessage) -> bool {
+    message.role == ChatRole::Assistant
+        && message.data.iter().any(|item| {
+            matches!(
+                item,
+                ChatMessageItem::Context(context)
+                    if context.text.starts_with(SESSION_PLAN_CONTEXT_MARKER)
+            )
+        })
 }
 
 fn parse_tool_arguments(text: &str) -> serde_json::Value {
@@ -3070,7 +3191,7 @@ mod tests {
         assert_eq!(actor.history().len(), 4);
         assert!(events.events.lock().unwrap().iter().any(|event| matches!(
             event,
-            SessionEvent::Progress { message } if message.contains("数据丢失")
+            SessionEvent::Progress { message, .. } if message.contains("数据丢失")
         )));
         assert!(matches!(
             events.events.lock().unwrap().last(),
@@ -3145,7 +3266,7 @@ mod tests {
         assert_eq!(seen_requests[0].message_count, 1);
         assert!(events.events.lock().unwrap().iter().any(|event| matches!(
             event,
-            SessionEvent::Progress { message } if message.contains("数据丢失")
+            SessionEvent::Progress { message, .. } if message.contains("数据丢失")
         )));
     }
 
@@ -3929,13 +4050,108 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|event| match event {
-                SessionEvent::Progress { message } => Some(message.clone()),
+                SessionEvent::Progress { message, .. } => Some(message.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert!(progress
             .iter()
             .all(|message| !message.contains("newer user message")));
+    }
+
+    #[test]
+    fn update_plan_is_session_actor_state_and_clears_on_turn_completion() {
+        let _cwd = temp_cwd("actor-update-plan-state");
+        let session_id = test_session_id("session_update_plan_state");
+        let (inbox, mailbox) = test_inbox();
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial {
+                initial: SessionInitial::new(session_id, super::super::SessionType::Foreground),
+            },
+        );
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "do planned work".to_string(),
+                    })],
+                ),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    tool_call_id: "call_plan".to_string(),
+                    tool_name: "update_plan".to_string(),
+                    arguments: ContextItem {
+                        text: r#"{"plan":[{"step":"Inspect state","status":"in_progress"},{"step":"Report result","status":"pending"}]}"#.to_string(),
+                    },
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "done".to_string(),
+                })],
+            ),
+        ]));
+        let tools = Arc::new(EchoToolExecutor::new());
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions {
+            host_tool_scope: Some(HostToolScope::MainForeground),
+            ..BuiltinToolCatalogOptions::default()
+        })
+        .unwrap();
+        let mut actor = SessionActor::new(
+            test_model_config(),
+            provider,
+            tools,
+            inbox,
+            events.clone(),
+            catalog,
+        );
+
+        assert_eq!(
+            actor.step().expect("initial should apply"),
+            SessionActorStep::ProcessedControl
+        );
+        assert_eq!(
+            actor.step().expect("plan tool batch should start"),
+            SessionActorStep::WaitingToolBatch
+        );
+        assert!(events.events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            SessionEvent::PlanUpdated { plan: Some(plan) }
+                if plan.plan.len() == 2
+                    && plan.plan[0].step == "Inspect state"
+                    && matches!(plan.plan[0].status, TaskPlanItemStatus::InProgress)
+        )));
+        assert!(events.events.lock().unwrap().iter().any(|event| matches!(
+            event,
+            SessionEvent::Progress {
+                plan: Some(plan), ..
+            } if plan.plan.len() == 2
+        )));
+
+        for _ in 0..10 {
+            if actor.step().expect("actor should advance") == SessionActorStep::Idle {
+                break;
+            }
+        }
+        assert!(events
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, SessionEvent::PlanUpdated { plan: None })));
+        assert!(matches!(
+            events.events.lock().unwrap().last(),
+            Some(SessionEvent::TurnCompleted { .. })
+        ));
     }
 
     #[test]

@@ -17,7 +17,8 @@ use stellaclaw_core::{
     session_actor::{
         ChatMessage, ChatMessageItem, ChatRole, ContextItem, ConversationBridgeRequest,
         ConversationBridgeResponse, FileItem, SessionErrorDetail, SessionEvent, SessionInitial,
-        SessionRequest, SessionType, ToolRemoteMode, ToolResultContent, ToolResultItem,
+        SessionRequest, SessionType, TaskPlanItemStatus, TaskPlanView, ToolRemoteMode,
+        ToolResultContent, ToolResultItem,
     },
 };
 
@@ -416,7 +417,6 @@ struct ConversationRuntime {
     background: BTreeMap<String, ManagedSessionRuntime>,
     subagents: BTreeMap<String, ManagedSessionRuntime>,
     foreground_progress: Option<ActiveForegroundProgress>,
-    session_plans: BTreeMap<String, TaskPlanView>,
 }
 
 struct ForegroundSessionRuntime {
@@ -435,28 +435,6 @@ struct ActiveForegroundProgress {
     turn_id: String,
     next_typing_at: Instant,
     activity: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TaskPlanView {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    explanation: Option<String>,
-    #[serde(default)]
-    plan: Vec<TaskPlanItemView>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TaskPlanItemView {
-    step: String,
-    status: TaskPlanItemStatus,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum TaskPlanItemStatus {
-    Pending,
-    InProgress,
-    Completed,
 }
 
 impl ConversationRuntime {
@@ -554,7 +532,6 @@ impl ConversationRuntime {
             background,
             subagents,
             foreground_progress: None,
-            session_plans: BTreeMap::new(),
         })
     }
 
@@ -869,8 +846,7 @@ impl ConversationRuntime {
                 }
                 Ok(false)
             }
-            SessionEvent::TurnStarted { turn_id } => {
-                self.clear_session_plan(agent_id.as_deref(), session_type);
+            SessionEvent::TurnStarted { turn_id, plan } => {
                 self.logger.info(
                     "turn_started",
                     json!({
@@ -880,11 +856,11 @@ impl ConversationRuntime {
                     }),
                 );
                 if session_type == SessionType::Foreground {
-                    self.start_foreground_progress(turn_id)?;
+                    self.start_foreground_progress(turn_id, plan.as_ref())?;
                 }
                 Ok(false)
             }
-            SessionEvent::Progress { message } => {
+            SessionEvent::Progress { message, plan } => {
                 self.logger.info(
                     "progress",
                     json!({
@@ -894,7 +870,21 @@ impl ConversationRuntime {
                     }),
                 );
                 if session_type == SessionType::Foreground {
-                    self.update_foreground_progress(&message)?;
+                    self.update_foreground_progress(&message, plan.as_ref())?;
+                }
+                Ok(false)
+            }
+            SessionEvent::PlanUpdated { plan } => {
+                self.logger.info(
+                    "plan_updated",
+                    json!({
+                        "session_type": format!("{session_type:?}"),
+                        "agent_id": agent_id,
+                        "plan_items": plan.as_ref().map(|plan| plan.plan.len()).unwrap_or(0),
+                    }),
+                );
+                if session_type == SessionType::Foreground {
+                    self.update_foreground_progress_plan(plan.as_ref())?;
                 }
                 Ok(false)
             }
@@ -977,7 +967,6 @@ impl ConversationRuntime {
                 error,
                 error_detail,
             } => {
-                self.clear_session_plan(agent_id.as_deref(), session_type);
                 self.host_logger.warn(
                     "session_runtime_crashed",
                     json!({
@@ -1008,7 +997,6 @@ impl ConversationRuntime {
         session_type: SessionType,
         message: ChatMessage,
     ) -> Result<bool> {
-        self.clear_session_plan(agent_id.as_deref(), session_type);
         match session_type {
             SessionType::Foreground => {
                 self.finish_foreground_progress(ProgressFeedbackFinalState::Done, None)?;
@@ -1079,7 +1067,6 @@ impl ConversationRuntime {
         error_detail: SessionErrorDetail,
         can_continue: bool,
     ) -> Result<bool> {
-        self.clear_session_plan(agent_id.as_deref(), session_type);
         let visible_error = format_session_error(&error, &error_detail);
         match session_type {
             SessionType::Foreground => {
@@ -1258,8 +1245,7 @@ impl ConversationRuntime {
                 Ok(bridge_result(request, json!({"sent": true}).to_string()))
             }
             "update_plan" => {
-                let plan = parse_task_plan_view(&request.payload)?;
-                self.update_session_plan(agent_id.as_deref(), session_type, plan.clone())?;
+                let plan = request.payload.clone();
                 Ok(bridge_result(
                     request,
                     json!({"updated": true, "plan": plan}).to_string(),
@@ -1452,45 +1438,6 @@ impl ConversationRuntime {
                 request,
                 json!({"error": format!("unsupported host action {}", request.action)}).to_string(),
             )),
-        }
-    }
-
-    fn update_session_plan(
-        &mut self,
-        agent_id: Option<&str>,
-        session_type: SessionType,
-        plan: TaskPlanView,
-    ) -> Result<()> {
-        let key = self.session_plan_key(agent_id, session_type);
-        self.session_plans.insert(key, plan);
-        if session_type == SessionType::Foreground {
-            self.update_foreground_progress_from_state(true)?;
-        }
-        Ok(())
-    }
-
-    fn clear_session_plan(&mut self, agent_id: Option<&str>, session_type: SessionType) {
-        let key = self.session_plan_key(agent_id, session_type);
-        self.session_plans.remove(&key);
-    }
-
-    fn current_session_plan(
-        &self,
-        agent_id: Option<&str>,
-        session_type: SessionType,
-    ) -> Option<&TaskPlanView> {
-        let key = self.session_plan_key(agent_id, session_type);
-        self.session_plans.get(&key)
-    }
-
-    fn session_plan_key(&self, agent_id: Option<&str>, session_type: SessionType) -> String {
-        match session_type {
-            SessionType::Foreground => format!(
-                "foreground:{}",
-                self.state.session_binding.foreground_session_id
-            ),
-            SessionType::Background => format!("background:{}", agent_id.unwrap_or("unknown")),
-            SessionType::Subagent => format!("subagent:{}", agent_id.unwrap_or("unknown")),
         }
     }
 
@@ -1989,7 +1936,11 @@ impl ConversationRuntime {
             .map_err(|_| anyhow!("outgoing conversation update channel closed"))
     }
 
-    fn start_foreground_progress(&mut self, turn_id: String) -> Result<()> {
+    fn start_foreground_progress(
+        &mut self,
+        turn_id: String,
+        plan: Option<&TaskPlanView>,
+    ) -> Result<()> {
         let now = Instant::now();
         let model_name = self.current_main_model_name();
         let progress_turn_id = self
@@ -2005,26 +1956,37 @@ impl ConversationRuntime {
         self.send_processing_state(ProcessingState::Typing)?;
         self.send_progress_feedback(
             progress_turn_id,
-            progress_thinking(&model_name, None),
+            progress_thinking(&model_name, plan),
             None,
             true,
         )
     }
 
-    fn update_foreground_progress(&mut self, message: &str) -> Result<()> {
+    fn update_foreground_progress(
+        &mut self,
+        message: &str,
+        plan: Option<&TaskPlanView>,
+    ) -> Result<()> {
         let Some(progress) = &mut self.foreground_progress else {
             return Ok(());
         };
         progress.activity = Some(message.trim().to_string()).filter(|value| !value.is_empty());
-        self.update_foreground_progress_from_state(false)
+        self.update_foreground_progress_from_state(plan, false)
     }
 
-    fn update_foreground_progress_from_state(&self, important: bool) -> Result<()> {
+    fn update_foreground_progress_plan(&self, plan: Option<&TaskPlanView>) -> Result<()> {
+        self.update_foreground_progress_from_state(plan, true)
+    }
+
+    fn update_foreground_progress_from_state(
+        &self,
+        plan: Option<&TaskPlanView>,
+        important: bool,
+    ) -> Result<()> {
         let Some(progress) = &self.foreground_progress else {
             return Ok(());
         };
         let model_name = self.current_main_model_name();
-        let plan = self.current_session_plan(None, SessionType::Foreground);
         self.send_progress_feedback(
             progress.turn_id.clone(),
             progress_update(&model_name, progress.activity.as_deref(), plan),
@@ -2681,33 +2643,6 @@ fn turn_progress_plan_item_status(status: TaskPlanItemStatus) -> TurnProgressPla
         TaskPlanItemStatus::InProgress => TurnProgressPlanItemStatus::InProgress,
         TaskPlanItemStatus::Completed => TurnProgressPlanItemStatus::Completed,
     }
-}
-
-fn parse_task_plan_view(payload: &Value) -> Result<TaskPlanView> {
-    let mut plan: TaskPlanView =
-        serde_json::from_value(payload.clone()).context("failed to parse update_plan payload")?;
-    plan.explanation = plan
-        .explanation
-        .take()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    for item in &mut plan.plan {
-        item.step = item.step.trim().to_string();
-        if item.step.is_empty() {
-            return Err(anyhow!("update_plan step must not be empty"));
-        }
-    }
-    let in_progress_count = plan
-        .plan
-        .iter()
-        .filter(|item| matches!(item.status, TaskPlanItemStatus::InProgress))
-        .count();
-    if in_progress_count > 1 {
-        return Err(anyhow!(
-            "update_plan may include at most one in_progress step"
-        ));
-    }
-    Ok(plan)
 }
 
 fn progress_done(model_key: &str) -> TurnProgress {
