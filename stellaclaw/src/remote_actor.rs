@@ -1,17 +1,19 @@
 use std::{
     fmt, fs,
-    io::{Read, Seek, SeekFrom},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
+    process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
 use base64::{engine::general_purpose, Engine as _};
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use stellaclaw_core::session_actor::ToolRemoteMode;
 
-use crate::{conversation::ConversationState, workspace::ensure_workspace_for_remote_mode};
+use crate::conversation::ConversationState;
 
 #[derive(Debug)]
 pub enum RemoteActorError {
@@ -67,7 +69,7 @@ pub struct WorkspaceFile {
     pub data: String,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceFileEncoding {
     Utf8,
@@ -98,13 +100,45 @@ pub struct WorkspaceEntry {
     pub readonly: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceEntryKind {
     Directory,
     File,
     Symlink,
     Other,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteListPayload {
+    entries: Vec<RemoteEntryPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteEntryPayload {
+    name: String,
+    kind: WorkspaceEntryKind,
+    size_bytes: Option<u64>,
+    modified_ms: Option<u128>,
+    hidden: bool,
+    readonly: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteReadPayload {
+    name: String,
+    size_bytes: u64,
+    modified_ms: Option<u128>,
+    offset: u64,
+    returned_bytes: usize,
+    truncated: bool,
+    encoding: WorkspaceFileEncoding,
+    data: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemoteCountPayload {
+    count: usize,
 }
 
 pub fn list_workspace_entries(
@@ -114,13 +148,11 @@ pub fn list_workspace_entries(
     limit: usize,
 ) -> std::result::Result<WorkspaceListing, RemoteActorError> {
     let normalized = normalize_workspace_path(relative_path.unwrap_or_default())?;
+    if let ToolRemoteMode::FixedSsh { host, cwd } = &state.tool_remote_mode {
+        return list_remote_workspace_entries(host, cwd.as_deref(), state, &normalized, limit);
+    }
     let conversation_root = workdir.join("conversations").join(&state.conversation_id);
-    let workspace_root = ensure_workspace_for_remote_mode(
-        workdir,
-        &conversation_root,
-        &state.conversation_id,
-        &state.tool_remote_mode,
-    )?;
+    let workspace_root = conversation_root;
     let target = workspace_root.join(&normalized);
     let metadata = fs::metadata(&target).with_context(|| {
         format!(
@@ -203,13 +235,18 @@ pub fn read_workspace_file(
             "workspace file path must not be empty".to_string(),
         ));
     }
+    if let ToolRemoteMode::FixedSsh { host, cwd } = &state.tool_remote_mode {
+        return read_remote_workspace_file(
+            host,
+            cwd.as_deref(),
+            state,
+            &normalized,
+            offset,
+            limit_bytes,
+        );
+    }
     let conversation_root = workdir.join("conversations").join(&state.conversation_id);
-    let workspace_root = ensure_workspace_for_remote_mode(
-        workdir,
-        &conversation_root,
-        &state.conversation_id,
-        &state.tool_remote_mode,
-    )?;
+    let workspace_root = conversation_root;
     let target = workspace_root.join(&normalized);
     let metadata = fs::metadata(&target).with_context(|| {
         format!(
@@ -300,13 +337,11 @@ pub fn upload_workspace_archive(
         )));
     }
     let normalized = normalize_workspace_path(relative_dir)?;
+    if let ToolRemoteMode::FixedSsh { host, cwd } = &state.tool_remote_mode {
+        return upload_remote_workspace_archive(host, cwd.as_deref(), &normalized, archive_data);
+    }
     let conversation_root = workdir.join("conversations").join(&state.conversation_id);
-    let workspace_root = ensure_workspace_for_remote_mode(
-        workdir,
-        &conversation_root,
-        &state.conversation_id,
-        &state.tool_remote_mode,
-    )?;
+    let workspace_root = conversation_root;
     let target_dir = workspace_root.join(&normalized);
     fs::create_dir_all(&target_dir)
         .with_context(|| format!("failed to create {}", target_dir.display()))?;
@@ -353,13 +388,11 @@ pub fn delete_workspace_path(
             "workspace path must not be empty".to_string(),
         ));
     }
+    if let ToolRemoteMode::FixedSsh { host, cwd } = &state.tool_remote_mode {
+        return delete_remote_workspace_path(host, cwd.as_deref(), &normalized);
+    }
     let conversation_root = workdir.join("conversations").join(&state.conversation_id);
-    let workspace_root = ensure_workspace_for_remote_mode(
-        workdir,
-        &conversation_root,
-        &state.conversation_id,
-        &state.tool_remote_mode,
-    )?;
+    let workspace_root = conversation_root;
     let target = workspace_root.join(&normalized);
     let metadata = fs::symlink_metadata(&target).with_context(|| {
         format!(
@@ -390,13 +423,11 @@ pub fn move_workspace_path(
             "workspace source and destination paths must not be empty".to_string(),
         ));
     }
+    if let ToolRemoteMode::FixedSsh { host, cwd } = &state.tool_remote_mode {
+        return move_remote_workspace_path(host, cwd.as_deref(), &from, &to);
+    }
     let conversation_root = workdir.join("conversations").join(&state.conversation_id);
-    let workspace_root = ensure_workspace_for_remote_mode(
-        workdir,
-        &conversation_root,
-        &state.conversation_id,
-        &state.tool_remote_mode,
-    )?;
+    let workspace_root = conversation_root;
     let source = workspace_root.join(&from);
     let target = workspace_root.join(&to);
     if !source.exists() {
@@ -437,13 +468,15 @@ pub fn download_workspace_archive(
             "at least one path is required for download".to_string(),
         ));
     }
+    if let ToolRemoteMode::FixedSsh { host, cwd } = &state.tool_remote_mode {
+        let normalized = relative_paths
+            .iter()
+            .map(|path| normalize_workspace_path(path))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        return download_remote_workspace_archive(host, cwd.as_deref(), &normalized);
+    }
     let conversation_root = workdir.join("conversations").join(&state.conversation_id);
-    let workspace_root = ensure_workspace_for_remote_mode(
-        workdir,
-        &conversation_root,
-        &state.conversation_id,
-        &state.tool_remote_mode,
-    )?;
+    let workspace_root = conversation_root;
 
     let mut output = Vec::new();
     {
@@ -488,6 +521,409 @@ pub fn download_workspace_archive(
         )));
     }
     Ok(output)
+}
+
+fn list_remote_workspace_entries(
+    host: &str,
+    cwd: Option<&str>,
+    state: &ConversationState,
+    normalized: &Path,
+    limit: usize,
+) -> std::result::Result<WorkspaceListing, RemoteActorError> {
+    let payload: RemoteListPayload = run_remote_json(
+        host,
+        cwd,
+        remote_json_script("list", json!({"path": path_to_api_string(normalized)})),
+        None,
+    )?;
+    let mut entries = payload
+        .entries
+        .into_iter()
+        .map(|entry| {
+            let relative_entry_path = normalized.join(&entry.name);
+            WorkspaceEntry {
+                name: entry.name,
+                path: path_to_api_string(&relative_entry_path),
+                kind: entry.kind,
+                size_bytes: entry.size_bytes,
+                modified_ms: entry.modified_ms,
+                hidden: entry.hidden,
+                readonly: entry.readonly,
+            }
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.kind
+            .cmp(&right.kind)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let total_entries = entries.len();
+    let effective_limit = limit.max(1);
+    let truncated = total_entries > effective_limit;
+    entries.truncate(effective_limit);
+    let returned_entries = entries.len();
+    Ok(WorkspaceListing {
+        conversation_id: state.conversation_id.clone(),
+        mode: WorkspaceMode::FixedSsh,
+        remote: fixed_remote(host, cwd),
+        workspace_root: cwd.unwrap_or(".").to_string(),
+        parent: parent_api_path(normalized),
+        path: path_to_api_string(normalized),
+        total_entries,
+        returned_entries,
+        truncated,
+        entries,
+    })
+}
+
+fn read_remote_workspace_file(
+    host: &str,
+    cwd: Option<&str>,
+    state: &ConversationState,
+    normalized: &Path,
+    offset: u64,
+    limit_bytes: Option<usize>,
+) -> std::result::Result<WorkspaceFile, RemoteActorError> {
+    let payload: RemoteReadPayload = run_remote_json(
+        host,
+        cwd,
+        remote_json_script(
+            "read",
+            json!({
+                "path": path_to_api_string(normalized),
+                "offset": offset,
+                "limit_bytes": limit_bytes,
+            }),
+        ),
+        None,
+    )?;
+    Ok(WorkspaceFile {
+        conversation_id: state.conversation_id.clone(),
+        mode: WorkspaceMode::FixedSsh,
+        remote: fixed_remote(host, cwd),
+        workspace_root: cwd.unwrap_or(".").to_string(),
+        path: path_to_api_string(normalized),
+        name: payload.name,
+        size_bytes: payload.size_bytes,
+        modified_ms: payload.modified_ms,
+        offset: payload.offset,
+        returned_bytes: payload.returned_bytes,
+        truncated: payload.truncated,
+        encoding: payload.encoding,
+        data: payload.data,
+    })
+}
+
+fn upload_remote_workspace_archive(
+    host: &str,
+    cwd: Option<&str>,
+    normalized: &Path,
+    archive_data: &[u8],
+) -> std::result::Result<usize, RemoteActorError> {
+    let payload: RemoteCountPayload = run_remote_json(
+        host,
+        cwd,
+        remote_json_script("upload", json!({"path": path_to_api_string(normalized)})),
+        Some(archive_data),
+    )?;
+    Ok(payload.count)
+}
+
+fn delete_remote_workspace_path(
+    host: &str,
+    cwd: Option<&str>,
+    normalized: &Path,
+) -> std::result::Result<(), RemoteActorError> {
+    let _: Value = run_remote_json(
+        host,
+        cwd,
+        remote_json_script("delete", json!({"path": path_to_api_string(normalized)})),
+        None,
+    )?;
+    Ok(())
+}
+
+fn move_remote_workspace_path(
+    host: &str,
+    cwd: Option<&str>,
+    from: &Path,
+    to: &Path,
+) -> std::result::Result<(), RemoteActorError> {
+    let _: Value = run_remote_json(
+        host,
+        cwd,
+        remote_json_script(
+            "move",
+            json!({
+                "from": path_to_api_string(from),
+                "to": path_to_api_string(to),
+            }),
+        ),
+        None,
+    )?;
+    Ok(())
+}
+
+fn download_remote_workspace_archive(
+    host: &str,
+    cwd: Option<&str>,
+    normalized_paths: &[PathBuf],
+) -> std::result::Result<Vec<u8>, RemoteActorError> {
+    let payload = json!({
+        "operation": "download",
+        "paths": normalized_paths.iter().map(|path| path_to_api_string(path)).collect::<Vec<_>>(),
+    });
+    let output = run_remote_command(
+        host,
+        cwd,
+        &format!(
+            "python3 - <<'PY'\n{}\nPY\n",
+            remote_workspace_script(&payload)
+        ),
+        None,
+    )?;
+    if output.len() > MAX_DOWNLOAD_BYTES {
+        return Err(RemoteActorError::InvalidPath(format!(
+            "download archive exceeds {} byte limit (got {} bytes)",
+            MAX_DOWNLOAD_BYTES,
+            output.len()
+        )));
+    }
+    Ok(output)
+}
+
+fn fixed_remote(host: &str, cwd: Option<&str>) -> Option<WorkspaceRemote> {
+    Some(WorkspaceRemote {
+        host: host.to_string(),
+        cwd: cwd.map(str::to_string),
+    })
+}
+
+fn run_remote_json<T: for<'de> Deserialize<'de>>(
+    host: &str,
+    cwd: Option<&str>,
+    script: String,
+    stdin: Option<&[u8]>,
+) -> std::result::Result<T, RemoteActorError> {
+    let stdout = run_remote_command(host, cwd, &script, stdin)?;
+    serde_json::from_slice(&stdout).map_err(|error| {
+        RemoteActorError::Internal(anyhow::anyhow!(
+            "remote output was not JSON: {error}; stdout: {}",
+            String::from_utf8_lossy(&stdout)
+        ))
+    })
+}
+
+fn run_remote_command(
+    host: &str,
+    cwd: Option<&str>,
+    command: &str,
+    stdin: Option<&[u8]>,
+) -> std::result::Result<Vec<u8>, RemoteActorError> {
+    let remote_command = match cwd.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(cwd) => format!("cd {} && {}", shell_quote(cwd), command),
+        None => command.to_string(),
+    };
+    let mut child = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-T")
+        .arg(host)
+        .arg(remote_command)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn ssh for {host}"))?;
+    if let Some(stdin_bytes) = stdin {
+        child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("failed to open ssh stdin"))?
+            .write_all(stdin_bytes)
+            .with_context(|| "failed to write ssh stdin")?;
+    }
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("failed to wait for ssh to {host}"))?;
+    if !output.status.success() {
+        return Err(RemoteActorError::Internal(anyhow::anyhow!(
+            "ssh exited with {}; stderr: {}",
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(output.stdout)
+}
+
+fn remote_json_script(operation: &str, mut payload: Value) -> String {
+    if let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "operation".to_string(),
+            Value::String(operation.to_string()),
+        );
+    }
+    format!(
+        "python3 - <<'PY'\n{}\nPY\n",
+        remote_workspace_script(&payload)
+    )
+}
+
+fn remote_workspace_script(payload: &Value) -> String {
+    let payload = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        r#"
+import base64, io, json, os, pathlib, shutil, sys, tarfile
+
+payload = json.loads({payload:?})
+
+def resolve(value):
+    path = pathlib.Path(value or ".")
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError("workspace path must be relative and must not contain ..")
+    return path
+
+def ms(path):
+    try:
+        return int(path.stat().st_mtime * 1000)
+    except OSError:
+        return None
+
+def kind(path):
+    if path.is_symlink():
+        return "symlink"
+    if path.is_dir():
+        return "directory"
+    if path.is_file():
+        return "file"
+    return "other"
+
+def list_entries():
+    base = resolve(payload.get("path"))
+    if not base.is_dir():
+        raise ValueError(f"workspace path {{base}} is not a directory")
+    entries = []
+    for child in base.iterdir():
+        st = child.lstat()
+        entries.append({{
+            "name": child.name,
+            "kind": kind(child),
+            "size_bytes": st.st_size if child.is_file() else None,
+            "modified_ms": int(st.st_mtime * 1000),
+            "hidden": child.name.startswith("."),
+            "readonly": not os.access(child, os.W_OK),
+        }})
+    return {{"entries": entries}}
+
+def read_file():
+    path = resolve(payload.get("path"))
+    if not path.is_file():
+        raise ValueError(f"workspace path {{path}} is not a file")
+    size = path.stat().st_size
+    offset = min(int(payload.get("offset") or 0), size)
+    limit = payload.get("limit_bytes")
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        data = handle.read(None if limit is None else max(1, int(limit)))
+    try:
+        text = data.decode("utf-8")
+        encoding = "utf8"
+        encoded = text
+    except UnicodeDecodeError:
+        encoding = "base64"
+        encoded = base64.b64encode(data).decode("ascii")
+    return {{
+        "name": path.name,
+        "size_bytes": size,
+        "modified_ms": ms(path),
+        "offset": offset,
+        "returned_bytes": len(data),
+        "truncated": offset + len(data) < size,
+        "encoding": encoding,
+        "data": encoded,
+    }}
+
+def safe_members(archive):
+    for member in archive.getmembers():
+        member_path = pathlib.PurePosixPath(member.name)
+        if member_path.is_absolute() or ".." in member_path.parts:
+            continue
+        yield member
+
+def upload():
+    target = resolve(payload.get("path"))
+    target.mkdir(parents=True, exist_ok=True)
+    raw = sys.stdin.buffer.read()
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz") as archive:
+        members = list(safe_members(archive))
+        archive.extractall(target, members=members)
+    return {{"count": len(members)}}
+
+def delete():
+    path = resolve(payload.get("path"))
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    return {{"ok": True}}
+
+def move():
+    source = resolve(payload.get("from"))
+    target = resolve(payload.get("to"))
+    if target.exists():
+        raise ValueError(f"workspace path {{target}} already exists")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source.rename(target)
+    return {{"ok": True}}
+
+def add_path(builder, rel):
+    path = resolve(rel)
+    archive_name = pathlib.Path("workspace") if str(path) == "." else path
+    if path.is_dir():
+        builder.add(path, arcname=str(archive_name))
+    elif path.is_file():
+        builder.add(path, arcname=str(archive_name))
+    else:
+        raise ValueError(f"workspace path {{path}} is not a file or directory")
+
+def download():
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w:gz") as archive:
+        for rel in payload.get("paths") or []:
+            add_path(archive, rel)
+    sys.stdout.buffer.write(output.getvalue())
+    return None
+
+handlers = {{
+    "list": list_entries,
+    "read": read_file,
+    "upload": upload,
+    "delete": delete,
+    "move": move,
+    "download": download,
+}}
+
+try:
+    result = handlers[payload["operation"]]()
+    if result is not None:
+        print(json.dumps(result, ensure_ascii=False))
+except Exception as error:
+    print(str(error), file=sys.stderr)
+    raise SystemExit(1)
+"#
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    let escaped = value.replace('\'', "'\\''");
+    format!("'{escaped}'")
 }
 
 fn normalize_workspace_path(value: &str) -> std::result::Result<PathBuf, RemoteActorError> {

@@ -18,7 +18,7 @@ pub(super) fn execute_edit_tool(
         return Ok(None);
     }
 
-    let result = match context.execution_target(arguments)? {
+    let result = match context.execution_target_for_path(arguments, &["path"])? {
         ExecutionTarget::Local => edit_local(arguments, context.workspace_root)?,
         ExecutionTarget::RemoteSsh { host, cwd } => {
             remote_file_tool("edit", arguments, &host, cwd.as_deref())?

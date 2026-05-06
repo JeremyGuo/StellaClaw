@@ -37,7 +37,7 @@ use crate::{
         delete_workspace_path, download_workspace_archive, list_workspace_entries,
         move_workspace_path, read_workspace_file, upload_workspace_archive, RemoteActorError,
     },
-    workspace::{is_sshfs_workspace_entry_name, sshfs_workspace_root, unmount_sshfs_workspace},
+    workspace::is_sshfs_workspace_entry_name,
 };
 
 use super::{
@@ -532,14 +532,6 @@ impl WebChannel {
         let terminated_terminals = self
             .terminal_manager
             .terminate_conversation(conversation_id);
-        if matches!(&state.tool_remote_mode, ToolRemoteMode::FixedSsh { .. }) {
-            unmount_sshfs_workspace(&self.workdir, conversation_id).map_err(ApiError::internal)?;
-            let sshfs_root = sshfs_workspace_root(&self.workdir, conversation_id);
-            if sshfs_root.exists() {
-                let _ = fs::remove_dir(&sshfs_root);
-            }
-        }
-
         let conversation_root = self.workdir.join("conversations").join(conversation_id);
         fs::remove_dir_all(&conversation_root).map_err(ApiError::internal)?;
 
@@ -2126,12 +2118,7 @@ impl WebAttachmentContext {
             .workdir
             .join("conversations")
             .join(&self.state.conversation_id);
-        let workspace_root = match &self.state.tool_remote_mode {
-            stellaclaw_core::session_actor::ToolRemoteMode::Selectable => conversation_root,
-            stellaclaw_core::session_actor::ToolRemoteMode::FixedSsh { .. } => {
-                sshfs_workspace_root(&self.workdir, &self.state.conversation_id)
-            }
-        };
+        let workspace_root = conversation_root;
         let shared_root = self.workdir.join("rundir").join("shared");
         WebAttachmentRoots {
             workspace_root,
@@ -2257,10 +2244,7 @@ fn conversation_remote_name(state: &ConversationState) -> String {
 }
 
 fn conversation_workspace_root(workdir: &Path, state: &ConversationState) -> PathBuf {
-    match &state.tool_remote_mode {
-        ToolRemoteMode::Selectable => workdir.join("conversations").join(&state.conversation_id),
-        ToolRemoteMode::FixedSsh { .. } => sshfs_workspace_root(workdir, &state.conversation_id),
-    }
+    workdir.join("conversations").join(&state.conversation_id)
 }
 
 fn conversation_message_summary(

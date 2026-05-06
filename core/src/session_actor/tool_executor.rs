@@ -1,10 +1,9 @@
 use std::{
     collections::HashMap,
-    fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{mpsc, Arc, Mutex, RwLock},
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use crossbeam_channel::Sender;
@@ -101,6 +100,16 @@ impl LocalToolBatchExecutor {
         arguments: &Map<String, Value>,
     ) -> Result<ExecutionTarget, LocalToolError> {
         self.context().execution_target(arguments)
+    }
+
+    #[cfg(test)]
+    fn execution_target_for_path(
+        &self,
+        arguments: &Map<String, Value>,
+        path_keys: &[&str],
+    ) -> Result<ExecutionTarget, LocalToolError> {
+        self.context()
+            .execution_target_for_path(arguments, path_keys)
     }
 
     #[cfg(test)]
@@ -587,33 +596,16 @@ impl ToolOperationRunner {
             return result;
         }
 
-        let saved_path = save_full_tool_result(
-            &self.data_root,
-            &result.tool_name,
-            &result.tool_call_id,
-            &context.text,
-        );
-        context.text = capped_truncated_tool_result_message(
-            total_chars,
-            saved_path.as_deref(),
-            saved_path.is_none(),
-            &context.text,
-        );
+        context.text = capped_truncated_tool_result_message(total_chars, &context.text);
         result
     }
 }
 
-fn capped_truncated_tool_result_message(
-    total_chars: usize,
-    full_output_path: Option<&str>,
-    save_failed: bool,
-    original: &str,
-) -> String {
+fn capped_truncated_tool_result_message(total_chars: usize, original: &str) -> String {
     let mut preview_chars = DEFAULT_TRUNCATED_TOOL_RESULT_PREVIEW_CHARS;
     loop {
         let (preview, _) = truncate_context_text(original, preview_chars);
-        let message =
-            truncated_tool_result_message(total_chars, full_output_path, save_failed, &preview);
+        let message = truncated_tool_result_message(total_chars, &preview);
         if message.chars().count() <= MAX_TOOL_RESULT_CONTEXT_CHARS || preview_chars == 0 {
             return message;
         }
@@ -621,68 +613,14 @@ fn capped_truncated_tool_result_message(
     }
 }
 
-fn truncated_tool_result_message(
-    total_chars: usize,
-    full_output_path: Option<&str>,
-    save_failed: bool,
-    preview: &str,
-) -> String {
-    let note = match full_output_path {
-        Some(path) => format!(
-            "Tool result exceeded the 100000 character runtime limit and was truncated to 100000 characters. The complete untruncated result was saved at: {path}."
-        ),
-        None if save_failed => {
-            "Tool result exceeded the 100000 character runtime limit and was truncated to 100000 characters. Saving the complete result failed.".to_string()
-        }
-        None => {
-            "Tool result exceeded the 100000 character runtime limit and was truncated to 100000 characters.".to_string()
-        }
-    };
+fn truncated_tool_result_message(total_chars: usize, preview: &str) -> String {
     normalize_tool_value(json!({
         "truncated": true,
         "limit_chars": MAX_TOOL_RESULT_CONTEXT_CHARS,
         "original_chars": total_chars,
-        "full_output_path": full_output_path,
-        "note": note,
+        "note": "Tool result exceeded the 100000 character runtime limit and was truncated to 100000 characters. Tools should return bounded output; the complete untruncated result was not saved.",
         "preview": preview,
     }))
-}
-
-fn save_full_tool_result(
-    workspace_root: &Path,
-    tool_name: &str,
-    tool_call_id: &str,
-    text: &str,
-) -> Option<String> {
-    let dir = workspace_root
-        .join(".stellaclaw")
-        .join("output")
-        .join("tool_results");
-    fs::create_dir_all(&dir).ok()?;
-    let file_name = format!(
-        "{}-{}-{}.txt",
-        nonce(),
-        sanitize_path_component(tool_name),
-        sanitize_path_component(tool_call_id)
-    );
-    let path = dir.join(file_name);
-    fs::write(&path, text).ok()?;
-    Some(path.display().to_string())
-}
-
-fn sanitize_path_component(value: &str) -> String {
-    let safe = value
-        .chars()
-        .map(|ch| match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' | '.' => ch,
-            _ => '_',
-        })
-        .collect::<String>();
-    if safe.trim_matches('_').is_empty() {
-        "tool".to_string()
-    } else {
-        safe
-    }
 }
 
 fn truncate_context_text(value: &str, max_chars: usize) -> (String, bool) {
@@ -715,13 +653,6 @@ fn truncate_context_text(value: &str, max_chars: usize) -> (String, bool) {
         .rev()
         .collect::<String>();
     (format!("{head}{marker}{tail}"), true)
-}
-
-fn nonce() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos().to_string())
-        .unwrap_or_else(|_| "0".to_string())
 }
 
 impl ToolBatchExecutor for LocalToolBatchExecutor {
@@ -925,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_results_are_capped_and_full_output_is_saved() {
+    fn tool_results_are_capped_without_saving_full_output() {
         let workspace = temp_workspace();
         let huge_line = "x".repeat(120_000);
         fs::write(
@@ -952,15 +883,12 @@ mod tests {
         assert!(value["note"]
             .as_str()
             .unwrap()
-            .contains("complete untruncated result was saved"));
+            .contains("complete untruncated result was not saved"));
         assert!(value["preview"]
             .as_str()
             .unwrap()
             .contains("chars truncated"));
-        let full_output_path = value["full_output_path"].as_str().unwrap();
-        assert!(std::path::Path::new(full_output_path).exists());
-        let full_output = fs::read_to_string(full_output_path).unwrap();
-        assert!(full_output.contains(&huge_line));
+        assert!(value.get("full_output_path").is_none());
     }
 
     #[test]
@@ -1026,7 +954,7 @@ mod tests {
         let message = start_and_wait(&executor, patch_batch);
 
         assert!(result_text(&message, 0).contains("\"applied\": true"));
-        assert!(result_text(&message, 0).contains("\"out_path\":"));
+        assert!(!result_text(&message, 0).contains("\"out_path\":"));
         assert_eq!(
             fs::read_to_string(workspace.join("patch.txt")).unwrap(),
             "new\n"
@@ -1133,6 +1061,38 @@ mod tests {
                 cwd: None
             } if host == "fake-host"
         ));
+    }
+
+    #[test]
+    fn fixed_remote_mode_routes_special_workspace_paths_locally() {
+        let workspace = temp_workspace();
+        let executor =
+            LocalToolBatchExecutor::new(&workspace).with_remote_mode(ToolRemoteMode::FixedSsh {
+                host: "fake-host".to_string(),
+                cwd: Some("/remote/project".to_string()),
+            });
+
+        let local_target = executor
+            .execution_target_for_path(
+                &Map::from_iter([(
+                    "file_path".to_string(),
+                    Value::String("attachments/incoming/photo.png".to_string()),
+                )]),
+                &["file_path", "path"],
+            )
+            .expect("special path target should resolve");
+        assert!(matches!(local_target, ExecutionTarget::Local));
+
+        let remote_target = executor
+            .execution_target_for_path(
+                &Map::from_iter([(
+                    "file_path".to_string(),
+                    Value::String("src/main.rs".to_string()),
+                )]),
+                &["file_path", "path"],
+            )
+            .expect("ordinary path target should resolve");
+        assert!(matches!(remote_target, ExecutionTarget::RemoteSsh { .. }));
     }
 
     #[test]

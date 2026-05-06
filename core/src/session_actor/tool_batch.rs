@@ -131,6 +131,8 @@ impl ToolExecutionOp {
                 "file_write"
                 | "edit"
                 | "apply_patch"
+                | "shell_make_visible"
+                | "attachment_make_visible"
                 | "shell_exec"
                 | "shell_observe"
                 | "shell_write_stdin"

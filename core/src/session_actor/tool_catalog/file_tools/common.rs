@@ -398,6 +398,10 @@ def handle_ls(args, workspace_root):
         raise ValueError("argument path must be a string")
     if path_arg == "":
         path_arg = "."
+    shadow_roots = args.get("shadow_roots", [])
+    if not isinstance(shadow_roots, list):
+        shadow_roots = []
+    shadow_roots = {{str(name) for name in shadow_roots}}
     base = resolve(path_arg, workspace_root)
     if not os.path.exists(base):
         raise ValueError(f"{{base}} does not exist")
@@ -409,9 +413,11 @@ def handle_ls(args, workspace_root):
         lines = [f"num_entries: 0", "", f"- {{base.rstrip(os.sep) + os.sep}}"]
         return "\n".join(lines)
     for root, dirs, files in os.walk(base, followlinks=False):
+        at_base = os.path.abspath(root) == os.path.abspath(base)
         dirs[:] = [
             name for name in dirs
-            if not should_skip_ls(name, True)
+            if not (at_base and name in shadow_roots)
+            and not should_skip_ls(name, True)
             and not is_slow_mount_path(os.path.join(root, name))
         ]
         for name in dirs:
@@ -423,6 +429,8 @@ def handle_ls(args, workspace_root):
         if truncated:
             break
         for name in files:
+            if at_base and name in shadow_roots:
+                continue
             if should_skip_ls(name, False):
                 continue
             if len(entries) >= LS_MAX_ENTRIES:

@@ -2,7 +2,7 @@ use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
 
-use super::{WorkdirUpgrader, LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_11};
+use super::{WorkdirUpgrader, WORKDIR_VERSION_0_11, WORKDIR_VERSION_0_12};
 use crate::config::StellaclawConfig;
 
 /// Migrate workdir-level files from .log/stellaclaw/ to .stellaclaw/.
@@ -14,7 +14,7 @@ impl WorkdirUpgrader for StellaclawWorkdirDirectoryUpgrade {
     }
 
     fn to_version(&self) -> &'static str {
-        LATEST_WORKDIR_VERSION
+        WORKDIR_VERSION_0_12
     }
 
     fn upgrade(&self, workdir: &Path, _config: &StellaclawConfig) -> Result<()> {

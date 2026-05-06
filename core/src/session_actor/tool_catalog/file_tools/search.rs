@@ -30,7 +30,7 @@ fn glob(
     arguments: &Map<String, Value>,
     context: &ToolExecutionContext<'_>,
 ) -> Result<Value, LocalToolError> {
-    match context.execution_target(arguments)? {
+    match context.execution_target_for_path(arguments, &["path"])? {
         ExecutionTarget::Local => glob_local(arguments, context.workspace_root),
         ExecutionTarget::RemoteSsh { host, cwd } => {
             remote_file_tool("glob", arguments, &host, cwd.as_deref())
@@ -42,7 +42,7 @@ fn grep(
     arguments: &Map<String, Value>,
     context: &ToolExecutionContext<'_>,
 ) -> Result<Value, LocalToolError> {
-    match context.execution_target(arguments)? {
+    match context.execution_target_for_path(arguments, &["path"])? {
         ExecutionTarget::Local => grep_local(arguments, context.workspace_root),
         ExecutionTarget::RemoteSsh { host, cwd } => {
             remote_file_tool("grep", arguments, &host, cwd.as_deref())

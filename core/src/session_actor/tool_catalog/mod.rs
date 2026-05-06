@@ -888,6 +888,8 @@ mod tests {
         assert!(shell.parameters["properties"].get("remote").is_none());
         let download = catalog.get("file_download_start").unwrap();
         assert!(download.parameters["properties"].get("remote").is_none());
+        assert!(catalog.contains("shell_make_visible"));
+        assert!(catalog.contains("attachment_make_visible"));
     }
 
     #[test]

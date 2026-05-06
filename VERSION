@@ -1,9 +1,24 @@
-version: 1.25.1
+version: 1.25.3
 ---
 
-# 1.25.1
+# 1.25.3
+
+- 重构 fixed SSH Remote Mode 的 workspace 可见性：
+  fixed SSH Remote Mode 不再依赖 `sshfs` 挂载普通工作区；文件、搜索、补丁、下载和 shell 工具默认作用于远程 workspace，本地 conversation workspace 只保留附件、channel 可下载产物、runtime 元数据和特殊本地文件。新增 `shell_make_visible` / `attachment_make_visible` 用于按同一个 workspace-relative 路径在本地与远程之间同步可见性；升级到 workdir schema `0.13` 时只会 materialize fixed SSH Remote Mode 下必须留在本地的关键路径（`.stellaclaw/`、`.output/`、`attachments/`、`shared/`、`STELLACLAW.md`），普通 workspace 文件继续留在远端。本次不改变 `config` schema，改变 `workdir` schema。
+
+- 修复 Telegram foreground final reply 附件标签未发送的问题：
+  foreground turn 完成时，如果 assistant 最终消息里包含 `<attachment>...</attachment>`，Conversation 会先按 workspace / shared 路径解析成 `OutgoingAttachment` 再交给 Telegram 发送，避免只把标签当普通文本展示。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 修复了一个shell工具在RemoteSSH模式下的BUG。
+
+- 修复 StellaCodeX Apple turn 内工具结果与失败展示问题：
+  工具过程组现在使用稳定 identity，新的 tool result 到达时不会重置用户已展开的中间结果；timeline 布局变化只在用户本来位于底部附近时才自动贴底，避免运行中折叠/展开把滚动位置拉飞；Apple WebSocket realtime error 解码兼容 Web channel 的结构化 `error` payload，并在 provider / turn 失败时显示可见系统错误。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 StellaCodeX iOS 模型切换后的导航与状态展示：
+  在 Actions 里的 Model 页面选择模型后会直接返回 Chat，并主动重建当前 conversation 的 foreground realtime 连接；连接层的 transient `Stream error` 不再作为标题下状态或聊天系统错误残留，provider / turn 失败仍会显示为可见错误。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 StellaCodeX Apple timeline 手动展开工具列表时的滚动问题：
+  用户展开/折叠 tool call / tool result 列表不再触发自动贴底滚动，避免 macOS 执行过程中 `LazyVStack` 动态高度变化把 scrollbar 推到空白渲染区域；新消息到达时的靠近底部自动跟随逻辑保持不变。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.25.0
 

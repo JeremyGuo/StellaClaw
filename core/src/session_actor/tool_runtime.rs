@@ -1,6 +1,6 @@
 use std::{
     io::Write,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -98,6 +98,50 @@ impl ToolExecutionContext<'_> {
                 })
             }
         }
+    }
+
+    pub(super) fn execution_target_for_path(
+        &self,
+        arguments: &Map<String, Value>,
+        path_keys: &[&str],
+    ) -> Result<ExecutionTarget, LocalToolError> {
+        match self.remote_mode {
+            ToolRemoteMode::FixedSsh { host, cwd } => {
+                for key in path_keys {
+                    let Some(path) = arguments.get(*key).and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if self.is_local_special_workspace_path(path) {
+                        return Ok(ExecutionTarget::Local);
+                    }
+                }
+                validate_remote_host(host)?;
+                Ok(ExecutionTarget::RemoteSsh {
+                    host: host.clone(),
+                    cwd: normalize_optional_cwd(cwd.as_deref()),
+                })
+            }
+            ToolRemoteMode::Selectable => self.execution_target(arguments),
+        }
+    }
+
+    fn is_local_special_workspace_path(&self, raw_path: &str) -> bool {
+        let path = raw_path.strip_prefix("file://").unwrap_or(raw_path).trim();
+        if path.is_empty() || path == "." {
+            return false;
+        }
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            return path.starts_with(self.workspace_root);
+        }
+        let mut components = path.components();
+        let Some(Component::Normal(first)) = components.next() else {
+            return false;
+        };
+        matches!(
+            first.to_string_lossy().as_ref(),
+            ".stellaclaw" | ".output" | "attachments" | "shared" | "STELLACLAW.md"
+        )
     }
 }
 

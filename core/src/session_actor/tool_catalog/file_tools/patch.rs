@@ -4,7 +4,6 @@ use std::{
     io::Write,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{json, Map, Value};
@@ -25,16 +24,10 @@ pub(super) fn execute_patch_tool(
     }
 
     let result = match context.execution_target(arguments)? {
-        ExecutionTarget::Local => {
-            apply_patch_local(arguments, context.workspace_root, context.data_root)?
+        ExecutionTarget::Local => apply_patch_local(arguments, context.workspace_root)?,
+        ExecutionTarget::RemoteSsh { host, cwd } => {
+            apply_patch_remote(arguments, &host, cwd.as_deref())?
         }
-        ExecutionTarget::RemoteSsh { host, cwd } => apply_patch_remote(
-            arguments,
-            context.workspace_root,
-            context.data_root,
-            &host,
-            cwd.as_deref(),
-        )?,
     };
     Ok(Some(result))
 }
@@ -42,35 +35,28 @@ pub(super) fn execute_patch_tool(
 fn apply_patch_local(
     arguments: &Map<String, Value>,
     workspace_root: &Path,
-    data_root: &Path,
 ) -> Result<Value, LocalToolError> {
     let patch = string_arg(arguments, "patch")?;
     let check = bool_arg_with_default(arguments, "check", false)?;
     let max_output_chars =
         clamp_tool_output_chars(usize_arg_with_default(arguments, "max_output_chars", 1000)?);
     match patch_format(arguments, &patch)? {
-        PatchFormat::Codex => apply_codex_patch_local(arguments, workspace_root, data_root),
-        PatchFormat::Unified => apply_unified_patch_local(
-            arguments,
-            workspace_root,
-            data_root,
-            check,
-            max_output_chars,
-        ),
+        PatchFormat::Codex => apply_codex_patch_local(arguments, workspace_root),
+        PatchFormat::Unified => {
+            apply_unified_patch_local(arguments, workspace_root, check, max_output_chars)
+        }
     }
 }
 
 fn apply_unified_patch_local(
     arguments: &Map<String, Value>,
     workspace_root: &Path,
-    data_root: &Path,
     check: bool,
     max_output_chars: usize,
 ) -> Result<Value, LocalToolError> {
     let patch = string_arg(arguments, "patch")?;
     let strip = usize_arg_with_default(arguments, "strip", 0)?;
     let reverse = bool_arg_with_default(arguments, "reverse", false)?;
-    let out_path = make_patch_output_dir(data_root)?;
 
     let mut command = Command::new("git");
     command
@@ -102,13 +88,11 @@ fn apply_unified_patch_local(
     let output = child
         .wait_with_output()
         .map_err(|error| LocalToolError::Io(format!("failed to wait for git apply: {error}")))?;
-    patch_result(output, out_path, None, max_output_chars)
+    Ok(patch_result(output, None, max_output_chars))
 }
 
 fn apply_patch_remote(
     arguments: &Map<String, Value>,
-    _workspace_root: &Path,
-    data_root: &Path,
     host: &str,
     cwd: Option<&str>,
 ) -> Result<Value, LocalToolError> {
@@ -146,8 +130,7 @@ fn apply_patch_remote(
         None => remote_command,
     };
     let output = run_remote_command_with_stdin(host, &remote_command, patch.as_bytes())?;
-    let out_path = make_patch_output_dir(data_root)?;
-    patch_result(output, out_path, Some(host), max_output_chars)
+    Ok(patch_result(output, Some(host), max_output_chars))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,7 +188,6 @@ struct CodexPatchChunk {
 fn apply_codex_patch_local(
     arguments: &Map<String, Value>,
     workspace_root: &Path,
-    data_root: &Path,
 ) -> Result<Value, LocalToolError> {
     let strip = usize_arg_with_default(arguments, "strip", 0)?;
     let reverse = bool_arg_with_default(arguments, "reverse", false)?;
@@ -231,7 +213,6 @@ fn apply_codex_patch_local(
         }
     }
 
-    let out_path = make_patch_output_dir(data_root)?;
     let summary = json!({
         "format": "codex",
         "applied": true,
@@ -239,20 +220,7 @@ fn apply_codex_patch_local(
         "files_changed": files_changed.iter().cloned().collect::<Vec<_>>(),
         "operation_count": ops.len(),
     });
-    let stdout = serde_json::to_vec_pretty(&summary).unwrap_or_default();
-    fs::write(out_path.join("stdout"), &stdout).map_err(|error| {
-        LocalToolError::Io(format!("failed to write patch stdout artifact: {error}"))
-    })?;
-    fs::write(out_path.join("stderr"), []).map_err(|error| {
-        LocalToolError::Io(format!("failed to write patch stderr artifact: {error}"))
-    })?;
-
-    let mut result = summary.as_object().cloned().unwrap_or_else(Map::new);
-    result.insert(
-        "out_path".to_string(),
-        Value::String(out_path.display().to_string()),
-    );
-    Ok(Value::Object(result))
+    Ok(summary)
 }
 
 fn parse_codex_patch(patch: &str) -> Result<Vec<CodexPatchOp>, LocalToolError> {
@@ -606,17 +574,9 @@ fn collect_codex_patch_paths(op: &CodexPatchOp, files_changed: &mut BTreeSet<Str
 
 fn patch_result(
     output: std::process::Output,
-    out_path: PathBuf,
     remote: Option<&str>,
     max_output_chars: usize,
-) -> Result<Value, LocalToolError> {
-    fs::write(out_path.join("stdout"), &output.stdout).map_err(|error| {
-        LocalToolError::Io(format!("failed to write patch stdout artifact: {error}"))
-    })?;
-    fs::write(out_path.join("stderr"), &output.stderr).map_err(|error| {
-        LocalToolError::Io(format!("failed to write patch stderr artifact: {error}"))
-    })?;
-
+) -> Value {
     let stdout_text = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr_text = String::from_utf8_lossy(&output.stderr).to_string();
     let (stdout, stdout_truncated) = truncate_tool_text(&stdout_text, max_output_chars);
@@ -624,10 +584,6 @@ fn patch_result(
 
     let mut result = Map::new();
     result.insert("applied".to_string(), Value::Bool(output.status.success()));
-    result.insert(
-        "out_path".to_string(),
-        Value::String(out_path.display().to_string()),
-    );
     if let Some(returncode) = output.status.code() {
         result.insert("returncode".to_string(), Value::from(returncode));
     }
@@ -646,24 +602,5 @@ fn patch_result(
     if stderr_truncated {
         result.insert("stderr_truncated".to_string(), Value::Bool(true));
     }
-    Ok(Value::Object(result))
-}
-
-fn make_patch_output_dir(data_root: &Path) -> Result<PathBuf, LocalToolError> {
-    let out_path = data_root
-        .join(".stellaclaw")
-        .join("output")
-        .join("apply_patch")
-        .join(nonce());
-    fs::create_dir_all(&out_path).map_err(|error| {
-        LocalToolError::Io(format!("failed to create {}: {error}", out_path.display()))
-    })?;
-    Ok(out_path)
-}
-
-fn nonce() -> String {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos().to_string())
-        .unwrap_or_else(|_| "0".to_string())
+    Value::Object(result)
 }

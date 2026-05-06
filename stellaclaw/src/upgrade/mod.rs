@@ -8,6 +8,7 @@ use crate::config::StellaclawConfig;
 mod v0_1;
 mod v0_10;
 mod v0_11;
+mod v0_12;
 mod v0_2;
 mod v0_3;
 mod v0_4;
@@ -28,7 +29,8 @@ pub const WORKDIR_VERSION_0_8: &str = "0.8";
 pub const WORKDIR_VERSION_0_9: &str = "0.9";
 pub const WORKDIR_VERSION_0_10: &str = "0.10";
 pub const WORKDIR_VERSION_0_11: &str = "0.11";
-pub const LATEST_WORKDIR_VERSION: &str = "0.12";
+pub const WORKDIR_VERSION_0_12: &str = "0.12";
+pub const LATEST_WORKDIR_VERSION: &str = "0.13";
 pub const PARTYCLAW_LATEST_WORKDIR_VERSION: &str = "0.39";
 
 const WORKDIR_VERSION_FILE: &str = "STELLA_VERSION";
@@ -47,7 +49,7 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
     let legacy_version_path = workdir.join(LEGACY_WORKDIR_VERSION_FILE);
     let mut current = read_workdir_version(&version_path, &legacy_version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 12] = [
+    let upgraders: [&dyn WorkdirUpgrader; 13] = [
         &v0_1::LegacyUpgrade,
         &v0_1::PartyClawUpgrade,
         &v0_2::ChatMessageReasoningUpgrade,
@@ -60,6 +62,7 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
         &v0_9::ConversationNicknameUpgrade,
         &v0_10::ChannelStateDirectoryUpgrade,
         &v0_11::StellaclawWorkdirDirectoryUpgrade,
+        &v0_12::SshfsWorkspaceMaterializeUpgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -109,6 +112,7 @@ fn read_version_file(version_path: &Path) -> Result<&'static str> {
         WORKDIR_VERSION_0_9 => Ok(WORKDIR_VERSION_0_9),
         WORKDIR_VERSION_0_10 => Ok(WORKDIR_VERSION_0_10),
         WORKDIR_VERSION_0_11 => Ok(WORKDIR_VERSION_0_11),
+        WORKDIR_VERSION_0_12 => Ok(WORKDIR_VERSION_0_12),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -125,4 +129,65 @@ fn remove_legacy_version_file_if_present(path: &Path) -> Result<()> {
             .with_context(|| format!("failed to remove legacy version file {}", path.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn upgrade_chain_runs_v0_12_key_path_materialization_to_latest() {
+        let root = std::env::temp_dir().join(format!(
+            "stellaclaw-upgrade-chain-v0_12-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let conversations = root.join("conversations");
+        let sshfs = conversations.join("sshfs-web-main-000001");
+        let local = conversations.join("web-main-000001");
+        fs::create_dir_all(sshfs.join("attachments")).unwrap();
+        fs::create_dir_all(sshfs.join("src")).unwrap();
+        fs::create_dir_all(&local).unwrap();
+        fs::write(
+            sshfs.join("attachments").join("report.txt"),
+            "remote attachment",
+        )
+        .unwrap();
+        fs::write(sshfs.join("src").join("main.rs"), "remote source").unwrap();
+        fs::write(
+            root.join(WORKDIR_VERSION_FILE),
+            format!("{WORKDIR_VERSION_0_12}\n"),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(&root, &test_config()).unwrap();
+
+        assert!(upgraded);
+        assert_eq!(
+            fs::read_to_string(root.join(WORKDIR_VERSION_FILE)).unwrap(),
+            format!("{LATEST_WORKDIR_VERSION}\n")
+        );
+        assert_eq!(
+            fs::read_to_string(local.join("attachments").join("report.txt")).unwrap(),
+            "remote attachment"
+        );
+        assert!(!local.join("src").join("main.rs").exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_config() -> StellaclawConfig {
+        StellaclawConfig {
+            version: LATEST_CONFIG_VERSION.to_string(),
+            agent_server: AgentServerConfig::default(),
+            default_profile: None,
+            channels: Vec::new(),
+            models: BTreeMap::new(),
+            session_defaults: SessionDefaults::default(),
+            sandbox: SandboxConfig::default(),
+            skill_sync: Vec::new(),
+            available_agent_models: Vec::new(),
+        }
+    }
 }

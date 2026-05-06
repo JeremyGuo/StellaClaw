@@ -25,7 +25,7 @@ fn file_read(
     arguments: &Map<String, Value>,
     context: &ToolExecutionContext<'_>,
 ) -> Result<Value, LocalToolError> {
-    match context.execution_target(arguments)? {
+    match context.execution_target_for_path(arguments, &["file_path", "path"])? {
         ExecutionTarget::Local => file_read_local(arguments, context.workspace_root),
         ExecutionTarget::RemoteSsh { host, cwd } => {
             file_read_remote(arguments, &host, cwd.as_deref())
@@ -37,7 +37,7 @@ fn file_write(
     arguments: &Map<String, Value>,
     context: &ToolExecutionContext<'_>,
 ) -> Result<Value, LocalToolError> {
-    match context.execution_target(arguments)? {
+    match context.execution_target_for_path(arguments, &["file_path", "path"])? {
         ExecutionTarget::Local => file_write_local(arguments, context.workspace_root),
         ExecutionTarget::RemoteSsh { host, cwd } => {
             file_write_remote(arguments, &host, cwd.as_deref())

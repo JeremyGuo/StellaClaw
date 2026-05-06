@@ -66,6 +66,8 @@ pub struct SessionInitial {
     pub search_video_tool_model: Option<ModelConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_news_tool_model: Option<ModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_workspace_instructions: Option<String>,
 }
 
 impl SessionInitial {
@@ -84,6 +86,7 @@ impl SessionInitial {
             search_image_tool_model: None,
             search_video_tool_model: None,
             search_news_tool_model: None,
+            remote_workspace_instructions: None,
         }
     }
 }

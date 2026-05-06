@@ -16,11 +16,21 @@ pub(crate) fn system_prompt_for_initial(
         SessionType::Background => background_prompt(),
         SessionType::Subagent => subagent_prompt(),
     };
-    let mut sections = vec![
-        common_prompt().to_string(),
-        session_kind.to_string(),
-        remote_prompt(&initial.tool_remote_mode),
-    ];
+    let mut sections = vec![common_prompt().to_string(), session_kind.to_string()];
+    if let Some(remote_prompt) = remote_prompt(&initial.tool_remote_mode) {
+        sections.push(remote_prompt);
+    }
+    if let Some(remote_workspace_instructions) = initial
+        .remote_workspace_instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        sections.push(format!(
+            "[Remote Workspace Instructions]\n{}",
+            remote_workspace_instructions
+        ));
+    }
     sections.extend(snapshot_sections(initial, runtime_metadata_state));
     sections.push(tool_efficiency_prompt(&initial.session_type).to_string());
     sections.join("\n\n")
@@ -118,21 +128,14 @@ fn tool_efficiency_prompt(session_type: &SessionType) -> &'static str {
     }
 }
 
-fn remote_prompt(remote_mode: &ToolRemoteMode) -> String {
+fn remote_prompt(remote_mode: &ToolRemoteMode) -> Option<String> {
     match remote_mode {
-        ToolRemoteMode::Selectable => {
+        ToolRemoteMode::Selectable => Some(
             "Tool remote mode: selectable. When a tool exposes remote, its value must be an SSH \
              Host alias from ~/.ssh/config; omit remote for local execution."
-                .to_string()
-        }
-        ToolRemoteMode::FixedSsh { host, cwd } => match cwd.as_deref().map(str::trim).filter(|cwd| !cwd.is_empty()) {
-            Some(cwd) => format!(
-                "Tool remote mode: fixed SSH. Tools execute on SSH Host alias `{host}` with cwd `{cwd}` when remote execution applies."
-            ),
-            None => format!(
-                "Tool remote mode: fixed SSH. Tools execute on SSH Host alias `{host}` when remote execution applies."
-            ),
-        },
+                .to_string(),
+        ),
+        ToolRemoteMode::FixedSsh { .. } => None,
     }
 }
 
@@ -304,7 +307,20 @@ mod tests {
             .unwrap();
 
         let prompt = system_prompt_for_initial(&initial, &state);
-        assert!(prompt.contains("Tool remote mode: fixed SSH"));
+        assert!(!prompt.contains("Tool remote mode: fixed SSH"));
         assert!(!prompt.contains("[Remote Aliases Snapshot]"));
+    }
+
+    #[test]
+    fn system_prompt_includes_remote_workspace_instructions() {
+        let mut initial = SessionInitial::new("s1", SessionType::Foreground);
+        initial.remote_workspace_instructions =
+            Some("[Remote AGENTS.md]\nremote rules".to_string());
+        let state = RuntimeMetadataState::default();
+
+        let prompt = system_prompt_for_initial(&initial, &state);
+
+        assert!(prompt.contains("[Remote Workspace Instructions]"));
+        assert!(prompt.contains("remote rules"));
     }
 }

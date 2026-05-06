@@ -730,6 +730,7 @@ fn migrate_foreground_session(
             config,
             session_model,
         )?,
+        remote_workspace_instructions: None,
     };
     let persisted = MigratedSessionState {
         version: 1,

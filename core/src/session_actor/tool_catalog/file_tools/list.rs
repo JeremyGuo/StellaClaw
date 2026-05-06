@@ -1,6 +1,6 @@
 use std::fs;
 
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::session_actor::tool_runtime::{
     resolve_local_path, string_arg_with_default, ExecutionTarget, LocalToolError,
@@ -21,13 +21,90 @@ pub(super) fn execute_list_tool(
         return Ok(None);
     }
 
-    let result = match context.execution_target(arguments)? {
+    if matches!(
+        context.remote_mode,
+        super::super::ToolRemoteMode::FixedSsh { .. }
+    ) && is_root_ls(arguments)
+    {
+        if let ExecutionTarget::RemoteSsh { host, cwd } =
+            context.execution_target_for_path(arguments, &["path"])?
+        {
+            let mut remote_arguments = arguments.clone();
+            remote_arguments.insert("shadow_roots".to_string(), json!(LOCAL_SPECIAL_ROOT_NAMES));
+            let remote_result = remote_file_tool("ls", &remote_arguments, &host, cwd.as_deref())?;
+            return Ok(Some(append_local_special_root_entries(
+                remote_result,
+                context.workspace_root,
+            )?));
+        }
+    }
+
+    let result = match context.execution_target_for_path(arguments, &["path"])? {
         ExecutionTarget::Local => ls_local(arguments, context.workspace_root)?,
         ExecutionTarget::RemoteSsh { host, cwd } => {
             remote_file_tool("ls", arguments, &host, cwd.as_deref())?
         }
     };
     Ok(Some(result))
+}
+
+const LOCAL_SPECIAL_ROOT_NAMES: &[&str] = &[
+    ".stellaclaw",
+    ".output",
+    "attachments",
+    "shared",
+    "STELLACLAW.md",
+];
+
+fn is_root_ls(arguments: &Map<String, Value>) -> bool {
+    match arguments.get("path").and_then(Value::as_str) {
+        None => true,
+        Some(path) => path.trim().is_empty() || path.trim() == ".",
+    }
+}
+
+fn append_local_special_root_entries(
+    remote_result: Value,
+    workspace_root: &std::path::Path,
+) -> Result<Value, LocalToolError> {
+    let Some(remote_text) = remote_result.as_str() else {
+        return Ok(remote_result);
+    };
+    let entries = local_special_root_entries(workspace_root);
+    if entries.is_empty() {
+        return Ok(remote_result);
+    }
+    let mut text = remote_text.to_string();
+    text.push_str("\n\nlocal_special_paths:");
+    text.push_str(
+        "\nThese workspace-relative paths are stored locally in fixed Remote Mode and shadow remote paths with the same name:",
+    );
+    for entry in entries {
+        let suffix = if entry.is_dir { "/" } else { "" };
+        text.push_str(&format!("\n- {}{}", entry.path, suffix));
+    }
+    Ok(Value::String(text))
+}
+
+fn local_special_root_entries(workspace_root: &std::path::Path) -> Vec<LsEntry> {
+    let mut entries = Vec::new();
+    for name in LOCAL_SPECIAL_ROOT_NAMES {
+        let path = workspace_root.join(name);
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let is_dir = metadata.is_dir()
+            || (metadata.file_type().is_symlink()
+                && fs::metadata(&path)
+                    .map(|target| target.is_dir())
+                    .unwrap_or(false));
+        entries.push(LsEntry {
+            path: (*name).to_string(),
+            is_dir,
+        });
+    }
+    entries.sort_by(|left, right| left.path.cmp(&right.path));
+    entries
 }
 
 fn ls_local(
@@ -177,7 +254,7 @@ fn render_ls_tree(base_path: &std::path::Path, entries: &[LsEntry], truncated: b
 
 #[cfg(test)]
 mod tests {
-    use super::ls_local;
+    use super::{append_local_special_root_entries, ls_local};
     use serde_json::Map;
 
     #[test]
@@ -214,6 +291,27 @@ mod tests {
             "marker.txt inside .stellaclaw should be hidden: {text}"
         );
 
+        std::fs::remove_dir_all(&root).expect("temp dir should be cleaned");
+    }
+
+    #[test]
+    fn root_remote_ls_can_surface_local_special_paths() {
+        let root =
+            std::env::temp_dir().join(format!("stellaclaw-ls-special-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("attachments")).expect("attachments should exist");
+        std::fs::write(root.join("STELLACLAW.md"), "memory").expect("memory should exist");
+
+        let result = append_local_special_root_entries(
+            serde_json::Value::String("num_entries: 0\n\n- /remote/".to_string()),
+            &root,
+        )
+        .expect("append should succeed");
+        let text = result.as_str().expect("result should be text");
+
+        assert!(text.contains("local_special_paths:"));
+        assert!(text.contains("- STELLACLAW.md"));
+        assert!(text.contains("- attachments/"));
         std::fs::remove_dir_all(&root).expect("temp dir should be cleaned");
     }
 }

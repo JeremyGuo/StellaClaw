@@ -2,10 +2,8 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
-    },
+    process::Command,
+    sync::{mpsc, Arc},
     thread,
     time::{Duration, Instant},
 };
@@ -45,10 +43,7 @@ use crate::{
     logger::StellaclawLogger,
     sandbox::bubblewrap_support_error,
     session_client::AgentServerClient,
-    workspace::{
-        ensure_workspace_for_remote_mode, ensure_workspace_seed, sshfs_health_check,
-        sshfs_workspace_root, unmount_sshfs_workspace,
-    },
+    workspace::{ensure_workspace_for_remote_mode, ensure_workspace_seed},
 };
 
 mod attachments;
@@ -246,35 +241,6 @@ pub fn spawn_conversation(
     tx
 }
 
-const SSHFS_WATCHDOG_INTERVAL: Duration = Duration::from_secs(20);
-const SSHFS_WATCHDOG_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-
-fn sshfs_watchdog_loop(
-    mountpoint: &Path,
-    failed: &AtomicBool,
-    logger: &StellaclawLogger,
-    conversation_id: &str,
-) {
-    loop {
-        thread::sleep(SSHFS_WATCHDOG_INTERVAL);
-        if failed.load(Ordering::Relaxed) {
-            // Already flagged; nothing more to do.
-            return;
-        }
-        if !sshfs_health_check(mountpoint, SSHFS_WATCHDOG_PROBE_TIMEOUT) {
-            logger.warn(
-                "sshfs_watchdog_failed",
-                json!({
-                    "conversation_id": conversation_id,
-                    "mountpoint": mountpoint.display().to_string(),
-                }),
-            );
-            failed.store(true, Ordering::SeqCst);
-            return;
-        }
-    }
-}
-
 fn run_conversation(
     workdir: PathBuf,
     state: ConversationState,
@@ -316,38 +282,6 @@ fn run_conversation(
     runtime.persist_state()?;
 
     loop {
-        // Check if the sshfs watchdog has flagged a failure.
-        if runtime.sshfs_failed.load(Ordering::Relaxed) {
-            runtime.logger.warn(
-                "sshfs_watchdog_conversation_stopping",
-                json!({
-                    "conversation_id": runtime.state.conversation_id,
-                    "workspace_root": runtime.workspace_root.display().to_string(),
-                }),
-            );
-            let mountpoint = runtime.workspace_root.display().to_string();
-            let sshfs_error_msg = format!(
-                "Remote workspace ({mountpoint}) is unresponsive. \
-                 Session stopped.\n\
-                 Send any message to attempt automatic recovery.",
-            );
-            let _ = runtime.send_channel_error(
-                OutgoingErrorScope::RemoteWorkspace,
-                OutgoingErrorSeverity::Error,
-                "sshfs_unresponsive",
-                sshfs_error_msg.clone(),
-                Some(json!({"mountpoint": mountpoint})),
-                false,
-                None,
-            );
-            let _ = runtime.send_delivery_from_text(sshfs_error_msg);
-            // Attempt lazy unmount so the next conversation start can remount
-            // cleanly.
-            let _ = unmount_sshfs_workspace(&runtime.workdir, &runtime.state.conversation_id);
-            runtime.shutdown();
-            break;
-        }
-
         let mut changed = false;
         while runtime.pump_session_events()? {
             changed = true;
@@ -449,10 +383,7 @@ pub fn load_conversation_status_snapshot(
 ) -> Result<OutgoingStatus> {
     let state = load_existing_conversation_state(workdir, conversation_id)?;
     let conversation_root = workdir.join("conversations").join(conversation_id);
-    let workspace_root = match &state.tool_remote_mode {
-        ToolRemoteMode::Selectable => conversation_root,
-        ToolRemoteMode::FixedSsh { .. } => sshfs_workspace_root(workdir, conversation_id),
-    };
+    let workspace_root = conversation_root;
     let session_root = workdir.join("conversations").join(conversation_id);
     conversation_status_snapshot(workdir, &session_root, &workspace_root, &state, config)
 }
@@ -486,10 +417,6 @@ struct ConversationRuntime {
     subagents: BTreeMap<String, ManagedSessionRuntime>,
     foreground_progress: Option<ActiveForegroundProgress>,
     session_plans: BTreeMap<String, TaskPlanView>,
-    /// Set to `true` by the sshfs watchdog thread when the mount becomes
-    /// unresponsive.  The main conversation loop checks this flag each
-    /// iteration and tears down the conversation when it fires.
-    sshfs_failed: Arc<AtomicBool>,
 }
 
 struct ForegroundSessionRuntime {
@@ -612,28 +539,6 @@ impl ConversationRuntime {
             );
         }
 
-        let sshfs_failed = Arc::new(AtomicBool::new(false));
-
-        // Spawn an sshfs watchdog thread for FixedSsh conversations.
-        // Skip the watchdog for localhost workspaces (symlinks, not FUSE mounts).
-        let is_symlink_workspace = workspace_root
-            .symlink_metadata()
-            .map_or(false, |m| m.file_type().is_symlink());
-        if matches!(state.tool_remote_mode, ToolRemoteMode::FixedSsh { .. })
-            && !is_symlink_workspace
-        {
-            let flag = sshfs_failed.clone();
-            let check_path = workspace_root.clone();
-            let watchdog_logger = logger.clone();
-            let conv_id = state.conversation_id.clone();
-            thread::Builder::new()
-                .name(format!("sshfs-watchdog-{conv_id}"))
-                .spawn(move || {
-                    sshfs_watchdog_loop(&check_path, &flag, &watchdog_logger, &conv_id);
-                })
-                .context("failed to spawn sshfs watchdog thread")?;
-        }
-
         Ok(Self {
             workdir,
             conversation_root,
@@ -650,7 +555,6 @@ impl ConversationRuntime {
             subagents,
             foreground_progress: None,
             session_plans: BTreeMap::new(),
-            sshfs_failed,
         })
     }
 
@@ -1920,6 +1824,41 @@ impl ConversationRuntime {
     }
 
     fn send_delivery_from_message(&self, message: ChatMessage) -> Result<()> {
+        let rendered = render_chat_message(&message);
+        if rendered.contains("<attachment>") {
+            let (clean_text, attachments) = match extract_attachment_references(
+                &rendered,
+                &self.workspace_root,
+                &self.workdir.join("rundir").join("shared"),
+            ) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    let fallback = format!(
+                        "{}\n\n⚠️ 附件发送失败: {error:#}",
+                        strip_attachment_tags(&rendered).trim()
+                    );
+                    self.logger.warn(
+                        "outgoing_attachment_resolution_failed",
+                        json!({"error": format!("{error:#}")}),
+                    );
+                    self.send_channel_error(
+                        OutgoingErrorScope::Attachment,
+                        OutgoingErrorSeverity::Warning,
+                        "attachment_resolution_failed",
+                        format!("附件发送失败: {error}"),
+                        Some(json!({"error": format!("{error:#}")})),
+                        false,
+                        None,
+                    )?;
+                    (fallback, Vec::new())
+                }
+            };
+            if clean_text.trim().is_empty() && attachments.is_empty() {
+                return Ok(());
+            }
+            return self.send_delivery(clean_text, attachments, None);
+        }
+
         self.outgoing_tx
             .send(OutgoingDispatch::Event(ChannelEvent::Delivery(
                 OutgoingDelivery {
@@ -2447,7 +2386,6 @@ impl ConversationRuntime {
             self.stop_running_managed_sessions_for_config_change(
                 "stopped because conversation remote workspace changed",
             );
-            let _ = unmount_sshfs_workspace(&self.workdir, &self.state.conversation_id);
         }
         let workspace_root = match ensure_workspace_for_remote_mode(
             &self.workdir,
@@ -2477,8 +2415,7 @@ impl ConversationRuntime {
         self.workspace_root = workspace_root;
         self.restart_foreground_session()?;
         self.send_delivery_from_text(format!(
-            "已切换到远程 workspace `{host}` `{path}`。\n本地 conversation 目录保留在 `{}`，sshfs workspace 为 `{}`。",
-            self.conversation_root.display(),
+            "已切换到远程 workspace `{host}` `{path}`。\n本地 conversation workspace 为 `{}`；文件、搜索、补丁和 shell 工具默认在远程路径执行。",
             self.workspace_root.display()
         ))?;
         self.send_status()?;
@@ -2566,7 +2503,6 @@ impl ConversationRuntime {
         self.stop_running_managed_sessions_for_config_change(
             "stopped because conversation remote workspace changed",
         );
-        let _ = unmount_sshfs_workspace(&self.workdir, &self.state.conversation_id);
         self.state.tool_remote_mode = ToolRemoteMode::Selectable;
         self.workspace_root = ensure_workspace_for_remote_mode(
             &self.workdir,
@@ -2894,6 +2830,7 @@ fn start_session_process(
             .map_err(anyhow::Error::msg)?;
     let mut initial = SessionInitial::new(session_id.to_string(), session_type);
     initial.tool_remote_mode = tool_remote_mode.clone();
+    initial.remote_workspace_instructions = remote_workspace_instructions(tool_remote_mode);
     initial.compression_threshold_tokens = defaults.compression_threshold_tokens;
     initial.compression_retain_recent_tokens = defaults.compression_retain_recent_tokens;
     let effective_model = effective_model_config(model_config, reasoning_effort);
@@ -2953,6 +2890,102 @@ fn start_session_process(
         .initialize(&effective_model, &initial)
         .map_err(anyhow::Error::msg)?;
     Ok((client, events))
+}
+
+const REMOTE_AGENTS_MAX_BYTES: usize = 64 * 1024;
+
+fn remote_workspace_instructions(remote_mode: &ToolRemoteMode) -> Option<String> {
+    let ToolRemoteMode::FixedSsh { host, cwd } = remote_mode else {
+        return None;
+    };
+    let Some(cwd) = cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Some(
+            "[Remote AGENTS.md Notice]\nCould not read remote AGENTS.md: fixed SSH workspace path is empty."
+                .to_string(),
+        );
+    };
+    match read_remote_agents_md(host, cwd) {
+        RemoteAgentsRead::Found { content, truncated } => {
+            let mut section = format!(
+                "[Remote AGENTS.md]\nThese scoped repository instructions were read from the fixed SSH workspace root `{}:{}/AGENTS.md`:\n{}",
+                host, cwd, content
+            );
+            if truncated {
+                section.push_str("\n\n[Remote AGENTS.md Notice]\nThe file was truncated to the first 65536 bytes.");
+            }
+            Some(section)
+        }
+        RemoteAgentsRead::Missing => None,
+        RemoteAgentsRead::Failed(reason) => Some(format!(
+            "[Remote AGENTS.md Notice]\nCould not read remote AGENTS.md from fixed SSH workspace `{}:{}/AGENTS.md`: {}",
+            host, cwd, reason
+        )),
+    }
+}
+
+enum RemoteAgentsRead {
+    Found { content: String, truncated: bool },
+    Missing,
+    Failed(String),
+}
+
+fn read_remote_agents_md(host: &str, cwd: &str) -> RemoteAgentsRead {
+    let script = format!(
+        "cd {} && if [ -f AGENTS.md ]; then bytes=$(wc -c < AGENTS.md | tr -d ' '); head -c {} AGENTS.md; if [ \"${{bytes:-0}}\" -gt {} ]; then exit 4; fi; elif [ -e AGENTS.md ]; then echo 'AGENTS.md exists but is not a regular file' >&2; exit 2; else exit 3; fi",
+        shell_quote(cwd),
+        REMOTE_AGENTS_MAX_BYTES,
+        REMOTE_AGENTS_MAX_BYTES,
+    );
+    let output = Command::new("ssh")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-o")
+        .arg("ConnectTimeout=10")
+        .arg("-T")
+        .arg(host)
+        .arg(script)
+        .output();
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => return RemoteAgentsRead::Failed(format!("failed to run ssh: {error}")),
+    };
+    match output.status.code() {
+        Some(0) | Some(4) => {
+            let mut content = String::from_utf8_lossy(&output.stdout).to_string();
+            if !content.ends_with('\n') {
+                content.push('\n');
+            }
+            RemoteAgentsRead::Found {
+                content,
+                truncated: output.status.code() == Some(4),
+            }
+        }
+        Some(3) => RemoteAgentsRead::Missing,
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let message = if stderr.is_empty() {
+                format!(
+                    "ssh exited with status {}",
+                    output.status.code().unwrap_or(-1)
+                )
+            } else {
+                stderr
+            };
+            RemoteAgentsRead::Failed(message)
+        }
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    let escaped = value.replace('\'', "'\"'\"'");
+    format!("'{escaped}'")
 }
 
 fn resolve_tool_model_target(

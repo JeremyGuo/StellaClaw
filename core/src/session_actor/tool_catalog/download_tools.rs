@@ -144,7 +144,7 @@ fn file_download_start(
     let path_arg = string_arg(arguments, "path")?;
     let overwrite = bool_arg_with_default(arguments, "overwrite", false)?;
     let download_id = format!("dl_{}", nonce());
-    let target = context.execution_target(arguments)?;
+    let target = context.execution_target_for_path(arguments, &["path"])?;
     let display_path = match &target {
         ExecutionTarget::Local => local_display_path(context.workspace_root, &path_arg),
         ExecutionTarget::RemoteSsh { host, cwd } => {

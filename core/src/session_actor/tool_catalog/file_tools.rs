@@ -4,17 +4,18 @@ mod list;
 mod patch;
 mod read_write;
 mod search;
+mod visibility;
 
 use serde_json::{json, Map, Value};
 
 use super::{
-    schema::{file_tool_schema, properties},
+    schema::{file_tool_schema, object_schema, properties},
     ToolBackend, ToolConcurrency, ToolDefinition, ToolExecutionMode, ToolRemoteMode,
 };
 use crate::session_actor::tool_runtime::{LocalToolError, ToolExecutionContext};
 
 pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition> {
-    vec![
+    let mut tools = vec![
         ToolDefinition::new(
             "file_read",
             "Read a UTF-8 text file. Supports file_path plus optional offset and limit for large files. All tool results are capped by the runtime; use smaller ranges for huge files.",
@@ -111,7 +112,7 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
         .with_concurrency(ToolConcurrency::Serial),
         ToolDefinition::new(
             "apply_patch",
-            "Apply a patch inside the workspace. Supports format=auto, format=codex, or format=unified. Codex format uses an envelope with *** Begin Patch / *** End Patch and file sections such as *** Add File, *** Delete File, and *** Update File, returning files_changed. Unified format is passed to git apply; returned stdout/stderr are capped by max_output_chars. Full artifacts are saved under out_path.",
+            "Apply a patch inside the workspace. Supports format=auto, format=codex, or format=unified. Codex format uses an envelope with *** Begin Patch / *** End Patch and file sections such as *** Add File, *** Delete File, and *** Update File, returning files_changed. Unified format is passed to git apply; non-empty stdout/stderr are returned and capped by max_output_chars.",
             file_tool_schema(
                 properties([
                     ("patch", json!({"type": "string"})),
@@ -134,7 +135,40 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
             ToolBackend::Local,
         )
         .with_concurrency(ToolConcurrency::Serial),
-    ]
+    ];
+    if matches!(remote_mode, ToolRemoteMode::FixedSsh { .. }) {
+        tools.extend([
+            ToolDefinition::new(
+                "shell_make_visible",
+                "Copy a local workspace-relative file or directory to the fixed remote workspace at the same relative path so remote shell and remote file tools can see it. Requires path and optional timeout_seconds.",
+                object_schema(
+                    properties([
+                        ("path", json!({"type": "string"})),
+                        ("timeout_seconds", json!({"type": "number"})),
+                    ]),
+                    &["path"],
+                ),
+                ToolExecutionMode::Interruptible,
+                ToolBackend::Local,
+            )
+            .with_concurrency(ToolConcurrency::Serial),
+            ToolDefinition::new(
+                "attachment_make_visible",
+                "Copy a fixed-remote workspace-relative file or directory back to the local workspace at the same relative path so <attachment> can reference it. Requires path and optional timeout_seconds.",
+                object_schema(
+                    properties([
+                        ("path", json!({"type": "string"})),
+                        ("timeout_seconds", json!({"type": "number"})),
+                    ]),
+                    &["path"],
+                ),
+                ToolExecutionMode::Interruptible,
+                ToolBackend::Local,
+            )
+            .with_concurrency(ToolConcurrency::Serial),
+        ]);
+    }
+    tools
 }
 
 pub(crate) fn execute_file_tool(
@@ -158,5 +192,8 @@ pub(crate) fn execute_file_tool(
     if let Some(result) = edit::execute_edit_tool(tool_name, arguments, context)? {
         return Ok(Some(result));
     }
-    patch::execute_patch_tool(tool_name, arguments, context)
+    if let Some(result) = patch::execute_patch_tool(tool_name, arguments, context)? {
+        return Ok(Some(result));
+    }
+    visibility::execute_visibility_tool(tool_name, arguments, context)
 }
