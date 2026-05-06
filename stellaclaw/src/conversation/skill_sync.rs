@@ -63,7 +63,7 @@ pub(crate) fn push_configured_skill_sync_on_startup(
         return Vec::new();
     }
 
-    let runtime_skill_root = workdir.join("rundir").join(".skill");
+    let runtime_skill_root = workdir.join("rundir").join(".stellaclaw").join("skill");
     let mut results = Vec::new();
     for skill_name in skill_names {
         let skill_path = runtime_skill_root.join(&skill_name);
@@ -720,7 +720,11 @@ mod tests {
             );
         }
 
-        let skill_path = root.join("rundir").join(".skill").join("demo");
+        let skill_path = root
+            .join("rundir")
+            .join(".stellaclaw")
+            .join("skill")
+            .join("demo");
         fs::create_dir_all(&skill_path).expect("skill path should exist");
         fs::write(
             skill_path.join("SKILL.md"),
@@ -769,14 +773,22 @@ mod tests {
             String::from_utf8_lossy(&init.stderr)
         );
 
-        let skill_path = root.join("rundir").join(".skill").join("demo");
+        let skill_path = root
+            .join("rundir")
+            .join(".stellaclaw")
+            .join("skill")
+            .join("demo");
         fs::create_dir_all(&skill_path).expect("skill path should exist");
         fs::write(
             skill_path.join("SKILL.md"),
             "---\nname: demo\ndescription: Demo skill\n---\nbody\n",
         )
         .expect("skill should be written");
-        let other_skill_path = root.join("rundir").join(".skill").join("other");
+        let other_skill_path = root
+            .join("rundir")
+            .join(".stellaclaw")
+            .join("skill")
+            .join("other");
         fs::create_dir_all(&other_skill_path).expect("other skill path should exist");
         fs::write(
             other_skill_path.join("SKILL.md"),

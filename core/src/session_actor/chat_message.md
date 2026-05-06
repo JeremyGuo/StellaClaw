@@ -390,7 +390,7 @@ File-only tool result:
         "tool_name": "image_load",
         "result": {
           "file": {
-            "uri": "file:///workspace/.output/loaded.png",
+            "uri": "file:///workspace/.stellaclaw/output/loaded.png",
             "name": "loaded.png",
             "media_type": "image/png",
             "width": 1024,
@@ -416,7 +416,7 @@ Tool result with both text and file:
         "text": "{\"status\":\"completed\",\"generation_id\":\"image_generation_123\"}"
       },
       "file": {
-        "uri": "file:///workspace/.output/generated.png",
+        "uri": "file:///workspace/.stellaclaw/output/generated.png",
         "name": "generated.png",
         "media_type": "image/png"
       }
@@ -448,7 +448,7 @@ When a provider itself returns an image or file as assistant output, persist it 
     {
       "type": "file",
       "payload": {
-        "uri": "file:///workspace/.output/paris.png",
+        "uri": "file:///workspace/.stellaclaw/output/paris.png",
         "name": "paris.png",
         "media_type": "image/png"
       }

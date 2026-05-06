@@ -9,7 +9,7 @@ use stellaclaw_core::session_actor::ToolRemoteMode;
 
 const RUNDIR: &str = "rundir";
 const STELLACLAW_DIR: &str = ".stellaclaw";
-const SHARED_DIR: &str = "stellaclaw_shared";
+const SHARED_DIR: &str = "shared";
 const SKILL_DIR: &str = "skill";
 const SHARED_SKILL_MEMORY_DIR: &str = "skill_memory";
 
@@ -44,8 +44,8 @@ pub fn ensure_workspace_seed(workdir: &Path, data_root: &Path) -> Result<()> {
     let runtime_root = workdir.join(RUNDIR);
     let runtime_shared = runtime_root.join("shared");
     let runtime_profile = runtime_root.join(STELLACLAW_DIR);
-    let runtime_skill = runtime_root.join(".skill");
-    let runtime_skill_memory = runtime_root.join(SHARED_SKILL_MEMORY_DIR);
+    let runtime_skill = runtime_profile.join(SKILL_DIR);
+    let runtime_skill_memory = runtime_profile.join(SHARED_SKILL_MEMORY_DIR);
 
     fs::create_dir_all(&runtime_shared)
         .with_context(|| format!("failed to create {}", runtime_shared.display()))?;
@@ -92,12 +92,18 @@ fn migrate_legacy_workspace_layout(data_root: &Path) {
         let _ = fs::rename(&old_skill, &new_skill);
     }
 
-    // shared -> .stellaclaw/stellaclaw_shared
+    // shared -> .stellaclaw/shared
     let old_shared = data_root.join("shared");
     let new_shared = stellaclaw_dir.join(SHARED_DIR);
     if old_shared.symlink_metadata().is_ok() && !new_shared.exists() {
         let _ = fs::create_dir_all(&stellaclaw_dir);
         let _ = fs::rename(&old_shared, &new_shared);
+    }
+
+    // .stellaclaw/stellaclaw_shared -> .stellaclaw/shared
+    let old_internal_shared = stellaclaw_dir.join("stellaclaw_shared");
+    if old_internal_shared.symlink_metadata().is_ok() && !new_shared.exists() {
+        let _ = fs::rename(&old_internal_shared, &new_shared);
     }
 
     // .skill_memory -> .stellaclaw/skill_memory
@@ -392,7 +398,7 @@ mod tests {
         std::fs::write(
             conversation_a
                 .join(".stellaclaw")
-                .join("stellaclaw_shared")
+                .join("shared")
                 .join("marker.txt"),
             "shared",
         )
@@ -402,7 +408,7 @@ mod tests {
             std::fs::read_to_string(
                 conversation_b
                     .join(".stellaclaw")
-                    .join("stellaclaw_shared")
+                    .join("shared")
                     .join("marker.txt")
             )
             .expect("shared file should be visible from other workspace"),

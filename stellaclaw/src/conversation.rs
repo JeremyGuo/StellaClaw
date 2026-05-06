@@ -1507,7 +1507,11 @@ impl ConversationRuntime {
             .ok_or_else(|| anyhow!("{} requires skill_name", request.action))?;
         validate_skill_name(skill_name)?;
 
-        let runtime_skill_root = self.workdir.join("rundir").join(".skill");
+        let runtime_skill_root = self
+            .workdir
+            .join("rundir")
+            .join(".stellaclaw")
+            .join("skill");
         let runtime_skill_path = runtime_skill_root.join(skill_name);
         let staged_skill_path = self
             .workspace_root

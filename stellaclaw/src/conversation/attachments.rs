@@ -132,11 +132,16 @@ fn is_inside_fenced_code_block(text: &str, byte_index: usize) -> bool {
 
 fn is_shared_attachment_path(path_text: &str) -> bool {
     // Exact directory references (no trailing separator).
-    if path_text == ".stellaclaw/stellaclaw_shared" || path_text == "shared" {
+    if path_text == ".stellaclaw/shared"
+        || path_text == ".stellaclaw/stellaclaw_shared"
+        || path_text == "shared"
+    {
         return true;
     }
     // Prefix with content after the separator.
     for prefix in [
+        ".stellaclaw/shared/",
+        ".stellaclaw/shared\\",
         ".stellaclaw/stellaclaw_shared/",
         ".stellaclaw/stellaclaw_shared\\",
         "shared/",
@@ -190,7 +195,7 @@ fn resolve_outgoing_attachment(
 fn attachment_candidate_path(workspace_root: &Path, path_text: &str) -> std::path::PathBuf {
     let path = Path::new(path_text);
     if !path.is_absolute() {
-        return workspace_root.join(path);
+        return workspace_root.join(canonical_relative_attachment_path(path_text));
     }
 
     if let Some(remapped) = remap_absolute_conversation_path(workspace_root, path) {
@@ -199,6 +204,31 @@ fn attachment_candidate_path(workspace_root: &Path, path_text: &str) -> std::pat
         }
     }
     path.to_path_buf()
+}
+
+fn canonical_relative_attachment_path(path_text: &str) -> std::path::PathBuf {
+    for (legacy_prefix, canonical_prefix) in [
+        ("attachments/", ".stellaclaw/attachments/"),
+        ("attachments\\", ".stellaclaw/attachments/"),
+        (".output/", ".stellaclaw/output/"),
+        (".output\\", ".stellaclaw/output/"),
+        ("shared/", ".stellaclaw/shared/"),
+        ("shared\\", ".stellaclaw/shared/"),
+        (".stellaclaw/stellaclaw_shared/", ".stellaclaw/shared/"),
+        (".stellaclaw/stellaclaw_shared\\", ".stellaclaw/shared/"),
+    ] {
+        if let Some(rest) = path_text.strip_prefix(legacy_prefix) {
+            return Path::new(canonical_prefix).join(rest);
+        }
+    }
+    match path_text {
+        "STELLACLAW.md" => Path::new(".stellaclaw").join("STELLACLAW.md"),
+        "attachments" => Path::new(".stellaclaw").join("attachments"),
+        ".output" => Path::new(".stellaclaw").join("output"),
+        "shared" => Path::new(".stellaclaw").join("shared"),
+        ".stellaclaw/stellaclaw_shared" => Path::new(".stellaclaw").join("shared"),
+        _ => Path::new(path_text).to_path_buf(),
+    }
 }
 
 fn remap_absolute_conversation_path(
@@ -220,6 +250,16 @@ fn remap_absolute_conversation_path(
         let mut remapped = workspace_root.to_path_buf();
         for rest in components {
             remapped.push(rest.as_os_str());
+        }
+        if !remapped.exists() {
+            if let Ok(relative) = remapped.strip_prefix(workspace_root) {
+                let canonical = workspace_root.join(canonical_relative_attachment_path(
+                    &relative.to_string_lossy(),
+                ));
+                if canonical.exists() {
+                    return Some(canonical);
+                }
+            }
         }
         return Some(remapped);
     }
@@ -302,7 +342,11 @@ mod tests {
 
     #[test]
     fn shared_attachment_path_accepts_unix_and_windows_separators() {
-        // New .stellaclaw/stellaclaw_shared/ paths.
+        // Canonical .stellaclaw/shared/ paths.
+        assert!(is_shared_attachment_path(".stellaclaw/shared"));
+        assert!(is_shared_attachment_path(".stellaclaw/shared/foo.pdf"));
+        assert!(!is_shared_attachment_path(".stellaclaw/shared/"));
+        // Legacy .stellaclaw/stellaclaw_shared/ paths.
         assert!(is_shared_attachment_path(".stellaclaw/stellaclaw_shared"));
         assert!(is_shared_attachment_path(
             ".stellaclaw/stellaclaw_shared/foo.pdf"
@@ -347,15 +391,17 @@ mod tests {
         std::fs::create_dir_all(&shared).expect("shared should exist");
         let file = shared.join("report.txt");
         std::fs::write(&file, "hello").expect("file should write");
+        std::fs::create_dir_all(workspace.join(".stellaclaw")).expect("stellaclaw should exist");
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&shared, workspace.join("shared"))
+        std::os::unix::fs::symlink(&shared, workspace.join(".stellaclaw/shared"))
             .expect("shared symlink should exist");
         #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&shared, workspace.join("shared"))
+        std::os::windows::fs::symlink_dir(&shared, workspace.join(".stellaclaw/shared"))
             .expect("shared symlink should exist");
 
-        let resolved = resolve_outgoing_attachment(&workspace, &shared, "shared/report.txt")
-            .expect("shared attachment should resolve");
+        let resolved =
+            resolve_outgoing_attachment(&workspace, &shared, ".stellaclaw/shared/report.txt")
+                .expect("shared attachment should resolve");
         assert_eq!(resolved.path, file.canonicalize().unwrap());
         std::fs::remove_dir_all(&root).expect("temp root should be removed");
     }

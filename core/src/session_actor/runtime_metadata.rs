@@ -17,7 +17,7 @@ pub(crate) const USER_META_PROMPT_COMPONENT: &str = "user_meta";
 
 const USER_META_PATH: &str = ".stellaclaw/USER.md";
 const IDENTITY_PATH: &str = ".stellaclaw/IDENTITY.md";
-const STELLACLAW_MEMORY_PATH: &str = "STELLACLAW.md";
+const STELLACLAW_MEMORY_PATH: &str = ".stellaclaw/STELLACLAW.md";
 const SKILL_ROOT: &str = ".stellaclaw/skill";
 const SKILL_ENTRY_FILE: &str = "SKILL.md";
 
@@ -440,7 +440,7 @@ fn render_skills_metadata(skills: &[SessionSkillObservation]) -> String {
         return String::new();
     }
     let mut lines = vec![
-        "Available skills from .skill/ in the current workspace:".to_string(),
+        "Available skills from .stellaclaw/skill/ in the current workspace:".to_string(),
         "Load a skill by exact name before relying on its detailed instructions.".to_string(),
     ];
     for skill in skills {
@@ -907,15 +907,15 @@ mod tests {
     #[test]
     fn stellaclaw_memory_updates_without_runtime_notice() {
         let root = temp_root();
-        fs::create_dir_all(&root).unwrap();
-        fs::write(root.join("STELLACLAW.md"), "old durable note").unwrap();
+        fs::create_dir_all(root.join(".stellaclaw")).unwrap();
+        fs::write(root.join(".stellaclaw/STELLACLAW.md"), "old durable note").unwrap();
 
         let mut state = RuntimeMetadataState::default();
         state
             .initialize_from_workspace(&root, &root, String::new())
             .expect("initial metadata should load");
 
-        fs::write(root.join("STELLACLAW.md"), "new durable note").unwrap();
+        fs::write(root.join(".stellaclaw/STELLACLAW.md"), "new durable note").unwrap();
         let notices = state
             .observe_for_user_turn_from_workspace(&root, &root, String::new())
             .expect("updated metadata should load");

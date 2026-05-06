@@ -31,7 +31,7 @@ pub struct FileItem {
 {
   "type": "file",
   "payload": {
-    "uri": "file:///workspace/attachments/incoming/input.png",
+    "uri": "file:///workspace/.stellaclaw/attachments/incoming/input.png",
     "name": "input.png",
     "media_type": "image/png",
     "width": 1024,
@@ -70,7 +70,7 @@ Example:
 
 ```json
 {
-  "uri": "file:///home/user/workdir/conversations/web-main-1/attachments/incoming/photo.png",
+  "uri": "file:///home/user/workdir/conversations/web-main-1/.stellaclaw/attachments/incoming/photo.png",
   "name": "photo.png",
   "media_type": "image/png"
 }
@@ -163,7 +163,7 @@ Example:
     {
       "type": "file",
       "payload": {
-        "uri": "file:///workdir/conversations/web-main-1/attachments/incoming/input.png",
+        "uri": "file:///workdir/conversations/web-main-1/.stellaclaw/attachments/incoming/input.png",
         "name": "input.png",
         "media_type": "image/png",
         "width": 800,
@@ -174,7 +174,7 @@ Example:
 }
 ```
 
-If a frontend sends a `FileItem` directly through REST, it should already refer to a materialized or otherwise retrievable file. The Web channel materializes incoming `data:` file items under `attachments/incoming` before enqueueing the user `ChatMessage`; other URI schemes must be durable according to the channel contract.
+If a frontend sends a `FileItem` directly through REST, it should already refer to a materialized or otherwise retrievable file. The Web channel materializes incoming `data:` file items under `.stellaclaw/attachments/incoming` before enqueueing the user `ChatMessage`; other URI schemes must be durable according to the channel contract.
 
 ### Tool Results
 
@@ -191,7 +191,7 @@ Tool output text goes in `ToolResultContent.context`. The primary produced file 
         "text": "{\"status\":\"loaded\"}"
       },
       "file": {
-        "uri": "file:///workdir/conversations/web-main-1/.output/loaded.png",
+        "uri": "file:///workdir/conversations/web-main-1/.stellaclaw/output/loaded.png",
         "name": "loaded.png",
         "media_type": "image/png",
         "width": 1024,
@@ -215,7 +215,7 @@ Provider-generated artifacts should be materialized and stored as assistant `Fil
     {
       "type": "file",
       "payload": {
-        "uri": "file:///workdir/conversations/web-main-1/.output/generated.png",
+        "uri": "file:///workdir/conversations/web-main-1/.stellaclaw/output/generated.png",
         "name": "generated.png",
         "media_type": "image/png",
         "width": 1536,
@@ -234,7 +234,7 @@ If a file reference exists but is unusable, keep the `FileItem` and set `state`:
 
 ```json
 {
-  "uri": "file:///workdir/conversations/web-main-1/attachments/incoming/photo.png",
+  "uri": "file:///workdir/conversations/web-main-1/.stellaclaw/attachments/incoming/photo.png",
   "name": "photo.png",
   "media_type": "image/png",
   "state": {

@@ -11,14 +11,17 @@ use anyhow::{anyhow, Context, Result};
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 
-use super::{WorkdirUpgrader, LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_12};
+use super::{WorkdirUpgrader, WORKDIR_VERSION_0_12, WORKDIR_VERSION_0_13};
 use crate::{config::StellaclawConfig, workspace::is_sshfs_workspace_entry_name};
 
-const LOCAL_KEY_PATHS: [&str; 5] = [
+const LOCAL_KEY_PATHS: [&str; 8] = [
     ".stellaclaw",
     ".output",
+    ".skill",
+    ".skill_memory",
     "attachments",
     "shared",
+    "skill_memory",
     "STELLACLAW.md",
 ];
 const REMOTE_COPY_TIMEOUT: Duration = Duration::from_secs(300);
@@ -31,7 +34,7 @@ impl WorkdirUpgrader for SshfsWorkspaceMaterializeUpgrade {
     }
 
     fn to_version(&self) -> &'static str {
-        LATEST_WORKDIR_VERSION
+        WORKDIR_VERSION_0_13
     }
 
     fn upgrade(&self, workdir: &Path, _config: &StellaclawConfig) -> Result<()> {
@@ -531,11 +534,23 @@ mod tests {
         let local = conversations.join("web-main-000001");
         fs::create_dir_all(sshfs.join("src")).unwrap();
         fs::create_dir_all(sshfs.join("attachments")).unwrap();
+        fs::create_dir_all(sshfs.join(".skill").join("demo")).unwrap();
+        fs::create_dir_all(sshfs.join(".skill_memory")).unwrap();
         fs::create_dir_all(&local).unwrap();
         fs::write(sshfs.join("src").join("main.rs"), "remote").unwrap();
         fs::write(
             sshfs.join("attachments").join("report.txt"),
             "remote attachment",
+        )
+        .unwrap();
+        fs::write(
+            sshfs.join(".skill").join("demo").join("SKILL.md"),
+            "remote skill",
+        )
+        .unwrap();
+        fs::write(
+            sshfs.join(".skill_memory").join("skill.txt"),
+            "remote skill",
         )
         .unwrap();
         fs::write(sshfs.join("STELLACLAW.md"), "remote memory").unwrap();
@@ -549,6 +564,14 @@ mod tests {
         assert_eq!(
             fs::read_to_string(local.join("attachments").join("report.txt")).unwrap(),
             "remote attachment"
+        );
+        assert_eq!(
+            fs::read_to_string(local.join(".skill_memory").join("skill.txt")).unwrap(),
+            "remote skill"
+        );
+        assert_eq!(
+            fs::read_to_string(local.join(".skill").join("demo").join("SKILL.md")).unwrap(),
+            "remote skill"
         );
         assert_eq!(
             fs::read_to_string(local.join("STELLACLAW.md")).unwrap(),

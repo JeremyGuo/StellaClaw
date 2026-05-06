@@ -1076,7 +1076,7 @@ mod tests {
             .execution_target_for_path(
                 &Map::from_iter([(
                     "file_path".to_string(),
-                    Value::String("attachments/incoming/photo.png".to_string()),
+                    Value::String(".stellaclaw/attachments/incoming/photo.png".to_string()),
                 )]),
                 &["file_path", "path"],
             )

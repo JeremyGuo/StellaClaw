@@ -69,7 +69,7 @@ File or media reference.
 {
   "type": "file",
   "payload": {
-    "uri": "file:///workspace/.output/paris.png",
+    "uri": "file:///workspace/.stellaclaw/output/paris.png",
     "name": "paris.png",
     "media_type": "image/png",
     "width": 1024,
@@ -90,7 +90,7 @@ For real user uploads, the preferred persisted shape is a materialized local fil
 {
   "type": "file",
   "payload": {
-    "uri": "file:///workspace/attachments/incoming/photo.png",
+    "uri": "file:///workspace/.stellaclaw/attachments/incoming/photo.png",
     "name": "photo.png",
     "media_type": "image/png"
   }
@@ -150,7 +150,7 @@ Runtime result for a previous tool call.
         "text": "{\"status\":\"completed\"}"
       },
       "file": {
-        "uri": "file:///workspace/.output/paris.png",
+        "uri": "file:///workspace/.stellaclaw/output/paris.png",
         "name": "paris.png",
         "media_type": "image/png"
       }
@@ -193,7 +193,7 @@ Input `ChatMessage`:
     {
       "type": "file",
       "payload": {
-        "uri": "file:///workspace/attachments/incoming/input.png",
+        "uri": "file:///workspace/.stellaclaw/attachments/incoming/input.png",
         "name": "input.png",
         "media_type": "image/png"
       }

@@ -1834,6 +1834,7 @@ fn materialize_web_data_file(
     let dir = workdir
         .join("conversations")
         .join(conversation_id)
+        .join(".stellaclaw")
         .join("attachments")
         .join("incoming");
     fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
@@ -3093,13 +3094,19 @@ fn attachment_workspace_path(path: &Path, roots: &WebAttachmentRoots) -> Option<
         }
     }
     if let Ok(relative) = path.strip_prefix(&roots.shared_root) {
-        return Some(format!("shared/{}", path_to_api_string(relative)));
+        return Some(format!(
+            ".stellaclaw/shared/{}",
+            path_to_api_string(relative)
+        ));
     }
     if let (Ok(canonical_path), Ok(canonical_shared)) =
         (path.canonicalize(), roots.shared_root.canonicalize())
     {
         if let Ok(relative) = canonical_path.strip_prefix(canonical_shared) {
-            return Some(format!("shared/{}", path_to_api_string(relative)));
+            return Some(format!(
+                ".stellaclaw/shared/{}",
+                path_to_api_string(relative)
+            ));
         }
     }
     None
@@ -3469,7 +3476,7 @@ mod tests {
         assert_eq!(files.len(), 1);
         let file = &files[0];
         assert!(file.uri.starts_with("file://"));
-        assert!(file.uri.contains("attachments/incoming"));
+        assert!(file.uri.contains(".stellaclaw/attachments/incoming"));
         assert_eq!(file.media_type.as_deref(), Some("image/png"));
         assert!(file
             .name

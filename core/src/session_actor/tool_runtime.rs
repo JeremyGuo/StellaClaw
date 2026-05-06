@@ -138,10 +138,7 @@ impl ToolExecutionContext<'_> {
         let Some(Component::Normal(first)) = components.next() else {
             return false;
         };
-        matches!(
-            first.to_string_lossy().as_ref(),
-            ".stellaclaw" | ".output" | "attachments" | "shared" | "STELLACLAW.md"
-        )
+        first.to_string_lossy() == ".stellaclaw"
     }
 }
 

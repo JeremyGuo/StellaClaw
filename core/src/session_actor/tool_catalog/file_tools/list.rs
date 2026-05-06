@@ -48,12 +48,16 @@ pub(super) fn execute_list_tool(
     Ok(Some(result))
 }
 
-const LOCAL_SPECIAL_ROOT_NAMES: &[&str] = &[
-    ".stellaclaw",
-    ".output",
-    "attachments",
-    "shared",
+const LOCAL_SPECIAL_ROOT_NAMES: &[&str] = &[".stellaclaw"];
+const LOCAL_SPECIAL_CHILD_NAMES: &[&str] = &[
+    "IDENTITY.md",
     "STELLACLAW.md",
+    "USER.md",
+    "attachments",
+    "output",
+    "shared",
+    "skill",
+    "skill_memory",
 ];
 
 fn is_root_ls(arguments: &Map<String, Value>) -> bool {
@@ -77,7 +81,7 @@ fn append_local_special_root_entries(
     let mut text = remote_text.to_string();
     text.push_str("\n\nlocal_special_paths:");
     text.push_str(
-        "\nThese workspace-relative paths are stored locally in fixed Remote Mode and shadow remote paths with the same name:",
+        "\nThese workspace-relative paths are stored locally in fixed Remote Mode and shadow remote paths under .stellaclaw:",
     );
     for entry in entries {
         let suffix = if entry.is_dir { "/" } else { "" };
@@ -88,23 +92,34 @@ fn append_local_special_root_entries(
 
 fn local_special_root_entries(workspace_root: &std::path::Path) -> Vec<LsEntry> {
     let mut entries = Vec::new();
-    for name in LOCAL_SPECIAL_ROOT_NAMES {
-        let path = workspace_root.join(name);
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        let is_dir = metadata.is_dir()
-            || (metadata.file_type().is_symlink()
-                && fs::metadata(&path)
-                    .map(|target| target.is_dir())
-                    .unwrap_or(false));
-        entries.push(LsEntry {
-            path: (*name).to_string(),
-            is_dir,
-        });
+    let stellaclaw_root = workspace_root.join(".stellaclaw");
+    if let Some(entry) = local_special_entry(&stellaclaw_root, ".stellaclaw") {
+        entries.push(entry);
+    }
+    for name in LOCAL_SPECIAL_CHILD_NAMES {
+        let path = stellaclaw_root.join(name);
+        let display_path = format!(".stellaclaw/{name}");
+        if let Some(entry) = local_special_entry(&path, &display_path) {
+            entries.push(entry);
+        }
     }
     entries.sort_by(|left, right| left.path.cmp(&right.path));
     entries
+}
+
+fn local_special_entry(path: &std::path::Path, display_path: &str) -> Option<LsEntry> {
+    let Ok(metadata) = fs::symlink_metadata(&path) else {
+        return None;
+    };
+    let is_dir = metadata.is_dir()
+        || (metadata.file_type().is_symlink()
+            && fs::metadata(&path)
+                .map(|target| target.is_dir())
+                .unwrap_or(false));
+    Some(LsEntry {
+        path: display_path.to_string(),
+        is_dir,
+    })
 }
 
 fn ls_local(
@@ -273,18 +288,18 @@ mod tests {
         std::fs::create_dir_all(&stellaclaw_dir).expect("stellaclaw dir should be created");
 
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&shared_target, stellaclaw_dir.join("stellaclaw_shared"))
+        std::os::unix::fs::symlink(&shared_target, stellaclaw_dir.join("shared"))
             .expect("shared symlink should be created");
 
         #[cfg(windows)]
-        std::os::windows::fs::symlink_dir(&shared_target, stellaclaw_dir.join("stellaclaw_shared"))
+        std::os::windows::fs::symlink_dir(&shared_target, stellaclaw_dir.join("shared"))
             .expect("shared symlink should be created");
 
         let result = ls_local(&Map::new(), &workspace).expect("ls should succeed");
         let text = result.as_str().expect("ls result should be text");
         assert!(
-            !text.contains("stellaclaw_shared"),
-            "stellaclaw_shared should be hidden: {text}"
+            !text.contains(".stellaclaw"),
+            ".stellaclaw should be hidden: {text}"
         );
         assert!(
             !text.contains("marker.txt"),
@@ -299,8 +314,10 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("stellaclaw-ls-special-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("attachments")).expect("attachments should exist");
-        std::fs::write(root.join("STELLACLAW.md"), "memory").expect("memory should exist");
+        std::fs::create_dir_all(root.join(".stellaclaw/attachments"))
+            .expect("attachments should exist");
+        std::fs::write(root.join(".stellaclaw/STELLACLAW.md"), "memory")
+            .expect("memory should exist");
 
         let result = append_local_special_root_entries(
             serde_json::Value::String("num_entries: 0\n\n- /remote/".to_string()),
@@ -310,8 +327,9 @@ mod tests {
         let text = result.as_str().expect("result should be text");
 
         assert!(text.contains("local_special_paths:"));
-        assert!(text.contains("- STELLACLAW.md"));
-        assert!(text.contains("- attachments/"));
+        assert!(text.contains("- .stellaclaw/"));
+        assert!(text.contains("- .stellaclaw/STELLACLAW.md"));
+        assert!(text.contains("- .stellaclaw/attachments/"));
         std::fs::remove_dir_all(&root).expect("temp dir should be cleaned");
     }
 }

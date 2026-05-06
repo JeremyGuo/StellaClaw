@@ -1,10 +1,13 @@
-version: 1.25.3
+version: 1.25.4
 ---
 
-# 1.25.3
+# 1.25.4
+
+- 统一 conversation workspace 的特殊本地路径到 `.stellaclaw/`：
+  workdir schema 升级到 `0.14` 时会把旧根路径 `.output/`、`attachments/`、`shared/`、`.skill/`、`.skill_memory/`、`skill_memory/` 和 `STELLACLAW.md` 迁移到 `.stellaclaw/output/`、`.stellaclaw/attachments/`、`.stellaclaw/shared/`、`.stellaclaw/skill/`、`.stellaclaw/skill_memory/` 和 `.stellaclaw/STELLACLAW.md`，并兼容 `.stellaclaw/stellaclaw_shared/` 到 `.stellaclaw/shared/`；runtime backing 的 `rundir/.skill/` 和 `rundir/skill_memory/` 也迁移到 `rundir/.stellaclaw/skill/` 和 `rundir/.stellaclaw/skill_memory/`。迁移会合并目录并保留冲突副本，避免覆盖已有本地数据；新上传附件、shared 入口、system prompt、runtime skill store 和 runtime memory 读取均改用新的 canonical 路径。本次不改变 `config` schema，改变 `workdir` schema。
 
 - 重构 fixed SSH Remote Mode 的 workspace 可见性：
-  fixed SSH Remote Mode 不再依赖 `sshfs` 挂载普通工作区；文件、搜索、补丁、下载和 shell 工具默认作用于远程 workspace，本地 conversation workspace 只保留附件、channel 可下载产物、runtime 元数据和特殊本地文件。新增 `shell_make_visible` / `attachment_make_visible` 用于按同一个 workspace-relative 路径在本地与远程之间同步可见性；升级到 workdir schema `0.13` 时只会 materialize fixed SSH Remote Mode 下必须留在本地的关键路径（`.stellaclaw/`、`.output/`、`attachments/`、`shared/`、`STELLACLAW.md`），普通 workspace 文件继续留在远端。本次不改变 `config` schema，改变 `workdir` schema。
+  fixed SSH Remote Mode 不再依赖 `sshfs` 挂载普通工作区；文件、搜索、补丁、下载和 shell 工具默认作用于远程 workspace，本地 conversation workspace 只保留附件、channel 可下载产物、runtime 元数据和特殊本地文件。新增 `shell_make_visible` / `attachment_make_visible` 用于按同一个 workspace-relative 路径在本地与远程之间同步可见性；升级到 workdir schema `0.13` 时只会 materialize fixed SSH Remote Mode 下必须留在本地的关键路径（`.stellaclaw/`、`.output/`、`.skill/`、`.skill_memory/`、`attachments/`、`shared/`、`skill_memory/`、`STELLACLAW.md`），普通 workspace 文件继续留在远端。本次不改变 `config` schema，改变 `workdir` schema。
 
 - 修复 Telegram foreground final reply 附件标签未发送的问题：
   foreground turn 完成时，如果 assistant 最终消息里包含 `<attachment>...</attachment>`，Conversation 会先按 workspace / shared 路径解析成 `OutgoingAttachment` 再交给 Telegram 发送，避免只把标签当普通文本展示。本次不改变 `config` schema，不改变 `workdir` schema。

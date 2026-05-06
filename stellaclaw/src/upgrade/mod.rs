@@ -9,6 +9,7 @@ mod v0_1;
 mod v0_10;
 mod v0_11;
 mod v0_12;
+mod v0_13;
 mod v0_2;
 mod v0_3;
 mod v0_4;
@@ -30,7 +31,8 @@ pub const WORKDIR_VERSION_0_9: &str = "0.9";
 pub const WORKDIR_VERSION_0_10: &str = "0.10";
 pub const WORKDIR_VERSION_0_11: &str = "0.11";
 pub const WORKDIR_VERSION_0_12: &str = "0.12";
-pub const LATEST_WORKDIR_VERSION: &str = "0.13";
+pub const WORKDIR_VERSION_0_13: &str = "0.13";
+pub const LATEST_WORKDIR_VERSION: &str = "0.14";
 pub const PARTYCLAW_LATEST_WORKDIR_VERSION: &str = "0.39";
 
 const WORKDIR_VERSION_FILE: &str = "STELLA_VERSION";
@@ -49,7 +51,7 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
     let legacy_version_path = workdir.join(LEGACY_WORKDIR_VERSION_FILE);
     let mut current = read_workdir_version(&version_path, &legacy_version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 13] = [
+    let upgraders: [&dyn WorkdirUpgrader; 14] = [
         &v0_1::LegacyUpgrade,
         &v0_1::PartyClawUpgrade,
         &v0_2::ChatMessageReasoningUpgrade,
@@ -63,6 +65,7 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
         &v0_10::ChannelStateDirectoryUpgrade,
         &v0_11::StellaclawWorkdirDirectoryUpgrade,
         &v0_12::SshfsWorkspaceMaterializeUpgrade,
+        &v0_13::StellaclawConversationSpecialPathUpgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -113,6 +116,7 @@ fn read_version_file(version_path: &Path) -> Result<&'static str> {
         WORKDIR_VERSION_0_10 => Ok(WORKDIR_VERSION_0_10),
         WORKDIR_VERSION_0_11 => Ok(WORKDIR_VERSION_0_11),
         WORKDIR_VERSION_0_12 => Ok(WORKDIR_VERSION_0_12),
+        WORKDIR_VERSION_0_13 => Ok(WORKDIR_VERSION_0_13),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -170,7 +174,7 @@ mod tests {
             format!("{LATEST_WORKDIR_VERSION}\n")
         );
         assert_eq!(
-            fs::read_to_string(local.join("attachments").join("report.txt")).unwrap(),
+            fs::read_to_string(local.join(".stellaclaw/attachments").join("report.txt")).unwrap(),
             "remote attachment"
         );
         assert!(!local.join("src").join("main.rs").exists());

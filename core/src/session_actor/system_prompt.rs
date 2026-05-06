@@ -55,10 +55,10 @@ fn common_prompt() -> &'static str {
      When you start working in a subdirectory, check whether that subtree has a more local \
      AGENTS.md or similar instruction file before editing there; when rules conflict, \
      follow the more local file. Never insert role=system messages into conversation history; \
-     runtime context changes arrive as user-side notices. STELLACLAW.md in the workspace root is \
+     runtime context changes arrive as user-side notices. .stellaclaw/STELLACLAW.md is \
      the durable project memory file: keep it concise and factual, update it only when long-lived \
      project facts, stable conventions, confirmed architecture notes, or handoff-critical decisions \
-     change. Do not use STELLACLAW.md for transient per-turn chatter, guesses, or unconfirmed \
+     change. Do not use .stellaclaw/STELLACLAW.md for transient per-turn chatter, guesses, or unconfirmed \
      notes. Use user_tell only for mid-task progress or coordination that must become visible \
      before the current turn is ready to finish. If you can return the final answer now, do not \
      send an extra user_tell first. Positive example: a long-running edit, benchmark, or debug \
@@ -72,7 +72,7 @@ fn common_prompt() -> &'static str {
      to send files or images back to the user, append one or more tags in this exact format: \
      <attachment>relative/path/from/workspace_root</attachment>. Each path must be relative to the \
      current workspace root. This attachment syntax is supported in both the final assistant reply \
-     and user_tell text. The workspace may contain .stellaclaw/stellaclaw_shared/; that directory is shared across \
+     and user_tell text. The workspace may contain .stellaclaw/shared/; that directory is shared across \
      conversations in this Stellaclaw workdir and is appropriate for reusable artifacts. If \
      STELLACLAW_SOFTWARE_DIR is set in the tool environment, that path is the configured shared \
      software directory for reusable binaries, checkouts, caches, or other tool installations."
@@ -163,7 +163,7 @@ fn snapshot_sections(
         runtime_metadata_state.snapshot_value(STELLACLAW_MEMORY_PROMPT_COMPONENT)
     {
         sections.push(format!(
-            "[STELLACLAW Memory Snapshot]\nTreat this as the canonical durable project memory from STELLACLAW.md:\n{}",
+            "[STELLACLAW Memory Snapshot]\nTreat this as the canonical durable project memory from .stellaclaw/STELLACLAW.md:\n{}",
             stellaclaw_memory
         ));
     }
@@ -236,7 +236,7 @@ mod tests {
         fs::create_dir_all(root.join(".stellaclaw/skill/demo")).unwrap();
         fs::write(root.join(".stellaclaw/IDENTITY.md"), "identity: old").unwrap();
         fs::write(root.join(".stellaclaw/USER.md"), "tier: old").unwrap();
-        fs::write(root.join("STELLACLAW.md"), "memory: old").unwrap();
+        fs::write(root.join(".stellaclaw/STELLACLAW.md"), "memory: old").unwrap();
         fs::write(
             root.join(".stellaclaw/skill/demo/SKILL.md"),
             "# Demo\n\nskills: old",
@@ -252,7 +252,7 @@ mod tests {
 
         fs::write(root.join(".stellaclaw/IDENTITY.md"), "identity: new").unwrap();
         fs::write(root.join(".stellaclaw/USER.md"), "tier: new").unwrap();
-        fs::write(root.join("STELLACLAW.md"), "memory: new").unwrap();
+        fs::write(root.join(".stellaclaw/STELLACLAW.md"), "memory: new").unwrap();
         fs::write(
             root.join(".stellaclaw/skill/demo/SKILL.md"),
             "# Demo\n\nskills: new",

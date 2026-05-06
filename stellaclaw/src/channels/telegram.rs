@@ -428,6 +428,7 @@ impl TelegramChannel {
             .workdir
             .join("conversations")
             .join(conversation_id)
+            .join(".stellaclaw")
             .join("attachments")
             .join("incoming");
         fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
