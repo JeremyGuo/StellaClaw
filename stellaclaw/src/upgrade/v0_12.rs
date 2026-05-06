@@ -125,7 +125,8 @@ struct FixedSshConversation {
 
 #[derive(Debug, Deserialize)]
 struct ConversationStateDisk {
-    conversation_id: String,
+    #[serde(default)]
+    conversation_id: Option<String>,
     #[serde(default)]
     tool_remote_mode: ToolRemoteModeDisk,
 }
@@ -168,16 +169,20 @@ fn fixed_ssh_conversations(conversations_root: &Path) -> Result<Vec<FixedSshConv
         let ToolRemoteModeDisk::FixedSsh { host, cwd } = state.tool_remote_mode else {
             continue;
         };
+        let conversation_id = state
+            .conversation_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| name.clone());
         let host = host.trim().to_string();
         let cwd = cwd.unwrap_or_default().trim().to_string();
         if host.is_empty() || cwd.is_empty() {
             return Err(anyhow!(
                 "conversation {} has fixed SSH remote mode with empty host or cwd",
-                state.conversation_id
+                conversation_id
             ));
         }
         conversations.push(FixedSshConversation {
-            conversation_id: state.conversation_id,
+            conversation_id,
             root,
             host,
             cwd,
@@ -556,6 +561,31 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].host, "demo-host");
         assert_eq!(found[0].cwd, "/srv/app");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn fixed_ssh_conversation_id_falls_back_to_directory_name() {
+        let root = test_root("workdir-upgrade-v0_12-fixed-no-id");
+        let conversations = root.join("conversations");
+        let local = conversations.join("web-main-000001");
+        fs::create_dir_all(&local).unwrap();
+        fs::write(
+            local.join("conversation.json"),
+            r#"{
+                "tool_remote_mode": {
+                    "type": "fixed_ssh",
+                    "host": "demo-host",
+                    "cwd": "/srv/app"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let found = fixed_ssh_conversations(&conversations).unwrap();
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].conversation_id, "web-main-000001");
         let _ = fs::remove_dir_all(root);
     }
 }
