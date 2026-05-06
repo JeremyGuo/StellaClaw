@@ -158,22 +158,62 @@ fn file_write_remote(
 fn remote_file_read_script(path: &str, offset: usize, limit: usize) -> String {
     format!(
         r#"
-import json, pathlib
+import json, pathlib, signal, sys, time
+
+class OperationTimeout(TimeoutError):
+    pass
+
+def timeout_handler(signum, frame):
+    raise OperationTimeout("operation timed out")
+
+def run_with_timeout(label, timeout_seconds, fn):
+    if timeout_seconds <= 0 or not hasattr(signal, "setitimer"):
+        return fn()
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, 0)
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        return fn()
+    except OperationTimeout:
+        raise OperationTimeout(f"{{label}} timed out after {{timeout_seconds}} seconds")
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+def run_with_retry(label, attempts, timeout_seconds, fn):
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return run_with_timeout(label, timeout_seconds, fn)
+        except (OperationTimeout, OSError) as error:
+            last_error = error
+            if attempt >= attempts:
+                break
+            time.sleep(0.2 * attempt)
+    raise RuntimeError(f"{{label}} failed after {{attempts}} attempt(s): {{last_error}}")
+
 path = pathlib.Path({path:?}).expanduser()
-text = path.read_text(encoding="utf-8")
-lines = text.splitlines()
-start = max(1, int({offset}))
-limit = int({limit})
-selected = [f"{{idx + 1}}: {{line}}" for idx, line in list(enumerate(lines))[start - 1:start - 1 + limit]]
-end = start + len(selected) - 1 if selected else start - 1
-print(json.dumps({{
-  "file_path": str(path),
-  "start_line": start,
-  "end_line": end,
-  "total_lines": len(lines),
-  "truncated": end < len(lines),
-  "content": "\n".join(selected),
-}}))
+try:
+    text = run_with_retry("file_read", 2, 30, lambda: path.read_text(encoding="utf-8"))
+    lines = text.splitlines()
+    start = max(1, int({offset}))
+    limit = int({limit})
+    selected = [f"{{idx + 1}}: {{line}}" for idx, line in list(enumerate(lines))[start - 1:start - 1 + limit]]
+    end = start + len(selected) - 1 if selected else start - 1
+    print(json.dumps({{
+      "file_path": str(path),
+      "start_line": start,
+      "end_line": end,
+      "total_lines": len(lines),
+      "truncated": end < len(lines),
+      "content": "\n".join(selected),
+    }}))
+except Exception as error:
+    print(str(error), file=sys.stderr)
+    raise SystemExit(1)
 "#
     )
 }
@@ -181,19 +221,88 @@ print(json.dumps({{
 fn remote_file_write_script(path: &str, content: &str, mode: &str) -> String {
     format!(
         r#"
-import json, pathlib
+import json, pathlib, signal, sys
+
+class OperationTimeout(TimeoutError):
+    pass
+
+def timeout_handler(signum, frame):
+    raise OperationTimeout("operation timed out")
+
+def run_with_timeout(label, timeout_seconds, fn):
+    if timeout_seconds <= 0 or not hasattr(signal, "setitimer"):
+        return fn()
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, 0)
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        return fn()
+    except OperationTimeout:
+        raise OperationTimeout(f"{{label}} timed out after {{timeout_seconds}} seconds")
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
 path = pathlib.Path({path:?}).expanduser()
-path.parent.mkdir(parents=True, exist_ok=True)
 mode = {mode:?}
 content = {content:?}
 write_mode = "a" if mode == "append" else "w"
-with path.open(write_mode, encoding="utf-8") as f:
-    f.write(content)
-print(json.dumps({{
-  "file_path": str(path),
-  "mode": mode,
-  "bytes_written": len(content.encode("utf-8")),
-}}))
+try:
+    def write_file():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open(write_mode, encoding="utf-8") as f:
+            f.write(content)
+    run_with_timeout("file_write", 30, write_file)
+    print(json.dumps({{
+      "file_path": str(path),
+      "mode": mode,
+      "bytes_written": len(content.encode("utf-8")),
+    }}))
+except Exception as error:
+    print(str(error), file=sys.stderr)
+    raise SystemExit(1)
 "#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+
+    #[test]
+    fn remote_read_write_scripts_are_valid_python() {
+        assert_python_compiles(&remote_file_read_script("README.md", 1, 20));
+        assert_python_compiles(&remote_file_write_script(
+            "tmp/test.txt",
+            "hello",
+            "overwrite",
+        ));
+    }
+
+    fn assert_python_compiles(script: &str) {
+        let mut child = match Command::new("python3")
+            .arg("-c")
+            .arg("import sys; compile(sys.stdin.read(), '<remote-read-write-tool>', 'exec')")
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin should be piped")
+            .write_all(script.as_bytes())
+            .expect("script should be written");
+        let status = child.wait().expect("python3 should exit");
+        assert!(status.success(), "generated Python script did not compile");
+    }
 }

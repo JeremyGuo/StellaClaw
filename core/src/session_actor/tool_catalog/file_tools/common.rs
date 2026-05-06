@@ -252,6 +252,9 @@ import fnmatch
 import json
 import os
 import re
+import signal
+import sys
+import time
 
 payload = json.loads({payload:?})
 
@@ -259,6 +262,44 @@ SEARCH_MAX_RESULTS = 100
 LS_MAX_ENTRIES = 1000
 COMMON_LS_SKIP_DIRS = {{"__pycache__", "node_modules", "target", "dist", "build", "coverage", "venv"}}
 SLOW_MOUNT_FS_TYPES = {{"fuse.sshfs", "sshfs", "nfs", "nfs4", "cifs", "smb3", "9p", "davfs", "fuse.rclone", "fuse.s3fs", "fuse.gcsfuse"}}
+OPERATION_TIMEOUT_SECONDS = {{"ls": 20, "glob": 30, "grep": 45, "edit": 30}}
+OPERATION_ATTEMPTS = {{"ls": 2, "glob": 2, "grep": 2, "edit": 1}}
+
+class OperationTimeout(TimeoutError):
+    pass
+
+def timeout_handler(signum, frame):
+    raise OperationTimeout("operation timed out")
+
+def run_with_timeout(label, timeout_seconds, fn):
+    if timeout_seconds <= 0 or not hasattr(signal, "setitimer"):
+        return fn()
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, 0)
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        return fn()
+    except OperationTimeout:
+        raise OperationTimeout(f"{{label}} timed out after {{timeout_seconds}} seconds")
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+def run_with_retry(label, attempts, timeout_seconds, fn):
+    last_error = None
+    attempts = max(1, int(attempts))
+    for attempt in range(1, attempts + 1):
+        try:
+            return run_with_timeout(label, timeout_seconds, fn)
+        except (OperationTimeout, OSError) as error:
+            last_error = error
+            if attempt >= attempts:
+                break
+            time.sleep(0.2 * attempt)
+    raise RuntimeError(f"{{label}} failed after {{attempts}} attempt(s): {{last_error}}")
 
 def resolve(path, root):
     if os.path.isabs(path):
@@ -505,9 +546,57 @@ handlers = {{
     "edit": handle_edit,
 }}
 
-operation = payload["operation"]
-result = handlers[operation](payload.get("arguments", {{}}), payload.get("workspace_root", "."))
-print(json.dumps(result, ensure_ascii=False))
+try:
+    operation = payload["operation"]
+    result = run_with_retry(
+        operation,
+        OPERATION_ATTEMPTS.get(operation, 1),
+        OPERATION_TIMEOUT_SECONDS.get(operation, 30),
+        lambda: handlers[operation](payload.get("arguments", {{}}), payload.get("workspace_root", ".")),
+    )
+    print(json.dumps(result, ensure_ascii=False))
+except Exception as error:
+    print(str(error), file=sys.stderr)
+    raise SystemExit(1)
 "#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        io::Write,
+        process::{Command, Stdio},
+    };
+
+    #[test]
+    fn remote_file_tool_script_is_valid_python() {
+        let script = remote_file_tool_script(&json!({
+            "operation": "ls",
+            "workspace_root": ".",
+            "arguments": {"path": "."},
+        }));
+        assert_python_compiles(&script);
+    }
+
+    fn assert_python_compiles(script: &str) {
+        let mut child = match Command::new("python3")
+            .arg("-c")
+            .arg("import sys; compile(sys.stdin.read(), '<remote-file-tool>', 'exec')")
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin should be piped")
+            .write_all(script.as_bytes())
+            .expect("script should be written");
+        let status = child.wait().expect("python3 should exit");
+        assert!(status.success(), "generated Python script did not compile");
+    }
 }

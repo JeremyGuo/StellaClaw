@@ -851,9 +851,47 @@ fn remote_workspace_script(payload: &Value) -> String {
     let payload = serde_json::to_string(payload).unwrap_or_else(|_| "{}".to_string());
     format!(
         r#"
-import base64, io, json, os, pathlib, shutil, sys, tarfile
+import base64, io, json, os, pathlib, shutil, signal, sys, tarfile, time
 
 payload = json.loads({payload:?})
+OPERATION_TIMEOUT_SECONDS = {{"list": 20, "read": 30, "upload": 45, "delete": 30, "move": 30, "download": 45}}
+OPERATION_ATTEMPTS = {{"list": 2, "read": 2, "upload": 1, "delete": 1, "move": 1, "download": 1}}
+
+class OperationTimeout(TimeoutError):
+    pass
+
+def timeout_handler(signum, frame):
+    raise OperationTimeout("operation timed out")
+
+def run_with_timeout(label, timeout_seconds, fn):
+    if timeout_seconds <= 0 or not hasattr(signal, "setitimer"):
+        return fn()
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, 0)
+    signal.signal(signal.SIGALRM, timeout_handler)
+    signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+    try:
+        return fn()
+    except OperationTimeout:
+        raise OperationTimeout(f"{{label}} timed out after {{timeout_seconds}} seconds")
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        if previous_timer[0] > 0:
+            signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+def run_with_retry(label, attempts, timeout_seconds, fn):
+    last_error = None
+    attempts = max(1, int(attempts))
+    for attempt in range(1, attempts + 1):
+        try:
+            return run_with_timeout(label, timeout_seconds, fn)
+        except (OperationTimeout, OSError) as error:
+            last_error = error
+            if attempt >= attempts:
+                break
+            time.sleep(0.2 * attempt)
+    raise RuntimeError(f"{{label}} failed after {{attempts}} attempt(s): {{last_error}}")
 
 def resolve(value):
     path = pathlib.Path(value or ".")
@@ -982,7 +1020,13 @@ handlers = {{
 }}
 
 try:
-    result = handlers[payload["operation"]]()
+    operation = payload["operation"]
+    result = run_with_retry(
+        operation,
+        OPERATION_ATTEMPTS.get(operation, 1),
+        OPERATION_TIMEOUT_SECONDS.get(operation, 30),
+        lambda: handlers[operation](),
+    )
     if result is not None:
         print(json.dumps(result, ensure_ascii=False))
 except Exception as error:
@@ -1100,5 +1144,30 @@ mod tests {
         assert_eq!(parent_api_path(&path).as_deref(), Some("src"));
         let root = normalize_workspace_path("").unwrap();
         assert_eq!(parent_api_path(&root), None);
+    }
+
+    #[test]
+    fn remote_workspace_script_is_valid_python() {
+        let script = remote_workspace_script(&json!({
+            "operation": "list",
+            "path": ".",
+        }));
+        let mut child = match Command::new("python3")
+            .arg("-c")
+            .arg("import sys; compile(sys.stdin.read(), '<remote-workspace>', 'exec')")
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => return,
+        };
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin should be piped")
+            .write_all(script.as_bytes())
+            .expect("script should be written");
+        let status = child.wait().expect("python3 should exit");
+        assert!(status.success(), "generated Python script did not compile");
     }
 }
