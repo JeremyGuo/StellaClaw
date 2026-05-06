@@ -3,7 +3,8 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
@@ -321,6 +322,7 @@ pub fn read_workspace_file(
 const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum compressed download archive size: 50 MiB.
 const MAX_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
+const REMOTE_WORKSPACE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Upload a tar.gz archive and extract it into the workspace directory at `relative_dir`.
 pub fn upload_workspace_archive(
@@ -742,17 +744,68 @@ fn run_remote_command(
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to spawn ssh for {host}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open ssh stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to open ssh stderr"))?;
+    let stdout_handle = thread::spawn(move || read_pipe(stdout));
+    let stderr_handle = thread::spawn(move || read_pipe(stderr));
+
     if let Some(stdin_bytes) = stdin {
-        child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("failed to open ssh stdin"))?
-            .write_all(stdin_bytes)
-            .with_context(|| "failed to write ssh stdin")?;
+        let write_result = match child.stdin.as_mut() {
+            Some(child_stdin) => child_stdin
+                .write_all(stdin_bytes)
+                .with_context(|| "failed to write ssh stdin"),
+            None => Err(anyhow::anyhow!("failed to open ssh stdin")),
+        };
+        if let Err(error) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = join_pipe_reader(stdout_handle, "stdout");
+            let _ = join_pipe_reader(stderr_handle, "stderr");
+            return Err(RemoteActorError::Internal(error));
+        }
     }
-    let output = child
-        .wait_with_output()
-        .with_context(|| format!("failed to wait for ssh to {host}"))?;
+    let _ = child.stdin.take();
+
+    let deadline = Instant::now() + REMOTE_WORKSPACE_TIMEOUT;
+    let status = loop {
+        match child
+            .try_wait()
+            .with_context(|| format!("failed to wait for ssh to {host}"))?
+        {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr = join_pipe_reader(stderr_handle, "stderr").unwrap_or_default();
+                let _ = join_pipe_reader(stdout_handle, "stdout");
+                let stderr = String::from_utf8_lossy(&stderr);
+                let stderr = stderr.trim();
+                let suffix = if stderr.is_empty() {
+                    String::new()
+                } else {
+                    format!("; stderr: {stderr}")
+                };
+                return Err(RemoteActorError::Internal(anyhow::anyhow!(
+                    "ssh to {host} timed out after {} seconds{suffix}",
+                    REMOTE_WORKSPACE_TIMEOUT.as_secs()
+                )));
+            }
+            None => thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    let stdout = join_pipe_reader(stdout_handle, "stdout")?;
+    let stderr = join_pipe_reader(stderr_handle, "stderr")?;
+    let output = std::process::Output {
+        status,
+        stdout,
+        stderr,
+    };
     if !output.status.success() {
         return Err(RemoteActorError::Internal(anyhow::anyhow!(
             "ssh exited with {}; stderr: {}",
@@ -761,6 +814,24 @@ fn run_remote_command(
         )));
     }
     Ok(output.stdout)
+}
+
+fn read_pipe<R: Read>(mut pipe: R) -> std::io::Result<Vec<u8>> {
+    let mut buffer = Vec::new();
+    pipe.read_to_end(&mut buffer)?;
+    Ok(buffer)
+}
+
+fn join_pipe_reader(
+    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    stream_name: &str,
+) -> std::result::Result<Vec<u8>, RemoteActorError> {
+    handle
+        .join()
+        .map_err(|_| RemoteActorError::Internal(anyhow::anyhow!("{stream_name} reader panicked")))?
+        .map_err(|error| {
+            RemoteActorError::Internal(anyhow::anyhow!("failed to read {stream_name}: {error}"))
+        })
 }
 
 fn remote_json_script(operation: &str, mut payload: Value) -> String {

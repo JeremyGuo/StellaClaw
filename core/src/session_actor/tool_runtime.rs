@@ -1,17 +1,22 @@
 use std::{
-    io::Write,
+    io::{Read, Write},
     path::{Component, Path, PathBuf},
     process::{Command, Output, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde_json::{Map, Value};
 use thiserror::Error;
 
 use super::ToolRemoteMode;
+
+const REMOTE_JSON_TIMEOUT: Duration = Duration::from_secs(60);
+const REMOTE_STDIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Default)]
 pub(super) struct ToolCancellationToken {
@@ -325,16 +330,16 @@ pub(super) fn run_remote_json(
         Some(cwd) => format!("cd {} && {}", shell_quote(cwd), script),
         None => script.to_string(),
     };
-    let output = Command::new("ssh")
+    let mut command = Command::new("ssh");
+    command
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg("-T")
         .arg(host)
-        .arg(remote_command)
-        .output()
-        .map_err(|error| LocalToolError::Remote(format!("failed to spawn ssh: {error}")))?;
+        .arg(remote_command);
+    let output = run_command_with_timeout(command, REMOTE_JSON_TIMEOUT, None, "ssh")?;
 
     if !output.status.success() {
         return Err(LocalToolError::Remote(format!(
@@ -357,29 +362,130 @@ pub(super) fn run_remote_command_with_stdin(
     remote_command: &str,
     stdin: &[u8],
 ) -> Result<Output, LocalToolError> {
-    let mut child = Command::new("ssh")
+    let mut command = Command::new("ssh");
+    command
         .arg("-o")
         .arg("BatchMode=yes")
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg("-T")
         .arg(host)
-        .arg(remote_command)
-        .stdin(Stdio::piped())
+        .arg(remote_command);
+    run_command_with_timeout(command, REMOTE_STDIN_TIMEOUT, Some(stdin), "ssh")
+}
+
+fn run_command_with_timeout(
+    mut command: Command,
+    timeout: Duration,
+    stdin: Option<&[u8]>,
+    command_label: &str,
+) -> Result<Output, LocalToolError> {
+    let mut child = command
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| LocalToolError::Remote(format!("failed to spawn ssh: {error}")))?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| LocalToolError::Remote("failed to open ssh stdin".to_string()))?
-        .write_all(stdin)
-        .map_err(|error| LocalToolError::Remote(format!("failed to write ssh stdin: {error}")))?;
+        .map_err(|error| {
+            LocalToolError::Remote(format!("failed to spawn {command_label}: {error}"))
+        })?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| LocalToolError::Remote(format!("failed to open {command_label} stdout")))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| LocalToolError::Remote(format!("failed to open {command_label} stderr")))?;
+    let stdout_handle = thread::spawn(move || read_pipe(stdout));
+    let stderr_handle = thread::spawn(move || read_pipe(stderr));
+
+    if let Some(stdin_bytes) = stdin {
+        let write_result = match child.stdin.as_mut() {
+            Some(child_stdin) => child_stdin.write_all(stdin_bytes).map_err(|error| {
+                LocalToolError::Remote(format!("failed to write {command_label} stdin: {error}"))
+            }),
+            None => Err(LocalToolError::Remote(format!(
+                "failed to open {command_label} stdin"
+            ))),
+        };
+        if let Err(error) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = join_pipe_reader(stdout_handle, command_label, "stdout");
+            let _ = join_pipe_reader(stderr_handle, command_label, "stderr");
+            return Err(error);
+        }
+    }
     let _ = child.stdin.take();
-    child
-        .wait_with_output()
-        .map_err(|error| LocalToolError::Remote(format!("failed to wait for ssh: {error}")))
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let stdout = join_pipe_reader(stdout_handle, command_label, "stdout")?;
+                let stderr = join_pipe_reader(stderr_handle, command_label, "stderr")?;
+                return Ok(Output {
+                    status,
+                    stdout,
+                    stderr,
+                });
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let stderr = join_pipe_reader(stderr_handle, command_label, "stderr")
+                        .unwrap_or_default();
+                    let _ = join_pipe_reader(stdout_handle, command_label, "stdout");
+                    let stderr = String::from_utf8_lossy(&stderr);
+                    let stderr = stderr.trim();
+                    let suffix = if stderr.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; stderr: {stderr}")
+                    };
+                    return Err(LocalToolError::Remote(format!(
+                        "{command_label} timed out after {} seconds{suffix}",
+                        timeout.as_secs()
+                    )));
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                return Err(LocalToolError::Remote(format!(
+                    "failed to wait for {command_label}: {error}"
+                )));
+            }
+        }
+    }
+}
+
+fn read_pipe<R: Read>(mut pipe: R) -> Result<Vec<u8>, std::io::Error> {
+    let mut buffer = Vec::new();
+    pipe.read_to_end(&mut buffer)?;
+    Ok(buffer)
+}
+
+fn join_pipe_reader(
+    handle: thread::JoinHandle<Result<Vec<u8>, std::io::Error>>,
+    command_label: &str,
+    stream_name: &str,
+) -> Result<Vec<u8>, LocalToolError> {
+    handle
+        .join()
+        .map_err(|_| {
+            LocalToolError::Remote(format!("{command_label} {stream_name} reader panicked"))
+        })?
+        .map_err(|error| {
+            LocalToolError::Remote(format!(
+                "failed to read {command_label} {stream_name}: {error}"
+            ))
+        })
 }
 
 pub(super) fn shell_quote(value: &str) -> String {
@@ -387,4 +493,39 @@ pub(super) fn shell_quote(value: &str) -> String {
         return "''".to_string();
     }
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_collects_output() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("printf ok && printf err >&2");
+
+        let output =
+            run_command_with_timeout(command, Duration::from_secs(5), None, "test command")
+                .expect("command should complete");
+
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "ok");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "err");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_command_with_timeout_kills_slow_process() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 5");
+
+        let started = Instant::now();
+        let error =
+            run_command_with_timeout(command, Duration::from_millis(100), None, "test command")
+                .expect_err("command should time out");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(error.to_string().contains("timed out"));
+    }
 }

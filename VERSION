@@ -1,7 +1,10 @@
-version: 1.25.5
+version: 1.25.6
 ---
 
-# 1.25.5
+# 1.25.6
+
+- 修复 Remote Mode 远程文件能力可能无限等待的问题：
+  fixed SSH Remote Mode 下，模型可见的远程 `ls` / `glob` / `grep` / `file_read` / `file_write` 等 JSON 文件工具现在有 60 秒总超时，远程 `apply_patch` 这类 stdin SSH 命令有 300 秒总超时；Web workspace 的远程 list/read/upload/delete/move/download 路径也增加 60 秒总超时，避免远端网络挂载目录在 `stat` / `readdir` 卡住时让一次工具调用或文件浏览请求无限挂起。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 修复已升级到 `0.14` workdir 的旧 special link：
   workdir schema 升级到 `0.15` 时会修复已经写入 `0.14` 的运行目录，把仍留在 `rundir/.skill/` 和 `rundir/skill_memory/` 的 runtime skill 数据迁移到 `rundir/.stellaclaw/skill/` 与 `rundir/.stellaclaw/skill_memory/`，并把 conversation 下指向旧 `rundir/skill_memory/` 的 stale `.stellaclaw/skill_memory` symlink 改到新的 canonical runtime target。旧路径兼容逻辑保留在 upgrade 内，运行时附件解析只接受新的 `.stellaclaw/...` canonical 路径。本次不改变 `config` schema，改变 `workdir` schema。
