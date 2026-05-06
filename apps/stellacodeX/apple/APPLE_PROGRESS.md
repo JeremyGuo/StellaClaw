@@ -148,23 +148,42 @@ From `apps/stellacode2`:
 - [x] macOS composer actions now keep only file attachment and image-library picking, with attachment chips and pasteboard image support routed through the same outgoing attachment pipeline.
 - [x] macOS Terminal text view now tracks the viewport width, disables horizontal scrolling, and applies fallback white monospace attributes so terminal output does not disappear on a black background.
 - [x] macOS Terminal ANSI rendering now uses AppKit-native attributed strings for foreground/background colors, and plain character input goes through AppKit text interpretation once to avoid duplicated keystrokes like `ls` becoming `lls`.
+- [x] macOS/iOS Terminal rendering now uses an xterm-style screen buffer with cursor-addressed output, clear/insert/delete operations, alternate screen handling, OSC skipping, 16/256/RGB color attributes, and raw-output cache replay.
 - [x] macOS/iOS conversation timelines now reset their scroll state per selected conversation, so opening a chat re-runs initial bottom anchoring instead of inheriting stale scroll position.
 - [x] iOS launch screen now uses a centered transparent StellaCodeX logo with no internal dark plate on the system background before SwiftUI starts, avoiding icon/background color seams.
 - [x] iOS Chats list now removes the extra top spacer/content margin under the custom header, so the first conversation starts directly below the bar.
 - [x] iOS chat keyboard behavior now matches Telegram more closely: dragging the transcript dismisses the keyboard interactively, and keyboard/composer height changes keep the bottom aligned only when the user is already at the bottom.
+- [x] iOS/macOS realtime recovery now uses lifecycle generation guards, foreground transport invalidation, SSH tunnel rebuild, conversation-list refresh, exponential reconnect backoff, and WebSocket receive idle timeout for half-open foreground/list streams.
 - [x] iOS Chats rows now center the text group vertically with the avatar and draw separators as row overlays, avoiding the bottom-heavy item layout.
+- [x] Telegram iOS/macOS source has been cloned into ignored `learnable_materials/` and summarized locally for chat timeline/list architecture.
+- [x] Shared chat timeline now has an explicit entry model and reusable row renderer, separating message/tool/auxiliary grouping from platform row rendering.
+- [x] Chat timeline scroll handling now uses explicit snapshot mutations (`prepended`, `appended`, `updated`, `replaced`) so history loads preserve the current anchor while realtime updates only stick to bottom when the user is already there.
+- [x] Timeline scroll decisions are now routed through a dedicated scroll transaction object, reducing View state coupling before the native UIKit/AppKit list replacement.
+- [x] Timeline rendering now builds one `TimelineRenderData` snapshot per view pass instead of recomputing entries and position metadata independently across body/onChange paths.
+- [x] Removed per-message `GeometryReader` visibility tracking from the transcript; older-page restoration now anchors to the previous first entry, avoiding continuous preference churn while scrolling.
+- [x] macOS transcript now uses an AppKit `NSTableView` container with SwiftUI hosted rows, row reuse, width-aware height caching, row-key diffing, and transaction-based anchor restoration.
+- [x] iOS transcript now uses a UIKit `UITableView` container with SwiftUI hosted rows, native cell reuse, automatic row heights, interactive keyboard dismissal, explicit anchor restoration, and visible-row-only refresh for streaming updates.
+- [x] iOS tool-process expansion now avoids reloading the hosted cell and preserves the visible top anchor while row height is recalculated, reducing expand/collapse flicker and scroll-position jumps.
+- [x] iOS Chats list uses native swipe actions for delete, pin/unpin, and mark-read, with bottom padding moved out of the List rows into a safe-area inset.
+- [x] iOS tool-process header no longer participates in expand/collapse animation; only the content area changes height, avoiding the summary row flying back in.
+- [x] iOS Chats edit entry now uses the system `EditButton`, letting `List` drive native edit-mode row controls instead of a custom animated toggle.
+- [x] iOS tool-process table row height recalculation now disables UIKit/Core Animation actions during expand/collapse, prioritizing a stable header over animated cell resizing.
+- [x] Markdown quote rendering now draws the leading bar as an overlay instead of an HStack child, avoiding extra vertical whitespace after simple `> quote` blocks.
+- [x] iOS native timeline now renders tool-process headers and expanded tool details as separate table rows, so the summary header stays fixed while only the detail content is inserted or removed.
 
 ## In Progress
 
+- [ ] Tighten native timeline row invalidation for edge cases in expanded tool/attachment content.
 - [ ] Host key trust policy and public key rotation UI.
 - [ ] Add richer workspace preview actions for large/binary files.
 
 ## Next Milestones
 
-1. Improve terminal emulation coverage for more ANSI/xterm escape sequences and color attributes.
-2. Add attachment download/open-in-place actions beyond the current preview/copy support.
-3. Refine macOS Files into a true outline/tree browser if deep workspace navigation becomes common.
-4. Add host key trust policy and SSH public key rotation UI.
+1. Continue the Telegram-style timeline rewrite with native UIKit/AppKit list containers and explicit scroll-anchor restoration.
+2. Improve terminal emulation coverage for more ANSI/xterm escape sequences and color attributes.
+3. Add attachment download/open-in-place actions beyond the current preview/copy support.
+4. Refine macOS Files into a true outline/tree browser if deep workspace navigation becomes common.
+5. Add host key trust policy and SSH public key rotation UI.
 
 ## Verification
 

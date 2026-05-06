@@ -267,14 +267,14 @@ private struct LongLogContentView: View {
                 Spacer()
 
                 Button("Show 160 more") {
-                    withAnimation(.smooth(duration: 0.16)) {
+                    withAnimation(StellaCodeXMotion.quick) {
                         visibleLineLimit = min(lines.count, visibleLineLimit + 160)
                     }
                 }
                 .disabled(visibleLineLimit >= lines.count)
 
                 Button("Show all") {
-                    withAnimation(.smooth(duration: 0.16)) {
+                    withAnimation(StellaCodeXMotion.quick) {
                         visibleLineLimit = lines.count
                     }
                 }

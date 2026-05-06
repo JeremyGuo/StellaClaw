@@ -1002,7 +1002,7 @@ fn convert_session_defaults(
                 .context_compaction
                 .recent_fidelity_target_ratio
         } else {
-            0.18
+            0.10
         };
         ((threshold as f64) * ratio).round().max(256.0) as u64
     });
@@ -1308,7 +1308,7 @@ mod tests {
         );
         assert_eq!(
             config.session_defaults.compression_retain_recent_tokens,
-            Some(18_000)
+            Some(10_000)
         );
     }
 

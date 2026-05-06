@@ -36,7 +36,7 @@ const DEFAULT_MAX_MODEL_STEPS_PER_TURN: usize = 200;
 const ACTIVE_COMPRESSION_THRESHOLD_RATIO: f64 = 0.9;
 const IDLE_COMPACTION_MIN_RATIO: f64 = 0.4;
 const REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS: usize = 8;
-const DEFAULT_RETAIN_RECENT_PERCENT: u64 = 18;
+const DEFAULT_RETAIN_RECENT_PERCENT: u64 = 10;
 const SESSION_PLAN_CONTEXT_MARKER: &str = "[StellaClaw Current Task Plan]";
 
 pub struct SessionActor {
@@ -2842,8 +2842,8 @@ mod tests {
 
     #[test]
     fn default_retain_recent_tokens_uses_clawparty_ratio() {
-        assert_eq!(default_retain_recent_tokens(235_929), 42_467);
-        assert_eq!(default_retain_recent_tokens(200_000), 36_000);
+        assert_eq!(default_retain_recent_tokens(235_929), 23_592);
+        assert_eq!(default_retain_recent_tokens(200_000), 20_000);
         assert_eq!(default_retain_recent_tokens(1_000), 512);
         assert_eq!(default_retain_recent_tokens(2), 1);
     }

@@ -33,10 +33,13 @@ final class AppViewModel: ObservableObject {
     private let makeClient: (ServerProfile) -> StellaAPIClient
     private var realtimeTask: Task<Void, Never>?
     private var conversationStreamTask: Task<Void, Never>?
+    private var foregroundResumeTask: Task<Void, Never>?
     private var seenSaveTasks: [ConversationSummary.ID: Task<Void, Never>] = [:]
     private var deletionTasks: [ConversationSummary.ID: Task<Void, Never>] = [:]
     private var deletionContexts: [ConversationSummary.ID: ConversationDeletionContext] = [:]
     private var pinnedConversationIDs: Set<ConversationSummary.ID>
+    private var realtimeGeneration: UInt64 = 0
+    private var isRealtimeSuspended = false
     private let pageSize = 50
     private let automaticVisibleMessageLimit = 160
 
@@ -90,6 +93,7 @@ final class AppViewModel: ObservableObject {
     deinit {
         realtimeTask?.cancel()
         conversationStreamTask?.cancel()
+        foregroundResumeTask?.cancel()
         seenSaveTasks.values.forEach { $0.cancel() }
         deletionTasks.values.forEach { $0.cancel() }
     }
@@ -385,23 +389,58 @@ final class AppViewModel: ObservableObject {
     }
 
     private func suspendRealtimeForBackground() {
+        isRealtimeSuspended = true
+        realtimeGeneration &+= 1
+        foregroundResumeTask?.cancel()
+        foregroundResumeTask = nil
         realtimeTask?.cancel()
         realtimeTask = nil
         conversationStreamTask?.cancel()
         conversationStreamTask = nil
         realtimeStatus = "Disconnected"
         activeTurnProgress = nil
+        isLoadingMessages = false
 
         Task {
-            await AppleSSHTunnelManager.shared.close()
+            await client.invalidateTransport()
         }
     }
 
     private func resumeRealtimeAfterForeground() {
-        Task {
-            await AppleSSHTunnelManager.shared.close()
+        isRealtimeSuspended = false
+        realtimeGeneration &+= 1
+        let generation = realtimeGeneration
 
-            guard !Task.isCancelled else {
+        foregroundResumeTask?.cancel()
+        realtimeTask?.cancel()
+        realtimeTask = nil
+        conversationStreamTask?.cancel()
+        conversationStreamTask = nil
+        activeTurnProgress = nil
+        realtimeStatus = "Reconnecting"
+
+        foregroundResumeTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+
+            await client.invalidateTransport()
+
+            guard !Task.isCancelled,
+                  generation == realtimeGeneration,
+                  !isRealtimeSuspended
+            else {
+                return
+            }
+
+            client = makeClient(profile)
+
+            await refreshConversationsAfterForeground(generation: generation)
+
+            guard !Task.isCancelled,
+                  generation == realtimeGeneration,
+                  !isRealtimeSuspended
+            else {
                 return
             }
 
@@ -413,10 +452,49 @@ final class AppViewModel: ObservableObject {
         }
     }
 
+    private func refreshConversationsAfterForeground(generation: UInt64) async {
+        do {
+            let loadedConversations = try await client.listConversations()
+            guard generation == realtimeGeneration,
+                  !isRealtimeSuspended
+            else {
+                return
+            }
+            let existingByID = Dictionary(uniqueKeysWithValues: conversations.map { ($0.id, $0) })
+            conversations = applyPinnedState(
+                to: loadedConversations.filter { deletionContexts[$0.id] == nil }
+            )
+            .map { mergeConversationSummary(existingByID[$0.id], $0) }
+            .sorted(by: sortConversations)
+
+            if let selectedConversationID,
+               conversations.contains(where: { $0.id == selectedConversationID }) == false {
+                #if os(iOS)
+                self.selectedConversationID = nil
+                messages = []
+                hasOlderMessages = false
+                isLoadingMessages = false
+                #else
+                self.selectedConversationID = conversations.first?.id
+                prepareConversationEntry()
+                #endif
+            }
+        } catch {
+            guard generation == realtimeGeneration,
+                  !isRealtimeSuspended
+            else {
+                return
+            }
+            realtimeStatus = "Reconnect failed"
+        }
+    }
+
     func updateProfile(_ profile: ServerProfile) {
         self.profile = profile
         self.client = makeClient(profile)
         ServerProfileStore.save(profile)
+        realtimeGeneration &+= 1
+        foregroundResumeTask?.cancel()
         realtimeTask?.cancel()
         conversationStreamTask?.cancel()
         seenSaveTasks.values.forEach { $0.cancel() }
@@ -440,7 +518,7 @@ final class AppViewModel: ObservableObject {
         realtimeStatus = "Disconnected"
 
         Task {
-            await AppleSSHTunnelManager.shared.close()
+            await client.invalidateTransport()
         }
     }
 
@@ -830,8 +908,9 @@ final class AppViewModel: ObservableObject {
     }
 
     func switchModel(_ model: ModelSummary) {
+        realtimeStatus = "Switching model"
         Task {
-            await sendControlCommand("/model \(model.alias)")
+            await sendControlCommand("/model \(model.alias)", restartRealtimeAfterSend: true)
         }
     }
 
@@ -965,7 +1044,7 @@ final class AppViewModel: ObservableObject {
         return try await client.terminalSession(conversationID: selectedConversationID, terminalID: id, offset: offset)
     }
 
-    private func sendControlCommand(_ command: String) async {
+    private func sendControlCommand(_ command: String, restartRealtimeAfterSend: Bool = false) async {
         guard let selectedConversationID else {
             return
         }
@@ -977,7 +1056,11 @@ final class AppViewModel: ObservableObject {
                 remoteMessageID: "apple-control-\(UUID().uuidString)",
                 files: []
             )
-            realtimeStatus = "Command sent"
+            if restartRealtimeAfterSend {
+                startRealtimeForSelectedConversation()
+            } else {
+                realtimeStatus = "Command sent"
+            }
             conversations = applyPinnedState(to: try await client.listConversations()).sorted(by: sortConversations)
             await loadSelectedConversation()
             await loadSelectedConversationStatus()
@@ -1041,16 +1124,27 @@ final class AppViewModel: ObservableObject {
 
     private func startConversationStream() {
         conversationStreamTask?.cancel()
+        guard !isRealtimeSuspended else {
+            return
+        }
+        let generation = realtimeGeneration
         conversationStreamTask = Task { [weak self] in
             guard let self else {
                 return
             }
+            var reconnectAttempt = 0
 
-            while !Task.isCancelled {
+            while !Task.isCancelled,
+                  generation == realtimeGeneration,
+                  !isRealtimeSuspended {
                 do {
                     let stream = try await client.conversationEvents()
+                    reconnectAttempt = 0
                     for try await event in stream {
-                        guard !Task.isCancelled else {
+                        guard !Task.isCancelled,
+                              generation == realtimeGeneration,
+                              !isRealtimeSuspended
+                        else {
                             return
                         }
                         handleConversationEvent(event)
@@ -1058,11 +1152,15 @@ final class AppViewModel: ObservableObject {
                 } catch is CancellationError {
                     return
                 } catch {
-                    guard !Task.isCancelled else {
+                    guard !Task.isCancelled,
+                          generation == realtimeGeneration,
+                          !isRealtimeSuspended
+                    else {
                         return
                     }
                     realtimeStatus = "Conversation stream reconnecting"
-                    try? await Task.sleep(nanoseconds: 1_600_000_000)
+                    reconnectAttempt += 1
+                    try? await Task.sleep(nanoseconds: reconnectDelayNanoseconds(for: reconnectAttempt))
                 }
             }
         }
@@ -1350,22 +1448,34 @@ final class AppViewModel: ObservableObject {
             activeTurnProgress = nil
             return
         }
+        guard !isRealtimeSuspended else {
+            return
+        }
 
         realtimeStatus = "Connecting"
         activeTurnProgress = nil
+        let generation = realtimeGeneration
         realtimeTask = Task { [weak self] in
             guard let self else {
                 return
             }
             var didFallbackLoad = false
+            var reconnectAttempt = 0
 
-            while !Task.isCancelled && self.selectedConversationID == selectedConversationID {
+            while !Task.isCancelled,
+                  generation == realtimeGeneration,
+                  !isRealtimeSuspended,
+                  self.selectedConversationID == selectedConversationID {
                 do {
                     realtimeStatus = "Connecting"
                     let stream = try await client.foregroundEvents(conversationID: selectedConversationID)
+                    reconnectAttempt = 0
                     var didReconcileAck = false
                     for try await event in stream {
-                        guard !Task.isCancelled else {
+                        guard !Task.isCancelled,
+                              generation == realtimeGeneration,
+                              !isRealtimeSuspended
+                        else {
                             return
                         }
                         guard self.selectedConversationID == selectedConversationID else {
@@ -1380,7 +1490,11 @@ final class AppViewModel: ObservableObject {
                         }
                     }
 
-                    guard !Task.isCancelled, self.selectedConversationID == selectedConversationID else {
+                    guard !Task.isCancelled,
+                          generation == realtimeGeneration,
+                          !isRealtimeSuspended,
+                          self.selectedConversationID == selectedConversationID
+                    else {
                         return
                     }
                     if !didReconcileAck {
@@ -1395,7 +1509,11 @@ final class AppViewModel: ObservableObject {
                 } catch is CancellationError {
                     return
                 } catch {
-                    guard !Task.isCancelled, self.selectedConversationID == selectedConversationID else {
+                    guard !Task.isCancelled,
+                          generation == realtimeGeneration,
+                          !isRealtimeSuspended,
+                          self.selectedConversationID == selectedConversationID
+                    else {
                         return
                     }
                     realtimeStatus = "Realtime reconnecting"
@@ -1407,12 +1525,22 @@ final class AppViewModel: ObservableObject {
                     }
                 }
 
-                try? await Task.sleep(nanoseconds: 1_200_000_000)
-                guard !Task.isCancelled, self.selectedConversationID == selectedConversationID else {
+                reconnectAttempt += 1
+                try? await Task.sleep(nanoseconds: reconnectDelayNanoseconds(for: reconnectAttempt))
+                guard !Task.isCancelled,
+                      generation == realtimeGeneration,
+                      !isRealtimeSuspended,
+                      self.selectedConversationID == selectedConversationID
+                else {
                     return
                 }
             }
         }
+    }
+
+    private func reconnectDelayNanoseconds(for attempt: Int) -> UInt64 {
+        let seconds = min(12.0, 0.8 * pow(1.7, Double(max(0, attempt - 1))))
+        return UInt64(seconds * 1_000_000_000)
     }
 
     private func reconcileSubscriptionAck(_ event: StellaRealtimeEvent, selectedConversationID: ConversationSummary.ID) async {
@@ -1469,15 +1597,26 @@ final class AppViewModel: ObservableObject {
             applyTurnProgress(progress, selectedConversationID: selectedConversationID)
         case .error(let message):
             let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            if isTransientRealtimeStreamError(trimmed) {
+                realtimeStatus = "Realtime reconnecting"
+                return
+            }
             realtimeStatus = trimmed.isEmpty ? "Realtime error" : "Realtime error"
             appendSystemError(trimmed.isEmpty ? "Realtime error." : trimmed)
         }
     }
 
     private func applyTurnProgress(_ progress: TurnProgressFeedback, selectedConversationID: ConversationSummary.ID) {
-        activeTurnProgress = progress.isActive ? progress : nil
-        realtimeStatus = progress.isActive ? progress.activity : "Connected"
-        updateConversationStatus(id: selectedConversationID, status: progress.isActive ? .running : (progress.finalState == "failed" ? .failed : .idle))
+        let failed = progress.finalState?.lowercased() == "failed" || progress.phase.lowercased() == "failed"
+        activeTurnProgress = progress.isActive || failed ? progress : nil
+        if failed {
+            let errorText = progress.error?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            realtimeStatus = errorText ?? "Turn failed"
+            appendSystemError(errorText ?? "Turn failed.")
+        } else {
+            realtimeStatus = progress.isActive ? progress.activity : "Connected"
+        }
+        updateConversationStatus(id: selectedConversationID, status: progress.isActive ? .running : (failed ? .failed : .idle))
     }
 
     private func updateConversationStatus(id: ConversationSummary.ID, status: ConversationStatus) {
@@ -1498,6 +1637,12 @@ final class AppViewModel: ObservableObject {
             return "Connected"
         }
         return normalized
+    }
+
+    private func isTransientRealtimeStreamError(_ message: String) -> Bool {
+        let lowercased = message.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return lowercased == "stream error"
+            || lowercased == "stream_error"
     }
 
     private func mergeIncomingMessages(_ incoming: [ChatMessage]) {
@@ -1590,17 +1735,27 @@ final class AppViewModel: ObservableObject {
     }
 
     private func appendSystemError(_ body: String) {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return
+        }
+        if let last = messages.last,
+           last.role == .system,
+           last.error == trimmed,
+           Date().timeIntervalSince(last.timestamp) < 5 {
+            return
+        }
         messages.append(
             ChatMessage(
                 id: "system-error-\(Date().timeIntervalSince1970)",
                 index: (messages.map(\.index).max() ?? -1) + 1,
                 role: .system,
-                body: body,
+                body: trimmed,
                 timestamp: Date(),
                 userName: nil,
                 isOptimistic: false,
                 pending: false,
-                error: body
+                error: trimmed
             )
         )
     }

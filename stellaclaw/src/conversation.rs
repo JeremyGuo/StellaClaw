@@ -417,6 +417,137 @@ struct ConversationRuntime {
     background: BTreeMap<String, ManagedSessionRuntime>,
     subagents: BTreeMap<String, ManagedSessionRuntime>,
     foreground_progress: Option<ActiveForegroundProgress>,
+    host_services: HostServiceRegistry,
+}
+
+#[derive(Debug, Clone)]
+struct HostServiceRegistry {
+    routes: BTreeMap<&'static str, HostServiceId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HostServiceId {
+    Core,
+    ManagedSession,
+    Skill,
+    Cron,
+}
+
+trait HostService {
+    fn handle(
+        &self,
+        runtime: &mut ConversationRuntime,
+        context: HostServiceContext,
+        request: &ConversationBridgeRequest,
+    ) -> Result<ToolResultItem>;
+}
+
+struct CoreHostService;
+struct ManagedSessionHostService;
+struct SkillHostService;
+struct CronHostService;
+
+#[derive(Debug, Clone)]
+struct HostServiceContext {
+    agent_id: Option<String>,
+    session_type: SessionType,
+}
+
+impl HostServiceRegistry {
+    fn new() -> Self {
+        let mut routes = BTreeMap::new();
+        for action in ["user_tell", "update_plan"] {
+            routes.insert(action, HostServiceId::Core);
+        }
+        for action in [
+            "start_background_agent",
+            "subagent_start",
+            "subagent_kill",
+            "subagent_join",
+            "terminate",
+        ] {
+            routes.insert(action, HostServiceId::ManagedSession);
+        }
+        for action in ["skill_create", "skill_update", "skill_delete"] {
+            routes.insert(action, HostServiceId::Skill);
+        }
+        for action in [
+            "list_cron_tasks",
+            "get_cron_task",
+            "create_cron_task",
+            "update_cron_task",
+            "remove_cron_task",
+        ] {
+            routes.insert(action, HostServiceId::Cron);
+        }
+        Self { routes }
+    }
+
+    fn resolve(&self, action: &str) -> Option<HostServiceId> {
+        self.routes.get(action).copied()
+    }
+}
+
+impl HostServiceId {
+    fn handle(
+        self,
+        runtime: &mut ConversationRuntime,
+        context: HostServiceContext,
+        request: &ConversationBridgeRequest,
+    ) -> Result<ToolResultItem> {
+        match self {
+            HostServiceId::Core => CoreHostService.handle(runtime, context, request),
+            HostServiceId::ManagedSession => {
+                ManagedSessionHostService.handle(runtime, context, request)
+            }
+            HostServiceId::Skill => SkillHostService.handle(runtime, context, request),
+            HostServiceId::Cron => CronHostService.handle(runtime, context, request),
+        }
+    }
+}
+
+impl HostService for CoreHostService {
+    fn handle(
+        &self,
+        runtime: &mut ConversationRuntime,
+        context: HostServiceContext,
+        request: &ConversationBridgeRequest,
+    ) -> Result<ToolResultItem> {
+        runtime.handle_core_host_action(context, request)
+    }
+}
+
+impl HostService for ManagedSessionHostService {
+    fn handle(
+        &self,
+        runtime: &mut ConversationRuntime,
+        context: HostServiceContext,
+        request: &ConversationBridgeRequest,
+    ) -> Result<ToolResultItem> {
+        runtime.handle_managed_session_host_action(context, request)
+    }
+}
+
+impl HostService for SkillHostService {
+    fn handle(
+        &self,
+        runtime: &mut ConversationRuntime,
+        context: HostServiceContext,
+        request: &ConversationBridgeRequest,
+    ) -> Result<ToolResultItem> {
+        runtime.handle_skill_host_action(context, request)
+    }
+}
+
+impl HostService for CronHostService {
+    fn handle(
+        &self,
+        runtime: &mut ConversationRuntime,
+        context: HostServiceContext,
+        request: &ConversationBridgeRequest,
+    ) -> Result<ToolResultItem> {
+        runtime.handle_cron_host_action(context, request)
+    }
 }
 
 struct ForegroundSessionRuntime {
@@ -532,6 +663,7 @@ impl ConversationRuntime {
             background,
             subagents,
             foreground_progress: None,
+            host_services: HostServiceRegistry::new(),
         })
     }
 
@@ -1234,6 +1366,24 @@ impl ConversationRuntime {
         session_type: SessionType,
         request: &ConversationBridgeRequest,
     ) -> Result<ToolResultItem> {
+        let context = HostServiceContext {
+            agent_id,
+            session_type,
+        };
+        let Some(service) = self.host_services.resolve(request.action.as_str()) else {
+            return Ok(bridge_result(
+                request,
+                json!({"error": format!("unsupported host action {}", request.action)}).to_string(),
+            ));
+        };
+        service.handle(self, context, request)
+    }
+
+    fn handle_core_host_action(
+        &mut self,
+        _context: HostServiceContext,
+        request: &ConversationBridgeRequest,
+    ) -> Result<ToolResultItem> {
         match request.action.as_str() {
             "user_tell" => {
                 let text = request
@@ -1251,6 +1401,16 @@ impl ConversationRuntime {
                     json!({"updated": true, "plan": plan}).to_string(),
                 ))
             }
+            _ => Err(anyhow!("unsupported core host action {}", request.action)),
+        }
+    }
+
+    fn handle_managed_session_host_action(
+        &mut self,
+        context: HostServiceContext,
+        request: &ConversationBridgeRequest,
+    ) -> Result<ToolResultItem> {
+        match request.action.as_str() {
             "start_background_agent" => {
                 let task = request
                     .payload
@@ -1302,10 +1462,10 @@ impl ConversationRuntime {
                 Ok(bridge_result(request, serde_json::to_string(&snapshot)?))
             }
             "terminate" => {
-                if session_type != SessionType::Background {
+                if context.session_type != SessionType::Background {
                     return Err(anyhow!("terminate is only valid in background sessions"));
                 }
-                let Some(agent_id) = agent_id else {
+                let Some(agent_id) = context.agent_id else {
                     return Err(anyhow!("missing background agent id"));
                 };
                 let Some(runtime) = self.background.get_mut(&agent_id) else {
@@ -1327,9 +1487,32 @@ impl ConversationRuntime {
                     json!({"terminated": true}).to_string(),
                 ))
             }
+            _ => Err(anyhow!(
+                "unsupported managed session host action {}",
+                request.action
+            )),
+        }
+    }
+
+    fn handle_skill_host_action(
+        &mut self,
+        _context: HostServiceContext,
+        request: &ConversationBridgeRequest,
+    ) -> Result<ToolResultItem> {
+        match request.action.as_str() {
             "skill_create" => self.persist_skill(request, SkillPersistMode::Create),
             "skill_update" => self.persist_skill(request, SkillPersistMode::Update),
             "skill_delete" => self.persist_skill(request, SkillPersistMode::Delete),
+            _ => Err(anyhow!("unsupported skill host action {}", request.action)),
+        }
+    }
+
+    fn handle_cron_host_action(
+        &mut self,
+        _context: HostServiceContext,
+        request: &ConversationBridgeRequest,
+    ) -> Result<ToolResultItem> {
+        match request.action.as_str() {
             "list_cron_tasks" => {
                 let tasks = self
                     .cron_manager
@@ -1434,10 +1617,7 @@ impl ConversationRuntime {
                     .remove_task(&self.state.conversation_id, &id)?;
                 Ok(bridge_result(request, serde_json::to_string(&removed)?))
             }
-            _ => Ok(bridge_result(
-                request,
-                json!({"error": format!("unsupported host action {}", request.action)}).to_string(),
-            )),
+            _ => Err(anyhow!("unsupported cron host action {}", request.action)),
         }
     }
 

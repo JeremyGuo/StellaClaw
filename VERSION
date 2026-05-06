@@ -3,6 +3,15 @@ version: 1.25.6
 
 # 1.25.6
 
+- 更新 Memory v1 TODO 设计：
+  memory scope 命名统一为 `user` / `public` / `conversation`，`memory_search` 默认搜索当前 conversation 与 public，user memory 作为 system prompt snapshot 中的长期记忆由后台压缩维护，并在两次 compact 之间保持稳定；`memory_write` 写入时由工具端自动做同 scope / 同 subject 候选检索，并交给轻量判重模型或本地小模型判断 `duplicate` / `create` / `create_with_related` / `reject_too_vague`，重复时不创建新 entry，只返回已重复状态和匹配 id，同时限制候选数量与 tool result 体积。核心抽象改成 `MemoryService` / `MemoryClient` / `WorkdirMemoryManager` / `MemoryBackend` 分层，和 host service registry 架构对齐。TODO 已按长期记忆和短期记忆两条线重排：长期线负责 memory tools、文件布局、search 和 user compaction，并只列出 memory 直接相关路径；短期线继续使用现有 `update_plan`、provider current context compression，并明确达到阈值时在待压缩 provider context 末尾追加一条 `role="user"` 的压缩请求消息，让模型返回结构化 JSON compaction result，其中工具结果保留改为 `preserved_tool_call_ids`，并由系统回填对应 tool call 参数和 tool result，不在 compacted block 中渲染工具结果列表，也不再从压缩流程输出长期记忆候选。正常 provider context 由当前 system prompt snapshot、按预算检索出的 conversation/public memory、compacted provider history block、当前 plan 和当前 user message 拼接。TODO 同时标记当前已落地的 HostServiceRegistry 骨架、SessionStateStore 历史文件、USER.md runtime metadata 读取、`update_plan` 内存态、provider context compression，以及现有 compaction request 的尾部 `role="user"` 请求形态。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 调整默认上下文压缩高保真保留比例：
+  未显式配置 `compression_retain_recent_tokens` 时，默认 recent high-fidelity context 保留预算从压缩阈值的 18% 调整为 10%；PartyClaw 兼容配置迁移在缺少 `recent_fidelity_target_ratio` 时也按 10% 生成 retain recent。示例配置同步把 `compression_retain_recent_tokens` 调整为阈值的 10%。显式配置值继续按用户配置生效。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 引入 Conversation host service 路由骨架：
+  Conversation 的 host bridge action 处理拆成 `HostServiceRegistry` 路由和 Core / ManagedSession / Skill / Cron service 边界，先保持现有工具行为不变，为后续 MemoryService、WorkdirMemoryManager 和 ask conversation 等 host service 接入留出解耦入口。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 调整 `update_plan` 的所有权到 SessionActor：
   `update_plan` 仍作为 host tool 暴露，但 plan payload 现在由 SessionActor 解析、校验和持有，并通过 SessionEvent 向 Conversation 推送 plan/progress snapshot；Conversation 不再维护 `session_plans` 数据源，只把事件投影到 channel progress。plan 不写入独立持久状态，正常 turn 完成会清空，用户中断不会主动清空；active context compression 时会临时把当前 plan 拼入压缩后的 provider context，turn 完成清空时移除。本次不改变 `config` schema，不改变 `workdir` schema。
 

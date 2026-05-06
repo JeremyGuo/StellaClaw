@@ -58,7 +58,7 @@ struct MarkdownContentView: View {
 
             if isCollapsible {
                 Button {
-                    withAnimation(.smooth(duration: 0.18)) {
+                    withAnimation(StellaCodeXMotion.quick) {
                         isExpanded.toggle()
                     }
                 } label: {
@@ -635,16 +635,18 @@ private struct MarkdownQuoteView: View {
     let fillsWidth: Bool
 
     var body: some View {
-        HStack(alignment: .top, spacing: 9) {
-            RoundedRectangle(cornerRadius: 2, style: .continuous)
-                .fill(Color.accentColor.opacity(0.65))
-                .frame(width: 3)
-
-            MarkdownParagraphView(text: text, compact: compact, fillsWidth: fillsWidth)
-                .foregroundStyle(.secondary)
-        }
-        .padding(.vertical, 6)
-        .padding(.horizontal, 9)
+        MarkdownParagraphView(text: text, compact: compact, fillsWidth: fillsWidth)
+            .foregroundStyle(.secondary)
+            .padding(.leading, 12)
+            .padding(.trailing, 9)
+            .padding(.vertical, compact ? 4 : 6)
+            .background(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 2, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.65))
+                    .frame(width: 3)
+                    .padding(.leading, 7)
+                    .padding(.vertical, compact ? 5 : 7)
+            }
         .background(PlatformColor.secondaryBackground.opacity(0.58))
         .clipShape(RoundedRectangle(cornerRadius: compact ? 10 : 8, style: .continuous))
     }
@@ -689,7 +691,7 @@ private struct MarkdownTableView: View {
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: true) {
+        scrollContainer {
             VStack(alignment: .leading, spacing: 0) {
                 tableRow(cells: table.headers, isHeader: true)
 
@@ -709,6 +711,17 @@ private struct MarkdownTableView: View {
             }
         }
         .modifier(MarkdownWidthModifier(fillsWidth: fillsWidth))
+    }
+
+    @ViewBuilder
+    private func scrollContainer<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        #if os(macOS)
+        MacHorizontalPassthroughScrollView(content: content())
+        #else
+        ScrollView(.horizontal, showsIndicators: true) {
+            content()
+        }
+        #endif
     }
 
     private func tableRow(cells: [String], isHeader: Bool) -> some View {
@@ -900,7 +913,7 @@ struct CodeBlockView: View {
                 Spacer(minLength: 8)
 
                 Button {
-                    withAnimation(.smooth(duration: 0.18)) {
+                    withAnimation(StellaCodeXMotion.quick) {
                         isCollapsed.toggle()
                     }
                 } label: {
@@ -929,7 +942,7 @@ struct CodeBlockView: View {
             .background(codeHeaderBackground)
 
             if !isCollapsed {
-                ScrollView(.horizontal) {
+                scrollContainer {
                     Text(code.isEmpty ? " " : code)
                         .font(.system(compact ? .caption : .callout, design: .monospaced))
                         .textSelection(.enabled)
@@ -966,7 +979,86 @@ struct CodeBlockView: View {
         PlatformColor.secondaryBackground.opacity(0.72)
         #endif
     }
+
+    @ViewBuilder
+    private func scrollContainer<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        #if os(macOS)
+        MacHorizontalPassthroughScrollView(content: content())
+        #else
+        ScrollView(.horizontal) {
+            content()
+        }
+        #endif
+    }
 }
+
+#if os(macOS)
+private struct MacHorizontalPassthroughScrollView<Content: View>: NSViewRepresentable {
+    let content: Content
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeNSView(context: Context) -> PassthroughScrollView {
+        let scrollView = PassthroughScrollView()
+        scrollView.drawsBackground = false
+        scrollView.hasHorizontalScroller = true
+        scrollView.hasVerticalScroller = false
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.borderType = .noBorder
+
+        let hostingView = NSHostingView(rootView: content)
+        hostingView.translatesAutoresizingMaskIntoConstraints = false
+        hostingView.setContentHuggingPriority(.required, for: .horizontal)
+        hostingView.setContentHuggingPriority(.required, for: .vertical)
+        hostingView.setContentCompressionResistancePriority(.required, for: .horizontal)
+        hostingView.setContentCompressionResistancePriority(.required, for: .vertical)
+        scrollView.documentView = hostingView
+        context.coordinator.hostingView = hostingView
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: PassthroughScrollView, context: Context) {
+        context.coordinator.hostingView?.rootView = content
+        DispatchQueue.main.async {
+            guard let hostingView = context.coordinator.hostingView else {
+                return
+            }
+            let fittingSize = hostingView.fittingSize
+            hostingView.frame = NSRect(
+                x: 0,
+                y: 0,
+                width: max(fittingSize.width, scrollView.contentView.bounds.width),
+                height: max(fittingSize.height, 1)
+            )
+            scrollView.frame.size.height = max(fittingSize.height, 1)
+        }
+    }
+
+    final class Coordinator {
+        var hostingView: NSHostingView<Content>?
+    }
+
+    final class PassthroughScrollView: NSScrollView {
+        override func scrollWheel(with event: NSEvent) {
+            if abs(event.scrollingDeltaY) > abs(event.scrollingDeltaX) {
+                nextResponder?.scrollWheel(with: event)
+            } else {
+                super.scrollWheel(with: event)
+            }
+        }
+
+        override var intrinsicContentSize: NSSize {
+            guard let documentView else {
+                return super.intrinsicContentSize
+            }
+            return NSSize(width: NSView.noIntrinsicMetric, height: max(documentView.fittingSize.height, 1))
+        }
+    }
+}
+#endif
 
 enum Pasteboard {
     static func copy(_ text: String) {

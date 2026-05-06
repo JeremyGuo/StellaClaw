@@ -17,18 +17,56 @@ struct MessageTimelineView: View {
     var inspectMessageAction: ((ChatMessage) -> Void)?
     var inspectToolAction: ((ChatMessage, ToolActivity) -> Void)?
 
-    @State private var lastVisibleMessageID: ChatMessage.ID?
-    @State private var olderLoadAnchorID: ChatMessage.ID?
+    @State private var olderLoadAnchorID: TimelineEntry.ID?
+    @State private var previousTimelineSnapshot: TimelineSnapshot?
     @State private var didCompleteInitialBottomScroll = false
     @State private var isPreparingInitialBottomScroll = false
     @State private var isOlderLoadTriggerVisible = false
     @State private var isNearBottom = true
+    @State private var bottomAnchorY: CGFloat?
+    @State private var lastManualScrollAt = Date.distantPast
+    @State private var isProgrammaticScrollInFlight = false
 
     var body: some View {
+        let renderData = buildTimelineRenderData(from: messages)
+
+        #if os(macOS)
+        MacNativeMessageTimelineView(
+            renderData: renderData,
+            hasOlderMessages: hasOlderMessages,
+            isLoadingMessages: isLoadingMessages,
+            isLoadingOlderMessages: isLoadingOlderMessages,
+            activityStatus: activityStatus,
+            isConversationRunning: isConversationRunning,
+            turnProgress: turnProgress,
+            bottomScrollTrigger: bottomScrollTrigger,
+            bottomScrollRequiresNearBottom: bottomScrollRequiresNearBottom,
+            bottomLayoutChangeTrigger: bottomLayoutChangeTrigger,
+            loadOlderAction: loadOlderAction,
+            inspectMessageAction: inspectMessageAction,
+            inspectToolAction: inspectToolAction
+        )
+        #elseif os(iOS)
+        IOSNativeMessageTimelineView(
+            renderData: renderData,
+            hasOlderMessages: hasOlderMessages,
+            isLoadingMessages: isLoadingMessages,
+            isLoadingOlderMessages: isLoadingOlderMessages,
+            activityStatus: activityStatus,
+            isConversationRunning: isConversationRunning,
+            turnProgress: turnProgress,
+            bottomScrollTrigger: bottomScrollTrigger,
+            bottomScrollRequiresNearBottom: bottomScrollRequiresNearBottom,
+            bottomLayoutChangeTrigger: bottomLayoutChangeTrigger,
+            loadOlderAction: loadOlderAction,
+            inspectMessageAction: inspectMessageAction,
+            inspectToolAction: inspectToolAction
+        )
+        #else
         ScrollViewReader { proxy in
             GeometryReader { viewportProxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
+                    timelineStack {
                         if isLoadingMessages && messages.isEmpty {
                             VStack(spacing: 10) {
                                 ProgressView()
@@ -64,50 +102,7 @@ struct MessageTimelineView: View {
                             .background(olderLoadVisibilityReader)
                         }
 
-                        ForEach(timelineEntries) { entry in
-                            switch entry {
-                            case .auxiliary(let messages):
-                                AuxiliaryStandaloneRow(
-                                    messages: messages,
-                                    compact: isCompactTimeline,
-                                    layoutChangeAction: {
-                                        keepBottomAlignedAfterLayoutChange(proxy)
-                                    }
-                                )
-                            case .message(let message, let auxiliaryMessages):
-                                #if os(macOS)
-                                MacMessageRow(
-                                    message: message,
-                                    auxiliaryMessages: auxiliaryMessages,
-                                    layoutChangeAction: {
-                                        keepBottomAlignedAfterLayoutChange(proxy)
-                                    },
-                                    inspectMessageAction: inspectMessageAction,
-                                    inspectToolAction: inspectToolAction
-                                )
-                                #else
-                                IOSMessageBubble(
-                                    message: message,
-                                    auxiliaryMessages: auxiliaryMessages,
-                                    layoutChangeAction: {
-                                        keepBottomAlignedAfterLayoutChange(proxy)
-                                    },
-                                    inspectMessageAction: inspectMessageAction,
-                                    inspectToolAction: inspectToolAction
-                                )
-                                #endif
-                            case .toolProcess(let group):
-                                ToolProcessGroupView(
-                                    group: group,
-                                    compact: isCompactTimeline,
-                                    layoutChangeAction: {
-                                        keepBottomAlignedAfterLayoutChange(proxy)
-                                    },
-                                    inspectMessageAction: inspectMessageAction,
-                                    inspectToolAction: inspectToolAction
-                                )
-                            }
-                        }
+                        timelineEntryViews(entries: renderData.entries, proxy: proxy)
 
                         if turnProgress?.isActive == true || isConversationRunning || ActivityStatusView.shouldDisplay(activityStatus) {
                             ActivityStatusView(
@@ -146,70 +141,69 @@ struct MessageTimelineView: View {
                         triggerLoadOlderIfNeeded()
                     }
                 }
-                .onPreferenceChange(BottomAnchorNearPreferenceKey.self) { nearBottom in
-                    isNearBottom = nearBottom || shouldHideTimelineForInitialPosition
+                .onPreferenceChange(BottomAnchorMetricsPreferenceKey.self) { metrics in
+                    updateBottomAnchorState(metrics)
                 }
                 .onAppear {
-                    guard let lastID = timelinePositionKey.lastMessageID else {
-                        lastVisibleMessageID = nil
+                    let snapshot = renderData.snapshot
+                    previousTimelineSnapshot = snapshot
+                    guard let lastID = snapshot.lastMessageID else {
                         didCompleteInitialBottomScroll = false
                         isPreparingInitialBottomScroll = false
                         return
                     }
-                    lastVisibleMessageID = lastID
                     prepareInitialBottomPosition(proxy, lastID: lastID)
                 }
-                .onChange(of: timelinePositionKey) { _, positionKey in
-                    guard let lastID = positionKey.lastMessageID else {
-                        lastVisibleMessageID = nil
+                .onChange(of: renderData.snapshot) { _, snapshot in
+                    let previousSnapshot = previousTimelineSnapshot
+                    previousTimelineSnapshot = snapshot
+
+                    guard let lastID = snapshot.lastMessageID else {
                         didCompleteInitialBottomScroll = false
                         isPreparingInitialBottomScroll = false
                         return
                     }
-                    guard let previousLastID = lastVisibleMessageID else {
-                        lastVisibleMessageID = lastID
+
+                    guard let previousSnapshot else {
                         prepareInitialBottomPosition(proxy, lastID: lastID)
                         return
                     }
-                    if let anchorID = olderLoadAnchorID,
-                       positionKey.firstMessageID != nil,
-                       positionKey.firstMessageID != anchorID,
-                       previousLastID == lastID {
-                        olderLoadAnchorID = nil
-                        DispatchQueue.main.async {
-                            proxy.scrollTo(anchorID, anchor: .top)
-                        }
-                        return
-                    }
 
-                    guard previousLastID != lastID else {
-                        return
-                    }
-                    lastVisibleMessageID = lastID
-
-                    if didCompleteInitialBottomScroll, isNearBottom {
-                        scrollToBottom(proxy, lastID: lastID, animated: true)
-                    } else if !didCompleteInitialBottomScroll {
-                        prepareInitialBottomPosition(proxy, lastID: lastID)
-                    }
+                    let transaction = TimelineScrollTransaction(
+                        previous: previousSnapshot,
+                        current: snapshot,
+                        olderLoadAnchorID: olderLoadAnchorID,
+                        canAutoAlignToBottom: canAutoAlignToBottom,
+                        didCompleteInitialBottomScroll: didCompleteInitialBottomScroll
+                    )
+                    applyScrollTransaction(transaction, proxy: proxy, lastID: lastID)
                 }
                 .onChange(of: isLoadingMessages) { _, isLoading in
                     guard !isLoading,
-                          let lastID = timelinePositionKey.lastMessageID
+                          renderData.snapshot.lastMessageID != nil
                     else {
                         return
                     }
-                    lastVisibleMessageID = lastID
                     scrollToBottom(proxy, animated: false)
                     if isOlderLoadTriggerVisible {
                         triggerLoadOlderIfNeeded()
+                    }
+                }
+                .onChange(of: isLoadingOlderMessages) { _, isLoading in
+                    guard !isLoading else {
+                        return
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        if olderLoadAnchorID != nil {
+                            olderLoadAnchorID = nil
+                        }
                     }
                 }
                 .onChange(of: bottomScrollTrigger) { _, _ in
                     guard didCompleteInitialBottomScroll else {
                         return
                     }
-                    guard !bottomScrollRequiresNearBottom || isNearBottom else {
+                    guard !bottomScrollRequiresNearBottom || canAutoAlignToBottom else {
                         return
                     }
                     scrollToBottom(proxy, animated: true)
@@ -219,10 +213,41 @@ struct MessageTimelineView: View {
                 }
             }
         }
+        #endif
     }
 
     private var shouldHideTimelineForInitialPosition: Bool {
         isPreparingInitialBottomScroll && !messages.isEmpty
+    }
+
+    @ViewBuilder
+    private func timelineStack<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+        #if os(macOS)
+        VStack(alignment: .leading, spacing: 0, content: content)
+        #else
+        LazyVStack(alignment: .leading, spacing: 0, content: content)
+        #endif
+    }
+
+    @ViewBuilder
+    private func timelineEntryViews(entries: [TimelineEntry], proxy: ScrollViewProxy) -> some View {
+        ForEach(entries) { entry in
+            timelineEntryView(entry, proxy: proxy)
+                .id(entry.id)
+        }
+    }
+
+    @ViewBuilder
+    private func timelineEntryView(_ entry: TimelineEntry, proxy: ScrollViewProxy) -> some View {
+        TimelineEntryRowView(
+            entry: entry,
+            compact: isCompactTimeline,
+            layoutChangeAction: {
+                keepBottomAlignedAfterLayoutChange(proxy)
+            },
+            inspectMessageAction: inspectMessageAction,
+            inspectToolAction: inspectToolAction
+        )
     }
 
     private func prepareInitialBottomPosition(_ proxy: ScrollViewProxy, lastID: ChatMessage.ID) {
@@ -249,8 +274,9 @@ struct MessageTimelineView: View {
 
     private func scrollToBottom(_ proxy: ScrollViewProxy, animated: Bool) {
         DispatchQueue.main.async {
+            isProgrammaticScrollInFlight = true
             if animated {
-                withAnimation(.easeOut(duration: 0.2)) {
+                withAnimation(StellaCodeXMotion.scroll) {
                     proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
                 }
             } else {
@@ -260,20 +286,26 @@ struct MessageTimelineView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                 proxy.scrollTo(Self.bottomAnchorID, anchor: .bottom)
             }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) {
+                isProgrammaticScrollInFlight = false
+            }
         }
     }
 
     private func keepBottomAlignedAfterLayoutChange(_ proxy: ScrollViewProxy) {
         guard didCompleteInitialBottomScroll,
-              isNearBottom || ActivityStatusView.shouldDisplay(activityStatus) || isConversationRunning || turnProgress?.isActive == true
+              canAutoAlignToBottom
         else {
             return
         }
         DispatchQueue.main.async {
-            scrollToBottom(proxy, animated: true)
+            scrollToBottom(proxy, animated: false)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
-            scrollToBottom(proxy, animated: true)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            scrollToBottom(proxy, animated: false)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            scrollToBottom(proxy, animated: false)
         }
     }
 
@@ -284,6 +316,30 @@ struct MessageTimelineView: View {
                 triggerLoadOlderIfNeeded()
             }
         }
+    }
+
+    private var canAutoAlignToBottom: Bool {
+        didCompleteInitialBottomScroll &&
+        isNearBottom &&
+        Date().timeIntervalSince(lastManualScrollAt) > 0.35
+    }
+
+    private func updateBottomAnchorState(_ metrics: BottomAnchorMetrics?) {
+        guard let metrics else {
+            return
+        }
+        let previousY = bottomAnchorY
+        let nearBottom = metrics.minY <= metrics.viewportHeight + 24
+        let movedMeaningfully = previousY.map { abs($0 - metrics.minY) > 2 } ?? false
+
+        if didCompleteInitialBottomScroll,
+           movedMeaningfully,
+           !isProgrammaticScrollInFlight {
+            lastManualScrollAt = Date()
+        }
+
+        bottomAnchorY = metrics.minY
+        isNearBottom = nearBottom || shouldHideTimelineForInitialPosition
     }
 
     private func triggerLoadOlderIfNeeded() {
@@ -306,8 +362,44 @@ struct MessageTimelineView: View {
         else {
             return
         }
-        olderLoadAnchorID = timelinePositionKey.firstMessageID
+        olderLoadAnchorID = previousTimelineSnapshot?.firstEntryID
         loadOlderAction?()
+    }
+
+    private func applyScrollTransaction(
+        _ transaction: TimelineScrollTransaction,
+        proxy: ScrollViewProxy,
+        lastID: ChatMessage.ID
+    ) {
+        switch transaction.intent {
+        case .none:
+            return
+        case .alignBottom(let animated):
+            scrollToBottom(proxy, lastID: lastID, animated: animated)
+        case .preserveAnchor(let anchorID):
+            olderLoadAnchorID = nil
+            restoreOlderLoadPosition(proxy, anchorID: anchorID)
+        case .resetToBottom:
+            olderLoadAnchorID = nil
+            prepareInitialBottomPosition(proxy, lastID: lastID)
+        }
+    }
+
+    private func restoreOlderLoadPosition(_ proxy: ScrollViewProxy, anchorID: TimelineEntry.ID) {
+        isProgrammaticScrollInFlight = true
+
+        DispatchQueue.main.async {
+            proxy.scrollTo(anchorID, anchor: .top)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.04) {
+            proxy.scrollTo(anchorID, anchor: .top)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            proxy.scrollTo(anchorID, anchor: .top)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.24) {
+            isProgrammaticScrollInFlight = false
+        }
     }
 
     private var olderLoadVisibilityReader: some View {
@@ -324,59 +416,10 @@ struct MessageTimelineView: View {
         GeometryReader { proxy in
             let frame = proxy.frame(in: .named("MessageTimelineScroll"))
             Color.clear.preference(
-                key: BottomAnchorNearPreferenceKey.self,
-                value: frame.minY <= viewportHeight + 140
+                key: BottomAnchorMetricsPreferenceKey.self,
+                value: BottomAnchorMetrics(minY: frame.minY, viewportHeight: viewportHeight)
             )
         }
-    }
-
-    private var timelinePositionKey: TimelinePositionKey {
-        var count = 0
-        var firstMessageID: ChatMessage.ID?
-        var lastMessageID: ChatMessage.ID?
-        for message in messages where message.shouldRenderInTimeline {
-            count += 1
-            if firstMessageID == nil {
-                firstMessageID = message.id
-            }
-            lastMessageID = message.id
-        }
-        return TimelinePositionKey(renderableCount: count, firstMessageID: firstMessageID, lastMessageID: lastMessageID)
-    }
-
-    private var timelineEntries: [TimelineEntry] {
-        var entries: [TimelineEntry] = []
-        var pendingToolMessages: [ChatMessage] = []
-        var pendingAuxiliaryMessages: [AuxiliaryUserMessage] = []
-
-        func flushToolMessages() {
-            guard !pendingToolMessages.isEmpty else {
-                return
-            }
-            entries.append(.toolProcess(ToolProcessGroup(messages: pendingToolMessages)))
-            pendingToolMessages.removeAll()
-        }
-
-        for message in messages where message.shouldRenderInTimeline {
-            if let auxiliaryMessage = message.auxiliaryUserMessage {
-                pendingAuxiliaryMessages.append(auxiliaryMessage)
-            } else if message.isToolProcessMessage {
-                pendingToolMessages.append(message)
-            } else {
-                flushToolMessages()
-                let auxiliaryMessages = message.role == .user ? pendingAuxiliaryMessages : []
-                if message.role == .user {
-                    pendingAuxiliaryMessages.removeAll()
-                }
-                entries.append(.message(message, auxiliaryMessages))
-            }
-        }
-
-        flushToolMessages()
-        if !pendingAuxiliaryMessages.isEmpty {
-            entries.append(.auxiliary(pendingAuxiliaryMessages))
-        }
-        return entries
     }
 
     private var isCompactTimeline: Bool {
@@ -399,7 +442,7 @@ private extension View {
     }
 }
 
-private struct LoadingMessagesView: View {
+struct LoadingMessagesView: View {
     var body: some View {
         VStack(spacing: 10) {
             ProgressView()
@@ -437,171 +480,61 @@ private struct OlderLoadTriggerVisiblePreferenceKey: PreferenceKey {
     }
 }
 
-private struct BottomAnchorNearPreferenceKey: PreferenceKey {
-    static var defaultValue = false
+private struct BottomAnchorMetrics: Equatable {
+    var minY: CGFloat
+    var viewportHeight: CGFloat
+}
 
-    static func reduce(value: inout Bool, nextValue: () -> Bool) {
-        value = value || nextValue()
+private struct BottomAnchorMetricsPreferenceKey: PreferenceKey {
+    static var defaultValue: BottomAnchorMetrics?
+
+    static func reduce(value: inout BottomAnchorMetrics?, nextValue: () -> BottomAnchorMetrics?) {
+        value = nextValue() ?? value
     }
 }
 
-private struct TimelinePositionKey: Equatable {
-    var renderableCount: Int
-    var firstMessageID: ChatMessage.ID?
-    var lastMessageID: ChatMessage.ID?
-}
+struct TimelineEntryRowView: View {
+    let entry: TimelineEntry
+    let compact: Bool
+    var layoutChangeAction: (() -> Void)?
+    var inspectMessageAction: ((ChatMessage) -> Void)?
+    var inspectToolAction: ((ChatMessage, ToolActivity) -> Void)?
 
-private enum TimelineEntry: Identifiable {
-    case auxiliary([AuxiliaryUserMessage])
-    case message(ChatMessage, [AuxiliaryUserMessage])
-    case toolProcess(ToolProcessGroup)
-
-    var id: String {
-        switch self {
+    var body: some View {
+        switch entry {
         case .auxiliary(let messages):
-            messages.map(\.id).joined(separator: "-")
-        case .message(let message, _):
-            message.id
+            AuxiliaryStandaloneRow(
+                messages: messages,
+                compact: compact,
+                layoutChangeAction: layoutChangeAction
+            )
+        case .message(let message, let auxiliaryMessages):
+            #if os(macOS)
+            MacMessageRow(
+                message: message,
+                auxiliaryMessages: auxiliaryMessages,
+                layoutChangeAction: layoutChangeAction,
+                inspectMessageAction: inspectMessageAction,
+                inspectToolAction: inspectToolAction
+            )
+            #else
+            IOSMessageBubble(
+                message: message,
+                auxiliaryMessages: auxiliaryMessages,
+                layoutChangeAction: layoutChangeAction,
+                inspectMessageAction: inspectMessageAction,
+                inspectToolAction: inspectToolAction
+            )
+            #endif
         case .toolProcess(let group):
-            group.id
+            ToolProcessGroupView(
+                group: group,
+                compact: compact,
+                layoutChangeAction: layoutChangeAction,
+                inspectMessageAction: inspectMessageAction,
+                inspectToolAction: inspectToolAction
+            )
         }
-    }
-}
-
-private struct AuxiliaryUserMessage: Identifiable {
-    let id: String
-    var title: String
-    var summary: String
-    var fields: [(String, String)]
-    var rawText: String
-
-    init(message: ChatMessage) {
-        id = message.id
-        rawText = message.body.trimmingCharacters(in: .whitespacesAndNewlines)
-        title = AuxiliaryUserMessage.title(from: rawText)
-        fields = AuxiliaryUserMessage.fields(from: rawText)
-
-        let fieldMap = Dictionary(uniqueKeysWithValues: fields)
-        if title == "Incoming User Metadata" {
-            let speaker = fieldMap["Speaker"]?.nilIfBlank ?? "unknown speaker"
-            if let messageTime = fieldMap["Message time"]?.nilIfBlank {
-                summary = "\(speaker) - \(messageTime)"
-            } else {
-                summary = speaker
-            }
-        } else {
-            summary = fields.first.map { "\($0.0): \($0.1)" } ?? title
-        }
-    }
-
-    private static func title(from text: String) -> String {
-        guard text.hasPrefix("["),
-              let end = text.firstIndex(of: "]")
-        else {
-            return "Context"
-        }
-        return String(text[text.index(after: text.startIndex)..<end])
-    }
-
-    private static func fields(from text: String) -> [(String, String)] {
-        let lines = text
-            .components(separatedBy: .newlines)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        var result: [(String, String)] = []
-        var currentKey: String?
-
-        func appendField(_ key: String, _ value: String) {
-            let cleanKey = key.trimmingCharacters(in: .whitespacesAndNewlines)
-            let cleanValue = value.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !cleanKey.isEmpty else {
-                return
-            }
-            if let index = result.firstIndex(where: { $0.0 == cleanKey }) {
-                result[index].1 = [result[index].1, cleanValue]
-                    .filter { !$0.isEmpty }
-                    .joined(separator: " ")
-            } else {
-                result.append((cleanKey, cleanValue))
-            }
-        }
-
-        for line in lines.dropFirst() {
-            if let delimiter = line.firstIndex(of: ":") {
-                let key = String(line[..<delimiter])
-                let value = String(line[line.index(after: delimiter)...])
-                appendField(key, value)
-                currentKey = value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? key : nil
-            } else if let key = currentKey {
-                appendField(key, line)
-                currentKey = nil
-            } else {
-                appendField("Note", line)
-            }
-        }
-        return result
-    }
-}
-
-private extension AuxiliaryUserMessage {
-    var presentationHeight: CGFloat {
-        let base: CGFloat = 104
-        let fieldHeight = CGFloat(max(fields.count, 1)) * 44
-        return min(max(base + fieldHeight, 190), 360)
-    }
-}
-
-private extension ChatMessage {
-    var shouldRenderInTimeline: Bool {
-        !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            || !toolActivities.isEmpty
-            || !attachments.isEmpty
-            || tokenUsage?.hasUsage == true
-            || pending
-            || error != nil
-    }
-
-    var isToolProcessMessage: Bool {
-        !toolActivities.isEmpty
-    }
-
-    var auxiliaryUserMessage: AuxiliaryUserMessage? {
-        guard role == .user else {
-            return nil
-        }
-        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lowercased = trimmed.lowercased()
-        let prefixes = [
-            "[incoming user metadata]",
-            "[runtime prompt updates]",
-            "[runtime skill updates]",
-            "[system context]",
-            "[developer context]",
-            "[tool context]"
-        ]
-        guard prefixes.contains(where: { lowercased.hasPrefix($0) }) else {
-            return nil
-        }
-        return AuxiliaryUserMessage(message: self)
-    }
-}
-
-private extension String {
-    var nilIfBlank: String? {
-        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-}
-
-private struct ToolProcessGroup: Identifiable {
-    let id: String
-    let messages: [ChatMessage]
-    let activities: [ToolActivity]
-
-    init(messages: [ChatMessage]) {
-        self.messages = messages
-        id = messages.last?.id ?? UUID().uuidString
-        activities = messages.flatMap(\.toolActivities)
     }
 }
 
@@ -692,10 +625,10 @@ private struct AuxiliaryStandaloneRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
             Button {
-                withAnimation(.smooth(duration: 0.16)) {
+                withAnimation(StellaCodeXMotion.quick) {
                     isExpanded.toggle()
                 }
-                layoutChangeAction?()
+                notifyLayoutChange()
             } label: {
                 HStack(spacing: 7) {
                     Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
@@ -742,6 +675,16 @@ private struct AuxiliaryStandaloneRow: View {
         .padding(.horizontal, compact ? 12 : 24)
         .padding(.vertical, 4)
     }
+
+    private func notifyLayoutChange() {
+        layoutChangeAction?()
+        DispatchQueue.main.async {
+            layoutChangeAction?()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
+            layoutChangeAction?()
+        }
+    }
 }
 
 #if os(macOS)
@@ -761,62 +704,68 @@ private struct MacMessageRow: View {
     }
 
     private var userRow: some View {
-        HStack(alignment: .bottom, spacing: 0) {
-            Spacer(minLength: 160)
-
-            VStack(alignment: .trailing, spacing: 6) {
-                if !auxiliaryMessages.isEmpty {
-                    AuxiliaryDotsView(messages: auxiliaryMessages)
-                }
-
-                VStack(alignment: .trailing, spacing: 8) {
-                    if !message.body.isEmpty {
-                        MarkdownContentView(text: message.body, compact: true, fillsWidth: false)
-                    }
-
-                    AttachmentStripView(
-                        attachments: message.attachments,
-                        compact: true,
-                        alignment: .trailing,
-                        fillsWidth: false
-                    )
-
-                    if !message.toolActivities.isEmpty {
-                        ToolBatchSummaryView(
-                            activities: message.toolActivities,
-                            compact: true,
-                            layoutChangeAction: layoutChangeAction,
-                            toolAction: { activity in
-                                inspectToolAction?(message, activity)
-                            }
-                        )
-                    }
-                }
-                .padding(.horizontal, userBubblePadding.horizontal)
-                .padding(.vertical, userBubblePadding.vertical)
-                .background(userBubbleBackgroundColor)
-                .foregroundStyle(Color.white)
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-
-                HStack(spacing: 7) {
-                    if let tokenUsage = message.tokenUsage, tokenUsage.hasUsage {
-                        TokenUsagePill(usage: tokenUsage)
-                    }
-
-                    Text(message.timestamp, style: .time)
-                    if message.pending {
-                        Text("正在发送")
-                    }
-                    if let error = message.error {
-                        Text(error)
-                            .foregroundStyle(.red)
-                    }
-                }
-                .font(.caption)
-                .foregroundStyle(.tertiary)
+        VStack(alignment: .trailing, spacing: 6) {
+            if !auxiliaryMessages.isEmpty {
+                AuxiliaryDotsView(messages: auxiliaryMessages)
             }
-            .frame(maxWidth: 640, alignment: .trailing)
+
+            VStack(alignment: .trailing, spacing: 8) {
+                if !message.body.isEmpty {
+                    if shouldUseLightweightUserText {
+                        Text(message.body)
+                            .font(.body)
+                            .lineSpacing(2)
+                            .multilineTextAlignment(.leading)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    } else {
+                        MarkdownContentView(text: message.body, compact: true, fillsWidth: true)
+                    }
+                }
+
+                AttachmentStripView(
+                    attachments: message.attachments,
+                    compact: true,
+                    alignment: .trailing,
+                    fillsWidth: true
+                )
+
+                if !message.toolActivities.isEmpty {
+                    ToolBatchSummaryView(
+                        activities: message.toolActivities,
+                        compact: true,
+                        layoutChangeAction: layoutChangeAction,
+                        toolAction: { activity in
+                            inspectToolAction?(message, activity)
+                        }
+                    )
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+            .padding(.horizontal, userBubblePadding.horizontal)
+            .padding(.vertical, userBubblePadding.vertical)
+            .background(userBubbleBackgroundColor)
+            .foregroundStyle(Color.white)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+
+            HStack(spacing: 7) {
+                if let tokenUsage = message.tokenUsage, tokenUsage.hasUsage {
+                    TokenUsagePill(usage: tokenUsage)
+                }
+
+                Text(message.timestamp, style: .time)
+                if message.pending {
+                    Text("正在发送")
+                }
+                if let error = message.error {
+                    Text(error)
+                        .foregroundStyle(.red)
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.tertiary)
         }
+        .frame(maxWidth: 640, alignment: .trailing)
         .frame(maxWidth: .infinity, alignment: .trailing)
         .padding(.horizontal, 28)
         .padding(.vertical, 7)
@@ -983,6 +932,21 @@ private struct MacMessageRow: View {
             && message.attachments.allSatisfy(\.isImage)
             && message.toolActivities.isEmpty
     }
+
+    private var shouldUseLightweightUserText: Bool {
+        let text = message.body
+        guard text.count < 700,
+              !text.contains("```"),
+              !text.contains("|"),
+              !text.contains("#"),
+              !text.contains(">"),
+              !text.contains("*"),
+              !text.contains("- ")
+        else {
+            return false
+        }
+        return true
+    }
 }
 #else
 private struct IOSMessageBubble: View {
@@ -1016,14 +980,23 @@ private struct IOSMessageBubble: View {
 
                 VStack(alignment: isUser ? .trailing : .leading, spacing: 8) {
                     if !message.body.isEmpty {
-                        MarkdownContentView(text: message.body, compact: true, fillsWidth: false)
+                        if shouldUseLightweightUserText {
+                            Text(message.body)
+                                .font(.body)
+                                .lineSpacing(2)
+                                .multilineTextAlignment(.leading)
+                                .textSelection(.enabled)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        } else {
+                            MarkdownContentView(text: message.body, compact: true, fillsWidth: true)
+                        }
                     }
 
                     AttachmentStripView(
                         attachments: message.attachments,
                         compact: true,
                         alignment: .trailing,
-                        fillsWidth: false
+                        fillsWidth: true
                     )
 
                     if !message.toolActivities.isEmpty {
@@ -1237,12 +1210,31 @@ private struct IOSMessageBubble: View {
             && message.attachments.allSatisfy(\.isImage)
             && message.toolActivities.isEmpty
     }
+
+    private var shouldUseLightweightUserText: Bool {
+        guard isUser else {
+            return false
+        }
+        let text = message.body
+        guard text.count < 700,
+              !text.contains("```"),
+              !text.contains("|"),
+              !text.contains("#"),
+              !text.contains(">"),
+              !text.contains("*"),
+              !text.contains("- ")
+        else {
+            return false
+        }
+        return true
+    }
 }
 #endif
 
-private struct ToolProcessGroupView: View {
+struct ToolProcessGroupView: View {
     let group: ToolProcessGroup
     let compact: Bool
+    var externalExpanded: Binding<Bool>? = nil
     let layoutChangeAction: (() -> Void)?
     let inspectMessageAction: ((ChatMessage) -> Void)?
     let inspectToolAction: ((ChatMessage, ToolActivity) -> Void)?
@@ -1251,73 +1243,22 @@ private struct ToolProcessGroupView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button {
-                withAnimation(.smooth(duration: 0.16)) {
-                    isExpanded.toggle()
+            headerButton
+                .transaction { transaction in
+                    transaction.animation = nil
                 }
-                layoutChangeAction?()
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(.tertiary)
-                        .frame(width: 12)
+                .animation(nil, value: isExpandedValue)
 
-                    Image(systemName: "wrench.and.screwdriver")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-
-                    Text(summaryTitle)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-
-                    Spacer(minLength: 8)
-
-                    Text(summaryMeta)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            if isExpanded {
-                VStack(alignment: .leading, spacing: 8) {
-                    ForEach(group.messages) { message in
-                        if let tokenUsage = message.tokenUsage, tokenUsage.hasUsage {
-                            TokenUsagePill(usage: tokenUsage)
-                                .padding(.horizontal, compact ? 10 : 0)
-                                .padding(.top, 2)
-                        }
-
-                        if !message.body.isEmpty || !message.attachments.isEmpty {
-                            VStack(alignment: .leading, spacing: 7) {
-                                if !message.body.isEmpty {
-                                    MarkdownContentView(text: message.body, compact: compact)
-                                }
-
-                                AttachmentStripView(attachments: message.attachments, compact: compact)
-                            }
-                            .padding(.horizontal, compact ? 10 : 0)
-                            .padding(.top, 3)
-                        }
-
-                        ForEach(message.toolActivities) { activity in
-                            Button {
-                                inspectToolAction?(message, activity)
-                            } label: {
-                                ToolActivityRow(activity: activity)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                }
-                .padding(.top, 8)
-                .padding(.bottom, 10)
+            if isExpandedValue {
+                ToolProcessExpandedContentView(
+                    group: group,
+                    compact: compact,
+                    inspectToolAction: inspectToolAction
+                )
+                .transition(.identity)
             }
         }
+        .animation(nil, value: isExpandedValue)
         .padding(.horizontal, compact ? 12 : 24)
         .padding(.vertical, compact ? 5 : 2)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1330,6 +1271,51 @@ private struct ToolProcessGroupView: View {
                 }
             }
         }
+    }
+
+    private var headerButton: some View {
+        Button {
+            #if os(iOS)
+            var transaction = Transaction()
+            transaction.animation = nil
+            withTransaction(transaction) {
+                setExpanded(!isExpandedValue)
+            }
+            #else
+            withAnimation(StellaCodeXMotion.quick) {
+                setExpanded(!isExpandedValue)
+            }
+            #endif
+            DispatchQueue.main.async {
+                notifyLayoutChange()
+            }
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: isExpandedValue ? "chevron.down" : "chevron.right")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.tertiary)
+                    .frame(width: 12)
+                    .contentTransition(.identity)
+
+                Image(systemName: "wrench.and.screwdriver")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+
+                Text(summaryTitle)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+
+                Spacer(minLength: 8)
+
+                Text(summaryMeta)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private var summaryTitle: String {
@@ -1356,6 +1342,87 @@ private struct ToolProcessGroupView: View {
         let suffix = uniqueNames.count > 2 ? " +\(uniqueNames.count - 2)" : ""
         return visibleNames.isEmpty ? "collapsed" : visibleNames + suffix
     }
+
+    private var isExpandedValue: Bool {
+        externalExpanded?.wrappedValue ?? isExpanded
+    }
+
+    private func setExpanded(_ value: Bool) {
+        if let externalExpanded {
+            externalExpanded.wrappedValue = value
+        } else {
+            isExpanded = value
+        }
+    }
+
+    private func notifyLayoutChange() {
+        layoutChangeAction?()
+        DispatchQueue.main.async {
+            layoutChangeAction?()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
+            layoutChangeAction?()
+        }
+    }
+}
+
+struct ToolProcessExpandedContentView: View {
+    let group: ToolProcessGroup
+    let compact: Bool
+    let inspectToolAction: ((ChatMessage, ToolActivity) -> Void)?
+
+    @State private var isContentVisible = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(group.messages) { message in
+                if let tokenUsage = message.tokenUsage, tokenUsage.hasUsage {
+                    TokenUsagePill(usage: tokenUsage)
+                        .padding(.horizontal, compact ? 10 : 0)
+                        .padding(.top, 2)
+                }
+
+                if !message.body.isEmpty || !message.attachments.isEmpty {
+                    VStack(alignment: .leading, spacing: 7) {
+                        if !message.body.isEmpty {
+                            MarkdownContentView(text: message.body, compact: compact)
+                        }
+
+                        AttachmentStripView(attachments: message.attachments, compact: compact)
+                    }
+                    .padding(.horizontal, compact ? 10 : 0)
+                    .padding(.top, 3)
+                }
+
+                ForEach(message.toolActivities) { activity in
+                    Button {
+                        inspectToolAction?(message, activity)
+                    } label: {
+                        ToolActivityRow(activity: activity)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .padding(.top, 8)
+        .padding(.bottom, 10)
+        .opacity(isContentVisible ? 1 : 0)
+        .offset(y: isContentVisible ? 0 : -4)
+        .clipped()
+        .onAppear {
+            guard compact else {
+                isContentVisible = true
+                return
+            }
+            isContentVisible = false
+            DispatchQueue.main.async {
+                isContentVisible = true
+            }
+        }
+        .onDisappear {
+            isContentVisible = false
+        }
+    }
 }
 
 private struct ToolBatchSummaryView: View {
@@ -1368,39 +1435,55 @@ private struct ToolBatchSummaryView: View {
     @State private var isExpanded = false
 
     var body: some View {
-        DisclosureGroup(isExpanded: $isExpanded) {
-            VStack(alignment: .leading, spacing: 6) {
-                ForEach(activities) { activity in
-                    Button {
-                        toolAction(activity)
-                    } label: {
-                        ToolActivityRow(activity: activity)
-                    }
-                    .buttonStyle(.plain)
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(StellaCodeXMotion.quick) {
+                    isExpanded.toggle()
                 }
-            }
-            .padding(.top, 7)
-        } label: {
-            HStack(spacing: 8) {
-                Image(systemName: "wrench.and.screwdriver")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                notifyLayoutChange()
+            } label: {
+                HStack(spacing: 8) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.tertiary)
+                        .frame(width: 10)
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(batchTitle)
+                    Image(systemName: "wrench.and.screwdriver")
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-
-                    Text(batchSubtitle)
-                        .font(.caption2)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
 
-                Spacer(minLength: 8)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(batchTitle)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+
+                        Text(batchSubtitle)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 8)
+                }
+                .contentShape(Rectangle())
             }
-            .contentShape(Rectangle())
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(activities) { activity in
+                        Button {
+                            toolAction(activity)
+                        } label: {
+                            ToolActivityRow(activity: activity)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+                .padding(.top, 7)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
         }
         .padding(.horizontal, compact ? 10 : 11)
         .padding(.vertical, compact ? 8 : 9)
@@ -1410,7 +1493,14 @@ private struct ToolBatchSummaryView: View {
             RoundedRectangle(cornerRadius: compact ? 13 : 8, style: .continuous)
                 .strokeBorder(PlatformColor.separator.opacity(0.35))
         }
-        .onChange(of: isExpanded) { _, _ in
+    }
+
+    private func notifyLayoutChange() {
+        layoutChangeAction?()
+        DispatchQueue.main.async {
+            layoutChangeAction?()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
             layoutChangeAction?()
         }
     }
@@ -1685,7 +1775,7 @@ private extension View {
     }
 }
 
-private struct ActivityStatusView: View {
+struct ActivityStatusView: View {
     let status: String?
     let isRunning: Bool
     let turnProgress: TurnProgressFeedback?

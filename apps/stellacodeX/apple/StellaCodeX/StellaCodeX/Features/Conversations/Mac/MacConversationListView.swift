@@ -60,8 +60,8 @@ struct MacConversationListView: View {
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
-        .animation(.easeInOut(duration: 0.18), value: viewModel.conversations.map(\.id))
-        .animation(.easeInOut(duration: 0.18), value: viewModel.pendingConversationDeletion)
+        .animation(StellaCodeXMotion.standard, value: viewModel.conversations.map(\.id))
+        .animation(StellaCodeXMotion.standard, value: viewModel.pendingConversationDeletion)
         .sheet(isPresented: $isNewConversationPresented) {
             NewConversationSheetView(
                 viewModel: viewModel,

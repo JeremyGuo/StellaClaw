@@ -151,7 +151,7 @@
   ],
   "session_defaults": {
     "compression_threshold_tokens": 180000,
-    "compression_retain_recent_tokens": 36000,
+    "compression_retain_recent_tokens": 18000,
     "search_tool_model": "search_brave",
     "search_image_tool_model": "search_brave_image",
     "search_video_tool_model": "search_brave_video",

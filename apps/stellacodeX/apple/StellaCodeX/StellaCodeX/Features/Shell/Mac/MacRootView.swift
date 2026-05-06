@@ -118,8 +118,8 @@ struct MacRootView: View {
         .animation(nil, value: sidebarWidth)
         .animation(nil, value: filesWidth)
         .animation(nil, value: terminalHeight)
-        .animation(.easeInOut(duration: 0.16), value: isFilesVisible)
-        .animation(.easeInOut(duration: 0.16), value: isInspectorVisible)
+        .animation(StellaCodeXMotion.quick, value: isFilesVisible)
+        .animation(StellaCodeXMotion.quick, value: isInspectorVisible)
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 Button {
@@ -146,7 +146,7 @@ struct MacRootView: View {
                 .help("Refresh")
 
                 Button {
-                    withAnimation(.easeInOut(duration: 0.18)) {
+                    withAnimation(StellaCodeXMotion.standard) {
                         isTerminalVisible.toggle()
                     }
                 } label: {
@@ -156,7 +156,7 @@ struct MacRootView: View {
                 .disabled(viewModel.selectedConversationID == nil)
 
                 Button {
-                    withAnimation(.easeInOut(duration: 0.16)) {
+                    withAnimation(StellaCodeXMotion.quick) {
                         isFilesVisible.toggle()
                     }
                 } label: {
@@ -174,7 +174,7 @@ struct MacRootView: View {
                 .disabled(viewModel.selectedConversationID == nil)
 
                 Button {
-                    withAnimation(.easeInOut(duration: 0.16)) {
+                    withAnimation(StellaCodeXMotion.quick) {
                         isInspectorVisible.toggle()
                     }
                 } label: {

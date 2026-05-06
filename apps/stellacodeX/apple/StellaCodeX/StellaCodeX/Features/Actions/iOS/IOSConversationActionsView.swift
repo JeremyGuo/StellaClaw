@@ -3,6 +3,7 @@ import SwiftUI
 
 struct IOSConversationActionsView: View {
     @ObservedObject var viewModel: AppViewModel
+    let onClose: () -> Void
     let onRename: () -> Void
 
     var body: some View {
@@ -65,7 +66,10 @@ struct IOSConversationActionsView: View {
 
             Section("Commands") {
                 NavigationLink {
-                    IOSModelCommandView(viewModel: viewModel)
+                    IOSModelCommandView(
+                        viewModel: viewModel,
+                        closeAction: onClose
+                    )
                 } label: {
                     CommandRow(icon: "cpu", title: "Model", detail: "Switch current conversation model")
                 }
@@ -297,6 +301,7 @@ private func formatCost(_ value: Double) -> String {
 
 private struct IOSModelCommandView: View {
     @ObservedObject var viewModel: AppViewModel
+    let closeAction: () -> Void
 
     var body: some View {
         List {
@@ -315,7 +320,8 @@ private struct IOSModelCommandView: View {
             Section("Available Models") {
                 ForEach(viewModel.availableModels) { model in
                     Button {
-                        viewModel.switchModel(model)
+                        viewModel.selectModelForCurrentConversation(model)
+                        closeAction()
                     } label: {
                         HStack {
                             VStack(alignment: .leading, spacing: 3) {

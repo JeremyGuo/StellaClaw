@@ -40,6 +40,7 @@ struct MacChatWorkspaceView: View {
                     }
                 )
                     .id(viewModel.selectedConversationID ?? "no-conversation")
+                    .animation(nil, value: viewModel.selectedConversationID)
                     .safeAreaInset(edge: .bottom) {
                         Color.clear.frame(height: viewModel.selectedConversationRequiresModel ? 0 : composerReservedHeight)
                     }

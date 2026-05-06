@@ -21,7 +21,7 @@ struct IOSRootView: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
-        .animation(.smooth(duration: 0.22), value: shouldShowTabBar)
+        .animation(StellaCodeXMotion.standard, value: shouldShowTabBar)
     }
 
     private var shouldShowTabBar: Bool {
@@ -55,7 +55,7 @@ private struct IOSFloatingTabBar: View {
 
     private func tabButton(_ tab: IOSTab, title: String, systemImage: String) -> some View {
         Button {
-            withAnimation(.smooth(duration: 0.22)) {
+            withAnimation(StellaCodeXMotion.standard) {
                 selectedTab = tab
             }
         } label: {

@@ -48,6 +48,7 @@ struct IOSChatWorkspaceView: View {
                     }
                 )
                     .id(viewModel.selectedConversationID ?? "no-conversation")
+                    .animation(nil, value: viewModel.selectedConversationID)
             }
 
             if viewModel.selectedConversationRequiresModel {
@@ -98,22 +99,11 @@ struct IOSChatWorkspaceView: View {
                 title: viewModel.selectedConversation?.title ?? "Conversation",
                 subtitle: headerSubtitle,
                 isActive: viewModel.activeTurnProgress?.isActive == true || viewModel.selectedConversation?.status == .running,
-                onBack: {
-                    dismiss()
-                },
-                onFiles: {
-                    destination = .files
-                },
-                onTerminal: {
-                    destination = .terminal
-                },
-                onRename: {
-                    renameName = viewModel.selectedConversation?.title ?? ""
-                    isRenamePresented = true
-                },
-                onActions: {
-                    destination = .actions
-                }
+                onBack: closeWorkspace,
+                onFiles: showFiles,
+                onTerminal: showTerminal,
+                onRename: showRename,
+                onActions: showActions
             )
         }
         .navigationDestination(item: $destination) { destination in
@@ -125,10 +115,8 @@ struct IOSChatWorkspaceView: View {
             case .actions:
                 IOSConversationActionsView(
                     viewModel: viewModel,
-                    onRename: {
-                        renameName = viewModel.selectedConversation?.title ?? ""
-                        isRenamePresented = true
-                    }
+                    onClose: closeConversationDestination,
+                    onRename: showRename
                 )
             }
         }
@@ -229,6 +217,31 @@ struct IOSChatWorkspaceView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) {
             keyboardScrollTrigger += 1
         }
+    }
+
+    private func closeWorkspace() {
+        dismiss()
+    }
+
+    private func closeConversationDestination() {
+        destination = nil
+    }
+
+    private func showFiles() {
+        destination = .files
+    }
+
+    private func showTerminal() {
+        destination = .terminal
+    }
+
+    private func showActions() {
+        destination = .actions
+    }
+
+    private func showRename() {
+        renameName = viewModel.selectedConversation?.title ?? ""
+        isRenamePresented = true
     }
 
     private var headerSubtitle: String {
@@ -811,7 +824,7 @@ private struct IOSMessageComposerView: View {
                 )
                 .ignoresSafeArea(edges: .bottom)
         }
-        .animation(.smooth(duration: 0.18), value: canSend)
+        .animation(StellaCodeXMotion.quick, value: canSend)
         .onChange(of: textViewHeight) { _, _ in
             layoutChangeAction()
         }
@@ -1375,7 +1388,7 @@ private struct IOSTerminalScreenView: View {
                 onViewportChange(size)
             }
             .onChange(of: text) { _, _ in
-                withAnimation(.easeOut(duration: 0.16)) {
+                withAnimation(StellaCodeXMotion.quick) {
                     proxy.scrollTo("terminal-bottom", anchor: .bottom)
                 }
             }
@@ -1779,12 +1792,16 @@ private final class XtermScreenBuffer {
         case normal
         case escape
         case csi(String)
+        case osc
+        case oscEscape
     }
 
     private let scrollbackLimit = 2_000
     private var cols: Int
     private var rows: Int
     private var lines: [[TerminalCell]]
+    private var alternateLines: [[TerminalCell]]?
+    private var primaryLines: [[TerminalCell]]?
     private var cursorRow = 0
     private var cursorCol = 0
     private var savedCursorRow = 0
@@ -1859,13 +1876,9 @@ private final class XtermScreenBuffer {
 
         self.cols = nextCols
         self.rows = nextRows
-        lines = lines.map { line in
-            var resized = Array(line.prefix(nextCols))
-            if resized.count < nextCols {
-                resized.append(contentsOf: Array(repeating: TerminalCell.blank, count: nextCols - resized.count))
-            }
-            return resized
-        }
+        lines = lines.map { resizeLine($0, cols: nextCols) }
+        primaryLines = primaryLines?.map { resizeLine($0, cols: nextCols) }
+        alternateLines = alternateLines?.map { resizeLine($0, cols: nextCols) }
         if lines.isEmpty {
             lines = [blankLine()]
         }
@@ -1886,20 +1899,7 @@ private final class XtermScreenBuffer {
         case .normal:
             handleNormal(scalar)
         case .escape:
-            if scalar == "[" {
-                parserState = .csi("")
-            } else if scalar == "7" {
-                savedCursorRow = cursorRow
-                savedCursorCol = cursorCol
-                parserState = .normal
-            } else if scalar == "8" {
-                cursorRow = savedCursorRow
-                cursorCol = savedCursorCol
-                ensureCursorLine()
-                parserState = .normal
-            } else {
-                parserState = .normal
-            }
+            handleEscape(scalar)
         case let .csi(buffer):
             let value = scalar.value
             if (0x40...0x7E).contains(value) {
@@ -1908,6 +1908,14 @@ private final class XtermScreenBuffer {
             } else {
                 parserState = .csi(buffer + String(scalar))
             }
+        case .osc:
+            if scalar == "\u{07}" {
+                parserState = .normal
+            } else if scalar == "\u{1B}" {
+                parserState = .oscEscape
+            }
+        case .oscEscape:
+            parserState = .normal
         }
     }
 
@@ -1934,6 +1942,37 @@ private final class XtermScreenBuffer {
         }
     }
 
+    private func handleEscape(_ scalar: UnicodeScalar) {
+        switch scalar {
+        case "[":
+            parserState = .csi("")
+        case "]":
+            parserState = .osc
+        case "7":
+            savedCursorRow = cursorRow
+            savedCursorCol = cursorCol
+            parserState = .normal
+        case "8":
+            restoreCursor()
+            parserState = .normal
+        case "D":
+            newLine()
+            parserState = .normal
+        case "E":
+            cursorCol = 0
+            newLine()
+            parserState = .normal
+        case "M":
+            reverseIndex()
+            parserState = .normal
+        case "c":
+            reset()
+            parserState = .normal
+        default:
+            parserState = .normal
+        }
+    }
+
     private func handleCSI(_ rawParameters: String, final: Character) {
         let parameters = csiParameters(rawParameters)
         let first = parameters.first ?? 0
@@ -1949,6 +1988,12 @@ private final class XtermScreenBuffer {
             cursorCol = min(cursorCol + max(first, 1), cols - 1)
         case "D":
             cursorCol = max(cursorCol - max(first, 1), 0)
+        case "E":
+            cursorRow = min(cursorRow + max(first, 1), max(lines.count - 1, 0))
+            cursorCol = 0
+        case "F":
+            cursorRow = max(cursorRow - max(first, 1), 0)
+            cursorCol = 0
         case "G":
             cursorCol = min(max(first, 1) - 1, cols - 1)
         case "d":
@@ -1956,7 +2001,7 @@ private final class XtermScreenBuffer {
             ensureCursorLine()
         case "H", "f":
             cursorRow = max((parameters.first ?? 1) - 1, 0)
-            cursorCol = max((parameters.dropFirst().first ?? 1) - 1, 0)
+            cursorCol = min(max((parameters.dropFirst().first ?? 1) - 1, 0), cols - 1)
             ensureCursorLine()
         case "J":
             if first == 0 {
@@ -1976,16 +2021,67 @@ private final class XtermScreenBuffer {
             } else {
                 clearLineFromCursor()
             }
+        case "P":
+            deleteCharacters(max(first, 1))
+        case "@":
+            insertCharacters(max(first, 1))
+        case "X":
+            eraseCharacters(max(first, 1))
+        case "L":
+            insertLines(max(first, 1))
+        case "M":
+            deleteLines(max(first, 1))
+        case "S":
+            scrollUp(max(first, 1))
+        case "T":
+            scrollDown(max(first, 1))
         case "s":
             savedCursorRow = cursorRow
             savedCursorCol = cursorCol
         case "u":
-            cursorRow = savedCursorRow
-            cursorCol = savedCursorCol
-            ensureCursorLine()
+            restoreCursor()
+        case "h", "l":
+            handleMode(rawParameters, enabled: final == "h")
         default:
             break
         }
+    }
+
+    private func handleMode(_ rawParameters: String, enabled: Bool) {
+        let values = Set(csiParameters(rawParameters))
+        guard values.contains(1049) || values.contains(47) || values.contains(1047) else {
+            return
+        }
+        if enabled {
+            guard primaryLines == nil else {
+                return
+            }
+            primaryLines = lines
+            savedCursorRow = cursorRow
+            savedCursorCol = cursorCol
+            alternateLines = Array(repeating: blankLine(), count: rows)
+            lines = alternateLines ?? [blankLine()]
+            cursorRow = 0
+            cursorCol = 0
+        } else if let primaryLines {
+            alternateLines = lines
+            lines = primaryLines
+            self.primaryLines = nil
+            restoreCursor()
+            ensureCursorLine()
+        }
+    }
+
+    private func reset() {
+        lines = [blankLine()]
+        primaryLines = nil
+        alternateLines = nil
+        cursorRow = 0
+        cursorCol = 0
+        savedCursorRow = 0
+        savedCursorCol = 0
+        parserState = .normal
+        currentStyle = TerminalStyle()
     }
 
     private func write(_ character: Character) {
@@ -2005,6 +2101,21 @@ private final class XtermScreenBuffer {
         trimScrollback()
     }
 
+    private func reverseIndex() {
+        if cursorRow > 0 {
+            cursorRow -= 1
+        } else {
+            lines.insert(blankLine(), at: 0)
+            trimScrollback()
+        }
+    }
+
+    private func restoreCursor() {
+        cursorRow = min(max(savedCursorRow, 0), max(lines.count - 1, 0))
+        cursorCol = min(max(savedCursorCol, 0), cols - 1)
+        ensureCursorLine()
+    }
+
     private func ensureCursorLine() {
         while cursorRow >= lines.count {
             lines.append(blankLine())
@@ -2021,6 +2132,14 @@ private final class XtermScreenBuffer {
             cells.append(contentsOf: Array(repeating: TerminalCell.blank, count: cols - cells.count))
         }
         return cells
+    }
+
+    private func resizeLine(_ line: [TerminalCell], cols: Int) -> [TerminalCell] {
+        var resized = Array(line.prefix(cols))
+        if resized.count < cols {
+            resized.append(contentsOf: Array(repeating: TerminalCell.blank, count: cols - resized.count))
+        }
+        return resized
     }
 
     private func visibleLength(_ line: [TerminalCell]) -> Int {
@@ -2073,6 +2192,79 @@ private final class XtermScreenBuffer {
         }
     }
 
+    private func deleteCharacters(_ count: Int) {
+        ensureCursorLine()
+        let end = min(cols, cursorCol + count)
+        guard cursorCol < end else {
+            return
+        }
+        lines[cursorRow].removeSubrange(cursorCol..<end)
+        lines[cursorRow].append(contentsOf: Array(repeating: TerminalCell.blank, count: end - cursorCol))
+    }
+
+    private func insertCharacters(_ count: Int) {
+        ensureCursorLine()
+        let insertCount = min(max(count, 0), cols - cursorCol)
+        guard insertCount > 0 else {
+            return
+        }
+        lines[cursorRow].insert(contentsOf: Array(repeating: TerminalCell.blank, count: insertCount), at: cursorCol)
+        lines[cursorRow] = Array(lines[cursorRow].prefix(cols))
+    }
+
+    private func eraseCharacters(_ count: Int) {
+        ensureCursorLine()
+        let end = min(cols, cursorCol + count)
+        guard cursorCol < end else {
+            return
+        }
+        for index in cursorCol..<end {
+            lines[cursorRow][index] = TerminalCell(character: " ", style: currentStyle.backgroundOnly)
+        }
+    }
+
+    private func insertLines(_ count: Int) {
+        ensureCursorLine()
+        let insertCount = min(max(count, 0), rows)
+        guard insertCount > 0 else {
+            return
+        }
+        for _ in 0..<insertCount {
+            lines.insert(blankLine(), at: cursorRow)
+        }
+        trimScrollback()
+    }
+
+    private func deleteLines(_ count: Int) {
+        ensureCursorLine()
+        let deleteCount = min(max(count, 0), max(lines.count - cursorRow, 0))
+        if deleteCount > 0 {
+            lines.removeSubrange(cursorRow..<(cursorRow + deleteCount))
+        }
+        if lines.isEmpty {
+            lines = [blankLine()]
+        }
+        ensureCursorLine()
+    }
+
+    private func scrollUp(_ count: Int) {
+        for _ in 0..<min(max(count, 0), max(lines.count, 1)) {
+            if !lines.isEmpty {
+                lines.removeFirst()
+            }
+            lines.append(blankLine())
+        }
+        cursorRow = min(cursorRow, max(lines.count - 1, 0))
+    }
+
+    private func scrollDown(_ count: Int) {
+        for _ in 0..<min(max(count, 0), rows) {
+            lines.insert(blankLine(), at: 0)
+        }
+        trimScrollback()
+        cursorRow = min(cursorRow + count, max(lines.count - 1, 0))
+    }
+
     private func trimmedCells(_ line: [TerminalCell]) -> [TerminalCell] {
         var end = line.count
         while end > 0, line[end - 1].character == " " {
@@ -2089,7 +2281,10 @@ private final class XtermScreenBuffer {
     }
 
     private func applySGR(_ raw: String) {
-        var parameters = raw.isEmpty ? [0] : raw.split(separator: ";", omittingEmptySubsequences: false).map { Int($0) ?? 0 }
+        var parameters = raw
+            .replacingOccurrences(of: ":", with: ";")
+            .split(separator: ";", omittingEmptySubsequences: false)
+            .map { Int($0) ?? 0 }
         if parameters.isEmpty {
             parameters = [0]
         }
@@ -2104,6 +2299,14 @@ private final class XtermScreenBuffer {
                 currentStyle.bold = true
             case 22:
                 currentStyle.bold = false
+            case 3:
+                currentStyle.italic = true
+            case 23:
+                currentStyle.italic = false
+            case 4:
+                currentStyle.underline = true
+            case 24:
+                currentStyle.underline = false
             case 7:
                 currentStyle.inverse = true
             case 27:
@@ -2163,6 +2366,8 @@ private struct TerminalStyle: Equatable {
     var foreground: TerminalColor?
     var background: TerminalColor?
     var bold = false
+    var italic = false
+    var underline = false
     var inverse = false
 
     var backgroundOnly: TerminalStyle {

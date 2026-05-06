@@ -23,6 +23,7 @@ protocol StellaAPIClient {
     func terminateTerminal(conversationID: ConversationSummary.ID, terminalID: TerminalSummary.ID) async throws -> TerminalSummary
     func terminalSession(conversationID: ConversationSummary.ID, terminalID: TerminalSummary.ID, offset: UInt64) async throws -> TerminalWebSocketSession
     func foregroundEvents(conversationID: ConversationSummary.ID) async throws -> AsyncThrowingStream<StellaRealtimeEvent, Error>
+    func invalidateTransport() async
 }
 
 struct ChatMessagePage: Hashable {
@@ -394,12 +395,15 @@ struct MockStellaAPIClient: StellaAPIClient {
             )
         }
     }
+
+    func invalidateTransport() async {}
 }
 
 struct StellaWebAPIClient: StellaAPIClient {
     let profile: ServerProfile
     var session: URLSession = StellaWebAPIClient.makeSession()
     private let tunnelManager = AppleSSHTunnelManager.shared
+    private static let realtimeReceiveTimeoutNanoseconds: UInt64 = 75_000_000_000
 
     private static func makeSession() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
@@ -440,7 +444,10 @@ struct StellaWebAPIClient: StellaAPIClient {
                 do {
                     task.resume()
                     while !Task.isCancelled {
-                        let message = try await task.receive()
+                        let message = try await Self.receiveWebSocketMessage(
+                            task,
+                            timeoutNanoseconds: Self.realtimeReceiveTimeoutNanoseconds
+                        )
                         guard let data = message.dataValue else {
                             continue
                         }
@@ -617,7 +624,10 @@ struct StellaWebAPIClient: StellaAPIClient {
                 do {
                     task.resume()
                     while !Task.isCancelled {
-                        let message = try await task.receive()
+                        let message = try await Self.receiveWebSocketMessage(
+                            task,
+                            timeoutNanoseconds: Self.realtimeReceiveTimeoutNanoseconds
+                        )
                         guard let data = message.dataValue else {
                             continue
                         }
@@ -637,6 +647,32 @@ struct StellaWebAPIClient: StellaAPIClient {
                 receiveTask.cancel()
                 task.cancel(with: .normalClosure, reason: nil)
             }
+        }
+    }
+
+    func invalidateTransport() async {
+        session.invalidateAndCancel()
+        await tunnelManager.close()
+    }
+
+    private static func receiveWebSocketMessage(
+        _ task: URLSessionWebSocketTask,
+        timeoutNanoseconds: UInt64
+    ) async throws -> URLSessionWebSocketTask.Message {
+        try await withThrowingTaskGroup(of: URLSessionWebSocketTask.Message.self) { group in
+            group.addTask {
+                try await task.receive()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: timeoutNanoseconds)
+                throw StellaAPIError.transport("WebSocket receive timed out.")
+            }
+
+            guard let message = try await group.next() else {
+                throw CancellationError()
+            }
+            group.cancelAll()
+            return message
         }
     }
 
@@ -741,6 +777,7 @@ enum StellaRealtimeEvent {
 enum StellaAPIError: Error, LocalizedError {
     case invalidResponse
     case http(status: Int, message: String)
+    case transport(String)
 
     var errorDescription: String? {
         switch self {
@@ -748,6 +785,8 @@ enum StellaAPIError: Error, LocalizedError {
             "Invalid server response"
         case .http(let status, let message):
             "HTTP \(status): \(message)"
+        case .transport(let message):
+            message
         }
     }
 }
@@ -1094,7 +1133,7 @@ private struct RealtimeEnvelope: Decodable {
     var next_message_id: String?
     var messages: [WebMessage]?
     var message: String?
-    var error: String?
+    var error: JSONValue?
     var phase: String?
     var final_state: String?
     var turn_id: String?
@@ -1135,7 +1174,7 @@ private struct RealtimeEnvelope: Decodable {
         case "turn_progress":
             return [.turnProgress(turnProgressFeedback)]
         case "error":
-            return [.error(message ?? error ?? "Realtime error")]
+            return [.error(message ?? error?.messageText ?? "Realtime error")]
         default:
             if type == nil,
                phase != nil || final_state != nil || progress != nil {
@@ -1158,7 +1197,7 @@ private struct RealtimeEnvelope: Decodable {
             model: model ?? progress?.model ?? "",
             activity: activity ?? progress?.activity ?? message ?? "",
             hint: hint ?? progress?.hint,
-            error: error ?? progress?.error,
+            error: error?.messageText ?? progress?.error,
             finalState: final_state ?? progress?.final_state,
             plan: (plan ?? progress?.plan)?.feedback
         )
@@ -1436,6 +1475,24 @@ private enum JSONValue: Decodable {
             return "[\(value.map(\.displayString).joined(separator: ", "))]"
         case .null:
             return "null"
+        }
+    }
+
+    var messageText: String? {
+        switch self {
+        case .string(let value):
+            return value.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        case .object(let value):
+            for key in ["message", "error", "detail", "code"] {
+                if let text = value[key]?.messageText {
+                    return text
+                }
+            }
+            return displayString.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        case .number, .bool, .array:
+            return displayString.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+        case .null:
+            return nil
         }
     }
 }

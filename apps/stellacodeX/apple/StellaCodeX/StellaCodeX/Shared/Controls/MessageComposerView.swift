@@ -8,6 +8,9 @@ struct MessageComposerView: View {
     let sendTitle: String
     let sendAction: () -> Void
     #if os(macOS)
+    @State private var measuredEditorHeight: CGFloat = 72
+    #endif
+    #if os(macOS)
     var attachments: [ComposerAttachment]
     var addFileAction: () -> Void
     var addImageAction: () -> Void
@@ -118,6 +121,7 @@ struct MessageComposerView: View {
             ZStack(alignment: .topLeading) {
                 MacMessageTextView(
                     text: $text,
+                    measuredHeight: $measuredEditorHeight,
                     submitAction: sendAction,
                     pasteImageAction: pasteImageAction
                 )
@@ -127,7 +131,7 @@ struct MessageComposerView: View {
 
                 if text.isEmpty {
                     Text("消息")
-                        .font(.body)
+                        .font(.system(size: StellaCodeXTypography.composerFontSize))
                         .foregroundStyle(.tertiary)
                         .padding(.horizontal, placeholderHorizontalPadding)
                         .padding(.vertical, placeholderVerticalPadding)
@@ -182,10 +186,7 @@ struct MessageComposerView: View {
 
     private var editorHeight: CGFloat {
         #if os(macOS)
-        let explicitLines = text.reduce(1) { count, character in
-            character == "\n" ? count + 1 : count
-        }
-        return min(132, max(76, CGFloat(explicitLines) * 20 + 42))
+        measuredEditorHeight
         #else
         54
         #endif
@@ -406,6 +407,7 @@ private struct ComposerAttachmentChip: View {
 
 private struct MacMessageTextView: NSViewRepresentable {
     @Binding var text: String
+    @Binding var measuredHeight: CGFloat
     let submitAction: () -> Void
     let pasteImageAction: () -> Bool
 
@@ -455,7 +457,7 @@ private struct MacMessageTextView: NSViewRepresentable {
         textView.isAutomaticDataDetectionEnabled = false
         textView.isAutomaticTextCompletionEnabled = false
         textView.enabledTextCheckingTypes = 0
-        textView.font = .preferredFont(forTextStyle: .body)
+        textView.font = .systemFont(ofSize: StellaCodeXTypography.composerFontSize)
         textView.textColor = .labelColor
         textView.insertionPointColor = .labelColor
         textView.textContainerInset = .zero
@@ -477,7 +479,7 @@ private struct MacMessageTextView: NSViewRepresentable {
         if textView.string != text {
             textView.string = text
         }
-        textView.font = .preferredFont(forTextStyle: .body)
+        textView.font = .systemFont(ofSize: StellaCodeXTypography.composerFontSize)
         textView.textColor = .labelColor
         textView.insertionPointColor = .labelColor
         if let composerTextView = textView as? MacComposerNSTextView {
@@ -486,18 +488,38 @@ private struct MacMessageTextView: NSViewRepresentable {
             }
             composerTextView.pasteImageAction = pasteImageAction
         }
+        Self.updateMeasuredHeight(for: textView, measuredHeight: $measuredHeight)
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text, submitAction: submitAction)
+        Coordinator(text: $text, measuredHeight: $measuredHeight, submitAction: submitAction)
+    }
+
+    fileprivate static func updateMeasuredHeight(for textView: NSTextView, measuredHeight: Binding<CGFloat>) {
+        guard let layoutManager = textView.layoutManager,
+              let textContainer = textView.textContainer
+        else {
+            return
+        }
+        layoutManager.ensureLayout(for: textContainer)
+        let usedHeight = ceil(layoutManager.usedRect(for: textContainer).height)
+        let nextHeight = min(126, max(72, usedHeight + 4))
+        guard abs(measuredHeight.wrappedValue - nextHeight) > 1 else {
+            return
+        }
+        DispatchQueue.main.async {
+            measuredHeight.wrappedValue = nextHeight
+        }
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         @Binding private var text: String
+        @Binding private var measuredHeight: CGFloat
         private let submitAction: () -> Void
 
-        init(text: Binding<String>, submitAction: @escaping () -> Void) {
+        init(text: Binding<String>, measuredHeight: Binding<CGFloat>, submitAction: @escaping () -> Void) {
             self._text = text
+            self._measuredHeight = measuredHeight
             self.submitAction = submitAction
         }
 
@@ -505,6 +527,7 @@ private struct MacMessageTextView: NSViewRepresentable {
             guard let textView = notification.object as? NSTextView else {
                 return
             }
+            MacMessageTextView.updateMeasuredHeight(for: textView, measuredHeight: $measuredHeight)
             let nextText = textView.string
             guard text != nextText else {
                 return
@@ -529,7 +552,9 @@ private final class MacComposerNSTextView: NSTextView {
 
     override func keyDown(with event: NSEvent) {
         let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        if flags.contains(.command), event.keyCode == 36 || event.keyCode == 76 {
+        let isReturn = event.keyCode == 36 || event.keyCode == 76
+        let wantsNewline = flags.contains(.shift) || flags.contains(.option)
+        if isReturn, !wantsNewline {
             submitAction?(string)
             return
         }

@@ -143,7 +143,6 @@ struct MacTerminalPanelView: View {
             .background(Color.black)
         } else {
             MacTerminalScreenView(
-                text: model.screenText,
                 attributedText: model.screenAttributedText,
                 statusText: model.statusText,
                 droppedBytes: model.droppedBytes,
@@ -170,7 +169,6 @@ private struct MacTerminalScreenView: View {
     private let terminalLineHeight: CGFloat = 20
     private let terminalContentInset: CGFloat = 18
 
-    let text: String
     let attributedText: NSAttributedString
     let statusText: String
     let droppedBytes: UInt64
@@ -277,13 +275,9 @@ private struct MacTerminalNativeTextView: NSViewRepresentable {
             )
             rendered.insert(gap, at: 0)
         }
-        rendered.addAttributes(
-            [.backgroundColor: NSColor.black],
-            range: NSRange(location: 0, length: rendered.length)
-        )
         applyDefaultTerminalAttributes(to: rendered)
 
-        if textView.string != rendered.string || context.coordinator.lastDroppedBytes != droppedBytes {
+        if !textView.attributedString().isEqual(to: rendered) || context.coordinator.lastDroppedBytes != droppedBytes {
             textView.textStorage?.setAttributedString(rendered)
             context.coordinator.lastDroppedBytes = droppedBytes
             textView.scrollRangeToVisible(NSRange(location: max(0, rendered.length - 1), length: 1))
@@ -461,6 +455,7 @@ private final class MacTerminalSessionsModel: ObservableObject {
     private var conversationID: ConversationSummary.ID?
     private var websocket: TerminalWebSocketSession?
     private var streamTask: Task<Void, Never>?
+    private var screen = MacXtermScreenBuffer(cols: 100, rows: 32)
     private var viewportSize = MacTerminalViewportSize(cols: 100, rows: 32)
     private var nextOffset: UInt64 = 0
     private var cachedRawOutput = Data()
@@ -498,6 +493,7 @@ private final class MacTerminalSessionsModel: ObservableObject {
                 await selectTerminal(activeTerminal)
             } else {
                 close()
+                screen = MacXtermScreenBuffer(cols: viewportSize.cols, rows: viewportSize.rows)
                 screenText = ""
                 statusText = ""
             }
@@ -542,6 +538,7 @@ private final class MacTerminalSessionsModel: ObservableObject {
             if let next = self.activeTerminal {
                 await selectTerminal(next)
             } else {
+                screen = MacXtermScreenBuffer(cols: viewportSize.cols, rows: viewportSize.rows)
                 screenText = ""
                 screenAttributedText = MacTerminalTextRenderer.attributedPlain(" ")
                 statusText = ""
@@ -563,11 +560,17 @@ private final class MacTerminalSessionsModel: ObservableObject {
         droppedBytes = 0
 
         let cached = MacTerminalOutputCacheStore.load(conversationID: terminal.conversationID, terminalID: terminal.id)
+        screen = MacXtermScreenBuffer(cols: viewportSize.cols, rows: viewportSize.rows)
         if let cached,
            cached.hasUsableContent,
            cached.nextOffset <= terminal.nextOffset {
             cachedRawOutput = cached.rawData
-            updateRenderedOutput(fallback: cached.text)
+            if cachedRawOutput.isEmpty {
+                screen.replace(with: cached.text)
+            } else {
+                screen.feed(cachedRawOutput)
+            }
+            updatePublishedScreen()
             nextOffset = cached.nextOffset
         } else {
             if cached != nil {
@@ -611,6 +614,18 @@ private final class MacTerminalSessionsModel: ObservableObject {
         }
         viewportSize = size
         websocket?.resize(cols: size.cols, rows: size.rows)
+
+        guard activeTerminal != nil else {
+            return
+        }
+
+        if cachedRawOutput.isEmpty {
+            screen.resize(cols: size.cols, rows: size.rows)
+        } else {
+            screen = MacXtermScreenBuffer(cols: size.cols, rows: size.rows)
+            screen.feed(cachedRawOutput)
+        }
+        updatePublishedScreen()
     }
 
     func sendInput(_ input: String) {
@@ -640,7 +655,8 @@ private final class MacTerminalSessionsModel: ObservableObject {
             if cachedRawOutput.count > 500_000 {
                 cachedRawOutput.removeFirst(cachedRawOutput.count - 500_000)
             }
-            updateRenderedOutput(fallback: screenText)
+            screen.feed(data)
+            updatePublishedScreen()
             MacTerminalOutputCacheStore.save(
                 MacTerminalCacheSnapshot(text: screenText, nextOffset: nextOffset, rawData: cachedRawOutput),
                 conversationID: terminal.conversationID,
@@ -662,10 +678,9 @@ private final class MacTerminalSessionsModel: ObservableObject {
         }
     }
 
-    private func updateRenderedOutput(fallback: String) {
-        let rendered = MacTerminalTextRenderer.render(cachedRawOutput, fallback: fallback)
-        screenText = rendered
-        screenAttributedText = MacTerminalTextRenderer.renderAttributed(cachedRawOutput, fallback: rendered)
+    private func updatePublishedScreen() {
+        screenText = screen.renderedText
+        screenAttributedText = screen.renderedAttributedText
     }
 }
 
@@ -737,6 +752,671 @@ private enum MacTerminalOutputCacheStore {
         }
         let result = String(scalars)
         return result.isEmpty ? "terminal" : result
+    }
+}
+
+private final class MacXtermScreenBuffer {
+    private enum ParserState {
+        case normal
+        case escape
+        case csi(String)
+        case osc
+        case oscEscape
+    }
+
+    private let scrollbackLimit = 2_000
+    private var cols: Int
+    private var rows: Int
+    private var lines: [[MacTerminalCell]]
+    private var alternateLines: [[MacTerminalCell]]?
+    private var primaryLines: [[MacTerminalCell]]?
+    private var cursorRow = 0
+    private var cursorCol = 0
+    private var savedCursorRow = 0
+    private var savedCursorCol = 0
+    private var parserState: ParserState = .normal
+    private var currentStyle = MacTerminalStyle()
+
+    init(cols: Int, rows: Int) {
+        self.cols = max(cols, 20)
+        self.rows = max(rows, 8)
+        self.lines = [Array(repeating: MacTerminalCell.blank, count: max(cols, 20))]
+    }
+
+    var renderedText: String {
+        lines
+            .map { String($0.map(\.character)).trimmingCharacters(in: .whitespaces) }
+            .joined(separator: "\n")
+    }
+
+    var renderedAttributedText: NSAttributedString {
+        let output = NSMutableAttributedString()
+        for (lineIndex, line) in lines.enumerated() {
+            let cells = trimmedCells(line)
+            if cells.isEmpty {
+                if lineIndex < lines.count - 1 {
+                    output.append(MacTerminalTextRenderer.attributedPlain("\n"))
+                }
+                continue
+            }
+
+            var runStart = 0
+            while runStart < cells.count {
+                let style = cells[runStart].style
+                var runEnd = runStart + 1
+                while runEnd < cells.count, cells[runEnd].style == style {
+                    runEnd += 1
+                }
+
+                output.append(NSAttributedString(
+                    string: String(cells[runStart..<runEnd].map(\.character)),
+                    attributes: style.attributes
+                ))
+                runStart = runEnd
+            }
+
+            if lineIndex < lines.count - 1 {
+                output.append(MacTerminalTextRenderer.attributedPlain("\n"))
+            }
+        }
+
+        return output.length == 0 ? MacTerminalTextRenderer.attributedPlain(" ") : output
+    }
+
+    func replace(with text: String) {
+        let split = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        lines = split.isEmpty ? [blankLine()] : split.map { paddedLine($0) }
+        cursorRow = max(lines.count - 1, 0)
+        cursorCol = lines.last.map { min(visibleLength($0), cols - 1) } ?? 0
+        trimScrollback()
+    }
+
+    func resize(cols: Int, rows: Int) {
+        let nextCols = max(cols, 20)
+        let nextRows = max(rows, 8)
+        guard nextCols != self.cols || nextRows != self.rows else {
+            return
+        }
+
+        self.cols = nextCols
+        self.rows = nextRows
+        lines = lines.map { resizeLine($0, cols: nextCols) }
+        primaryLines = primaryLines?.map { resizeLine($0, cols: nextCols) }
+        alternateLines = alternateLines?.map { resizeLine($0, cols: nextCols) }
+        if lines.isEmpty {
+            lines = [blankLine()]
+        }
+        cursorRow = min(cursorRow, max(lines.count - 1, 0))
+        cursorCol = min(cursorCol, nextCols - 1)
+        trimScrollback()
+    }
+
+    func feed(_ data: Data) {
+        let string = String(decoding: data, as: UTF8.self)
+        for scalar in string.unicodeScalars {
+            feed(scalar)
+        }
+    }
+
+    private func feed(_ scalar: UnicodeScalar) {
+        switch parserState {
+        case .normal:
+            handleNormal(scalar)
+        case .escape:
+            handleEscape(scalar)
+        case let .csi(buffer):
+            let value = scalar.value
+            if (0x40...0x7E).contains(value) {
+                handleCSI(buffer, final: Character(scalar))
+                parserState = .normal
+            } else {
+                parserState = .csi(buffer + String(scalar))
+            }
+        case .osc:
+            if scalar == "\u{07}" {
+                parserState = .normal
+            } else if scalar == "\u{1B}" {
+                parserState = .oscEscape
+            }
+        case .oscEscape:
+            parserState = .normal
+        }
+    }
+
+    private func handleNormal(_ scalar: UnicodeScalar) {
+        switch scalar {
+        case "\u{1B}":
+            parserState = .escape
+        case "\r":
+            cursorCol = 0
+        case "\n":
+            newLine()
+        case "\u{08}":
+            cursorCol = max(cursorCol - 1, 0)
+        case "\t":
+            let spaces = max(1, 8 - (cursorCol % 8))
+            for _ in 0..<spaces {
+                write(" ")
+            }
+        default:
+            guard !CharacterSet.controlCharacters.contains(scalar) else {
+                return
+            }
+            write(Character(scalar))
+        }
+    }
+
+    private func handleEscape(_ scalar: UnicodeScalar) {
+        switch scalar {
+        case "[":
+            parserState = .csi("")
+        case "]":
+            parserState = .osc
+        case "7":
+            savedCursorRow = cursorRow
+            savedCursorCol = cursorCol
+            parserState = .normal
+        case "8":
+            restoreCursor()
+            parserState = .normal
+        case "D":
+            newLine()
+            parserState = .normal
+        case "E":
+            cursorCol = 0
+            newLine()
+            parserState = .normal
+        case "M":
+            reverseIndex()
+            parserState = .normal
+        case "c":
+            reset()
+            parserState = .normal
+        default:
+            parserState = .normal
+        }
+    }
+
+    private func handleCSI(_ rawParameters: String, final: Character) {
+        let parameters = csiParameters(rawParameters)
+        let first = parameters.first ?? 0
+
+        switch final {
+        case "m":
+            applySGR(rawParameters)
+        case "A":
+            cursorRow = max(cursorRow - max(first, 1), 0)
+        case "B":
+            cursorRow = min(cursorRow + max(first, 1), max(lines.count - 1, 0))
+        case "C":
+            cursorCol = min(cursorCol + max(first, 1), cols - 1)
+        case "D":
+            cursorCol = max(cursorCol - max(first, 1), 0)
+        case "E":
+            cursorRow = min(cursorRow + max(first, 1), max(lines.count - 1, 0))
+            cursorCol = 0
+        case "F":
+            cursorRow = max(cursorRow - max(first, 1), 0)
+            cursorCol = 0
+        case "G":
+            cursorCol = min(max(first, 1) - 1, cols - 1)
+        case "d":
+            cursorRow = max(first - 1, 0)
+            ensureCursorLine()
+        case "H", "f":
+            cursorRow = max((parameters.first ?? 1) - 1, 0)
+            cursorCol = min(max((parameters.dropFirst().first ?? 1) - 1, 0), cols - 1)
+            ensureCursorLine()
+        case "J":
+            if first == 0 {
+                clearDisplayFromCursor()
+            } else if first == 1 {
+                clearDisplayToCursor()
+            } else if first == 2 || first == 3 {
+                lines = [blankLine()]
+                cursorRow = 0
+                cursorCol = 0
+            }
+        case "K":
+            if first == 1 {
+                clearLineToCursor()
+            } else if first == 2 {
+                lines[cursorRow] = blankLine()
+            } else {
+                clearLineFromCursor()
+            }
+        case "P":
+            deleteCharacters(max(first, 1))
+        case "@":
+            insertCharacters(max(first, 1))
+        case "X":
+            eraseCharacters(max(first, 1))
+        case "L":
+            insertLines(max(first, 1))
+        case "M":
+            deleteLines(max(first, 1))
+        case "S":
+            scrollUp(max(first, 1))
+        case "T":
+            scrollDown(max(first, 1))
+        case "s":
+            savedCursorRow = cursorRow
+            savedCursorCol = cursorCol
+        case "u":
+            restoreCursor()
+        case "h", "l":
+            handleMode(rawParameters, enabled: final == "h")
+        default:
+            break
+        }
+    }
+
+    private func handleMode(_ rawParameters: String, enabled: Bool) {
+        let values = Set(csiParameters(rawParameters))
+        guard values.contains(1049) || values.contains(47) || values.contains(1047) else {
+            return
+        }
+        if enabled {
+            guard primaryLines == nil else {
+                return
+            }
+            primaryLines = lines
+            savedCursorRow = cursorRow
+            savedCursorCol = cursorCol
+            alternateLines = Array(repeating: blankLine(), count: rows)
+            lines = alternateLines ?? [blankLine()]
+            cursorRow = 0
+            cursorCol = 0
+        } else if let primaryLines {
+            alternateLines = lines
+            lines = primaryLines
+            self.primaryLines = nil
+            restoreCursor()
+            ensureCursorLine()
+        }
+    }
+
+    private func reset() {
+        lines = [blankLine()]
+        primaryLines = nil
+        alternateLines = nil
+        cursorRow = 0
+        cursorCol = 0
+        savedCursorRow = 0
+        savedCursorCol = 0
+        parserState = .normal
+        currentStyle = MacTerminalStyle()
+    }
+
+    private func write(_ character: Character) {
+        ensureCursorLine()
+        lines[cursorRow][cursorCol] = MacTerminalCell(character: character, style: currentStyle)
+        cursorCol += 1
+        if cursorCol >= cols {
+            cursorCol = 0
+            newLine()
+        }
+    }
+
+    private func newLine() {
+        cursorRow += 1
+        cursorCol = 0
+        ensureCursorLine()
+        trimScrollback()
+    }
+
+    private func reverseIndex() {
+        if cursorRow > 0 {
+            cursorRow -= 1
+        } else {
+            lines.insert(blankLine(), at: 0)
+            trimScrollback()
+        }
+    }
+
+    private func restoreCursor() {
+        cursorRow = min(max(savedCursorRow, 0), max(lines.count - 1, 0))
+        cursorCol = min(max(savedCursorCol, 0), cols - 1)
+    }
+
+    private func ensureCursorLine() {
+        while cursorRow >= lines.count {
+            lines.append(blankLine())
+        }
+    }
+
+    private func blankLine() -> [MacTerminalCell] {
+        Array(repeating: MacTerminalCell(character: " ", style: currentStyle.backgroundOnly), count: cols)
+    }
+
+    private func paddedLine(_ text: String) -> [MacTerminalCell] {
+        var cells = text.prefix(cols).map { MacTerminalCell(character: $0, style: MacTerminalStyle()) }
+        if cells.count < cols {
+            cells.append(contentsOf: Array(repeating: MacTerminalCell.blank, count: cols - cells.count))
+        }
+        return cells
+    }
+
+    private func resizeLine(_ line: [MacTerminalCell], cols: Int) -> [MacTerminalCell] {
+        var resized = Array(line.prefix(cols))
+        if resized.count < cols {
+            resized.append(contentsOf: Array(repeating: MacTerminalCell.blank, count: cols - resized.count))
+        }
+        return resized
+    }
+
+    private func visibleLength(_ line: [MacTerminalCell]) -> Int {
+        String(line.map(\.character)).trimmingCharacters(in: .whitespaces).count
+    }
+
+    private func trimScrollback() {
+        let limit = max(scrollbackLimit, rows)
+        if lines.count > limit {
+            let overflow = lines.count - limit
+            lines.removeFirst(overflow)
+            cursorRow = max(cursorRow - overflow, 0)
+        }
+    }
+
+    private func clearDisplayFromCursor() {
+        ensureCursorLine()
+        clearLineFromCursor()
+        if cursorRow + 1 < lines.count {
+            for row in (cursorRow + 1)..<lines.count {
+                lines[row] = blankLine()
+            }
+        }
+    }
+
+    private func clearDisplayToCursor() {
+        ensureCursorLine()
+        if cursorRow > 0 {
+            for row in 0..<cursorRow {
+                lines[row] = blankLine()
+            }
+        }
+        clearLineToCursor()
+    }
+
+    private func clearLineFromCursor() {
+        ensureCursorLine()
+        guard cursorCol < cols else {
+            return
+        }
+        for index in cursorCol..<cols {
+            lines[cursorRow][index] = MacTerminalCell(character: " ", style: currentStyle.backgroundOnly)
+        }
+    }
+
+    private func clearLineToCursor() {
+        ensureCursorLine()
+        for index in 0...min(cursorCol, cols - 1) {
+            lines[cursorRow][index] = MacTerminalCell(character: " ", style: currentStyle.backgroundOnly)
+        }
+    }
+
+    private func deleteCharacters(_ count: Int) {
+        ensureCursorLine()
+        let end = min(cols, cursorCol + count)
+        lines[cursorRow].removeSubrange(cursorCol..<end)
+        lines[cursorRow].append(contentsOf: Array(repeating: MacTerminalCell.blank, count: end - cursorCol))
+    }
+
+    private func insertCharacters(_ count: Int) {
+        ensureCursorLine()
+        let insertCount = min(max(count, 0), cols - cursorCol)
+        lines[cursorRow].insert(contentsOf: Array(repeating: MacTerminalCell.blank, count: insertCount), at: cursorCol)
+        lines[cursorRow] = Array(lines[cursorRow].prefix(cols))
+    }
+
+    private func eraseCharacters(_ count: Int) {
+        ensureCursorLine()
+        let end = min(cols, cursorCol + count)
+        for index in cursorCol..<end {
+            lines[cursorRow][index] = MacTerminalCell(character: " ", style: currentStyle.backgroundOnly)
+        }
+    }
+
+    private func insertLines(_ count: Int) {
+        ensureCursorLine()
+        let insertCount = min(max(count, 0), rows)
+        for _ in 0..<insertCount {
+            lines.insert(blankLine(), at: cursorRow)
+        }
+        trimScrollback()
+    }
+
+    private func deleteLines(_ count: Int) {
+        ensureCursorLine()
+        let deleteCount = min(max(count, 0), max(lines.count - cursorRow, 0))
+        if deleteCount > 0 {
+            lines.removeSubrange(cursorRow..<(cursorRow + deleteCount))
+        }
+        if lines.isEmpty {
+            lines = [blankLine()]
+        }
+        ensureCursorLine()
+    }
+
+    private func scrollUp(_ count: Int) {
+        for _ in 0..<min(max(count, 0), max(lines.count, 1)) {
+            if !lines.isEmpty {
+                lines.removeFirst()
+            }
+            lines.append(blankLine())
+        }
+        cursorRow = min(cursorRow, max(lines.count - 1, 0))
+    }
+
+    private func scrollDown(_ count: Int) {
+        for _ in 0..<min(max(count, 0), rows) {
+            lines.insert(blankLine(), at: 0)
+        }
+        trimScrollback()
+        cursorRow = min(cursorRow + count, max(lines.count - 1, 0))
+    }
+
+    private func trimmedCells(_ line: [MacTerminalCell]) -> [MacTerminalCell] {
+        var end = line.count
+        while end > 0, line[end - 1].character == " " {
+            end -= 1
+        }
+        return Array(line.prefix(end))
+    }
+
+    private func csiParameters(_ raw: String) -> [Int] {
+        raw.split(separator: ";", omittingEmptySubsequences: false).map { part in
+            let digits = part.filter { $0.isNumber || $0 == "-" }
+            return Int(digits) ?? 0
+        }
+    }
+
+    private func applySGR(_ raw: String) {
+        var parameters = raw
+            .replacingOccurrences(of: ":", with: ";")
+            .split(separator: ";", omittingEmptySubsequences: false)
+            .map { Int($0) ?? 0 }
+        if parameters.isEmpty {
+            parameters = [0]
+        }
+
+        var index = 0
+        while index < parameters.count {
+            let value = parameters[index]
+            switch value {
+            case 0:
+                currentStyle = MacTerminalStyle()
+            case 1:
+                currentStyle.bold = true
+            case 2:
+                currentStyle.dim = true
+            case 22:
+                currentStyle.bold = false
+                currentStyle.dim = false
+            case 3:
+                currentStyle.italic = true
+            case 23:
+                currentStyle.italic = false
+            case 4:
+                currentStyle.underline = true
+            case 24:
+                currentStyle.underline = false
+            case 7:
+                currentStyle.inverse = true
+            case 27:
+                currentStyle.inverse = false
+            case 30...37:
+                currentStyle.foreground = MacTerminalColor.palette(value - 30)
+            case 39:
+                currentStyle.foreground = nil
+            case 40...47:
+                currentStyle.background = MacTerminalColor.palette(value - 40)
+            case 49:
+                currentStyle.background = nil
+            case 90...97:
+                currentStyle.foreground = MacTerminalColor.palette(value - 90 + 8)
+            case 100...107:
+                currentStyle.background = MacTerminalColor.palette(value - 100 + 8)
+            case 38, 48:
+                let isForeground = value == 38
+                if index + 2 < parameters.count, parameters[index + 1] == 5 {
+                    setColor(MacTerminalColor.ansi256(parameters[index + 2]), foreground: isForeground)
+                    index += 2
+                } else if index + 4 < parameters.count, parameters[index + 1] == 2 {
+                    setColor(
+                        MacTerminalColor.rgb(
+                            red: parameters[index + 2],
+                            green: parameters[index + 3],
+                            blue: parameters[index + 4]
+                        ),
+                        foreground: isForeground
+                    )
+                    index += 4
+                }
+            default:
+                break
+            }
+            index += 1
+        }
+    }
+
+    private func setColor(_ color: MacTerminalColor, foreground: Bool) {
+        if foreground {
+            currentStyle.foreground = color
+        } else {
+            currentStyle.background = color
+        }
+    }
+}
+
+private struct MacTerminalCell: Equatable {
+    var character: Character
+    var style: MacTerminalStyle
+
+    static let blank = MacTerminalCell(character: " ", style: MacTerminalStyle())
+}
+
+private struct MacTerminalStyle: Equatable {
+    var foreground: MacTerminalColor?
+    var background: MacTerminalColor?
+    var bold = false
+    var dim = false
+    var italic = false
+    var underline = false
+    var inverse = false
+
+    var backgroundOnly: MacTerminalStyle {
+        MacTerminalStyle(foreground: nil, background: background)
+    }
+
+    var attributes: [NSAttributedString.Key: Any] {
+        var attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: 15, weight: bold ? .bold : .regular),
+            .foregroundColor: foregroundColor,
+            .backgroundColor: backgroundColor
+        ]
+        if underline {
+            attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue
+        }
+        if italic {
+            attributes[.obliqueness] = 0.18
+        }
+        return attributes
+    }
+
+    private var foregroundColor: NSColor {
+        if inverse {
+            return background?.nsColor ?? .black
+        }
+        let color = foreground?.nsColor ?? (bold ? .white : NSColor(calibratedWhite: 0.92, alpha: 1))
+        return dim ? color.withAlphaComponent(0.68) : color
+    }
+
+    private var backgroundColor: NSColor {
+        if inverse {
+            return foreground?.nsColor ?? NSColor(calibratedWhite: 0.92, alpha: 1)
+        }
+        return background?.nsColor ?? .black
+    }
+}
+
+private struct MacTerminalColor: Equatable {
+    var red: Double
+    var green: Double
+    var blue: Double
+
+    var nsColor: NSColor {
+        NSColor(calibratedRed: red, green: green, blue: blue, alpha: 1)
+    }
+
+    static func palette(_ index: Int) -> MacTerminalColor {
+        let palette: [MacTerminalColor] = [
+            rgb(red: 0, green: 0, blue: 0),
+            rgb(red: 205, green: 49, blue: 49),
+            rgb(red: 13, green: 188, blue: 121),
+            rgb(red: 229, green: 229, blue: 16),
+            rgb(red: 36, green: 114, blue: 200),
+            rgb(red: 188, green: 63, blue: 188),
+            rgb(red: 17, green: 168, blue: 205),
+            rgb(red: 229, green: 229, blue: 229),
+            rgb(red: 102, green: 102, blue: 102),
+            rgb(red: 241, green: 76, blue: 76),
+            rgb(red: 35, green: 209, blue: 139),
+            rgb(red: 245, green: 245, blue: 67),
+            rgb(red: 59, green: 142, blue: 234),
+            rgb(red: 214, green: 112, blue: 214),
+            rgb(red: 41, green: 184, blue: 219),
+            rgb(red: 255, green: 255, blue: 255)
+        ]
+        return palette[max(0, min(index, palette.count - 1))]
+    }
+
+    static func ansi256(_ index: Int) -> MacTerminalColor {
+        let clamped = max(0, min(index, 255))
+        if clamped < 16 {
+            return palette(clamped)
+        }
+        if clamped < 232 {
+            let value = clamped - 16
+            let red = value / 36
+            let green = (value % 36) / 6
+            let blue = value % 6
+            return rgb(red: cubeComponent(red), green: cubeComponent(green), blue: cubeComponent(blue))
+        }
+        let gray = 8 + (clamped - 232) * 10
+        return rgb(red: gray, green: gray, blue: gray)
+    }
+
+    static func rgb(red: Int, green: Int, blue: Int) -> MacTerminalColor {
+        MacTerminalColor(
+            red: Double(max(0, min(red, 255))) / 255.0,
+            green: Double(max(0, min(green, 255))) / 255.0,
+            blue: Double(max(0, min(blue, 255))) / 255.0
+        )
+    }
+
+    private static func cubeComponent(_ value: Int) -> Int {
+        value == 0 ? 0 : 55 + value * 40
     }
 }
 

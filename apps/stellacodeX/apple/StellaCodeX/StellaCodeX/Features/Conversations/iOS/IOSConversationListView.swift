@@ -23,6 +23,33 @@ struct IOSConversationListView: View {
                 .listRowInsets(EdgeInsets())
                 .listRowSeparator(.hidden)
                 .listRowBackground(PlatformColor.appBackground)
+                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                    Button(role: .destructive) {
+                        withAnimation(StellaCodeXMotion.standard) {
+                            viewModel.deleteConversationWithUndo(id: conversation.id)
+                        }
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+
+                    Button {
+                        withAnimation(StellaCodeXMotion.quick) {
+                            viewModel.toggleConversationPinned(id: conversation.id)
+                        }
+                    } label: {
+                        Label(conversation.isPinned ? "Unpin" : "Pin", systemImage: conversation.isPinned ? "pin.slash" : "pin")
+                    }
+                    .tint(.orange)
+                }
+                .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                    Button {
+                        viewModel.markConversationReadNow(id: conversation.id)
+                    } label: {
+                        Label("Read", systemImage: "checkmark.circle")
+                    }
+                    .tint(.blue)
+                    .disabled(!conversation.isUnread)
+                }
                 .contextMenu {
                     Button {
                         renameDraft = ConversationRenameDraft(conversation: conversation)
@@ -31,7 +58,7 @@ struct IOSConversationListView: View {
                     }
 
                     Button {
-                        withAnimation(.smooth(duration: 0.2)) {
+                        withAnimation(StellaCodeXMotion.quick) {
                             viewModel.toggleConversationPinned(id: conversation.id)
                         }
                     } label: {
@@ -49,18 +76,12 @@ struct IOSConversationListView: View {
                 let ids = offsets.compactMap { index in
                     viewModel.conversations.indices.contains(index) ? viewModel.conversations[index].id : nil
                 }
-                withAnimation(.smooth(duration: 0.22)) {
+                withAnimation(StellaCodeXMotion.standard) {
                     ids.forEach { id in
                         viewModel.deleteConversationWithUndo(id: id)
                     }
                 }
             }
-
-            Color.clear
-                .frame(height: viewModel.pendingConversationDeletion == nil ? 92 : 154)
-                .listRowInsets(EdgeInsets())
-                .listRowSeparator(.hidden)
-                .listRowBackground(PlatformColor.appBackground)
         }
         .listStyle(.plain)
         .contentMargins(.top, 0, for: .scrollContent)
@@ -69,11 +90,14 @@ struct IOSConversationListView: View {
         .background(PlatformColor.appBackground)
         .safeAreaInset(edge: .top, spacing: 0) {
             IOSChatsHeader(
-                isEditing: editingBinding,
                 onCreate: {
                     isNewConversationPresented = true
                 }
             )
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            Color.clear
+                .frame(height: viewModel.pendingConversationDeletion == nil ? 92 : 154)
         }
         .overlay {
             if viewModel.conversations.isEmpty {
@@ -83,7 +107,7 @@ struct IOSConversationListView: View {
         .overlay(alignment: .bottom) {
             if let deletion = viewModel.pendingConversationDeletion {
                 IOSUndoDeleteBanner(deletion: deletion) {
-                    withAnimation(.smooth(duration: 0.22)) {
+                    withAnimation(StellaCodeXMotion.standard) {
                         viewModel.undoPendingConversationDeletion(id: deletion.id)
                     }
                 }
@@ -92,7 +116,7 @@ struct IOSConversationListView: View {
                 .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
-        .animation(.smooth(duration: 0.22), value: viewModel.pendingConversationDeletion)
+        .animation(StellaCodeXMotion.standard, value: viewModel.pendingConversationDeletion?.id)
         .toolbar(.hidden, for: .navigationBar)
         .sheet(isPresented: $isNewConversationPresented) {
             NewConversationSheetView(
@@ -118,19 +142,6 @@ struct IOSConversationListView: View {
         } message: {
             Text("Set a display name for this conversation.")
         }
-    }
-
-    private var editingBinding: Binding<Bool> {
-        Binding(
-            get: {
-                editMode.isEditing
-            },
-            set: { value in
-                withAnimation(.smooth(duration: 0.22)) {
-                    editMode = value ? .active : .inactive
-                }
-            }
-        )
     }
 }
 
@@ -160,7 +171,6 @@ private struct ConversationRenameDraft {
 }
 
 private struct IOSChatsHeader: View {
-    @Binding var isEditing: Bool
     let onCreate: () -> Void
 
     var body: some View {
@@ -171,11 +181,7 @@ private struct IOSChatsHeader: View {
                     .frame(maxWidth: .infinity)
 
                 HStack(alignment: .center) {
-                    Button(isEditing ? "Done" : "Edit") {
-                        withAnimation(.smooth(duration: 0.22)) {
-                            isEditing.toggle()
-                        }
-                    }
+                    EditButton()
                     .font(.body.weight(.semibold))
                     .padding(.horizontal, 15)
                     .frame(height: 44)
@@ -237,12 +243,12 @@ private struct IOSConversationRow: View {
                     .lineLimit(1)
             }
             .padding(.trailing, hasRightStatus ? 42 : 0)
-            .frame(maxWidth: .infinity, minHeight: 66, maxHeight: 66, alignment: .leading)
-            .offset(y: -3)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .padding(.leading, 20)
         .padding(.trailing, 16)
-        .frame(maxWidth: .infinity, minHeight: 86, alignment: .center)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, minHeight: 86, idealHeight: 86, alignment: .center)
         .contentShape(Rectangle())
         .overlay(alignment: .bottom) {
             Rectangle()
