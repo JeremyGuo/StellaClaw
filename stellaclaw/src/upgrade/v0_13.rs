@@ -38,7 +38,7 @@ impl WorkdirUpgrader for StellaclawConversationSpecialPathUpgrade {
             }
             let root = entry.path();
             if root.is_dir() {
-                migrate_conversation_special_paths(&root)?;
+                migrate_conversation_special_paths(workdir, &root)?;
             }
         }
 
@@ -65,7 +65,7 @@ fn migrate_runtime_special_paths(workdir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn migrate_conversation_special_paths(root: &Path) -> Result<()> {
+fn migrate_conversation_special_paths(workdir: &Path, root: &Path) -> Result<()> {
     let stellaclaw_root = root.join(".stellaclaw");
     fs::create_dir_all(&stellaclaw_root)
         .with_context(|| format!("failed to create {}", stellaclaw_root.display()))?;
@@ -88,6 +88,27 @@ fn migrate_conversation_special_paths(root: &Path) -> Result<()> {
         migrate_entry_without_following_symlink(&source, &destination)?;
     }
 
+    ensure_conversation_skill_memory_link(workdir, root)?;
+    Ok(())
+}
+
+fn ensure_conversation_skill_memory_link(workdir: &Path, root: &Path) -> Result<()> {
+    let link_path = root.join(".stellaclaw").join("skill_memory");
+    let target = workdir
+        .join("rundir")
+        .join(".stellaclaw")
+        .join("skill_memory");
+    fs::create_dir_all(&target)
+        .with_context(|| format!("failed to create {}", target.display()))?;
+
+    let Ok(metadata) = fs::symlink_metadata(&link_path) else {
+        return create_directory_link(&target, &link_path);
+    };
+    if metadata.file_type().is_symlink() {
+        fs::remove_file(&link_path)
+            .with_context(|| format!("failed to remove {}", link_path.display()))?;
+        return create_directory_link(&target, &link_path);
+    }
     Ok(())
 }
 
@@ -200,6 +221,28 @@ fn non_overwriting_destination(destination: &Path) -> Result<PathBuf> {
     Ok(parent.join(format!("{file_name}.migrated-copy")))
 }
 
+#[cfg(unix)]
+fn create_directory_link(target: &Path, link_path: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, link_path).with_context(|| {
+        format!(
+            "failed to create symlink {} -> {}",
+            link_path.display(),
+            target.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn create_directory_link(target: &Path, link_path: &Path) -> Result<()> {
+    std::os::windows::fs::symlink_dir(target, link_path).with_context(|| {
+        format!(
+            "failed to create symlink {} -> {}",
+            link_path.display(),
+            target.display()
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,6 +335,32 @@ mod tests {
 
         assert!(sshfs.join("STELLACLAW.md").exists());
         assert!(!sshfs.join(".stellaclaw/STELLACLAW.md").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replaces_stale_conversation_skill_memory_symlink() {
+        let root = test_root("conversation-special-paths-stale-symlink");
+        let conversation = root.join("conversations").join("web-main-000001");
+        fs::create_dir_all(root.join("rundir/skill_memory")).unwrap();
+        fs::create_dir_all(conversation.join(".stellaclaw")).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("rundir").join("skill_memory"),
+            conversation.join(".stellaclaw/skill_memory"),
+        )
+        .unwrap();
+
+        StellaclawConversationSpecialPathUpgrade
+            .upgrade(&root, &test_config())
+            .unwrap();
+
+        assert_eq!(
+            fs::read_link(conversation.join(".stellaclaw/skill_memory")).unwrap(),
+            root.join("rundir/.stellaclaw/skill_memory")
+        );
+        assert!(!root.join("rundir/skill_memory").exists());
 
         let _ = fs::remove_dir_all(root);
     }
