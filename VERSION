@@ -1,7 +1,10 @@
-version: 1.25.4
+version: 1.25.5
 ---
 
-# 1.25.4
+# 1.25.5
+
+- 修复已升级到 `0.14` workdir 的旧 special link：
+  workdir schema 升级到 `0.15` 时会修复已经写入 `0.14` 的运行目录，把仍留在 `rundir/.skill/` 和 `rundir/skill_memory/` 的 runtime skill 数据迁移到 `rundir/.stellaclaw/skill/` 与 `rundir/.stellaclaw/skill_memory/`，并把 conversation 下指向旧 `rundir/skill_memory/` 的 stale `.stellaclaw/skill_memory` symlink 改到新的 canonical runtime target。旧路径兼容逻辑保留在 upgrade 内，运行时附件解析只接受新的 `.stellaclaw/...` canonical 路径。本次不改变 `config` schema，改变 `workdir` schema。
 
 - 统一 conversation workspace 的特殊本地路径到 `.stellaclaw/`：
   workdir schema 升级到 `0.14` 时会把旧根路径 `.output/`、`attachments/`、`shared/`、`.skill/`、`.skill_memory/`、`skill_memory/` 和 `STELLACLAW.md` 迁移到 `.stellaclaw/output/`、`.stellaclaw/attachments/`、`.stellaclaw/shared/`、`.stellaclaw/skill/`、`.stellaclaw/skill_memory/` 和 `.stellaclaw/STELLACLAW.md`，并兼容 `.stellaclaw/stellaclaw_shared/` 到 `.stellaclaw/shared/`；runtime backing 的 `rundir/.skill/` 和 `rundir/skill_memory/` 也迁移到 `rundir/.stellaclaw/skill/` 和 `rundir/.stellaclaw/skill_memory/`。迁移会合并目录并保留冲突副本，避免覆盖已有本地数据；新上传附件、shared 入口、system prompt、runtime skill store 和 runtime memory 读取均改用新的 canonical 路径。本次不改变 `config` schema，改变 `workdir` schema。

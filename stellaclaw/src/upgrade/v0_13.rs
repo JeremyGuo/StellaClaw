@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use super::{WorkdirUpgrader, LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_13};
+use super::{WorkdirUpgrader, WORKDIR_VERSION_0_13, WORKDIR_VERSION_0_14};
 use crate::{config::StellaclawConfig, workspace::is_sshfs_workspace_entry_name};
 
 pub struct StellaclawConversationSpecialPathUpgrade;
@@ -16,7 +16,7 @@ impl WorkdirUpgrader for StellaclawConversationSpecialPathUpgrade {
     }
 
     fn to_version(&self) -> &'static str {
-        LATEST_WORKDIR_VERSION
+        WORKDIR_VERSION_0_14
     }
 
     fn upgrade(&self, workdir: &Path, _config: &StellaclawConfig) -> Result<()> {
