@@ -1270,7 +1270,10 @@ fn resolve_shell(
     let (shell, validate) = match requested {
         Some(shell) => (shell, true),
         None => match binding {
-            ShellBinding::Local => (env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()), true),
+            ShellBinding::Local => (
+                env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+                true,
+            ),
             ShellBinding::RemoteSsh { .. } => ("${SHELL:-sh}".to_string(), false),
         },
     };
