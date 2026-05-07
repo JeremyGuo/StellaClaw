@@ -32,6 +32,7 @@ learnable_materials/
 
 .codex
 tmp/
+report_harness_design/
 
 # Runtime workspace artifacts
 .skill/
