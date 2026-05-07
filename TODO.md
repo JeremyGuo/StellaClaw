@@ -1,5 +1,9 @@
 # TODO
 
+## Remote Tool Bootstrap
+
+- [ ] 设计 remote mode 下的按需工具安装机制，学习 Codex 的 DotSlash manifest 思路：当远端缺少 `rg`、`fd`、`jq`、`tar` 等常用辅助二进制时，允许工具 runtime 在远端 workspace 外的受控 cache 目录下载或同步经过 manifest 描述、hash 校验和平台匹配的二进制，并把安装位置记录到 runtime/tool 环境中复用。该机制需要有 host/arch 检测、版本 pin、校验失败回滚、不可写/无网络 fallback、固定 SSH remote 与 selectable remote 的隔离策略，以及不会污染项目仓库的安装路径约束。
+
 ## Remote Mode visibility 重构
 
 - [x] 移除 Remote Mode 对 `sshfs` 的依赖。Remote Mode 下普通文件、搜索、补丁、下载和 shell 类工具默认作用于远程 workspace；本地 conversation workspace 只承载用户附件、channel 可下载产物、runtime 元数据和少量本地特殊文件。

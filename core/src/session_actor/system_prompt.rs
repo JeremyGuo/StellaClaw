@@ -1,21 +1,29 @@
+use std::collections::BTreeSet;
+
 use super::{
     runtime_metadata::{
         RuntimeMetadataState, IDENTITY_PROMPT_COMPONENT, REMOTE_ALIASES_PROMPT_COMPONENT,
         SKILLS_METADATA_PROMPT_COMPONENT, USER_MEMORY_PROMPT_COMPONENT, USER_META_PROMPT_COMPONENT,
     },
+    tool_catalog::enabled_prompt_protocols,
     SessionInitial, SessionType, ToolRemoteMode,
 };
 
 pub(crate) fn system_prompt_for_initial(
     initial: &SessionInitial,
     runtime_metadata_state: &RuntimeMetadataState,
+    enabled_tools: &BTreeSet<String>,
 ) -> String {
     let session_kind = match initial.session_type {
         SessionType::Foreground => foreground_prompt(),
         SessionType::Background => background_prompt(),
         SessionType::Subagent => subagent_prompt(),
     };
-    let mut sections = vec![common_prompt().to_string(), session_kind.to_string()];
+    let mut sections = vec![common_prompt().to_string()];
+    if let Some(protocols_prompt) = render_prompt_protocols(enabled_tools) {
+        sections.push(protocols_prompt);
+    }
+    sections.push(session_kind.to_string());
     if let Some(remote_prompt) = remote_prompt(&initial.tool_remote_mode) {
         sections.push(remote_prompt);
     }
@@ -31,9 +39,6 @@ pub(crate) fn system_prompt_for_initial(
         ));
     }
     sections.extend(snapshot_sections(initial, runtime_metadata_state));
-    if initial.memory_enabled {
-        sections.push(memory_prompt().to_string());
-    }
     sections.push(tool_efficiency_prompt(&initial.session_type).to_string());
     sections.join("\n\n")
 }
@@ -44,41 +49,22 @@ fn common_prompt() -> &'static str {
      and grounded in the current workspace. If you are unsure, do not answer from memory: inspect \
      the repository, current session context, or run a narrow verification step first. Before using \
      any library, framework, command, flag, file path, or project capability, verify that it exists \
-     in this repository or local environment instead of assuming it exists. For repository \
-     exploration, use the dedicated tools instead of shell read/search commands: use glob to find \
-     files by path pattern, grep to find files by content pattern, ls for narrowed directory \
-     listings, and file_read for file contents. These dedicated recursive tools skip slow remote \
-     mounts such as sshfs/NFS by default. Do not use shell for direct grep, find, cat, head, \
-     tail, or ls. When using shell for commands that dedicated tools do not cover, start a new \
-     command with the command field and omit session_id; use session_id only to poll or continue an \
-     existing shell session. Positive example: {\"command\":\"cargo check -p stellaclaw_core\"}. \
-     Negative example: {\"session_id\":\"sh_123\"} to start work, or using cmd instead of command. \
-     Treat AGENTS.md and similar repository instruction files as scoped rules, not background lore. \
+     in this repository or local environment instead of assuming it exists. Treat AGENTS.md and similar repository instruction files as scoped rules, not background lore. \
      When you start working in a subdirectory, check whether that subtree has a more local \
      AGENTS.md or similar instruction file before editing there; when rules conflict, \
      follow the more local file. Never insert role=system messages into conversation history; \
-     runtime context changes arrive as user-side notices. Use user_tell only for mid-task progress or coordination that must become visible \
-     before the current turn is ready to finish. If you can return the final answer now, do not \
-     send an extra user_tell first. Positive example: a long-running edit, benchmark, or debug \
-     session is still in progress and the user needs an immediate visible status update. Negative \
-     example: you already have the result and are about to finish, so a separate 'working on it' \
-     or 'done' user_tell is unnecessary. Use update_plan for multi-step, long-running, or \
-     ambiguous work so the user can see the current checklist. Positive examples: a refactor \
-     across several files, a bug investigation with multiple plausible causes, or a task that \
-     needs several verification steps. Negative examples: a one-line fix, a single file read, or \
-     a straightforward reply that can be finished immediately without a visible plan. If you need \
-     to send files or images back to the user, write generated artifacts under \
-     .stellaclaw/output/ or another intentional workspace path, then append one or more tags in \
-     this exact format: \
-     <attachment>relative/path/from/workspace_root</attachment>. Each path must be relative to the \
-     current workspace root. This attachment syntax is supported in both the final assistant reply \
-     and user_tell text. User-provided attachments may appear under .stellaclaw/attachments/. \
-     The workspace may contain .stellaclaw/shared/; that directory is shared across \
-     conversations in this Stellaclaw workdir and is appropriate for reusable artifacts. \
-     .stellaclaw/ is hidden from ordinary ls output, but exact paths under .stellaclaw/output/, \
-     .stellaclaw/attachments/, and .stellaclaw/shared/ are valid for file tools. If \
-     STELLACLAW_SOFTWARE_DIR is set in the tool environment, that path is the configured shared \
-     software directory for reusable binaries, checkouts, caches, or other tool installations."
+     runtime context changes arrive as user-side notices."
+}
+
+fn render_prompt_protocols(enabled_tools: &BTreeSet<String>) -> Option<String> {
+    let rendered = enabled_prompt_protocols(enabled_tools)
+        .into_iter()
+        .map(|protocol| protocol.body.trim())
+        .filter(|body| !body.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    (!rendered.is_empty()).then_some(rendered)
 }
 
 fn foreground_prompt() -> &'static str {
@@ -86,28 +72,9 @@ fn foreground_prompt() -> &'static str {
      concrete code changes, and a short final summary with verification."
 }
 
-fn memory_prompt() -> &'static str {
-    "[Memory Instructions]\n\
-     Use memory_write only for stable information that is likely to be reused after this turn. Do \
-     not save transient execution steps, one-off tool output, guesses, ordinary chat, compacted \
-     summaries, or facts already present in memory.\n\
-     Save scope=user for durable collaboration preferences, response style, general corrections, \
-     and user work habits. Save scope=conversation for goals, constraints, key facts, durable \
-     state, and handoff that every session or agent in this conversation should know. Save \
-     scope=public for stable project, customer, data definition, or long-running task facts that \
-     may be useful across conversations.\n\
-     memory_write resolves duplicates and conflicts internally and returns only success or failure. \
-     If it fails, retry only when you can provide more specific, stable text. Long memory is not \
-     automatically injected into every turn; use memory_search when the current short context is \
-     insufficient, when the user asks about durable project/conversation facts, or when the task \
-     likely depends on prior cross-conversation or current-conversation agreements. \
-     Use memory_update or memory_delete only when search reveals an obviously stale, incomplete, \
-     duplicate, or wrong entry."
-}
-
 fn background_prompt() -> &'static str {
-    "Session kind: background. Work autonomously on the assigned task. Use user_tell only for \
-     useful progress or coordination; put the primary result in the final assistant response."
+    "Session kind: background. Work autonomously on the assigned task and put the primary result in \
+     the final assistant response."
 }
 
 fn subagent_prompt() -> &'static str {
@@ -127,13 +94,7 @@ fn tool_efficiency_prompt(session_type: &SessionType) -> &'static str {
              If you intend to call multiple tools and there are no dependencies between the calls, \
              make all of the independent calls in the same tool-call batch (same assistant turn), otherwise \
              you MUST wait for previous calls to finish first to determine the dependent values \
-             (do NOT use placeholders or guess missing parameters).\n\n\
-             For multi-step tasks that require more than 3 sequential tool operations and can be \
-             clearly scoped (e.g. explore a codebase module, run benchmarks, set up a dependency), \
-             prefer subagent_start to keep the main conversation context lean. Do NOT batch tool \
-             calls that could cause irreversible damage if an earlier step produces unexpected \
-             results (destructive shell commands, production deploys, database mutations); use \
-             subagent_start for those instead so that intermediate results can be inspected."
+             (do NOT use placeholders or guess missing parameters)."
         }
         SessionType::Subagent => {
             "Check that all the required parameters for each tool call are provided or can \
@@ -234,19 +195,89 @@ mod tests {
         std::env::temp_dir().join(format!("stellaclaw_system_prompt_{id}"))
     }
 
+    fn enabled_tools(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|name| (*name).to_string()).collect()
+    }
+
+    fn default_enabled_tools() -> BTreeSet<String> {
+        enabled_tools(&[
+            "file_read",
+            "file_write",
+            "grep",
+            "ls",
+            "apply_patch",
+            "shell_exec",
+            "shell_write_stdin",
+            "shell_stop",
+            "user_tell",
+            "update_plan",
+            "subagent_start",
+            "memory_search",
+            "memory_write",
+            "memory_update",
+            "memory_delete",
+        ])
+    }
+
     #[test]
     fn system_prompt_changes_by_session_type() {
         let state = RuntimeMetadataState::default();
-        let foreground =
-            system_prompt_for_initial(&SessionInitial::new("s1", SessionType::Foreground), &state);
-        let background =
-            system_prompt_for_initial(&SessionInitial::new("s2", SessionType::Background), &state);
-        let subagent =
-            system_prompt_for_initial(&SessionInitial::new("s3", SessionType::Subagent), &state);
+        let enabled_tools = default_enabled_tools();
+        let foreground = system_prompt_for_initial(
+            &SessionInitial::new("s1", SessionType::Foreground),
+            &state,
+            &enabled_tools,
+        );
+        let background = system_prompt_for_initial(
+            &SessionInitial::new("s2", SessionType::Background),
+            &state,
+            &enabled_tools,
+        );
+        let subagent = system_prompt_for_initial(
+            &SessionInitial::new("s3", SessionType::Subagent),
+            &state,
+            &enabled_tools,
+        );
 
         assert!(foreground.contains("Session kind: foreground"));
         assert!(background.contains("Session kind: background"));
         assert!(subagent.contains("Session kind: subagent"));
+    }
+
+    #[test]
+    fn system_prompt_guides_apply_patch_without_redundant_rereads() {
+        let state = RuntimeMetadataState::default();
+        let enabled_tools = default_enabled_tools();
+        let prompt = system_prompt_for_initial(
+            &SessionInitial::new("s1", SessionType::Foreground),
+            &state,
+            &enabled_tools,
+        );
+
+        assert!(prompt.contains("use apply_patch for targeted edits"));
+        assert!(prompt.contains("do not re-read changed files"));
+        assert!(prompt.contains("the tool reports failure when it does not apply"));
+        assert!(!prompt.contains("old_text"));
+        assert!(!prompt.contains("replace_all"));
+        assert!(!prompt.contains("create_if_missing"));
+    }
+
+    #[test]
+    fn system_prompt_omits_protocols_for_disabled_tools() {
+        let state = RuntimeMetadataState::default();
+        let enabled_tools = enabled_tools(&["file_read", "file_write", "grep", "ls"]);
+        let prompt = system_prompt_for_initial(
+            &SessionInitial::new("s1", SessionType::Foreground),
+            &state,
+            &enabled_tools,
+        );
+
+        assert!(prompt.contains("For repository exploration"));
+        assert!(!prompt.contains("use apply_patch for targeted edits"));
+        assert!(!prompt.contains("When using shell for commands"));
+        assert!(!prompt.contains("Use user_tell only"));
+        assert!(!prompt.contains("Use update_plan"));
+        assert!(!prompt.contains("prefer subagent_start"));
     }
 
     #[test]
@@ -306,7 +337,8 @@ mod tests {
         assert!(rendered_notices.contains("USER.md metadata changed"));
         assert!(!rendered_notices.contains("tier: new"));
 
-        let prompt_before_promote = system_prompt_for_initial(&initial, &state);
+        let enabled_tools = default_enabled_tools();
+        let prompt_before_promote = system_prompt_for_initial(&initial, &state, &enabled_tools);
         assert!(prompt_before_promote.contains("identity: old"));
         assert!(prompt_before_promote.contains("Profile metadata file: .stellaclaw/USER.md"));
         assert!(prompt_before_promote.contains("Read .stellaclaw/USER.md with file_read"));
@@ -321,7 +353,7 @@ mod tests {
         assert!(!prompt_before_promote.contains("new-host"));
 
         state.promote_notified_components_to_system_snapshot();
-        let prompt_after_promote = system_prompt_for_initial(&initial, &state);
+        let prompt_after_promote = system_prompt_for_initial(&initial, &state, &enabled_tools);
         assert!(prompt_after_promote.contains("identity: new"));
         assert!(prompt_after_promote.contains("Profile metadata file: .stellaclaw/USER.md"));
         assert!(!prompt_after_promote.contains("tier: new"));
@@ -350,7 +382,8 @@ mod tests {
             )
             .unwrap();
 
-        let prompt = system_prompt_for_initial(&initial, &state);
+        let enabled_tools = default_enabled_tools();
+        let prompt = system_prompt_for_initial(&initial, &state, &enabled_tools);
         assert!(!prompt.contains("Tool remote mode: fixed SSH"));
         assert!(!prompt.contains("[Remote Aliases Snapshot]"));
     }
@@ -362,7 +395,8 @@ mod tests {
             Some("[Remote AGENTS.md]\nremote rules".to_string());
         let state = RuntimeMetadataState::default();
 
-        let prompt = system_prompt_for_initial(&initial, &state);
+        let enabled_tools = default_enabled_tools();
+        let prompt = system_prompt_for_initial(&initial, &state, &enabled_tools);
 
         assert!(prompt.contains("[Remote Workspace Instructions]"));
         assert!(prompt.contains("remote rules"));

@@ -129,7 +129,6 @@ impl ToolExecutionOp {
         match self {
             Self::LocalTool(tool_call) => match tool_call.tool_name.as_str() {
                 "file_write"
-                | "edit"
                 | "apply_patch"
                 | "shell_make_visible"
                 | "attachment_make_visible"

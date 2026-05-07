@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     env,
     path::PathBuf,
     sync::Arc,
@@ -222,6 +222,29 @@ impl SessionActor {
 
     pub fn tool_catalog(&self) -> &ToolCatalog {
         &self.tool_catalog
+    }
+
+    fn system_prompt_for_current_initial(&self) -> Option<String> {
+        let initial = self.initial.as_ref()?;
+        let enabled_tools = self.provider_enabled_tool_names();
+        Some(system_prompt_for_initial(
+            initial,
+            &self.runtime_metadata_state,
+            &enabled_tools,
+        ))
+    }
+
+    fn provider_enabled_tool_names(&self) -> BTreeSet<String> {
+        let tools = self
+            .tool_catalog
+            .iter()
+            .map(|(_, tool)| tool)
+            .collect::<Vec<_>>();
+        self.provider
+            .filter_tools_for_provider(tools)
+            .into_iter()
+            .map(|tool| tool.name.clone())
+            .collect()
     }
 
     pub fn with_conversation_bridge(
@@ -529,10 +552,7 @@ impl SessionActor {
                 "all_messages_len": self.all_messages.len(),
             }),
         );
-        let system_prompt = self
-            .initial
-            .as_ref()
-            .map(|initial| system_prompt_for_initial(initial, &self.runtime_metadata_state));
+        let system_prompt = self.system_prompt_for_current_initial();
         let compression_context = self.compression_memory_context(&self.history, None);
 
         let report = match compressor.compact_now(
@@ -944,9 +964,7 @@ impl SessionActor {
                 }),
             );
             let system_prompt = self
-                .initial
-                .as_ref()
-                .map(|initial| system_prompt_for_initial(initial, &self.runtime_metadata_state))
+                .system_prompt_for_current_initial()
                 .ok_or(SessionActorError::MissingInitial)?;
             let model_message = {
                 let mut request_too_large_attempts = 0usize;
@@ -1329,10 +1347,7 @@ impl SessionActor {
         };
 
         self.all_messages.push(message.clone());
-        let system_prompt = self
-            .initial
-            .as_ref()
-            .map(|initial| system_prompt_for_initial(initial, &self.runtime_metadata_state));
+        let system_prompt = self.system_prompt_for_current_initial();
         if compressor
             .would_compress_with_next(&self.history, &message)
             .unwrap_or(false)
@@ -1674,10 +1689,7 @@ impl SessionActor {
 
         let threshold_tokens =
             idle_compaction_token_threshold(&self.model_config, self.initial.as_ref());
-        let system_prompt = self
-            .initial
-            .as_ref()
-            .map(|initial| system_prompt_for_initial(initial, &self.runtime_metadata_state));
+        let system_prompt = self.system_prompt_for_current_initial();
         let mut request_too_large_attempts = 0usize;
         let report = loop {
             let compression_context = if compressor

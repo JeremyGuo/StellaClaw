@@ -11,7 +11,6 @@ use super::{
 };
 
 pub const COMPRESSION_MARKER: &str = "[StellaClaw Context Compression]";
-const COMPRESSION_SYSTEM_PROMPT: &str = "You compress StellaClaw provider context. Return strict JSON only. Preserve continuation-critical facts, state, and next steps while avoiding unnecessary raw history.";
 const MAX_PRESERVED_TOOL_CALL_IDS: usize = 8;
 const MAX_PRESERVED_TOOL_RESULT_TEXT_CHARS: usize = 4096;
 
@@ -283,7 +282,7 @@ impl SessionCompressor {
         preserved_recent_count: usize,
         provider: &(dyn Provider + Send + Sync),
         _model_config: &ModelConfig,
-        _system_prompt: Option<&str>,
+        system_prompt: Option<&str>,
         compression_context: Option<&str>,
     ) -> Result<Option<GeneratedCompression>, CompressionError> {
         let mut request_messages = sanitize_messages_for_compression_request(messages_to_summarize);
@@ -312,8 +311,7 @@ impl SessionCompressor {
 
         let response = send_provider_request_with_retry(
             provider,
-            ProviderRequest::new(&request_messages)
-                .with_system_prompt(Some(COMPRESSION_SYSTEM_PROMPT)),
+            ProviderRequest::new(&request_messages).with_system_prompt(system_prompt),
             |_| {},
         )
         .map_err(|error| CompressionError::Provider(error.to_string()))?;
@@ -403,7 +401,23 @@ struct CompressionResult {
     #[serde(default)]
     plan: String,
     #[serde(default)]
+    active_tasks: Vec<ActiveTaskSummary>,
+    #[serde(default)]
     preserved_tool_call_ids: Vec<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ActiveTaskSummary {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    purpose: String,
+    #[serde(default)]
+    next_action: String,
 }
 
 fn recent_tail_start_by_token_budget(
@@ -497,26 +511,32 @@ fn sanitize_message_for_compression_request(message: &ChatMessage) -> Option<Cha
 
 fn compression_instruction(preserved_recent_count: usize) -> String {
     format!(
-        "Compress the older stable conversation history that appears above this request.\n\n\
+        "The conversation is nearing its context limit. To continue effectively, create a comprehensive, high-fidelity summary of the task's progress.\n\n\
+This compression will be the only low-level context available for the compressed portion of the conversation. Prioritize continuation fidelity over brevity, but do not copy raw history that can be accurately summarized.\n\n\
 Return strict JSON only. Do not output Markdown, code fences, or commentary.\n\n\
 Schema:\n\
 {{\n\
-  \"summary\": \"Concise natural-language summary of goals, key facts, decisions, touched files/modules, completed work, and important errors.\",\n\
-  \"current_state\": \"What is happening now, the latest meaningful tool result, and any current blocker.\",\n\
-  \"plan\": \"Natural-language next step plan if still needed. Use a short paragraph or compact list text.\",\n\
+  \"summary\": \"High-fidelity natural-language summary of all user intents and requirements, key facts, technical findings, architectural decisions, code patterns discovered, touched files/modules, completed work, and important errors.\",\n\
+  \"current_state\": \"Precise current status: what is happening now, the latest meaningful tool result, files currently being worked on, blockers, and any pending user decision.\",\n\
+  \"plan\": \"Exact next steps needed to continue safely if work remains. Include ordering, verification steps, and any path/cwd/command/id needed for the next action.\",\n\
+  \"active_tasks\": [{{\"id\":\"process_id_or_other_handle\", \"kind\":\"shell|download|subagent|background_agent|dsl|other\", \"status\":\"running|waiting|blocked|unknown\", \"purpose\":\"what this task is doing\", \"next_action\":\"how to observe, continue, stop, or recover this task\"}}],\n\
   \"preserved_tool_call_ids\": [\"call_id\"]\n\
 }}\n\n\
 Rules:\n\
 - keep every field factual, compact, and continuation-oriented\n\
+- capture the whole task state, not just a chat recap: goals, constraints, decisions, findings, touched files, code patterns, completed work, remaining work, and verification state\n\
+- include critical code snippets or exact symbols only when they are needed to continue safely; otherwise cite file paths, modules, functions, commands, ids, URLs, and conclusions\n\
 - preserve concrete decisions, file paths, commands, errors, ids, URLs, and the current next step\n\
+- active_tasks is required for unfinished external work. Include every still-running or still-waiting handle needed to resume safely, especially shell process_id, download_id, file_download id, subagent id, background agent_id, DSL job id, and any associated command, cwd, remote target, output path, URL, or wait/stop/observe instruction\n\
+- do not put completed one-off tool calls in active_tasks; only include tasks whose future state can still change or whose handle is needed for recovery\n\
 - redact long secrets; mention that a secret was provided without copying the full value\n\
 - do not invent details\n\
 - do not restate shared context that already lives in the canonical system prompt snapshots\n\
 - ignore transient runtime update notices; they are reconstructed separately and should not be preserved in the summary\n\
-- if unfinished work still matters, preserve the continuation-critical identifier needed to resume it safely, especially shell session_id, download_id, file_download id, subagent id, plus any path, cwd, or url needed to continue\n\
+- if unfinished work still matters, preserve the continuation-critical identifier in active_tasks and also mention it in current_state or plan when it is the immediate next action\n\
 - if a task is already finished or no longer relevant, do not preserve its identifier just because it appeared earlier\n\
 - intermediate tool calls and tool results should be summarized by outcome, not replayed step by step, unless a still-needed identifier or exact reference is required to continue safely\n\
-- preserved_tool_call_ids should only include real tool_call ids from the compressed history whose arguments and result are very likely to be needed later\n\
+- preserved_tool_call_ids is optional. Prefer active_tasks and summary/current_state/plan. Only include real tool_call ids from the compressed history if the raw tool arguments and result are very likely to be needed later and cannot be safely summarized\n\
 - if you already extracted the useful conclusion from a tool result into summary/current_state/plan, do not preserve that tool call id\n\
 - be conservative with preserved_tool_call_ids so compression does not keep too much raw context\n\
 - the most recent {preserved_recent_count} message(s) immediately before this request are preserved separately as high-fidelity context; do not summarize them unless continuity requires a short pointer\n\
@@ -535,6 +555,13 @@ fn normalize_compression_result(mut result: CompressionResult) -> CompressionRes
     result.summary = result.summary.trim().to_string();
     result.current_state = result.current_state.trim().to_string();
     result.plan = result.plan.trim().to_string();
+    result.active_tasks = result
+        .active_tasks
+        .into_iter()
+        .map(normalize_active_task_summary)
+        .filter(|task| !task.id.is_empty())
+        .take(16)
+        .collect();
     result.preserved_tool_call_ids = result
         .preserved_tool_call_ids
         .into_iter()
@@ -543,6 +570,15 @@ fn normalize_compression_result(mut result: CompressionResult) -> CompressionRes
         .take(MAX_PRESERVED_TOOL_CALL_IDS)
         .collect();
     result
+}
+
+fn normalize_active_task_summary(mut task: ActiveTaskSummary) -> ActiveTaskSummary {
+    task.id = task.id.trim().to_string();
+    task.kind = task.kind.trim().to_string();
+    task.status = task.status.trim().to_string();
+    task.purpose = task.purpose.trim().to_string();
+    task.next_action = task.next_action.trim().to_string();
+    task
 }
 
 fn render_compression_result(result: &CompressionResult) -> String {
@@ -560,10 +596,36 @@ fn render_compression_result(result: &CompressionResult) -> String {
     if !result.plan.trim().is_empty() {
         sections.push(format!("Plan:\n{}", result.plan.trim()));
     }
+    if !result.active_tasks.is_empty() {
+        let tasks = result
+            .active_tasks
+            .iter()
+            .map(render_active_task_summary)
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!("Active Tasks:\n{tasks}"));
+    }
     if sections.len() == 2 {
         sections.push("Summary:\nNo useful older context was returned.".to_string());
     }
     sections.join("\n\n")
+}
+
+fn render_active_task_summary(task: &ActiveTaskSummary) -> String {
+    let mut parts = vec![format!("- id: {}", task.id)];
+    if !task.kind.is_empty() {
+        parts.push(format!("kind: {}", task.kind));
+    }
+    if !task.status.is_empty() {
+        parts.push(format!("status: {}", task.status));
+    }
+    if !task.purpose.is_empty() {
+        parts.push(format!("purpose: {}", task.purpose));
+    }
+    if !task.next_action.is_empty() {
+        parts.push(format!("next_action: {}", task.next_action));
+    }
+    parts.join("; ")
 }
 
 fn preserve_tool_messages(messages: &[ChatMessage], requested_ids: &[String]) -> Vec<ChatMessage> {
@@ -948,14 +1010,11 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].system_prompt.as_deref(),
-            Some(COMPRESSION_SYSTEM_PROMPT)
+            Some("stable compression instructions")
         );
-        assert!(!requests[0]
-            .system_prompt
-            .as_deref()
-            .unwrap()
-            .contains("stable compression instructions"));
-        assert!(message_text(requests[0].messages.last().unwrap()).contains("Compress the older"));
+        assert!(message_text(requests[0].messages.last().unwrap())
+            .contains("The conversation is nearing its context limit"));
+        assert!(message_text(requests[0].messages.last().unwrap()).contains("process_id"));
         let request_body = requests[0]
             .messages
             .iter()
@@ -1030,6 +1089,13 @@ mod tests {
                 "summary": "Read the config and found memory disabled.",
                 "current_state": "Need to update docs next.",
                 "plan": "Patch TODO.md and run tests.",
+                "active_tasks": [{
+                    "id": "sh_test_123",
+                    "kind": "shell",
+                    "status": "running",
+                    "purpose": "cargo test is still running in /tmp/project",
+                    "next_action": "poll with shell_write_stdin using process_id sh_test_123"
+                }],
                 "preserved_tool_call_ids": ["call_keep", "missing_call"]
             }"#,
         );
@@ -1092,6 +1158,10 @@ mod tests {
         assert!(summary_text.contains("Summary:\nRead the config"));
         assert!(summary_text.contains("Current State:\nNeed to update docs next."));
         assert!(summary_text.contains("Plan:\nPatch TODO.md and run tests."));
+        assert!(summary_text.contains("Active Tasks:"));
+        assert!(summary_text.contains("id: sh_test_123"));
+        assert!(summary_text.contains("kind: shell"));
+        assert!(summary_text.contains("process_id sh_test_123"));
         assert!(matches!(
             messages[1].data.first(),
             Some(ChatMessageItem::ToolCall(tool_call)) if tool_call.tool_call_id == "call_keep"

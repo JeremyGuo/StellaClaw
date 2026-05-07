@@ -3,7 +3,7 @@ use serde_json::json;
 
 use super::{
     schema::{object_schema, properties},
-    ToolBackend, ToolConcurrency, ToolDefinition, ToolExecutionMode,
+    PromptProtocol, ToolBackend, ToolConcurrency, ToolDefinition, ToolExecutionMode,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,6 +47,37 @@ pub fn host_tool_definitions(
 
     tools
 }
+
+pub(crate) fn host_prompt_protocols() -> &'static [PromptProtocol] {
+    HOST_PROMPT_PROTOCOLS
+}
+
+const HOST_PROMPT_PROTOCOLS: &[PromptProtocol] = &[
+    PromptProtocol {
+        id: "host.user_tell",
+        priority: 300,
+        required_tools: &["user_tell"],
+        body: "Use user_tell only for mid-task progress or coordination that must become visible before the current turn is ready to finish. If you can return the final answer now, do not send an extra user_tell first. Positive example: a long-running edit, benchmark, or debug session is still in progress and the user needs an immediate visible status update. Negative example: you already have the result and are about to finish, so a separate 'working on it' or 'done' user_tell is unnecessary.",
+    },
+    PromptProtocol {
+        id: "host.update_plan",
+        priority: 310,
+        required_tools: &["update_plan"],
+        body: "Use update_plan for multi-step, long-running, or ambiguous work so the user can see the current checklist. Positive examples: a refactor across several files, a bug investigation with multiple plausible causes, or a task that needs several verification steps. Negative examples: a one-line fix, a single file read, or a straightforward reply that can be finished immediately without a visible plan.",
+    },
+    PromptProtocol {
+        id: "host.memory",
+        priority: 320,
+        required_tools: &["memory_search", "memory_write", "memory_update", "memory_delete"],
+        body: "Use memory_write only for stable information that is likely to be reused after this turn. Do not save transient execution steps, one-off tool output, guesses, ordinary chat, compacted summaries, or facts already present in memory. Save scope=user for durable collaboration preferences, response style, general corrections, and user work habits. Save scope=conversation for goals, constraints, key facts, durable state, and handoff that every session or agent in this conversation should know. Save scope=public for stable project, customer, data definition, or long-running task facts that may be useful across conversations. memory_write resolves duplicates and conflicts internally and returns only success or failure. If it fails, retry only when you can provide more specific, stable text. Long memory is not automatically injected into every turn; use memory_search when the current short context is insufficient, when the user asks about durable project/conversation facts, or when the task likely depends on prior cross-conversation or current-conversation agreements. Use memory_update or memory_delete only when search reveals an obviously stale, incomplete, duplicate, or wrong entry.",
+    },
+    PromptProtocol {
+        id: "host.subagent",
+        priority: 330,
+        required_tools: &["subagent_start"],
+        body: "For multi-step tasks that require more than 3 sequential tool operations and can be clearly scoped, such as exploring a codebase module, running benchmarks, or setting up a dependency, prefer subagent_start to keep the main conversation context lean. Do not batch tool calls that could cause irreversible damage if an earlier step produces unexpected results, such as destructive shell commands, production deploys, or database mutations; use subagent_start for those instead so intermediate results can be inspected.",
+    },
+];
 
 fn user_tell_tool(scope: HostToolScope) -> ToolDefinition {
     let description = match scope {

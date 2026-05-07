@@ -892,7 +892,7 @@ mod tests {
     }
 
     #[test]
-    fn executes_search_list_edit_and_apply_patch_locally() {
+    fn executes_search_list_and_apply_patch_locally() {
         let workspace = temp_workspace();
         fs::create_dir_all(workspace.join("src")).unwrap();
         fs::write(
@@ -907,33 +907,19 @@ mod tests {
         let batch = ToolBatch::new(
             "batch_search",
             vec![
-                tool_call("glob", json!({"pattern": "**/*.rs", "path": "."})),
                 tool_call(
                     "grep",
                     json!({"pattern": "marker", "path": ".", "include": "src/*"}),
                 ),
                 tool_call("ls", json!({"path": "."})),
-                tool_call(
-                    "edit",
-                    json!({
-                        "path": "src/main.rs",
-                        "old_text": "let marker = 1;",
-                        "new_text": "let marker = 2;"
-                    }),
-                ),
             ],
         );
 
         let message = start_and_wait(&executor, batch);
 
-        assert!(result_text(&message, 0).contains("main.rs"));
-        assert!(result_text(&message, 1).contains("readme.txt"));
-        assert!(result_text(&message, 2).contains("src/"));
-        assert!(!result_text(&message, 2).contains(".hidden"));
-        assert!(result_text(&message, 3).contains("\"replacements\": 1"));
-        assert!(fs::read_to_string(workspace.join("src/main.rs"))
-            .unwrap()
-            .contains("let marker = 2;"));
+        assert!(result_text(&message, 0).contains("readme.txt"));
+        assert!(result_text(&message, 1).contains("src/"));
+        assert!(!result_text(&message, 1).contains(".hidden"));
 
         fs::write(workspace.join("patch.txt"), "old\n").unwrap();
         let patch = r#"diff --git a/patch.txt b/patch.txt
@@ -1104,7 +1090,6 @@ mod tests {
             "batch_default_path",
             vec![
                 tool_call("ls", json!({})),
-                tool_call("glob", json!({"pattern": "*.txt", "path": ""})),
                 tool_call("grep", json!({"pattern": "root marker", "path": ""})),
             ],
         );
@@ -1113,7 +1098,6 @@ mod tests {
 
         assert!(result_text(&message, 0).contains("root.txt"));
         assert!(result_text(&message, 1).contains("root.txt"));
-        assert!(result_text(&message, 2).contains("root.txt"));
     }
 
     #[test]

@@ -195,37 +195,6 @@ pub(super) fn sort_search_matches(matches: &mut [SearchMatch]) {
     });
 }
 
-pub(super) fn search_result(
-    key: &str,
-    pattern: &str,
-    base_path: &Path,
-    include: Option<&str>,
-    matches: Vec<SearchMatch>,
-) -> Result<Value, LocalToolError> {
-    let total_matches = matches.len();
-    let truncated = total_matches > SEARCH_MAX_RESULTS;
-    let filenames = matches
-        .into_iter()
-        .take(SEARCH_MAX_RESULTS)
-        .map(|entry| entry.path)
-        .collect::<Vec<_>>();
-    let mut result = Map::new();
-    result.insert(key.to_string(), Value::String(pattern.to_string()));
-    result.insert(
-        "path".to_string(),
-        Value::String(base_path.display().to_string()),
-    );
-    if let Some(include) = include {
-        result.insert("include".to_string(), Value::String(include.to_string()));
-    }
-    result.insert("num_files".to_string(), Value::from(total_matches));
-    if truncated {
-        result.insert("truncated".to_string(), Value::Bool(true));
-    }
-    result.insert("filenames".to_string(), json!(filenames));
-    Ok(Value::Object(result))
-}
-
 pub(super) fn remote_file_tool(
     operation: &str,
     arguments: &Map<String, Value>,
@@ -259,11 +228,16 @@ import time
 payload = json.loads({payload:?})
 
 SEARCH_MAX_RESULTS = 100
+GREP_MAX_CONTEXT_LINES = 10
+GREP_DEFAULT_TOTAL_MAX_MATCHES = SEARCH_MAX_RESULTS
+GREP_MAX_TOTAL_MATCHES = 1000
+GREP_MAX_MATCHES_PER_FILE = 1000
+GREP_MAX_LINE_CHARS = 600
 LS_MAX_ENTRIES = 1000
 COMMON_LS_SKIP_DIRS = {{"__pycache__", "node_modules", "target", "dist", "build", "coverage", "venv"}}
 SLOW_MOUNT_FS_TYPES = {{"fuse.sshfs", "sshfs", "nfs", "nfs4", "cifs", "smb3", "9p", "davfs", "fuse.rclone", "fuse.s3fs", "fuse.gcsfuse"}}
-OPERATION_TIMEOUT_SECONDS = {{"ls": 20, "glob": 30, "grep": 45, "edit": 30}}
-OPERATION_ATTEMPTS = {{"ls": 2, "glob": 2, "grep": 2, "edit": 1}}
+OPERATION_TIMEOUT_SECONDS = {{"ls": 20, "grep": 45}}
+OPERATION_ATTEMPTS = {{"ls": 2, "grep": 2}}
 
 class OperationTimeout(TimeoutError):
     pass
@@ -371,28 +345,30 @@ def walk_files(base):
                 paths.append(path)
     return paths
 
-def handle_glob(args, workspace_root):
-    pattern = args.get("pattern")
-    if not isinstance(pattern, str):
-        raise ValueError("missing required argument: pattern")
-    base = resolve(args.get("path", "."), workspace_root)
-    if not os.path.exists(base):
-        raise ValueError(f"{{base}} does not exist")
-    matches = []
-    for path in walk_files(base):
-        rel = os.path.relpath(path, base).replace(os.sep, "/")
-        if fnmatch.fnmatch(rel, pattern):
-            matches.append({{"path": path, "mtime_ms": file_mtime_ms(path)}})
-    matches.sort(key=lambda item: (-item["mtime_ms"], item["path"]))
-    result = {{
-        "pattern": pattern,
-        "path": base,
-        "num_files": len(matches),
-        "filenames": [item["path"] for item in matches[:SEARCH_MAX_RESULTS]],
-    }}
-    if len(matches) > SEARCH_MAX_RESULTS:
-        result["truncated"] = True
-    return result
+def int_arg(args, key, default, min_value, max_value):
+    value = args.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{{key}} must be an integer")
+    if value < min_value:
+        raise ValueError(f"{{key}} must be greater than or equal to {{min_value}}")
+    return min(value, max_value)
+
+def bool_arg(args, key, default=False):
+    value = args.get(key, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{{key}} must be a boolean")
+    return value
+
+def bounded_line(line):
+    if len(line) <= GREP_MAX_LINE_CHARS:
+        return line
+    return line[:GREP_MAX_LINE_CHARS] + "... [truncated]"
+
+def context_entries(lines, start, end):
+    return [
+        {{"line": index + 1, "text": bounded_line(lines[index])}}
+        for index in range(start, end)
+    ]
 
 def handle_grep(args, workspace_root):
     pattern = args.get("pattern")
@@ -402,29 +378,70 @@ def handle_grep(args, workspace_root):
     if not os.path.exists(base):
         raise ValueError(f"{{base}} does not exist")
     include = args.get("include")
+    exclude = args.get("exclude")
+    context_lines = int_arg(args, "context_lines", 0, 0, GREP_MAX_CONTEXT_LINES)
+    max_matches_per_file = int_arg(args, "max_matches_per_file", GREP_MAX_MATCHES_PER_FILE, 1, GREP_MAX_MATCHES_PER_FILE)
+    total_max_matches = int_arg(args, "total_max_matches", GREP_DEFAULT_TOTAL_MAX_MATCHES, 1, GREP_MAX_TOTAL_MATCHES)
+    names_only = bool_arg(args, "names_only", False)
     regex = re.compile(pattern)
-    matches = []
+    file_matches = []
+    result_matches = []
+    matched_files = set()
+    total_matches = 0
     for path in walk_files(base):
         rel = os.path.relpath(path, base).replace(os.sep, "/")
         if include and not fnmatch.fnmatch(rel, include):
+            continue
+        if exclude and fnmatch.fnmatch(rel, exclude):
             continue
         try:
             with open(path, "r", encoding="utf-8") as handle:
                 text = handle.read()
         except (UnicodeDecodeError, OSError):
             continue
-        if regex.search(text):
-            matches.append({{"path": path, "mtime_ms": file_mtime_ms(path)}})
-    matches.sort(key=lambda item: (-item["mtime_ms"], item["path"]))
+        lines = text.splitlines()
+        file_match_count = 0
+        for line_index, line in enumerate(lines):
+            match = regex.search(line)
+            if not match:
+                continue
+            if file_match_count == 0:
+                matched_files.add(path)
+                file_matches.append({{"path": path, "mtime_ms": file_mtime_ms(path)}})
+            file_match_count += 1
+            total_matches += 1
+            if file_match_count > max_matches_per_file or len(result_matches) >= total_max_matches:
+                continue
+            if names_only:
+                continue
+            before_start = max(0, line_index - context_lines)
+            after_end = min(len(lines), line_index + 1 + context_lines)
+            result_matches.append({{
+                "file": path,
+                "line": line_index + 1,
+                "column": match.start() + 1,
+                "text": bounded_line(line),
+                "before": context_entries(lines, before_start, line_index),
+                "after": context_entries(lines, line_index + 1, after_end),
+            }})
+    file_matches.sort(key=lambda item: (-item["mtime_ms"], item["path"]))
     result = {{
         "pattern": pattern,
         "path": base,
-        "num_files": len(matches),
-        "filenames": [item["path"] for item in matches[:SEARCH_MAX_RESULTS]],
+        "context_lines": context_lines,
+        "num_files": len(matched_files),
+        "num_matches": total_matches,
+        "filenames": [item["path"] for item in file_matches[:SEARCH_MAX_RESULTS]],
     }}
     if include:
         result["include"] = include
-    if len(matches) > SEARCH_MAX_RESULTS:
+    if exclude:
+        result["exclude"] = exclude
+    if names_only:
+        result["names_only"] = True
+    else:
+        result["matches"] = result_matches
+    if (not names_only and total_matches > len(result_matches)) or len(file_matches) > SEARCH_MAX_RESULTS:
         result["truncated"] = True
     return result
 
@@ -486,7 +503,7 @@ def handle_ls(args, workspace_root):
     if truncated:
         lines.append(f"num_entries: >{{LS_MAX_ENTRIES}}")
         lines.append("truncated: true")
-        lines.append(f"There are more than {{LS_MAX_ENTRIES}} files and directories under {{base}}. Use ls with a more specific path, or use glob/grep to narrow the search. The first {{LS_MAX_ENTRIES}} files and directories are included below:")
+        lines.append(f"There are more than {{LS_MAX_ENTRIES}} files and directories under {{base}}. Use ls with a more specific path, grep for content search, or narrow shell rg/ripgrep commands such as rg --files for path pattern discovery. The first {{LS_MAX_ENTRIES}} files and directories are included below:")
         lines.append("")
     else:
         lines.append(f"num_entries: {{len(entries)}}")
@@ -504,46 +521,9 @@ def handle_ls(args, workspace_root):
         lines.append(f"{{indent}}- {{parts[-1]}}{{suffix}}")
     return "\n".join(lines)
 
-def handle_edit(args, workspace_root):
-    path_arg = args.get("path")
-    if not isinstance(path_arg, str):
-        raise ValueError("missing required argument: path")
-    old_text = args.get("old_text")
-    new_text = args.get("new_text")
-    if not isinstance(old_text, str):
-        raise ValueError("argument old_text must be a string")
-    if not isinstance(new_text, str):
-        raise ValueError("argument new_text must be a string")
-    encoding = args.get("encoding", "utf-8")
-    if str(encoding).lower() != "utf-8":
-        raise ValueError("only utf-8 encoding is supported")
-    path = resolve(path_arg, workspace_root)
-    replace_all = bool(args.get("replace_all", False))
-    create_if_missing = bool(args.get("create_if_missing", False))
-    if not os.path.exists(path) and create_if_missing:
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as handle:
-            handle.write(new_text)
-        return {{"path": path, "created": True, "replacements": 1, "bytes_written": len(new_text.encode("utf-8"))}}
-    with open(path, "r", encoding="utf-8") as handle:
-        content = handle.read()
-    replacements = content.count(old_text)
-    if replacements == 0:
-        raise ValueError(f"old_text was not found in {{path}}")
-    if replacements > 1 and not replace_all:
-        raise ValueError(f"old_text matched {{replacements}} locations in {{path}}; include more surrounding context or set replace_all=true")
-    updated = content.replace(old_text, new_text) if replace_all else content.replace(old_text, new_text, 1)
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(updated)
-    return {{"path": path, "created": False, "replacements": replacements if replace_all else 1, "bytes_written": len(updated.encode("utf-8"))}}
-
 handlers = {{
-    "glob": handle_glob,
     "grep": handle_grep,
     "ls": handle_ls,
-    "edit": handle_edit,
 }}
 
 try:

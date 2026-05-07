@@ -8,7 +8,7 @@ mod schema;
 mod skill_tools;
 mod web_tools;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -32,6 +32,14 @@ pub(crate) use skill_tools::execute_skill_load_tool;
 pub use skill_tools::skill_tool_definitions;
 pub(crate) use web_tools::execute_web_tool;
 pub use web_tools::{web_tool_definitions, WebSearchOptions};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PromptProtocol {
+    pub(crate) id: &'static str,
+    pub(crate) priority: u32,
+    pub(crate) required_tools: &'static [&'static str],
+    pub(crate) body: &'static str,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -318,6 +326,25 @@ impl ToolCatalog {
     }
 }
 
+pub(crate) fn enabled_prompt_protocols(
+    enabled_tools: &BTreeSet<String>,
+) -> Vec<&'static PromptProtocol> {
+    let mut protocols: Vec<&'static PromptProtocol> = Vec::new();
+    protocols.extend(file_tools::file_prompt_protocols());
+    protocols.extend(process_tools::process_prompt_protocols());
+    protocols.extend(host_tools::host_prompt_protocols());
+
+    protocols.retain(|protocol| {
+        protocol
+            .required_tools
+            .iter()
+            .all(|tool_name| enabled_tools.contains(*tool_name))
+    });
+    protocols.sort_by_key(|protocol| (protocol.priority, protocol.id));
+    protocols.dedup_by_key(|protocol| protocol.id);
+    protocols
+}
+
 struct SelectedMediaTool<'a> {
     model_config: &'a ModelConfig,
     self_model: bool,
@@ -486,6 +513,7 @@ mod tests {
         let file_read = catalog.get("file_read").unwrap();
         assert_eq!(file_read.parameters["required"], json!(["file_path"]));
         assert!(file_read.parameters["properties"].get("remote").is_some());
+        assert!(!catalog.contains("edit"));
 
         let ls = catalog.get("ls").unwrap();
         assert_eq!(ls.parameters["required"], json!([]));

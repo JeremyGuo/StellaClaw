@@ -1,5 +1,4 @@
 mod common;
-mod edit;
 mod list;
 mod patch;
 mod read_write;
@@ -10,7 +9,8 @@ use serde_json::{json, Map, Value};
 
 use super::{
     schema::{file_tool_schema, object_schema, properties},
-    ToolBackend, ToolConcurrency, ToolDefinition, ToolExecutionMode, ToolRemoteMode,
+    PromptProtocol, ToolBackend, ToolConcurrency, ToolDefinition, ToolExecutionMode,
+    ToolRemoteMode,
 };
 use crate::session_actor::tool_runtime::{LocalToolError, ToolExecutionContext};
 
@@ -18,12 +18,12 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
     let mut tools = vec![
         ToolDefinition::new(
             "file_read",
-            "Read a UTF-8 text file. Supports file_path plus optional offset and limit for large files. All tool results are capped by the runtime; use smaller ranges for huge files.",
+            "Read a UTF-8 text file. Supports file_path plus optional start_line and end_line for large files. Lines are 1-based and end_line is inclusive. When end_line is omitted, reads up to 200 lines from start_line. All tool results are capped by the runtime; use smaller ranges for huge files.",
             file_tool_schema(
                 properties([
                     ("file_path", json!({"type": "string"})),
-                    ("offset", json!({"type": "integer"})),
-                    ("limit", json!({"type": "integer"})),
+                    ("start_line", json!({"type": "integer", "minimum": 1})),
+                    ("end_line", json!({"type": "integer", "minimum": 1})),
                 ]),
                 &["file_path"],
                 remote_mode,
@@ -52,27 +52,18 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
         )
         .with_concurrency(ToolConcurrency::Serial),
         ToolDefinition::new(
-            "glob",
-            "Fast file pattern matching tool. Supports glob patterns like **/*.rs and src/**/*.ts. Omit path or pass an empty string to search from the current workspace directory. Skips slow remote mounts such as sshfs/NFS by default.",
-            file_tool_schema(
-                properties([
-                    ("pattern", json!({"type": "string"})),
-                    ("path", json!({"type": "string"})),
-                ]),
-                &["pattern"],
-                remote_mode,
-            ),
-            ToolExecutionMode::Immediate,
-            ToolBackend::Local,
-        ),
-        ToolDefinition::new(
             "grep",
-            "Fast content search tool. Searches file contents with a regex pattern and returns matching file paths. Omit path or pass an empty string to search from the current workspace directory. Skips slow remote mounts such as sshfs/NFS by default.",
+            "Fast content search tool. Searches file contents with a regex pattern and returns matching files plus line-level matches. Omit path or pass an empty string to search from the current workspace directory. Set context_lines from 0 to 10 to include surrounding lines. Use names_only=true when only matching paths are needed. Skips slow remote mounts such as sshfs/NFS by default.",
             file_tool_schema(
                 properties([
                     ("pattern", json!({"type": "string"})),
                     ("path", json!({"type": "string"})),
                     ("include", json!({"type": "string"})),
+                    ("exclude", json!({"type": "string"})),
+                    ("context_lines", json!({"type": "integer", "minimum": 0, "maximum": 10})),
+                    ("max_matches_per_file", json!({"type": "integer", "minimum": 1})),
+                    ("total_max_matches", json!({"type": "integer", "minimum": 1})),
+                    ("names_only", json!({"type": "boolean"})),
                 ]),
                 &["pattern"],
                 remote_mode,
@@ -82,7 +73,7 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
         ),
         ToolDefinition::new(
             "ls",
-            "List a recursive directory tree for non-hidden files and directories under a path. Omit path or pass an empty string to list the current workspace directory. Skips common cache/build directories and slow remote mounts such as sshfs/NFS by default. Large trees are truncated to the first 1000 files and directories; pass a more specific path or use glob/grep when you know what to search for.",
+            "List a recursive directory tree for non-hidden files and directories under a path. Omit path or pass an empty string to list the current workspace directory. Skips common cache/build directories and slow remote mounts such as sshfs/NFS by default. Large trees are truncated to the first 1000 files and directories; pass a more specific path, use grep when you know a content pattern, or use narrow shell rg/ripgrep commands for path pattern discovery.",
             file_tool_schema(
                 properties([("path", json!({"type": "string"}))]),
                 &[],
@@ -91,25 +82,6 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
             ToolExecutionMode::Immediate,
             ToolBackend::Local,
         ),
-        ToolDefinition::new(
-            "edit",
-            "Edit a UTF-8 text file by replacing old_text with new_text. When replace_all=false, old_text must match exactly one location; if it matches multiple locations, include more surrounding context.",
-            file_tool_schema(
-                properties([
-                    ("path", json!({"type": "string"})),
-                    ("old_text", json!({"type": "string"})),
-                    ("new_text", json!({"type": "string"})),
-                    ("replace_all", json!({"type": "boolean"})),
-                    ("create_if_missing", json!({"type": "boolean"})),
-                    ("encoding", json!({"type": "string"})),
-                ]),
-                &["path", "old_text", "new_text"],
-                remote_mode,
-            ),
-            ToolExecutionMode::Immediate,
-            ToolBackend::Local,
-        )
-        .with_concurrency(ToolConcurrency::Serial),
         ToolDefinition::new(
             "apply_patch",
             "Apply a patch inside the workspace. Supports format=auto, format=codex, or format=unified. Codex format uses an envelope with *** Begin Patch / *** End Patch and file sections such as *** Add File, *** Delete File, and *** Update File, returning files_changed. Unified format is passed to git apply; non-empty stdout/stderr are returned and capped by max_output_chars.",
@@ -171,6 +143,31 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
     tools
 }
 
+pub(crate) fn file_prompt_protocols() -> &'static [PromptProtocol] {
+    FILE_PROMPT_PROTOCOLS
+}
+
+const FILE_PROMPT_PROTOCOLS: &[PromptProtocol] = &[
+    PromptProtocol {
+        id: "file.discovery",
+        priority: 100,
+        required_tools: &["grep", "ls", "file_read"],
+        body: "For repository exploration, prefer dedicated tools when they cover the need: use grep to find files by content pattern with line numbers and optional context, ls for narrowed directory listings, and file_read for file contents. For path pattern discovery or advanced search output, use narrow and bounded shell rg/ripgrep commands such as rg --files -g '<pattern>'; if rg is unavailable, use bounded alternatives. Keep shell search scoped to the relevant directory. The recursive discovery/search tools skip slow remote mounts such as sshfs/NFS by default. Do not use shell for direct cat, head, tail, or ls.",
+    },
+    PromptProtocol {
+        id: "file.editing",
+        priority: 110,
+        required_tools: &["file_write", "apply_patch"],
+        body: "Use file_write for new files, complete rewrites, or append-only output; use apply_patch for targeted edits. After a successful apply_patch, do not re-read changed files just to verify that the patch applied; the tool reports failure when it does not apply. Re-read only when you need new context, a follow-up command or formatter may have rewritten the file, or a verification failure needs inspection.",
+    },
+    PromptProtocol {
+        id: "file.attachments",
+        priority: 120,
+        required_tools: &["file_write"],
+        body: "If you need to send files or images back to the user, write generated artifacts under .stellaclaw/output/ or another intentional workspace path, then append one or more tags in this exact format: <attachment>relative/path/from/workspace_root</attachment>. Each path must be relative to the current workspace root. User-provided attachments may appear under .stellaclaw/attachments/. The workspace may contain .stellaclaw/shared/; that directory is shared across conversations in this Stellaclaw workdir and is appropriate for reusable artifacts. .stellaclaw/ is hidden from ordinary ls output, but exact paths under .stellaclaw/output/, .stellaclaw/attachments/, and .stellaclaw/shared/ are valid for file tools. If STELLACLAW_SOFTWARE_DIR is set in the tool environment, that path is the configured shared software directory for reusable binaries, checkouts, caches, or other tool installations.",
+    },
+];
+
 pub(crate) fn execute_file_tool(
     tool_name: &str,
     arguments: &Map<String, Value>,
@@ -187,9 +184,6 @@ pub(crate) fn execute_file_tool(
         return Ok(Some(result));
     }
     if let Some(result) = list::execute_list_tool(tool_name, arguments, context)? {
-        return Ok(Some(result));
-    }
-    if let Some(result) = edit::execute_edit_tool(tool_name, arguments, context)? {
         return Ok(Some(result));
     }
     if let Some(result) = patch::execute_patch_tool(tool_name, arguments, context)? {

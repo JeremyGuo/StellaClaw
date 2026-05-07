@@ -237,7 +237,7 @@ fn render_ls_tree(base_path: &std::path::Path, entries: &[LsEntry], truncated: b
         lines.push(format!("num_entries: >{LS_MAX_ENTRIES}"));
         lines.push("truncated: true".to_string());
         lines.push(format!(
-            "There are more than {LS_MAX_ENTRIES} files and directories under {}. Use ls with a more specific path, or use glob/grep to narrow the search. The first {LS_MAX_ENTRIES} files and directories are included below:",
+            "There are more than {LS_MAX_ENTRIES} files and directories under {}. Use ls with a more specific path, grep for content search, or narrow shell rg/ripgrep commands such as rg --files for path pattern discovery. The first {LS_MAX_ENTRIES} files and directories are included below:",
             base_path.display()
         ));
         lines.push(String::new());

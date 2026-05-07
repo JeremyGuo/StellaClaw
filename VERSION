@@ -3,6 +3,27 @@ version: 1.26.0
 
 # 1.26.0
 
+- 引入 Prompt Protocol 层：
+  system prompt 不再把文件搜索、文件编辑、shell、`user_tell`、`update_plan` 和 memory 的工具操作细节全部塞进 `common_prompt`；新增 `PromptProtocol { id, priority, required_tools, body }`，由对应工具模块声明协议内容，并按 provider 实际可见工具集合筛选后以自然语言拼接进 system prompt。协议不渲染 title 或总标题，避免额外 token；`required_tools` 保证工具未启用或被 provider 过滤时不会注入相关 prompt。同步检查并对齐第一批协议和工具 description，避免搜索、编辑、shell 与 memory 规则互相冲突。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 强化 apply_patch 后的 system prompt 行为约束：
+  system prompt 学习 Codex 的 patch-first 使用方式，明确 `apply_patch` 用于定点修改，且成功后不要为了确认补丁是否应用而无意义重读已修改文件；工具未应用会报告失败，只有需要新上下文、后续命令或 formatter 可能改写文件、或验证失败需要排查时才重新读取。同时检查 system prompt 中已删除工具残留，当前未发现 `edit` / `old_text` / `replace_all` / `create_if_missing` 之类旧工具噪声。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 移除 edit 文件编辑工具：
+  删除 `edit` 字符串替换工具的模型可见定义、本地实现和 fixed SSH remote handler，避免同时暴露多套文件编辑语义；后续定点/多文件修改统一走 `apply_patch`，新建或完整写入仍保留 `file_write`。这使核心编辑路径更接近 Codex 的 patch-first 设计。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 调整 file_read 行范围参数：
+  `file_read` 的模型可见参数从 `offset` / `limit` 改为更贴近 Gemini CLI、Dirac、Cline 的 `start_line` / `end_line`，其中行号从 1 开始且 `end_line` 为 inclusive；省略 `end_line` 时默认从 `start_line` 读取最多 200 行。内部继续兼容旧的 `offset` / `limit` 调用，避免既有历史或客户端立即失效。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 强化 grep 工具能力和搜索 prompt：
+  `grep` 工具学习 Gemini CLI / Dirac / Codex 的可用设计，除匹配文件列表外新增返回 line-level `matches`，包含 `file`、`line`、`column`、匹配行文本以及可选 `before` / `after` 上下文；`context_lines` 支持 Dirac 风格的 0 到 10 行，新增 `exclude`、`max_matches_per_file`、`total_max_matches` 和 `names_only`，本地与 fixed SSH remote 文件工具保持同形输出。system prompt 现在优先引导模型使用 `grep` / `ls` / `file_read`，并学习 Codex：路径模式发现不再暴露单独 `glob` 工具，而是明确允许使用窄范围、有限制的 `rg --files -g <pattern>` / ripgrep 命令；如果 `rg` 不可用，则使用有边界的替代方案。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 移除 glob 文件发现工具：
+  删除模型可见 `glob` 工具、本地执行入口和 fixed SSH remote handler，减少文件发现工具语义重叠；后续按路径 pattern 找文件统一学习 Codex 使用 `rg --files`，按内容搜索继续使用 `grep`，目录树查看继续使用 `ls`。保留内部 glob matcher 仅用于 `grep.include` / `grep.exclude` 文件过滤。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 强化 SessionActor 上下文压缩 prompt：
+  压缩 provider request 不再使用独立 compression system prompt，改为沿用当前 session 的原始 system prompt 以保持 provider prefix/cache 一致性；压缩请求仍在 user instruction 中要求严格 JSON。prompt 吸收 Dirac 式高保真续写要求，明确压缩结果必须覆盖用户意图、需求约束、技术发现、架构决策、代码模式、涉及文件、当前状态、阻塞项、验证状态和精确下一步，同时避免复制不必要的原始历史。压缩 JSON 新增 `active_tasks`，用于结构化保留仍在运行或等待中的 `process_id`、`download_id`、`subagent` / background agent id、DSL job id 等恢复句柄及其目的、状态和下一步观察/继续/停止方式；`preserved_tool_call_ids` 保留为可选 raw tool pair 回填机制，仅在工具参数和结果无法安全摘要时使用。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 调整 SessionActor idle 压缩触发比例：
   idle compaction 在模型输出后等待 cache 过期前做维护性压缩时，token 触发上限从当前模型上下文窗口的 40% 降到 30%；如果显式配置了更低的 `compression_threshold_tokens`，仍按更低配置提前压缩。压缩后的 recent high-fidelity 保留默认继续是压缩阈值的 10%，显式配置 `compression_retain_recent_tokens` 时仍优先生效。本次不改变 `config` schema，不改变 `workdir` schema。
 

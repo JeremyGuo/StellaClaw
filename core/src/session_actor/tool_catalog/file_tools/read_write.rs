@@ -4,8 +4,7 @@ use serde_json::{json, Map, Value};
 
 use crate::session_actor::tool_runtime::{
     resolve_local_path, run_remote_json, string_arg, string_arg_with_alias,
-    string_arg_with_default, usize_arg_with_default, ExecutionTarget, LocalToolError,
-    ToolExecutionContext,
+    string_arg_with_default, ExecutionTarget, LocalToolError, ToolExecutionContext,
 };
 
 pub(super) fn execute_read_write_tool(
@@ -62,9 +61,7 @@ fn file_read_local(
         LocalToolError::Io(format!("failed to read {}: {error}", path.display()))
     })?;
     let total_lines = text.lines().count();
-    let offset = usize_arg_with_default(arguments, "offset", 1)?;
-    let limit = usize_arg_with_default(arguments, "limit", 200)?;
-    let start_line = offset.max(1);
+    let (start_line, limit) = file_read_range(arguments)?;
     let selected = text
         .lines()
         .enumerate()
@@ -86,6 +83,50 @@ fn file_read_local(
         "truncated": end_line < total_lines,
         "content": selected.join("\n"),
     }))
+}
+
+fn file_read_range(arguments: &Map<String, Value>) -> Result<(usize, usize), LocalToolError> {
+    let start_line = usize_arg_with_alias_default(arguments, "start_line", "offset", 1)?.max(1);
+    let limit = match usize_arg_optional(arguments, "end_line")? {
+        Some(end_line) => {
+            if end_line < start_line {
+                return Err(LocalToolError::InvalidArguments(
+                    "argument end_line must be greater than or equal to start_line".to_string(),
+                ));
+            }
+            end_line - start_line + 1
+        }
+        None => usize_arg_optional(arguments, "limit")?.unwrap_or(200),
+    };
+    Ok((start_line, limit))
+}
+
+fn usize_arg_with_alias_default(
+    arguments: &Map<String, Value>,
+    key: &str,
+    alias: &str,
+    default: usize,
+) -> Result<usize, LocalToolError> {
+    match usize_arg_optional(arguments, key)? {
+        Some(value) => Ok(value),
+        None => Ok(usize_arg_optional(arguments, alias)?.unwrap_or(default)),
+    }
+}
+
+fn usize_arg_optional(
+    arguments: &Map<String, Value>,
+    key: &str,
+) -> Result<Option<usize>, LocalToolError> {
+    match arguments.get(key) {
+        Some(value) => value
+            .as_u64()
+            .map(|value| value as usize)
+            .ok_or_else(|| {
+                LocalToolError::InvalidArguments(format!("argument {key} must be an integer"))
+            })
+            .map(Some),
+        None => Ok(None),
+    }
 }
 
 fn file_write_local(
@@ -131,11 +172,10 @@ fn file_read_remote(
     cwd: Option<&str>,
 ) -> Result<Value, LocalToolError> {
     let file_path = string_arg_with_alias(arguments, "file_path", "path")?;
-    let offset = usize_arg_with_default(arguments, "offset", 1)?;
-    let limit = usize_arg_with_default(arguments, "limit", 200)?;
+    let (start_line, limit) = file_read_range(arguments)?;
     let script = format!(
         "python3 - <<'PY'\n{}\nPY\n",
-        remote_file_read_script(&file_path, offset, limit)
+        remote_file_read_script(&file_path, start_line, limit)
     );
     run_remote_json(host, cwd, &script)
 }
@@ -271,6 +311,7 @@ except Exception as error:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::{
         io::Write,
         process::{Command, Stdio},
@@ -284,6 +325,31 @@ mod tests {
             "hello",
             "overwrite",
         ));
+    }
+
+    #[test]
+    fn file_read_accepts_start_and_end_line() {
+        let root =
+            std::env::temp_dir().join(format!("stellaclaw-file-read-range-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("workspace should be created");
+        std::fs::write(root.join("demo.txt"), "one\ntwo\nthree\nfour\n")
+            .expect("file should be written");
+
+        let result = file_read_local(
+            &serde_json::Map::from_iter([
+                ("file_path".to_string(), json!("demo.txt")),
+                ("start_line".to_string(), json!(2)),
+                ("end_line".to_string(), json!(3)),
+            ]),
+            &root,
+        )
+        .expect("file_read should succeed");
+
+        assert_eq!(result["start_line"], json!(2));
+        assert_eq!(result["end_line"], json!(3));
+        assert_eq!(result["content"], json!("2: two\n3: three"));
+        std::fs::remove_dir_all(&root).expect("temp dir should be cleaned");
     }
 
     fn assert_python_compiles(script: &str) {
