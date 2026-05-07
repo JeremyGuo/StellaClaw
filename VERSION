@@ -3,6 +3,9 @@ version: 1.25.9
 
 # 1.25.9
 
+- 清理客户端目录布局：
+  Electron 客户端从 `apps/stellacode2` 迁移到 `apps/stellacodeX/electron`，发布 workflow、文档和 SSH 更新固定路径同步切换；原 `apps/stellacodeX/apple` 迁移为 `apps/stellacodeX/ios`，作为后续 iOS 原生客户端入口。Electron 与 iOS app icon / launch logo 同步改用 `apps/stellacodeX/shared/assets/icons/stellacodex/` 下的新 Logo。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 修复 StellaCodeX macOS 空 conversation 状态下展开右侧概览可能闪退的问题：
   Web API client 的 `invalidateTransport()` 不再永久 invalidate 底层 `URLSession`，改为取消当前 session tasks 并关闭 SSH tunnel，避免后续 SwiftUI 视图重建触发 `loadInitialData` 时复用已经 invalidated 的 session。`AppViewModel.loadInitialData` 增加运行中和已完成 guard，设置页保存 profile 后使用强制 reload；profile 切换时只关闭旧 client transport，不会误关新 client。本次不改变 `config` schema，不改变 `workdir` schema。
 

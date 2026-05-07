@@ -4,11 +4,10 @@ Shared, platform-neutral assets live here so each native client can consume the 
 
 ## Icons
 
-`icons/stellacodex/` contains the StellacodeX app icon set:
+`icons/stellacodex/` contains the StellacodeX source logo files:
 
-- root PNGs: full-size dark, light, and transparent variants;
-- `android/`: density-sized PNGs grouped by variant;
-- `ios/`: app-icon PNG sizes grouped by variant;
-- `macos/`: macOS icon PNG sizes grouped by variant;
-- `windows/`: Windows icon PNG sizes and `.ico` files grouped by variant.
+- `StellacodeX-icon-light.png`: RGB app icon source for light/default app icon exports;
+- `StellacodeX-icon-dark.png`: RGB app icon source for dark-surface uses;
+- `StellacodeX-icon-transparent.png`: transparent logo source for launch screens and in-app logo rendering.
 
+Client-specific bundles should generate their required PNG, `.icns`, or `.ico` files from these sources.

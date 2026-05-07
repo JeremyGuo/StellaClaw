@@ -44,7 +44,7 @@ The current Rust implementation is split across these runtime layers:
 
 | Layer | Binary / Crate | Owns |
 |---|---|---|
-| Client and channel surface | `apps/stellacode2`, Telegram, Web API | User interaction, desktop workspace browsing, terminal UI, attachments, delivery. |
+| Client and channel surface | `apps/stellacodeX/electron`, Telegram, Web API | User interaction, desktop workspace browsing, terminal UI, attachments, delivery. |
 | Host server | `stellaclaw` | Channels, conversations, workdirs, Telegram/Web surfaces, config, routing, delivery, runtime skill persistence. |
 | Agent server | `agent_server` + `stellaclaw_core` | SessionActor state machine, provider/tool loop, compaction, session history, runtime metadata. |
 | Remote workspace server | SSH/sshfs target | Optional fixed or selectable remote workspace, remote shell, project files, execution root. |

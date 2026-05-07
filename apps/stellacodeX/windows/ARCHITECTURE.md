@@ -32,7 +32,7 @@ Windows follows the established native-client profile shape:
 - `Direct`: requests use `baseUrl`.
 - `SshProxy`: client opens a local tunnel through `ssh.exe`, then requests use the resolved `127.0.0.1:<port>` base URL while the remote side reaches `targetUrl`.
 
-First implementation should prioritize SSH alias mode, matching `apps/stellacode2`: users may enter a `~/.ssh/config` Host alias in `sshHost`. Explicit host/user/port/private-key UI can be added after alias mode is stable.
+First implementation should prioritize SSH alias mode, matching `apps/stellacodeX/electron`: users may enter a `~/.ssh/config` Host alias in `sshHost`. Explicit host/user/port/private-key UI can be added after alias mode is stable.
 
 ## API coverage
 

@@ -260,7 +260,7 @@
         <span class="pill">生成日期：2026-04-30</span>
         <span class="pill">作者：<strong>郭俊毅</strong></span>
         <span class="pill">源代码：<code>stellaclaw/src/channels/web.rs</code></span>
-        <span class="pill">客户端：<code>apps/stellacode2</code></span>
+        <span class="pill">客户端：<code>apps/stellacodeX/electron</code></span>
       </div>
     </div>
   </header>
@@ -564,8 +564,8 @@ ws://host:port/api/conversations/{id}/foreground/ws?token=&lt;web_token&gt;</cod
       <section id="client">
         <h2>Stellacode 2 当前使用方式</h2>
         <ul>
-          <li><code>apps/stellacode2/src/lib/api.js</code> 是 renderer 侧 Web Channel API wrapper。</li>
-          <li><code>apps/stellacode2/electron/main.cjs</code> 负责 server settings、Direct/SSH Proxy、请求超时、workspace 二进制上传下载、系统通知、更新。</li>
+          <li><code>apps/stellacodeX/electron/src/lib/api.js</code> 是 renderer 侧 Web Channel API wrapper。</li>
+          <li><code>apps/stellacodeX/electron/electron/main.cjs</code> 负责 server settings、Direct/SSH Proxy、请求超时、workspace 二进制上传下载、系统通知、更新。</li>
           <li><code>App.jsx</code> 维护两个长连接：conversation list stream 和当前 foreground session stream；前者承载 conversation 级事实，后者只承载当前消息、turn progress 和错误。</li>
           <li>workspace upload/download 不走通用 <code>api()</code> wrapper，因为需要 gzip binary body、tar 解析和 native save dialog。</li>
           <li>terminal dock 使用 terminal WebSocket 承载 PTY output/input/resize；REST 只保留 terminal 生命周期管理。</li>

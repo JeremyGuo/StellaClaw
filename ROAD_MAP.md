@@ -37,7 +37,7 @@
 
 - `apps/stellacodeX/*` 是 Stellaclaw Web channel 的原生客户端轨道；客户端只连接现有 Host Web Service，不在本地运行 `stellaclaw`、`agent_server` 或工具执行 runtime。
 - 原生客户端按平台拥有自己的 UI、OS 集成和发布流水线；`apps/stellacodeX/shared/` 只放协议契约、生成 schema、共享资产和 fixture，不放跨平台 UI 层。
-- Windows 客户端第一阶段采用 WinUI 3 / Windows App SDK 方向，功能语义对齐 `apps/stellacode2` 与已落地的 Apple/Android 客户端：server profiles、conversation list、message history/send、foreground WebSocket、conversation stream、workspace、terminal、status/actions 和 SSH Proxy。
+- Windows 客户端第一阶段采用 WinUI 3 / Windows App SDK 方向，功能语义对齐 `apps/stellacodeX/electron` 与已落地的 iOS/Android 客户端：server profiles、conversation list、message history/send、foreground WebSocket、conversation stream、workspace、terminal、status/actions 和 SSH Proxy。
 - Windows 发布方式先固定为 portable zip：在 Windows 构建机上产出可独立运行目录，压缩后分发；解压即可运行，不先引入 MSIX、安装器或自动更新。
 - 非 Windows 服务器可以承载 Stellaclaw 测试后端、协议 fixture、普通 .NET 代码检查和文档维护；WinUI 构建、窗口交互、Windows Credential/SSH/通知和 portable zip 验证必须在 Windows runner、Windows VM 或真实 Windows 机器上完成。
 

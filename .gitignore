@@ -10,6 +10,7 @@ target/
 **/target/
 apps/*/node_modules/
 apps/*/dist/
+apps/stellacodeX/**/node_modules/
 .log/
 **/.log/
 .output/
@@ -37,8 +38,8 @@ tmp/
 .stellaclaw/
 .skill_memory
 shared
-!apps/stellacodeX/apple/StellaCodeX/StellaCodeX/Shared/
-!apps/stellacodeX/apple/StellaCodeX/StellaCodeX/Shared/**
+!apps/stellacodeX/ios/StellaCodeX/StellaCodeX/Shared/
+!apps/stellacodeX/ios/StellaCodeX/StellaCodeX/Shared/**
 !apps/stellacodeX/shared/
 !apps/stellacodeX/shared/**
 STELLACLAW.md
@@ -52,6 +53,7 @@ restart.log
 **/build/
 **/local.properties
 apps/stellacodeX/**/dist/
+apps/stellacodeX/**/release/
 
 # Xcode user state
 **/xcuserdata/

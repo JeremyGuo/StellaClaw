@@ -10,7 +10,7 @@ The Windows app is a client only. It connects to an existing Stellaclaw Web chan
 
 - UI: WinUI 3 / Windows App SDK on Windows.
 - Language/runtime: C# / .NET 8.
-- Protocol: same Web channel REST/WebSocket semantics used by `apps/stellacode2`, Apple, and Android clients.
+- Protocol: same Web channel REST/WebSocket semantics used by `apps/stellacodeX/electron`, iOS, and Android clients.
 - Shared code: only platform-neutral protocol/schema/assets/fixtures under `apps/stellacodeX/shared`; no shared UI layer.
 - Release shape: portable self-contained directory zipped for distribution. Users unzip and run the executable; no installer, MSIX, or auto-update in the first phase.
 

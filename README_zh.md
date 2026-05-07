@@ -44,7 +44,7 @@ Stellacode、Telegram group 和 Web client 是用户侧 host surface。Stellacla
 
 | 层 | Binary / Crate | 负责 |
 |---|---|---|
-| Client / channel surface | `apps/stellacode2`、Telegram、Web API | 用户交互、桌面 workspace 浏览、terminal UI、附件、delivery |
+| Client / channel surface | `apps/stellacodeX/electron`、Telegram、Web API | 用户交互、桌面 workspace 浏览、terminal UI、附件、delivery |
 | Host server | `stellaclaw` | Channels、conversations、workdirs、Telegram/Web surfaces、config、routing、delivery、runtime skill persistence |
 | Agent server | `agent_server` + `stellaclaw_core` | SessionActor 状态机、provider/tool loop、compaction、session history、runtime metadata |
 | Remote workspace server | SSH/sshfs target | 可选 fixed/selectable remote workspace、remote shell、项目文件、执行根目录 |
@@ -333,7 +333,7 @@ Release 产物包括：
 ```text
 agent_host/       # Host-facing abstractions
 agent_server/     # Session process wrapper around stellaclaw_core
-apps/stellacode2/ # React/Electron desktop client
+apps/stellacodeX/electron/ # React/Electron desktop client
 core/             # Core SessionActor and provider/tool loop
 docs/             # Documentation assets
 pricing/          # Provider model pricing tables
@@ -354,14 +354,14 @@ cargo test --workspace --locked
 Stellacode 2 前端检查：
 
 ```bash
-cd apps/stellacode2
+cd apps/stellacodeX/electron
 npm run check
 ```
 
 本地开发启动 Stellacode 2：
 
 ```bash
-cd apps/stellacode2
+cd apps/stellacodeX/electron
 npm start
 ```
 

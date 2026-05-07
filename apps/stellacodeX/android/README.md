@@ -51,7 +51,7 @@ Later scope:
 
 ## Backend contract
 
-The Android client should use the same Web channel API consumed by `apps/stellacode2/src/lib/api.js`, excluding terminal endpoints for the first version.
+The Android client should use the same Web channel API consumed by `apps/stellacodeX/electron/src/lib/api.js`, excluding terminal endpoints for the first version.
 
 First-version endpoints:
 
