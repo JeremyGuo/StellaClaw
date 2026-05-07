@@ -18,7 +18,8 @@ pub const CONFIG_VERSION_0_7: &str = "0.7";
 pub const CONFIG_VERSION_0_8: &str = "0.8";
 pub const CONFIG_VERSION_0_9: &str = "0.9";
 pub const CONFIG_VERSION_0_10: &str = "0.10";
-pub const LATEST_CONFIG_VERSION: &str = "0.11";
+pub const CONFIG_VERSION_0_11: &str = "0.11";
+pub const LATEST_CONFIG_VERSION: &str = "0.12";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StellaclawConfig {
@@ -34,6 +35,8 @@ pub struct StellaclawConfig {
     pub available_agent_models: Vec<String>,
     #[serde(default)]
     pub session_defaults: SessionDefaults,
+    #[serde(default)]
+    pub memory: MemoryConfig,
     #[serde(default)]
     pub skill_sync: Vec<SkillSyncConfig>,
     #[serde(default)]
@@ -119,6 +122,69 @@ pub struct SessionDefaults {
     pub search_video_tool_model: Option<ToolModelTarget>,
     #[serde(default)]
     pub search_news_tool_model: Option<ToolModelTarget>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub user_compaction_model_alias: Option<String>,
+    #[serde(default)]
+    pub dedupe_model_alias: Option<String>,
+    #[serde(default = "default_user_soft_threshold_bytes")]
+    pub user_soft_threshold_bytes: u64,
+    #[serde(default = "default_user_hard_threshold_bytes")]
+    pub user_hard_threshold_bytes: u64,
+    #[serde(default = "default_user_retry_after_failed_hard_compaction_secs")]
+    pub user_retry_after_failed_hard_compaction_secs: u64,
+    #[serde(default = "default_user_soft_compaction_schedule")]
+    pub user_soft_compaction_schedule: String,
+    #[serde(default = "default_memory_write_candidate_limit")]
+    pub write_candidate_limit: usize,
+    #[serde(default = "default_memory_tool_result_max_bytes")]
+    pub tool_result_max_bytes: usize,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            user_compaction_model_alias: None,
+            dedupe_model_alias: None,
+            user_soft_threshold_bytes: default_user_soft_threshold_bytes(),
+            user_hard_threshold_bytes: default_user_hard_threshold_bytes(),
+            user_retry_after_failed_hard_compaction_secs:
+                default_user_retry_after_failed_hard_compaction_secs(),
+            user_soft_compaction_schedule: default_user_soft_compaction_schedule(),
+            write_candidate_limit: default_memory_write_candidate_limit(),
+            tool_result_max_bytes: default_memory_tool_result_max_bytes(),
+        }
+    }
+}
+
+fn default_user_soft_threshold_bytes() -> u64 {
+    4096
+}
+
+fn default_user_hard_threshold_bytes() -> u64 {
+    8192
+}
+
+fn default_user_retry_after_failed_hard_compaction_secs() -> u64 {
+    21_600
+}
+
+fn default_user_soft_compaction_schedule() -> String {
+    "daily".to_string()
+}
+
+fn default_memory_write_candidate_limit() -> usize {
+    10
+}
+
+fn default_memory_tool_result_max_bytes() -> usize {
+    4096
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,6 +307,7 @@ impl StellaclawConfig {
             return Err("config must include at least one model".to_string());
         }
         self.validate_available_agent_models()?;
+        self.validate_memory_models()?;
         if self.available_agent_models().is_empty() {
             return Err("config must include at least one chat-capable model".to_string());
         }
@@ -263,6 +330,31 @@ impl StellaclawConfig {
                 return Err(format!(
                     "available_agent_models entry {alias} is not chat-capable"
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_memory_models(&self) -> Result<(), String> {
+        for (field, alias) in [
+            (
+                "memory.user_compaction_model_alias",
+                self.memory.user_compaction_model_alias.as_deref(),
+            ),
+            (
+                "memory.dedupe_model_alias",
+                self.memory.dedupe_model_alias.as_deref(),
+            ),
+        ] {
+            let Some(alias) = alias.map(str::trim).filter(|alias| !alias.is_empty()) else {
+                continue;
+            };
+            let model = self
+                .models
+                .get(alias)
+                .ok_or_else(|| format!("{field} references unknown model {alias}"))?;
+            if !model.supports(ModelCapability::Chat) {
+                return Err(format!("{field} entry {alias} is not chat-capable"));
             }
         }
         Ok(())

@@ -222,12 +222,16 @@ struct ConversationUsageSummary: Hashable {
     var background: ConversationUsageTotals
     var subagents: ConversationUsageTotals
     var mediaTools: ConversationUsageTotals
+    var memory: ConversationUsageTotals
+    var userMemoryCompaction: ConversationUsageTotals
 
     var total: ConversationUsageTotals {
         foreground
             .adding(background)
             .adding(subagents)
             .adding(mediaTools)
+            .adding(memory)
+            .adding(userMemoryCompaction)
     }
 }
 

@@ -14,7 +14,10 @@ pub enum HostToolScope {
     SubAgent,
 }
 
-pub fn host_tool_definitions(scope: HostToolScope) -> Vec<ToolDefinition> {
+pub fn host_tool_definitions(
+    scope: HostToolScope,
+    enable_memory_tools: bool,
+) -> Vec<ToolDefinition> {
     let mut tools = Vec::new();
 
     if matches!(
@@ -27,6 +30,9 @@ pub fn host_tool_definitions(scope: HostToolScope) -> Vec<ToolDefinition> {
 
     tools.push(user_tell_tool(scope));
     tools.push(update_plan_tool());
+    if enable_memory_tools {
+        tools.extend(memory_tools());
+    }
     tools.extend(subagent_tools());
 
     match scope {
@@ -175,6 +181,73 @@ fn cron_tools() -> Vec<ToolDefinition> {
             "remove_cron_task",
             "Remove a cron task permanently.",
             object_schema(properties([("id", json!({"type": "string"}))]), &["id"]),
+            ToolExecutionMode::Immediate,
+        ),
+    ]
+}
+
+fn memory_tools() -> Vec<ToolDefinition> {
+    vec![
+        bridge_tool(
+            "memory_search",
+            "Search long memory for stable facts from the current conversation and public cross-conversation memory. Use this before answering questions about durable facts that may be outside the current short context.",
+            object_schema(
+                properties([
+                    ("query", json!({"type": "string", "description": "Natural language search query."})),
+                    ("limit", json!({"type": "number", "description": "Optional maximum result count. Defaults to 5 and is capped by the host."})),
+                    (
+                        "scopes",
+                        json!({
+                            "type": "array",
+                            "items": {"type": "string", "enum": ["conversation", "public"]},
+                            "description": "Optional scopes to search. Defaults to conversation and public."
+                        }),
+                    ),
+                ]),
+                &["query"],
+            ),
+            ToolExecutionMode::Immediate,
+        ),
+        bridge_tool(
+            "memory_write",
+            "Write stable long memory only when the information is durable, likely to be reused later, and still useful after the current turn. Do not store transient steps, one-off tool output, guesses, ordinary chat, compacted summaries, or facts already present in memory. Scope user is for durable collaboration preferences and general corrections; conversation is for goals, constraints, key facts, state, and handoff that all sessions in this conversation should know; public is for stable project/customer/data/task facts useful across conversations. The host resolves duplicates and conflicts internally and returns only success or failure.",
+            object_schema(
+                properties([
+                    (
+                        "scope",
+                        json!({
+                            "type": "string",
+                            "enum": ["user", "public", "conversation"],
+                            "description": "user for durable collaboration preferences; conversation for this conversation's shared long memory; public for cross-conversation long memory."
+                        }),
+                    ),
+                    ("subject", json!({"type": "string", "description": "Optional short subject or entity name."})),
+                    ("text", json!({"type": "string", "description": "Compact durable memory text. About 1KB maximum."})),
+                    ("tags", json!({"type": "array", "items": {"type": "string"}, "description": "Optional compact tags."})),
+                ]),
+                &["scope", "text"],
+            ),
+            ToolExecutionMode::Immediate,
+        ),
+        bridge_tool(
+            "memory_update",
+            "Replace a memory entry by id when search reveals an obviously stale, incomplete, or wrong entry.",
+            object_schema(
+                properties([
+                    ("memory_id", json!({"type": "string"})),
+                    ("text", json!({"type": "string"})),
+                ]),
+                &["memory_id", "text"],
+            ),
+            ToolExecutionMode::Immediate,
+        ),
+        bridge_tool(
+            "memory_delete",
+            "Delete or tombstone a memory entry by id when search reveals it is obsolete, duplicate, or wrong.",
+            object_schema(
+                properties([("memory_id", json!({"type": "string"}))]),
+                &["memory_id"],
+            ),
             ToolExecutionMode::Immediate,
         ),
     ]

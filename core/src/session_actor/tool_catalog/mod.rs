@@ -273,6 +273,7 @@ impl ToolCatalog {
                 || generation_tool.model_config.provider_type != ProviderType::CodexSubscription)
                 && generation_tool.model_supports(ModelCapability::ImageOut),
             enable_skill_persistence_tools: true,
+            enable_memory_tools: initial.memory_enabled,
             host_tool_scope: Some(HostToolScope::from(initial.session_type)),
             ..BuiltinToolCatalogOptions::default()
         };
@@ -368,6 +369,7 @@ pub struct BuiltinToolCatalogOptions {
     pub enable_provider_image_generation: bool,
     pub skill_names: Vec<String>,
     pub enable_skill_persistence_tools: bool,
+    pub enable_memory_tools: bool,
     pub host_tool_scope: Option<HostToolScope>,
 }
 
@@ -386,6 +388,7 @@ impl Default for BuiltinToolCatalogOptions {
             enable_provider_image_generation: false,
             skill_names: Vec::new(),
             enable_skill_persistence_tools: false,
+            enable_memory_tools: false,
             host_tool_scope: None,
         }
     }
@@ -416,7 +419,7 @@ pub fn builtin_tool_catalog(
         catalog.add(tool)?;
     }
     if let Some(scope) = options.host_tool_scope {
-        for tool in host_tool_definitions(scope) {
+        for tool in host_tool_definitions(scope, options.enable_memory_tools) {
             catalog.add(tool)?;
         }
     }
@@ -461,9 +464,8 @@ mod tests {
         assert!(catalog.contains("file_read"));
         assert!(!catalog.contains("shell"));
         assert!(catalog.contains("shell_exec"));
-        assert!(catalog.contains("shell_observe"));
         assert!(catalog.contains("shell_write_stdin"));
-        assert!(catalog.contains("shell_close"));
+        assert!(catalog.contains("shell_stop"));
         assert!(catalog.contains("file_download_start"));
         assert!(!catalog.contains("dsl_start"));
         assert!(catalog.contains("web_search"));
@@ -495,6 +497,8 @@ mod tests {
             .is_some());
         assert!(shell.parameters["properties"].get("remote").is_some());
         assert!(shell.parameters["properties"].get("session_id").is_none());
+        assert!(shell.parameters["properties"].get("shell_id").is_none());
+        assert!(shell.parameters["properties"].get("tty").is_some());
 
         let image_generation = catalog.get("image_generation").unwrap();
         assert_eq!(
@@ -806,6 +810,8 @@ mod tests {
         assert!(catalog.contains("subagent_start"));
         assert!(catalog.contains("start_background_agent"));
         assert!(catalog.contains("list_cron_tasks"));
+        assert!(!catalog.contains("memory_search"));
+        assert!(!catalog.contains("memory_write"));
         assert!(!catalog.contains("workpath_add"));
         assert!(!catalog.contains("workspaces_list"));
         assert!(!catalog.contains("workspace_content_list"));
@@ -823,6 +829,30 @@ mod tests {
         let background = catalog.get("start_background_agent").unwrap();
         assert_eq!(background.parameters["required"], json!(["task"]));
         assert!(background.parameters["properties"].get("model").is_none());
+    }
+
+    #[test]
+    fn memory_host_tools_are_config_gated() {
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions {
+            host_tool_scope: Some(HostToolScope::MainForeground),
+            enable_memory_tools: true,
+            ..BuiltinToolCatalogOptions::default()
+        })
+        .expect("catalog should build");
+        let memory_write = catalog.get("memory_write").unwrap();
+        assert_eq!(
+            memory_write.backend,
+            ToolBackend::ConversationBridge {
+                action: "memory_write".to_string()
+            }
+        );
+        assert_eq!(
+            memory_write.parameters["required"],
+            json!(["scope", "text"])
+        );
+        assert!(memory_write.parameters["properties"]
+            .get("reason")
+            .is_none());
     }
 
     #[test]

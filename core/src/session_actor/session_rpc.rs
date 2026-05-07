@@ -68,6 +68,8 @@ pub struct SessionInitial {
     pub search_news_tool_model: Option<ModelConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_workspace_instructions: Option<String>,
+    #[serde(default)]
+    pub memory_enabled: bool,
 }
 
 impl SessionInitial {
@@ -87,6 +89,7 @@ impl SessionInitial {
             search_video_tool_model: None,
             search_news_tool_model: None,
             remote_workspace_instructions: None,
+            memory_enabled: false,
         }
     }
 }
@@ -212,6 +215,10 @@ pub enum SessionEvent {
         threshold_tokens: u64,
         retained_message_count: usize,
         compressed_message_count: usize,
+    },
+    CompactFailed {
+        phase: String,
+        reason: String,
     },
     ControlRejected {
         reason: String,

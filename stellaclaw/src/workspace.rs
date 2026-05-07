@@ -9,6 +9,8 @@ use stellaclaw_core::session_actor::ToolRemoteMode;
 
 const RUNDIR: &str = "rundir";
 const STELLACLAW_DIR: &str = ".stellaclaw";
+const ATTACHMENTS_DIR: &str = "attachments";
+const OUTPUT_DIR: &str = "output";
 const SHARED_DIR: &str = "shared";
 const SKILL_DIR: &str = "skill";
 const SHARED_SKILL_MEMORY_DIR: &str = "skill_memory";
@@ -58,11 +60,17 @@ pub fn ensure_workspace_seed(workdir: &Path, data_root: &Path) -> Result<()> {
 
     let stellaclaw_dir = data_root.join(STELLACLAW_DIR);
     let workspace_profile = &stellaclaw_dir;
+    let workspace_attachments = stellaclaw_dir.join(ATTACHMENTS_DIR);
+    let workspace_output = stellaclaw_dir.join(OUTPUT_DIR);
     let workspace_skill = stellaclaw_dir.join(SKILL_DIR);
     let workspace_shared = stellaclaw_dir.join(SHARED_DIR);
     let workspace_skill_memory = stellaclaw_dir.join(SHARED_SKILL_MEMORY_DIR);
     fs::create_dir_all(workspace_profile)
         .with_context(|| format!("failed to create {}", workspace_profile.display()))?;
+    fs::create_dir_all(&workspace_attachments)
+        .with_context(|| format!("failed to create {}", workspace_attachments.display()))?;
+    fs::create_dir_all(&workspace_output)
+        .with_context(|| format!("failed to create {}", workspace_output.display()))?;
     fs::create_dir_all(&workspace_skill)
         .with_context(|| format!("failed to create {}", workspace_skill.display()))?;
 
@@ -395,6 +403,8 @@ mod tests {
 
         ensure_workspace_seed(&root, &conversation_a).expect("first workspace should seed");
         ensure_workspace_seed(&root, &conversation_b).expect("second workspace should seed");
+        assert!(conversation_a.join(".stellaclaw/attachments").is_dir());
+        assert!(conversation_a.join(".stellaclaw/output").is_dir());
         std::fs::write(
             conversation_a
                 .join(".stellaclaw")

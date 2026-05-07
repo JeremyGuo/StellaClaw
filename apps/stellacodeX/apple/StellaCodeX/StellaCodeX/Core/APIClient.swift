@@ -154,7 +154,9 @@ struct MockStellaAPIClient: StellaAPIClient {
                     cost: ConversationUsageCost(cacheRead: 0.004, cacheWrite: 0.008, input: 0.017, output: 0.041)
                 ),
                 subagents: .empty,
-                mediaTools: .empty
+                mediaTools: .empty,
+                memory: .empty,
+                userMemoryCompaction: .empty
             )
         )
     }
@@ -651,7 +653,12 @@ struct StellaWebAPIClient: StellaAPIClient {
     }
 
     func invalidateTransport() async {
-        session.invalidateAndCancel()
+        await withCheckedContinuation { continuation in
+            session.getAllTasks { tasks in
+                tasks.forEach { $0.cancel() }
+                continuation.resume()
+            }
+        }
         await tunnelManager.close()
     }
 
@@ -1014,6 +1021,8 @@ private struct WebConversationUsageSummary: Decodable {
     var background: WebConversationUsageTotals
     var subagents: WebConversationUsageTotals
     var media_tools: WebConversationUsageTotals
+    var memory: WebConversationUsageTotals?
+    var user_memory_compaction: WebConversationUsageTotals?
 }
 
 private struct WebConversationUsageTotals: Decodable {
@@ -1575,7 +1584,9 @@ extension ConversationUsageSummary {
             foreground: ConversationUsageTotals(web: web.foreground),
             background: ConversationUsageTotals(web: web.background),
             subagents: ConversationUsageTotals(web: web.subagents),
-            mediaTools: ConversationUsageTotals(web: web.media_tools)
+            mediaTools: ConversationUsageTotals(web: web.media_tools),
+            memory: web.memory.map(ConversationUsageTotals.init(web:)) ?? .empty,
+            userMemoryCompaction: web.user_memory_compaction.map(ConversationUsageTotals.init(web:)) ?? .empty
         )
     }
 }

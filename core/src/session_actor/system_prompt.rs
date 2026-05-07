@@ -1,8 +1,7 @@
 use super::{
     runtime_metadata::{
         RuntimeMetadataState, IDENTITY_PROMPT_COMPONENT, REMOTE_ALIASES_PROMPT_COMPONENT,
-        SKILLS_METADATA_PROMPT_COMPONENT, STELLACLAW_MEMORY_PROMPT_COMPONENT,
-        USER_META_PROMPT_COMPONENT,
+        SKILLS_METADATA_PROMPT_COMPONENT, USER_MEMORY_PROMPT_COMPONENT, USER_META_PROMPT_COMPONENT,
     },
     SessionInitial, SessionType, ToolRemoteMode,
 };
@@ -32,6 +31,9 @@ pub(crate) fn system_prompt_for_initial(
         ));
     }
     sections.extend(snapshot_sections(initial, runtime_metadata_state));
+    if initial.memory_enabled {
+        sections.push(memory_prompt().to_string());
+    }
     sections.push(tool_efficiency_prompt(&initial.session_type).to_string());
     sections.join("\n\n")
 }
@@ -55,11 +57,7 @@ fn common_prompt() -> &'static str {
      When you start working in a subdirectory, check whether that subtree has a more local \
      AGENTS.md or similar instruction file before editing there; when rules conflict, \
      follow the more local file. Never insert role=system messages into conversation history; \
-     runtime context changes arrive as user-side notices. .stellaclaw/STELLACLAW.md is \
-     the durable project memory file: keep it concise and factual, update it only when long-lived \
-     project facts, stable conventions, confirmed architecture notes, or handoff-critical decisions \
-     change. Do not use .stellaclaw/STELLACLAW.md for transient per-turn chatter, guesses, or unconfirmed \
-     notes. Use user_tell only for mid-task progress or coordination that must become visible \
+     runtime context changes arrive as user-side notices. Use user_tell only for mid-task progress or coordination that must become visible \
      before the current turn is ready to finish. If you can return the final answer now, do not \
      send an extra user_tell first. Positive example: a long-running edit, benchmark, or debug \
      session is still in progress and the user needs an immediate visible status update. Negative \
@@ -69,11 +67,16 @@ fn common_prompt() -> &'static str {
      across several files, a bug investigation with multiple plausible causes, or a task that \
      needs several verification steps. Negative examples: a one-line fix, a single file read, or \
      a straightforward reply that can be finished immediately without a visible plan. If you need \
-     to send files or images back to the user, append one or more tags in this exact format: \
+     to send files or images back to the user, write generated artifacts under \
+     .stellaclaw/output/ or another intentional workspace path, then append one or more tags in \
+     this exact format: \
      <attachment>relative/path/from/workspace_root</attachment>. Each path must be relative to the \
      current workspace root. This attachment syntax is supported in both the final assistant reply \
-     and user_tell text. The workspace may contain .stellaclaw/shared/; that directory is shared across \
-     conversations in this Stellaclaw workdir and is appropriate for reusable artifacts. If \
+     and user_tell text. User-provided attachments may appear under .stellaclaw/attachments/. \
+     The workspace may contain .stellaclaw/shared/; that directory is shared across \
+     conversations in this Stellaclaw workdir and is appropriate for reusable artifacts. \
+     .stellaclaw/ is hidden from ordinary ls output, but exact paths under .stellaclaw/output/, \
+     .stellaclaw/attachments/, and .stellaclaw/shared/ are valid for file tools. If \
      STELLACLAW_SOFTWARE_DIR is set in the tool environment, that path is the configured shared \
      software directory for reusable binaries, checkouts, caches, or other tool installations."
 }
@@ -81,6 +84,25 @@ fn common_prompt() -> &'static str {
 fn foreground_prompt() -> &'static str {
     "Session kind: foreground. You are interacting with the user directly. Prefer clear progress, \
      concrete code changes, and a short final summary with verification."
+}
+
+fn memory_prompt() -> &'static str {
+    "[Memory Instructions]\n\
+     Use memory_write only for stable information that is likely to be reused after this turn. Do \
+     not save transient execution steps, one-off tool output, guesses, ordinary chat, compacted \
+     summaries, or facts already present in memory.\n\
+     Save scope=user for durable collaboration preferences, response style, general corrections, \
+     and user work habits. Save scope=conversation for goals, constraints, key facts, durable \
+     state, and handoff that every session or agent in this conversation should know. Save \
+     scope=public for stable project, customer, data definition, or long-running task facts that \
+     may be useful across conversations.\n\
+     memory_write resolves duplicates and conflicts internally and returns only success or failure. \
+     If it fails, retry only when you can provide more specific, stable text. Long memory is not \
+     automatically injected into every turn; use memory_search when the current short context is \
+     insufficient, when the user asks about durable project/conversation facts, or when the task \
+     likely depends on prior cross-conversation or current-conversation agreements. \
+     Use memory_update or memory_delete only when search reveals an obviously stale, incomplete, \
+     duplicate, or wrong entry."
 }
 
 fn background_prompt() -> &'static str {
@@ -154,18 +176,20 @@ fn snapshot_sections(
 
     if let Some(user_meta) = runtime_metadata_state.snapshot_value(USER_META_PROMPT_COMPONENT) {
         sections.push(format!(
-            "[User Metadata Snapshot]\nTreat this as the canonical durable user metadata:\n{}",
+            "[User Metadata Snapshot]\nThis is metadata for .stellaclaw/USER.md, not the full file content. Treat it as the canonical profile file status; read .stellaclaw/USER.md with file_read when exact profile details are needed:\n{}",
             user_meta
         ));
     }
 
-    if let Some(stellaclaw_memory) =
-        runtime_metadata_state.snapshot_value(STELLACLAW_MEMORY_PROMPT_COMPONENT)
-    {
-        sections.push(format!(
-            "[STELLACLAW Memory Snapshot]\nTreat this as the canonical durable project memory from .stellaclaw/STELLACLAW.md:\n{}",
-            stellaclaw_memory
-        ));
+    if initial.memory_enabled {
+        if let Some(user_memory) =
+            runtime_metadata_state.snapshot_value(USER_MEMORY_PROMPT_COMPONENT)
+        {
+            sections.push(format!(
+                "[User Memory Snapshot]\nTreat this as canonical durable collaboration memory for the user. Each entry is an active long-memory item by id:\n{}",
+                user_memory
+            ));
+        }
     }
 
     if let Some(skills_metadata) =
@@ -229,14 +253,21 @@ mod tests {
     fn system_prompt_uses_snapshot_values_not_notified_values() {
         let mut initial = SessionInitial::new("s1", SessionType::Foreground);
         initial.tool_remote_mode = ToolRemoteMode::Selectable;
+        initial.memory_enabled = true;
 
         let mut state = RuntimeMetadataState::default();
-        let root = temp_root();
+        let workdir = temp_root();
+        let root = workdir.join("conversations").join("c1");
         fs::create_dir_all(root.join(".stellaclaw")).unwrap();
         fs::create_dir_all(root.join(".stellaclaw/skill/demo")).unwrap();
+        fs::create_dir_all(workdir.join("rundir/memory_v1/user")).unwrap();
         fs::write(root.join(".stellaclaw/IDENTITY.md"), "identity: old").unwrap();
         fs::write(root.join(".stellaclaw/USER.md"), "tier: old").unwrap();
-        fs::write(root.join(".stellaclaw/STELLACLAW.md"), "memory: old").unwrap();
+        fs::write(
+            workdir.join("rundir/memory_v1/user/entries.jsonl"),
+            r#"{"id":"u_1","scope":"user","subject":"style","text":"Prefer concise Chinese answers.","tags":["style"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","state":"active"}"#,
+        )
+        .unwrap();
         fs::write(
             root.join(".stellaclaw/skill/demo/SKILL.md"),
             "# Demo\n\nskills: old",
@@ -247,46 +278,58 @@ mod tests {
                 &root,
                 &root,
                 "Available SSH remote aliases from ~/.ssh/config:\n- `old-host`".to_string(),
+                initial.memory_enabled,
             )
             .unwrap();
 
         fs::write(root.join(".stellaclaw/IDENTITY.md"), "identity: new").unwrap();
         fs::write(root.join(".stellaclaw/USER.md"), "tier: new").unwrap();
-        fs::write(root.join(".stellaclaw/STELLACLAW.md"), "memory: new").unwrap();
+        fs::write(
+            workdir.join("rundir/memory_v1/user/entries.jsonl"),
+            r#"{"id":"u_1","scope":"user","subject":"style","text":"Prefer detailed Chinese answers.","tags":["style"],"created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z","state":"active"}"#,
+        )
+        .unwrap();
         fs::write(
             root.join(".stellaclaw/skill/demo/SKILL.md"),
             "# Demo\n\nskills: new",
         )
         .unwrap();
-        state
+        let notices = state
             .observe_for_user_turn_from_workspace(
                 &root,
                 &root,
                 "Available SSH remote aliases from ~/.ssh/config:\n- `new-host`".to_string(),
+                initial.memory_enabled,
             )
             .unwrap();
+        let rendered_notices = notices.join("\n");
+        assert!(rendered_notices.contains("USER.md metadata changed"));
+        assert!(!rendered_notices.contains("tier: new"));
 
         let prompt_before_promote = system_prompt_for_initial(&initial, &state);
         assert!(prompt_before_promote.contains("identity: old"));
-        assert!(prompt_before_promote.contains("tier: old"));
-        assert!(prompt_before_promote.contains("memory: old"));
+        assert!(prompt_before_promote.contains("Profile metadata file: .stellaclaw/USER.md"));
+        assert!(prompt_before_promote.contains("Read .stellaclaw/USER.md with file_read"));
+        assert!(!prompt_before_promote.contains("tier: old"));
+        assert!(prompt_before_promote.contains("Prefer concise Chinese answers."));
         assert!(prompt_before_promote.contains("skills: old"));
         assert!(prompt_before_promote.contains("old-host"));
         assert!(!prompt_before_promote.contains("identity: new"));
         assert!(!prompt_before_promote.contains("tier: new"));
-        assert!(!prompt_before_promote.contains("memory: new"));
+        assert!(!prompt_before_promote.contains("Prefer detailed Chinese answers."));
         assert!(!prompt_before_promote.contains("skills: new"));
         assert!(!prompt_before_promote.contains("new-host"));
 
         state.promote_notified_components_to_system_snapshot();
         let prompt_after_promote = system_prompt_for_initial(&initial, &state);
         assert!(prompt_after_promote.contains("identity: new"));
-        assert!(prompt_after_promote.contains("tier: new"));
-        assert!(prompt_after_promote.contains("memory: new"));
+        assert!(prompt_after_promote.contains("Profile metadata file: .stellaclaw/USER.md"));
+        assert!(!prompt_after_promote.contains("tier: new"));
+        assert!(prompt_after_promote.contains("Prefer detailed Chinese answers."));
         assert!(prompt_after_promote.contains("skills: new"));
         assert!(prompt_after_promote.contains("new-host"));
 
-        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(workdir);
     }
 
     #[test]
@@ -303,6 +346,7 @@ mod tests {
                 &root,
                 &root,
                 remote_aliases_prompt_for_mode(&ToolRemoteMode::Selectable),
+                initial.memory_enabled,
             )
             .unwrap();
 

@@ -11,6 +11,8 @@ mod v0_11;
 mod v0_12;
 mod v0_13;
 mod v0_14;
+mod v0_15;
+mod v0_16;
 mod v0_2;
 mod v0_3;
 mod v0_4;
@@ -34,7 +36,9 @@ pub const WORKDIR_VERSION_0_11: &str = "0.11";
 pub const WORKDIR_VERSION_0_12: &str = "0.12";
 pub const WORKDIR_VERSION_0_13: &str = "0.13";
 pub const WORKDIR_VERSION_0_14: &str = "0.14";
-pub const LATEST_WORKDIR_VERSION: &str = "0.15";
+pub const WORKDIR_VERSION_0_15: &str = "0.15";
+pub const WORKDIR_VERSION_0_16: &str = "0.16";
+pub const LATEST_WORKDIR_VERSION: &str = "0.17";
 pub const PARTYCLAW_LATEST_WORKDIR_VERSION: &str = "0.39";
 
 const WORKDIR_VERSION_FILE: &str = "STELLA_VERSION";
@@ -53,7 +57,7 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
     let legacy_version_path = workdir.join(LEGACY_WORKDIR_VERSION_FILE);
     let mut current = read_workdir_version(&version_path, &legacy_version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 15] = [
+    let upgraders: [&dyn WorkdirUpgrader; 17] = [
         &v0_1::LegacyUpgrade,
         &v0_1::PartyClawUpgrade,
         &v0_2::ChatMessageReasoningUpgrade,
@@ -69,6 +73,8 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
         &v0_12::SshfsWorkspaceMaterializeUpgrade,
         &v0_13::StellaclawConversationSpecialPathUpgrade,
         &v0_14::StaleSpecialLinkRepairUpgrade,
+        &v0_15::MemoryV1DirectoryUpgrade,
+        &v0_16::MemoryV1UsageLogUpgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -121,6 +127,8 @@ fn read_version_file(version_path: &Path) -> Result<&'static str> {
         WORKDIR_VERSION_0_12 => Ok(WORKDIR_VERSION_0_12),
         WORKDIR_VERSION_0_13 => Ok(WORKDIR_VERSION_0_13),
         WORKDIR_VERSION_0_14 => Ok(WORKDIR_VERSION_0_14),
+        WORKDIR_VERSION_0_15 => Ok(WORKDIR_VERSION_0_15),
+        WORKDIR_VERSION_0_16 => Ok(WORKDIR_VERSION_0_16),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -182,6 +190,12 @@ mod tests {
             "remote attachment"
         );
         assert!(!local.join("src").join("main.rs").exists());
+        let compaction_status =
+            fs::read_to_string(root.join("rundir/memory_v1/user/compaction.json")).unwrap();
+        let compaction_status: serde_json::Value =
+            serde_json::from_str(&compaction_status).unwrap();
+        assert_eq!(compaction_status["state"], "idle");
+        assert_eq!(compaction_status["attempts"], 0);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -193,6 +207,7 @@ mod tests {
             channels: Vec::new(),
             models: BTreeMap::new(),
             session_defaults: SessionDefaults::default(),
+            memory: crate::config::MemoryConfig::default(),
             sandbox: SandboxConfig::default(),
             skill_sync: Vec::new(),
             available_agent_models: Vec::new(),

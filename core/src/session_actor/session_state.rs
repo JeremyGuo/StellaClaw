@@ -68,6 +68,10 @@ impl SessionStateStore {
         Ok(())
     }
 
+    pub(crate) fn save_all_messages_jsonl(&self, messages: &[ChatMessage]) -> Result<(), String> {
+        write_messages_jsonl(&self.all_messages_path(), messages)
+    }
+
     fn session_json_path(&self) -> PathBuf {
         self.dir.join("session.json")
     }
@@ -212,6 +216,32 @@ mod tests {
             .exists());
         assert!(root
             .join(".stellaclaw/log/session_1/current_messages.jsonl")
+            .exists());
+    }
+
+    #[test]
+    fn saves_all_messages_jsonl_without_rewriting_session_json() {
+        let root = temp_root();
+        let store = SessionStateStore::open_under(&root, "session/all").expect("store opens");
+        let message = ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "hello".to_string(),
+            })],
+        );
+
+        store
+            .save_all_messages_jsonl(std::slice::from_ref(&message))
+            .expect("all messages save");
+
+        assert!(root
+            .join(".stellaclaw/log/session_all/all_messages.jsonl")
+            .exists());
+        assert!(!root
+            .join(".stellaclaw/log/session_all/session.json")
+            .exists());
+        assert!(!root
+            .join(".stellaclaw/log/session_all/current_messages.jsonl")
             .exists());
     }
 

@@ -231,6 +231,7 @@ mod tests {
             models: BTreeMap::from([("opus-4.6".to_string(), model)]),
             available_agent_models: Vec::new(),
             session_defaults: SessionDefaults::default(),
+            memory: crate::config::MemoryConfig::default(),
             skill_sync: Vec::new(),
             sandbox: SandboxConfig::default(),
             channels: vec![ChannelConfig::Telegram(TelegramChannelConfig {

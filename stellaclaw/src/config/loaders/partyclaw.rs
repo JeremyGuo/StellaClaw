@@ -12,7 +12,7 @@ use stellaclaw_core::model_config::{
 };
 
 use crate::config::{
-    AgentServerConfig, ChannelConfig, SandboxConfig, SandboxMode, SessionDefaults,
+    AgentServerConfig, ChannelConfig, MemoryConfig, SandboxConfig, SandboxMode, SessionDefaults,
     StellaclawConfig, TelegramChannelConfig, ToolModelTarget,
 };
 
@@ -367,6 +367,7 @@ fn convert_legacy_config(legacy: LegacyServerConfig, path: &Path) -> Result<Stel
         models: named_models,
         available_agent_models: Vec::new(),
         session_defaults,
+        memory: MemoryConfig::default(),
         skill_sync: Vec::new(),
         sandbox: SandboxConfig {
             mode: match legacy.sandbox.mode {

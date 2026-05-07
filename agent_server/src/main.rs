@@ -135,6 +135,7 @@ fn initialize(params: Value, output: Arc<JsonRpcOutput>) -> Result<AgentRuntime,
     });
     let rpc_thread = SessionRpcThread::spawn(Arc::new(sender.clone()), event_sink.clone());
     let bridge = rpc_thread.conversation_bridge();
+    let actor_bridge = bridge.clone();
     let tool_executor = Arc::new(
         LocalToolBatchExecutor::new(workspace_root)
             .with_remote_mode(params.initial.tool_remote_mode.clone())
@@ -153,7 +154,8 @@ fn initialize(params: Value, output: Arc<JsonRpcOutput>) -> Result<AgentRuntime,
         inbox,
         event_sink,
         catalog,
-    );
+    )
+    .with_conversation_bridge(Arc::new(actor_bridge));
     rpc_thread
         .enqueue_from_conversation(SessionRequest::Initial {
             initial: params.initial,

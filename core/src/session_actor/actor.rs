@@ -7,6 +7,7 @@ use std::{
 };
 
 use crossbeam_channel::{select, Receiver, Sender};
+use serde::Deserialize;
 use thiserror::Error;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -26,10 +27,11 @@ use super::{
     runtime_metadata::{remote_aliases_prompt_for_mode, RuntimeMetadataState},
     session_state::{SessionActorPersistedState, SessionStateStore},
     system_prompt_for_initial, ChatMessage, ChatMessageItem, ChatRole, CompressionError,
-    CompressionReport, ContextItem, ConversationBridgeRequest, SessionCompressor,
-    SessionErrorDetail, SessionEvent, SessionInitial, SessionMailbox, SessionMailboxKind,
-    SessionRequest, TaskPlanItemStatus, TaskPlanView, TokenEstimator, ToolBatch,
-    ToolBatchCompletion, ToolBatchExecutor, ToolBatchOperation, ToolCatalog, ToolExecutionOp,
+    CompressionReport, ContextItem, ConversationBridge, ConversationBridgeRequest,
+    SessionCompressor, SessionErrorDetail, SessionEvent, SessionInitial, SessionMailbox,
+    SessionMailboxKind, SessionRequest, TaskPlanItemStatus, TaskPlanView, TokenEstimator,
+    ToolBatch, ToolBatchCompletion, ToolBatchExecutor, ToolBatchOperation, ToolCatalog,
+    ToolExecutionOp,
 };
 
 const DEFAULT_MAX_MODEL_STEPS_PER_TURN: usize = 200;
@@ -38,11 +40,15 @@ const IDLE_COMPACTION_MIN_RATIO: f64 = 0.4;
 const REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS: usize = 8;
 const DEFAULT_RETAIN_RECENT_PERCENT: u64 = 10;
 const SESSION_PLAN_CONTEXT_MARKER: &str = "[StellaClaw Current Task Plan]";
+const COMPRESSION_MEMORY_SCOPE_CANDIDATE_LIMIT: usize = 20;
+const COMPRESSION_MEMORY_CONTEXT_MAX_TOKENS: u64 = 4_000;
+const COMPRESSION_MEMORY_ENTRY_MAX_CHARS: usize = 640;
 
 pub struct SessionActor {
     model_config: ModelConfig,
     provider: Arc<dyn Provider + Send + Sync>,
     tool_executor: Arc<dyn ToolBatchExecutor + Send + Sync>,
+    conversation_bridge: Option<Arc<dyn ConversationBridge + Send + Sync>>,
     request_rx: Receiver<SessionRequest>,
     tool_completion_tx: Sender<ToolBatchCompletion>,
     tool_completion_rx: Receiver<ToolBatchCompletion>,
@@ -93,6 +99,27 @@ enum ToolBatchInterrupt {
 enum PendingContinuation {
     CurrentHistory,
     DataRequest(SessionRequest),
+}
+
+#[derive(Debug, Deserialize)]
+struct MemorySearchToolResponse {
+    #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
+    results: Vec<MemorySearchToolResult>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MemorySearchToolResult {
+    id: String,
+    scope: String,
+    #[serde(default)]
+    subject: Option<String>,
+    text: String,
+    #[serde(default)]
+    updated_at: Option<String>,
+    #[serde(default)]
+    score: f64,
 }
 
 pub struct SessionActorInbox {
@@ -154,6 +181,7 @@ impl SessionActor {
             model_config,
             provider,
             tool_executor,
+            conversation_bridge: None,
             request_rx: inbox.request_rx,
             tool_completion_tx: inbox.tool_completion_tx,
             tool_completion_rx: inbox.tool_completion_rx,
@@ -194,6 +222,14 @@ impl SessionActor {
 
     pub fn tool_catalog(&self) -> &ToolCatalog {
         &self.tool_catalog
+    }
+
+    pub fn with_conversation_bridge(
+        mut self,
+        conversation_bridge: Arc<dyn ConversationBridge + Send + Sync>,
+    ) -> Self {
+        self.conversation_bridge = Some(conversation_bridge);
+        self
     }
 
     pub fn set_max_model_steps_per_turn(&mut self, max_steps: usize) {
@@ -407,6 +443,7 @@ impl SessionActor {
                                 .data_root()
                                 .map_err(SessionActorError::RuntimeMetadata)?,
                             remote_aliases_prompt_for_mode(&initial.tool_remote_mode),
+                            initial.memory_enabled,
                         )
                         .map_err(SessionActorError::RuntimeMetadata)?;
                 }
@@ -496,12 +533,14 @@ impl SessionActor {
             .initial
             .as_ref()
             .map(|initial| system_prompt_for_initial(initial, &self.runtime_metadata_state));
+        let compression_context = self.compression_memory_context(&self.history, None);
 
         let report = match compressor.compact_now(
             &mut self.history,
             self.provider.as_ref(),
             &self.model_config,
             system_prompt.as_deref(),
+            compression_context.as_deref(),
         ) {
             Ok(report) => report,
             Err(error) => {
@@ -513,10 +552,7 @@ impl SessionActor {
                         "history_len": self.history.len(),
                     }),
                 );
-                return self.emit(SessionEvent::ControlRejected {
-                    reason,
-                    payload: serde_json::json!({"type": "compact_now"}),
-                });
+                return self.emit_compact_failed("manual_compaction", reason);
             }
         };
 
@@ -1268,6 +1304,17 @@ impl SessionActor {
         })
     }
 
+    fn emit_compact_failed(
+        &self,
+        phase: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Result<(), SessionActorError> {
+        self.emit(SessionEvent::CompactFailed {
+            phase: phase.into(),
+            reason: reason.into(),
+        })
+    }
+
     fn append_history_message(
         &mut self,
         phase: &str,
@@ -1286,15 +1333,24 @@ impl SessionActor {
             .initial
             .as_ref()
             .map(|initial| system_prompt_for_initial(initial, &self.runtime_metadata_state));
+        if compressor
+            .would_compress_with_next(&self.history, &message)
+            .unwrap_or(false)
+        {
+            self.flush_all_messages_before_compression(phase)?;
+        }
         let report = {
             let mut request_too_large_attempts = 0usize;
             loop {
+                let compression_context =
+                    self.compression_memory_context_for_append(&compressor, &message);
                 match compressor.append_with_compression(
                     &mut self.history,
                     message.clone(),
                     self.provider.as_ref(),
                     &self.model_config,
                     system_prompt.as_deref(),
+                    compression_context.as_deref(),
                 ) {
                     Ok(report) => break report,
                     Err(error)
@@ -1311,9 +1367,15 @@ impl SessionActor {
                         )? {
                             continue;
                         }
-                        return Err(SessionActorError::Compression(error.to_string()));
+                        let reason = error.to_string();
+                        self.emit_compact_failed(phase, reason.clone())?;
+                        return Err(SessionActorError::Compression(reason));
                     }
-                    Err(error) => return Err(SessionActorError::Compression(error.to_string())),
+                    Err(error) => {
+                        let reason = error.to_string();
+                        self.emit_compact_failed(phase, reason.clone())?;
+                        return Err(SessionActorError::Compression(reason));
+                    }
                 }
             }
         };
@@ -1321,25 +1383,91 @@ impl SessionActor {
         if report.compressed {
             self.runtime_metadata_state
                 .promote_notified_components_to_system_snapshot();
-            self.append_current_plan_to_compressed_history();
         }
         self.persist_state_if_history_closed(phase)?;
         Ok(index)
     }
 
-    fn append_current_plan_to_compressed_history(&mut self) {
-        let Some(plan) = self.current_plan.as_ref() else {
-            return;
+    fn compression_memory_context_for_append(
+        &self,
+        compressor: &SessionCompressor,
+        next_message: &ChatMessage,
+    ) -> Option<String> {
+        if !compressor
+            .would_compress_with_next(&self.history, next_message)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        self.compression_memory_context(&self.history, Some(next_message))
+    }
+
+    fn compression_memory_context(
+        &self,
+        messages: &[ChatMessage],
+        next_message: Option<&ChatMessage>,
+    ) -> Option<String> {
+        if !self.initial.as_ref()?.memory_enabled {
+            return None;
+        }
+        let bridge = self.conversation_bridge.as_ref()?;
+        let query =
+            build_compression_memory_query(messages, next_message, self.current_plan.as_ref());
+        if query.trim().is_empty() {
+            return None;
+        }
+        let mut results = Vec::new();
+        results.extend(self.search_memory_scope_for_compression(bridge, "conversation", &query));
+        results.extend(self.search_memory_scope_for_compression(bridge, "public", &query));
+        render_compression_memory_context(results, self.compression_memory_budget_tokens())
+    }
+
+    fn search_memory_scope_for_compression(
+        &self,
+        bridge: &Arc<dyn ConversationBridge + Send + Sync>,
+        scope: &str,
+        query: &str,
+    ) -> Vec<MemorySearchToolResult> {
+        let request = ConversationBridgeRequest {
+            request_id: format!("compression_memory_{scope}"),
+            tool_call_id: format!("compression_memory_{scope}"),
+            tool_name: "memory_search".to_string(),
+            action: "memory_search".to_string(),
+            payload: serde_json::json!({
+                "query": query,
+                "limit": COMPRESSION_MEMORY_SCOPE_CANDIDATE_LIMIT,
+                "scopes": [scope],
+            }),
         };
-        let Some(text) = render_task_plan_context(plan) else {
-            return;
+        let response = match bridge.call(request) {
+            Ok(response) => response,
+            Err(error) => {
+                self.log_info(
+                    "compression_memory_lookup_failed",
+                    serde_json::json!({"scope": scope, "error": error.to_string()}),
+                );
+                return Vec::new();
+            }
         };
-        self.history
-            .retain(|message| !is_task_plan_context_message(message));
-        self.history.push(ChatMessage::new(
-            ChatRole::Assistant,
-            vec![ChatMessageItem::Context(ContextItem { text })],
-        ));
+        let Some(context) = response.result.result.context.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(search) = serde_json::from_str::<MemorySearchToolResponse>(&context.text) else {
+            self.log_info(
+                "compression_memory_parse_failed",
+                serde_json::json!({"scope": scope}),
+            );
+            return Vec::new();
+        };
+        if search.status.as_deref() != Some("success") {
+            return Vec::new();
+        }
+        search.results
+    }
+
+    fn compression_memory_budget_tokens(&self) -> usize {
+        let ratio_budget = (self.model_config.token_max_context.saturating_mul(3) / 100).max(1);
+        ratio_budget.min(COMPRESSION_MEMORY_CONTEXT_MAX_TOKENS) as usize
     }
 
     fn append_runtime_synthetic_messages(
@@ -1359,6 +1487,9 @@ impl SessionActor {
                     .as_ref()
                     .map(|initial| remote_aliases_prompt_for_mode(&initial.tool_remote_mode))
                     .unwrap_or_default(),
+                self.initial
+                    .as_ref()
+                    .is_some_and(|initial| initial.memory_enabled),
             )
             .map_err(SessionActorError::RuntimeMetadata)?;
         for notice in notices {
@@ -1418,6 +1549,7 @@ impl SessionActor {
                         .data_root()
                         .map_err(SessionActorError::RuntimeMetadata)?,
                     remote_aliases_prompt_for_mode(&incoming_initial.tool_remote_mode),
+                    incoming_initial.memory_enabled,
                 )
                 .map_err(SessionActorError::RuntimeMetadata)?;
         }
@@ -1439,6 +1571,23 @@ impl SessionActor {
                 runtime_metadata_state: self.runtime_metadata_state.clone(),
             })
             .map_err(SessionActorError::Persistence)
+    }
+
+    fn flush_all_messages_before_compression(&self, phase: &str) -> Result<(), SessionActorError> {
+        let Some(store) = &self.state_store else {
+            return Ok(());
+        };
+        store
+            .save_all_messages_jsonl(&self.all_messages)
+            .map_err(SessionActorError::Persistence)?;
+        self.log_info(
+            "all_messages_flushed_before_compression",
+            serde_json::json!({
+                "phase": phase,
+                "all_messages_len": self.all_messages.len(),
+            }),
+        );
+        Ok(())
     }
 
     fn persist_state_if_history_closed(&self, phase: &str) -> Result<(), SessionActorError> {
@@ -1531,12 +1680,21 @@ impl SessionActor {
             .map(|initial| system_prompt_for_initial(initial, &self.runtime_metadata_state));
         let mut request_too_large_attempts = 0usize;
         let report = loop {
+            let compression_context = if compressor
+                .would_compact_with_threshold(&self.history, threshold_tokens)
+                .unwrap_or(false)
+            {
+                self.compression_memory_context(&self.history, None)
+            } else {
+                None
+            };
             match compressor.compact_if_needed_with_threshold(
                 &mut self.history,
                 self.provider.as_ref(),
                 &self.model_config,
                 system_prompt.as_deref(),
                 threshold_tokens,
+                compression_context.as_deref(),
             ) {
                 Ok(report) => break Ok(report),
                 Err(error)
@@ -1585,10 +1743,10 @@ impl SessionActor {
                     "idle_compaction_failed",
                     serde_json::json!({"error": error.to_string()}),
                 );
-                self.emit(SessionEvent::Progress {
-                    message: format!("idle context compression failed: {error}"),
-                    plan: self.current_plan.clone(),
-                })?;
+                self.emit_compact_failed(
+                    "idle_compaction",
+                    format!("idle context compression failed: {error}"),
+                )?;
                 Ok(false)
             }
         }
@@ -2081,6 +2239,132 @@ fn count_unclosed_tool_calls(messages: &[ChatMessage]) -> usize {
     open.len()
 }
 
+fn build_compression_memory_query(
+    messages: &[ChatMessage],
+    next_message: Option<&ChatMessage>,
+    current_plan: Option<&TaskPlanView>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(plan) = current_plan.and_then(render_task_plan_context) {
+        parts.push(plan);
+    }
+    for message in messages.iter().rev().take(6).rev() {
+        let text = message_text_for_memory_query(message);
+        if !text.trim().is_empty() {
+            parts.push(text);
+        }
+    }
+    if let Some(message) = next_message {
+        let text = message_text_for_memory_query(message);
+        if !text.trim().is_empty() {
+            parts.push(text);
+        }
+    }
+    truncate_chars(&parts.join("\n\n"), 4_000)
+}
+
+fn message_text_for_memory_query(message: &ChatMessage) -> String {
+    let mut parts = Vec::new();
+    for item in &message.data {
+        match item {
+            ChatMessageItem::Context(context) => parts.push(context.text.trim().to_string()),
+            ChatMessageItem::ToolResult(tool_result) => {
+                if let Some(context) = tool_result.result.context.as_ref() {
+                    parts.push(context.text.trim().to_string());
+                }
+            }
+            ChatMessageItem::ToolCall(tool_call) => {
+                parts.push(format!(
+                    "tool_call {} {}",
+                    tool_call.tool_name, tool_call.arguments.text
+                ));
+            }
+            ChatMessageItem::File(file) => {
+                let name = file.name.as_deref().unwrap_or(file.uri.as_str());
+                parts.push(format!("file {name} {}", file.uri));
+            }
+            ChatMessageItem::Reasoning(_) => {}
+        }
+    }
+    truncate_chars(&parts.join("\n"), 1_200)
+}
+
+fn render_compression_memory_context(
+    mut results: Vec<MemorySearchToolResult>,
+    budget_tokens: usize,
+) -> Option<String> {
+    if results.is_empty() || budget_tokens == 0 {
+        return None;
+    }
+    results.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                right
+                    .updated_at
+                    .as_deref()
+                    .unwrap_or_default()
+                    .cmp(left.updated_at.as_deref().unwrap_or_default())
+            })
+    });
+
+    let mut selected = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut used_chars = 0usize;
+    let budget_chars = budget_tokens.saturating_mul(4).max(1);
+    for result in results {
+        if !seen.insert(result.id.clone()) {
+            continue;
+        }
+        let text = truncate_chars(
+            &result.text.replace('\n', " "),
+            COMPRESSION_MEMORY_ENTRY_MAX_CHARS,
+        );
+        let subject = result
+            .subject
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!(" ({value})"))
+            .unwrap_or_default();
+        let updated = result
+            .updated_at
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!(" updated {value}"))
+            .unwrap_or_default();
+        let line = format!(
+            "* [{}:{}]{}{} {}",
+            result.scope, result.id, subject, updated, text
+        );
+        let line_len = line.len() + 1;
+        if used_chars + line_len > budget_chars {
+            break;
+        }
+        used_chars += line_len;
+        selected.push(line);
+    }
+    if selected.is_empty() {
+        return None;
+    }
+    Some(selected.join("\n"))
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut output = String::new();
+    for (index, ch) in value.trim().chars().enumerate() {
+        if index >= max_chars {
+            output.push_str("...");
+            return output;
+        }
+        output.push(ch);
+    }
+    output
+}
+
 fn compression_error_is_request_too_large(error: &CompressionError) -> bool {
     request_too_large_text(&error.to_string())
 }
@@ -2251,6 +2535,11 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "estimated_tokens_after": estimated_tokens_after,
             "threshold_tokens": threshold_tokens,
         }),
+        SessionEvent::CompactFailed { phase, reason } => serde_json::json!({
+            "event": "compact_failed",
+            "phase": phase,
+            "reason": reason,
+        }),
         SessionEvent::ControlRejected { reason, payload } => serde_json::json!({
             "event": "control_rejected",
             "reason": reason,
@@ -2391,8 +2680,8 @@ mod tests {
         providers::{Provider, ProviderError},
         session_actor::{
             builtin_tool_catalog, BuiltinToolCatalogOptions, ChatRole, ContextItem, FileItem,
-            HostToolScope, SessionMailboxKind, ToolBatchError, ToolBatchHandle, ToolCallItem,
-            ToolResultContent, ToolResultItem, COMPRESSION_MARKER,
+            HostToolScope, SessionMailboxKind, TaskPlanItemView, ToolBatchError, ToolBatchHandle,
+            ToolCallItem, ToolResultContent, ToolResultItem, COMPRESSION_MARKER,
         },
         test_support::temp_cwd,
     };
@@ -2472,6 +2761,16 @@ mod tests {
                 .pop_front()
                 .ok_or(ProviderError::EmptyChoices)
         }
+    }
+
+    fn compression_response(summary: &str) -> String {
+        serde_json::json!({
+            "summary": summary,
+            "current_state": "",
+            "plan": "",
+            "preserved_tool_call_ids": [],
+        })
+        .to_string()
     }
 
     struct RequestTooLargeThenOkProvider {
@@ -3616,7 +3915,9 @@ mod tests {
         actor.run_until_idle(4).expect("actor should run");
 
         assert!(message_text_for_test(&actor.history()[0]).contains("[Runtime Prompt Updates]"));
-        assert!(message_text_for_test(&actor.history()[0]).contains("tier: new"));
+        assert!(message_text_for_test(&actor.history()[0]).contains("USER.md metadata changed"));
+        assert!(message_text_for_test(&actor.history()[0]).contains(".stellaclaw/USER.md"));
+        assert!(!message_text_for_test(&actor.history()[0]).contains("tier: new"));
         assert!(message_text_for_test(&actor.history()[1]).contains("[Runtime Skill Updates]"));
         assert!(message_text_for_test(&actor.history()[2]).contains("real user request"));
     }
@@ -4201,7 +4502,7 @@ mod tests {
             ChatMessage::new(
                 ChatRole::Assistant,
                 vec![ChatMessageItem::Context(ContextItem {
-                    text: "summary".to_string(),
+                    text: compression_response("summary"),
                 })],
             ),
             ChatMessage::new(
@@ -4224,6 +4525,86 @@ mod tests {
             .history()
             .iter()
             .any(|message| message_text_for_test(message).contains("second final")));
+
+        fs::remove_dir_all(tokenizer_dir).expect("tokenizer dir should be removed");
+    }
+
+    #[test]
+    fn compression_does_not_append_runtime_update_plan_context() {
+        let _cwd = temp_cwd("actor-compression-no-runtime-plan");
+        let (inbox, mailbox) = test_inbox();
+        let mut initial = SessionInitial::new(
+            test_session_id("session_compression_no_runtime_plan"),
+            super::super::SessionType::Foreground,
+        );
+        initial.compression_threshold_tokens = Some(32);
+        initial.compression_retain_recent_tokens = Some(12);
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial { initial },
+        );
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "old ".repeat(50),
+                    })],
+                ),
+            },
+        );
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "second request".to_string(),
+                    })],
+                ),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "first final".to_string(),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: compression_response("summary"),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "second final".to_string(),
+                })],
+            ),
+        ]));
+        let tools = Arc::new(EchoToolExecutor::new());
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
+        let (model_config, tokenizer_dir) = test_model_config_with_tokenizer();
+        let mut actor = SessionActor::new(model_config, provider, tools, inbox, events, catalog);
+        actor.current_plan = Some(TaskPlanView {
+            explanation: None,
+            plan: vec![TaskPlanItemView {
+                step: "Do not append this as a separate compacted message".to_string(),
+                status: TaskPlanItemStatus::InProgress,
+            }],
+        });
+
+        actor.run_until_idle(8).expect("actor should run");
+
+        assert!(actor
+            .history()
+            .iter()
+            .all(|message| !message_text_for_test(message).contains(SESSION_PLAN_CONTEXT_MARKER)));
+        assert!(message_text_for_test(&actor.history()[0]).contains(COMPRESSION_MARKER));
 
         fs::remove_dir_all(tokenizer_dir).expect("tokenizer dir should be removed");
     }
@@ -4264,7 +4645,7 @@ mod tests {
             ChatMessage::new(
                 ChatRole::Assistant,
                 vec![ChatMessageItem::Context(ContextItem {
-                    text: "manual summary".to_string(),
+                    text: compression_response("manual summary"),
                 })],
             ),
         ]));
@@ -4296,6 +4677,78 @@ mod tests {
             )
         });
         assert!(completed);
+
+        fs::remove_dir_all(tokenizer_dir).expect("tokenizer dir should be removed");
+    }
+
+    #[test]
+    fn manual_compact_failure_emits_compact_failed_event() {
+        let _cwd = temp_cwd("actor-manual-compression-failed");
+        let (inbox, mailbox) = test_inbox();
+        let mut initial = SessionInitial::new(
+            test_session_id("session_manual_compression_failed"),
+            super::super::SessionType::Foreground,
+        );
+        initial.compression_threshold_tokens = Some(1_000);
+        initial.compression_retain_recent_tokens = Some(12);
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial { initial },
+        );
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "old ".repeat(50),
+                    })],
+                ),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "first final".to_string(),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "not json".to_string(),
+                })],
+            ),
+        ]));
+        let tools = Arc::new(EchoToolExecutor::new());
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
+        let (model_config, tokenizer_dir) = test_model_config_with_tokenizer();
+        let mut actor = SessionActor::new(
+            model_config,
+            provider,
+            tools,
+            inbox,
+            events.clone(),
+            catalog,
+        );
+
+        actor.run_until_idle(4).expect("initial turn should run");
+        mailbox.append(SessionMailboxKind::Control, SessionRequest::CompactNow);
+        actor
+            .run_until_idle(4)
+            .expect("compact failure should be reported");
+
+        let failed = events.events.lock().unwrap().iter().any(|event| {
+            matches!(
+                event,
+                SessionEvent::CompactFailed { phase, reason }
+                    if phase == "manual_compaction"
+                        && reason.contains("compression summary was not valid JSON")
+            )
+        });
+        assert!(failed);
+        assert!(!message_text_for_test(&actor.history()[0]).contains(COMPRESSION_MARKER));
 
         fs::remove_dir_all(tokenizer_dir).expect("tokenizer dir should be removed");
     }
@@ -4336,7 +4789,7 @@ mod tests {
             ChatMessage::new(
                 ChatRole::Assistant,
                 vec![ChatMessageItem::Context(ContextItem {
-                    text: "summary".to_string(),
+                    text: compression_response("summary"),
                 })],
             ),
         ]));

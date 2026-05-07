@@ -11,6 +11,9 @@ use super::{
 };
 
 pub const COMPRESSION_MARKER: &str = "[StellaClaw Context Compression]";
+const COMPRESSION_SYSTEM_PROMPT: &str = "You compress StellaClaw provider context. Return strict JSON only. Preserve continuation-critical facts, state, and next steps while avoiding unnecessary raw history.";
+const MAX_PRESERVED_TOOL_CALL_IDS: usize = 8;
+const MAX_PRESERVED_TOOL_RESULT_TEXT_CHARS: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct SessionCompressor {
@@ -43,6 +46,7 @@ impl SessionCompressor {
         provider: &(dyn Provider + Send + Sync),
         model_config: &ModelConfig,
         system_prompt: Option<&str>,
+        compression_context: Option<&str>,
     ) -> Result<CompressionReport, CompressionError> {
         let estimated_tokens_before = self.estimate_with_next(messages, &next_message)?;
         if estimated_tokens_before <= self.threshold_tokens {
@@ -70,17 +74,19 @@ impl SessionCompressor {
             });
         };
 
-        let summary_message = self.generate_summary_message(
+        let generated_compression = self.generate_compression(
             &messages[..plan.recent_start],
             messages.len() - plan.recent_start,
             provider,
             model_config,
             system_prompt,
+            compression_context,
         )?;
-        let summary_present = summary_message.is_some();
+        let summary_present = generated_compression.is_some();
         let mut compressed_messages = Vec::new();
-        if let Some(summary_message) = summary_message {
-            compressed_messages.push(summary_message);
+        if let Some(generated_compression) = generated_compression {
+            compressed_messages.push(generated_compression.summary_message);
+            compressed_messages.extend(generated_compression.preserved_tool_messages);
         }
         compressed_messages.extend_from_slice(&messages[plan.recent_start..]);
         let compressed_message_count = plan.recent_start;
@@ -115,6 +121,7 @@ impl SessionCompressor {
             model_config,
             system_prompt,
             self.threshold_tokens,
+            None,
         )
     }
 
@@ -124,6 +131,7 @@ impl SessionCompressor {
         provider: &(dyn Provider + Send + Sync),
         model_config: &ModelConfig,
         system_prompt: Option<&str>,
+        compression_context: Option<&str>,
     ) -> Result<CompressionReport, CompressionError> {
         let estimated_tokens_before = self.estimator.estimate(messages)?.total_tokens;
         let Some(plan) = self.plan_compression(messages)? else {
@@ -137,17 +145,19 @@ impl SessionCompressor {
             });
         };
 
-        let summary_message = self.generate_summary_message(
+        let generated_compression = self.generate_compression(
             &messages[..plan.recent_start],
             messages.len() - plan.recent_start,
             provider,
             model_config,
             system_prompt,
+            compression_context,
         )?;
-        let summary_present = summary_message.is_some();
+        let summary_present = generated_compression.is_some();
         let mut compressed_messages = Vec::new();
-        if let Some(summary_message) = summary_message {
-            compressed_messages.push(summary_message);
+        if let Some(generated_compression) = generated_compression {
+            compressed_messages.push(generated_compression.summary_message);
+            compressed_messages.extend(generated_compression.preserved_tool_messages);
         }
         compressed_messages.extend_from_slice(&messages[plan.recent_start..]);
         let compressed_message_count = plan.recent_start;
@@ -175,6 +185,7 @@ impl SessionCompressor {
         model_config: &ModelConfig,
         system_prompt: Option<&str>,
         threshold_tokens: u64,
+        compression_context: Option<&str>,
     ) -> Result<CompressionReport, CompressionError> {
         if threshold_tokens == 0 {
             return Err(CompressionError::InvalidThreshold);
@@ -202,17 +213,19 @@ impl SessionCompressor {
             });
         };
 
-        let summary_message = self.generate_summary_message(
+        let generated_compression = self.generate_compression(
             &messages[..plan.recent_start],
             messages.len() - plan.recent_start,
             provider,
             model_config,
             system_prompt,
+            compression_context,
         )?;
-        let summary_present = summary_message.is_some();
+        let summary_present = generated_compression.is_some();
         let mut compressed_messages = Vec::new();
-        if let Some(summary_message) = summary_message {
-            compressed_messages.push(summary_message);
+        if let Some(generated_compression) = generated_compression {
+            compressed_messages.push(generated_compression.summary_message);
+            compressed_messages.extend(generated_compression.preserved_tool_messages);
         }
         compressed_messages.extend_from_slice(&messages[plan.recent_start..]);
         let compressed_message_count = plan.recent_start;
@@ -264,17 +277,31 @@ impl SessionCompressor {
         Ok(Some(CompressionPlan { recent_start }))
     }
 
-    fn generate_summary_message(
+    fn generate_compression(
         &self,
         messages_to_summarize: &[ChatMessage],
         preserved_recent_count: usize,
         provider: &(dyn Provider + Send + Sync),
         _model_config: &ModelConfig,
-        system_prompt: Option<&str>,
-    ) -> Result<Option<ChatMessage>, CompressionError> {
+        _system_prompt: Option<&str>,
+        compression_context: Option<&str>,
+    ) -> Result<Option<GeneratedCompression>, CompressionError> {
         let mut request_messages = sanitize_messages_for_compression_request(messages_to_summarize);
         if request_messages.is_empty() {
             return Ok(None);
+        }
+        if let Some(context) = compression_context
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            request_messages.push(ChatMessage::new(
+                ChatRole::User,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: format!(
+                        "[Relevant Long Memory For Compression]\nUse this as small background context while compressing. Keep only details that are still relevant to the current conversation state; do not copy unrelated memory.\n\n{context}"
+                    ),
+                })],
+            ));
         }
         request_messages.push(ChatMessage::new(
             ChatRole::User,
@@ -283,26 +310,54 @@ impl SessionCompressor {
             })],
         ));
 
-        let summary = send_provider_request_with_retry(
+        let response = send_provider_request_with_retry(
             provider,
-            ProviderRequest::new(&request_messages).with_system_prompt(system_prompt),
+            ProviderRequest::new(&request_messages)
+                .with_system_prompt(Some(COMPRESSION_SYSTEM_PROMPT)),
             |_| {},
         )
         .map_err(|error| CompressionError::Provider(error.to_string()))?;
-        let summary_text = message_text(&summary);
-        if summary_text.trim().is_empty() {
+        let response_text = message_text(&response);
+        if response_text.trim().is_empty() {
             return Err(CompressionError::EmptySummary);
         }
+        let result = parse_compression_result(&response_text)?;
+        let summary_text = render_compression_result(&result);
+        let preserved_tool_messages =
+            preserve_tool_messages(messages_to_summarize, &result.preserved_tool_call_ids);
 
-        Ok(Some(ChatMessage::new(
-            ChatRole::Assistant,
-            vec![ChatMessageItem::Context(ContextItem {
-                text: format!(
-                    "{COMPRESSION_MARKER}\n\nOlder conversation history has been compressed into the summary below.\n\n{}",
-                    summary_text.trim()
-                ),
-            })],
-        )))
+        Ok(Some(GeneratedCompression {
+            summary_message: ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem { text: summary_text })],
+            ),
+            preserved_tool_messages,
+        }))
+    }
+
+    pub fn would_compress_with_next(
+        &self,
+        messages: &[ChatMessage],
+        next_message: &ChatMessage,
+    ) -> Result<bool, CompressionError> {
+        if self.estimate_with_next(messages, next_message)? <= self.threshold_tokens {
+            return Ok(false);
+        }
+        Ok(self.plan_compression(messages)?.is_some())
+    }
+
+    pub fn would_compact_with_threshold(
+        &self,
+        messages: &[ChatMessage],
+        threshold_tokens: u64,
+    ) -> Result<bool, CompressionError> {
+        if threshold_tokens == 0 {
+            return Err(CompressionError::InvalidThreshold);
+        }
+        if self.estimator.estimate(messages)?.total_tokens <= threshold_tokens {
+            return Ok(false);
+        }
+        Ok(self.plan_compression(messages)?.is_some())
     }
 }
 
@@ -326,10 +381,29 @@ pub enum CompressionError {
     Provider(String),
     #[error("compression summary came back empty")]
     EmptySummary,
+    #[error("compression summary was not valid JSON: {0}")]
+    InvalidSummaryJson(String),
 }
 
 struct CompressionPlan {
     recent_start: usize,
+}
+
+struct GeneratedCompression {
+    summary_message: ChatMessage,
+    preserved_tool_messages: Vec<ChatMessage>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct CompressionResult {
+    #[serde(default)]
+    summary: String,
+    #[serde(default)]
+    current_state: String,
+    #[serde(default)]
+    plan: String,
+    #[serde(default)]
+    preserved_tool_call_ids: Vec<String>,
 }
 
 fn recent_tail_start_by_token_budget(
@@ -424,9 +498,16 @@ fn sanitize_message_for_compression_request(message: &ChatMessage) -> Option<Cha
 fn compression_instruction(preserved_recent_count: usize) -> String {
     format!(
         "Compress the older stable conversation history that appears above this request.\n\n\
-Return a concise, factual summary that is useful for safely continuing the session.\n\n\
+Return strict JSON only. Do not output Markdown, code fences, or commentary.\n\n\
+Schema:\n\
+{{\n\
+  \"summary\": \"Concise natural-language summary of goals, key facts, decisions, touched files/modules, completed work, and important errors.\",\n\
+  \"current_state\": \"What is happening now, the latest meaningful tool result, and any current blocker.\",\n\
+  \"plan\": \"Natural-language next step plan if still needed. Use a short paragraph or compact list text.\",\n\
+  \"preserved_tool_call_ids\": [\"call_id\"]\n\
+}}\n\n\
 Rules:\n\
-- keep the summary factual, compact, and continuation-oriented\n\
+- keep every field factual, compact, and continuation-oriented\n\
 - preserve concrete decisions, file paths, commands, errors, ids, URLs, and the current next step\n\
 - redact long secrets; mention that a secret was provided without copying the full value\n\
 - do not invent details\n\
@@ -435,10 +516,129 @@ Rules:\n\
 - if unfinished work still matters, preserve the continuation-critical identifier needed to resume it safely, especially shell session_id, download_id, file_download id, subagent id, plus any path, cwd, or url needed to continue\n\
 - if a task is already finished or no longer relevant, do not preserve its identifier just because it appeared earlier\n\
 - intermediate tool calls and tool results should be summarized by outcome, not replayed step by step, unless a still-needed identifier or exact reference is required to continue safely\n\
+- preserved_tool_call_ids should only include real tool_call ids from the compressed history whose arguments and result are very likely to be needed later\n\
+- if you already extracted the useful conclusion from a tool result into summary/current_state/plan, do not preserve that tool call id\n\
+- be conservative with preserved_tool_call_ids so compression does not keep too much raw context\n\
 - the most recent {preserved_recent_count} message(s) immediately before this request are preserved separately as high-fidelity context; do not summarize them unless continuity requires a short pointer\n\
-- output markdown bullet points only\n\
-- return plain text only"
+Return JSON only."
     )
+}
+
+fn parse_compression_result(text: &str) -> Result<CompressionResult, CompressionError> {
+    let trimmed = text.trim();
+    serde_json::from_str::<CompressionResult>(trimmed)
+        .map(normalize_compression_result)
+        .map_err(|error| CompressionError::InvalidSummaryJson(error.to_string()))
+}
+
+fn normalize_compression_result(mut result: CompressionResult) -> CompressionResult {
+    result.summary = result.summary.trim().to_string();
+    result.current_state = result.current_state.trim().to_string();
+    result.plan = result.plan.trim().to_string();
+    result.preserved_tool_call_ids = result
+        .preserved_tool_call_ids
+        .into_iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .take(MAX_PRESERVED_TOOL_CALL_IDS)
+        .collect();
+    result
+}
+
+fn render_compression_result(result: &CompressionResult) -> String {
+    let mut sections = vec![
+        COMPRESSION_MARKER.to_string(),
+        "Older conversation history has been compressed into the structured context below."
+            .to_string(),
+    ];
+    if !result.summary.trim().is_empty() {
+        sections.push(format!("Summary:\n{}", result.summary.trim()));
+    }
+    if !result.current_state.trim().is_empty() {
+        sections.push(format!("Current State:\n{}", result.current_state.trim()));
+    }
+    if !result.plan.trim().is_empty() {
+        sections.push(format!("Plan:\n{}", result.plan.trim()));
+    }
+    if sections.len() == 2 {
+        sections.push("Summary:\nNo useful older context was returned.".to_string());
+    }
+    sections.join("\n\n")
+}
+
+fn preserve_tool_messages(messages: &[ChatMessage], requested_ids: &[String]) -> Vec<ChatMessage> {
+    if requested_ids.is_empty() {
+        return Vec::new();
+    }
+    let existing_ids: std::collections::BTreeSet<&str> = messages
+        .iter()
+        .flat_map(|message| message.data.iter())
+        .filter_map(|item| match item {
+            ChatMessageItem::ToolCall(tool_call) => Some(tool_call.tool_call_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    let requested: std::collections::BTreeSet<&str> = requested_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| existing_ids.contains(id))
+        .collect();
+    if requested.is_empty() {
+        return Vec::new();
+    }
+
+    messages
+        .iter()
+        .filter_map(|message| {
+            let data = message
+                .data
+                .iter()
+                .filter_map(|item| match item {
+                    ChatMessageItem::ToolCall(tool_call)
+                        if requested.contains(tool_call.tool_call_id.as_str()) =>
+                    {
+                        Some(ChatMessageItem::ToolCall(tool_call.clone()))
+                    }
+                    ChatMessageItem::ToolResult(tool_result)
+                        if requested.contains(tool_result.tool_call_id.as_str()) =>
+                    {
+                        Some(ChatMessageItem::ToolResult(truncate_tool_result_content(
+                            tool_result.clone(),
+                        )))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            if data.is_empty() {
+                return None;
+            }
+            Some(ChatMessage {
+                role: message.role.clone(),
+                user_name: message.user_name.clone(),
+                message_time: message.message_time.clone(),
+                token_usage: None,
+                data,
+            })
+        })
+        .collect()
+}
+
+fn truncate_tool_result_content(mut tool_result: super::ToolResultItem) -> super::ToolResultItem {
+    if let Some(context) = tool_result.result.context.as_mut() {
+        context.text =
+            truncate_text_with_notice(&context.text, MAX_PRESERVED_TOOL_RESULT_TEXT_CHARS);
+    }
+    tool_result
+}
+
+fn truncate_text_with_notice(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut output = trimmed.chars().take(max_chars).collect::<String>();
+    output.push_str("\n[tool result truncated during context compression]");
+    output
 }
 
 fn find_originating_tool_call_index(
@@ -578,6 +778,7 @@ mod tests {
     struct SummaryProvider {
         model_config: ModelConfig,
         seen_requests: Arc<Mutex<Vec<SummaryRequestSnapshot>>>,
+        response_text: String,
     }
 
     impl SummaryProvider {
@@ -585,6 +786,19 @@ mod tests {
             Self {
                 model_config: test_model_config(String::new()),
                 seen_requests,
+                response_text: r#"{"summary":"summary of older context","current_state":"","plan":"","preserved_tool_call_ids":[]}"#
+                    .to_string(),
+            }
+        }
+
+        fn with_response(
+            seen_requests: Arc<Mutex<Vec<SummaryRequestSnapshot>>>,
+            response_text: impl Into<String>,
+        ) -> Self {
+            Self {
+                model_config: test_model_config(String::new()),
+                seen_requests,
+                response_text: response_text.into(),
             }
         }
     }
@@ -605,7 +819,7 @@ mod tests {
             Ok(ChatMessage::new(
                 ChatRole::Assistant,
                 vec![ChatMessageItem::Context(ContextItem {
-                    text: "summary of older context".to_string(),
+                    text: self.response_text.clone(),
                 })],
             ))
         }
@@ -718,6 +932,7 @@ mod tests {
                 &provider,
                 &model_config,
                 Some("stable compression instructions"),
+                None,
             )
             .expect("append should compress");
 
@@ -733,8 +948,13 @@ mod tests {
         assert_eq!(requests.len(), 1);
         assert_eq!(
             requests[0].system_prompt.as_deref(),
-            Some("stable compression instructions")
+            Some(COMPRESSION_SYSTEM_PROMPT)
         );
+        assert!(!requests[0]
+            .system_prompt
+            .as_deref()
+            .unwrap()
+            .contains("stable compression instructions"));
         assert!(message_text(requests[0].messages.last().unwrap()).contains("Compress the older"));
         let request_body = requests[0]
             .messages
@@ -746,6 +966,198 @@ mod tests {
         assert!(request_body.contains("old"));
         assert!(!request_body.contains("recent context"));
 
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn compression_request_includes_optional_memory_context() {
+        let (estimator, model_config, directory) = build_test_estimator();
+        let compressor = SessionCompressor::new(estimator, 24, 8).expect("compressor should build");
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = SummaryProvider::new(seen_requests.clone());
+        let mut messages = vec![
+            ChatMessage::new(
+                ChatRole::User,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "old ".repeat(30),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "recent context".to_string(),
+                })],
+            ),
+        ];
+        let next_message = ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "next request".to_string(),
+            })],
+        );
+
+        compressor
+            .append_with_compression(
+                &mut messages,
+                next_message,
+                &provider,
+                &model_config,
+                None,
+                Some("* [conversation:c_1] Project A background"),
+            )
+            .expect("append should compress");
+
+        let requests = seen_requests.lock().unwrap();
+        let rendered = requests[0]
+            .messages
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("[Relevant Long Memory For Compression]"));
+        assert!(rendered.contains("Project A background"));
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn structured_compression_renders_sections_and_preserves_selected_tool_pair() {
+        let (estimator, model_config, directory) = build_test_estimator();
+        let compressor = SessionCompressor::new(estimator, 24, 8).expect("compressor should build");
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = SummaryProvider::with_response(
+            seen_requests,
+            r#"{
+                "summary": "Read the config and found memory disabled.",
+                "current_state": "Need to update docs next.",
+                "plan": "Patch TODO.md and run tests.",
+                "preserved_tool_call_ids": ["call_keep", "missing_call"]
+            }"#,
+        );
+        let mut messages = vec![
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    tool_call_id: "call_keep".to_string(),
+                    tool_name: "file_read".to_string(),
+                    arguments: ContextItem {
+                        text: r#"{"file_path":"TODO.md"}"#.to_string(),
+                    },
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::User,
+                vec![ChatMessageItem::ToolResult(ToolResultItem {
+                    tool_call_id: "call_keep".to_string(),
+                    tool_name: "file_read".to_string(),
+                    result: ToolResultContent {
+                        context: Some(ContextItem {
+                            text: "memory disabled in config".to_string(),
+                        }),
+                        file: None,
+                    },
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "old ".repeat(30),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "recent context".to_string(),
+                })],
+            ),
+        ];
+        let next_message = ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "next request".to_string(),
+            })],
+        );
+
+        compressor
+            .append_with_compression(
+                &mut messages,
+                next_message,
+                &provider,
+                &model_config,
+                None,
+                None,
+            )
+            .expect("append should compress");
+
+        let summary_text = message_text(&messages[0]);
+        assert!(summary_text.contains("Summary:\nRead the config"));
+        assert!(summary_text.contains("Current State:\nNeed to update docs next."));
+        assert!(summary_text.contains("Plan:\nPatch TODO.md and run tests."));
+        assert!(matches!(
+            messages[1].data.first(),
+            Some(ChatMessageItem::ToolCall(tool_call)) if tool_call.tool_call_id == "call_keep"
+        ));
+        assert!(matches!(
+            messages[2].data.first(),
+            Some(ChatMessageItem::ToolResult(tool_result))
+                if tool_result.tool_call_id == "call_keep"
+                    && tool_result
+                        .result
+                        .context
+                        .as_ref()
+                        .is_some_and(|context| context.text.contains("memory disabled"))
+        ));
+        assert!(!messages
+            .iter()
+            .flat_map(|message| message.data.iter())
+            .any(|item| matches!(
+                item,
+                ChatMessageItem::ToolCall(tool_call)
+                    if tool_call.tool_call_id == "missing_call"
+            )));
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn compression_fails_when_provider_does_not_return_json() {
+        let (estimator, model_config, directory) = build_test_estimator();
+        let compressor = SessionCompressor::new(estimator, 24, 8).expect("compressor should build");
+        let provider = SummaryProvider::with_response(
+            Arc::new(Mutex::new(Vec::new())),
+            "summary of older context",
+        );
+        let mut messages = vec![
+            ChatMessage::new(
+                ChatRole::User,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "old ".repeat(30),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "recent context".to_string(),
+                })],
+            ),
+        ];
+        let next_message = ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "next request".to_string(),
+            })],
+        );
+
+        let error = compressor
+            .append_with_compression(
+                &mut messages,
+                next_message,
+                &provider,
+                &model_config,
+                None,
+                None,
+            )
+            .expect_err("plain text compression response should fail");
+
+        assert!(matches!(error, CompressionError::InvalidSummaryJson(_)));
         fs::remove_dir_all(directory).expect("test directory should be removed");
     }
 

@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use super::{WorkdirUpgrader, LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_14};
+use super::{WorkdirUpgrader, WORKDIR_VERSION_0_14, WORKDIR_VERSION_0_15};
 use crate::{config::StellaclawConfig, workspace::is_sshfs_workspace_entry_name};
 
 pub struct StaleSpecialLinkRepairUpgrade;
@@ -16,7 +16,7 @@ impl WorkdirUpgrader for StaleSpecialLinkRepairUpgrade {
     }
 
     fn to_version(&self) -> &'static str {
-        LATEST_WORKDIR_VERSION
+        WORKDIR_VERSION_0_15
     }
 
     fn upgrade(&self, workdir: &Path, _config: &StellaclawConfig) -> Result<()> {
@@ -245,6 +245,7 @@ mod tests {
             channels: Vec::new(),
             models: BTreeMap::new(),
             session_defaults: SessionDefaults::default(),
+            memory: crate::config::MemoryConfig::default(),
             sandbox: SandboxConfig::default(),
             skill_sync: Vec::new(),
             available_agent_models: Vec::new(),

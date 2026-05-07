@@ -42,6 +42,11 @@ use crate::{
         UpdateCronTaskRequest,
     },
     logger::StellaclawLogger,
+    memory::{
+        shared_workdir_memory_client, MemoryBackend, MemoryClient, MemoryClientAction,
+        MemoryDeleteRequest, MemoryOptions, MemorySearchRequest, MemoryService, MemorySource,
+        MemoryUpdateRequest, MemoryWriteRequest,
+    },
     sandbox::bubblewrap_support_error,
     session_client::AgentServerClient,
     workspace::{ensure_workspace_for_remote_mode, ensure_workspace_seed},
@@ -418,6 +423,7 @@ struct ConversationRuntime {
     subagents: BTreeMap<String, ManagedSessionRuntime>,
     foreground_progress: Option<ActiveForegroundProgress>,
     host_services: HostServiceRegistry,
+    memory_client: Option<MemoryClient>,
 }
 
 #[derive(Debug, Clone)]
@@ -431,6 +437,7 @@ enum HostServiceId {
     ManagedSession,
     Skill,
     Cron,
+    Memory,
 }
 
 trait HostService {
@@ -446,6 +453,7 @@ struct CoreHostService;
 struct ManagedSessionHostService;
 struct SkillHostService;
 struct CronHostService;
+struct MemoryHostService;
 
 #[derive(Debug, Clone)]
 struct HostServiceContext {
@@ -480,6 +488,14 @@ impl HostServiceRegistry {
         ] {
             routes.insert(action, HostServiceId::Cron);
         }
+        for action in [
+            "memory_search",
+            "memory_write",
+            "memory_update",
+            "memory_delete",
+        ] {
+            routes.insert(action, HostServiceId::Memory);
+        }
         Self { routes }
     }
 
@@ -502,6 +518,7 @@ impl HostServiceId {
             }
             HostServiceId::Skill => SkillHostService.handle(runtime, context, request),
             HostServiceId::Cron => CronHostService.handle(runtime, context, request),
+            HostServiceId::Memory => MemoryHostService.handle(runtime, context, request),
         }
     }
 }
@@ -547,6 +564,17 @@ impl HostService for CronHostService {
         request: &ConversationBridgeRequest,
     ) -> Result<ToolResultItem> {
         runtime.handle_cron_host_action(context, request)
+    }
+}
+
+impl HostService for MemoryHostService {
+    fn handle(
+        &self,
+        runtime: &mut ConversationRuntime,
+        context: HostServiceContext,
+        request: &ConversationBridgeRequest,
+    ) -> Result<ToolResultItem> {
+        runtime.handle_memory_host_action(context, request)
     }
 }
 
@@ -600,6 +628,7 @@ impl ConversationRuntime {
             state.reasoning_effort.as_deref(),
             &config.models,
             &config.session_defaults,
+            config.memory.enabled,
         )?;
 
         let mut background = BTreeMap::new();
@@ -621,6 +650,7 @@ impl ConversationRuntime {
                     state.reasoning_effort.as_deref(),
                     &config.models,
                     &config.session_defaults,
+                    config.memory.enabled,
                 )?,
             );
         }
@@ -644,9 +674,17 @@ impl ConversationRuntime {
                     state.reasoning_effort.as_deref(),
                     &config.models,
                     &config.session_defaults,
+                    config.memory.enabled,
                 )?,
             );
         }
+
+        let memory_client = config.memory.enabled.then(|| {
+            shared_workdir_memory_client(
+                workdir.clone(),
+                memory_options_from_config(config.as_ref()),
+            )
+        });
 
         Ok(Self {
             workdir,
@@ -664,6 +702,7 @@ impl ConversationRuntime {
             subagents,
             foreground_progress: None,
             host_services: HostServiceRegistry::new(),
+            memory_client,
         })
     }
 
@@ -1071,6 +1110,29 @@ impl ConversationRuntime {
                         retained_message_count,
                         compressed_message_count,
                     ))?;
+                }
+                Ok(false)
+            }
+            SessionEvent::CompactFailed { phase, reason } => {
+                self.logger.warn(
+                    "compact_failed",
+                    json!({
+                        "phase": phase,
+                        "reason": reason,
+                        "session_type": format!("{session_type:?}"),
+                        "agent_id": agent_id,
+                    }),
+                );
+                if session_type == SessionType::Foreground {
+                    self.send_channel_error(
+                        OutgoingErrorScope::Runtime,
+                        OutgoingErrorSeverity::Warning,
+                        "compact_failed",
+                        format!("上下文压缩失败：{reason}"),
+                        Some(json!({"phase": phase, "reason": reason})),
+                        false,
+                        None,
+                    )?;
                 }
                 Ok(false)
             }
@@ -1621,6 +1683,130 @@ impl ConversationRuntime {
         }
     }
 
+    fn handle_memory_host_action(
+        &mut self,
+        context: HostServiceContext,
+        request: &ConversationBridgeRequest,
+    ) -> Result<ToolResultItem> {
+        if !self.config.memory.enabled {
+            return Ok(bridge_result(
+                request,
+                json!({"status": "failure", "reason": "memory_disabled"}).to_string(),
+            ));
+        }
+        let source = MemorySource {
+            conversation_id: self.state.conversation_id.clone(),
+            agent_id: context.agent_id,
+            session_type: format!("{:?}", context.session_type).to_lowercase(),
+        };
+        let memory = MemoryService::with_options(
+            self.workdir.clone(),
+            self.conversation_root.clone(),
+            source.clone(),
+            memory_options_from_config(self.config.as_ref()),
+        );
+        let memory: &dyn MemoryBackend = &memory;
+        let output = match request.action.as_str() {
+            "memory_search" => {
+                let payload: MemorySearchRequest = serde_json::from_value(request.payload.clone())
+                    .context("failed to parse memory_search request")?;
+                let limit = memory_search_limit(&payload);
+                let mut outputs = Vec::new();
+                if memory_search_includes_scope(&payload, "conversation") {
+                    let mut conversation_payload = payload.clone();
+                    conversation_payload.scopes = vec!["conversation".to_string()];
+                    outputs.push(memory.search(conversation_payload).unwrap_or_else(|error| {
+                        json!({"status": "failure", "reason": memory_failure_reason(&error)})
+                    }));
+                }
+                if memory_search_includes_scope(&payload, "public") {
+                    let mut public_payload = payload;
+                    public_payload.scopes = vec!["public".to_string()];
+                    outputs.push(
+                        self.memory_client
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("memory_manager_unavailable"))?
+                            .execute(
+                                self.conversation_root.clone(),
+                                source.clone(),
+                                MemoryClientAction::Search(public_payload),
+                            )
+                            .unwrap_or_else(|error| {
+                                json!({"status": "failure", "reason": memory_failure_reason(&error)})
+                            }),
+                    );
+                }
+                merge_memory_search_outputs(outputs, limit)
+            }
+            "memory_write" => {
+                let payload: MemoryWriteRequest =
+                    serde_json::from_value(request.payload.clone())
+                        .context("failed to parse memory_write request")?;
+                if memory_write_uses_workdir_manager(&payload) {
+                    self.memory_client
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("memory_manager_unavailable"))?
+                        .execute(
+                            self.conversation_root.clone(),
+                            source.clone(),
+                            MemoryClientAction::Write(payload),
+                        )
+                        .unwrap_or_else(|error| {
+                            json!({"status": "failure", "reason": memory_failure_reason(&error)})
+                        })
+                } else {
+                    memory.write(payload).unwrap_or_else(|error| {
+                        json!({"status": "failure", "reason": memory_failure_reason(&error)})
+                    })
+                }
+            }
+            "memory_update" => {
+                let payload: MemoryUpdateRequest = serde_json::from_value(request.payload.clone())
+                    .context("failed to parse memory_update request")?;
+                if memory_id_uses_workdir_manager(&payload.memory_id) {
+                    self.memory_client
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("memory_manager_unavailable"))?
+                        .execute(
+                            self.conversation_root.clone(),
+                            source.clone(),
+                            MemoryClientAction::Update(payload),
+                        )
+                        .unwrap_or_else(|error| {
+                            json!({"status": "failure", "reason": memory_failure_reason(&error)})
+                        })
+                } else {
+                    memory.update(payload).unwrap_or_else(|error| {
+                        json!({"status": "failure", "reason": memory_failure_reason(&error)})
+                    })
+                }
+            }
+            "memory_delete" => {
+                let payload: MemoryDeleteRequest = serde_json::from_value(request.payload.clone())
+                    .context("failed to parse memory_delete request")?;
+                if memory_id_uses_workdir_manager(&payload.memory_id) {
+                    self.memory_client
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("memory_manager_unavailable"))?
+                        .execute(
+                            self.conversation_root.clone(),
+                            source,
+                            MemoryClientAction::Delete(payload),
+                        )
+                        .unwrap_or_else(|error| {
+                            json!({"status": "failure", "reason": memory_failure_reason(&error)})
+                        })
+                } else {
+                    memory.delete(payload).unwrap_or_else(|error| {
+                        json!({"status": "failure", "reason": memory_failure_reason(&error)})
+                    })
+                }
+            }
+            _ => return Err(anyhow!("unsupported memory host action {}", request.action)),
+        };
+        Ok(bridge_result(request, serde_json::to_string(&output)?))
+    }
+
     fn persist_skill(
         &self,
         request: &ConversationBridgeRequest,
@@ -1781,6 +1967,7 @@ impl ConversationRuntime {
             self.state.reasoning_effort.as_deref(),
             &self.config.models,
             &self.config.session_defaults,
+            self.config.memory.enabled,
         )?;
 
         runtime
@@ -2682,6 +2869,7 @@ impl ConversationRuntime {
             self.state.reasoning_effort.as_deref(),
             &self.config.models,
             &self.config.session_defaults,
+            self.config.memory.enabled,
         )?;
         Ok(())
     }
@@ -2851,6 +3039,31 @@ fn progress_failed(model_key: &str, error: Option<&str>) -> TurnProgress {
     }
 }
 
+fn memory_options_from_config(config: &StellaclawConfig) -> MemoryOptions {
+    MemoryOptions {
+        write_candidate_limit: config.memory.write_candidate_limit,
+        tool_result_max_bytes: config.memory.tool_result_max_bytes,
+        user_soft_threshold_bytes: config.memory.user_soft_threshold_bytes,
+        user_hard_threshold_bytes: config.memory.user_hard_threshold_bytes,
+        user_retry_after_failed_hard_compaction_secs: config
+            .memory
+            .user_retry_after_failed_hard_compaction_secs,
+        user_compaction_model: config
+            .memory
+            .user_compaction_model_alias
+            .as_deref()
+            .and_then(|alias| config.models.get(alias))
+            .cloned(),
+        dedupe_model: config
+            .memory
+            .dedupe_model_alias
+            .as_deref()
+            .and_then(|alias| config.models.get(alias))
+            .cloned(),
+        user_soft_compaction_schedule: config.memory.user_soft_compaction_schedule.clone(),
+    }
+}
+
 fn start_foreground_session(
     agent_server_path: &Path,
     session_root: &Path,
@@ -2862,6 +3075,7 @@ fn start_foreground_session(
     reasoning_effort: Option<&str>,
     models: &BTreeMap<String, ModelConfig>,
     defaults: &SessionDefaults,
+    memory_enabled: bool,
 ) -> Result<ForegroundSessionRuntime> {
     let (client, events) = start_session_process(
         agent_server_path,
@@ -2875,6 +3089,7 @@ fn start_foreground_session(
         reasoning_effort,
         models,
         defaults,
+        memory_enabled,
     )?;
     Ok(ForegroundSessionRuntime {
         client: Some(client),
@@ -2893,6 +3108,7 @@ fn start_managed_session_runtime(
     reasoning_effort: Option<&str>,
     models: &BTreeMap<String, ModelConfig>,
     defaults: &SessionDefaults,
+    memory_enabled: bool,
 ) -> Result<ManagedSessionRuntime> {
     let (client, events) = start_session_process(
         agent_server_path,
@@ -2906,6 +3122,7 @@ fn start_managed_session_runtime(
         reasoning_effort,
         models,
         defaults,
+        memory_enabled,
     )?;
     Ok(ManagedSessionRuntime {
         record,
@@ -2943,6 +3160,7 @@ fn start_session_process(
     reasoning_effort: Option<&str>,
     models: &BTreeMap<String, ModelConfig>,
     defaults: &SessionDefaults,
+    memory_enabled: bool,
 ) -> Result<(AgentServerClient, mpsc::Receiver<SessionEvent>)> {
     let (client, events) =
         AgentServerClient::spawn(agent_server_path, workspace_root, session_root, sandbox)
@@ -2952,6 +3170,7 @@ fn start_session_process(
     initial.remote_workspace_instructions = remote_workspace_instructions(tool_remote_mode);
     initial.compression_threshold_tokens = defaults.compression_threshold_tokens;
     initial.compression_retain_recent_tokens = defaults.compression_retain_recent_tokens;
+    initial.memory_enabled = memory_enabled;
     let effective_model = effective_model_config(model_config, reasoning_effort);
     initial.image_tool_model = resolve_tool_model_target(
         "image_tool_model",
@@ -3200,6 +3419,92 @@ fn bridge_result(request: &ConversationBridgeRequest, text: String) -> ToolResul
     }
 }
 
+fn memory_failure_reason(error: &anyhow::Error) -> String {
+    let reason = error.to_string();
+    if reason.contains("entry_too_large") {
+        "entry_too_large".to_string()
+    } else if reason.contains("memory_store_entry_limit") {
+        "memory_store_entry_limit".to_string()
+    } else if reason.contains("memory_store_too_large") {
+        "memory_store_too_large".to_string()
+    } else if reason.contains("invalid_action") {
+        "invalid_action".to_string()
+    } else if reason.contains("memory text must not be empty") {
+        "memory_too_vague".to_string()
+    } else {
+        "storage_error".to_string()
+    }
+}
+
+fn memory_write_uses_workdir_manager(request: &MemoryWriteRequest) -> bool {
+    matches!(request.scope.as_str(), "user" | "public")
+}
+
+fn memory_id_uses_workdir_manager(memory_id: &str) -> bool {
+    memory_id.starts_with("u_") || memory_id.starts_with("p_")
+}
+
+fn memory_search_includes_scope(request: &MemorySearchRequest, scope: &str) -> bool {
+    request.scopes.is_empty() || request.scopes.iter().any(|item| item == scope)
+}
+
+fn memory_search_limit(request: &MemorySearchRequest) -> usize {
+    request.limit.unwrap_or(5).clamp(1, 20)
+}
+
+fn merge_memory_search_outputs(outputs: Vec<Value>, limit: usize) -> Value {
+    let mut results = Vec::new();
+    let mut truncated = false;
+    for output in outputs {
+        if output.get("status").and_then(Value::as_str) != Some("success") {
+            return output;
+        }
+        truncated |= output
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if let Some(items) = output.get("results").and_then(Value::as_array) {
+            results.extend(items.iter().cloned());
+        }
+    }
+    results.sort_by(|left, right| {
+        let left_score = left.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        let right_score = right.get("score").and_then(Value::as_f64).unwrap_or(0.0);
+        right_score
+            .partial_cmp(&left_score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| memory_result_scope_rank(left).cmp(&memory_result_scope_rank(right)))
+            .then_with(|| {
+                right
+                    .get("updated_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .cmp(
+                        left.get("updated_at")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+            })
+    });
+    if results.len() > limit {
+        results.truncate(limit);
+        truncated = true;
+    }
+    json!({
+        "status": "success",
+        "results": results,
+        "truncated": truncated,
+    })
+}
+
+fn memory_result_scope_rank(value: &Value) -> u8 {
+    match value.get("scope").and_then(Value::as_str) {
+        Some("conversation") => 0,
+        Some("public") => 1,
+        _ => 2,
+    }
+}
+
 fn format_script_output_section(label: &str, value: &str) -> String {
     let value = value.trim();
     if value.is_empty() {
@@ -3226,5 +3531,37 @@ fn format_session_error(error: &str, detail: &SessionErrorDetail) -> String {
         error.to_string()
     } else {
         format!("{summary}\n{error}")
+    }
+}
+
+#[cfg(test)]
+mod memory_host_tests {
+    use super::*;
+
+    #[test]
+    fn merge_memory_search_outputs_sorts_and_limits_results() {
+        let merged = merge_memory_search_outputs(
+            vec![
+                json!({
+                    "status": "success",
+                    "results": [
+                        {"id": "c_1", "scope": "conversation", "text": "local", "updated_at": "2026-01-01", "score": 0.5}
+                    ],
+                    "truncated": false
+                }),
+                json!({
+                    "status": "success",
+                    "results": [
+                        {"id": "p_1", "scope": "public", "text": "global", "updated_at": "2026-01-02", "score": 0.8}
+                    ],
+                    "truncated": false
+                }),
+            ],
+            1,
+        );
+
+        assert_eq!(merged["status"], "success");
+        assert_eq!(merged["results"][0]["id"], "p_1");
+        assert_eq!(merged["truncated"], true);
     }
 }
