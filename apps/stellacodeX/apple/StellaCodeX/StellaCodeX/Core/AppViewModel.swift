@@ -40,6 +40,8 @@ final class AppViewModel: ObservableObject {
     private var pinnedConversationIDs: Set<ConversationSummary.ID>
     private var realtimeGeneration: UInt64 = 0
     private var isRealtimeSuspended = false
+    private var isLoadingInitialData = false
+    private var hasLoadedInitialData = false
     private let pageSize = 50
     private let automaticVisibleMessageLimit = 160
 
@@ -490,8 +492,10 @@ final class AppViewModel: ObservableObject {
     }
 
     func updateProfile(_ profile: ServerProfile) {
+        let previousClient = client
         self.profile = profile
         self.client = makeClient(profile)
+        hasLoadedInitialData = false
         ServerProfileStore.save(profile)
         realtimeGeneration &+= 1
         foregroundResumeTask?.cancel()
@@ -518,7 +522,7 @@ final class AppViewModel: ObservableObject {
         realtimeStatus = "Disconnected"
 
         Task {
-            await client.invalidateTransport()
+            await previousClient.invalidateTransport()
         }
     }
 
@@ -532,7 +536,14 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    func loadInitialData() async {
+    func loadInitialData(force: Bool = false) async {
+        if isLoadingInitialData || (hasLoadedInitialData && !force) {
+            return
+        }
+        isLoadingInitialData = true
+        defer {
+            isLoadingInitialData = false
+        }
         do {
             await loadModels()
             let loadedConversations = try await client.listConversations()
@@ -549,6 +560,7 @@ final class AppViewModel: ObservableObject {
             startConversationStream()
             startRealtimeForSelectedConversation()
             #endif
+            hasLoadedInitialData = true
         } catch {
             messages = [
                 ChatMessage(

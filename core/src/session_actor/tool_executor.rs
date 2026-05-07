@@ -1146,7 +1146,7 @@ mod tests {
     }
 
     #[test]
-    fn executes_shell_and_shell_close_locally() {
+    fn executes_shell_and_shell_stop_locally() {
         let workspace = temp_workspace();
         let executor = LocalToolBatchExecutor::new(&workspace);
         let message = start_and_wait(
@@ -1155,7 +1155,7 @@ mod tests {
                 "batch_shell",
                 vec![tool_call(
                     "shell_exec",
-                    json!({"shell_id": "test_shell", "command": "printf hello", "yield_time_ms": 1000}),
+                    json!({"command": "printf hello", "yield_time_ms": 1000}),
                 )],
             ),
         );
@@ -1171,20 +1171,22 @@ mod tests {
                 "batch_shell_running",
                 vec![tool_call(
                     "shell_exec",
-                    json!({"shell_id": "sleep_shell", "command": "sleep 5", "yield_time_ms": 250}),
+                    json!({"command": "sleep 5", "yield_time_ms": 250}),
                 )],
             ),
         );
-        assert!(result_text(&message, 0).contains("\"running\": true"));
+        let running_result: Value = serde_json::from_str(result_text(&message, 0)).unwrap();
+        assert_eq!(running_result["running"], json!(true));
+        let process_id = running_result["process_id"].as_str().unwrap();
 
         let message = start_and_wait(
             &executor,
             ToolBatch::new(
-                "batch_shell_close",
-                vec![tool_call("shell_close", json!({"shell_id": "sleep_shell"}))],
+                "batch_shell_stop",
+                vec![tool_call("shell_stop", json!({"process_id": process_id}))],
             ),
         );
-        assert!(result_text(&message, 0).contains("\"closed\": true"));
+        assert!(result_text(&message, 0).contains("\"stopped\": true"));
     }
 
     #[test]
@@ -1205,6 +1207,94 @@ mod tests {
     }
 
     #[test]
+    fn shell_write_empty_observes_but_non_tty_stdin_is_closed() {
+        let workspace = temp_workspace();
+        let executor = LocalToolBatchExecutor::new(&workspace);
+        let message = start_and_wait(
+            &executor,
+            ToolBatch::new(
+                "batch_shell_running_process",
+                vec![tool_call(
+                    "shell_exec",
+                    json!({"command": "sleep 1; printf done", "yield_time_ms": 250}),
+                )],
+            ),
+        );
+        let started: Value = serde_json::from_str(result_text(&message, 0)).unwrap();
+        assert_eq!(started["running"], json!(true));
+        let process_id = started["process_id"].as_str().unwrap();
+
+        let message = start_and_wait(
+            &executor,
+            ToolBatch::new(
+                "batch_shell_stdin_closed",
+                vec![tool_call(
+                    "shell_write_stdin",
+                    json!({"process_id": process_id, "chars": "ignored\n"}),
+                )],
+            ),
+        );
+        assert!(result_text(&message, 0).contains("stdin_closed"));
+
+        thread::sleep(Duration::from_millis(1200));
+        let message = start_and_wait(
+            &executor,
+            ToolBatch::new(
+                "batch_shell_empty_observe",
+                vec![tool_call(
+                    "shell_write_stdin",
+                    json!({"process_id": process_id, "chars": "", "yield_time_ms": 250}),
+                )],
+            ),
+        );
+        let text = result_text(&message, 0);
+        assert!(text.contains("\"running\": false"), "{text}");
+        assert!(text.contains("done"), "{text}");
+    }
+
+    #[test]
+    fn shell_write_stdin_supports_tty_processes() {
+        let workspace = temp_workspace();
+        let executor = LocalToolBatchExecutor::new(&workspace);
+        let message = start_and_wait(
+            &executor,
+            ToolBatch::new(
+                "batch_shell_tty_start",
+                vec![tool_call(
+                    "shell_exec",
+                    json!({
+                        "command": "python3 -c \"import sys; print('ready'); print('got:' + sys.stdin.readline().strip())\"",
+                        "tty": true,
+                        "yield_time_ms": 250
+                    }),
+                )],
+            ),
+        );
+        let initial_text = result_text(&message, 0).to_string();
+        let started: Value = serde_json::from_str(result_text(&message, 0)).unwrap();
+        assert_eq!(started["running"], json!(true));
+        let process_id = started["process_id"].as_str().unwrap();
+
+        let message = start_and_wait(
+            &executor,
+            ToolBatch::new(
+                "batch_shell_tty_write",
+                vec![tool_call(
+                    "shell_write_stdin",
+                    json!({"process_id": process_id, "chars": "hello\n", "yield_time_ms": 1000}),
+                )],
+            ),
+        );
+        let text = result_text(&message, 0);
+        assert!(
+            initial_text.contains("ready") || text.contains("ready"),
+            "{initial_text}\n{text}"
+        );
+        assert!(text.contains("got:hello"), "{text}");
+        assert!(text.contains("\"running\": false"), "{text}");
+    }
+
+    #[test]
     fn shell_truncates_agent_visible_output() {
         let workspace = temp_workspace();
         let executor = LocalToolBatchExecutor::new(&workspace);
@@ -1215,7 +1305,6 @@ mod tests {
                 vec![tool_call(
                     "shell_exec",
                     json!({
-                        "shell_id": "truncated_shell",
                         "command": "python3 -c \"print('x' * 4000)\"",
                         "yield_time_ms": 1000,
                         "max_output_chars": 80
@@ -1238,7 +1327,6 @@ mod tests {
             vec![tool_call(
                 "shell_exec",
                 json!({
-                    "shell_id": "interrupt_shell",
                     "command": "sleep 5",
                     "yield_time_ms": 10_000
                 }),
@@ -1265,20 +1353,18 @@ mod tests {
 
         let text = result_text(&message, 0);
         assert!(text.contains("\"running\": true"));
-        assert!(text.contains("\"shell_id\": \"interrupt_shell\""));
+        let interrupted_result: Value = serde_json::from_str(text).unwrap();
+        let process_id = interrupted_result["process_id"].as_str().unwrap();
         assert!(!text.contains("tool batch interrupted"));
 
         let message = start_and_wait(
             &executor,
             ToolBatch::new(
                 "batch_shell_interrupt_close",
-                vec![tool_call(
-                    "shell_close",
-                    json!({"shell_id": "interrupt_shell"}),
-                )],
+                vec![tool_call("shell_stop", json!({"process_id": process_id}))],
             ),
         );
-        assert!(result_text(&message, 0).contains("\"closed\": true"));
+        assert!(result_text(&message, 0).contains("\"stopped\": true"));
     }
 
     #[test]

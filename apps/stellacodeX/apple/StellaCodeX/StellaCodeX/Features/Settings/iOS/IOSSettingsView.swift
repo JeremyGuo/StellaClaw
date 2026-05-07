@@ -219,7 +219,7 @@ struct IOSSettingsView: View {
             viewModel.updateProfile(profile)
 
             Task {
-                await viewModel.loadInitialData()
+                await viewModel.loadInitialData(force: true)
             }
         } catch {
             errorMessage = error.localizedDescription

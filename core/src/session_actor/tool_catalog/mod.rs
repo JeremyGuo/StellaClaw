@@ -464,9 +464,8 @@ mod tests {
         assert!(catalog.contains("file_read"));
         assert!(!catalog.contains("shell"));
         assert!(catalog.contains("shell_exec"));
-        assert!(catalog.contains("shell_observe"));
         assert!(catalog.contains("shell_write_stdin"));
-        assert!(catalog.contains("shell_close"));
+        assert!(catalog.contains("shell_stop"));
         assert!(catalog.contains("file_download_start"));
         assert!(!catalog.contains("dsl_start"));
         assert!(catalog.contains("web_search"));
@@ -498,6 +497,8 @@ mod tests {
             .is_some());
         assert!(shell.parameters["properties"].get("remote").is_some());
         assert!(shell.parameters["properties"].get("session_id").is_none());
+        assert!(shell.parameters["properties"].get("shell_id").is_none());
+        assert!(shell.parameters["properties"].get("tty").is_some());
 
         let image_generation = catalog.get("image_generation").unwrap();
         assert_eq!(

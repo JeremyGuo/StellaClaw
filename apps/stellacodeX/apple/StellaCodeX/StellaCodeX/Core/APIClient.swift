@@ -653,7 +653,12 @@ struct StellaWebAPIClient: StellaAPIClient {
     }
 
     func invalidateTransport() async {
-        session.invalidateAndCancel()
+        await withCheckedContinuation { continuation in
+            session.getAllTasks { tasks in
+                tasks.forEach { $0.cancel() }
+                continuation.resume()
+            }
+        }
         await tunnelManager.close()
     }
 

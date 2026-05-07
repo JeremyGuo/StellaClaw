@@ -1,5 +1,13 @@
-version: 1.25.8
+version: 1.25.9
 ---
+
+# 1.25.9
+
+- 修复 StellaCodeX macOS 空 conversation 状态下展开右侧概览可能闪退的问题：
+  Web API client 的 `invalidateTransport()` 不再永久 invalidate 底层 `URLSession`，改为取消当前 session tasks 并关闭 SSH tunnel，避免后续 SwiftUI 视图重建触发 `loadInitialData` 时复用已经 invalidated 的 session。`AppViewModel.loadInitialData` 增加运行中和已完成 guard，设置页保存 profile 后使用强制 reload；profile 切换时只关闭旧 client transport，不会误关新 client。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 重构 shell 工具默认执行语义：
+  `shell_exec` 现在每次启动 fresh process，默认 `tty=false`、stdin 关闭、不复用隐藏 shell，并以 child process exit 作为完成信号，不再注入 sentinel；运行超过 `yield_time_ms` 时返回 `process_id`，后续通过 `shell_write_stdin(chars="")` 观察输出或 `shell_stop` 停止。`tty=true` 时才分配 PTY 并允许非空 `shell_write_stdin` 写入；`login=true` 使用 shell `-lc` 加载用户 profile 环境。移除模型可见 `shell_observe` / `shell_close`，新增 `shell_stop`。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.25.8
 
