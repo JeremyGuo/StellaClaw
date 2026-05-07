@@ -107,10 +107,12 @@ Memory v1 新增：
         entries.jsonl                 # user scope active 条目
         manifest.json                 # hash、大小、last_updated_at、压缩状态、阈值快照
         compaction.json               # 后台压缩任务状态、失败次数、next_retry_at
+        usage.jsonl                   # user memory dedupe 与 user compaction provider token usage
       public/
         entries.jsonl                 # public scope 长期记忆
         subjects.json                 # subject/entity aliases、最近访问、entry ids、短摘要
         index.json                    # public manifest、hash、大小、last_indexed_at
+        usage.jsonl                   # public memory dedupe provider token usage
   conversations/
     <conversation_id>/
       .stellaclaw/
@@ -118,6 +120,7 @@ Memory v1 新增：
           conversation/
             entries.jsonl             # conversation scope 长期记忆
             index.json                # conversation manifest、hash、大小、last_indexed_at
+            usage.jsonl               # conversation memory dedupe provider token usage
 ```
 
 - [x] 新增目录统一使用 `memory_v1/`，明确这是第一版 memory 持久化格式。
@@ -128,10 +131,13 @@ Memory v1 新增：
 - [x] `rundir/memory_v1/user/entries.jsonl`：用户长期合作记忆 active 条目。系统自动填 `id`、`created_at`、`updated_at`；模型通过 `memory_write(scope="user")` 新增，通过 `memory_update` / `memory_delete` 按 id 整理。
 - [x] `rundir/memory_v1/user/manifest.json`：记录 entries hash、raw size、rendered size、next id 和 last_updated_at；compaction 运行态由 `compaction.json` 维护。
 - [x] `rundir/memory_v1/user/compaction.json`：已初始化为 user memory 压缩状态文件，包含 `state`、`attempts`、`last_error`、`next_retry_at`、`last_input_hash`、`last_output_hash`、`threshold_override_bytes`、`last_soft_compaction_at` 和 `updated_at`。
+- [x] `rundir/memory_v1/user/usage.jsonl`：记录 user scope dedupe provider 调用和 user memory provider compaction 调用的 `token_usage`、model、scope、conversation id、session type、日期和触发类型；status 汇总会按天聚合 user memory compaction。
 - [x] `rundir/memory_v1/public/entries.jsonl`：`public` scope 的长期记忆。系统自动填 `id`、`source_conversation_id`、`source_session_type`、`created_at`、`updated_at`；模型提供 `subject`、`text`、`tags`。
 - [x] `rundir/memory_v1/public/subjects.json`：public 查询索引，记录 subject、aliases、entry ids、last_seen_at 和短摘要。
+- [x] `rundir/memory_v1/public/usage.jsonl`：记录 public scope dedupe provider 调用的 `token_usage`，Conversation status 会按 `conversation_id` 汇总当前 conversation 触发的 public memory API 用量。
 - [x] `conversations/<id>/.stellaclaw/memory_v1/conversation/entries.jsonl`：`conversation` scope 的长期记忆。同 conversation 的所有 session/agent 可以搜索和维护。
 - [x] `index.json` 保存 entries hash、size、next_id 和 last_updated_at，由 runtime 维护。
+- [x] `conversations/<id>/.stellaclaw/memory_v1/conversation/usage.jsonl`：记录当前 conversation scope dedupe provider 调用的 `token_usage`，并进入该 conversation 的 status 用量汇总。
 
 ### 工具
 
@@ -206,6 +212,7 @@ request
 - [x] 如果旧条目和新事实冲突，以新事实为准。完全冲突时删除旧条目；部分冲突时修正旧条目的冲突部分并保留仍有效的信息；完全相同或同义时不插入新条目，只 touch 旧条目。应用 actions 后，同一主题的查询结果应保持事实一致。
 - [x] judge 输出无法解析、Provider 调用失败、返回非法 action、引用非候选 id、update 后超过大小限制、存储事务失败时，本次写入失败，不改变 memory。
 - [x] `memory_write` 对外 tool result 只返回成功或失败以及失败原因；内部候选、judge 输出、actions、被 touch/update/delete/insert 的 id 写入 audit log，不进入模型上下文。
+- [x] MemoryService 独立记录 provider Token Usage：dedupe judge 和 user memory provider compaction 都写入对应 scope 的 `usage.jsonl`，Channel status 查询会汇总当前 conversation 的 memory API 用量和 user memory compaction 的每日用量。
 
 ```json
 {

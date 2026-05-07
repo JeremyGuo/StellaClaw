@@ -456,6 +456,8 @@ private struct MacUsageOverviewView: View {
                 MacUsageBucketRow(title: "Background", usage: status.usage.background)
                 MacUsageBucketRow(title: "Subagents", usage: status.usage.subagents)
                 MacUsageBucketRow(title: "Media Tools", usage: status.usage.mediaTools)
+                MacUsageBucketRow(title: "Memory", usage: status.usage.memory)
+                MacUsageBucketRow(title: "User Memory Compaction", usage: status.usage.userMemoryCompaction)
             }
 
             Divider()

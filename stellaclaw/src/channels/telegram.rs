@@ -1259,14 +1259,31 @@ fn render_usage_summary(summary: &OutgoingUsageSummary) -> String {
     add_usage_totals(&mut total, &summary.background);
     add_usage_totals(&mut total, &summary.subagents);
     add_usage_totals(&mut total, &summary.media_tools);
+    add_usage_totals(&mut total, &summary.memory);
+    add_usage_totals(&mut total, &summary.user_memory_compaction);
+    let compaction_daily = summary
+        .user_memory_compaction_daily
+        .iter()
+        .rev()
+        .take(7)
+        .map(|item| render_usage_line(&format!("user memory compact {}", item.date), &item.usage))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     format!(
-        "token usage\n{}\n{}\n{}\n{}\n{}",
+        "token usage\n{}\n{}\n{}\n{}\n{}\n{}\n{}{}",
         render_usage_line("total", &total),
         render_usage_line("foreground", &summary.foreground),
         render_usage_line("background", &summary.background),
         render_usage_line("subagents", &summary.subagents),
         render_usage_line("media tools", &summary.media_tools),
+        render_usage_line("memory", &summary.memory),
+        render_usage_line("user memory compaction", &summary.user_memory_compaction),
+        if compaction_daily.is_empty() {
+            String::new()
+        } else {
+            format!("\n{compaction_daily}")
+        },
     )
 }
 

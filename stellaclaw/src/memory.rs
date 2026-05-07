@@ -18,7 +18,7 @@ use sha1::{Digest, Sha1};
 use stellaclaw_core::{
     model_config::ModelConfig,
     providers::{provider_from_model_config, send_provider_request_with_retry, ProviderRequest},
-    session_actor::{ChatMessage, ChatMessageItem, ChatRole, ContextItem},
+    session_actor::{ChatMessage, ChatMessageItem, ChatRole, ContextItem, TokenUsage},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -390,6 +390,15 @@ enum UserCompactionTrigger {
     Soft,
 }
 
+impl UserCompactionTrigger {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hard => "hard",
+            Self::Soft => "soft",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum MemoryAction {
@@ -536,7 +545,7 @@ impl MemoryService {
             self.options.write_candidate_limit,
             Some(scope),
         );
-        let decision = match self.consistency_decision(&draft, &candidates) {
+        let decision = match self.consistency_decision(&store, &draft, &candidates) {
             Ok(decision) => decision,
             Err(error) => {
                 let reason = format!("dedupe_model_failed: {error}");
@@ -897,13 +906,14 @@ impl MemoryService {
 
     fn consistency_decision(
         &self,
+        store: &ScopeStore,
         draft: &MemoryEntry,
         candidates: &[MemoryCandidate],
     ) -> Result<MemoryConsistencyDecision> {
         let Some(model_config) = self.options.dedupe_model.clone() else {
             return Ok(local_consistency_decision(draft, candidates));
         };
-        provider_consistency_decision(model_config, draft, candidates)
+        self.provider_consistency_decision(store, model_config, draft, candidates)
     }
 
     fn user_soft_compaction_due(&self, status: &UserMemoryCompactionStatus) -> bool {
@@ -939,7 +949,7 @@ impl MemoryService {
             ChatRole::User,
             vec![ChatMessageItem::Context(ContextItem { text: request_text })],
         )];
-        let provider = provider_from_model_config(model_config);
+        let provider = provider_from_model_config(model_config.clone());
         let response = send_provider_request_with_retry(
             provider.as_ref(),
             ProviderRequest::new(&messages)
@@ -947,6 +957,13 @@ impl MemoryService {
             |_| {},
         )
         .map_err(|error| anyhow!("user_compaction_provider_failed: {error}"))?;
+        let _ = self.write_provider_usage(
+            store,
+            "user_memory_compaction",
+            Some(trigger.as_str()),
+            &model_config,
+            &response,
+        );
         let response_text = chat_message_text(&response);
         let output = parse_user_compaction_output(&response_text)?;
         let compacted = build_user_compaction_entries(&self.source, store, &entries, output)?;
@@ -1004,6 +1021,64 @@ impl MemoryService {
                 "active_entry_count": output_entries.len(),
             }),
         )
+    }
+
+    fn provider_consistency_decision(
+        &self,
+        store: &ScopeStore,
+        model_config: ModelConfig,
+        draft: &MemoryEntry,
+        candidates: &[MemoryCandidate],
+    ) -> Result<MemoryConsistencyDecision> {
+        let request_text = render_consistency_decision_request(draft, candidates)?;
+        let messages = vec![ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem { text: request_text })],
+        )];
+        let provider = provider_from_model_config(model_config.clone());
+        let response = send_provider_request_with_retry(
+            provider.as_ref(),
+            ProviderRequest::new(&messages).with_system_prompt(Some(MEMORY_DEDUPE_SYSTEM_PROMPT)),
+            |_| {},
+        )
+        .map_err(|error| anyhow!("dedupe_provider_failed: {error}"))?;
+        let _ = self.write_provider_usage(store, "memory_dedupe", None, &model_config, &response);
+        parse_memory_consistency_decision(&chat_message_text(&response))
+    }
+
+    fn write_provider_usage(
+        &self,
+        store: &ScopeStore,
+        kind: &str,
+        trigger: Option<&str>,
+        model_config: &ModelConfig,
+        response: &ChatMessage,
+    ) -> Result<()> {
+        ensure_scope_dirs(store)?;
+        let path = store.root.join("usage.jsonl");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .with_context(|| format!("failed to open {}", path.display()))?;
+        let mut record = json!({
+            "ts": now_string(),
+            "date": today_string(),
+            "kind": kind,
+            "scope": store.scope,
+            "conversation_id": &self.source.conversation_id,
+            "source_agent_id": self.source.agent_id.as_ref(),
+            "source_session_type": &self.source.session_type,
+            "provider_type": &model_config.provider_type,
+            "model_name": &model_config.model_name,
+        });
+        if let Some(trigger) = trigger {
+            record["trigger"] = Value::String(trigger.to_string());
+        }
+        if let Some(token_usage) = &response.token_usage {
+            record["token_usage"] = token_usage_json(token_usage);
+        }
+        writeln!(file, "{record}").with_context(|| format!("failed to write {}", path.display()))
     }
 
     #[allow(dead_code)]
@@ -1628,6 +1703,21 @@ fn chat_message_text(message: &ChatMessage) -> String {
     output
 }
 
+fn token_usage_json(token_usage: &TokenUsage) -> Value {
+    json!({
+        "cache_read": token_usage.cache_read,
+        "cache_write": token_usage.cache_write,
+        "uncache_input": token_usage.uncache_input,
+        "output": token_usage.output,
+        "cost_usd": token_usage.cost_usd.as_ref().map(|cost| json!({
+            "cache_read": cost.cache_read,
+            "cache_write": cost.cache_write,
+            "uncache_input": cost.uncache_input,
+            "output": cost.output,
+        })),
+    })
+}
+
 fn render_memory_prompt_entries<'a>(entries: impl IntoIterator<Item = &'a MemoryEntry>) -> String {
     let mut output = String::new();
     for entry in entries {
@@ -2175,26 +2265,6 @@ fn local_consistency_decision(
     MemoryConsistencyDecision::success(vec![MemoryAction::Insert])
 }
 
-fn provider_consistency_decision(
-    model_config: ModelConfig,
-    draft: &MemoryEntry,
-    candidates: &[MemoryCandidate],
-) -> Result<MemoryConsistencyDecision> {
-    let request_text = render_consistency_decision_request(draft, candidates)?;
-    let messages = vec![ChatMessage::new(
-        ChatRole::User,
-        vec![ChatMessageItem::Context(ContextItem { text: request_text })],
-    )];
-    let provider = provider_from_model_config(model_config);
-    let response = send_provider_request_with_retry(
-        provider.as_ref(),
-        ProviderRequest::new(&messages).with_system_prompt(Some(MEMORY_DEDUPE_SYSTEM_PROMPT)),
-        |_| {},
-    )
-    .map_err(|error| anyhow!("dedupe_provider_failed: {error}"))?;
-    parse_memory_consistency_decision(&chat_message_text(&response))
-}
-
 fn render_consistency_decision_request(
     draft: &MemoryEntry,
     candidates: &[MemoryCandidate],
@@ -2436,6 +2506,56 @@ mod tests {
             multimodal_input: None,
             token_estimator_url: None,
         }
+    }
+
+    #[test]
+    fn provider_usage_log_records_token_usage() {
+        let workdir = temp_root("provider-usage");
+        let conversation_root = workdir.join("conversations").join("c1");
+        fs::create_dir_all(&conversation_root).unwrap();
+        let service = MemoryService::new(
+            workdir.clone(),
+            conversation_root,
+            MemorySource {
+                conversation_id: "c1".to_string(),
+                agent_id: Some("agent-a".to_string()),
+                session_type: "foreground".to_string(),
+            },
+        );
+        let store = service.store(MemoryScope::Conversation);
+        let response = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "{}".to_string(),
+            })],
+        )
+        .with_token_usage(TokenUsage {
+            cache_read: 1,
+            cache_write: 2,
+            uncache_input: 3,
+            output: 4,
+            cost_usd: None,
+        });
+
+        service
+            .write_provider_usage(
+                &store,
+                "memory_dedupe",
+                None,
+                &test_chat_model_config(),
+                &response,
+            )
+            .unwrap();
+
+        let raw = fs::read_to_string(store.root.join("usage.jsonl")).unwrap();
+        let value: Value = serde_json::from_str(raw.lines().next().unwrap()).unwrap();
+        assert_eq!(value["kind"], "memory_dedupe");
+        assert_eq!(value["scope"], "conversation");
+        assert_eq!(value["conversation_id"], "c1");
+        assert_eq!(value["source_agent_id"], "agent-a");
+        assert_eq!(value["token_usage"]["cache_read"], 1);
+        assert_eq!(value["token_usage"]["output"], 4);
+        let _ = fs::remove_dir_all(workdir);
     }
 
     #[test]

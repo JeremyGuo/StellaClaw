@@ -1,5 +1,10 @@
-version: 1.25.7
+version: 1.25.8
 ---
+
+# 1.25.8
+
+- 增加 Memory v1 独立 Token Usage 统计：
+  MemoryService 会把 dedupe provider 调用和 user memory provider compaction 调用记录到对应 scope 的 `usage.jsonl`；Conversation status 用量汇总新增 `memory`、`user_memory_compaction` 和按天聚合的 `user_memory_compaction_daily`，Web `/api/conversations/{id}/status`、Channel status 事件和 Telegram `/status` 都能看到当前 conversation 触发的 memory API 用量以及全局 user memory 压缩每日用量。workdir schema 升级到 `0.17`，为 `rundir/memory_v1/user|public/usage.jsonl` 和 `conversations/<id>/.stellaclaw/memory_v1/conversation/usage.jsonl` 初始化 usage log。本次不改变 `config` schema，改变 `workdir` schema。
 
 # 1.25.7
 

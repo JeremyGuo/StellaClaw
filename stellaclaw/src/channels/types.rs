@@ -251,6 +251,15 @@ pub struct OutgoingUsageSummary {
     pub background: OutgoingUsageTotals,
     pub subagents: OutgoingUsageTotals,
     pub media_tools: OutgoingUsageTotals,
+    pub memory: OutgoingUsageTotals,
+    pub user_memory_compaction: OutgoingUsageTotals,
+    pub user_memory_compaction_daily: Vec<OutgoingDailyUsageTotals>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OutgoingDailyUsageTotals {
+    pub date: String,
+    pub usage: OutgoingUsageTotals,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

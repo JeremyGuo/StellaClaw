@@ -191,6 +191,8 @@ private struct UsageOverviewView: View {
                 UsageBucketRow(title: "Background", usage: status.usage.background)
                 UsageBucketRow(title: "Subagents", usage: status.usage.subagents)
                 UsageBucketRow(title: "Media Tools", usage: status.usage.mediaTools)
+                UsageBucketRow(title: "Memory", usage: status.usage.memory)
+                UsageBucketRow(title: "User Memory Compaction", usage: status.usage.userMemoryCompaction)
             }
 
             Divider()

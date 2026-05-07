@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Serialize;
 
-use super::{WorkdirUpgrader, LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_15};
+use super::{WorkdirUpgrader, WORKDIR_VERSION_0_15, WORKDIR_VERSION_0_16};
 use crate::config::StellaclawConfig;
 
 pub struct MemoryV1DirectoryUpgrade;
@@ -15,7 +15,7 @@ impl WorkdirUpgrader for MemoryV1DirectoryUpgrade {
     }
 
     fn to_version(&self) -> &'static str {
-        LATEST_WORKDIR_VERSION
+        WORKDIR_VERSION_0_16
     }
 
     fn upgrade(&self, workdir: &Path, _config: &StellaclawConfig) -> Result<()> {

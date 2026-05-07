@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     io::{BufRead, BufReader, ErrorKind},
     path::Path,
@@ -9,7 +10,8 @@ use stellaclaw_core::session_actor::{ChatMessage, TokenUsage, TokenUsageCost, To
 
 use crate::{
     channels::types::{
-        OutgoingStatus, OutgoingUsageCost, OutgoingUsageSummary, OutgoingUsageTotals,
+        OutgoingDailyUsageTotals, OutgoingStatus, OutgoingUsageCost, OutgoingUsageSummary,
+        OutgoingUsageTotals,
     },
     config::StellaclawConfig,
 };
@@ -31,6 +33,9 @@ struct ConversationUsageSummary {
     background: UsageTotals,
     subagents: UsageTotals,
     media_tools: UsageTotals,
+    memory: UsageTotals,
+    user_memory_compaction: UsageTotals,
+    user_memory_compaction_daily: BTreeMap<String, UsageTotals>,
 }
 
 impl UsageTotals {
@@ -61,7 +66,7 @@ impl UsageTotals {
 }
 
 pub(super) fn conversation_status_snapshot(
-    _workdir: &Path,
+    workdir: &Path,
     session_root: &Path,
     workspace_root: &Path,
     state: &ConversationState,
@@ -109,6 +114,12 @@ pub(super) fn conversation_status_snapshot(
     usage
         .media_tools
         .add_totals(&media_tool_usage_totals(workspace_root));
+    let memory_usage = memory_usage_totals(workdir, workspace_root, &state.conversation_id);
+    usage.memory.add_totals(&memory_usage.memory);
+    usage
+        .user_memory_compaction
+        .add_totals(&memory_usage.user_memory_compaction);
+    usage.user_memory_compaction_daily = memory_usage.user_memory_compaction_daily;
 
     Ok(OutgoingStatus {
         channel_id: state.channel_id.clone(),
@@ -188,6 +199,99 @@ fn media_tool_usage_totals(workspace_root: &Path) -> UsageTotals {
     totals
 }
 
+#[derive(Debug, Clone, Default)]
+struct MemoryUsageAggregation {
+    memory: UsageTotals,
+    user_memory_compaction: UsageTotals,
+    user_memory_compaction_daily: BTreeMap<String, UsageTotals>,
+}
+
+fn memory_usage_totals(
+    workdir: &Path,
+    workspace_root: &Path,
+    conversation_id: &str,
+) -> MemoryUsageAggregation {
+    let mut aggregation = MemoryUsageAggregation::default();
+    let conversation_usage = workspace_root
+        .join(".stellaclaw")
+        .join("memory_v1")
+        .join("conversation")
+        .join("usage.jsonl");
+    add_memory_usage_records(
+        &mut aggregation,
+        &conversation_usage,
+        Some(conversation_id),
+        true,
+    );
+
+    let memory_root = workdir.join("rundir").join("memory_v1");
+    add_memory_usage_records(
+        &mut aggregation,
+        &memory_root.join("public").join("usage.jsonl"),
+        Some(conversation_id),
+        true,
+    );
+    add_memory_usage_records(
+        &mut aggregation,
+        &memory_root.join("user").join("usage.jsonl"),
+        Some(conversation_id),
+        true,
+    );
+    aggregation
+}
+
+fn add_memory_usage_records(
+    aggregation: &mut MemoryUsageAggregation,
+    path: &Path,
+    conversation_id: Option<&str>,
+    include_user_compaction: bool,
+) {
+    let Ok(Some(reader)) = open_jsonl_reader(path) else {
+        return;
+    };
+
+    for line in reader.lines().map_while(Result::ok) {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(token_usage) = value.get("token_usage") else {
+            continue;
+        };
+        let Ok(usage) = serde_json::from_value::<TokenUsage>(token_usage.clone()) else {
+            continue;
+        };
+        let kind = value.get("kind").and_then(serde_json::Value::as_str);
+        if kind == Some("user_memory_compaction") {
+            if include_user_compaction {
+                aggregation.user_memory_compaction.add_token_usage(&usage);
+                let date = value
+                    .get("date")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string();
+                aggregation
+                    .user_memory_compaction_daily
+                    .entry(date)
+                    .or_default()
+                    .add_token_usage(&usage);
+            }
+            continue;
+        }
+        if let Some(expected_conversation_id) = conversation_id {
+            let record_conversation_id = value
+                .get("conversation_id")
+                .and_then(serde_json::Value::as_str);
+            if record_conversation_id != Some(expected_conversation_id) {
+                continue;
+            }
+        }
+        aggregation.memory.add_token_usage(&usage);
+    }
+}
+
 fn open_jsonl_reader(path: &Path) -> Result<Option<BufReader<fs::File>>, std::io::Error> {
     match fs::File::open(path) {
         Ok(file) => Ok(Some(BufReader::new(file))),
@@ -209,6 +313,16 @@ fn outgoing_usage_summary(summary: &ConversationUsageSummary) -> OutgoingUsageSu
         background: outgoing_usage_totals(&summary.background),
         subagents: outgoing_usage_totals(&summary.subagents),
         media_tools: outgoing_usage_totals(&summary.media_tools),
+        memory: outgoing_usage_totals(&summary.memory),
+        user_memory_compaction: outgoing_usage_totals(&summary.user_memory_compaction),
+        user_memory_compaction_daily: summary
+            .user_memory_compaction_daily
+            .iter()
+            .map(|(date, totals)| OutgoingDailyUsageTotals {
+                date: date.clone(),
+                usage: outgoing_usage_totals(totals),
+            })
+            .collect(),
     }
 }
 
@@ -292,5 +406,68 @@ mod tests {
         assert_eq!(totals.output, 4);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn memory_usage_reads_conversation_and_user_compaction_logs() {
+        let workdir = temp_root("memory-usage-workdir");
+        let workspace = temp_root("memory-usage-workspace");
+        let conversation_usage_path = workspace
+            .join(".stellaclaw")
+            .join("memory_v1")
+            .join("conversation")
+            .join("usage.jsonl");
+        let user_usage_path = workdir
+            .join("rundir")
+            .join("memory_v1")
+            .join("user")
+            .join("usage.jsonl");
+        fs::create_dir_all(conversation_usage_path.parent().unwrap()).unwrap();
+        fs::create_dir_all(user_usage_path.parent().unwrap()).unwrap();
+        let usage = serde_json::json!({
+            "cache_read": 1,
+            "cache_write": 2,
+            "uncache_input": 3,
+            "output": 4,
+            "cost_usd": null,
+        });
+        writeln!(
+            File::create(&conversation_usage_path).unwrap(),
+            "{}",
+            serde_json::json!({
+                "date": "2026-05-07",
+                "kind": "memory_dedupe",
+                "conversation_id": "conv-a",
+                "token_usage": usage,
+            })
+        )
+        .unwrap();
+        writeln!(
+            File::create(&user_usage_path).unwrap(),
+            "{}",
+            serde_json::json!({
+                "date": "2026-05-07",
+                "kind": "user_memory_compaction",
+                "conversation_id": "workdir",
+                "token_usage": usage,
+            })
+        )
+        .unwrap();
+
+        let totals = memory_usage_totals(&workdir, &workspace, "conv-a");
+        assert_eq!(totals.memory.cache_read, 1);
+        assert_eq!(totals.memory.cache_write, 2);
+        assert_eq!(totals.user_memory_compaction.uncache_input, 3);
+        assert_eq!(
+            totals
+                .user_memory_compaction_daily
+                .get("2026-05-07")
+                .unwrap()
+                .output,
+            4
+        );
+
+        let _ = fs::remove_dir_all(workdir);
+        let _ = fs::remove_dir_all(workspace);
     }
 }
