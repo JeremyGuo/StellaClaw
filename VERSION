@@ -6,6 +6,9 @@ version: 1.26.0
 - 引入 Prompt Protocol 层：
   system prompt 不再把文件搜索、文件编辑、shell、`user_tell`、`update_plan` 和 memory 的工具操作细节全部塞进 `common_prompt`；新增 `PromptProtocol { id, priority, required_tools, body }`，由对应工具模块声明协议内容，并按 provider 实际可见工具集合筛选后以自然语言拼接进 system prompt。协议不渲染 title 或总标题，避免额外 token；`required_tools` 保证工具未启用或被 provider 过滤时不会注入相关 prompt。同步检查并对齐第一批协议和工具 description，避免搜索、编辑、shell 与 memory 规则互相冲突。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 调整附件输出 prompt 分层：
+  `<attachment>relative/path/from/workspace_root</attachment>` 是 assistant 输出协议而不是文件写入工具协议，现已移到始终注入的 common system prompt，并明确附件路径必须是 workspace-relative、不能是绝对路径或 `file://` URI、发送时必须对 conversation workspace 可见；common prompt 同时保留 `.stellaclaw/shared/` 跨 conversation 共享目录和 `STELLACLAW_SOFTWARE_DIR` 共享软件目录说明。删除 `file_write` 相关附件协议中的 `.stellaclaw/output/` 写入建议，`.stellaclaw/` 普通 `ls` 隐藏但精确路径可用的说明改由 `ls` 工具协议注入，`attachment_make_visible` 和 `user_tell` 描述也改为只保留必要语义。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 强化 apply_patch 后的 system prompt 行为约束：
   system prompt 学习 Codex 的 patch-first 使用方式，明确 `apply_patch` 用于定点修改，且成功后不要为了确认补丁是否应用而无意义重读已修改文件；工具未应用会报告失败，只有需要新上下文、后续命令或 formatter 可能改写文件、或验证失败需要排查时才重新读取。同时检查 system prompt 中已删除工具残留，当前未发现 `edit` / `old_text` / `replace_all` / `create_if_missing` 之类旧工具噪声。本次不改变 `config` schema，不改变 `workdir` schema。
 

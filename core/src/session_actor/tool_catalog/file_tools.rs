@@ -126,7 +126,7 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
             .with_concurrency(ToolConcurrency::Serial),
             ToolDefinition::new(
                 "attachment_make_visible",
-                "Copy a fixed-remote workspace-relative file or directory back to the local workspace at the same relative path so <attachment> can reference it. Requires path and optional timeout_seconds.",
+                "Make a workspace-relative file or directory visible for attachment sending. Requires path and optional timeout_seconds.",
                 object_schema(
                     properties([
                         ("path", json!({"type": "string"})),
@@ -155,16 +155,22 @@ const FILE_PROMPT_PROTOCOLS: &[PromptProtocol] = &[
         body: "For repository exploration, prefer dedicated tools when they cover the need: use grep to find files by content pattern with line numbers and optional context, ls for narrowed directory listings, and file_read for file contents. For path pattern discovery or advanced search output, use narrow and bounded shell rg/ripgrep commands such as rg --files -g '<pattern>'; if rg is unavailable, use bounded alternatives. Keep shell search scoped to the relevant directory. The recursive discovery/search tools skip slow remote mounts such as sshfs/NFS by default. Do not use shell for direct cat, head, tail, or ls.",
     },
     PromptProtocol {
+        id: "file.listing",
+        priority: 105,
+        required_tools: &["ls"],
+        body: "The ls tool hides .stellaclaw/ from broad directory listings, but exact .stellaclaw/ paths remain valid for file tools.",
+    },
+    PromptProtocol {
         id: "file.editing",
         priority: 110,
         required_tools: &["file_write", "apply_patch"],
         body: "Use file_write for new files, complete rewrites, or append-only output; use apply_patch for targeted edits. After a successful apply_patch, do not re-read changed files just to verify that the patch applied; the tool reports failure when it does not apply. Re-read only when you need new context, a follow-up command or formatter may have rewritten the file, or a verification failure needs inspection.",
     },
     PromptProtocol {
-        id: "file.attachments",
+        id: "file.attachment_visibility",
         priority: 120,
-        required_tools: &["file_write"],
-        body: "If you need to send files or images back to the user, write generated artifacts under .stellaclaw/output/ or another intentional workspace path, then append one or more tags in this exact format: <attachment>relative/path/from/workspace_root</attachment>. Each path must be relative to the current workspace root. User-provided attachments may appear under .stellaclaw/attachments/. The workspace may contain .stellaclaw/shared/; that directory is shared across conversations in this Stellaclaw workdir and is appropriate for reusable artifacts. .stellaclaw/ is hidden from ordinary ls output, but exact paths under .stellaclaw/output/, .stellaclaw/attachments/, and .stellaclaw/shared/ are valid for file tools. If STELLACLAW_SOFTWARE_DIR is set in the tool environment, that path is the configured shared software directory for reusable binaries, checkouts, caches, or other tool installations.",
+        required_tools: &["attachment_make_visible"],
+        body: "Before referencing a file with <attachment>, use attachment_make_visible when that file is not yet visible to the conversation workspace; reference it only after the tool succeeds.",
     },
 ];
 

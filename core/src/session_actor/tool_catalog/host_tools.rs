@@ -82,10 +82,10 @@ const HOST_PROMPT_PROTOCOLS: &[PromptProtocol] = &[
 fn user_tell_tool(scope: HostToolScope) -> ToolDefinition {
     let description = match scope {
         HostToolScope::MainBackground => {
-            "Immediately send a short progress or coordination message to the current user conversation without waiting for the current background turn to finish; do not use user_tell for the primary result. Put that primary user-facing message in your final answer instead. To include files or images, append one or more <attachment>relative/path/from/workspace_root</attachment> tags inside text."
+            "Immediately send a short progress or coordination message to the current user conversation without waiting for the current background turn to finish; do not use user_tell for the primary result. Attachment markers are supported."
         }
         HostToolScope::MainForeground | HostToolScope::SubAgent => {
-            "Immediately send a short progress or coordination message to the current user conversation without waiting for the current turn to finish. To include files or images, append one or more <attachment>relative/path/from/workspace_root</attachment> tags inside text."
+            "Immediately send a short progress or coordination message to the current user conversation without waiting for the current turn to finish. Attachment markers are supported."
         }
     };
 

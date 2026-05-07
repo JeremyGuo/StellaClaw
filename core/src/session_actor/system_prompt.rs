@@ -53,7 +53,15 @@ fn common_prompt() -> &'static str {
      When you start working in a subdirectory, check whether that subtree has a more local \
      AGENTS.md or similar instruction file before editing there; when rules conflict, \
      follow the more local file. Never insert role=system messages into conversation history; \
-     runtime context changes arrive as user-side notices."
+     runtime context changes arrive as user-side notices. To send files or images to the user, \
+     append one or more tags in final answer text or user_tell text using exactly this format: \
+     <attachment>relative/path/from/workspace_root</attachment>. Attachment paths must be relative \
+     to the current workspace root, must not be absolute paths or file:// URIs, and must refer to \
+     files visible in the conversation workspace when the message is sent. The workspace may \
+     contain .stellaclaw/shared/; that directory is shared across conversations in this \
+     Stellaclaw workdir and is appropriate for reusable artifacts. If STELLACLAW_SOFTWARE_DIR is \
+     set in the tool environment, that path is the configured shared software directory for \
+     reusable binaries, checkouts, caches, or other tool installations."
 }
 
 fn render_prompt_protocols(enabled_tools: &BTreeSet<String>) -> Option<String> {
@@ -273,7 +281,13 @@ mod tests {
         );
 
         assert!(prompt.contains("For repository exploration"));
+        assert!(prompt.contains("<attachment>relative/path/from/workspace_root</attachment>"));
+        assert!(prompt.contains("Attachment paths must be relative"));
+        assert!(prompt.contains(".stellaclaw/shared/"));
+        assert!(prompt.contains("STELLACLAW_SOFTWARE_DIR"));
+        assert!(prompt.contains("The ls tool hides .stellaclaw/"));
         assert!(!prompt.contains("use apply_patch for targeted edits"));
+        assert!(!prompt.contains("Before referencing a file with <attachment>"));
         assert!(!prompt.contains("When using shell for commands"));
         assert!(!prompt.contains("Use user_tell only"));
         assert!(!prompt.contains("Use update_plan"));
