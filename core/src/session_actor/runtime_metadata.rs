@@ -12,20 +12,21 @@ use super::ToolRemoteMode;
 pub(crate) const IDENTITY_PROMPT_COMPONENT: &str = "identity";
 pub(crate) const REMOTE_ALIASES_PROMPT_COMPONENT: &str = "ssh_remote_aliases";
 pub(crate) const SKILLS_METADATA_PROMPT_COMPONENT: &str = "skills_metadata";
-pub(crate) const STELLACLAW_MEMORY_PROMPT_COMPONENT: &str = "stellaclaw_memory";
 pub(crate) const USER_META_PROMPT_COMPONENT: &str = "user_meta";
+pub(crate) const USER_MEMORY_PROMPT_COMPONENT: &str = "user_memory";
 
 const USER_META_PATH: &str = ".stellaclaw/USER.md";
 const IDENTITY_PATH: &str = ".stellaclaw/IDENTITY.md";
-const STELLACLAW_MEMORY_PATH: &str = ".stellaclaw/STELLACLAW.md";
 const SKILL_ROOT: &str = ".stellaclaw/skill";
 const SKILL_ENTRY_FILE: &str = "SKILL.md";
+const USER_MEMORY_ENTRIES_PATH: &str = "rundir/memory_v1/user/entries.jsonl";
+const USER_MEMORY_ENTRY_MAX_CHARS: usize = 700;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WorkspaceRuntimeMetadata {
     pub identity: String,
-    pub stellaclaw_memory: String,
     pub user_meta: String,
+    pub user_memory: String,
     pub skills_metadata: String,
     pub skills: Vec<SessionSkillObservation>,
 }
@@ -75,6 +76,7 @@ impl RuntimeMetadataState {
         workspace_root: &Path,
         data_root: &Path,
         remote_aliases_prompt: String,
+        memory_enabled: bool,
     ) -> Result<(), String> {
         let metadata = load_workspace_runtime_metadata(workspace_root, data_root)?;
         initialize_component(
@@ -84,14 +86,18 @@ impl RuntimeMetadataState {
         );
         initialize_component(
             &mut self.prompt_components,
-            STELLACLAW_MEMORY_PROMPT_COMPONENT,
-            metadata.stellaclaw_memory,
-        );
-        initialize_component(
-            &mut self.prompt_components,
             USER_META_PROMPT_COMPONENT,
             metadata.user_meta,
         );
+        if memory_enabled {
+            initialize_component(
+                &mut self.prompt_components,
+                USER_MEMORY_PROMPT_COMPONENT,
+                metadata.user_memory,
+            );
+        } else {
+            self.prompt_components.remove(USER_MEMORY_PROMPT_COMPONENT);
+        }
         initialize_component(
             &mut self.prompt_components,
             SKILLS_METADATA_PROMPT_COMPONENT,
@@ -121,6 +127,7 @@ impl RuntimeMetadataState {
         workspace_root: &Path,
         data_root: &Path,
         remote_aliases_prompt: String,
+        memory_enabled: bool,
     ) -> Result<Vec<String>, String> {
         let metadata = load_workspace_runtime_metadata(workspace_root, data_root)?;
         let mut prompt_notices = Vec::new();
@@ -130,17 +137,22 @@ impl RuntimeMetadataState {
             metadata.identity,
             &mut prompt_notices,
         );
-        observe_component_without_notice(
-            &mut self.prompt_components,
-            STELLACLAW_MEMORY_PROMPT_COMPONENT,
-            metadata.stellaclaw_memory,
-        );
         observe_component(
             &mut self.prompt_components,
             USER_META_PROMPT_COMPONENT,
             metadata.user_meta,
             &mut prompt_notices,
         );
+        if memory_enabled {
+            observe_component(
+                &mut self.prompt_components,
+                USER_MEMORY_PROMPT_COMPONENT,
+                metadata.user_memory,
+                &mut prompt_notices,
+            );
+        } else {
+            self.prompt_components.remove(USER_MEMORY_PROMPT_COMPONENT);
+        }
         observe_component(
             &mut self.prompt_components,
             SKILLS_METADATA_PROMPT_COMPONENT,
@@ -256,6 +268,7 @@ impl RuntimeMetadataState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PromptComponentChangeNotice {
     key: String,
+    previous_value: String,
     value: String,
 }
 
@@ -273,13 +286,13 @@ enum SkillChangeNotice {
 }
 
 pub(crate) fn load_workspace_runtime_metadata(
-    workspace_root: &Path,
+    _workspace_root: &Path,
     data_root: &Path,
 ) -> Result<WorkspaceRuntimeMetadata, String> {
     Ok(WorkspaceRuntimeMetadata {
         identity: read_optional_workspace_file(data_root, IDENTITY_PATH)?,
-        stellaclaw_memory: read_optional_workspace_file(workspace_root, STELLACLAW_MEMORY_PATH)?,
-        user_meta: read_optional_workspace_file(data_root, USER_META_PATH)?,
+        user_meta: load_user_meta_snapshot(data_root)?,
+        user_memory: load_user_memory_snapshot(data_root)?,
         skills: load_workspace_skills(data_root)?,
         skills_metadata: String::new(),
     })
@@ -300,6 +313,109 @@ fn read_optional_workspace_file(
     fs::read_to_string(&path)
         .map(|content| content.trim().to_string())
         .map_err(|error| format!("failed to read {}: {error}", path.display()))
+}
+
+fn load_user_meta_snapshot(data_root: &Path) -> Result<String, String> {
+    let path = data_root.join(USER_META_PATH);
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    let raw =
+        fs::read(&path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let hash = prompt_component_hash(&String::from_utf8_lossy(&raw));
+    Ok(format!(
+        "Profile metadata file: {USER_META_PATH}\nstatus: present\nbytes: {}\nhash: {hash}\nRead {USER_META_PATH} with file_read when exact profile details are needed.",
+        raw.len()
+    ))
+}
+
+fn load_user_memory_snapshot(data_root: &Path) -> Result<String, String> {
+    let Some(workdir_root) = discover_workdir_root(data_root) else {
+        return Ok(String::new());
+    };
+    let path = workdir_root.join(USER_MEMORY_ENTRIES_PATH);
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    let raw = fs::read_to_string(&path)
+        .map_err(|error| format!("failed to read {}: {error}", path.display()))?;
+    let mut lines = Vec::new();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line)
+            .map_err(|error| format!("failed to parse {}: {error}", path.display()))?;
+        if value.get("state").and_then(serde_json::Value::as_str) != Some("active") {
+            continue;
+        }
+        let id = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let subject = value
+            .get("subject")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!(" ({value})"))
+            .unwrap_or_default();
+        let text = value
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if text.is_empty() {
+            continue;
+        }
+        let mut rendered = format!(
+            "* [{id}]{subject} {}",
+            truncate_user_memory_text(text, USER_MEMORY_ENTRY_MAX_CHARS).replace('\n', " ")
+        );
+        let tags = value
+            .get("tags")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty())
+                    .take(4)
+                    .map(|tag| format!("#{tag}"))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !tags.is_empty() {
+            rendered.push(' ');
+            rendered.push_str(&tags.join(" "));
+        }
+        lines.push(rendered);
+    }
+    Ok(lines.join("\n"))
+}
+
+fn discover_workdir_root(start: &Path) -> Option<PathBuf> {
+    for candidate in start.ancestors() {
+        if candidate.join(USER_MEMORY_ENTRIES_PATH).exists() {
+            return Some(candidate.to_path_buf());
+        }
+        if candidate.join("rundir").exists() && candidate.join("conversations").exists() {
+            return Some(candidate.to_path_buf());
+        }
+    }
+    None
+}
+
+fn truncate_user_memory_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+    let mut output = trimmed.chars().take(max_chars).collect::<String>();
+    output.push_str("...");
+    output
 }
 
 fn load_workspace_skills(workspace_root: &Path) -> Result<Vec<SessionSkillObservation>, String> {
@@ -493,37 +609,14 @@ fn observe_component(
     }
 
     if state.notified_hash != hash {
+        let previous_value = state.notified_value.clone();
         state.notified_value = value.clone();
         state.notified_hash = hash;
         notices.push(PromptComponentChangeNotice {
             key: key.to_string(),
+            previous_value,
             value,
         });
-    }
-}
-
-fn observe_component_without_notice(
-    components: &mut BTreeMap<String, SessionPromptComponentState>,
-    key: &str,
-    value: String,
-) {
-    let hash = prompt_component_hash(&value);
-    let state = components.entry(key.to_string()).or_default();
-    if state.system_prompt_hash.is_empty()
-        && state.system_prompt_value.is_empty()
-        && state.notified_hash.is_empty()
-        && state.notified_value.is_empty()
-    {
-        state.system_prompt_value = value.clone();
-        state.system_prompt_hash = hash.clone();
-        state.notified_value = value;
-        state.notified_hash = hash;
-        return;
-    }
-
-    if state.notified_hash != hash {
-        state.notified_value = value;
-        state.notified_hash = hash;
     }
 }
 
@@ -559,13 +652,26 @@ fn render_prompt_component_change_notices(notices: &[PromptComponentChangeNotice
             USER_META_PROMPT_COMPONENT => {
                 if notice.value.trim().is_empty() {
                     sections.push(
-                        "User meta is now empty. Ignore earlier User meta prompt content."
+                        "User metadata file is now absent. Ignore earlier USER.md metadata."
                             .to_string(),
                     );
                 } else {
                     sections.push(format!(
-                        "User meta changed. Treat this refreshed user metadata as authoritative for this turn:\n{}",
+                        "USER.md metadata changed. The full file content is not included in this notice; read .stellaclaw/USER.md with file_read if exact profile details are needed. Refreshed metadata:\n{}",
                         notice.value.trim()
+                    ));
+                }
+            }
+            USER_MEMORY_PROMPT_COMPONENT => {
+                if notice.value.trim().is_empty() {
+                    sections.push(
+                        "User memory is now empty. Apply this diff:\n".to_string()
+                            + &render_prompt_component_line_diff(&notice.previous_value, ""),
+                    );
+                } else {
+                    sections.push(format!(
+                        "User memory changed. Apply this diff to the current User Memory snapshot for this turn:\n{}",
+                        render_prompt_component_line_diff(&notice.previous_value, &notice.value)
                     ));
                 }
             }
@@ -590,6 +696,30 @@ fn render_prompt_component_change_notices(notices: &[PromptComponentChangeNotice
         }
     }
     sections.join("\n\n")
+}
+
+fn render_prompt_component_line_diff(previous: &str, current: &str) -> String {
+    let previous_lines = previous
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<BTreeSet<_>>();
+    let current_lines = current
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<BTreeSet<_>>();
+    let mut lines = vec!["--- previous".to_string(), "+++ current".to_string()];
+    for removed in previous_lines.difference(&current_lines) {
+        lines.push(format!("- {removed}"));
+    }
+    for added in current_lines.difference(&previous_lines) {
+        lines.push(format!("+ {added}"));
+    }
+    if lines.len() == 2 {
+        lines.push(" unchanged".to_string());
+    }
+    lines.join("\n")
 }
 
 fn render_skill_change_notices(notices: &[SkillChangeNotice]) -> String {
@@ -769,17 +899,25 @@ fn expand_tilde_path(raw: &str) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
     use crate::session_actor::ToolRemoteMode;
 
     fn temp_root() -> PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("stellaclaw_runtime_metadata_{id}"))
+        let sequence = NEXT_ID.fetch_add(1, AtomicOrdering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "stellaclaw_runtime_metadata_{}_{}_{}",
+            std::process::id(),
+            id,
+            sequence
+        ))
     }
 
     #[test]
@@ -790,22 +928,92 @@ mod tests {
 
         let mut state = RuntimeMetadataState::default();
         state
-            .initialize_from_workspace(&root, &root, String::new())
+            .initialize_from_workspace(&root, &root, String::new(), false)
             .expect("initial metadata should load");
 
         fs::write(root.join(".stellaclaw/USER.md"), "tier: enterprise").unwrap();
         let notices = state
-            .observe_for_user_turn_from_workspace(&root, &root, String::new())
+            .observe_for_user_turn_from_workspace(&root, &root, String::new(), false)
             .expect("changed metadata should load");
         assert_eq!(notices.len(), 1);
         assert!(notices[0].contains("[Runtime Prompt Updates]"));
-        assert!(notices[0].contains("tier: enterprise"));
+        assert!(notices[0].contains("USER.md metadata changed"));
+        assert!(notices[0].contains(".stellaclaw/USER.md"));
+        assert!(!notices[0].contains("tier: enterprise"));
 
         assert!(state
-            .observe_for_user_turn_from_workspace(&root, &root, String::new())
+            .observe_for_user_turn_from_workspace(&root, &root, String::new(), false)
             .expect("metadata should still load")
             .is_empty());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn user_memory_change_notice_uses_diff() {
+        let root = temp_root();
+        let memory_dir = root.join("rundir/memory_v1/user");
+        fs::create_dir_all(&memory_dir).unwrap();
+        fs::write(
+            memory_dir.join("entries.jsonl"),
+            r#"{"id":"u_1","scope":"user","text":"用户偏好中文沟通。","created_at":"t","updated_at":"t","state":"active"}"#,
+        )
+        .unwrap();
+
+        let mut state = RuntimeMetadataState::default();
+        state
+            .initialize_from_workspace(&root, &root, String::new(), true)
+            .expect("initial metadata should load");
+
+        fs::write(
+            memory_dir.join("entries.jsonl"),
+            r#"{"id":"u_1","scope":"user","text":"用户偏好中文沟通。","created_at":"t","updated_at":"t","state":"active"}
+{"id":"u_2","scope":"user","subject":"Style","text":"用户偏好直接、少废话的工程答复。","tags":["style"],"created_at":"t","updated_at":"t","state":"active"}"#,
+        )
+        .unwrap();
+        let notices = state
+            .observe_for_user_turn_from_workspace(&root, &root, String::new(), true)
+            .expect("changed metadata should load");
+
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("User memory changed. Apply this diff"));
+        assert!(notices[0].contains("+++ current"));
+        assert!(notices[0].contains("+ * [u_2] (Style)"));
+        assert!(!notices[0].contains("Treat this refreshed user memory as authoritative"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn disabled_memory_does_not_observe_user_memory_notices() {
+        let root = temp_root();
+        let memory_dir = root.join("rundir/memory_v1/user");
+        fs::create_dir_all(&memory_dir).unwrap();
+        fs::write(
+            memory_dir.join("entries.jsonl"),
+            r#"{"id":"u_1","scope":"user","text":"用户偏好中文沟通。","created_at":"t","updated_at":"t","state":"active"}"#,
+        )
+        .unwrap();
+
+        let mut state = RuntimeMetadataState::default();
+        state
+            .initialize_from_workspace(&root, &root, String::new(), false)
+            .expect("initial metadata should load");
+        assert!(!state
+            .prompt_components
+            .contains_key(USER_MEMORY_PROMPT_COMPONENT));
+
+        fs::write(
+            memory_dir.join("entries.jsonl"),
+            r#"{"id":"u_2","scope":"user","text":"用户偏好直接答复。","created_at":"t","updated_at":"t","state":"active"}"#,
+        )
+        .unwrap();
+        let notices = state
+            .observe_for_user_turn_from_workspace(&root, &root, String::new(), false)
+            .expect("changed metadata should load");
+        assert!(notices.is_empty());
+        assert!(!state
+            .prompt_components
+            .contains_key(USER_MEMORY_PROMPT_COMPONENT));
         let _ = fs::remove_dir_all(root);
     }
 
@@ -821,7 +1029,7 @@ mod tests {
 
         let mut state = RuntimeMetadataState::default();
         state
-            .initialize_from_workspace(&root, &root, String::new())
+            .initialize_from_workspace(&root, &root, String::new(), false)
             .expect("initial metadata should load");
         state.mark_loaded_skills(&["demo".to_string()], 1);
 
@@ -831,7 +1039,7 @@ mod tests {
         )
         .unwrap();
         let notices = state
-            .observe_for_user_turn_from_workspace(&root, &root, String::new())
+            .observe_for_user_turn_from_workspace(&root, &root, String::new(), false)
             .expect("changed metadata should load");
         assert!(notices
             .iter()
@@ -900,41 +1108,6 @@ mod tests {
         assert!(metadata
             .skills_metadata
             .contains("- example: Do the important thing with care."));
-
-        let _ = fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn stellaclaw_memory_updates_without_runtime_notice() {
-        let root = temp_root();
-        fs::create_dir_all(root.join(".stellaclaw")).unwrap();
-        fs::write(root.join(".stellaclaw/STELLACLAW.md"), "old durable note").unwrap();
-
-        let mut state = RuntimeMetadataState::default();
-        state
-            .initialize_from_workspace(&root, &root, String::new())
-            .expect("initial metadata should load");
-
-        fs::write(root.join(".stellaclaw/STELLACLAW.md"), "new durable note").unwrap();
-        let notices = state
-            .observe_for_user_turn_from_workspace(&root, &root, String::new())
-            .expect("updated metadata should load");
-
-        assert!(notices.is_empty());
-        assert_eq!(
-            state
-                .snapshot_value(STELLACLAW_MEMORY_PROMPT_COMPONENT)
-                .expect("snapshot should exist"),
-            "old durable note"
-        );
-
-        state.promote_notified_components_to_system_snapshot();
-        assert_eq!(
-            state
-                .snapshot_value(STELLACLAW_MEMORY_PROMPT_COMPONENT)
-                .expect("promoted snapshot should exist"),
-            "new durable note"
-        );
 
         let _ = fs::remove_dir_all(root);
     }

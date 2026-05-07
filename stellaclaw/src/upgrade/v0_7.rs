@@ -129,6 +129,7 @@ mod tests {
             models: BTreeMap::new(),
             available_agent_models: Vec::new(),
             session_defaults: SessionDefaults::default(),
+            memory: crate::config::MemoryConfig::default(),
             skill_sync: Vec::new(),
             sandbox: SandboxConfig::default(),
             channels: Vec::new(),

@@ -731,6 +731,7 @@ fn migrate_foreground_session(
             session_model,
         )?,
         remote_workspace_instructions: None,
+        memory_enabled: config.memory.enabled,
     };
     let persisted = MigratedSessionState {
         version: 1,

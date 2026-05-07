@@ -34,19 +34,19 @@ Memory v1 只保留两条清晰路径：
 
 长期记忆保存跨 turn / session / conversation 仍有用的用户偏好、事实、约束和 handoff。它由 `memory_write` / `memory_search` / `memory_update` / `memory_delete` 维护，持久化为 `user` / `public` / `conversation` 三个 scope 的 entries。
 
-短期记忆保存当前 session/run 的计划、最近工具结果、压缩后的 provider history 和下一步状态。它继续使用现有 `update_plan`、provider current context compression、`all_messages.jsonl` 和 `current_messages.jsonl`。
+短期记忆保存当前 session/run 的计划、最近工具结果、压缩后的 provider history 和下一步状态。它继续使用现有 `update_plan`、provider current context compression、`all_messages.jsonl` 和 `current_messages.jsonl`。`update_plan` 是 SessionActor 的运行态进度，不再额外拼接进压缩后的 provider context；压缩 JSON 自带的 `plan` 字段仍由模型描述需要延续的下一步。
 
 完整历史权威来源是 `conversations/<id>/.stellaclaw/log/<session_id>/all_messages.jsonl`。provider 下一轮实际看到的短上下文是 `current_messages.jsonl`：较早历史由结构化 compaction result 渲染成简短上下文，最近几轮消息和工具结果保留原文。
 
 ### 核心抽象
 
 - [x] Host service registry 骨架已接入 Conversation，现有 Core / ManagedSession / Skill / Cron host action 已通过 service 边界路由。
-- [ ] Memory v1 按 host service 架构接入。Conversation 只负责 host service 路由、session 生命周期和 channel 投影；memory 文件、索引和算法由 MemoryService 层处理。
-- [ ] `MemoryService` 实现为 host service，挂到 `HostServiceRegistry`，处理 `memory_write`、`memory_search`、`memory_update`、`memory_delete`。
-- [ ] `MemoryClient` 是 Conversation 持有的轻量 clone，用于把 user/public 请求非阻塞投递给 workdir 级 `WorkdirMemoryManager`。
-- [ ] `WorkdirMemoryManager` 是 workdir 级共享管理线程，统一维护 `user` / `public` memory、索引、user memory 后台压缩、重试和 notification snapshot。
-- [ ] `conversation` scope 由 `MemoryService` 使用 conversation-local backend 维护，数据在当前 conversation workdir 内。
-- [ ] `MemoryBackend` 是具体存储和检索算法接口。v1 backend 可以是文件 + 可重建索引；后续算法实现同一个 trait。
+- [x] Memory v1 按 host service 架构接入。Conversation 只负责 host service 路由、session 生命周期和 channel 投影；memory 文件、索引和算法由 MemoryService 层处理。
+- [x] `MemoryService` 实现为 host service，挂到 `HostServiceRegistry`，处理 `memory_write`、`memory_search`、`memory_update`、`memory_delete`。
+- [x] `MemoryClient` 是 Conversation 持有的轻量 clone，用于把 user/public 写入、更新和删除请求投递给 workdir 级 `WorkdirMemoryManager`。
+- [x] `WorkdirMemoryManager` 是 workdir 级共享管理线程，统一维护 `user` / `public` memory、索引、user memory 后台压缩、重试和 notification snapshot。当前已接入共享线程和 user/public 写入、更新、删除、public search 路径，并会定期维护 hard retry 与每日 soft compaction。
+- [x] `conversation` scope 由 `MemoryService` 使用 conversation-local backend 维护，数据在当前 conversation workdir 内。
+- [x] `MemoryBackend` 是具体存储和检索算法接口。当前文件型 `MemoryService` 已实现该 trait，并提供 `write` / `update` / `delete` / `search` / `prompt_context` 统一入口；后续 WorkdirMemoryManager 或 embedding backend 继续实现同一接口。
 
 ```rust
 trait MemoryBackend {
@@ -68,7 +68,7 @@ trait MemoryBackend {
 
 `memory_search` 默认搜索当前 `conversation` scope 和全局 `public` scope。`user` 作为 system prompt snapshot 的一部分直接提供。
 
-`memory_write` 写入后返回新 entry 和同 scope / 同 subject 附近的 5 条相关记忆。模型在同一个回合里检查这些结果；发现重复、冲突或过期内容时，继续调用 `memory_update` / `memory_delete` / `memory_write` 整理。
+`memory_write` 对外只返回成功或失败。工具内部负责检索相似条目并消融重复、冲突和过期事实；模型不需要在写入后手动检查一组相关记忆。
 
 长期 memory 保存密集自然语言事实或逻辑，单条硬限制约 1KB。工具端负责限制体积、裁剪返回和提示整理方式。
 
@@ -94,8 +94,8 @@ trait MemoryBackend {
 
 - [x] `SessionStateStore` 已保存 `session.json`、`all_messages.jsonl` 和 `current_messages.jsonl`。
 - [x] `all_messages.jsonl` 已作为完整历史来源，`current_messages.jsonl` 已作为 provider 当前短上下文来源。
-- [x] `USER.md` profile 文件已由 runtime metadata 读取并进入 system prompt snapshot。
-- [ ] `USER.md` prompt 注入改成 meta snapshot / notification；全文内容由模型按需读取。
+- [x] `USER.md` profile 文件已由 runtime metadata 读取为 meta snapshot，并进入 system prompt snapshot。
+- [x] `USER.md` prompt 注入改成 meta snapshot / notification；全文内容由模型按需读取。
 
 Memory v1 新增：
 
@@ -120,22 +120,22 @@ Memory v1 新增：
             index.json                # conversation manifest、hash、大小、last_indexed_at
 ```
 
-- [ ] 新增目录统一使用 `memory_v1/`，明确这是第一版 memory 持久化格式。
-- [ ] `USER.md` 保留为用户个人信息/profile metadata；模型可维护的合作偏好进入 `rundir/memory_v1/user/entries.jsonl`。
+- [x] 新增目录统一使用 `memory_v1/`，明确这是第一版 memory 持久化格式。
+- [x] `USER.md` 保留为用户个人信息/profile metadata；模型可维护的合作偏好进入 `rundir/memory_v1/user/entries.jsonl`。
 
 ### 文件内容和维护
 
-- [ ] `rundir/memory_v1/user/entries.jsonl`：用户长期合作记忆 active 条目。系统自动填 `id`、`created_at`、`updated_at`；模型通过 `memory_write(scope="user")` 新增，通过 `memory_update` / `memory_delete` 按 id 整理。
-- [ ] `rundir/memory_v1/user/manifest.json`：记录 entries hash、rendered hash、rendered bytes、last_compacted_at、soft/hard threshold、dirty 状态和最后一次注入版本。
-- [ ] `rundir/memory_v1/user/compaction.json`：记录 `state`、`attempts`、`last_error`、`next_retry_at`、`last_input_hash`、`last_output_hash`，用于失败重试和相同输入去重。
-- [ ] `rundir/memory_v1/public/entries.jsonl`：`public` scope 的长期记忆。系统自动填 `id`、`source_conversation_id`、`source_session_id`、`created_at`、`updated_at`；模型提供 `subject`、`text`、`tags`。
-- [ ] `rundir/memory_v1/public/subjects.json`：public 查询索引，记录 subject、aliases、summary、entry ids、last_seen_at。
-- [ ] `conversations/<id>/.stellaclaw/memory_v1/conversation/entries.jsonl`：`conversation` scope 的长期记忆。同 conversation 的所有 session/agent 可以搜索和维护。
-- [ ] `index.json` 保存 hash、mtime、size、last_injected_turn、last_indexed_at、active_session_id 等系统字段，由 runtime 维护。
+- [x] `rundir/memory_v1/user/entries.jsonl`：用户长期合作记忆 active 条目。系统自动填 `id`、`created_at`、`updated_at`；模型通过 `memory_write(scope="user")` 新增，通过 `memory_update` / `memory_delete` 按 id 整理。
+- [x] `rundir/memory_v1/user/manifest.json`：记录 entries hash、raw size、rendered size、next id 和 last_updated_at；compaction 运行态由 `compaction.json` 维护。
+- [x] `rundir/memory_v1/user/compaction.json`：已初始化为 user memory 压缩状态文件，包含 `state`、`attempts`、`last_error`、`next_retry_at`、`last_input_hash`、`last_output_hash`、`threshold_override_bytes`、`last_soft_compaction_at` 和 `updated_at`。
+- [x] `rundir/memory_v1/public/entries.jsonl`：`public` scope 的长期记忆。系统自动填 `id`、`source_conversation_id`、`source_session_type`、`created_at`、`updated_at`；模型提供 `subject`、`text`、`tags`。
+- [x] `rundir/memory_v1/public/subjects.json`：public 查询索引，记录 subject、aliases、entry ids、last_seen_at 和短摘要。
+- [x] `conversations/<id>/.stellaclaw/memory_v1/conversation/entries.jsonl`：`conversation` scope 的长期记忆。同 conversation 的所有 session/agent 可以搜索和维护。
+- [x] `index.json` 保存 entries hash、size、next_id 和 last_updated_at，由 runtime 维护。
 
 ### 工具
 
-- [ ] 新增 `memory_search`，查询当前 conversation scope 和全局 public scope 的长期记忆。参数保持 `query` + `limit`；返回 top 5-10 条，包含 `id`、`scope`、`subject`、`text`、`updated_at` 和排序提示。
+- [x] 新增 `memory_search`，默认查询当前 conversation scope 和全局 public scope 的长期记忆。参数为 `query`、可选 `limit`、可选 `scopes`；模型显式调用默认 5 条，建议不超过 10 条，压缩内部 recall 可以每个 scope 取 20 条候选。返回结果包含 `id`、`scope`、`subject`、`text`、`tags`、`updated_at`、`score`。
 
 ```json
 {
@@ -147,7 +147,12 @@ Memory v1 新增：
       "type": "object",
       "properties": {
         "query": { "type": "string", "description": "Natural language search query." },
-        "limit": { "type": "number", "description": "Maximum results. Tool enforces a conservative upper bound." }
+        "limit": { "type": "number", "description": "Optional maximum result count. Defaults to 5 and is capped by the host." },
+        "scopes": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["conversation", "public"] },
+          "description": "Optional scopes to search. Defaults to conversation and public."
+        }
       },
       "required": ["query"]
     }
@@ -155,14 +160,14 @@ Memory v1 新增：
 }
 ```
 
-- [ ] 新增 `memory_write`，统一写 `user` / `public` / `conversation`。工具端把它实现成幂等写入：先自动检索同 scope / 同 subject 附近候选，再用轻量判重模型或本地小模型判断是否重复、是否应该写入。
+- [x] 新增 `memory_write`，统一写 `user` / `public` / `conversation`。工具端把它实现成一致性写入：先自动检索同 scope / 同 subject 附近候选，再用本地一致性判定器输出 actions，消融旧条目的重复、冲突和过期事实。
 
 ```json
 {
   "type": "function",
   "function": {
     "name": "memory_write",
-    "description": "Write a compact long-memory entry for durable facts, preferences, constraints, or handoff. The tool performs internal dedupe before creating an entry.",
+    "description": "Write a compact long-memory entry for durable facts, preferences, constraints, or handoff. The tool internally resolves duplicate or conflicting entries before committing.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -173,8 +178,7 @@ Memory v1 新增：
         },
         "subject": { "type": "string", "description": "Optional short subject/entity name." },
         "text": { "type": "string", "description": "Compact durable memory text. Tool enforces about 1KB per entry." },
-        "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional compact tags." },
-        "reason": { "type": "string", "description": "Why this should be durable long memory." }
+        "tags": { "type": "array", "items": { "type": "string" }, "description": "Optional compact tags." }
       },
       "required": ["scope", "text"]
     }
@@ -182,7 +186,7 @@ Memory v1 新增：
 }
 ```
 
-- [ ] `memory_write` 内部流程：
+- [x] `memory_write` 内部流程：
 
 ```text
 request
@@ -190,25 +194,33 @@ request
   -> hard size check, about 1KB per entry
   -> exact hash dedupe in target scope
   -> internal memory_search(target scope, subject + text, candidate_limit <= 10)
-  -> dedupe judge model/local model
-  -> duplicate: return status="duplicate" and the matched entry id
-  -> create: append entry and return status="created" plus the new entry
-  -> uncertain/related: create only when judge says the new text adds durable information; return at most return_related_limit related ids
+  -> consistency judge model/local model outputs decision + actions
+  -> validate actions only reference candidate ids and obey size limits
+  -> apply actions transactionally, or fail without changing memory
+  -> update indexes, manifests, access times, and internal audit log
 ```
 
-- [ ] 判重模型输入只包含新 entry 草稿和裁剪后的候选条目；候选超过上限直接丢弃，不把长列表交给模型。判重输出只允许 `duplicate` / `create` / `create_with_related` / `reject_too_vague`。
-- [ ] `memory_write` tool result 有硬预算：默认最多返回 1 条 duplicate entry 或 1 条 created entry，加上最多 3-5 条 related ids/short snippets；超过预算的候选不返回。
-- [ ] 重复时不创建新 entry，只返回类似：
+- [x] 判重输入只包含新 entry 草稿和裁剪后的候选条目；候选超过上限直接丢弃，不把长列表交给 judge。配置 `memory.dedupe_model_alias` 时，judge 复用现有 Provider 调用链并输出 `decision` 和 `actions`；未配置时使用本地规则 judge。
+- [x] `decision` 只允许 `success` / `failure`。`success` 表示 actions 可以让 memory 保持一致；`failure` 表示本次写入不应提交，并给出短 `reason`。
+- [x] `actions` 只在 `decision="success"` 时允许出现，类型只允许 `touch` / `update` / `delete` / `insert`。`touch` 用于完全相同或等价的旧条目，更新访问时间但不插入；`update` 用于部分冲突或补充；`delete` 用于完全冲突、过期或被替代的旧条目；`insert` 用于真正新增事实。一次 `memory_write` 最多插入 1 条新 entry。
+- [x] 如果旧条目和新事实冲突，以新事实为准。完全冲突时删除旧条目；部分冲突时修正旧条目的冲突部分并保留仍有效的信息；完全相同或同义时不插入新条目，只 touch 旧条目。应用 actions 后，同一主题的查询结果应保持事实一致。
+- [x] judge 输出无法解析、Provider 调用失败、返回非法 action、引用非候选 id、update 后超过大小限制、存储事务失败时，本次写入失败，不改变 memory。
+- [x] `memory_write` 对外 tool result 只返回成功或失败以及失败原因；内部候选、judge 输出、actions、被 touch/update/delete/insert 的 id 写入 audit log，不进入模型上下文。
 
 ```json
 {
-  "status": "duplicate",
-  "duplicate_id": "m_123",
-  "message": "A highly similar memory already exists; no new entry was created."
+  "status": "success"
 }
 ```
 
-- [ ] 新增 `memory_update` / `memory_delete`，让模型在读到重复、过期或冲突 memory 时主动整理；工具端按 id 操作并写审计记录。
+```json
+{
+  "status": "failure",
+  "reason": "dedupe_model_failed: ..."
+}
+```
+
+- [x] 新增 `memory_update` / `memory_delete`，让模型在读到重复、过期或冲突 memory 时主动整理；工具端按 id 操作并写审计记录。
 
 ```json
 {
@@ -220,8 +232,7 @@ request
       "type": "object",
       "properties": {
         "memory_id": { "type": "string" },
-        "text": { "type": "string" },
-        "reason": { "type": "string" }
+        "text": { "type": "string" }
       },
       "required": ["memory_id", "text"]
     }
@@ -238,8 +249,7 @@ request
     "parameters": {
       "type": "object",
       "properties": {
-        "memory_id": { "type": "string" },
-        "reason": { "type": "string" }
+        "memory_id": { "type": "string" }
       },
       "required": ["memory_id"]
     }
@@ -247,29 +257,32 @@ request
 }
 ```
 
-- [ ] 保留/新增只读 `session_history_lookup` 作为当前 conversation 的精确回查工具；跨 conversation 细节通过独立的 Cross Conversation Ask 工具查询。
+模型可见的长期记忆交互入口只保留 `memory_search` / `memory_write` / `memory_update` / `memory_delete`。完整 transcript 是系统内部持久化历史，不暴露成模型可调用的记忆查询工具。
 
 ### 调用时机
 
-- [ ] 用户表达稳定偏好、长期合作方式或纠正通用行为时，调用 `memory_write(scope="user", text=...)`。
-- [ ] 当前 conversation 下所有 session 都应该知道的事实、目标、约束、handoff，调用 `memory_write(scope="conversation", ...)`。
-- [ ] 其他 conversation 也应该能查到的稳定事实，调用 `memory_write(scope="public", ...)`。
-- [ ] 用户问简单跨 conversation 或当前 conversation 长期事实问题时，先 `memory_search(query=...)`；工具会搜索当前 `conversation` 和全局 `public`。
-- [ ] `memory_write` 会自动去重；模型看到 `status="duplicate"` 时停止重复写入。模型读到 `memory_search` 返回的冲突或过期条目时，调用 `memory_update` / `memory_delete` / `memory_write` 整理。
+- [x] system prompt 中新增 `MemoryInstructions`，强化 `memory_write` 的调用时机、保存类型和 scope 选择。
+- [x] 只在信息稳定、未来会复用、当前 turn 结束后仍有价值时调用 `memory_write`。一次性工具输出、当前执行步骤、临时猜测、已经写入过的偏好、普通聊天寒暄和压缩摘要本身不写入 long memory。
+- [x] 用户表达长期合作方式、稳定偏好、通用纠正或个人工作习惯时，调用 `memory_write(scope="user", text=...)`。例如语言偏好、回答风格、工程取舍、长期约束。
+- [x] 当前 conversation 下所有 session / foreground / background / subagent 都应该知道的目标、约束、关键事实、handoff、当前长期状态，调用 `memory_write(scope="conversation", ...)`。
+- [x] 其他 conversation 也应该能查到的稳定项目事实、客户约定、数据口径、长期任务事实，调用 `memory_write(scope="public", ...)`。
+- [x] 同一事实不要反复写入。`memory_write` 内部会处理重复和冲突；如果返回失败，模型只根据失败原因决定是否用更具体、更稳定的文本重试。
+- [x] 用户问简单跨 conversation 或当前 conversation 长期事实问题时，先 `memory_search(query=...)`；工具会搜索当前 `conversation` 和全局 `public`。
+- [x] `memory_write` 会自动消融重复、冲突和过期事实；模型只需要根据 `status="success"` / `status="failure"` 判断本次是否写成。模型读到 `memory_search` 返回的明显错误条目时，仍可调用 `memory_update` / `memory_delete` 手动整理。
 - [x] 当前 run 的短期执行状态已由现有 `update_plan` 内存态维护。
-- [ ] 跨 session 仍有用的 conversation 状态提升为 `memory_write(scope="conversation", ...)`。
+- [x] 跨 session 仍有用的 conversation 状态提升为 `memory_write(scope="conversation", ...)`。
 
 ### User Memory 压缩与容错
 
-- [ ] MemorySystem 独立维护 user memory 压缩。超过 hard threshold 后由 WorkdirMemoryManager 立即排队压缩；每日定时任务负责 soft threshold 整理。
-- [ ] soft threshold 默认 4KB：超过后标记 `dirty`，每天固定时间尝试压缩一次。soft 压缩失败不影响会话启动和工具调用，第二天再重试。
-- [ ] hard threshold 默认 8KB：超过后立即触发后台压缩。压缩成功后按 notification 逻辑通知已有 conversation；新 conversation 直接加载压缩后的条目。
-- [ ] hard 压缩失败时 conversation 继续运行，user memory 保持原样注入。系统记录错误和输入 hash，设置 `next_retry_at = now + 6h`；到期后重试。
-- [ ] 如果压缩输出没有比输入更短，立刻再重试一次。第二次仍没有变短时，降低压缩目标或提高本次阈值/预算，记录 `threshold_override`，让同一输入进入有界重试流程。
-- [ ] 压缩目标是删除重复、过时、一次性、偏离 user scope 的信息，并把同类偏好合并成更密集条目。若压缩会丢失仍有用的用户偏好或合作约束，应保留信息并允许暂时超过 soft threshold。
-- [ ] 压缩复用现有 Provider 调用链。配置中指定用于 memory compaction 的 provider alias / model alias；缺省可以复用当前默认 low-cost text model。
-- [ ] 压缩输入全量包含当前 active user memory 条目，输出仍是条目列表，保留稳定 id 或给出 id 映射，便于后续按 id 更新和删除。
-- [ ] user memory 的 system prompt 渲染使用紧凑列表：
+- [x] MemorySystem 独立维护 user memory 压缩。超过 hard threshold 后由 WorkdirMemoryManager 立即排队压缩；每日维护负责 soft threshold 整理。每日任务的职责是压缩、过滤和去重：删除一次性信息、过时偏好、重复条目和不属于 user scope 的内容，把仍然有用的长期合作偏好合并成更密集的 user memory 条目。
+- [x] soft threshold 默认 4KB：超过后标记 `dirty`，每天尝试压缩一次。soft 压缩失败不影响会话启动和工具调用，记录 `last_soft_compaction_at` 后第二天再重试。
+- [x] hard threshold 默认 8KB：超过后立即触发后台压缩。压缩成功后按 notification 逻辑通知已有 conversation；新 conversation 直接加载压缩后的条目。当前已落地 `hard_pending` 状态、Provider 调用、失败重试、本地 fallback、成功状态复位和 snapshot diff 通知。
+- [x] hard 压缩失败时 conversation 继续运行，user memory 保持原样注入。系统记录错误和输入 hash，设置 `next_retry_at = now + 6h`；到期后重试。
+- [x] 如果压缩输出没有比输入更短，立刻再重试一次。第二次仍没有变短时，降低压缩目标或提高本次阈值/预算，记录 `threshold_override`，让同一输入进入有界重试流程。
+- [x] user memory 压缩目标是减少冗余和噪声，不是为了强行变短而丢事实。当前 hard fallback 只删除完全重复的 active 条目；无法变短时走 no-shrink/threshold_override，不丢弃仍有用的用户偏好或合作约束。
+- [x] 压缩复用现有 Provider 调用链。配置中指定用于 memory compaction 的 provider alias / model alias；hard pending 时 WorkdirMemoryManager 持有的 MemoryService 会使用该 model 调 provider，失败进入 retry_waiting。本地未配置 compaction model 时使用安全 fallback。
+- [x] 压缩输入全量包含当前 active user memory 条目，输出仍是条目列表，保留稳定 id 或给出 id 映射，便于后续按 id 更新和删除。当前已落地 Provider 输出应用层：保留已存在 id，缺失旧条目视为过滤，新增条目自动分配短 id，非法 id / 重复 id / 超长条目会拒绝整次应用。
+- [x] user memory 的 system prompt 渲染使用紧凑列表：
 
 ```text
 User Memory:
@@ -277,20 +290,20 @@ User Memory:
 * [u_014] 用户偏好直接、可落地、少废话的工程方案。
 ```
 
-- [ ] user memory 更新、压缩完成或当前 system prompt 中的 user memory snapshot 落后时，在下一个用户消息送入模型前插入 host notification。notification 使用类似 git diff 的紧凑格式，带 id。
+- [x] user memory 更新或当前 system prompt 中的 user memory snapshot 落后时，在下一个用户消息送入模型前插入 host notification。notification 使用类似 git diff 的紧凑格式，带 id。压缩完成后的通知会复用同一 snapshot diff 机制。
 
 ### Search 算法
 
-- [ ] v1 使用本地 hybrid retrieval：metadata/alias filter + BM25Okapi lexical search + dense embedding cosine search + Reciprocal Rank Fusion + lightweight rule rerank。
-- [ ] 索引对象包括 `public/entries.jsonl` 和当前 conversation 的 `conversation/entries.jsonl`。
-- [ ] 每个 searchable document 至少包含 `id`、`scope`、`subject`、`aliases`、`text`、`tags`、`conversation_id`、`updated_at`。字段缺失时用空值，索引继续构建。
-- [ ] query normalization 做大小写归一、标点清理、基础中英文 tokenization、subject alias 展开。`subjects.json` 是 alias / subject catalog。
-- [ ] metadata/alias filter 先用 `scope`、`subject`、`aliases`、`tags`、`conversation_id`、`updated_at` 缩小候选或加召回 boost。最终召回同时保留 lexical/vector 路径。
-- [ ] BM25 使用 BM25Okapi，默认参数 `k1 = 1.2`、`b = 0.75`。
-- [ ] embedding search 使用 dense embedding + cosine similarity。v1 数据量小先本地 brute-force topK；后续数据量变大再考虑 HNSW。
-- [ ] BM25 topK 和 vector topK 使用 Reciprocal Rank Fusion 合并，默认 `k = 60`。
-- [ ] RRF 后做轻量规则 rerank：subject exact match、alias match、scope match、recent update 加小分；obsolete/archived、同 conversation 重复结果扣小分。
-- [ ] Rust v1 实现建议：BM25 用 `tantivy`；中文分词直接用 `jieba-rs`；embedding vectors 先本地文件/SQLite 存储并 brute-force cosine。
+- [x] v1 使用本地 hybrid retrieval：metadata/alias filter + BM25Okapi lexical search + dense vector cosine search + Reciprocal Rank Fusion + lightweight rule rerank。当前已落地 BM25Okapi lexical path、本地 hashed dense feature vector cosine path、metadata boost、RRF 多路融合和轻量 rerank；后续可把本地 dense feature vector backend 替换成外部语义 embedding。
+- [x] 索引对象包括 `public/entries.jsonl` 和当前 conversation 的 `conversation/entries.jsonl`。
+- [x] 每个 searchable document 至少包含 `id`、`scope`、`subject`、`aliases`、`text`、`tags`、`conversation_id`、`updated_at`。字段缺失时用空值，索引继续构建。
+- [x] query normalization 做大小写归一、标点清理和中英文 tokenization；中文分词已接入 `jieba-rs`。subject alias 已从 subject / tags 派生并写入 searchable document 与 public `subjects.json`。
+- [x] metadata/alias filter 先用 `scope`、`subject`、`aliases`、`tags`、`conversation_id`、`updated_at` 缩小候选或加召回 boost。当前先实现为 subject / alias / tags / conversation_id / scope 的轻量 boost；最终召回同时保留 lexical/vector 路径。
+- [x] BM25 使用 BM25Okapi，默认参数 `k1 = 1.2`、`b = 0.75`。
+- [x] dense vector search 使用本地 hashed feature vector + cosine similarity。v1 数据量小先本地 brute-force topK；后续数据量变大再考虑 HNSW 或外部 embedding backend。
+- [x] BM25 topK 和 vector topK 使用 Reciprocal Rank Fusion 合并，默认 `k = 60`。当前 BM25 path 和本地 dense feature vector cosine path 已进入同一个 RRF 合并器。
+- [x] RRF 后做轻量规则 rerank：subject exact match、alias match、scope match、recent update 加小分；obsolete/archived、同 conversation 重复结果扣小分。当前已落地 subject/alias/tag/conversation_id metadata boost、scope/update 排序和重复文本去重。
+- [x] Rust v1 实现：中文分词使用 `jieba-rs`；BM25Okapi 当前用本地实现；dense vector 当前用本地 hashed feature vector brute-force cosine。后续如需要持久化倒排索引再接 `tantivy`，需要语义召回时替换 dense backend。
 
 默认检索流程：
 
@@ -300,7 +313,7 @@ query
   -> alias expansion
   -> metadata/alias candidate boost
   -> BM25 top 50
-  -> embedding cosine top 50
+  -> dense vector cosine top 50
   -> RRF merge top 30
   -> lightweight rerank
   -> return top N under budget
@@ -310,11 +323,12 @@ query
 
 - [x] `update_plan` 继续作为当前 session 的内存态执行计划，由 SessionActor 持有。
 - [x] provider current context compression 继续负责解决 turn 数多、工具结果多导致的上下文膨胀；完整历史仍以 `all_messages.jsonl` 为权威来源，压缩后的 provider context 存在 `current_messages.jsonl`。
-- [ ] system prompt 中新增 `MemoryInstructions`：清楚定义 `memory_write(scope="user"|"public"|"conversation")`、`memory_search`、`memory_update`、`memory_delete` 的边界。
-- [ ] 每轮 runtime context 使用当前 system prompt snapshot，并追加按预算检索出的 conversation/public memory、现有 provider current context compression 和当前 `update_plan`。其他 conversation 的内容通过 `memory_search` 或 Cross Conversation Ask 查询。
-- [ ] 达到压缩阈值时，先确保 `SessionStateStore::save` 已 flush `all_messages.jsonl`，再基于当前 provider context 构造一次 compaction provider request。
+- [x] system prompt 中新增 `MemoryInstructions`：清楚定义 `memory_write(scope="user"|"public"|"conversation")`、`memory_search`、`memory_update`、`memory_delete` 的边界，并强调 long memory 由模型显式调用 `memory_search` 进入上下文。
+- [x] 每轮 runtime context 使用当前 system prompt snapshot 和现有 provider current context compression。`update_plan` 保持为 SessionActor 的运行态 progress；压缩后的 provider context 不额外拼接运行态 plan，压缩 JSON 自带的 `plan` 字段由模型维护。conversation/public memory 不自动注入；其他 conversation 的内容通过 `memory_search` 或 Cross Conversation Ask 查询。
+- [x] 达到压缩阈值时，当前追加消息会先 flush 到 `all_messages.jsonl`，再基于当前 provider context 构造一次 compaction provider request；turn 正常结束仍由现有 session save 写入 `session.json` / `all_messages.jsonl` / `current_messages.jsonl`。
 - [x] 当前 compaction provider request 已使用原本要压缩的上下文作为前缀，在末尾追加一条 `role="user"` 的压缩请求消息；这个请求只用于生成压缩结果，不写入 `all_messages.jsonl`。
-- [ ] 压缩请求消息示例：
+- [x] compaction provider request 使用专用短 system prompt，不复用聊天时的完整 system prompt，避免把 Memory Instructions、工具规范、runtime metadata 等常驻上下文重复计入压缩请求。
+- [x] 压缩请求消息要求严格 JSON，不输出 Markdown / code fence / 额外解释。示例：
 
 ```json
 {
@@ -323,7 +337,7 @@ query
 }
 ```
 
-- [ ] 压缩输出使用结构化 JSON，字段内容仍是自然语言，便于后续渲染成 provider context：
+- [x] 压缩输出使用结构化 JSON，字段内容仍是自然语言，便于后续渲染成 provider context。返回非 JSON 时压缩失败，并通过 `CompactFailed` 事件把原因发给 Conversation，再由 foreground Channel 展示。
 
 ```json
 {
@@ -336,22 +350,28 @@ query
 }
 ```
 
-- [ ] `preserved_tool_call_ids` 只引用当前 session history 中真实存在的 tool call id；系统校验 id，忽略不存在的 id，并按预算从 `all_messages.jsonl` / 当前 history 精确保留对应 tool call 参数和 tool result。
-- [ ] `preserved_tool_call_ids` 不渲染成 compacted block 里的 “Preserved Tool Results” 文本列表；它只作为系统回填对应 tool call / tool result pair 的控制字段。
-- [ ] 系统把压缩 JSON 的 `summary` / `current_state` / `plan` 渲染成一条 compacted provider history block，写入 `current_messages.jsonl`；最近几轮消息和被 `preserved_tool_call_ids` 命中的工具调用参数与结果按预算保留，完整 transcript 继续由 `all_messages.jsonl` 回查。
-- [ ] 默认高保真 recent context 保留预算调整为压缩阈值的 10%；显式配置的 `compression_retain_recent_tokens` 仍按配置值生效。
-- [ ] 压缩后的 provider context 拼接顺序固定：current system prompt snapshot -> budgeted conversation/public memory -> compacted provider history block -> 当前 `update_plan` plan -> 当前 user message。
-- [ ] 长期 memory 注入预算按相关性分配：至少 80% 给 `scope="conversation"` 的搜索结果，至少 20% 给 `scope="public"` 的搜索结果；某一侧结果不足时，剩余预算可被另一侧使用。
-- [ ] `RuntimeMetadataState` 需要新增 memory component hashes：`user_memory_snapshot`、`conversation_memory_manifest`、`public_memory_manifest`。
+- [x] `preserved_tool_call_ids` 只引用当前 session history 中真实存在的 tool call id；系统校验 id，忽略不存在的 id，并按预算从当前 history 保留对应 tool call 参数和 tool result。
+- [x] `preserved_tool_call_ids` 不渲染成 compacted block 里的 “Preserved Tool Results” 文本列表；它只作为系统回填对应 tool call / tool result pair 的控制字段。
+- [x] 系统把压缩 JSON 的 `summary` / `current_state` / `plan` 渲染成一条 compacted provider history block，写入 `current_messages.jsonl`；最近几轮消息和被 `preserved_tool_call_ids` 命中的工具调用参数与结果按预算保留，完整 transcript 继续由 `all_messages.jsonl` 保存。
+- [x] 默认高保真 recent context 保留预算调整为压缩阈值的 10%；显式配置的 `compression_retain_recent_tokens` 仍按配置值生效。
+- [x] 压缩触发时系统做一次小预算 long-memory recall，作为 compaction provider request 的辅助背景，不写入 `all_messages.jsonl` / `current_messages.jsonl`。候选从 `conversation` 和 `public` 两侧各取 20 条，按相关性分数和更新时间排序，再用模型 context window 的 3% 预算裁剪后插入压缩请求。
+- [x] 压缩结果不直接内嵌长期 memory。压缩模型只输出 `summary` / `current_state` / `plan` / `preserved_tool_call_ids`；长期 memory 通过模型显式调用 `memory_search` 进入上下文。
+- [x] `memory_search` 是 long memory 的按需 paging 机制。模型在当前短上下文不足以回答、用户询问跨 conversation / 当前 conversation 的长期事实、或当前任务明显依赖历史约定时调用它；普通 provider request 不自动注入 conversation/public memory。
+- [x] `memory_search` 返回结果由工具端按 limit、相关性、更新时间和去重规则裁剪。明显重复的 entry 优先只返回最新或更具体的一条；互相冲突但无法自动消融的 entry 可以同时返回少量，并让模型在需要时通过 `memory_update` / `memory_delete` 整理。
+- [x] user memory 不通过每轮 retrieval 决定是否注入；它属于 current system prompt snapshot。user memory 的大小控制由后台压缩/过滤任务负责。
+- [x] 压缩后的 provider context 拼接顺序固定：current system prompt snapshot -> compacted provider history block -> recent high-fidelity messages / preserved tool pairs -> 当前 user message。当前 `update_plan` 保持在 SessionActor 内存态和 channel progress 中，不再额外拼接成一条 provider context 消息；需要延续的下一步由压缩模型写进压缩 JSON 的 `plan` 字段。
+- [x] `memory_search` 默认 limit 为 5，模型显式调用时建议不超过 10；压缩内部 recall 每侧最多 20 条候选。工具端返回必须有严格字符预算，避免一次 search 让上下文重新膨胀。
+- [x] `RuntimeMetadataState` 已新增 `user_memory` prompt component hash，用来保持两次 compact 之间的 user memory system prompt snapshot 稳定，并在变化时生成紧凑 diff notice。
 
 ### Memory Config
 
-- [ ] config 增加 `memory` 小节，后续实现时必须走 config schema 迁移和 `VERSION` changelog：
+- [x] config 增加 `memory` 小节，默认 `enabled=false`。禁用时不暴露 memory tools / Memory Instructions；host 侧兜底返回 `memory_disabled`。
+- [x] `write_candidate_limit`、`tool_result_max_bytes`、`user_compaction_model_alias` 和 `dedupe_model_alias` 已接入 `MemoryService`。写入候选数仍按 v1 上限裁剪，搜索结果按配置的总字节预算裁剪后返回。
 
 ```json
 {
   "memory": {
-    "enabled": true,
+    "enabled": false,
     "user_compaction_model_alias": "default",
     "dedupe_model_alias": "default",
     "user_soft_threshold_bytes": 4096,
@@ -359,20 +379,19 @@ query
     "user_retry_after_failed_hard_compaction_secs": 21600,
     "user_soft_compaction_schedule": "daily",
     "write_candidate_limit": 10,
-    "write_return_related_limit": 5,
     "tool_result_max_bytes": 4096
   }
 }
 ```
 
-- [ ] threshold 按渲染后注入文本预算计算。系统同时记录 raw bytes 和 rendered bytes，触发压缩以 rendered bytes 为准。
-- [ ] 工具端限制单条 entry、`memory_write` 候选数、单次返回、单文件和总 records JSONL 大小；超过上限时拒绝写入、丢弃多余候选、要求合并旧 entry，或自动截断并在 tool result 中说明。
+- [x] threshold 按渲染后注入文本预算计算。`manifest.json` 同时记录 raw `size_bytes` 和 `rendered_size_bytes`；user memory 写入后会按 rendered bytes 把 `compaction.json` 标记为 `idle` / `dirty` / `hard_pending`。
+- [x] 工具端限制单条 entry、`memory_write` 候选数、单次返回、单文件和总 records JSONL 大小；超过上限时拒绝写入、丢弃多余候选、要求合并旧 entry，或自动截断并在 tool result 中说明。
 
 ## Cross Conversation Ask 工具
 
 - [ ] `ask_conversation` 是独立系统工具。Memory 负责建立 public/conversation 索引；ask 负责按需启动 background agent 到目标 conversation 查细节。
 - [ ] 当前 Agent 必须先用 `memory_search(query=...)`、conversation index，或用户直接给出的 conversation id 确定目标 conversation，再调用 `ask_conversation`。
-- [ ] background agent 读取目标 conversation 的 `.stellaclaw/memory_v1/conversation/entries.jsonl`、压缩后的 provider current context 和已有 `.stellaclaw/log/<session_id>/all_messages.jsonl`，并把整理后的答案返回当前 Agent。
+- [ ] background agent 基于目标 conversation 的 memory 和压缩后的 provider current context 整理答案，并把结果返回当前 Agent。
 - [ ] `ask_conversation` 的返回作为普通 tool result 回到当前 Agent，可以直接用于回答用户，也可以提示当前 Agent 是否需要把新确认的稳定事实写回 `memory_write(scope="public")`。
 
 ```json
