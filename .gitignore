@@ -39,6 +39,8 @@ tmp/
 shared
 !apps/stellacodeX/apple/StellaCodeX/StellaCodeX/Shared/
 !apps/stellacodeX/apple/StellaCodeX/StellaCodeX/Shared/**
+!apps/stellacodeX/shared/
+!apps/stellacodeX/shared/**
 STELLACLAW.md
 MEMORY_DESIGN.md
 
