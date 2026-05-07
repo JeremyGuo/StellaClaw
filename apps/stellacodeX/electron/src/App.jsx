@@ -1525,11 +1525,14 @@ function App() {
     return loadModels(selected.serverId);
   }, [selected?.serverId]);
 
-  const sendMessage = useCallback(async (text) => {
+  const sendMessage = useCallback(async (text, files = []) => {
     const value = String(text || '').trim();
-    if (!value || !selected || sending) return false;
+    const outgoingFiles = Array.isArray(files) ? files : [];
+    if ((!value && outgoingFiles.length === 0) || !selected || sending) return false;
     const key = conversationKey(selected.serverId, selected.conversationId);
-    const commandState = slashCommandState(value);
+    const commandState = outgoingFiles.length > 0
+      ? { control: false, name: '', title: '等待响应', detail: '消息已送达，等待模型开始处理' }
+      : slashCommandState(value);
     const previousLastServerId = lastServerMessageId(messagesRef.current);
     const optimistic = {
       id: `local-${Date.now()}`,
@@ -1537,6 +1540,8 @@ function App() {
       user_name: activeUserName,
       text: value,
       preview: value,
+      files: outgoingFiles,
+      attachment_count: outgoingFiles.length,
       message_time: new Date().toISOString(),
       _optimistic: true,
       pending: true
@@ -1544,7 +1549,7 @@ function App() {
     setSending(true);
     setSessionActivity('正在发送');
     updateRunningActivities(() => [
-      { id: 'sending', title: '发送中', detail: shortText(value), state: 'running' }
+      { id: 'sending', title: '发送中', detail: shortText(value || `${outgoingFiles.length} 个附件`), state: 'running' }
     ]);
     setMessages((current) => {
       const next = [...current, optimistic];
@@ -1552,7 +1557,7 @@ function App() {
       return next;
     });
     try {
-      await postConversationMessage(selected.serverId, selected.conversationId, value, activeUserName);
+      await postConversationMessage(selected.serverId, selected.conversationId, value, activeUserName, outgoingFiles);
       if (websocketKeyRef.current !== key) return false;
       setMessages((current) => {
         const next = commandState.control

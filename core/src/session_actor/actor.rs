@@ -36,7 +36,7 @@ use super::{
 
 const DEFAULT_MAX_MODEL_STEPS_PER_TURN: usize = 200;
 const ACTIVE_COMPRESSION_THRESHOLD_RATIO: f64 = 0.9;
-const IDLE_COMPACTION_MIN_RATIO: f64 = 0.4;
+const IDLE_COMPACTION_MIN_RATIO: f64 = 0.3;
 const REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS: usize = 8;
 const DEFAULT_RETAIN_RECENT_PERCENT: u64 = 10;
 const SESSION_PLAN_CONTEXT_MARKER: &str = "[StellaClaw Current Task Plan]";
@@ -3145,6 +3145,33 @@ mod tests {
         assert_eq!(default_retain_recent_tokens(200_000), 20_000);
         assert_eq!(default_retain_recent_tokens(1_000), 512);
         assert_eq!(default_retain_recent_tokens(2), 1);
+    }
+
+    #[test]
+    fn idle_compaction_threshold_uses_lower_context_ratio() {
+        let mut model_config = test_model_config();
+        model_config.token_max_context = 200_000;
+        let mut initial = SessionInitial::new(
+            test_session_id("session_idle_compression_threshold"),
+            super::super::SessionType::Foreground,
+        );
+
+        assert_eq!(
+            idle_compaction_token_threshold(&model_config, Some(&initial)),
+            60_000
+        );
+
+        initial.compression_threshold_tokens = Some(235_929);
+        assert_eq!(
+            idle_compaction_token_threshold(&model_config, Some(&initial)),
+            60_000
+        );
+
+        initial.compression_threshold_tokens = Some(40_000);
+        assert_eq!(
+            idle_compaction_token_threshold(&model_config, Some(&initial)),
+            40_000
+        );
     }
 
     #[test]

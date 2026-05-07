@@ -2,7 +2,7 @@ import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState }
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import remarkGfm from 'remark-gfm';
-import { FileText, Plus, Send, TerminalSquare } from 'lucide-react';
+import { FileText, Pin, Plus, Send, TerminalSquare } from 'lucide-react';
 import * as Popover from '@radix-ui/react-popover';
 import { attachmentName, attachmentUrl, isImageAttachment, messageText } from '../lib/fileUtils';
 import { formatBytes, formatTokens, modelAlias, modelDisplayName } from '../lib/format';
@@ -32,6 +32,67 @@ function serverMessageIndex(message) {
   return Number.isFinite(index) ? index : -1;
 }
 
+function readFileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error || new Error('Failed to read file'));
+    reader.onload = () => {
+      const value = String(reader.result || '');
+      resolve(value.includes(',') ? value.split(',').pop() : value);
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function imageSizeFromUrl(url) {
+  return new Promise((resolve) => {
+    if (!url) {
+      resolve({});
+      return;
+    }
+    const image = new Image();
+    image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight });
+    image.onerror = () => resolve({});
+    image.src = url;
+  });
+}
+
+function fileMediaType(file) {
+  return file?.type || 'application/octet-stream';
+}
+
+function isImageFileObject(file) {
+  return String(fileMediaType(file)).toLowerCase().startsWith('image/');
+}
+
+async function composerAttachmentFromFile(file, fallbackName = '') {
+  const name = file?.name || fallbackName || 'attachment';
+  const mediaType = fileMediaType(file);
+  const previewUrl = isImageFileObject(file) ? URL.createObjectURL(file) : '';
+  const imageSize = previewUrl ? await imageSizeFromUrl(previewUrl) : {};
+  return {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    name,
+    media_type: mediaType,
+    size_bytes: file?.size || 0,
+    data_base64: await readFileAsBase64(file),
+    previewUrl,
+    width: imageSize.width,
+    height: imageSize.height
+  };
+}
+
+function outgoingAttachmentPayload(attachment) {
+  return {
+    name: attachment.name,
+    media_type: attachment.media_type,
+    uri: `data:${attachment.media_type || 'application/octet-stream'};base64,${attachment.data_base64}`,
+    size_bytes: attachment.size_bytes,
+    width: attachment.width,
+    height: attachment.height
+  };
+}
+
 export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, runningActivities }) {
   const renderedMessages = useMemo(() => displayMessages(messages), [messages]);
   const activitySignature = useMemo(() => liveActivitySignature(runningActivities || []), [runningActivities]);
@@ -45,8 +106,12 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const [modelsLoading, setModelsLoading] = useState(false);
   const [modelsError, setModelsError] = useState('');
   const [draft, setDraft] = useState('');
+  const [composerAttachments, setComposerAttachments] = useState([]);
   const progressRef = useRef(null);
   const composerRef = useRef(null);
+  const textareaRef = useRef(null);
+  const fileInputRef = useRef(null);
+  const composerAttachmentsRef = useRef([]);
   const composingRef = useRef(false);
   const lastComposingEnterAtRef = useRef(0);
   const lastEnterKeyUpAtRef = useRef(0);
@@ -61,40 +126,47 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const typewriterHydratedRef = useRef(false);
   const newestSeenIndexRef = useRef(-1);
   const currentActivity = (runningActivities || []).at(-1) || null;
-  const currentPlan = normalizeActivityPlan(currentActivity?.plan);
   const progressVisible = Boolean(currentActivity);
 
-  useLayoutEffect(() => {
-    const node = progressRef.current;
-    if (!node || !progressVisible) {
-      scrollRef.current?.style.setProperty('--progress-height', '0px');
-      return undefined;
+  const updateComposerMetrics = () => {
+    const node = composerRef.current;
+    if (!node) return;
+    const root = node.closest('.chat-workspace');
+    const composer = node.querySelector('.composer');
+    root?.style.setProperty('--composer-wrap-height', `${Math.ceil(node.getBoundingClientRect().height)}px`);
+    if (composer) {
+      root?.style.setProperty('--composer-card-height', `${Math.ceil(composer.getBoundingClientRect().height)}px`);
     }
-    const update = () => {
-      scrollRef.current?.style.setProperty('--progress-height', `${Math.ceil(node.getBoundingClientRect().height)}px`);
-    };
-    update();
-    const observer = new ResizeObserver(update);
-    observer.observe(node);
-    return () => observer.disconnect();
-  }, [activitySignature, progressVisible]);
+  };
+
+  useLayoutEffect(() => {
+    scrollRef.current?.style.setProperty('--progress-height', '0px');
+  }, [activeMessageScope, activitySignature, progressVisible]);
 
   useLayoutEffect(() => {
     const node = composerRef.current;
     if (!node) return undefined;
-    const update = () => {
-      const root = node.closest('.chat-workspace');
-      const composer = node.querySelector('.composer');
-      root?.style.setProperty('--composer-wrap-height', `${Math.ceil(node.getBoundingClientRect().height)}px`);
-      if (composer) {
-        root?.style.setProperty('--composer-card-height', `${Math.ceil(composer.getBoundingClientRect().height)}px`);
-      }
-    };
-    update();
-    const observer = new ResizeObserver(update);
+    updateComposerMetrics();
+    const observer = new ResizeObserver(updateComposerMetrics);
     observer.observe(node);
+    const composer = node.querySelector('.composer');
+    if (composer) observer.observe(composer);
     return () => observer.disconnect();
   }, []);
+
+  useLayoutEffect(() => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    const maxHeight = Number.parseFloat(window.getComputedStyle(textarea).maxHeight) || 220;
+    textarea.style.height = 'auto';
+    const nextHeight = Math.min(textarea.scrollHeight, maxHeight);
+    textarea.style.height = `${nextHeight}px`;
+    textarea.style.overflowY = textarea.scrollHeight > maxHeight ? 'auto' : 'hidden';
+    updateComposerMetrics();
+    if (stickToBottomRef.current) {
+      requestAnimationFrame(scrollToBottom);
+    }
+  }, [draft, composerAttachments.length]);
 
   useEffect(() => {
     if (modelSelectionPending) {
@@ -131,8 +203,24 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     typewriterHydratedRef.current = false;
     newestSeenIndexRef.current = -1;
     setDraft('');
+    setComposerAttachments((current) => {
+      current.forEach((attachment) => {
+        if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+      });
+      return [];
+    });
     setTypingKeys(new Set());
   }, [activeMessageScope]);
+
+  useEffect(() => {
+    composerAttachmentsRef.current = composerAttachments;
+  }, [composerAttachments]);
+
+  useEffect(() => () => {
+    composerAttachmentsRef.current.forEach((attachment) => {
+      if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+    });
+  }, []);
 
   useEffect(() => {
     const known = knownMessagesRef.current;
@@ -223,13 +311,54 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     }
   };
 
+  const addComposerFiles = async (files, source = 'file') => {
+    const values = Array.from(files || []).filter(Boolean);
+    if (!values.length) return;
+    const baseTime = Date.now();
+    const next = await Promise.all(values.map((file, index) => {
+      const fallbackName = source === 'paste' && isImageFileObject(file)
+        ? `pasted-image-${baseTime + index}.png`
+        : '';
+      return composerAttachmentFromFile(file, fallbackName);
+    }));
+    setComposerAttachments((current) => [...current, ...next]);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  };
+
+  const removeComposerAttachment = (id) => {
+    setComposerAttachments((current) => {
+      const removed = current.find((attachment) => attachment.id === id);
+      if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+      return current.filter((attachment) => attachment.id !== id);
+    });
+  };
+
   const submitDraft = async () => {
-    if (!draft.trim() || sending) return;
+    if ((!draft.trim() && composerAttachments.length === 0) || sending) return;
     const value = draft;
+    const attachments = composerAttachments;
     setDraft('');
-    const sent = await onSend?.(value);
+    setComposerAttachments([]);
+    const sent = await onSend?.(value, attachments.map(outgoingAttachmentPayload));
     if (sent === false) {
       setDraft((current) => current || value);
+      setComposerAttachments((current) => current.length ? current : attachments);
+    } else {
+      attachments.forEach((attachment) => {
+        if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
+      });
+    }
+  };
+
+  const handlePaste = (event) => {
+    const items = Array.from(event.clipboardData?.items || []);
+    const files = items
+      .filter((item) => item.kind === 'file')
+      .map((item) => item.getAsFile())
+      .filter(Boolean);
+    if (files.length > 0) {
+      event.preventDefault();
+      addComposerFiles(files, 'paste').catch(() => {});
     }
   };
 
@@ -300,34 +429,71 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
             <span>选择一个 Conversation，或者新建对话，让 Stellacode 帮你检查项目、修改代码、运行命令和整理上下文。</span>
           </div>
         ) : (
-          renderedMessages.map((message, index) => (
-            message.type === 'toolGroup'
-              ? <MemoToolProcessGroup key={message.id} group={message} />
-              : (
-                <MemoMessageArticle
-                  key={messageKey(message, index)}
-                  message={message}
-                  typewriter={typingKeys.has(messageKey(message, index))}
-                  onTypewriterDone={() => {
-                    const key = messageKey(message, index);
-                    setTypingKeys((current) => {
-                      if (!current.has(key)) return current;
-                      const next = new Set(current);
-                      next.delete(key);
-                      return next;
-                    });
-                  }}
-                />
-              )
-          ))
+          <>
+            {renderedMessages.map((message, index) => (
+              message.type === 'toolGroup'
+                ? <MemoToolProcessGroup key={message.id} group={message} />
+                : (
+                  <MemoMessageArticle
+                    key={messageKey(message, index)}
+                    message={message}
+                    typewriter={typingKeys.has(messageKey(message, index))}
+                    onTypewriterDone={() => {
+                      const key = messageKey(message, index);
+                      setTypingKeys((current) => {
+                        if (!current.has(key)) return current;
+                        const next = new Set(current);
+                        next.delete(key);
+                        return next;
+                      });
+                    }}
+                  />
+                )
+            ))}
+            {currentActivity && <InlineActivityStatus activity={currentActivity} />}
+          </>
         )}
       </div>
       <LiveActivityStack activities={runningActivities} progressRef={progressRef} />
-      <footer className={`composer-wrap${progressVisible ? ' with-progress' : ''}`} ref={composerRef}>
+      <footer className="composer-wrap" ref={composerRef}>
         <div className="composer">
+          {composerAttachments.length > 0 && (
+            <div className="composer-attachments" aria-label="待发送附件">
+              {composerAttachments.map((attachment) => (
+                <button
+                  className="composer-attachment-chip"
+                  type="button"
+                  key={attachment.id}
+                  title={`移除 ${attachment.name}`}
+                  onClick={() => removeComposerAttachment(attachment.id)}
+                >
+                  {attachment.previewUrl ? (
+                    <img src={attachment.previewUrl} alt="" />
+                  ) : (
+                    <span className="composer-attachment-icon"><FileText size={13} /></span>
+                  )}
+                  <span>{attachment.name}</span>
+                  <small>×</small>
+                </button>
+              ))}
+            </div>
+          )}
+          <input
+            ref={fileInputRef}
+            className="composer-file-input"
+            type="file"
+            multiple
+            onChange={(event) => {
+              const files = Array.from(event.currentTarget.files || []);
+              event.currentTarget.value = '';
+              addComposerFiles(files, 'file').catch(() => {});
+            }}
+          />
           <textarea
+            ref={textareaRef}
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
+            onPaste={handlePaste}
             disabled={modelSelectionPending}
             onCompositionStart={() => {
               composingRef.current = true;
@@ -365,7 +531,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
             placeholder={modelSelectionPending ? '请先选择模型' : 'Ask Stellacode to change, inspect, or explain...'}
           />
           <div className="composer-row">
-            <button className="composer-icon" type="button" title="添加附件">
+            <button className="composer-icon" type="button" title="添加附件" onClick={() => fileInputRef.current?.click()}>
               <Plus size={18} />
             </button>
             <Popover.Root onOpenChange={(open) => {
@@ -460,7 +626,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
               </Popover.Portal>
             </Popover.Root>
             <span className={`mode-pill ${modeTone}`} title={modeTitle}>{modeLabel}</span>
-            <button className="send-button" type="button" disabled={modelSelectionPending || !draft.trim() || sending} onClick={() => submitDraft().catch(() => {})}>
+            <button className="send-button" type="button" disabled={modelSelectionPending || (!draft.trim() && composerAttachments.length === 0) || sending} onClick={() => submitDraft().catch(() => {})}>
               <Send size={18} />
             </button>
           </div>
@@ -502,10 +668,25 @@ export function LiveActivityStack({ activities, progressRef }) {
   if (!activities?.length) return null;
   const current = activities.at(-1) || {};
   const plan = normalizeActivityPlan(current.plan);
+  if (!plan) return null;
   return (
-    <section className={`session-progress-card${plan ? '' : ' compact'}`} aria-live="polite" ref={progressRef}>
-      {plan ? <ActivityPlanPanel plan={plan} /> : <ActivityStatus activity={current} />}
+    <section className="session-progress-card with-plan" aria-live="polite" ref={progressRef}>
+      <ActivityPlanPanel plan={plan} />
     </section>
+  );
+}
+
+function InlineActivityStatus({ activity }) {
+  const state = String(activity?.state || 'running').toLowerCase();
+  const title = String(activity?.title || '').trim();
+  const detail = String(activity?.detail || activity?.activity || activity?.model || '').trim();
+  const label = title || (state === 'failed' ? '执行失败' : state === 'done' ? '已完成' : '正在思考');
+  return (
+    <div className={`chat-activity-status ${state}`}>
+      <i className="chat-activity-icon" aria-hidden="true" />
+      <span>{label}</span>
+      {detail && <code>{detail}</code>}
+    </div>
   );
 }
 
@@ -573,11 +754,12 @@ function normalizePlanStatus(status) {
 
 function ActivityPlanPanel({ plan }) {
   return (
-    <details className="activity-plan-panel" open>
-      <summary>
-        <span>计划</span>
+    <section className="activity-plan-panel">
+      <div className="activity-plan-head">
+        <span>进度</span>
         <code>共 {plan.total} 项，已完成 {plan.completed} 项</code>
-      </summary>
+        <Pin className="activity-plan-pin" size={15} aria-hidden="true" />
+      </div>
       <div className="activity-plan-body">
         {plan.explanation && <p>{plan.explanation}</p>}
         {plan.items.map((item, index) => (
@@ -588,7 +770,7 @@ function ActivityPlanPanel({ plan }) {
           </div>
         ))}
       </div>
-    </details>
+    </section>
   );
 }
 
@@ -607,8 +789,9 @@ function planStatusMark(status) {
 export function MessageArticle({ message, typewriter = false, onTypewriterDone }) {
   const usage = tokenUsage(message);
   const role = message.user_name || message.role || 'assistant';
+  const className = messageArticleClassName(message);
   return (
-    <article className={`message ${message.role || 'assistant'}${message._forceSeparate ? ' force-separate' : ''}`}>
+    <article className={className}>
       <div className="message-role">
         <span>{role}</span>
         {Array.isArray(message._auxiliary) && message._auxiliary.length > 0 && (
@@ -623,6 +806,24 @@ export function MessageArticle({ message, typewriter = false, onTypewriterDone }
       )}
     </article>
   );
+}
+
+function messageArticleClassName(message) {
+  const classes = ['message', message.role || 'assistant'];
+  if (message._forceSeparate) classes.push('force-separate');
+  if (String(message.role || '').toLowerCase() === 'user') {
+    const text = messageText(message).trim();
+    const attachments = [
+      ...(Array.isArray(message?.attachments) ? message.attachments : []),
+      ...(Array.isArray(message?.files) ? message.files : [])
+    ];
+    const itemAttachments = (Array.isArray(message?.items) ? message.items : [])
+      .filter((item) => item?.type === 'file');
+    if (text && (attachments.length > 0 || itemAttachments.length > 0 || Number(message?.attachment_count || 0) > 0)) {
+      classes.push('media-combo');
+    }
+  }
+  return classes.join(' ');
 }
 
 const MemoMessageArticle = memo(MessageArticle, (previous, next) => {
@@ -657,14 +858,18 @@ export function AuxiliaryDots({ messages }) {
 
 export function TokenUsage({ usage }) {
   if (!Number(usage?.total || 0)) return null;
+  const cacheReadDominant = usage.cacheRead > 0
+    && usage.cacheRead >= usage.input
+    && usage.cacheRead >= usage.output
+    && usage.cacheRead >= usage.cacheWrite;
   return (
     <Popover.Root>
-      <div className="token-usage">
-        <Popover.Trigger asChild>
-          <button className="token-dot" type="button" aria-label="查看 Token Usage" />
-        </Popover.Trigger>
-        <span>{formatTokens(usage.total)}</span>
-      </div>
+      <Popover.Trigger asChild>
+        <button className={`token-usage${cacheReadDominant ? ' cache-read-dominant' : ''}`} type="button" aria-label="查看 Token Usage">
+          <span className="token-dot" aria-hidden="true" />
+          <span>{formatTokens(usage.total)}</span>
+        </button>
+      </Popover.Trigger>
       <Popover.Portal>
         <Popover.Content className="floating-popover token-popover" side="top" align="end" sideOffset={8}>
           <div><span>Input</span><strong>{usage.input}</strong></div>
@@ -804,7 +1009,7 @@ export function MessageBody({ message, typewriter = false, onTypewriterDone }) {
         <StructuredItems items={message.items} attachments={allAttachments} fallbackText={text} />
       ) : text ? (
         <MarkdownContent className="message-text" text={text} attachments={allAttachments} />
-      ) : (
+      ) : trailingAttachments.length > 0 ? null : (
         <div className="message-text muted">空消息</div>
       )}
       {trailingAttachments.length > 0 && <AttachmentList attachments={trailingAttachments} />}
@@ -955,10 +1160,25 @@ export function AttachmentCard({ attachment, inline = false }) {
   const name = attachmentName(attachment);
   const url = attachmentUrl(attachment);
   const size = formatBytes(attachment?.size_bytes || attachment?.size);
+  const [loadedImageSize, setLoadedImageSize] = useState(null);
   if (isImageAttachment(attachment)) {
+    const imageWidth = attachmentImageDisplayWidth(attachment, loadedImageSize);
+    const imageStyle = imageWidth ? { '--attachment-image-width': `${imageWidth}px` } : undefined;
     return (
-      <button className={`message-attachment image${inline ? ' inline' : ''}${url ? '' : ' loading'}`} type="button">
-        {url ? <img src={url} alt={name} loading="lazy" /> : <span className="image-placeholder">正在加载图片</span>}
+      <button className={`message-attachment image${inline ? ' inline' : ''}${url ? '' : ' loading'}`} type="button" style={imageStyle}>
+        {url ? (
+          <img
+            src={url}
+            alt={name}
+            loading="lazy"
+            onLoad={(event) => {
+              const image = event.currentTarget;
+              if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+                setLoadedImageSize({ width: image.naturalWidth, height: image.naturalHeight });
+              }
+            }}
+          />
+        ) : <span className="image-placeholder">正在加载图片</span>}
         <span>{name}</span>
       </button>
     );
@@ -970,6 +1190,23 @@ export function AttachmentCard({ attachment, inline = false }) {
       {size && <small>{size}</small>}
     </button>
   );
+}
+
+function attachmentNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : null;
+}
+
+function attachmentImageDisplayWidth(attachment, loadedImageSize) {
+  const width = attachmentNumber(attachment?.width ?? attachment?.pixel_width ?? loadedImageSize?.width);
+  const height = attachmentNumber(attachment?.height ?? attachment?.pixel_height ?? loadedImageSize?.height);
+  if (!width) return null;
+  const maxWidth = 340;
+  const maxHeight = 240;
+  const minWidth = 96;
+  if (!height) return Math.max(minWidth, Math.min(maxWidth, Math.round(width)));
+  const scale = Math.min(1, maxWidth / width, maxHeight / height);
+  return Math.max(minWidth, Math.min(maxWidth, Math.round(width * scale)));
 }
 
 function parseToolPayload(payload) {

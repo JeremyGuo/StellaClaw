@@ -79,12 +79,13 @@ export async function loadMessages(serverId, conversationId, options = {}) {
   return response.data?.messages || [];
 }
 
-export async function postConversationMessage(serverId, conversationId, text, userName = 'workspace-user') {
+export async function postConversationMessage(serverId, conversationId, text, userName = 'workspace-user', files = []) {
   return api(serverId, `/api/conversations/${conversationId}/messages`, {
     method: 'POST',
     body: {
       user_name: String(userName || '').trim() || 'workspace-user',
-      text
+      text,
+      files: Array.isArray(files) && files.length > 0 ? files : undefined
     }
   });
 }

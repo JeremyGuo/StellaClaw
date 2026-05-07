@@ -1,7 +1,19 @@
-version: 1.25.9
+version: 1.26.0
 ---
 
-# 1.25.9
+# 1.26.0
+
+- 调整 SessionActor idle 压缩触发比例：
+  idle compaction 在模型输出后等待 cache 过期前做维护性压缩时，token 触发上限从当前模型上下文窗口的 40% 降到 30%；如果显式配置了更低的 `compression_threshold_tokens`，仍按更低配置提前压缩。压缩后的 recent high-fidelity 保留默认继续是压缩阈值的 10%，显式配置 `compression_retain_recent_tokens` 时仍优先生效。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 增加 StellaCodeX Electron 多模态发送能力：
+  Electron 聊天输入框支持直接 `Ctrl+V` / `Cmd+V` 粘贴剪贴板图片作为待发送附件，也支持点击左下角 `+` 打开系统文件选择器选择多个文件；待发送附件会在输入框顶部以 chip 列表展示，图片显示缩略图，点击 chip 可移除。发送时 Electron 使用 Web Channel `files` payload 传输 `data:` 文件，服务端继续 materialize 到 conversation `.stellaclaw/attachments/incoming` 后再写入标准 `FileItem`。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 StellaCodeX Electron 用户消息带图片附件时气泡过宽的问题：
+  用户消息改为聊天软件常见的整行右对齐、内部气泡包内容布局，用户名在气泡外侧弱化显示；正文和图片/文件附件在同一个收缩边界内靠右排列，图片附件继续按真实尺寸和最大预览尺寸裁剪，避免文字在右侧、附件贴左侧并撑出大块空白。Token usage 也改成右侧紧凑椭圆 meta pill，cache read 主导时显示绿色点，否则显示红色点，整个 pill 都可点击展开明细，并和下一条用户气泡保持更清晰的底部间距；token pill 字号和状态点进一步收小。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 调整 StellaCodeX Electron 运行计划展示：
+  带计划的运行状态不再把进度面板压在输入框上方，当前“思考中 / 运行中”状态改回聊天流内显示；计划详情作为右侧悬浮面板显示，宽屏时放在主聊天列右边的空白区，空间不足时收进右侧并只保留透明 hover 热区，鼠标移入或聚焦时滑出；计划面板本身不再提供折叠控件。聊天流底部和输入框之间增加固定留白，避免最后一条状态/消息贴住输入框。输入框会随内容自动增高，到达最大高度后再显示内部滚动条；输入框增高时会同步刷新聊天流底部占位并保持贴底内容向上移动。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 清理客户端目录布局：
   Electron 客户端从 `apps/stellacode2` 迁移到 `apps/stellacodeX/electron`，发布 workflow、文档和 SSH 更新固定路径同步切换；原 `apps/stellacodeX/apple` 迁移为 `apps/stellacodeX/ios`，作为后续 iOS 原生客户端入口。Electron 与 iOS app icon / launch logo 同步改用 `apps/stellacodeX/shared/assets/icons/stellacodex/` 下的新 Logo。本次不改变 `config` schema，不改变 `workdir` schema。
