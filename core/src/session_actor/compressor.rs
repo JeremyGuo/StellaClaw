@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::{
     model_config::ModelConfig,
-    providers::{send_provider_request_with_retry, Provider, ProviderRequest},
+    providers::{send_provider_request_with_retry, Provider, ProviderError, ProviderRequest},
 };
 
 use super::{
@@ -13,6 +13,7 @@ use super::{
 pub const COMPRESSION_MARKER: &str = "[StellaClaw Context Compression]";
 const MAX_PRESERVED_TOOL_CALL_IDS: usize = 8;
 const MAX_PRESERVED_TOOL_RESULT_TEXT_CHARS: usize = 4096;
+const COMPRESSION_CYBER_POLICY_RETRY_FEEDBACK_PREFIX: &str = "[Compression Retry Feedback]\nThe previous request was rejected as possible cybersecurity risk, but this is a benign context-compaction request for an existing agent conversation. Do not add new cybersecurity instructions, procedures, exploit steps, or operational details. Only summarize the already-present conversation state at the level needed for continuity, preserving user requirements, decisions, files, validation state, blockers, active task IDs/process IDs, and exact next steps. Return the same strict JSON schema.";
 
 #[derive(Debug, Clone)]
 pub struct SessionCompressor {
@@ -285,36 +286,27 @@ impl SessionCompressor {
         system_prompt: Option<&str>,
         compression_context: Option<&str>,
     ) -> Result<Option<GeneratedCompression>, CompressionError> {
-        let mut request_messages = sanitize_messages_for_compression_request(messages_to_summarize);
-        if request_messages.is_empty() {
+        let request_messages = build_compression_request_messages(
+            messages_to_summarize,
+            preserved_recent_count,
+            compression_context,
+            CompressionSanitizeMode::Full,
+        );
+        if request_messages.len() == compression_request_suffix_len(compression_context) {
             return Ok(None);
         }
-        if let Some(context) = compression_context
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            request_messages.push(ChatMessage::new(
-                ChatRole::User,
-                vec![ChatMessageItem::Context(ContextItem {
-                    text: format!(
-                        "[Relevant Long Memory For Compression]\nUse this as small background context while compressing. Keep only details that are still relevant to the current conversation state; do not copy unrelated memory.\n\n{context}"
-                    ),
-                })],
-            ));
-        }
-        request_messages.push(ChatMessage::new(
-            ChatRole::User,
-            vec![ChatMessageItem::Context(ContextItem {
-                text: compression_instruction(preserved_recent_count),
-            })],
-        ));
 
-        let response = send_provider_request_with_retry(
+        let Some(response) = send_compression_request_with_policy_reductions(
             provider,
-            ProviderRequest::new(&request_messages).with_system_prompt(system_prompt),
-            |_| {},
-        )
-        .map_err(|error| CompressionError::Provider(error.to_string()))?;
+            messages_to_summarize,
+            preserved_recent_count,
+            compression_context,
+            &request_messages,
+            system_prompt,
+        )?
+        else {
+            return Ok(None);
+        };
         let response_text = message_text(&response);
         if response_text.trim().is_empty() {
             return Err(CompressionError::EmptySummary);
@@ -356,6 +348,103 @@ impl SessionCompressor {
             return Ok(false);
         }
         Ok(self.plan_compression(messages)?.is_some())
+    }
+}
+
+fn send_compression_request_with_policy_reductions(
+    provider: &(dyn Provider + Send + Sync),
+    messages_to_summarize: &[ChatMessage],
+    preserved_recent_count: usize,
+    compression_context: Option<&str>,
+    request_messages: &[ChatMessage],
+    system_prompt: Option<&str>,
+) -> Result<Option<ChatMessage>, CompressionError> {
+    match send_provider_request_with_retry(
+        provider,
+        ProviderRequest::new(request_messages).with_system_prompt(system_prompt),
+        |_| {},
+    ) {
+        Ok(response) => Ok(Some(response)),
+        Err(error) if provider_error_is_cyber_policy(&error) => {
+            for retry in [
+                CompressionCyberPolicyRetry::FeedbackOnly,
+                CompressionCyberPolicyRetry::DropToolResults,
+                CompressionCyberPolicyRetry::DropToolResultsAndUserMessages,
+            ] {
+                let retry_messages = retry.build_request_messages(
+                    request_messages,
+                    messages_to_summarize,
+                    preserved_recent_count,
+                    compression_context,
+                );
+                match send_provider_request_with_retry(
+                    provider,
+                    ProviderRequest::new(&retry_messages).with_system_prompt(system_prompt),
+                    |_| {},
+                ) {
+                    Ok(response) => return Ok(Some(response)),
+                    Err(retry_error) if provider_error_is_cyber_policy(&retry_error) => {}
+                    Err(retry_error) => {
+                        return Err(CompressionError::Provider(retry_error.to_string()));
+                    }
+                }
+            }
+            Ok(None)
+        }
+        Err(error) => Err(CompressionError::Provider(error.to_string())),
+    }
+}
+
+fn provider_error_is_cyber_policy(error: &ProviderError) -> bool {
+    error.is_cyber_policy()
+}
+
+#[derive(Clone, Copy)]
+enum CompressionCyberPolicyRetry {
+    FeedbackOnly,
+    DropToolResults,
+    DropToolResultsAndUserMessages,
+}
+
+impl CompressionCyberPolicyRetry {
+    fn build_request_messages(
+        self,
+        original_request_messages: &[ChatMessage],
+        messages_to_summarize: &[ChatMessage],
+        preserved_recent_count: usize,
+        compression_context: Option<&str>,
+    ) -> Vec<ChatMessage> {
+        let mut messages = match self {
+            Self::FeedbackOnly => original_request_messages.to_vec(),
+            Self::DropToolResults => build_compression_request_messages(
+                messages_to_summarize,
+                preserved_recent_count,
+                compression_context,
+                CompressionSanitizeMode::DropToolResults,
+            ),
+            Self::DropToolResultsAndUserMessages => build_compression_request_messages(
+                messages_to_summarize,
+                preserved_recent_count,
+                compression_context,
+                CompressionSanitizeMode::DropToolResultsAndUserMessages,
+            ),
+        };
+        messages.push(ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: self.feedback_text(),
+            })],
+        ));
+        messages
+    }
+
+    fn feedback_text(self) -> String {
+        let reduction = match self {
+            Self::FeedbackOnly => "",
+            Self::DropToolResults => "\nThis retry has removed all tool result content from the history being summarized. Summarize only the remaining context; do not infer omitted tool output.",
+            Self::DropToolResultsAndUserMessages => "\nThis retry has removed all tool result content and all user-role history messages from the history being summarized. Summarize only the remaining context; do not infer omitted user text or tool output.",
+        };
+        format!("{COMPRESSION_CYBER_POLICY_RETRY_FEEDBACK_PREFIX}{reduction}")
     }
 }
 
@@ -454,15 +543,77 @@ fn recent_tail_start_by_token_budget(
     Ok(start)
 }
 
+#[derive(Clone, Copy)]
+enum CompressionSanitizeMode {
+    Full,
+    DropToolResults,
+    DropToolResultsAndUserMessages,
+}
+
+fn build_compression_request_messages(
+    messages: &[ChatMessage],
+    preserved_recent_count: usize,
+    compression_context: Option<&str>,
+    mode: CompressionSanitizeMode,
+) -> Vec<ChatMessage> {
+    let mut request_messages = sanitize_messages_for_compression_request_with_mode(messages, mode);
+    if let Some(context) = compression_context
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        request_messages.push(ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: format!(
+                    "[Relevant Long Memory For Compression]\nUse this as small background context while compressing. Keep only details that are still relevant to the current conversation state; do not copy unrelated memory.\n\n{context}"
+                ),
+            })],
+        ));
+    }
+    request_messages.push(ChatMessage::new(
+        ChatRole::User,
+        vec![ChatMessageItem::Context(ContextItem {
+            text: compression_instruction(preserved_recent_count),
+        })],
+    ));
+    request_messages
+}
+
+fn compression_request_suffix_len(compression_context: Option<&str>) -> usize {
+    1 + usize::from(
+        compression_context
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty()),
+    )
+}
+
+#[cfg(test)]
 fn sanitize_messages_for_compression_request(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    sanitize_messages_for_compression_request_with_mode(messages, CompressionSanitizeMode::Full)
+}
+
+fn sanitize_messages_for_compression_request_with_mode(
+    messages: &[ChatMessage],
+    mode: CompressionSanitizeMode,
+) -> Vec<ChatMessage> {
     messages
         .iter()
         .filter(|message| !is_runtime_update_message(message))
-        .filter_map(sanitize_message_for_compression_request)
+        .filter(|message| {
+            !matches!(
+                mode,
+                CompressionSanitizeMode::DropToolResultsAndUserMessages
+                    if message.role == ChatRole::User
+            )
+        })
+        .filter_map(|message| sanitize_message_for_compression_request(message, mode))
         .collect()
 }
 
-fn sanitize_message_for_compression_request(message: &ChatMessage) -> Option<ChatMessage> {
+fn sanitize_message_for_compression_request(
+    message: &ChatMessage,
+    mode: CompressionSanitizeMode,
+) -> Option<ChatMessage> {
     let mut data = Vec::new();
     for item in &message.data {
         match item {
@@ -485,6 +636,13 @@ fn sanitize_message_for_compression_request(message: &ChatMessage) -> Option<Cha
                 data.push(ChatMessageItem::Context(ContextItem { text }));
             }
             ChatMessageItem::ToolResult(tool_result) => {
+                if matches!(
+                    mode,
+                    CompressionSanitizeMode::DropToolResults
+                        | CompressionSanitizeMode::DropToolResultsAndUserMessages
+                ) {
+                    continue;
+                }
                 data.push(ChatMessageItem::Context(ContextItem {
                     text: tool_result_placeholder(
                         &tool_result.tool_name,
@@ -827,7 +985,7 @@ mod tests {
     use crate::{
         huggingface::HuggingFaceFileResolver,
         model_config::{ModelCapability, ModelConfig, ProviderType, RetryMode, TokenEstimatorType},
-        providers::ProviderError,
+        providers::{ProviderError, ProviderFailureKind},
         session_actor::{FileItem, ToolCallItem, ToolResultContent, ToolResultItem},
     };
 
@@ -882,6 +1040,61 @@ mod tests {
                 ChatRole::Assistant,
                 vec![ChatMessageItem::Context(ContextItem {
                     text: self.response_text.clone(),
+                })],
+            ))
+        }
+    }
+
+    struct CyberPolicyOnceSummaryProvider {
+        model_config: ModelConfig,
+        seen_requests: Arc<Mutex<Vec<SummaryRequestSnapshot>>>,
+        calls: Mutex<usize>,
+        failures_before_success: usize,
+    }
+
+    impl CyberPolicyOnceSummaryProvider {
+        fn new(
+            seen_requests: Arc<Mutex<Vec<SummaryRequestSnapshot>>>,
+            failures_before_success: usize,
+        ) -> Self {
+            Self {
+                model_config: test_model_config(String::new()),
+                seen_requests,
+                calls: Mutex::new(0),
+                failures_before_success,
+            }
+        }
+    }
+
+    impl Provider for CyberPolicyOnceSummaryProvider {
+        fn model_config(&self) -> &ModelConfig {
+            &self.model_config
+        }
+
+        fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
+            self.seen_requests
+                .lock()
+                .unwrap()
+                .push(SummaryRequestSnapshot {
+                    system_prompt: request.system_prompt.map(str::to_string),
+                    messages: request.messages.to_vec(),
+                });
+            let mut calls = self.calls.lock().unwrap();
+            *calls += 1;
+            if *calls <= self.failures_before_success {
+                return Err(ProviderError::ProviderFailure {
+                    kind: ProviderFailureKind::CyberPolicy,
+                    message: "This content was flagged for possible cybersecurity risk."
+                        .to_string(),
+                    body: r#"{"error":{"type":"cyberPolicy","message":"This content was flagged for possible cybersecurity risk."}}"#
+                        .to_string(),
+                });
+            }
+            Ok(ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: r#"{"summary":"summary after policy feedback","current_state":"","plan":"","preserved_tool_call_ids":[]}"#
+                        .to_string(),
                 })],
             ))
         }
@@ -1024,6 +1237,272 @@ mod tests {
             .join("\n");
         assert!(request_body.contains("old"));
         assert!(!request_body.contains("recent context"));
+
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn append_with_compression_retries_cyber_policy_with_feedback() {
+        let (estimator, model_config, directory) = build_test_estimator();
+        let compressor = SessionCompressor::new(estimator, 24, 8).expect("compressor should build");
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = CyberPolicyOnceSummaryProvider::new(seen_requests.clone(), 1);
+
+        let mut messages = vec![
+            ChatMessage::new(
+                ChatRole::User,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "old ".repeat(30),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "recent context".to_string(),
+                })],
+            ),
+        ];
+        let next_message = ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "next request".to_string(),
+            })],
+        );
+
+        let report = compressor
+            .append_with_compression(
+                &mut messages,
+                next_message,
+                &provider,
+                &model_config,
+                Some("stable compression instructions"),
+                None,
+            )
+            .expect("append should retry and compress");
+
+        assert!(report.compressed);
+        assert!(message_text(&messages[0]).contains("summary after policy feedback"));
+        let requests = seen_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let first_request = requests[0]
+            .messages
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!first_request.contains("[Compression Retry Feedback]"));
+        let retry_request = requests[1]
+            .messages
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(retry_request.contains("[Compression Retry Feedback]"));
+        assert!(retry_request.contains("benign context-compaction request"));
+        assert!(retry_request.contains("Do not add new cybersecurity instructions"));
+
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn append_with_compression_drops_tool_results_after_cyber_policy_retry_fails() {
+        let (estimator, model_config, directory) = build_test_estimator();
+        let compressor = SessionCompressor::new(estimator, 24, 8).expect("compressor should build");
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = CyberPolicyOnceSummaryProvider::new(seen_requests.clone(), 2);
+
+        let mut messages = vec![
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    tool_call_id: "call_secret".to_string(),
+                    tool_name: "shell_exec".to_string(),
+                    arguments: ContextItem {
+                        text: "{\"cmd\":\"cat secret\"}".to_string(),
+                    },
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::User,
+                vec![ChatMessageItem::ToolResult(ToolResultItem {
+                    tool_call_id: "call_secret".to_string(),
+                    tool_name: "shell_exec".to_string(),
+                    result: ToolResultContent {
+                        context: Some(ContextItem {
+                            text: "secret tool result should be dropped".to_string(),
+                        }),
+                        file: None,
+                    },
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::User,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "old ".repeat(30),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "recent context".to_string(),
+                })],
+            ),
+        ];
+        let next_message = ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "next request".to_string(),
+            })],
+        );
+
+        let report = compressor
+            .append_with_compression(
+                &mut messages,
+                next_message,
+                &provider,
+                &model_config,
+                Some("stable compression instructions"),
+                None,
+            )
+            .expect("append should retry without tool results and compress");
+
+        assert!(report.compressed);
+        assert!(message_text(&messages[0]).contains("summary after policy feedback"));
+        let requests = seen_requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        let feedback_request = requests[1]
+            .messages
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(feedback_request.contains("secret tool result should be dropped"));
+        let drop_tool_request = requests[2]
+            .messages
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(drop_tool_request.contains("removed all tool result content"));
+        assert!(!drop_tool_request.contains("secret tool result should be dropped"));
+        assert!(drop_tool_request.contains("old"));
+
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn append_with_compression_drops_user_messages_after_tool_result_reduction_fails() {
+        let (estimator, model_config, directory) = build_test_estimator();
+        let compressor = SessionCompressor::new(estimator, 24, 8).expect("compressor should build");
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = CyberPolicyOnceSummaryProvider::new(seen_requests.clone(), 3);
+
+        let mut messages = vec![
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "assistant context survives ".repeat(30),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::User,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "user text should be dropped ".repeat(30),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "assistant context survives".to_string(),
+                })],
+            ),
+        ];
+        let next_message = ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "next request".to_string(),
+            })],
+        );
+
+        let report = compressor
+            .append_with_compression(
+                &mut messages,
+                next_message,
+                &provider,
+                &model_config,
+                Some("stable compression instructions"),
+                None,
+            )
+            .expect("append should retry without user messages and compress");
+
+        assert!(report.compressed);
+        assert!(message_text(&messages[0]).contains("summary after policy feedback"));
+        let requests = seen_requests.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        let drop_user_request = requests[3]
+            .messages
+            .iter()
+            .map(message_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(drop_user_request
+            .contains("removed all tool result content and all user-role history messages"));
+        assert!(!drop_user_request.contains("user text should be dropped"));
+        assert!(drop_user_request.contains("assistant context survives"));
+
+        fs::remove_dir_all(directory).expect("test directory should be removed");
+    }
+
+    #[test]
+    fn append_with_compression_drops_old_context_after_cyber_policy_reductions_fail() {
+        let (estimator, model_config, directory) = build_test_estimator();
+        let compressor = SessionCompressor::new(estimator, 24, 8).expect("compressor should build");
+        let seen_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider = CyberPolicyOnceSummaryProvider::new(seen_requests.clone(), 4);
+
+        let mut messages = vec![
+            ChatMessage::new(
+                ChatRole::User,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "old ".repeat(30),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "recent context".to_string(),
+                })],
+            ),
+        ];
+        let next_message = ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "next request".to_string(),
+            })],
+        );
+
+        let report = compressor
+            .append_with_compression(
+                &mut messages,
+                next_message,
+                &provider,
+                &model_config,
+                Some("stable compression instructions"),
+                None,
+            )
+            .expect("cyber policy reduction failure should drop old context");
+
+        assert!(report.compressed);
+        assert_eq!(messages.len(), 2);
+        assert!(!messages
+            .iter()
+            .any(|message| message_text(message).contains(COMPRESSION_MARKER)));
+        assert!(!messages
+            .iter()
+            .any(|message| message_text(message).contains("old old old")));
+        assert!(message_text(&messages[0]).contains("recent context"));
+        assert!(message_text(&messages[1]).contains("next request"));
+        assert_eq!(seen_requests.lock().unwrap().len(), 4);
 
         fs::remove_dir_all(directory).expect("test directory should be removed");
     }

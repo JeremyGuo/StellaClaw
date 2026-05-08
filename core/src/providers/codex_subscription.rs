@@ -27,7 +27,7 @@ use crate::{
 use super::{
     common::{
         account_id_from_access_token, ensure_request_payload_size, is_image_file, nonce,
-        provider_error_message, token_usage_from_value,
+        provider_error_kind, provider_error_message, token_usage_from_value,
     },
     OutputPersistor, ProviderBackend, ProviderError, ProviderRequest,
 };
@@ -429,11 +429,26 @@ fn send_response_create(
                         })?;
                         merge_streamed_response_output(&mut response, accumulator);
                         if let Some(error) = provider_error_message(&response) {
+                            if let Some(kind) = provider_error_kind(&response) {
+                                return Err(ProviderError::ProviderFailure {
+                                    kind,
+                                    message: error,
+                                    body: response.to_string(),
+                                });
+                            }
                             return Err(ProviderError::InvalidResponse(error));
                         }
                         return Ok(response);
                     }
                     Some("response.failed") | Some("error") => {
+                        if let Some(kind) = provider_error_kind(&value) {
+                            return Err(ProviderError::ProviderFailure {
+                                kind,
+                                message: provider_error_message(&value)
+                                    .unwrap_or_else(|| "provider returned an error".to_string()),
+                                body: value.to_string(),
+                            });
+                        }
                         if let Some(status) = value
                             .get("status")
                             .or_else(|| value.get("status_code"))
@@ -1221,6 +1236,13 @@ fn responses_value_to_chat_message(
     output_persistor: &OutputPersistor,
 ) -> Result<ChatMessage, ProviderError> {
     if let Some(error) = provider_error_message(value) {
+        if let Some(kind) = provider_error_kind(value) {
+            return Err(ProviderError::ProviderFailure {
+                kind,
+                message: error,
+                body: value.to_string(),
+            });
+        }
         return Err(ProviderError::InvalidResponse(error));
     }
 

@@ -31,7 +31,7 @@ use super::{
     SessionCompressor, SessionErrorDetail, SessionEvent, SessionInitial, SessionMailbox,
     SessionMailboxKind, SessionRequest, TaskPlanItemStatus, TaskPlanView, TokenEstimator,
     ToolBatch, ToolBatchCompletion, ToolBatchExecutor, ToolBatchOperation, ToolCatalog,
-    ToolExecutionOp,
+    ToolExecutionOp, ToolResultContent,
 };
 
 const DEFAULT_MAX_MODEL_STEPS_PER_TURN: usize = 200;
@@ -84,9 +84,15 @@ struct ActiveToolBatch {
     turn_number: u64,
     step_index: usize,
     handle: super::ToolBatchHandle,
+    operations: Vec<ToolBatchOperation>,
     operation_summary: String,
     started_at_ms: u128,
     interrupt: Option<ToolBatchInterrupt>,
+}
+
+struct BuiltToolBatch {
+    batch: ToolBatch,
+    immediate_results: Vec<super::ToolResultItem>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -963,6 +969,7 @@ impl SessionActor {
                     "model_name": &self.model_config.model_name,
                 }),
             );
+            self.repair_unclosed_tool_calls_before_provider_request(turn_id, step_index)?;
             let system_prompt = self
                 .system_prompt_for_current_initial()
                 .ok_or(SessionActorError::MissingInitial)?;
@@ -1083,7 +1090,30 @@ impl SessionActor {
                 return Ok(());
             }
 
-            let batch = self.build_tool_batch(turn_id, tool_calls)?;
+            let built_batch = self.build_tool_batch(turn_id, tool_calls)?;
+            if !built_batch.immediate_results.is_empty() {
+                let mut immediate_message = ChatMessage::new(
+                    ChatRole::Assistant,
+                    built_batch
+                        .immediate_results
+                        .into_iter()
+                        .map(ChatMessageItem::ToolResult)
+                        .collect(),
+                );
+                stamp_assistant_message_time(&mut immediate_message);
+                self.mark_loaded_skills_from_message(&immediate_message, turn_number)?;
+                let tool_message_index =
+                    self.append_history_message("tool_result", immediate_message.clone())?;
+                self.emit(SessionEvent::MessageAppended {
+                    index: tool_message_index,
+                    message: immediate_message,
+                })?;
+            }
+
+            let batch = built_batch.batch;
+            if batch.is_empty() {
+                continue;
+            }
             let batch_progress = batch.progress_summary();
             self.log_info(
                 "tool_batch_started",
@@ -1099,15 +1129,33 @@ impl SessionActor {
                 plan: self.current_plan.clone(),
             })?;
 
-            let handle = self
+            let operations = batch.operations.clone();
+            let handle = match self
                 .tool_executor
                 .start(batch, self.tool_completion_tx.clone())
-                .map_err(|error| SessionActorError::Tool(error.to_string()))?;
+            {
+                Ok(handle) => handle,
+                Err(error) => {
+                    let mut tool_message = tool_error_message_for_operations(
+                        &operations,
+                        format!("tool batch failed to start: {error}"),
+                    );
+                    stamp_assistant_message_time(&mut tool_message);
+                    let tool_message_index =
+                        self.append_history_message("tool_result", tool_message.clone())?;
+                    self.emit(SessionEvent::MessageAppended {
+                        index: tool_message_index,
+                        message: tool_message,
+                    })?;
+                    continue;
+                }
+            };
             self.active_tool_batch = Some(ActiveToolBatch {
                 turn_id: turn_id.to_string(),
                 turn_number,
                 step_index,
                 handle,
+                operations,
                 operation_summary: batch_progress,
                 started_at_ms: current_time_millis(),
                 interrupt: None,
@@ -1124,14 +1172,15 @@ impl SessionActor {
         &mut self,
         turn_id: &str,
         tool_calls: Vec<super::ToolCallItem>,
-    ) -> Result<ToolBatch, SessionActorError> {
+    ) -> Result<BuiltToolBatch, SessionActorError> {
         let batch_id = self.allocate_batch_id(turn_id);
         let mut operations = Vec::with_capacity(tool_calls.len());
+        let mut immediate_results = Vec::new();
         let provider_enabled_tool_names = self.provider_enabled_tool_names();
 
         for tool_call in tool_calls {
             if tool_call.tool_name == "update_plan" {
-                self.handle_update_plan_tool_call(&tool_call.arguments.text)?;
+                immediate_results.push(self.handle_update_plan_tool_call(tool_call)?);
                 continue;
             }
             if !provider_enabled_tool_names.contains(&tool_call.tool_name) {
@@ -1175,7 +1224,54 @@ impl SessionActor {
             operations.push(scheduled);
         }
 
-        Ok(ToolBatch::new_scheduled(batch_id, operations))
+        Ok(BuiltToolBatch {
+            batch: ToolBatch::new_scheduled(batch_id, operations),
+            immediate_results,
+        })
+    }
+
+    fn repair_unclosed_tool_calls_before_provider_request(
+        &mut self,
+        turn_id: &str,
+        step_index: usize,
+    ) -> Result<(), SessionActorError> {
+        let unclosed_tool_calls = collect_unclosed_tool_calls(&self.history);
+        if unclosed_tool_calls.is_empty() {
+            return Ok(());
+        }
+
+        let reason = "previous tool call did not receive a tool result before the session continued; closing it locally so the provider can accept the next request";
+        self.log_warn(
+            "unclosed_tool_calls_repaired",
+            serde_json::json!({
+                "turn_id": turn_id,
+                "step_index": step_index,
+                "tool_call_count": unclosed_tool_calls.len(),
+                "tool_calls": unclosed_tool_calls
+                    .iter()
+                    .map(|tool_call| serde_json::json!({
+                        "tool_call_id": tool_call.tool_call_id,
+                        "tool_name": tool_call.tool_name,
+                    }))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+        let mut tool_message = ChatMessage::new(
+            ChatRole::Assistant,
+            unclosed_tool_calls
+                .iter()
+                .map(|tool_call| {
+                    ChatMessageItem::ToolResult(tool_error_result_for_tool_call(tool_call, reason))
+                })
+                .collect(),
+        );
+        stamp_assistant_message_time(&mut tool_message);
+        let tool_message_index =
+            self.append_history_message("tool_result_repair", tool_message.clone())?;
+        self.emit(SessionEvent::MessageAppended {
+            index: tool_message_index,
+            message: tool_message,
+        })
     }
 
     fn build_web_search_operation(
@@ -1194,11 +1290,31 @@ impl SessionActor {
         })
     }
 
-    fn handle_update_plan_tool_call(&mut self, arguments: &str) -> Result<(), SessionActorError> {
-        let payload = parse_tool_arguments(arguments);
-        let plan = parse_task_plan_view(payload).map_err(SessionActorError::Tool)?;
-        self.current_plan = Some(plan.clone());
-        self.emit(SessionEvent::PlanUpdated { plan: Some(plan) })
+    fn handle_update_plan_tool_call(
+        &mut self,
+        tool_call: super::ToolCallItem,
+    ) -> Result<super::ToolResultItem, SessionActorError> {
+        let payload = parse_tool_arguments(&tool_call.arguments.text);
+        let result = match parse_task_plan_view(payload) {
+            Ok(plan) => {
+                self.current_plan = Some(plan.clone());
+                self.emit(SessionEvent::PlanUpdated { plan: Some(plan) })?;
+                serde_json::json!({"updated": true}).to_string()
+            }
+            Err(error) => serde_json::json!({
+                "updated": false,
+                "error": error,
+            })
+            .to_string(),
+        };
+        Ok(super::ToolResultItem {
+            tool_call_id: tool_call.tool_call_id,
+            tool_name: tool_call.tool_name,
+            result: ToolResultContent {
+                context: Some(ContextItem { text: result }),
+                file: None,
+            },
+        })
     }
 
     fn clear_current_plan(&mut self) -> Result<(), SessionActorError> {
@@ -1268,9 +1384,24 @@ impl SessionActor {
         self.tool_executor
             .finish(&active.handle.batch_id)
             .map_err(|error| SessionActorError::Tool(error.to_string()))?;
-        let mut tool_message = completion
-            .result
-            .map_err(|error| SessionActorError::Tool(error.to_string()))?;
+        let mut tool_message = match completion.result {
+            Ok(message) => message,
+            Err(error) => {
+                self.log_warn(
+                    "tool_batch_completion_failed",
+                    serde_json::json!({
+                        "turn_id": &active.turn_id,
+                        "batch_id": &active.handle.batch_id,
+                        "error": error,
+                        "synthetic_tool_results": active.operations.len(),
+                    }),
+                );
+                tool_error_message_for_operations(
+                    &active.operations,
+                    format!("tool batch failed before returning results: {error}"),
+                )
+            }
+        };
         stamp_assistant_message_time(&mut tool_message);
         self.log_info(
             "tool_batch_completed",
@@ -2113,8 +2244,67 @@ fn provider_failure_kind_label(kind: ProviderFailureKind) -> &'static str {
         ProviderFailureKind::RateLimited => "rate_limited",
         ProviderFailureKind::Authentication => "authentication",
         ProviderFailureKind::Permission => "permission",
+        ProviderFailureKind::CyberPolicy => "cyber_policy",
         ProviderFailureKind::ProviderUnavailable => "provider_unavailable",
         ProviderFailureKind::Unknown => "unknown",
+    }
+}
+
+fn tool_error_message_for_operations(
+    operations: &[ToolBatchOperation],
+    error: String,
+) -> ChatMessage {
+    ChatMessage::new(
+        ChatRole::Assistant,
+        operations
+            .iter()
+            .map(|operation| {
+                ChatMessageItem::ToolResult(tool_error_result_for_operation(operation, &error))
+            })
+            .collect(),
+    )
+}
+
+fn tool_error_result_for_operation(
+    operation: &ToolBatchOperation,
+    error: &str,
+) -> super::ToolResultItem {
+    let (tool_call_id, tool_name) = match &operation.operation {
+        ToolExecutionOp::LocalTool(tool_call)
+        | ToolExecutionOp::UnsupportedTool { tool_call, .. }
+        | ToolExecutionOp::SkillLoad { tool_call, .. }
+        | ToolExecutionOp::ProviderBacked { tool_call, .. }
+        | ToolExecutionOp::WebSearch { tool_call, .. } => {
+            (tool_call.tool_call_id.clone(), tool_call.tool_name.clone())
+        }
+        ToolExecutionOp::ConversationBridge(request) => {
+            (request.tool_call_id.clone(), request.tool_name.clone())
+        }
+    };
+    super::ToolResultItem {
+        tool_call_id,
+        tool_name,
+        result: tool_error_content(error),
+    }
+}
+
+fn tool_error_result_for_tool_call(
+    tool_call: &super::ToolCallItem,
+    error: &str,
+) -> super::ToolResultItem {
+    super::ToolResultItem {
+        tool_call_id: tool_call.tool_call_id.clone(),
+        tool_name: tool_call.tool_name.clone(),
+        result: tool_error_content(error),
+    }
+}
+
+fn tool_error_content(error: &str) -> ToolResultContent {
+    ToolResultContent {
+        context: Some(ContextItem {
+            text: serde_json::json!({ "error": error }).to_string(),
+        }),
+        file: None,
     }
 }
 
@@ -2246,12 +2436,20 @@ fn loaded_skill_names_from_message(message: &ChatMessage) -> Vec<String> {
 }
 
 fn count_unclosed_tool_calls(messages: &[ChatMessage]) -> usize {
-    let mut open = std::collections::BTreeSet::new();
+    collect_unclosed_tool_calls(messages).len()
+}
+
+fn collect_unclosed_tool_calls(messages: &[ChatMessage]) -> Vec<super::ToolCallItem> {
+    let mut open = std::collections::BTreeMap::new();
+    let mut order = Vec::new();
     for message in messages {
         for item in &message.data {
             match item {
                 ChatMessageItem::ToolCall(tool_call) => {
-                    open.insert(tool_call.tool_call_id.clone());
+                    if !open.contains_key(&tool_call.tool_call_id) {
+                        order.push(tool_call.tool_call_id.clone());
+                    }
+                    open.insert(tool_call.tool_call_id.clone(), tool_call.clone());
                 }
                 ChatMessageItem::ToolResult(tool_result) => {
                     open.remove(&tool_result.tool_call_id);
@@ -2260,7 +2458,10 @@ fn count_unclosed_tool_calls(messages: &[ChatMessage]) -> usize {
             }
         }
     }
-    open.len()
+    order
+        .into_iter()
+        .filter_map(|tool_call_id| open.remove(&tool_call_id))
+        .collect()
 }
 
 fn build_compression_memory_query(
@@ -3060,6 +3261,31 @@ mod tests {
             if let Some(interrupt_tx) = self.interrupt_tx.lock().unwrap().take() {
                 let _ = interrupt_tx.send(());
             }
+            Ok(())
+        }
+
+        fn finish(&self, _batch_id: &str) -> Result<(), ToolBatchError> {
+            Ok(())
+        }
+    }
+
+    struct FailingCompletionToolExecutor;
+
+    impl ToolBatchExecutor for FailingCompletionToolExecutor {
+        fn start(
+            &self,
+            batch: ToolBatch,
+            completion_tx: Sender<ToolBatchCompletion>,
+        ) -> Result<ToolBatchHandle, ToolBatchError> {
+            let handle = ToolBatchHandle::new(batch.batch_id);
+            let _ = completion_tx.send(ToolBatchCompletion {
+                batch_id: handle.batch_id.clone(),
+                result: Err("simulated tool batch failure".to_string()),
+            });
+            Ok(handle)
+        }
+
+        fn interrupt(&self, _handle: &ToolBatchHandle) -> Result<(), ToolBatchError> {
             Ok(())
         }
 
@@ -4498,6 +4724,173 @@ mod tests {
     }
 
     #[test]
+    fn failed_tool_batch_closes_tool_calls_before_continuing_model_loop() {
+        let _cwd = temp_cwd("actor-tool-batch-failure-closes-calls");
+        let session_id = test_session_id("session_tool_batch_failure_closes_calls");
+        let (inbox, mailbox) = test_inbox();
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial {
+                initial: SessionInitial::new(session_id, super::super::SessionType::Foreground),
+            },
+        );
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "run a tool that fails".to_string(),
+                    })],
+                ),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "user_tell".to_string(),
+                    arguments: ContextItem {
+                        text: r#"{"text":"working"}"#.to_string(),
+                    },
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "recovered after tool failure".to_string(),
+                })],
+            ),
+        ]));
+        let tools = Arc::new(FailingCompletionToolExecutor);
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions {
+            host_tool_scope: Some(HostToolScope::MainForeground),
+            ..BuiltinToolCatalogOptions::default()
+        })
+        .unwrap();
+        let mut actor = SessionActor::new(
+            test_model_config(),
+            provider,
+            tools,
+            inbox,
+            events.clone(),
+            catalog,
+        );
+
+        actor.run_until_idle(10).expect("actor should recover");
+
+        assert_eq!(count_unclosed_tool_calls(actor.history()), 0);
+        let has_failure_result = actor.history().iter().any(|message| {
+            message.data.iter().any(|item| {
+                matches!(
+                    item,
+                    ChatMessageItem::ToolResult(result)
+                        if result.tool_call_id == "call_1"
+                            && result.result.context.as_ref().is_some_and(|context| {
+                                context.text.contains("simulated tool batch failure")
+                            })
+                )
+            })
+        });
+        assert!(has_failure_result);
+        let completed = events
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::TurnCompleted { message } => Some(message_text_for_test(message)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completed, vec!["recovered after tool failure".to_string()]);
+    }
+
+    #[test]
+    fn repairs_preexisting_unclosed_tool_call_before_provider_request() {
+        let _cwd = temp_cwd("actor-repairs-unclosed-tool-call");
+        let (inbox, mailbox) = test_inbox();
+        let session_id = test_session_id("session_repair_unclosed_tool_call");
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial {
+                initial: SessionInitial::new(session_id, super::super::SessionType::Foreground),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(ScriptedProvider::new(vec![ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "continued after repair".to_string(),
+            })],
+        )]));
+        let tools = Arc::new(EchoToolExecutor::new());
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions {
+            host_tool_scope: Some(HostToolScope::MainForeground),
+            ..BuiltinToolCatalogOptions::default()
+        })
+        .unwrap();
+        let mut actor = SessionActor::new(
+            test_model_config(),
+            provider.clone(),
+            tools,
+            inbox,
+            events.clone(),
+            catalog,
+        );
+
+        assert_eq!(
+            actor.step().expect("initial should process"),
+            SessionActorStep::ProcessedControl
+        );
+        actor.history.push(ChatMessage::new(
+            ChatRole::User,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "continue".to_string(),
+            })],
+        ));
+        actor.history.push(ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::ToolCall(ToolCallItem {
+                tool_call_id: "call_orphan".to_string(),
+                tool_name: "user_tell".to_string(),
+                arguments: ContextItem {
+                    text: r#"{"text":"orphaned"}"#.to_string(),
+                },
+            })],
+        ));
+
+        actor
+            .run_model_tool_loop("turn_repair", 1, 0)
+            .expect("unclosed tool call should be repaired");
+
+        assert_eq!(count_unclosed_tool_calls(actor.history()), 0);
+        let repaired = actor.history().iter().any(|message| {
+            message.data.iter().any(|item| {
+                matches!(
+                    item,
+                    ChatMessageItem::ToolResult(result)
+                        if result.tool_call_id == "call_orphan"
+                            && result.result.context.as_ref().is_some_and(|context| {
+                                context.text.contains("did not receive a tool result")
+                            })
+                )
+            })
+        });
+        assert!(repaired);
+        let message_counts = provider
+            .seen_requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|request| request.message_count)
+            .collect::<Vec<_>>();
+        assert_eq!(message_counts, vec![3]);
+    }
+
+    #[test]
     fn update_plan_is_session_actor_state_and_clears_on_turn_completion() {
         let _cwd = temp_cwd("actor-update-plan-state");
         let session_id = test_session_id("session_update_plan_state");
@@ -4558,8 +4951,10 @@ mod tests {
             SessionActorStep::ProcessedControl
         );
         assert_eq!(
-            actor.step().expect("plan tool batch should start"),
-            SessionActorStep::WaitingToolBatch
+            actor
+                .step()
+                .expect("plan tool call should close and finish"),
+            SessionActorStep::ProcessedData
         );
         assert!(events.events.lock().unwrap().iter().any(|event| matches!(
             event,
@@ -4568,18 +4963,17 @@ mod tests {
                     && plan.plan[0].step == "Inspect state"
                     && matches!(plan.plan[0].status, TaskPlanItemStatus::InProgress)
         )));
-        assert!(events.events.lock().unwrap().iter().any(|event| matches!(
-            event,
-            SessionEvent::Progress {
-                plan: Some(plan), ..
-            } if plan.plan.len() == 2
-        )));
-
-        for _ in 0..10 {
-            if actor.step().expect("actor should advance") == SessionActorStep::Idle {
-                break;
-            }
-        }
+        assert_eq!(count_unclosed_tool_calls(actor.history()), 0);
+        assert!(actor.history().iter().any(|message| {
+            message.data.iter().any(|item| {
+                matches!(
+                    item,
+                    ChatMessageItem::ToolResult(result)
+                        if result.tool_call_id == "call_plan"
+                            && result.tool_name == "update_plan"
+                )
+            })
+        }));
         assert!(events
             .events
             .lock()

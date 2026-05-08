@@ -291,6 +291,7 @@ pub enum ProviderFailureKind {
     RateLimited,
     Authentication,
     Permission,
+    CyberPolicy,
     ProviderUnavailable,
     Unknown,
 }
@@ -302,6 +303,7 @@ impl std::fmt::Display for ProviderFailureKind {
             Self::RateLimited => "rate_limited",
             Self::Authentication => "authentication",
             Self::Permission => "permission",
+            Self::CyberPolicy => "cyber_policy",
             Self::ProviderUnavailable => "provider_unavailable",
             Self::Unknown => "unknown",
         };
@@ -354,6 +356,27 @@ impl ProviderError {
             | Self::EmptyChoices => false,
         }
     }
+
+    pub fn is_cyber_policy(&self) -> bool {
+        match self {
+            Self::ProviderFailure {
+                kind: ProviderFailureKind::CyberPolicy,
+                ..
+            } => true,
+            Self::HttpStatus { body, .. }
+            | Self::Request(body)
+            | Self::InvalidResponse(body)
+            | Self::WebSocket(body)
+            | Self::Subprocess(body) => cyber_policy_text(body),
+            Self::MissingApiKeyEnv(_)
+            | Self::BuildHttpClient(_)
+            | Self::DecodeResponse(_)
+            | Self::DecodeJson(_)
+            | Self::PersistOutput(_)
+            | Self::ProviderFailure { .. }
+            | Self::EmptyChoices => false,
+        }
+    }
 }
 
 pub(crate) fn error_chain_message(error: &dyn StdError) -> String {
@@ -388,4 +411,15 @@ pub(crate) fn request_too_large_text(message: &str) -> bool {
         || message.contains("code:413")
         || message.contains("code: 413")
         || message.contains("status 413")
+}
+
+pub(crate) fn cyber_policy_text(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("cyberpolicy")
+        || message.contains("cyber_policy")
+        || message.contains("cyber policy")
+        || message.contains("possible cybersecurity risk")
+        || message.contains("cybersecurity risk")
+        || message.contains("trusted access for cyber")
+        || message.contains("chatgpt.com/cyber")
 }

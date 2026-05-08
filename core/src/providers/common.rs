@@ -71,6 +71,9 @@ pub(crate) fn provider_error_kind(value: &Value) -> Option<ProviderFailureKind> 
     .join(" ")
     .to_ascii_lowercase();
 
+    if super::cyber_policy_text(&text) {
+        return Some(ProviderFailureKind::CyberPolicy);
+    }
     if super::request_too_large_text(&text) || numeric_error_code(error) == Some(413) {
         return Some(ProviderFailureKind::RequestTooLarge);
     }
@@ -374,5 +377,20 @@ mod tests {
 
         assert!(error.is_request_too_large());
         assert!(error.to_string().contains("maxRequestSize"));
+    }
+
+    #[test]
+    fn provider_error_kind_detects_cyber_policy_blocks() {
+        let value = serde_json::json!({
+            "error": {
+                "type": "cyberPolicy",
+                "message": "This content was flagged for possible cybersecurity risk. Visit https://chatgpt.com/cyber"
+            }
+        });
+
+        assert_eq!(
+            provider_error_kind(&value),
+            Some(ProviderFailureKind::CyberPolicy)
+        );
     }
 }

@@ -3,6 +3,12 @@ version: 1.26.0
 
 # 1.26.0
 
+- 修复工具调用历史可能缺失 ToolResult 的问题：
+  `update_plan` 被 SessionActor 接管后仍会为原始 tool call 写入即时 ToolResult，恢复前端“工具结果”展示并保持 provider tool protocol 闭合；工具 batch 启动失败或 completion 返回错误时，也会为 batch 中每个未完成操作生成结构化 error ToolResult，再继续后续模型循环。对于已经写入历史的旧半开 tool call，SessionActor 会在下一次 provider request 前自动追加 synthetic error ToolResult 修复协议，避免 Codex subscription 报 `No tool output found for function call`。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Codex cyber policy 错误阻塞上下文压缩的问题：
+  provider error 分类新增 `cyber_policy`，Codex subscription websocket 的 `response.completed` / `response.failed` 错误会优先保留结构化失败类型；上下文压缩遇到 cyber policy 拒绝时，会学习 Codex hooks feedback-to-model 的思路，追加一条压缩重试反馈并自动重试一次，明确这是 benign context-compaction、禁止新增安全操作细节、只保留续写所需状态。如果仍失败，压缩器只针对 `cyber_policy` 继续做两级降噪重试：先移除待压缩历史中的全部 tool result content，再移除全部 user-role 历史消息；三层降噪后仍被拒绝时，不再把原始旧上下文继续追加进 current context，而是丢弃待总结旧区间，仅保留 recent high-fidelity 区域并视为完成压缩。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 修复 StellaCodeX Electron 消息附件卡片不可操作的问题：
   assistant / user 消息中的 Web attachment 现在复用 workspace 文件预览和下载链路，附件卡片按文件实体样式展示，右侧提供“打开”菜单，可直接预览或下载对应文件；图片附件也可点击预览并通过同一菜单下载。本次不改变 `config` schema，不改变 `workdir` schema。
 
