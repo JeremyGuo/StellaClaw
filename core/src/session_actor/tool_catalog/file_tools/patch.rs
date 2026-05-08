@@ -54,7 +54,11 @@ fn apply_unified_patch_local(
     check: bool,
     max_output_chars: usize,
 ) -> Result<Value, LocalToolError> {
-    let patch = string_arg(arguments, "patch")?;
+    let patch = normalize_unified_patch_paths(
+        &string_arg(arguments, "patch")?,
+        Some(workspace_root),
+        "local workspace",
+    )?;
     let strip = usize_arg_with_default(arguments, "strip", 0)?;
     let reverse = bool_arg_with_default(arguments, "reverse", false)?;
 
@@ -102,6 +106,7 @@ fn apply_patch_remote(
             "format=codex is currently supported only for local workspace patches; use format=unified for remote patches".to_string(),
         ));
     }
+    let patch = normalize_unified_patch_paths(&patch, cwd.map(Path::new), "remote cwd")?;
     let strip = usize_arg_with_default(arguments, "strip", 0)?;
     let reverse = bool_arg_with_default(arguments, "reverse", false)?;
     let check = bool_arg_with_default(arguments, "check", false)?;
@@ -131,6 +136,114 @@ fn apply_patch_remote(
     };
     let output = run_remote_command_with_stdin(host, &remote_command, patch.as_bytes())?;
     Ok(patch_result(output, Some(host), max_output_chars))
+}
+
+fn normalize_unified_patch_paths(
+    patch: &str,
+    base: Option<&Path>,
+    base_label: &str,
+) -> Result<String, LocalToolError> {
+    let mut changed = false;
+    let mut output = String::with_capacity(patch.len());
+    for segment in patch.split_inclusive('\n') {
+        let (line, newline) = segment
+            .strip_suffix('\n')
+            .map_or((segment, ""), |line| (line, "\n"));
+        let normalized = if let Some(rest) = line.strip_prefix("--- ") {
+            normalize_unified_file_header("--- ", rest, base, base_label, &mut changed)?
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            normalize_unified_file_header("+++ ", rest, base, base_label, &mut changed)?
+        } else if let Some(rest) = line.strip_prefix("diff --git ") {
+            normalize_diff_git_header(rest, base, base_label, &mut changed)?
+        } else {
+            line.to_string()
+        };
+        output.push_str(&normalized);
+        output.push_str(newline);
+    }
+    if changed {
+        Ok(output)
+    } else {
+        Ok(patch.to_string())
+    }
+}
+
+fn normalize_unified_file_header(
+    prefix: &str,
+    rest: &str,
+    base: Option<&Path>,
+    base_label: &str,
+    changed: &mut bool,
+) -> Result<String, LocalToolError> {
+    let (path, suffix) = split_unified_header_path(rest);
+    let normalized = normalize_unified_path_token(path, base, base_label)?;
+    if normalized != path {
+        *changed = true;
+    }
+    Ok(format!("{prefix}{normalized}{suffix}"))
+}
+
+fn normalize_diff_git_header(
+    rest: &str,
+    base: Option<&Path>,
+    base_label: &str,
+    changed: &mut bool,
+) -> Result<String, LocalToolError> {
+    let mut parts = rest.split_whitespace();
+    let Some(old_path) = parts.next() else {
+        return Ok("diff --git ".to_string());
+    };
+    let Some(new_path) = parts.next() else {
+        return Ok(format!("diff --git {rest}"));
+    };
+    if parts.next().is_some() {
+        return Ok(format!("diff --git {rest}"));
+    }
+    let normalized_old = normalize_unified_path_token(old_path, base, base_label)?;
+    let normalized_new = normalize_unified_path_token(new_path, base, base_label)?;
+    if normalized_old != old_path || normalized_new != new_path {
+        *changed = true;
+    }
+    Ok(format!("diff --git {normalized_old} {normalized_new}"))
+}
+
+fn split_unified_header_path(rest: &str) -> (&str, &str) {
+    if let Some(index) = rest.find('\t') {
+        return rest.split_at(index);
+    }
+    if rest.starts_with('/') {
+        if let Some(index) = rest.find(char::is_whitespace) {
+            return rest.split_at(index);
+        }
+    }
+    (rest, "")
+}
+
+fn normalize_unified_path_token(
+    path: &str,
+    base: Option<&Path>,
+    base_label: &str,
+) -> Result<String, LocalToolError> {
+    if path == "/dev/null" || !Path::new(path).is_absolute() {
+        return Ok(path.to_string());
+    }
+    let Some(base) = base else {
+        return Err(LocalToolError::InvalidArguments(format!(
+            "unified patch path {path:?} is absolute; use a workspace-relative path"
+        )));
+    };
+    let relative = Path::new(path).strip_prefix(base).map_err(|_| {
+        LocalToolError::InvalidArguments(format!(
+            "unified patch path {path:?} is absolute and outside the {base_label} {}; use a relative patch path",
+            base.display()
+        ))
+    })?;
+    if relative.as_os_str().is_empty() {
+        return Err(LocalToolError::InvalidArguments(format!(
+            "unified patch path {path:?} points at the {base_label} root; use a file path"
+        )));
+    }
+    Ok(relative.display().to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -603,4 +716,48 @@ fn patch_result(
         result.insert("stderr_truncated".to_string(), Value::Bool(true));
     }
     Value::Object(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_absolute_unified_paths_under_base() {
+        let patch = "\
+diff --git /home/me/work/src/a.py /home/me/work/src/a.py
+--- /home/me/work/src/a.py\t2026-05-08
++++ /home/me/work/src/a.py\t2026-05-08
+@@ -1 +1 @@
+-old
++new
+";
+
+        let normalized =
+            normalize_unified_patch_paths(patch, Some(Path::new("/home/me/work")), "remote cwd")
+                .expect("patch should normalize");
+
+        assert!(normalized.contains("diff --git src/a.py src/a.py"));
+        assert!(normalized.contains("--- src/a.py\t2026-05-08"));
+        assert!(normalized.contains("+++ src/a.py\t2026-05-08"));
+    }
+
+    #[test]
+    fn rejects_absolute_unified_paths_outside_base() {
+        let patch = "\
+--- /other/work/src/a.py
++++ /other/work/src/a.py
+@@ -1 +1 @@
+-old
++new
+";
+
+        let error =
+            normalize_unified_patch_paths(patch, Some(Path::new("/home/me/work")), "remote cwd")
+                .expect_err("outside path should be rejected");
+
+        assert!(error
+            .to_string()
+            .contains("outside the remote cwd /home/me/work"));
+    }
 }

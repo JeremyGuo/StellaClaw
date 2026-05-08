@@ -3,6 +3,21 @@ version: 1.26.0
 
 # 1.26.0
 
+- 优化 memory 工具 prompt 分层和写入触发：
+  common prompt 不再用容易抑制工具调用的“answer from memory”表述，改为区分模型内部记忆和可验证的长期记忆/仓库检查；`host.memory` protocol 现在把 `memory_write` 作为 turn 结束前的持久状态维护动作，明确用户 facts、conversation facts、项目实现要求、关键文件/模块知识、长任务恢复句柄等都应在可复用时写入。`memory_search` / `memory_write` / `memory_update` / `memory_delete` 的工具 description 收敛为接口契约和参数限制，具体触发场景、scope 选择、禁止写入项和 update/delete 流程集中在 tool protocol，避免重复说明互相稀释。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 清理工具 description 与 Prompt Protocol 重复说明：
+  `user_tell` 和 `update_plan` 的工具 description 只保留直接作用，使用偏好继续放在对应 `host.*` protocol；`grep` 和 `apply_patch` description 保留搜索/补丁格式、路径和参数硬约束，编辑偏好继续放在 `file.*` protocol；`process.shell` protocol 修正旧的 `session_id` / `cmd` 噪声，改为当前 `shell_exec.command`、`shell_write_stdin.process_id` 和 `shell_stop.process_id` 语义。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 优化 update_plan 工具说明：
+  `update_plan` 的工具 description 和 `host.update_plan` prompt protocol 现在明确建议：如果首个计划步骤可以立即开始，应把 `update_plan` 和下一批相互独立的工具调用放在同一个 tool-call batch 中返回，而不是单独消耗一轮只更新计划；SessionActor 会立即应用计划并继续执行剩余工具。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 优化 apply_patch unified diff 绝对路径处理：
+  `apply_patch` 工具 description 和文件编辑协议现在明确 patch 路径必须是 workspace-relative，remote 执行时必须是 remote cwd-relative；unified diff 在执行前会扫描 `---` / `+++` / `diff --git` 文件头，若绝对路径位于当前本地 workspace 或 remote cwd 下，会自动归一化成相对路径再交给 `git apply`，若绝对路径位于工作区外或 remote 没有 cwd，则提前返回明确参数错误，避免模型先触发 `git apply` 的 `invalid path` 再重复尝试一次几乎相同的 patch。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 StellaCodeX Electron split diff 滚动条闪烁的问题：
+  Git diff split 视图不再用 `ResizeObserver` 动态检测横向溢出并切换 `x-overflow` class，避免滚动条出现/消失反复触发布局测量；左右 pane 改为稳定的 CSS overflow 布局，行内容用 `width: max-content` 与 `min-width: 100%` 自然决定是否需要横向滚动，并为 pane 增加稳定 scrollbar gutter。同步纵向滚动时也会跳过小于 1px 的无意义回写，减少程序化 scroll 事件抖动。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 统一工具 provider 可见性过滤：
   `ToolDefinition` 新增 provider visibility 元数据，工具可以在定义处声明不支持的 provider；`user_tell` 现在由自身声明对 Codex subscription 不可见，`ToolCatalog` 构建和 `SessionActor::new` 会按 `ModelConfig` 统一过滤。删除 Codex provider 侧的 `filter_tools_for_provider` 特例后，system prompt 协议注入、provider request tools 和本地执行白名单都依赖同一个已过滤 catalog，避免 provider 与工具目录之间继续耦合。本次不改变 `config` schema，不改变 `workdir` schema。
 

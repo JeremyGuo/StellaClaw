@@ -948,6 +948,29 @@ mod tests {
             "new\n"
         );
 
+        fs::write(workspace.join("absolute_patch.txt"), "before\n").unwrap();
+        let absolute_patch_path = workspace.join("absolute_patch.txt");
+        let absolute_patch = format!(
+            "--- {}\n+++ {}\n@@ -1 +1 @@\n-before\n+after\n",
+            absolute_patch_path.display(),
+            absolute_patch_path.display()
+        );
+        let absolute_patch_batch = ToolBatch::new(
+            "batch_absolute_patch",
+            vec![tool_call(
+                "apply_patch",
+                json!({"patch": absolute_patch, "format": "unified"}),
+            )],
+        );
+
+        let message = start_and_wait(&executor, absolute_patch_batch);
+
+        assert!(result_text(&message, 0).contains("\"applied\": true"));
+        assert_eq!(
+            fs::read_to_string(workspace.join("absolute_patch.txt")).unwrap(),
+            "after\n"
+        );
+
         fs::write(workspace.join("codex_patch.txt"), "alpha\nbeta\ngamma\n").unwrap();
         let codex_patch = r#"*** Begin Patch
 *** Update File: codex_patch.txt

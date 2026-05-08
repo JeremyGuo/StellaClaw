@@ -1577,6 +1577,7 @@ function DiffSplitFile({ file }) {
     if (!leftNode || !rightNode) return undefined;
     const syncScroll = (sourceNode, targetNode) => {
       if (syncingRef.current) return;
+      if (Math.abs(targetNode.scrollTop - sourceNode.scrollTop) < 1) return;
       syncingRef.current = true;
       targetNode.scrollTop = sourceNode.scrollTop;
       window.requestAnimationFrame(() => {
@@ -1607,23 +1608,8 @@ function DiffSplitFile({ file }) {
 }
 
 function DiffSplitPane({ side, hunks, paneRef }) {
-  const [hasHorizontalOverflow, setHasHorizontalOverflow] = useState(false);
-  useEffect(() => {
-    const node = paneRef.current;
-    if (!node) return undefined;
-    const updateOverflow = () => {
-      const overflowingLine = Array.from(node.querySelectorAll('.diff-pane-line code'))
-        .some((code) => code.scrollWidth > code.clientWidth + 1);
-      setHasHorizontalOverflow(overflowingLine);
-    };
-    updateOverflow();
-    const resizeObserver = new ResizeObserver(updateOverflow);
-    resizeObserver.observe(node);
-    window.setTimeout(updateOverflow, 0);
-    return () => resizeObserver.disconnect();
-  }, [hunks, paneRef]);
   return (
-    <div className={`diff-split-pane ${side}${hasHorizontalOverflow ? ' x-overflow' : ''}`} ref={paneRef}>
+    <div className={`diff-split-pane ${side}`} ref={paneRef}>
       {hunks.map((hunk) => (
         <div className="diff-split-pane-hunk" key={hunk.id}>
           {hunk.header ? <div className="diff-hunk-head split">{hunk.header}</div> : null}

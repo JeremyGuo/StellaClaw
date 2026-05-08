@@ -65,13 +65,13 @@ const HOST_PROMPT_PROTOCOLS: &[PromptProtocol] = &[
         id: "host.update_plan",
         priority: 310,
         required_tools: &["update_plan"],
-        body: "Use update_plan for multi-step, long-running, or ambiguous work so the user can see the current checklist. Positive examples: a refactor across several files, a bug investigation with multiple plausible causes, or a task that needs several verification steps. Negative examples: a one-line fix, a single file read, or a straightforward reply that can be finished immediately without a visible plan.",
+        body: "Use update_plan for multi-step, long-running, or ambiguous work so the user can see the current checklist. If the first planned step can start immediately, return update_plan in the same tool-call batch as the next independent tool calls instead of spending a separate model round only updating the plan; the host applies the plan immediately and continues with the remaining tools. Positive examples: a refactor across several files, a bug investigation with multiple plausible causes, or a task that needs several verification steps. Negative examples: a one-line fix, a single file read, or a straightforward reply that can be finished immediately without a visible plan.",
     },
     PromptProtocol {
         id: "host.memory",
         priority: 320,
         required_tools: &["memory_search", "memory_write", "memory_update", "memory_delete"],
-        body: "Use memory_write only for stable information that is likely to be reused after this turn. Do not save transient execution steps, one-off tool output, guesses, ordinary chat, compacted summaries, or facts already present in memory. Save scope=user for durable collaboration preferences, response style, general corrections, and user work habits. Save scope=conversation for goals, constraints, key facts, durable state, and handoff that every session or agent in this conversation should know. Save scope=public for stable project, customer, data definition, or long-running task facts that may be useful across conversations. memory_write resolves duplicates and conflicts internally and returns only success or failure. If it fails, retry only when you can provide more specific, stable text. Long memory is not automatically injected into every turn; use memory_search when the current short context is insufficient, when the user asks about durable project/conversation facts, or when the task likely depends on prior cross-conversation or current-conversation agreements. Use memory_update or memory_delete only when search reveals an obviously stale, incomplete, duplicate, or wrong entry.",
+        body: "Use memory_write before finishing a turn when you learned a durable fact future turns, agents, compaction recovery, or future conversations would otherwise need to rediscover. Write immediately if the user asks you to remember/save something; if you learn a stable user fact, preference, correction, working style, or recurring expectation; if this conversation establishes goals, constraints, decisions, handoff state, running task/process ids, artifact paths, blockers, or next recovery steps; if you learn stable project, environment, deployment, or data facts, critical file/module responsibilities, architecture constraints, project-specific implementation requirements, or recurring pitfalls. Save scope=user for durable facts about the user, preferences, response style, recurring corrections, work habits, and global expectations; scope=conversation for current goals, constraints, decisions, active handoff, running task/process ids, artifact paths, blockers, next steps, and task-specific assumptions; scope=public for stable cross-conversation project/customer/data/deployment facts, critical file/module notes, architecture constraints, recurring implementation rules, and reusable operational knowledge. Do not save transient command output, one-off progress, guesses, ordinary chat, secrets, credentials, raw tool logs, compacted summaries, or facts already present in visible memory or returned by memory_search. Use memory_search when prior conversation decisions, public project conventions, deployment details, long-running task state, previous blockers, project-specific requirements, or critical module knowledge may matter and are not visible. Use memory_update or memory_delete only after memory_search returns the exact stale, duplicate, incomplete, or wrong entry id.",
     },
     PromptProtocol {
         id: "host.subagent",
@@ -84,7 +84,7 @@ const HOST_PROMPT_PROTOCOLS: &[PromptProtocol] = &[
 fn user_tell_tool(scope: HostToolScope) -> ToolDefinition {
     let description = match scope {
         HostToolScope::MainBackground => {
-            "Immediately send a short progress or coordination message to the current user conversation without waiting for the current background turn to finish; do not use user_tell for the primary result. Attachment markers are supported."
+            "Immediately send a short progress or coordination message to the current user conversation without waiting for the current background turn to finish. Attachment markers are supported."
         }
         HostToolScope::MainForeground | HostToolScope::SubAgent => {
             "Immediately send a short progress or coordination message to the current user conversation without waiting for the current turn to finish. Attachment markers are supported."
@@ -224,7 +224,7 @@ fn memory_tools() -> Vec<ToolDefinition> {
     vec![
         bridge_tool(
             "memory_search",
-            "Search long memory for stable facts from the current conversation and public cross-conversation memory. Use this before answering questions about durable facts that may be outside the current short context.",
+            "Search long memory for durable facts from conversation and public scopes.",
             object_schema(
                 properties([
                     ("query", json!({"type": "string", "description": "Natural language search query."})),
@@ -244,7 +244,7 @@ fn memory_tools() -> Vec<ToolDefinition> {
         ),
         bridge_tool(
             "memory_write",
-            "Write stable long memory only when the information is durable, likely to be reused later, and still useful after the current turn. Do not store transient steps, one-off tool output, guesses, ordinary chat, compacted summaries, or facts already present in memory. Scope user is for durable collaboration preferences and general corrections; conversation is for goals, constraints, key facts, state, and handoff that all sessions in this conversation should know; public is for stable project/customer/data/task facts useful across conversations. The host resolves duplicates and conflicts internally and returns only success or failure.",
+            "Persist one concise long-memory entry. The host may deduplicate or merge conflicting entries and returns success or failure.",
             object_schema(
                 properties([
                     (
@@ -252,7 +252,7 @@ fn memory_tools() -> Vec<ToolDefinition> {
                         json!({
                             "type": "string",
                             "enum": ["user", "public", "conversation"],
-                            "description": "user for durable collaboration preferences; conversation for this conversation's shared long memory; public for cross-conversation long memory."
+                            "description": "Memory scope: user, conversation, or public."
                         }),
                     ),
                     ("subject", json!({"type": "string", "description": "Optional short subject or entity name."})),
@@ -265,7 +265,7 @@ fn memory_tools() -> Vec<ToolDefinition> {
         ),
         bridge_tool(
             "memory_update",
-            "Replace a memory entry by id when search reveals an obviously stale, incomplete, or wrong entry.",
+            "Replace a memory entry by id.",
             object_schema(
                 properties([
                     ("memory_id", json!({"type": "string"})),
@@ -277,7 +277,7 @@ fn memory_tools() -> Vec<ToolDefinition> {
         ),
         bridge_tool(
             "memory_delete",
-            "Delete or tombstone a memory entry by id when search reveals it is obsolete, duplicate, or wrong.",
+            "Delete or tombstone a memory entry by id.",
             object_schema(
                 properties([("memory_id", json!({"type": "string"}))]),
                 &["memory_id"],

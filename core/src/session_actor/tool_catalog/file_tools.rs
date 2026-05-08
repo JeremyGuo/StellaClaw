@@ -52,7 +52,7 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
         .with_concurrency(ToolConcurrency::Serial),
         ToolDefinition::new(
             "grep",
-            "Fast content search tool. Searches file contents with a regex pattern and returns matching files plus line-level matches. Omit path or pass an empty string to search from the current workspace directory. Set context_lines from 0 to 10 to include surrounding lines. Use names_only=true when only matching paths are needed. Skips slow remote mounts such as sshfs/NFS by default.",
+            "Search file contents with a regex pattern and return matching files plus line-level matches. Omit path or pass an empty string to search from the current workspace directory. context_lines must be 0..10. names_only returns only matching paths. Slow remote mounts such as sshfs/NFS are skipped by default.",
             file_tool_schema(
                 properties([
                     ("pattern", json!({"type": "string"})),
@@ -72,7 +72,7 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
         ),
         ToolDefinition::new(
             "apply_patch",
-            "Apply a patch inside the workspace. Supports format=auto, format=codex, or format=unified. Codex format uses an envelope with *** Begin Patch / *** End Patch and file sections such as *** Add File, *** Delete File, and *** Update File, returning files_changed. Unified format is passed to git apply; non-empty stdout/stderr are returned and capped by max_output_chars.",
+            "Apply a patch inside the workspace. Patch file paths must be workspace-relative paths, or remote-cwd-relative paths when remote execution is selected. Absolute paths under the active workspace/cwd are normalized to relative paths before applying; absolute paths outside it are rejected. Supports format=auto, format=codex, or format=unified. Codex format uses *** Begin Patch / *** End Patch sections. Unified format is passed to git apply; non-empty stdout/stderr are returned and capped by max_output_chars.",
             file_tool_schema(
                 properties([
                     ("patch", json!({"type": "string"})),
@@ -146,7 +146,7 @@ const FILE_PROMPT_PROTOCOLS: &[PromptProtocol] = &[
         id: "file.editing",
         priority: 110,
         required_tools: &["file_write", "apply_patch"],
-        body: "Use file_write for new files, complete rewrites, or append-only output; use apply_patch for targeted edits. After a successful apply_patch, do not re-read changed files just to verify that the patch applied; the tool reports failure when it does not apply. Re-read only when you need new context, a follow-up command or formatter may have rewritten the file, or a verification failure needs inspection.",
+        body: "Use file_write for new files, complete rewrites, or append-only output; use apply_patch for targeted edits. apply_patch paths must be workspace-relative, and related multi-file edits should be combined into one patch when practical. After a successful apply_patch, do not re-read changed files just to verify that the patch applied; the tool reports failure when it does not apply. Re-read only when you need new context, a follow-up command or formatter may have rewritten the file, or a verification failure needs inspection.",
     },
     PromptProtocol {
         id: "file.attachment_visibility",

@@ -1929,17 +1929,13 @@ button {
 
   .diff-split-pane {
     min-width: 0;
-    overflow-x: hidden;
-    overflow-y: auto;
+    overflow: auto;
     border-right: 1px solid var(--border);
     font-family: var(--font-mono);
     font-size: 11px;
     line-height: 1.45;
     overscroll-behavior: contain;
-  }
-
-  .diff-split-pane.x-overflow {
-    overflow-x: auto;
+    scrollbar-gutter: stable;
   }
 
   .diff-split-pane.new {
@@ -1947,14 +1943,16 @@ button {
   }
 
   .diff-split-pane-hunk {
-    min-width: 0;
+    width: max-content;
+    min-width: 100%;
   }
 
   .diff-split-pane .diff-hunk-head {
     position: sticky;
     top: 0;
     z-index: 1;
-    min-width: 0;
+    width: max-content;
+    min-width: 100%;
     overflow: hidden;
     border-bottom: 1px solid color-mix(in srgb, var(--border), transparent 20%);
     text-overflow: ellipsis;
@@ -1962,16 +1960,11 @@ button {
 
   .diff-pane-line {
     display: grid;
-    min-width: 0;
+    width: max-content;
+    min-width: 100%;
     min-height: 22px;
-    grid-template-columns: 48px minmax(0, 1fr);
+    grid-template-columns: 48px max-content;
     color: var(--text);
-  }
-
-  .diff-split-pane.x-overflow .diff-split-pane-hunk,
-  .diff-split-pane.x-overflow .diff-hunk-head,
-  .diff-split-pane.x-overflow .diff-pane-line {
-    min-width: max-content;
   }
 
   .diff-pane-line.add {

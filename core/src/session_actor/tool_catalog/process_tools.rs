@@ -291,7 +291,7 @@ const PROCESS_PROMPT_PROTOCOLS: &[PromptProtocol] = &[PromptProtocol {
     id: "process.shell",
     priority: 200,
     required_tools: &["shell_exec", "shell_write_stdin", "shell_stop"],
-    body: "When using shell for commands that dedicated tools do not cover, start a new command with the command field and omit session_id; use session_id only to poll or continue an existing shell session. Positive example: {\"command\":\"cargo check -p stellaclaw_core\"}. Negative example: {\"session_id\":\"sh_123\"} to start work, or using cmd instead of command.",
+    body: "When using shell for commands that dedicated tools do not cover, start a new command with shell_exec.command. Use shell_write_stdin with process_id only to poll or continue an existing process, and shell_stop with process_id to stop one. Positive example: {\"command\":\"cargo check -p stellaclaw_core\"}. Negative example: using process_id to start work, or using cmd instead of command.",
 }];
 
 pub(crate) fn execute_process_tool(
