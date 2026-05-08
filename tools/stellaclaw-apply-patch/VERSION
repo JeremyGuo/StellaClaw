@@ -1,0 +1,7 @@
+version: 0.1.0
+---
+
+# 0.1.0
+
+- 初始化独立 `stellaclaw-apply-patch` 子软件包：
+  提供跨平台 CLI，从 stdin 或 patch 文件读取补丁，支持 Codex patch 格式和 unified diff 格式，输出稳定 JSON，供后续 local / remote tool bootstrap 复用。该子软件包版本独立于根 Stellaclaw 发布版本。

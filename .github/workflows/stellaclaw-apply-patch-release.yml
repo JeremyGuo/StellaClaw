@@ -1,0 +1,199 @@
+name: stellaclaw-apply-patch CD
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "stellaclaw-apply-patch-v*"
+
+permissions:
+  contents: write
+
+env:
+  TOOL_NAME: stellaclaw-apply-patch
+  TOOL_DIR: tools/stellaclaw-apply-patch
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux-x64
+            archive: tar.gz
+            binary: stellaclaw-apply-patch
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            platform: linux-arm64
+            archive: tar.gz
+            binary: stellaclaw-apply-patch
+            apt: gcc-aarch64-linux-gnu
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          - runner: macos-13
+            target: x86_64-apple-darwin
+            platform: macos-x64
+            archive: tar.gz
+            binary: stellaclaw-apply-patch
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            platform: macos-arm64
+            archive: tar.gz
+            binary: stellaclaw-apply-patch
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x64
+            archive: zip
+            binary: stellaclaw-apply-patch.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install target linker
+        if: ${{ matrix.apt != null }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt }}
+          echo "${{ matrix.linker_env }}" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        run: cargo build -p "${TOOL_NAME}" --release --locked --target "${{ matrix.target }}"
+
+      - name: Package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version: //p' "${TOOL_DIR}/VERSION" | head -n 1)"
+          asset="${TOOL_NAME}-v${version}-${{ matrix.platform }}.${{ matrix.archive }}"
+          staging="dist/${TOOL_NAME}-v${version}-${{ matrix.platform }}"
+          mkdir -p "${staging}"
+          cp "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${staging}/"
+          cp "${TOOL_DIR}/README.md" "${staging}/"
+          cp "${TOOL_DIR}/VERSION" "${staging}/"
+          if [[ "${{ matrix.archive }}" == "zip" ]]; then
+            (cd dist && 7z a "${asset}" "$(basename "${staging}")")
+          else
+            tar -czf "dist/${asset}" -C dist "$(basename "${staging}")"
+          fi
+          (
+            cd dist
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "${asset}" > "${asset}.sha256"
+            else
+              shasum -a 256 "${asset}" > "${asset}.sha256"
+            fi
+          )
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: |
+            dist/${{ steps.package.outputs.asset }}
+            dist/${{ steps.package.outputs.asset }}.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Prepare manifest
+        id: manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version: //p' "${TOOL_DIR}/VERSION" | head -n 1)"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="${TOOL_NAME}-v${version}"
+          fi
+          expected_tag="${TOOL_NAME}-v${version}"
+          if [[ "${tag}" != "${expected_tag}" ]]; then
+            echo "tag ${tag} does not match ${TOOL_DIR}/VERSION ${expected_tag}" >&2
+            exit 1
+          fi
+          export RELEASE_TAG="${tag}"
+          python3 - <<'PY'
+          import glob
+          import hashlib
+          import json
+          import os
+          import re
+
+          tool = os.environ["TOOL_NAME"]
+          version = open(os.path.join(os.environ["TOOL_DIR"], "VERSION"), encoding="utf-8").read().splitlines()[0].split(":", 1)[1].strip()
+          tag = os.environ.get("RELEASE_TAG")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          assets = []
+          pattern = re.compile(rf"^{re.escape(tool)}-v{re.escape(version)}-(?P<platform>.+)\.(?P<archive>tar\.gz|zip)$")
+          for path in sorted(glob.glob("dist/*")):
+              name = os.path.basename(path)
+              match = pattern.match(name)
+              if not match:
+                  continue
+              sha_path = path + ".sha256"
+              if os.path.exists(sha_path):
+                  sha256 = open(sha_path, encoding="utf-8").read().split()[0]
+              else:
+                  sha256 = hashlib.sha256(open(path, "rb").read()).hexdigest()
+              platform = match.group("platform")
+              binary = f"{tool}.exe" if platform.startswith("windows-") else tool
+              assets.append({
+                  "platform": platform,
+                  "archive": match.group("archive"),
+                  "url": f"https://github.com/{repo}/releases/download/{tag}/{name}",
+                  "sha256": sha256,
+                  "binary": binary,
+              })
+          manifest = {
+              "schema_version": 1,
+              "package": tool,
+              "version": version,
+              "assets": assets,
+          }
+          with open("dist/tools-manifest.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2, sort_keys=True)
+              f.write("\n")
+          PY
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.manifest.outputs.tag }}
+          name: stellaclaw-apply-patch v${{ steps.manifest.outputs.version }}
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+            dist/tools-manifest.json
+          body: |
+            Standalone stellaclaw-apply-patch release.
+
+            This package is versioned independently from the main Stellaclaw release.

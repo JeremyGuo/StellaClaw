@@ -2480,6 +2480,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "stellaclaw-apply-patch"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "stellaclaw_core"
 version = "1.0.2"
 dependencies = [

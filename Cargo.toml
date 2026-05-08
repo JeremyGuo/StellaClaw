@@ -1,3 +1,8 @@
 [workspace]
-members = ["core", "agent_server", "stellaclaw"]
+members = [
+    "core",
+    "agent_server",
+    "stellaclaw",
+    "tools/stellaclaw-apply-patch",
+]
 resolver = "2"
