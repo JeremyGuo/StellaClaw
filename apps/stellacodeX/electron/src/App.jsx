@@ -1158,6 +1158,26 @@ function App() {
     }
   }, [selected, upsertTransfer, finishTransfer]);
 
+  const openMessageAttachment = useCallback((attachment) => {
+    if (!attachment?.path) return;
+    openWorkspaceFile({
+      ...attachment,
+      path: attachment.path,
+      name: attachment.name || fileNameFromPath(attachment.path),
+      type: attachment.kind
+    }).catch(() => {});
+  }, [openWorkspaceFile]);
+
+  const downloadMessageAttachment = useCallback((attachment) => {
+    if (!attachment?.path) return;
+    downloadWorkspaceEntry({
+      ...attachment,
+      path: attachment.path,
+      name: attachment.name || fileNameFromPath(attachment.path),
+      type: attachment.kind
+    }).catch(() => {});
+  }, [downloadWorkspaceEntry]);
+
   useEffect(() => {
     if (!selected) return;
     const key = conversationKey(selected.serverId, selected.conversationId);
@@ -1696,6 +1716,8 @@ function App() {
           onLoadModels={loadAvailableModels}
           sending={sending}
           runningActivities={runningActivities}
+          onOpenAttachment={openMessageAttachment}
+          onDownloadAttachment={downloadMessageAttachment}
         />
       </main>
       <OverviewPanel

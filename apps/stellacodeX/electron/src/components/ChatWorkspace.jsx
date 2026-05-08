@@ -2,9 +2,9 @@ import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState }
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import remarkGfm from 'remark-gfm';
-import { FileText, Pin, Plus, Send, TerminalSquare } from 'lucide-react';
+import { ChevronDown, Download, FileText, Pin, Plus, Send, TerminalSquare } from 'lucide-react';
 import * as Popover from '@radix-ui/react-popover';
-import { attachmentName, attachmentUrl, isImageAttachment, messageText } from '../lib/fileUtils';
+import { attachmentName, attachmentUrl, fileExtension, isImageAttachment, messageText } from '../lib/fileUtils';
 import { formatBytes, formatTokens, modelAlias, modelDisplayName } from '../lib/format';
 import { displayMessages, firstMessageId, firstToolNameForMessage, liveActivitySignature, markerIndexes, messageKey, shouldTypewriterMessage, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
 
@@ -93,7 +93,7 @@ function outgoingAttachmentPayload(attachment) {
   };
 }
 
-export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, runningActivities }) {
+export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, runningActivities, onOpenAttachment, onDownloadAttachment }) {
   const renderedMessages = useMemo(() => displayMessages(messages), [messages]);
   const activitySignature = useMemo(() => liveActivitySignature(runningActivities || []), [runningActivities]);
   const oldestMessageKey = useMemo(() => firstMessageId(messages) || messages[0]?.id || messages[0]?.index || '', [messages]);
@@ -438,6 +438,8 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
                     key={messageKey(message, index)}
                     message={message}
                     typewriter={typingKeys.has(messageKey(message, index))}
+                    onOpenAttachment={onOpenAttachment}
+                    onDownloadAttachment={onDownloadAttachment}
                     onTypewriterDone={() => {
                       const key = messageKey(message, index);
                       setTypingKeys((current) => {
@@ -786,7 +788,7 @@ function planStatusMark(status) {
   return '○';
 }
 
-export function MessageArticle({ message, typewriter = false, onTypewriterDone }) {
+export function MessageArticle({ message, typewriter = false, onTypewriterDone, onOpenAttachment, onDownloadAttachment }) {
   const usage = tokenUsage(message);
   const role = message.user_name || message.role || 'assistant';
   const className = messageArticleClassName(message);
@@ -798,7 +800,7 @@ export function MessageArticle({ message, typewriter = false, onTypewriterDone }
           <AuxiliaryDots messages={message._auxiliary} />
         )}
       </div>
-      <MessageBody message={message} typewriter={typewriter} onTypewriterDone={onTypewriterDone} />
+      <MessageBody message={message} typewriter={typewriter} onTypewriterDone={onTypewriterDone} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
       {message.pending && <div className="message-status">正在发送...</div>}
       {message.error && <div className="message-status error">{message.error}</div>}
       {String(message.role || '').toLowerCase() === 'assistant' && (
@@ -828,6 +830,7 @@ function messageArticleClassName(message) {
 
 const MemoMessageArticle = memo(MessageArticle, (previous, next) => {
   if (previous.message !== next.message || previous.typewriter !== next.typewriter) return false;
+  if (previous.onOpenAttachment !== next.onOpenAttachment || previous.onDownloadAttachment !== next.onDownloadAttachment) return false;
   if (previous.typewriter || next.typewriter) return previous.onTypewriterDone === next.onTypewriterDone;
   return true;
 });
@@ -982,7 +985,7 @@ function toolCardsAreComplete(cards) {
   return hasResult && (open.size === 0 || cards.at(-1)?.kind === 'result');
 }
 
-export function MessageBody({ message, typewriter = false, onTypewriterDone }) {
+export function MessageBody({ message, typewriter = false, onTypewriterDone, onOpenAttachment, onDownloadAttachment }) {
   const text = messageText(message);
   const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
   const files = Array.isArray(message?.files) ? message.files : [];
@@ -1004,15 +1007,15 @@ export function MessageBody({ message, typewriter = false, onTypewriterDone }) {
   return (
     <div className="message-body">
       {typewriter && text ? (
-        <TypewriterMarkdown className="message-text" text={text} attachments={allAttachments} onDone={onTypewriterDone} />
+        <TypewriterMarkdown className="message-text" text={text} attachments={allAttachments} onDone={onTypewriterDone} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
       ) : Array.isArray(message?.items) && message.items.length > 0 ? (
-        <StructuredItems items={message.items} attachments={allAttachments} fallbackText={text} />
+        <StructuredItems items={message.items} attachments={allAttachments} fallbackText={text} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
       ) : text ? (
-        <MarkdownContent className="message-text" text={text} attachments={allAttachments} />
+        <MarkdownContent className="message-text" text={text} attachments={allAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
       ) : trailingAttachments.length > 0 ? null : (
         <div className="message-text muted">空消息</div>
       )}
-      {trailingAttachments.length > 0 && <AttachmentList attachments={trailingAttachments} />}
+      {trailingAttachments.length > 0 && <AttachmentList attachments={trailingAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />}
       {Number(message?.attachment_count || 0) > 0 && allAttachments.length === 0 && (
         <div className="message-attachments muted">正在加载附件...</div>
       )}
@@ -1023,17 +1026,17 @@ export function MessageBody({ message, typewriter = false, onTypewriterDone }) {
   );
 }
 
-export function StructuredItems({ items, attachments, fallbackText }) {
+export function StructuredItems({ items, attachments, fallbackText, onOpenAttachment, onDownloadAttachment }) {
   const rendered = items
     .map((item, index) => {
       if (typeof item === 'string') {
-        return <MarkdownContent key={index} className="message-text" text={item} attachments={attachments} />;
+        return <MarkdownContent key={index} className="message-text" text={item} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />;
       }
       if (item?.type === 'text') {
-        return <MarkdownContent key={index} className="message-text" text={item.text_with_attachment_markers || item.text || item.content || ''} attachments={attachments} />;
+        return <MarkdownContent key={index} className="message-text" text={item.text_with_attachment_markers || item.text || item.content || ''} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />;
       }
       if (item?.type === 'file') {
-        return <AttachmentCard key={index} attachment={attachments[item.attachment_index] || item} />;
+        return <AttachmentCard key={index} attachment={attachments[item.attachment_index] || item} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />;
       }
       if (item?.type === 'tool_call' || item?.type === 'tool_result') {
         return (
@@ -1049,10 +1052,10 @@ export function StructuredItems({ items, attachments, fallbackText }) {
     })
     .filter(Boolean);
   if (rendered.length) return <>{rendered}</>;
-  return <MarkdownContent className="message-text" text={fallbackText} attachments={attachments} />;
+  return <MarkdownContent className="message-text" text={fallbackText} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />;
 }
 
-export function TypewriterMarkdown({ text, attachments = [], className = 'message-text', onDone }) {
+export function TypewriterMarkdown({ text, attachments = [], className = 'message-text', onDone, onOpenAttachment, onDownloadAttachment }) {
   const value = String(text || '');
   const [count, setCount] = useState(0);
   const doneRef = useRef(false);
@@ -1089,13 +1092,13 @@ export function TypewriterMarkdown({ text, attachments = [], className = 'messag
 
   return (
     <div className="typewriter-message">
-      <MarkdownContent className={className} text={value.slice(0, count)} attachments={attachments} />
+      <MarkdownContent className={className} text={value.slice(0, count)} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
       {count < value.length && <span className="typewriter-caret" aria-hidden="true" />}
     </div>
   );
 }
 
-export function MarkdownContent({ text, attachments = [], className = 'markdown-content' }) {
+export function MarkdownContent({ text, attachments = [], className = 'markdown-content', onOpenAttachment, onDownloadAttachment }) {
   const value = String(text || '');
   if (!value.trim()) return <span className="message-empty">空消息</span>;
   const parts = [];
@@ -1110,7 +1113,7 @@ export function MarkdownContent({ text, attachments = [], className = 'markdown-
     if (match[2] !== undefined) {
       const attachment = attachments[Number(match[2])];
       if (attachment) {
-        parts.push(<AttachmentCard key={`attachment-${match.index}`} attachment={attachment} inline />);
+        parts.push(<AttachmentCard key={`attachment-${match.index}`} attachment={attachment} inline onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />);
       }
     } else if (match[3]) {
       parts.push(
@@ -1146,27 +1149,42 @@ export function MarkdownBlock({ text }) {
   );
 }
 
-export function AttachmentList({ attachments }) {
+export function AttachmentList({ attachments, onOpenAttachment, onDownloadAttachment }) {
   return (
     <div className="message-attachments">
       {attachments.map((attachment, index) => (
-        <AttachmentCard key={`${attachmentName(attachment)}-${attachment?.path || index}`} attachment={attachment} />
+        <AttachmentCard key={`${attachmentName(attachment)}-${attachment?.path || index}`} attachment={attachment} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
       ))}
     </div>
   );
 }
 
-export function AttachmentCard({ attachment, inline = false }) {
+export function AttachmentCard({ attachment, inline = false, onOpenAttachment, onDownloadAttachment }) {
   const name = attachmentName(attachment);
   const url = attachmentUrl(attachment);
   const size = formatBytes(attachment?.size_bytes || attachment?.size);
   const [loadedImageSize, setLoadedImageSize] = useState(null);
+  const canOpen = Boolean(onOpenAttachment && attachment?.path);
+  const canDownload = Boolean(onDownloadAttachment && attachment?.path);
+  const openAttachment = () => {
+    if (canOpen) onOpenAttachment(attachment);
+  };
+  const downloadAttachment = (event) => {
+    event.stopPropagation();
+    if (canDownload) onDownloadAttachment(attachment);
+  };
+  const meta = attachmentMeta(attachment, name);
   if (isImageAttachment(attachment)) {
     const imageWidth = attachmentImageDisplayWidth(attachment, loadedImageSize);
     const imageStyle = imageWidth ? { '--attachment-image-width': `${imageWidth}px` } : undefined;
     return (
-      <button className={`message-attachment image${inline ? ' inline' : ''}${url ? '' : ' loading'}`} type="button" style={imageStyle}>
-        {url ? (
+      <div
+        className={`message-attachment image${inline ? ' inline' : ''}${url ? '' : ' loading'}${canOpen ? ' clickable' : ''}`}
+        style={imageStyle}
+        title={canOpen ? `预览 ${name}` : name}
+      >
+        <button className="attachment-image-preview" type="button" onClick={openAttachment} disabled={!canOpen}>
+          {url ? (
           <img
             src={url}
             alt={name}
@@ -1178,18 +1196,88 @@ export function AttachmentCard({ attachment, inline = false }) {
               }
             }}
           />
-        ) : <span className="image-placeholder">正在加载图片</span>}
-        <span>{name}</span>
-      </button>
+          ) : <span className="image-placeholder">正在加载图片</span>}
+        </button>
+        <div className="attachment-image-caption">
+          <span>{name}</span>
+          <AttachmentOpenMenu
+            name={name}
+            canOpen={canOpen}
+            canDownload={canDownload}
+            onOpen={openAttachment}
+            onDownload={downloadAttachment}
+          />
+        </div>
+      </div>
     );
   }
   return (
-    <button className="message-attachment file" type="button">
-      <span className="attachment-file-icon"><FileText size={14} /></span>
-      <span>{name}</span>
-      {size && <small>{size}</small>}
-    </button>
+    <div
+      className={`message-attachment file${canOpen ? ' clickable' : ''}`}
+      title={canOpen ? `预览 ${name}` : name}
+    >
+      <button className="attachment-file-main" type="button" onClick={openAttachment} disabled={!canOpen}>
+        <span className="attachment-file-icon"><FileText size={18} /></span>
+        <span className="attachment-file-text">
+          <strong>{name}</strong>
+          <small>{[meta, size].filter(Boolean).join(' · ')}</small>
+        </span>
+      </button>
+      <AttachmentOpenMenu
+        name={name}
+        canOpen={canOpen}
+        canDownload={canDownload}
+        onOpen={openAttachment}
+        onDownload={downloadAttachment}
+      />
+    </div>
   );
+}
+
+function AttachmentOpenMenu({ name, canOpen, canDownload, onOpen, onDownload }) {
+  if (!canOpen && !canDownload) return null;
+  return (
+    <Popover.Root>
+      <Popover.Trigger asChild>
+        <button className="attachment-open-button" type="button" title={`打开 ${name}`} onClick={(event) => event.stopPropagation()}>
+          <span>打开</span>
+          <ChevronDown size={14} />
+        </button>
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content className="floating-popover attachment-menu" side="bottom" align="end" sideOffset={6}>
+          {canOpen && (
+            <Popover.Close asChild>
+              <button className="attachment-menu-item" type="button" onClick={onOpen}>
+                预览
+              </button>
+            </Popover.Close>
+          )}
+          {canDownload && (
+            <Popover.Close asChild>
+              <button className="attachment-menu-item" type="button" onClick={onDownload}>
+                <Download size={13} />
+                下载
+              </button>
+            </Popover.Close>
+          )}
+          <Popover.Arrow className="floating-popover-arrow" />
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
+  );
+}
+
+function attachmentMeta(attachment, name) {
+  const mediaType = String(attachment?.media_type || attachment?.mime_type || attachment?.mime || '').toLowerCase();
+  const ext = fileExtension(name).toUpperCase();
+  if (mediaType.startsWith('image/')) return ['图片', ext].filter(Boolean).join(' · ');
+  if (mediaType.startsWith('text/') || ['MD', 'TXT', 'JSON', 'CSV', 'TS', 'JS', 'RS', 'PY', 'HTML', 'CSS'].includes(ext)) {
+    return ['文档', ext].filter(Boolean).join(' · ');
+  }
+  if (ext === 'PDF') return '文档 · PDF';
+  if (ext) return `文件 · ${ext}`;
+  return attachment?.kind ? String(attachment.kind) : '文件';
 }
 
 function attachmentNumber(value) {
@@ -1336,8 +1424,12 @@ function toolGroupSummary(cards, messages, fallbackName) {
   };
 }
 
-function ToolDetail({ title, payload }) {
+function ToolDetail({ title, name, payload }) {
   const data = parseToolPayload(payload);
+  const patchText = editPatchText(name, data);
+  if (patchText) {
+    return <EditDiffDetail title={title} data={data} patchText={patchText} />;
+  }
   const entries = Object.entries(data).filter(([, value]) => value !== undefined && value !== null && value !== '');
   if (entries.length === 1 && entries[0][0] === 'text') {
     return (
@@ -1366,6 +1458,341 @@ function ToolDetail({ title, payload }) {
   );
 }
 
+function editPatchText(name, data) {
+  const lowerName = String(name || '').toLowerCase();
+  if (!lowerName.includes('edit') && !lowerName.includes('write') && !lowerName.includes('patch')) return '';
+  const patch = typeof data.patch === 'string'
+    ? data.patch
+    : typeof data.diff === 'string'
+      ? data.diff
+      : typeof data.text === 'string'
+        ? data.text
+        : '';
+  if (!patch.trim()) return '';
+  if (
+    /(^|\n)(diff --git|--- |\+\+\+ |@@ |@@$|\*\*\* (Begin Patch|Update File|Add File|Delete File))/m.test(patch)
+  ) {
+    return patch;
+  }
+  return '';
+}
+
+function EditDiffDetail({ title, data, patchText }) {
+  const files = useMemo(() => parsePatchForDisplay(patchText), [patchText]);
+  const metaEntries = Object.entries(data)
+    .filter(([key, value]) => (
+      !['patch', 'diff', 'text'].includes(key)
+      && value !== undefined
+      && value !== null
+      && value !== ''
+    ));
+  return (
+    <div className="tool-detail edit-diff-detail">
+      <strong>{title}</strong>
+      {metaEntries.length > 0 ? (
+        <div className="edit-diff-meta">
+          {metaEntries.map(([key, value]) => (
+            <div key={key}>
+              <span>{key}</span>
+              <code>{typeof value === 'string' ? value : JSON.stringify(value)}</code>
+            </div>
+          ))}
+        </div>
+      ) : null}
+      <DiffViewer files={files} />
+    </div>
+  );
+}
+
+function DiffViewer({ files }) {
+  if (!files.length) {
+    return <span className="muted">没有可展示的 diff</span>;
+  }
+  return (
+    <div className="edit-diff-view edit-diff-view-split-ready">
+      <div className="diff-unified">
+        {files.map((file, index) => (
+          <DiffUnifiedFile file={file} key={`${file.path}-${index}`} />
+        ))}
+      </div>
+      <div className="diff-split">
+        {files.map((file, index) => (
+          <DiffSplitFile file={file} key={`${file.path}-${index}`} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DiffUnifiedFile({ file }) {
+  return (
+    <section className="diff-file">
+      <div className="diff-file-head">
+        <span>{file.path}</span>
+        <code>{file.additions ? `+${file.additions}` : '+0'} {file.deletions ? `-${file.deletions}` : '-0'}</code>
+      </div>
+      {file.hunks.map((hunk, index) => (
+        <div className="diff-hunk" key={`${hunk.header}-${index}`}>
+          {hunk.header ? <div className="diff-hunk-head">{hunk.header}</div> : null}
+          {limitedDiffLines(hunk.lines).map((line, lineIndex) => (
+            <div className={`diff-row ${line.type}`} key={lineIndex}>
+              <span className="diff-gutter old">{formatLineNumber(line.oldNumber)}</span>
+              <span className="diff-gutter new">{formatLineNumber(line.newNumber)}</span>
+              <span className="diff-marker">{diffMarker(line.type)}</span>
+              <code>{line.text}</code>
+            </div>
+          ))}
+          {hunk.lines.length > DIFF_MAX_LINES_PER_HUNK ? (
+            <div className="diff-omitted">{hunk.lines.length - DIFF_MAX_LINES_PER_HUNK} lines omitted</div>
+          ) : null}
+        </div>
+      ))}
+    </section>
+  );
+}
+
+function DiffSplitFile({ file }) {
+  const leftRef = useRef(null);
+  const rightRef = useRef(null);
+  const syncingRef = useRef(false);
+  const [paneHeight, setPaneHeight] = useState('auto');
+  const hunks = useMemo(() => file.hunks.map((hunk, index) => {
+    const rows = splitDiffRows(hunk.lines);
+    return {
+      id: `${hunk.header}-${index}`,
+      header: hunk.header,
+      rows: limitedSplitRows(rows),
+      omitted: Math.max(0, rows.length - DIFF_MAX_LINES_PER_HUNK)
+    };
+  }), [file.hunks]);
+  useEffect(() => {
+    const estimateRows = hunks.reduce((total, hunk) => total + hunk.rows.length + (hunk.header ? 1 : 0) + (hunk.omitted ? 1 : 0), 0);
+    const naturalHeight = Math.max(72, 24 + estimateRows * 22);
+    const maxHeight = Math.max(220, Math.round(window.innerHeight * 0.64));
+    setPaneHeight(`${Math.min(naturalHeight, maxHeight, 680)}px`);
+  }, [hunks]);
+  useEffect(() => {
+    const leftNode = leftRef.current;
+    const rightNode = rightRef.current;
+    if (!leftNode || !rightNode) return undefined;
+    const syncScroll = (sourceNode, targetNode) => {
+      if (syncingRef.current) return;
+      syncingRef.current = true;
+      targetNode.scrollTop = sourceNode.scrollTop;
+      window.requestAnimationFrame(() => {
+        syncingRef.current = false;
+      });
+    };
+    const syncLeft = () => syncScroll(leftNode, rightNode);
+    const syncRight = () => syncScroll(rightNode, leftNode);
+    leftNode.addEventListener('scroll', syncLeft, { passive: true });
+    rightNode.addEventListener('scroll', syncRight, { passive: true });
+    return () => {
+      leftNode.removeEventListener('scroll', syncLeft);
+      rightNode.removeEventListener('scroll', syncRight);
+    };
+  }, [hunks]);
+  return (
+    <section className="diff-file">
+      <div className="diff-file-head">
+        <span>{file.path}</span>
+        <code>{file.additions ? `+${file.additions}` : '+0'} {file.deletions ? `-${file.deletions}` : '-0'}</code>
+      </div>
+      <div className="diff-split-panes" style={{ '--diff-pane-height': paneHeight }}>
+        <DiffSplitPane side="old" hunks={hunks} paneRef={leftRef} />
+        <DiffSplitPane side="new" hunks={hunks} paneRef={rightRef} />
+      </div>
+    </section>
+  );
+}
+
+function DiffSplitPane({ side, hunks, paneRef }) {
+  const [hasHorizontalOverflow, setHasHorizontalOverflow] = useState(false);
+  useEffect(() => {
+    const node = paneRef.current;
+    if (!node) return undefined;
+    const updateOverflow = () => {
+      const overflowingLine = Array.from(node.querySelectorAll('.diff-pane-line code'))
+        .some((code) => code.scrollWidth > code.clientWidth + 1);
+      setHasHorizontalOverflow(overflowingLine);
+    };
+    updateOverflow();
+    const resizeObserver = new ResizeObserver(updateOverflow);
+    resizeObserver.observe(node);
+    window.setTimeout(updateOverflow, 0);
+    return () => resizeObserver.disconnect();
+  }, [hunks, paneRef]);
+  return (
+    <div className={`diff-split-pane ${side}${hasHorizontalOverflow ? ' x-overflow' : ''}`} ref={paneRef}>
+      {hunks.map((hunk) => (
+        <div className="diff-split-pane-hunk" key={hunk.id}>
+          {hunk.header ? <div className="diff-hunk-head split">{hunk.header}</div> : null}
+          {hunk.rows.map((row, rowIndex) => (
+            row.type === 'meta'
+              ? <div className="diff-pane-line meta" key={rowIndex}><code>{row.text}</code></div>
+              : <DiffSplitCell key={rowIndex} side={side} line={side === 'old' ? row.left : row.right} />
+          ))}
+          {hunk.omitted > 0 ? <div className="diff-omitted">{hunk.omitted} rows omitted</div> : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DiffSplitCell({ line }) {
+  const type = line?.type || 'empty';
+  return (
+    <div className={`diff-pane-line ${type}`}>
+      <span className="diff-gutter">{formatLineNumber(line?.oldNumber ?? line?.newNumber)}</span>
+      <code>{line?.text || ''}</code>
+    </div>
+  );
+}
+
+const DIFF_MAX_LINES_PER_HUNK = 260;
+
+function limitedDiffLines(lines) {
+  return lines.slice(0, DIFF_MAX_LINES_PER_HUNK);
+}
+
+function limitedSplitRows(rows) {
+  return rows.slice(0, DIFF_MAX_LINES_PER_HUNK);
+}
+
+function parsePatchForDisplay(patchText) {
+  const lines = String(patchText || '').replace(/\r\n/g, '\n').split('\n');
+  const files = [];
+  let current = null;
+  let hunk = null;
+
+  const ensureFile = (path = 'patch') => {
+    if (!current || current.path !== path) {
+      current = { path, additions: 0, deletions: 0, hunks: [] };
+      files.push(current);
+      hunk = null;
+    }
+    return current;
+  };
+  const ensureHunk = (header = '') => {
+    ensureFile(current?.path || 'patch');
+    if (!hunk || header) {
+      hunk = { header, oldLine: null, newLine: null, lines: [] };
+      const match = header.match(/@@\s+-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?/);
+      if (match) {
+        hunk.oldLine = Number(match[1]);
+        hunk.newLine = Number(match[2]);
+      }
+      current.hunks.push(hunk);
+    }
+    return hunk;
+  };
+  const addLine = (type, text, original) => {
+    const target = ensureHunk('');
+    let oldNumber = null;
+    let newNumber = null;
+    if (type === 'context') {
+      oldNumber = target.oldLine;
+      newNumber = target.newLine;
+      if (target.oldLine !== null) target.oldLine += 1;
+      if (target.newLine !== null) target.newLine += 1;
+    } else if (type === 'remove') {
+      oldNumber = target.oldLine;
+      if (target.oldLine !== null) target.oldLine += 1;
+      current.deletions += 1;
+    } else if (type === 'add') {
+      newNumber = target.newLine;
+      if (target.newLine !== null) target.newLine += 1;
+      current.additions += 1;
+    }
+    target.lines.push({ type, text, oldNumber, newNumber, original });
+  };
+
+  for (const rawLine of lines) {
+    if (rawLine === '*** Begin Patch' || rawLine === '*** End Patch') {
+      continue;
+    }
+    if (rawLine.startsWith('diff --git ')) {
+      const match = rawLine.match(/^diff --git a\/(.+?) b\/(.+)$/);
+      ensureFile(match?.[2] || match?.[1] || rawLine.replace(/^diff --git\s+/, ''));
+      continue;
+    }
+    if (rawLine.startsWith('*** Update File: ') || rawLine.startsWith('*** Add File: ') || rawLine.startsWith('*** Delete File: ')) {
+      ensureFile(rawLine.replace(/^\*\*\* (?:Update|Add|Delete) File:\s+/, '').trim() || 'patch');
+      continue;
+    }
+    if (rawLine.startsWith('+++ ')) {
+      const path = rawLine.replace(/^\+\+\+\s+/, '').replace(/^[ab]\//, '').trim();
+      if (path && path !== '/dev/null') ensureFile(path);
+      continue;
+    }
+    if (rawLine.startsWith('--- ')) {
+      const path = rawLine.replace(/^---\s+/, '').replace(/^[ab]\//, '').trim();
+      if (!current && path && path !== '/dev/null') ensureFile(path);
+      continue;
+    }
+    if (rawLine.startsWith('@@')) {
+      ensureHunk(rawLine);
+      continue;
+    }
+    if (rawLine.startsWith('+') && !rawLine.startsWith('+++')) {
+      addLine('add', rawLine.slice(1), rawLine);
+    } else if (rawLine.startsWith('-') && !rawLine.startsWith('---')) {
+      addLine('remove', rawLine.slice(1), rawLine);
+    } else if (rawLine.startsWith(' ')) {
+      addLine('context', rawLine.slice(1), rawLine);
+    } else if (rawLine.trim()) {
+      addLine('meta', rawLine, rawLine);
+    }
+  }
+  return files
+    .map((file) => ({
+      ...file,
+      hunks: file.hunks.filter((item) => item.lines.length > 0 || item.header)
+    }))
+    .filter((file) => file.hunks.length > 0);
+}
+
+function splitDiffRows(lines) {
+  const rows = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    if (line.type === 'remove') {
+      const removes = [];
+      const adds = [];
+      while (lines[index]?.type === 'remove') {
+        removes.push(lines[index]);
+        index += 1;
+      }
+      while (lines[index]?.type === 'add') {
+        adds.push(lines[index]);
+        index += 1;
+      }
+      index -= 1;
+      const count = Math.max(removes.length, adds.length);
+      for (let pairIndex = 0; pairIndex < count; pairIndex += 1) {
+        rows.push({ type: 'change', left: removes[pairIndex] || null, right: adds[pairIndex] || null });
+      }
+    } else if (line.type === 'add') {
+      rows.push({ type: 'add', left: null, right: line });
+    } else if (line.type === 'context') {
+      rows.push({ type: 'context', left: line, right: line });
+    } else {
+      rows.push({ type: 'meta', text: line.text });
+    }
+  }
+  return rows;
+}
+
+function formatLineNumber(value) {
+  return Number.isFinite(value) ? value : '';
+}
+
+function diffMarker(type) {
+  if (type === 'add') return '+';
+  if (type === 'remove') return '-';
+  return ' ';
+}
+
 export function ToolInlineCard({ kind, name, payload, usage }) {
   const display = toolDisplay(kind, name, payload);
   return (
@@ -1377,7 +1804,7 @@ export function ToolInlineCard({ kind, name, payload, usage }) {
         <InlineTokenUsage usage={usage} />
         <i className="tool-detail-dot" aria-hidden="true" />
       </summary>
-      <ToolDetail title={display.detailTitle} payload={payload} />
+      <ToolDetail title={display.detailTitle} name={name} payload={payload} />
     </details>
   );
 }

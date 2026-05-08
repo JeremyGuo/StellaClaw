@@ -3,9 +3,9 @@ import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import remarkGfm from 'remark-gfm';
 import hljs from 'highlight.js';
-import { Download, FileText, Minus, Plus, Printer, X } from 'lucide-react';
+import { Code2, Download, Eye, FileText, Minus, Plus, Printer, X } from 'lucide-react';
 import stellacodeMark from '../assets/stellacode-mark.svg';
-import { fileExtension, fileNameFromPath, imageMimeType, isImageFile, isMarkdownFile, isPdfFile } from '../lib/fileUtils';
+import { fileExtension, fileNameFromPath, imageMimeType, isHtmlFile, isImageFile, isMarkdownFile, isPdfFile } from '../lib/fileUtils';
 
 export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile, onCloseFile, onDownloadFile }) {
   const activeFile = openFiles.find((file) => file.path === activeFilePath) || null;
@@ -121,8 +121,62 @@ function FilePreview({ file, onDownloadFile }) {
       </article>
     );
   }
+  if (file.kind === 'html' || isHtmlFile(name)) {
+    return <HtmlPreview name={name} source={source} language={file.language || ext} />;
+  }
   return (
     <CodePreview code={source} language={file.language || ext} />
+  );
+}
+
+function HtmlPreview({ name, source, language }) {
+  const [mode, setMode] = useState('render');
+
+  useEffect(() => {
+    setMode('render');
+  }, [name, source]);
+
+  return (
+    <div className="html-preview">
+      <div className="html-preview-toolbar">
+        <strong>{name}</strong>
+        <div className="preview-mode-toggle" role="tablist" aria-label="HTML preview mode">
+          <button
+            className={mode === 'render' ? 'active' : ''}
+            type="button"
+            role="tab"
+            aria-selected={mode === 'render'}
+            onClick={() => setMode('render')}
+          >
+            <Eye size={13} />
+            预览
+          </button>
+          <button
+            className={mode === 'source' ? 'active' : ''}
+            type="button"
+            role="tab"
+            aria-selected={mode === 'source'}
+            onClick={() => setMode('source')}
+          >
+            <Code2 size={13} />
+            源码
+          </button>
+        </div>
+      </div>
+      <div className="html-preview-body">
+        {mode === 'render' ? (
+          <iframe
+            className="html-render-frame"
+            title={name}
+            sandbox=""
+            referrerPolicy="no-referrer"
+            srcDoc={source}
+          />
+        ) : (
+          <CodePreview code={source} language={language || 'html'} />
+        )}
+      </div>
+    </div>
   );
 }
 

@@ -1,5 +1,5 @@
 import { FileArchive, FileCode, FileImage, FileJson, FileText, Folder } from 'lucide-react';
-import { fileExtension, isImageFile, isMarkdownFile, isPdfFile } from './fileUtils';
+import { fileExtension, isHtmlFile, isImageFile, isMarkdownFile, isPdfFile } from './fileUtils';
 
 export function normalizeWorkspacePath(value = '') {
   return String(value || '')
@@ -60,6 +60,7 @@ export function workspaceFileKind(entryOrPath) {
   const name = typeof entryOrPath === 'string' ? entryOrPath : entryOrPath?.name || entryOrPath?.path || '';
   if (isImageFile(name)) return 'image';
   if (isPdfFile(name)) return 'pdf';
+  if (isHtmlFile(name)) return 'html';
   if (isMarkdownFile(name)) return 'markdown';
   return 'code';
 }

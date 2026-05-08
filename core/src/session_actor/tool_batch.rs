@@ -108,6 +108,10 @@ impl From<ToolExecutionOp> for ToolBatchOperation {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ToolExecutionOp {
     LocalTool(ToolCallItem),
+    UnsupportedTool {
+        tool_call: ToolCallItem,
+        reason: String,
+    },
     SkillLoad {
         tool_call: ToolCallItem,
         skill: SessionSkillObservation,
@@ -143,6 +147,7 @@ impl ToolExecutionOp {
                 | "image_generation_stop" => ToolConcurrency::Serial,
                 _ => ToolConcurrency::Parallel,
             },
+            Self::UnsupportedTool { .. } => ToolConcurrency::Parallel,
             Self::SkillLoad { .. } | Self::ProviderBacked { .. } | Self::WebSearch { .. } => {
                 ToolConcurrency::Parallel
             }
@@ -153,6 +158,7 @@ impl ToolExecutionOp {
     pub fn progress_label(&self) -> String {
         match self {
             Self::LocalTool(tool_call)
+            | Self::UnsupportedTool { tool_call, .. }
             | Self::SkillLoad { tool_call, .. }
             | Self::ProviderBacked { tool_call, .. }
             | Self::WebSearch { tool_call, .. } => tool_call_progress_label(tool_call),

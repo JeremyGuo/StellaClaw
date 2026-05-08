@@ -1148,7 +1148,7 @@ fn merge_streamed_response_output(response: &mut Value, accumulator: StreamAccum
         }
     }
 
-    if merged_output.is_empty() && !accumulator.text_deltas.is_empty() {
+    if !accumulator.text_deltas.is_empty() && !output_has_assistant_text(&merged_output) {
         merged_output.push(serde_json::json!({
             "type": "message",
             "role": "assistant",
@@ -1160,6 +1160,27 @@ fn merge_streamed_response_output(response: &mut Value, accumulator: StreamAccum
     }
 
     response_object.insert("output".to_string(), Value::Array(merged_output));
+}
+
+fn output_has_assistant_text(output: &[Value]) -> bool {
+    output.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("message")
+            && item.get("role").and_then(Value::as_str) == Some("assistant")
+            && item
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|content| {
+                    content.iter().any(|content_item| {
+                        matches!(
+                            content_item.get("type").and_then(Value::as_str),
+                            Some("output_text" | "text" | "refusal")
+                        ) && content_item
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.is_empty())
+                    })
+                })
+    })
 }
 
 fn build_responses_input(
@@ -1789,6 +1810,57 @@ mod tests {
         merge_streamed_response_output(&mut response, accumulator);
 
         assert_eq!(response["output"][0]["content"][0]["text"], "streamed text");
+    }
+
+    #[test]
+    fn merges_stream_delta_when_completed_response_has_non_text_output() {
+        let mut response = serde_json::json!({
+            "id": "resp_1",
+            "output": [{
+                "type": "reasoning",
+                "summary": [],
+                "encrypted_content": "opaque"
+            }]
+        });
+        let accumulator = StreamAccumulator {
+            output_items: Vec::new(),
+            text_deltas: "streamed final answer".to_string(),
+        };
+
+        merge_streamed_response_output(&mut response, accumulator);
+
+        assert_eq!(response["output"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            response["output"][1]["content"][0]["text"],
+            "streamed final answer"
+        );
+    }
+
+    #[test]
+    fn does_not_duplicate_stream_delta_when_completed_response_has_text_output() {
+        let mut response = serde_json::json!({
+            "id": "resp_1",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "completed text"
+                }]
+            }]
+        });
+        let accumulator = StreamAccumulator {
+            output_items: Vec::new(),
+            text_deltas: "completed text".to_string(),
+        };
+
+        merge_streamed_response_output(&mut response, accumulator);
+
+        assert_eq!(response["output"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            response["output"][0]["content"][0]["text"],
+            "completed text"
+        );
     }
 
     #[test]

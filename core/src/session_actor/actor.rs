@@ -1127,10 +1127,22 @@ impl SessionActor {
     ) -> Result<ToolBatch, SessionActorError> {
         let batch_id = self.allocate_batch_id(turn_id);
         let mut operations = Vec::with_capacity(tool_calls.len());
+        let provider_enabled_tool_names = self.provider_enabled_tool_names();
 
         for tool_call in tool_calls {
             if tool_call.tool_name == "update_plan" {
                 self.handle_update_plan_tool_call(&tool_call.arguments.text)?;
+                continue;
+            }
+            if !provider_enabled_tool_names.contains(&tool_call.tool_name) {
+                operations.push(
+                    ToolExecutionOp::UnsupportedTool {
+                        reason: format!("{} is disabled for this provider", tool_call.tool_name),
+                        tool_call,
+                    }
+                    .into(),
+                );
+                continue;
             }
             let scheduled = match self.tool_catalog.get(&tool_call.tool_name) {
                 Some(definition) => {
@@ -2693,7 +2705,7 @@ mod tests {
         session_actor::{
             builtin_tool_catalog, BuiltinToolCatalogOptions, ChatRole, ContextItem, FileItem,
             HostToolScope, SessionMailboxKind, TaskPlanItemView, ToolBatchError, ToolBatchHandle,
-            ToolCallItem, ToolResultContent, ToolResultItem, COMPRESSION_MARKER,
+            ToolCallItem, ToolDefinition, ToolResultContent, ToolResultItem, COMPRESSION_MARKER,
         },
         test_support::temp_cwd,
     };
@@ -2734,6 +2746,7 @@ mod tests {
         model_config: ModelConfig,
         responses: Mutex<VecDeque<ChatMessage>>,
         seen_requests: Mutex<Vec<ProviderRequestSnapshot>>,
+        hidden_tools: Vec<String>,
     }
 
     impl ScriptedProvider {
@@ -2742,7 +2755,13 @@ mod tests {
                 model_config: test_model_config(),
                 responses: Mutex::new(VecDeque::from(responses)),
                 seen_requests: Mutex::new(Vec::new()),
+                hidden_tools: Vec::new(),
             }
+        }
+
+        fn with_hidden_tools(mut self, tools: &[&str]) -> Self {
+            self.hidden_tools = tools.iter().map(|tool| tool.to_string()).collect();
+            self
         }
     }
 
@@ -2756,6 +2775,16 @@ mod tests {
     impl Provider for ScriptedProvider {
         fn model_config(&self) -> &ModelConfig {
             &self.model_config
+        }
+
+        fn filter_tools_for_provider<'a>(
+            &self,
+            tools: Vec<&'a ToolDefinition>,
+        ) -> Vec<&'a ToolDefinition> {
+            tools
+                .into_iter()
+                .filter(|tool| !self.hidden_tools.iter().any(|hidden| hidden == &tool.name))
+                .collect()
         }
 
         fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
@@ -3773,6 +3802,75 @@ mod tests {
         assert!(matches!(
             batches[0].operations[0].operation,
             ToolExecutionOp::ConversationBridge(_)
+        ));
+    }
+
+    #[test]
+    fn provider_filtered_tools_are_not_executed_from_global_catalog() {
+        let _cwd = temp_cwd("actor-provider-filtered-tools");
+        let (inbox, mailbox) = test_inbox();
+        let session_id = test_session_id("session_provider_filtered_tool");
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial {
+                initial: SessionInitial::new(session_id, super::super::SessionType::Foreground),
+            },
+        );
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "tell user".to_string(),
+                    })],
+                ),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(
+            ScriptedProvider::new(vec![
+                ChatMessage::new(
+                    ChatRole::Assistant,
+                    vec![ChatMessageItem::ToolCall(ToolCallItem {
+                        tool_call_id: "call_1".to_string(),
+                        tool_name: "user_tell".to_string(),
+                        arguments: ContextItem {
+                            text: r#"{"text":"working"}"#.to_string(),
+                        },
+                    })],
+                ),
+                ChatMessage::new(
+                    ChatRole::Assistant,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "done".to_string(),
+                    })],
+                ),
+            ])
+            .with_hidden_tools(&["user_tell"]),
+        );
+        let tools = Arc::new(EchoToolExecutor::new());
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions {
+            host_tool_scope: Some(HostToolScope::MainForeground),
+            ..BuiltinToolCatalogOptions::default()
+        })
+        .unwrap();
+        let mut actor = SessionActor::new(
+            test_model_config(),
+            provider,
+            tools.clone(),
+            inbox,
+            events,
+            catalog,
+        );
+
+        actor.run_until_idle(4).expect("actor should run");
+
+        let batches = tools.batches.lock().unwrap();
+        assert_eq!(batches.len(), 1);
+        assert!(matches!(
+            batches[0].operations[0].operation,
+            ToolExecutionOp::UnsupportedTool { .. }
         ));
     }
 

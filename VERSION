@@ -3,6 +3,30 @@ version: 1.26.0
 
 # 1.26.0
 
+- 修复 StellaCodeX Electron 消息附件卡片不可操作的问题：
+  assistant / user 消息中的 Web attachment 现在复用 workspace 文件预览和下载链路，附件卡片按文件实体样式展示，右侧提供“打开”菜单，可直接预览或下载对应文件；图片附件也可点击预览并通过同一菜单下载。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 增强 StellaCodeX Electron HTML 文件预览：
+  workspace/附件打开 `.html` / `.htm` 文件时不再只显示源码，文件预览面板默认渲染 HTML，并提供带图标的“预览 / 源码”切换；渲染预览使用 sandbox iframe 禁止脚本执行，报告类产物可以直接查看也可以切回源码排查。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 StellaCodeX Electron light theme 下发送按钮过黑的问题：
+  composer 发送按钮改为使用主题 accent 色，并补齐 hover / disabled 状态，避免浅色主题里显示成黑色圆形按钮。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 StellaCodeX Electron markdown 表格列对齐不一致的问题：
+  GFM table 的列对齐属性不再覆盖聊天和文件预览里的表格样式，markdown 表格单元格统一左对齐，避免文档类表格出现部分列右对齐、部分列左对齐的阅读割裂。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 优化 StellaCodeX Electron edit/apply_patch 工具详情展示：
+  编辑类工具参数中包含 `patch` / `diff` 时，不再以普通 key-value 方式展示大段补丁，而是渲染成 Git diff 风格视图，包含文件头、hunk、行号 gutter、红/绿增删行和新增/删除统计；窄宽度自动使用 unified diff，宽屏自动切换为左右 split diff。split diff 左右栏各自横向滚动，并同步纵向滚动位置，避免宽行对照时两栏被同一个横向滚动条一起带走。没有 diff 内容的工具结果继续按普通详情展示。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Fixed SSH Remote Mode 下 Web workspace 的 `.stellaclaw` 本地 overlay：
+  远程 workspace 根目录会合并显示本地 conversation workspace 的 `.stellaclaw/`，并且 `.stellaclaw/**` 的列表、读取、上传、删除、同 overlay 内移动和下载均走本地 conversation workspace；其他路径继续走远程 SSH。跨本地 overlay 和远程 workspace 的移动、混合下载会明确拒绝，避免把本地运行产物误当远端文件处理。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Codex provider 下已过滤工具仍可能被执行的问题：
+  provider 可见工具集合现在不仅用于 system prompt 和 request tools，也会在本地构造 tool batch 时作为执行白名单；如果 Codex subscription 的旧服务端会话状态或历史残留返回了 `user_tell` 这类当前 provider 已过滤工具，本地不再按全局 catalog 执行，而是返回明确的 unsupported tool 结果。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 Codex subscription streaming 文本可能不渲染的问题：
+  Codex websocket 流中的 `response.output_text.delta` 现在只要最终 `response.completed.output` 没有 assistant 文本项，就会合成为 assistant `message/output_text`，即使 completed output 里已经包含 reasoning 或 tool call 也不会丢弃；如果 completed output 已经带有文本，则不会重复追加。前端因此能收到并渲染 Codex SDK 层对应的 agent message 文本。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 引入 Prompt Protocol 层：
   system prompt 不再把文件搜索、文件编辑、shell、`user_tell`、`update_plan` 和 memory 的工具操作细节全部塞进 `common_prompt`；新增 `PromptProtocol { id, priority, required_tools, body }`，由对应工具模块声明协议内容，并按 provider 实际可见工具集合筛选后以自然语言拼接进 system prompt。协议不渲染 title 或总标题，避免额外 token；`required_tools` 保证工具未启用或被 provider 过滤时不会注入相关 prompt。同步检查并对齐第一批协议和工具 description，避免搜索、编辑、shell 与 memory 规则互相冲突。本次不改变 `config` schema，不改变 `workdir` schema。
 

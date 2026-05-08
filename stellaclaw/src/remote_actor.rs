@@ -150,11 +150,29 @@ pub fn list_workspace_entries(
 ) -> std::result::Result<WorkspaceListing, RemoteActorError> {
     let normalized = normalize_workspace_path(relative_path.unwrap_or_default())?;
     if let ToolRemoteMode::FixedSsh { host, cwd } = &state.tool_remote_mode {
-        return list_remote_workspace_entries(host, cwd.as_deref(), state, &normalized, limit);
+        if is_local_overlay_path(&normalized) {
+            return list_local_workspace_entries(workdir, state, &normalized, limit);
+        }
+        return list_remote_workspace_entries(
+            workdir,
+            host,
+            cwd.as_deref(),
+            state,
+            &normalized,
+            limit,
+        );
     }
-    let conversation_root = workdir.join("conversations").join(&state.conversation_id);
-    let workspace_root = conversation_root;
-    let target = workspace_root.join(&normalized);
+    list_local_workspace_entries(workdir, state, &normalized, limit)
+}
+
+fn list_local_workspace_entries(
+    workdir: &Path,
+    state: &ConversationState,
+    normalized: &Path,
+    limit: usize,
+) -> std::result::Result<WorkspaceListing, RemoteActorError> {
+    let workspace_root = local_workspace_root(workdir, state);
+    let target = workspace_root.join(normalized);
     let metadata = fs::metadata(&target).with_context(|| {
         format!(
             "failed to inspect workspace path {}",
@@ -214,8 +232,8 @@ pub fn list_workspace_entries(
             }),
         },
         workspace_root: workspace_root.display().to_string(),
-        parent: parent_api_path(&normalized),
-        path: path_to_api_string(&normalized),
+        parent: parent_api_path(normalized),
+        path: path_to_api_string(normalized),
         total_entries,
         returned_entries,
         truncated,
@@ -237,6 +255,9 @@ pub fn read_workspace_file(
         ));
     }
     if let ToolRemoteMode::FixedSsh { host, cwd } = &state.tool_remote_mode {
+        if is_local_overlay_path(&normalized) {
+            return read_local_workspace_file(workdir, state, &normalized, offset, limit_bytes);
+        }
         return read_remote_workspace_file(
             host,
             cwd.as_deref(),
@@ -246,9 +267,18 @@ pub fn read_workspace_file(
             limit_bytes,
         );
     }
-    let conversation_root = workdir.join("conversations").join(&state.conversation_id);
-    let workspace_root = conversation_root;
-    let target = workspace_root.join(&normalized);
+    read_local_workspace_file(workdir, state, &normalized, offset, limit_bytes)
+}
+
+fn read_local_workspace_file(
+    workdir: &Path,
+    state: &ConversationState,
+    normalized: &Path,
+    offset: u64,
+    limit_bytes: Option<usize>,
+) -> std::result::Result<WorkspaceFile, RemoteActorError> {
+    let workspace_root = local_workspace_root(workdir, state);
+    let target = workspace_root.join(normalized);
     let metadata = fs::metadata(&target).with_context(|| {
         format!(
             "failed to inspect workspace file {}",
@@ -303,7 +333,7 @@ pub fn read_workspace_file(
             }),
         },
         workspace_root: workspace_root.display().to_string(),
-        path: path_to_api_string(&normalized),
+        path: path_to_api_string(normalized),
         name: normalized
             .file_name()
             .map(|value| value.to_string_lossy().to_string())
@@ -323,6 +353,7 @@ const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum compressed download archive size: 50 MiB.
 const MAX_DOWNLOAD_BYTES: usize = 50 * 1024 * 1024;
 const REMOTE_WORKSPACE_TIMEOUT: Duration = Duration::from_secs(60);
+const LOCAL_OVERLAY_DIR: &str = ".stellaclaw";
 
 /// Upload a tar.gz archive and extract it into the workspace directory at `relative_dir`.
 pub fn upload_workspace_archive(
@@ -340,10 +371,21 @@ pub fn upload_workspace_archive(
     }
     let normalized = normalize_workspace_path(relative_dir)?;
     if let ToolRemoteMode::FixedSsh { host, cwd } = &state.tool_remote_mode {
+        if is_local_overlay_path(&normalized) {
+            return upload_local_workspace_archive(workdir, state, &normalized, archive_data);
+        }
         return upload_remote_workspace_archive(host, cwd.as_deref(), &normalized, archive_data);
     }
-    let conversation_root = workdir.join("conversations").join(&state.conversation_id);
-    let workspace_root = conversation_root;
+    upload_local_workspace_archive(workdir, state, &normalized, archive_data)
+}
+
+fn upload_local_workspace_archive(
+    workdir: &Path,
+    state: &ConversationState,
+    normalized: &Path,
+    archive_data: &[u8],
+) -> std::result::Result<usize, RemoteActorError> {
+    let workspace_root = local_workspace_root(workdir, state);
     let target_dir = workspace_root.join(&normalized);
     fs::create_dir_all(&target_dir)
         .with_context(|| format!("failed to create {}", target_dir.display()))?;
@@ -391,10 +433,20 @@ pub fn delete_workspace_path(
         ));
     }
     if let ToolRemoteMode::FixedSsh { host, cwd } = &state.tool_remote_mode {
+        if is_local_overlay_path(&normalized) {
+            return delete_local_workspace_path(workdir, state, &normalized);
+        }
         return delete_remote_workspace_path(host, cwd.as_deref(), &normalized);
     }
-    let conversation_root = workdir.join("conversations").join(&state.conversation_id);
-    let workspace_root = conversation_root;
+    delete_local_workspace_path(workdir, state, &normalized)
+}
+
+fn delete_local_workspace_path(
+    workdir: &Path,
+    state: &ConversationState,
+    normalized: &Path,
+) -> std::result::Result<(), RemoteActorError> {
+    let workspace_root = local_workspace_root(workdir, state);
     let target = workspace_root.join(&normalized);
     let metadata = fs::symlink_metadata(&target).with_context(|| {
         format!(
@@ -426,10 +478,29 @@ pub fn move_workspace_path(
         ));
     }
     if let ToolRemoteMode::FixedSsh { host, cwd } = &state.tool_remote_mode {
+        let from_local_overlay = is_local_overlay_path(&from);
+        let to_local_overlay = is_local_overlay_path(&to);
+        if from_local_overlay && to_local_overlay {
+            return move_local_workspace_path(workdir, state, &from, &to);
+        }
+        if from_local_overlay || to_local_overlay {
+            return Err(RemoteActorError::InvalidPath(
+                "cannot move paths across the local .stellaclaw overlay and remote workspace"
+                    .to_string(),
+            ));
+        }
         return move_remote_workspace_path(host, cwd.as_deref(), &from, &to);
     }
-    let conversation_root = workdir.join("conversations").join(&state.conversation_id);
-    let workspace_root = conversation_root;
+    move_local_workspace_path(workdir, state, &from, &to)
+}
+
+fn move_local_workspace_path(
+    workdir: &Path,
+    state: &ConversationState,
+    from: &Path,
+    to: &Path,
+) -> std::result::Result<(), RemoteActorError> {
+    let workspace_root = local_workspace_root(workdir, state);
     let source = workspace_root.join(&from);
     let target = workspace_root.join(&to);
     if !source.exists() {
@@ -470,22 +541,41 @@ pub fn download_workspace_archive(
             "at least one path is required for download".to_string(),
         ));
     }
+    let normalized = relative_paths
+        .iter()
+        .map(|path| normalize_workspace_path(path))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
     if let ToolRemoteMode::FixedSsh { host, cwd } = &state.tool_remote_mode {
-        let normalized = relative_paths
+        let local_overlay_count = normalized
             .iter()
-            .map(|path| normalize_workspace_path(path))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
+            .filter(|path| is_local_overlay_path(path))
+            .count();
+        if local_overlay_count == normalized.len() {
+            return download_local_workspace_archive(workdir, state, &normalized);
+        }
+        if local_overlay_count > 0 {
+            return Err(RemoteActorError::InvalidPath(
+                "cannot download local .stellaclaw overlay paths together with remote workspace paths"
+                    .to_string(),
+            ));
+        }
         return download_remote_workspace_archive(host, cwd.as_deref(), &normalized);
     }
-    let conversation_root = workdir.join("conversations").join(&state.conversation_id);
-    let workspace_root = conversation_root;
+    download_local_workspace_archive(workdir, state, &normalized)
+}
+
+fn download_local_workspace_archive(
+    workdir: &Path,
+    state: &ConversationState,
+    normalized_paths: &[PathBuf],
+) -> std::result::Result<Vec<u8>, RemoteActorError> {
+    let workspace_root = local_workspace_root(workdir, state);
 
     let mut output = Vec::new();
     {
         let encoder = GzEncoder::new(&mut output, Compression::fast());
         let mut builder = tar::Builder::new(encoder);
-        for relative_path in relative_paths {
-            let normalized = normalize_workspace_path(relative_path)?;
+        for normalized in normalized_paths {
             let target = workspace_root.join(&normalized);
             let metadata = fs::metadata(&target).with_context(|| {
                 format!(
@@ -526,6 +616,7 @@ pub fn download_workspace_archive(
 }
 
 fn list_remote_workspace_entries(
+    workdir: &Path,
     host: &str,
     cwd: Option<&str>,
     state: &ConversationState,
@@ -554,6 +645,12 @@ fn list_remote_workspace_entries(
             }
         })
         .collect::<Vec<_>>();
+    if normalized.as_os_str().is_empty() {
+        entries.retain(|entry| entry.name != LOCAL_OVERLAY_DIR);
+        if let Some(entry) = local_overlay_root_entry(workdir, state) {
+            entries.push(entry);
+        }
+    }
     entries.sort_by(|left, right| {
         left.kind
             .cmp(&right.kind)
@@ -699,6 +796,35 @@ fn fixed_remote(host: &str, cwd: Option<&str>) -> Option<WorkspaceRemote> {
     Some(WorkspaceRemote {
         host: host.to_string(),
         cwd: cwd.map(str::to_string),
+    })
+}
+
+fn local_workspace_root(workdir: &Path, state: &ConversationState) -> PathBuf {
+    workdir.join("conversations").join(&state.conversation_id)
+}
+
+fn is_local_overlay_path(path: &Path) -> bool {
+    path.components().next().is_some_and(|component| {
+        matches!(
+            component,
+            Component::Normal(value) if value == std::ffi::OsStr::new(LOCAL_OVERLAY_DIR)
+        )
+    })
+}
+
+fn local_overlay_root_entry(workdir: &Path, state: &ConversationState) -> Option<WorkspaceEntry> {
+    let path = Path::new(LOCAL_OVERLAY_DIR);
+    let target = local_workspace_root(workdir, state).join(path);
+    fs::create_dir_all(&target).ok()?;
+    let metadata = fs::symlink_metadata(&target).ok()?;
+    Some(WorkspaceEntry {
+        name: LOCAL_OVERLAY_DIR.to_string(),
+        path: LOCAL_OVERLAY_DIR.to_string(),
+        kind: entry_kind(&metadata),
+        size_bytes: metadata.is_file().then_some(metadata.len()),
+        modified_ms: metadata.modified().ok().and_then(system_time_ms),
+        hidden: true,
+        readonly: metadata.permissions().readonly(),
     })
 }
 
@@ -1118,7 +1244,57 @@ fn system_time_ms(value: SystemTime) -> Option<u128> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
+    use crate::{
+        config::{ModelSelection, SessionProfile},
+        conversation::ConversationSessionBinding,
+    };
+
+    fn test_workdir(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "stellaclaw-remote-actor-{name}-{}-{}",
+            std::process::id(),
+            system_time_ms(SystemTime::now()).unwrap_or_default()
+        ));
+        fs::create_dir_all(&path).expect("create temp workdir");
+        path
+    }
+
+    fn test_state(conversation_id: &str, tool_remote_mode: ToolRemoteMode) -> ConversationState {
+        ConversationState {
+            version: 1,
+            conversation_id: conversation_id.to_string(),
+            nickname: conversation_id.to_string(),
+            channel_id: "web-main".to_string(),
+            platform_chat_id: "test-chat".to_string(),
+            session_profile: SessionProfile {
+                main_model: ModelSelection::alias("main"),
+            },
+            model_selection_pending: false,
+            tool_remote_mode,
+            sandbox: None,
+            reasoning_effort: None,
+            session_binding: ConversationSessionBinding {
+                foreground_session_id: format!("{conversation_id}.foreground"),
+                next_background_index: 1,
+                next_subagent_index: 1,
+                background_sessions: BTreeMap::new(),
+                subagent_sessions: BTreeMap::new(),
+            },
+        }
+    }
+
+    fn fixed_ssh_state(conversation_id: &str) -> ConversationState {
+        test_state(
+            conversation_id,
+            ToolRemoteMode::FixedSsh {
+                host: "invalid.example".to_string(),
+                cwd: Some("/remote/workspace".to_string()),
+            },
+        )
+    }
 
     #[test]
     fn normalizes_relative_workspace_paths() {
@@ -1144,6 +1320,89 @@ mod tests {
         assert_eq!(parent_api_path(&path).as_deref(), Some("src"));
         let root = normalize_workspace_path("").unwrap();
         assert_eq!(parent_api_path(&root), None);
+    }
+
+    #[test]
+    fn fixed_ssh_reads_local_overlay_files() {
+        let workdir = test_workdir("overlay-read");
+        let state = fixed_ssh_state("overlay-read");
+        let report_dir = local_workspace_root(&workdir, &state).join(".stellaclaw/output");
+        fs::create_dir_all(&report_dir).expect("create overlay output");
+        fs::write(report_dir.join("report.html"), "<h1>local</h1>").expect("write overlay file");
+
+        let file = read_workspace_file(&workdir, &state, ".stellaclaw/output/report.html", 0, None)
+            .expect("read local overlay file");
+
+        assert_eq!(file.path, ".stellaclaw/output/report.html");
+        assert_eq!(
+            file.workspace_root,
+            local_workspace_root(&workdir, &state).display().to_string()
+        );
+        assert_eq!(file.data, "<h1>local</h1>");
+
+        fs::remove_dir_all(workdir).ok();
+    }
+
+    #[test]
+    fn fixed_ssh_lists_local_overlay_directories() {
+        let workdir = test_workdir("overlay-list");
+        let state = fixed_ssh_state("overlay-list");
+        let report_dir = local_workspace_root(&workdir, &state).join(".stellaclaw/output");
+        fs::create_dir_all(&report_dir).expect("create overlay output");
+        fs::write(report_dir.join("report.html"), "<h1>local</h1>").expect("write overlay file");
+
+        let listing = list_workspace_entries(&workdir, &state, Some(".stellaclaw/output"), 20)
+            .expect("list local overlay directory");
+
+        assert_eq!(listing.path, ".stellaclaw/output");
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].path, ".stellaclaw/output/report.html");
+
+        fs::remove_dir_all(workdir).ok();
+    }
+
+    #[test]
+    fn local_overlay_root_entry_creates_missing_overlay_dir() {
+        let workdir = test_workdir("overlay-root-entry");
+        let state = fixed_ssh_state("overlay-root-entry");
+        let overlay_dir = local_workspace_root(&workdir, &state).join(".stellaclaw");
+        assert!(!overlay_dir.exists());
+
+        let entry =
+            local_overlay_root_entry(&workdir, &state).expect("overlay root entry should exist");
+
+        assert!(overlay_dir.is_dir());
+        assert_eq!(entry.name, ".stellaclaw");
+        assert_eq!(entry.kind, WorkspaceEntryKind::Directory);
+
+        fs::remove_dir_all(workdir).ok();
+    }
+
+    #[test]
+    fn fixed_ssh_rejects_cross_overlay_move_and_mixed_download() {
+        let workdir = test_workdir("overlay-boundaries");
+        let state = fixed_ssh_state("overlay-boundaries");
+
+        let move_error = move_workspace_path(
+            &workdir,
+            &state,
+            ".stellaclaw/output/report.html",
+            "remote/report.html",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(move_error.contains("cannot move paths across"));
+
+        let download_error = download_workspace_archive(
+            &workdir,
+            &state,
+            &[".stellaclaw/output/report.html", "remote/report.html"],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(download_error.contains("cannot download local .stellaclaw overlay paths"));
+
+        fs::remove_dir_all(workdir).ok();
     }
 
     #[test]

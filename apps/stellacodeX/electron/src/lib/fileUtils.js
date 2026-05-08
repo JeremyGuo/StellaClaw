@@ -43,6 +43,10 @@ export function isPdfFile(path = '') {
   return fileExtension(path) === 'pdf';
 }
 
+export function isHtmlFile(path = '') {
+  return ['html', 'htm'].includes(fileExtension(path));
+}
+
 export function imageMimeType(path = '') {
   const ext = fileExtension(path);
   if (ext === 'jpg') return 'image/jpeg';

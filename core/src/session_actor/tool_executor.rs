@@ -446,6 +446,9 @@ impl ToolOperationRunner {
     ) -> Result<ToolResultItem, LocalToolError> {
         let result = match operation {
             ToolExecutionOp::LocalTool(tool_call) => self.execute_local_tool(tool_call),
+            ToolExecutionOp::UnsupportedTool { reason, .. } => {
+                Err(LocalToolError::UnsupportedTool(reason.clone()))
+            }
             ToolExecutionOp::SkillLoad { tool_call, skill } => {
                 self.execute_skill_load_tool(tool_call, skill)
             }
@@ -711,6 +714,9 @@ impl ToolBatchExecutor for LocalToolBatchExecutor {
 fn tool_error_result(operation: &ToolBatchOperation, error: String) -> ToolResultItem {
     let (tool_call_id, tool_name) = match &operation.operation {
         ToolExecutionOp::LocalTool(tool_call) => {
+            (tool_call.tool_call_id.clone(), tool_call.tool_name.clone())
+        }
+        ToolExecutionOp::UnsupportedTool { tool_call, .. } => {
             (tool_call.tool_call_id.clone(), tool_call.tool_name.clone())
         }
         ToolExecutionOp::SkillLoad { tool_call, .. } => {
