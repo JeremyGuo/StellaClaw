@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import * as Dialog from '@radix-ui/react-dialog';
+import { DEFAULT_THEME_COLORS, normalizeContrast, normalizeHexColor, normalizeThemeColors } from '../lib/theme';
 
 const AUTHOR = 'Stellacode contributors';
 const MIN_DISPLAY_FONT_SIZE = 11;
@@ -59,6 +60,59 @@ function blankServer(index) {
   };
 }
 
+function ThemeColorEditor({ mode, title, colors, onChange }) {
+  const rows = [
+    ['accent', '强调色'],
+    ['background', '背景'],
+    ['foreground', '前景']
+  ];
+  return (
+    <section className="theme-editor-panel">
+      <div className="theme-editor-head">
+        <strong>{title}</strong>
+        <span className="theme-editor-preview">
+          <span>Aa</span>
+          Codex
+        </span>
+      </div>
+      {rows.map(([key, label]) => (
+        <label className="theme-editor-row" key={`${mode}-${key}`}>
+          <span>{label}</span>
+          <span className="color-value-control">
+            <input
+              aria-label={label}
+              className="color-picker-input"
+              type="color"
+              value={colors[key]}
+              onChange={(event) => onChange({ [key]: normalizeHexColor(event.target.value, colors[key]) })}
+            />
+            <input
+              className="color-hex-input"
+              value={colors[key]}
+              spellCheck={false}
+              onChange={(event) => onChange({ [key]: normalizeHexColor(event.target.value, colors[key]) })}
+            />
+          </span>
+        </label>
+      ))}
+      <label className="theme-editor-row">
+        <span>对比度</span>
+        <span className="contrast-control">
+          <input
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+            value={colors.contrast}
+            onChange={(event) => onChange({ contrast: normalizeContrast(event.target.value, colors.contrast) })}
+          />
+          <em>{colors.contrast}</em>
+        </span>
+      </label>
+    </section>
+  );
+}
+
 export function SettingsDialog({ open, settings, saving, onOpenChange, onSave }) {
   const [tab, setTab] = useState('appearance');
   const [draft, setDraft] = useState(settings);
@@ -102,6 +156,54 @@ export function SettingsDialog({ open, settings, saving, onOpenChange, onSave })
   const servers = useMemo(() => draft?.servers || [], [draft]);
   const displayFontSize = normalizeDisplayFontSize(draft?.displayFontSize);
   const uiScale = normalizeUiScale(draft?.uiScale);
+  const themeColors = useMemo(() => normalizeThemeColors(draft?.themeColors), [draft?.themeColors]);
+
+  const updateThemeColor = (mode, patch) => {
+    setDraft((current) => {
+      const currentColors = normalizeThemeColors(current?.themeColors);
+      return {
+        ...current,
+        themeColors: normalizeThemeColors({
+          ...currentColors,
+          [mode]: {
+            ...currentColors[mode],
+            ...patch
+          }
+        })
+      };
+    });
+  };
+
+  const resetThemeColors = () => {
+    setDraft((current) => ({
+      ...current,
+      themeColors: normalizeThemeColors(DEFAULT_THEME_COLORS)
+    }));
+  };
+
+  const importThemeColors = () => {
+    const text = window.prompt('粘贴主题 JSON');
+    if (!text) return;
+    try {
+      const parsed = JSON.parse(text);
+      setDraft((current) => ({
+        ...current,
+        themeColors: normalizeThemeColors(parsed?.themeColors || parsed)
+      }));
+    } catch {
+      window.alert('主题 JSON 解析失败');
+    }
+  };
+
+  const copyThemeColors = async () => {
+    const text = JSON.stringify(themeColors, null, 2);
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('clipboard unavailable');
+      await navigator.clipboard.writeText(text);
+    } catch {
+      window.prompt('复制主题 JSON', text);
+    }
+  };
 
   const updateServer = (serverId, patch) => {
     setDraft((current) => ({
@@ -227,6 +329,31 @@ export function SettingsDialog({ open, settings, saving, onOpenChange, onSave })
                         <small>{description}</small>
                       </button>
                     ))}
+                  </div>
+                  <div className="theme-color-panel">
+                    <div className="theme-color-panel-head">
+                      <div>
+                        <strong>配色</strong>
+                        <span>调整浅色和深色主题的强调色、背景、前景与对比度。</span>
+                      </div>
+                      <div>
+                        <button className="plain-button" type="button" onClick={importThemeColors}>导入</button>
+                        <button className="plain-button" type="button" onClick={copyThemeColors}>复制主题</button>
+                        <button className="plain-button" type="button" onClick={resetThemeColors}>重置 Codex</button>
+                      </div>
+                    </div>
+                    <ThemeColorEditor
+                      mode="light"
+                      title="浅色主题"
+                      colors={themeColors.light}
+                      onChange={(patch) => updateThemeColor('light', patch)}
+                    />
+                    <ThemeColorEditor
+                      mode="dark"
+                      title="深色主题"
+                      colors={themeColors.dark}
+                      onChange={(patch) => updateThemeColor('dark', patch)}
+                    />
                   </div>
                   <div className="font-size-control">
                     <div className="font-size-control-head">

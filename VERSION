@@ -3,6 +3,9 @@ version: 1.26.0
 
 # 1.26.0
 
+- 新增 StellaCodeX Electron Codex 风格可配置主题：
+  Electron 默认浅色/深色配色改为 Codex 风格的蓝色强调色、白色浅色背景和 #181818 深色背景；设置页外观中新增主题配色面板，可分别调整浅色和深色主题的强调色、背景、前景和对比度，并支持导入、复制和重置主题 JSON。设置持久化新增 `themeColors` 字段，但不改变服务端 `config` schema，不改变 `workdir` schema。
+
 - 新增独立 stellaclaw-apply-patch 子软件包：
   在 `tools/stellaclaw-apply-patch` 下新增独立版本的跨平台补丁应用 CLI，支持 Codex patch 格式和 unified diff 格式，输出稳定 JSON；新增独立 CD workflow，可按 `stellaclaw-apply-patch-v*` tag 或手动触发构建 linux-x64、linux-arm64、macos-x64、macos-arm64、windows-x64 产物并生成 hash-pinned manifest，供后续 remote tool bootstrap 安装到受控 cache。本次不改变 `config` schema，不改变 `workdir` schema。
 

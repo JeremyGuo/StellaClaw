@@ -31,6 +31,7 @@ import { SettingsDialog } from './components/SettingsDialog';
 import { clamp, formatBytes, formatModel, statusUsageTotals } from './lib/format';
 import { fileExtension, fileNameFromPath, imageMimeType } from './lib/fileUtils';
 import { activityFromMessages, addUsageTotals, firstMessageId, hasOlderMessages, isFinalAssistantMessage, lastMessageId, lastServerMessageId, liveActivitySignature, mergeMessages, shortText, usageDeltaFromMessages, websocketUrl } from './lib/messageUtils';
+import { effectiveThemeMode, themeCssVariables } from './lib/theme';
 import { collectDroppedFiles, packFilesToTarGz, uploadPayloadStats } from './lib/uploadArchive';
 import { normalizeWorkspacePath, parentWorkspacePath, workspaceEntryKind, workspaceFileKind } from './lib/workspaceUtils';
 
@@ -358,6 +359,10 @@ function mergeProgressActivity(current, progress) {
 
 function App() {
   const [settings, setSettings] = useState(null);
+  const [systemTheme, setSystemTheme] = useState(() => {
+    if (typeof window === 'undefined' || !window.matchMedia) return 'dark';
+    return window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  });
   const [sidebarMode, setSidebarMode] = useState('expanded');
   const [activeServerId, setActiveServerId] = useState('');
   const [conversations, setConversations] = useState([]);
@@ -477,6 +482,28 @@ function App() {
   useEffect(() => {
     document.documentElement.dataset.theme = settings?.themeMode || 'system';
   }, [settings?.themeMode]);
+
+  useEffect(() => {
+    if (!window.matchMedia) return undefined;
+    const query = window.matchMedia('(prefers-color-scheme: light)');
+    const apply = () => setSystemTheme(query.matches ? 'light' : 'dark');
+    apply();
+    query.addEventListener?.('change', apply);
+    return () => query.removeEventListener?.('change', apply);
+  }, []);
+
+  const activeThemeMode = effectiveThemeMode(settings?.themeMode, systemTheme);
+  const themeVariables = useMemo(
+    () => themeCssVariables(settings?.themeColors, activeThemeMode),
+    [activeThemeMode, settings?.themeColors]
+  );
+
+  useEffect(() => {
+    const root = document.documentElement;
+    Object.entries(themeVariables).forEach(([name, value]) => {
+      root.style.setProperty(name, value);
+    });
+  }, [themeVariables]);
 
   useEffect(() => {
     selectedRef.current = selected;
@@ -1650,6 +1677,7 @@ function App() {
       className={`app-root sidebar-${sidebarMode}${rightContentInset ? ' right-panel-open' : ''}${workspacePanelOpen ? ' workspace-panel-open' : ''}${previewPanelOpen ? ' preview-panel-open' : ''}${terminalOpen ? ' terminal-open' : ''}`}
       data-theme={settings?.themeMode || 'system'}
       style={{
+        ...themeVariables,
         '--sidebar-width': `${sidebarWidth}px`,
         '--overview-panel-width': `${overviewPanelWidth}px`,
         '--overview-panel-right': `${overviewPanelRight}px`,

@@ -15,6 +15,21 @@ const MAX_DISPLAY_FONT_SIZE = 18;
 const MIN_UI_SCALE = 0.8;
 const MAX_UI_SCALE = 1.4;
 const WORKSPACE_PREVIEW_MAX_BYTES = 50 * 1024 * 1024;
+const DEFAULT_THEME_COLORS = {
+  light: {
+    accent: '#339CFF',
+    background: '#FFFFFF',
+    foreground: '#1A1C1F',
+    contrast: 45
+  },
+  dark: {
+    accent: '#339CFF',
+    background: '#181818',
+    foreground: '#FFFFFF',
+    contrast: 60
+  }
+};
+const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 
 let mainWindow;
 let updateCheckTimer = null;
@@ -78,6 +93,7 @@ function defaultSettings() {
     activeServerId: 'local',
     sidebarMode: 'expanded',
     themeMode: 'system',
+    themeColors: DEFAULT_THEME_COLORS,
     displayFontSize: 12,
     uiScale: 1,
     layout: {
@@ -101,6 +117,35 @@ function defaultSettings() {
       }
     ],
     conversationUi: {}
+  };
+}
+
+function normalizeHexColor(value, fallback) {
+  const text = String(value || '').trim();
+  return HEX_COLOR_RE.test(text) ? text.toUpperCase() : fallback;
+}
+
+function normalizeThemeContrast(value, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.min(100, Math.max(0, Math.round(number)));
+}
+
+function normalizeThemeVariant(value, fallback) {
+  const source = value && typeof value === 'object' ? value : {};
+  return {
+    accent: normalizeHexColor(source.accent, fallback.accent),
+    background: normalizeHexColor(source.background, fallback.background),
+    foreground: normalizeHexColor(source.foreground, fallback.foreground),
+    contrast: normalizeThemeContrast(source.contrast, fallback.contrast)
+  };
+}
+
+function normalizeThemeColors(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  return {
+    light: normalizeThemeVariant(source.light, DEFAULT_THEME_COLORS.light),
+    dark: normalizeThemeVariant(source.dark, DEFAULT_THEME_COLORS.dark)
   };
 }
 
@@ -140,6 +185,7 @@ function normalizeSettings(value) {
         : normalizedServers[0]?.id || fallback.activeServerId,
     sidebarMode: value?.sidebarMode === 'collapsed' ? 'collapsed' : 'expanded',
     themeMode: ['system', 'light', 'dark'].includes(value?.themeMode) ? value.themeMode : fallback.themeMode,
+    themeColors: normalizeThemeColors(value?.themeColors),
     displayFontSize: normalizedDisplayFontSize,
     uiScale: normalizedUiScale,
     layout: {
