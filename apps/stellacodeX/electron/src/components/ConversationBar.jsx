@@ -69,7 +69,7 @@ export function ConversationBar({ serverId, sidebarMode, conversations, statuses
           );
         })}
       </div>
-      <div className="sidebar-footer-note">{sidebarMode === 'collapsed' ? '' : 'Stellacode 2'}</div>
+      <div className="sidebar-footer-note">{sidebarMode === 'collapsed' ? '' : 'stellacodex'}</div>
     </aside>
   );
 }
