@@ -88,6 +88,8 @@ pub struct ToolDefinition {
     pub execution_mode: ToolExecutionMode,
     pub concurrency: ToolConcurrency,
     pub backend: ToolBackend,
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub disabled_provider_types: Vec<ProviderType>,
 }
 
 impl ToolDefinition {
@@ -105,12 +107,31 @@ impl ToolDefinition {
             execution_mode,
             concurrency: ToolConcurrency::Parallel,
             backend,
+            disabled_provider_types: Vec::new(),
         }
     }
 
     pub fn with_concurrency(mut self, concurrency: ToolConcurrency) -> Self {
         self.concurrency = concurrency;
         self
+    }
+
+    pub fn disabled_for_provider(mut self, provider_type: ProviderType) -> Self {
+        if !self
+            .disabled_provider_types
+            .iter()
+            .any(|disabled| disabled == &provider_type)
+        {
+            self.disabled_provider_types.push(provider_type);
+        }
+        self
+    }
+
+    pub fn is_enabled_for_model(&self, model_config: &ModelConfig) -> bool {
+        !self
+            .disabled_provider_types
+            .iter()
+            .any(|provider_type| provider_type == &model_config.provider_type)
     }
 
     pub fn openai_tool_schema(&self) -> Value {
@@ -200,11 +221,10 @@ impl ToolCatalog {
             enable_provider_image_generation: model_config.provider_type
                 != ProviderType::CodexSubscription
                 && model_config.supports(ModelCapability::ImageOut),
-            enable_user_tell: model_config.provider_type != ProviderType::CodexSubscription,
             ..BuiltinToolCatalogOptions::default()
         };
 
-        builtin_tool_catalog(options)
+        builtin_tool_catalog(options).map(|catalog| catalog.filtered_for_model_config(model_config))
     }
 
     pub fn from_model_config_and_session_type(
@@ -226,12 +246,11 @@ impl ToolCatalog {
             enable_provider_image_generation: model_config.provider_type
                 != ProviderType::CodexSubscription
                 && model_config.supports(ModelCapability::ImageOut),
-            enable_user_tell: model_config.provider_type != ProviderType::CodexSubscription,
             host_tool_scope: Some(HostToolScope::from(session_type)),
             ..BuiltinToolCatalogOptions::default()
         };
 
-        builtin_tool_catalog(options)
+        builtin_tool_catalog(options).map(|catalog| catalog.filtered_for_model_config(model_config))
     }
 
     pub fn from_model_config_and_initial(
@@ -284,12 +303,11 @@ impl ToolCatalog {
                 && generation_tool.model_supports(ModelCapability::ImageOut),
             enable_skill_persistence_tools: true,
             enable_memory_tools: initial.memory_enabled,
-            enable_user_tell: model_config.provider_type != ProviderType::CodexSubscription,
             host_tool_scope: Some(HostToolScope::from(initial.session_type)),
             ..BuiltinToolCatalogOptions::default()
         };
 
-        builtin_tool_catalog(options)
+        builtin_tool_catalog(options).map(|catalog| catalog.filtered_for_model_config(model_config))
     }
 
     pub fn add(&mut self, tool: ToolDefinition) -> Result<(), ToolCatalogError> {
@@ -319,6 +337,12 @@ impl ToolCatalog {
 
     pub fn iter(&self) -> impl Iterator<Item = (&String, &ToolDefinition)> {
         self.tools.iter()
+    }
+
+    pub fn filtered_for_model_config(mut self, model_config: &ModelConfig) -> Self {
+        self.tools
+            .retain(|_, tool| tool.is_enabled_for_model(model_config));
+        self
     }
 
     pub fn openai_tool_schemas(&self) -> Vec<Value> {
@@ -400,7 +424,6 @@ pub struct BuiltinToolCatalogOptions {
     pub skill_names: Vec<String>,
     pub enable_skill_persistence_tools: bool,
     pub enable_memory_tools: bool,
-    pub enable_user_tell: bool,
     pub host_tool_scope: Option<HostToolScope>,
 }
 
@@ -420,7 +443,6 @@ impl Default for BuiltinToolCatalogOptions {
             skill_names: Vec::new(),
             enable_skill_persistence_tools: false,
             enable_memory_tools: false,
-            enable_user_tell: true,
             host_tool_scope: None,
         }
     }
@@ -451,9 +473,7 @@ pub fn builtin_tool_catalog(
         catalog.add(tool)?;
     }
     if let Some(scope) = options.host_tool_scope {
-        for tool in
-            host_tool_definitions(scope, options.enable_user_tell, options.enable_memory_tools)
-        {
+        for tool in host_tool_definitions(scope, options.enable_memory_tools) {
             catalog.add(tool)?;
         }
     }

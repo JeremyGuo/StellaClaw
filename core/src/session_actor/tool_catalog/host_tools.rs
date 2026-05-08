@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::model_config::ProviderType;
+
 use super::{
     schema::{object_schema, properties},
     PromptProtocol, ToolBackend, ToolConcurrency, ToolDefinition, ToolExecutionMode,
@@ -16,7 +18,6 @@ pub enum HostToolScope {
 
 pub fn host_tool_definitions(
     scope: HostToolScope,
-    enable_user_tell: bool,
     enable_memory_tools: bool,
 ) -> Vec<ToolDefinition> {
     let mut tools = Vec::new();
@@ -29,9 +30,7 @@ pub fn host_tool_definitions(
         tools.extend(managed_agent_tools());
     }
 
-    if enable_user_tell {
-        tools.push(user_tell_tool(scope));
-    }
+    tools.push(user_tell_tool(scope));
     tools.push(update_plan_tool());
     if enable_memory_tools {
         tools.extend(memory_tools());
@@ -98,6 +97,7 @@ fn user_tell_tool(scope: HostToolScope) -> ToolDefinition {
         object_schema(properties([("text", json!({"type": "string"}))]), &["text"]),
         ToolExecutionMode::Immediate,
     )
+    .disabled_for_provider(ProviderType::CodexSubscription)
 }
 
 fn update_plan_tool() -> ToolDefinition {

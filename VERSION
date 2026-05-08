@@ -3,6 +3,9 @@ version: 1.26.0
 
 # 1.26.0
 
+- 统一工具 provider 可见性过滤：
+  `ToolDefinition` 新增 provider visibility 元数据，工具可以在定义处声明不支持的 provider；`user_tell` 现在由自身声明对 Codex subscription 不可见，`ToolCatalog` 构建和 `SessionActor::new` 会按 `ModelConfig` 统一过滤。删除 Codex provider 侧的 `filter_tools_for_provider` 特例后，system prompt 协议注入、provider request tools 和本地执行白名单都依赖同一个已过滤 catalog，避免 provider 与工具目录之间继续耦合。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 移除 ls 文件工具：
   删除模型可见 `ls` 工具、本地执行入口和 fixed SSH remote handler，减少文件发现语义重叠；后续目录/路径发现统一学习 Codex 使用窄范围、有限制的 `rg --files` / ripgrep shell 命令，内容搜索继续使用 `grep`，文件内容读取继续使用 `file_read`。system prompt 和 README 同步移除 `ls` 工具说明；`.stellaclaw/` broad listing 隐藏但精确路径仍可用于文件工具的规则并入文件发现协议。本次不改变 `config` schema，不改变 `workdir` schema。
 

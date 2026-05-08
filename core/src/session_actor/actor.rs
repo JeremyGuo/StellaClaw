@@ -183,6 +183,7 @@ impl SessionActor {
         event_sink: Arc<dyn SessionActorEventSink>,
         tool_catalog: ToolCatalog,
     ) -> Self {
+        let tool_catalog = tool_catalog.filtered_for_model_config(&model_config);
         Self {
             model_config,
             provider,
@@ -241,15 +242,9 @@ impl SessionActor {
     }
 
     fn provider_enabled_tool_names(&self) -> BTreeSet<String> {
-        let tools = self
-            .tool_catalog
+        self.tool_catalog
             .iter()
-            .map(|(_, tool)| tool)
-            .collect::<Vec<_>>();
-        self.provider
-            .filter_tools_for_provider(tools)
-            .into_iter()
-            .map(|tool| tool.name.clone())
+            .map(|(_, tool)| tool.name.clone())
             .collect()
     }
 
@@ -1012,7 +1007,6 @@ impl SessionActor {
                             .iter()
                             .map(|(_, tool)| tool)
                             .collect::<Vec<_>>();
-                        let tools = self.provider.filter_tools_for_provider(tools);
                         let request = ProviderRequest::new(&provider_history)
                             .with_system_prompt(Some(system_prompt.as_str()))
                             .with_tools(tools);
@@ -2906,7 +2900,7 @@ mod tests {
         session_actor::{
             builtin_tool_catalog, BuiltinToolCatalogOptions, ChatRole, ContextItem, FileItem,
             HostToolScope, SessionMailboxKind, TaskPlanItemView, ToolBatchError, ToolBatchHandle,
-            ToolCallItem, ToolDefinition, ToolResultContent, ToolResultItem, COMPRESSION_MARKER,
+            ToolCallItem, ToolResultContent, ToolResultItem, COMPRESSION_MARKER,
         },
         test_support::temp_cwd,
     };
@@ -2947,7 +2941,6 @@ mod tests {
         model_config: ModelConfig,
         responses: Mutex<VecDeque<ChatMessage>>,
         seen_requests: Mutex<Vec<ProviderRequestSnapshot>>,
-        hidden_tools: Vec<String>,
     }
 
     impl ScriptedProvider {
@@ -2956,12 +2949,11 @@ mod tests {
                 model_config: test_model_config(),
                 responses: Mutex::new(VecDeque::from(responses)),
                 seen_requests: Mutex::new(Vec::new()),
-                hidden_tools: Vec::new(),
             }
         }
 
-        fn with_hidden_tools(mut self, tools: &[&str]) -> Self {
-            self.hidden_tools = tools.iter().map(|tool| tool.to_string()).collect();
+        fn with_model_config(mut self, model_config: ModelConfig) -> Self {
+            self.model_config = model_config;
             self
         }
     }
@@ -2976,16 +2968,6 @@ mod tests {
     impl Provider for ScriptedProvider {
         fn model_config(&self) -> &ModelConfig {
             &self.model_config
-        }
-
-        fn filter_tools_for_provider<'a>(
-            &self,
-            tools: Vec<&'a ToolDefinition>,
-        ) -> Vec<&'a ToolDefinition> {
-            tools
-                .into_iter()
-                .filter(|tool| !self.hidden_tools.iter().any(|hidden| hidden == &tool.name))
-                .collect()
         }
 
         fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
@@ -4032,7 +4014,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_filtered_tools_are_not_executed_from_global_catalog() {
+    fn provider_disabled_tools_are_not_executed_from_filtered_catalog() {
         let _cwd = temp_cwd("actor-provider-filtered-tools");
         let (inbox, mailbox) = test_inbox();
         let session_id = test_session_id("session_provider_filtered_tool");
@@ -4054,6 +4036,10 @@ mod tests {
             },
         );
         let events = Arc::new(MemoryEventSink::default());
+        let mut model_config = test_model_config();
+        model_config.provider_type = ProviderType::CodexSubscription;
+        model_config.url = "wss://codex.example.invalid".to_string();
+        model_config.api_key_env = "CODEX_AUTH".to_string();
         let provider = Arc::new(
             ScriptedProvider::new(vec![
                 ChatMessage::new(
@@ -4073,16 +4059,17 @@ mod tests {
                     })],
                 ),
             ])
-            .with_hidden_tools(&["user_tell"]),
+            .with_model_config(model_config.clone()),
         );
         let tools = Arc::new(EchoToolExecutor::new());
-        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions {
-            host_tool_scope: Some(HostToolScope::MainForeground),
-            ..BuiltinToolCatalogOptions::default()
-        })
-        .unwrap();
+        let catalog = ToolCatalog::from_model_config_and_session_type(
+            &model_config,
+            super::super::SessionType::Foreground,
+        )
+        .expect("catalog should build");
+        assert!(!catalog.contains("user_tell"));
         let mut actor = SessionActor::new(
-            test_model_config(),
+            model_config,
             provider,
             tools.clone(),
             inbox,

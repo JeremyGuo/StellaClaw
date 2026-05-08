@@ -20,7 +20,7 @@ use crate::{
     model_config::ModelConfig,
     session_actor::{
         normalize_messages_for_model, ChatMessage, ChatMessageItem, ChatRole, ContextItem,
-        FileItem, ReasoningItem, ToolCallItem, ToolDefinition,
+        FileItem, ReasoningItem, ToolCallItem,
     },
 };
 
@@ -263,17 +263,6 @@ impl ProviderBackend for CodexSubscriptionProvider {
         messages
             .iter()
             .filter_map(normalize_message_for_codex_provider)
-            .collect()
-    }
-
-    fn filter_tools_for_provider<'a>(
-        &self,
-        _model_config: &ModelConfig,
-        tools: Vec<&'a ToolDefinition>,
-    ) -> Vec<&'a ToolDefinition> {
-        tools
-            .into_iter()
-            .filter(|tool| tool.name != "user_tell")
             .collect()
     }
 
@@ -1771,7 +1760,7 @@ mod tests {
         MediaInputConfig, MediaInputTransport, ModelCapability, MultimodalInputConfig,
         ProviderType, RetryMode, TokenEstimatorType,
     };
-    use crate::session_actor::{ToolBackend, ToolExecutionMode, ToolResultContent, ToolResultItem};
+    use crate::session_actor::{ToolResultContent, ToolResultItem};
     use std::path::PathBuf;
 
     #[test]
@@ -2265,38 +2254,6 @@ mod tests {
         assert_eq!(
             reasoning.codex_encrypted_content.as_deref(),
             Some("encrypted")
-        );
-    }
-
-    #[test]
-    fn codex_provider_filters_user_tell_tool() {
-        let user_tell = ToolDefinition::new(
-            "user_tell",
-            "send progress",
-            json!({"type": "object"}),
-            ToolExecutionMode::Immediate,
-            ToolBackend::ConversationBridge {
-                action: "user_tell".to_string(),
-            },
-        );
-        let file_read = ToolDefinition::new(
-            "file_read",
-            "read file",
-            json!({"type": "object"}),
-            ToolExecutionMode::Immediate,
-            ToolBackend::Local,
-        );
-        let tools = vec![&user_tell, &file_read];
-
-        let provider = CodexSubscriptionProvider::new();
-        let filtered = provider.filter_tools_for_provider(&test_model_config(), tools);
-
-        assert_eq!(
-            filtered
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["file_read"]
         );
     }
 

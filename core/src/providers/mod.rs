@@ -57,13 +57,6 @@ pub trait Provider {
         messages.to_vec()
     }
 
-    fn filter_tools_for_provider<'a>(
-        &self,
-        tools: Vec<&'a ToolDefinition>,
-    ) -> Vec<&'a ToolDefinition> {
-        tools
-    }
-
     fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError>;
 
     fn before_retry(&self, _error: &ProviderError) {}
@@ -76,14 +69,6 @@ pub(crate) trait ProviderBackend: Send + Sync {
         messages: &[ChatMessage],
     ) -> Vec<ChatMessage> {
         messages.to_vec()
-    }
-
-    fn filter_tools_for_provider<'a>(
-        &self,
-        _model_config: &ModelConfig,
-        tools: Vec<&'a ToolDefinition>,
-    ) -> Vec<&'a ToolDefinition> {
-        tools
     }
 
     fn send(
@@ -108,14 +93,6 @@ impl Provider for ModelBoundProvider {
     fn normalize_messages_for_provider(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
         self.backend
             .normalize_messages_for_provider(&self.model_config, messages)
-    }
-
-    fn filter_tools_for_provider<'a>(
-        &self,
-        tools: Vec<&'a ToolDefinition>,
-    ) -> Vec<&'a ToolDefinition> {
-        self.backend
-            .filter_tools_for_provider(&self.model_config, tools)
     }
 
     fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
