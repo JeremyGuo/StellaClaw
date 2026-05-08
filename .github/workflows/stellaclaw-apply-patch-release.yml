@@ -31,7 +31,7 @@ jobs:
             binary: stellaclaw-apply-patch
             apt: gcc-aarch64-linux-gnu
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-          - runner: macos-13
+          - runner: macos-14
             target: x86_64-apple-darwin
             platform: macos-x64
             archive: tar.gz
