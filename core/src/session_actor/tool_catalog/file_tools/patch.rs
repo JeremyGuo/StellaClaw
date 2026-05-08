@@ -339,7 +339,7 @@ fn ensure_remote_apply_patch_tool(host: &str) -> Result<String, LocalToolError> 
         RemoteApplyPatchState::Missing { path, tmp_path } => {
             copy_apply_patch_binary_to_remote(host, &local_binary, &tmp_path)?;
             let install = format!(
-                "set -e; chmod 755 {tmp}; mv {tmp} {path}; printf '%s' {path}",
+                "set -e; /bin/chmod 755 {tmp}; /bin/mv {tmp} {path}; printf '%s' {path}",
                 tmp = shell_quote(&tmp_path),
                 path = shell_quote(&path),
             );
@@ -362,7 +362,9 @@ enum RemoteApplyPatchState {
 }
 
 fn detect_remote_apply_patch_platform(host: &str) -> Result<String, LocalToolError> {
-    let command = remote_shell_command("printf '%s\\n%s\\n' \"$(uname -s)\" \"$(uname -m)\"");
+    let command = remote_shell_command(
+        "if [ -x /usr/bin/uname ]; then uname_cmd=/usr/bin/uname; else uname_cmd=/bin/uname; fi; printf '%s\\n%s\\n' \"$($uname_cmd -s)\" \"$($uname_cmd -m)\"",
+    );
     let output = run_remote_command_with_stdin(host, &command, b"")?;
     if !output.status.success() {
         return Err(LocalToolError::Remote(format!(
@@ -398,7 +400,7 @@ fn remote_apply_patch_install_state(
     platform: &str,
 ) -> Result<RemoteApplyPatchState, LocalToolError> {
     let script = format!(
-        "set -e; root=\"${{STELLACLAW_TOOL_CACHE_DIR:-${{HOME:-/tmp}}/.cache/stellaclaw/tools}}\"; dir=\"$root/{name}/{version}/{platform}\"; path=\"$dir/{name}\"; mkdir -p \"$dir\"; if [ -x \"$path\" ]; then printf 'ready\\n%s\\n' \"$path\"; else tmp=\"$dir/.{name}.incoming.$$\"; rm -f \"$tmp\"; printf 'missing\\n%s\\n%s\\n' \"$path\" \"$tmp\"; fi",
+        "set -e; root=\"${{STELLACLAW_TOOL_CACHE_DIR:-${{HOME:-/tmp}}/.cache/stellaclaw/tools}}\"; dir=\"$root/{name}/{version}/{platform}\"; path=\"$dir/{name}\"; /bin/mkdir -p \"$dir\"; if [ -x \"$path\" ]; then printf 'ready\\n%s\\n' \"$path\"; else tmp=\"$dir/.{name}.incoming.$$\"; /bin/rm -f \"$tmp\"; printf 'missing\\n%s\\n%s\\n' \"$path\" \"$tmp\"; fi",
         name = APPLY_PATCH_TOOL_NAME,
         version = APPLY_PATCH_TOOL_VERSION,
         platform = platform,

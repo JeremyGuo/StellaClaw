@@ -7,7 +7,7 @@ version: 1.26.0
   `stellaclaw-apply-patch` 子包版本提升到 `0.1.2`，CD 中 `linux-x64` / `linux-arm64` 资产改用 `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` 构建但保留原 platform 名；`linux-arm64` 交叉编译显式使用 Rust toolchain 自带的 `rust-lld`，避免 GitHub Actions 用宿主 `/usr/bin/ld` 链接 AArch64 对象；remote `apply_patch` runtime 期望的 release manifest 同步切到 `stellaclaw-apply-patch-v0.1.2`，避免 Ubuntu 20.04 这类 glibc 2.31 机器命中旧动态链接二进制后无法执行。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 修复 remote apply_patch bootstrap 依赖远端 PATH 的问题：
-  fixed/selectable SSH remote 下准备 `stellaclaw-apply-patch` cache、检测远端平台、安装二进制和执行二进制前都会先注入保底 `PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin...`，避免某些 zsh 非交互环境里 `mkdir`、`rm`、`chmod`、`mv`、`uname` 或二进制内部调用的 `git` 因 PATH 缺失而 `command not found`。本次不改变 `config` schema，不改变 `workdir` schema。
+  fixed/selectable SSH remote 下准备 `stellaclaw-apply-patch` cache、检测远端平台、安装二进制和执行二进制前都会先注入保底 `PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin...`；cache/bootstrap 阶段的 `mkdir`、`rm`、`chmod`、`mv`、`uname` 进一步改用绝对路径或绝对路径探测，避免某些 zsh 非交互环境里基础命令因 PATH 缺失而 `command not found`。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 新增 StellaCodeX Electron Codex 风格可配置主题：
   Electron 默认浅色/深色配色改为 Codex 风格的蓝色强调色、白色浅色背景和 #181818 深色背景；设置页外观中新增主题配色面板，可分别调整浅色和深色主题的强调色、背景、前景和对比度，并支持导入、复制和重置主题 JSON。设置持久化新增 `themeColors` 字段，但不改变服务端 `config` schema，不改变 `workdir` schema。
