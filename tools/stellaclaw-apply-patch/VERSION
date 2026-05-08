@@ -1,5 +1,11 @@
-version: 0.1.1
+version: 0.1.2
 ---
+
+# 0.1.2
+
+- 修复 `linux-arm64` musl release 在 GitHub Actions 中仍使用宿主
+  `/usr/bin/ld` 链接 AArch64 对象的问题；CD 现在为
+  `aarch64-unknown-linux-musl` 显式使用 Rust toolchain 自带的 `rust-lld`。
 
 # 0.1.1
 

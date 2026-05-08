@@ -29,6 +29,7 @@ jobs:
             platform: linux-arm64
             archive: tar.gz
             binary: stellaclaw-apply-patch
+            linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
           - runner: macos-14
             target: x86_64-apple-darwin
             platform: macos-x64
@@ -57,14 +58,10 @@ jobs:
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Install target linker
-        if: ${{ matrix.apt != null }}
+      - name: Configure target linker
+        if: ${{ matrix.linker_env != null && matrix.linker_env != '' }}
         shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.apt }}
-          echo "${{ matrix.linker_env }}" >> "$GITHUB_ENV"
+        run: echo "${{ matrix.linker_env }}" >> "$GITHUB_ENV"
 
       - name: Build
         shell: bash
