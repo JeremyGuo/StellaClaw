@@ -1,5 +1,11 @@
-version: 0.1.0
+version: 0.1.1
 ---
+
+# 0.1.1
+
+- Linux release assets now build with musl targets while keeping the existing
+  `linux-x64` and `linux-arm64` platform names. The resulting binaries are
+  statically linked and do not depend on the remote host glibc version.
 
 # 0.1.0
 

@@ -18,8 +18,8 @@ use crate::session_actor::tool_runtime::{
 };
 
 const APPLY_PATCH_TOOL_NAME: &str = "stellaclaw-apply-patch";
-const APPLY_PATCH_TOOL_VERSION: &str = "0.1.0";
-const APPLY_PATCH_MANIFEST_URL: &str = "https://github.com/JeremyGuo/StellaClaw/releases/download/stellaclaw-apply-patch-v0.1.0/tools-manifest.json";
+const APPLY_PATCH_TOOL_VERSION: &str = "0.1.1";
+const APPLY_PATCH_MANIFEST_URL: &str = "https://github.com/JeremyGuo/StellaClaw/releases/download/stellaclaw-apply-patch-v0.1.1/tools-manifest.json";
 
 pub(super) fn execute_patch_tool(
     tool_name: &str,
