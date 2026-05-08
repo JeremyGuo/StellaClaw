@@ -1107,6 +1107,44 @@ mod tests {
     }
 
     #[test]
+    fn fixed_remote_mode_applies_patch_to_stellaclaw_paths_locally() {
+        let workspace = temp_workspace();
+        fs::create_dir_all(workspace.join(".stellaclaw")).unwrap();
+        fs::write(
+            workspace.join(".stellaclaw/apply_patch_smoke_test.txt"),
+            "old\n",
+        )
+        .unwrap();
+        let executor =
+            LocalToolBatchExecutor::new(&workspace).with_remote_mode(ToolRemoteMode::FixedSsh {
+                host: "fake-host".to_string(),
+                cwd: Some("/remote/project".to_string()),
+            });
+        let patch = "\
+--- .stellaclaw/apply_patch_smoke_test.txt
++++ .stellaclaw/apply_patch_smoke_test.txt
+@@ -1 +1 @@
+-old
++new
+";
+        let batch = ToolBatch::new(
+            "batch_local_overlay_patch",
+            vec![tool_call(
+                "apply_patch",
+                json!({"patch": patch, "format": "unified"}),
+            )],
+        );
+
+        let message = start_and_wait(&executor, batch);
+
+        assert!(result_text(&message, 0).contains("\"applied\": true"));
+        assert_eq!(
+            fs::read_to_string(workspace.join(".stellaclaw/apply_patch_smoke_test.txt")).unwrap(),
+            "new\n"
+        );
+    }
+
+    #[test]
     fn directory_path_tools_default_to_workspace_root() {
         let workspace = temp_workspace();
         fs::write(workspace.join("root.txt"), "root marker\n").unwrap();

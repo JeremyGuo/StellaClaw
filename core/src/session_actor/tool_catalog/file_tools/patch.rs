@@ -20,6 +20,8 @@ use crate::session_actor::tool_runtime::{
 const APPLY_PATCH_TOOL_NAME: &str = "stellaclaw-apply-patch";
 const APPLY_PATCH_TOOL_VERSION: &str = "0.1.2";
 const APPLY_PATCH_MANIFEST_URL: &str = "https://github.com/JeremyGuo/StellaClaw/releases/download/stellaclaw-apply-patch-v0.1.2/tools-manifest.json";
+const REMOTE_SAFE_PATH_PREFIX: &str =
+    "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}; export PATH;";
 
 pub(super) fn execute_patch_tool(
     tool_name: &str,
@@ -30,13 +32,33 @@ pub(super) fn execute_patch_tool(
         return Ok(None);
     }
 
-    let result = match context.execution_target(arguments)? {
+    let result = match apply_patch_execution_target(arguments, context)? {
         ExecutionTarget::Local => apply_patch_local(arguments, context.workspace_root)?,
         ExecutionTarget::RemoteSsh { host, cwd } => {
             apply_patch_remote(arguments, &host, cwd.as_deref())?
         }
     };
     Ok(Some(result))
+}
+
+fn apply_patch_execution_target(
+    arguments: &Map<String, Value>,
+    context: &ToolExecutionContext<'_>,
+) -> Result<ExecutionTarget, LocalToolError> {
+    if !matches!(
+        context.remote_mode,
+        crate::session_actor::ToolRemoteMode::FixedSsh { .. }
+    ) {
+        return context.execution_target(arguments);
+    }
+    let patch = string_arg(arguments, "patch")?;
+    let format = patch_format(arguments, &patch)?;
+    match classify_patch_target_paths(format, &patch, context.workspace_root)? {
+        PatchTargetPaths::LocalSpecial => Ok(ExecutionTarget::Local),
+        PatchTargetPaths::RemoteDefault | PatchTargetPaths::Unknown => {
+            context.execution_target(arguments)
+        }
+    }
 }
 
 fn apply_patch_local(
@@ -145,6 +167,7 @@ fn apply_patch_remote(
         Some(cwd) => format!("cd {} && {}", shell_quote(cwd), remote_command),
         None => remote_command,
     };
+    let remote_command = remote_shell_command(&remote_command);
     let output = run_remote_command_with_stdin(host, &remote_command, patch.as_bytes())?;
     if let Some(result) = parse_remote_apply_patch_json(&output, host) {
         return Ok(result);
@@ -320,6 +343,7 @@ fn ensure_remote_apply_patch_tool(host: &str) -> Result<String, LocalToolError> 
                 tmp = shell_quote(&tmp_path),
                 path = shell_quote(&path),
             );
+            let install = remote_shell_command(&install);
             let output = run_remote_command_with_stdin(host, &install, b"")?;
             if !output.status.success() {
                 return Err(LocalToolError::Remote(format!(
@@ -338,11 +362,8 @@ enum RemoteApplyPatchState {
 }
 
 fn detect_remote_apply_patch_platform(host: &str) -> Result<String, LocalToolError> {
-    let output = run_remote_command_with_stdin(
-        host,
-        "printf '%s\\n%s\\n' \"$(uname -s)\" \"$(uname -m)\"",
-        b"",
-    )?;
+    let command = remote_shell_command("printf '%s\\n%s\\n' \"$(uname -s)\" \"$(uname -m)\"");
+    let output = run_remote_command_with_stdin(host, &command, b"")?;
     if !output.status.success() {
         return Err(LocalToolError::Remote(format!(
             "failed to detect remote platform: {}",
@@ -382,6 +403,7 @@ fn remote_apply_patch_install_state(
         version = APPLY_PATCH_TOOL_VERSION,
         platform = platform,
     );
+    let script = remote_shell_command(&script);
     let output = run_remote_command_with_stdin(host, &script, b"")?;
     if !output.status.success() {
         return Err(LocalToolError::Remote(format!(
@@ -402,6 +424,117 @@ fn remote_apply_patch_install_state(
         other => Err(LocalToolError::Remote(format!(
             "unexpected remote {APPLY_PATCH_TOOL_NAME} cache response: {other}"
         ))),
+    }
+}
+
+fn remote_shell_command(script: &str) -> String {
+    format!("{REMOTE_SAFE_PATH_PREFIX} {script}")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatchTargetPaths {
+    LocalSpecial,
+    RemoteDefault,
+    Unknown,
+}
+
+fn classify_patch_target_paths(
+    format: PatchFormat,
+    patch: &str,
+    workspace_root: &Path,
+) -> Result<PatchTargetPaths, LocalToolError> {
+    let mut saw_local = false;
+    let mut saw_remote = false;
+    match format {
+        PatchFormat::Codex => {
+            for op in parse_codex_patch(patch)? {
+                for path in codex_patch_op_paths(&op) {
+                    if is_local_special_patch_path(path, workspace_root) {
+                        saw_local = true;
+                    } else {
+                        saw_remote = true;
+                    }
+                }
+            }
+        }
+        PatchFormat::Unified => {
+            for path in unified_patch_header_paths(patch) {
+                if path == "/dev/null" {
+                    continue;
+                }
+                if is_local_special_patch_path(Path::new(path), workspace_root) {
+                    saw_local = true;
+                } else {
+                    saw_remote = true;
+                }
+            }
+        }
+    }
+    match (saw_local, saw_remote) {
+        (true, false) => Ok(PatchTargetPaths::LocalSpecial),
+        (false, true) => Ok(PatchTargetPaths::RemoteDefault),
+        (false, false) => Ok(PatchTargetPaths::Unknown),
+        (true, true) => Err(LocalToolError::InvalidArguments(
+            "apply_patch cannot mix local .stellaclaw/workspace absolute paths and remote workspace paths in one patch while fixed remote mode is active".to_string(),
+        )),
+    }
+}
+
+fn codex_patch_op_paths(op: &CodexPatchOp) -> Vec<&Path> {
+    match op {
+        CodexPatchOp::Add { path, .. } | CodexPatchOp::Delete { path } => vec![path.as_path()],
+        CodexPatchOp::Update { path, move_to, .. } => {
+            let mut paths = vec![path.as_path()];
+            if let Some(move_to) = move_to {
+                paths.push(move_to.as_path());
+            }
+            paths
+        }
+    }
+}
+
+fn unified_patch_header_paths(patch: &str) -> Vec<&str> {
+    let mut paths = Vec::new();
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("--- ") {
+            paths.push(split_unified_header_path(rest).0);
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            paths.push(split_unified_header_path(rest).0);
+        } else if let Some(rest) = line.strip_prefix("diff --git ") {
+            let mut parts = rest.split_whitespace();
+            if let Some(path) = parts.next() {
+                paths.push(path);
+            }
+            if let Some(path) = parts.next() {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+fn is_local_special_patch_path(path: &Path, workspace_root: &Path) -> bool {
+    if path.is_absolute() {
+        return path.starts_with(workspace_root);
+    }
+    let path = strip_unified_side_prefix(path);
+    let mut components = path.components();
+    let Some(Component::Normal(first)) = components.next() else {
+        return false;
+    };
+    first.to_string_lossy() == ".stellaclaw"
+}
+
+fn strip_unified_side_prefix(path: &Path) -> &Path {
+    let mut components = path.components();
+    let Some(Component::Normal(first)) = components.next() else {
+        return path;
+    };
+    let first = first.to_string_lossy();
+    if first == "a" || first == "b" {
+        components.as_path()
+    } else {
+        path
     }
 }
 
@@ -1157,5 +1290,87 @@ diff --git /home/me/work/src/a.py /home/me/work/src/a.py
             Some("macos-arm64")
         );
         assert_eq!(remote_platform_from_uname("FreeBSD", "x86_64"), None);
+    }
+
+    #[test]
+    fn remote_shell_command_sets_safe_path() {
+        let command = remote_shell_command("mkdir -p \"$dir\"");
+        assert!(command.starts_with("PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"));
+        assert!(command.contains("export PATH;"));
+        assert!(command.ends_with("mkdir -p \"$dir\""));
+    }
+
+    #[test]
+    fn classifies_absolute_workspace_patch_as_local_special() {
+        let patch = "\
+--- /home/me/work/.stellaclaw/apply_patch_smoke_test.txt
++++ /home/me/work/.stellaclaw/apply_patch_smoke_test.txt
+@@ -1 +1 @@
+-old
++new
+";
+
+        let classification =
+            classify_patch_target_paths(PatchFormat::Unified, patch, Path::new("/home/me/work"))
+                .expect("classification should succeed");
+
+        assert_eq!(classification, PatchTargetPaths::LocalSpecial);
+    }
+
+    #[test]
+    fn classifies_stellaclaw_git_style_patch_as_local_special() {
+        let patch = "\
+diff --git a/.stellaclaw/a.txt b/.stellaclaw/a.txt
+--- a/.stellaclaw/a.txt
++++ b/.stellaclaw/a.txt
+@@ -1 +1 @@
+-old
++new
+";
+
+        let classification =
+            classify_patch_target_paths(PatchFormat::Unified, patch, Path::new("/home/me/work"))
+                .expect("classification should succeed");
+
+        assert_eq!(classification, PatchTargetPaths::LocalSpecial);
+    }
+
+    #[test]
+    fn classifies_ordinary_relative_patch_as_remote_default() {
+        let patch = "\
+--- src/main.rs
++++ src/main.rs
+@@ -1 +1 @@
+-old
++new
+";
+
+        let classification =
+            classify_patch_target_paths(PatchFormat::Unified, patch, Path::new("/home/me/work"))
+                .expect("classification should succeed");
+
+        assert_eq!(classification, PatchTargetPaths::RemoteDefault);
+    }
+
+    #[test]
+    fn rejects_mixed_local_special_and_remote_patch_paths() {
+        let patch = "\
+--- .stellaclaw/local.txt
++++ .stellaclaw/local.txt
+@@ -1 +1 @@
+-old
++new
+--- src/remote.rs
++++ src/remote.rs
+@@ -1 +1 @@
+-old
++new
+";
+
+        let error =
+            classify_patch_target_paths(PatchFormat::Unified, patch, Path::new("/home/me/work"))
+                .expect_err("mixed paths should be rejected");
+
+        assert!(error.to_string().contains("cannot mix local .stellaclaw"));
     }
 }
