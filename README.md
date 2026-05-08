@@ -215,7 +215,7 @@ Stellaclaw exposes tools through a dynamic catalog that is rebuilt from runtime 
 
 | Family | Examples |
 |---|---|
-| Files and search | `file_read`, `file_write`, `apply_patch`, `grep`, `ls` |
+| Files and search | `file_read`, `file_write`, `apply_patch`, `grep` |
 | Shell | `shell_exec`, `shell_write_stdin`, `shell_stop` |
 | Web | `web_fetch`, `web_search` |
 | Downloads | `file_download_start`, `file_download_progress`, `file_download_wait`, `file_download_cancel` |

@@ -3,6 +3,12 @@ version: 1.26.0
 
 # 1.26.0
 
+- 移除 ls 文件工具：
+  删除模型可见 `ls` 工具、本地执行入口和 fixed SSH remote handler，减少文件发现语义重叠；后续目录/路径发现统一学习 Codex 使用窄范围、有限制的 `rg --files` / ripgrep shell 命令，内容搜索继续使用 `grep`，文件内容读取继续使用 `file_read`。system prompt 和 README 同步移除 `ls` 工具说明；`.stellaclaw/` broad listing 隐藏但精确路径仍可用于文件工具的规则并入文件发现协议。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 common prompt 泄漏 user_tell 工具名的问题：
+  Codex subscription 的 SessionActor tool catalog 现在从源头不再加入 `user_tell`，而不是只在 provider request tools 阶段过滤；`<attachment>...</attachment>` 的通用输出协议也不再提到 `user_tell`，只说明 final answer 的附件标签格式和路径规则；`user_tell` 文本可带附件标签的说明改到 `host.user_tell` 工具协议中，并且只有 `user_tell` 工具实际启用且 provider 可见时才注入。Codex subscription 下 system prompt、工具协议、执行白名单和最终 request tools 都不应再暴露该工具名。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 修复工具调用历史可能缺失 ToolResult 的问题：
   `update_plan` 被 SessionActor 接管后仍会为原始 tool call 写入即时 ToolResult，恢复前端“工具结果”展示并保持 provider tool protocol 闭合；工具 batch 启动失败或 completion 返回错误时，也会为 batch 中每个未完成操作生成结构化 error ToolResult，再继续后续模型循环。对于已经写入历史的旧半开 tool call，SessionActor 会在下一次 provider request 前自动追加 synthetic error ToolResult 修复协议，避免 Codex subscription 报 `No tool output found for function call`。本次不改变 `config` schema，不改变 `workdir` schema。
 
@@ -37,7 +43,7 @@ version: 1.26.0
   system prompt 不再把文件搜索、文件编辑、shell、`user_tell`、`update_plan` 和 memory 的工具操作细节全部塞进 `common_prompt`；新增 `PromptProtocol { id, priority, required_tools, body }`，由对应工具模块声明协议内容，并按 provider 实际可见工具集合筛选后以自然语言拼接进 system prompt。协议不渲染 title 或总标题，避免额外 token；`required_tools` 保证工具未启用或被 provider 过滤时不会注入相关 prompt。同步检查并对齐第一批协议和工具 description，避免搜索、编辑、shell 与 memory 规则互相冲突。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 调整附件输出 prompt 分层：
-  `<attachment>relative/path/from/workspace_root</attachment>` 是 assistant 输出协议而不是文件写入工具协议，现已移到始终注入的 common system prompt，并明确附件路径必须是 workspace-relative、不能是绝对路径或 `file://` URI、发送时必须对 conversation workspace 可见；common prompt 同时保留 `.stellaclaw/shared/` 跨 conversation 共享目录和 `STELLACLAW_SOFTWARE_DIR` 共享软件目录说明。删除 `file_write` 相关附件协议中的 `.stellaclaw/output/` 写入建议，`.stellaclaw/` 普通 `ls` 隐藏但精确路径可用的说明改由 `ls` 工具协议注入，`attachment_make_visible` 和 `user_tell` 描述也改为只保留必要语义。本次不改变 `config` schema，不改变 `workdir` schema。
+  `<attachment>relative/path/from/workspace_root</attachment>` 是 assistant 输出协议而不是文件写入工具协议，现已移到始终注入的 common system prompt，并明确附件路径必须是 workspace-relative、不能是绝对路径或 `file://` URI、发送时必须对 conversation workspace 可见；common prompt 同时保留 `.stellaclaw/shared/` 跨 conversation 共享目录和 `STELLACLAW_SOFTWARE_DIR` 共享软件目录说明。删除 `file_write` 相关附件协议中的 `.stellaclaw/output/` 写入建议，`.stellaclaw/` broad listing 隐藏但精确路径可用的说明改由文件发现协议注入，`attachment_make_visible` 和 `user_tell` 描述也改为只保留必要语义。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 强化 apply_patch 后的 system prompt 行为约束：
   system prompt 学习 Codex 的 patch-first 使用方式，明确 `apply_patch` 用于定点修改，且成功后不要为了确认补丁是否应用而无意义重读已修改文件；工具未应用会报告失败，只有需要新上下文、后续命令或 formatter 可能改写文件、或验证失败需要排查时才重新读取。同时检查 system prompt 中已删除工具残留，当前未发现 `edit` / `old_text` / `replace_all` / `create_if_missing` 之类旧工具噪声。本次不改变 `config` schema，不改变 `workdir` schema。
@@ -49,10 +55,10 @@ version: 1.26.0
   `file_read` 的模型可见参数从 `offset` / `limit` 改为更贴近 Gemini CLI、Dirac、Cline 的 `start_line` / `end_line`，其中行号从 1 开始且 `end_line` 为 inclusive；省略 `end_line` 时默认从 `start_line` 读取最多 200 行。内部继续兼容旧的 `offset` / `limit` 调用，避免既有历史或客户端立即失效。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 强化 grep 工具能力和搜索 prompt：
-  `grep` 工具学习 Gemini CLI / Dirac / Codex 的可用设计，除匹配文件列表外新增返回 line-level `matches`，包含 `file`、`line`、`column`、匹配行文本以及可选 `before` / `after` 上下文；`context_lines` 支持 Dirac 风格的 0 到 10 行，新增 `exclude`、`max_matches_per_file`、`total_max_matches` 和 `names_only`，本地与 fixed SSH remote 文件工具保持同形输出。system prompt 现在优先引导模型使用 `grep` / `ls` / `file_read`，并学习 Codex：路径模式发现不再暴露单独 `glob` 工具，而是明确允许使用窄范围、有限制的 `rg --files -g <pattern>` / ripgrep 命令；如果 `rg` 不可用，则使用有边界的替代方案。本次不改变 `config` schema，不改变 `workdir` schema。
+  `grep` 工具学习 Gemini CLI / Dirac / Codex 的可用设计，除匹配文件列表外新增返回 line-level `matches`，包含 `file`、`line`、`column`、匹配行文本以及可选 `before` / `after` 上下文；`context_lines` 支持 Dirac 风格的 0 到 10 行，新增 `exclude`、`max_matches_per_file`、`total_max_matches` 和 `names_only`，本地与 fixed SSH remote 文件工具保持同形输出。system prompt 现在优先引导模型使用 `grep` / `file_read`，并学习 Codex：路径模式发现不再暴露单独 `glob` 工具，而是明确允许使用窄范围、有限制的 `rg --files -g <pattern>` / ripgrep 命令；如果 `rg` 不可用，则使用有边界的替代方案。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 移除 glob 文件发现工具：
-  删除模型可见 `glob` 工具、本地执行入口和 fixed SSH remote handler，减少文件发现工具语义重叠；后续按路径 pattern 找文件统一学习 Codex 使用 `rg --files`，按内容搜索继续使用 `grep`，目录树查看继续使用 `ls`。保留内部 glob matcher 仅用于 `grep.include` / `grep.exclude` 文件过滤。本次不改变 `config` schema，不改变 `workdir` schema。
+  删除模型可见 `glob` 工具、本地执行入口和 fixed SSH remote handler，减少文件发现工具语义重叠；后续按路径 pattern 找文件统一学习 Codex 使用 `rg --files`，按内容搜索继续使用 `grep`。保留内部 glob matcher 仅用于 `grep.include` / `grep.exclude` 文件过滤。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 强化 SessionActor 上下文压缩 prompt：
   压缩 provider request 不再使用独立 compression system prompt，改为沿用当前 session 的原始 system prompt 以保持 provider prefix/cache 一致性；压缩请求仍在 user instruction 中要求严格 JSON。prompt 吸收 Dirac 式高保真续写要求，明确压缩结果必须覆盖用户意图、需求约束、技术发现、架构决策、代码模式、涉及文件、当前状态、阻塞项、验证状态和精确下一步，同时避免复制不必要的原始历史。压缩 JSON 新增 `active_tasks`，用于结构化保留仍在运行或等待中的 `process_id`、`download_id`、`subagent` / background agent id、DSL job id 等恢复句柄及其目的、状态和下一步观察/继续/停止方式；`preserved_tool_call_ids` 保留为可选 raw tool pair 回填机制，仅在工具参数和结果无法安全摘要时使用。本次不改变 `config` schema，不改变 `workdir` schema。

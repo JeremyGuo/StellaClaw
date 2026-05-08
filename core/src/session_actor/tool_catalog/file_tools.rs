@@ -1,5 +1,4 @@
 mod common;
-mod list;
 mod patch;
 mod read_write;
 mod search;
@@ -66,17 +65,6 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
                     ("names_only", json!({"type": "boolean"})),
                 ]),
                 &["pattern"],
-                remote_mode,
-            ),
-            ToolExecutionMode::Immediate,
-            ToolBackend::Local,
-        ),
-        ToolDefinition::new(
-            "ls",
-            "List a recursive directory tree for non-hidden files and directories under a path. Omit path or pass an empty string to list the current workspace directory. Skips common cache/build directories and slow remote mounts such as sshfs/NFS by default. Large trees are truncated to the first 1000 files and directories; pass a more specific path, use grep when you know a content pattern, or use narrow shell rg/ripgrep commands for path pattern discovery.",
-            file_tool_schema(
-                properties([("path", json!({"type": "string"}))]),
-                &[],
                 remote_mode,
             ),
             ToolExecutionMode::Immediate,
@@ -151,14 +139,8 @@ const FILE_PROMPT_PROTOCOLS: &[PromptProtocol] = &[
     PromptProtocol {
         id: "file.discovery",
         priority: 100,
-        required_tools: &["grep", "ls", "file_read"],
-        body: "For repository exploration, prefer dedicated tools when they cover the need: use grep to find files by content pattern with line numbers and optional context, ls for narrowed directory listings, and file_read for file contents. For path pattern discovery or advanced search output, use narrow and bounded shell rg/ripgrep commands such as rg --files -g '<pattern>'; if rg is unavailable, use bounded alternatives. Keep shell search scoped to the relevant directory. The recursive discovery/search tools skip slow remote mounts such as sshfs/NFS by default. Do not use shell for direct cat, head, tail, or ls.",
-    },
-    PromptProtocol {
-        id: "file.listing",
-        priority: 105,
-        required_tools: &["ls"],
-        body: "The ls tool hides .stellaclaw/ from broad directory listings, but exact .stellaclaw/ paths remain valid for file tools.",
+        required_tools: &["grep", "file_read"],
+        body: "For repository exploration, prefer grep to find files by content pattern with line numbers and optional context, and file_read for file contents. For path pattern discovery or directory listings, use narrow and bounded shell rg/ripgrep commands such as rg --files -g '<pattern>' or rg --files <dir>; if rg is unavailable, use bounded alternatives. Keep shell search scoped to the relevant directory, and avoid direct cat/head/tail when file_read covers the need. Recursive search skips slow remote mounts such as sshfs/NFS by default. Broad directory listings hide .stellaclaw/, but exact .stellaclaw/ paths remain valid for file tools.",
     },
     PromptProtocol {
         id: "file.editing",
@@ -187,9 +169,6 @@ pub(crate) fn execute_file_tool(
         return Ok(Some(result));
     }
     if let Some(result) = search::execute_search_tool(tool_name, arguments, context)? {
-        return Ok(Some(result));
-    }
-    if let Some(result) = list::execute_list_tool(tool_name, arguments, context)? {
         return Ok(Some(result));
     }
     if let Some(result) = patch::execute_patch_tool(tool_name, arguments, context)? {

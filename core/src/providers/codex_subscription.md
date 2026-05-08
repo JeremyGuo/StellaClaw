@@ -558,8 +558,8 @@ Input:
       "type": "tool_call",
       "payload": {
         "tool_call_id": "call_1",
-        "tool_name": "ls",
-        "arguments": { "text": "{\"path\":\".\"}" }
+        "tool_name": "grep",
+        "arguments": { "text": "{\"pattern\":\"TODO\",\"path\":\".\"}" }
       }
     },
     {
@@ -583,8 +583,8 @@ Output:
   },
   {
     "type": "function_call",
-    "name": "ls",
-    "arguments": "{\"path\":\".\"}",
+    "name": "grep",
+    "arguments": "{\"pattern\":\"TODO\",\"path\":\".\"}",
     "call_id": "call_1"
   },
   {

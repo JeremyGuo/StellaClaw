@@ -54,7 +54,7 @@ fn common_prompt() -> &'static str {
      AGENTS.md or similar instruction file before editing there; when rules conflict, \
      follow the more local file. Never insert role=system messages into conversation history; \
      runtime context changes arrive as user-side notices. To send files or images to the user, \
-     append one or more tags in final answer text or user_tell text using exactly this format: \
+     append one or more tags in final answer text using exactly this format: \
      <attachment>relative/path/from/workspace_root</attachment>. Attachment paths must be relative \
      to the current workspace root, must not be absolute paths or file:// URIs, and must refer to \
      files visible in the conversation workspace when the message is sent. The workspace may \
@@ -212,7 +212,6 @@ mod tests {
             "file_read",
             "file_write",
             "grep",
-            "ls",
             "apply_patch",
             "shell_exec",
             "shell_write_stdin",
@@ -273,7 +272,7 @@ mod tests {
     #[test]
     fn system_prompt_omits_protocols_for_disabled_tools() {
         let state = RuntimeMetadataState::default();
-        let enabled_tools = enabled_tools(&["file_read", "file_write", "grep", "ls"]);
+        let enabled_tools = enabled_tools(&["file_read", "file_write", "grep"]);
         let prompt = system_prompt_for_initial(
             &SessionInitial::new("s1", SessionType::Foreground),
             &state,
@@ -285,10 +284,11 @@ mod tests {
         assert!(prompt.contains("Attachment paths must be relative"));
         assert!(prompt.contains(".stellaclaw/shared/"));
         assert!(prompt.contains("STELLACLAW_SOFTWARE_DIR"));
-        assert!(prompt.contains("The ls tool hides .stellaclaw/"));
+        assert!(prompt.contains("Broad directory listings hide .stellaclaw/"));
         assert!(!prompt.contains("use apply_patch for targeted edits"));
         assert!(!prompt.contains("Before referencing a file with <attachment>"));
         assert!(!prompt.contains("When using shell for commands"));
+        assert!(!prompt.contains("user_tell"));
         assert!(!prompt.contains("Use user_tell only"));
         assert!(!prompt.contains("Use update_plan"));
         assert!(!prompt.contains("prefer subagent_start"));

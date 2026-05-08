@@ -10,16 +10,6 @@ use serde_json::{json, Map, Value};
 use crate::session_actor::tool_runtime::{run_remote_json, LocalToolError};
 
 pub(super) const SEARCH_MAX_RESULTS: usize = 100;
-pub(super) const LS_MAX_ENTRIES: usize = 1000;
-pub(super) const COMMON_LS_SKIP_DIRS: &[&str] = &[
-    "__pycache__",
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    "coverage",
-    "venv",
-];
 
 const SLOW_MOUNT_FS_TYPES: &[&str] = &[
     "fuse.sshfs",
@@ -82,11 +72,6 @@ impl SlowMountTable {
 pub(super) struct SearchMatch {
     pub path: String,
     pub mtime_ms: u128,
-}
-
-pub(super) struct LsEntry {
-    pub path: String,
-    pub is_dir: bool,
 }
 
 pub(super) fn build_glob_matcher(pattern: &str) -> Result<GlobMatcher, LocalToolError> {
@@ -233,11 +218,9 @@ GREP_DEFAULT_TOTAL_MAX_MATCHES = SEARCH_MAX_RESULTS
 GREP_MAX_TOTAL_MATCHES = 1000
 GREP_MAX_MATCHES_PER_FILE = 1000
 GREP_MAX_LINE_CHARS = 600
-LS_MAX_ENTRIES = 1000
-COMMON_LS_SKIP_DIRS = {{"__pycache__", "node_modules", "target", "dist", "build", "coverage", "venv"}}
 SLOW_MOUNT_FS_TYPES = {{"fuse.sshfs", "sshfs", "nfs", "nfs4", "cifs", "smb3", "9p", "davfs", "fuse.rclone", "fuse.s3fs", "fuse.gcsfuse"}}
-OPERATION_TIMEOUT_SECONDS = {{"ls": 20, "grep": 45}}
-OPERATION_ATTEMPTS = {{"ls": 2, "grep": 2}}
+OPERATION_TIMEOUT_SECONDS = {{"grep": 45}}
+OPERATION_ATTEMPTS = {{"grep": 2}}
 
 class OperationTimeout(TimeoutError):
     pass
@@ -445,85 +428,8 @@ def handle_grep(args, workspace_root):
         result["truncated"] = True
     return result
 
-def should_skip_ls(name, is_dir):
-    if name.startswith("."):
-        return True
-    return is_dir and name in COMMON_LS_SKIP_DIRS
-
-def handle_ls(args, workspace_root):
-    path_arg = args.get("path", ".")
-    if not isinstance(path_arg, str):
-        raise ValueError("argument path must be a string")
-    if path_arg == "":
-        path_arg = "."
-    shadow_roots = args.get("shadow_roots", [])
-    if not isinstance(shadow_roots, list):
-        shadow_roots = []
-    shadow_roots = {{str(name) for name in shadow_roots}}
-    base = resolve(path_arg, workspace_root)
-    if not os.path.exists(base):
-        raise ValueError(f"{{base}} does not exist")
-    if not os.path.isdir(base):
-        raise ValueError(f"{{base}} is not a directory")
-    entries = []
-    truncated = False
-    if is_slow_mount_path(base):
-        lines = [f"num_entries: 0", "", f"- {{base.rstrip(os.sep) + os.sep}}"]
-        return "\n".join(lines)
-    for root, dirs, files in os.walk(base, followlinks=False):
-        at_base = os.path.abspath(root) == os.path.abspath(base)
-        dirs[:] = [
-            name for name in dirs
-            if not (at_base and name in shadow_roots)
-            and not should_skip_ls(name, True)
-            and not is_slow_mount_path(os.path.join(root, name))
-        ]
-        for name in dirs:
-            if len(entries) >= LS_MAX_ENTRIES:
-                truncated = True
-                break
-            path = os.path.join(root, name)
-            entries.append((os.path.relpath(path, base).replace(os.sep, "/"), True))
-        if truncated:
-            break
-        for name in files:
-            if at_base and name in shadow_roots:
-                continue
-            if should_skip_ls(name, False):
-                continue
-            if len(entries) >= LS_MAX_ENTRIES:
-                truncated = True
-                break
-            path = os.path.join(root, name)
-            entries.append((os.path.relpath(path, base).replace(os.sep, "/"), False))
-        if truncated:
-            break
-    entries.sort(key=lambda item: item[0])
-    lines = []
-    if truncated:
-        lines.append(f"num_entries: >{{LS_MAX_ENTRIES}}")
-        lines.append("truncated: true")
-        lines.append(f"There are more than {{LS_MAX_ENTRIES}} files and directories under {{base}}. Use ls with a more specific path, grep for content search, or narrow shell rg/ripgrep commands such as rg --files for path pattern discovery. The first {{LS_MAX_ENTRIES}} files and directories are included below:")
-        lines.append("")
-    else:
-        lines.append(f"num_entries: {{len(entries)}}")
-        lines.append("")
-    display_base = base.replace(os.sep, "/")
-    if not display_base.endswith("/"):
-        display_base += "/"
-    lines.append(f"- {{display_base}}")
-    for rel_path, is_dir in entries:
-        parts = [part for part in rel_path.split("/") if part]
-        if not parts:
-            continue
-        indent = "  " * len(parts)
-        suffix = "/" if is_dir else ""
-        lines.append(f"{{indent}}- {{parts[-1]}}{{suffix}}")
-    return "\n".join(lines)
-
 handlers = {{
     "grep": handle_grep,
-    "ls": handle_ls,
 }}
 
 try:
@@ -553,9 +459,9 @@ mod tests {
     #[test]
     fn remote_file_tool_script_is_valid_python() {
         let script = remote_file_tool_script(&json!({
-            "operation": "ls",
+            "operation": "grep",
             "workspace_root": ".",
-            "arguments": {"path": "."},
+            "arguments": {"pattern": "demo", "path": "."},
         }));
         assert_python_compiles(&script);
     }

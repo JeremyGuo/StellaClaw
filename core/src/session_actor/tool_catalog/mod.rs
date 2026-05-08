@@ -200,6 +200,7 @@ impl ToolCatalog {
             enable_provider_image_generation: model_config.provider_type
                 != ProviderType::CodexSubscription
                 && model_config.supports(ModelCapability::ImageOut),
+            enable_user_tell: model_config.provider_type != ProviderType::CodexSubscription,
             ..BuiltinToolCatalogOptions::default()
         };
 
@@ -225,6 +226,7 @@ impl ToolCatalog {
             enable_provider_image_generation: model_config.provider_type
                 != ProviderType::CodexSubscription
                 && model_config.supports(ModelCapability::ImageOut),
+            enable_user_tell: model_config.provider_type != ProviderType::CodexSubscription,
             host_tool_scope: Some(HostToolScope::from(session_type)),
             ..BuiltinToolCatalogOptions::default()
         };
@@ -282,6 +284,7 @@ impl ToolCatalog {
                 && generation_tool.model_supports(ModelCapability::ImageOut),
             enable_skill_persistence_tools: true,
             enable_memory_tools: initial.memory_enabled,
+            enable_user_tell: model_config.provider_type != ProviderType::CodexSubscription,
             host_tool_scope: Some(HostToolScope::from(initial.session_type)),
             ..BuiltinToolCatalogOptions::default()
         };
@@ -397,6 +400,7 @@ pub struct BuiltinToolCatalogOptions {
     pub skill_names: Vec<String>,
     pub enable_skill_persistence_tools: bool,
     pub enable_memory_tools: bool,
+    pub enable_user_tell: bool,
     pub host_tool_scope: Option<HostToolScope>,
 }
 
@@ -416,6 +420,7 @@ impl Default for BuiltinToolCatalogOptions {
             skill_names: Vec::new(),
             enable_skill_persistence_tools: false,
             enable_memory_tools: false,
+            enable_user_tell: true,
             host_tool_scope: None,
         }
     }
@@ -446,7 +451,9 @@ pub fn builtin_tool_catalog(
         catalog.add(tool)?;
     }
     if let Some(scope) = options.host_tool_scope {
-        for tool in host_tool_definitions(scope, options.enable_memory_tools) {
+        for tool in
+            host_tool_definitions(scope, options.enable_user_tell, options.enable_memory_tools)
+        {
             catalog.add(tool)?;
         }
     }
@@ -514,9 +521,7 @@ mod tests {
         assert_eq!(file_read.parameters["required"], json!(["file_path"]));
         assert!(file_read.parameters["properties"].get("remote").is_some());
         assert!(!catalog.contains("edit"));
-
-        let ls = catalog.get("ls").unwrap();
-        assert_eq!(ls.parameters["required"], json!([]));
+        assert!(!catalog.contains("ls"));
 
         let shell = catalog.get("shell_exec").unwrap();
         assert_eq!(shell.execution_mode, ToolExecutionMode::Interruptible);
@@ -789,6 +794,41 @@ mod tests {
             .get("model")
             .is_none());
         assert!(!subagent.contains("list_cron_tasks"));
+    }
+
+    #[test]
+    fn codex_subscription_catalog_excludes_user_tell_at_source() {
+        let config = ModelConfig {
+            provider_type: ProviderType::CodexSubscription,
+            model_name: "gpt-5.5".to_string(),
+            url: "wss://codex.example.invalid".to_string(),
+            api_key_env: "CODEX_AUTH".to_string(),
+            capabilities: vec![ModelCapability::Chat],
+            token_max_context: 128_000,
+            max_tokens: 0,
+            cache_timeout: 300,
+            conn_timeout: 10,
+            request_timeout: 600,
+            max_request_size: 30 * 1024 * 1024,
+            retry_mode: RetryMode::Once,
+            reasoning: None,
+            token_estimator_type: TokenEstimatorType::Local,
+            multimodal_estimator: None,
+            multimodal_input: None,
+            token_estimator_url: None,
+        };
+
+        let foreground =
+            ToolCatalog::from_model_config_and_session_type(&config, SessionType::Foreground)
+                .expect("foreground catalog should build");
+        let initial = SessionInitial::new("session_1", SessionType::Foreground);
+        let from_initial =
+            ToolCatalog::from_model_config_and_initial(&config, &initial).expect("catalog");
+
+        for catalog in [&foreground, &from_initial] {
+            assert!(!catalog.contains("user_tell"));
+            assert!(catalog.contains("update_plan"));
+        }
     }
 
     #[test]

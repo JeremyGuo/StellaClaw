@@ -16,6 +16,7 @@ pub enum HostToolScope {
 
 pub fn host_tool_definitions(
     scope: HostToolScope,
+    enable_user_tell: bool,
     enable_memory_tools: bool,
 ) -> Vec<ToolDefinition> {
     let mut tools = Vec::new();
@@ -28,7 +29,9 @@ pub fn host_tool_definitions(
         tools.extend(managed_agent_tools());
     }
 
-    tools.push(user_tell_tool(scope));
+    if enable_user_tell {
+        tools.push(user_tell_tool(scope));
+    }
     tools.push(update_plan_tool());
     if enable_memory_tools {
         tools.extend(memory_tools());
@@ -57,7 +60,7 @@ const HOST_PROMPT_PROTOCOLS: &[PromptProtocol] = &[
         id: "host.user_tell",
         priority: 300,
         required_tools: &["user_tell"],
-        body: "Use user_tell only for mid-task progress or coordination that must become visible before the current turn is ready to finish. If you can return the final answer now, do not send an extra user_tell first. Positive example: a long-running edit, benchmark, or debug session is still in progress and the user needs an immediate visible status update. Negative example: you already have the result and are about to finish, so a separate 'working on it' or 'done' user_tell is unnecessary.",
+        body: "Use user_tell only for mid-task progress or coordination that must become visible before the current turn is ready to finish. If you can return the final answer now, do not send an extra user_tell first. user_tell text may include <attachment> tags using the common attachment format. Positive example: a long-running edit, benchmark, or debug session is still in progress and the user needs an immediate visible status update. Negative example: you already have the result and are about to finish, so a separate 'working on it' or 'done' user_tell is unnecessary.",
     },
     PromptProtocol {
         id: "host.update_plan",

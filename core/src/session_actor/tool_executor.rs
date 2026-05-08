@@ -898,7 +898,7 @@ mod tests {
     }
 
     #[test]
-    fn executes_search_list_and_apply_patch_locally() {
+    fn executes_search_and_apply_patch_locally() {
         let workspace = temp_workspace();
         fs::create_dir_all(workspace.join("src")).unwrap();
         fs::write(
@@ -912,20 +912,16 @@ mod tests {
         let executor = LocalToolBatchExecutor::new(&workspace);
         let batch = ToolBatch::new(
             "batch_search",
-            vec![
-                tool_call(
-                    "grep",
-                    json!({"pattern": "marker", "path": ".", "include": "src/*"}),
-                ),
-                tool_call("ls", json!({"path": "."})),
-            ],
+            vec![tool_call(
+                "grep",
+                json!({"pattern": "marker", "path": ".", "include": "src/*"}),
+            )],
         );
 
         let message = start_and_wait(&executor, batch);
 
         assert!(result_text(&message, 0).contains("readme.txt"));
-        assert!(result_text(&message, 1).contains("src/"));
-        assert!(!result_text(&message, 1).contains(".hidden"));
+        assert!(!result_text(&message, 0).contains(".hidden"));
 
         fs::write(workspace.join("patch.txt"), "old\n").unwrap();
         let patch = r#"diff --git a/patch.txt b/patch.txt
@@ -1094,16 +1090,15 @@ mod tests {
         let executor = LocalToolBatchExecutor::new(&workspace);
         let batch = ToolBatch::new(
             "batch_default_path",
-            vec![
-                tool_call("ls", json!({})),
-                tool_call("grep", json!({"pattern": "root marker", "path": ""})),
-            ],
+            vec![tool_call(
+                "grep",
+                json!({"pattern": "root marker", "path": ""}),
+            )],
         );
 
         let message = start_and_wait(&executor, batch);
 
         assert!(result_text(&message, 0).contains("root.txt"));
-        assert!(result_text(&message, 1).contains("root.txt"));
     }
 
     #[test]
