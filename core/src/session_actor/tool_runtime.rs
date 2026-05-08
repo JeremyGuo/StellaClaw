@@ -374,7 +374,7 @@ pub(super) fn run_remote_command_with_stdin(
     run_command_with_timeout(command, REMOTE_STDIN_TIMEOUT, Some(stdin), "ssh")
 }
 
-fn run_command_with_timeout(
+pub(super) fn run_command_with_timeout(
     mut command: Command,
     timeout: Duration,
     stdin: Option<&[u8]>,

@@ -1,18 +1,25 @@
 use std::{
     collections::BTreeSet,
-    fs,
+    env, fs,
     io::Write,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::session_actor::tool_runtime::{
-    bool_arg_with_default, clamp_tool_output_chars, run_remote_command_with_stdin, shell_quote,
-    string_arg, string_arg_with_default, truncate_tool_text, usize_arg_with_default,
-    ExecutionTarget, LocalToolError, ToolExecutionContext,
+    bool_arg_with_default, clamp_tool_output_chars, run_command_with_timeout,
+    run_remote_command_with_stdin, shell_quote, string_arg, string_arg_with_default,
+    truncate_tool_text, usize_arg_with_default, ExecutionTarget, LocalToolError,
+    ToolExecutionContext,
 };
+
+const APPLY_PATCH_TOOL_NAME: &str = "stellaclaw-apply-patch";
+const APPLY_PATCH_TOOL_VERSION: &str = "0.1.0";
+const APPLY_PATCH_MANIFEST_URL: &str = "https://github.com/JeremyGuo/StellaClaw/releases/download/stellaclaw-apply-patch-v0.1.0/tools-manifest.json";
 
 pub(super) fn execute_patch_tool(
     tool_name: &str,
@@ -101,30 +108,34 @@ fn apply_patch_remote(
     cwd: Option<&str>,
 ) -> Result<Value, LocalToolError> {
     let patch = string_arg(arguments, "patch")?;
-    if patch_format(arguments, &patch)? == PatchFormat::Codex {
-        return Err(LocalToolError::InvalidArguments(
-            "format=codex is currently supported only for local workspace patches; use format=unified for remote patches".to_string(),
-        ));
-    }
-    let patch = normalize_unified_patch_paths(&patch, cwd.map(Path::new), "remote cwd")?;
+    let format = patch_format(arguments, &patch)?;
     let strip = usize_arg_with_default(arguments, "strip", 0)?;
     let reverse = bool_arg_with_default(arguments, "reverse", false)?;
     let check = bool_arg_with_default(arguments, "check", false)?;
     let max_output_chars =
         clamp_tool_output_chars(usize_arg_with_default(arguments, "max_output_chars", 1000)?);
+
+    let remote_binary = ensure_remote_apply_patch_tool(host)?;
     let mut args = vec![
-        "git".to_string(),
-        "apply".to_string(),
-        "--recount".to_string(),
-        "--whitespace=nowarn".to_string(),
-        format!("-p{strip}"),
+        remote_binary,
+        "--workspace".to_string(),
+        ".".to_string(),
+        "--format".to_string(),
+        format.cli_name().to_string(),
+        "--max-output-chars".to_string(),
+        max_output_chars.to_string(),
     ];
-    if reverse {
-        args.push("--reverse".to_string());
-    }
     if check {
         args.push("--check".to_string());
     }
+    if reverse {
+        args.push("--reverse".to_string());
+    }
+    if strip != 0 {
+        args.push("--strip".to_string());
+        args.push(strip.to_string());
+    }
+
     let remote_command = args
         .iter()
         .map(|arg| shell_quote(arg))
@@ -135,7 +146,18 @@ fn apply_patch_remote(
         None => remote_command,
     };
     let output = run_remote_command_with_stdin(host, &remote_command, patch.as_bytes())?;
+    if let Some(result) = parse_remote_apply_patch_json(&output, host) {
+        return Ok(result);
+    }
     Ok(patch_result(output, Some(host), max_output_chars))
+}
+
+fn parse_remote_apply_patch_json(output: &std::process::Output, host: &str) -> Option<Value> {
+    let mut value = serde_json::from_slice::<Value>(&output.stdout).ok()?;
+    if let Value::Object(object) = &mut value {
+        object.insert("remote".to_string(), Value::String(host.to_string()));
+    }
+    Some(value)
 }
 
 fn normalize_unified_patch_paths(
@@ -252,6 +274,15 @@ enum PatchFormat {
     Unified,
 }
 
+impl PatchFormat {
+    fn cli_name(self) -> &'static str {
+        match self {
+            PatchFormat::Codex => "codex",
+            PatchFormat::Unified => "unified",
+        }
+    }
+}
+
 fn patch_format(
     arguments: &Map<String, Value>,
     patch: &str,
@@ -274,6 +305,352 @@ fn patch_format(
             "unsupported patch format {other}; expected auto, codex, or unified"
         ))),
     }
+}
+
+fn ensure_remote_apply_patch_tool(host: &str) -> Result<String, LocalToolError> {
+    let platform = detect_remote_apply_patch_platform(host)?;
+    let local_binary = ensure_local_apply_patch_binary(&platform)?;
+    let remote_state = remote_apply_patch_install_state(host, &platform)?;
+    match remote_state {
+        RemoteApplyPatchState::Ready { path } => Ok(path),
+        RemoteApplyPatchState::Missing { path, tmp_path } => {
+            copy_apply_patch_binary_to_remote(host, &local_binary, &tmp_path)?;
+            let install = format!(
+                "set -e; chmod 755 {tmp}; mv {tmp} {path}; printf '%s' {path}",
+                tmp = shell_quote(&tmp_path),
+                path = shell_quote(&path),
+            );
+            let output = run_remote_command_with_stdin(host, &install, b"")?;
+            if !output.status.success() {
+                return Err(LocalToolError::Remote(format!(
+                    "failed to install remote {APPLY_PATCH_TOOL_NAME}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                )));
+            }
+            Ok(path)
+        }
+    }
+}
+
+enum RemoteApplyPatchState {
+    Ready { path: String },
+    Missing { path: String, tmp_path: String },
+}
+
+fn detect_remote_apply_patch_platform(host: &str) -> Result<String, LocalToolError> {
+    let output = run_remote_command_with_stdin(
+        host,
+        "printf '%s\\n%s\\n' \"$(uname -s)\" \"$(uname -m)\"",
+        b"",
+    )?;
+    if !output.status.success() {
+        return Err(LocalToolError::Remote(format!(
+            "failed to detect remote platform: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    let os = lines.next().unwrap_or_default();
+    let arch = lines.next().unwrap_or_default();
+    remote_platform_from_uname(os, arch).ok_or_else(|| {
+        LocalToolError::Remote(format!(
+            "unsupported remote platform for {APPLY_PATCH_TOOL_NAME}: {os} {arch}"
+        ))
+    })
+}
+
+fn remote_platform_from_uname(os: &str, arch: &str) -> Option<String> {
+    let os = os.trim().to_ascii_lowercase();
+    let arch = arch.trim().to_ascii_lowercase();
+    match (os.as_str(), arch.as_str()) {
+        ("linux", "x86_64") | ("linux", "amd64") => Some("linux-x64".to_string()),
+        ("linux", "aarch64") | ("linux", "arm64") => Some("linux-arm64".to_string()),
+        ("darwin", "x86_64") | ("darwin", "amd64") => Some("macos-x64".to_string()),
+        ("darwin", "aarch64") | ("darwin", "arm64") => Some("macos-arm64".to_string()),
+        _ => None,
+    }
+}
+
+fn remote_apply_patch_install_state(
+    host: &str,
+    platform: &str,
+) -> Result<RemoteApplyPatchState, LocalToolError> {
+    let script = format!(
+        "set -e; root=\"${{STELLACLAW_TOOL_CACHE_DIR:-${{HOME:-/tmp}}/.cache/stellaclaw/tools}}\"; dir=\"$root/{name}/{version}/{platform}\"; path=\"$dir/{name}\"; mkdir -p \"$dir\"; if [ -x \"$path\" ]; then printf 'ready\\n%s\\n' \"$path\"; else tmp=\"$dir/.{name}.incoming.$$\"; rm -f \"$tmp\"; printf 'missing\\n%s\\n%s\\n' \"$path\" \"$tmp\"; fi",
+        name = APPLY_PATCH_TOOL_NAME,
+        version = APPLY_PATCH_TOOL_VERSION,
+        platform = platform,
+    );
+    let output = run_remote_command_with_stdin(host, &script, b"")?;
+    if !output.status.success() {
+        return Err(LocalToolError::Remote(format!(
+            "failed to prepare remote {APPLY_PATCH_TOOL_NAME} cache: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut lines = text.lines();
+    match lines.next().unwrap_or_default() {
+        "ready" => Ok(RemoteApplyPatchState::Ready {
+            path: lines.next().unwrap_or_default().to_string(),
+        }),
+        "missing" => Ok(RemoteApplyPatchState::Missing {
+            path: lines.next().unwrap_or_default().to_string(),
+            tmp_path: lines.next().unwrap_or_default().to_string(),
+        }),
+        other => Err(LocalToolError::Remote(format!(
+            "unexpected remote {APPLY_PATCH_TOOL_NAME} cache response: {other}"
+        ))),
+    }
+}
+
+fn copy_apply_patch_binary_to_remote(
+    host: &str,
+    local_binary: &Path,
+    remote_tmp_path: &str,
+) -> Result<(), LocalToolError> {
+    let command = format!(
+        "scp -p -o BatchMode=yes -o ConnectTimeout=10 {} {}:{}",
+        shell_quote(&local_binary.display().to_string()),
+        shell_quote(host),
+        shell_quote(remote_tmp_path),
+    );
+    let mut shell = Command::new("sh");
+    shell.arg("-c").arg(command);
+    let output = run_command_with_timeout(shell, Duration::from_secs(120), None, "scp")?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(LocalToolError::Remote(format!(
+            "failed to copy {APPLY_PATCH_TOOL_NAME}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )))
+    }
+}
+
+fn ensure_local_apply_patch_binary(platform: &str) -> Result<PathBuf, LocalToolError> {
+    let cache_dir = local_apply_patch_cache_dir(platform)?;
+    let binary = cache_dir.join(APPLY_PATCH_TOOL_NAME);
+    if binary.is_file() {
+        return Ok(binary);
+    }
+    fs::create_dir_all(&cache_dir).map_err(|error| {
+        LocalToolError::Io(format!(
+            "failed to create local {APPLY_PATCH_TOOL_NAME} cache {}: {error}",
+            cache_dir.display()
+        ))
+    })?;
+    install_local_apply_patch_binary(platform, &binary)?;
+    Ok(binary)
+}
+
+fn local_apply_patch_cache_dir(platform: &str) -> Result<PathBuf, LocalToolError> {
+    let root = env::var_os("STELLACLAW_SOFTWARE_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/stellaclaw/tools"))
+        })
+        .ok_or_else(|| {
+            LocalToolError::Io(
+                "HOME or STELLACLAW_SOFTWARE_DIR is required for the local tool cache".to_string(),
+            )
+        })?;
+    Ok(root
+        .join(APPLY_PATCH_TOOL_NAME)
+        .join(APPLY_PATCH_TOOL_VERSION)
+        .join(platform))
+}
+
+fn install_local_apply_patch_binary(platform: &str, binary: &Path) -> Result<(), LocalToolError> {
+    let manifest = fetch_apply_patch_manifest()?;
+    let asset = manifest.asset_for_platform(platform).ok_or_else(|| {
+        LocalToolError::Remote(format!("release manifest has no {platform} asset"))
+    })?;
+    let temp_dir = local_temp_dir(format!("{}-{platform}", APPLY_PATCH_TOOL_NAME))?;
+    let archive = temp_dir.join(format!(
+        "{APPLY_PATCH_TOOL_NAME}-{platform}.{}",
+        asset.archive
+    ));
+    download_file(&asset.url, &archive)?;
+    verify_sha256(&archive, &asset.sha256)?;
+    extract_apply_patch_archive(&archive, &temp_dir, &asset.archive)?;
+    let extracted = temp_dir
+        .join(format!(
+            "{APPLY_PATCH_TOOL_NAME}-v{APPLY_PATCH_TOOL_VERSION}-{platform}"
+        ))
+        .join(&asset.binary);
+    if !extracted.is_file() {
+        return Err(LocalToolError::Remote(format!(
+            "downloaded {APPLY_PATCH_TOOL_NAME} archive did not contain {}",
+            extracted.display()
+        )));
+    }
+    let tmp_binary = binary.with_extension("incoming");
+    if let Some(parent) = binary.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            LocalToolError::Io(format!("failed to create {}: {error}", parent.display()))
+        })?;
+    }
+    fs::copy(&extracted, &tmp_binary).map_err(|error| {
+        LocalToolError::Io(format!(
+            "failed to stage {} to {}: {error}",
+            extracted.display(),
+            tmp_binary.display()
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp_binary, fs::Permissions::from_mode(0o755)).map_err(|error| {
+            LocalToolError::Io(format!("failed to chmod {}: {error}", tmp_binary.display()))
+        })?;
+    }
+    fs::rename(&tmp_binary, binary).map_err(|error| {
+        LocalToolError::Io(format!(
+            "failed to install {} to {}: {error}",
+            tmp_binary.display(),
+            binary.display()
+        ))
+    })?;
+    let _ = fs::remove_dir_all(temp_dir);
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ApplyPatchManifest {
+    assets: Vec<ApplyPatchAsset>,
+}
+
+#[derive(Debug)]
+struct ApplyPatchAsset {
+    platform: String,
+    archive: String,
+    url: String,
+    sha256: String,
+    binary: String,
+}
+
+impl ApplyPatchManifest {
+    fn asset_for_platform(&self, platform: &str) -> Option<&ApplyPatchAsset> {
+        self.assets.iter().find(|asset| asset.platform == platform)
+    }
+}
+
+fn fetch_apply_patch_manifest() -> Result<ApplyPatchManifest, LocalToolError> {
+    let value: Value = reqwest::blocking::get(APPLY_PATCH_MANIFEST_URL)
+        .and_then(|response| response.error_for_status())
+        .and_then(|response| response.json())
+        .map_err(|error| {
+            LocalToolError::Remote(format!(
+                "failed to fetch {APPLY_PATCH_TOOL_NAME} manifest {APPLY_PATCH_MANIFEST_URL}: {error}"
+            ))
+        })?;
+    let version = value
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if version != APPLY_PATCH_TOOL_VERSION {
+        return Err(LocalToolError::Remote(format!(
+            "{APPLY_PATCH_TOOL_NAME} manifest version {version:?} does not match expected {APPLY_PATCH_TOOL_VERSION}"
+        )));
+    }
+    let assets = value
+        .get("assets")
+        .and_then(Value::as_array)
+        .ok_or_else(|| LocalToolError::Remote("apply-patch manifest missing assets".to_string()))?
+        .iter()
+        .filter_map(|asset| {
+            Some(ApplyPatchAsset {
+                platform: asset.get("platform")?.as_str()?.to_string(),
+                archive: asset.get("archive")?.as_str()?.to_string(),
+                url: asset.get("url")?.as_str()?.to_string(),
+                sha256: asset.get("sha256")?.as_str()?.to_string(),
+                binary: asset.get("binary")?.as_str()?.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(ApplyPatchManifest { assets })
+}
+
+fn download_file(url: &str, path: &Path) -> Result<(), LocalToolError> {
+    let bytes = reqwest::blocking::get(url)
+        .and_then(|response| response.error_for_status())
+        .and_then(|response| response.bytes())
+        .map_err(|error| LocalToolError::Remote(format!("failed to download {url}: {error}")))?;
+    fs::write(path, &bytes)
+        .map_err(|error| LocalToolError::Io(format!("failed to write {}: {error}", path.display())))
+}
+
+fn verify_sha256(path: &Path, expected: &str) -> Result<(), LocalToolError> {
+    let bytes = fs::read(path).map_err(|error| {
+        LocalToolError::Io(format!("failed to read {}: {error}", path.display()))
+    })?;
+    let actual = format!("{:x}", Sha256::digest(&bytes));
+    if actual.eq_ignore_ascii_case(expected.trim()) {
+        Ok(())
+    } else {
+        Err(LocalToolError::Remote(format!(
+            "sha256 mismatch for {}: expected {}, got {}",
+            path.display(),
+            expected,
+            actual
+        )))
+    }
+}
+
+fn extract_apply_patch_archive(
+    archive: &Path,
+    destination: &Path,
+    archive_kind: &str,
+) -> Result<(), LocalToolError> {
+    let command = match archive_kind {
+        "tar.gz" => {
+            let mut command = Command::new("tar");
+            command.arg("-xzf").arg(archive).arg("-C").arg(destination);
+            command
+        }
+        "zip" => {
+            let mut command = Command::new("unzip");
+            command.arg("-q").arg(archive).arg("-d").arg(destination);
+            command
+        }
+        other => {
+            return Err(LocalToolError::Remote(format!(
+                "unsupported {APPLY_PATCH_TOOL_NAME} archive format {other}"
+            )));
+        }
+    };
+    let output = run_command_with_timeout(
+        command,
+        Duration::from_secs(60),
+        None,
+        &format!("extract {APPLY_PATCH_TOOL_NAME}"),
+    )?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(LocalToolError::Remote(format!(
+            "failed to extract {}: {}",
+            archive.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )))
+    }
+}
+
+fn local_temp_dir(label: String) -> Result<PathBuf, LocalToolError> {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let path = env::temp_dir().join(format!("{label}-{}-{nanos}", std::process::id()));
+    fs::create_dir_all(&path).map_err(|error| {
+        LocalToolError::Io(format!(
+            "failed to create temp dir {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(path)
 }
 
 #[derive(Debug, Clone)]
@@ -759,5 +1136,26 @@ diff --git /home/me/work/src/a.py /home/me/work/src/a.py
         assert!(error
             .to_string()
             .contains("outside the remote cwd /home/me/work"));
+    }
+
+    #[test]
+    fn maps_remote_uname_to_apply_patch_release_platforms() {
+        assert_eq!(
+            remote_platform_from_uname("Linux", "x86_64").as_deref(),
+            Some("linux-x64")
+        );
+        assert_eq!(
+            remote_platform_from_uname("Linux", "aarch64").as_deref(),
+            Some("linux-arm64")
+        );
+        assert_eq!(
+            remote_platform_from_uname("Darwin", "x86_64").as_deref(),
+            Some("macos-x64")
+        );
+        assert_eq!(
+            remote_platform_from_uname("Darwin", "arm64").as_deref(),
+            Some("macos-arm64")
+        );
+        assert_eq!(remote_platform_from_uname("FreeBSD", "x86_64"), None);
     }
 }
