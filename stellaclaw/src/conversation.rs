@@ -18,7 +18,7 @@ use stellaclaw_core::{
         ChatMessage, ChatMessageItem, ChatRole, ContextItem, ConversationBridgeRequest,
         ConversationBridgeResponse, FileItem, SelectionReferenceItem, SessionErrorDetail,
         SessionEvent, SessionInitial, SessionRequest, SessionType, TaskPlanItemStatus,
-        TaskPlanView, ToolRemoteMode, ToolResultContent, ToolResultItem,
+        TaskPlanView, ToolBinaryEnsureRequest, ToolRemoteMode, ToolResultContent, ToolResultItem,
     },
 };
 
@@ -49,6 +49,7 @@ use crate::{
     },
     sandbox::bubblewrap_support_error,
     session_client::AgentServerClient,
+    tool_binary_manager::{shared_tool_binary_client, ToolBinaryClient},
     workspace::{ensure_workspace_for_remote_mode, ensure_workspace_seed},
 };
 
@@ -425,6 +426,7 @@ struct ConversationRuntime {
     foreground_progress: Option<ActiveForegroundProgress>,
     host_services: HostServiceRegistry,
     memory_client: Option<MemoryClient>,
+    tool_binary_client: ToolBinaryClient,
 }
 
 #[derive(Debug, Clone)]
@@ -439,6 +441,7 @@ enum HostServiceId {
     Skill,
     Cron,
     Memory,
+    ToolBinary,
 }
 
 trait HostService {
@@ -455,6 +458,7 @@ struct ManagedSessionHostService;
 struct SkillHostService;
 struct CronHostService;
 struct MemoryHostService;
+struct ToolBinaryHostService;
 
 #[derive(Debug, Clone)]
 struct HostServiceContext {
@@ -497,6 +501,7 @@ impl HostServiceRegistry {
         ] {
             routes.insert(action, HostServiceId::Memory);
         }
+        routes.insert("tool_binary_ensure", HostServiceId::ToolBinary);
         Self { routes }
     }
 
@@ -520,6 +525,7 @@ impl HostServiceId {
             HostServiceId::Skill => SkillHostService.handle(runtime, context, request),
             HostServiceId::Cron => CronHostService.handle(runtime, context, request),
             HostServiceId::Memory => MemoryHostService.handle(runtime, context, request),
+            HostServiceId::ToolBinary => ToolBinaryHostService.handle(runtime, context, request),
         }
     }
 }
@@ -576,6 +582,17 @@ impl HostService for MemoryHostService {
         request: &ConversationBridgeRequest,
     ) -> Result<ToolResultItem> {
         runtime.handle_memory_host_action(context, request)
+    }
+}
+
+impl HostService for ToolBinaryHostService {
+    fn handle(
+        &self,
+        runtime: &mut ConversationRuntime,
+        _context: HostServiceContext,
+        request: &ConversationBridgeRequest,
+    ) -> Result<ToolResultItem> {
+        runtime.handle_tool_binary_host_action(request)
     }
 }
 
@@ -704,6 +721,7 @@ impl ConversationRuntime {
             foreground_progress: None,
             host_services: HostServiceRegistry::new(),
             memory_client,
+            tool_binary_client: shared_tool_binary_client(),
         })
     }
 
@@ -1808,6 +1826,24 @@ impl ConversationRuntime {
             }
             _ => return Err(anyhow!("unsupported memory host action {}", request.action)),
         };
+        Ok(bridge_result(request, serde_json::to_string(&output)?))
+    }
+
+    fn handle_tool_binary_host_action(
+        &mut self,
+        request: &ConversationBridgeRequest,
+    ) -> Result<ToolResultItem> {
+        let payload: ToolBinaryEnsureRequest = serde_json::from_value(request.payload.clone())
+            .context("failed to parse tool_binary_ensure request")?;
+        let output = self
+            .tool_binary_client
+            .ensure(payload)
+            .map(|response| {
+                serde_json::to_value(response).unwrap_or_else(
+                    |_| json!({"status": "failure", "reason": "serialization_failed"}),
+                )
+            })
+            .unwrap_or_else(|error| json!({"status": "failure", "reason": error}));
         Ok(bridge_result(request, serde_json::to_string(&output)?))
     }
 

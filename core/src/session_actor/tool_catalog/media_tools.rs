@@ -1259,6 +1259,7 @@ mod tests {
             workspace_root: root,
             data_root: root,
             remote_mode: &REMOTE_MODE,
+            conversation_bridge: None,
             cancel_token,
         }
     }

@@ -10,11 +10,14 @@ use std::{
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 
-use crate::session_actor::tool_runtime::{
-    bool_arg_with_default, clamp_tool_output_chars, run_command_with_timeout,
-    run_remote_command_with_stdin, shell_quote, string_arg, string_arg_with_default,
-    truncate_tool_text, usize_arg_with_default, ExecutionTarget, LocalToolError,
-    ToolExecutionContext,
+use crate::session_actor::{
+    tool_binary::ensure_tool_binary,
+    tool_runtime::{
+        bool_arg_with_default, clamp_tool_output_chars, run_command_with_timeout,
+        run_remote_command_with_stdin, shell_quote, string_arg, string_arg_with_default,
+        truncate_tool_text, usize_arg_with_default, ExecutionTarget, LocalToolError,
+        ToolExecutionContext,
+    },
 };
 
 pub(super) const FS_TOOL_NAME: &str = "stellaclaw-fs-tool";
@@ -34,9 +37,9 @@ pub(super) fn execute_patch_tool(
     }
 
     let result = match fs_tool_execution_target(arguments, context)? {
-        ExecutionTarget::Local => fs_tool_local(arguments, context.workspace_root)?,
+        ExecutionTarget::Local => fs_tool_local(arguments, context)?,
         ExecutionTarget::RemoteSsh { host, cwd } => {
-            fs_tool_remote(arguments, &host, cwd.as_deref())?
+            fs_tool_remote(arguments, context, &host, cwd.as_deref())?
         }
     };
     Ok(Some(result))
@@ -64,7 +67,7 @@ fn fs_tool_execution_target(
 
 fn fs_tool_local(
     arguments: &Map<String, Value>,
-    workspace_root: &Path,
+    context: &ToolExecutionContext<'_>,
 ) -> Result<Value, LocalToolError> {
     let patch = string_arg(arguments, "patch")?;
     let format = patch_format(arguments, &patch)?;
@@ -77,19 +80,22 @@ fn fs_tool_local(
     #[cfg(test)]
     if env::var_os(FS_TOOL_PATH_ENV).is_none() {
         return match format {
-            PatchFormat::Codex => apply_codex_patch_local(arguments, workspace_root),
-            PatchFormat::Unified => {
-                apply_unified_patch_local(arguments, workspace_root, check, max_output_chars)
-            }
+            PatchFormat::Codex => apply_codex_patch_local(arguments, context.workspace_root),
+            PatchFormat::Unified => apply_unified_patch_local(
+                arguments,
+                context.workspace_root,
+                check,
+                max_output_chars,
+            ),
         };
     }
 
-    let binary = ensure_local_fs_tool_for_current_platform()?;
+    let binary = ensure_fs_tool_local(context)?;
     let mut command = Command::new(&binary);
     command
         .arg("apply-patch")
         .arg("--workspace")
-        .arg(workspace_root)
+        .arg(context.workspace_root)
         .arg("--format")
         .arg(format.cli_name())
         .arg("--max-output-chars")
@@ -166,6 +172,7 @@ fn apply_unified_patch_local(
 
 fn fs_tool_remote(
     arguments: &Map<String, Value>,
+    context: &ToolExecutionContext<'_>,
     host: &str,
     cwd: Option<&str>,
 ) -> Result<Value, LocalToolError> {
@@ -177,7 +184,7 @@ fn fs_tool_remote(
     let max_output_chars =
         clamp_tool_output_chars(usize_arg_with_default(arguments, "max_output_chars", 1000)?);
 
-    let remote_binary = ensure_remote_fs_tool(host)?;
+    let remote_binary = ensure_fs_tool_remote(context, host)?;
     let mut args = vec![
         remote_binary,
         "apply-patch".to_string(),
@@ -404,6 +411,19 @@ pub(super) fn ensure_remote_fs_tool(host: &str) -> Result<String, LocalToolError
     }
 }
 
+pub(super) fn ensure_fs_tool_remote(
+    context: &ToolExecutionContext<'_>,
+    host: &str,
+) -> Result<String, LocalToolError> {
+    if context.conversation_bridge.is_some() {
+        let response = ensure_tool_binary(context, FS_TOOL_NAME, Some(host))?;
+        return response.remote_path.ok_or_else(|| {
+            LocalToolError::Bridge("tool_binary_ensure did not return remote_path".to_string())
+        });
+    }
+    ensure_remote_fs_tool(host)
+}
+
 enum RemoteFilesystemToolState {
     Ready { path: String },
     Missing { path: String, tmp_path: String },
@@ -624,6 +644,28 @@ pub(super) fn ensure_local_fs_tool_for_current_platform() -> Result<PathBuf, Loc
     }
     let platform = local_fs_tool_platform()?;
     ensure_local_fs_tool_binary(&platform)
+}
+
+pub(super) fn ensure_fs_tool_local(
+    context: &ToolExecutionContext<'_>,
+) -> Result<PathBuf, LocalToolError> {
+    if let Some(path) = env::var_os(FS_TOOL_PATH_ENV).map(PathBuf::from) {
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(LocalToolError::Io(format!(
+            "{FS_TOOL_PATH_ENV} points to {}, but it is not a file",
+            path.display()
+        )));
+    }
+    if context.conversation_bridge.is_some() {
+        let response = ensure_tool_binary(context, FS_TOOL_NAME, None)?;
+        let path = response.local_path.ok_or_else(|| {
+            LocalToolError::Bridge("tool_binary_ensure did not return local_path".to_string())
+        })?;
+        return Ok(PathBuf::from(path));
+    }
+    ensure_local_fs_tool_for_current_platform()
 }
 
 fn local_fs_tool_platform() -> Result<String, LocalToolError> {

@@ -118,6 +118,7 @@ impl LocalToolBatchExecutor {
             workspace_root: &self.workspace_root,
             data_root: &self.data_root,
             remote_mode: &self.remote_mode,
+            conversation_bridge: self.conversation_bridge.as_ref(),
             cancel_token: ToolCancellationToken::default(),
         }
     }
@@ -586,6 +587,7 @@ impl ToolOperationRunner {
             workspace_root: &self.workspace_root,
             data_root: &self.data_root,
             remote_mode: &self.remote_mode,
+            conversation_bridge: self.conversation_bridge.as_ref(),
             cancel_token: self.cancel_token.clone(),
         }
     }

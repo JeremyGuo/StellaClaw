@@ -9,6 +9,7 @@ mod memory;
 mod remote_actor;
 mod sandbox;
 mod session_client;
+mod tool_binary_manager;
 mod upgrade;
 mod workspace;
 

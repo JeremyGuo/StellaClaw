@@ -18,6 +18,7 @@ use super::{
     PromptProtocol, ToolBackend, ToolConcurrency, ToolDefinition, ToolExecutionMode,
     ToolRemoteMode,
 };
+use crate::session_actor::tool_binary::ensure_tool_binary;
 use crate::session_actor::tool_runtime::{
     shell_quote, string_arg, usize_arg_with_default, ExecutionTarget, LocalToolError,
     ToolCancellationToken, ToolExecutionContext,
@@ -435,6 +436,7 @@ fn spawn_pty_process(
     timeout_ms: usize,
 ) -> Result<Arc<ShellSession>, LocalToolError> {
     let (cols, rows) = terminal_size(arguments)?;
+    let managed_rg_path_dir = managed_rg_path_dir(context, &binding, command_text)?;
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -451,13 +453,25 @@ fn spawn_pty_process(
             let cwd = resolve_local_workdir(context.workspace_root, arguments)?;
             let mut command = CommandBuilder::new(&shell);
             command.arg(shell_exec_flag(login));
-            command.arg(command_text);
+            command.arg(managed_shell_command(
+                command_text,
+                managed_rg_path_dir.as_deref(),
+            ));
             command.cwd(&cwd);
+            if let Some(path_dir) = &managed_rg_path_dir {
+                command.env("PATH", local_path_with_managed_priority(path_dir));
+            }
             (cwd.display().to_string(), command)
         }
         ShellBinding::RemoteSsh { host, cwd } => {
             let remote_cwd = resolve_remote_workdir(cwd.as_deref(), arguments);
-            let remote_command = remote_exec_command(&remote_cwd, &shell, login, command_text);
+            let remote_command = remote_exec_command(
+                &remote_cwd,
+                &shell,
+                login,
+                command_text,
+                managed_rg_path_dir.as_deref(),
+            );
             let mut command = CommandBuilder::new("ssh");
             command.arg("-tt");
             command.arg(host);
@@ -553,18 +567,31 @@ fn spawn_pipe_process(
     login: bool,
     timeout_ms: usize,
 ) -> Result<Arc<ShellSession>, LocalToolError> {
+    let managed_rg_path_dir = managed_rg_path_dir(context, &binding, command_text)?;
     let (cwd_label, mut command) = match &binding {
         ShellBinding::Local => {
             let cwd = resolve_local_workdir(context.workspace_root, arguments)?;
             let mut command = Command::new(&shell);
             command.arg(shell_exec_flag(login));
-            command.arg(command_text);
+            command.arg(managed_shell_command(
+                command_text,
+                managed_rg_path_dir.as_deref(),
+            ));
             command.current_dir(&cwd);
+            if let Some(path_dir) = &managed_rg_path_dir {
+                command.env("PATH", local_path_with_managed_priority(path_dir));
+            }
             (cwd.display().to_string(), command)
         }
         ShellBinding::RemoteSsh { host, cwd } => {
             let remote_cwd = resolve_remote_workdir(cwd.as_deref(), arguments);
-            let remote_command = remote_exec_command(&remote_cwd, &shell, login, command_text);
+            let remote_command = remote_exec_command(
+                &remote_cwd,
+                &shell,
+                login,
+                command_text,
+                managed_rg_path_dir.as_deref(),
+            );
             let mut command = Command::new("ssh");
             command.arg(host);
             command.arg("--");
@@ -1507,13 +1534,76 @@ fn resolve_remote_workdir(base: Option<&str>, arguments: &Map<String, Value>) ->
     }
 }
 
-fn remote_exec_command(cwd: &str, shell: &str, login: bool, command: &str) -> String {
+fn managed_rg_path_dir(
+    context: &ToolExecutionContext<'_>,
+    binding: &ShellBinding,
+    command_text: &str,
+) -> Result<Option<String>, LocalToolError> {
+    if !command_may_use_rg(command_text) || context.conversation_bridge.is_none() {
+        return Ok(None);
+    }
+    let host = match binding {
+        ShellBinding::Local => None,
+        ShellBinding::RemoteSsh { host, .. } => Some(host.as_str()),
+    };
+    let response = ensure_tool_binary(context, "ripgrep", host)?;
+    Ok(response.path_dir)
+}
+
+fn command_may_use_rg(command: &str) -> bool {
+    let trimmed = command.trim_start();
+    trimmed == "rg"
+        || trimmed.starts_with("rg ")
+        || trimmed.starts_with("rg\t")
+        || trimmed.starts_with("rg\n")
+        || command.contains(" rg ")
+        || command.contains(" rg\t")
+        || command.contains(" rg\n")
+        || command.contains("\nrg ")
+        || command.contains("$(rg ")
+        || command.contains("`rg ")
+        || command.contains("command -v rg")
+        || command.contains("which rg")
+}
+
+fn local_path_with_managed_priority(path_dir: &str) -> String {
+    let current = env::var("PATH").unwrap_or_default();
+    if current.is_empty() {
+        path_dir.to_string()
+    } else {
+        let separator = if cfg!(windows) { ';' } else { ':' };
+        format!("{path_dir}{separator}{current}")
+    }
+}
+
+fn remote_path_priority(path_dir: &str) -> String {
+    format!(
+        "PATH={}${{PATH:+:$PATH}}; export PATH; ",
+        shell_quote(path_dir)
+    )
+}
+
+fn managed_shell_command(command: &str, managed_path_dir: Option<&str>) -> String {
+    match managed_path_dir {
+        Some(path_dir) => format!("{}{}", remote_path_priority(path_dir), command),
+        None => command.to_string(),
+    }
+}
+
+fn remote_exec_command(
+    cwd: &str,
+    shell: &str,
+    login: bool,
+    command: &str,
+    managed_path_dir: Option<&str>,
+) -> String {
+    let command = managed_shell_command(command, managed_path_dir);
     format!(
         "export TERM=xterm-256color COLORTERM=truecolor TERM_PROGRAM=Stellaclaw; cd {} && exec {} {} {}",
         remote_workdir_shell_arg(cwd),
         shell,
         shell_exec_flag(login),
-        shell_quote(command)
+        shell_quote(&command)
     )
 }
 
@@ -1712,9 +1802,26 @@ mod tests {
 
     #[test]
     fn remote_exec_command_does_not_quote_tilde() {
-        let command = remote_exec_command("~", "${SHELL:-sh}", false, "pwd");
+        let command = remote_exec_command("~", "${SHELL:-sh}", false, "pwd", None);
 
         assert!(command.contains("cd ${HOME} &&"), "{command}");
         assert!(!command.contains("cd '~'"), "{command}");
+    }
+
+    #[test]
+    fn remote_exec_command_injects_managed_path_inside_shell_command() {
+        let command = remote_exec_command(
+            "~",
+            "${SHELL:-sh}",
+            true,
+            "rg --files",
+            Some("/home/me/.cache/stellaclaw/tools/ripgrep/15.1.0/linux-x64"),
+        );
+
+        assert!(command.contains("${SHELL:-sh} -lc "), "{command}");
+        assert!(
+            command.contains("PATH='\"'\"'/home/me/.cache/stellaclaw/tools/ripgrep/15.1.0/linux-x64'\"'\"'${PATH:+:$PATH}; export PATH; rg --files"),
+            "{command}"
+        );
     }
 }

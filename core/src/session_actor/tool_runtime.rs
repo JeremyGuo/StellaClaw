@@ -16,7 +16,7 @@ use std::os::unix::process::CommandExt;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use super::ToolRemoteMode;
+use super::{ConversationBridge, ToolRemoteMode};
 
 const REMOTE_JSON_TIMEOUT: Duration = Duration::from_secs(60);
 const REMOTE_STDIN_TIMEOUT: Duration = Duration::from_secs(300);
@@ -67,6 +67,7 @@ pub(super) struct ToolExecutionContext<'a> {
     pub workspace_root: &'a Path,
     pub data_root: &'a Path,
     pub remote_mode: &'a ToolRemoteMode,
+    pub conversation_bridge: Option<&'a Arc<dyn ConversationBridge + Send + Sync>>,
     pub cancel_token: ToolCancellationToken,
 }
 

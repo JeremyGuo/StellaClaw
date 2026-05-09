@@ -9,6 +9,7 @@ mod session_state;
 mod system_prompt;
 mod token_estimator;
 mod tool_batch;
+mod tool_binary;
 mod tool_catalog;
 mod tool_executor;
 mod tool_runtime;
@@ -41,6 +42,7 @@ pub use tool_batch::{
     ToolBatch, ToolBatchCompletion, ToolBatchError, ToolBatchExecutor, ToolBatchHandle,
     ToolBatchOperation, ToolExecutionOp,
 };
+pub use tool_binary::{ToolBinaryEnsureRequest, ToolBinaryEnsureResponse};
 pub use tool_catalog::{
     builtin_tool_catalog, download_tool_definitions, file_tool_definitions, host_tool_definitions,
     media_tool_definitions, process_tool_definitions, skill_tool_definitions, web_tool_definitions,

@@ -14,10 +14,7 @@ use crate::session_actor::tool_runtime::{
     string_arg_with_default, ExecutionTarget, LocalToolError, ToolExecutionContext,
 };
 
-use super::patch::{
-    ensure_local_fs_tool_for_current_platform, ensure_remote_fs_tool, parse_fs_tool_json,
-    FS_TOOL_NAME,
-};
+use super::patch::{ensure_fs_tool_local, ensure_fs_tool_remote, parse_fs_tool_json, FS_TOOL_NAME};
 
 pub(super) fn execute_read_write_tool(
     tool_name: &str,
@@ -37,9 +34,9 @@ fn file_read(
     context: &ToolExecutionContext<'_>,
 ) -> Result<Value, LocalToolError> {
     match context.execution_target_for_path(arguments, &["file_path", "path"])? {
-        ExecutionTarget::Local => file_read_local(arguments, context.workspace_root),
+        ExecutionTarget::Local => file_read_local(arguments, context),
         ExecutionTarget::RemoteSsh { host, cwd } => {
-            file_read_remote(arguments, &host, cwd.as_deref())
+            file_read_remote(arguments, context, &host, cwd.as_deref())
         }
     }
 }
@@ -49,22 +46,22 @@ fn file_write(
     context: &ToolExecutionContext<'_>,
 ) -> Result<Value, LocalToolError> {
     match context.execution_target_for_path(arguments, &["file_path", "path"])? {
-        ExecutionTarget::Local => file_write_local(arguments, context.workspace_root),
+        ExecutionTarget::Local => file_write_local(arguments, context),
         ExecutionTarget::RemoteSsh { host, cwd } => {
-            file_write_remote(arguments, &host, cwd.as_deref())
+            file_write_remote(arguments, context, &host, cwd.as_deref())
         }
     }
 }
 
 fn file_read_local(
     arguments: &Map<String, Value>,
-    workspace_root: &std::path::Path,
+    context: &ToolExecutionContext<'_>,
 ) -> Result<Value, LocalToolError> {
     #[cfg(test)]
     if std::env::var_os("STELLACLAW_FS_TOOL_PATH").is_none() {
-        return file_read_local_direct(arguments, workspace_root);
+        return file_read_local_direct(arguments, context.workspace_root);
     }
-    file_read_via_fs_tool(arguments, workspace_root, None)
+    file_read_via_fs_tool(arguments, context.workspace_root, context, None)
 }
 
 #[cfg(test)]
@@ -155,13 +152,13 @@ fn usize_arg_optional(
 
 fn file_write_local(
     arguments: &Map<String, Value>,
-    workspace_root: &std::path::Path,
+    context: &ToolExecutionContext<'_>,
 ) -> Result<Value, LocalToolError> {
     #[cfg(test)]
     if std::env::var_os("STELLACLAW_FS_TOOL_PATH").is_none() {
-        return file_write_local_direct(arguments, workspace_root);
+        return file_write_local_direct(arguments, context.workspace_root);
     }
-    file_write_via_fs_tool(arguments, workspace_root, None)
+    file_write_via_fs_tool(arguments, context.workspace_root, context, None)
 }
 
 #[cfg(test)]
@@ -204,23 +201,26 @@ fn file_write_local_direct(
 
 fn file_read_remote(
     arguments: &Map<String, Value>,
+    context: &ToolExecutionContext<'_>,
     host: &str,
     cwd: Option<&str>,
 ) -> Result<Value, LocalToolError> {
-    file_read_via_fs_tool(arguments, Path::new("."), Some((host, cwd)))
+    file_read_via_fs_tool(arguments, Path::new("."), context, Some((host, cwd)))
 }
 
 fn file_write_remote(
     arguments: &Map<String, Value>,
+    context: &ToolExecutionContext<'_>,
     host: &str,
     cwd: Option<&str>,
 ) -> Result<Value, LocalToolError> {
-    file_write_via_fs_tool(arguments, Path::new("."), Some((host, cwd)))
+    file_write_via_fs_tool(arguments, Path::new("."), context, Some((host, cwd)))
 }
 
 fn file_read_via_fs_tool(
     arguments: &Map<String, Value>,
     workspace_root: &Path,
+    context: &ToolExecutionContext<'_>,
     remote: Option<(&str, Option<&str>)>,
 ) -> Result<Value, LocalToolError> {
     let file_path = string_arg_with_alias(arguments, "file_path", "path")?;
@@ -240,12 +240,13 @@ fn file_read_via_fs_tool(
         args.push("--end-line".to_string());
         args.push(end_line.to_string());
     }
-    run_fs_tool(args, remote, &[])
+    run_fs_tool(args, context, remote, &[])
 }
 
 fn file_write_via_fs_tool(
     arguments: &Map<String, Value>,
     workspace_root: &Path,
+    context: &ToolExecutionContext<'_>,
     remote: Option<(&str, Option<&str>)>,
 ) -> Result<Value, LocalToolError> {
     let file_path = string_arg_with_alias(arguments, "file_path", "path")?;
@@ -260,17 +261,18 @@ fn file_write_via_fs_tool(
         "--mode".to_string(),
         mode,
     ];
-    run_fs_tool(args, remote, content.as_bytes())
+    run_fs_tool(args, context, remote, content.as_bytes())
 }
 
 fn run_fs_tool(
     mut args: Vec<String>,
+    context: &ToolExecutionContext<'_>,
     remote: Option<(&str, Option<&str>)>,
     stdin: &[u8],
 ) -> Result<Value, LocalToolError> {
     match remote {
         Some((host, cwd)) => {
-            let binary = ensure_remote_fs_tool(host)?;
+            let binary = ensure_fs_tool_remote(context, host)?;
             args.insert(0, binary);
             let remote_command = args
                 .iter()
@@ -291,7 +293,7 @@ fn run_fs_tool(
             })
         }
         None => {
-            let binary = ensure_local_fs_tool_for_current_platform()?;
+            let binary = ensure_fs_tool_local(context)?;
             let mut command = Command::new(binary);
             command.args(args);
             let output = crate::session_actor::tool_runtime::run_command_with_timeout(
@@ -453,6 +455,14 @@ mod tests {
         std::fs::create_dir_all(&root).expect("workspace should be created");
         std::fs::write(root.join("demo.txt"), "one\ntwo\nthree\nfour\n")
             .expect("file should be written");
+        let remote_mode = crate::session_actor::ToolRemoteMode::Selectable;
+        let context = ToolExecutionContext {
+            workspace_root: &root,
+            data_root: &root,
+            remote_mode: &remote_mode,
+            conversation_bridge: None,
+            cancel_token: crate::session_actor::tool_runtime::ToolCancellationToken::default(),
+        };
 
         let result = file_read_local(
             &serde_json::Map::from_iter([
@@ -460,7 +470,7 @@ mod tests {
                 ("start_line".to_string(), json!(2)),
                 ("end_line".to_string(), json!(3)),
             ]),
-            &root,
+            &context,
         )
         .expect("file_read should succeed");
 

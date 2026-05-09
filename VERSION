@@ -1,5 +1,10 @@
-version: 1.26.1
+version: 1.26.2
 ---
+
+# 1.26.2
+
+- 新增 host 侧统一 ToolBinaryManager：
+  `core` 只保留 managed tool binary 的请求/响应 DTO 和 conversation bridge 调用，实际下载、校验、缓存、SSH 平台探测和远端上传由 `stellaclaw` host 中的全局单例服务处理，避免每个 conversation 重复下载/上传同一工具。`stellaclaw-fs-tool` 的 local/remote 执行改为优先经该服务保证二进制存在；`shell_exec` 在检测到命令会使用 `rg` 时会通过同一服务保证官方 ripgrep 15.1.0 可用，并把对应目录注入本地或远端 PATH。远端 cache 准备阶段会先解析绝对 `$HOME` 路径并注入保底 PATH，避免 zsh 非交互环境里基础命令不可见。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.26.1
 
