@@ -84,6 +84,7 @@ ChannelEvent::Error {
 - conversation 级配置已经包括 `model_selection_pending`、`tool_remote_mode`、`sandbox` override、`reasoning_effort` 和 foreground/background/subagent session binding。
 - Telegram 控制面当前支持 `/model`、`/remote`、`/sandbox`、`/status`、`/continue`、`/cancel`。
 - Telegram 输出面当前支持普通 delivery、typing indicator、可编辑 progress feedback 面板和最终完成/失败状态。
+- Web / StellaCodeX Electron 当前已经支持聊天附件粘贴/选择、workspace 与 message attachment 预览/下载、HTML sandbox 预览、工具详情中的 Git diff 展示、右侧计划面板和 token usage 明细。
 - Codex subscription provider 当前按官方订阅 websocket 形态调用，支持 access token 自动刷新；`reasoning.service_tier = fast/priority` 会映射到请求级 `service_tier = priority`，不会塞进 `reasoning` payload。
 - 多模态输入在 `SessionActor` 发 provider 前统一 normalization：模型支持对应模态时按 `ModelConfig.multimodal_input` 发送；不支持或文件损坏时降级为包含文件路径/原因的文本上下文。
 - Provider 请求前的消息规整采用双层 normalization：先做通用模型能力降级，再做 provider 特化 normalization。Codex subscription provider 会保留并回传 `codex_summary` / `codex_encrypted_content`，普通 reasoning text 仍不会作为 model-visible 内容回传。
@@ -92,8 +93,14 @@ ChannelEvent::Error {
 - `ChatMessage::Reasoning` 当前支持 Codex 专用 encrypted reasoning continuation；token 估算按 Codex 风格把 `codex_encrypted_content` 作为上下文成本估入，但展示层和普通文本路径不暴露密文。
 - `reasoning_effort` 是 conversation 级 override；已有 conversation 的 `session_profile.main_model` 是持久化快照，不会自动跟随全局 config 更新。
 - 每轮 model/tool loop 默认上限是 200 步，主要作为防无限循环兜底，而不是正常工作流限制。
-- 所有工具结果在进入 `ChatMessage::ToolResult` 前必须经过统一输出上限：单个 tool result 的 model-visible `context.text` 不得超过 100,000 字符；超过时返回截断提示和预览，并把完整未截断结果保存到 workspace 的 `.output/tool_results/`。这条规则适用于现在和未来所有工具；工具自身可以有更小的业务级 preview/limit，但不能绕过统一上限。
-- skill 工具当前包括 `skill_load`、`skill_create`、`skill_update`、`skill_delete`；持久化类工具走 ConversationBridge，由 Host/Conversation 写回 runtime skill store 并同步已有 conversation workspace。
+- 所有工具结果在进入 `ChatMessage::ToolResult` 前必须经过统一输出上限：单个 tool result 的 model-visible `context.text` 不得超过 100,000 字符；超过时返回截断提示和预览，当前不会再自动保存完整未截断结果路径。工具自身可以有更小的业务级 preview/limit，但不能绕过统一上限。
+- Prompt Protocol 已经落地：文件搜索/编辑、shell、`user_tell`、`update_plan`、memory、subagent 等操作偏好由工具模块声明 `PromptProtocol`，按当前 provider 实际可见工具集合筛选后注入 system prompt；工具未启用或被 provider 过滤时不会泄漏对应 prompt。
+- `ToolDefinition` 已经包含 provider visibility 元数据；同一个过滤后的 `ToolCatalog` 同时决定 system prompt 协议注入、provider request tools 和本地执行白名单，避免 Codex subscription 等 provider 下出现“prompt 看不见但本地仍可执行”的工具。
+- 文件工具 surface 已收敛：`glob`、`ls`、`edit` 不再模型可见；内容搜索使用增强后的 `grep`，路径 pattern 发现走有边界的 `rg --files` shell 命令；`file_read` 使用 `start_line` / `end_line`，定点修改统一走 `apply_patch`。
+- Shell 工具已经改成 fresh process 语义：`shell_exec` 每次启动新进程，长运行返回 `process_id`，后续用 `shell_write_stdin` 观察/交互，用 `shell_stop` 停止；旧的持久 `shell` / `shell_close` surface 已移除。
+- Memory v1 已经落地：Host 侧 `MemoryService` 按 `user` / `public` / `conversation` 三个 scope 保存 entries，暴露 `memory_search` / `memory_write` / `memory_update` / `memory_delete` bridge tools；`user` memory 渲染为 system prompt 的 `User Memory Snapshot`，`conversation` / `public` memory 只在模型显式搜索或压缩背景 recall 时进入上下文。
+- MemoryService 会记录独立 token usage；Conversation status、Web status 和 Telegram `/status` 能看到 memory / user memory compaction 用量。
+- skill 工具当前包括 `skill_load`、`skill_create`、`skill_update`、`skill_delete`；持久化类工具走 ConversationBridge，由 Host/Conversation 写回 `.stellaclaw/skill/` runtime skill store 并同步已有 conversation workspace。
 
 ## 1.3 当前核心组件内部构筑
 
@@ -467,16 +474,20 @@ Bridge 工具的完整链路是：
 
 ### 2.1.3 Session History 不变量
 
-- system prompt 内容只能由 `SessionKind` / `SessionInitial` 统一生成，Provider 不能各自定义不同 system prompt 内容。
+- system prompt 内容只能由 `SessionInitial`、runtime metadata snapshot 和当前已过滤 `ToolCatalog` 统一生成，Provider 不能各自定义不同 system prompt 内容。
 - Provider 只负责把同一份 system prompt 映射到自己的协议字段：
   - Chat Completions: `role = "system"`
   - Responses / Codex Subscription: `instructions`
   - Claude: top-level `system`
-- `history` 中不持久化 `role = "system"`；canonical system prompt snapshot 由 session state 持有，并且只能由 `SessionKind` 决定。
+- `history` 中不持久化 `role = "system"`；canonical system prompt snapshot 由 session state 持有，并在稳定边界更新。
 - 禁止在 `history` 中间插入新的 `system` message；运行期提示变化应作为本轮用户消息前的 `user` 侧运行期通知进入上下文。
 - 压缩完成后，才允许更新当前 session 的 canonical system prompt snapshot。
-- `STELLACLAW.md` 是 workspace 根目录下唯一的长期项目记录文件；它只作为 snapshot 进入 system prompt，不生成运行期 notice。压缩完成后直接把最新文件内容提升到 canonical system prompt snapshot。
-- `skill metadata`、已加载 skill 内容、`user meta`、identity、SSH remote alias 列表发生变化时，必须在真实 user message 前插入 synthetic `role = "user"` 通知；这些通知进入 durable history。
+- `common_prompt` 只放跨工具、跨 provider 始终成立的核心规则，例如身份、仓库检查、附件输出标签和共享目录说明；文件搜索/编辑、shell、host memory、plan、subagent 等工具操作偏好必须优先放在对应工具模块的 `PromptProtocol` 中。
+- `PromptProtocol { id, priority, required_tools, body }` 是 system prompt 的条件层：只有所有 `required_tools` 都在 provider 可见工具集合里时才注入，避免工具被过滤后 prompt 仍然暴露对应能力。
+- `.stellaclaw/STELLACLAW.md` 不再作为长期项目记录 snapshot 常驻 system prompt；长期稳定信息应进入 Memory v1，或作为普通 workspace 文档由模型按需读取。
+- `USER.md` 也不全文常驻注入；system prompt 只注入 profile metadata（路径、状态、bytes、hash），需要精确 profile 内容时由模型读取 `.stellaclaw/USER.md`。
+- `user` scope active memory 在 memory 启用时渲染为 `User Memory Snapshot`，作为 system prompt snapshot 的稳定组成部分；`conversation` / `public` memory 不自动进入普通 provider request，需要模型显式 `memory_search` 或由压缩流程作为 compression-only 背景 recall。
+- `skill metadata`、已加载 skill 内容、`user meta`、identity、SSH remote alias 列表和 user memory snapshot 发生变化时，必须在真实 user message 前插入 synthetic `role = "user"` 通知；这些通知进入 durable history。
 - SSH remote alias 列表来源是 `~/.ssh/config` 的 `Host` alias（支持 `Include`），不是 Conversation 自己维护的 remote workspace 列表。
 - `session.json` 必须持久化当前 runtime prompt component snapshot、已通知 snapshot、skill content/load state、`current_messages` 和 `all_messages`，保证 crash 后恢复不会重复通知或丢失旧 system prompt 组装依据。
 
@@ -1115,7 +1126,7 @@ loop {
 - `tool_executor` 只负责统一调度、统一中断语义和统一结果包装，不承载各工具族自己的业务状态机。
 - 每个工具文件负责自己的核心执行语义；新增工具族时，允许在 `tool_executor` 中增加一个显式分发 case。
 - 特殊状态默认留在工具模块内部，不回流到 `tool_executor`；避免把工具内部 job 管理、权限细节和业务分叉重新集中到 executor。
-- 当前已落地的工具执行族包括：file/search/patch、`shell`、`file_download_*`、`web_fetch`、`web_search`、`skill_load`、`skill_create`、`skill_update`、`skill_delete`、native `*_load`、Provider-backed `*_analysis` / `*_stop` / `image_generation`。
+- 当前已落地的工具执行族包括：file/search/patch、fresh-process shell、`file_download_*`、`web_fetch`、`web_search`、skill tools、host bridge tools（plan、subagent/background、cron、memory）、native `*_load`、Provider-backed `*_analysis` / `*_stop` / `image_generation`。
 - 工具内部 job 状态默认是内存临时状态；只有工具产出闭合的 tool result 后，结果才进入 session history 并参与持久化。
 
 ## 7. 统一消息接入流
@@ -1364,12 +1375,13 @@ sequenceDiagram
 
 | tool family | 代表 tool | 执行类型 | 主要用途 |
 |---|---|---|---|
-| 文件与补丁 | `file_read`、`file_write`、`glob`、`grep`、`ls`、`edit`、`apply_patch` | `Immediate` | 读写 workspace、搜索文件、应用 patch。 |
-| Shell / Exec | `shell`、`shell_close` | `shell = Interruptible`，`shell_close = Immediate` | 运行或继续一个持久 shell session。 |
+| 文件、搜索与补丁 | `file_read`、`file_write`、`grep`、`apply_patch`、`shell_make_visible`、`attachment_make_visible` | `Immediate`，部分 serial | 读写 workspace、内容搜索、应用 patch、同步本地/远程可见性。 |
+| Shell / Process | `shell_exec`、`shell_write_stdin`、`shell_stop` | `shell_exec = Interruptible`，其余 `Immediate` | 启动 fresh process、观察/交互、停止进程。 |
 | Web | `web_fetch`、`web_search` | `Interruptible` | 获取网页或调用搜索 provider。 |
-| 多模态加载与分析 | `image_load`、`pdf_load`、`audio_load`、`image_analysis`、`image_stop`、`pdf_analysis`、`pdf_stop`、`audio_analysis`、`audio_stop`、`image_generation`、`image_generation_stop` | 混合型，见下面明细 | 把本地媒体放进上下文，或调用 helper 做分析/生成。 |
-| 下载 | `file_download_start`、`file_download_progress`、`file_download_wait`、`file_download_cancel` | 混合型，见下面明细 | 后台下载远端资源到本地。 |
-| Skill | `skill_load`、`skill_create`、`skill_update`、`skill_delete` | `Immediate` | 读取或管理 skill。 |
+| 多模态加载与生成/分析 | `image_load`、`pdf_load`、`audio_load`、`image_generation`、provider-backed `*_analysis` / `*_stop` | 混合型，见下面明细 | 把本地媒体放进上下文，或调用 helper 做分析/生成。 |
+| 下载 | `file_download_start`、`file_download_progress`、`file_download_wait`、`file_download_cancel` | 混合型，见下面明细 | 后台下载远端资源到本地或远程 workspace。 |
+| Host coordination | `user_tell`、`update_plan`、`subagent_start`、`subagent_join`、`subagent_kill`、`start_background_agent`、cron、managed-agent、memory tools | `Immediate` 或 bridge-owned lifecycle | 需要 Conversation/Host 串行 owner 配合的计划、通知、托管 session、定时任务和长期记忆操作。 |
+| Skill | `skill_load`、`skill_create`、`skill_update`、`skill_delete` | `Immediate`，持久化类 serial | 读取或管理 skill。 |
 
 ### 13.1.1 执行类型定义
 
@@ -1416,6 +1428,9 @@ sequenceDiagram
 - `upstream_capabilities`
 - `helper_model_capabilities`
 - `search_provider_capabilities`
+- `model_config.provider_type` 和 provider visibility 规则
+- `memory.enabled` / `enable_memory_tools`
+- 当前 session kind 和 host tool scope
 - `skill_catalog`
 
 可以把它抽象成：
@@ -1424,78 +1439,54 @@ sequenceDiagram
 ToolSchemaContext {
   execution_mode,
   enable_remote_tools,
+  enable_memory_tools,
+  provider_type,
   upstream_caps,
   helper_caps,
   search_caps,
   session_mode,
+  host_tool_scope,
   available_skills,
 }
 ```
 
-### 13.3 文件与补丁类 tools
+当前实现里，动态 schema 不只是“字段裁剪”：`ToolDefinition` 自身可以声明 provider visibility，`ToolCatalog` 会先按模型/provider 过滤工具，再用过滤后的集合决定 provider request tools、本地执行白名单和 `PromptProtocol` 注入内容。
+
+### 13.3 文件、搜索与补丁类 tools
 
 | tool | 类型 | schema 关键字段 | option 含义 |
 |---|---|---|---|
-| `file_read` | `Immediate` | `file_path`、`offset?`、`limit?`、`remote?` | 读文本文件；`offset/limit` 控制窗口；`remote` 只在允许 remote tools 时出现。 |
-| `file_write` | `Immediate` | `file_path`、`content`、`mode?`、`encoding?`、`remote?` | 写文本；`mode` 通常是 `overwrite` 或 `append`。 |
-| `glob` | `Immediate` | `pattern`、`path?`、`remote?` | 做文件名模式匹配。 |
-| `grep` | `Immediate` | `pattern`、`path?`、`include?`、`remote?` | 做内容搜索；`include` 是路径过滤。 |
-| `ls` | `Immediate` | `path?`、`remote?` | 列目录树；`path` 缺省或空串等价当前工作目录。 |
-| `edit` | `Immediate` | `path`、`old_text`、`new_text`、`replace_all?`、`create_if_missing?`、`encoding?`、`remote?` | 精确替换文本。 |
-| `apply_patch` | `Immediate` | `patch`、`strip?`、`reverse?`、`check?`、`remote?` | 应用 unified diff patch。 |
+| `file_read` | `Immediate` | `file_path`、`start_line?`、`end_line?`、`remote?` | 读 UTF-8 文本文件；行号从 1 开始，`end_line` 为 inclusive；省略 `end_line` 时从 `start_line` 起默认最多读 200 行。 |
+| `file_write` | `Immediate` / serial | `file_path`、`content`、`mode`、`encoding?`、`remote?` | 新建、完整重写或 append 文本文件。 |
+| `grep` | `Immediate` / serial | `pattern`、`path?`、`include?`、`exclude?`、`context_lines?`、`names_only?`、`max_matches_per_file?`、`total_max_matches?`、`remote?` | 内容搜索；返回文件列表和 line-level matches，可带有限上下文。 |
+| `apply_patch` | `Immediate` / serial | `patch`、`format?`、`strip?`、`reverse?`、`check?`、`remote?` | 应用 codex 或 unified diff patch；路径应是 workspace-relative，remote 下是 remote cwd-relative。 |
+| `shell_make_visible` | `Interruptible` / serial | `path`、`timeout_seconds?` | fixed remote 场景下把本地 workspace 文件/目录同步到远端同路径。 |
+| `attachment_make_visible` | `Interruptible` / serial | `path`、`timeout_seconds?` | 发送 `<attachment>...</attachment>` 前确保文件对 conversation workspace 可见。 |
 
-目录型参数规则：
+当前约束：
 
-- `glob.path`、`grep.path`、`ls.path` 缺省或空串都等价于当前工作目录。
-- `agent_server` 进程启动时的 cwd 就是本地工具工作目录；初始化协议不再传 workspace/workdir 参数。
-- `ToolRemoteMode::FixedSsh.cwd` 缺省或空串表示不显式 `cd`，使用 SSH 登录后的当前目录。
+- `glob`、`ls`、`edit` 不再是模型可见工具；路径 pattern 发现统一使用窄范围、有限制的 `rg --files -g '<pattern>'` / ripgrep shell 命令，内容搜索继续使用 `grep`。
+- `.stellaclaw/` broad listing 默认隐藏，但精确 `.stellaclaw/...` 路径仍可被文件工具读取或写入。
+- `apply_patch` 是定点修改的默认路径；成功应用后不需要为了确认应用结果而重读文件，只有 formatter/验证失败/需要新上下文时才重新读取。
+- unified diff 的文件头如果带当前 workspace 或 fixed remote cwd 下的绝对路径，执行前会归一化为相对路径；工作区外绝对路径应提前报参数错误。
+- selectable remote 模式下，各工具的 `remote` 是可选 SSH alias；fixed SSH 模式下，`remote` 字段从 schema 移除，当前绑定 execution root 是隐式目标。
+- `agent_server` 进程启动时的 cwd 就是本地工具工作目录；`ToolRemoteMode::FixedSsh.cwd` 缺省或空串表示不显式 `cd`。
 
-这组里最重要的动态 option 是 `remote`：
-
-- selectable remote 模式下：
-  - `remote` 是可选 string
-  - 模型可以选择本地或某个 SSH alias
-- fixed `/remote` execution mode 下：
-  - `remote` 不应该出现在 schema 里
-  - 当前绑定 execution root 直接成为隐式默认目标
-  - 这不是 “remote=某个默认值”，而是“根本不给模型这个选择”
-
-当前实现状态：
-
-- 文件与补丁类工具已经在 core 内按独立模块执行。
-- `remote` 目标统一来自 `~/.ssh/config` 中的 SSH alias；完全 remote mode 下由 `SessionInitial.tool_remote_mode` 指定隐式目标，schema 不再暴露 `remote` 选择。
-
-### 13.4 Shell / Exec 类 tools
+### 13.4 Shell / Process 类 tools
 
 | tool | 类型 | schema 关键字段 | option 含义 |
 |---|---|---|---|
-| `shell` | `Interruptible` | `session_id?`、`command?`、`input?`、`interactive?`、`wait_ms?`、`remote?` | 既能新建 session，也能继续已有 session。 |
-| `shell_close` | `Immediate` | `session_id` | 关闭 shell session。 |
-
-`shell` 的几个关键 option：
-
-- `session_id`
-  - 有值：复用已有 session
-  - 无值：新建 session
-- `command`
-  - 有值：启动下一条命令
-  - 无值：只观察当前状态
-  - 新建 shell command 时必须使用 `command` 字段；当前 schema 不再支持 `cmd` alias
-  - 没有 `session_id` 时必须提供非空 `command`，否则会返回 missing command
-- `input`
-  - 给交互式进程写 stdin
-  - 和 `command` 互斥
-- `interactive`
-  - 只允许在新建 session 时出现
-- `remote`
-  - 和文件类 tools 一样，受 execution mode 裁剪
+| `shell_exec` | `Interruptible` / serial | `command`、`shell?`、`login?`、`tty?`、`timeout_ms?`、`yield_time_ms?`、`workdir?`、`remote?` | 每次启动一个 fresh process；超过 `yield_time_ms` 仍运行时返回 `process_id`。 |
+| `shell_write_stdin` | `Interruptible` / serial | `process_id`、`chars`、`yield_time_ms?` | `chars=""` 表示观察运行中进程最近输出；非空输入只对 `tty=true` 的进程有效。 |
+| `shell_stop` | `Immediate` / serial | `process_id`、`signal?` | 停止运行中进程，`signal` 通常为 interrupt / terminate / kill。 |
 
 当前实现状态：
 
-- `shell` / `shell_close` 已经在 core 内执行。
-- `shell` 的 interrupt 只打断本次等待，不默认杀死底层进程；需要停止时由 `shell_close` 显式关闭。
-- shell 输出由工具侧落盘到 `.output` 下，再通过 tool result 返回摘要和路径。
-- `session_id` 只用于轮询或继续已有 shell session；新启动命令时应省略 `session_id` 让工具生成新 session。
+- 不再有隐藏持久 shell session，也不再有 sentinel 完成检测；`shell_exec` 以 child process exit 作为完成信号。
+- 默认 `tty=false`、stdin 关闭；只有 `tty=true` 才分配 PTY 并支持交互输入。
+- `login=true` 通过 shell `-lc` 加载用户 profile；默认 shell 必须是简单路径或命令名。
+- 旧的 `shell_observe` / `shell_close` 已从模型可见 surface 移除；观察用 `shell_write_stdin(chars="")`，停止用 `shell_stop`。
+- `remote` 裁剪规则和文件类工具一致。
 
 ### 13.5 Web 与搜索类 tools
 
@@ -1591,7 +1582,27 @@ ToolSchemaContext {
 - `dsl_*` 相关实现代码当前保留在仓库中，但 tool surface 已临时关闭；后续需要先补 DSL bridge、权限边界和模型/工具绑定，再重新开放。
 - 长生命周期任务的 interrupt 只要求当前 tool batch 尽快收敛；后台任务是否继续由 `on_timeout` 或对应的 cancel/kill tool 决定。
 
-### 13.8 Skill 类 tools
+### 13.8 Host coordination 与 Memory tools
+
+这些工具都是 ConversationBridge / Host-owned 能力：模型看到的是工具调用，真实状态修改发生在 Conversation/Host 串行 owner 内部，结果再回到 SessionActor 的 tool result。
+
+| tool family | 代表 tool | schema 关键字段 | 语义 |
+|---|---|---|---|
+| 用户可见协调 | `user_tell` | `text` | 当前 turn 未结束但需要提前向用户发进度或协调信息。 |
+| 计划 | `update_plan` | `explanation`、`plan[]` | SessionActor 持有当前计划并通过事件投影到 channel；不是 Conversation durable truth。 |
+| Subagent / background | `subagent_start`、`subagent_join`、`subagent_kill`、`start_background_agent`、`background_agents_list`、`get_agent_stats` | agent id / task / description | 托管 session 生命周期由 Host/Conversation 管理，结果通过 actor-to-actor delivery 或最终回复回到当前 conversation。 |
+| Cron | `list_cron_tasks`、`get_cron_task`、`create_cron_task`、`update_cron_task`、`remove_cron_task` | cron fields、task 或 script | 定时任务是 workdir/host 级持久能力；script 创建前必须先用 shell 验证。 |
+| Memory | `memory_search`、`memory_write`、`memory_update`、`memory_delete` | `query` / `scope` / `text` / `memory_id` | 长期记忆服务，按 `user` / `conversation` / `public` scope 保存稳定事实。 |
+
+Memory 当前实现约束：
+
+- `memory_search` 默认只搜索当前 conversation 与 public cross-conversation memory；user memory 作为 system prompt snapshot 暴露，不通过普通 `memory_search` 搜索。
+- `memory_write` 对外只返回 success/failure，内部会做候选检索、dedupe/consistency 判定、audit 和大小限制；模型不应保存临时步骤、一次性 tool output、猜测、普通聊天或已存在事实。
+- `memory_update` / `memory_delete` 只能在 search 揭示条目 stale、incomplete、duplicate、obsolete 或 wrong 后按 id 操作。
+- `user` scope 用于用户长期协作偏好和工作习惯；`conversation` scope 用于当前 conversation 的目标、约束、关键状态和 handoff；`public` scope 用于跨 conversation 复用的项目、客户、数据或长任务事实。
+- MemoryService 会为 dedupe 和 user memory compaction 记录独立 usage，供 status 汇总。
+
+### 13.9 Skill 类 tools
 
 | tool | 类型 | schema 关键字段 | option 含义 |
 |---|---|---|---|
@@ -1606,10 +1617,10 @@ ToolSchemaContext {
 - 它应该根据当前 runtime 可见 skill catalog 动态生成 enum
 - `skill_load` 在 core 内执行；SessionActor 构造 `ToolBatch` 时把 `SessionInitial.runtime_metadata.skills` 中对应 skill 内容嵌入 operation，避免 ToolBatchExecutor 反向依赖 actor 状态。
 - `skill_create` / `skill_update` / `skill_delete` 是 ConversationBridge 工具，由 Host/Conversation 侧负责持久化。
-- 持久化目标是 `rundir/.skill/<skill_name>`；成功后同步到已有 conversation workspace 的 `.skill/<skill_name>`。
+- 持久化目标是 runtime skill store 的 `.stellaclaw/skill/<skill_name>`；成功后同步到已有 conversation workspace 的 `.stellaclaw/skill/<skill_name>`。
 - `skill_create` / `skill_update` 会校验 staged skill 目录中 `SKILL.md` 存在、frontmatter `name` 匹配目录名、`description` 非空。
 
-### 13.9 哪些状态会改变 schema
+### 13.10 哪些状态会改变 schema
 
 建议文档里明确把下面几类状态视为 schema 裁剪输入：
 
@@ -1620,6 +1631,9 @@ ToolSchemaContext {
 | helper/search provider 的 vision 能力变化 | 控制 `images` option 是否暴露。 |
 | 当前 session mode 切换 | 可能改变整个 tool surface，而不是只改一个字段。 |
 | 当前可用 skill 集变化 | 改变 `skill_load` 的 enum 值。 |
+| provider visibility 过滤 | 移除当前 provider 不支持的工具，并同步影响 prompt protocol 注入和本地执行白名单。 |
+| `memory.enabled` | 控制 memory bridge tools 是否暴露，以及 user memory snapshot 是否进入 system prompt。 |
+| Host tool scope | 控制 main foreground / background / subagent 可见的 cron、managed agent、terminate 等 host 工具集合。 |
 
 这里要再加一条硬约束：
 
@@ -1627,7 +1641,7 @@ ToolSchemaContext {
 - 如果当前正处于 `mode switch in-flight`，那就只能使用“切换前 schema”或“切换后 schema”其中之一，不能混出一个半旧半新的 schema。
 - 这也是为什么 mode switch 失败会被归类为 gating failure。
 
-### 13.10 持久化什么，不持久化什么
+### 13.11 持久化什么，不持久化什么
 
 这里建议明确：
 
@@ -1636,9 +1650,12 @@ ToolSchemaContext {
   - workspace binding
   - session mode
   - upstream capability snapshot
+  - provider/model selection state used to derive visible tools
   - active mode switch state
+  - memory entries / audit / usage in MemoryService-owned stores
 - 不持久化：
   - 某一轮请求时展开后的完整 tool schema JSON
+  - 已拼接后的 PromptProtocol 文本；它应由当前过滤后的工具集合重新派生
 
 理由是：
 

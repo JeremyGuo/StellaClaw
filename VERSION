@@ -18,6 +18,9 @@ version: 1.26.0
 - 接入 remote apply_patch 的独立执行器：
   fixed/selectable SSH remote 下 `apply_patch` 会按远端 `uname` 选择 `stellaclaw-apply-patch` release 资产，从 GitHub release manifest 下载并校验 SHA256 后缓存到本地 `STELLACLAW_SOFTWARE_DIR` 或 `~/.cache/stellaclaw/tools`，再通过 `scp` 安装到远端 `~/.cache/stellaclaw/tools` 执行；Codex patch 格式因此不再只支持本地 workspace。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 更新 ROAD_MAP 当前实现快照和工具边界：
+  ROAD_MAP 现在补齐已经落地的 Prompt Protocol、provider visibility 过滤、Memory v1/user memory snapshot、fresh-process shell、文件工具 surface 收敛、Host coordination tools、StellaCodeX Electron 附件/预览/diff UI、skill canonical 路径和 tool schema 动态裁剪规则；同时移除旧 `glob` / `ls` / `edit`、持久 shell、`STELLACLAW.md` system snapshot 等过期描述。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 优化 memory 工具 prompt 分层和写入触发：
   common prompt 不再用容易抑制工具调用的“answer from memory”表述，改为区分模型内部记忆和可验证的长期记忆/仓库检查；`host.memory` protocol 现在把 `memory_write` 作为 turn 结束前的持久状态维护动作，明确用户 facts、conversation facts、项目实现要求、关键文件/模块知识、长任务恢复句柄等都应在可复用时写入。`memory_search` / `memory_write` / `memory_update` / `memory_delete` 的工具 description 收敛为接口契约和参数限制，具体触发场景、scope 选择、禁止写入项和 update/delete 流程集中在 tool protocol，避免重复说明互相稀释。本次不改变 `config` schema，不改变 `workdir` schema。
 
