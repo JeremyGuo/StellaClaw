@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, Notification } = require('electron');
+const { app, BrowserWindow, dialog, ipcMain, Notification, shell } = require('electron');
 const { autoUpdater } = require('electron-updater');
 const childProcess = require('node:child_process');
 const fs = require('node:fs/promises');
@@ -116,7 +116,8 @@ function defaultSettings() {
         userName: 'workspace-user'
       }
     ],
-    conversationUi: {}
+    conversationUi: {},
+    hiddenConversations: {}
   };
 }
 
@@ -178,6 +179,18 @@ function normalizeSettings(value) {
     userName: String(server.userName || 'workspace-user').trim() || 'workspace-user'
   }));
   const layout = value?.layout && typeof value.layout === 'object' ? value.layout : {};
+  const hiddenConversations = value?.hiddenConversations && typeof value.hiddenConversations === 'object'
+    ? Object.fromEntries(
+      Object.entries(value.hiddenConversations)
+        .map(([serverId, ids]) => [
+          String(serverId),
+          Array.isArray(ids)
+            ? [...new Set(ids.map((id) => String(id)).filter(Boolean))]
+            : []
+        ])
+        .filter(([, ids]) => ids.length > 0)
+    )
+    : {};
   return {
     activeServerId:
       value?.activeServerId && normalizedServers.some((server) => server.id === value.activeServerId)
@@ -200,7 +213,8 @@ function normalizeSettings(value) {
     conversationUi:
       value?.conversationUi && typeof value.conversationUi === 'object'
         ? value.conversationUi
-        : {}
+        : {},
+    hiddenConversations
   };
 }
 
@@ -446,6 +460,23 @@ function showNotification(_event, payload = {}) {
   return { shown: true };
 }
 
+async function openExternalUrl(_event, value) {
+  const url = normalizedExternalUrl(value);
+  if (!url) return { opened: false, reason: 'unsupported-url' };
+  await shell.openExternal(url);
+  return { opened: true };
+}
+
+function normalizedExternalUrl(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  try {
+    const url = new URL(text);
+    if (['http:', 'https:', 'mailto:'].includes(url.protocol)) return url.toString();
+  } catch {}
+  return '';
+}
+
 function parseTarEntries(buffer) {
   const entries = [];
   let offset = 0;
@@ -626,6 +657,12 @@ function createWindow() {
   } else {
     mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
   }
+
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    const externalUrl = normalizedExternalUrl(url);
+    if (externalUrl) shell.openExternal(externalUrl).catch(() => {});
+    return { action: 'deny' };
+  });
 
   mainWindow.webContents.on('console-message', (event) => {
     if (event.level >= 2) {
@@ -955,6 +992,7 @@ app.whenReady().then(() => {
   });
   ipcMain.handle('app:versionInfo', appVersionInfo);
   ipcMain.handle('app:setZoomFactor', setRendererZoomFactor);
+  ipcMain.handle('app:openExternal', openExternalUrl);
   ipcMain.handle('server:request', requestServer);
   ipcMain.handle('server:connectionInfo', serverConnectionInfo);
   ipcMain.handle('binary:gzip', gzipBinary);

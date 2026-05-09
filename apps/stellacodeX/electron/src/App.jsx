@@ -55,6 +55,46 @@ function setPxVariable(element, name, value) {
   element.style.setProperty(name, `${value}px`);
 }
 
+function workspaceFileImageDataUrl(path, file) {
+  const mime = imageMimeType(path);
+  const data = file?.data || file?.content || '';
+  if (!data) return '';
+  if (file?.encoding === 'base64') {
+    return `data:${mime};base64,${String(data).replace(/\s/g, '')}`;
+  }
+  if (file?.encoding === 'utf8' && mime === 'image/svg+xml') {
+    return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(data)}`;
+  }
+  return '';
+}
+
+function resolveWorkspaceAssetPath(markdownPath, rawSrc) {
+  const value = String(rawSrc || '').trim();
+  if (!value || /^(?:[a-z][a-z0-9+.-]*:|#)/i.test(value)) return '';
+  const pathPart = value.split(/[?#]/, 1)[0];
+  const decoded = safeDecodeUriComponent(pathPart);
+  const parts = decoded.startsWith('/')
+    ? []
+    : parentWorkspacePath(markdownPath).split('/').filter(Boolean);
+  decoded.split('/').forEach((part) => {
+    if (!part || part === '.') return;
+    if (part === '..') {
+      parts.pop();
+      return;
+    }
+    parts.push(part);
+  });
+  return normalizeWorkspacePath(parts.join('/'));
+}
+
+function safeDecodeUriComponent(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 function applyChromeMetrics(metrics) {
   if (!metrics || typeof document === 'undefined') return;
   const root = document.documentElement;
@@ -614,7 +654,10 @@ function App() {
     const merged = {
       ...saved,
       layout: next?.layout ? { ...(saved.layout || {}), ...(next.layout || {}) } : saved.layout,
-      conversationUi: next?.conversationUi ? { ...(saved.conversationUi || {}), ...(next.conversationUi || {}) } : saved.conversationUi
+      conversationUi: next?.conversationUi ? { ...(saved.conversationUi || {}), ...(next.conversationUi || {}) } : saved.conversationUi,
+      hiddenConversations: next?.hiddenConversations
+        ? { ...(saved.hiddenConversations || {}), ...(next.hiddenConversations || {}) }
+        : saved.hiddenConversations
     };
     setSettings(merged);
     return merged;
@@ -824,6 +867,41 @@ function App() {
     }
   }, [activeServerId, selected?.conversationId, settings]);
 
+  const setConversationHidden = useCallback(async (conversation, hidden) => {
+    if (!activeServerId || !conversation || !settings) return;
+    const conversationId = conversation.conversation_id;
+    const currentIds = new Set((settings.hiddenConversations?.[activeServerId] || []).map(String));
+    if (hidden) {
+      currentIds.add(conversationId);
+    } else {
+      currentIds.delete(conversationId);
+    }
+    const nextHiddenConversations = {
+      ...(settings.hiddenConversations || {}),
+      [activeServerId]: Array.from(currentIds)
+    };
+    if (nextHiddenConversations[activeServerId].length === 0) {
+      delete nextHiddenConversations[activeServerId];
+    }
+    const nextSettings = {
+      ...settings,
+      hiddenConversations: nextHiddenConversations
+    };
+    setSettings(nextSettings);
+    if (hidden && selected?.conversationId === conversationId) {
+      const nextVisible = conversations.find((item) => (
+        item.conversation_id !== conversationId
+          && !currentIds.has(item.conversation_id)
+      ));
+      setSelected(nextVisible ? { serverId: activeServerId, conversationId: nextVisible.conversation_id } : null);
+    }
+    try {
+      await saveSettings(nextSettings);
+    } catch (error) {
+      window.alert(error?.message || '保存隐藏状态失败');
+    }
+  }, [activeServerId, conversations, saveSettings, selected?.conversationId, settings]);
+
   const createNewConversation = useCallback(async ({ serverId, nickname }) => {
     if (!serverId || creatingConversation) return;
     setCreatingConversation(true);
@@ -1004,8 +1082,8 @@ function App() {
         .then((loaded) => {
           if (disposed) return;
           const kind = workspaceFileKind(file.path);
-          const data = loaded?.encoding === 'base64' && kind === 'image'
-            ? `data:${imageMimeType(file.path)};base64,${loaded.data || ''}`
+          const data = kind === 'image'
+            ? workspaceFileImageDataUrl(file.path, loaded)
             : loaded?.data || '';
           setOpenFiles((current) => current.map((item) => (
             item.path === file.path
@@ -1102,8 +1180,8 @@ function App() {
     try {
       const file = await loadWorkspaceFile(selected.serverId, selected.conversationId, path);
       const kind = workspaceFileKind(path);
-      const data = file?.encoding === 'base64' && kind === 'image'
-        ? `data:${imageMimeType(path)};base64,${file.data || ''}`
+      const data = kind === 'image'
+        ? workspaceFileImageDataUrl(path, file)
         : file?.data || '';
       setOpenFiles((current) => current.map((item) => (
         item.path === path
@@ -1124,6 +1202,15 @@ function App() {
       )));
     }
   }, [selected, loadPdfPreviewIntoTab]);
+
+  const resolveMarkdownAsset = useCallback(async (markdownPath, rawSrc) => {
+    const source = String(rawSrc || '').trim();
+    if (!source || /^(?:https?:|data:|blob:|file:)/i.test(source)) return source;
+    const path = resolveWorkspaceAssetPath(markdownPath, source);
+    if (!selected || !path || workspaceFileKind(path) !== 'image') return source;
+    const file = await loadWorkspaceFile(selected.serverId, selected.conversationId, path);
+    return workspaceFileImageDataUrl(path, file) || source;
+  }, [selected]);
 
   const uploadWorkspaceItems = useCallback(async (targetPath, dataTransferItems) => {
     if (!selected || !dataTransferItems?.length) return;
@@ -1714,6 +1801,7 @@ function App() {
         serverId={activeServerId}
         sidebarMode={sidebarMode}
         conversations={conversations}
+        hiddenConversationIds={settings?.hiddenConversations?.[activeServerId] || []}
         statuses={statuses}
         selected={selected}
         loading={loading}
@@ -1721,6 +1809,8 @@ function App() {
         onSelect={setSelected}
         onOpenSettings={() => setSettingsOpen(true)}
         onRename={renameSelectedConversation}
+        onHide={(conversation) => setConversationHidden(conversation, true)}
+        onUnhide={(conversation) => setConversationHidden(conversation, false)}
         onDelete={deleteSelectedConversation}
       />
       {sidebarMode !== 'collapsed' && (
@@ -1777,6 +1867,7 @@ function App() {
         activeFilePath={activeFilePath}
         onSelectFile={setActiveFilePath}
         onDownloadFile={downloadWorkspaceEntry}
+        onResolveMarkdownAsset={resolveMarkdownAsset}
         onCloseFile={(path) => {
           setOpenFiles((items) => {
             revokeFilePreviewUrls(items.filter((item) => item.path === path));

@@ -38,6 +38,7 @@ contextBridge.exposeInMainWorld('stellacode2', {
   chromeMetrics,
   appVersion: () => ipcRenderer.invoke('app:version'),
   appVersionInfo: () => ipcRenderer.invoke('app:versionInfo'),
+  openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),
   loadSettings: () => ipcRenderer.invoke('settings:load'),
   saveSettings: (settings) => ipcRenderer.invoke('settings:save', settings),
   setZoomFactor: (scale) => ipcRenderer.invoke('app:setZoomFactor', scale),

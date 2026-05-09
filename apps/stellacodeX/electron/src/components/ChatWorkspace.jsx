@@ -5,6 +5,7 @@ import remarkGfm from 'remark-gfm';
 import { ChevronDown, Download, FileText, Pin, Plus, Send, TerminalSquare } from 'lucide-react';
 import * as Popover from '@radix-ui/react-popover';
 import { attachmentName, attachmentUrl, fileExtension, isImageAttachment, messageText } from '../lib/fileUtils';
+import { handleExternalLinkClick, isExternalUrl } from '../lib/externalLinks';
 import { formatBytes, formatTokens, modelAlias, modelDisplayName } from '../lib/format';
 import { displayMessages, firstMessageId, firstToolNameForMessage, liveActivitySignature, markerIndexes, messageKey, shouldTypewriterMessage, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
 
@@ -1165,7 +1166,14 @@ export function MarkdownBlock({ text }) {
       remarkPlugins={[remarkGfm]}
       rehypePlugins={[rehypeHighlight]}
       components={{
-        a: ({ node, ...props }) => <a {...props} target="_blank" rel="noreferrer" />,
+        a: ({ node, ...props }) => (
+          <a
+            {...props}
+            target={isExternalUrl(props.href) ? '_blank' : undefined}
+            rel={isExternalUrl(props.href) ? 'noreferrer' : undefined}
+            onClick={(event) => handleExternalLinkClick(event, props.href)}
+          />
+        ),
         img: ({ node, ...props }) => <img {...props} className="message-inline-image" loading="lazy" alt={props.alt || ''} />
       }}
     >

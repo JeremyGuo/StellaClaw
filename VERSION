@@ -3,6 +3,18 @@ version: 1.26.0
 
 # 1.26.0
 
+- 调整 StellaCodeX Electron URL 打开方式：
+  聊天消息和文件预览 Markdown 中的 `http` / `https` / `mailto` 链接点击后默认通过系统浏览器打开；Electron main process 同时拦截 `target=_blank` / `window.open` 作为兜底，避免外部 URL 在客户端内部新开窗口或导航当前页面。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 增强 StellaCodeX Electron 文件预览 Markdown 渲染：
+  文件预览里的 Markdown 现在支持 raw HTML 标签渲染，并会按当前 Markdown 文件路径解析相对图片资源，从 workspace API 拉取后渲染为 data URL；SVG 图片也会在 utf8 内容返回时转为 `image/svg+xml` data URL 展示。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 调整 StellaCodeX Electron 顶部渐变覆盖下的聊天布局：
+  聊天内容区现在显式让出标题栏渐变安全区，短 conversation 内容不足一屏时自动底部对齐；右上角运行计划面板下移到标题栏下方，避免被渐变标题栏和顶部按钮遮挡。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 新增 StellaCodeX Electron 本地隐藏 Conversation：
+  Conversation Bar 的会话右键菜单新增“隐藏 / 取消隐藏”，隐藏状态按 server 保存到 Electron 本地 settings；被隐藏的 conversation 会从普通列表移入可折叠的“已隐藏”文件夹，隐藏当前会话时自动切到下一条可见会话。该功能只影响客户端本地展示，不删除服务端 conversation。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 更新 README / README_zh 和 ROAD_MAP 的 StellaClaw 对外描述：
   README 与 README_zh 改用 SVG 架构图替代 mermaid，并优化图中信息层次：把 `stellaclaw` Host、`agent_server + core` 和服务器实体合并展示，把 Local / SSH workspace 拆成多个可连接的目标服务器，并把 StellaCodeX 与 Telegram/Chat/Web 等 Channel 以及 macOS / Windows / Linux 全平台同步入口并列展示。文档补齐 StellaCodeX/Web 当前已落地的 workspace、terminal、attachment preview、HTML sandbox preview、Git diff tool detail、plan/usage panel 等高级能力，并把 Dynamic ToolCatalog、Prompt Protocol、Memory v1、FileItem 附件/多模态链路、Codex subscription reasoning summary 和三跳 Remote 工作路径作为核心产品能力说明；同时补充 paper wiki / 大规模论文库整理、远程服务器实验、benchmark 驱动代码优化、长时间后台任务、论文和 artifact 开发等典型场景。ROAD_MAP 同步更新 Web channel 当前状态和对外描述时应强调的高级能力，并明确 memory 存储/检索/写入策略暂不作为产品 roadmap 展开。本次不改变 `config` schema，不改变 `workdir` schema。
 

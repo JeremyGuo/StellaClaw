@@ -1,13 +1,15 @@
 import { Component, useEffect, useMemo, useState } from 'react';
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
+import rehypeRaw from 'rehype-raw';
 import remarkGfm from 'remark-gfm';
 import hljs from 'highlight.js';
 import { Code2, Download, Eye, FileText, Minus, Plus, Printer, X } from 'lucide-react';
 import stellacodeMark from '../assets/stellacode-mark.svg';
+import { handleExternalLinkClick, isExternalUrl } from '../lib/externalLinks';
 import { fileExtension, fileNameFromPath, imageMimeType, isHtmlFile, isImageFile, isMarkdownFile, isPdfFile } from '../lib/fileUtils';
 
-export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile, onCloseFile, onDownloadFile }) {
+export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile, onCloseFile, onDownloadFile, onResolveMarkdownAsset }) {
   const activeFile = openFiles.find((file) => file.path === activeFilePath) || null;
   return (
     <aside className={`right-panel preview-panel${open ? ' open' : ''}`} aria-hidden={!open}>
@@ -49,7 +51,7 @@ export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile
             <div className="panel-placeholder">{activeFile.error}</div>
           ) : activeFile ? (
             <PreviewErrorBoundary resetKey={activeFile.path}>
-              <FilePreview file={activeFile} onDownloadFile={onDownloadFile} />
+              <FilePreview file={activeFile} onDownloadFile={onDownloadFile} onResolveMarkdownAsset={onResolveMarkdownAsset} />
             </PreviewErrorBoundary>
           ) : (
             <div className="panel-placeholder">打开一个文件查看预览</div>
@@ -85,7 +87,7 @@ class PreviewErrorBoundary extends Component {
   }
 }
 
-function FilePreview({ file, onDownloadFile }) {
+function FilePreview({ file, onDownloadFile, onResolveMarkdownAsset }) {
   const name = file.name || fileNameFromPath(file.path);
   const ext = fileExtension(name);
   const source = file.content || file.data || '';
@@ -124,7 +126,7 @@ function FilePreview({ file, onDownloadFile }) {
   if (file.kind === 'markdown' || isMarkdownFile(name)) {
     return (
       <article className="markdown-preview">
-        <MarkdownBlock text={source} />
+        <MarkdownBlock text={source} path={file.path} onResolveAsset={onResolveMarkdownAsset} />
       </article>
     );
   }
@@ -296,15 +298,67 @@ function pdfEmbedUrl(url, zoomPercent = 100) {
   return `${url}#toolbar=0&navpanes=0&scrollbar=1&view=FitH&zoom=${Math.round(zoomPercent)}`;
 }
 
-function MarkdownBlock({ text }) {
+function MarkdownBlock({ text, path, onResolveAsset }) {
   const parsed = useMemo(() => splitMarkdownMetadata(text), [text]);
+  const components = useMemo(() => ({
+    a: ({ node, ...props }) => (
+      <a
+        {...props}
+        target={isExternalUrl(props.href) ? '_blank' : undefined}
+        rel={isExternalUrl(props.href) ? 'noreferrer' : undefined}
+        onClick={(event) => handleExternalLinkClick(event, props.href)}
+      />
+    ),
+    img: (props) => (
+      <MarkdownImage
+        {...props}
+        markdownPath={path}
+        onResolveAsset={onResolveAsset}
+      />
+    )
+  }), [path, onResolveAsset]);
   return (
     <>
       {parsed.metadata.length ? <MarkdownMetadata entries={parsed.metadata} /> : null}
-      <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeRaw, rehypeHighlight]}
+        components={components}
+      >
         {parsed.body}
       </ReactMarkdown>
     </>
+  );
+}
+
+function MarkdownImage({ markdownPath, onResolveAsset, src, alt, ...props }) {
+  const [resolvedSrc, setResolvedSrc] = useState(src || '');
+
+  useEffect(() => {
+    let disposed = false;
+    const source = String(src || '');
+    setResolvedSrc(source);
+    if (!source || !onResolveAsset) return () => {
+      disposed = true;
+    };
+    onResolveAsset(markdownPath, source)
+      .then((value) => {
+        if (!disposed && value) setResolvedSrc(value);
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+    };
+  }, [markdownPath, onResolveAsset, src]);
+
+  return (
+    <img
+      {...props}
+      src={resolvedSrc}
+      alt={alt || ''}
+      loading="lazy"
+      referrerPolicy="no-referrer"
+    />
   );
 }
 
