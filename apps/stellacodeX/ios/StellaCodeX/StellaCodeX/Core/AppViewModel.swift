@@ -16,6 +16,7 @@ final class AppViewModel: ObservableObject {
     @Published private(set) var modelsError: String?
     @Published var selectedConversationID: ConversationSummary.ID?
     @Published var composerText: String
+    @Published var composerSelectionReferences: [SelectionReference]
     @Published private(set) var sshPublicKey: String
     @Published private(set) var sshIdentityError: String?
     @Published private(set) var realtimeStatus: String
@@ -59,6 +60,7 @@ final class AppViewModel: ObservableObject {
         self.modelsError = nil
         self.selectedConversationID = nil
         self.composerText = ""
+        self.composerSelectionReferences = []
         self.sshPublicKey = ""
         self.sshIdentityError = nil
         self.realtimeStatus = "Disconnected"
@@ -864,17 +866,20 @@ final class AppViewModel: ObservableObject {
 
     func sendComposerMessage(files: [OutgoingMessageFile] = []) async {
         let trimmedBody = composerText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard (!trimmedBody.isEmpty || !files.isEmpty), let selectedConversationID else {
+        let selectionReferences = composerSelectionReferences
+        guard (!trimmedBody.isEmpty || !files.isEmpty || !selectionReferences.isEmpty), let selectedConversationID else {
             return
         }
 
         composerText = ""
+        composerSelectionReferences = []
         let remoteMessageID = "apple-\(UUID().uuidString)"
         let optimistic = ChatMessage(
             id: remoteMessageID,
             index: (messages.map(\.index).max() ?? -1) + 1,
             role: .user,
             body: trimmedBody,
+            selectionReferences: selectionReferences.isEmpty ? nil : selectionReferences,
             attachments: files.enumerated().map { index, file in
                 ChatAttachment(outgoingFile: file, index: index)
             },
@@ -892,7 +897,8 @@ final class AppViewModel: ObservableObject {
                 conversationID: selectedConversationID,
                 userName: profile.username,
                 remoteMessageID: remoteMessageID,
-                files: files
+                files: files,
+                selectionReferences: selectionReferences
             )
             if let index = messages.firstIndex(where: { $0.id == optimistic.id }) {
                 messages[index].pending = false
@@ -907,6 +913,21 @@ final class AppViewModel: ObservableObject {
             }
             appendSystemError("Failed to send message: \(error.localizedDescription)")
         }
+    }
+
+    func addSelectionReference(_ selection: SelectionReference) {
+        guard !selection.selectedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+        if let index = composerSelectionReferences.firstIndex(where: { $0.id == selection.id }) {
+            composerSelectionReferences[index] = selection
+        } else {
+            composerSelectionReferences.append(selection)
+        }
+    }
+
+    func removeSelectionReference(_ selection: SelectionReference) {
+        composerSelectionReferences.removeAll { $0.id == selection.id }
     }
 
     func clearMessageCache() {
@@ -1066,7 +1087,8 @@ final class AppViewModel: ObservableObject {
                 conversationID: selectedConversationID,
                 userName: profile.username,
                 remoteMessageID: "apple-control-\(UUID().uuidString)",
-                files: []
+                files: [],
+                selectionReferences: []
             )
             if restartRealtimeAfterSend {
                 startRealtimeForSelectedConversation()

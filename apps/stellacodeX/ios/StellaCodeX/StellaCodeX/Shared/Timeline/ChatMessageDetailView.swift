@@ -22,6 +22,12 @@ struct ChatMessageDetailView: View {
                         }
                     }
 
+                    if presentation.detail.message.selectionReferences?.isEmpty == false {
+                        detailSection("Selection References") {
+                            SelectionReferenceStripView(selections: presentation.detail.message.selectionReferences ?? [])
+                        }
+                    }
+
                     if !presentation.detail.toolActivities.isEmpty {
                         detailSection("Tool Batch") {
                             toolBatchPreview

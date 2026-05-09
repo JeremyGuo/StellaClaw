@@ -141,6 +141,7 @@ struct ChatMessage: Identifiable, Hashable, Codable {
     var index: Int
     var role: ChatRole
     var body: String
+    var selectionReferences: [SelectionReference]? = nil
     var toolActivities: [ToolActivity] = []
     var attachments: [ChatAttachment] = []
     var tokenUsage: TokenUsage? = nil
@@ -149,6 +150,81 @@ struct ChatMessage: Identifiable, Hashable, Codable {
     var isOptimistic: Bool
     var pending: Bool
     var error: String?
+}
+
+struct SelectionReference: Identifiable, Hashable, Codable {
+    var filePath: String
+    var fileName: String?
+    var mediaType: String?
+    var sourceKind: String
+    var selectedText: String
+    var locator: SelectionLocator?
+    var context: SelectionContext?
+    var originalTextLength: Int?
+
+    var id: String {
+        "\(filePath)#\(sourceKind)#\(selectedText.hashValue)"
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case filePath = "file_path"
+        case fileName = "file_name"
+        case mediaType = "media_type"
+        case sourceKind = "source_kind"
+        case selectedText = "selected_text"
+        case locator
+        case context
+        case originalTextLength = "original_text_length"
+    }
+}
+
+struct SelectionLocator: Hashable, Codable {
+    var kind: String
+    var startLine: Int?
+    var endLine: Int?
+    var startColumn: Int?
+    var endColumn: Int?
+    var page: Int?
+    var rects: [SelectionRect]? = nil
+    var heading: String?
+    var selector: String?
+    var xpath: String?
+    var blockID: String?
+    var blockIndex: Int?
+    var textOffset: Int?
+    var textLength: Int?
+    var anchorText: String?
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case startLine = "start_line"
+        case endLine = "end_line"
+        case startColumn = "start_column"
+        case endColumn = "end_column"
+        case page
+        case rects
+        case heading
+        case selector
+        case xpath
+        case blockID = "block_id"
+        case blockIndex = "block_index"
+        case textOffset = "text_offset"
+        case textLength = "text_length"
+        case anchorText = "anchor_text"
+    }
+}
+
+struct SelectionRect: Hashable, Codable {
+    var page: Int?
+    var x: Int?
+    var y: Int?
+    var width: Int?
+    var height: Int?
+}
+
+struct SelectionContext: Hashable, Codable {
+    var before: String?
+    var after: String?
 }
 
 struct TokenUsage: Hashable, Codable {
@@ -370,6 +446,104 @@ struct WorkspaceFile: Hashable {
 
     var decodedData: Data? {
         Data(base64Encoded: data)
+    }
+
+    func previewSelectionReference() -> SelectionReference {
+        let sourceKind = selectionSourceKind
+        let mediaType = inferredMediaType
+        let text = isText
+            ? data
+            : "Referenced file: \(path)\nSize: \(ByteCountFormatter.string(fromByteCount: sizeBytes, countStyle: .file))\nType: \(sourceKind)"
+        let cleanText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let selectedText = String(cleanText.prefix(4_000))
+        let selectedLineCount = max(1, selectedText.components(separatedBy: .newlines).count)
+        let locator = SelectionLocator(
+            kind: isText ? "text" : "file",
+            startLine: isText ? 1 : nil,
+            endLine: isText ? selectedLineCount : nil,
+            startColumn: nil,
+            endColumn: nil,
+            page: nil,
+            rects: nil,
+            heading: nil,
+            selector: nil,
+            xpath: nil,
+            blockID: nil,
+            blockIndex: nil,
+            textOffset: isText ? 0 : nil,
+            textLength: selectedText.count,
+            anchorText: fileName
+        )
+        return SelectionReference(
+            filePath: path,
+            fileName: fileName,
+            mediaType: mediaType,
+            sourceKind: sourceKind,
+            selectedText: selectedText,
+            locator: locator,
+            context: nil,
+            originalTextLength: cleanText.count
+        )
+    }
+
+    private var fileName: String {
+        name.isEmpty ? (path.split(separator: "/").last.map(String.init) ?? path) : name
+    }
+
+    private var fileExtension: String {
+        path.split(separator: ".").last.map { String($0).lowercased() } ?? ""
+    }
+
+    private var selectionSourceKind: String {
+        switch fileExtension {
+        case "md", "markdown", "mdown", "mkd":
+            return "markdown"
+        case "html", "htm":
+            return "html"
+        case "pdf":
+            return "pdf"
+        case "doc", "docx":
+            return "word"
+        case "ppt", "pptx", "pps", "ppsx", "pot", "potx":
+            return "presentation"
+        case "png", "jpg", "jpeg", "gif", "webp", "heic":
+            return "image"
+        case "swift", "rs", "js", "mjs", "cjs", "ts", "tsx", "jsx", "json", "jsonl", "py", "sh", "bash", "zsh", "css", "toml", "yaml", "yml", "xml", "c", "h", "cpp", "cc", "cxx", "hpp", "java", "go", "rb":
+            return "source"
+        default:
+            return isText ? "text" : "file"
+        }
+    }
+
+    private var inferredMediaType: String? {
+        switch fileExtension {
+        case "md", "markdown", "mdown", "mkd":
+            return "text/markdown"
+        case "html", "htm":
+            return "text/html"
+        case "pdf":
+            return "application/pdf"
+        case "doc":
+            return "application/msword"
+        case "docx":
+            return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        case "ppt", "pps", "pot":
+            return "application/vnd.ms-powerpoint"
+        case "pptx", "ppsx", "potx":
+            return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        case "png":
+            return "image/png"
+        case "jpg", "jpeg":
+            return "image/jpeg"
+        case "gif":
+            return "image/gif"
+        case "webp":
+            return "image/webp"
+        case "heic":
+            return "image/heic"
+        default:
+            return isText ? "text/plain" : nil
+        }
     }
 }
 

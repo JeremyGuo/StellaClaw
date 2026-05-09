@@ -16,6 +16,7 @@ struct IOSNativeMessageTimelineView: UIViewRepresentable {
     var loadOlderAction: (() -> Void)?
     var inspectMessageAction: ((ChatMessage) -> Void)?
     var inspectToolAction: ((ChatMessage, ToolActivity) -> Void)?
+    var openAttachmentAction: ((ChatAttachment) -> Void)?
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -58,6 +59,7 @@ struct IOSNativeMessageTimelineView: UIViewRepresentable {
         private var loadOlderAction: (() -> Void)?
         private var inspectMessageAction: ((ChatMessage) -> Void)?
         private var inspectToolAction: ((ChatMessage, ToolActivity) -> Void)?
+        private var openAttachmentAction: ((ChatAttachment) -> Void)?
         private var bottomScrollRequiresNearBottom = false
         private var isProgrammaticScrollInFlight = false
         private var lastManualScrollAt = Date.distantPast
@@ -130,6 +132,7 @@ struct IOSNativeMessageTimelineView: UIViewRepresentable {
             loadOlderAction = view.loadOlderAction
             inspectMessageAction = view.inspectMessageAction
             inspectToolAction = view.inspectToolAction
+            openAttachmentAction = view.openAttachmentAction
             bottomScrollRequiresNearBottom = view.bottomScrollRequiresNearBottom
             let width = max(tableView.bounds.width, 320)
             if abs(lastMeasuredWidth - width) > 1 {
@@ -356,7 +359,8 @@ struct IOSNativeMessageTimelineView: UIViewRepresentable {
                 ToolProcessExpandedContentView(
                     group: group,
                     compact: true,
-                    inspectToolAction: inspectToolAction
+                    inspectToolAction: inspectToolAction,
+                    openAttachmentAction: openAttachmentAction
                 )
                 .padding(.horizontal, 12)
                 .frame(width: width, alignment: .leading)
@@ -368,7 +372,8 @@ struct IOSNativeMessageTimelineView: UIViewRepresentable {
                         self?.scheduleHeightInvalidation(for: rowID, keepBottomAligned: true)
                     },
                     inspectMessageAction: inspectMessageAction,
-                    inspectToolAction: inspectToolAction
+                    inspectToolAction: inspectToolAction,
+                    openAttachmentAction: openAttachmentAction
                 )
                 .frame(width: width, alignment: .leading)
             }
@@ -600,7 +605,8 @@ private enum IOSTimelineRow: Identifiable {
         loadOlderAction: (() -> Void)?,
         layoutChangeAction: (() -> Void)?,
         inspectMessageAction: ((ChatMessage) -> Void)?,
-        inspectToolAction: ((ChatMessage, ToolActivity) -> Void)?
+        inspectToolAction: ((ChatMessage, ToolActivity) -> Void)?,
+        openAttachmentAction: ((ChatAttachment) -> Void)?
     ) -> some View {
         switch self {
         case .emptyLoading:
@@ -634,7 +640,8 @@ private enum IOSTimelineRow: Identifiable {
                 compact: true,
                 layoutChangeAction: layoutChangeAction,
                 inspectMessageAction: inspectMessageAction,
-                inspectToolAction: inspectToolAction
+                inspectToolAction: inspectToolAction,
+                openAttachmentAction: openAttachmentAction
             )
             .frame(width: width, alignment: .leading)
         case .toolProcessHeader, .toolProcessContent:
@@ -689,6 +696,7 @@ private extension ChatMessage {
     func fastIOSTimelineHeight(width: CGFloat, auxiliaryCount: Int) -> CGFloat? {
         guard role == .user,
               attachments.isEmpty,
+              selectionReferences?.isEmpty != false,
               toolActivities.isEmpty,
               !pending,
               error == nil

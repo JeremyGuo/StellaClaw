@@ -1,5 +1,13 @@
-version: 1.26.0
+version: 1.26.1
 ---
+
+# 1.26.1
+
+- 修复 `shell_exec.workdir` 显式传 `~` 或 `~/...` 时的路径展开：
+  本地 shell 会把 `~` 展开到 `$HOME`，不再误当作 workspace 下的普通目录；fixed/selectable SSH remote shell 会把默认 `~` 和 `~/...` 转成 `${HOME}` 形式再 `cd`，避免 shell quote 后变成 `cd '~'` 导致远端不展开。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 补齐 StellaCodeX iOS 选区引用和附件预览链路：
+  iOS conversation model 新增 `SelectionReference` payload，composer 支持显示和移除待发送选区引用，workspace 文件预览可以把当前文件内容作为引用加入 composer；聊天附件支持跳转到 workspace 文件预览，文件预览/QuickLook 路径支持更完整的引用、分享和打开体验。本次不改变服务端 `config` schema，不改变 `workdir` schema。
 
 # 1.26.0
 

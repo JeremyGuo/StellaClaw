@@ -12,6 +12,7 @@ struct AttachmentStripView: View {
     var compact = false
     var alignment: HorizontalAlignment = .leading
     var fillsWidth = true
+    var openAttachmentAction: ((ChatAttachment) -> Void)?
 
     var body: some View {
         if !attachments.isEmpty {
@@ -22,10 +23,15 @@ struct AttachmentStripView: View {
                             attachment: attachment,
                             compact: compact,
                             alignment: frameAlignment,
-                            fillsWidth: fillsWidth
+                            fillsWidth: fillsWidth,
+                            openAttachmentAction: openAttachmentAction
                         )
                     } else {
-                        AttachmentCardView(attachment: attachment, compact: compact)
+                        AttachmentCardView(
+                            attachment: attachment,
+                            compact: compact,
+                            openAttachmentAction: openAttachmentAction
+                        )
                     }
                 }
             }
@@ -43,11 +49,16 @@ private struct ImageAttachmentPreview: View {
     let compact: Bool
     let alignment: Alignment
     let fillsWidth: Bool
+    let openAttachmentAction: ((ChatAttachment) -> Void)?
     @State private var isPreviewPresented = false
 
     var body: some View {
         Button {
-            isPreviewPresented = true
+            if let openAttachmentAction {
+                openAttachmentAction(attachment)
+            } else {
+                isPreviewPresented = true
+            }
         } label: {
             ZStack {
                 RoundedRectangle(cornerRadius: compact ? 14 : 16, style: .continuous)
@@ -71,6 +82,14 @@ private struct ImageAttachmentPreview: View {
                     .strokeBorder(PlatformColor.separator.opacity(0.34))
             }
             .contextMenu {
+                if openAttachmentAction != nil {
+                    Button {
+                        openAttachmentAction?(attachment)
+                    } label: {
+                        Label("Preview Attachment", systemImage: "doc.viewfinder")
+                    }
+                }
+
                 Button {
                     Pasteboard.copy(attachment.path.isEmpty ? attachment.uri : attachment.path)
                 } label: {
@@ -123,6 +142,7 @@ private struct AttachmentStripWidthModifier: ViewModifier {
 private struct AttachmentCardView: View {
     let attachment: ChatAttachment
     let compact: Bool
+    let openAttachmentAction: ((ChatAttachment) -> Void)?
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -160,6 +180,13 @@ private struct AttachmentCardView: View {
 
             Spacer(minLength: 8)
 
+            if openAttachmentAction != nil {
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .padding(.top, 4)
+            }
+
             Button {
                 Pasteboard.copy(attachment.path.isEmpty ? attachment.uri : attachment.path)
             } label: {
@@ -168,6 +195,25 @@ private struct AttachmentCardView: View {
             .buttonStyle(.plain)
             .foregroundStyle(.secondary)
             .accessibilityLabel("Copy Attachment Path")
+        }
+        .contentShape(RoundedRectangle(cornerRadius: compact ? 11 : 9, style: .continuous))
+        .onTapGesture {
+            openAttachmentAction?(attachment)
+        }
+        .contextMenu {
+            if openAttachmentAction != nil {
+                Button {
+                    openAttachmentAction?(attachment)
+                } label: {
+                    Label("Preview Attachment", systemImage: "doc.viewfinder")
+                }
+            }
+
+            Button {
+                Pasteboard.copy(attachment.path.isEmpty ? attachment.uri : attachment.path)
+            } label: {
+                Label("Copy Attachment Path", systemImage: "doc.on.doc")
+            }
         }
         .padding(9)
         .background(PlatformColor.secondaryBackground.opacity(0.68))

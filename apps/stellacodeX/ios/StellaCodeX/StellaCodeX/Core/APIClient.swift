@@ -11,7 +11,7 @@ protocol StellaAPIClient {
     func markConversationSeen(conversationID: ConversationSummary.ID, lastSeenMessageID: String) async throws -> ConversationSeen
     func listMessagePage(conversationID: ConversationSummary.ID, offset: Int, limit: Int) async throws -> ChatMessagePage
     func messageDetail(conversationID: ConversationSummary.ID, messageID: ChatMessage.ID) async throws -> ChatMessageDetail
-    func sendMessage(_ body: String, conversationID: ConversationSummary.ID, userName: String, remoteMessageID: String, files: [OutgoingMessageFile]) async throws
+    func sendMessage(_ body: String, conversationID: ConversationSummary.ID, userName: String, remoteMessageID: String, files: [OutgoingMessageFile], selectionReferences: [SelectionReference]) async throws
     func listWorkspace(conversationID: ConversationSummary.ID, path: String, limit: Int) async throws -> WorkspaceListing
     func workspaceFile(conversationID: ConversationSummary.ID, path: String, limitBytes: Int, full: Bool) async throws -> WorkspaceFile
     func downloadWorkspaceArchive(conversationID: ConversationSummary.ID, path: String) async throws -> Data
@@ -288,7 +288,7 @@ struct MockStellaAPIClient: StellaAPIClient {
         )
     }
 
-    func sendMessage(_ body: String, conversationID: ConversationSummary.ID, userName: String, remoteMessageID: String, files: [OutgoingMessageFile]) async throws {
+    func sendMessage(_ body: String, conversationID: ConversationSummary.ID, userName: String, remoteMessageID: String, files: [OutgoingMessageFile], selectionReferences: [SelectionReference]) async throws {
     }
 
     func listWorkspace(conversationID: ConversationSummary.ID, path: String, limit: Int) async throws -> WorkspaceListing {
@@ -531,13 +531,14 @@ struct StellaWebAPIClient: StellaAPIClient {
         )
     }
 
-    func sendMessage(_ body: String, conversationID: ConversationSummary.ID, userName: String, remoteMessageID: String, files: [OutgoingMessageFile]) async throws {
+    func sendMessage(_ body: String, conversationID: ConversationSummary.ID, userName: String, remoteMessageID: String, files: [OutgoingMessageFile], selectionReferences: [SelectionReference]) async throws {
         let path = "/api/conversations/\(conversationID.urlPathEncoded)/messages"
         let requestBody = SendMessageBody(
             user_name: userName,
             text: body,
             remote_message_id: remoteMessageID,
-            files: files.isEmpty ? nil : files
+            files: files.isEmpty ? nil : files,
+            selection_references: selectionReferences.isEmpty ? nil : selectionReferences
         )
         let _: SendMessageResponse = try await request(path, method: "POST", body: requestBody)
     }
@@ -907,6 +908,7 @@ private struct SendMessageBody: Encodable {
     var text: String
     var remote_message_id: String
     var files: [OutgoingMessageFile]?
+    var selection_references: [SelectionReference]?
 }
 
 private struct SendMessageResponse: Decodable {
@@ -1079,6 +1081,7 @@ private struct WebTokenUsageCost: Decodable {
 private struct WebMessageItem: Decodable {
     var type: String
     var text: String?
+    var selection: SelectionReference?
     var tool_name: String?
     var arguments: JSONValue?
     var context: String?
@@ -1615,6 +1618,10 @@ extension ChatMessage {
         let toolActivities = web.items?.enumerated().compactMap { index, item -> ToolActivity? in
             item.toolActivity(messageID: web.id, itemIndex: index)
         } ?? []
+        let selectionReferences = web.items?
+            .compactMap { item -> SelectionReference? in
+                item.type == "selection_reference" ? item.selection : nil
+            } ?? []
         let itemText = web.items?
             .compactMap { item -> String? in
                 switch item.type {
@@ -1639,6 +1646,7 @@ extension ChatMessage {
             index: web.index ?? (Int(web.id) ?? 0),
             role: ChatRole(webRole: web.role),
             body: body,
+            selectionReferences: selectionReferences.isEmpty ? nil : selectionReferences,
             toolActivities: toolActivities,
             attachments: web.attachments?.map(ChatAttachment.init(web:)) ?? [],
             tokenUsage: web.token_usage.map(TokenUsage.init(web:)),

@@ -1,4 +1,5 @@
 #if os(iOS)
+import QuickLook
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -284,7 +285,7 @@ struct IOSWorkspaceFilesView: View {
     }
 }
 
-private struct WorkspaceFilePreviewScreen: View {
+struct WorkspaceFilePreviewScreen: View {
     @ObservedObject var viewModel: AppViewModel
     let entry: WorkspaceEntry
     let onWorkspaceChanged: () -> Void
@@ -329,6 +330,13 @@ private struct WorkspaceFilePreviewScreen: View {
                 } label: {
                     Image(systemName: "square.and.arrow.up")
                 }
+
+                Button {
+                    addPreviewReference()
+                } label: {
+                    Image(systemName: "quote.bubble")
+                }
+                .disabled(file == nil)
 
                 Menu {
                     Button {
@@ -393,6 +401,7 @@ private struct WorkspaceFilePreviewScreen: View {
         }
         errorMessage = nil
         let image = isImagePath(entry.path)
+        let quickLook = isQuickLookPreviewPath(entry.path)
         if !image, let sizeBytes = entry.sizeBytes, sizeBytes > 25_000_000 {
             file = nil
             errorMessage = "Preview is limited to 25 MB for this file type. Use Share / Open In... to download it."
@@ -406,12 +415,20 @@ private struct WorkspaceFilePreviewScreen: View {
         do {
             file = try await viewModel.loadWorkspaceFile(
                 path: entry.path,
-                previewLimitBytes: image ? 1 : 2_000_000,
-                full: image
+                previewLimitBytes: (image || quickLook) ? 25_000_000 : 2_000_000,
+                full: image || quickLook
             )
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func addPreviewReference() {
+        guard let file else {
+            return
+        }
+        viewModel.addSelectionReference(file.previewSelectionReference())
+        dismiss()
     }
 
     private func download(path: String, name: String) async {
@@ -489,6 +506,8 @@ private struct WorkspaceFilePreviewContent: View {
                         .frame(maxWidth: .infinity)
                 }
                 .background(Color.black.opacity(0.04))
+            } else if isQuickLookPreviewPath(file.path), let data = file.decodedData {
+                WorkspaceQuickLookPreview(file: file, data: data)
             } else if file.isText {
                 WorkspaceSourceCodeView(text: file.data, language: languageForPath(file.path))
             } else {
@@ -606,6 +625,93 @@ private struct ActivityShareSheet: UIViewControllerRepresentable {
     }
 }
 
+private struct WorkspaceQuickLookPreview: View {
+    let file: WorkspaceFile
+    let data: Data
+
+    @State private var previewURL: URL?
+    @State private var errorMessage: String?
+
+    var body: some View {
+        Group {
+            if let previewURL {
+                QuickLookPreviewController(url: previewURL)
+            } else if let errorMessage {
+                ContentUnavailableView(
+                    "Preview Unavailable",
+                    systemImage: "doc.questionmark",
+                    description: Text(errorMessage)
+                )
+            } else {
+                ProgressView("Preparing preview")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .task(id: file.path) {
+            preparePreviewFile()
+        }
+    }
+
+    private func preparePreviewFile() {
+        do {
+            let directory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("StellaCodeXWorkspacePreviews", isDirectory: true)
+                .appendingPathComponent(UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let url = directory.appendingPathComponent(file.name.workspaceFileNameSafe)
+            try data.write(to: url, options: .atomic)
+            previewURL = url
+            errorMessage = nil
+        } catch {
+            previewURL = nil
+            errorMessage = error.localizedDescription
+        }
+    }
+}
+
+private extension String {
+    var workspaceFileNameSafe: String {
+        let unsafe = CharacterSet(charactersIn: "/\\:?%*|\"<>")
+        let value = components(separatedBy: unsafe).joined(separator: "_")
+        return value.isEmpty ? "preview" : value
+    }
+}
+
+private struct QuickLookPreviewController: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(url: url)
+    }
+
+    func makeUIViewController(context: Context) -> QLPreviewController {
+        let controller = QLPreviewController()
+        controller.dataSource = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: QLPreviewController, context: Context) {
+        context.coordinator.url = url
+        uiViewController.reloadData()
+    }
+
+    final class Coordinator: NSObject, QLPreviewControllerDataSource {
+        var url: URL
+
+        init(url: URL) {
+            self.url = url
+        }
+
+        func numberOfPreviewItems(in controller: QLPreviewController) -> Int {
+            1
+        }
+
+        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
+            url as NSURL
+        }
+    }
+}
+
 private func isImagePath(_ path: String) -> Bool {
     let ext = path.split(separator: ".").last?.lowercased() ?? ""
     return ["png", "jpg", "jpeg", "gif", "webp", "heic"].contains(String(ext))
@@ -614,6 +720,15 @@ private func isImagePath(_ path: String) -> Bool {
 private func isMarkdownPath(_ path: String) -> Bool {
     let ext = fileExtension(path)
     return ["md", "markdown", "mdown", "mkd"].contains(ext)
+}
+
+private func isQuickLookPreviewPath(_ path: String) -> Bool {
+    switch fileExtension(path) {
+    case "pdf", "doc", "docx", "ppt", "pptx", "pps", "ppsx", "pot", "potx", "xls", "xlsx", "csv", "rtf", "txt":
+        return true
+    default:
+        return false
+    }
 }
 
 private func languageForPath(_ path: String) -> String? {

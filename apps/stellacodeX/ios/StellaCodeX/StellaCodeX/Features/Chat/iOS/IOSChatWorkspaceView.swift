@@ -45,6 +45,9 @@ struct IOSChatWorkspaceView: View {
                     },
                     inspectToolAction: { message, tool in
                         viewModel.inspectTool(message: message, tool: tool)
+                    },
+                    openAttachmentAction: { attachment in
+                        openAttachmentPreview(attachment)
                     }
                 )
                     .id(viewModel.selectedConversationID ?? "no-conversation")
@@ -71,9 +74,13 @@ struct IOSChatWorkspaceView: View {
             if !viewModel.selectedConversationRequiresModel {
                 IOSMessageComposerView(
                     text: $viewModel.composerText,
+                    selectionReferences: $viewModel.composerSelectionReferences,
                     attachments: $pendingAttachments,
                     addAttachmentAction: {
                         isAttachmentMenuPresented = true
+                    },
+                    removeSelectionReferenceAction: { selection in
+                        viewModel.removeSelectionReference(selection)
                     },
                     removeAttachmentAction: { attachment in
                         pendingAttachments.removeAll { $0.id == attachment.id }
@@ -110,6 +117,12 @@ struct IOSChatWorkspaceView: View {
             switch destination {
             case .files:
                 IOSWorkspaceFilesView(viewModel: viewModel)
+            case .filePreview(let entry):
+                WorkspaceFilePreviewScreen(
+                    viewModel: viewModel,
+                    entry: entry,
+                    onWorkspaceChanged: {}
+                )
             case .terminal:
                 IOSTerminalSessionsView(viewModel: viewModel)
             case .actions:
@@ -229,6 +242,13 @@ struct IOSChatWorkspaceView: View {
 
     private func showFiles() {
         destination = .files
+    }
+
+    private func openAttachmentPreview(_ attachment: ChatAttachment) {
+        guard let entry = attachment.workspacePreviewEntry else {
+            return
+        }
+        destination = .filePreview(entry)
     }
 
     private func showTerminal() {
@@ -658,12 +678,42 @@ private struct IOSAttachmentPickerPanel: View {
     }
 }
 
-private enum IOSConversationDestination: String, Identifiable {
+private enum IOSConversationDestination: Identifiable, Hashable {
     case files
+    case filePreview(WorkspaceEntry)
     case terminal
     case actions
 
-    var id: String { rawValue }
+    var id: String {
+        switch self {
+        case .files:
+            "files"
+        case .filePreview(let entry):
+            "filePreview:\(entry.path)"
+        case .terminal:
+            "terminal"
+        case .actions:
+            "actions"
+        }
+    }
+}
+
+private extension ChatAttachment {
+    var workspacePreviewEntry: WorkspaceEntry? {
+        let normalizedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedPath.isEmpty else {
+            return nil
+        }
+        return WorkspaceEntry(
+            name: normalizedPath.split(separator: "/").last.map(String.init) ?? name,
+            path: normalizedPath,
+            kind: "file",
+            sizeBytes: sizeBytes.map(Int64.init),
+            modifiedMS: nil,
+            hidden: false,
+            readonly: false
+        )
+    }
 }
 
 private struct IOSChatWallpaper: View {
@@ -707,8 +757,10 @@ private struct IOSChatWallpaper: View {
 
 private struct IOSMessageComposerView: View {
     @Binding var text: String
+    @Binding var selectionReferences: [SelectionReference]
     @Binding var attachments: [PendingMessageAttachment]
     let addAttachmentAction: () -> Void
+    let removeSelectionReferenceAction: (SelectionReference) -> Void
     let removeAttachmentAction: (PendingMessageAttachment) -> Void
     let cameraAction: () -> Void
     let sendAction: () -> Void
@@ -718,6 +770,19 @@ private struct IOSMessageComposerView: View {
 
     var body: some View {
         VStack(spacing: 8) {
+            if !selectionReferences.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(selectionReferences) { selection in
+                            PendingSelectionReferenceChip(selection: selection) {
+                                removeSelectionReferenceAction(selection)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                }
+            }
+
             if !attachments.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
@@ -831,6 +896,9 @@ private struct IOSMessageComposerView: View {
         .onChange(of: attachments.count) { _, _ in
             layoutChangeAction()
         }
+        .onChange(of: selectionReferences.count) { _, _ in
+            layoutChangeAction()
+        }
         .onChange(of: isTextViewFocused) { _, focused in
             if focused {
                 layoutChangeAction()
@@ -839,7 +907,7 @@ private struct IOSMessageComposerView: View {
     }
 
     private var canSend: Bool {
-        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
+        !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !selectionReferences.isEmpty || !attachments.isEmpty
     }
 
     private var inputBorderColor: Color {
@@ -1079,6 +1147,49 @@ private struct PendingAttachmentChip: View {
             return "doc.richtext"
         }
         return "doc"
+    }
+}
+
+private struct PendingSelectionReferenceChip: View {
+    let selection: SelectionReference
+    let remove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "quote.opening")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 34, height: 34)
+                .background(Color.accentColor.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(selection.fileName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false ? selection.fileName! : selection.filePath)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(selection.selectedText.trimmingCharacters(in: .whitespacesAndNewlines))
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: 190, alignment: .leading)
+
+            Button(action: remove) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .background(.ultraThinMaterial)
+        .clipShape(Capsule())
+        .overlay {
+            Capsule()
+                .strokeBorder(Color.accentColor.opacity(0.18))
+        }
     }
 }
 

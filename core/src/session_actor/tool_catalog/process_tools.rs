@@ -1462,7 +1462,7 @@ fn resolve_local_workdir(
     else {
         return Ok(workspace_root.to_path_buf());
     };
-    let path = PathBuf::from(workdir);
+    let path = expand_local_tilde_path(&workdir).unwrap_or_else(|| PathBuf::from(workdir));
     let path = if path.is_absolute() {
         path
     } else {
@@ -1475,6 +1475,19 @@ fn resolve_local_workdir(
         )));
     }
     Ok(path)
+}
+
+fn expand_local_tilde_path(path: &str) -> Option<PathBuf> {
+    if path != "~" && !path.starts_with("~/") {
+        return None;
+    }
+    let home = env::var_os("HOME").filter(|value| !value.is_empty())?;
+    let home = PathBuf::from(home);
+    if path == "~" {
+        Some(home)
+    } else {
+        Some(home.join(&path[2..]))
+    }
 }
 
 fn resolve_remote_workdir(base: Option<&str>, arguments: &Map<String, Value>) -> String {
@@ -1497,11 +1510,26 @@ fn resolve_remote_workdir(base: Option<&str>, arguments: &Map<String, Value>) ->
 fn remote_exec_command(cwd: &str, shell: &str, login: bool, command: &str) -> String {
     format!(
         "export TERM=xterm-256color COLORTERM=truecolor TERM_PROGRAM=Stellaclaw; cd {} && exec {} {} {}",
-        shell_quote(cwd),
+        remote_workdir_shell_arg(cwd),
         shell,
         shell_exec_flag(login),
         shell_quote(command)
     )
+}
+
+fn remote_workdir_shell_arg(cwd: &str) -> String {
+    match cwd {
+        "~" => "${HOME}".to_string(),
+        value if value.starts_with("~/") => {
+            let suffix = &value[2..];
+            if suffix.is_empty() {
+                "${HOME}".to_string()
+            } else {
+                format!("${{HOME}}/{}", shell_quote(suffix))
+            }
+        }
+        value => shell_quote(value),
+    }
 }
 
 fn shell_exec_flag(login: bool) -> &'static str {
@@ -1658,5 +1686,35 @@ mod tests {
             .expect("repeated carriage return should snapshot");
 
         assert_eq!(snapshot["visible_text"], "progress done");
+    }
+
+    #[test]
+    fn local_workdir_expands_home_tilde() {
+        let home = env::var("HOME").expect("HOME should be set in tests");
+        let workspace = Path::new("/tmp/stellaclaw-workspace");
+        let args = Map::from_iter([("workdir".to_string(), Value::String("~".to_string()))]);
+
+        let resolved = resolve_local_workdir(workspace, &args).expect("home should resolve");
+
+        assert_eq!(resolved, PathBuf::from(home));
+    }
+
+    #[test]
+    fn remote_workdir_uses_home_variable_for_tilde() {
+        assert_eq!(remote_workdir_shell_arg("~"), "${HOME}");
+        assert_eq!(remote_workdir_shell_arg("~/project"), "${HOME}/'project'");
+        assert_eq!(
+            remote_workdir_shell_arg("~/project with space"),
+            "${HOME}/'project with space'"
+        );
+        assert_eq!(remote_workdir_shell_arg("/tmp/work"), "'/tmp/work'");
+    }
+
+    #[test]
+    fn remote_exec_command_does_not_quote_tilde() {
+        let command = remote_exec_command("~", "${SHELL:-sh}", false, "pwd");
+
+        assert!(command.contains("cd ${HOME} &&"), "{command}");
+        assert!(!command.contains("cd '~'"), "{command}");
     }
 }

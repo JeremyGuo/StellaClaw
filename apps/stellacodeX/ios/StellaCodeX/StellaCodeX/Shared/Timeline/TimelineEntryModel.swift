@@ -229,6 +229,7 @@ extension AuxiliaryUserMessage {
 extension ChatMessage {
     var shouldRenderInTimeline: Bool {
         !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || selectionReferences?.isEmpty == false
             || !toolActivities.isEmpty
             || !attachments.isEmpty
             || tokenUsage?.hasUsage == true
@@ -271,6 +272,9 @@ extension ChatMessage {
         hasher.combine(pending)
         hasher.combine(error)
         hasher.combine(tokenUsage)
+        for selection in selectionReferences ?? [] {
+            hasher.combine(selection)
+        }
         for activity in toolActivities {
             hasher.combine(activity.id)
             hasher.combine(activity.kind.rawValue)

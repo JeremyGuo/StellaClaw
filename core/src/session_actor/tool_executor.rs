@@ -1236,6 +1236,32 @@ mod tests {
     }
 
     #[test]
+    fn shell_exec_expands_tilde_workdir_locally() {
+        let workspace = temp_workspace();
+        let home = std::env::var("HOME").expect("HOME should be set");
+        let executor = LocalToolBatchExecutor::new(&workspace);
+        let message = start_and_wait(
+            &executor,
+            ToolBatch::new(
+                "batch_shell_home_workdir",
+                vec![tool_call(
+                    "shell_exec",
+                    json!({
+                        "command": "pwd",
+                        "workdir": "~",
+                        "yield_time_ms": 1000
+                    }),
+                )],
+            ),
+        );
+
+        let result: Value = serde_json::from_str(result_text(&message, 0)).unwrap();
+        assert_eq!(result["success"], json!(true), "{result}");
+        assert_eq!(result["cwd"], json!(home), "{result}");
+        assert_eq!(result["output"], json!(format!("{home}\n")), "{result}");
+    }
+
+    #[test]
     fn shell_exec_reports_missing_command() {
         let workspace = temp_workspace();
         let executor = LocalToolBatchExecutor::new(&workspace);

@@ -16,6 +16,7 @@ struct MessageTimelineView: View {
     var loadOlderAction: (() -> Void)?
     var inspectMessageAction: ((ChatMessage) -> Void)?
     var inspectToolAction: ((ChatMessage, ToolActivity) -> Void)?
+    var openAttachmentAction: ((ChatAttachment) -> Void)?
 
     @State private var olderLoadAnchorID: TimelineEntry.ID?
     @State private var previousTimelineSnapshot: TimelineSnapshot?
@@ -44,7 +45,8 @@ struct MessageTimelineView: View {
             bottomLayoutChangeTrigger: bottomLayoutChangeTrigger,
             loadOlderAction: loadOlderAction,
             inspectMessageAction: inspectMessageAction,
-            inspectToolAction: inspectToolAction
+            inspectToolAction: inspectToolAction,
+            openAttachmentAction: openAttachmentAction
         )
         #elseif os(iOS)
         IOSNativeMessageTimelineView(
@@ -60,7 +62,8 @@ struct MessageTimelineView: View {
             bottomLayoutChangeTrigger: bottomLayoutChangeTrigger,
             loadOlderAction: loadOlderAction,
             inspectMessageAction: inspectMessageAction,
-            inspectToolAction: inspectToolAction
+            inspectToolAction: inspectToolAction,
+            openAttachmentAction: openAttachmentAction
         )
         #else
         ScrollViewReader { proxy in
@@ -246,7 +249,8 @@ struct MessageTimelineView: View {
                 keepBottomAlignedAfterLayoutChange(proxy)
             },
             inspectMessageAction: inspectMessageAction,
-            inspectToolAction: inspectToolAction
+            inspectToolAction: inspectToolAction,
+            openAttachmentAction: openAttachmentAction
         )
     }
 
@@ -499,6 +503,7 @@ struct TimelineEntryRowView: View {
     var layoutChangeAction: (() -> Void)?
     var inspectMessageAction: ((ChatMessage) -> Void)?
     var inspectToolAction: ((ChatMessage, ToolActivity) -> Void)?
+    var openAttachmentAction: ((ChatAttachment) -> Void)?
 
     var body: some View {
         switch entry {
@@ -515,7 +520,8 @@ struct TimelineEntryRowView: View {
                 auxiliaryMessages: auxiliaryMessages,
                 layoutChangeAction: layoutChangeAction,
                 inspectMessageAction: inspectMessageAction,
-                inspectToolAction: inspectToolAction
+                inspectToolAction: inspectToolAction,
+                openAttachmentAction: openAttachmentAction
             )
             #else
             IOSMessageBubble(
@@ -523,17 +529,19 @@ struct TimelineEntryRowView: View {
                 auxiliaryMessages: auxiliaryMessages,
                 layoutChangeAction: layoutChangeAction,
                 inspectMessageAction: inspectMessageAction,
-                inspectToolAction: inspectToolAction
+                inspectToolAction: inspectToolAction,
+                openAttachmentAction: openAttachmentAction
             )
             #endif
         case .toolProcess(let group):
             ToolProcessGroupView(
                 group: group,
                 compact: compact,
-                layoutChangeAction: layoutChangeAction,
-                inspectMessageAction: inspectMessageAction,
-                inspectToolAction: inspectToolAction
-            )
+            layoutChangeAction: layoutChangeAction,
+            inspectMessageAction: inspectMessageAction,
+            inspectToolAction: inspectToolAction,
+            openAttachmentAction: openAttachmentAction
+        )
         }
     }
 }
@@ -694,6 +702,7 @@ private struct MacMessageRow: View {
     let layoutChangeAction: (() -> Void)?
     let inspectMessageAction: ((ChatMessage) -> Void)?
     let inspectToolAction: ((ChatMessage, ToolActivity) -> Void)?
+    let openAttachmentAction: ((ChatAttachment) -> Void)?
 
     var body: some View {
         if message.role == .user {
@@ -723,11 +732,19 @@ private struct MacMessageRow: View {
                     }
                 }
 
+                SelectionReferenceStripView(
+                    selections: message.selectionReferences ?? [],
+                    compact: true,
+                    alignment: .trailing,
+                    fillsWidth: true
+                )
+
                 AttachmentStripView(
                     attachments: message.attachments,
                     compact: true,
                     alignment: .trailing,
-                    fillsWidth: true
+                    fillsWidth: true,
+                    openAttachmentAction: openAttachmentAction
                 )
 
                 if !message.toolActivities.isEmpty {
@@ -819,9 +836,14 @@ private struct MacMessageRow: View {
                     MarkdownContentView(text: message.body)
                 }
 
-                AttachmentStripView(attachments: message.attachments)
+                SelectionReferenceStripView(selections: message.selectionReferences ?? [])
 
-                if message.body.isEmpty && message.attachments.isEmpty && message.toolActivities.isEmpty,
+                AttachmentStripView(
+                    attachments: message.attachments,
+                    openAttachmentAction: openAttachmentAction
+                )
+
+                if message.body.isEmpty && message.selectionReferences?.isEmpty != false && message.attachments.isEmpty && message.toolActivities.isEmpty,
                    let tokenUsage = message.tokenUsage,
                    tokenUsage.hasUsage {
                     TokenUsageSummaryView(usage: tokenUsage)
@@ -928,6 +950,7 @@ private struct MacMessageRow: View {
 
     private var isUserImageOnlyMessage: Bool {
         message.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && message.selectionReferences?.isEmpty != false
             && !message.attachments.isEmpty
             && message.attachments.allSatisfy(\.isImage)
             && message.toolActivities.isEmpty
@@ -955,6 +978,7 @@ private struct IOSMessageBubble: View {
     let layoutChangeAction: (() -> Void)?
     let inspectMessageAction: ((ChatMessage) -> Void)?
     let inspectToolAction: ((ChatMessage, ToolActivity) -> Void)?
+    let openAttachmentAction: ((ChatAttachment) -> Void)?
 
     var body: some View {
         if isUser {
@@ -989,14 +1013,22 @@ private struct IOSMessageBubble: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                         } else {
                             MarkdownContentView(text: message.body, compact: true, fillsWidth: true)
-                        }
                     }
+                }
+
+                    SelectionReferenceStripView(
+                        selections: message.selectionReferences ?? [],
+                        compact: true,
+                        alignment: .trailing,
+                        fillsWidth: true
+                    )
 
                     AttachmentStripView(
                         attachments: message.attachments,
                         compact: true,
                         alignment: .trailing,
-                        fillsWidth: true
+                        fillsWidth: true,
+                        openAttachmentAction: openAttachmentAction
                     )
 
                     if !message.toolActivities.isEmpty {
@@ -1078,9 +1110,15 @@ private struct IOSMessageBubble: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
-                AttachmentStripView(attachments: message.attachments, compact: true)
+                SelectionReferenceStripView(selections: message.selectionReferences ?? [], compact: true)
 
-                if message.body.isEmpty && message.attachments.isEmpty && message.toolActivities.isEmpty,
+                AttachmentStripView(
+                    attachments: message.attachments,
+                    compact: true,
+                    openAttachmentAction: openAttachmentAction
+                )
+
+                if message.body.isEmpty && message.selectionReferences?.isEmpty != false && message.attachments.isEmpty && message.toolActivities.isEmpty,
                    let tokenUsage = message.tokenUsage,
                    tokenUsage.hasUsage {
                     TokenUsageSummaryView(usage: tokenUsage, compact: true)
@@ -1206,6 +1244,7 @@ private struct IOSMessageBubble: View {
     private var isUserImageOnlyMessage: Bool {
         isUser
             && message.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && message.selectionReferences?.isEmpty != false
             && !message.attachments.isEmpty
             && message.attachments.allSatisfy(\.isImage)
             && message.toolActivities.isEmpty
@@ -1238,6 +1277,7 @@ struct ToolProcessGroupView: View {
     let layoutChangeAction: (() -> Void)?
     let inspectMessageAction: ((ChatMessage) -> Void)?
     let inspectToolAction: ((ChatMessage, ToolActivity) -> Void)?
+    let openAttachmentAction: ((ChatAttachment) -> Void)?
 
     @State private var isExpanded = false
 
@@ -1253,7 +1293,8 @@ struct ToolProcessGroupView: View {
                 ToolProcessExpandedContentView(
                     group: group,
                     compact: compact,
-                    inspectToolAction: inspectToolAction
+                    inspectToolAction: inspectToolAction,
+                    openAttachmentAction: openAttachmentAction
                 )
                 .transition(.identity)
             }
@@ -1370,6 +1411,7 @@ struct ToolProcessExpandedContentView: View {
     let group: ToolProcessGroup
     let compact: Bool
     let inspectToolAction: ((ChatMessage, ToolActivity) -> Void)?
+    let openAttachmentAction: ((ChatAttachment) -> Void)?
 
     @State private var isContentVisible = false
 
@@ -1382,13 +1424,19 @@ struct ToolProcessExpandedContentView: View {
                         .padding(.top, 2)
                 }
 
-                if !message.body.isEmpty || !message.attachments.isEmpty {
+                if !message.body.isEmpty || message.selectionReferences?.isEmpty == false || !message.attachments.isEmpty {
                     VStack(alignment: .leading, spacing: 7) {
                         if !message.body.isEmpty {
                             MarkdownContentView(text: message.body, compact: compact)
                         }
 
-                        AttachmentStripView(attachments: message.attachments, compact: compact)
+                        SelectionReferenceStripView(selections: message.selectionReferences ?? [], compact: compact)
+
+                        AttachmentStripView(
+                            attachments: message.attachments,
+                            compact: compact,
+                            openAttachmentAction: openAttachmentAction
+                        )
                     }
                     .padding(.horizontal, compact ? 10 : 0)
                     .padding(.top, 3)
