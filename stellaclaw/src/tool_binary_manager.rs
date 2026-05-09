@@ -12,6 +12,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use stellaclaw_core::session_actor::{ToolBinaryEnsureRequest, ToolBinaryEnsureResponse};
 
+use crate::config::{SandboxConfig, SandboxMode};
+
 const SAFE_REMOTE_PATH: &str =
     "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}; export PATH;";
 
@@ -29,6 +31,7 @@ pub struct ToolBinaryClient {
 
 struct ToolBinaryCommand {
     request: ToolBinaryEnsureRequest,
+    runtime: ToolBinaryRuntime,
     response: mpsc::Sender<Result<ToolBinaryEnsureResponse, String>>,
 }
 
@@ -41,11 +44,13 @@ impl ToolBinaryClient {
     pub fn ensure(
         &self,
         request: ToolBinaryEnsureRequest,
+        sandbox: &SandboxConfig,
     ) -> Result<ToolBinaryEnsureResponse, String> {
         let (response_tx, response_rx) = mpsc::channel();
         self.tx
             .send(ToolBinaryCommand {
                 request,
+                runtime: ToolBinaryRuntime::from_sandbox(sandbox),
                 response: response_tx,
             })
             .map_err(|error| format!("tool binary manager is unavailable: {error}"))?;
@@ -59,6 +64,29 @@ struct ToolBinaryManager {
     lock: Mutex<()>,
 }
 
+#[derive(Clone)]
+struct ToolBinaryRuntime {
+    local_cache_root: PathBuf,
+    local_visible_root: PathBuf,
+}
+
+impl ToolBinaryRuntime {
+    fn from_sandbox(sandbox: &SandboxConfig) -> Self {
+        let software_root = sandbox_software_dir_or_default(sandbox);
+        let cache_root = tool_cache_root(&software_root);
+        let visible_root = match sandbox.mode {
+            SandboxMode::Bubblewrap => {
+                tool_cache_root(Path::new(sandbox.software_mount_path.trim()))
+            }
+            SandboxMode::Subprocess => cache_root.clone(),
+        };
+        Self {
+            local_cache_root: cache_root,
+            local_visible_root: visible_root,
+        }
+    }
+}
+
 impl ToolBinaryManager {
     fn start() -> ToolBinaryClient {
         let (tx, rx) = mpsc::channel::<ToolBinaryCommand>();
@@ -70,7 +98,7 @@ impl ToolBinaryManager {
                 };
                 while let Ok(command) = rx.recv() {
                     let result = manager
-                        .ensure(command.request)
+                        .ensure(command.request, command.runtime)
                         .map_err(|error| format!("{error:#}"));
                     let _ = command.response.send(result);
                 }
@@ -79,7 +107,11 @@ impl ToolBinaryManager {
         ToolBinaryClient { tx }
     }
 
-    fn ensure(&self, request: ToolBinaryEnsureRequest) -> Result<ToolBinaryEnsureResponse> {
+    fn ensure(
+        &self,
+        request: ToolBinaryEnsureRequest,
+        runtime: ToolBinaryRuntime,
+    ) -> Result<ToolBinaryEnsureResponse> {
         let _guard = self.lock.lock().expect("tool binary manager lock poisoned");
         let spec = spec_for_tool(&request.tool)?;
         match request
@@ -88,8 +120,8 @@ impl ToolBinaryManager {
             .map(str::trim)
             .filter(|host| !host.is_empty())
         {
-            Some(host) => ensure_remote(spec, host),
-            None => ensure_local(spec),
+            Some(host) => ensure_remote(spec, host, &runtime),
+            None => ensure_local(spec, &runtime),
         }
     }
 }
@@ -196,28 +228,35 @@ const RIPGREP_ASSETS: &[StaticToolAsset] = &[
     },
 ];
 
-fn ensure_local(spec: ToolSpec) -> Result<ToolBinaryEnsureResponse> {
+fn ensure_local(spec: ToolSpec, runtime: &ToolBinaryRuntime) -> Result<ToolBinaryEnsureResponse> {
     let platform = local_platform()?;
     let asset = spec.asset_for_platform(&platform)?;
-    let binary = local_binary_path(spec, &platform, &asset);
+    let binary = local_binary_path(&runtime.local_cache_root, spec, &platform, &asset);
     if !binary.is_file() {
         install_local_binary(spec, &platform, &asset, &binary)?;
     }
+    let visible_binary = visible_binary_path(runtime, spec, &platform, &asset);
     Ok(ToolBinaryEnsureResponse {
         status: "success".to_string(),
         tool: spec.name.to_string(),
         version: spec.version.to_string(),
         platform: Some(platform),
-        path_dir: binary.parent().map(|path| path.display().to_string()),
-        local_path: Some(binary.display().to_string()),
+        path_dir: visible_binary
+            .parent()
+            .map(|path| path.display().to_string()),
+        local_path: Some(visible_binary.display().to_string()),
         remote_path: None,
     })
 }
 
-fn ensure_remote(spec: ToolSpec, host: &str) -> Result<ToolBinaryEnsureResponse> {
+fn ensure_remote(
+    spec: ToolSpec,
+    host: &str,
+    runtime: &ToolBinaryRuntime,
+) -> Result<ToolBinaryEnsureResponse> {
     let platform = remote_platform(host)?;
     let asset = spec.asset_for_platform(&platform)?;
-    let local_binary = local_binary_path(spec, &platform, &asset);
+    let local_binary = local_binary_path(&runtime.local_cache_root, spec, &platform, &asset);
     if !local_binary.is_file() {
         install_local_binary(spec, &platform, &asset, &local_binary)?;
     }
@@ -334,21 +373,39 @@ fn remote_platform(host: &str) -> Result<String> {
     }
 }
 
-fn local_binary_path(spec: ToolSpec, platform: &str, asset: &ToolAsset) -> PathBuf {
-    local_cache_root()
-        .join(spec.name)
+fn local_binary_path(root: &Path, spec: ToolSpec, platform: &str, asset: &ToolAsset) -> PathBuf {
+    root.join(spec.name)
         .join(spec.version)
         .join(platform)
         .join(&asset.binary)
 }
 
-fn local_cache_root() -> PathBuf {
-    env::var_os("STELLACLAW_SOFTWARE_DIR")
+fn visible_binary_path(
+    runtime: &ToolBinaryRuntime,
+    spec: ToolSpec,
+    platform: &str,
+    asset: &ToolAsset,
+) -> PathBuf {
+    local_binary_path(&runtime.local_visible_root, spec, platform, asset)
+}
+
+fn sandbox_software_dir_or_default(sandbox: &SandboxConfig) -> PathBuf {
+    sandbox
+        .software_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/stellaclaw/tools"))
-        })
-        .unwrap_or_else(|| env::temp_dir().join("stellaclaw-tools"))
+        .or_else(default_software_dir)
+        .unwrap_or_else(|| env::temp_dir().join("stellaclaw-software"))
+}
+
+fn default_software_dir() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache"))
+}
+
+fn tool_cache_root(software_root: &Path) -> PathBuf {
+    software_root.join("stellaclaw").join("tools")
 }
 
 fn remote_home_dir(host: &str) -> Result<String> {

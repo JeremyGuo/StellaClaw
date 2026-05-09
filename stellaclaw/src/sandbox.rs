@@ -253,7 +253,7 @@ fn software_dir_or_default(sandbox: &SandboxConfig) -> Option<PathBuf> {
 }
 
 fn default_software_dir() -> Option<PathBuf> {
-    env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/stellaclaw/tools"))
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache"))
 }
 
 fn configured_software_mount_path(sandbox: &SandboxConfig) -> Result<PathBuf> {

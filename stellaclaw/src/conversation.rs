@@ -1837,7 +1837,10 @@ impl ConversationRuntime {
             .context("failed to parse tool_binary_ensure request")?;
         let output = self
             .tool_binary_client
-            .ensure(payload)
+            .ensure(
+                payload,
+                self.state.sandbox.as_ref().unwrap_or(&self.config.sandbox),
+            )
             .map(|response| {
                 serde_json::to_value(response).unwrap_or_else(
                     |_| json!({"status": "failure", "reason": "serialization_failed"}),

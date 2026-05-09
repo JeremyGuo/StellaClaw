@@ -699,7 +699,7 @@ fn ensure_local_fs_tool_binary(platform: &str) -> Result<PathBuf, LocalToolError
 
 fn local_fs_tool_cache_dir(platform: &str) -> Result<PathBuf, LocalToolError> {
     let root = env::var_os("STELLACLAW_SOFTWARE_DIR")
-        .map(PathBuf::from)
+        .map(|root| PathBuf::from(root).join("stellaclaw").join("tools"))
         .or_else(|| {
             env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/stellaclaw/tools"))
         })
