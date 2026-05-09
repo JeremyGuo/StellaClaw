@@ -46,10 +46,12 @@ pub(crate) fn system_prompt_for_initial(
 fn common_prompt() -> &'static str {
     "You are StellaClaw, a pragmatic coding agent. Work in Rust-first codebases with minimal, \
      direct abstractions. Use tools when they materially advance the task. Keep answers concise \
-     and grounded in the current workspace. Before making tool calls, send a brief preamble message \
-     explaining what you are about to do. Group related tool calls under one preamble, keep it to \
-     one or two short sentences, and focus on the immediate next action rather than narrating every \
-     command. Do not rely on model-internal memory; when prior durable \
+     and grounded in the current workspace. At the start of tool-using work, briefly acknowledge \
+     the task and give a one-to-two sentence plan before the first tool calls. During longer work, \
+     send short progress updates every 1-3 execution steps, and at minimum within every 6 steps or \
+     10 tool calls. Each update should state useful outcome or impact so far plus the next 1-3 \
+     steps or open question when relevant. Avoid headings, status labels, repetitive tics, and \
+     command-by-command log narration. Do not rely on model-internal memory; when prior durable \
      user, conversation, or project facts may matter and are not visible in current context, use an \
      available long-memory search tool, inspect the repository, or run a narrow verification step. Before using \
      any library, framework, command, flag, file path, or project capability, verify that it exists \
@@ -106,7 +108,11 @@ fn tool_efficiency_prompt(session_type: &SessionType) -> &'static str {
              If you intend to call multiple tools and there are no dependencies between the calls, \
              make all of the independent calls in the same tool-call batch (same assistant turn), otherwise \
              you MUST wait for previous calls to finish first to determine the dependent values \
-             (do NOT use placeholders or guess missing parameters)."
+             (do NOT use placeholders or guess missing parameters). Before repository exploration \
+             or other read-heavy work, think first about all files, searches, listings, and command \
+             outputs you are likely to need, then issue one bounded independent batch. This applies \
+             to read, list, search, git inspection, and similar shell commands. Do not read files \
+             one-by-one unless the next path truly depends on an earlier result."
         }
         SessionType::Subagent => {
             "Check that all the required parameters for each tool call are provided or can \
@@ -118,7 +124,11 @@ fn tool_efficiency_prompt(session_type: &SessionType) -> &'static str {
              If you intend to call multiple tools and there are no dependencies between the calls, \
              make all of the independent calls in the same tool-call batch (same assistant turn), otherwise \
              you MUST wait for previous calls to finish first to determine the dependent values \
-             (do NOT use placeholders or guess missing parameters)."
+             (do NOT use placeholders or guess missing parameters). Before repository exploration \
+             or other read-heavy work, think first about all files, searches, listings, and command \
+             outputs you are likely to need, then issue one bounded independent batch. This applies \
+             to read, list, search, git inspection, and similar shell commands. Do not read files \
+             one-by-one unless the next path truly depends on an earlier result."
         }
     }
 }
@@ -265,9 +275,26 @@ mod tests {
             &enabled_tools,
         );
 
-        assert!(prompt.contains("Before making tool calls, send a brief preamble message"));
-        assert!(prompt.contains("Group related tool calls under one preamble"));
-        assert!(prompt.contains("rather than narrating every command"));
+        assert!(prompt.contains("briefly acknowledge"));
+        assert!(prompt.contains("one-to-two sentence plan before the first tool calls"));
+        assert!(prompt.contains("within every 6 steps or 10 tool calls"));
+        assert!(prompt.contains("Avoid headings, status labels"));
+    }
+
+    #[test]
+    fn system_prompt_guides_parallel_reading_batches() {
+        let state = RuntimeMetadataState::default();
+        let enabled_tools = default_enabled_tools();
+        let prompt = system_prompt_for_initial(
+            &SessionInitial::new("s1", SessionType::Foreground),
+            &state,
+            &enabled_tools,
+        );
+
+        assert!(prompt.contains("Before repository exploration"));
+        assert!(prompt.contains("one bounded independent batch"));
+        assert!(prompt.contains("read, list, search, git inspection"));
+        assert!(prompt.contains("Do not read files one-by-one"));
     }
 
     #[test]
