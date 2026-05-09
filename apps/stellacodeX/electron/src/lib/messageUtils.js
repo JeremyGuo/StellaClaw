@@ -55,6 +55,15 @@ function normalizeChatMessageItem(item, index, renderedByIndex) {
           text_with_attachment_markers: payload.text || ''
         };
   }
+  if (item.type === 'selection_reference') {
+    return rendered?.type === 'selection_reference'
+      ? rendered
+      : {
+          type: 'selection_reference',
+          index,
+          selection: payload
+        };
+  }
   if (item.type === 'file') {
     return rendered?.type === 'file' ? rendered : { type: 'file', index, file: payload };
   }

@@ -1,5 +1,5 @@
 import { FileArchive, FileCode, FileImage, FileJson, FileText, Folder } from 'lucide-react';
-import { fileExtension, isHtmlFile, isImageFile, isMarkdownFile, isPdfFile } from './fileUtils';
+import { fileExtension, isHtmlFile, isImageFile, isMarkdownFile, isPdfFile, isPresentationFile, isWordFile } from './fileUtils';
 
 export function normalizeWorkspacePath(value = '') {
   return String(value || '')
@@ -50,6 +50,8 @@ export function workspaceEntryIcon(entry) {
   if (kind === 'symlink') return <span className="file-tree-link-icon">↪</span>;
   if (isImageFile(name)) return <FileImage size={14} />;
   if (isPdfFile(name)) return <FileText size={14} />;
+  if (isWordFile(name)) return <FileText size={14} />;
+  if (isPresentationFile(name)) return <FileText size={14} />;
   if (['zip', 'gz', 'tgz', 'tar', 'rar', '7z'].includes(ext)) return <FileArchive size={14} />;
   if (['json', 'jsonl'].includes(ext)) return <FileJson size={14} />;
   if (['js', 'jsx', 'ts', 'tsx', 'rs', 'py', 'c', 'cpp', 'h', 'hpp', 'css', 'html', 'sh', 'zsh', 'go', 'java'].includes(ext)) return <FileCode size={14} />;
@@ -60,6 +62,8 @@ export function workspaceFileKind(entryOrPath) {
   const name = typeof entryOrPath === 'string' ? entryOrPath : entryOrPath?.name || entryOrPath?.path || '';
   if (isImageFile(name)) return 'image';
   if (isPdfFile(name)) return 'pdf';
+  if (isWordFile(name)) return 'word';
+  if (isPresentationFile(name)) return 'presentation';
   if (isHtmlFile(name)) return 'html';
   if (isMarkdownFile(name)) return 'markdown';
   return 'code';

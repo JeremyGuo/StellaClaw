@@ -19,7 +19,8 @@ pub use actor::{
 };
 pub use chat_message::{
     ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, FileState, ReasoningItem,
-    TokenUsage, TokenUsageCost, ToolCallItem, ToolResultContent, ToolResultItem,
+    SelectionContext, SelectionLocator, SelectionRect, SelectionReferenceItem, TokenUsage,
+    TokenUsageCost, ToolCallItem, ToolResultContent, ToolResultItem,
 };
 pub use compressor::{CompressionError, CompressionReport, SessionCompressor, COMPRESSION_MARKER};
 pub(crate) use media_normalizer::normalize_messages_for_model;

@@ -2487,6 +2487,9 @@ fn message_text_for_memory_query(message: &ChatMessage) -> String {
     for item in &message.data {
         match item {
             ChatMessageItem::Context(context) => parts.push(context.text.trim().to_string()),
+            ChatMessageItem::SelectionReference(selection) => {
+                parts.push(selection.to_prompt_text());
+            }
             ChatMessageItem::ToolResult(tool_result) => {
                 if let Some(context) = tool_result.result.context.as_ref() {
                     parts.push(context.text.trim().to_string());

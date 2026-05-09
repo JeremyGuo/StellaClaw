@@ -593,6 +593,9 @@ fn collect_visible_text_segments(message: &ChatMessage) -> Vec<String> {
         match item {
             ChatMessageItem::Reasoning(_) => {}
             ChatMessageItem::Context(context) => segments.push(context.text.clone()),
+            ChatMessageItem::SelectionReference(selection) => {
+                segments.push(selection.to_prompt_text());
+            }
             ChatMessageItem::File(file) => {
                 if !is_image_file(file) || !matches!(message.role, ChatRole::User) {
                     segments.push(file.uri.clone());

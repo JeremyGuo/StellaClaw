@@ -531,6 +531,9 @@ fn render_message_content(message: &ChatMessage) -> String {
             ChatMessageItem::Context(context) => {
                 sections.push(context.text.clone());
             }
+            ChatMessageItem::SelectionReference(selection) => {
+                sections.push(selection.to_prompt_text());
+            }
             ChatMessageItem::File(_) => {}
             ChatMessageItem::ToolCall(tool_call) => {
                 sections.push(format!(
@@ -559,6 +562,9 @@ fn render_openai_message_content(message: &ChatMessage) -> String {
             | ChatMessageItem::ToolCall(_) => {}
             ChatMessageItem::Context(context) => {
                 sections.push(context.text.clone());
+            }
+            ChatMessageItem::SelectionReference(selection) => {
+                sections.push(selection.to_prompt_text());
             }
             ChatMessageItem::ToolResult(tool_result) => {
                 if let Some(context) = &tool_result.result.context {
@@ -643,6 +649,7 @@ fn collect_message_files(message: &ChatMessage) -> Vec<FileItem> {
             }
             ChatMessageItem::Reasoning(_)
             | ChatMessageItem::Context(_)
+            | ChatMessageItem::SelectionReference(_)
             | ChatMessageItem::ToolCall(_) => {}
         }
     }

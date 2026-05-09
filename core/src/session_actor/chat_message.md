@@ -104,6 +104,7 @@ USD cost values corresponding to the token buckets above.
 pub enum ChatMessageItem {
     Reasoning(ReasoningItem),
     Context(ContextItem),
+    SelectionReference(SelectionReferenceItem),
     File(FileItem),
     ToolCall(ToolCallItem),
     ToolResult(ToolResultItem),
@@ -135,6 +136,38 @@ Typical uses:
 - fallback text when media cannot be sent directly to a model
 
 `text` may contain structured strings such as JSON, XML-like tool-call fallbacks, or system-generated metadata blocks.
+
+### `SelectionReference`
+
+Provider-neutral reference to a user-selected range inside a previewed file.
+
+```rust
+pub struct SelectionReferenceItem {
+    pub file_path: String,
+    pub file_name: Option<String>,
+    pub media_type: Option<String>,
+    pub source_kind: String,
+    pub selected_text: String,
+    pub locator: Option<SelectionLocator>,
+    pub context: Option<SelectionContext>,
+    pub original_text_length: Option<u32>,
+}
+```
+
+`SelectionReference` is used when a client lets the user select a precise span from a Markdown/HTML/PDF/Word/source preview and then ask about or edit that span. It should carry enough locator data for the model to understand the scope without embedding the entire file.
+
+Fields:
+
+- `file_path`: workspace-relative file path.
+- `file_name`: optional display filename.
+- `media_type`: optional MIME type.
+- `source_kind`: preview/source category such as `markdown`, `html`, `pdf`, `docx`, `code`, or `text`.
+- `selected_text`: capped selected text, not a full-file dump.
+- `locator`: optional structured locator, for example line range, rendered-text offset, heading, PDF page, DOM selector, block id, or rectangles.
+- `context`: optional small before/after snippets around the selection.
+- `original_text_length`: length of the uncapped selected text when available.
+
+Providers translate this item into a selected content block in ordinary visible text. It is persisted as structured history so clients can render chips/cards and future provider translators can use richer modality-specific locators.
 
 ### `Reasoning`
 

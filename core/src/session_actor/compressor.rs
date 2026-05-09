@@ -621,6 +621,11 @@ fn sanitize_message_for_compression_request(
             ChatMessageItem::Context(context) => {
                 data.push(ChatMessageItem::Context(context.clone()))
             }
+            ChatMessageItem::SelectionReference(selection) => {
+                data.push(ChatMessageItem::Context(ContextItem {
+                    text: selection.to_prompt_text(),
+                }));
+            }
             ChatMessageItem::File(file) => data.push(ChatMessageItem::Context(ContextItem {
                 text: file_placeholder(file),
             })),
@@ -931,6 +936,9 @@ fn message_text(message: &ChatMessage) -> String {
                 if !context.text.trim().is_empty() {
                     parts.push(context.text.clone());
                 }
+            }
+            ChatMessageItem::SelectionReference(selection) => {
+                parts.push(selection.to_prompt_text());
             }
             ChatMessageItem::File(file) => parts.push(file_placeholder(file)),
             ChatMessageItem::ToolCall(tool_call) => parts.push(format!(

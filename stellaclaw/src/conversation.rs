@@ -16,9 +16,9 @@ use stellaclaw_core::{
     model_config::{ModelCapability, ModelConfig},
     session_actor::{
         ChatMessage, ChatMessageItem, ChatRole, ContextItem, ConversationBridgeRequest,
-        ConversationBridgeResponse, FileItem, SessionErrorDetail, SessionEvent, SessionInitial,
-        SessionRequest, SessionType, TaskPlanItemStatus, TaskPlanView, ToolRemoteMode,
-        ToolResultContent, ToolResultItem,
+        ConversationBridgeResponse, FileItem, SelectionReferenceItem, SessionErrorDetail,
+        SessionEvent, SessionInitial, SessionRequest, SessionType, TaskPlanItemStatus,
+        TaskPlanView, ToolRemoteMode, ToolResultContent, ToolResultItem,
     },
 };
 
@@ -76,6 +76,7 @@ pub struct IncomingConversationMessage {
     pub user_name: Option<String>,
     pub message_time: Option<String>,
     pub text: Option<String>,
+    pub selection_references: Vec<SelectionReferenceItem>,
     pub files: Vec<FileItem>,
     pub control: Option<ConversationControl>,
 }
@@ -920,6 +921,9 @@ impl ConversationRuntime {
         let mut data = Vec::new();
         if let Some(text) = message.text.filter(|text| !text.trim().is_empty()) {
             data.push(ChatMessageItem::Context(ContextItem { text }));
+        }
+        for selection_reference in message.selection_references {
+            data.push(ChatMessageItem::SelectionReference(selection_reference));
         }
         for file in message.files {
             data.push(ChatMessageItem::File(file));

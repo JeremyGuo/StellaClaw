@@ -94,7 +94,17 @@ function outgoingAttachmentPayload(attachment) {
   };
 }
 
-export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, runningActivities, onOpenAttachment, onDownloadAttachment }) {
+function selectionSummary(selection) {
+  const locator = selection?.locator || {};
+  if (locator.start_line && locator.end_line) {
+    return `L${locator.start_line}-${locator.end_line}`;
+  }
+  if (locator.page) return `P${locator.page}`;
+  const text = String(selection?.selected_text || '').replace(/\s+/g, ' ').trim();
+  return text.length > 28 ? `${text.slice(0, 28)}...` : text || '选区';
+}
+
+export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, runningActivities, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment }) {
   const renderedMessages = useMemo(() => displayMessages(messages), [messages]);
   const activitySignature = useMemo(() => liveActivitySignature(runningActivities || []), [runningActivities]);
   const oldestMessageKey = useMemo(() => firstMessageId(messages) || messages[0]?.id || messages[0]?.index || '', [messages]);
@@ -167,7 +177,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     if (stickToBottomRef.current) {
       requestAnimationFrame(scrollToBottom);
     }
-  }, [draft, composerAttachments.length]);
+  }, [draft, composerAttachments.length, selectionReferences.length]);
 
   useEffect(() => {
     if (modelSelectionPending) {
@@ -335,12 +345,13 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   };
 
   const submitDraft = async () => {
-    if ((!draft.trim() && composerAttachments.length === 0) || sending) return;
+    if ((!draft.trim() && composerAttachments.length === 0 && selectionReferences.length === 0) || sending) return;
     const value = draft;
     const attachments = composerAttachments;
+    const selections = selectionReferences;
     setDraft('');
     setComposerAttachments([]);
-    const sent = await onSend?.(value, attachments.map(outgoingAttachmentPayload));
+    const sent = await onSend?.(value, attachments.map(outgoingAttachmentPayload), selections);
     if (sent === false) {
       setDraft((current) => current || value);
       setComposerAttachments((current) => current.length ? current : attachments);
@@ -477,6 +488,24 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
                   )}
                   <span>{attachment.name}</span>
                   <small>×</small>
+                </button>
+              ))}
+            </div>
+          )}
+          {selectionReferences.length > 0 && (
+            <div className="composer-selection-references" aria-label="待发送选区引用">
+              {selectionReferences.map((selection, index) => (
+                <button
+                  className="composer-selection-chip"
+                  type="button"
+                  key={selection.id || `${selection.file_path}-${index}`}
+                  title={`移除 ${selection.file_path}`}
+                  onClick={() => onRemoveSelectionReference?.(selection.id)}
+                >
+                  <FileText size={13} />
+                  <span>{selection.file_name || selection.file_path}</span>
+                  <small>{selectionSummary(selection)}</small>
+                  <em>×</em>
                 </button>
               ))}
             </div>
@@ -629,7 +658,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
               </Popover.Portal>
             </Popover.Root>
             <span className={`mode-pill ${modeTone}`} title={modeTitle}>{modeLabel}</span>
-            <button className="send-button" type="button" disabled={modelSelectionPending || (!draft.trim() && composerAttachments.length === 0) || sending} onClick={() => submitDraft().catch(() => {})}>
+            <button className="send-button" type="button" disabled={modelSelectionPending || (!draft.trim() && composerAttachments.length === 0 && selectionReferences.length === 0) || sending} onClick={() => submitDraft().catch(() => {})}>
               <Send size={18} />
             </button>
           </div>
@@ -1050,6 +1079,9 @@ export function StructuredItems({ items, attachments, fallbackText, onOpenAttach
       if (item?.type === 'file') {
         return <AttachmentCard key={index} attachment={attachments[item.attachment_index] || item} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />;
       }
+      if (item?.type === 'selection_reference') {
+        return <SelectionReferenceCard key={index} selection={item.selection || item.payload || item} />;
+      }
       if (item?.type === 'reasoning') {
         return <ReasoningNote key={index} text={item.text || item.summary || ''} />;
       }
@@ -1068,6 +1100,28 @@ export function StructuredItems({ items, attachments, fallbackText, onOpenAttach
     .filter(Boolean);
   if (rendered.length) return <>{rendered}</>;
   return <MarkdownContent className="message-text" text={fallbackText} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />;
+}
+
+function SelectionReferenceCard({ selection }) {
+  const filePath = selection?.file_path || selection?.fileName || '';
+  const sourceKind = selection?.source_kind || selection?.sourceKind || 'selection';
+  const text = String(selection?.selected_text || '').replace(/\s+/g, ' ').trim();
+  const locator = selection?.locator || {};
+  const locatorText = locator.start_line && locator.end_line
+    ? `L${locator.start_line}-${locator.end_line}`
+    : locator.page
+      ? `P${locator.page}`
+      : locator.heading || locator.kind || '';
+  return (
+    <div className="selection-reference-card">
+      <div>
+        <FileText size={14} />
+        <strong>{filePath}</strong>
+        <span>{sourceKind}{locatorText ? ` · ${locatorText}` : ''}</span>
+      </div>
+      {text && <blockquote>{text.length > 240 ? `${text.slice(0, 240)}...` : text}</blockquote>}
+    </div>
+  );
 }
 
 function ReasoningNote({ text }) {

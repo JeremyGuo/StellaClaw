@@ -162,6 +162,36 @@ function fileTabSnapshot(file) {
   };
 }
 
+class AppErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { error: null };
+  }
+
+  static getDerivedStateFromError(error) {
+    return { error };
+  }
+
+  componentDidCatch(error, info) {
+    console.error('[StellaCodeX fatal render error]', error, info);
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="app-fatal-error">
+          <strong>界面渲染失败</strong>
+          <span>{this.state.error?.message || '未知错误'}</span>
+          <button type="button" onClick={() => window.location.reload()}>
+            重新加载
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 function revokeFilePreviewUrls(files = []) {
   files.forEach((file) => {
     if (typeof file?.pdf_url === 'string' && file.pdf_url.startsWith('blob:')) {
@@ -432,6 +462,7 @@ function App() {
   const [creatingConversation, setCreatingConversation] = useState(false);
   const [openFiles, setOpenFiles] = useState([]);
   const [activeFilePath, setActiveFilePath] = useState('');
+  const [selectionReferences, setSelectionReferences] = useState([]);
   const [appForeground, setAppForeground] = useState(() => (
     typeof document === 'undefined'
       ? true
@@ -552,6 +583,10 @@ function App() {
   useEffect(() => {
     openFilesRef.current = openFiles;
   }, [openFiles]);
+
+  useEffect(() => {
+    setSelectionReferences([]);
+  }, [selected?.serverId, selected?.conversationId]);
 
   useEffect(() => () => {
     revokeFilePreviewUrls(openFilesRef.current);
@@ -951,11 +986,16 @@ function App() {
     }
   }, [selected, workspaceListings]);
 
-  const loadPdfPreviewIntoTab = useCallback(async (entry) => {
+  const loadPdfPreviewIntoTab = useCallback(async (entry, options = {}) => {
     if (!selected || !entry) return;
     const path = normalizeWorkspacePath(entry.path);
     const serverId = selected.serverId;
     const conversationId = selected.conversationId;
+    if (!options.keepExistingPreview) {
+      setOpenFiles((current) => current.map((item) => (
+        item.path === path ? { ...item, loading: true, error: '' } : item
+      )));
+    }
     try {
       const preview = await window.stellacode2.previewWorkspace({
         serverId,
@@ -995,6 +1035,7 @@ function App() {
               pdf_url: pdfUrl,
               pdf_buffer: preview.data,
               preview_size: preview.size,
+              scroll_hint: options.scrollHint || item.scroll_hint,
               loading: false,
               error: ''
             }
@@ -1013,6 +1054,10 @@ function App() {
       )));
     }
   }, [selected]);
+
+  const refreshPdfPreview = useCallback((entry, scrollHint) => {
+    return loadPdfPreviewIntoTab(entry, { keepExistingPreview: true, scrollHint });
+  }, [loadPdfPreviewIntoTab]);
 
   useEffect(() => {
     if (!selected || !settings) {
@@ -1049,7 +1094,14 @@ function App() {
     setWorkspaceError('');
     setOpenFiles((current) => {
       revokeFilePreviewUrls(current);
-      return savedFiles.map((file) => ({ ...file, loading: true }));
+      return savedFiles.map((file) => {
+        const savedKind = workspaceFileKind(file.path);
+        return {
+          ...file,
+          kind: savedKind,
+          loading: savedKind !== 'presentation'
+        };
+      });
     });
     setActiveFilePath(savedActivePath);
     queueMicrotask(() => {
@@ -1071,9 +1123,12 @@ function App() {
           next.delete('');
           return next;
         });
-      });
+    });
     savedFiles.forEach((file) => {
       const savedKind = workspaceFileKind(file.path);
+      if (savedKind === 'presentation') {
+        return;
+      }
       if (savedKind === 'pdf') {
         loadPdfPreviewIntoTab(file);
         return;
@@ -1175,6 +1230,23 @@ function App() {
     const initialKind = workspaceFileKind(path);
     if (initialKind === 'pdf') {
       await loadPdfPreviewIntoTab({ ...entry, path });
+      return;
+    }
+    if (initialKind === 'presentation') {
+      setOpenFiles((current) => current.map((item) => (
+        item.path === path
+          ? {
+            ...item,
+            ...entry,
+            path,
+            kind: initialKind,
+            language: fileExtension(path),
+            content: '',
+            data: '',
+            loading: false
+          }
+          : item
+      )));
       return;
     }
     try {
@@ -1613,6 +1685,14 @@ function App() {
       } else {
         setSettings((prev) => prev ? { ...prev, layout: { ...(prev.layout || {}), ...latestLayout } } : prev);
       }
+      const finalPreviewRight = workspacePanelOpen ? latestLayout.file : 0;
+      const finalOverviewRight = finalPreviewRight + (previewPanelOpen ? latestLayout.preview : 0);
+      const finalContentRight = (overviewPanelOpen ? latestLayout.inspector : 0)
+        + (workspacePanelOpen ? latestLayout.file : 0)
+        + (previewPanelOpen ? latestLayout.preview : 0);
+      root?.style.setProperty('--preview-panel-right', `${finalPreviewRight}px`);
+      root?.style.setProperty('--overview-panel-right', `${finalOverviewRight}px`);
+      root?.style.setProperty('--content-right', `${finalContentRight}px`);
       layoutDraftRef.current = null;
       window.requestAnimationFrame(() => {
         root?.style.removeProperty('--terminal-height-live');
@@ -1659,10 +1739,11 @@ function App() {
     return loadModels(selected.serverId);
   }, [selected?.serverId]);
 
-  const sendMessage = useCallback(async (text, files = []) => {
+  const sendMessage = useCallback(async (text, files = [], selections = []) => {
     const value = String(text || '').trim();
     const outgoingFiles = Array.isArray(files) ? files : [];
-    if ((!value && outgoingFiles.length === 0) || !selected || sending) return false;
+    const outgoingSelections = Array.isArray(selections) ? selections : [];
+    if ((!value && outgoingFiles.length === 0 && outgoingSelections.length === 0) || !selected || sending) return false;
     const key = conversationKey(selected.serverId, selected.conversationId);
     const commandState = outgoingFiles.length > 0
       ? { control: false, name: '', title: '等待响应', detail: '消息已送达，等待模型开始处理' }
@@ -1675,6 +1756,11 @@ function App() {
       text: value,
       preview: value,
       files: outgoingFiles,
+      items: outgoingSelections.map((selection, index) => ({
+        type: 'selection_reference',
+        index,
+        selection
+      })),
       attachment_count: outgoingFiles.length,
       message_time: new Date().toISOString(),
       _optimistic: true,
@@ -1683,7 +1769,7 @@ function App() {
     setSending(true);
     setSessionActivity('正在发送');
     updateRunningActivities(() => [
-      { id: 'sending', title: '发送中', detail: shortText(value || `${outgoingFiles.length} 个附件`), state: 'running' }
+      { id: 'sending', title: '发送中', detail: shortText(value || (outgoingSelections.length ? `${outgoingSelections.length} 个选区引用` : `${outgoingFiles.length} 个附件`)), state: 'running' }
     ]);
     setMessages((current) => {
       const next = [...current, optimistic];
@@ -1691,7 +1777,8 @@ function App() {
       return next;
     });
     try {
-      await postConversationMessage(selected.serverId, selected.conversationId, value, activeUserName, outgoingFiles);
+      await postConversationMessage(selected.serverId, selected.conversationId, value, activeUserName, outgoingFiles, outgoingSelections);
+      setSelectionReferences((current) => current.filter((item) => !outgoingSelections.some((sent) => sent.id === item.id)));
       if (websocketKeyRef.current !== key) return false;
       setMessages((current) => {
         const next = commandState.control
@@ -1751,6 +1838,15 @@ function App() {
       if (websocketKeyRef.current === key) setSending(false);
     }
   }, [selected, sending, activeUserName]);
+
+  const addSelectionReference = useCallback((selection) => {
+    if (!selection?.file_path || !selection?.selected_text) return;
+    const id = selection.id || `${selection.file_path}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    setSelectionReferences((current) => [
+      ...current.filter((item) => item.id !== id),
+      { ...selection, id }
+    ].slice(-8));
+  }, []);
 
   const title = activeConversation
     ? displayConversationName(activeConversation)
@@ -1835,6 +1931,8 @@ function App() {
           onLoadModels={loadAvailableModels}
           sending={sending}
           runningActivities={runningActivities}
+          selectionReferences={selectionReferences}
+          onRemoveSelectionReference={(id) => setSelectionReferences((current) => current.filter((item) => item.id !== id))}
           onOpenAttachment={openMessageAttachment}
           onDownloadAttachment={downloadMessageAttachment}
         />
@@ -1867,7 +1965,9 @@ function App() {
         activeFilePath={activeFilePath}
         onSelectFile={setActiveFilePath}
         onDownloadFile={downloadWorkspaceEntry}
+        onRefreshPdfPreview={refreshPdfPreview}
         onResolveMarkdownAsset={resolveMarkdownAsset}
+        onCreateSelectionReference={addSelectionReference}
         onCloseFile={(path) => {
           setOpenFiles((items) => {
             revokeFilePreviewUrls(items.filter((item) => item.path === path));
@@ -1933,4 +2033,8 @@ function App() {
   );
 }
 
-createRoot(document.getElementById('root')).render(<App />);
+createRoot(document.getElementById('root')).render(
+  <AppErrorBoundary>
+    <App />
+  </AppErrorBoundary>
+);

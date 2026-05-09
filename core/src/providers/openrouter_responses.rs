@@ -395,6 +395,12 @@ fn user_responses_content(message: &ChatMessage) -> Vec<Value> {
                     "text": context.text,
                 }));
             }
+            ChatMessageItem::SelectionReference(selection) => {
+                content.push(json!({
+                    "type": "input_text",
+                    "text": selection.to_prompt_text(),
+                }));
+            }
             ChatMessageItem::File(file) => content.push(responses_file_item(file)),
             ChatMessageItem::ToolCall(tool_call) => {
                 content.push(json!({
@@ -420,6 +426,12 @@ fn assistant_responses_content(message: &ChatMessage) -> Vec<Value> {
                 content.push(json!({
                     "type": "output_text",
                     "text": context.text,
+                }));
+            }
+            ChatMessageItem::SelectionReference(selection) => {
+                content.push(json!({
+                    "type": "output_text",
+                    "text": selection.to_prompt_text(),
                 }));
             }
             ChatMessageItem::File(file) => {

@@ -58,7 +58,9 @@ fn common_prompt() -> &'static str {
      in this repository or local environment instead of assuming it exists. Treat AGENTS.md and similar repository instruction files as scoped rules, not background lore. \
      When you start working in a subdirectory, check whether that subtree has a more local \
      AGENTS.md or similar instruction file before editing there; when rules conflict, \
-     follow the more local file. Never insert role=system messages into conversation history; \
+     follow the more local file. When a user message contains a selected content block, treat it \
+     as the user's precise current focus; if editing a file, prefer the block's locator and \
+     surrounding context over guessing where the text came from. Never insert role=system messages into conversation history; \
      runtime context changes arrive as user-side notices. To send files or images to the user, \
      append one or more tags in final answer text using exactly this format: \
      <attachment>relative/path/from/workspace_root</attachment>. Attachment paths must be relative \

@@ -1532,6 +1532,12 @@ fn user_responses_content(message: &ChatMessage) -> Result<Vec<Value>, ProviderE
                     "text": context.text,
                 }));
             }
+            ChatMessageItem::SelectionReference(selection) => {
+                content.push(json!({
+                    "type": "input_text",
+                    "text": selection.to_prompt_text(),
+                }));
+            }
             ChatMessageItem::File(file) => content.push(responses_file_item(file)?),
             ChatMessageItem::ToolCall(tool_call) => {
                 content.push(json!({
@@ -1561,6 +1567,12 @@ fn append_assistant_response_items(
                 content.push(json!({
                     "type": "output_text",
                     "text": context.text,
+                }));
+            }
+            ChatMessageItem::SelectionReference(selection) => {
+                content.push(json!({
+                    "type": "output_text",
+                    "text": selection.to_prompt_text(),
                 }));
             }
             ChatMessageItem::File(file) if is_image_file(file) && file.state.is_none() => {

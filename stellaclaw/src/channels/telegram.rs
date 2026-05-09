@@ -256,6 +256,7 @@ impl TelegramChannel {
                 } else {
                     Some(text)
                 },
+                selection_references: Vec::new(),
                 files,
                 control,
             },
@@ -318,6 +319,7 @@ impl TelegramChannel {
                 } else {
                     Some(text)
                 },
+                selection_references: Vec::new(),
                 files,
                 control,
             },

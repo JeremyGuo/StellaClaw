@@ -11,6 +11,10 @@ export function messageText(message) {
         if (typeof item === 'string') return item;
         if (typeof item?.text === 'string') return item.text;
         if (typeof item?.content === 'string') return item.content;
+        if (item?.type === 'selection_reference') {
+          const selection = item.selection || item.payload || item;
+          return `[selection] ${selection.file_path || selection.fileName || ''}`;
+        }
         if (item?.type === 'file') return `[file] ${item.name || item.path || ''}`;
         return '';
       })
@@ -45,6 +49,14 @@ export function isPdfFile(path = '') {
 
 export function isHtmlFile(path = '') {
   return ['html', 'htm'].includes(fileExtension(path));
+}
+
+export function isWordFile(path = '') {
+  return ['docx', 'doc'].includes(fileExtension(path));
+}
+
+export function isPresentationFile(path = '') {
+  return ['pptx', 'ppt', 'ppsx', 'pps', 'potx', 'pot'].includes(fileExtension(path));
 }
 
 export function imageMimeType(path = '') {

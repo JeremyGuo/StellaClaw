@@ -18,7 +18,10 @@ use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use stellaclaw_core::{
     model_config::{ModelCapability, ProviderType},
-    session_actor::{ChatMessage, ChatMessageItem, ChatRole, FileItem, TokenUsage, ToolRemoteMode},
+    session_actor::{
+        ChatMessage, ChatMessageItem, ChatRole, FileItem, SelectionReferenceItem, TokenUsage,
+        ToolRemoteMode,
+    },
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -602,8 +605,13 @@ impl WebChannel {
             request.files.unwrap_or_default(),
         )
         .map_err(ApiError::internal)?;
-        if text.trim().is_empty() && files.is_empty() {
-            return Err(ApiError::new(400, "message requires text or files"));
+        let selection_references =
+            sanitize_selection_references(request.selection_references.unwrap_or_default());
+        if text.trim().is_empty() && files.is_empty() && selection_references.is_empty() {
+            return Err(ApiError::new(
+                400,
+                "message requires text, files, or selection references",
+            ));
         }
         let control = text
             .trim()
@@ -622,6 +630,7 @@ impl WebChannel {
                         .unwrap_or_else(now_rfc3339),
                 ),
                 text: (!text.is_empty()).then_some(text),
+                selection_references,
                 files,
                 control,
             },
@@ -1756,6 +1765,8 @@ struct SendMessageRequest {
     #[serde(default)]
     text: Option<String>,
     #[serde(default)]
+    selection_references: Option<Vec<SelectionReferenceItem>>,
+    #[serde(default)]
     files: Option<Vec<WebFileItem>>,
 }
 
@@ -1792,6 +1803,99 @@ impl From<WebFileItem> for FileItem {
             state: None,
         }
     }
+}
+
+fn sanitize_selection_references(
+    selections: Vec<SelectionReferenceItem>,
+) -> Vec<SelectionReferenceItem> {
+    const MAX_SELECTIONS: usize = 8;
+    const MAX_SELECTED_TEXT_CHARS: usize = 4_000;
+    const MAX_CONTEXT_CHARS: usize = 800;
+    const MAX_PATH_CHARS: usize = 512;
+    const MAX_SMALL_FIELD_CHARS: usize = 180;
+    const MAX_RECTS: usize = 16;
+
+    selections
+        .into_iter()
+        .take(MAX_SELECTIONS)
+        .filter_map(|mut selection| {
+            selection.file_path = clean_selection_string(selection.file_path, MAX_PATH_CHARS)
+                .trim_start_matches('/')
+                .to_string();
+            selection.source_kind =
+                clean_selection_string(selection.source_kind.to_lowercase(), MAX_SMALL_FIELD_CHARS);
+            let original_len = selection.original_text_length.unwrap_or_else(|| {
+                selection
+                    .selected_text
+                    .chars()
+                    .count()
+                    .min(u32::MAX as usize) as u32
+            });
+            selection.selected_text =
+                clean_selection_string(selection.selected_text, MAX_SELECTED_TEXT_CHARS);
+            selection.original_text_length = Some(original_len);
+            selection.file_name = selection
+                .file_name
+                .map(|value| clean_selection_string(value, MAX_SMALL_FIELD_CHARS))
+                .filter(|value| !value.is_empty());
+            selection.media_type = selection
+                .media_type
+                .map(|value| clean_selection_string(value, MAX_SMALL_FIELD_CHARS))
+                .filter(|value| !value.is_empty());
+            if let Some(locator) = &mut selection.locator {
+                locator.kind =
+                    clean_selection_string(locator.kind.to_lowercase(), MAX_SMALL_FIELD_CHARS);
+                locator.heading = locator
+                    .heading
+                    .take()
+                    .map(|value| clean_selection_string(value, MAX_SMALL_FIELD_CHARS))
+                    .filter(|value| !value.is_empty());
+                locator.selector = locator
+                    .selector
+                    .take()
+                    .map(|value| clean_selection_string(value, MAX_SMALL_FIELD_CHARS))
+                    .filter(|value| !value.is_empty());
+                locator.xpath = locator
+                    .xpath
+                    .take()
+                    .map(|value| clean_selection_string(value, MAX_SMALL_FIELD_CHARS))
+                    .filter(|value| !value.is_empty());
+                locator.block_id = locator
+                    .block_id
+                    .take()
+                    .map(|value| clean_selection_string(value, MAX_SMALL_FIELD_CHARS))
+                    .filter(|value| !value.is_empty());
+                locator.anchor_text = locator
+                    .anchor_text
+                    .take()
+                    .map(|value| clean_selection_string(value, MAX_SMALL_FIELD_CHARS))
+                    .filter(|value| !value.is_empty());
+                locator.rects.truncate(MAX_RECTS);
+            }
+            if let Some(context) = &mut selection.context {
+                context.before = context
+                    .before
+                    .take()
+                    .map(|value| clean_selection_string(value, MAX_CONTEXT_CHARS))
+                    .filter(|value| !value.is_empty());
+                context.after = context
+                    .after
+                    .take()
+                    .map(|value| clean_selection_string(value, MAX_CONTEXT_CHARS))
+                    .filter(|value| !value.is_empty());
+            }
+
+            (!selection.file_path.is_empty()
+                && !selection.source_kind.is_empty()
+                && !selection.selected_text.trim().is_empty())
+            .then_some(selection)
+        })
+        .collect()
+}
+
+fn clean_selection_string(value: String, max_chars: usize) -> String {
+    let trimmed = value.trim().replace('\0', "");
+    trimmed.chars().take(max_chars).collect()
 }
 
 fn materialize_web_file_items(
@@ -2063,6 +2167,10 @@ enum WebMessageItem {
         index: usize,
         text: String,
         text_with_attachment_markers: String,
+    },
+    SelectionReference {
+        index: usize,
+        selection: SelectionReferenceItem,
     },
     File {
         index: usize,
@@ -2876,6 +2984,12 @@ fn render_web_message(
                         text_with_attachment_markers: part.text_with_attachment_markers,
                     });
                 }
+            }
+            ChatMessageItem::SelectionReference(selection) => {
+                items.push(WebMessageItem::SelectionReference {
+                    index: item_index,
+                    selection: selection.clone(),
+                });
             }
             ChatMessageItem::File(file) => {
                 let attachment_index = attachments.len();

@@ -79,6 +79,7 @@ impl ChatMessage {
 pub enum ChatMessageItem {
     Reasoning(ReasoningItem),
     Context(ContextItem),
+    SelectionReference(SelectionReferenceItem),
     File(FileItem),
     ToolCall(ToolCallItem),
     ToolResult(ToolResultItem),
@@ -126,6 +127,154 @@ impl ReasoningItem {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextItem {
     pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionReferenceItem {
+    pub file_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_type: Option<String>,
+    pub source_kind: String,
+    pub selected_text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<SelectionLocator>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<SelectionContext>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_text_length: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionLocator {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_column: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_column: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rects: Vec<SelectionRect>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heading: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xpath: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_offset: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_length: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_text: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionRect {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectionContext {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+}
+
+impl SelectionReferenceItem {
+    pub fn to_prompt_text(&self) -> String {
+        let mut lines = Vec::new();
+        lines.push("[Selected Content Reference]".to_string());
+        lines.push(format!("File: {}", self.file_path));
+        if let Some(name) = self.file_name.as_deref().filter(|value| !value.is_empty()) {
+            lines.push(format!("Name: {name}"));
+        }
+        lines.push(format!("Type: {}", self.source_kind));
+        if let Some(media_type) = self.media_type.as_deref().filter(|value| !value.is_empty()) {
+            lines.push(format!("Media type: {media_type}"));
+        }
+        if let Some(locator) = &self.locator {
+            let mut parts = vec![format!("kind={}", locator.kind)];
+            if let (Some(start), Some(end)) = (locator.start_line, locator.end_line) {
+                parts.push(format!("lines={start}-{end}"));
+            }
+            if let Some(page) = locator.page {
+                parts.push(format!("page={page}"));
+            }
+            if let Some(heading) = locator.heading.as_deref().filter(|value| !value.is_empty()) {
+                parts.push(format!("heading={heading}"));
+            }
+            if let Some(selector) = locator
+                .selector
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                parts.push(format!("selector={selector}"));
+            }
+            if let Some(block_id) = locator
+                .block_id
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                parts.push(format!("block_id={block_id}"));
+            }
+            if let Some(offset) = locator.text_offset {
+                parts.push(format!("text_offset={offset}"));
+            }
+            if let Some(length) = locator.text_length {
+                parts.push(format!("text_length={length}"));
+            }
+            if let Some(anchor) = locator
+                .anchor_text
+                .as_deref()
+                .filter(|value| !value.is_empty())
+            {
+                parts.push(format!("anchor={anchor}"));
+            }
+            lines.push(format!("Locator: {}", parts.join("; ")));
+        }
+        if let Some(original_len) = self.original_text_length {
+            lines.push(format!(
+                "Original selected text length: {original_len} chars"
+            ));
+        }
+        if let Some(context) = &self.context {
+            if let Some(before) = context.before.as_deref().filter(|value| !value.is_empty()) {
+                lines.push("Context before:".to_string());
+                lines.push(before.to_string());
+            }
+        }
+        lines.push("Selected text:".to_string());
+        lines.push(self.selected_text.clone());
+        if let Some(context) = &self.context {
+            if let Some(after) = context.after.as_deref().filter(|value| !value.is_empty()) {
+                lines.push("Context after:".to_string());
+                lines.push(after.to_string());
+            }
+        }
+        lines.push("[/Selected Content Reference]".to_string());
+        lines.join("\n")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,5 +430,45 @@ mod tests {
 
         assert_eq!(json["user_name"], "alice");
         assert_eq!(json["message_time"], "2026-04-23T10:20:30Z");
+    }
+
+    #[test]
+    fn selection_reference_renders_prompt_block() {
+        let selection = SelectionReferenceItem {
+            file_path: "src/lib.rs".to_string(),
+            file_name: Some("lib.rs".to_string()),
+            media_type: Some("text/x-rust".to_string()),
+            source_kind: "code".to_string(),
+            selected_text: "fn selected() {}".to_string(),
+            locator: Some(SelectionLocator {
+                kind: "line_range".to_string(),
+                start_line: Some(12),
+                end_line: Some(12),
+                start_column: Some(1),
+                end_column: Some(17),
+                page: None,
+                rects: Vec::new(),
+                heading: None,
+                selector: None,
+                xpath: None,
+                block_id: None,
+                block_index: None,
+                text_offset: Some(128),
+                text_length: Some(16),
+                anchor_text: None,
+            }),
+            context: Some(SelectionContext {
+                before: Some("mod tests;".to_string()),
+                after: Some("fn next() {}".to_string()),
+            }),
+            original_text_length: Some(16),
+        };
+
+        let text = selection.to_prompt_text();
+
+        assert!(text.contains("[Selected Content Reference]"));
+        assert!(text.contains("File: src/lib.rs"));
+        assert!(text.contains("Locator: kind=line_range; lines=12-12"));
+        assert!(text.contains("Selected text:\nfn selected() {}"));
     }
 }

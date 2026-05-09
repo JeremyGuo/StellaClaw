@@ -304,6 +304,12 @@ fn claude_content_blocks(message: &ChatMessage) -> Vec<Value> {
                     "text": context.text,
                 }));
             }
+            ChatMessageItem::SelectionReference(selection) => {
+                blocks.push(json!({
+                    "type": "text",
+                    "text": selection.to_prompt_text(),
+                }));
+            }
             ChatMessageItem::File(file)
                 if matches!(message.role, ChatRole::User) && is_image_file(file) =>
             {

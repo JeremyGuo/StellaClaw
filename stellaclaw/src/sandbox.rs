@@ -146,15 +146,7 @@ fn build_bubblewrap_command(
         "STELLACLAW_DATA_ROOT",
         session_root_env.as_str(),
     ]);
-    if let Some(software_dir) = configured_software_dir(sandbox) {
-        let software_dir = software_dir
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", software_dir.display()))?;
-        let software_mount_path = configured_software_mount_path(sandbox)?;
-        bind_path_to(&mut command, &software_dir, &software_mount_path, false)?;
-        let software_mount_path = software_mount_path.to_string_lossy().to_string();
-        command.args(["--setenv", "STELLACLAW_SOFTWARE_DIR", &software_mount_path]);
-    }
+    mount_configured_software_dir_or_create_default(&mut command, sandbox)?;
     if let Some(home_ssh_dir) = discover_home_ssh_dir() {
         bind_path(&mut command, &home_ssh_dir, false)?;
     }
@@ -229,15 +221,7 @@ fn build_bubblewrap_shell_command(
         "STELLACLAW_DATA_ROOT",
         session_root_env.as_str(),
     ]);
-    if let Some(software_dir) = configured_software_dir(sandbox) {
-        let software_dir = software_dir
-            .canonicalize()
-            .with_context(|| format!("failed to canonicalize {}", software_dir.display()))?;
-        let software_mount_path = configured_software_mount_path(sandbox)?;
-        bind_path_to(&mut command, &software_dir, &software_mount_path, false)?;
-        let software_mount_path = software_mount_path.to_string_lossy().to_string();
-        command.args(["--setenv", "STELLACLAW_SOFTWARE_DIR", &software_mount_path]);
-    }
+    mount_configured_software_dir_or_create_default(&mut command, sandbox)?;
     if let Some(home_ssh_dir) = discover_home_ssh_dir() {
         bind_path(&mut command, &home_ssh_dir, false)?;
     }
@@ -273,6 +257,30 @@ fn configured_software_mount_path(sandbox: &SandboxConfig) -> Result<PathBuf> {
         "sandbox.software_mount_path must be absolute, got {}",
         sandbox.software_mount_path
     ))
+}
+
+fn mount_configured_software_dir_or_create_default(
+    command: &mut Command,
+    sandbox: &SandboxConfig,
+) -> Result<()> {
+    let Some(software_dir) = configured_software_dir(sandbox) else {
+        create_empty_default_software_mount(command, sandbox);
+        return Ok(());
+    };
+    let software_dir = software_dir
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize {}", software_dir.display()))?;
+    let software_mount_path = configured_software_mount_path(sandbox)?;
+    bind_path_to(command, &software_dir, &software_mount_path, false)?;
+    let software_mount_path = software_mount_path.to_string_lossy().to_string();
+    command.args(["--setenv", "STELLACLAW_SOFTWARE_DIR", &software_mount_path]);
+    Ok(())
+}
+
+fn create_empty_default_software_mount(command: &mut Command, sandbox: &SandboxConfig) {
+    if sandbox.software_mount_path.trim() == "/opt" {
+        command.args(["--dir", "/opt"]);
+    }
 }
 
 fn bind_path(command: &mut Command, source: &Path, readonly: bool) -> Result<()> {
@@ -356,8 +364,9 @@ fn binary_in_path(binary: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::build_agent_server_command;
+    use super::{build_agent_server_command, create_empty_default_software_mount};
     use crate::config::{SandboxConfig, SandboxMode};
+    use std::ffi::OsStr;
 
     #[test]
     fn subprocess_sets_software_dir_env_when_configured() {
@@ -397,5 +406,41 @@ mod tests {
             session_root_env.as_deref(),
             Some(std::ffi::OsStr::new("/tmp/session"))
         );
+    }
+
+    #[test]
+    fn bubblewrap_creates_empty_default_software_mount_when_unconfigured() {
+        let sandbox = SandboxConfig {
+            mode: SandboxMode::Bubblewrap,
+            software_dir: None,
+            software_mount_path: "/opt".to_string(),
+            ..SandboxConfig::default()
+        };
+        let mut command = std::process::Command::new("bwrap");
+
+        create_empty_default_software_mount(&mut command, &sandbox);
+
+        let args = command.get_args().collect::<Vec<_>>();
+        assert!(args
+            .windows(2)
+            .any(|window| window == [OsStr::new("--dir"), OsStr::new("/opt")]));
+        assert!(command
+            .get_envs()
+            .all(|(key, _)| key != "STELLACLAW_SOFTWARE_DIR"));
+    }
+
+    #[test]
+    fn bubblewrap_does_not_create_non_default_software_mount_when_unconfigured() {
+        let sandbox = SandboxConfig {
+            mode: SandboxMode::Bubblewrap,
+            software_dir: None,
+            software_mount_path: "/tools".to_string(),
+            ..SandboxConfig::default()
+        };
+        let mut command = std::process::Command::new("bwrap");
+
+        create_empty_default_software_mount(&mut command, &sandbox);
+
+        assert!(command.get_args().next().is_none());
     }
 }

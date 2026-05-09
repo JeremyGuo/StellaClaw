@@ -811,6 +811,7 @@ fn estimate_message_tokens(message: &ChatMessage) -> usize {
         chars = chars.saturating_add(match item {
             ChatMessageItem::Reasoning(reasoning) => reasoning.text.len(),
             ChatMessageItem::Context(context) => context.text.len(),
+            ChatMessageItem::SelectionReference(selection) => selection.to_prompt_text().len(),
             ChatMessageItem::File(file) => estimate_file_item_chars(file),
             ChatMessageItem::ToolCall(tool_call) => {
                 tool_call.tool_call_id.len()
