@@ -3,6 +3,9 @@ version: 1.26.0
 
 # 1.26.0
 
+- 强化 common system prompt 的工具调用 preamble 规则：
+  common prompt 现在明确要求模型在发起工具调用前先发送简短 preamble，说明接下来要做什么；相关工具调用应合并到同一个 preamble 下，保持一到两句短说明，避免逐条命令式旁白。该规则不提具体工具名，避免 provider 过滤工具后泄漏不可见工具。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 调整 StellaCodeX Electron URL 打开方式：
   聊天消息和文件预览 Markdown 中的 `http` / `https` / `mailto` 链接点击后默认通过系统浏览器打开；Electron main process 同时拦截 `target=_blank` / `window.open` 作为兜底，避免外部 URL 在客户端内部新开窗口或导航当前页面。本次不改变 `config` schema，不改变 `workdir` schema。
 

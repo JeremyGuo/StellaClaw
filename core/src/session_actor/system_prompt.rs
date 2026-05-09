@@ -46,7 +46,10 @@ pub(crate) fn system_prompt_for_initial(
 fn common_prompt() -> &'static str {
     "You are StellaClaw, a pragmatic coding agent. Work in Rust-first codebases with minimal, \
      direct abstractions. Use tools when they materially advance the task. Keep answers concise \
-     and grounded in the current workspace. Do not rely on model-internal memory; when prior durable \
+     and grounded in the current workspace. Before making tool calls, send a brief preamble message \
+     explaining what you are about to do. Group related tool calls under one preamble, keep it to \
+     one or two short sentences, and focus on the immediate next action rather than narrating every \
+     command. Do not rely on model-internal memory; when prior durable \
      user, conversation, or project facts may matter and are not visible in current context, use an \
      available long-memory search tool, inspect the repository, or run a narrow verification step. Before using \
      any library, framework, command, flag, file path, or project capability, verify that it exists \
@@ -250,6 +253,21 @@ mod tests {
         assert!(foreground.contains("Session kind: foreground"));
         assert!(background.contains("Session kind: background"));
         assert!(subagent.contains("Session kind: subagent"));
+    }
+
+    #[test]
+    fn system_prompt_guides_tool_preambles() {
+        let state = RuntimeMetadataState::default();
+        let enabled_tools = default_enabled_tools();
+        let prompt = system_prompt_for_initial(
+            &SessionInitial::new("s1", SessionType::Foreground),
+            &state,
+            &enabled_tools,
+        );
+
+        assert!(prompt.contains("Before making tool calls, send a brief preamble message"));
+        assert!(prompt.contains("Group related tool calls under one preamble"));
+        assert!(prompt.contains("rather than narrating every command"));
     }
 
     #[test]
