@@ -17,9 +17,10 @@ use crate::session_actor::tool_runtime::{
     ToolExecutionContext,
 };
 
-const APPLY_PATCH_TOOL_NAME: &str = "stellaclaw-apply-patch";
-const APPLY_PATCH_TOOL_VERSION: &str = "0.1.2";
-const APPLY_PATCH_MANIFEST_URL: &str = "https://github.com/JeremyGuo/StellaClaw/releases/download/stellaclaw-apply-patch-v0.1.2/tools-manifest.json";
+pub(super) const FS_TOOL_NAME: &str = "stellaclaw-fs-tool";
+const FS_TOOL_VERSION: &str = "0.2.0";
+const FS_TOOL_MANIFEST_URL: &str = "https://github.com/JeremyGuo/ClawParty/releases/download/stellaclaw-fs-tool-v0.2.0/tools-manifest.json";
+const FS_TOOL_PATH_ENV: &str = "STELLACLAW_FS_TOOL_PATH";
 const REMOTE_SAFE_PATH_PREFIX: &str =
     "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}; export PATH;";
 
@@ -32,16 +33,16 @@ pub(super) fn execute_patch_tool(
         return Ok(None);
     }
 
-    let result = match apply_patch_execution_target(arguments, context)? {
-        ExecutionTarget::Local => apply_patch_local(arguments, context.workspace_root)?,
+    let result = match fs_tool_execution_target(arguments, context)? {
+        ExecutionTarget::Local => fs_tool_local(arguments, context.workspace_root)?,
         ExecutionTarget::RemoteSsh { host, cwd } => {
-            apply_patch_remote(arguments, &host, cwd.as_deref())?
+            fs_tool_remote(arguments, &host, cwd.as_deref())?
         }
     };
     Ok(Some(result))
 }
 
-fn apply_patch_execution_target(
+fn fs_tool_execution_target(
     arguments: &Map<String, Value>,
     context: &ToolExecutionContext<'_>,
 ) -> Result<ExecutionTarget, LocalToolError> {
@@ -61,22 +62,61 @@ fn apply_patch_execution_target(
     }
 }
 
-fn apply_patch_local(
+fn fs_tool_local(
     arguments: &Map<String, Value>,
     workspace_root: &Path,
 ) -> Result<Value, LocalToolError> {
     let patch = string_arg(arguments, "patch")?;
+    let format = patch_format(arguments, &patch)?;
+    let strip = usize_arg_with_default(arguments, "strip", 0)?;
+    let reverse = bool_arg_with_default(arguments, "reverse", false)?;
     let check = bool_arg_with_default(arguments, "check", false)?;
     let max_output_chars =
         clamp_tool_output_chars(usize_arg_with_default(arguments, "max_output_chars", 1000)?);
-    match patch_format(arguments, &patch)? {
-        PatchFormat::Codex => apply_codex_patch_local(arguments, workspace_root),
-        PatchFormat::Unified => {
-            apply_unified_patch_local(arguments, workspace_root, check, max_output_chars)
-        }
+
+    #[cfg(test)]
+    if env::var_os(FS_TOOL_PATH_ENV).is_none() {
+        return match format {
+            PatchFormat::Codex => apply_codex_patch_local(arguments, workspace_root),
+            PatchFormat::Unified => {
+                apply_unified_patch_local(arguments, workspace_root, check, max_output_chars)
+            }
+        };
     }
+
+    let binary = ensure_local_fs_tool_for_current_platform()?;
+    let mut command = Command::new(&binary);
+    command
+        .arg("apply-patch")
+        .arg("--workspace")
+        .arg(workspace_root)
+        .arg("--format")
+        .arg(format.cli_name())
+        .arg("--max-output-chars")
+        .arg(max_output_chars.to_string());
+    if check {
+        command.arg("--check");
+    }
+    if reverse {
+        command.arg("--reverse");
+    }
+    if strip != 0 {
+        command.arg("--strip").arg(strip.to_string());
+    }
+
+    let output = run_command_with_timeout(
+        command,
+        Duration::from_secs(300),
+        Some(patch.as_bytes()),
+        FS_TOOL_NAME,
+    )?;
+    if let Some(result) = parse_fs_tool_json(&output, None) {
+        return Ok(result);
+    }
+    Ok(patch_result(output, None, max_output_chars))
 }
 
+#[allow(dead_code)]
 fn apply_unified_patch_local(
     arguments: &Map<String, Value>,
     workspace_root: &Path,
@@ -124,7 +164,7 @@ fn apply_unified_patch_local(
     Ok(patch_result(output, None, max_output_chars))
 }
 
-fn apply_patch_remote(
+fn fs_tool_remote(
     arguments: &Map<String, Value>,
     host: &str,
     cwd: Option<&str>,
@@ -137,9 +177,10 @@ fn apply_patch_remote(
     let max_output_chars =
         clamp_tool_output_chars(usize_arg_with_default(arguments, "max_output_chars", 1000)?);
 
-    let remote_binary = ensure_remote_apply_patch_tool(host)?;
+    let remote_binary = ensure_remote_fs_tool(host)?;
     let mut args = vec![
         remote_binary,
+        "apply-patch".to_string(),
         "--workspace".to_string(),
         ".".to_string(),
         "--format".to_string(),
@@ -169,20 +210,24 @@ fn apply_patch_remote(
     };
     let remote_command = remote_shell_command(&remote_command);
     let output = run_remote_command_with_stdin(host, &remote_command, patch.as_bytes())?;
-    if let Some(result) = parse_remote_apply_patch_json(&output, host) {
+    if let Some(result) = parse_fs_tool_json(&output, Some(host)) {
         return Ok(result);
     }
     Ok(patch_result(output, Some(host), max_output_chars))
 }
 
-fn parse_remote_apply_patch_json(output: &std::process::Output, host: &str) -> Option<Value> {
+pub(super) fn parse_fs_tool_json(
+    output: &std::process::Output,
+    remote: Option<&str>,
+) -> Option<Value> {
     let mut value = serde_json::from_slice::<Value>(&output.stdout).ok()?;
-    if let Value::Object(object) = &mut value {
-        object.insert("remote".to_string(), Value::String(host.to_string()));
+    if let (Some(remote), Value::Object(object)) = (remote, &mut value) {
+        object.insert("remote".to_string(), Value::String(remote.to_string()));
     }
     Some(value)
 }
 
+#[allow(dead_code)]
 fn normalize_unified_patch_paths(
     patch: &str,
     base: Option<&Path>,
@@ -213,6 +258,7 @@ fn normalize_unified_patch_paths(
     }
 }
 
+#[allow(dead_code)]
 fn normalize_unified_file_header(
     prefix: &str,
     rest: &str,
@@ -228,6 +274,7 @@ fn normalize_unified_file_header(
     Ok(format!("{prefix}{normalized}{suffix}"))
 }
 
+#[allow(dead_code)]
 fn normalize_diff_git_header(
     rest: &str,
     base: Option<&Path>,
@@ -264,6 +311,7 @@ fn split_unified_header_path(rest: &str) -> (&str, &str) {
     (rest, "")
 }
 
+#[allow(dead_code)]
 fn normalize_unified_path_token(
     path: &str,
     base: Option<&Path>,
@@ -330,14 +378,14 @@ fn patch_format(
     }
 }
 
-fn ensure_remote_apply_patch_tool(host: &str) -> Result<String, LocalToolError> {
-    let platform = detect_remote_apply_patch_platform(host)?;
-    let local_binary = ensure_local_apply_patch_binary(&platform)?;
-    let remote_state = remote_apply_patch_install_state(host, &platform)?;
+pub(super) fn ensure_remote_fs_tool(host: &str) -> Result<String, LocalToolError> {
+    let platform = detect_remote_fs_tool_platform(host)?;
+    let local_binary = ensure_local_fs_tool_binary(&platform)?;
+    let remote_state = remote_fs_tool_install_state(host, &platform)?;
     match remote_state {
-        RemoteApplyPatchState::Ready { path } => Ok(path),
-        RemoteApplyPatchState::Missing { path, tmp_path } => {
-            copy_apply_patch_binary_to_remote(host, &local_binary, &tmp_path)?;
+        RemoteFilesystemToolState::Ready { path } => Ok(path),
+        RemoteFilesystemToolState::Missing { path, tmp_path } => {
+            copy_fs_tool_binary_to_remote(host, &local_binary, &tmp_path)?;
             let install = format!(
                 "set -e; /bin/chmod 755 {tmp}; /bin/mv {tmp} {path}; printf '%s' {path}",
                 tmp = shell_quote(&tmp_path),
@@ -347,7 +395,7 @@ fn ensure_remote_apply_patch_tool(host: &str) -> Result<String, LocalToolError> 
             let output = run_remote_command_with_stdin(host, &install, b"")?;
             if !output.status.success() {
                 return Err(LocalToolError::Remote(format!(
-                    "failed to install remote {APPLY_PATCH_TOOL_NAME}: {}",
+                    "failed to install remote {FS_TOOL_NAME}: {}",
                     String::from_utf8_lossy(&output.stderr)
                 )));
             }
@@ -356,12 +404,12 @@ fn ensure_remote_apply_patch_tool(host: &str) -> Result<String, LocalToolError> 
     }
 }
 
-enum RemoteApplyPatchState {
+enum RemoteFilesystemToolState {
     Ready { path: String },
     Missing { path: String, tmp_path: String },
 }
 
-fn detect_remote_apply_patch_platform(host: &str) -> Result<String, LocalToolError> {
+fn detect_remote_fs_tool_platform(host: &str) -> Result<String, LocalToolError> {
     let command = remote_shell_command(
         "if [ -x /usr/bin/uname ]; then uname_cmd=/usr/bin/uname; else uname_cmd=/bin/uname; fi; printf '%s\\n%s\\n' \"$($uname_cmd -s)\" \"$($uname_cmd -m)\"",
     );
@@ -378,7 +426,7 @@ fn detect_remote_apply_patch_platform(host: &str) -> Result<String, LocalToolErr
     let arch = lines.next().unwrap_or_default();
     remote_platform_from_uname(os, arch).ok_or_else(|| {
         LocalToolError::Remote(format!(
-            "unsupported remote platform for {APPLY_PATCH_TOOL_NAME}: {os} {arch}"
+            "unsupported remote platform for {FS_TOOL_NAME}: {os} {arch}"
         ))
     })
 }
@@ -395,36 +443,36 @@ fn remote_platform_from_uname(os: &str, arch: &str) -> Option<String> {
     }
 }
 
-fn remote_apply_patch_install_state(
+fn remote_fs_tool_install_state(
     host: &str,
     platform: &str,
-) -> Result<RemoteApplyPatchState, LocalToolError> {
+) -> Result<RemoteFilesystemToolState, LocalToolError> {
     let script = format!(
         "set -e; root=\"${{STELLACLAW_TOOL_CACHE_DIR:-${{HOME:-/tmp}}/.cache/stellaclaw/tools}}\"; dir=\"$root/{name}/{version}/{platform}\"; path=\"$dir/{name}\"; /bin/mkdir -p \"$dir\"; if [ -x \"$path\" ]; then printf 'ready\\n%s\\n' \"$path\"; else tmp=\"$dir/.{name}.incoming.$$\"; /bin/rm -f \"$tmp\"; printf 'missing\\n%s\\n%s\\n' \"$path\" \"$tmp\"; fi",
-        name = APPLY_PATCH_TOOL_NAME,
-        version = APPLY_PATCH_TOOL_VERSION,
+        name = FS_TOOL_NAME,
+        version = FS_TOOL_VERSION,
         platform = platform,
     );
     let script = remote_shell_command(&script);
     let output = run_remote_command_with_stdin(host, &script, b"")?;
     if !output.status.success() {
         return Err(LocalToolError::Remote(format!(
-            "failed to prepare remote {APPLY_PATCH_TOOL_NAME} cache: {}",
+            "failed to prepare remote {FS_TOOL_NAME} cache: {}",
             String::from_utf8_lossy(&output.stderr)
         )));
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let mut lines = text.lines();
     match lines.next().unwrap_or_default() {
-        "ready" => Ok(RemoteApplyPatchState::Ready {
+        "ready" => Ok(RemoteFilesystemToolState::Ready {
             path: lines.next().unwrap_or_default().to_string(),
         }),
-        "missing" => Ok(RemoteApplyPatchState::Missing {
+        "missing" => Ok(RemoteFilesystemToolState::Missing {
             path: lines.next().unwrap_or_default().to_string(),
             tmp_path: lines.next().unwrap_or_default().to_string(),
         }),
         other => Err(LocalToolError::Remote(format!(
-            "unexpected remote {APPLY_PATCH_TOOL_NAME} cache response: {other}"
+            "unexpected remote {FS_TOOL_NAME} cache response: {other}"
         ))),
     }
 }
@@ -540,7 +588,7 @@ fn strip_unified_side_prefix(path: &Path) -> &Path {
     }
 }
 
-fn copy_apply_patch_binary_to_remote(
+fn copy_fs_tool_binary_to_remote(
     host: &str,
     local_binary: &Path,
     remote_tmp_path: &str,
@@ -558,29 +606,56 @@ fn copy_apply_patch_binary_to_remote(
         Ok(())
     } else {
         Err(LocalToolError::Remote(format!(
-            "failed to copy {APPLY_PATCH_TOOL_NAME}: {}",
+            "failed to copy {FS_TOOL_NAME}: {}",
             String::from_utf8_lossy(&output.stderr)
         )))
     }
 }
 
-fn ensure_local_apply_patch_binary(platform: &str) -> Result<PathBuf, LocalToolError> {
-    let cache_dir = local_apply_patch_cache_dir(platform)?;
-    let binary = cache_dir.join(APPLY_PATCH_TOOL_NAME);
+pub(super) fn ensure_local_fs_tool_for_current_platform() -> Result<PathBuf, LocalToolError> {
+    if let Some(path) = env::var_os(FS_TOOL_PATH_ENV).map(PathBuf::from) {
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(LocalToolError::Io(format!(
+            "{FS_TOOL_PATH_ENV} points to {}, but it is not a file",
+            path.display()
+        )));
+    }
+    let platform = local_fs_tool_platform()?;
+    ensure_local_fs_tool_binary(&platform)
+}
+
+fn local_fs_tool_platform() -> Result<String, LocalToolError> {
+    match (env::consts::OS, env::consts::ARCH) {
+        ("linux", "x86_64") => Ok("linux-x64".to_string()),
+        ("linux", "aarch64") => Ok("linux-arm64".to_string()),
+        ("macos", "x86_64") => Ok("macos-x64".to_string()),
+        ("macos", "aarch64") => Ok("macos-arm64".to_string()),
+        ("windows", "x86_64") => Ok("windows-x64".to_string()),
+        (os, arch) => Err(LocalToolError::Io(format!(
+            "unsupported local platform for {FS_TOOL_NAME}: {os} {arch}"
+        ))),
+    }
+}
+
+fn ensure_local_fs_tool_binary(platform: &str) -> Result<PathBuf, LocalToolError> {
+    let cache_dir = local_fs_tool_cache_dir(platform)?;
+    let binary = cache_dir.join(FS_TOOL_NAME);
     if binary.is_file() {
         return Ok(binary);
     }
     fs::create_dir_all(&cache_dir).map_err(|error| {
         LocalToolError::Io(format!(
-            "failed to create local {APPLY_PATCH_TOOL_NAME} cache {}: {error}",
+            "failed to create local {FS_TOOL_NAME} cache {}: {error}",
             cache_dir.display()
         ))
     })?;
-    install_local_apply_patch_binary(platform, &binary)?;
+    install_local_fs_tool_binary(platform, &binary)?;
     Ok(binary)
 }
 
-fn local_apply_patch_cache_dir(platform: &str) -> Result<PathBuf, LocalToolError> {
+fn local_fs_tool_cache_dir(platform: &str) -> Result<PathBuf, LocalToolError> {
     let root = env::var_os("STELLACLAW_SOFTWARE_DIR")
         .map(PathBuf::from)
         .or_else(|| {
@@ -591,33 +666,25 @@ fn local_apply_patch_cache_dir(platform: &str) -> Result<PathBuf, LocalToolError
                 "HOME or STELLACLAW_SOFTWARE_DIR is required for the local tool cache".to_string(),
             )
         })?;
-    Ok(root
-        .join(APPLY_PATCH_TOOL_NAME)
-        .join(APPLY_PATCH_TOOL_VERSION)
-        .join(platform))
+    Ok(root.join(FS_TOOL_NAME).join(FS_TOOL_VERSION).join(platform))
 }
 
-fn install_local_apply_patch_binary(platform: &str, binary: &Path) -> Result<(), LocalToolError> {
-    let manifest = fetch_apply_patch_manifest()?;
+fn install_local_fs_tool_binary(platform: &str, binary: &Path) -> Result<(), LocalToolError> {
+    let manifest = fetch_fs_tool_manifest()?;
     let asset = manifest.asset_for_platform(platform).ok_or_else(|| {
         LocalToolError::Remote(format!("release manifest has no {platform} asset"))
     })?;
-    let temp_dir = local_temp_dir(format!("{}-{platform}", APPLY_PATCH_TOOL_NAME))?;
-    let archive = temp_dir.join(format!(
-        "{APPLY_PATCH_TOOL_NAME}-{platform}.{}",
-        asset.archive
-    ));
+    let temp_dir = local_temp_dir(format!("{}-{platform}", FS_TOOL_NAME))?;
+    let archive = temp_dir.join(format!("{FS_TOOL_NAME}-{platform}.{}", asset.archive));
     download_file(&asset.url, &archive)?;
     verify_sha256(&archive, &asset.sha256)?;
-    extract_apply_patch_archive(&archive, &temp_dir, &asset.archive)?;
+    extract_fs_tool_archive(&archive, &temp_dir, &asset.archive)?;
     let extracted = temp_dir
-        .join(format!(
-            "{APPLY_PATCH_TOOL_NAME}-v{APPLY_PATCH_TOOL_VERSION}-{platform}"
-        ))
+        .join(format!("{FS_TOOL_NAME}-v{FS_TOOL_VERSION}-{platform}"))
         .join(&asset.binary);
     if !extracted.is_file() {
         return Err(LocalToolError::Remote(format!(
-            "downloaded {APPLY_PATCH_TOOL_NAME} archive did not contain {}",
+            "downloaded {FS_TOOL_NAME} archive did not contain {}",
             extracted.display()
         )));
     }
@@ -653,12 +720,12 @@ fn install_local_apply_patch_binary(platform: &str, binary: &Path) -> Result<(),
 }
 
 #[derive(Debug)]
-struct ApplyPatchManifest {
-    assets: Vec<ApplyPatchAsset>,
+struct FilesystemToolManifest {
+    assets: Vec<FilesystemToolAsset>,
 }
 
 #[derive(Debug)]
-struct ApplyPatchAsset {
+struct FilesystemToolAsset {
     platform: String,
     archive: String,
     url: String,
@@ -666,37 +733,37 @@ struct ApplyPatchAsset {
     binary: String,
 }
 
-impl ApplyPatchManifest {
-    fn asset_for_platform(&self, platform: &str) -> Option<&ApplyPatchAsset> {
+impl FilesystemToolManifest {
+    fn asset_for_platform(&self, platform: &str) -> Option<&FilesystemToolAsset> {
         self.assets.iter().find(|asset| asset.platform == platform)
     }
 }
 
-fn fetch_apply_patch_manifest() -> Result<ApplyPatchManifest, LocalToolError> {
-    let value: Value = reqwest::blocking::get(APPLY_PATCH_MANIFEST_URL)
+fn fetch_fs_tool_manifest() -> Result<FilesystemToolManifest, LocalToolError> {
+    let value: Value = reqwest::blocking::get(FS_TOOL_MANIFEST_URL)
         .and_then(|response| response.error_for_status())
         .and_then(|response| response.json())
         .map_err(|error| {
             LocalToolError::Remote(format!(
-                "failed to fetch {APPLY_PATCH_TOOL_NAME} manifest {APPLY_PATCH_MANIFEST_URL}: {error}"
+                "failed to fetch {FS_TOOL_NAME} manifest {FS_TOOL_MANIFEST_URL}: {error}"
             ))
         })?;
     let version = value
         .get("version")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if version != APPLY_PATCH_TOOL_VERSION {
+    if version != FS_TOOL_VERSION {
         return Err(LocalToolError::Remote(format!(
-            "{APPLY_PATCH_TOOL_NAME} manifest version {version:?} does not match expected {APPLY_PATCH_TOOL_VERSION}"
+            "{FS_TOOL_NAME} manifest version {version:?} does not match expected {FS_TOOL_VERSION}"
         )));
     }
     let assets = value
         .get("assets")
         .and_then(Value::as_array)
-        .ok_or_else(|| LocalToolError::Remote("apply-patch manifest missing assets".to_string()))?
+        .ok_or_else(|| LocalToolError::Remote("fs-tool manifest missing assets".to_string()))?
         .iter()
         .filter_map(|asset| {
-            Some(ApplyPatchAsset {
+            Some(FilesystemToolAsset {
                 platform: asset.get("platform")?.as_str()?.to_string(),
                 archive: asset.get("archive")?.as_str()?.to_string(),
                 url: asset.get("url")?.as_str()?.to_string(),
@@ -705,7 +772,7 @@ fn fetch_apply_patch_manifest() -> Result<ApplyPatchManifest, LocalToolError> {
             })
         })
         .collect::<Vec<_>>();
-    Ok(ApplyPatchManifest { assets })
+    Ok(FilesystemToolManifest { assets })
 }
 
 fn download_file(url: &str, path: &Path) -> Result<(), LocalToolError> {
@@ -734,7 +801,7 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<(), LocalToolError> {
     }
 }
 
-fn extract_apply_patch_archive(
+fn extract_fs_tool_archive(
     archive: &Path,
     destination: &Path,
     archive_kind: &str,
@@ -752,7 +819,7 @@ fn extract_apply_patch_archive(
         }
         other => {
             return Err(LocalToolError::Remote(format!(
-                "unsupported {APPLY_PATCH_TOOL_NAME} archive format {other}"
+                "unsupported {FS_TOOL_NAME} archive format {other}"
             )));
         }
     };
@@ -760,7 +827,7 @@ fn extract_apply_patch_archive(
         command,
         Duration::from_secs(60),
         None,
-        &format!("extract {APPLY_PATCH_TOOL_NAME}"),
+        &format!("extract {FS_TOOL_NAME}"),
     )?;
     if output.status.success() {
         Ok(())
@@ -789,6 +856,7 @@ fn local_temp_dir(label: String) -> Result<PathBuf, LocalToolError> {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 enum CodexPatchOp {
     Add {
         path: PathBuf,
@@ -805,11 +873,13 @@ enum CodexPatchOp {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct CodexPatchChunk {
     old: String,
     new: String,
 }
 
+#[allow(dead_code)]
 fn apply_codex_patch_local(
     arguments: &Map<String, Value>,
     workspace_root: &Path,
@@ -1043,6 +1113,7 @@ fn safe_patch_path(path: &str) -> Result<PathBuf, LocalToolError> {
     Ok(path)
 }
 
+#[allow(dead_code)]
 fn verify_codex_patch_op(op: &CodexPatchOp, workspace_root: &Path) -> Result<(), LocalToolError> {
     match op {
         CodexPatchOp::Add { path, .. } => {
@@ -1093,6 +1164,7 @@ fn verify_codex_patch_op(op: &CodexPatchOp, workspace_root: &Path) -> Result<(),
     Ok(())
 }
 
+#[allow(dead_code)]
 fn verify_chunks_match(
     path: &Path,
     content: &str,
@@ -1119,6 +1191,7 @@ fn verify_chunks_match(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn apply_codex_patch_op(
     op: &CodexPatchOp,
     workspace_root: &Path,
@@ -1180,6 +1253,7 @@ fn apply_codex_patch_op(
     Ok(())
 }
 
+#[allow(dead_code)]
 fn collect_codex_patch_paths(op: &CodexPatchOp, files_changed: &mut BTreeSet<String>) {
     match op {
         CodexPatchOp::Add { path, .. }
@@ -1274,7 +1348,7 @@ diff --git /home/me/work/src/a.py /home/me/work/src/a.py
     }
 
     #[test]
-    fn maps_remote_uname_to_apply_patch_release_platforms() {
+    fn maps_remote_uname_to_fs_tool_release_platforms() {
         assert_eq!(
             remote_platform_from_uname("Linux", "x86_64").as_deref(),
             Some("linux-x64")
@@ -1305,8 +1379,8 @@ diff --git /home/me/work/src/a.py /home/me/work/src/a.py
     #[test]
     fn classifies_absolute_workspace_patch_as_local_special() {
         let patch = "\
---- /home/me/work/.stellaclaw/apply_patch_smoke_test.txt
-+++ /home/me/work/.stellaclaw/apply_patch_smoke_test.txt
+--- /home/me/work/.stellaclaw/fs_tool_smoke_test.txt
++++ /home/me/work/.stellaclaw/fs_tool_smoke_test.txt
 @@ -1 +1 @@
 -old
 +new

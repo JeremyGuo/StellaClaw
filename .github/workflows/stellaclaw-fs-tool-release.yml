@@ -1,17 +1,17 @@
-name: stellaclaw-apply-patch CD
+name: stellaclaw-fs-tool CD
 
 on:
   workflow_dispatch:
   push:
     tags:
-      - "stellaclaw-apply-patch-v*"
+      - "stellaclaw-fs-tool-v*"
 
 permissions:
   contents: write
 
 env:
-  TOOL_NAME: stellaclaw-apply-patch
-  TOOL_DIR: tools/stellaclaw-apply-patch
+  TOOL_NAME: stellaclaw-fs-tool
+  TOOL_DIR: tools/stellaclaw-fs-tool
 
 jobs:
   build:
@@ -23,28 +23,28 @@ jobs:
             target: x86_64-unknown-linux-musl
             platform: linux-x64
             archive: tar.gz
-            binary: stellaclaw-apply-patch
+            binary: stellaclaw-fs-tool
           - runner: ubuntu-latest
             target: aarch64-unknown-linux-musl
             platform: linux-arm64
             archive: tar.gz
-            binary: stellaclaw-apply-patch
+            binary: stellaclaw-fs-tool
             linker_env: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=rust-lld
           - runner: macos-14
             target: x86_64-apple-darwin
             platform: macos-x64
             archive: tar.gz
-            binary: stellaclaw-apply-patch
+            binary: stellaclaw-fs-tool
           - runner: macos-14
             target: aarch64-apple-darwin
             platform: macos-arm64
             archive: tar.gz
-            binary: stellaclaw-apply-patch
+            binary: stellaclaw-fs-tool
           - runner: windows-latest
             target: x86_64-pc-windows-msvc
             platform: windows-x64
             archive: zip
-            binary: stellaclaw-apply-patch.exe
+            binary: stellaclaw-fs-tool.exe
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
@@ -182,13 +182,13 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.manifest.outputs.tag }}
-          name: stellaclaw-apply-patch v${{ steps.manifest.outputs.version }}
+          name: stellaclaw-fs-tool v${{ steps.manifest.outputs.version }}
           files: |
             dist/*.tar.gz
             dist/*.zip
             dist/*.sha256
             dist/tools-manifest.json
           body: |
-            Standalone stellaclaw-apply-patch release.
+            Standalone stellaclaw-fs-tool release.
 
             This package is versioned independently from the main Stellaclaw release.

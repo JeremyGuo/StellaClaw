@@ -36,6 +36,37 @@ pub fn apply_patch(patch: &str, options: &ApplyPatchOptions) -> Value {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct FileReadOptions {
+    pub workspace: PathBuf,
+    pub file_path: String,
+    pub start_line: usize,
+    pub end_line: Option<usize>,
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileWriteOptions {
+    pub workspace: PathBuf,
+    pub file_path: String,
+    pub content: String,
+    pub mode: String,
+}
+
+pub fn file_read(options: &FileReadOptions) -> Value {
+    match file_read_inner(options) {
+        Ok(result) => result,
+        Err(error) => tool_error(error),
+    }
+}
+
+pub fn file_write(options: &FileWriteOptions) -> Value {
+    match file_write_inner(options) {
+        Ok(result) => result,
+        Err(error) => tool_error(error),
+    }
+}
+
 fn apply_patch_inner(patch: &str, options: &ApplyPatchOptions) -> Result<Value, PatchError> {
     let workspace = canonical_workspace(&options.workspace)?;
     match resolve_format(options.format, patch) {
@@ -693,6 +724,96 @@ fn normalize_unified_path_token(
     Ok(relative.display().to_string())
 }
 
+fn file_read_inner(options: &FileReadOptions) -> Result<Value, PatchError> {
+    let workspace = canonical_workspace(&options.workspace)?;
+    let path = resolve_workspace_path(&workspace, &options.file_path);
+    if path.is_dir() {
+        return Err(PatchError::invalid(format!(
+            "{} is a directory, not a file",
+            path.display()
+        )));
+    }
+    let text = fs::read_to_string(&path)
+        .map_err(|error| PatchError::io(format!("failed to read {}: {error}", path.display())))?;
+    let total_lines = text.lines().count();
+    let start_line = options.start_line.max(1);
+    let limit = match options.end_line {
+        Some(end_line) => {
+            if end_line < start_line {
+                return Err(PatchError::invalid(
+                    "argument end_line must be greater than or equal to start_line",
+                ));
+            }
+            end_line - start_line + 1
+        }
+        None => options.limit.unwrap_or(200),
+    };
+    let selected = text
+        .lines()
+        .enumerate()
+        .skip(start_line.saturating_sub(1))
+        .take(limit)
+        .map(|(index, line)| format!("{}: {}", index + 1, line))
+        .collect::<Vec<_>>();
+    let end_line = if selected.is_empty() {
+        start_line.saturating_sub(1)
+    } else {
+        start_line + selected.len() - 1
+    };
+
+    Ok(json!({
+        "file_path": path.display().to_string(),
+        "start_line": start_line,
+        "end_line": end_line,
+        "total_lines": total_lines,
+        "truncated": end_line < total_lines,
+        "content": selected.join("\n"),
+    }))
+}
+
+fn file_write_inner(options: &FileWriteOptions) -> Result<Value, PatchError> {
+    let workspace = canonical_workspace(&options.workspace)?;
+    let path = resolve_workspace_path(&workspace, &options.file_path);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            PatchError::io(format!("failed to create {}: {error}", parent.display()))
+        })?;
+    }
+    let mut open_options = fs::OpenOptions::new();
+    open_options.create(true).write(true);
+    if options.mode == "append" {
+        open_options.append(true);
+    } else if options.mode == "overwrite" {
+        open_options.truncate(true);
+    } else {
+        return Err(PatchError::invalid(
+            "mode must be either overwrite or append",
+        ));
+    }
+    let mut file = open_options
+        .open(&path)
+        .map_err(|error| PatchError::io(format!("failed to open {}: {error}", path.display())))?;
+    file.write_all(options.content.as_bytes())
+        .map_err(|error| PatchError::io(format!("failed to write {}: {error}", path.display())))?;
+    Ok(json!({
+        "file_path": path.display().to_string(),
+        "mode": options.mode,
+        "bytes_written": options.content.len(),
+    }))
+}
+
+fn resolve_workspace_path(workspace: &Path, path: &str) -> PathBuf {
+    if path.trim().is_empty() {
+        return workspace.to_path_buf();
+    }
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else {
+        workspace.join(path)
+    }
+}
+
 fn process_output_result(output: std::process::Output, max_output_chars: usize) -> Value {
     let stdout_text = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr_text = String::from_utf8_lossy(&output.stderr).to_string();
@@ -718,6 +839,14 @@ fn process_output_result(output: std::process::Output, max_output_chars: usize) 
         result.insert("stderr_truncated".to_string(), Value::Bool(true));
     }
     Value::Object(result)
+}
+
+fn tool_error(error: PatchError) -> Value {
+    json!({
+        "ok": false,
+        "error_kind": error.kind,
+        "error": error.message,
+    })
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> (String, bool) {
@@ -876,7 +1005,7 @@ diff --git /home/me/work/src/a.py /home/me/work/src/a.py
             .expect("clock")
             .as_nanos();
         let root = std::env::temp_dir().join(format!(
-            "stellaclaw-apply-patch-{label}-{}-{nanos}",
+            "stellaclaw-fs-tool-{label}-{}-{nanos}",
             std::process::id()
         ));
         fs::create_dir_all(&root).expect("create temp workspace");

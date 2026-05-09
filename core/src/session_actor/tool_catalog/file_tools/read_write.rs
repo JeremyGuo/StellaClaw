@@ -1,10 +1,22 @@
+use std::{path::Path, process::Command, time::Duration};
+
+use serde_json::{Map, Value};
+
+#[cfg(test)]
+use serde_json::json;
+#[cfg(test)]
 use std::{fs, io::Write};
 
-use serde_json::{json, Map, Value};
-
+#[cfg(test)]
+use crate::session_actor::tool_runtime::resolve_local_path;
 use crate::session_actor::tool_runtime::{
-    resolve_local_path, run_remote_json, string_arg, string_arg_with_alias,
+    run_remote_command_with_stdin, shell_quote, string_arg, string_arg_with_alias,
     string_arg_with_default, ExecutionTarget, LocalToolError, ToolExecutionContext,
+};
+
+use super::patch::{
+    ensure_local_fs_tool_for_current_platform, ensure_remote_fs_tool, parse_fs_tool_json,
+    FS_TOOL_NAME,
 };
 
 pub(super) fn execute_read_write_tool(
@@ -45,6 +57,18 @@ fn file_write(
 }
 
 fn file_read_local(
+    arguments: &Map<String, Value>,
+    workspace_root: &std::path::Path,
+) -> Result<Value, LocalToolError> {
+    #[cfg(test)]
+    if std::env::var_os("STELLACLAW_FS_TOOL_PATH").is_none() {
+        return file_read_local_direct(arguments, workspace_root);
+    }
+    file_read_via_fs_tool(arguments, workspace_root, None)
+}
+
+#[cfg(test)]
+fn file_read_local_direct(
     arguments: &Map<String, Value>,
     workspace_root: &std::path::Path,
 ) -> Result<Value, LocalToolError> {
@@ -133,6 +157,18 @@ fn file_write_local(
     arguments: &Map<String, Value>,
     workspace_root: &std::path::Path,
 ) -> Result<Value, LocalToolError> {
+    #[cfg(test)]
+    if std::env::var_os("STELLACLAW_FS_TOOL_PATH").is_none() {
+        return file_write_local_direct(arguments, workspace_root);
+    }
+    file_write_via_fs_tool(arguments, workspace_root, None)
+}
+
+#[cfg(test)]
+fn file_write_local_direct(
+    arguments: &Map<String, Value>,
+    workspace_root: &std::path::Path,
+) -> Result<Value, LocalToolError> {
     let file_path = string_arg_with_alias(arguments, "file_path", "path")?;
     let path = resolve_local_path(workspace_root, &file_path);
     let content = string_arg(arguments, "content")?;
@@ -171,13 +207,7 @@ fn file_read_remote(
     host: &str,
     cwd: Option<&str>,
 ) -> Result<Value, LocalToolError> {
-    let file_path = string_arg_with_alias(arguments, "file_path", "path")?;
-    let (start_line, limit) = file_read_range(arguments)?;
-    let script = format!(
-        "python3 - <<'PY'\n{}\nPY\n",
-        remote_file_read_script(&file_path, start_line, limit)
-    );
-    run_remote_json(host, cwd, &script)
+    file_read_via_fs_tool(arguments, Path::new("."), Some((host, cwd)))
 }
 
 fn file_write_remote(
@@ -185,16 +215,103 @@ fn file_write_remote(
     host: &str,
     cwd: Option<&str>,
 ) -> Result<Value, LocalToolError> {
+    file_write_via_fs_tool(arguments, Path::new("."), Some((host, cwd)))
+}
+
+fn file_read_via_fs_tool(
+    arguments: &Map<String, Value>,
+    workspace_root: &Path,
+    remote: Option<(&str, Option<&str>)>,
+) -> Result<Value, LocalToolError> {
+    let file_path = string_arg_with_alias(arguments, "file_path", "path")?;
+    let (start_line, limit) = file_read_range(arguments)?;
+    let mut args = vec![
+        "file-read".to_string(),
+        "--workspace".to_string(),
+        workspace_root.display().to_string(),
+        "--file-path".to_string(),
+        file_path,
+        "--start-line".to_string(),
+        start_line.to_string(),
+        "--limit".to_string(),
+        limit.to_string(),
+    ];
+    if let Some(end_line) = usize_arg_optional(arguments, "end_line")? {
+        args.push("--end-line".to_string());
+        args.push(end_line.to_string());
+    }
+    run_fs_tool(args, remote, &[])
+}
+
+fn file_write_via_fs_tool(
+    arguments: &Map<String, Value>,
+    workspace_root: &Path,
+    remote: Option<(&str, Option<&str>)>,
+) -> Result<Value, LocalToolError> {
     let file_path = string_arg_with_alias(arguments, "file_path", "path")?;
     let content = string_arg(arguments, "content")?;
     let mode = string_arg_with_default(arguments, "mode", "overwrite")?;
-    let script = format!(
-        "python3 - <<'PY'\n{}\nPY\n",
-        remote_file_write_script(&file_path, &content, &mode)
-    );
-    run_remote_json(host, cwd, &script)
+    let args = vec![
+        "file-write".to_string(),
+        "--workspace".to_string(),
+        workspace_root.display().to_string(),
+        "--file-path".to_string(),
+        file_path,
+        "--mode".to_string(),
+        mode,
+    ];
+    run_fs_tool(args, remote, content.as_bytes())
 }
 
+fn run_fs_tool(
+    mut args: Vec<String>,
+    remote: Option<(&str, Option<&str>)>,
+    stdin: &[u8],
+) -> Result<Value, LocalToolError> {
+    match remote {
+        Some((host, cwd)) => {
+            let binary = ensure_remote_fs_tool(host)?;
+            args.insert(0, binary);
+            let remote_command = args
+                .iter()
+                .map(|arg| shell_quote(arg))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let remote_command = match cwd {
+                Some(cwd) => format!("cd {} && {}", shell_quote(cwd), remote_command),
+                None => remote_command,
+            };
+            let output = run_remote_command_with_stdin(host, &remote_command, stdin)?;
+            parse_fs_tool_json(&output, Some(host)).ok_or_else(|| {
+                LocalToolError::Remote(format!(
+                    "{FS_TOOL_NAME} output was not JSON: stdout: {}; stderr: {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ))
+            })
+        }
+        None => {
+            let binary = ensure_local_fs_tool_for_current_platform()?;
+            let mut command = Command::new(binary);
+            command.args(args);
+            let output = crate::session_actor::tool_runtime::run_command_with_timeout(
+                command,
+                Duration::from_secs(300),
+                Some(stdin),
+                FS_TOOL_NAME,
+            )?;
+            parse_fs_tool_json(&output, None).ok_or_else(|| {
+                LocalToolError::Io(format!(
+                    "{FS_TOOL_NAME} output was not JSON: stdout: {}; stderr: {}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                ))
+            })
+        }
+    }
+}
+
+#[cfg(test)]
 fn remote_file_read_script(path: &str, offset: usize, limit: usize) -> String {
     format!(
         r#"
@@ -258,6 +375,7 @@ except Exception as error:
     )
 }
 
+#[cfg(test)]
 fn remote_file_write_script(path: &str, content: &str, mode: &str) -> String {
     format!(
         r#"

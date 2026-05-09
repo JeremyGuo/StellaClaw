@@ -3,6 +3,6 @@ members = [
     "core",
     "agent_server",
     "stellaclaw",
-    "tools/stellaclaw-apply-patch",
+    "tools/stellaclaw-fs-tool",
 ]
 resolver = "2"

@@ -1,5 +1,5 @@
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -37,7 +37,7 @@ pub fn build_agent_server_command(
             command.current_dir(current_dir);
             command.env("STELLACLAW_SESSION_ROOT", session_root);
             command.env("STELLACLAW_DATA_ROOT", session_root);
-            if let Some(software_dir) = configured_software_dir(sandbox) {
+            if let Some(software_dir) = software_dir_or_default(sandbox) {
                 command.env("STELLACLAW_SOFTWARE_DIR", software_dir);
             }
             Ok(command)
@@ -61,7 +61,7 @@ pub fn build_workspace_shell_command(
             command.current_dir(current_dir);
             command.env("STELLACLAW_SESSION_ROOT", session_root);
             command.env("STELLACLAW_DATA_ROOT", session_root);
-            if let Some(software_dir) = configured_software_dir(sandbox) {
+            if let Some(software_dir) = software_dir_or_default(sandbox) {
                 command.env("STELLACLAW_SOFTWARE_DIR", software_dir);
             }
             Ok(command)
@@ -248,6 +248,14 @@ fn configured_software_dir(sandbox: &SandboxConfig) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+fn software_dir_or_default(sandbox: &SandboxConfig) -> Option<PathBuf> {
+    configured_software_dir(sandbox).or_else(default_software_dir)
+}
+
+fn default_software_dir() -> Option<PathBuf> {
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache/stellaclaw/tools"))
+}
+
 fn configured_software_mount_path(sandbox: &SandboxConfig) -> Result<PathBuf> {
     let path = PathBuf::from(sandbox.software_mount_path.trim());
     if path.is_absolute() {
@@ -263,10 +271,11 @@ fn mount_configured_software_dir_or_create_default(
     command: &mut Command,
     sandbox: &SandboxConfig,
 ) -> Result<()> {
-    let Some(software_dir) = configured_software_dir(sandbox) else {
-        create_empty_default_software_mount(command, sandbox);
+    let Some(software_dir) = software_dir_or_default(sandbox) else {
         return Ok(());
     };
+    fs::create_dir_all(&software_dir)
+        .with_context(|| format!("failed to create {}", software_dir.display()))?;
     let software_dir = software_dir
         .canonicalize()
         .with_context(|| format!("failed to canonicalize {}", software_dir.display()))?;
@@ -277,6 +286,7 @@ fn mount_configured_software_dir_or_create_default(
     Ok(())
 }
 
+#[cfg(test)]
 fn create_empty_default_software_mount(command: &mut Command, sandbox: &SandboxConfig) {
     if sandbox.software_mount_path.trim() == "/opt" {
         command.args(["--dir", "/opt"]);
