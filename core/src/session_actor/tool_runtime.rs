@@ -10,6 +10,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use serde_json::{Map, Value};
 use thiserror::Error;
 
@@ -380,6 +383,9 @@ pub(super) fn run_command_with_timeout(
     stdin: Option<&[u8]>,
     command_label: &str,
 ) -> Result<Output, LocalToolError> {
+    #[cfg(unix)]
+    command.process_group(0);
+
     let mut child = command
         .stdin(if stdin.is_some() {
             Stdio::piped()
@@ -414,7 +420,7 @@ pub(super) fn run_command_with_timeout(
             ))),
         };
         if let Err(error) = write_result {
-            let _ = child.kill();
+            kill_child_process_group(&mut child);
             let _ = child.wait();
             let _ = join_pipe_reader(stdout_handle, command_label, "stdout");
             let _ = join_pipe_reader(stderr_handle, command_label, "stderr");
@@ -437,7 +443,7 @@ pub(super) fn run_command_with_timeout(
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    let _ = child.kill();
+                    kill_child_process_group(&mut child);
                     let _ = child.wait();
                     let stderr = join_pipe_reader(stderr_handle, command_label, "stderr")
                         .unwrap_or_default();
@@ -463,6 +469,22 @@ pub(super) fn run_command_with_timeout(
             }
         }
     }
+}
+
+fn kill_child_process_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id() as libc::pid_t;
+        if pgid > 0 {
+            // The child is spawned into its own process group on Unix, so killing
+            // the group also terminates shell grandchildren that still hold pipes.
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+    }
+
+    let _ = child.kill();
 }
 
 fn read_pipe<R: Read>(mut pipe: R) -> Result<Vec<u8>, std::io::Error> {
@@ -518,14 +540,14 @@ mod tests {
     #[test]
     fn run_command_with_timeout_kills_slow_process() {
         let mut command = Command::new("sh");
-        command.arg("-c").arg("sleep 5");
+        command.arg("-c").arg("sleep 30");
 
         let started = Instant::now();
         let error =
             run_command_with_timeout(command, Duration::from_millis(100), None, "test command")
                 .expect_err("command should time out");
 
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert!(error.to_string().contains("timed out"));
     }
 }

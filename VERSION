@@ -3,6 +3,9 @@ version: 1.26.0
 
 # 1.26.0
 
+- 修复命令超时后 shell 子进程残留的问题：
+  `run_command_with_timeout` 在 Unix 下会把子进程放入独立 process group，超时时 kill 整个 group，避免只终止 shell 但 `sleep` / 远端命令子进程继续持有 stdout/stderr pipe，导致工具调用和 CI 测试等待到子进程自然退出。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 新增 StellaCodeX Electron 选区引用协议：
   `ChatMessageItem` 新增 provider-neutral 的 `SelectionReference`，Web channel 入站消息支持结构化 `selection_references`，provider 发送时会渲染成 selected content block。StellaCodeX 文件预览支持从 Markdown、HTML 源码、PDF、docx/Word 版式预览和源码/纯文本选区生成引用 chip，发送时只带选区文本、文件路径、定位信息和少量上下文，不全量复制文件内容；选区引用改为右键菜单显式触发，支持引用到对话和复制选中内容。PDF 预览从 PDF.js 自绘 canvas/text layer 切换为 EmbedPDF PDFium WASM direct engine 渲染，避免公式、嵌入字体和复杂版式依赖 PDF.js text layer 时出现乱码和字体退化；PDF 选区引用后续会基于 PDFium 文本几何单独补齐。docx 预览改用 docx-preview 保留 Word 样式、分页、字体、段距、页眉页脚和图片，Mammoth 只保留为选区引用的纯文本提取 fallback；docx 页面会根据预览面板可用宽度等比缩放，避免右侧面板打开时页面被横向裁切。本次不改变 `config` schema，不改变 `workdir` schema。
 
