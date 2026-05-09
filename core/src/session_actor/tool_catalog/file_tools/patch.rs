@@ -19,7 +19,7 @@ use crate::session_actor::tool_runtime::{
 
 pub(super) const FS_TOOL_NAME: &str = "stellaclaw-fs-tool";
 const FS_TOOL_VERSION: &str = "0.2.0";
-const FS_TOOL_MANIFEST_URL: &str = "https://github.com/JeremyGuo/ClawParty/releases/download/stellaclaw-fs-tool-v0.2.0/tools-manifest.json";
+const FS_TOOL_MANIFEST_URL: &str = "https://github.com/JeremyGuo/StellaClaw/releases/download/stellaclaw-fs-tool-v0.2.0/tools-manifest.json";
 const FS_TOOL_PATH_ENV: &str = "STELLACLAW_FS_TOOL_PATH";
 const REMOTE_SAFE_PATH_PREFIX: &str =
     "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin${PATH:+:$PATH}; export PATH;";
