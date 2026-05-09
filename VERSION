@@ -3,6 +3,9 @@ version: 1.26.0
 
 # 1.26.0
 
+- 补齐 Codex subscription reasoning summary 持久化：
+  Codex websocket provider 现在会处理 `response.output_item.added`、`response.reasoning_summary_text.delta` 和 `response.reasoning_summary_part.added` 流事件，按 `summary_index` 聚合 reasoning summary，并在 `response.completed` 合并到最终 reasoning output item；如果 completed output 省略 reasoning item，也会生成 summary-only reasoning item。`ChatMessage::Reasoning` 对 summary-only Codex reasoning 会写入 `codex_summary`，密文 reasoning 仍只用于 replay，展示层继续不暴露 `codex_encrypted_content`。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 切换 stellaclaw-apply-patch Linux release 为 musl static：
   `stellaclaw-apply-patch` 子包版本提升到 `0.1.2`，CD 中 `linux-x64` / `linux-arm64` 资产改用 `x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` 构建但保留原 platform 名；`linux-arm64` 交叉编译显式使用 Rust toolchain 自带的 `rust-lld`，避免 GitHub Actions 用宿主 `/usr/bin/ld` 链接 AArch64 对象；remote `apply_patch` runtime 期望的 release manifest 同步切到 `stellaclaw-apply-patch-v0.1.2`，避免 Ubuntu 20.04 这类 glibc 2.31 机器命中旧动态链接二进制后无法执行。本次不改变 `config` schema，不改变 `workdir` schema。
 

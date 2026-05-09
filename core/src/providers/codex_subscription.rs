@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs,
     net::{TcpStream, ToSocketAddrs},
     path::PathBuf,
@@ -49,7 +50,11 @@ pub struct CodexSubscriptionProvider {
 struct StreamAccumulator {
     output_items: Vec<Value>,
     text_deltas: String,
+    active_reasoning_item_id: Option<String>,
+    reasoning_summaries: BTreeMap<String, Vec<String>>,
 }
+
+const PENDING_REASONING_SUMMARY_KEY: &str = "__pending_reasoning_summary__";
 
 #[derive(Debug, Default)]
 struct CodexSubscriptionAuthManager {
@@ -459,8 +464,17 @@ fn send_response_create(
                     Some("response.output_item.done") => {
                         accumulator.record_output_item_done(&value);
                     }
+                    Some("response.output_item.added") => {
+                        accumulator.record_output_item_added(&value);
+                    }
                     Some("response.output_text.delta") => {
                         accumulator.record_output_text_delta(&value);
+                    }
+                    Some("response.reasoning_summary_text.delta") => {
+                        accumulator.record_reasoning_summary_text_delta(&value);
+                    }
+                    Some("response.reasoning_summary_part.added") => {
+                        accumulator.record_reasoning_summary_part_added(&value);
                     }
                     _ => {}
                 }
@@ -1102,7 +1116,27 @@ fn is_unauthorized(error: &ProviderError) -> bool {
 impl StreamAccumulator {
     fn record_output_item_done(&mut self, event: &Value) {
         if let Some(item) = event.get("item") {
-            self.push_unique_item(item.clone());
+            let mut item = item.clone();
+            if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                if let Some(item_id) = item.get("id").and_then(Value::as_str) {
+                    self.activate_reasoning_item(item_id);
+                }
+                self.attach_reasoning_summary_to_item(&mut item);
+                self.active_reasoning_item_id = None;
+            }
+            self.push_unique_item(item);
+        }
+    }
+
+    fn record_output_item_added(&mut self, event: &Value) {
+        let Some(item) = event.get("item") else {
+            return;
+        };
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            return;
+        }
+        if let Some(item_id) = item.get("id").and_then(Value::as_str) {
+            self.activate_reasoning_item(item_id);
         }
     }
 
@@ -1110,6 +1144,38 @@ impl StreamAccumulator {
         if let Some(delta) = event.get("delta").and_then(Value::as_str) {
             self.text_deltas.push_str(delta);
         }
+    }
+
+    fn record_reasoning_summary_text_delta(&mut self, event: &Value) {
+        let Some(delta) = event.get("delta").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(summary_index) = event
+            .get("summary_index")
+            .and_then(Value::as_i64)
+            .and_then(|index| usize::try_from(index).ok())
+        else {
+            return;
+        };
+
+        let key = self.current_reasoning_summary_key();
+        let parts = self.reasoning_summaries.entry(key).or_default();
+        ensure_summary_part(parts, summary_index);
+        parts[summary_index].push_str(delta);
+    }
+
+    fn record_reasoning_summary_part_added(&mut self, event: &Value) {
+        let Some(summary_index) = event
+            .get("summary_index")
+            .and_then(Value::as_i64)
+            .and_then(|index| usize::try_from(index).ok())
+        else {
+            return;
+        };
+
+        let key = self.current_reasoning_summary_key();
+        let parts = self.reasoning_summaries.entry(key).or_default();
+        ensure_summary_part(parts, summary_index);
     }
 
     fn push_unique_item(&mut self, item: Value) {
@@ -1127,9 +1193,105 @@ impl StreamAccumulator {
 
         self.output_items.push(item);
     }
+
+    fn activate_reasoning_item(&mut self, item_id: &str) {
+        self.active_reasoning_item_id = Some(item_id.to_string());
+        if let Some(pending) = self
+            .reasoning_summaries
+            .remove(PENDING_REASONING_SUMMARY_KEY)
+        {
+            let target = self
+                .reasoning_summaries
+                .entry(item_id.to_string())
+                .or_default();
+            merge_summary_parts(target, pending);
+        }
+    }
+
+    fn current_reasoning_summary_key(&self) -> String {
+        self.active_reasoning_item_id
+            .clone()
+            .unwrap_or_else(|| PENDING_REASONING_SUMMARY_KEY.to_string())
+    }
+
+    fn attach_reasoning_summary_to_item(&mut self, item: &mut Value) -> bool {
+        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
+            return false;
+        }
+
+        let item_id = item.get("id").and_then(Value::as_str).map(str::to_string);
+        let summary_parts = item_id
+            .as_deref()
+            .and_then(|id| self.reasoning_summaries.remove(id))
+            .or_else(|| {
+                self.reasoning_summaries
+                    .remove(PENDING_REASONING_SUMMARY_KEY)
+            });
+        let Some(summary_parts) = summary_parts else {
+            return false;
+        };
+        if summary_parts.iter().all(|part| part.is_empty()) {
+            return false;
+        }
+
+        let existing_summary_is_empty = item
+            .get("summary")
+            .and_then(Value::as_array)
+            .is_none_or(|summary| summary.is_empty());
+        if !existing_summary_is_empty {
+            return false;
+        }
+
+        let Some(object) = item.as_object_mut() else {
+            return false;
+        };
+        object.insert(
+            "summary".to_string(),
+            Value::Array(reasoning_summary_parts_payload(summary_parts)),
+        );
+        true
+    }
+
+    fn take_unattached_reasoning_summary_item(&mut self) -> Option<Value> {
+        let (_key, summary_parts) = self
+            .reasoning_summaries
+            .iter()
+            .find(|(_, parts)| parts.iter().any(|part| !part.is_empty()))
+            .map(|(key, parts)| (key.clone(), parts.clone()))?;
+        Some(json!({
+            "type": "reasoning",
+            "summary": reasoning_summary_parts_payload(summary_parts),
+        }))
+    }
 }
 
-fn merge_streamed_response_output(response: &mut Value, accumulator: StreamAccumulator) {
+fn ensure_summary_part(parts: &mut Vec<String>, summary_index: usize) {
+    if parts.len() <= summary_index {
+        parts.resize_with(summary_index + 1, String::new);
+    }
+}
+
+fn merge_summary_parts(target: &mut Vec<String>, source: Vec<String>) {
+    for (index, part) in source.into_iter().enumerate() {
+        ensure_summary_part(target, index);
+        target[index].push_str(&part);
+    }
+}
+
+fn reasoning_summary_parts_payload(summary_parts: Vec<String>) -> Vec<Value> {
+    summary_parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .map(|text| {
+            json!({
+                "type": "summary_text",
+                "text": text,
+            })
+        })
+        .collect()
+}
+
+fn merge_streamed_response_output(response: &mut Value, mut accumulator: StreamAccumulator) {
     let Some(response_object) = response.as_object_mut() else {
         return;
     };
@@ -1140,7 +1302,11 @@ fn merge_streamed_response_output(response: &mut Value, accumulator: StreamAccum
         .cloned()
         .unwrap_or_default();
 
-    for item in accumulator.output_items {
+    for item in &mut merged_output {
+        accumulator.attach_reasoning_summary_to_item(item);
+    }
+
+    for item in std::mem::take(&mut accumulator.output_items) {
         let item_id = item.get("id").and_then(Value::as_str);
         let already_present = item_id.is_some_and(|item_id| {
             merged_output
@@ -1149,6 +1315,12 @@ fn merge_streamed_response_output(response: &mut Value, accumulator: StreamAccum
         });
         if !already_present {
             merged_output.push(item);
+        }
+    }
+
+    if !output_has_reasoning_summary(&merged_output) {
+        if let Some(reasoning_item) = accumulator.take_unattached_reasoning_summary_item() {
+            merged_output.push(reasoning_item);
         }
     }
 
@@ -1164,6 +1336,23 @@ fn merge_streamed_response_output(response: &mut Value, accumulator: StreamAccum
     }
 
     response_object.insert("output".to_string(), Value::Array(merged_output));
+}
+
+fn output_has_reasoning_summary(output: &[Value]) -> bool {
+    output.iter().any(|item| {
+        item.get("type").and_then(Value::as_str) == Some("reasoning")
+            && item
+                .get("summary")
+                .and_then(Value::as_array)
+                .is_some_and(|summary| {
+                    summary.iter().any(|part| {
+                        part.get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.is_empty())
+                            || part.as_str().is_some_and(|text| !text.is_empty())
+                    })
+                })
+    })
 }
 
 fn output_has_assistant_text(output: &[Value]) -> bool {
@@ -1701,17 +1890,14 @@ fn extract_codex_reasoning(item: &Value) -> Option<ReasoningItem> {
         .filter(|content| !content.is_empty())
         .map(str::to_string);
 
-    if encrypted_content.is_some() {
+    if summary.is_some() || encrypted_content.is_some() {
         return Some(ReasoningItem::codex(summary, encrypted_content, None));
     }
 
-    summary
-        .or_else(|| {
-            item.get("text")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-                .map(str::to_string)
-        })
+    item.get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
         .map(ReasoningItem::from_text)
 }
 
@@ -1816,6 +2002,7 @@ mod tests {
         let accumulator = StreamAccumulator {
             output_items: Vec::new(),
             text_deltas: "streamed text".to_string(),
+            ..Default::default()
         };
 
         merge_streamed_response_output(&mut response, accumulator);
@@ -1836,6 +2023,7 @@ mod tests {
         let accumulator = StreamAccumulator {
             output_items: Vec::new(),
             text_deltas: "streamed final answer".to_string(),
+            ..Default::default()
         };
 
         merge_streamed_response_output(&mut response, accumulator);
@@ -1863,6 +2051,7 @@ mod tests {
         let accumulator = StreamAccumulator {
             output_items: Vec::new(),
             text_deltas: "completed text".to_string(),
+            ..Default::default()
         };
 
         merge_streamed_response_output(&mut response, accumulator);
@@ -1871,6 +2060,69 @@ mod tests {
         assert_eq!(
             response["output"][0]["content"][0]["text"],
             "completed text"
+        );
+    }
+
+    #[test]
+    fn merges_streamed_reasoning_summary_into_completed_reasoning_item() {
+        let mut response = serde_json::json!({
+            "id": "resp_1",
+            "output": [{
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [],
+                "encrypted_content": "opaque"
+            }]
+        });
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.record_output_item_added(&serde_json::json!({
+            "type": "response.output_item.added",
+            "item": {
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": []
+            }
+        }));
+        accumulator.record_reasoning_summary_text_delta(&serde_json::json!({
+            "type": "response.reasoning_summary_text.delta",
+            "summary_index": 0,
+            "delta": "**Inspecting**\n\nRead files"
+        }));
+        accumulator.record_reasoning_summary_part_added(&serde_json::json!({
+            "type": "response.reasoning_summary_part.added",
+            "summary_index": 1
+        }));
+        accumulator.record_reasoning_summary_text_delta(&serde_json::json!({
+            "type": "response.reasoning_summary_text.delta",
+            "summary_index": 1,
+            "delta": "Ran tests"
+        }));
+
+        merge_streamed_response_output(&mut response, accumulator);
+
+        assert_eq!(
+            response["output"][0]["summary"][0]["text"],
+            "**Inspecting**\n\nRead files"
+        );
+        assert_eq!(response["output"][0]["summary"][1]["text"], "Ran tests");
+    }
+
+    #[test]
+    fn creates_reasoning_item_from_streamed_summary_when_completed_output_omits_it() {
+        let mut response = serde_json::json!({"id": "resp_1", "output": []});
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.record_reasoning_summary_text_delta(&serde_json::json!({
+            "type": "response.reasoning_summary_text.delta",
+            "summary_index": 0,
+            "delta": "Looked through the code."
+        }));
+
+        merge_streamed_response_output(&mut response, accumulator);
+
+        assert_eq!(response["output"][0]["type"], "reasoning");
+        assert_eq!(
+            response["output"][0]["summary"][0]["text"],
+            "Looked through the code."
         );
     }
 
@@ -2196,6 +2448,23 @@ mod tests {
         assert!(reasoning.text.is_empty());
         assert_eq!(reasoning.codex_summary, None);
         assert_eq!(reasoning.codex_encrypted_content.as_deref(), Some("opaque"));
+    }
+
+    #[test]
+    fn streamed_reasoning_summary_is_stored_as_codex_summary() {
+        let item = serde_json::json!({
+            "type": "reasoning",
+            "summary": [{
+                "type": "summary_text",
+                "text": "Inspected files."
+            }]
+        });
+
+        let reasoning = extract_codex_reasoning(&item).expect("summary reasoning is retained");
+
+        assert!(reasoning.text.is_empty());
+        assert_eq!(reasoning.codex_summary.as_deref(), Some("Inspected files."));
+        assert_eq!(reasoning.codex_encrypted_content, None);
     }
 
     #[test]
