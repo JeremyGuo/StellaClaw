@@ -1993,6 +1993,7 @@ struct MessageSkeleton {
     text: String,
     text_with_attachment_markers: String,
     preview: String,
+    data: Vec<ChatMessageItem>,
     items: Vec<WebMessageItem>,
     attachments: Vec<WebMessageAttachment>,
     attachment_count: usize,
@@ -2053,6 +2054,11 @@ struct WebMessageAttachment {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum WebMessageItem {
+    Reasoning {
+        index: usize,
+        text: String,
+        summary: Option<String>,
+    },
     Text {
         index: usize,
         text: String,
@@ -2090,6 +2096,16 @@ struct WebRenderedMessage {
 struct WebRenderedTextPart {
     text: String,
     text_with_attachment_markers: String,
+}
+
+fn reasoning_web_text(reasoning: &stellaclaw_core::session_actor::ReasoningItem) -> Option<String> {
+    reasoning
+        .codex_summary
+        .as_deref()
+        .or_else(|| (!reasoning.text.is_empty()).then_some(reasoning.text.as_str()))
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 struct WebAttachmentContext {
@@ -2792,6 +2808,7 @@ fn message_skeleton(
         text: rendered.text.clone(),
         text_with_attachment_markers: rendered.text_with_attachment_markers.clone(),
         preview: preview_text(&rendered.text),
+        data: web_chat_message_data(message),
         items: rendered.items,
         attachment_count: rendered.attachments.len(),
         attachments: rendered.attachments,
@@ -2801,6 +2818,23 @@ fn message_skeleton(
         has_token_usage: message.token_usage.is_some(),
         token_usage: message.token_usage.as_ref().map(WebTokenUsage::from),
     }
+}
+
+fn web_chat_message_data(message: &ChatMessage) -> Vec<ChatMessageItem> {
+    message
+        .data
+        .iter()
+        .map(|item| match item {
+            ChatMessageItem::Reasoning(reasoning) => {
+                ChatMessageItem::Reasoning(stellaclaw_core::session_actor::ReasoningItem {
+                    text: reasoning.text.clone(),
+                    codex_summary: reasoning.codex_summary.clone(),
+                    codex_encrypted_content: None,
+                })
+            }
+            other => other.clone(),
+        })
+        .collect()
 }
 
 fn render_web_message(
@@ -2816,7 +2850,15 @@ fn render_web_message(
 
     for (item_index, item) in message.data.iter().enumerate() {
         match item {
-            ChatMessageItem::Reasoning(_) => {}
+            ChatMessageItem::Reasoning(reasoning) => {
+                if let Some(text) = reasoning_web_text(reasoning) {
+                    items.push(WebMessageItem::Reasoning {
+                        index: item_index,
+                        text,
+                        summary: reasoning.codex_summary.clone(),
+                    });
+                }
+            }
             ChatMessageItem::Context(context_item) => {
                 let part = render_web_text_part(
                     &context_item.text,
@@ -4016,6 +4058,45 @@ mod tests {
         assert_eq!(skeleton.preview, "done\nmissing.txt");
         assert_eq!(skeleton.attachment_count, 0);
         assert!(skeleton.has_attachment_errors);
+
+        let _ = fs::remove_dir_all(workdir);
+    }
+
+    #[test]
+    fn web_message_rendering_exposes_reasoning_summary_items() {
+        let workdir = test_workdir("reasoning-summary");
+        let state = test_state("web-main-test-reasoning-summary");
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Reasoning(
+                stellaclaw_core::session_actor::ReasoningItem::codex(
+                    Some("checked current patch".to_string()),
+                    Some("encrypted-state".to_string()),
+                    Some("raw reasoning".to_string()),
+                ),
+            )],
+        );
+
+        let context = test_attachment_context(&workdir, &state);
+        let roots = context.roots();
+        let rendered = render_web_message(&message, &context, &roots);
+
+        assert_eq!(rendered.text, "");
+        assert_eq!(rendered.items.len(), 1);
+        assert!(matches!(
+            &rendered.items[0],
+            WebMessageItem::Reasoning { text, summary, .. }
+                if text == "checked current patch"
+                    && summary.as_deref() == Some("checked current patch")
+        ));
+        let skeleton = message_skeleton(3, &message, &context, &roots);
+        assert_eq!(skeleton.data.len(), 1);
+        assert!(matches!(
+            &skeleton.data[0],
+            ChatMessageItem::Reasoning(reasoning)
+                if reasoning.codex_summary.as_deref() == Some("checked current patch")
+                    && reasoning.codex_encrypted_content.is_none()
+        ));
 
         let _ = fs::remove_dir_all(workdir);
     }

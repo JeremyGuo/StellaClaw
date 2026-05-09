@@ -11,7 +11,14 @@ function hasUnreadMessage(conversation, active) {
   return lastId > seenId;
 }
 
-export function ConversationBar({ serverId, sidebarMode, conversations, statuses, selected, loading, onSelect, onOpenSettings, onRename, onDelete }) {
+function isWorkingConversation(conversation, activeRunning) {
+  const processingState = String(conversation?.processing_state || '').trim().toLowerCase();
+  return Boolean(conversation?.running)
+    || (processingState && processingState !== 'idle')
+    || Boolean(activeRunning);
+}
+
+export function ConversationBar({ serverId, sidebarMode, conversations, statuses, selected, loading, activeRunning, onSelect, onOpenSettings, onRename, onDelete }) {
   return (
     <aside className="conversation-bar">
       <div className="conversation-top-spacer" />
@@ -35,18 +42,22 @@ export function ConversationBar({ serverId, sidebarMode, conversations, statuses
           const active = selected?.conversationId === conversation.conversation_id;
           const status = statuses.get(key);
           const unread = hasUnreadMessage(conversation, active);
+          const working = isWorkingConversation(conversation, active && activeRunning);
           return (
             <ContextMenu.Root key={conversation.conversation_id}>
               <ContextMenu.Trigger asChild>
                 <button
-                  className={`conversation-row${active ? ' active' : ''}${unread ? ' unread' : ''}`}
+                  className={`conversation-row${active ? ' active' : ''}${unread ? ' unread' : ''}${working ? ' working' : ''}`}
                   type="button"
                   onClick={() => onSelect({ serverId, conversationId: conversation.conversation_id })}
                 >
                   {unread && <i className="conversation-unread-dot" aria-label="有新消息" />}
                   <strong>{displayConversationName(conversation)}</strong>
                   <span>{conversation.nickname || conversation.platform_chat_id || 'Local Stellaclaw'}</span>
-                  <em>{formatModel(conversation, status)}</em>
+                  <em title={working ? '正在工作' : undefined}>
+                    {working && <i className="conversation-working-dot" aria-hidden="true" />}
+                    {formatModel(conversation, status)}
+                  </em>
                 </button>
               </ContextMenu.Trigger>
               <ContextMenu.Portal>

@@ -20,7 +20,66 @@ export function isAuxiliaryUserMessage(message) {
 }
 
 export function messageItems(message) {
-  return Array.isArray(message?.items) ? message.items : [];
+  const renderedItems = Array.isArray(message?.items) ? message.items : [];
+  const rawItems = Array.isArray(message?.data) ? message.data : [];
+  if (!rawItems.length) return renderedItems;
+  const renderedByIndex = new Map(
+    renderedItems
+      .filter((item) => item?.index !== undefined)
+      .map((item) => [Number(item.index), item])
+  );
+  return rawItems
+    .map((item, index) => normalizeChatMessageItem(item, index, renderedByIndex))
+    .filter(Boolean);
+}
+
+function normalizeChatMessageItem(item, index, renderedByIndex) {
+  if (!item || typeof item !== 'object') return null;
+  const rendered = renderedByIndex.get(index);
+  const payload = item.payload && typeof item.payload === 'object' ? item.payload : {};
+  if (item.type === 'reasoning') {
+    return {
+      type: 'reasoning',
+      index,
+      text: payload.codex_summary || payload.text || '',
+      summary: payload.codex_summary || ''
+    };
+  }
+  if (item.type === 'context') {
+    return rendered?.type === 'text'
+      ? rendered
+      : {
+          type: 'text',
+          index,
+          text: payload.text || '',
+          text_with_attachment_markers: payload.text || ''
+        };
+  }
+  if (item.type === 'file') {
+    return rendered?.type === 'file' ? rendered : { type: 'file', index, file: payload };
+  }
+  if (item.type === 'tool_call') {
+    return {
+      type: 'tool_call',
+      index,
+      tool_call_id: payload.tool_call_id || '',
+      tool_name: payload.tool_name || 'tool',
+      arguments: payload.arguments?.text || payload.arguments || ''
+    };
+  }
+  if (item.type === 'tool_result') {
+    const result = payload.result || {};
+    return {
+      type: 'tool_result',
+      index,
+      tool_call_id: payload.tool_call_id || '',
+      tool_name: payload.tool_name || 'tool',
+      context: result.context?.text || rendered?.context || null,
+      context_with_attachment_markers: rendered?.context_with_attachment_markers || result.context?.text || null,
+      file_attachment_index: rendered?.file_attachment_index
+    };
+  }
+  return rendered || null;
 }
 
 export function hasToolItems(message) {
@@ -88,9 +147,28 @@ export function splitMessageForDisplay(message) {
   const usage = tokenUsage(message);
   const items = messageItems(message);
   if (items.length > 0) {
-    const toolCards = items
-      .filter((item) => item?.type === 'tool_call' || item?.type === 'tool_result')
-      .map((item) => ({
+    const segments = [];
+    let pendingNotes = [];
+    let currentSegment = null;
+    const flushSegment = () => {
+      if (!currentSegment) return;
+      if (currentSegment.notes.length || currentSegment.cards.length) {
+        segments.push(currentSegment);
+      }
+      currentSegment = null;
+    };
+    const addNote = (kind, text) => {
+      const value = String(text || '').trim();
+      if (!value) return;
+      if (currentSegment?.cards.length) flushSegment();
+      pendingNotes.push({ kind, text: value });
+    };
+    const addCard = (item) => {
+      if (!currentSegment) {
+        currentSegment = { notes: pendingNotes, cards: [] };
+        pendingNotes = [];
+      }
+      currentSegment.cards.push({
         id: item.tool_call_id || '',
         kind: item.type === 'tool_result' ? 'result' : 'call',
         name: item.tool_name || 'tool',
@@ -98,11 +176,24 @@ export function splitMessageForDisplay(message) {
           ? (item.context_with_attachment_markers || item.context || '')
           : (item.arguments || ''),
         usage
-      }));
+      });
+    };
+    items.forEach((item) => {
+      if (item?.type === 'reasoning') {
+        addNote('reasoning', item.text || item.summary || '');
+      } else if (item?.type === 'text') {
+        addNote('text', item.text_with_attachment_markers || item.text || item.content || '');
+      } else if (item?.type === 'tool_call' || item?.type === 'tool_result') {
+        addCard(item);
+      }
+    });
+    flushSegment();
+    if (pendingNotes.length) segments.push({ notes: pendingNotes, cards: [] });
+    const toolCards = segments.flatMap((segment) => segment.cards);
     if (!toolCards.length) {
-      return { textMessage: message, toolCards: [] };
+      return { textMessage: message, toolCards: [], segments };
     }
-    const nonToolItems = items.filter((item) => item?.type !== 'tool_call' && item?.type !== 'tool_result');
+    const nonToolItems = items.filter((item) => !['tool_call', 'tool_result', 'reasoning', 'text'].includes(item?.type));
     const textMessage = nonToolItems.length > 0
       ? {
           ...message,
@@ -113,18 +204,18 @@ export function splitMessageForDisplay(message) {
           content: ''
         }
       : null;
-    return { textMessage, toolCards };
+    return { textMessage, toolCards, segments };
   }
   const text = messageText(message);
   const toolCards = parseToolTextBlocks(text).map((card) => ({ ...card, usage }));
   if (!toolCards.length) {
-    return { textMessage: message, toolCards: [] };
+    return { textMessage: message, toolCards: [], segments: [] };
   }
   const cleanedText = stripToolTextBlocks(text);
   const textMessage = cleanedText
     ? { ...message, text_with_attachment_markers: cleanedText, text: cleanedText, preview: cleanedText, content: cleanedText }
     : null;
-  return { textMessage, toolCards };
+  return { textMessage, toolCards, segments: [{ notes: [], cards: toolCards }] };
 }
 
 export function tokenUsage(message) {

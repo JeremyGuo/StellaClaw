@@ -66,8 +66,21 @@
   --danger: #ff8a7a;
   --green: #339cff;
   --orange: #ee9b57;
-  --code-bg: #131313;
-  --code-inline-bg: rgba(255, 255, 255, 0.075);
+  --code-bg: var(--panel-2);
+  --code-inline-bg: var(--tool-chip-bg);
+  --syntax-text: #c9d1d9;
+  --syntax-keyword: #ff7b72;
+  --syntax-entity: #d2a8ff;
+  --syntax-constant: #79c0ff;
+  --syntax-string: #a5d6ff;
+  --syntax-variable: #ffa657;
+  --syntax-comment: #8b949e;
+  --syntax-tag: #7ee787;
+  --syntax-heading: #1f6feb;
+  --syntax-addition: #aff5b4;
+  --syntax-addition-bg: #033a16;
+  --syntax-deletion: #ffdcd7;
+  --syntax-deletion-bg: #67060c;
   --message-user-bg: #2a2a2a;
   --message-user-border: rgba(255, 255, 255, 0.08);
   --tool-row-bg: #262626;
@@ -100,8 +113,21 @@
   --danger: #c24132;
   --green: #339cff;
   --orange: #b45f20;
-  --code-bg: #f5f5f5;
-  --code-inline-bg: rgba(21, 24, 21, 0.055);
+  --code-bg: var(--panel-2);
+  --code-inline-bg: var(--tool-chip-bg);
+  --syntax-text: #24292f;
+  --syntax-keyword: #cf222e;
+  --syntax-entity: #8250df;
+  --syntax-constant: #0550ae;
+  --syntax-string: #0a3069;
+  --syntax-variable: #953800;
+  --syntax-comment: #6e7781;
+  --syntax-tag: #116329;
+  --syntax-heading: #0550ae;
+  --syntax-addition: #116329;
+  --syntax-addition-bg: #dafbe1;
+  --syntax-deletion: #82071e;
+  --syntax-deletion-bg: #ffebe9;
   --message-user-bg: #f6f6f6;
   --message-user-border: rgba(26, 28, 31, 0.06);
   --tool-row-bg: #f6f6f6;
@@ -135,8 +161,21 @@
     --danger: #c24132;
     --green: #339cff;
     --orange: #b45f20;
-    --code-bg: #f5f5f5;
-    --code-inline-bg: rgba(21, 24, 21, 0.055);
+    --code-bg: var(--panel-2);
+    --code-inline-bg: var(--tool-chip-bg);
+    --syntax-text: #24292f;
+    --syntax-keyword: #cf222e;
+    --syntax-entity: #8250df;
+    --syntax-constant: #0550ae;
+    --syntax-string: #0a3069;
+    --syntax-variable: #953800;
+    --syntax-comment: #6e7781;
+    --syntax-tag: #116329;
+    --syntax-heading: #0550ae;
+    --syntax-addition: #116329;
+    --syntax-addition-bg: #dafbe1;
+    --syntax-deletion: #82071e;
+    --syntax-deletion-bg: #ffebe9;
     --message-user-bg: #f6f6f6;
     --message-user-border: rgba(26, 28, 31, 0.06);
     --tool-row-bg: #f6f6f6;
@@ -243,7 +282,7 @@ button {
   position: absolute;
   z-index: 0;
   top: 0;
-  right: 0;
+  right: var(--content-right);
   bottom: -88px;
   left: var(--content-left);
   background: linear-gradient(
@@ -356,19 +395,21 @@ button {
   z-index: 2;
   top: 0;
   left: max(var(--sidebar-width), var(--chrome-title-left-offset));
-  right: var(--chrome-title-right-offset-with-update);
+  right: calc(var(--content-right) + var(--chrome-title-right-offset-with-update));
   display: flex;
   height: var(--topbar-height);
   min-width: 0;
   align-items: center;
   gap: 8px;
   padding-left: 24px;
-  transition: left 190ms cubic-bezier(.2, .8, .2, 1);
+  transition:
+    left 190ms cubic-bezier(.2, .8, .2, 1),
+    right 190ms cubic-bezier(.2, .8, .2, 1);
   -webkit-app-region: no-drag;
 }
 
 .window-chrome:not(.update-ready) .title-track {
-  right: var(--chrome-title-right-offset);
+  right: calc(var(--content-right) + var(--chrome-title-right-offset));
 }
 
 .transfer-spinner {
@@ -551,11 +592,12 @@ button {
   position: absolute;
   z-index: 4;
   top: 0;
-  right: var(--chrome-right-toolbar-offset);
+  right: calc(var(--content-right) + var(--chrome-right-toolbar-offset));
   display: flex;
   height: var(--topbar-height);
   align-items: center;
   gap: 6px;
+  transition: right 190ms cubic-bezier(.2, .8, .2, 1);
   -webkit-app-region: no-drag;
 }
 
@@ -710,8 +752,8 @@ button {
     "title model"
     "sub model";
   align-items: center;
-  gap: 2px 8px;
-  padding: 8px 10px;
+  gap: 2px 7px;
+  padding: 8px 8px 8px 10px;
   border: 1px solid transparent;
   border-radius: 10px;
   background: transparent;
@@ -759,8 +801,36 @@ button {
 
 .conversation-row em {
   grid-area: model;
+  display: inline-flex;
+  justify-self: end;
+  align-items: center;
+  gap: 5px;
   color: var(--muted);
   font-style: normal;
+  white-space: nowrap;
+}
+
+.conversation-working-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 999px;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent), transparent 78%);
+  animation: conversation-working-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes conversation-working-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(0.82);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
 }
 
 .sidebar-collapsed .conversation-row {
@@ -1133,6 +1203,85 @@ button {
   font-family: var(--font-mono);
   font-size: 0.92em;
   line-height: 1.5;
+}
+
+.message-text pre code.hljs {
+  color: var(--syntax-text);
+  background: transparent;
+}
+
+.message-text .hljs-doctag,
+.message-text .hljs-keyword,
+.message-text .hljs-meta .hljs-keyword,
+.message-text .hljs-template-tag,
+.message-text .hljs-template-variable,
+.message-text .hljs-type,
+.message-text .hljs-variable.language_ {
+  color: var(--syntax-keyword);
+}
+
+.message-text .hljs-title,
+.message-text .hljs-title.class_,
+.message-text .hljs-title.class_.inherited__,
+.message-text .hljs-title.function_ {
+  color: var(--syntax-entity);
+}
+
+.message-text .hljs-attr,
+.message-text .hljs-attribute,
+.message-text .hljs-literal,
+.message-text .hljs-meta,
+.message-text .hljs-number,
+.message-text .hljs-operator,
+.message-text .hljs-variable,
+.message-text .hljs-selector-attr,
+.message-text .hljs-selector-class,
+.message-text .hljs-selector-id {
+  color: var(--syntax-constant);
+}
+
+.message-text .hljs-regexp,
+.message-text .hljs-string,
+.message-text .hljs-meta .hljs-string {
+  color: var(--syntax-string);
+}
+
+.message-text .hljs-built_in,
+.message-text .hljs-symbol {
+  color: var(--syntax-variable);
+}
+
+.message-text .hljs-comment,
+.message-text .hljs-code,
+.message-text .hljs-formula {
+  color: var(--syntax-comment);
+}
+
+.message-text .hljs-name,
+.message-text .hljs-quote,
+.message-text .hljs-selector-tag,
+.message-text .hljs-selector-pseudo {
+  color: var(--syntax-tag);
+}
+
+.message-text .hljs-subst,
+.message-text .hljs-emphasis,
+.message-text .hljs-strong {
+  color: var(--syntax-text);
+}
+
+.message-text .hljs-section {
+  color: var(--syntax-heading);
+}
+
+.message-text .hljs-addition {
+  color: var(--syntax-addition);
+  background-color: var(--syntax-addition-bg);
+}
+
+.message-text .hljs-deletion {
+  color: var(--syntax-deletion);
+  background-color: var(--syntax-deletion-bg);
 }
 
 .message-text code:not(pre code),
@@ -1563,6 +1712,36 @@ button {
   min-width: 0;
   color: var(--text);
   font-size: 13px;
+}
+
+.reasoning-note {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  min-width: 0;
+  align-items: start;
+  gap: 8px;
+  padding: 4px 6px;
+  color: var(--muted);
+  font-size: 12px;
+  animation: live-activity-enter 180ms ease-out both;
+}
+
+.reasoning-note > span {
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 18px;
+}
+
+.reasoning-note-text {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.reasoning-note-text p {
+  margin: 0;
 }
 
 .tool-inline-card {
@@ -2733,8 +2912,8 @@ button {
 
 .right-panel {
   position: fixed;
-  z-index: 80;
-  top: var(--topbar-height);
+  z-index: 320;
+  top: 0;
   right: 0;
   bottom: var(--content-bottom);
   width: var(--right-panel-width);
@@ -2748,23 +2927,24 @@ button {
     opacity 120ms ease,
     bottom 190ms cubic-bezier(.2, .8, .2, 1);
   will-change: transform;
+  -webkit-app-region: no-drag;
 }
 
 .workspace-panel {
-  z-index: 82;
+  z-index: 322;
   right: 0;
   width: clamp(var(--workspace-panel-min-width), var(--workspace-panel-width), 620px);
   min-width: var(--workspace-panel-min-width);
 }
 
 .preview-panel {
-  z-index: 81;
+  z-index: 321;
   right: var(--preview-panel-right);
   width: var(--preview-panel-width);
 }
 
 .overview-panel {
-  z-index: 80;
+  z-index: 320;
   right: var(--overview-panel-right);
   width: var(--overview-panel-width);
 }
@@ -2785,7 +2965,7 @@ button {
 
 .layout-handle {
   position: fixed;
-  z-index: 260;
+  z-index: 340;
   border: 0;
   padding: 0;
   background: transparent;
@@ -2821,7 +3001,7 @@ button {
 .workspace-panel-handle,
 .preview-panel-handle,
 .overview-panel-handle {
-  top: var(--topbar-height);
+  top: 0;
   bottom: var(--content-bottom);
   width: 8px;
 }
@@ -3133,8 +3313,12 @@ button {
   height: 16px;
   flex: 0 0 auto;
   place-items: center;
+  padding: 0;
+  border: 0;
   border-radius: 5px;
   color: var(--faint);
+  background: transparent;
+  cursor: pointer;
 }
 
 .editor-tab-close:hover {

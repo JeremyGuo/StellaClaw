@@ -14,25 +14,32 @@ export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile
       <section className="file-preview detached">
         <div className="editor-tabs">
           {openFiles.map((file) => (
-            <button
+            <div
               key={file.path}
               className={`editor-tab${activeFile?.path === file.path ? ' active' : ''}`}
-              type="button"
+              role="button"
+              tabIndex={0}
               onClick={() => onSelectFile(file.path)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault();
+                  onSelectFile(file.path);
+                }
+              }}
             >
               <span>{file.name}</span>
-              <span
+              <button
                 className="editor-tab-close"
-                role="button"
-                tabIndex={0}
+                type="button"
+                aria-label={`关闭 ${file.name}`}
                 onClick={(event) => {
                   event.stopPropagation();
                   onCloseFile(file.path);
                 }}
               >
                 <X size={12} />
-              </span>
-            </button>
+              </button>
+            </div>
           ))}
         </div>
         <div className="preview-surface">

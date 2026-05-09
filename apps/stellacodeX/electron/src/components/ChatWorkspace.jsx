@@ -915,10 +915,11 @@ export function ToolProcessGroup({ group }) {
   const [open, setOpen] = useState(false);
   const messages = group.messages || [];
   const expandedRows = useMemo(() => messages.map((message, index) => {
-    const { textMessage, toolCards } = splitMessageForDisplay(message);
+    const { textMessage, toolCards, segments } = splitMessageForDisplay(message);
     return {
       id: messageKey(message, index),
       textMessage,
+      segments,
       toolCards,
       usage: tokenUsage(message)
     };
@@ -942,22 +943,32 @@ export function ToolProcessGroup({ group }) {
           {expandedRows.map((row) => {
             const attachments = row.textMessage ? [...(row.textMessage.attachments || []), ...(row.textMessage.files || [])] : [];
             const text = row.textMessage ? messageText(row.textMessage) : '';
+            let renderedCardIndex = 0;
             return (
               <Fragment key={row.id}>
                 {text && <MarkdownContent className="tool-note" text={text} attachments={attachments} />}
-                {row.toolCards.map((card, index) => {
-                  const showRowUsage = index === row.toolCards.length - 1;
-                  const cardKey = `${row.id}-${index}`;
-                  return (
-                    <ToolInlineCard
-                      key={cardKey}
-                      kind={card.kind}
-                      name={card.name}
-                      payload={card.payload}
-                      usage={showRowUsage ? row.usage : null}
-                    />
-                  );
-                })}
+                {(row.segments || [{ notes: [], cards: row.toolCards }]).map((segment, segmentIndex) => (
+                  <Fragment key={`${row.id}-segment-${segmentIndex}`}>
+                    {segment.notes?.map((note, noteIndex) => (
+                      note.kind === 'reasoning'
+                        ? <ReasoningNote key={`${row.id}-${segmentIndex}-note-${noteIndex}`} text={note.text} />
+                        : <MarkdownContent key={`${row.id}-${segmentIndex}-note-${noteIndex}`} className="tool-note" text={note.text} attachments={attachments} />
+                    ))}
+                    {segment.cards.map((card, cardIndex) => {
+                      const showRowUsage = renderedCardIndex === row.toolCards.length - 1;
+                      renderedCardIndex += 1;
+                      return (
+                        <ToolInlineCard
+                          key={`${row.id}-${segmentIndex}-card-${cardIndex}`}
+                          kind={card.kind}
+                          name={card.name}
+                          payload={card.payload}
+                          usage={showRowUsage ? row.usage : null}
+                        />
+                      );
+                    })}
+                  </Fragment>
+                ))}
               </Fragment>
             );
           })}
@@ -1038,6 +1049,9 @@ export function StructuredItems({ items, attachments, fallbackText, onOpenAttach
       if (item?.type === 'file') {
         return <AttachmentCard key={index} attachment={attachments[item.attachment_index] || item} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />;
       }
+      if (item?.type === 'reasoning') {
+        return <ReasoningNote key={index} text={item.text || item.summary || ''} />;
+      }
       if (item?.type === 'tool_call' || item?.type === 'tool_result') {
         return (
           <ToolInlineCard
@@ -1053,6 +1067,17 @@ export function StructuredItems({ items, attachments, fallbackText, onOpenAttach
     .filter(Boolean);
   if (rendered.length) return <>{rendered}</>;
   return <MarkdownContent className="message-text" text={fallbackText} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />;
+}
+
+function ReasoningNote({ text }) {
+  const value = String(text || '').trim();
+  if (!value) return null;
+  return (
+    <div className="reasoning-note">
+      <span>思考</span>
+      <MarkdownContent className="reasoning-note-text" text={value} />
+    </div>
+  );
 }
 
 export function TypewriterMarkdown({ text, attachments = [], className = 'message-text', onDone, onOpenAttachment, onDownloadAttachment }) {

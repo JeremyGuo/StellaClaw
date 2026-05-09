@@ -1717,6 +1717,7 @@ function App() {
         statuses={statuses}
         selected={selected}
         loading={loading}
+        activeRunning={runningActivities.length > 0}
         onSelect={setSelected}
         onOpenSettings={() => setSettingsOpen(true)}
         onRename={renameSelectedConversation}
