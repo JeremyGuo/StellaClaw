@@ -3,6 +3,9 @@ version: 1.26.0
 
 # 1.26.0
 
+- 更新 README / README_zh 和 ROAD_MAP 的 StellaClaw 对外描述：
+  README 与 README_zh 改用 SVG 架构图替代 mermaid，并优化图中信息层次：把 `stellaclaw` Host、`agent_server + core` 和服务器实体合并展示，把 Local / SSH workspace 拆成多个可连接的目标服务器，并把 StellaCodeX 与 Telegram/Chat/Web 等 Channel 以及 macOS / Windows / Linux 全平台同步入口并列展示。文档补齐 StellaCodeX/Web 当前已落地的 workspace、terminal、attachment preview、HTML sandbox preview、Git diff tool detail、plan/usage panel 等高级能力，并把 Dynamic ToolCatalog、Prompt Protocol、Memory v1、FileItem 附件/多模态链路、Codex subscription reasoning summary 和三跳 Remote 工作路径作为核心产品能力说明；同时补充 paper wiki / 大规模论文库整理、远程服务器实验、benchmark 驱动代码优化、长时间后台任务、论文和 artifact 开发等典型场景。ROAD_MAP 同步更新 Web channel 当前状态和对外描述时应强调的高级能力，并明确 memory 存储/检索/写入策略暂不作为产品 roadmap 展开。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 补齐 Codex subscription reasoning summary 持久化：
   Codex websocket provider 现在会处理 `response.output_item.added`、`response.reasoning_summary_text.delta` 和 `response.reasoning_summary_part.added` 流事件，按 `summary_index` 聚合 reasoning summary，并在 `response.completed` 合并到最终 reasoning output item；如果 completed output 省略 reasoning item，也会生成 summary-only reasoning item。`ChatMessage::Reasoning` 对 summary-only Codex reasoning 会写入 `codex_summary`，密文 reasoning 仍只用于 replay，展示层继续不暴露 `codex_encrypted_content`。本次不改变 `config` schema，不改变 `workdir` schema。
 

@@ -1,0 +1,203 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="760" viewBox="0 0 1500 760" role="img" aria-labelledby="title desc">
+  <title id="title">Stellaclaw architecture</title>
+  <desc id="desc">StellaCodeX and chat channels synchronize through a durable Stellaclaw server, which hosts stellaclaw, agent_server, and stellaclaw_core together and can connect to local or multiple SSH remote workspaces.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#f8fbff"/>
+      <stop offset="56%" stop-color="#f7f6ff"/>
+      <stop offset="100%" stop-color="#fff8ed"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#2563eb"/><stop offset="100%" stop-color="#06b6d4"/></linearGradient>
+    <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#0ea5e9"/><stop offset="100%" stop-color="#22d3ee"/></linearGradient>
+    <linearGradient id="purple" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#7c3aed"/><stop offset="100%" stop-color="#ec4899"/></linearGradient>
+    <linearGradient id="green" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#059669"/><stop offset="100%" stop-color="#84cc16"/></linearGradient>
+    <linearGradient id="server" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#111827"/><stop offset="100%" stop-color="#334155"/></linearGradient>
+    <filter id="shadow" x="-10%" y="-12%" width="120%" height="128%"><feDropShadow dx="0" dy="18" stdDeviation="18" flood-color="#0f172a" flood-opacity="0.16"/></filter>
+    <filter id="soft" x="-8%" y="-8%" width="116%" height="116%"><feDropShadow dx="0" dy="8" stdDeviation="10" flood-color="#0f172a" flood-opacity="0.10"/></filter>
+    <marker id="arrowBlue" markerWidth="14" markerHeight="14" refX="11" refY="7" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L12,7 L2,12 Z" fill="#2563eb"/></marker>
+    <marker id="arrowDark" markerWidth="14" markerHeight="14" refX="11" refY="7" orient="auto" markerUnits="strokeWidth"><path d="M2,2 L12,7 L2,12 Z" fill="#334155"/></marker>
+    <style><![CDATA[
+      .title { font: 800 34px ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; fill: #0f172a; }
+      .subtitle { font: 500 16px ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; fill: #475569; }
+      .section { font: 800 18px ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; fill: #0f172a; }
+      .section-sm { font: 800 15px ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; fill: #0f172a; }
+      .sub { font: 700 12px ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; fill: #64748b; text-transform: uppercase; letter-spacing: .08em; }
+      .body { font: 600 13px ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; fill: #334155; }
+      .small { font: 600 11px ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; fill: #475569; }
+      .mono { font: 800 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; fill: #1e293b; }
+      .label { font: 800 13px ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; fill: #2563eb; }
+      .panel { fill: rgba(255,255,255,.94); stroke: #dbeafe; stroke-width: 1.25; rx: 28; filter: url(#shadow); }
+      .inner { fill: #f8fafc; stroke: #e2e8f0; stroke-width: 1; rx: 18; }
+      .pill { fill: #eff6ff; stroke: #bfdbfe; stroke-width: 1; rx: 16; }
+      .chip { fill: #ffffff; stroke: #dbeafe; stroke-width: 1; rx: 18; filter: url(#soft); }
+      .arrow { stroke: #2563eb; stroke-width: 3.2; fill: none; marker-end: url(#arrowBlue); }
+      .dash { stroke: #334155; stroke-width: 2.6; fill: none; stroke-dasharray: 8 8; marker-end: url(#arrowDark); }
+      .thin { stroke: #94a3b8; stroke-width: 1.4; fill: none; }
+    ]]></style>
+  </defs>
+
+  <rect width="1500" height="760" fill="url(#bg)"/>
+  <circle cx="1330" cy="88" r="180" fill="#dbeafe" opacity="0.42"/>
+  <circle cx="168" cy="660" r="210" fill="#fde68a" opacity="0.26"/>
+  <circle cx="760" cy="706" r="240" fill="#e9d5ff" opacity="0.20"/>
+
+  <text x="58" y="60" class="title">Stellaclaw: server-backed, full-platform agent workspace</text>
+  <text x="58" y="90" class="subtitle">StellaCodeX + channels synchronize through one durable server · local or many SSH remote workspaces stay behind the host</text>
+
+  <!-- Client surfaces -->
+  <g transform="translate(58 132)">
+    <rect class="panel" width="390" height="500"/>
+    <rect x="28" y="26" width="54" height="54" rx="18" fill="url(#blue)"/>
+    <text x="100" y="46" class="sub">Client surfaces</text>
+    <text x="100" y="72" class="section">StellaCodeX + Channels</text>
+
+    <rect x="28" y="106" width="334" height="154" class="inner"/>
+    <text x="50" y="132" class="sub">Chat channels</text>
+    <text x="50" y="154" class="body">Group chat, bot commands, mobile handoff</text>
+
+    <g transform="translate(50 178)">
+      <rect class="chip" x="0" y="0" width="58" height="58"/>
+      <circle cx="29" cy="29" r="20" fill="#2AABEE"/>
+      <path d="M18 29 L42 18 L35 42 L29 33 L24 38 L25 31 Z" fill="#ffffff" opacity="0.96"/>
+      <text x="29" y="77" text-anchor="middle" class="small">Telegram</text>
+    </g>
+    <g transform="translate(126 178)">
+      <rect class="chip" x="0" y="0" width="58" height="58"/>
+      <circle cx="24" cy="28" r="15" fill="#22c55e"/>
+      <circle cx="36" cy="34" r="13" fill="#16a34a"/>
+      <circle cx="19" cy="26" r="2.6" fill="#fff"/><circle cx="29" cy="26" r="2.6" fill="#fff"/>
+      <circle cx="32" cy="33" r="2.4" fill="#fff"/><circle cx="40" cy="33" r="2.4" fill="#fff"/>
+      <text x="29" y="77" text-anchor="middle" class="small">Chat</text>
+    </g>
+    <g transform="translate(202 178)">
+      <rect class="chip" x="0" y="0" width="58" height="58"/>
+      <circle cx="29" cy="29" r="20" fill="#5865F2"/>
+      <path d="M18 33 C20 22,38 22,40 33 C35 38,23 38,18 33 Z" fill="#fff"/>
+      <circle cx="25" cy="31" r="2.4" fill="#5865F2"/><circle cx="33" cy="31" r="2.4" fill="#5865F2"/>
+      <text x="29" y="77" text-anchor="middle" class="small">Groups</text>
+    </g>
+    <g transform="translate(278 178)">
+      <rect class="chip" x="0" y="0" width="58" height="58"/>
+      <circle cx="29" cy="29" r="20" fill="#0f172a"/>
+      <path d="M15 29 H43 M29 15 C36 22,36 36,29 43 M29 15 C22 22,22 36,29 43" stroke="#fff" stroke-width="2.3" fill="none"/>
+      <text x="29" y="77" text-anchor="middle" class="small">Web API</text>
+    </g>
+
+    <rect x="28" y="284" width="334" height="164" class="inner"/>
+    <text x="50" y="310" class="sub">StellaCodeX desktop</text>
+    <text x="50" y="332" class="body">One workspace UI, synchronized everywhere</text>
+
+    <g transform="translate(48 358)">
+      <rect class="chip" x="0" y="0" width="86" height="58"/>
+      <circle cx="43" cy="23" r="14" fill="#111827"/>
+      <text x="43" y="29" text-anchor="middle" font-size="17" font-weight="800" fill="#fff">⌘</text>
+      <text x="43" y="50" text-anchor="middle" class="small">macOS</text>
+    </g>
+    <g transform="translate(151 358)">
+      <rect class="chip" x="0" y="0" width="86" height="58"/>
+      <rect x="29" y="11" width="12" height="12" fill="#2563eb"/><rect x="44" y="11" width="12" height="12" fill="#60a5fa"/>
+      <rect x="29" y="26" width="12" height="12" fill="#1d4ed8"/><rect x="44" y="26" width="12" height="12" fill="#3b82f6"/>
+      <text x="43" y="50" text-anchor="middle" class="small">Windows</text>
+    </g>
+    <g transform="translate(254 358)">
+      <rect class="chip" x="0" y="0" width="86" height="58"/>
+      <circle cx="43" cy="20" r="11" fill="#111827"/><ellipse cx="43" cy="34" rx="16" ry="9" fill="#111827"/>
+      <circle cx="39" cy="19" r="1.8" fill="#fff"/><circle cx="47" cy="19" r="1.8" fill="#fff"/>
+      <path d="M38 27 Q43 32 48 27" stroke="#facc15" stroke-width="2" fill="none"/>
+      <text x="43" y="50" text-anchor="middle" class="small">Linux</text>
+    </g>
+
+    <rect x="58" y="464" width="274" height="28" class="pill"/>
+    <text x="195" y="483" text-anchor="middle" class="mono">full-platform conversation sync</text>
+  </g>
+
+  <!-- Stellaclaw server -->
+  <g transform="translate(540 112)">
+    <rect class="panel" width="508" height="540"/>
+    <rect x="30" y="28" width="58" height="58" rx="18" fill="url(#purple)"/>
+    <text x="108" y="50" class="sub">Durable server boundary</text>
+    <text x="108" y="78" class="section">Stellaclaw Server</text>
+
+    <rect x="34" y="112" width="205" height="270" class="inner"/>
+    <rect x="56" y="136" width="42" height="42" rx="14" fill="url(#purple)"/>
+    <text x="114" y="152" class="sub">Host process</text>
+    <text x="114" y="176" class="section">stellaclaw</text>
+    <rect x="56" y="206" width="160" height="34" class="pill"/><text x="136" y="228" text-anchor="middle" class="body">Conversation router</text>
+    <rect x="56" y="250" width="160" height="34" class="pill"/><text x="136" y="272" text-anchor="middle" class="body">Workdir + delivery</text>
+    <rect x="56" y="294" width="160" height="34" class="pill"/><text x="136" y="316" text-anchor="middle" class="body">Cron / skills / memory</text>
+    <rect x="56" y="338" width="160" height="28" class="pill"/><text x="136" y="357" text-anchor="middle" class="mono">durable state</text>
+
+    <rect x="269" y="112" width="205" height="270" class="inner"/>
+    <rect x="291" y="136" width="42" height="42" rx="14" fill="url(#green)"/>
+    <text x="349" y="152" class="sub">Agent runtime</text>
+    <text x="349" y="170" class="section">agent_server</text>
+    <text x="349" y="190" class="section-sm">+ stellaclaw_core</text>
+    <rect x="291" y="206" width="160" height="34" class="pill"/><text x="371" y="228" text-anchor="middle" class="body">SessionActor loop</text>
+    <rect x="291" y="250" width="160" height="34" class="pill"/><text x="371" y="272" text-anchor="middle" class="body">Provider + tools</text>
+    <rect x="291" y="294" width="160" height="34" class="pill"/><text x="371" y="316" text-anchor="middle" class="body">Dynamic ToolCatalog</text>
+    <rect x="291" y="338" width="160" height="28" class="pill"/><text x="371" y="357" text-anchor="middle" class="mono">isolated recovery</text>
+
+    <path d="M239 246 C255 246,253 246,269 246" class="thin"/>
+    <text x="254" y="228" text-anchor="middle" class="small">stdio</text>
+    <text x="254" y="242" text-anchor="middle" class="small">JSON-RPC</text>
+
+    <g transform="translate(88 418)">
+      <rect x="0" y="0" width="332" height="82" rx="18" fill="url(#server)"/>
+      <rect x="24" y="18" width="284" height="16" rx="8" fill="#475569"/>
+      <rect x="24" y="48" width="284" height="16" rx="8" fill="#475569"/>
+      <circle cx="44" cy="26" r="4" fill="#22c55e"/><circle cx="60" cy="26" r="4" fill="#38bdf8"/><circle cx="76" cy="26" r="4" fill="#f59e0b"/>
+      <circle cx="44" cy="56" r="4" fill="#22c55e"/><circle cx="60" cy="56" r="4" fill="#38bdf8"/><circle cx="76" cy="56" r="4" fill="#f59e0b"/>
+      <text x="196" y="32" text-anchor="middle" font-size="12" font-weight="800" fill="#e2e8f0" font-family="ui-sans-serif, system-ui">persistent host service</text>
+      <text x="196" y="62" text-anchor="middle" font-size="10.5" font-weight="700" fill="#cbd5e1" font-family="ui-monospace, SFMono-Regular, Menlo">conversations · sessions · workspace bindings</text>
+    </g>
+  </g>
+
+  <!-- Remote workspace servers -->
+  <g transform="translate(1164 132)">
+    <rect class="panel" width="278" height="500"/>
+    <rect x="28" y="26" width="54" height="54" rx="18" fill="url(#cyan)"/>
+    <text x="100" y="46" class="sub">Workspace targets</text>
+    <text x="100" y="72" class="section">Local / SSH remotes</text>
+
+    <g transform="translate(34 112)">
+      <rect width="210" height="74" rx="18" fill="#f8fafc" stroke="#dbeafe"/>
+      <rect x="18" y="17" width="42" height="40" rx="10" fill="#0f172a"/>
+      <rect x="25" y="24" width="28" height="5" rx="2" fill="#64748b"/><rect x="25" y="34" width="28" height="5" rx="2" fill="#64748b"/>
+      <text x="76" y="30" class="body">Local workspace</text>
+      <text x="76" y="51" class="small">files · tests · artifacts</text>
+    </g>
+    <g transform="translate(34 210)">
+      <rect width="210" height="74" rx="18" fill="#f8fafc" stroke="#dbeafe"/>
+      <rect x="18" y="17" width="42" height="40" rx="10" fill="#1e3a8a"/>
+      <rect x="25" y="24" width="28" height="5" rx="2" fill="#93c5fd"/><rect x="25" y="34" width="28" height="5" rx="2" fill="#93c5fd"/>
+      <text x="76" y="30" class="body">SSH remote A</text>
+      <text x="76" y="51" class="small">project repo / terminal</text>
+    </g>
+    <g transform="translate(34 308)">
+      <rect width="210" height="74" rx="18" fill="#f8fafc" stroke="#dbeafe"/>
+      <rect x="18" y="17" width="42" height="40" rx="10" fill="#14532d"/>
+      <rect x="25" y="24" width="28" height="5" rx="2" fill="#86efac"/><rect x="25" y="34" width="28" height="5" rx="2" fill="#86efac"/>
+      <text x="76" y="30" class="body">GPU / lab server</text>
+      <text x="76" y="51" class="small">data · builds · benchmarks</text>
+    </g>
+    <g transform="translate(34 422)">
+      <rect width="210" height="38" rx="19" fill="#eff6ff" stroke="#bfdbfe"/>
+      <text x="105" y="24" text-anchor="middle" class="mono">per-conversation target</text>
+    </g>
+  </g>
+
+  <!-- Flow arrows -->
+  <path d="M448 382 C492 382,500 382,540 382" class="arrow"/>
+  <text x="494" y="362" text-anchor="middle" class="label">HTTP / WS / Bot</text>
+  <path d="M1048 382 C1094 330,1150 290,1216 282" class="dash"/>
+  <path d="M1048 382 C1100 382,1150 380,1216 380" class="dash"/>
+  <path d="M1048 382 C1094 432,1150 470,1216 478" class="dash"/>
+  <text x="1106" y="356" text-anchor="middle" class="label">Local / SSH</text>
+
+  <g transform="translate(116 672)">
+    <rect width="1268" height="62" rx="24" fill="#0f172a" opacity="0.94"/>
+    <text x="30" y="26" font-family="ui-sans-serif, system-ui" font-size="15" font-weight="800" fill="#ffffff">Advanced path</text>
+    <text x="160" y="26" font-family="ui-sans-serif, system-ui" font-size="13" font-weight="600" fill="#cbd5e1">FileItem attachments → multimodal normalization → provider transport · tool visibility → Prompt Protocol → execution allowlist · recoverable long-running agents</text>
+    <text x="30" y="48" font-family="ui-sans-serif, system-ui" font-size="13" font-weight="600" fill="#cbd5e1">Client state stays portable; server state stays durable; heavy work stays on the selected local or remote machine.</text>
+  </g>
+</svg>

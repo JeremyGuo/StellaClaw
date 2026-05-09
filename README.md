@@ -16,13 +16,13 @@ Durable conversations. Isolated execution. Recoverable agents.
 
 Stellaclaw is the next-generation runtime for ClawParty: a self-hosted agent system that stays online, receives messages from external channels, and drives LLM sessions with durable state, tools, skills, workspaces, and crash recovery.
 
-Stellaclaw is multi-channel by design. Stellacode is the desktop surface; Telegram groups can act as lightweight conversation surfaces; and the Web API can power other clients. They all share the same Stellaclaw backend, durable conversations, session runtime, provider configuration, and workspace model.
+Stellaclaw is multi-channel by design. StellaCodeX is the desktop surface; Telegram groups can act as lightweight conversation surfaces; and the Web API can power other clients. They all share the same Stellaclaw backend, durable conversations, session runtime, provider configuration, and workspace model.
 
-Stellacode lets you open the same agent workspace from any computer: the UI runs locally, but the files, terminal, tool calls, and code changes belong to the Stellaclaw server workspace that the conversation is connected to.
+StellaCodeX lets you open the same agent workspace from any computer: the UI runs locally, but the files, terminal, tool calls, and code changes belong to the Stellaclaw server workspace that the conversation is connected to.
 
-![Stellacode desktop connected to a server workspace](docs/assets/stellacode.png)
+![StellaCodeX desktop connected to a server workspace](docs/assets/stellacode.png)
 
-That makes Stellacode similar in spirit to VS Code Server, but centered on long-running agents instead of manual remote editing. The repository lives where the server can access it; the agent works there; the user can supervise, interrupt, inspect files, open terminals, and take over from anywhere.
+That makes StellaCodeX similar in spirit to VS Code Server, but centered on long-running agents instead of manual remote editing. The repository lives where the server can access it; the agent works there; the user can supervise, interrupt, inspect files, open terminals, and take over from anywhere.
 
 Telegram is a first-class surface too. Creating different Telegram groups gives you quick separate conversations for different tasks or roles, while they still share the same backend service.
 
@@ -30,13 +30,13 @@ Telegram is a first-class surface too. Creating different Telegram groups gives 
 
 Each conversation can independently choose its model, sandbox policy, and remote execution binding. Remote mode can make a conversation behave as if it is running directly on another server that Stellaclaw can access over SSH, which is how Stellaclaw supports SSH Remote workflows without making the client own remote execution.
 
-One of its product advantages is the three-hop work path enabled by Stellacode and Remote mode:
+One of its product advantages is the three-hop work path enabled by StellaCodeX and Remote mode:
 
 ```text
-Stellacode / Channel Host -> Stellaclaw Server -> Remote Workspace Server
+StellaCodeX / Channel Host -> Stellaclaw Server -> Remote Workspace Server
 ```
 
-Stellacode, Telegram groups, and Web clients provide the user-facing host surface. Stellaclaw runs as the durable agent server that owns conversations, routing, sessions, delivery, and recovery. Remote mode can then bind a conversation to another server's workspace, terminal, and filesystem through SSH/sshfs, so the agent can work where the project actually lives.
+StellaCodeX, Telegram groups, and Web clients provide the user-facing host surface. Stellaclaw runs as the durable agent server that owns conversations, routing, sessions, delivery, and recovery. Remote mode can then bind a conversation to another server's workspace, terminal, and filesystem through SSH/sshfs, so the agent can work where the project actually lives.
 
 That gives Stellaclaw a practical deployment advantage: users get a local desktop or channel experience, the central agent service stays durable, and heavy project work can happen on a separate remote machine without moving the conversation state out of the host.
 
@@ -62,39 +62,62 @@ This keeps platform concerns out of the model loop, keeps remote workspace conce
 
 ## Highlights
 
-- **Host -> server -> server workflow**: Stellacode, Telegram, or another channel talks to the Stellaclaw server, while Remote mode lets that conversation operate on a second server's workspace.
-- **Multiple surfaces, one backend**: desktop, Telegram groups, and Web API clients share the same durable Stellaclaw backend and conversation runtime.
-- **Per-conversation control**: each conversation can independently choose model, sandbox policy, and remote execution binding.
-- **Durable conversations**: conversation state, session state, runtime skills, workspaces, and migration markers live in the workdir instead of in memory-only chat loops.
-- **Multi-channel by design**: Telegram is production-usable today, including group-based conversations for separate tasks; the Web channel and REST-style APIs provide the desktop and integration surface.
-- **Recoverable execution**: unfinished turns, crashed runtimes, provider failures, and long tool batches are handled as session lifecycle events instead of silent state loss.
-- **Server-backed Stellacode workspace**: every laptop sees the same conversation UI, while files, terminals, tools, and agent edits operate in the workspace available to the Stellaclaw server.
-- **Remote-aware Stellacode**: workspace browsing, file upload/download, terminal sessions, and agent tools can follow the conversation's local or remote execution mode.
-- **Runtime skills**: `SKILL.md` directories can be loaded, created, updated, deleted, persisted, and synced from the running host.
+- **Three-hop work path**: StellaCodeX / Telegram / Web clients talk to the Stellaclaw host, while Remote mode can bind the same conversation to a second SSH workspace server.
+- **Multiple surfaces, one backend**: desktop, Telegram groups, and Web API clients share the same durable conversation runtime, model config, skill store, memory store, and workspace model.
+- **Per-conversation control**: each conversation carries its own model snapshot, sandbox override, reasoning effort, remote binding, and foreground/background/subagent session bindings.
+- **Recoverable execution**: unfinished turns, cooperative interrupts, crashed runtimes, provider failures, compaction, and long tool batches are handled as lifecycle events instead of silent state loss.
+- **Server-backed desktop workspace**: StellaCodeX can browse, preview, upload/download, open terminals, inspect tool details, and render message attachments against the server-side workspace.
+- **Remote-aware tools**: file, shell, download, patch, and visibility tools are schema-aware; fixed SSH Remote mode hides the `remote` choice and treats the bound remote cwd as implicit.
+- **Runtime skills and memory**: `SKILL.md` directories can be loaded or persisted at runtime, while Memory v1 keeps durable user, conversation, and public facts separate from transient chat history.
+
+## Advanced Capabilities
+
+These are the higher-level features to call out when describing Stellaclaw:
+
+| Capability | What it means in the current code |
+|---|---|
+| Durable host / isolated execution split | `Conversation` owns routing, workspace materialization, attachments, state, and delivery; `SessionActor` owns the provider/tool loop inside `agent_server`. |
+| Dynamic ToolCatalog | Tool schemas are rebuilt from runtime state, model capabilities, remote mode, session kind, host tool scope, and provider visibility. The filtered catalog is also the local execution allowlist. |
+| Prompt Protocol | Tool-use instructions live beside tool definitions and are injected only when their required tools are visible to the selected provider. |
+| Memory v1 | Host-side memory has `user`, `conversation`, and `public` scopes. User memory becomes a system prompt snapshot; conversation/public memory enters context by explicit search or compression recall. |
+| FileItem / attachment pipeline | User uploads, tool products, and assistant attachment tags resolve to structured files, stable workspace paths, previews, downloads, and provider-time multimodal normalization. |
+| Codex subscription support | The Codex websocket provider keeps auth state, supports priority service tier, preserves encrypted reasoning continuation, and stores streamed reasoning summaries. |
+| Rich StellaCodeX UI | Electron supports conversation lists, WebSocket foreground updates, workspace tree, file/message attachment preview, sandboxed HTML preview, split Git diff tool details, xterm terminals, plan panel, usage panel, and theme colors. |
+
+## Typical Workloads
+
+Stellaclaw is built for long-running research and engineering workflows where the user, agent, files, terminals, and remote machines need to stay in the same recoverable context:
+
+- **Paper wiki and research knowledge bases**: summarize large paper collections, compare venues or years, extract trends, and keep generated reports attached to the conversation workspace.
+- **Remote server experiments**: bind one conversation to each project or machine, let the agent run builds, tests, traces, and scripts where the data and GPUs actually live, and inspect results from StellaCodeX or Telegram.
+- **Benchmark-driven code optimization**: let the agent iterate on low-level code, run benchmarks, inspect diffs and artifacts, and keep the full optimization trail in one conversation.
+- **Long background jobs**: start an agent task from desktop, close the client, and later check progress or continue from another device/channel because the runtime lives on the backend.
+- **Paper and artifact development**: keep manuscript edits, experiment scripts, figures, generated files, and remote terminals connected to the same project conversation.
 
 ---
 
 ## Current Status
 
-Stellaclaw is already usable as a Telegram-backed agent host and includes a growing Web channel for desktop and external integrations.
+Stellaclaw is already usable as a Telegram-backed and StellaCodeX/Web-backed agent host. The implementation is Rust-first and keeps the host/runtime boundary explicit.
 
 Implemented today:
 
-- Telegram channel with inbound messages, group-based conversations, attachments, typing indicator, progress panel, and final success/failure delivery.
-- Web channel APIs for conversations, messages, status, workspace browsing, uploads/downloads, terminals, and foreground WebSocket updates.
-- Per-conversation model switching, sandbox switching, remote workspace switching, status query, cancel, and continue.
+- Telegram channel with inbound messages, group-based conversations, attachments, typing indicator, editable progress panel, final success/failure delivery, and `/model` / `/remote` / `/sandbox` / `/status` / `/continue` / `/cancel` controls.
+- Web channel APIs for models, conversations, messages, status, workspace list/read/upload/download/move/delete, terminals, foreground WebSocket updates, conversation streams, and seen-state tracking.
+- StellaCodeX Electron desktop client with server profiles, conversation list, chat, paste/drop attachments, workspace browser, previews, HTML sandbox rendering, terminal dock, plan/overview panels, usage breakdown, configurable themes, and Git diff tool detail rendering.
+- Per-conversation model switching, sandbox switching, reasoning effort, remote workspace switching, status query, cancel, continue, foreground/background/subagent bindings, and managed-agent status.
 - `agent_server` subprocess boundary using stdin/stdout line-delimited JSON-RPC.
-- SessionActor control/data mailboxes, turn loop, tool batch executor, idle compaction, crash recovery, and unfinished-turn continuation.
-- Codex subscription provider using the official websocket shape, including access token refresh and priority service tier support.
-- OpenRouter chat-completions / responses providers, Claude provider, Brave Search provider, and provider-backed media helpers.
-- Model-aware multimodal input normalization with graceful downgrade to text context when a model cannot accept a file modality.
-- Built-in tools for files, search, patching, shell, downloads, web fetch/search, media, cron, subagents, and host coordination.
-- Runtime `SKILL.md` system with `skill_load`, `skill_create`, `skill_update`, and `skill_delete`.
+- `SessionActor` control/data mailboxes, turn loop, tool batch executor, provider worker isolation, idle compaction, crash recovery, unfinished-turn continuation, and closed tool-call history repair.
+- Codex subscription provider using the official websocket shape, including access token refresh, priority service tier, encrypted reasoning continuation, and streamed reasoning summary persistence.
+- OpenRouter chat-completions / responses providers, Claude provider, Brave Search provider, OpenAI-compatible image generation/editing, and provider-backed media helpers.
+- Model-aware multimodal input normalization with graceful downgrade to text/file context when a model cannot accept a file modality.
+- Built-in tools for files, search, patching, fresh-process shell, downloads, web fetch/search, media, cron, subagents, background agents, memory, and host coordination.
+- Runtime `SKILL.md` system with `skill_load`, `skill_create`, `skill_update`, and `skill_delete`, persisted through `.stellaclaw/skill/`.
 - Workdir migration from legacy PartyClaw layouts into the current Stellaclaw layout.
 
 Planned next surfaces:
 
-- RESTful API for external systems and admin UI.
+- Stabilized REST/admin API shape for external systems.
 - Richer host management and observability.
 
 See [ROAD_MAP.md](ROAD_MAP.md) for the full architecture direction.
@@ -103,67 +126,23 @@ See [ROAD_MAP.md](ROAD_MAP.md) for the full architecture direction.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    User[User]
+![Stellaclaw architecture](docs/assets/stellaclaw-architecture.svg)
 
-    subgraph Surface[Client and channel surface]
-        Stellacode[Stellacode desktop]
-        Channel[Telegram or Web API]
-    end
+The important runtime boundary is still:
 
-    subgraph Host[Host process: stellaclaw]
-        Ingress[Channel ingress]
-        Conv[Conversation thread]
-        Delivery[Outgoing delivery]
-        CStore[(Conversation state)]
-        WStore[(Workspace and runtime bindings)]
-    end
-
-    IPC{stdio JSON-RPC}
-
-    subgraph Runtime[Agent server process: agent_server]
-        Rpc[Session RPC thread]
-        Actor[SessionActor]
-        Tools[ToolBatchExecutor]
-        SStore[(Session state)]
-    end
-
-    subgraph Remote[Optional remote workspace server]
-        RemoteFs[Project filesystem]
-        RemoteShell[Remote shell]
-        RemoteRoot[Execution root]
-    end
-
-    User --> Stellacode
-    User --> Channel
-    Stellacode --> Ingress
-    Channel --> Ingress
-    Ingress --> Conv
-    Conv --> CStore
-    Conv --> WStore
-    Conv --> IPC
-    IPC --> Rpc
-    Rpc --> Actor
-    Actor --> Tools
-    Tools --> Actor
-    Tools -. Remote mode .-> RemoteFs
-    Tools -. Remote mode .-> RemoteShell
-    Conv -. Remote binding .-> RemoteRoot
-    Actor --> SStore
-    Actor --> Rpc
-    Rpc --> IPC
-    IPC --> Conv
-    Conv --> Delivery
-    Delivery --> User
+```text
+Conversation = durable boundary + router
+SessionActor = execution boundary + state machine
 ```
+
+Stellaclaw intentionally keeps the local client/channel surface, durable host server, isolated agent runtime, and optional remote workspace as separate layers. The UI can restart, the agent runtime can crash and recover, and the project repository can stay on a different SSH server without moving conversation history out of the host workdir.
 
 ### Why This Split?
 
 - Channel code stays platform-specific and user-facing.
 - Conversation code owns durable routing decisions and workspace materialization.
 - SessionActor owns the model/tool loop and session history.
-- Remote workspace behavior can evolve without turning Stellacode, Telegram, or Web code into session internals.
+- Remote workspace behavior can evolve without turning StellaCodeX, Telegram, or Web code into session internals.
 - A crashed or restarted service can resume from persisted conversation/session state.
 - The client/channel surface, durable host server, internal agent server, and optional remote workspace server each stay at clear boundaries.
 
@@ -177,9 +156,9 @@ In fixed Remote mode, file tools operate on the sshfs-mounted workspace path, so
 
 That is the illusion: the agent receives a normal workspace path, but the bytes and shell are backed by a remote server.
 
-![Two-hop remote access through Stellacode and Web Channel](docs/assets/remote-web-two-hop.svg)
+![Two-hop remote access through StellaCodeX and Web Channel](docs/assets/remote-web-two-hop.svg)
 
-With the Web Channel, Stellacode can connect to a Stellaclaw server that is itself remote from the user's laptop. Remote mode can then jump again from that Stellaclaw server into another remote project server. The active work is resumable because the conversation and session state are persisted by Stellaclaw, while the actual repository remains on the remote machine where builds, tests, terminals, and file edits should happen.
+With the Web Channel, StellaCodeX can connect to a Stellaclaw server that is itself remote from the user's laptop. Remote mode can then jump again from that Stellaclaw server into another remote project server. The active work is resumable because the conversation and session state are persisted by Stellaclaw, while the actual repository remains on the remote machine where builds, tests, terminals, and file edits should happen.
 
 ---
 
@@ -211,33 +190,34 @@ Each conversation has its own workspace, model snapshot, sandbox override, remot
 
 ## Tooling
 
-Stellaclaw exposes tools through a dynamic catalog that is rebuilt from runtime state, model capabilities, session type, and remote mode.
+Stellaclaw exposes tools through a dynamic catalog rebuilt from runtime state, model capabilities, session type, host tool scope, provider visibility, and remote mode. The same filtered catalog drives provider request schemas, Prompt Protocol injection, and local execution allowlisting.
 
 | Family | Examples |
 |---|---|
-| Files and search | `file_read`, `file_write`, `apply_patch`, `grep` |
-| Shell | `shell_exec`, `shell_write_stdin`, `shell_stop` |
-| Web | `web_fetch`, `web_search` |
-| Downloads | `file_download_start`, `file_download_progress`, `file_download_wait`, `file_download_cancel` |
+| Files, search, visibility | `file_read`, `file_write`, `grep`, `apply_patch`, `shell_make_visible`, `attachment_make_visible` |
+| Fresh-process shell | `shell_exec`, `shell_write_stdin`, `shell_stop` |
+| Web and downloads | `web_fetch`, `web_search`, `file_download_start`, `file_download_progress`, `file_download_wait`, `file_download_cancel` |
 | Media | `image_load`, `pdf_load`, `audio_load`, provider-backed analysis/generation tools |
-| Host coordination | subagents, background sessions, cron, status and conversation bridge tools |
+| Host coordination | `user_tell`, `update_plan`, subagents, background agents, cron, managed-agent status |
+| Memory | `memory_search`, `memory_write`, `memory_update`, `memory_delete` |
 | Skills | `skill_load`, `skill_create`, `skill_update`, `skill_delete` |
 
 Remote mode is schema-aware:
 
 - selectable mode exposes a `remote` field where tools can choose a local or SSH target;
-- fixed remote mode hides `remote` entirely and treats the bound execution root as implicit.
+- fixed remote mode hides `remote` entirely and treats the bound execution root as implicit;
+- `apply_patch` normalizes absolute paths under the active workspace/remote cwd to relative paths, and rejects paths outside the execution root.
 
-The shell tool intentionally uses `command` for new commands. It does not accept a `cmd` alias.
+The shell surface is deliberately process-based. New work starts with `shell_exec.command`; long-running commands return a `process_id`; later calls observe/interact with `shell_write_stdin` or stop with `shell_stop`. There is no hidden reusable shell session and no `cmd` alias.
 
 ---
 
 ## Skills
 
-Skills are `SKILL.md` directories synced into each workspace:
+Skills are `SKILL.md` directories synced into each conversation workspace under `.stellaclaw/skill/`:
 
 ```text
-.skill/
+.stellaclaw/skill/
   web-report-deploy/
     SKILL.md
     references/
@@ -249,7 +229,7 @@ The runtime tracks skill metadata and loaded skill content. When a skill changes
 
 Persistent skill operations are host bridge tools:
 
-- `skill_create` persists a staged workspace skill into `rundir/.skill/<name>`.
+- `skill_create` persists a staged workspace skill into the runtime skill store at `.stellaclaw/skill/<name>`.
 - `skill_update` validates and updates an existing runtime skill. If root config `skill_sync` includes the skill, Stellaclaw commits the runtime skill and pushes it to each configured upstream. Each push has a short timeout; failures are reported as warnings and do not fail the skill update.
 - `skill_delete` removes it from the runtime store and existing conversation workspaces.
 
@@ -261,6 +241,8 @@ name: web-report-deploy
 description: Generate and deploy static web reports.
 ---
 ```
+
+Skills capture reusable workflows; durable project/user facts should go through Memory v1 or normal repository documentation instead of being inflated into every system prompt.
 
 ---
 
@@ -280,14 +262,16 @@ Each local conversation workspace has a `shared/` directory linked to `rundir/sh
 
 Current provider support includes:
 
-- Codex subscription websocket with automatic access token refresh.
-- OpenRouter chat completions.
-- OpenRouter responses.
+- Codex subscription websocket with automatic access token refresh, priority service tier mapping, encrypted reasoning continuation, and streamed reasoning summary persistence.
+- OpenRouter chat completions and OpenRouter responses.
 - OpenAI-compatible image generation and edits.
 - Claude messages.
 - Brave Search, including image, video, and news verticals.
+- Provider-backed media helpers.
 
-Model behavior is configured with `ModelConfig`, including capabilities, multimodal input transport, context window, output token cap, timeout, retry mode, token estimation, cache TTL, and optional fast/priority service tier.
+Model behavior is configured with `ModelConfig`, including capabilities, multimodal input transport, context window, output token cap, timeout, retry mode, token estimation, cache TTL, and optional fast/priority service tier. Provider-specific request shaping happens after provider-neutral `ChatMessage` and `FileItem` history has been normalized.
+
+Provider pricing configuration lives under `pricing/` and is split by provider type. Missing model prices mean Stellaclaw reports token usage without computing dollar cost.
 
 For `openai_image`, configure `url` as the API base such as `https://host/v1`; Stellaclaw routes generation requests to `/images/generations` and image edit requests to `/images/edits`.
 
@@ -314,7 +298,7 @@ Start from [example_config.json](example_config.json).
 
 Important fields:
 
-- `version`: current config schema version, currently `0.11`.
+- `version`: current config schema version, currently `0.12`.
 - `agent_server.path`: path to the `agent_server` binary.
 - `models`: named model configs.
 - `skill_sync`: optional runtime skill git sync targets.
@@ -335,16 +319,24 @@ Optional Web channel config:
 The Web channel exposes JSON APIs under `/api/` and accepts
 `Authorization: Bearer <token>`.
 
-Current Web channel endpoints:
+Current Web channel endpoints include:
 
 - `GET /api/models`
 - `GET /api/conversations?offset=0&limit=50`
 - `POST /api/conversations`
+- `PATCH /api/conversations/{conversation_id}`
 - `DELETE /api/conversations/{conversation_id}`
+- `POST /api/conversations/{conversation_id}/seen`
 - `GET /api/conversations/{conversation_id}/messages?offset=0&limit=50`
 - `GET /api/conversations/{conversation_id}/messages/{message_id}`
 - `POST /api/conversations/{conversation_id}/messages`
 - `GET /api/conversations/{conversation_id}/status`
+- `GET /api/conversations/{conversation_id}/workspace`
+- `GET /api/conversations/{conversation_id}/workspace/file`
+- `POST /api/conversations/{conversation_id}/workspace/upload`
+- `GET /api/conversations/{conversation_id}/workspace/download`
+- `PATCH /api/conversations/{conversation_id}/workspace`
+- `DELETE /api/conversations/{conversation_id}/workspace`
 - `GET /api/conversations/{conversation_id}/terminals`
 - `POST /api/conversations/{conversation_id}/terminals`
 - `GET /api/conversations/{conversation_id}/terminals/{terminal_id}`
@@ -405,8 +397,8 @@ Stellaclaw deliberately has separate version tracks:
 | File / Field | Meaning |
 |---|---|
 | Root `VERSION` | Project release version and changelog. Starts at `1.0.0`. |
-| Config JSON `version` | Config schema version. Currently `0.11`. |
-| Workdir `STELLA_VERSION` | Workdir schema version. Currently `0.10`. |
+| Config JSON `version` | Config schema version. Currently `0.12`. |
+| Workdir `STELLA_VERSION` | Workdir schema version. Currently `0.17`. |
 | Legacy workdir `VERSION` | PartyClaw compatibility input, not the project release version. |
 
 Before bumping the root `VERSION`, check whether the previous GitHub Release exists. If it does not, merge the unpublished changelog into the next release notes so release history does not skip user-visible changes.

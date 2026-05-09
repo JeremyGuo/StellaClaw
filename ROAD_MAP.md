@@ -29,11 +29,11 @@
 
 - Host 侧的 `Channel` 应该是统一抽象，允许同时存在多个 channel 实例，各自维护自己的平台安全策略和管理员逻辑。
 - 当前 `Telegram` 已经是主要可用 channel：支持入站消息/附件、模型切换、remote workspace 切换、conversation 级 sandbox 切换、状态查询、typing indicator 和进度面板。
-- 后续会增加 `Web` 作为新的 channel 类型。
-- 在 channel 抽象之上，后续会补一层统一的 `RESTful API`，作为外部系统接入和管理面的稳定边界。
-- 更后续阶段，前端界面应优先基于这层 `RESTful API` 构建，而不是直接耦合内部运行时。
+- `Web` channel 已经落地为 StellaCodeX Electron、外部 API 和 foreground WebSocket 的主要服务入口，覆盖 conversation、message、workspace、terminal、status、attachment 和 seen-state 等能力。
+- 在 channel 抽象之上，仍需要继续稳定 REST/admin API 形态，作为外部系统接入和管理面的长期边界。
+- 前端界面应继续基于 Web/API 协议演进，而不是直接耦合内部运行时。
 
-### 1.1.0 StellacodeX 原生客户端边界
+### 1.1.0 StellaCodeX 原生客户端边界
 
 - `apps/stellacodeX/*` 是 Stellaclaw Web channel 的原生客户端轨道；客户端只连接现有 Host Web Service，不在本地运行 `stellaclaw`、`agent_server` 或工具执行 runtime。
 - 原生客户端按平台拥有自己的 UI、OS 集成和发布流水线；`apps/stellacodeX/shared/` 只放协议契约、生成 schema、共享资产和 fixture，不放跨平台 UI 层。
@@ -101,6 +101,20 @@ ChannelEvent::Error {
 - Memory v1 已经落地：Host 侧 `MemoryService` 按 `user` / `public` / `conversation` 三个 scope 保存 entries，暴露 `memory_search` / `memory_write` / `memory_update` / `memory_delete` bridge tools；`user` memory 渲染为 system prompt 的 `User Memory Snapshot`，`conversation` / `public` memory 只在模型显式搜索或压缩背景 recall 时进入上下文。
 - MemoryService 会记录独立 token usage；Conversation status、Web status 和 Telegram `/status` 能看到 memory / user memory compaction 用量。
 - skill 工具当前包括 `skill_load`、`skill_create`、`skill_update`、`skill_delete`；持久化类工具走 ConversationBridge，由 Host/Conversation 写回 `.stellaclaw/skill/` runtime skill store 并同步已有 conversation workspace。
+
+
+### 1.2.1 对外描述时需要强调的高级能力
+
+README / README_zh 面向用户介绍时应优先强调这些已经落地的能力，而不是只描述内部模块名：
+
+- 三跳工作路径：`StellaCodeX / Telegram / Web client -> Stellaclaw Host -> optional SSH Remote Workspace`。
+- 持久 Host 与隔离执行拆分：`Conversation` 保存 durable routing / workspace / attachment / delivery 状态，`SessionActor` 在 `agent_server` 内执行 provider/tool loop。
+- 动态 `ToolCatalog`、provider visibility、Prompt Protocol 和本地执行白名单来自同一份过滤后的工具集合。
+- Memory v1 把 user、conversation、public 长期事实和普通 chat history 分开；user memory 是 system prompt snapshot，conversation/public memory 通过 search 或 compression recall 进入上下文。
+- `ChatMessageItem::File` / `FileItem` 是附件和多模态的持久中立形态；provider 需要的 base64、URL、file id 或 multipart 只在发送请求前派生。
+- StellaCodeX Electron 不只是聊天壳，而是 server-backed workspace UI：workspace tree、message/workspace attachment preview、HTML sandbox preview、xterm terminal、计划面板、usage 面板和 Git diff tool detail 都应被作为产品能力描述。
+- 典型场景可以明确写进 README：paper wiki / 大规模论文库整理、远程服务器实验、benchmark 驱动代码优化、长时间后台任务、论文和 artifact 开发。
+- Memory 相关对外描述先限于已落地的 Memory v1 能力；memory 存储结构、检索时机、写入时机等更偏科研的问题，暂不作为产品 roadmap 展开。
 
 ## 1.3 当前核心组件内部构筑
 
