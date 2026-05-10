@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -27,6 +29,8 @@ pub struct ToolBinaryEnsureResponse {
     pub path_dir: Option<String>,
 }
 
+static TOOL_BINARY_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 pub(super) fn ensure_tool_binary(
     context: &ToolExecutionContext<'_>,
     tool: &str,
@@ -41,10 +45,14 @@ pub(super) fn ensure_tool_binary(
         tool: tool.to_string(),
         host: host.map(str::to_string),
     };
+    let request_id = format!(
+        "tool_binary_ensure_{tool}_{}",
+        TOOL_BINARY_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
     let response = bridge
         .call(ConversationBridgeRequest {
-            request_id: format!("tool_binary_ensure_{tool}"),
-            tool_call_id: "tool_binary_ensure".to_string(),
+            request_id: request_id.clone(),
+            tool_call_id: request_id,
             tool_name: "tool_binary_ensure".to_string(),
             action: "tool_binary_ensure".to_string(),
             payload: serde_json::to_value(request).map_err(|error| {
