@@ -69,7 +69,9 @@ fn common_prompt() -> &'static str {
      contain .stellaclaw/shared/; that directory is shared across conversations in this \
      Stellaclaw workdir and is appropriate for reusable artifacts. If STELLACLAW_SOFTWARE_DIR is \
      set in the tool environment, that path is the configured shared software directory for \
-     reusable binaries, checkouts, caches, or other tool installations."
+     reusable binaries, checkouts, caches, or other tool installations. Use documented \
+     .stellaclaw/ paths only through their intended tool workflows. Do not create files or \
+     directories under .stellaclaw/ outside documented tool workflows."
 }
 
 fn render_prompt_protocols(enabled_tools: &BTreeSet<String>) -> Option<String> {
@@ -227,7 +229,6 @@ mod tests {
         enabled_tools(&[
             "file_read",
             "file_write",
-            "grep",
             "apply_patch",
             "shell_exec",
             "shell_write_stdin",
@@ -320,7 +321,7 @@ mod tests {
     #[test]
     fn system_prompt_omits_protocols_for_disabled_tools() {
         let state = RuntimeMetadataState::default();
-        let enabled_tools = enabled_tools(&["file_read", "file_write", "grep"]);
+        let enabled_tools = enabled_tools(&["file_read", "file_write"]);
         let prompt = system_prompt_for_initial(
             &SessionInitial::new("s1", SessionType::Foreground),
             &state,
@@ -333,6 +334,10 @@ mod tests {
         assert!(prompt.contains(".stellaclaw/shared/"));
         assert!(prompt.contains("STELLACLAW_SOFTWARE_DIR"));
         assert!(prompt.contains("Broad directory listings hide .stellaclaw/"));
+        assert!(prompt.contains(
+            "Do not create files or directories under .stellaclaw/ outside documented tool workflows"
+        ));
+        assert!(!prompt.contains("only after shell_make_visible"));
         assert!(!prompt.contains("use apply_patch for targeted edits"));
         assert!(!prompt.contains("Before referencing a file with <attachment>"));
         assert!(!prompt.contains("When using shell for commands"));
@@ -340,6 +345,22 @@ mod tests {
         assert!(!prompt.contains("Use user_tell only"));
         assert!(!prompt.contains("Use update_plan"));
         assert!(!prompt.contains("prefer subagent_start"));
+    }
+
+    #[test]
+    fn system_prompt_includes_shell_visibility_protocol_when_enabled() {
+        let state = RuntimeMetadataState::default();
+        let enabled_tools = enabled_tools(&["file_read", "shell_exec", "shell_make_visible"]);
+        let prompt = system_prompt_for_initial(
+            &SessionInitial::new("s1", SessionType::Foreground),
+            &state,
+            &enabled_tools,
+        );
+
+        assert!(
+            prompt.contains("shell_exec can read .stellaclaw/... only after shell_make_visible")
+        );
+        assert!(prompt.contains("treat those copied .stellaclaw files as read-only from shell"));
     }
 
     #[test]

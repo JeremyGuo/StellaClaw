@@ -7,12 +7,13 @@ use std::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use stellaclaw_core::{
+    huggingface::HuggingFaceFileResolver,
     model_config::ModelConfig,
     providers::{init_global_provider_fork_server, ForkServerProvider},
     session_actor::{
         ConversationTransport, LocalToolBatchExecutor, SessionActor, SessionActorEventSink,
         SessionActorInbox, SessionActorStep, SessionErrorDetail, SessionEvent, SessionInitial,
-        SessionRequest, SessionRpcThread, ToolCatalog,
+        SessionRequest, SessionRpcThread, TokenEstimator, ToolCatalog,
     },
 };
 
@@ -136,11 +137,14 @@ fn initialize(params: Value, output: Arc<JsonRpcOutput>) -> Result<AgentRuntime,
     let rpc_thread = SessionRpcThread::spawn(Arc::new(sender.clone()), event_sink.clone());
     let bridge = rpc_thread.conversation_bridge();
     let actor_bridge = bridge.clone();
-    let tool_executor = Arc::new(
-        LocalToolBatchExecutor::new(workspace_root)
-            .with_remote_mode(params.initial.tool_remote_mode.clone())
-            .with_conversation_bridge(Arc::new(bridge)),
-    );
+    let token_estimator = build_tool_token_estimator(&params.model_config);
+    let mut local_tool_executor = LocalToolBatchExecutor::new(workspace_root)
+        .with_remote_mode(params.initial.tool_remote_mode.clone())
+        .with_conversation_bridge(Arc::new(bridge));
+    if let Some(token_estimator) = token_estimator {
+        local_tool_executor = local_tool_executor.with_token_estimator(Arc::new(token_estimator));
+    }
+    let tool_executor = Arc::new(local_tool_executor);
     let provider: Arc<dyn stellaclaw_core::providers::Provider + Send + Sync> = Arc::new(
         ForkServerProvider::global(params.model_config.clone())
             .map_err(|error| error.to_string())?,
@@ -171,6 +175,11 @@ fn initialize(params: Value, output: Arc<JsonRpcOutput>) -> Result<AgentRuntime,
         actor_handle: Some(actor_handle),
         stop_tx,
     })
+}
+
+fn build_tool_token_estimator(model_config: &ModelConfig) -> Option<TokenEstimator> {
+    let resolver = HuggingFaceFileResolver::new().ok()?;
+    TokenEstimator::from_model_config(model_config, &resolver).ok()
 }
 
 fn run_actor_loop(

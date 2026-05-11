@@ -26,10 +26,13 @@ use crate::session_actor::tool_runtime::{
 
 const SHELL_EXEC_DEFAULT_YIELD_MS: usize = 10_000;
 const SHELL_WRITE_DEFAULT_YIELD_MS: usize = 250;
+const SHELL_WRITE_EMPTY_MIN_YIELD_MS: usize = 5_000;
 const SHELL_MIN_YIELD_MS: usize = 250;
 const SHELL_MAX_YIELD_MS: usize = 30_000;
-const SHELL_DEFAULT_OUTPUT_CHARS: usize = 20_000;
 const SHELL_MAX_OUTPUT_CHARS: usize = 200_000;
+const SHELL_DEFAULT_OUTPUT_TOKENS: usize = 10_000;
+const SHELL_MAX_OUTPUT_TOKENS: usize = 50_000;
+const SHELL_TOKEN_TO_CHAR_SAFETY_RATIO: usize = 8;
 const SHELL_BUFFER_MAX_BYTES: usize = 1024 * 1024;
 const SHELL_STDIN_QUEUE_SLOTS: usize = 128;
 const SHELL_DEFAULT_COLS: u16 = 100;
@@ -50,6 +53,7 @@ enum ShellBinding {
 
 struct ShellSession {
     process_id: String,
+    command: String,
     binding: ShellBinding,
     shell: String,
     cwd: String,
@@ -60,6 +64,8 @@ struct ShellSession {
     writer: Option<SyncSender<Vec<u8>>>,
     stopper: ProcessStopper,
     output: Mutex<HeadTailBuffer>,
+    stdout: Mutex<HeadTailBuffer>,
+    stderr: Mutex<HeadTailBuffer>,
     terminal: Mutex<TerminalEmulator>,
     status: Mutex<ShellStatus>,
 }
@@ -73,8 +79,57 @@ enum ProcessStopper {
 struct ShellStatus {
     running: bool,
     exit_code: Option<i32>,
+    timed_out: bool,
     created_ms: u128,
     updated_ms: u128,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ShellOutputStream {
+    Pty,
+    Stdout,
+    Stderr,
+}
+
+#[derive(Default)]
+struct ShellOutputDrain {
+    aggregate: Vec<u8>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+struct ShellOutputLimit {
+    max_tokens: usize,
+}
+
+struct TruncatedShellText {
+    text: String,
+    truncated: bool,
+    original_chars: usize,
+    original_tokens: Option<u64>,
+}
+
+struct ShellResultFormat<'a> {
+    operation: &'a str,
+    session: &'a ShellSession,
+    running: bool,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    duration_ms: u128,
+    max_output_tokens: usize,
+    total_output_lines: usize,
+    output: TruncatedShellText,
+    stdout: TruncatedShellText,
+    stderr: TruncatedShellText,
+    snapshot: Option<Value>,
+}
+
+impl ShellOutputDrain {
+    fn extend(&mut self, other: ShellOutputDrain) {
+        self.aggregate.extend_from_slice(&other.aggregate);
+        self.stdout.extend_from_slice(&other.stdout);
+        self.stderr.extend_from_slice(&other.stderr);
+    }
 }
 
 struct TerminalRender {
@@ -222,15 +277,15 @@ pub fn process_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinit
         ),
         (
             "yield_time_ms",
-            json!({"type": "integer", "minimum": 250, "maximum": 30000}),
+            json!({"type": "integer", "minimum": 250, "maximum": 30000, "description": "How long to wait for output before yielding. Defaults to 10000."}),
         ),
         (
             "timeout_ms",
             json!({"type": "integer", "minimum": 0, "maximum": 86400000}),
         ),
         (
-            "max_output_chars",
-            json!({"type": "integer", "minimum": 0, "maximum": 200000}),
+            "max_output_tokens",
+            json!({"type": "integer", "minimum": 0, "maximum": 50000, "description": "Model-visible output token budget. Defaults to 10000."}),
         ),
     ]);
     add_remote_property(&mut exec_properties, remote_mode);
@@ -240,11 +295,11 @@ pub fn process_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinit
         ("chars", json!({"type": "string"})),
         (
             "yield_time_ms",
-            json!({"type": "integer", "minimum": 250, "maximum": 30000}),
+            json!({"type": "integer", "minimum": 250, "maximum": 30000, "description": "How long to wait for output before yielding. Defaults to 250 for non-empty input; empty poll waits at least 5000."}),
         ),
         (
-            "max_output_chars",
-            json!({"type": "integer", "minimum": 0, "maximum": 200000}),
+            "max_output_tokens",
+            json!({"type": "integer", "minimum": 0, "maximum": 50000, "description": "Model-visible output token budget. Defaults to 10000."}),
         ),
     ]);
 
@@ -259,7 +314,7 @@ pub fn process_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinit
     vec![
         ToolDefinition::new(
             "shell_exec",
-            "Execute a command as a fresh process. By default tty=false, stdin is closed, and no hidden shell is reused. If the process is still running after yield_time_ms, the result includes process_id for later shell_write_stdin polling or shell_stop. Set tty=true only for interactive terminal sessions.",
+            "Execute a command as a fresh process. By default tty=false, stdin is closed, stdout/stderr are captured separately, no hidden shell is reused, and yield_time_ms defaults to 10000. If still running after yield_time_ms, the result includes process_id for shell_write_stdin polling or shell_stop. max_output_tokens controls model-visible output truncation; set tty=true only for interactive terminal sessions.",
             object_schema(exec_properties.clone(), &["command"]),
             ToolExecutionMode::Interruptible,
             ToolBackend::Local,
@@ -267,7 +322,7 @@ pub fn process_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinit
         .with_concurrency(ToolConcurrency::Serial),
         ToolDefinition::new(
             "shell_write_stdin",
-            "Write chars to an existing tty=true process, or pass empty chars to observe recent output from any running process. Non-empty chars against tty=false returns stdin_closed.",
+            "Write chars to an existing tty=true process, or pass empty chars to observe recent output from any running process. Empty polling waits at least 5000ms unless the process exits or produces output earlier. Non-empty chars against tty=false returns stdin_closed.",
             object_schema(write_properties, &["process_id"]),
             ToolExecutionMode::Interruptible,
             ToolBackend::Local,
@@ -321,11 +376,12 @@ fn shell_exec(
     }
     let session = spawn_process(&command, arguments, context)?;
     let wait = yield_ms(arguments, SHELL_EXEC_DEFAULT_YIELD_MS, SHELL_MAX_YIELD_MS)?;
-    let max_output_chars = shell_max_output_chars(arguments)?;
+    let output_limit = shell_output_limit(arguments)?;
     collect_until(
         &session,
         wait,
-        max_output_chars,
+        &output_limit,
+        context,
         &context.cancel_token,
         "shell_exec",
     )
@@ -341,11 +397,22 @@ fn shell_write_stdin(
     if !chars.is_empty() {
         write_to_process(&session, chars.as_bytes())?;
     }
-    let wait = yield_ms(arguments, SHELL_WRITE_DEFAULT_YIELD_MS, SHELL_MAX_YIELD_MS)?;
+    let wait = if chars.is_empty() {
+        yield_ms_with_min(
+            arguments,
+            SHELL_WRITE_EMPTY_MIN_YIELD_MS,
+            SHELL_WRITE_EMPTY_MIN_YIELD_MS,
+            SHELL_MAX_YIELD_MS,
+        )?
+    } else {
+        yield_ms(arguments, SHELL_WRITE_DEFAULT_YIELD_MS, SHELL_MAX_YIELD_MS)?
+    };
+    let output_limit = shell_output_limit(arguments)?;
     collect_until(
         &session,
         wait,
-        shell_max_output_chars(arguments)?,
+        &output_limit,
+        context,
         &context.cancel_token,
         "shell_write_stdin",
     )
@@ -436,7 +503,7 @@ fn spawn_pty_process(
     timeout_ms: usize,
 ) -> Result<Arc<ShellSession>, LocalToolError> {
     let (cols, rows) = terminal_size(arguments)?;
-    let managed_rg_path_dir = managed_rg_path_dir(context, &binding, command_text)?;
+    let managed_rg_path_dir = managed_rg_path_dir(context, &binding)?;
 
     let pty_system = native_pty_system();
     let pair = pty_system
@@ -511,6 +578,7 @@ fn spawn_pty_process(
 
     let session = Arc::new(ShellSession {
         process_id: process_id.clone(),
+        command: command_text.to_string(),
         binding: binding.clone(),
         shell,
         cwd: cwd_label,
@@ -521,10 +589,13 @@ fn spawn_pty_process(
         writer: Some(writer_tx),
         stopper,
         output: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
+        stdout: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
+        stderr: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
         terminal: Mutex::new(TerminalEmulator::new(cols as usize, rows as usize)),
         status: Mutex::new(ShellStatus {
             running: true,
             exit_code: None,
+            timed_out: false,
             created_ms: unix_millis(),
             updated_ms: unix_millis(),
         }),
@@ -536,10 +607,13 @@ fn spawn_pty_process(
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(read) => push_process_output(&reader_session, &buffer[..read]),
+                Ok(read) => {
+                    push_process_output(&reader_session, ShellOutputStream::Pty, &buffer[..read])
+                }
                 Err(error) => {
                     push_process_output(
                         &reader_session,
+                        ShellOutputStream::Pty,
                         format!("\r\n[shell read error: {error}]\r\n").as_bytes(),
                     );
                     break;
@@ -567,7 +641,7 @@ fn spawn_pipe_process(
     login: bool,
     timeout_ms: usize,
 ) -> Result<Arc<ShellSession>, LocalToolError> {
-    let managed_rg_path_dir = managed_rg_path_dir(context, &binding, command_text)?;
+    let managed_rg_path_dir = managed_rg_path_dir(context, &binding)?;
     let (cwd_label, mut command) = match &binding {
         ShellBinding::Local => {
             let cwd = resolve_local_workdir(context.workspace_root, arguments)?;
@@ -614,6 +688,7 @@ fn spawn_pipe_process(
     let stderr = child.stderr.take();
     let session = Arc::new(ShellSession {
         process_id: process_id.clone(),
+        command: command_text.to_string(),
         binding: binding.clone(),
         shell,
         cwd: cwd_label,
@@ -624,6 +699,8 @@ fn spawn_pipe_process(
         writer: None,
         stopper: ProcessStopper::Pid(pid),
         output: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
+        stdout: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
+        stderr: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
         terminal: Mutex::new(TerminalEmulator::new(
             SHELL_DEFAULT_COLS as usize,
             SHELL_DEFAULT_ROWS as usize,
@@ -631,16 +708,17 @@ fn spawn_pipe_process(
         status: Mutex::new(ShellStatus {
             running: true,
             exit_code: None,
+            timed_out: false,
             created_ms: unix_millis(),
             updated_ms: unix_millis(),
         }),
     });
 
     if let Some(stdout) = stdout {
-        spawn_pipe_reader(Arc::clone(&session), stdout);
+        spawn_pipe_reader(Arc::clone(&session), stdout, ShellOutputStream::Stdout);
     }
     if let Some(stderr) = stderr {
-        spawn_pipe_reader(Arc::clone(&session), stderr);
+        spawn_pipe_reader(Arc::clone(&session), stderr, ShellOutputStream::Stderr);
     }
     spawn_pipe_waiter(Arc::clone(&session), child);
     spawn_timeout_watcher(Arc::clone(&session), timeout_ms);
@@ -650,7 +728,7 @@ fn spawn_pipe_process(
     Ok(session)
 }
 
-fn spawn_pipe_reader<R>(session: Arc<ShellSession>, mut reader: R)
+fn spawn_pipe_reader<R>(session: Arc<ShellSession>, mut reader: R, stream: ShellOutputStream)
 where
     R: Read + Send + 'static,
 {
@@ -659,10 +737,11 @@ where
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(read) => push_process_output(&session, &buffer[..read]),
+                Ok(read) => push_process_output(&session, stream, &buffer[..read]),
                 Err(error) => {
                     push_process_output(
                         &session,
+                        stream,
                         format!("\n[shell read error: {error}]\n").as_bytes(),
                     );
                     break;
@@ -706,15 +785,36 @@ fn spawn_timeout_watcher(session: Arc<ShellSession>, timeout_ms: usize) {
             .map(|status| status.running)
             .unwrap_or(false);
         if running {
+            if let Ok(mut status) = session.status.lock() {
+                status.timed_out = true;
+                status.updated_ms = unix_millis();
+            }
             stop_process(&session, "kill");
-            push_process_output(&session, b"\n[shell timeout: process killed]\n");
+            push_process_output(
+                &session,
+                ShellOutputStream::Stderr,
+                b"\n[shell timeout: process killed]\n",
+            );
         }
     });
 }
 
-fn push_process_output(session: &ShellSession, bytes: &[u8]) {
+fn push_process_output(session: &ShellSession, stream: ShellOutputStream, bytes: &[u8]) {
     if let Ok(mut output) = session.output.lock() {
         output.push(bytes);
+    }
+    match stream {
+        ShellOutputStream::Pty => {}
+        ShellOutputStream::Stdout => {
+            if let Ok(mut stdout) = session.stdout.lock() {
+                stdout.push(bytes);
+            }
+        }
+        ShellOutputStream::Stderr => {
+            if let Ok(mut stderr) = session.stderr.lock() {
+                stderr.push(bytes);
+            }
+        }
     }
     if let Ok(mut status) = session.status.lock() {
         status.updated_ms = unix_millis();
@@ -777,18 +877,16 @@ fn configure_process_group(_command: &mut Command) {}
 fn collect_until(
     session: &Arc<ShellSession>,
     wait_ms: usize,
-    max_output_chars: usize,
+    output_limit: &ShellOutputLimit,
+    context: &ToolExecutionContext<'_>,
     cancel_token: &ToolCancellationToken,
     operation: &str,
 ) -> Result<Value, LocalToolError> {
     let deadline = Instant::now() + Duration::from_millis(wait_ms as u64);
-    let mut collected = Vec::new();
+    let mut collected = ShellOutputDrain::default();
     let mut exit_code = None;
     loop {
-        let chunk = drain_shell_output(session);
-        if !chunk.is_empty() {
-            collected.extend_from_slice(&chunk);
-        }
+        collected.extend(drain_shell_output(session));
 
         if !session
             .status
@@ -797,7 +895,7 @@ fn collect_until(
             .unwrap_or(false)
         {
             thread::sleep(Duration::from_millis(50));
-            collected.extend_from_slice(&drain_shell_output(session));
+            collected.extend(drain_shell_output(session));
             exit_code = session
                 .status
                 .lock()
@@ -817,66 +915,48 @@ fn collect_until(
     if exit_code.is_none() {
         exit_code = status.exit_code;
     }
+    let timed_out = status.timed_out;
     let created_ms = status.created_ms;
     let updated_ms = status.updated_ms;
+    let duration_ms = if running {
+        unix_millis().saturating_sub(created_ms)
+    } else {
+        updated_ms.saturating_sub(created_ms)
+    };
     drop(status);
 
-    let raw_text = String::from_utf8_lossy(&collected).to_string();
-    let rendered = render_session_terminal_output(session, &raw_text, max_output_chars);
+    let raw_text = String::from_utf8_lossy(&collected.aggregate).to_string();
+    let rendered = render_session_terminal_output(
+        session,
+        &raw_text,
+        shell_char_safety_limit(output_limit.max_tokens),
+    );
     let plain = rendered.plain_text;
     let total_output_lines = plain.lines().count();
-    let original_chars = plain.chars().count();
-    let (output, output_truncated) = truncate_middle_chars(&plain, max_output_chars);
+    let output = truncate_shell_text(&plain, output_limit, context.token_estimator);
+    let stdout_text = String::from_utf8_lossy(&collected.stdout).to_string();
+    let stderr_text = String::from_utf8_lossy(&collected.stderr).to_string();
+    let stdout = truncate_shell_text(&stdout_text, output_limit, context.token_estimator);
+    let stderr = truncate_shell_text(&stderr_text, output_limit, context.token_estimator);
     let snapshot = rendered.snapshot;
-    let mut result = Map::new();
-    result.insert(
-        "operation".to_string(),
-        Value::String(operation.to_string()),
-    );
-    result.insert(
-        "process_id".to_string(),
-        Value::String(session.process_id.clone()),
-    );
-    result.insert("running".to_string(), Value::Bool(running));
-    result.insert(
-        "remote".to_string(),
-        Value::String(binding_label(&session.binding)),
-    );
-    result.insert("cwd".to_string(), Value::String(session.cwd.clone()));
-    result.insert("shell".to_string(), Value::String(session.shell.clone()));
-    result.insert("tty".to_string(), Value::Bool(session.tty));
-    result.insert("cols".to_string(), Value::from(session.cols));
-    result.insert("rows".to_string(), Value::from(session.rows));
-    result.insert("created_ms".to_string(), Value::from(created_ms as u64));
-    result.insert("updated_ms".to_string(), Value::from(updated_ms as u64));
-    result.insert("original_chars".to_string(), Value::from(original_chars));
-    result.insert(
-        "total_output_lines".to_string(),
-        Value::from(total_output_lines),
-    );
-    if output_truncated {
-        result.insert("output_truncated".to_string(), Value::Bool(true));
-    }
-    if !output.is_empty() {
-        result.insert("output".to_string(), Value::String(output));
-    }
-    if let Some(code) = exit_code {
-        result.insert("exit_code".to_string(), Value::from(code));
-        result.insert("success".to_string(), Value::Bool(code == 0));
-    }
-    if let Some(snapshot) = snapshot {
-        result.insert(
-            "kind".to_string(),
-            Value::String("terminal_snapshot".to_string()),
-        );
-        result.insert("terminal_snapshot".to_string(), snapshot);
-    } else {
-        result.insert("kind".to_string(), Value::String("text".to_string()));
-    }
+    let text = format_shell_result(ShellResultFormat {
+        operation,
+        session,
+        running,
+        exit_code,
+        timed_out,
+        duration_ms,
+        max_output_tokens: output_limit.max_tokens,
+        total_output_lines,
+        output,
+        stdout,
+        stderr,
+        snapshot,
+    });
     if !running {
         remove_completed_process(&session.process_id);
     }
-    Ok(Value::Object(result))
+    Ok(Value::String(text))
 }
 
 fn remove_completed_process(process_id: &str) {
@@ -891,12 +971,24 @@ fn remove_completed_process(process_id: &str) {
     }
 }
 
-fn drain_shell_output(session: &ShellSession) -> Vec<u8> {
-    session
-        .output
-        .lock()
-        .map(|mut output| output.drain())
-        .unwrap_or_default()
+fn drain_shell_output(session: &ShellSession) -> ShellOutputDrain {
+    ShellOutputDrain {
+        aggregate: session
+            .output
+            .lock()
+            .map(|mut output| output.drain())
+            .unwrap_or_default(),
+        stdout: session
+            .stdout
+            .lock()
+            .map(|mut output| output.drain())
+            .unwrap_or_default(),
+        stderr: session
+            .stderr
+            .lock()
+            .map(|mut output| output.drain())
+            .unwrap_or_default(),
+    }
 }
 
 fn write_to_process(session: &ShellSession, bytes: &[u8]) -> Result<(), LocalToolError> {
@@ -1415,6 +1507,252 @@ fn truncate_middle_chars(value: &str, max_chars: usize) -> (String, bool) {
     (format!("{head}{marker}{tail}"), true)
 }
 
+fn truncate_shell_text(
+    value: &str,
+    limit: &ShellOutputLimit,
+    estimator: Option<&super::super::TokenEstimator>,
+) -> TruncatedShellText {
+    let original_chars = value.chars().count();
+    let original_tokens = estimator.and_then(|estimator| estimator.estimate_raw_text(value).ok());
+    let mut truncated = false;
+
+    let mut text = if let (Some(estimator), Some(tokens)) = (estimator, original_tokens) {
+        if tokens as usize > limit.max_tokens {
+            truncated = true;
+            truncate_middle_tokens(value, limit.max_tokens, estimator)
+        } else {
+            value.to_string()
+        }
+    } else if original_chars > limit.max_tokens.saturating_mul(4) {
+        truncated = true;
+        truncate_middle_chars(value, limit.max_tokens.saturating_mul(4)).0
+    } else {
+        value.to_string()
+    };
+
+    let (char_limited, char_truncated) =
+        truncate_middle_chars(&text, shell_char_safety_limit(limit.max_tokens));
+    if char_truncated {
+        text = char_limited;
+        truncated = true;
+    }
+
+    TruncatedShellText {
+        text,
+        truncated,
+        original_chars,
+        original_tokens,
+    }
+}
+
+fn shell_char_safety_limit(max_tokens: usize) -> usize {
+    max_tokens
+        .saturating_mul(SHELL_TOKEN_TO_CHAR_SAFETY_RATIO)
+        .min(SHELL_MAX_OUTPUT_CHARS)
+}
+
+fn truncate_middle_tokens(
+    value: &str,
+    max_tokens: usize,
+    estimator: &super::super::TokenEstimator,
+) -> String {
+    if max_tokens == 0 {
+        return String::new();
+    }
+    let total_chars = value.chars().count();
+    if total_chars == 0 {
+        return String::new();
+    }
+    let original_tokens = estimator.estimate_raw_text(value).unwrap_or(0);
+    let omitted_hint = original_tokens.saturating_sub(max_tokens as u64);
+    let marker = format!("\n...<{omitted_hint} estimated tokens truncated>...\n");
+
+    let mut low = 0usize;
+    let mut high = total_chars;
+    let mut best = marker.clone();
+    while low <= high {
+        let retained = low + (high - low) / 2;
+        let head_chars = retained / 2;
+        let tail_chars = retained.saturating_sub(head_chars);
+        let candidate = middle_truncation_candidate(value, head_chars, tail_chars, &marker);
+        let tokens = estimator
+            .estimate_raw_text_stream([candidate.as_str()])
+            .unwrap_or(u64::MAX);
+        if tokens <= max_tokens as u64 {
+            best = candidate;
+            low = retained.saturating_add(1);
+        } else if retained == 0 {
+            break;
+        } else {
+            high = retained - 1;
+        }
+    }
+    best
+}
+
+fn middle_truncation_candidate(
+    value: &str,
+    head_chars: usize,
+    tail_chars: usize,
+    marker: &str,
+) -> String {
+    let total_chars = value.chars().count();
+    if head_chars + tail_chars >= total_chars {
+        return value.to_string();
+    }
+    let head = value.chars().take(head_chars).collect::<String>();
+    let tail = value
+        .chars()
+        .rev()
+        .take(tail_chars)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!("{head}{marker}{tail}")
+}
+
+fn shell_status_line(
+    running: bool,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    duration_ms: u128,
+) -> String {
+    if running {
+        return format!("Process still running after {duration_ms} ms");
+    }
+    if timed_out {
+        return format!("Process timed out after {duration_ms} ms");
+    }
+    match exit_code {
+        Some(code) => format!("Process exited with code {code} after {duration_ms} ms"),
+        None => format!("Process exited after {duration_ms} ms"),
+    }
+}
+
+fn format_shell_result(result: ShellResultFormat<'_>) -> String {
+    let ShellResultFormat {
+        operation,
+        session,
+        running,
+        exit_code,
+        timed_out,
+        duration_ms,
+        max_output_tokens,
+        total_output_lines,
+        output,
+        stdout,
+        stderr,
+        snapshot,
+    } = result;
+
+    let mut sections = Vec::new();
+    sections.push(shell_status_line(
+        running,
+        exit_code,
+        timed_out,
+        duration_ms,
+    ));
+    sections.push(format!("Operation: {operation}"));
+    sections.push(format!("Process ID: {}", session.process_id));
+    sections.push(format!("Running: {running}"));
+    sections.push(format!("Remote: {}", binding_label(&session.binding)));
+    sections.push(format!("Cwd: {}", session.cwd));
+    sections.push(format!("Shell: {}", session.shell));
+    sections.push(format!("TTY: {}", session.tty));
+    sections.push(format!("Command: {}", session.command));
+    sections.push(format!("Wall time: {duration_ms} ms"));
+    if let Some(code) = exit_code {
+        sections.push(format!("Exit code: {code}"));
+    }
+    sections.push(format!("Max output tokens: {max_output_tokens}"));
+    sections.push(format!(
+        "Combined output: {total_output_lines} lines, {} chars{}{}",
+        output.original_chars,
+        optional_token_suffix(output.original_tokens),
+        truncated_suffix(output.truncated)
+    ));
+
+    if session.tty {
+        sections.push(text_section("Output", &output.text));
+    } else {
+        sections.push(format!(
+            "Stdout: {} chars{}{}",
+            stdout.original_chars,
+            optional_token_suffix(stdout.original_tokens),
+            truncated_suffix(stdout.truncated)
+        ));
+        if !stdout.text.is_empty() {
+            sections.push(text_section("Stdout", &stdout.text));
+        }
+
+        sections.push(format!(
+            "Stderr: {} chars{}{}",
+            stderr.original_chars,
+            optional_token_suffix(stderr.original_tokens),
+            truncated_suffix(stderr.truncated)
+        ));
+        if !stderr.text.is_empty() {
+            sections.push(text_section("Stderr", &stderr.text));
+        }
+
+        if stdout.text.is_empty() && stderr.text.is_empty() && !output.text.is_empty() {
+            sections.push(text_section("Output", &output.text));
+        }
+    }
+
+    if let Some(snapshot) = snapshot.and_then(terminal_snapshot_text) {
+        sections.push(snapshot);
+    }
+
+    sections.join("\n")
+}
+
+fn optional_token_suffix(tokens: Option<u64>) -> String {
+    tokens
+        .map(|tokens| format!(", {tokens} estimated tokens"))
+        .unwrap_or_default()
+}
+
+fn truncated_suffix(truncated: bool) -> &'static str {
+    if truncated {
+        ", truncated"
+    } else {
+        ""
+    }
+}
+
+fn text_section(title: &str, text: &str) -> String {
+    if text.is_empty() {
+        format!("{title}:\n<empty>")
+    } else {
+        format!("{title}:\n{text}")
+    }
+}
+
+fn terminal_snapshot_text(snapshot: Value) -> Option<String> {
+    let object = snapshot.as_object()?;
+    let visible_text = object
+        .get("visible_text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let alternate_screen = object
+        .get("alternate_screen")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let saw_alternate_screen = object
+        .get("saw_alternate_screen")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let truncated = object
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Some(format!(
+        "Terminal snapshot: alternate_screen={alternate_screen}, saw_alternate_screen={saw_alternate_screen}, truncated={truncated}\n{visible_text}"
+    ))
+}
+
 fn validate_remote_consistency(
     arguments: &Map<String, Value>,
     context: &ToolExecutionContext<'_>,
@@ -1537,9 +1875,8 @@ fn resolve_remote_workdir(base: Option<&str>, arguments: &Map<String, Value>) ->
 fn managed_rg_path_dir(
     context: &ToolExecutionContext<'_>,
     binding: &ShellBinding,
-    command_text: &str,
 ) -> Result<Option<String>, LocalToolError> {
-    if !command_may_use_rg(command_text) || context.conversation_bridge.is_none() {
+    if context.conversation_bridge.is_none() {
         return Ok(None);
     }
     let host = match binding {
@@ -1548,22 +1885,6 @@ fn managed_rg_path_dir(
     };
     let response = ensure_tool_binary(context, "ripgrep", host)?;
     Ok(response.path_dir)
-}
-
-fn command_may_use_rg(command: &str) -> bool {
-    let trimmed = command.trim_start();
-    trimmed == "rg"
-        || trimmed.starts_with("rg ")
-        || trimmed.starts_with("rg\t")
-        || trimmed.starts_with("rg\n")
-        || command.contains(" rg ")
-        || command.contains(" rg\t")
-        || command.contains(" rg\n")
-        || command.contains("\nrg ")
-        || command.contains("$(rg ")
-        || command.contains("`rg ")
-        || command.contains("command -v rg")
-        || command.contains("which rg")
 }
 
 fn local_path_with_managed_priority(path_dir: &str) -> String {
@@ -1643,15 +1964,28 @@ fn yield_ms(
     default: usize,
     max: usize,
 ) -> Result<usize, LocalToolError> {
-    let value = usize_arg_with_default(arguments, "yield_time_ms", default)?;
-    Ok(value.clamp(SHELL_MIN_YIELD_MS, max))
+    yield_ms_with_min(arguments, default, SHELL_MIN_YIELD_MS, max)
 }
 
-fn shell_max_output_chars(arguments: &Map<String, Value>) -> Result<usize, LocalToolError> {
-    Ok(
-        usize_arg_with_default(arguments, "max_output_chars", SHELL_DEFAULT_OUTPUT_CHARS)?
-            .min(SHELL_MAX_OUTPUT_CHARS),
-    )
+fn yield_ms_with_min(
+    arguments: &Map<String, Value>,
+    default: usize,
+    min: usize,
+    max: usize,
+) -> Result<usize, LocalToolError> {
+    let value = usize_arg_with_default(arguments, "yield_time_ms", default)?;
+    Ok(value.clamp(min, max))
+}
+
+fn shell_output_limit(arguments: &Map<String, Value>) -> Result<ShellOutputLimit, LocalToolError> {
+    Ok(ShellOutputLimit {
+        max_tokens: usize_arg_with_default(
+            arguments,
+            "max_output_tokens",
+            SHELL_DEFAULT_OUTPUT_TOKENS,
+        )?
+        .min(SHELL_MAX_OUTPUT_TOKENS),
+    })
 }
 
 fn process_id_arg(arguments: &Map<String, Value>) -> Option<String> {

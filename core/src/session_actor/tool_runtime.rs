@@ -16,9 +16,8 @@ use std::os::unix::process::CommandExt;
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use super::{ConversationBridge, ToolRemoteMode};
+use super::{ConversationBridge, TokenEstimator, ToolRemoteMode};
 
-const REMOTE_JSON_TIMEOUT: Duration = Duration::from_secs(60);
 const REMOTE_STDIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Default)]
@@ -68,6 +67,7 @@ pub(super) struct ToolExecutionContext<'a> {
     pub data_root: &'a Path,
     pub remote_mode: &'a ToolRemoteMode,
     pub conversation_bridge: Option<&'a Arc<dyn ConversationBridge + Send + Sync>>,
+    pub token_estimator: Option<&'a TokenEstimator>,
     pub cancel_token: ToolCancellationToken,
 }
 
@@ -323,42 +323,6 @@ pub(super) fn validate_remote_host(host: &str) -> Result<(), LocalToolError> {
         ));
     }
     Ok(())
-}
-
-pub(super) fn run_remote_json(
-    host: &str,
-    cwd: Option<&str>,
-    script: &str,
-) -> Result<Value, LocalToolError> {
-    let remote_command = match cwd {
-        Some(cwd) => format!("cd {} && {}", shell_quote(cwd), script),
-        None => script.to_string(),
-    };
-    let mut command = Command::new("ssh");
-    command
-        .arg("-o")
-        .arg("BatchMode=yes")
-        .arg("-o")
-        .arg("ConnectTimeout=10")
-        .arg("-T")
-        .arg(host)
-        .arg(remote_command);
-    let output = run_command_with_timeout(command, REMOTE_JSON_TIMEOUT, None, "ssh")?;
-
-    if !output.status.success() {
-        return Err(LocalToolError::Remote(format!(
-            "ssh exited with {}; stderr: {}",
-            output.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-
-    serde_json::from_slice(&output.stdout).map_err(|error| {
-        LocalToolError::Remote(format!(
-            "remote output was not JSON: {error}; stdout: {}",
-            String::from_utf8_lossy(&output.stdout)
-        ))
-    })
 }
 
 pub(super) fn run_remote_command_with_stdin(

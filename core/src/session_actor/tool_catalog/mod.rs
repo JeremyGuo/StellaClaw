@@ -541,6 +541,7 @@ mod tests {
         assert_eq!(file_read.parameters["required"], json!(["file_path"]));
         assert!(file_read.parameters["properties"].get("remote").is_some());
         assert!(!catalog.contains("edit"));
+        assert!(!catalog.contains("grep"));
         assert!(!catalog.contains("ls"));
 
         let shell = catalog.get("shell_exec").unwrap();

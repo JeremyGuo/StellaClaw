@@ -9,6 +9,7 @@ mod memory;
 mod remote_actor;
 mod sandbox;
 mod session_client;
+mod setup;
 mod tool_binary_manager;
 mod upgrade;
 mod workspace;
@@ -49,7 +50,10 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let args = parse_args()?;
+    let args = match parse_args()? {
+        Command::Serve(args) => args,
+        Command::Setup(args) => return setup::run(args),
+    };
     fs::create_dir_all(&args.workdir)
         .with_context(|| format!("failed to create {}", args.workdir.display()))?;
     let logger = Arc::new(
@@ -444,8 +448,18 @@ struct Args {
     workdir: PathBuf,
 }
 
-fn parse_args() -> Result<Args> {
+enum Command {
+    Serve(Args),
+    Setup(setup::SetupArgs),
+}
+
+fn parse_args() -> Result<Command> {
     let mut args = env::args().skip(1);
+    let first = args.next().ok_or_else(|| anyhow!(usage()))?;
+    if first == "setup" {
+        return parse_setup_args(args);
+    }
+    let mut args = std::iter::once(first).chain(args);
     let mut config = None;
     let mut workdir = None;
     while let Some(arg) = args.next() {
@@ -462,11 +476,61 @@ fn parse_args() -> Result<Args> {
                         .ok_or_else(|| anyhow!("--workdir requires a path"))?,
                 ));
             }
+            "--help" | "-h" => return Err(anyhow!(usage())),
             other => return Err(anyhow!("unknown argument {other}")),
         }
     }
-    Ok(Args {
+    Ok(Command::Serve(Args {
         config: config.ok_or_else(|| anyhow!("missing --config"))?,
         workdir: workdir.ok_or_else(|| anyhow!("missing --workdir"))?,
-    })
+    }))
+}
+
+fn parse_setup_args(args: impl Iterator<Item = String>) -> Result<Command> {
+    let mut positionals = Vec::new();
+    let mut install_systemd = false;
+    let mut systemd_user = false;
+    let mut dry_run = false;
+    for arg in args {
+        match arg.as_str() {
+            "--systemd" => install_systemd = true,
+            "--user" => systemd_user = true,
+            "--dry-run" => dry_run = true,
+            "--help" | "-h" => return Err(anyhow!(setup_usage())),
+            other if other.starts_with('-') => {
+                return Err(anyhow!("unknown setup argument {other}"))
+            }
+            _ => positionals.push(arg),
+        }
+    }
+    if positionals.len() > 2 {
+        return Err(anyhow!(
+            "too many setup positional arguments\n\n{}",
+            setup_usage()
+        ));
+    }
+    let config = positionals
+        .first()
+        .ok_or_else(|| anyhow!("missing setup <config>\n\n{}", setup_usage()))?;
+    let workdir = positionals
+        .get(1)
+        .ok_or_else(|| anyhow!("missing setup <workdir>\n\n{}", setup_usage()))?;
+    if systemd_user && !install_systemd {
+        return Err(anyhow!("--user requires --systemd"));
+    }
+    Ok(Command::Setup(setup::SetupArgs {
+        config: PathBuf::from(config),
+        workdir: PathBuf::from(workdir),
+        install_systemd,
+        systemd_user,
+        dry_run,
+    }))
+}
+
+fn usage() -> &'static str {
+    "usage:\n  stellaclaw --config <config> --workdir <workdir>\n  stellaclaw setup <config> <workdir> [--systemd [--user]] [--dry-run]"
+}
+
+fn setup_usage() -> &'static str {
+    "usage: stellaclaw setup <config> <workdir> [--systemd [--user]] [--dry-run]"
 }

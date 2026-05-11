@@ -706,16 +706,16 @@ fn file_item_from_path(
     media_kind: &str,
 ) -> Result<FileItem, LocalToolError> {
     let path = string_arg(arguments, "path")?;
-    if matches!(context.remote_mode, super::ToolRemoteMode::Selectable) {
-        if let ExecutionTarget::RemoteSsh { host, cwd } = context.execution_target(arguments)? {
-            return remote_file_item_from_path(
-                context.data_root,
-                &host,
-                cwd.as_deref(),
-                &path,
-                media_kind,
-            );
-        }
+    if let ExecutionTarget::RemoteSsh { host, cwd } =
+        context.execution_target_for_path(arguments, &["path"])?
+    {
+        return remote_file_item_from_path(
+            context.data_root,
+            &host,
+            cwd.as_deref(),
+            &path,
+            media_kind,
+        );
     }
     let path = resolve_local_path(context.workspace_root, &path);
     local_file_item_from_path(&path, media_kind)
@@ -1250,6 +1250,48 @@ mod tests {
         test_context_with_cancel(root, ToolCancellationToken::default())
     }
 
+    #[test]
+    fn fixed_ssh_media_paths_respect_local_stellaclaw_overlay() {
+        let temp = TempDir::new("media-route");
+        let remote_mode = ToolRemoteMode::FixedSsh {
+            host: "cpu001".to_string(),
+            cwd: Some("/remote/workspace".to_string()),
+        };
+        let context = ToolExecutionContext {
+            workspace_root: temp.path(),
+            data_root: temp.path(),
+            remote_mode: &remote_mode,
+            conversation_bridge: None,
+            token_estimator: None,
+            cancel_token: ToolCancellationToken::default(),
+        };
+
+        let mut overlay_args = Map::new();
+        overlay_args.insert(
+            "path".to_string(),
+            Value::String(".stellaclaw/output/report.png".to_string()),
+        );
+        assert!(matches!(
+            context
+                .execution_target_for_path(&overlay_args, &["path"])
+                .expect("overlay path target"),
+            ExecutionTarget::Local
+        ));
+
+        let mut remote_args = Map::new();
+        remote_args.insert(
+            "path".to_string(),
+            Value::String("src/report.png".to_string()),
+        );
+        assert!(matches!(
+            context
+                .execution_target_for_path(&remote_args, &["path"])
+                .expect("remote path target"),
+            ExecutionTarget::RemoteSsh { host, cwd }
+                if host == "cpu001" && cwd.as_deref() == Some("/remote/workspace")
+        ));
+    }
+
     fn test_context_with_cancel(
         root: &Path,
         cancel_token: ToolCancellationToken,
@@ -1260,6 +1302,7 @@ mod tests {
             data_root: root,
             remote_mode: &REMOTE_MODE,
             conversation_bridge: None,
+            token_estimator: None,
             cancel_token,
         }
     }

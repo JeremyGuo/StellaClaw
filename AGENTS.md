@@ -81,6 +81,7 @@
 - 更新 [stellaclaw/src/config/mod.rs](stellaclaw/src/config/mod.rs) 的 `LATEST_CONFIG_VERSION`。
 - 在 [stellaclaw/src/config/loaders/](stellaclaw/src/config/loaders) 下新增或更新 loader，保留旧 config 的升级路径。
 - 更新 [example_config.json](example_config.json) 以及相关部署样例中的配置形态。
+- 同步更新 `stellaclaw setup <config> <workdir>` 配置向导，确保向导生成的 `config.json` 仍符合最新 schema，且不要在 TUI 中暴露 provider 不支持的参数。
 - 更新根 [VERSION](VERSION) changelog，明确说明这是 `config` schema 变更。
 
 本地部署配置文件里的顶层 `version` 字段只描述 config schema，不是项目发布版本。

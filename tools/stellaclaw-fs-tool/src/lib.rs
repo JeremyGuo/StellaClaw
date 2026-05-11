@@ -726,14 +726,21 @@ fn normalize_unified_path_token(
 
 fn file_read_inner(options: &FileReadOptions) -> Result<Value, PatchError> {
     let workspace = canonical_workspace(&options.workspace)?;
-    let path = resolve_workspace_path(&workspace, &options.file_path);
-    if path.is_dir() {
+    let path = resolve_workspace_path(&workspace, &options.file_path)?;
+    let canonical = path.canonicalize().map_err(|error| {
+        PatchError::io(format!(
+            "failed to canonicalize {}: {error}",
+            path.display()
+        ))
+    })?;
+    ensure_inside_workspace(&workspace, &canonical)?;
+    if canonical.is_dir() {
         return Err(PatchError::invalid(format!(
             "{} is a directory, not a file",
             path.display()
         )));
     }
-    let text = fs::read_to_string(&path)
+    let text = fs::read_to_string(&canonical)
         .map_err(|error| PatchError::io(format!("failed to read {}: {error}", path.display())))?;
     let total_lines = text.lines().count();
     let start_line = options.start_line.max(1);
@@ -773,7 +780,18 @@ fn file_read_inner(options: &FileReadOptions) -> Result<Value, PatchError> {
 
 fn file_write_inner(options: &FileWriteOptions) -> Result<Value, PatchError> {
     let workspace = canonical_workspace(&options.workspace)?;
-    let path = resolve_workspace_path(&workspace, &options.file_path);
+    let path = resolve_workspace_path(&workspace, &options.file_path)?;
+    ensure_parent_stays_inside_workspace(&workspace, &path)?;
+    if path.exists() {
+        let canonical = path.canonicalize().map_err(|error| {
+            PatchError::io(format!(
+                "failed to canonicalize {}: {error}",
+                path.display()
+            ))
+        })?;
+        ensure_inside_workspace(&workspace, &canonical)?;
+        reject_symlink(&path)?;
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
             PatchError::io(format!("failed to create {}: {error}", parent.display()))
@@ -802,16 +820,67 @@ fn file_write_inner(options: &FileWriteOptions) -> Result<Value, PatchError> {
     }))
 }
 
-fn resolve_workspace_path(workspace: &Path, path: &str) -> PathBuf {
+fn resolve_workspace_path(workspace: &Path, path: &str) -> Result<PathBuf, PatchError> {
     if path.trim().is_empty() {
-        return workspace.to_path_buf();
+        return Ok(workspace.to_path_buf());
     }
-    let path = PathBuf::from(path);
+    let path = PathBuf::from(path.trim());
     if path.is_absolute() {
-        path
+        let normalized = normalize_absolute_path(&path)?;
+        if normalized == workspace || normalized.starts_with(workspace) {
+            Ok(normalized)
+        } else {
+            Err(PatchError::invalid(format!(
+                "file path {} is outside workspace {}; use a workspace-relative path",
+                path.display(),
+                workspace.display()
+            )))
+        }
     } else {
-        workspace.join(path)
+        Ok(workspace.join(normalize_workspace_relative_path(&path)?))
     }
+}
+
+fn normalize_workspace_relative_path(path: &Path) -> Result<PathBuf, PatchError> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                return Err(PatchError::invalid(
+                    "file_path must be a workspace-relative path without ..",
+                ));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(PatchError::invalid(
+                    "file_path must be a workspace-relative path",
+                ));
+            }
+        }
+    }
+    Ok(normalized)
+}
+
+fn normalize_absolute_path(path: &Path) -> Result<PathBuf, PatchError> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(PatchError::invalid(format!(
+                        "file path {} escapes filesystem root",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(normalized)
 }
 
 fn process_output_result(output: std::process::Output, max_output_chars: usize) -> Value {
@@ -986,6 +1055,45 @@ diff --git /home/me/work/src/a.py /home/me/work/src/a.py
         .expect_err("outside path should fail");
 
         assert!(err.message.contains("outside the workspace"));
+    }
+
+    #[test]
+    fn file_read_rejects_absolute_path_outside_workspace() {
+        let workspace = temp_workspace("file-read-outside");
+        let outside = workspace
+            .parent()
+            .expect("workspace parent")
+            .join(format!("outside-{}.txt", std::process::id()));
+        fs::write(&outside, "secret\n").expect("write outside file");
+
+        let err = file_read_inner(&FileReadOptions {
+            workspace: workspace.clone(),
+            file_path: outside.display().to_string(),
+            start_line: 1,
+            end_line: None,
+            limit: None,
+        })
+        .expect_err("outside absolute path should be rejected");
+
+        assert!(err.message.contains("outside workspace"));
+        let _ = fs::remove_file(outside);
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn file_write_rejects_parent_escape() {
+        let workspace = temp_workspace("file-write-parent-escape");
+
+        let err = file_write_inner(&FileWriteOptions {
+            workspace: workspace.clone(),
+            file_path: "../outside.txt".to_string(),
+            content: "nope\n".to_string(),
+            mode: "overwrite".to_string(),
+        })
+        .expect_err("parent escape should be rejected");
+
+        assert!(err.message.contains("without .."));
+        let _ = fs::remove_dir_all(workspace);
     }
 
     fn codex_options(workspace: &Path, check: bool) -> ApplyPatchOptions {

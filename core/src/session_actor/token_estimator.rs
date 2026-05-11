@@ -2,7 +2,7 @@ use jinja::{context, new_jinja2};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tiktoken_rs::{
-    num_tokens_from_messages, tokenizer::get_tokenizer as get_tiktoken_tokenizer,
+    bpe_for_model, num_tokens_from_messages, tokenizer::get_tokenizer as get_tiktoken_tokenizer,
     ChatCompletionRequestMessage, FunctionCall,
 };
 use tokenizers::Tokenizer as HuggingFaceTokenizer;
@@ -82,6 +82,21 @@ impl TokenEstimator {
             total_tokens: text_tokens + multimodal_tokens + reasoning_tokens,
         })
     }
+
+    pub fn estimate_raw_text(&self, text: &str) -> Result<u64, TokenEstimatorError> {
+        self.backend.estimate_raw_text(text)
+    }
+
+    pub fn estimate_raw_text_stream<'a, I>(&self, chunks: I) -> Result<u64, TokenEstimatorError>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        let mut text = String::new();
+        for chunk in chunks {
+            text.push_str(chunk);
+        }
+        self.estimate_raw_text(&text)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +113,13 @@ impl TokenEstimatorBackend {
         match self {
             Self::HuggingFace(estimator) => estimator.estimate_text(messages),
             Self::OpenAiTiktoken(estimator) => estimator.estimate_text(messages),
+        }
+    }
+
+    fn estimate_raw_text(&self, text: &str) -> Result<u64, TokenEstimatorError> {
+        match self {
+            Self::HuggingFace(estimator) => estimator.estimate_raw_text(text),
+            Self::OpenAiTiktoken(estimator) => estimator.estimate_raw_text(text),
         }
     }
 }
@@ -123,6 +145,14 @@ impl HuggingFaceEstimator {
             text_tokens: encoding.len() as u64,
             files: rendered.files,
         })
+    }
+
+    fn estimate_raw_text(&self, text: &str) -> Result<u64, TokenEstimatorError> {
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
+            .map_err(TokenEstimatorError::Tokenize)?;
+        Ok(encoding.len() as u64)
     }
 }
 
@@ -193,6 +223,12 @@ impl OpenAiTiktokenEstimator {
             text_tokens,
             files: collect_all_files(messages),
         })
+    }
+
+    fn estimate_raw_text(&self, text: &str) -> Result<u64, TokenEstimatorError> {
+        let bpe = bpe_for_model(&self.model_name)
+            .map_err(|error| TokenEstimatorError::LocalTokenEstimate(error.to_string()))?;
+        Ok(bpe.encode_ordinary(text).len() as u64)
     }
 }
 
@@ -1147,6 +1183,26 @@ tool reference
 
         assert!(estimate.text_tokens > 0);
         assert_eq!(estimate.multimodal_tokens, 0);
+    }
+
+    #[test]
+    fn estimates_raw_text_stream_with_current_backend() {
+        let resolver = HuggingFaceFileResolver::new().expect("resolver should build");
+        let estimator = TokenEstimator::from_model_config(
+            &local_tiktoken_model_config("gpt-4o", MultimodalTokenStrategy::Ignore),
+            &resolver,
+        )
+        .expect("openai local estimator should build");
+
+        let direct = estimator
+            .estimate_raw_text("hello from shell output")
+            .expect("raw estimate should work");
+        let streamed = estimator
+            .estimate_raw_text_stream(["hello ", "from ", "shell output"])
+            .expect("stream estimate should work");
+
+        assert!(direct > 0);
+        assert_eq!(direct, streamed);
     }
 
     #[test]

@@ -37,12 +37,34 @@ pub(super) fn execute_patch_tool(
     }
 
     let result = match fs_tool_execution_target(arguments, context)? {
-        ExecutionTarget::Local => fs_tool_local(arguments, context)?,
+        ExecutionTarget::Local => {
+            let local_arguments =
+                normalize_local_patch_arguments(arguments, context.workspace_root)?;
+            fs_tool_local(&local_arguments, context)?
+        }
         ExecutionTarget::RemoteSsh { host, cwd } => {
             fs_tool_remote(arguments, context, &host, cwd.as_deref())?
         }
     };
     Ok(Some(result))
+}
+
+fn normalize_local_patch_arguments(
+    arguments: &Map<String, Value>,
+    workspace_root: &Path,
+) -> Result<Map<String, Value>, LocalToolError> {
+    let patch = string_arg(arguments, "patch")?;
+    let format = patch_format(arguments, &patch)?;
+    let normalized_patch = match format {
+        PatchFormat::Codex => patch.clone(),
+        PatchFormat::Unified => normalize_local_unified_patch_paths(&patch, workspace_root)?,
+    };
+    if normalized_patch == patch {
+        return Ok(arguments.clone());
+    }
+    let mut arguments = arguments.clone();
+    arguments.insert("patch".to_string(), Value::String(normalized_patch));
+    Ok(arguments)
 }
 
 fn fs_tool_execution_target(
@@ -265,6 +287,31 @@ fn normalize_unified_patch_paths(
     }
 }
 
+fn normalize_local_unified_patch_paths(
+    patch: &str,
+    workspace_root: &Path,
+) -> Result<String, LocalToolError> {
+    let mut changed = false;
+    let mut output = String::with_capacity(patch.len());
+    for segment in patch.split_inclusive('\n') {
+        let (line, newline) = segment
+            .strip_suffix('\n')
+            .map_or((segment, ""), |line| (line, "\n"));
+        let normalized = if let Some(rest) = line.strip_prefix("--- ") {
+            normalize_local_unified_file_header("--- ", rest, workspace_root, &mut changed)?
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            normalize_local_unified_file_header("+++ ", rest, workspace_root, &mut changed)?
+        } else if let Some(rest) = line.strip_prefix("diff --git ") {
+            normalize_local_diff_git_header(rest, workspace_root, &mut changed)?
+        } else {
+            line.to_string()
+        };
+        output.push_str(&normalized);
+        output.push_str(newline);
+    }
+    Ok(output)
+}
+
 #[allow(dead_code)]
 fn normalize_unified_file_header(
     prefix: &str,
@@ -275,6 +322,20 @@ fn normalize_unified_file_header(
 ) -> Result<String, LocalToolError> {
     let (path, suffix) = split_unified_header_path(rest);
     let normalized = normalize_unified_path_token(path, base, base_label)?;
+    if normalized != path {
+        *changed = true;
+    }
+    Ok(format!("{prefix}{normalized}{suffix}"))
+}
+
+fn normalize_local_unified_file_header(
+    prefix: &str,
+    rest: &str,
+    workspace_root: &Path,
+    changed: &mut bool,
+) -> Result<String, LocalToolError> {
+    let (path, suffix) = split_unified_header_path(rest);
+    let normalized = normalize_local_unified_path_token(path, workspace_root)?;
     if normalized != path {
         *changed = true;
     }
@@ -300,6 +361,29 @@ fn normalize_diff_git_header(
     }
     let normalized_old = normalize_unified_path_token(old_path, base, base_label)?;
     let normalized_new = normalize_unified_path_token(new_path, base, base_label)?;
+    if normalized_old != old_path || normalized_new != new_path {
+        *changed = true;
+    }
+    Ok(format!("diff --git {normalized_old} {normalized_new}"))
+}
+
+fn normalize_local_diff_git_header(
+    rest: &str,
+    workspace_root: &Path,
+    changed: &mut bool,
+) -> Result<String, LocalToolError> {
+    let mut parts = rest.split_whitespace();
+    let Some(old_path) = parts.next() else {
+        return Ok("diff --git ".to_string());
+    };
+    let Some(new_path) = parts.next() else {
+        return Ok(format!("diff --git {rest}"));
+    };
+    if parts.next().is_some() {
+        return Ok(format!("diff --git {rest}"));
+    }
+    let normalized_old = normalize_local_unified_path_token(old_path, workspace_root)?;
+    let normalized_new = normalize_local_unified_path_token(new_path, workspace_root)?;
     if normalized_old != old_path || normalized_new != new_path {
         *changed = true;
     }
@@ -344,6 +428,31 @@ fn normalize_unified_path_token(
         )));
     }
     Ok(relative.display().to_string())
+}
+
+fn normalize_local_unified_path_token(
+    path: &str,
+    workspace_root: &Path,
+) -> Result<String, LocalToolError> {
+    if path == "/dev/null" || !Path::new(path).is_absolute() {
+        return Ok(path.to_string());
+    }
+    let path_obj = Path::new(path);
+    if let Ok(relative) = path_obj.strip_prefix(workspace_root) {
+        if relative.as_os_str().is_empty() {
+            return Err(LocalToolError::InvalidArguments(format!(
+                "unified patch path {path:?} points at the local workspace root; use a file path"
+            )));
+        }
+        return Ok(relative.display().to_string());
+    }
+    if let Some(relative) = local_special_relative_path(path_obj, workspace_root) {
+        return Ok(relative.display().to_string());
+    }
+    Err(LocalToolError::InvalidArguments(format!(
+        "unified patch path {path:?} is absolute and outside the local workspace {}; use a relative patch path",
+        workspace_root.display()
+    )))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -584,15 +693,55 @@ fn unified_patch_header_paths(patch: &str) -> Vec<&str> {
 }
 
 fn is_local_special_patch_path(path: &Path, workspace_root: &Path) -> bool {
-    if path.is_absolute() {
-        return path.starts_with(workspace_root);
-    }
+    local_special_relative_path(path, workspace_root).is_some()
+}
+
+fn local_special_relative_path(path: &Path, workspace_root: &Path) -> Option<PathBuf> {
     let path = strip_unified_side_prefix(path);
+    if path.is_absolute() {
+        if let Ok(relative) = path.strip_prefix(workspace_root) {
+            return relative_stellaclaw_path(relative);
+        }
+        return absolute_stellaclaw_tail(path);
+    }
+    relative_stellaclaw_path(path)
+}
+
+fn relative_stellaclaw_path(path: &Path) -> Option<PathBuf> {
+    let mut normalized = PathBuf::new();
     let mut components = path.components();
     let Some(Component::Normal(first)) = components.next() else {
-        return false;
+        return None;
     };
-    first.to_string_lossy() == ".stellaclaw"
+    if first.to_string_lossy() != ".stellaclaw" {
+        return None;
+    }
+    normalized.push(first);
+    for component in components {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    Some(normalized)
+}
+
+fn absolute_stellaclaw_tail(path: &Path) -> Option<PathBuf> {
+    let components = path.components().collect::<Vec<_>>();
+    let start = components.iter().position(|component| match component {
+        Component::Normal(part) => part.to_string_lossy() == ".stellaclaw",
+        _ => false,
+    })?;
+    let mut normalized = PathBuf::new();
+    for component in &components[start..] {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+    Some(normalized)
 }
 
 fn strip_unified_side_prefix(path: &Path) -> &Path {
@@ -1433,6 +1582,42 @@ diff --git /home/me/work/src/a.py /home/me/work/src/a.py
                 .expect("classification should succeed");
 
         assert_eq!(classification, PatchTargetPaths::LocalSpecial);
+    }
+
+    #[test]
+    fn classifies_remote_absolute_stellaclaw_patch_as_local_special() {
+        let patch = "\
+--- /home/remote/project/.stellaclaw/fs_tool_smoke_test.txt
++++ /home/remote/project/.stellaclaw/fs_tool_smoke_test.txt
+@@ -1 +1 @@
+-old
++new
+";
+
+        let classification =
+            classify_patch_target_paths(PatchFormat::Unified, patch, Path::new("/local/workspace"))
+                .expect("classification should succeed");
+
+        assert_eq!(classification, PatchTargetPaths::LocalSpecial);
+    }
+
+    #[test]
+    fn normalizes_remote_absolute_stellaclaw_patch_to_local_overlay_path() {
+        let patch = "\
+diff --git /home/remote/project/.stellaclaw/a.txt /home/remote/project/.stellaclaw/a.txt
+--- /home/remote/project/.stellaclaw/a.txt\t2026-05-11
++++ /home/remote/project/.stellaclaw/a.txt\t2026-05-11
+@@ -1 +1 @@
+-old
++new
+";
+
+        let normalized = normalize_local_unified_patch_paths(patch, Path::new("/local/workspace"))
+            .expect("patch should normalize");
+
+        assert!(normalized.contains("diff --git .stellaclaw/a.txt .stellaclaw/a.txt"));
+        assert!(normalized.contains("--- .stellaclaw/a.txt\t2026-05-11"));
+        assert!(normalized.contains("+++ .stellaclaw/a.txt\t2026-05-11"));
     }
 
     #[test]

@@ -22,9 +22,9 @@ use super::{
         normalize_tool_value, parse_arguments, LocalToolError, ToolCancellationToken,
         ToolExecutionContext,
     },
-    ChatMessage, ContextItem, ConversationBridge, ToolBatch, ToolBatchCompletion, ToolBatchError,
-    ToolBatchExecutor, ToolBatchHandle, ToolBatchOperation, ToolConcurrency, ToolExecutionOp,
-    ToolRemoteMode, ToolResultContent, ToolResultItem,
+    ChatMessage, ContextItem, ConversationBridge, TokenEstimator, ToolBatch, ToolBatchCompletion,
+    ToolBatchError, ToolBatchExecutor, ToolBatchHandle, ToolBatchOperation, ToolConcurrency,
+    ToolExecutionOp, ToolRemoteMode, ToolResultContent, ToolResultItem,
 };
 
 const TOOL_INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -37,6 +37,7 @@ pub struct LocalToolBatchExecutor {
     data_root: PathBuf,
     remote_mode: ToolRemoteMode,
     conversation_bridge: Option<Arc<dyn ConversationBridge + Send + Sync>>,
+    token_estimator: Option<Arc<TokenEstimator>>,
     running_batches: Mutex<HashMap<String, RunningToolBatch>>,
 }
 
@@ -52,6 +53,7 @@ impl LocalToolBatchExecutor {
             data_root,
             remote_mode: ToolRemoteMode::Selectable,
             conversation_bridge: None,
+            token_estimator: None,
             running_batches: Mutex::new(HashMap::new()),
         }
     }
@@ -69,6 +71,11 @@ impl LocalToolBatchExecutor {
         self
     }
 
+    pub fn with_token_estimator(mut self, token_estimator: Arc<TokenEstimator>) -> Self {
+        self.token_estimator = Some(token_estimator);
+        self
+    }
+
     fn spawn_batch_worker(
         &self,
         batch: ToolBatch,
@@ -81,6 +88,7 @@ impl LocalToolBatchExecutor {
             data_root: self.data_root.clone(),
             remote_mode: self.remote_mode.clone(),
             conversation_bridge: self.conversation_bridge.clone(),
+            token_estimator: self.token_estimator.clone(),
             cancel_token: cancel_token.clone(),
             operation_lock: Arc::new(RwLock::new(())),
         };
@@ -119,6 +127,7 @@ impl LocalToolBatchExecutor {
             data_root: &self.data_root,
             remote_mode: &self.remote_mode,
             conversation_bridge: self.conversation_bridge.as_ref(),
+            token_estimator: self.token_estimator.as_deref(),
             cancel_token: ToolCancellationToken::default(),
         }
     }
@@ -134,6 +143,7 @@ struct ToolBatchRunner {
     data_root: PathBuf,
     remote_mode: ToolRemoteMode,
     conversation_bridge: Option<Arc<dyn ConversationBridge + Send + Sync>>,
+    token_estimator: Option<Arc<TokenEstimator>>,
     cancel_token: ToolCancellationToken,
     operation_lock: Arc<RwLock<()>>,
 }
@@ -311,6 +321,7 @@ impl ToolBatchRunner {
             data_root: self.data_root.clone(),
             remote_mode: self.remote_mode.clone(),
             conversation_bridge: self.conversation_bridge.clone(),
+            token_estimator: self.token_estimator.clone(),
             cancel_token: self.cancel_token.clone(),
         }
     }
@@ -437,6 +448,7 @@ struct ToolOperationRunner {
     data_root: PathBuf,
     remote_mode: ToolRemoteMode,
     conversation_bridge: Option<Arc<dyn ConversationBridge + Send + Sync>>,
+    token_estimator: Option<Arc<TokenEstimator>>,
     cancel_token: ToolCancellationToken,
 }
 
@@ -588,6 +600,7 @@ impl ToolOperationRunner {
             data_root: &self.data_root,
             remote_mode: &self.remote_mode,
             conversation_bridge: self.conversation_bridge.as_ref(),
+            token_estimator: self.token_estimator.as_deref(),
             cancel_token: self.cancel_token.clone(),
         }
     }
@@ -802,6 +815,12 @@ mod tests {
         }
     }
 
+    fn process_id_from_shell_text(text: &str) -> &str {
+        text.lines()
+            .find_map(|line| line.strip_prefix("Process ID: "))
+            .expect("shell result should include process id")
+    }
+
     fn result_file_media_type(message: &ChatMessage, index: usize) -> Option<&str> {
         match &message.data[index] {
             ChatMessageItem::ToolResult(result) => result
@@ -900,31 +919,9 @@ mod tests {
     }
 
     #[test]
-    fn executes_search_and_apply_patch_locally() {
+    fn executes_apply_patch_locally() {
         let workspace = temp_workspace();
-        fs::create_dir_all(workspace.join("src")).unwrap();
-        fs::write(
-            workspace.join("src/main.rs"),
-            "fn main() {}\nlet marker = 1;\n",
-        )
-        .unwrap();
-        fs::write(workspace.join("src/readme.txt"), "marker text\n").unwrap();
-        fs::write(workspace.join(".hidden"), "secret\n").unwrap();
-
         let executor = LocalToolBatchExecutor::new(&workspace);
-        let batch = ToolBatch::new(
-            "batch_search",
-            vec![tool_call(
-                "grep",
-                json!({"pattern": "marker", "path": ".", "include": "src/*"}),
-            )],
-        );
-
-        let message = start_and_wait(&executor, batch);
-
-        assert!(result_text(&message, 0).contains("readme.txt"));
-        assert!(!result_text(&message, 0).contains(".hidden"));
-
         fs::write(workspace.join("patch.txt"), "old\n").unwrap();
         let patch = r#"diff --git a/patch.txt b/patch.txt
 --- a/patch.txt
@@ -1147,24 +1144,6 @@ mod tests {
     }
 
     #[test]
-    fn directory_path_tools_default_to_workspace_root() {
-        let workspace = temp_workspace();
-        fs::write(workspace.join("root.txt"), "root marker\n").unwrap();
-        let executor = LocalToolBatchExecutor::new(&workspace);
-        let batch = ToolBatch::new(
-            "batch_default_path",
-            vec![tool_call(
-                "grep",
-                json!({"pattern": "root marker", "path": ""}),
-            )],
-        );
-
-        let message = start_and_wait(&executor, batch);
-
-        assert!(result_text(&message, 0).contains("root.txt"));
-    }
-
-    #[test]
     fn executes_web_fetch_locally() {
         let mut server = mockito::Server::new();
         let _mock = server
@@ -1209,9 +1188,9 @@ mod tests {
         );
 
         let text = result_text(&message, 0);
-        assert!(text.contains("\"running\": false"), "{text}");
+        assert!(text.contains("Running: false"), "{text}");
         assert!(text.contains("hello"), "{text}");
-        assert!(!text.contains("\"stderr\":"), "{text}");
+        assert!(!text.contains("Stderr:\n"), "{text}");
 
         let message = start_and_wait(
             &executor,
@@ -1223,9 +1202,9 @@ mod tests {
                 )],
             ),
         );
-        let running_result: Value = serde_json::from_str(result_text(&message, 0)).unwrap();
-        assert_eq!(running_result["running"], json!(true));
-        let process_id = running_result["process_id"].as_str().unwrap();
+        let running_text = result_text(&message, 0);
+        assert!(running_text.contains("Running: true"), "{running_text}");
+        let process_id = process_id_from_shell_text(running_text);
 
         let message = start_and_wait(
             &executor,
@@ -1257,10 +1236,10 @@ mod tests {
             ),
         );
 
-        let result: Value = serde_json::from_str(result_text(&message, 0)).unwrap();
-        assert_eq!(result["success"], json!(true), "{result}");
-        assert_eq!(result["cwd"], json!(home), "{result}");
-        assert_eq!(result["output"], json!(format!("{home}\n")), "{result}");
+        let text = result_text(&message, 0);
+        assert!(text.contains("Exit code: 0"), "{text}");
+        assert!(text.contains(&format!("Cwd: {home}")), "{text}");
+        assert!(text.contains(&format!("Stdout:\n{home}")), "{text}");
     }
 
     #[test]
@@ -1294,9 +1273,9 @@ mod tests {
                 )],
             ),
         );
-        let started: Value = serde_json::from_str(result_text(&message, 0)).unwrap();
-        assert_eq!(started["running"], json!(true));
-        let process_id = started["process_id"].as_str().unwrap();
+        let started = result_text(&message, 0);
+        assert!(started.contains("Running: true"), "{started}");
+        let process_id = process_id_from_shell_text(started);
 
         let message = start_and_wait(
             &executor,
@@ -1322,7 +1301,7 @@ mod tests {
             ),
         );
         let text = result_text(&message, 0);
-        assert!(text.contains("\"running\": false"), "{text}");
+        assert!(text.contains("Running: false"), "{text}");
         assert!(text.contains("done"), "{text}");
     }
 
@@ -1345,9 +1324,8 @@ mod tests {
             ),
         );
         let initial_text = result_text(&message, 0).to_string();
-        let started: Value = serde_json::from_str(result_text(&message, 0)).unwrap();
-        assert_eq!(started["running"], json!(true));
-        let process_id = started["process_id"].as_str().unwrap();
+        assert!(initial_text.contains("Running: true"), "{initial_text}");
+        let process_id = process_id_from_shell_text(&initial_text);
 
         let message = start_and_wait(
             &executor,
@@ -1365,7 +1343,7 @@ mod tests {
             "{initial_text}\n{text}"
         );
         assert!(text.contains("got:hello"), "{text}");
-        assert!(text.contains("\"running\": false"), "{text}");
+        assert!(text.contains("Running: false"), "{text}");
     }
 
     #[test]
@@ -1381,15 +1359,41 @@ mod tests {
                     json!({
                         "command": "python3 -c \"print('x' * 4000)\"",
                         "yield_time_ms": 1000,
-                        "max_output_chars": 80
+                        "max_output_tokens": 20
                     }),
                 )],
             ),
         );
 
         let text = result_text(&message, 0);
-        assert!(text.contains("\"output_truncated\": true"));
-        assert!(text.contains("\"original_chars\""));
+        assert!(text.contains("truncated"));
+        assert!(text.contains("Combined output:"));
+    }
+
+    #[test]
+    fn shell_exec_reports_stdout_and_stderr_separately() {
+        let workspace = temp_workspace();
+        let executor = LocalToolBatchExecutor::new(&workspace);
+        let message = start_and_wait(
+            &executor,
+            ToolBatch::new(
+                "batch_shell_streams",
+                vec![tool_call(
+                    "shell_exec",
+                    json!({
+                        "command": "python3 -c \"import sys; print('out'); print('err', file=sys.stderr)\"",
+                        "yield_time_ms": 1000
+                    }),
+                )],
+            ),
+        );
+
+        let text = result_text(&message, 0);
+        assert!(text.contains("Process exited with code 0"), "{text}");
+        assert!(text.contains("Stdout:"), "{text}");
+        assert!(text.contains("out"), "{text}");
+        assert!(text.contains("Stderr:"), "{text}");
+        assert!(text.contains("err"), "{text}");
     }
 
     #[test]
@@ -1426,9 +1430,8 @@ mod tests {
         assert!(wait_started.elapsed() < Duration::from_secs(1));
 
         let text = result_text(&message, 0);
-        assert!(text.contains("\"running\": true"));
-        let interrupted_result: Value = serde_json::from_str(text).unwrap();
-        let process_id = interrupted_result["process_id"].as_str().unwrap();
+        assert!(text.contains("Running: true"));
+        let process_id = process_id_from_shell_text(text);
         assert!(!text.contains("tool batch interrupted"));
 
         let message = start_and_wait(

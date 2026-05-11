@@ -461,6 +461,7 @@ mod tests {
             data_root: &root,
             remote_mode: &remote_mode,
             conversation_bridge: None,
+            token_estimator: None,
             cancel_token: crate::session_actor::tool_runtime::ToolCancellationToken::default(),
         };
 

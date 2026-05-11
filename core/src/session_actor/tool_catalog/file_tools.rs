@@ -1,7 +1,5 @@
-mod common;
 mod patch;
 mod read_write;
-mod search;
 mod visibility;
 
 use serde_json::{json, Map, Value};
@@ -50,26 +48,6 @@ pub fn file_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinition
             ToolBackend::Local,
         )
         .with_concurrency(ToolConcurrency::Serial),
-        ToolDefinition::new(
-            "grep",
-            "Search file contents with a regex pattern and return matching files plus line-level matches. Omit path or pass an empty string to search from the current workspace directory. context_lines must be 0..10. names_only returns only matching paths. Slow remote mounts such as sshfs/NFS are skipped by default.",
-            file_tool_schema(
-                properties([
-                    ("pattern", json!({"type": "string"})),
-                    ("path", json!({"type": "string"})),
-                    ("include", json!({"type": "string"})),
-                    ("exclude", json!({"type": "string"})),
-                    ("context_lines", json!({"type": "integer", "minimum": 0, "maximum": 10})),
-                    ("max_matches_per_file", json!({"type": "integer", "minimum": 1})),
-                    ("total_max_matches", json!({"type": "integer", "minimum": 1})),
-                    ("names_only", json!({"type": "boolean"})),
-                ]),
-                &["pattern"],
-                remote_mode,
-            ),
-            ToolExecutionMode::Immediate,
-            ToolBackend::Local,
-        ),
         ToolDefinition::new(
             "apply_patch",
             "Apply a patch inside the workspace. Patch file paths must be workspace-relative paths, or remote-cwd-relative paths when remote execution is selected. Absolute paths under the active workspace/cwd are normalized to relative paths before applying; absolute paths outside it are rejected. Supports format=auto, format=codex, or format=unified. Codex format uses *** Begin Patch / *** End Patch sections. Unified format is passed to git apply; non-empty stdout/stderr are returned and capped by max_output_chars.",
@@ -139,8 +117,14 @@ const FILE_PROMPT_PROTOCOLS: &[PromptProtocol] = &[
     PromptProtocol {
         id: "file.discovery",
         priority: 100,
-        required_tools: &["grep", "file_read"],
-        body: "For repository exploration, prefer grep to find files by content pattern with line numbers and optional context, and file_read for file contents. For path pattern discovery or directory listings, use narrow and bounded shell rg/ripgrep commands such as rg --files -g '<pattern>' or rg --files <dir>; if rg is unavailable, use bounded alternatives. Keep shell search scoped to the relevant directory, and avoid direct cat/head/tail when file_read covers the need. Recursive search skips slow remote mounts such as sshfs/NFS by default. Broad directory listings hide .stellaclaw/, but exact .stellaclaw/ paths remain valid for file tools.",
+        required_tools: &["file_read"],
+        body: "For repository exploration, use narrow and bounded shell rg/ripgrep commands such as rg -n '<pattern>' <dir>, rg --files -g '<pattern>', or rg --files <dir>; shell_exec ensures managed rg when needed. Use file_read for file contents and line ranges, and avoid direct cat/head/tail when file_read covers the need. Keep shell search scoped to the relevant directory. Broad directory listings hide .stellaclaw/. File tools may access documented .stellaclaw/ paths when needed, but do not create paths outside documented .stellaclaw workflows.",
+    },
+    PromptProtocol {
+        id: "file.shell_visibility",
+        priority: 105,
+        required_tools: &["shell_make_visible"],
+        body: "In Fixed SSH mode, shell_exec can read .stellaclaw/... only after shell_make_visible copies that path to the remote workspace; treat those copied .stellaclaw files as read-only from shell and do not mutate .stellaclaw/ from shell.",
     },
     PromptProtocol {
         id: "file.editing",
@@ -166,9 +150,6 @@ pub(crate) fn execute_file_tool(
     }
 
     if let Some(result) = read_write::execute_read_write_tool(tool_name, arguments, context)? {
-        return Ok(Some(result));
-    }
-    if let Some(result) = search::execute_search_tool(tool_name, arguments, context)? {
         return Ok(Some(result));
     }
     if let Some(result) = patch::execute_patch_tool(tool_name, arguments, context)? {
