@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     env, fs,
-    io::{self, Write},
+    io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -40,16 +40,20 @@ pub fn run(args: SetupArgs) -> Result<()> {
 
     let mut config = empty_config();
 
-    println!("Stellaclaw setup");
-    println!("Config: {}", config_path.display());
-    println!("Workdir: {}", workdir.display());
+    println!("{}", bold("Stellaclaw setup"));
+    println!("{} {}", dim("Config:"), config_path.display());
+    println!("{} {}", dim("Workdir:"), workdir.display());
     if args.dry_run {
-        println!("Dry run: no files or systemd units will be created.");
+        println!(
+            "{}",
+            yellow("Dry run: no files or systemd units will be created.")
+        );
     }
     println!();
 
     configure_models(&mut config)?;
     configure_tooling(&mut config)?;
+    configure_memory(&mut config)?;
     configure_channels(&mut config)?;
     confirm_and_create(&args, &config_path, &workdir, &mut config)?;
     Ok(())
@@ -70,10 +74,48 @@ fn empty_config() -> StellaclawConfig {
     }
 }
 
+fn stage_title(text: &str) -> String {
+    bold(&cyan(text))
+}
+
+fn bold(text: &str) -> String {
+    paint("1", text)
+}
+
+fn dim(text: &str) -> String {
+    paint("2", text)
+}
+
+fn cyan(text: &str) -> String {
+    paint("36", text)
+}
+
+fn green(text: &str) -> String {
+    paint("32", text)
+}
+
+fn yellow(text: &str) -> String {
+    paint("33", text)
+}
+
+fn paint(code: &str, text: &str) -> String {
+    if color_enabled() {
+        format!("\x1b[{code}m{text}\x1b[0m")
+    } else {
+        text.to_string()
+    }
+}
+
+fn color_enabled() -> bool {
+    env::var_os("NO_COLOR").is_none()
+        && env::var("TERM").map(|term| term != "dumb").unwrap_or(true)
+        && io::stdout().is_terminal()
+}
+
 fn configure_models(config: &mut StellaclawConfig) -> Result<()> {
     loop {
         println!();
-        println!("Stage 1/4: Model configuration");
+        println!("{}", stage_title("Stage 1/5: Model configuration"));
         print_model_summary(config);
         let choice = prompt_menu(
             "Choose an action",
@@ -91,7 +133,10 @@ fn configure_models(config: &mut StellaclawConfig) -> Result<()> {
             2 => add_claude_model(config)?,
             3 => remove_model(config)?,
             4 if config.available_agent_models().is_empty() => {
-                println!("Add at least one chat-capable model before continuing.");
+                println!(
+                    "{}",
+                    yellow("Add at least one chat-capable model before continuing.")
+                );
             }
             4 => return Ok(()),
             _ => unreachable!(),
@@ -101,7 +146,10 @@ fn configure_models(config: &mut StellaclawConfig) -> Result<()> {
 
 fn add_codex_model(config: &mut StellaclawConfig) -> Result<()> {
     println!();
-    println!("Codex subscription uses Codex auth.json first, then CHATGPT_ACCESS_TOKEN.");
+    println!(
+        "{}",
+        dim("Codex subscription uses Codex auth.json first, then CHATGPT_ACCESS_TOKEN.")
+    );
     maybe_run_codex_login()?;
 
     let alias = prompt_alias(config, "Model alias", "main")?;
@@ -131,12 +179,15 @@ fn add_codex_model(config: &mut StellaclawConfig) -> Result<()> {
 
 fn maybe_run_codex_login() -> Result<()> {
     if codex_auth_json_exists() {
-        println!("Existing Codex auth.json was found.");
+        println!("{}", green("Existing Codex auth.json was found."));
         return Ok(());
     }
     let Some(codex) = find_in_path("codex") else {
-        println!("codex executable was not found in PATH.");
-        println!("Install Codex CLI, then run `codex login --device-auth`, or provide CHATGPT_ACCESS_TOKEN.");
+        println!("{}", yellow("codex executable was not found in PATH."));
+        println!(
+            "{}",
+            dim("Install Codex CLI, then run `codex login --device-auth`, or provide CHATGPT_ACCESS_TOKEN.")
+        );
         return Ok(());
     };
     if !prompt_bool("Run `codex login --device-auth` now", true)? {
@@ -147,7 +198,12 @@ fn maybe_run_codex_login() -> Result<()> {
         .status()
         .context("failed to run codex login --device-auth")?;
     if !status.success() {
-        println!("codex login exited with status {status}; setup will continue.");
+        println!(
+            "{}",
+            yellow(&format!(
+                "codex login exited with status {status}; setup will continue."
+            ))
+        );
     }
     Ok(())
 }
@@ -235,14 +291,17 @@ fn add_claude_model(config: &mut StellaclawConfig) -> Result<()> {
 fn configure_tooling(config: &mut StellaclawConfig) -> Result<()> {
     loop {
         println!();
-        println!("Stage 2/4: Tooling configuration");
-        println!("Tool model target `main:self` means the tool reuses the active session model.");
-        println!("Use it when the current model already supports the capability; use a plain alias for a separate helper model.");
+        println!("{}", stage_title("Stage 2/5: Tooling configuration"));
+        println!(
+            "{}",
+            dim("Tool model target `main:self` means the tool reuses the active session model.")
+        );
+        println!("{}", dim("Use it when the current model already supports the capability; use a plain alias for a separate helper model."));
         print_tooling_summary(config);
         let choice = prompt_menu(
             "Choose an action",
             &[
-                "Set compression defaults",
+                "Advanced: override compression budgets",
                 "Set media helper tool models",
                 "Add Brave Search tool models",
                 "Add OpenAI image generation tool model",
@@ -263,9 +322,31 @@ fn configure_tooling(config: &mut StellaclawConfig) -> Result<()> {
 }
 
 fn configure_compression(config: &mut StellaclawConfig) -> Result<()> {
-    let threshold = prompt_optional_u64("Compression threshold tokens", Some(180_000))?;
-    let retain_default = threshold.map(|value| value / 10);
-    let retain = prompt_optional_u64("Recent high-fidelity retain tokens", retain_default)?;
+    println!(
+        "{}",
+        dim("By default Stellaclaw compresses at about 90% of the active model context window.")
+    );
+    println!(
+        "{}",
+        dim("You usually do not need to set this. Use an override only to compress earlier.")
+    );
+    println!(
+        "{}",
+        dim("Retain is the recent high-fidelity token budget kept uncompressed after compaction.")
+    );
+    let threshold = prompt_optional_u64_with_label(
+        "Override compression threshold tokens",
+        config.session_defaults.compression_threshold_tokens,
+        &default_compression_threshold_label(config),
+    )?;
+    let retain_default_label = threshold
+        .map(|value| format!("default {} (10% of override threshold)", value / 10))
+        .unwrap_or_else(|| default_compression_retain_label(config));
+    let retain = prompt_optional_u64_with_label(
+        "Override recent high-fidelity retain tokens",
+        config.session_defaults.compression_retain_recent_tokens,
+        &retain_default_label,
+    )?;
     config.session_defaults.compression_threshold_tokens = threshold;
     config.session_defaults.compression_retain_recent_tokens = retain;
     Ok(())
@@ -356,10 +437,83 @@ fn add_openai_image_model(config: &mut StellaclawConfig) -> Result<()> {
     Ok(())
 }
 
+fn configure_memory(config: &mut StellaclawConfig) -> Result<()> {
+    loop {
+        println!();
+        println!("{}", stage_title("Stage 3/5: Memory System"));
+        println!(
+            "{}",
+            dim("Memory stores durable user, public, and conversation facts separately from chat history.")
+        );
+        println!(
+            "{}",
+            dim("For dedupe and user-memory compaction, choose a cheap reliable chat model when possible.")
+        );
+        println!(
+            "{}",
+            dim("Leaving model fields unset uses local fallback behavior.")
+        );
+        print_memory_summary(config);
+        let choice = prompt_menu(
+            "Choose an action",
+            &[
+                "Enable Memory System",
+                "Disable Memory System",
+                "Select cheap dedupe model",
+                "Select cheap user compaction model",
+                "Continue",
+            ],
+        )?;
+        match choice {
+            0 => {
+                config.memory.enabled = true;
+                if config.memory.dedupe_model_alias.is_none()
+                    && prompt_bool("Select a cheap dedupe model now", true)?
+                {
+                    config.memory.dedupe_model_alias =
+                        prompt_optional_memory_model(config, "Cheap dedupe model")?;
+                }
+                if config.memory.user_compaction_model_alias.is_none()
+                    && prompt_bool("Select a cheap user compaction model now", true)?
+                {
+                    config.memory.user_compaction_model_alias =
+                        prompt_optional_memory_model(config, "Cheap user compaction model")?;
+                }
+            }
+            1 => {
+                config.memory.enabled = false;
+                config.memory.dedupe_model_alias = None;
+                config.memory.user_compaction_model_alias = None;
+            }
+            2 => {
+                config.memory.dedupe_model_alias =
+                    prompt_optional_memory_model(config, "Cheap dedupe model")?;
+            }
+            3 => {
+                config.memory.user_compaction_model_alias =
+                    prompt_optional_memory_model(config, "Cheap user compaction model")?;
+            }
+            4 => {
+                if config.memory.enabled
+                    && (config.memory.dedupe_model_alias.is_none()
+                        || config.memory.user_compaction_model_alias.is_none())
+                {
+                    println!(
+                        "{}",
+                        yellow("Memory is enabled without one or more cheap model aliases; local fallback will be used for those tasks.")
+                    );
+                }
+                return Ok(());
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
 fn configure_channels(config: &mut StellaclawConfig) -> Result<()> {
     loop {
         println!();
-        println!("Stage 3/4: Channel configuration");
+        println!("{}", stage_title("Stage 4/5: Channel configuration"));
         print_channel_summary(config);
         let choice = prompt_menu(
             "Choose an action",
@@ -375,7 +529,7 @@ fn configure_channels(config: &mut StellaclawConfig) -> Result<()> {
             1 => add_telegram_channel(config)?,
             2 => remove_channel(config)?,
             3 if config.channels.is_empty() => {
-                println!("Add at least one channel before continuing.");
+                println!("{}", yellow("Add at least one channel before continuing."));
             }
             3 => return Ok(()),
             _ => unreachable!(),
@@ -437,35 +591,37 @@ fn confirm_and_create(
     config.validate().map_err(anyhow::Error::msg)?;
 
     println!();
-    println!("Stage 4/4: Confirm and create");
+    println!("{}", stage_title("Stage 5/5: Confirm and create"));
     print_model_summary(config);
     print_tooling_summary(config);
+    print_memory_summary(config);
     print_channel_summary(config);
-    println!("Config file: {}", config_path.display());
-    println!("Workdir: {}", workdir.display());
+    println!("{} {}", dim("Config file:"), config_path.display());
+    println!("{} {}", dim("Workdir:"), workdir.display());
     if args.install_systemd {
         println!(
-            "systemd: {} service",
-            if args.systemd_user { "user" } else { "system" }
+            "{} {} service",
+            dim("systemd:"),
+            cyan(if args.systemd_user { "user" } else { "system" })
         );
     } else {
-        println!("systemd: disabled");
+        println!("{} disabled", dim("systemd:"));
     }
     println!();
 
     if args.dry_run {
         let serialized =
             serde_json::to_string_pretty(config).context("failed to serialize setup config")?;
-        println!("Dry-run config preview:");
+        println!("{}", bold("Dry-run config preview:"));
         println!("{serialized}");
         if args.install_systemd {
             let exe = env::current_exe().context("failed to resolve current executable")?;
             let unit = systemd_unit(&exe, config_path, workdir, args.systemd_user)?;
             println!();
-            println!("Dry-run systemd unit preview:");
+            println!("{}", bold("Dry-run systemd unit preview:"));
             println!("{unit}");
         }
-        println!("Dry run complete. No files were written.");
+        println!("{}", green("Dry run complete. No files were written."));
         return Ok(());
     }
 
@@ -492,11 +648,18 @@ fn confirm_and_create(
     }
 
     println!();
-    println!("Created config at {}", config_path.display());
-    println!("Created workdir at {}", workdir.display());
+    println!(
+        "{}",
+        green(&format!("Created config at {}", config_path.display()))
+    );
+    println!(
+        "{}",
+        green(&format!("Created workdir at {}", workdir.display()))
+    );
     if !args.install_systemd {
         println!(
-            "Run: stellaclaw --config {} --workdir {}",
+            "{} stellaclaw --config {} --workdir {}",
+            dim("Run:"),
             config_path.display(),
             workdir.display()
         );
@@ -619,7 +782,7 @@ fn refresh_model_defaults(config: &mut StellaclawConfig) {
 
 fn remove_model(config: &mut StellaclawConfig) -> Result<()> {
     if config.models.is_empty() {
-        println!("No models to remove.");
+        println!("{}", yellow("No models to remove."));
         return Ok(());
     }
     let aliases: Vec<String> = config.models.keys().cloned().collect();
@@ -680,9 +843,44 @@ fn prompt_tool_target(config: &StellaclawConfig, label: &str) -> Result<Option<T
     Ok(values[choice].clone().map(ToolModelTarget::Alias))
 }
 
+fn prompt_optional_memory_model(config: &StellaclawConfig, label: &str) -> Result<Option<String>> {
+    let chat_models = chat_model_aliases(config);
+    if chat_models.is_empty() {
+        println!(
+            "{}",
+            yellow("No chat-capable models are available for memory tasks.")
+        );
+        return Ok(None);
+    }
+
+    let mut values: Vec<Option<String>> = Vec::new();
+    let mut labels = Vec::new();
+    for alias in chat_models {
+        values.push(Some(alias.clone()));
+        labels.push(format!("{alias} (recommended: cheap chat model)"));
+    }
+    values.push(None);
+    labels.push("Unset (use local fallback)".to_string());
+    let refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let choice = prompt_menu(label, &refs)?;
+    Ok(values[choice].clone())
+}
+
+fn chat_model_aliases(config: &StellaclawConfig) -> Vec<String> {
+    config
+        .models
+        .iter()
+        .filter_map(|(alias, model)| {
+            model
+                .supports(ModelCapability::Chat)
+                .then(|| alias.to_string())
+        })
+        .collect()
+}
+
 fn remove_channel(config: &mut StellaclawConfig) -> Result<()> {
     if config.channels.is_empty() {
-        println!("No channels to remove.");
+        println!("{}", yellow("No channels to remove."));
         return Ok(());
     }
     let ids: Vec<String> = config
@@ -705,39 +903,45 @@ fn remove_channel(config: &mut StellaclawConfig) -> Result<()> {
 
 fn print_model_summary(config: &StellaclawConfig) {
     if config.models.is_empty() {
-        println!("Models: none");
+        println!("{} {}", bold("Models:"), dim("none"));
         return;
     }
-    println!("Models:");
+    println!("{}", bold("Models:"));
     for (alias, model) in &config.models {
         let agent = if config.available_agent_models.contains(alias) {
-            " agent"
+            format!(" {}", green("agent"))
         } else {
-            ""
+            String::new()
         };
         println!(
-            "  - {alias}: {:?} {}{}",
-            model.provider_type, model.model_name, agent
+            "  - {}: {:?} {}{}",
+            cyan(alias),
+            model.provider_type,
+            model.model_name,
+            agent
         );
     }
 }
 
 fn print_tooling_summary(config: &StellaclawConfig) {
-    println!("Tooling:");
+    println!("{}", bold("Tooling:"));
     println!(
-        "  compression: threshold={:?}, retain={:?}",
-        config.session_defaults.compression_threshold_tokens,
-        config.session_defaults.compression_retain_recent_tokens
+        "  {} threshold={}, retain={}",
+        cyan("compression:"),
+        display_compression_threshold(config),
+        display_compression_retain(config)
     );
     println!(
-        "  media: image={:?}, pdf={:?}, audio={:?}, image_generation={:?}",
+        "  {} image={:?}, pdf={:?}, audio={:?}, image_generation={:?}",
+        cyan("media:"),
         display_target(&config.session_defaults.image_tool_model),
         display_target(&config.session_defaults.pdf_tool_model),
         display_target(&config.session_defaults.audio_tool_model),
         display_target(&config.session_defaults.image_generation_tool_model)
     );
     println!(
-        "  search: web={:?}, image={:?}, video={:?}, news={:?}",
+        "  {} web={:?}, image={:?}, video={:?}, news={:?}",
+        cyan("search:"),
         display_target(&config.session_defaults.search_tool_model),
         display_target(&config.session_defaults.search_image_tool_model),
         display_target(&config.session_defaults.search_video_tool_model),
@@ -745,22 +949,96 @@ fn print_tooling_summary(config: &StellaclawConfig) {
     );
 }
 
+fn display_compression_threshold(config: &StellaclawConfig) -> String {
+    config
+        .session_defaults
+        .compression_threshold_tokens
+        .map(|value| format!("override {value}"))
+        .unwrap_or_else(|| default_compression_threshold_label(config))
+}
+
+fn display_compression_retain(config: &StellaclawConfig) -> String {
+    config
+        .session_defaults
+        .compression_retain_recent_tokens
+        .map(|value| format!("override {value}"))
+        .unwrap_or_else(|| default_compression_retain_label(config))
+}
+
+fn default_compression_threshold_label(config: &StellaclawConfig) -> String {
+    runtime_compression_defaults(config)
+        .map(|(alias, threshold, _retain)| format!("default {threshold} (90% of {alias} context)"))
+        .unwrap_or_else(|| "default 90% of active model context".to_string())
+}
+
+fn default_compression_retain_label(config: &StellaclawConfig) -> String {
+    runtime_compression_defaults(config)
+        .map(|(alias, _threshold, retain)| {
+            format!("default {retain} (10% of compression threshold for {alias})")
+        })
+        .unwrap_or_else(|| "default 10% of compression threshold".to_string())
+}
+
+fn runtime_compression_defaults(config: &StellaclawConfig) -> Option<(String, u64, u64)> {
+    let alias = config.initial_main_model_name()?;
+    let model = config.models.get(&alias)?;
+    let threshold = model.token_max_context.saturating_mul(9) / 10;
+    let retain = threshold / 10;
+    Some((alias, threshold, retain))
+}
+
+fn print_memory_summary(config: &StellaclawConfig) {
+    println!("{}", bold("Memory System:"));
+    println!(
+        "  {} {}",
+        cyan("enabled:"),
+        if config.memory.enabled {
+            green("true")
+        } else {
+            dim("false")
+        }
+    );
+    println!(
+        "  {} {}",
+        cyan("dedupe model:"),
+        display_optional_alias(config.memory.dedupe_model_alias.as_deref())
+    );
+    println!(
+        "  {} {}",
+        cyan("user compaction model:"),
+        display_optional_alias(config.memory.user_compaction_model_alias.as_deref())
+    );
+}
+
+fn display_optional_alias(value: Option<&str>) -> String {
+    value
+        .map(cyan)
+        .unwrap_or_else(|| dim("local fallback / unset"))
+}
+
 fn print_channel_summary(config: &StellaclawConfig) {
     if config.channels.is_empty() {
-        println!("Channels: none");
+        println!("{} {}", bold("Channels:"), dim("none"));
         return;
     }
-    println!("Channels:");
+    println!("{}", bold("Channels:"));
     for channel in &config.channels {
         match channel {
             ChannelConfig::Telegram(channel) => {
                 println!(
-                    "  - telegram:{} token_env={}",
-                    channel.id, channel.bot_token_env
+                    "  - {}:{} token_env={}",
+                    cyan("telegram"),
+                    channel.id,
+                    channel.bot_token_env
                 );
             }
             ChannelConfig::Web(channel) => {
-                println!("  - web:{} bind={}", channel.id, channel.bind_addr);
+                println!(
+                    "  - {}:{} bind={}",
+                    cyan("web"),
+                    channel.id,
+                    channel.bind_addr
+                );
             }
         }
     }
@@ -780,7 +1058,10 @@ fn prompt_alias(config: &StellaclawConfig, label: &str, default: &str) -> Result
         if is_valid_id(&value) && !config.models.contains_key(&value) {
             return Ok(value);
         }
-        println!("Alias must be unique and contain only ASCII letters, digits, '_' or '-'.");
+        println!(
+            "{}",
+            yellow("Alias must be unique and contain only ASCII letters, digits, '_' or '-'.")
+        );
     }
 }
 
@@ -790,7 +1071,10 @@ fn prompt_channel_id(config: &StellaclawConfig, label: &str, default: &str) -> R
         if is_valid_id(&value) && !channel_id_exists(config, &value) {
             return Ok(value);
         }
-        println!("Channel id must be unique and contain only ASCII letters, digits, '_' or '-'.");
+        println!(
+            "{}",
+            yellow("Channel id must be unique and contain only ASCII letters, digits, '_' or '-'.")
+        );
     }
 }
 
@@ -831,11 +1115,11 @@ fn is_valid_id(value: &str) -> bool {
 
 fn prompt_menu(prompt: &str, options: &[&str]) -> Result<usize> {
     loop {
-        println!("{prompt}:");
+        println!("{}:", bold(prompt));
         for (index, option) in options.iter().enumerate() {
-            println!("  {}. {option}", index + 1);
+            println!("  {} {option}", cyan(&format!("{}.", index + 1)));
         }
-        print!("> ");
+        print!("{} ", cyan(">"));
         io::stdout().flush()?;
         let input = read_line()?;
         if let Ok(value) = input.parse::<usize>() {
@@ -843,15 +1127,18 @@ fn prompt_menu(prompt: &str, options: &[&str]) -> Result<usize> {
                 return Ok(value - 1);
             }
         }
-        println!("Enter a number from 1 to {}.", options.len());
+        println!(
+            "{}",
+            yellow(&format!("Enter a number from 1 to {}.", options.len()))
+        );
     }
 }
 
 fn prompt_text(prompt: &str, default: Option<&str>) -> Result<String> {
     loop {
         match default {
-            Some(default) => print!("{prompt} [{default}]: "),
-            None => print!("{prompt}: "),
+            Some(default) => print!("{} {}: ", cyan(prompt), dim(&format!("[{default}]"))),
+            None => print!("{}: ", cyan(prompt)),
         }
         io::stdout().flush()?;
         let input = read_line()?;
@@ -863,14 +1150,14 @@ fn prompt_text(prompt: &str, default: Option<&str>) -> Result<String> {
         if !value.trim().is_empty() {
             return Ok(value.trim().to_string());
         }
-        println!("Value must not be empty.");
+        println!("{}", yellow("Value must not be empty."));
     }
 }
 
 fn prompt_bool(prompt: &str, default: bool) -> Result<bool> {
     let suffix = if default { "Y/n" } else { "y/N" };
     loop {
-        print!("{prompt} [{suffix}]: ");
+        print!("{} {}: ", cyan(prompt), dim(&format!("[{suffix}]")));
         io::stdout().flush()?;
         let input = read_line()?.to_ascii_lowercase();
         if input.is_empty() {
@@ -879,7 +1166,7 @@ fn prompt_bool(prompt: &str, default: bool) -> Result<bool> {
         match input.as_str() {
             "y" | "yes" => return Ok(true),
             "n" | "no" => return Ok(false),
-            _ => println!("Enter y or n."),
+            _ => println!("{}", yellow("Enter y or n.")),
         }
     }
 }
@@ -889,25 +1176,33 @@ fn prompt_u64(prompt: &str, default: u64) -> Result<u64> {
         let value = prompt_text(prompt, Some(&default.to_string()))?;
         match value.parse::<u64>() {
             Ok(value) if value > 0 => return Ok(value),
-            _ => println!("Enter a positive integer."),
+            _ => println!("{}", yellow("Enter a positive integer.")),
         }
     }
 }
 
-fn prompt_optional_u64(prompt: &str, default: Option<u64>) -> Result<Option<u64>> {
+fn prompt_optional_u64_with_label(
+    prompt: &str,
+    current: Option<u64>,
+    default_label: &str,
+) -> Result<Option<u64>> {
     loop {
-        let default_text = default.map(|value| value.to_string());
-        let shown = default_text.as_deref().unwrap_or("disabled");
-        print!("{prompt} [{shown}, blank keeps default, 0 disables]: ");
+        print!(
+            "{} {}: ",
+            cyan(prompt),
+            dim(&format!(
+                "[{default_label}, blank keeps default, 0 clears override]"
+            ))
+        );
         io::stdout().flush()?;
         let input = read_line()?;
         if input.is_empty() {
-            return Ok(default);
+            return Ok(current);
         }
         match input.parse::<u64>() {
             Ok(0) => return Ok(None),
             Ok(value) => return Ok(Some(value)),
-            Err(_) => println!("Enter a positive integer or 0."),
+            Err(_) => println!("{}", yellow("Enter a positive integer or 0.")),
         }
     }
 }
@@ -978,7 +1273,13 @@ fn install_systemd_unit(user: bool, config_path: &Path, workdir: &Path) -> Resul
         enable.arg("--user");
     }
     run_command(enable.args(["enable", "--now", "stellaclaw.service"]))?;
-    println!("Installed systemd unit at {}", unit_path.display());
+    println!(
+        "{}",
+        green(&format!(
+            "Installed systemd unit at {}",
+            unit_path.display()
+        ))
+    );
     Ok(())
 }
 
