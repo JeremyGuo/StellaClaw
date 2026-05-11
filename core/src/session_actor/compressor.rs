@@ -6,8 +6,8 @@ use crate::{
 };
 
 use super::{
-    tool_result_text, ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem,
-    TokenEstimator, TokenEstimatorError, ToolResultContent,
+    ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, TokenEstimator,
+    TokenEstimatorError, ToolResultContent,
 };
 
 pub const COMPRESSION_MARKER: &str = "[StellaClaw Context Compression]";
@@ -849,7 +849,7 @@ fn preserve_tool_messages(messages: &[ChatMessage], requested_ids: &[String]) ->
 }
 
 fn truncate_tool_result_content(mut tool_result: super::ToolResultItem) -> super::ToolResultItem {
-    let rendered = tool_result_text(&tool_result);
+    let rendered = super::tool_result_structured_text(&tool_result);
     if rendered.chars().count() > MAX_PRESERVED_TOOL_RESULT_TEXT_CHARS {
         let files = std::mem::take(&mut tool_result.result.files);
         tool_result.result = ToolResultContent::from_text(truncate_text_with_notice(
@@ -966,13 +966,17 @@ fn tool_result_placeholder(
     result: &ToolResultContent,
 ) -> String {
     let mut parts = vec![format!("[tool result: {tool_name} id={tool_call_id}]")];
-    let rendered = tool_result_text(&super::ToolResultItem {
+    let result_item = super::ToolResultItem {
         tool_call_id: tool_call_id.to_string(),
         tool_name: tool_name.to_string(),
         result: result.clone(),
-    });
+    };
+    let rendered = super::tool_result_structured_text(&result_item);
     if !rendered.trim().is_empty() {
         parts.push(rendered);
+    }
+    for file in &result.files {
+        parts.push(file_placeholder(file));
     }
     parts.join("\n")
 }
@@ -1654,7 +1658,7 @@ mod tests {
             messages[2].data.first(),
             Some(ChatMessageItem::ToolResult(tool_result))
                 if tool_result.tool_call_id == "call_keep"
-                    && tool_result_text(tool_result).contains("memory disabled")
+                    && crate::session_actor::tool_result_text(tool_result).contains("memory disabled")
         ));
         assert!(!messages
             .iter()

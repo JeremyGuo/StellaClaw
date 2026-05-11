@@ -430,8 +430,10 @@ pub fn tool_result_text(tool_result: &ToolResultItem) -> String {
             parts.push(text);
         }
     }
-    for file in &tool_result.result.files {
-        parts.push(file.uri.clone());
+    if parts.is_empty() {
+        for file in &tool_result.result.files {
+            parts.push(file.uri.clone());
+        }
     }
     parts.join("\n")
 }

@@ -6,6 +6,9 @@ version: 1.27.0
 - 新增 `stellaclaw setup <config> <workdir> [--systemd [--user]]` 配置向导：
   向导按模型、Tooling、Memory System、Channel、确认创建五个阶段生成当前 `config` schema 的配置文件，并在 TTY 中使用轻量 ANSI 颜色区分阶段、菜单、提示、警告和成功状态；非终端、`NO_COLOR` 或 `TERM=dumb` 时自动退回纯文本。向导会在开始时检查 config 目录、workdir 和可选 systemd unit 目录权限，避免最后保存时才失败；`--dry-run` 会完整跑向导并打印 config / systemd 预览，但不写文件、不创建 workdir、不安装服务。模型阶段支持添加多个 chat model，并按 provider 只暴露对应参数；Codex subscription 会复用 Codex auth.json / `CHATGPT_ACCESS_TOKEN` 约定，并可辅助运行 `codex login --device-auth`。Tooling 阶段解释并支持 `alias:self` 工具模型目标，Brave Search 和 OpenAI image helper 会生成独立工具模型；compression 配置在向导中标为高级 override，默认显示按当前默认模型 context window 90% 计算的压缩阈值和 10% retain 预算，但不写入固定 override。Memory System 阶段说明长期记忆用途，并提示 dedupe / user compaction 应优先选择便宜可靠的 chat 模型，也允许保持本地 fallback。Channel 阶段支持 Web / Telegram 多实例。`--systemd --user` 会写入 user service 并 enable/start，`--systemd` 会写入 system service。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 修复结构化 tool result 文件渲染：
+  `ToolResultContent.files[]` 不再在已有结构化文本时重复混入通用 `tool_result_text`，避免 token estimator 和 context compression 把文件 URI 当作普通文本；压缩请求会继续为 tool result 附件输出明确的文件省略占位符，纯文件 tool result 仍会回退渲染 URI 作为文本协议兼容。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 移除 `grep` 文件工具：
   模型可见工具目录不再暴露独立 `grep` 工具，也删除对应本地扫描器和 fixed SSH remote Python handler；代码/路径发现统一回到 Codex 风格的 shell `rg` 路线，由 `shell_exec` 每次执行前通过 ToolBinaryManager 确保 managed ripgrep 并把其目录前置到 PATH，不再依赖命令字符串启发式判断；文件内容读取继续使用 `file_read`。文件发现协议同步改为提示窄范围 `rg -n` / `rg --files` 命令。本次不改变 `config` schema，不改变 `workdir` schema。
 
