@@ -12,8 +12,13 @@
   },
   "main": "electron/main.cjs",
   "scripts": {
+    "prepare:embedpdf": "node scripts/prepare-embedpdf.cjs",
+    "watch:embedpdf": "node scripts/watch-embedpdf.cjs",
+    "prestart": "npm run prepare:embedpdf",
     "start": "node scripts/start-electron.cjs",
+    "predev": "npm run prepare:embedpdf",
     "dev": "vite --host 127.0.0.1",
+    "prebuild": "npm run prepare:embedpdf",
     "build": "vite build",
     "check": "node --check electron/main.cjs && node --check electron/preload.cjs && node --check scripts/start-electron.cjs && vite build",
     "dist": "npm run build && electron-builder --publish never",

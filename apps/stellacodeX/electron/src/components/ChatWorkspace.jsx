@@ -843,14 +843,17 @@ export function MessageArticle({ message, typewriter = false, onTypewriterDone, 
 function messageArticleClassName(message) {
   const classes = ['message', message.role || 'assistant'];
   if (message._forceSeparate) classes.push('force-separate');
+  const itemList = Array.isArray(message?.items) ? message.items : [];
+  if (itemList.some((item) => item?.type === 'selection_reference')) {
+    classes.push('has-selection-reference');
+  }
   if (String(message.role || '').toLowerCase() === 'user') {
     const text = messageText(message).trim();
     const attachments = [
       ...(Array.isArray(message?.attachments) ? message.attachments : []),
       ...(Array.isArray(message?.files) ? message.files : [])
     ];
-    const itemAttachments = (Array.isArray(message?.items) ? message.items : [])
-      .filter((item) => item?.type === 'file');
+    const itemAttachments = itemList.filter((item) => item?.type === 'file');
     if (text && (attachments.length > 0 || itemAttachments.length > 0 || Number(message?.attachment_count || 0) > 0)) {
       classes.push('media-combo');
     }
@@ -1050,7 +1053,7 @@ export function MessageBody({ message, typewriter = false, onTypewriterDone, onO
       {typewriter && text ? (
         <TypewriterMarkdown className="message-text" text={text} attachments={allAttachments} onDone={onTypewriterDone} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
       ) : Array.isArray(message?.items) && message.items.length > 0 ? (
-        <StructuredItems items={message.items} attachments={allAttachments} fallbackText={text} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
+        <StructuredItems role={message?.role} items={message.items} attachments={allAttachments} fallbackText={text} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
       ) : text ? (
         <MarkdownContent className="message-text" text={text} attachments={allAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
       ) : trailingAttachments.length > 0 ? null : (
@@ -1067,9 +1070,13 @@ export function MessageBody({ message, typewriter = false, onTypewriterDone, onO
   );
 }
 
-export function StructuredItems({ items, attachments, fallbackText, onOpenAttachment, onDownloadAttachment }) {
-  const rendered = items
-    .map((item, index) => {
+export function StructuredItems({ role, items, attachments, fallbackText, onOpenAttachment, onDownloadAttachment }) {
+  const orderedItems = orderedStructuredItems(items, role);
+  const hasTextItem = orderedItems.some(({ item }) => typeof item === 'string' || item?.type === 'text');
+  const hasSelectionReference = orderedItems.some(({ item }) => item?.type === 'selection_reference');
+  const fallback = String(fallbackText || '').trim();
+  const rendered = orderedItems
+    .map(({ item, index }) => {
       if (typeof item === 'string') {
         return <MarkdownContent key={index} className="message-text" text={item} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />;
       }
@@ -1098,8 +1105,31 @@ export function StructuredItems({ items, attachments, fallbackText, onOpenAttach
       return null;
     })
     .filter(Boolean);
+  if (String(role || '').toLowerCase() === 'user' && hasSelectionReference && fallback && !hasTextItem) {
+    rendered.push(
+      <MarkdownContent
+        key="fallback-text"
+        className="message-text"
+        text={fallbackText}
+        attachments={attachments}
+        onOpenAttachment={onOpenAttachment}
+        onDownloadAttachment={onDownloadAttachment}
+      />
+    );
+  }
   if (rendered.length) return <>{rendered}</>;
   return <MarkdownContent className="message-text" text={fallbackText} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />;
+}
+
+function orderedStructuredItems(items, role) {
+  const entries = (Array.isArray(items) ? items : []).map((item, index) => ({ item, index }));
+  if (String(role || '').toLowerCase() !== 'user') return entries;
+  const references = entries.filter(({ item }) => item?.type === 'selection_reference');
+  if (!references.length) return entries;
+  return [
+    ...references,
+    ...entries.filter(({ item }) => item?.type !== 'selection_reference')
+  ];
 }
 
 function SelectionReferenceCard({ selection }) {

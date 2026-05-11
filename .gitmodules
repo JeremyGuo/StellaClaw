@@ -1,0 +1,4 @@
+[submodule "3rd_party/embed-pdf-viewer"]
+	path = 3rd_party/embed-pdf-viewer
+	url = git@github.com:JeremyGuo/embed-pdf-viewer.git
+	branch = stellacodex/pdfium-glyph-worker

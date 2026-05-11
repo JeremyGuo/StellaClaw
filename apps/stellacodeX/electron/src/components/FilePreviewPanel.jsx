@@ -1,4 +1,4 @@
-import { Component, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { Component, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
@@ -8,10 +8,101 @@ import hljs from 'highlight.js';
 import mammoth from 'mammoth/mammoth.browser';
 import { renderAsync as renderDocxAsync } from 'docx-preview';
 import embedPdfiumWasmUrl from '@embedpdf/pdfium/pdfium.wasm?url';
-import { Code2, Download, Eye, FileText, Info, Printer, RefreshCw, X } from 'lucide-react';
+import { Bug, Code2, Download, Eye, FileText, Info, Printer, RefreshCw, X } from 'lucide-react';
 import stellacodeMark from '../assets/stellacode-mark.svg';
 import { handleExternalLinkClick, isExternalUrl } from '../lib/externalLinks';
 import { fileExtension, fileNameFromPath, imageMimeType, isHtmlFile, isImageFile, isMarkdownFile, isPdfFile, isPresentationFile, isWordFile } from '../lib/fileUtils';
+import { PDF_SELECTION_ENGINE_VERSION, PdfSelectionIndex, glyphPageFromEmbedPdf } from '../lib/pdf_selection_engine/src/index.js';
+
+const PDF_ENGINE_KIND = 'stella-pdfium-glyph';
+const PDF_WORKER_ENGINE_LABEL = 'Stella PDFium Worker';
+const PDF_DIRECT_ENGINE_LABEL = 'Stella PDFium Glyph';
+const PDF_RENDER_WORKER_COUNT = 2;
+const PDF_RENDER_CONCURRENCY = 2;
+
+function createEmptyPdfPerfStats() {
+  return {
+    pages: {},
+    renderedPages: 0,
+    paintedPages: 0,
+    renderMsTotal: 0,
+    geometryMsTotal: 0,
+    paintMsTotal: 0,
+    totalMsTotal: 0,
+    maxTotalMs: null,
+    lastPage: null,
+    lastPixels: ''
+  };
+}
+
+function updatePdfPerfStats(previous, sample) {
+  const pages = {
+    ...previous.pages,
+    [sample.page]: {
+      ...(previous.pages[sample.page] || {}),
+      ...sample
+    }
+  };
+  const rendered = Object.values(pages).filter((page) => Number.isFinite(page.totalMs));
+  const painted = Object.values(pages).filter((page) => Number.isFinite(page.paintMs));
+  const sum = (key) => rendered.reduce((total, page) => total + (Number.isFinite(page[key]) ? page[key] : 0), 0);
+  return {
+    pages,
+    renderedPages: rendered.length,
+    paintedPages: painted.length,
+    renderMsTotal: sum('renderMs'),
+    geometryMsTotal: sum('geometryMs'),
+    paintMsTotal: sum('paintMs'),
+    totalMsTotal: sum('totalMs'),
+    maxTotalMs: rendered.length > 0 ? rendered.reduce((max, page) => Math.max(max, Number.isFinite(page.totalMs) ? page.totalMs : 0), 0) : null,
+    lastPage: sample.page,
+    lastPixels: sample.pixels || previous.lastPixels || ''
+  };
+}
+
+function averagePdfMs(total, count) {
+  return count > 0 ? `${Math.round(total / count)} ms` : '-';
+}
+
+function formatPdfMs(value) {
+  return Number.isFinite(value) ? `${Math.round(value)} ms` : '-';
+}
+
+function pdfPageMetaFromPage(page, availableWidth, zoomPercent, existing = {}) {
+  const basePadding = Math.min(10, Math.max(4, availableWidth * 0.01));
+  const fitScale = Math.max(0.2, Math.min(3, (availableWidth - basePadding * 2) / Math.max(1, page.size.width)));
+  const scaleFactor = fitScale * (zoomPercent / 100);
+  return {
+    ...existing,
+    pageNumber: page.index + 1,
+    width: Math.max(1, Math.round(page.size.width * scaleFactor)),
+    height: Math.max(1, Math.round(page.size.height * scaleFactor)),
+    scaleFactor,
+    url: existing.url || '',
+    imageKey: existing.imageKey || '',
+    textRuns: existing.textRuns || [],
+    rendered: Boolean(existing.rendered),
+    rendering: Boolean(existing.rendering)
+  };
+}
+
+function updatePdfSelectionPage(runtime, page, meta, textGeometry) {
+  if (!runtime || !page || !meta || !textGeometry?.geometry || !textGeometry?.pageText) return false;
+  runtime.selectionPages.set(meta.pageNumber, glyphPageFromEmbedPdf({
+    page,
+    geometry: textGeometry.geometry,
+    textRuns: textGeometry.pageText,
+    pageIndex: page.index,
+    scale: meta.scaleFactor
+  }));
+  return true;
+}
+
+function buildPdfSelectionIndexFromRuntime(runtime) {
+  const selectionPages = Array.from(runtime?.selectionPages?.values?.() || [])
+    .sort((a, b) => a.pageNumber - b.pageNumber);
+  return selectionPages.length > 0 ? PdfSelectionIndex.fromPages(selectionPages) : null;
+}
 
 export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile, onCloseFile, onDownloadFile, onRefreshPdfPreview, onResolveMarkdownAsset, onCreateSelectionReference }) {
   const activeFile = openFiles.find((file) => file.path === activeFilePath) || null;
@@ -328,14 +419,27 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
   const scrollHintAppliedRef = useRef('');
   const pdfDragRef = useRef(null);
   const pdfSelectionRef = useRef(null);
+  const pdfSelectionIndexRef = useRef(null);
+  const pdfRuntimeRef = useRef(null);
   const pdfSelectionFrameRef = useRef(0);
+  const pdfSelectionFinalizeTimerRef = useRef(0);
+  const pdfRenderScheduleRef = useRef(0);
+  const pdfRenderPumpTimerRef = useRef(0);
+  const pdfPerfFrameRef = useRef(0);
+  const pdfPerfPendingRef = useRef([]);
+  const paintedImageKeysRef = useRef(new Set());
   const [wasmUrl, setWasmUrl] = useState('');
   const [wasmError, setWasmError] = useState('');
   const [debugEntries, setDebugEntries] = useState([]);
   const [shellWidth, setShellWidth] = useState(0);
   const zoomPercent = 100;
   const [showInfoPanel, setShowInfoPanel] = useState(false);
+  const [showPdfSelectionDebug, setShowPdfSelectionDebug] = useState(false);
+  const [activePdfEngineLabel, setActivePdfEngineLabel] = useState(PDF_WORKER_ENGINE_LABEL);
+  const [pdfPerfStats, setPdfPerfStats] = useState(() => createEmptyPdfPerfStats());
   const [pdfSelectionRects, setPdfSelectionRects] = useState([]);
+  const [pdfSelectionDebugSnapshot, setPdfSelectionDebugSnapshot] = useState(null);
+  const [pdfSelectionDebugDetail, setPdfSelectionDebugDetail] = useState(null);
   const [renderState, setRenderState] = useState({
     loading: true,
     pages: [],
@@ -344,6 +448,25 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
   });
   const documentId = useMemo(() => `preview-${stableHash(file.path || name)}`, [file.path, name]);
   const pdfBuffer = useMemo(() => arrayBufferFromPdfFile(file), [file]);
+  const pdfSelectionRectsByPage = useMemo(() => {
+    const byPage = new Map();
+    for (const rect of pdfSelectionRects) {
+      const pageRects = byPage.get(rect.pageNumber);
+      if (pageRects) {
+        pageRects.push(rect);
+      } else {
+        byPage.set(rect.pageNumber, [rect]);
+      }
+    }
+    return byPage;
+  }, [pdfSelectionRects]);
+  const pdfSelectionDebugByPage = useMemo(() => {
+    const byPage = new Map();
+    for (const page of pdfSelectionDebugSnapshot?.pages || []) {
+      byPage.set(page.pageNumber, page);
+    }
+    return byPage;
+  }, [pdfSelectionDebugSnapshot]);
   const addDebugEntry = (level, message, detail) => {
     const entry = {
       at: new Date().toLocaleTimeString(),
@@ -351,16 +474,49 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
       message,
       detail: detail ? stringifyDebugDetail(detail) : ''
     };
-    setDebugEntries((entries) => [...entries.slice(-15), entry]);
-    const logger = level === 'error' ? console.error : level === 'warn' ? console.warn : console.info;
-    logger('[StellaCodeX PDF]', message, detail || '');
+    setDebugEntries((entries) => [...entries.slice(-29), entry]);
+    if (level === 'error') {
+      console.error('[StellaCodeX PDF]', message, detail || '');
+    } else if (level === 'warn') {
+      console.warn('[StellaCodeX PDF]', message, detail || '');
+    }
   };
+  const recordPdfPerfSample = useCallback((sample) => {
+    pdfPerfPendingRef.current.push(sample);
+    if (pdfPerfFrameRef.current) return;
+    pdfPerfFrameRef.current = requestAnimationFrame(() => {
+      pdfPerfFrameRef.current = 0;
+      const samples = pdfPerfPendingRef.current;
+      pdfPerfPendingRef.current = [];
+      if (samples.length === 0) return;
+      setPdfPerfStats((current) => samples.reduce(updatePdfPerfStats, current));
+    });
+  }, []);
+  const handlePdfCanvasPaint = useCallback((pageNumber, imageKey, paintMs) => {
+    if (!imageKey || paintedImageKeysRef.current.has(imageKey)) return;
+    paintedImageKeysRef.current.add(imageKey);
+    recordPdfPerfSample({ page: pageNumber, paintMs });
+  }, [recordPdfPerfSample]);
 
   useEffect(() => {
     let disposed = false;
     setWasmUrl('');
     setWasmError('');
     setDebugEntries([]);
+    setActivePdfEngineLabel(PDF_WORKER_ENGINE_LABEL);
+    setPdfPerfStats(createEmptyPdfPerfStats());
+    pdfPerfPendingRef.current = [];
+    if (pdfPerfFrameRef.current) {
+      cancelAnimationFrame(pdfPerfFrameRef.current);
+      pdfPerfFrameRef.current = 0;
+    }
+    paintedImageKeysRef.current.clear();
+    pdfDragRef.current = null;
+    pdfSelectionRef.current = null;
+    pdfSelectionIndexRef.current = null;
+    setPdfSelectionDebugSnapshot(null);
+    setPdfSelectionDebugDetail(null);
+    setPdfSelectionRects([]);
     addDebugEntry('info', 'Using Vite PDFium WASM asset URL', { url: embedPdfiumWasmUrl });
     if (!disposed) setWasmUrl(embedPdfiumWasmUrl);
     return () => {
@@ -371,32 +527,26 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
   useEffect(() => {
     const node = shellRef.current;
     if (!node) return undefined;
-    let timeoutId = 0;
+    let frameId = 0;
     let lastWidth = 0;
     const applyWidth = (width) => {
-      if (!width || Math.abs(width - lastWidth) < 8) return;
+      if (!width || Math.abs(width - lastWidth) < 4) return;
       lastWidth = width;
       setShellWidth(width);
     };
     const update = () => {
-      if (document.querySelector('.app-root.layout-resizing')) {
-        window.clearTimeout(timeoutId);
-        timeoutId = window.setTimeout(update, 220);
-        return;
-      }
-      const width = Math.max(0, Math.floor(node.clientWidth || 0));
-      if (!lastWidth) {
+      if (frameId) return;
+      frameId = requestAnimationFrame(() => {
+        frameId = 0;
+        const width = Math.max(0, Math.floor(node.clientWidth || 0));
         applyWidth(width);
-        return;
-      }
-      window.clearTimeout(timeoutId);
-      timeoutId = window.setTimeout(() => applyWidth(width), 260);
+      });
     };
     update();
     const observer = new ResizeObserver(update);
     observer.observe(node);
     return () => {
-      window.clearTimeout(timeoutId);
+      if (frameId) cancelAnimationFrame(frameId);
       observer.disconnect();
     };
   }, []);
@@ -437,78 +587,97 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
     if (!wasmUrl || !pdfBuffer) return undefined;
     let disposed = false;
     let engine = null;
-    const localUrls = [];
-    const availableWidth = shellWidth > 0 ? shellWidth : 820;
-    const basePadding = Math.min(10, Math.max(4, availableWidth * 0.01));
-    const render = async () => {
+    const revision = (pdfRuntimeRef.current?.revision || 0) + 1;
+    const availableWidth = shellRef.current?.clientWidth || shellWidth || 820;
+    const load = async () => {
       const previousUrls = renderUrlsRef.current;
       setRenderState((current) => ({ ...current, loading: true, error: '' }));
+      setPdfPerfStats(createEmptyPdfPerfStats());
+      paintedImageKeysRef.current.clear();
+      closePdfRuntime(pdfRuntimeRef.current);
+      pdfRuntimeRef.current = null;
+      pdfSelectionIndexRef.current = null;
       try {
-        addDebugEntry('info', 'Creating PDFium direct engine', { wasmUrl, pdfBytes: pdfBuffer.byteLength, shellWidth: availableWidth });
-        const { createPdfiumEngine } = await import('@embedpdf/engines/pdfium-direct-engine');
-        engine = await withTimeout(createPdfiumEngine(wasmUrl), 20_000, 'PDFium engine initialization timed out');
-        if (disposed) return;
-        addDebugEntry('info', 'PDFium direct engine created');
-        addDebugEntry('info', 'Opening PDF document buffer', { documentId, pdfBytes: pdfBuffer.byteLength });
-        const doc = await taskToPromise(
-          engine.openDocumentBuffer({
-            id: documentId,
-            content: pdfBuffer.slice(0)
-          }, { normalizeRotation: true }),
-          'openDocumentBuffer',
-          20_000
-        );
-        if (disposed) return;
-        addDebugEntry('info', 'PDF document opened', { pageCount: doc.pageCount });
-        setRenderState((current) => ({ ...current, loading: true, pageCount: doc.pageCount, error: '' }));
-        const nextPages = [];
-        for (const page of doc.pages) {
-          if (disposed) return;
-          const fitScale = Math.max(0.2, Math.min(3, (availableWidth - basePadding * 2) / Math.max(1, page.size.width)));
-          const scaleFactor = fitScale * (zoomPercent / 100);
-          const dpr = Math.min(window.devicePixelRatio || 1, 2);
-          addDebugEntry('info', 'Rendering PDF page', { page: page.index + 1, scaleFactor: Number(scaleFactor.toFixed(3)), dpr });
-          const blob = await taskToPromise(
-            engine.renderPage(doc, page, {
-              scaleFactor,
-              dpr,
-              imageType: 'image/png',
-              withAnnotations: true,
-              withForms: true
-            }),
-            `renderPage:${page.index + 1}`,
-            30_000
+        const openWithEngine = async (mode) => {
+          const label = mode === 'worker' ? PDF_WORKER_ENGINE_LABEL : PDF_DIRECT_ENGINE_LABEL;
+          const engineWasmUrl = absoluteUrlForWorker(wasmUrl);
+          addDebugEntry('info', `Creating ${label}`, {
+            wasmUrl: engineWasmUrl,
+            pdfBytes: pdfBuffer.byteLength,
+            shellWidth: availableWidth
+          });
+          const { createPdfiumEngine } = mode === 'worker'
+            ? await import('@embedpdf/engines/pdfium-worker-engine')
+            : await import('@embedpdf/engines/pdfium-direct-engine');
+          const nextEngine = await withTimeout(
+            Promise.resolve(createPdfiumEngine(engineWasmUrl, mode === 'worker' ? { encoderPoolSize: 0, fontFallback: null } : undefined)),
+            20_000,
+            `${label} initialization timed out`
           );
-          if (disposed) return;
-          const url = URL.createObjectURL(blob);
-          localUrls.push(url);
-          let textRuns = [];
-          try {
-            const pageText = await taskToPromise(
-              engine.getPageTextRuns(doc, page),
-              `getPageTextRuns:${page.index + 1}`,
-              15_000
-            );
-            textRuns = normalizePdfTextRuns(pageText?.runs || [], scaleFactor);
-          } catch (textError) {
-            addDebugEntry('warn', 'PDF text layer failed', { page: page.index + 1, error: textError });
-          }
-          const nextPage = {
-            pageNumber: page.index + 1,
-            width: Math.max(1, Math.round(page.size.width * scaleFactor)),
-            height: Math.max(1, Math.round(page.size.height * scaleFactor)),
-            url,
-            textRuns
-          };
-          nextPages.push(nextPage);
-          setRenderState((current) => ({
-            ...current,
-            loading: true,
-            pageCount: doc.pageCount
-          }));
+          if (disposed) return null;
+          engine = nextEngine;
+          addDebugEntry('info', `${label} created`);
+          addDebugEntry('info', 'Opening PDF document buffer', { documentId, pdfBytes: pdfBuffer.byteLength, engine: label });
+          const nextDoc = await taskToPromise(
+            nextEngine.openDocumentBuffer({
+              id: documentId,
+              content: pdfBuffer.slice(0)
+            }, { normalizeRotation: true }),
+            `openDocumentBuffer:${mode}`,
+            mode === 'worker' ? 12_000 : 20_000
+          );
+          return { engine: nextEngine, doc: nextDoc, label, mode };
+        };
+
+        let opened = null;
+        try {
+          opened = await openWithEngine('worker');
+        } catch (workerError) {
+          addDebugEntry('warn', 'PDFium worker engine failed; falling back to direct engine', workerError);
+          closePdfEngine(engine);
+          engine = null;
         }
-        renderUrlsRef.current = localUrls;
-        addDebugEntry('info', 'PDF pages rendered', { pageCount: doc.pageCount });
+        if (!opened && !disposed) {
+          opened = await openWithEngine('direct');
+        }
+        if (!opened) return;
+        engine = opened.engine;
+        const doc = opened.doc;
+        setActivePdfEngineLabel(opened.label);
+        if (disposed) return;
+        addDebugEntry('info', 'PDF document opened', { pageCount: doc.pageCount, engine: opened.label });
+        const nextPages = doc.pages.map((page) => pdfPageMetaFromPage(page, availableWidth, zoomPercent));
+        pdfRuntimeRef.current = {
+          revision,
+          engine,
+          doc,
+          disposed: false,
+          pageByNumber: new Map(doc.pages.map((page) => [page.index + 1, page])),
+          pageMetaByNumber: new Map(nextPages.map((page) => [page.pageNumber, page])),
+          renderedUrls: [],
+          pageImageByNumber: new Map(),
+          renderWorkers: [createPdfRenderWorker(engine, doc, true)],
+          imageSeq: 0,
+          rendering: new Set(),
+          selectionPages: new Map(),
+          textGeometryByPage: new Map(),
+          textGeometryQueued: new Set(),
+          textGeometryTimers: new Map(),
+          renderQueue: [],
+          renderQueued: new Set(),
+          renderPumpTimer: 0,
+          pendingPageMeta: new Map(),
+          pageMetaCommitFrame: 0,
+          selectionIndexTimer: 0,
+          layoutSeq: 0,
+          deferRenderUntil: 0
+        };
+        renderUrlsRef.current = pdfRuntimeRef.current.renderedUrls;
+        addDebugEntry('info', 'PDF document ready; pages will render lazily', {
+          pageCount: doc.pageCount,
+          engine: PDF_ENGINE_KIND,
+          pagePlaceholders: nextPages.length
+        });
         setRenderState({
           loading: false,
           pages: nextPages,
@@ -516,10 +685,20 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
           error: ''
         });
         revokeObjectUrls(previousUrls);
+        if (opened.mode === 'worker') {
+          warmPdfRenderWorkers(pdfRuntimeRef.current, {
+            wasmUrl: absoluteUrlForWorker(wasmUrl),
+            pdfBuffer,
+            documentId,
+            targetCount: PDF_RENDER_WORKER_COUNT,
+            addDebugEntry,
+            scheduleRender: () => schedulePdfRenderPump(pdfRuntimeRef.current)
+          });
+        }
+        requestAnimationFrame(() => scheduleVisiblePdfRender());
       } catch (error) {
         if (!disposed) {
           addDebugEntry('error', 'PDFium render failed', error);
-          revokeObjectUrls(localUrls);
           setRenderState((current) => ({
             ...current,
             loading: false,
@@ -528,22 +707,96 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
         }
       }
     };
-    render();
+    load();
     return () => {
       disposed = true;
-      revokeObjectUrls(localUrls);
-      closePdfEngine(engine);
+      if (pdfRuntimeRef.current?.revision === revision) {
+        closePdfRuntime(pdfRuntimeRef.current);
+        pdfRuntimeRef.current = null;
+      } else {
+        closePdfEngine(engine);
+      }
     };
-  }, [documentId, pdfBuffer, shellWidth, wasmUrl, zoomPercent]);
+  }, [documentId, pdfBuffer, wasmUrl, zoomPercent, recordPdfPerfSample]);
 
   useEffect(() => () => {
     if (pdfSelectionFrameRef.current) {
       cancelAnimationFrame(pdfSelectionFrameRef.current);
       pdfSelectionFrameRef.current = 0;
     }
+    if (pdfSelectionFinalizeTimerRef.current) {
+      cancelIdleCallbackSafe(pdfSelectionFinalizeTimerRef.current);
+      pdfSelectionFinalizeTimerRef.current = 0;
+    }
+    if (pdfRenderScheduleRef.current) {
+      cancelAnimationFrame(pdfRenderScheduleRef.current);
+      pdfRenderScheduleRef.current = 0;
+    }
+    if (pdfRenderPumpTimerRef.current) {
+      window.clearTimeout(pdfRenderPumpTimerRef.current);
+      pdfRenderPumpTimerRef.current = 0;
+    }
+    if (pdfPerfFrameRef.current) {
+      cancelAnimationFrame(pdfPerfFrameRef.current);
+      pdfPerfFrameRef.current = 0;
+    }
+    pdfPerfPendingRef.current = [];
+    closePdfRuntime(pdfRuntimeRef.current);
+    pdfRuntimeRef.current = null;
     revokeObjectUrls(renderUrlsRef.current);
     renderUrlsRef.current = [];
   }, []);
+
+  useEffect(() => {
+    const runtime = pdfRuntimeRef.current;
+    if (!runtime || runtime.disposed || !runtime.doc || !shellWidth || renderState.loading) return;
+    let changed = false;
+    const nextPages = runtime.doc.pages.map((page) => {
+      const pageNumber = page.index + 1;
+      const previous = runtime.pageMetaByNumber.get(pageNumber) || {};
+      const next = pdfPageMetaFromPage(page, shellWidth, zoomPercent, previous);
+      const scaleChanged = Math.abs((previous.scaleFactor || 0) - next.scaleFactor) > 0.01;
+      if (scaleChanged) {
+        changed = true;
+        next.needsRerender = Boolean(previous.imageKey);
+        next.rendered = Boolean(previous.imageKey);
+        next.rendering = false;
+        if (!updatePdfSelectionPage(runtime, page, next, runtime.textGeometryByPage?.get(pageNumber))) {
+          runtime.selectionPages.delete(pageNumber);
+        }
+      }
+      runtime.pageMetaByNumber.set(pageNumber, next);
+      return next;
+    });
+    if (!changed) return;
+    runtime.layoutSeq = (runtime.layoutSeq || 0) + 1;
+    runtime.deferRenderUntil = performance.now() + 900;
+    runtime.renderQueue = [];
+    runtime.renderQueued?.clear?.();
+    schedulePdfSelectionIndexRebuild(runtime);
+    if (!showPdfSelectionDebug) {
+      pdfSelectionRef.current = null;
+    }
+    setPdfSelectionDebugSnapshot(null);
+    setPdfSelectionDebugDetail(null);
+    setPdfSelectionRects([]);
+    setRenderState((current) => ({
+      ...current,
+      pages: nextPages
+    }));
+    window.setTimeout(() => scheduleVisiblePdfRender(), 920);
+  }, [shellWidth, zoomPercent, renderState.loading]);
+
+  useEffect(() => {
+    const node = shellRef.current;
+    if (!node) return undefined;
+    const schedule = () => scheduleVisiblePdfRender();
+    node.addEventListener('scroll', schedule, { passive: true });
+    schedule();
+    return () => {
+      node.removeEventListener('scroll', schedule);
+    };
+  }, [renderState.pages.length]);
 
   useLayoutEffect(() => {
     const node = shellRef.current;
@@ -604,7 +857,7 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
 
   const handlePdfPointerDown = (event) => {
     if (event.button !== 0) return;
-    const point = pdfPointFromEvent(event);
+    const point = pdfPagePointFromEvent(event, event.currentTarget);
     if (!point) return;
     event.preventDefault();
     window.getSelection?.()?.removeAllRanges();
@@ -613,26 +866,213 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
       start: point,
       current: point,
       moved: false,
-      runs: collectPdfTextRuns(event.currentTarget).filter(isSelectablePdfTextRun)
+      engine: PDF_ENGINE_KIND,
+      runs: null
     };
-    pdfSelectionRef.current = null;
-    setPdfSelectionRects([]);
+    if (!showPdfSelectionDebug) {
+      pdfSelectionRef.current = null;
+    }
+    if (pdfSelectionFinalizeTimerRef.current) {
+      cancelIdleCallbackSafe(pdfSelectionFinalizeTimerRef.current);
+      pdfSelectionFinalizeTimerRef.current = 0;
+    }
     event.currentTarget.setPointerCapture?.(event.pointerId);
   };
 
   const applyPdfDragSelection = (drag, current) => {
     const shell = shellRef.current;
     if (!drag || !shell) return;
-    const selection = buildPdfDragSelection(shell, drag.start, current, drag.runs);
+    const index = currentPdfSelectionIndex();
+    const selection = buildPdfGlyphDragSelection(index, drag.start, current, {
+      includeText: false
+    });
     pdfSelectionRef.current = selection;
     setPdfSelectionRects(selection?.rects || []);
+    if (showPdfSelectionDebug) {
+      setPdfSelectionDebugSnapshot(buildPdfSelectionDebugSnapshot(index, selection, {
+        anchorPoint: drag.start,
+        focusPoint: current,
+        phase: 'drag'
+      }));
+      setPdfSelectionDebugDetail(null);
+    }
+  };
+
+  const schedulePdfSelectionFinalize = (drag, current) => {
+    if (!drag || !current) return;
+    if (pdfSelectionFinalizeTimerRef.current) {
+      cancelIdleCallbackSafe(pdfSelectionFinalizeTimerRef.current);
+      pdfSelectionFinalizeTimerRef.current = 0;
+    }
+    pdfSelectionFinalizeTimerRef.current = requestIdleCallbackSafe(() => {
+      pdfSelectionFinalizeTimerRef.current = 0;
+      const index = currentPdfSelectionIndex();
+      const selection = buildPdfGlyphDragSelection(index, drag.start, current, {
+        includeText: true
+      });
+      if (!selection) return;
+      pdfSelectionRef.current = selection;
+      setPdfSelectionRects(selection.rects || []);
+      if (showPdfSelectionDebug) {
+        setPdfSelectionDebugSnapshot(buildPdfSelectionDebugSnapshot(index, selection, {
+          anchorPoint: drag.start,
+          focusPoint: current,
+          phase: 'finalize'
+        }));
+        setPdfSelectionDebugDetail(null);
+      }
+    });
+  };
+
+  const schedulePdfSelectionIndexRebuild = (runtime) => {
+    if (!runtime || runtime.disposed || runtime.selectionIndexTimer) return;
+    runtime.selectionIndexTimer = requestIdleCallbackSafe(() => {
+      runtime.selectionIndexTimer = 0;
+      if (runtime.disposed) return;
+      pdfSelectionIndexRef.current = buildPdfSelectionIndexFromRuntime(runtime);
+    });
+  };
+
+  const currentPdfSelectionIndex = () => {
+    if (pdfSelectionIndexRef.current?.engineVersion === PDF_SELECTION_ENGINE_VERSION) {
+      return pdfSelectionIndexRef.current;
+    }
+    const runtime = pdfRuntimeRef.current;
+    if (!runtime || runtime.disposed) return pdfSelectionIndexRef.current;
+    pdfSelectionIndexRef.current = buildPdfSelectionIndexFromRuntime(runtime);
+    return pdfSelectionIndexRef.current;
+  };
+
+  const togglePdfSelectionDebug = () => {
+    setShowPdfSelectionDebug((enabled) => {
+      const next = !enabled;
+      if (next) {
+        const index = currentPdfSelectionIndex();
+        setPdfSelectionDebugSnapshot(buildPdfSelectionDebugSnapshot(index, pdfSelectionRef.current, {
+          phase: 'manual'
+        }));
+      } else {
+        setPdfSelectionDebugSnapshot(null);
+        setPdfSelectionDebugDetail(null);
+      }
+      return next;
+    });
+  };
+
+  const inspectPdfSelectionDebugAtPoint = (point) => {
+    const index = currentPdfSelectionIndex();
+    if (!index || !point) return;
+    const snapshot = buildPdfSelectionDebugSnapshot(index, pdfSelectionRef.current, {
+      focusPoint: point,
+      phase: 'inspect'
+    });
+    setPdfSelectionDebugSnapshot(snapshot);
+    setPdfSelectionDebugDetail(findPdfSelectionDebugItem(snapshot, point));
+  };
+
+  const schedulePdfTextGeometry = (runtime, pageNumber, page, meta, layoutSeq, renderMs) => {
+    if (!runtime || runtime.disposed || runtime.textGeometryQueued?.has(pageNumber)) return;
+    runtime.textGeometryQueued.add(pageNumber);
+    const timerId = requestIdleCallbackSafe(() => {
+      runtime.textGeometryTimers?.delete(pageNumber);
+      processPdfTextGeometry(runtime, pageNumber, page, meta, layoutSeq, renderMs).finally(() => {
+        runtime.textGeometryQueued?.delete(pageNumber);
+      });
+    });
+    runtime.textGeometryTimers?.set(pageNumber, timerId);
+  };
+
+  const schedulePdfPageMetaCommit = (runtime, pageNumber, meta) => {
+    if (!runtime || runtime.disposed) return;
+    runtime.pageMetaByNumber.set(pageNumber, meta);
+    runtime.pendingPageMeta?.set(pageNumber, meta);
+    if (runtime.pageMetaCommitFrame) return;
+    runtime.pageMetaCommitFrame = requestAnimationFrame(() => {
+      runtime.pageMetaCommitFrame = 0;
+      const pending = runtime.pendingPageMeta;
+      runtime.pendingPageMeta = new Map();
+      if (runtime.disposed || !pending || pending.size === 0) return;
+      setRenderState((current) => ({
+        ...current,
+        pages: current.pages.map((item) => pending.get(item.pageNumber) || item)
+      }));
+    });
+  };
+
+  const processPdfTextGeometry = async (runtime, pageNumber, page, meta, layoutSeq, renderMs) => {
+    if (!runtime || runtime.disposed || runtime.layoutSeq !== layoutSeq) return;
+    let pageText = null;
+    let geometryMode = 'none';
+    let geometryMs = 0;
+    const cachedGeometry = runtime.textGeometryByPage?.get(pageNumber);
+    if (cachedGeometry && updatePdfSelectionPage(runtime, page, meta, cachedGeometry)) {
+      geometryMode = `${cachedGeometry.mode || 'fast-glyph'}-cache`;
+      pageText = cachedGeometry.pageText;
+      schedulePdfSelectionIndexRebuild(runtime);
+    } else {
+      try {
+        const geometryStartAt = performance.now();
+        const fastGeometry = await taskToPromise(
+          runtime.engine.getPageTextGeometry(runtime.doc, page),
+          `getPageTextGeometry:${pageNumber}`,
+          15_000
+        );
+        geometryMs = performance.now() - geometryStartAt;
+        geometryMode = 'fast-glyph';
+        pageText = fastGeometry.pageText;
+        const textGeometry = {
+          geometry: fastGeometry.geometry,
+          pageText,
+          mode: geometryMode
+        };
+        runtime.textGeometryByPage?.set(pageNumber, textGeometry);
+        updatePdfSelectionPage(runtime, page, meta, textGeometry);
+        schedulePdfSelectionIndexRebuild(runtime);
+      } catch (fastGeometryError) {
+        addDebugEntry('warn', 'Fast PDF glyph geometry failed; falling back', { page: pageNumber, error: fastGeometryError });
+      }
+    }
+    if (!geometryMode || geometryMode === 'none') {
+      try {
+        const geometryStartAt = performance.now();
+        pageText = await taskToPromise(
+          runtime.engine.getPageTextRuns(runtime.doc, page),
+          `getPageTextRuns:${pageNumber}`,
+          15_000
+        );
+        const geometry = await taskToPromise(
+          runtime.engine.getPageGeometry(runtime.doc, page),
+          `getPageGeometry:${pageNumber}`,
+          15_000
+        );
+        geometryMs = performance.now() - geometryStartAt;
+        geometryMode = 'fallback-glyph';
+        const textGeometry = {
+          geometry,
+          pageText,
+          mode: geometryMode
+        };
+        runtime.textGeometryByPage?.set(pageNumber, textGeometry);
+        updatePdfSelectionPage(runtime, page, meta, textGeometry);
+        schedulePdfSelectionIndexRebuild(runtime);
+      } catch (geometryError) {
+        addDebugEntry('warn', 'PDF glyph geometry failed', { page: pageNumber, error: geometryError });
+      }
+    }
+    if (runtime.disposed || runtime.layoutSeq !== layoutSeq) return;
+    recordPdfPerfSample({
+      page: pageNumber,
+      renderMs,
+      geometryMs: Math.round(geometryMs),
+      geometryMode
+    });
   };
 
   const handlePdfPointerMove = (event) => {
     const drag = pdfDragRef.current;
     const shell = shellRef.current;
     if (!drag || drag.pointerId !== event.pointerId || !shell) return;
-    const current = pdfPointFromEvent(event, shell);
+    const current = pdfPagePointFromEvent(event, shell);
     if (!current) return;
     const distance = Math.abs(current.clientX - drag.start.clientX) + Math.abs(current.clientY - drag.start.clientY);
     if (distance < 3 && !drag.moved) return;
@@ -654,12 +1094,23 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
     const drag = pdfDragRef.current;
     const shell = shellRef.current;
     if (!drag || drag.pointerId !== event.pointerId || !shell) return;
-    const current = pdfPointFromEvent(event, shell);
+    const current = pdfPagePointFromEvent(event, shell);
     pdfDragRef.current = null;
     event.currentTarget.releasePointerCapture?.(event.pointerId);
     if (!current || !drag.moved) {
-      pdfSelectionRef.current = null;
-      setPdfSelectionRects([]);
+      if (pdfSelectionFinalizeTimerRef.current) {
+        cancelIdleCallbackSafe(pdfSelectionFinalizeTimerRef.current);
+        pdfSelectionFinalizeTimerRef.current = 0;
+      }
+      if (showPdfSelectionDebug && current) {
+        event.preventDefault();
+        inspectPdfSelectionDebugAtPoint(current);
+      } else {
+        pdfSelectionRef.current = null;
+        setPdfSelectionRects([]);
+        setPdfSelectionDebugSnapshot(null);
+        setPdfSelectionDebugDetail(null);
+      }
       return;
     }
     event.preventDefault();
@@ -668,6 +1119,7 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
       pdfSelectionFrameRef.current = 0;
     }
     applyPdfDragSelection(drag, current);
+    schedulePdfSelectionFinalize(drag, current);
   };
 
   const handlePdfPointerCancel = (event) => {
@@ -677,6 +1129,151 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
     if (pdfSelectionFrameRef.current) {
       cancelAnimationFrame(pdfSelectionFrameRef.current);
       pdfSelectionFrameRef.current = 0;
+    }
+  };
+
+  const scheduleVisiblePdfRender = () => {
+    if (pdfRenderScheduleRef.current) return;
+    pdfRenderScheduleRef.current = requestAnimationFrame(() => {
+      pdfRenderScheduleRef.current = 0;
+      renderVisiblePdfPages();
+    });
+  };
+
+  const renderVisiblePdfPages = () => {
+    const runtime = pdfRuntimeRef.current;
+    const shell = shellRef.current;
+    if (!runtime || runtime.disposed || !shell) return;
+    const pageNodes = shell.querySelectorAll('.pdfium-page');
+    if (pageNodes.length === 0) return;
+    const shellRect = shell.getBoundingClientRect();
+    const prefetch = Math.max(600, shell.clientHeight * 1.4);
+    const viewportCenter = shellRect.top + shellRect.height / 2;
+    const visible = [];
+    for (const node of pageNodes) {
+      const rect = node.getBoundingClientRect();
+      if (rect.bottom < shellRect.top - prefetch || rect.top > shellRect.bottom + prefetch) continue;
+      const pageNumber = Number(node.dataset?.pdfPage || 0);
+      if (pageNumber) {
+        visible.push({
+          pageNumber,
+          score: Math.abs((rect.top + rect.bottom) / 2 - viewportCenter)
+        });
+      }
+    }
+    if (visible.length === 0 && renderState.pages.length > 0) {
+      visible.push({ pageNumber: renderState.pages[0].pageNumber, score: 0 });
+    }
+    visible.sort((a, b) => a.score - b.score);
+    for (const { pageNumber } of visible) {
+      const meta = runtime.pageMetaByNumber.get(pageNumber);
+      if (!meta || (meta.rendered && !meta.needsRerender)) continue;
+      if (meta.needsRerender && performance.now() < (runtime.deferRenderUntil || 0)) continue;
+      enqueuePdfPageRender(runtime, pageNumber);
+    }
+  };
+
+  const enqueuePdfPageRender = (runtime, pageNumber) => {
+    if (!runtime || runtime.disposed || runtime.renderQueued?.has(pageNumber)) return;
+    runtime.renderQueued.add(pageNumber);
+    runtime.renderQueue.push(pageNumber);
+    schedulePdfRenderPump(runtime);
+  };
+
+  const schedulePdfRenderPump = (runtime, delay = 0) => {
+    if (!runtime || runtime.disposed || runtime.renderPumpTimer) return;
+    const timerId = window.setTimeout(() => {
+      runtime.renderPumpTimer = 0;
+      if (pdfRenderPumpTimerRef.current === timerId) {
+        pdfRenderPumpTimerRef.current = 0;
+      }
+      pumpPdfRenderQueue(runtime);
+    }, delay);
+    runtime.renderPumpTimer = timerId;
+    pdfRenderPumpTimerRef.current = timerId;
+  };
+
+  const pumpPdfRenderQueue = (runtime) => {
+    if (!runtime || runtime.disposed) return;
+    const workerCount = runtime.renderWorkers?.length || 1;
+    const limit = Math.max(1, Math.min(PDF_RENDER_CONCURRENCY, workerCount));
+    while (runtime.renderQueue.length > 0 && runtime.rendering.size < limit) {
+      const pageNumber = runtime.renderQueue.shift();
+      if (!pageNumber) continue;
+      runtime.renderQueued.delete(pageNumber);
+      renderPdfPageLazy(runtime, pageNumber).finally(() => {
+        if (!runtime.disposed && runtime.renderQueue.length > 0) {
+          schedulePdfRenderPump(runtime);
+        }
+      });
+    }
+  };
+
+  const renderPdfPageLazy = async (runtime, pageNumber) => {
+    if (!runtime || runtime.disposed || runtime.rendering.has(pageNumber)) return;
+    const meta = runtime.pageMetaByNumber.get(pageNumber);
+    const page = runtime.pageByNumber.get(pageNumber);
+    if (!meta || !page || (meta.rendered && !meta.needsRerender)) return;
+    const layoutSeq = runtime.layoutSeq || 0;
+    const rerenderingForResize = Boolean(meta.needsRerender && meta.imageKey);
+    const renderWorker = acquirePdfRenderWorker(runtime);
+    const renderPage = renderWorker?.pageByNumber?.get(pageNumber) || page;
+    runtime.rendering.add(pageNumber);
+    if (renderWorker) renderWorker.inFlight = (renderWorker.inFlight || 0) + 1;
+    if (!meta.imageKey) {
+      schedulePdfPageMetaCommit(runtime, pageNumber, { ...meta, rendering: true });
+    }
+    try {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const pageStartAt = performance.now();
+      const image = await taskToPromise(
+        (renderWorker?.engine || runtime.engine).renderPageRaw(renderWorker?.doc || runtime.doc, renderPage, {
+          scaleFactor: meta.scaleFactor,
+          dpr,
+          withAnnotations: true,
+          withForms: true,
+          preferImageBitmap: true
+        }),
+        `renderPage:${pageNumber}`,
+        30_000
+      );
+      const renderDoneAt = performance.now();
+      if (runtime.disposed || runtime.layoutSeq !== layoutSeq) return;
+      runtime.imageSeq = (runtime.imageSeq || 0) + 1;
+      closePdfImage(runtime.pageImageByNumber.get(pageNumber));
+      runtime.pageImageByNumber.set(pageNumber, image);
+      const imageKey = `${runtime.revision}:${pageNumber}:${runtime.imageSeq}`;
+      const pixels = image?.width && image?.height
+        ? `${image.width}x${image.height}${image.bitmapMode ? ` ${image.bitmapMode}` : ''}`
+        : '';
+      const renderMs = Math.round(renderDoneAt - pageStartAt);
+      const visualMeta = {
+        ...meta,
+        imageKey,
+        textRuns: meta.textRuns || [],
+        rendered: true,
+        rendering: false,
+        needsRerender: false
+      };
+      schedulePdfPageMetaCommit(runtime, pageNumber, visualMeta);
+      recordPdfPerfSample({
+        page: pageNumber,
+        renderMs,
+        totalMs: renderMs,
+        geometryMode: 'pending',
+        pixels
+      });
+      schedulePdfTextGeometry(runtime, pageNumber, page, visualMeta, layoutSeq, renderMs);
+    } catch (error) {
+      addDebugEntry('warn', 'Visible PDF page render failed', { page: pageNumber, error });
+      schedulePdfPageMetaCommit(runtime, pageNumber, {
+        ...(runtime.pageMetaByNumber.get(pageNumber) || meta),
+        rendering: false,
+        error: error?.message || '页面渲染失败'
+      });
+    } finally {
+      if (renderWorker) renderWorker.inFlight = Math.max(0, (renderWorker.inFlight || 1) - 1);
+      runtime.rendering.delete(pageNumber);
     }
   };
 
@@ -692,7 +1289,7 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
   };
 
   return (
-    <div className="pdf-preview">
+    <div className={`pdf-preview${showInfoPanel ? ' showing-debug' : ''}`}>
       <div className="pdf-preview-toolbar">
         <div className="pdf-preview-title">
           <strong>{name}</strong>
@@ -708,6 +1305,16 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
             onClick={() => setShowInfoPanel((value) => !value)}
           >
             <Info size={14} />
+          </button>
+          <button
+            className={`secondary-button icon-only${showPdfSelectionDebug ? ' active' : ''}`}
+            type="button"
+            title={showPdfSelectionDebug ? '隐藏选区调试层' : '显示选区调试层'}
+            aria-label={showPdfSelectionDebug ? '隐藏选区调试层' : '显示选区调试层'}
+            aria-pressed={showPdfSelectionDebug}
+            onClick={togglePdfSelectionDebug}
+          >
+            <Bug size={14} />
           </button>
           <button
             className="secondary-button icon-only"
@@ -752,11 +1359,24 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
           <div className="pdfium-pages">
             {renderState.pages.map((page) => (
               <div
-                className="pdfium-page"
-                key={`${documentId}-${page.pageNumber}-${page.url}`}
+                className={`pdfium-page${page.rendering ? ' rendering' : ''}${page.error ? ' error' : ''}`}
+                data-pdf-page={page.pageNumber}
+                key={`${documentId}-${page.pageNumber}`}
                 style={{ width: `${page.width}px`, height: `${page.height}px` }}
               >
-                <img src={page.url} alt={`${name} page ${page.pageNumber}`} draggable={false} />
+                {page.imageKey ? (
+                  <PdfiumPageCanvas
+                    image={pdfRuntimeRef.current?.pageImageByNumber?.get(page.pageNumber)}
+                    imageKey={page.imageKey}
+                    label={`${name} page ${page.pageNumber}`}
+                    pageNumber={page.pageNumber}
+                    onPaint={handlePdfCanvasPaint}
+                  />
+                ) : (
+                  <div className="pdfium-page-placeholder">
+                    <span>{page.error || (page.rendering ? '渲染中...' : '等待进入视口')}</span>
+                  </div>
+                )}
                 <div className="pdfium-text-layer" data-pdf-page={page.pageNumber}>
                   {page.textRuns.map((run, index) => (
                     <span
@@ -778,7 +1398,7 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
                   ))}
                 </div>
                 <div className="pdfium-selection-overlay" aria-hidden="true">
-                  {pdfSelectionRects.filter((rect) => rect.pageNumber === page.pageNumber).map((rect, index) => (
+                  {(pdfSelectionRectsByPage.get(page.pageNumber) || []).map((rect, index) => (
                     <span
                       key={`${page.pageNumber}-${index}-${rect.left}-${rect.top}`}
                       style={{
@@ -790,26 +1410,47 @@ function PdfPreview({ file, name, onDownloadFile, onRefreshPdfPreview, onSelecti
                     />
                   ))}
                 </div>
+                {showPdfSelectionDebug ? (
+                  <PdfSelectionDebugOverlay
+                    debug={pdfSelectionDebugByPage.get(page.pageNumber)}
+                    detail={pdfSelectionDebugDetail?.pageNumber === page.pageNumber ? pdfSelectionDebugDetail : null}
+                  />
+                ) : null}
                 <span className="pdfium-page-number">{page.pageNumber}</span>
               </div>
             ))}
           </div>
         )}
-        {renderState.loading && !showInfoPanel ? (
-          <div className="pdf-loading-status">
-            PDFium 渲染中{renderState.pageCount ? ` ${renderState.pages.length}/${renderState.pageCount}` : ''}
-          </div>
-        ) : null}
-        {showInfoPanel ? (
-          <div className="pdf-debug-overlay">
-            <strong>{renderState.loading ? `PDFium 渲染中${renderState.pageCount ? `：${renderState.pages.length}/${renderState.pageCount}` : ''}` : 'PDF 信息'}</strong>
-            <span>当前使用 direct engine，绕过 EmbedPDF snippet 插件初始化。</span>
-            <pre>{debugEntries.map((entry) => (
-              `[${entry.at}] ${entry.level.toUpperCase()} ${entry.message}${entry.detail ? `\n${entry.detail}` : ''}`
-            )).join('\n\n')}</pre>
-          </div>
-        ) : null}
       </div>
+      {renderState.loading && !showInfoPanel ? (
+        <div className="pdf-loading-status">
+          PDFium 渲染中{renderState.pageCount ? ` ${pdfPerfStats.renderedPages}/${renderState.pageCount}` : ''}
+        </div>
+      ) : null}
+      {showInfoPanel ? (
+        <div className="pdf-debug-overlay">
+          <strong>{renderState.loading ? `PDFium 渲染中${renderState.pageCount ? `：${pdfPerfStats.renderedPages}/${renderState.pageCount}` : ''}` : 'PDF 信息'}</strong>
+          <span>当前引擎：{activePdfEngineLabel}</span>
+          <div className="pdf-perf-grid">
+            <span><b>{pdfPerfStats.renderedPages}/{renderState.pageCount || 0}</b><small>已渲染页</small></span>
+            <span><b>{averagePdfMs(pdfPerfStats.totalMsTotal, pdfPerfStats.renderedPages)}</b><small>平均总耗时</small></span>
+            <span><b>{averagePdfMs(pdfPerfStats.renderMsTotal, pdfPerfStats.renderedPages)}</b><small>平均渲染</small></span>
+            <span><b>{averagePdfMs(pdfPerfStats.geometryMsTotal, pdfPerfStats.renderedPages)}</b><small>平均文字几何</small></span>
+            <span><b>{averagePdfMs(pdfPerfStats.paintMsTotal, pdfPerfStats.paintedPages)}</b><small>平均画布绘制</small></span>
+            <span><b>{formatPdfMs(pdfPerfStats.maxTotalMs)}</b><small>单页最慢</small></span>
+          </div>
+          <span>最近页面：{pdfPerfStats.lastPage ? `第 ${pdfPerfStats.lastPage} 页` : '-'}{pdfPerfStats.lastPixels ? `，${pdfPerfStats.lastPixels}` : ''}</span>
+          {pdfSelectionDebugDetail ? (
+            <pre>{stringifyDebugDetail(pdfSelectionDebugDetail.detail)}</pre>
+          ) : null}
+          {pdfSelectionDebugSnapshot ? (
+            <pre>{stringifyDebugDetail(pdfSelectionDebugSnapshot.summary)}</pre>
+          ) : null}
+          <pre>{debugEntries.map((entry) => (
+            `[${entry.at}] ${entry.level.toUpperCase()} ${entry.message}${entry.detail ? `\n${entry.detail}` : ''}`
+          )).join('\n\n')}</pre>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1201,6 +1842,424 @@ function pdfPointFromEvent(event) {
     clientX: event.clientX,
     clientY: event.clientY
   };
+}
+
+function isPdfGlyphEngine(engine) {
+  return engine === 'pdfium-glyph' || engine === 'pdfium-worker';
+}
+
+function pdfPagePointFromEvent(event, shell) {
+  if (!event || !shell || !Number.isFinite(event.clientX) || !Number.isFinite(event.clientY)) return null;
+  const hit = document.elementFromPoint(event.clientX, event.clientY);
+  const hitPage = hit?.closest?.('.pdfium-page');
+  if (hitPage && shell.contains(hitPage)) {
+    return pdfPagePointFromPageElement(event, hitPage);
+  }
+  const pages = shell.querySelectorAll('.pdfium-page');
+  if (pages.length === 0) return null;
+  let best = null;
+  for (const page of pages) {
+    const rect = page.getBoundingClientRect();
+    const verticalDistance = event.clientY < rect.top ? rect.top - event.clientY : event.clientY > rect.bottom ? event.clientY - rect.bottom : 0;
+    const horizontalDistance = event.clientX < rect.left ? rect.left - event.clientX : event.clientX > rect.right ? event.clientX - rect.right : 0;
+    const score = verticalDistance * 1000 + horizontalDistance;
+    if (!best || score < best.score) best = { page, rect, score };
+  }
+  if (!best) return null;
+  return pdfPagePointFromPageElement(event, best.page, best.rect);
+}
+
+function pdfPagePointFromPageElement(event, page, cachedRect = null) {
+  const rect = cachedRect || page.getBoundingClientRect();
+  const layer = page.querySelector('.pdfium-text-layer');
+  const declaredWidth = parseFloat(page.style.width || '0') || rect.width || 1;
+  const declaredHeight = parseFloat(page.style.height || '0') || rect.height || 1;
+  const scaleX = rect.width / declaredWidth;
+  const scaleY = rect.height / declaredHeight;
+  return {
+    pageNumber: Number(layer?.dataset?.pdfPage || 0) || undefined,
+    x: clampNumber((event.clientX - rect.left) / Math.max(scaleX, 0.0001), 0, declaredWidth),
+    y: clampNumber((event.clientY - rect.top) / Math.max(scaleY, 0.0001), 0, declaredHeight),
+    clientX: event.clientX,
+    clientY: event.clientY
+  };
+}
+
+function buildPdfGlyphDragSelection(index, startPoint, endPoint, options = {}) {
+  if (!index || !startPoint || !endPoint) return null;
+  const anchor = index.hitTest(startPoint);
+  const focus = index.hitTest(endPoint);
+  const clientDeltaY = Math.abs((endPoint.clientY ?? endPoint.y ?? 0) - (startPoint.clientY ?? startPoint.y ?? 0));
+  const pageDeltaY = Math.abs((endPoint.y ?? 0) - (startPoint.y ?? 0));
+  const selection = index.selectBetween(anchor, focus, {
+    sameLaneSelection: true,
+    focusPoint: endPoint,
+    forceAnchorLine: clientDeltaY <= 18 || pageDeltaY <= 18,
+    includeText: options.includeText ?? true
+  });
+  if (!selection || selection.glyphCount <= 0) return null;
+  if ((options.includeText ?? true) && !selection.selectedText) return null;
+  const pages = selection.pages || [];
+  const rects = mergePdfSelectionRects(selection.rects || []);
+  if (rects.length === 0) return null;
+  return {
+    selectedText: selection.selectedText || '',
+    textReady: Boolean(selection.textReady),
+    rects,
+    page: pages[0],
+    debug: {
+      anchor: summarizePdfSelectionHit(anchor),
+      focus: summarizePdfSelectionHit(focus),
+      start: selection.start,
+      end: selection.end,
+      glyphCount: selection.glyphCount,
+      rawRectCount: selection.rects?.length || 0,
+      mergedRectCount: rects.length
+    },
+    locator: selection.textReady ? {
+        kind: 'pdf_glyph_selection',
+        page: pages[0],
+        pages,
+        text_length: selection.selectedText.length,
+        glyph_count: selection.glyphCount,
+        rects: (selection.rects || []).slice(0, 64).map((rect) => ({
+          page: rect.pageNumber,
+          left: roundPdfNumber(rect.left),
+          top: roundPdfNumber(rect.top),
+          width: roundPdfNumber(rect.width),
+          height: roundPdfNumber(rect.height)
+        }))
+      } : null
+  };
+}
+
+function buildPdfSelectionDebugSnapshot(index, selection, meta = {}) {
+  if (!index) return null;
+  const selectedOrders = new Set();
+  const start = Number(selection?.debug?.start);
+  const end = Number(selection?.debug?.end);
+  if (Number.isFinite(start) && Number.isFinite(end)) {
+    for (let order = start; order < end; order += 1) selectedOrders.add(order);
+  }
+
+  const anchorHit = meta.anchorPoint ? summarizePdfSelectionHit(index.hitTest(meta.anchorPoint)) : selection?.debug?.anchor || null;
+  const focusHit = meta.focusPoint ? summarizePdfSelectionHit(index.hitTest(meta.focusPoint)) : selection?.debug?.focus || null;
+  const selectionRects = selection?.rects || [];
+  const selectionPages = new Set(selectionRects.map((rect) => rect.pageNumber).filter(Boolean));
+  const pages = [];
+
+  for (const page of index.pageMap?.values?.() || []) {
+    const pageGlyphs = index.pageGlyphs?.get(page.pageNumber) || [];
+    const shouldInclude =
+      selectionPages.size === 0 ||
+      selectionPages.has(page.pageNumber) ||
+      meta.anchorPoint?.pageNumber === page.pageNumber ||
+      meta.focusPoint?.pageNumber === page.pageNumber;
+    if (!shouldInclude) continue;
+
+    const glyphs = pageGlyphs.map((glyph) => ({
+      key: glyph.id || `${glyph.pageNumber}:${glyph.localIndex}`,
+      char: debugGlyphLabel(glyph.char),
+      order: glyph.order,
+      localIndex: glyph.localIndex,
+      lineId: glyph.line?.id ?? glyph.lineId ?? '',
+      laneIndex: glyph.laneIndex ?? -1,
+      blockId: glyph.block?.id ?? '',
+      blockType: glyph.block?.type ?? '',
+      selected: selectedOrders.has(glyph.order),
+      rect: debugRect(glyph.rect),
+      hitRect: debugRect(glyph.hitRect || glyph.tightRect || glyph.rect)
+    })).filter((glyph) => glyph.rect);
+
+    const lines = Array.from(index.lineGlyphs?.values?.() || [])
+      .filter((line) => line.pageNumber === page.pageNumber)
+      .map((line) => {
+        const bounds = debugRectFromGlyphs(line.glyphs || []);
+        return bounds ? {
+          key: line.key,
+          lineId: line.lineId ?? '',
+          laneIndex: line.laneIndex ?? -1,
+          blockId: line.blockId ?? '',
+          blockType: line.blockType ?? '',
+          tableLike: Boolean(line.tableLike),
+          indexInLane: line.indexInLane,
+          glyphCount: line.glyphs?.length || 0,
+          text: debugLinePreview(line.glyphs || []),
+          rect: bounds
+        } : null;
+      })
+      .filter(Boolean);
+
+    const lanes = (page.lanes || []).map((lane) => ({
+      key: `${page.pageNumber}:${lane.laneIndex}`,
+      laneIndex: lane.laneIndex,
+      left: roundPdfNumber(lane.left),
+      right: roundPdfNumber(lane.right),
+      margin: roundPdfNumber(lane.margin || 0),
+      rect: {
+        left: roundPdfNumber(Math.max(0, lane.left - (lane.margin || 0))),
+        top: 0,
+        width: roundPdfNumber(Math.max(1, lane.right - lane.left + (lane.margin || 0) * 2)),
+        height: roundPdfNumber(page.height || 0)
+      }
+    }));
+
+    const blocks = (page.blocks || []).map((block) => ({
+      key: `${page.pageNumber}:${block.id}`,
+      id: block.id,
+      type: block.type,
+      laneIndex: block.laneIndex ?? -1,
+      lineCount: block.units?.length || 0,
+      rect: debugRect(block.bounds || block)
+    })).filter((block) => block.rect);
+
+    const points = [
+      debugPoint('anchor', meta.anchorPoint),
+      debugPoint('focus', meta.focusPoint)
+    ].filter((point) => point && point.pageNumber === page.pageNumber);
+
+    pages.push({
+      pageNumber: page.pageNumber,
+      width: roundPdfNumber(page.width || 0),
+      height: roundPdfNumber(page.height || 0),
+      glyphs,
+      lines,
+      lanes,
+      blocks,
+      selectionRects: selectionRects
+        .filter((rect) => rect.pageNumber === page.pageNumber)
+        .map((rect, rectIndex) => ({
+          key: `${page.pageNumber}:${rectIndex}:${rect.left}:${rect.top}`,
+          rect: debugRect(rect)
+        }))
+        .filter((entry) => entry.rect),
+      points
+    });
+  }
+
+  return {
+    version: PDF_SELECTION_ENGINE_VERSION,
+    phase: meta.phase || 'manual',
+    summary: {
+      phase: meta.phase || 'manual',
+      engineVersion: index.engineVersion,
+      pageCount: index.pages?.length || 0,
+      glyphCount: index.glyphs?.length || 0,
+      selectedGlyphRange: Number.isFinite(start) && Number.isFinite(end) ? `${start}..${end}` : '-',
+      selectedGlyphCount: selection?.debug?.glyphCount || 0,
+      rawSelectionRects: selection?.debug?.rawRectCount || 0,
+      mergedSelectionRects: selection?.debug?.mergedRectCount || selectionRects.length || 0,
+      anchor: anchorHit,
+      focus: focusHit
+    },
+    pages
+  };
+}
+
+function summarizePdfSelectionHit(hit) {
+  if (!hit?.glyph) return null;
+  const glyph = hit.glyph;
+  return {
+    page: hit.pageNumber,
+    point: {
+      x: roundPdfNumber(hit.x),
+      y: roundPdfNumber(hit.y)
+    },
+    boundary: hit.boundary,
+    glyph: {
+      char: debugGlyphLabel(glyph.char),
+      order: glyph.order,
+      localIndex: glyph.localIndex,
+      lineId: glyph.line?.id ?? glyph.lineId ?? '',
+      laneIndex: glyph.laneIndex ?? -1,
+      blockId: glyph.block?.id ?? '',
+      blockType: glyph.block?.type ?? '',
+      rect: debugRect(glyph.rect),
+      hitRect: debugRect(glyph.hitRect || glyph.tightRect || glyph.rect)
+    },
+    lane: hit.lane ? {
+      index: hit.lane.laneIndex,
+      left: roundPdfNumber(hit.lane.left),
+      right: roundPdfNumber(hit.lane.right),
+      margin: roundPdfNumber(hit.lane.margin)
+    } : null
+  };
+}
+
+function debugRect(rect) {
+  if (!rect) return null;
+  const left = Number(rect.left);
+  const top = Number(rect.top);
+  const width = Number(rect.width);
+  const height = Number(rect.height);
+  if (!(width > 0) || !(height > 0) || !Number.isFinite(left) || !Number.isFinite(top)) return null;
+  return {
+    left: roundPdfNumber(left),
+    top: roundPdfNumber(top),
+    width: roundPdfNumber(width),
+    height: roundPdfNumber(height)
+  };
+}
+
+function debugRectFromGlyphs(glyphs) {
+  let left = Infinity;
+  let top = Infinity;
+  let right = -Infinity;
+  let bottom = -Infinity;
+  let count = 0;
+  for (const glyph of glyphs) {
+    const rect = glyph?.hitRect || glyph?.rect;
+    if (!rect) continue;
+    left = Math.min(left, rect.left);
+    top = Math.min(top, rect.top);
+    right = Math.max(right, rect.right);
+    bottom = Math.max(bottom, rect.bottom);
+    count += 1;
+  }
+  if (count === 0) return null;
+  return debugRect({ left, top, width: right - left, height: bottom - top });
+}
+
+function debugPoint(kind, point) {
+  if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) return null;
+  return {
+    key: kind,
+    kind,
+    pageNumber: point.pageNumber,
+    x: roundPdfNumber(point.x),
+    y: roundPdfNumber(point.y)
+  };
+}
+
+function debugGlyphLabel(char) {
+  if (char === ' ') return 'space';
+  if (char === '\n') return '\\n';
+  return String(char || '').slice(0, 8);
+}
+
+function debugLinePreview(glyphs) {
+  return glyphs
+    .slice()
+    .sort((a, b) => a.left - b.left || a.localIndex - b.localIndex)
+    .map((glyph) => glyph.char || '')
+    .join('')
+    .trim()
+    .slice(0, 80);
+}
+
+function findPdfSelectionDebugItem(snapshot, point) {
+  const page = snapshot?.pages?.find((candidate) => candidate.pageNumber === point?.pageNumber);
+  if (!page || !point) return null;
+  const x = Number(point.x);
+  const y = Number(point.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+
+  const selection = smallestContaining(page.selectionRects, x, y, (entry) => entry.rect);
+  if (selection) {
+    return debugItem('selection', page.pageNumber, selection.key, selection.rect, {
+      kind: 'selection',
+      page: page.pageNumber,
+      rect: selection.rect
+    });
+  }
+
+  const glyph = smallestContaining(page.glyphs, x, y, (entry) => entry.hitRect || entry.rect);
+  if (glyph) {
+    const line = page.lines.find((candidate) => (
+      candidate.lineId === glyph.lineId &&
+      candidate.laneIndex === glyph.laneIndex &&
+      pointInsideDebugRect(x, y, candidate.rect)
+    )) || smallestContaining(page.lines, x, y, (entry) => entry.rect);
+    return debugItem('glyph', page.pageNumber, glyph.key, glyph.hitRect || glyph.rect, {
+      kind: 'glyph',
+      page: page.pageNumber,
+      char: glyph.char,
+      order: glyph.order,
+      localIndex: glyph.localIndex,
+      laneIndex: glyph.laneIndex,
+      blockId: glyph.blockId,
+      blockType: glyph.blockType,
+      lineId: glyph.lineId,
+      selected: glyph.selected,
+      rect: glyph.rect,
+      hitRect: glyph.hitRect,
+      line: line ? debugLineDetail(line) : null
+    });
+  }
+
+  const block = smallestContaining(page.blocks || [], x, y, (entry) => entry.rect);
+  if (block) {
+    return debugItem('block', page.pageNumber, block.key, block.rect, {
+      kind: 'block',
+      page: page.pageNumber,
+      blockId: block.id,
+      blockType: block.type,
+      laneIndex: block.laneIndex,
+      lineCount: block.lineCount,
+      rect: block.rect
+    });
+  }
+
+  const line = smallestContaining(page.lines, x, y, (entry) => entry.rect);
+  if (line) {
+    return debugItem('line', page.pageNumber, line.key, line.rect, debugLineDetail(line));
+  }
+
+  const lane = smallestContaining(page.lanes, x, y, (entry) => entry.rect);
+  if (lane) {
+    return debugItem('lane', page.pageNumber, lane.key, lane.rect, {
+      kind: 'lane',
+      page: page.pageNumber,
+      laneIndex: lane.laneIndex,
+      left: lane.left,
+      right: lane.right,
+      margin: lane.margin,
+      rect: lane.rect
+    });
+  }
+
+  return null;
+}
+
+function debugLineDetail(line) {
+  return {
+    kind: 'line',
+    lineId: line.lineId,
+    laneIndex: line.laneIndex,
+    blockId: line.blockId,
+    blockType: line.blockType,
+    tableLike: Boolean(line.tableLike),
+    row: line.indexInLane,
+    glyphCount: line.glyphCount,
+    rect: line.rect,
+    text: line.text
+  };
+}
+
+function debugItem(kind, pageNumber, key, rect, detail) {
+  return {
+    kind,
+    pageNumber,
+    key,
+    rect,
+    detail
+  };
+}
+
+function smallestContaining(items, x, y, rectForItem) {
+  let best = null;
+  for (const item of items || []) {
+    const rect = rectForItem(item);
+    if (!pointInsideDebugRect(x, y, rect)) continue;
+    const area = Math.max(1, rect.width * rect.height);
+    if (!best || area < best.area) best = { item, area };
+  }
+  return best?.item || null;
+}
+
+function pointInsideDebugRect(x, y, rect) {
+  if (!rect) return false;
+  return x >= rect.left && x <= rect.left + rect.width && y >= rect.top && y <= rect.top + rect.height;
 }
 
 function buildPdfDragSelection(container, startPoint, endPoint, cachedRuns = null) {
@@ -1885,6 +2944,30 @@ function withTimeout(promise, timeoutMs, message) {
   });
 }
 
+function requestIdleCallbackSafe(callback) {
+  if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
+    return window.requestIdleCallback(callback, { timeout: 250 });
+  }
+  return window.setTimeout(() => callback({ didTimeout: true, timeRemaining: () => 0 }), 0);
+}
+
+function cancelIdleCallbackSafe(id) {
+  if (!id) return;
+  if (typeof window !== 'undefined' && typeof window.cancelIdleCallback === 'function') {
+    window.cancelIdleCallback(id);
+    return;
+  }
+  window.clearTimeout(id);
+}
+
+function absoluteUrlForWorker(url) {
+  try {
+    return new URL(url, window.location.href).href;
+  } catch {
+    return url;
+  }
+}
+
 function createPdfDebugLogger(addDebugEntry) {
   const emit = (level, source, category, args) => {
     addDebugEntry(level, `PDFium ${source}/${category}`, args);
@@ -1914,6 +2997,288 @@ function closePdfEngine(engine) {
   } catch {
     // Best effort cleanup during preview teardown.
   }
+}
+
+function createPdfRenderWorker(engine, doc, primary = false) {
+  return {
+    engine,
+    doc,
+    primary,
+    inFlight: 0,
+    pageByNumber: new Map((doc?.pages || []).map((page) => [page.index + 1, page]))
+  };
+}
+
+function acquirePdfRenderWorker(runtime) {
+  const workers = runtime?.renderWorkers || [];
+  if (workers.length === 0) return null;
+  let best = workers[0];
+  for (const worker of workers) {
+    if ((worker.inFlight || 0) < (best.inFlight || 0)) best = worker;
+  }
+  return best;
+}
+
+async function warmPdfRenderWorkers(runtime, { wasmUrl, pdfBuffer, documentId, targetCount, addDebugEntry, scheduleRender }) {
+  if (!runtime || runtime.disposed || runtime.renderWorkersWarming) return;
+  runtime.renderWorkersWarming = true;
+  const missing = Math.max(0, targetCount - (runtime.renderWorkers?.length || 0));
+  if (missing === 0) {
+    runtime.renderWorkersWarming = false;
+    return;
+  }
+  const jobs = [];
+  for (let index = 0; index < missing; index += 1) {
+    const workerIndex = (runtime.renderWorkers?.length || 0) + index + 1;
+    jobs.push(createPdfRenderWorkerDocument({
+      wasmUrl,
+      pdfBuffer,
+      documentId: `${documentId}-render-${workerIndex}`,
+      workerIndex
+    }));
+  }
+  const results = await Promise.allSettled(jobs);
+  if (runtime.disposed) {
+    for (const result of results) {
+      if (result.status === 'fulfilled') closePdfEngine(result.value.engine);
+    }
+    return;
+  }
+  let added = 0;
+  for (const result of results) {
+    if (result.status === 'fulfilled') {
+      runtime.renderWorkers.push(result.value);
+      added += 1;
+    } else {
+      addDebugEntry?.('warn', 'PDF render worker warmup failed', result.reason);
+    }
+  }
+  runtime.renderWorkersWarming = false;
+  if (added > 0) {
+    addDebugEntry?.('info', 'PDF render worker pool ready', {
+      workers: runtime.renderWorkers.length,
+      concurrency: Math.min(PDF_RENDER_CONCURRENCY, runtime.renderWorkers.length)
+    });
+    scheduleRender?.();
+  }
+}
+
+async function createPdfRenderWorkerDocument({ wasmUrl, pdfBuffer, documentId, workerIndex }) {
+  const { createPdfiumEngine } = await import('@embedpdf/engines/pdfium-worker-engine');
+  const engine = await withTimeout(
+    Promise.resolve(createPdfiumEngine(wasmUrl, { encoderPoolSize: 0, fontFallback: null })),
+    20_000,
+    `PDF render worker ${workerIndex} initialization timed out`
+  );
+  try {
+    const doc = await taskToPromise(
+      engine.openDocumentBuffer({
+        id: documentId,
+        content: pdfBuffer.slice(0)
+      }, { normalizeRotation: true }),
+      `openRenderWorkerDocument:${workerIndex}`,
+      20_000
+    );
+    return createPdfRenderWorker(engine, doc, false);
+  } catch (error) {
+    closePdfEngine(engine);
+    throw error;
+  }
+}
+
+function closePdfImage(image) {
+  try {
+    image?.bitmap?.close?.();
+  } catch {
+    // Best effort cleanup during preview teardown.
+  }
+}
+
+function closePdfRuntime(runtime) {
+  if (!runtime) return;
+  runtime.disposed = true;
+  if (runtime.renderPumpTimer) {
+    window.clearTimeout(runtime.renderPumpTimer);
+    runtime.renderPumpTimer = 0;
+  }
+  if (runtime.pageMetaCommitFrame) {
+    cancelAnimationFrame(runtime.pageMetaCommitFrame);
+    runtime.pageMetaCommitFrame = 0;
+  }
+  runtime.pendingPageMeta?.clear?.();
+  if (runtime.selectionIndexTimer) {
+    cancelIdleCallbackSafe(runtime.selectionIndexTimer);
+    runtime.selectionIndexTimer = 0;
+  }
+  for (const timerId of runtime.textGeometryTimers?.values?.() || []) {
+    cancelIdleCallbackSafe(timerId);
+  }
+  runtime.textGeometryTimers?.clear?.();
+  runtime.textGeometryQueued?.clear?.();
+  revokeObjectUrls(runtime.renderedUrls || []);
+  for (const image of runtime.pageImageByNumber?.values?.() || []) {
+    closePdfImage(image);
+  }
+  runtime.pageImageByNumber?.clear();
+  const closed = new Set();
+  for (const worker of runtime.renderWorkers || []) {
+    if (!worker?.engine || closed.has(worker.engine)) continue;
+    closed.add(worker.engine);
+    closePdfEngine(worker.engine);
+  }
+  if (runtime.engine && !closed.has(runtime.engine)) closePdfEngine(runtime.engine);
+}
+
+function PdfSelectionDebugOverlay({ debug, detail }) {
+  if (!debug) return null;
+  return (
+    <div className="pdf-selection-debug-overlay" aria-hidden="true">
+      {(debug.blocks || []).map((block) => (
+        <span
+          className={`pdf-selection-debug-block ${block.type || 'unknown'}${detail?.kind === 'block' && detail.key === block.key ? ' focused' : ''}`}
+          key={`block-${block.key}`}
+          style={{
+            left: `${block.rect.left}px`,
+            top: `${block.rect.top}px`,
+            width: `${block.rect.width}px`,
+            height: `${block.rect.height}px`
+          }}
+        />
+      ))}
+      {debug.lanes.map((lane) => (
+        <span
+          className={`pdf-selection-debug-lane${detail?.kind === 'lane' && detail.key === lane.key ? ' focused' : ''}`}
+          key={`lane-${lane.key}`}
+          style={{
+            left: `${lane.rect.left}px`,
+            top: `${lane.rect.top}px`,
+            width: `${lane.rect.width}px`,
+            height: `${lane.rect.height}px`
+          }}
+        />
+      ))}
+      {debug.lines.map((line) => (
+        <span
+          className={`pdf-selection-debug-line${detail?.kind === 'line' && detail.key === line.key ? ' focused' : ''}`}
+          key={`line-${line.key}`}
+          style={{
+            left: `${line.rect.left}px`,
+            top: `${line.rect.top}px`,
+            width: `${line.rect.width}px`,
+            height: `${line.rect.height}px`
+          }}
+        />
+      ))}
+      {debug.glyphs.map((glyph) => (
+        <span
+          className={`pdf-selection-debug-glyph${glyph.selected ? ' selected' : ''}${detail?.kind === 'glyph' && detail.key === glyph.key ? ' focused' : ''}`}
+          key={`glyph-${glyph.key}`}
+          style={{
+            left: `${glyph.rect.left}px`,
+            top: `${glyph.rect.top}px`,
+            width: `${glyph.rect.width}px`,
+            height: `${glyph.rect.height}px`
+          }}
+        />
+      ))}
+      {debug.glyphs.map((glyph) => (
+        <span
+          className="pdf-selection-debug-hit"
+          key={`hit-${glyph.key}`}
+          style={{
+            left: `${glyph.hitRect.left}px`,
+            top: `${glyph.hitRect.top}px`,
+            width: `${glyph.hitRect.width}px`,
+            height: `${glyph.hitRect.height}px`
+          }}
+        />
+      ))}
+      {debug.selectionRects.map((entry) => (
+        <span
+          className={`pdf-selection-debug-selection${detail?.kind === 'selection' && detail.key === entry.key ? ' focused' : ''}`}
+          key={`selection-${entry.key}`}
+          style={{
+            left: `${entry.rect.left}px`,
+            top: `${entry.rect.top}px`,
+            width: `${entry.rect.width}px`,
+            height: `${entry.rect.height}px`
+          }}
+        />
+      ))}
+      {debug.points.map((point) => (
+        <span
+          className={`pdf-selection-debug-point ${point.kind}`}
+          key={point.key}
+          style={{
+            left: `${point.x}px`,
+            top: `${point.y}px`
+          }}
+        >
+          {point.kind === 'anchor' ? 'A' : 'F'}
+        </span>
+      ))}
+      {detail?.rect ? (
+        <span
+          className="pdf-selection-debug-popover"
+          style={debugPopoverStyle(detail.rect)}
+        >
+          {debugDetailTitle(detail)}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
+function debugPopoverStyle(rect) {
+  return {
+    left: `${Math.max(0, rect.left)}px`,
+    top: `${Math.max(0, rect.top - 24)}px`
+  };
+}
+
+function debugDetailTitle(detail) {
+  const data = detail.detail || {};
+  if (detail.kind === 'glyph') {
+    return `glyph "${data.char}" order:${data.order} line:${data.lineId || '-'} block:${data.blockType || '-'} lane:${data.laneIndex}`;
+  }
+  if (detail.kind === 'line') {
+    return `line:${data.lineId || '-'} block:${data.blockType || '-'} lane:${data.laneIndex} row:${data.row ?? '-'} n:${data.glyphCount}`;
+  }
+  if (detail.kind === 'block') {
+    return `block:${data.blockId || '-'} type:${data.blockType || '-'} lane:${data.laneIndex} lines:${data.lineCount}`;
+  }
+  if (detail.kind === 'lane') {
+    return `lane:${data.laneIndex} left:${data.left} right:${data.right} margin:${data.margin}`;
+  }
+  return 'selection rect';
+}
+
+function PdfiumPageCanvas({ image, imageKey, label, pageNumber, onPaint }) {
+  const canvasRef = useRef(null);
+
+  useLayoutEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas || !(image?.width > 0) || !(image?.height > 0)) return undefined;
+    canvas.width = image.width;
+    canvas.height = image.height;
+    const context = canvas.getContext('2d', { alpha: false });
+    if (!context) return undefined;
+    const paintStartAt = performance.now();
+    if (image.bitmap) {
+      context.drawImage(image.bitmap, 0, 0);
+    } else if (image.data) {
+      const imageData = new ImageData(
+        image.data instanceof Uint8ClampedArray ? image.data : new Uint8ClampedArray(image.data),
+        image.width,
+        image.height
+      );
+      context.putImageData(imageData, 0, 0);
+    }
+    onPaint?.(pageNumber, imageKey, performance.now() - paintStartAt);
+    return undefined;
+  }, [image, imageKey, onPaint, pageNumber]);
+
+  return <canvas ref={canvasRef} aria-label={label} className="pdfium-page-canvas" />;
 }
 
 function revokeObjectUrls(urls = []) {

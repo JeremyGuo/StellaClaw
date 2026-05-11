@@ -1,5 +1,10 @@
-version: 1.26.2
+version: 1.26.3
 ---
+
+# 1.26.3
+
+- 优化 StellaCodeX Electron PDF 预览和选区引擎：
+  EmbedPDF 作为 `3rd_party/embed-pdf-viewer` submodule 接入并固定到 StellaCodeX 优化分支，Electron 开发和构建流程会自动准备本地 EmbedPDF dist 产物；PDFium worker/raw render 路径增加 ImageBitmap 传输和 worker 初始化错误透传，减少渲染结果从 worker 回主线程的拷贝成本。PDF 预览保留优化后的 Stella PDFium Glyph 引擎，增加渲染耗时统计面板和 Debug 叠层；选区引擎迁入 Electron 源码目录，新增 glyph/line/segment/lane/block 调试信息，并迭代修复跨行吸附、表格误判、段落块过度合并、复制空格/换行丢失等问题。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.26.2
 
