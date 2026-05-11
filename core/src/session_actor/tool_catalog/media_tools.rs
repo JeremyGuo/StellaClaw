@@ -306,6 +306,7 @@ fn native_load(
         context: Some(ContextItem {
             text: status.to_string(),
         }),
+        structured: None,
         file: Some(file),
     })
 }
@@ -530,6 +531,7 @@ fn wait_media_job(
                         text: json!({"status": "failed", id_field: job_id, "error": error})
                             .to_string(),
                     }),
+                    structured: None,
                     file: None,
                 });
             }
@@ -605,6 +607,7 @@ fn job_snapshot_result(
             })
             .to_string(),
         }),
+        structured: None,
         file: None,
     }
 }
@@ -635,6 +638,7 @@ fn provider_message_to_tool_result(message: ChatMessage) -> ToolResultContent {
                 text.join("\n")
             },
         }),
+        structured: None,
         file,
     }
 }

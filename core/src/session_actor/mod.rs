@@ -18,6 +18,7 @@ pub use actor::{
     SessionActor, SessionActorError, SessionActorEventSink, SessionActorInbox,
     SessionActorRequestSender, SessionActorStep,
 };
+pub use chat_message::tool_result_text;
 pub use chat_message::{
     ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, FileState, ReasoningItem,
     SelectionContext, SelectionLocator, SelectionRect, SelectionReferenceItem, TokenUsage,

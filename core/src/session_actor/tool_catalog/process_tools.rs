@@ -109,21 +109,6 @@ struct TruncatedShellText {
     original_tokens: Option<u64>,
 }
 
-struct ShellResultFormat<'a> {
-    operation: &'a str,
-    session: &'a ShellSession,
-    running: bool,
-    exit_code: Option<i32>,
-    timed_out: bool,
-    duration_ms: u128,
-    max_output_tokens: usize,
-    total_output_lines: usize,
-    output: TruncatedShellText,
-    stdout: TruncatedShellText,
-    stderr: TruncatedShellText,
-    snapshot: Option<Value>,
-}
-
 impl ShellOutputDrain {
     fn extend(&mut self, other: ShellOutputDrain) {
         self.aggregate.extend_from_slice(&other.aggregate);
@@ -939,24 +924,24 @@ fn collect_until(
     let stdout = truncate_shell_text(&stdout_text, output_limit, context.token_estimator);
     let stderr = truncate_shell_text(&stderr_text, output_limit, context.token_estimator);
     let snapshot = rendered.snapshot;
-    let text = format_shell_result(ShellResultFormat {
+    let result = structured_shell_result(
         operation,
         session,
         running,
         exit_code,
         timed_out,
         duration_ms,
-        max_output_tokens: output_limit.max_tokens,
+        output_limit.max_tokens,
         total_output_lines,
         output,
         stdout,
         stderr,
         snapshot,
-    });
+    );
     if !running {
         remove_completed_process(&session.process_id);
     }
-    Ok(Value::String(text))
+    Ok(result)
 }
 
 fn remove_completed_process(process_id: &str) {
@@ -1612,145 +1597,95 @@ fn middle_truncation_candidate(
     format!("{head}{marker}{tail}")
 }
 
-fn shell_status_line(
+fn structured_shell_result(
+    operation: &str,
+    session: &ShellSession,
     running: bool,
     exit_code: Option<i32>,
     timed_out: bool,
     duration_ms: u128,
-) -> String {
-    if running {
-        return format!("Process still running after {duration_ms} ms");
-    }
-    if timed_out {
-        return format!("Process timed out after {duration_ms} ms");
-    }
-    match exit_code {
-        Some(code) => format!("Process exited with code {code} after {duration_ms} ms"),
-        None => format!("Process exited after {duration_ms} ms"),
-    }
-}
-
-fn format_shell_result(result: ShellResultFormat<'_>) -> String {
-    let ShellResultFormat {
-        operation,
-        session,
-        running,
-        exit_code,
-        timed_out,
-        duration_ms,
-        max_output_tokens,
-        total_output_lines,
-        output,
-        stdout,
-        stderr,
-        snapshot,
-    } = result;
-
-    let mut sections = Vec::new();
-    sections.push(shell_status_line(
-        running,
-        exit_code,
-        timed_out,
-        duration_ms,
-    ));
-    sections.push(format!("Operation: {operation}"));
-    sections.push(format!("Process ID: {}", session.process_id));
-    sections.push(format!("Running: {running}"));
-    sections.push(format!("Remote: {}", binding_label(&session.binding)));
-    sections.push(format!("Cwd: {}", session.cwd));
-    sections.push(format!("Shell: {}", session.shell));
-    sections.push(format!("TTY: {}", session.tty));
-    sections.push(format!("Command: {}", session.command));
-    sections.push(format!("Wall time: {duration_ms} ms"));
+    max_output_tokens: usize,
+    total_output_lines: usize,
+    output: TruncatedShellText,
+    stdout: TruncatedShellText,
+    stderr: TruncatedShellText,
+    snapshot: Option<Value>,
+) -> Value {
+    let mut object = Map::new();
+    object.insert(
+        "kind".to_string(),
+        Value::String("shell_result".to_string()),
+    );
+    object.insert(
+        "operation".to_string(),
+        Value::String(operation.to_string()),
+    );
+    object.insert(
+        "process_id".to_string(),
+        Value::String(session.process_id.clone()),
+    );
+    object.insert("running".to_string(), Value::Bool(running));
+    object.insert("timed_out".to_string(), Value::Bool(timed_out));
+    object.insert(
+        "duration_ms".to_string(),
+        Value::Number(serde_json::Number::from(duration_ms as u64)),
+    );
+    object.insert(
+        "wall_time_seconds".to_string(),
+        json!(duration_ms as f64 / 1000.0),
+    );
     if let Some(code) = exit_code {
-        sections.push(format!("Exit code: {code}"));
+        object.insert("exit_code".to_string(), Value::Number(code.into()));
     }
-    sections.push(format!("Max output tokens: {max_output_tokens}"));
-    sections.push(format!(
-        "Combined output: {total_output_lines} lines, {} chars{}{}",
-        output.original_chars,
-        optional_token_suffix(output.original_tokens),
-        truncated_suffix(output.truncated)
-    ));
-
-    if session.tty {
-        sections.push(text_section("Output", &output.text));
-    } else {
-        sections.push(format!(
-            "Stdout: {} chars{}{}",
-            stdout.original_chars,
-            optional_token_suffix(stdout.original_tokens),
-            truncated_suffix(stdout.truncated)
-        ));
-        if !stdout.text.is_empty() {
-            sections.push(text_section("Stdout", &stdout.text));
-        }
-
-        sections.push(format!(
-            "Stderr: {} chars{}{}",
-            stderr.original_chars,
-            optional_token_suffix(stderr.original_tokens),
-            truncated_suffix(stderr.truncated)
-        ));
-        if !stderr.text.is_empty() {
-            sections.push(text_section("Stderr", &stderr.text));
-        }
-
-        if stdout.text.is_empty() && stderr.text.is_empty() && !output.text.is_empty() {
-            sections.push(text_section("Output", &output.text));
-        }
+    if running {
+        object.insert(
+            "session_id".to_string(),
+            Value::String(session.process_id.clone()),
+        );
     }
-
-    if let Some(snapshot) = snapshot.and_then(terminal_snapshot_text) {
-        sections.push(snapshot);
+    object.insert(
+        "remote".to_string(),
+        Value::String(binding_label(&session.binding)),
+    );
+    object.insert("cwd".to_string(), Value::String(session.cwd.clone()));
+    object.insert("shell".to_string(), Value::String(session.shell.clone()));
+    object.insert("tty".to_string(), Value::Bool(session.tty));
+    object.insert(
+        "command".to_string(),
+        Value::String(session.command.clone()),
+    );
+    object.insert(
+        "max_output_tokens".to_string(),
+        Value::Number((max_output_tokens as u64).into()),
+    );
+    object.insert(
+        "total_output_lines".to_string(),
+        Value::Number((total_output_lines as u64).into()),
+    );
+    object.insert("output".to_string(), shell_stream_value(output));
+    object.insert("stdout".to_string(), shell_stream_value(stdout));
+    object.insert("stderr".to_string(), shell_stream_value(stderr));
+    if let Some(snapshot) = snapshot {
+        object.insert("terminal_snapshot".to_string(), snapshot);
     }
-
-    sections.join("\n")
+    Value::Object(object)
 }
 
-fn optional_token_suffix(tokens: Option<u64>) -> String {
-    tokens
-        .map(|tokens| format!(", {tokens} estimated tokens"))
-        .unwrap_or_default()
-}
-
-fn truncated_suffix(truncated: bool) -> &'static str {
-    if truncated {
-        ", truncated"
-    } else {
-        ""
+fn shell_stream_value(stream: TruncatedShellText) -> Value {
+    let mut object = Map::new();
+    object.insert("text".to_string(), Value::String(stream.text));
+    object.insert("truncated".to_string(), Value::Bool(stream.truncated));
+    object.insert(
+        "original_chars".to_string(),
+        Value::Number((stream.original_chars as u64).into()),
+    );
+    if let Some(tokens) = stream.original_tokens {
+        object.insert(
+            "original_token_count".to_string(),
+            Value::Number(tokens.into()),
+        );
     }
-}
-
-fn text_section(title: &str, text: &str) -> String {
-    if text.is_empty() {
-        format!("{title}:\n<empty>")
-    } else {
-        format!("{title}:\n{text}")
-    }
-}
-
-fn terminal_snapshot_text(snapshot: Value) -> Option<String> {
-    let object = snapshot.as_object()?;
-    let visible_text = object
-        .get("visible_text")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let alternate_screen = object
-        .get("alternate_screen")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let saw_alternate_screen = object
-        .get("saw_alternate_screen")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let truncated = object
-        .get("truncated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    Some(format!(
-        "Terminal snapshot: alternate_screen={alternate_screen}, saw_alternate_screen={saw_alternate_screen}, truncated={truncated}\n{visible_text}"
-    ))
+    Value::Object(object)
 }
 
 fn validate_remote_consistency(

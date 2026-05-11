@@ -6,8 +6,8 @@ use crate::{
 };
 
 use super::{
-    ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, TokenEstimator,
-    TokenEstimatorError, ToolResultContent,
+    tool_result_text, ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem,
+    TokenEstimator, TokenEstimatorError, ToolResultContent,
 };
 
 pub const COMPRESSION_MARKER: &str = "[StellaClaw Context Compression]";
@@ -961,13 +961,13 @@ fn tool_result_placeholder(
     result: &ToolResultContent,
 ) -> String {
     let mut parts = vec![format!("[tool result: {tool_name} id={tool_call_id}]")];
-    if let Some(context) = &result.context {
-        if !context.text.trim().is_empty() {
-            parts.push(context.text.clone());
-        }
-    }
-    if let Some(file) = &result.file {
-        parts.push(file_placeholder(file));
+    let rendered = tool_result_text(&super::ToolResultItem {
+        tool_call_id: tool_call_id.to_string(),
+        tool_name: tool_name.to_string(),
+        result: result.clone(),
+    });
+    if !rendered.trim().is_empty() {
+        parts.push(rendered);
     }
     parts.join("\n")
 }
@@ -1339,6 +1339,7 @@ mod tests {
                         context: Some(ContextItem {
                             text: "secret tool result should be dropped".to_string(),
                         }),
+                        structured: None,
                         file: None,
                     },
                 })],
@@ -1606,6 +1607,7 @@ mod tests {
                         context: Some(ContextItem {
                             text: "memory disabled in config".to_string(),
                         }),
+                        structured: None,
                         file: None,
                     },
                 })],
@@ -1750,6 +1752,7 @@ mod tests {
                         context: Some(ContextItem {
                             text: "loaded".to_string(),
                         }),
+                        structured: None,
                         file: Some(FileItem {
                             uri: "file:///tmp/report.pdf".to_string(),
                             name: Some("report.pdf".to_string()),
@@ -1842,6 +1845,7 @@ mod tests {
                         context: Some(ContextItem {
                             text: "hi".to_string(),
                         }),
+                        structured: None,
                         file: None,
                     },
                 })],

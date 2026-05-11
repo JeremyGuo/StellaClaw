@@ -292,6 +292,7 @@ Provider translations normally map this to native function/tool output protocol 
 ```rust
 pub struct ToolResultContent {
     pub context: Option<ContextItem>,
+    pub structured: Option<serde_json::Value>,
     pub file: Option<FileItem>,
 }
 ```
@@ -299,9 +300,10 @@ pub struct ToolResultContent {
 Fields:
 
 - `context`: optional textual tool output.
+- `structured`: optional provider-neutral structured tool output. Use this when the runtime has stable fields such as shell status, output streams, process ids, and truncation metadata. Provider/web translators render it into their target text or UI shape at send time.
 - `file`: optional file/media output.
 
-Either or both may be present. Both fields are omitted during serialization when absent.
+Any combination may be present. Fields are omitted during serialization when absent.
 
 ## Expected Conversions
 

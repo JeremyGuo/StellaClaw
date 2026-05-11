@@ -3457,6 +3457,7 @@ fn bridge_result(request: &ConversationBridgeRequest, text: String) -> ToolResul
         tool_name: request.tool_name.clone(),
         result: ToolResultContent {
             context: Some(ContextItem { text }),
+            structured: None,
             file: None,
         },
     }

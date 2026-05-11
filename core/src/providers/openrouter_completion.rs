@@ -631,16 +631,7 @@ fn collect_request_tool_calls(message: &ChatMessage) -> Vec<OpenRouterRequestToo
 }
 
 fn tool_result_content_text(tool_result: &crate::session_actor::ToolResultItem) -> String {
-    let mut parts = Vec::new();
-    if let Some(context) = &tool_result.result.context {
-        if !context.text.trim().is_empty() {
-            parts.push(context.text.clone());
-        }
-    }
-    if let Some(file) = &tool_result.result.file {
-        parts.push(file.uri.clone());
-    }
-    parts.join("\n")
+    crate::session_actor::tool_result_text(tool_result)
 }
 
 fn collect_image_files(message: &ChatMessage) -> Vec<FileItem> {

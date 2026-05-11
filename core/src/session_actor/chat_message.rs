@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -325,8 +326,148 @@ pub struct ToolResultItem {
 pub struct ToolResultContent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<ContextItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<FileItem>,
+}
+
+pub fn tool_result_text(tool_result: &ToolResultItem) -> String {
+    let mut parts = Vec::new();
+    if let Some(text) = structured_tool_result_text(tool_result) {
+        if !text.trim().is_empty() {
+            parts.push(text);
+        }
+    } else if let Some(context) = &tool_result.result.context {
+        if !context.text.trim().is_empty() {
+            parts.push(context.text.clone());
+        }
+    }
+    if let Some(file) = &tool_result.result.file {
+        parts.push(file.uri.clone());
+    }
+    parts.join("\n")
+}
+
+fn structured_tool_result_text(tool_result: &ToolResultItem) -> Option<String> {
+    let value = tool_result.result.structured.as_ref()?;
+    if value.get("kind").and_then(Value::as_str) == Some("shell_result") {
+        return Some(shell_structured_result_text(value));
+    }
+    serde_json::to_string_pretty(value).ok()
+}
+
+fn shell_structured_result_text(value: &Value) -> String {
+    let running = value
+        .get("running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let timed_out = value
+        .get("timed_out")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let wall_time_seconds = value
+        .get("wall_time_seconds")
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            value
+                .get("duration_ms")
+                .and_then(Value::as_u64)
+                .map(|millis| millis as f64 / 1000.0)
+        })
+        .unwrap_or_default();
+    let exit_code = value.get("exit_code").and_then(Value::as_i64);
+    let mut parts = Vec::new();
+    if running {
+        parts.push(format!(
+            "Process running with session ID {}",
+            value
+                .get("session_id")
+                .or_else(|| value.get("process_id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+        ));
+    } else if timed_out {
+        parts.push("Process timed out".to_string());
+    } else if let Some(code) = exit_code {
+        parts.push(format!("Process exited with code {code}"));
+    } else {
+        parts.push("Process exited".to_string());
+    }
+    parts.push(format!("Wall time: {wall_time_seconds:.4} seconds"));
+    if let Some(original_token_count) = value
+        .get("output")
+        .and_then(|output| output.get("original_token_count"))
+        .and_then(Value::as_u64)
+    {
+        parts.push(format!("Original token count: {original_token_count}"));
+    }
+
+    let tty = value.get("tty").and_then(Value::as_bool).unwrap_or(false);
+    if tty {
+        push_shell_stream(&mut parts, "Output", value.get("output"));
+    } else {
+        push_shell_stream(&mut parts, "Stdout", value.get("stdout"));
+        push_shell_stream(&mut parts, "Stderr", value.get("stderr"));
+        if !has_stream_text(value.get("stdout")) && !has_stream_text(value.get("stderr")) {
+            push_shell_stream(&mut parts, "Output", value.get("output"));
+        }
+    }
+    if let Some(snapshot) = value.get("terminal_snapshot").and_then(Value::as_object) {
+        let visible_text = snapshot
+            .get("visible_text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let alternate_screen = snapshot
+            .get("alternate_screen")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let saw_alternate_screen = snapshot
+            .get("saw_alternate_screen")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let truncated = snapshot
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        parts.push(format!(
+            "Terminal snapshot: alternate_screen={alternate_screen}, saw_alternate_screen={saw_alternate_screen}, truncated={truncated}\n{visible_text}"
+        ));
+    }
+    parts.join("\n")
+}
+
+fn push_shell_stream(parts: &mut Vec<String>, label: &str, value: Option<&Value>) {
+    let Some(value) = value else {
+        return;
+    };
+    let text = value
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let truncated = value
+        .get("truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if text.is_empty() && !truncated {
+        return;
+    }
+    let mut header = label.to_string();
+    if truncated {
+        header.push_str(" (truncated)");
+    }
+    if text.is_empty() {
+        parts.push(format!("{header}:\n<empty>"));
+    } else {
+        parts.push(format!("{header}:\n{text}"));
+    }
+}
+
+fn has_stream_text(value: Option<&Value>) -> bool {
+    value
+        .and_then(|value| value.get("text"))
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.is_empty())
 }
 
 #[cfg(test)]
@@ -346,6 +487,7 @@ mod tests {
                         context: Some(ContextItem {
                             text: "file loaded".to_string(),
                         }),
+                        structured: None,
                         file: Some(FileItem {
                             uri: "file:///tmp/demo.png".to_string(),
                             name: Some("demo.png".to_string()),

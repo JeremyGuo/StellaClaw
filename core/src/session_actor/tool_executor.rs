@@ -7,9 +7,9 @@ use std::{
 };
 
 use crossbeam_channel::Sender;
-use serde_json::json;
 #[cfg(test)]
-use serde_json::{Map, Value};
+use serde_json::Map;
+use serde_json::{json, Value};
 
 #[cfg(test)]
 use super::tool_runtime::ExecutionTarget;
@@ -525,12 +525,7 @@ impl ToolOperationRunner {
         Ok(ToolResultItem {
             tool_call_id: tool_call.tool_call_id.clone(),
             tool_name: tool_call.tool_name.clone(),
-            result: ToolResultContent {
-                context: Some(ContextItem {
-                    text: normalize_tool_value(result),
-                }),
-                file: None,
-            },
+            result: tool_result_content_from_value(result),
         })
     }
 
@@ -567,12 +562,7 @@ impl ToolOperationRunner {
         Ok(ToolResultItem {
             tool_call_id: tool_call.tool_call_id.clone(),
             tool_name: tool_call.tool_name.clone(),
-            result: ToolResultContent {
-                context: Some(ContextItem {
-                    text: normalize_tool_value(result),
-                }),
-                file: None,
-            },
+            result: tool_result_content_from_value(result),
         })
     }
 
@@ -585,12 +575,7 @@ impl ToolOperationRunner {
         Ok(ToolResultItem {
             tool_call_id: tool_call.tool_call_id.clone(),
             tool_name: tool_call.tool_name.clone(),
-            result: ToolResultContent {
-                context: Some(ContextItem {
-                    text: normalize_tool_value(result),
-                }),
-                file: None,
-            },
+            result: tool_result_content_from_value(result),
         })
     }
 
@@ -617,6 +602,31 @@ impl ToolOperationRunner {
         context.text = capped_truncated_tool_result_message(total_chars, &context.text);
         result
     }
+}
+
+fn tool_result_content_from_value(value: Value) -> ToolResultContent {
+    if is_structured_tool_result(&value) {
+        return ToolResultContent {
+            context: None,
+            structured: Some(value),
+            file: None,
+        };
+    }
+
+    ToolResultContent {
+        context: Some(ContextItem {
+            text: normalize_tool_value(value),
+        }),
+        structured: None,
+        file: None,
+    }
+}
+
+fn is_structured_tool_result(value: &Value) -> bool {
+    matches!(
+        value.get("kind").and_then(Value::as_str),
+        Some("shell_result")
+    )
 }
 
 fn capped_truncated_tool_result_message(total_chars: usize, original: &str) -> String {
@@ -755,6 +765,7 @@ fn tool_error_result(operation: &ToolBatchOperation, error: String) -> ToolResul
             context: Some(ContextItem {
                 text: normalize_tool_value(json!({ "error": error })),
             }),
+            structured: None,
             file: None,
         },
     }
@@ -806,18 +817,16 @@ mod tests {
         })
     }
 
-    fn result_text(message: &ChatMessage, index: usize) -> &str {
+    fn result_text(message: &ChatMessage, index: usize) -> String {
         match &message.data[index] {
-            ChatMessageItem::ToolResult(result) => {
-                result.result.context.as_ref().unwrap().text.as_str()
-            }
+            ChatMessageItem::ToolResult(result) => crate::session_actor::tool_result_text(result),
             other => panic!("expected tool result, got {other:?}"),
         }
     }
 
     fn process_id_from_shell_text(text: &str) -> &str {
         text.lines()
-            .find_map(|line| line.strip_prefix("Process ID: "))
+            .find_map(|line| line.strip_prefix("Process running with session ID "))
             .expect("shell result should include process id")
     }
 
@@ -902,7 +911,7 @@ mod tests {
 
         let message = start_and_wait(&executor, batch);
         let value: Value =
-            serde_json::from_str(result_text(&message, 0)).expect("file_read should return JSON");
+            serde_json::from_str(&result_text(&message, 0)).expect("file_read should return JSON");
 
         assert!(value["truncated"].as_bool().unwrap());
         assert_eq!(value["limit_chars"], MAX_TOOL_RESULT_CONTEXT_CHARS);
@@ -1188,9 +1197,24 @@ mod tests {
         );
 
         let text = result_text(&message, 0);
-        assert!(text.contains("Running: false"), "{text}");
+        assert!(text.contains("Process exited with code 0"), "{text}");
         assert!(text.contains("hello"), "{text}");
         assert!(!text.contains("Stderr:\n"), "{text}");
+        match &message.data[0] {
+            ChatMessageItem::ToolResult(result) => {
+                assert!(result.result.context.is_none());
+                assert_eq!(
+                    result
+                        .result
+                        .structured
+                        .as_ref()
+                        .and_then(|value| value.get("kind"))
+                        .and_then(Value::as_str),
+                    Some("shell_result")
+                );
+            }
+            other => panic!("expected tool result, got {other:?}"),
+        }
 
         let message = start_and_wait(
             &executor,
@@ -1203,8 +1227,11 @@ mod tests {
             ),
         );
         let running_text = result_text(&message, 0);
-        assert!(running_text.contains("Running: true"), "{running_text}");
-        let process_id = process_id_from_shell_text(running_text);
+        assert!(
+            running_text.contains("Process running with session ID "),
+            "{running_text}"
+        );
+        let process_id = process_id_from_shell_text(&running_text);
 
         let message = start_and_wait(
             &executor,
@@ -1237,8 +1264,7 @@ mod tests {
         );
 
         let text = result_text(&message, 0);
-        assert!(text.contains("Exit code: 0"), "{text}");
-        assert!(text.contains(&format!("Cwd: {home}")), "{text}");
+        assert!(text.contains("Process exited with code 0"), "{text}");
         assert!(text.contains(&format!("Stdout:\n{home}")), "{text}");
     }
 
@@ -1274,8 +1300,11 @@ mod tests {
             ),
         );
         let started = result_text(&message, 0);
-        assert!(started.contains("Running: true"), "{started}");
-        let process_id = process_id_from_shell_text(started);
+        assert!(
+            started.contains("Process running with session ID "),
+            "{started}"
+        );
+        let process_id = process_id_from_shell_text(&started);
 
         let message = start_and_wait(
             &executor,
@@ -1301,7 +1330,7 @@ mod tests {
             ),
         );
         let text = result_text(&message, 0);
-        assert!(text.contains("Running: false"), "{text}");
+        assert!(text.contains("Process exited with code 0"), "{text}");
         assert!(text.contains("done"), "{text}");
     }
 
@@ -1324,7 +1353,10 @@ mod tests {
             ),
         );
         let initial_text = result_text(&message, 0).to_string();
-        assert!(initial_text.contains("Running: true"), "{initial_text}");
+        assert!(
+            initial_text.contains("Process running with session ID "),
+            "{initial_text}"
+        );
         let process_id = process_id_from_shell_text(&initial_text);
 
         let message = start_and_wait(
@@ -1343,7 +1375,7 @@ mod tests {
             "{initial_text}\n{text}"
         );
         assert!(text.contains("got:hello"), "{text}");
-        assert!(text.contains("Running: false"), "{text}");
+        assert!(text.contains("Process exited with code 0"), "{text}");
     }
 
     #[test]
@@ -1367,7 +1399,7 @@ mod tests {
 
         let text = result_text(&message, 0);
         assert!(text.contains("truncated"));
-        assert!(text.contains("Combined output:"));
+        assert!(text.contains("Output (truncated):") || text.contains("Stdout (truncated):"));
     }
 
     #[test]
@@ -1430,8 +1462,8 @@ mod tests {
         assert!(wait_started.elapsed() < Duration::from_secs(1));
 
         let text = result_text(&message, 0);
-        assert!(text.contains("Running: true"));
-        let process_id = process_id_from_shell_text(text);
+        assert!(text.contains("Process running with session ID "));
+        let process_id = process_id_from_shell_text(&text);
         assert!(!text.contains("tool batch interrupted"));
 
         let message = start_and_wait(
@@ -1593,6 +1625,7 @@ mod tests {
                         context: Some(ContextItem {
                             text: "sent".to_string(),
                         }),
+                        structured: None,
                         file: None,
                     },
                 },
@@ -1681,6 +1714,7 @@ mod tests {
                             context: Some(ContextItem {
                                 text: "sent".to_string(),
                             }),
+                            structured: None,
                             file: None,
                         },
                     },
@@ -1851,6 +1885,7 @@ mod tests {
                         context: Some(ContextItem {
                             text: "cooperative status".to_string(),
                         }),
+                        structured: None,
                         file: None,
                     },
                 },

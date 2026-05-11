@@ -83,7 +83,7 @@ function normalizeChatMessageItem(item, index, renderedByIndex) {
       index,
       tool_call_id: payload.tool_call_id || '',
       tool_name: payload.tool_name || 'tool',
-      context: result.context?.text || rendered?.context || null,
+      context: rendered?.context || result.context?.text || null,
       context_with_attachment_markers: rendered?.context_with_attachment_markers || result.context?.text || null,
       file_attachment_index: rendered?.file_attachment_index
     };

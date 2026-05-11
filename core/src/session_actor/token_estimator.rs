@@ -15,7 +15,10 @@ use crate::{
     model_config::{ModelConfig, TokenEstimatorType},
 };
 
-use super::{normalize_messages_for_model, ChatMessage, ChatMessageItem, ChatRole, FileItem};
+use super::{
+    normalize_messages_for_model, tool_result_text, ChatMessage, ChatMessageItem, ChatRole,
+    FileItem,
+};
 
 const FALLBACK_TIKTOKEN_MODEL: &str = "gpt-4o";
 
@@ -578,8 +581,9 @@ fn render_message_content(message: &ChatMessage) -> String {
                 ));
             }
             ChatMessageItem::ToolResult(tool_result) => {
-                if let Some(context) = &tool_result.result.context {
-                    sections.push(context.text.clone());
+                let text = tool_result_text(tool_result);
+                if !text.trim().is_empty() {
+                    sections.push(text);
                 }
             }
         }
@@ -603,8 +607,9 @@ fn render_openai_message_content(message: &ChatMessage) -> String {
                 sections.push(selection.to_prompt_text());
             }
             ChatMessageItem::ToolResult(tool_result) => {
-                if let Some(context) = &tool_result.result.context {
-                    sections.push(context.text.clone());
+                let text = tool_result_text(tool_result);
+                if !text.trim().is_empty() {
+                    sections.push(text);
                 }
             }
         }
@@ -1098,6 +1103,7 @@ mod tests {
                     context: Some(ContextItem {
                         text: "loaded".to_string(),
                     }),
+                    structured: None,
                     file: Some(FileItem {
                         uri: "file:///tmp/out.png".to_string(),
                         name: None,

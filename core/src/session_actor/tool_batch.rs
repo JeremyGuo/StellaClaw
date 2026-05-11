@@ -305,6 +305,7 @@ mod tests {
                 context: Some(ContextItem {
                     text: "file loaded".to_string(),
                 }),
+                structured: None,
                 file: None,
             },
         }]);

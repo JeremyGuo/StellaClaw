@@ -543,6 +543,7 @@ mod tests {
                         context: Some(ContextItem {
                             text: "sent".to_string(),
                         }),
+                        structured: None,
                         file: None,
                     },
                 },

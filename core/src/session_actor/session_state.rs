@@ -259,6 +259,7 @@ mod tests {
                     context: Some(ContextItem {
                         text: large_content,
                     }),
+                    structured: None,
                     file: None,
                 },
             })],

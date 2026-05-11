@@ -1306,6 +1306,7 @@ impl SessionActor {
             tool_name: tool_call.tool_name,
             result: ToolResultContent {
                 context: Some(ContextItem { text: result }),
+                structured: None,
                 file: None,
             },
         })
@@ -2298,6 +2299,7 @@ fn tool_error_content(error: &str) -> ToolResultContent {
         context: Some(ContextItem {
             text: serde_json::json!({ "error": error }).to_string(),
         }),
+        structured: None,
         file: None,
     }
 }
@@ -3117,6 +3119,7 @@ mod tests {
                         context: Some(ContextItem {
                             text: format!("tool batch {} done", handle.batch_id),
                         }),
+                        structured: None,
                         file: None,
                     },
                 })],
@@ -3157,6 +3160,7 @@ mod tests {
                             context: Some(ContextItem {
                                 text: "loaded image".to_string(),
                             }),
+                            structured: None,
                             file: Some(FileItem {
                                 uri: "file:///tmp/test.png".to_string(),
                                 name: Some("test.png".to_string()),
@@ -3232,6 +3236,7 @@ mod tests {
                                     context: Some(ContextItem {
                                         text: "tool result".to_string(),
                                     }),
+                                    structured: None,
                                     file: None,
                                 },
                             })],
@@ -3450,6 +3455,7 @@ mod tests {
                         context: Some(ContextItem {
                             text: "contents".to_string(),
                         }),
+                        structured: None,
                         file: None,
                     },
                 })],

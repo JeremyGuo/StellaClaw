@@ -3013,26 +3013,33 @@ fn render_web_message(
             }),
             ChatMessageItem::ToolResult(tool_result) => {
                 let mut context_with_attachment_markers = None;
-                let context_text = tool_result
-                    .result
-                    .context
-                    .as_ref()
-                    .and_then(|context_item| {
-                        let part = render_web_text_part(
-                            &context_item.text,
-                            context,
-                            roots,
-                            &mut attachments,
-                            &mut attachment_errors,
-                        );
-                        if part.text.is_empty() && part.text_with_attachment_markers.is_empty() {
-                            None
-                        } else {
-                            context_with_attachment_markers =
-                                Some(part.text_with_attachment_markers);
-                            Some(part.text)
-                        }
-                    });
+                let rendered_tool_result = if tool_result.result.structured.is_some() {
+                    stellaclaw_core::session_actor::tool_result_text(tool_result)
+                } else {
+                    tool_result
+                        .result
+                        .context
+                        .as_ref()
+                        .map(|context_item| context_item.text.clone())
+                        .unwrap_or_default()
+                };
+                let context_text = if rendered_tool_result.trim().is_empty() {
+                    None
+                } else {
+                    let part = render_web_text_part(
+                        &rendered_tool_result,
+                        context,
+                        roots,
+                        &mut attachments,
+                        &mut attachment_errors,
+                    );
+                    if part.text.is_empty() && part.text_with_attachment_markers.is_empty() {
+                        None
+                    } else {
+                        context_with_attachment_markers = Some(part.text_with_attachment_markers);
+                        Some(part.text)
+                    }
+                };
                 let file_attachment_index = if let Some(file) = &tool_result.result.file {
                     let attachment_index = attachments.len();
                     attachments.push(web_file_item_attachment(
@@ -4292,6 +4299,7 @@ mod tests {
                         context: Some(ContextItem {
                             text: "downloaded".to_string(),
                         }),
+                        structured: None,
                         file: Some(FileItem {
                             uri: format!("file://{}", file_path.display()),
                             name: Some("result.txt".to_string()),
