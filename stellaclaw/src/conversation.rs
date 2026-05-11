@@ -57,6 +57,7 @@ mod attachments;
 mod cron_script;
 mod skill_sync;
 mod status;
+mod store;
 
 pub use attachments::render_chat_message;
 pub(crate) use attachments::{
@@ -70,6 +71,7 @@ use skill_sync::{
     validate_skill_directory, validate_skill_name, SkillPersistMode,
 };
 use status::conversation_status_snapshot;
+pub(crate) use store::{ConversationStore, WorkdirLayout};
 
 #[derive(Debug, Clone)]
 pub struct IncomingConversationMessage {
@@ -259,9 +261,8 @@ fn run_conversation(
     outgoing_tx: Sender<OutgoingDispatch>,
     host_logger: Arc<StellaclawLogger>,
 ) -> Result<()> {
-    let conversation_root = workdir.join("conversations").join(&state.conversation_id);
-    fs::create_dir_all(&conversation_root)
-        .with_context(|| format!("failed to create {}", conversation_root.display()))?;
+    let store = ConversationStore::new(workdir.clone());
+    let conversation_root = store.ensure_conversation_root(&state.conversation_id)?;
     ensure_workspace_seed(&workdir, &conversation_root)?;
     let logger = Arc::new(
         StellaclawLogger::open_under_stellaclaw(&conversation_root, "conversation.log")
@@ -339,49 +340,12 @@ pub fn load_or_create_conversation_state(
     platform_chat_id: &str,
     config: &StellaclawConfig,
 ) -> Result<ConversationState> {
-    let root = workdir.join("conversations").join(conversation_id);
-    fs::create_dir_all(&root).with_context(|| format!("failed to create {}", root.display()))?;
-    let path = root.join("conversation.json");
-    if path.exists() {
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        let mut state: ConversationState = serde_json::from_str(&raw)
-            .with_context(|| format!("failed to parse {}", path.display()))?;
-        if state.nickname.trim().is_empty() {
-            state.nickname = state.conversation_id.clone();
-        }
-        return Ok(state);
-    }
-    Ok(ConversationState {
-        version: 1,
-        conversation_id: conversation_id.to_string(),
-        nickname: conversation_id.to_string(),
-        channel_id: channel_id.to_string(),
-        platform_chat_id: platform_chat_id.to_string(),
-        session_profile: config
-            .initial_session_profile()
-            .map_err(anyhow::Error::msg)?,
-        model_selection_pending: true,
-        tool_remote_mode: ToolRemoteMode::Selectable,
-        sandbox: None,
-        reasoning_effort: None,
-        session_binding: ConversationSessionBinding {
-            foreground_session_id: format!("{conversation_id}.foreground"),
-            next_background_index: default_index(),
-            next_subagent_index: default_index(),
-            background_sessions: BTreeMap::new(),
-            subagent_sessions: BTreeMap::new(),
-        },
-    })
-}
-
-pub fn persist_conversation_state(workdir: &Path, state: &ConversationState) -> Result<()> {
-    let root = workdir.join("conversations").join(&state.conversation_id);
-    fs::create_dir_all(&root).with_context(|| format!("failed to create {}", root.display()))?;
-    let path = root.join("conversation.json");
-    let raw =
-        serde_json::to_string_pretty(state).context("failed to serialize conversation state")?;
-    fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))
+    ConversationStore::new(workdir).load_or_create(
+        conversation_id,
+        channel_id,
+        platform_chat_id,
+        config,
+    )
 }
 
 pub fn load_conversation_status_snapshot(
@@ -390,9 +354,10 @@ pub fn load_conversation_status_snapshot(
     conversation_id: &str,
 ) -> Result<OutgoingStatus> {
     let state = load_existing_conversation_state(workdir, conversation_id)?;
-    let conversation_root = workdir.join("conversations").join(conversation_id);
+    let layout = WorkdirLayout::new(workdir);
+    let conversation_root = layout.conversation_root(conversation_id);
     let workspace_root = conversation_root;
-    let session_root = workdir.join("conversations").join(conversation_id);
+    let session_root = layout.conversation_root(conversation_id);
     conversation_status_snapshot(workdir, &session_root, &workspace_root, &state, config)
 }
 
@@ -400,13 +365,7 @@ fn load_existing_conversation_state(
     workdir: &Path,
     conversation_id: &str,
 ) -> Result<ConversationState> {
-    let path = workdir
-        .join("conversations")
-        .join(conversation_id)
-        .join("conversation.json");
-    let raw =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
+    ConversationStore::new(workdir).load(conversation_id)
 }
 
 struct ConversationRuntime {
@@ -726,10 +685,7 @@ impl ConversationRuntime {
     }
 
     fn persist_state(&self) -> Result<()> {
-        let path = self.conversation_root.join("conversation.json");
-        let raw = serde_json::to_string_pretty(&self.state)
-            .context("failed to serialize conversation state")?;
-        fs::write(&path, raw).with_context(|| format!("failed to write {}", path.display()))
+        ConversationStore::new(&self.workdir).persist(&self.state)
     }
 
     fn persist_state_and_publish(&self) -> Result<()> {
@@ -1863,11 +1819,7 @@ impl ConversationRuntime {
             .ok_or_else(|| anyhow!("{} requires skill_name", request.action))?;
         validate_skill_name(skill_name)?;
 
-        let runtime_skill_root = self
-            .workdir
-            .join("rundir")
-            .join(".stellaclaw")
-            .join("skill");
+        let runtime_skill_root = WorkdirLayout::new(&self.workdir).runtime_skill_root();
         let runtime_skill_path = runtime_skill_root.join(skill_name);
         let staged_skill_path = self
             .workspace_root
@@ -2154,7 +2106,7 @@ impl ConversationRuntime {
         let (clean_text, attachments) = match extract_attachment_references(
             &text,
             &self.workspace_root,
-            &self.workdir.join("rundir").join("shared"),
+            &WorkdirLayout::new(&self.workdir).runtime_shared_root(),
         ) {
             Ok(parsed) => parsed,
             Err(error) => {
@@ -2190,7 +2142,7 @@ impl ConversationRuntime {
             let (clean_text, attachments) = match extract_attachment_references(
                 &rendered,
                 &self.workspace_root,
-                &self.workdir.join("rundir").join("shared"),
+                &WorkdirLayout::new(&self.workdir).runtime_shared_root(),
             ) {
                 Ok(parsed) => parsed,
                 Err(error) => {

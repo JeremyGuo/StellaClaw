@@ -14,7 +14,10 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use stellaclaw_core::session_actor::ToolRemoteMode;
 
-use crate::{conversation::ConversationState, workspace::ensure_workspace_for_remote_mode};
+use crate::{
+    conversation::{ConversationState, WorkdirLayout},
+    workspace::ensure_workspace_for_remote_mode,
+};
 
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 30;
@@ -695,7 +698,7 @@ fn spawn_terminal_session(
         })
         .context("failed to open terminal pty")?;
 
-    let conversation_root = workdir.join("conversations").join(&state.conversation_id);
+    let conversation_root = WorkdirLayout::new(workdir).conversation_root(&state.conversation_id);
     let runtime_key = terminal_runtime_key(state);
     let (mode, remote, cwd_label, mut command) = match &state.tool_remote_mode {
         ToolRemoteMode::Selectable => {

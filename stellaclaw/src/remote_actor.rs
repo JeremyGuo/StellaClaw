@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use stellaclaw_core::session_actor::ToolRemoteMode;
 
-use crate::conversation::ConversationState;
+use crate::conversation::{ConversationState, WorkdirLayout};
 
 #[derive(Debug)]
 pub enum RemoteActorError {
@@ -800,7 +800,7 @@ fn fixed_remote(host: &str, cwd: Option<&str>) -> Option<WorkspaceRemote> {
 }
 
 fn local_workspace_root(workdir: &Path, state: &ConversationState) -> PathBuf {
-    workdir.join("conversations").join(&state.conversation_id)
+    WorkdirLayout::new(workdir).conversation_root(&state.conversation_id)
 }
 
 fn is_local_overlay_path(path: &Path) -> bool {

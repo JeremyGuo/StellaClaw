@@ -30,9 +30,9 @@ use crate::{
     config::{ModelSelection, SandboxMode, StellaclawConfig},
     conversation::{
         attachment_marker, extract_attachment_references_with_markers,
-        load_conversation_status_snapshot, load_or_create_conversation_state,
-        parse_reasoning_control_argument, persist_conversation_state, strip_attachment_tags,
-        ConversationControl, ConversationState, IncomingConversationMessage,
+        load_conversation_status_snapshot, parse_reasoning_control_argument, strip_attachment_tags,
+        ConversationControl, ConversationState, ConversationStore, IncomingConversationMessage,
+        WorkdirLayout,
     },
     conversation_id_manager::ConversationIdManager,
     logger::StellaclawLogger,
@@ -291,58 +291,52 @@ impl WebChannel {
 
     fn conversation_summaries(&self) -> ApiResult<Vec<ConversationSummary>> {
         let mut conversations = Vec::new();
-        let root = self.workdir.join("conversations");
-        if root.exists() {
-            for entry in fs::read_dir(&root).map_err(ApiError::internal)? {
-                let entry = entry.map_err(ApiError::internal)?;
-                if entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(is_sshfs_workspace_entry_name)
-                {
+        let store = ConversationStore::new(&self.workdir);
+        for path in store.list_state_paths().map_err(ApiError::internal)? {
+            if path
+                .parent()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
+                .is_some_and(is_sshfs_workspace_entry_name)
+            {
+                continue;
+            }
+            let raw = match fs::read_to_string(&path) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    self.logger.warn(
+                        "web_conversation_list_read_failed",
+                        json!({"path": path.display().to_string(), "error": error.to_string()}),
+                    );
                     continue;
                 }
-                let path = entry.path().join("conversation.json");
-                if !path.exists() {
+            };
+            let state: ConversationState = match serde_json::from_str(&raw) {
+                Ok(state) => state,
+                Err(error) => {
+                    self.logger.warn(
+                        "web_conversation_list_parse_failed",
+                        json!({"path": path.display().to_string(), "error": error.to_string()}),
+                    );
                     continue;
                 }
-                let raw = match fs::read_to_string(&path) {
-                    Ok(raw) => raw,
-                    Err(error) => {
-                        self.logger.warn(
-                            "web_conversation_list_read_failed",
-                            json!({"path": path.display().to_string(), "error": error.to_string()}),
-                        );
-                        continue;
-                    }
-                };
-                let state: ConversationState = match serde_json::from_str(&raw) {
-                    Ok(state) => state,
-                    Err(error) => {
-                        self.logger.warn(
-                            "web_conversation_list_parse_failed",
-                            json!({"path": path.display().to_string(), "error": error.to_string()}),
-                        );
-                        continue;
-                    }
-                };
-                if state.channel_id == self.id {
-                    let processing_state = self
-                        .processing_states
-                        .lock()
-                        .ok()
-                        .and_then(|states| states.get(&state.platform_chat_id).copied())
-                        .unwrap_or(ProcessingState::Idle);
-                    let message_summary = conversation_message_summary(&self.workdir, &state);
-                    conversations.push(ConversationSummary::from_state(
-                        &self.workdir,
-                        &state,
-                        &self.config,
-                        processing_state,
-                        message_summary,
-                        self.conversation_seen(&state.conversation_id),
-                    ));
-                }
+            };
+            if state.channel_id == self.id {
+                let processing_state = self
+                    .processing_states
+                    .lock()
+                    .ok()
+                    .and_then(|states| states.get(&state.platform_chat_id).copied())
+                    .unwrap_or(ProcessingState::Idle);
+                let message_summary = conversation_message_summary(&self.workdir, &state);
+                conversations.push(ConversationSummary::from_state(
+                    &self.workdir,
+                    &state,
+                    &self.config,
+                    processing_state,
+                    message_summary,
+                    self.conversation_seen(&state.conversation_id),
+                ));
             }
         }
         conversations.sort_by(|left, right| left.conversation_id.cmp(&right.conversation_id));
@@ -435,14 +429,10 @@ impl WebChannel {
             .map_err(|_| ApiError::new(500, "conversation id manager lock poisoned"))?
             .get_or_create(&self.id, &platform_chat_id)
             .map_err(|error| ApiError::new(500, error))?;
-        let mut state = load_or_create_conversation_state(
-            &self.workdir,
-            &conversation_id,
-            &self.id,
-            &platform_chat_id,
-            &self.config,
-        )
-        .map_err(ApiError::internal)?;
+        let store = ConversationStore::new(&self.workdir);
+        let mut state = store
+            .load_or_create(&conversation_id, &self.id, &platform_chat_id, &self.config)
+            .map_err(ApiError::internal)?;
 
         if let Some(model) = request.model {
             let Some(model_config) = self.config.models.get(&model) else {
@@ -466,7 +456,7 @@ impl WebChannel {
         if let Some(nickname) = request.nickname {
             state.nickname = normalize_conversation_nickname(&state.conversation_id, &nickname);
         }
-        persist_conversation_state(&self.workdir, &state).map_err(ApiError::internal)?;
+        store.persist(&state).map_err(ApiError::internal)?;
         self.publish_conversation_upserted(&state);
 
         Ok(json_response(
@@ -487,7 +477,9 @@ impl WebChannel {
         if let Some(nickname) = request.nickname {
             state.nickname = normalize_conversation_nickname(&state.conversation_id, &nickname);
         }
-        persist_conversation_state(&self.workdir, &state).map_err(ApiError::internal)?;
+        ConversationStore::new(&self.workdir)
+            .persist(&state)
+            .map_err(ApiError::internal)?;
         let processing_state = self
             .processing_states
             .lock()
@@ -535,7 +527,8 @@ impl WebChannel {
         let terminated_terminals = self
             .terminal_manager
             .terminate_conversation(conversation_id);
-        let conversation_root = self.workdir.join("conversations").join(conversation_id);
+        let conversation_root =
+            WorkdirLayout::new(&self.workdir).conversation_root(conversation_id);
         fs::remove_dir_all(&conversation_root).map_err(ApiError::internal)?;
 
         let removed_seen = {
@@ -1034,21 +1027,14 @@ impl WebChannel {
         &self,
         platform_chat_id: &str,
     ) -> ApiResult<Option<ConversationState>> {
-        let root = self.workdir.join("conversations");
-        if !root.exists() {
-            return Ok(None);
-        }
-        for entry in fs::read_dir(&root).map_err(ApiError::internal)? {
-            let entry = entry.map_err(ApiError::internal)?;
-            if entry
-                .file_name()
-                .to_str()
+        let store = ConversationStore::new(&self.workdir);
+        for path in store.list_state_paths().map_err(ApiError::internal)? {
+            if path
+                .parent()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str())
                 .is_some_and(is_sshfs_workspace_entry_name)
             {
-                continue;
-            }
-            let path = entry.path().join("conversation.json");
-            if !path.exists() {
                 continue;
             }
             let raw = match fs::read_to_string(&path) {
@@ -1419,14 +1405,15 @@ impl WebChannel {
 
     fn load_web_state(&self, conversation_id: &str) -> ApiResult<ConversationState> {
         validate_conversation_id(conversation_id)?;
-        let path = self
-            .workdir
-            .join("conversations")
-            .join(conversation_id)
-            .join("conversation.json");
-        let raw =
-            fs::read_to_string(&path).map_err(|_| ApiError::new(404, "conversation_not_found"))?;
-        let state: ConversationState = serde_json::from_str(&raw).map_err(ApiError::internal)?;
+        let store = ConversationStore::new(&self.workdir);
+        if !store
+            .layout()
+            .conversation_state_path(conversation_id)
+            .exists()
+        {
+            return Err(ApiError::new(404, "conversation_not_found"));
+        }
+        let state = store.load(conversation_id).map_err(ApiError::internal)?;
         if state.channel_id != self.id {
             return Err(ApiError::new(404, "conversation_not_found"));
         }
@@ -1935,9 +1922,8 @@ fn materialize_web_data_file(
     let bytes = general_purpose::STANDARD
         .decode(payload)
         .context("failed to decode web message data URL file")?;
-    let dir = workdir
-        .join("conversations")
-        .join(conversation_id)
+    let dir = WorkdirLayout::new(workdir)
+        .conversation_root(conversation_id)
         .join(".stellaclaw")
         .join("attachments")
         .join("incoming");
@@ -2240,12 +2226,10 @@ impl WebAttachmentContext {
     }
 
     fn roots(&self) -> WebAttachmentRoots {
-        let conversation_root = self
-            .workdir
-            .join("conversations")
-            .join(&self.state.conversation_id);
+        let layout = WorkdirLayout::new(&self.workdir);
+        let conversation_root = layout.conversation_root(&self.state.conversation_id);
         let workspace_root = conversation_root;
-        let shared_root = self.workdir.join("rundir").join("shared");
+        let shared_root = layout.runtime_shared_root();
         WebAttachmentRoots {
             workspace_root,
             shared_root,
@@ -2370,7 +2354,7 @@ fn conversation_remote_name(state: &ConversationState) -> String {
 }
 
 fn conversation_workspace_root(workdir: &Path, state: &ConversationState) -> PathBuf {
-    workdir.join("conversations").join(&state.conversation_id)
+    WorkdirLayout::new(workdir).conversation_root(&state.conversation_id)
 }
 
 fn conversation_message_summary(
@@ -3366,9 +3350,8 @@ fn preview_text(text: &str) -> String {
 }
 
 fn message_log_path(workdir: &Path, state: &ConversationState) -> PathBuf {
-    workdir
-        .join("conversations")
-        .join(&state.conversation_id)
+    WorkdirLayout::new(workdir)
+        .conversation_root(&state.conversation_id)
         .join(".stellaclaw")
         .join("log")
         .join(sanitize_session_id_for_log_path(
