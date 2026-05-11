@@ -62,12 +62,12 @@ pub(super) fn ensure_tool_binary(
             })?,
         })
         .map_err(|error| LocalToolError::Bridge(error.to_string()))?;
-    let text = response
-        .result
-        .result
-        .context
-        .ok_or_else(|| LocalToolError::Bridge("tool binary response missing context".to_string()))?
-        .text;
+    let text = crate::session_actor::tool_result_text(&response.result);
+    if text.trim().is_empty() {
+        return Err(LocalToolError::Bridge(
+            "tool binary response missing result".to_string(),
+        ));
+    }
     let parsed: ToolBinaryEnsureResponse = serde_json::from_str(&text).map_err(|error| {
         LocalToolError::Bridge(format!(
             "failed to parse tool binary response: {error}: {text}"

@@ -22,7 +22,7 @@ use super::{
         normalize_tool_value, parse_arguments, LocalToolError, ToolCancellationToken,
         ToolExecutionContext,
     },
-    ChatMessage, ContextItem, ConversationBridge, TokenEstimator, ToolBatch, ToolBatchCompletion,
+    ChatMessage, ConversationBridge, TokenEstimator, ToolBatch, ToolBatchCompletion,
     ToolBatchError, ToolBatchExecutor, ToolBatchHandle, ToolBatchOperation, ToolConcurrency,
     ToolExecutionOp, ToolRemoteMode, ToolResultContent, ToolResultItem,
 };
@@ -591,51 +591,37 @@ impl ToolOperationRunner {
     }
 
     fn cap_tool_result_context(&self, mut result: ToolResultItem) -> ToolResultItem {
-        let Some(context) = result.result.context.as_mut() else {
-            return result;
-        };
-        let total_chars = context.text.chars().count();
+        result.result.normalize_legacy_context();
+        let rendered = crate::session_actor::tool_result_text(&result);
+        let total_chars = rendered.chars().count();
         if total_chars <= MAX_TOOL_RESULT_CONTEXT_CHARS {
             return result;
         }
 
-        context.text = capped_truncated_tool_result_message(total_chars, &context.text);
+        let files = std::mem::take(&mut result.result.files);
+        result.result = ToolResultContent::from_json(json!({
+            "truncated": true,
+            "limit_chars": MAX_TOOL_RESULT_CONTEXT_CHARS,
+            "original_chars": total_chars,
+            "note": "Tool result exceeded the 100000 character runtime limit and was truncated to 100000 characters. Tools should return bounded output; the complete untruncated result was not saved.",
+            "preview": capped_truncated_tool_result_preview(total_chars, &rendered),
+        }));
+        result.result.files = files;
         result
     }
 }
 
 fn tool_result_content_from_value(value: Value) -> ToolResultContent {
-    if is_structured_tool_result(&value) {
-        return ToolResultContent {
-            context: None,
-            structured: Some(value),
-            file: None,
-        };
-    }
-
-    ToolResultContent {
-        context: Some(ContextItem {
-            text: normalize_tool_value(value),
-        }),
-        structured: None,
-        file: None,
-    }
+    ToolResultContent::from_tool_value(value)
 }
 
-fn is_structured_tool_result(value: &Value) -> bool {
-    matches!(
-        value.get("kind").and_then(Value::as_str),
-        Some("shell_result")
-    )
-}
-
-fn capped_truncated_tool_result_message(total_chars: usize, original: &str) -> String {
+fn capped_truncated_tool_result_preview(total_chars: usize, original: &str) -> String {
     let mut preview_chars = DEFAULT_TRUNCATED_TOOL_RESULT_PREVIEW_CHARS;
     loop {
         let (preview, _) = truncate_context_text(original, preview_chars);
         let message = truncated_tool_result_message(total_chars, &preview);
         if message.chars().count() <= MAX_TOOL_RESULT_CONTEXT_CHARS || preview_chars == 0 {
-            return message;
+            return preview;
         }
         preview_chars = preview_chars.saturating_mul(4) / 5;
     }
@@ -761,13 +747,7 @@ fn tool_error_result(operation: &ToolBatchOperation, error: String) -> ToolResul
     ToolResultItem {
         tool_call_id,
         tool_name,
-        result: ToolResultContent {
-            context: Some(ContextItem {
-                text: normalize_tool_value(json!({ "error": error })),
-            }),
-            structured: None,
-            file: None,
-        },
+        result: ToolResultContent::from_json(json!({ "error": error })),
     }
 }
 
@@ -792,7 +772,8 @@ mod tests {
     };
 
     use crate::session_actor::{
-        ChatMessageItem, ConversationBridgeRequest, ConversationBridgeResponse, ToolCallItem,
+        ChatMessageItem, ContextItem, ConversationBridgeRequest, ConversationBridgeResponse,
+        ToolCallItem,
     };
 
     use super::*;
@@ -834,8 +815,8 @@ mod tests {
         match &message.data[index] {
             ChatMessageItem::ToolResult(result) => result
                 .result
-                .file
-                .as_ref()
+                .files
+                .first()
                 .and_then(|file| file.media_type.as_deref()),
             other => panic!("expected tool result, got {other:?}"),
         }
@@ -845,8 +826,8 @@ mod tests {
         match &message.data[index] {
             ChatMessageItem::ToolResult(result) => result
                 .result
-                .file
-                .as_ref()
+                .files
+                .first()
                 .and_then(|file| file.state.as_ref())
                 .is_some(),
             other => panic!("expected tool result, got {other:?}"),
@@ -1202,7 +1183,7 @@ mod tests {
         assert!(!text.contains("Stderr:\n"), "{text}");
         match &message.data[0] {
             ChatMessageItem::ToolResult(result) => {
-                assert!(result.result.context.is_none());
+                assert!(result.result.structured.is_some());
                 assert_eq!(
                     result
                         .result
@@ -1621,13 +1602,7 @@ mod tests {
                 result: ToolResultItem {
                     tool_call_id: "call_1".to_string(),
                     tool_name: "user_tell".to_string(),
-                    result: ToolResultContent {
-                        context: Some(ContextItem {
-                            text: "sent".to_string(),
-                        }),
-                        structured: None,
-                        file: None,
-                    },
+                    result: ToolResultContent::from_text("sent".to_string()),
                 },
             })),
         });
@@ -1710,13 +1685,7 @@ mod tests {
                     result: ToolResultItem {
                         tool_call_id: request.tool_call_id,
                         tool_name: request.tool_name,
-                        result: ToolResultContent {
-                            context: Some(ContextItem {
-                                text: "sent".to_string(),
-                            }),
-                            structured: None,
-                            file: None,
-                        },
+                        result: ToolResultContent::from_text("sent".to_string()),
                     },
                 })
                 .unwrap();
@@ -1881,13 +1850,7 @@ mod tests {
                 result: ToolResultItem {
                     tool_call_id: "call_bridge".to_string(),
                     tool_name: "user_tell".to_string(),
-                    result: ToolResultContent {
-                        context: Some(ContextItem {
-                            text: "cooperative status".to_string(),
-                        }),
-                        structured: None,
-                        file: None,
-                    },
+                    result: ToolResultContent::from_text("cooperative status".to_string()),
                 },
             })
             .unwrap();

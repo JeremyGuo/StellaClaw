@@ -431,7 +431,7 @@ pub enum SessionRpcError {
 mod tests {
     use std::sync::Mutex;
 
-    use crate::session_actor::{ContextItem, ToolResultContent, ToolResultItem};
+    use crate::session_actor::{ToolResultContent, ToolResultItem};
 
     use super::*;
 
@@ -539,13 +539,7 @@ mod tests {
                 result: ToolResultItem {
                     tool_call_id: "call_1".to_string(),
                     tool_name: "user_tell".to_string(),
-                    result: ToolResultContent {
-                        context: Some(ContextItem {
-                            text: "sent".to_string(),
-                        }),
-                        structured: None,
-                        file: None,
-                    },
+                    result: ToolResultContent::from_text("sent".to_string()),
                 },
             },
         })

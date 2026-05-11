@@ -15,6 +15,9 @@ version: 1.27.0
 - 将 shell 工具结果改为结构化持久化、按目标协议渲染：
   `ToolResultContent` 新增可选 `structured` 字段，`shell_exec` / `shell_write_stdin` 现在保存 provider-neutral 的 shell 状态、输出流、截断元数据和 process id，而不是把预渲染文本塞进 `context.text`；provider、token estimator、context compression 和 Web channel 统一通过 `tool_result_text` 在发送或展示前渲染。模型可见文本进一步对齐 Codex unified exec，只保留状态、wall time、必要的 session id、输出和截断信息，避免重复 command/cwd/shell/remote 等已经存在于 tool call 参数或本地 UI 的信息。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 收敛所有工具结果到结构化 payload：
+  新工具结果统一写入 `ToolResultContent.structured`，普通文本包装为 `text_result`，普通 JSON 包装为 `json_result`，工具产物文件统一写入 `ToolResultContent.files[]`；`context.text` 和单文件 `file` 只保留为旧历史兼容输入。Web channel 会把 raw structured payload 一并下发给前端，Electron 工具卡片优先展示结构化 payload，并支持同一个 tool result 关联多个文件附件。新增 workdir `0.17 -> 0.18` upgrade，会迁移各 conversation `.stellaclaw/log/*/session.json`、`all_messages.jsonl` 和 `current_messages.jsonl` 中旧的 tool result `context.text` 到 `structured.text_result`，并把旧 `file` 合并进 `files[]`。本次不改变 `config` schema，改变 `workdir` schema 至 `0.18`。
+
 - 收紧 `.stellaclaw/` 工具协议边界并修复 Fixed SSH 路径判定：
   common prompt 现在只保留 `.stellaclaw/` 应走文档化工具工作流的通用边界；文件工具协议明确 `.stellaclaw/` 下的文档化路径优先由 file tools 访问，且 Fixed SSH 模式下，shell 需要读取 `.stellaclaw/...` 时必须先用 `shell_make_visible` 把本地 overlay 路径复制到远端 workspace，并且只读使用，不应从 shell 修改 `.stellaclaw/`。模型也不应在文档化工具工作流范围之外自行创建 `.stellaclaw/` 路径。media load/analysis 工具现在使用 path-aware execution target，Fixed SSH 下普通 workspace 路径继续走远端，`.stellaclaw/**` 继续走本地 overlay；`apply_patch` 在 Fixed SSH 下会把远端绝对路径中的 `.stellaclaw/...` 识别为本地 overlay patch，并在本地执行前重写成 workspace-relative `.stellaclaw/...`，避免误改远端 `.stellaclaw/`；`stellaclaw-fs-tool` 的 `file_read` / `file_write` 会拒绝绝对路径或 `..` 逃逸 workspace，避免文件工具绕过 workspace 边界。本次不改变 `config` schema，不改变 `workdir` schema。
 

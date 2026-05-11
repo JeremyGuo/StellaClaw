@@ -2188,7 +2188,8 @@ enum WebMessageItem {
         tool_name: String,
         context: Option<String>,
         context_with_attachment_markers: Option<String>,
-        file_attachment_index: Option<usize>,
+        structured: Option<Value>,
+        file_attachment_indices: Vec<usize>,
     },
 }
 
@@ -3013,16 +3014,8 @@ fn render_web_message(
             }),
             ChatMessageItem::ToolResult(tool_result) => {
                 let mut context_with_attachment_markers = None;
-                let rendered_tool_result = if tool_result.result.structured.is_some() {
-                    stellaclaw_core::session_actor::tool_result_text(tool_result)
-                } else {
-                    tool_result
-                        .result
-                        .context
-                        .as_ref()
-                        .map(|context_item| context_item.text.clone())
-                        .unwrap_or_default()
-                };
+                let rendered_tool_result =
+                    stellaclaw_core::session_actor::tool_result_structured_text(tool_result);
                 let context_text = if rendered_tool_result.trim().is_empty() {
                     None
                 } else {
@@ -3040,7 +3033,8 @@ fn render_web_message(
                         Some(part.text)
                     }
                 };
-                let file_attachment_index = if let Some(file) = &tool_result.result.file {
+                let mut file_attachment_indices = Vec::new();
+                for file in &tool_result.result.files {
                     let attachment_index = attachments.len();
                     attachments.push(web_file_item_attachment(
                         attachment_index,
@@ -3049,17 +3043,16 @@ fn render_web_message(
                         context,
                         roots,
                     ));
-                    Some(attachment_index)
-                } else {
-                    None
-                };
+                    file_attachment_indices.push(attachment_index);
+                }
                 items.push(WebMessageItem::ToolResult {
                     index: item_index,
                     tool_call_id: tool_result.tool_call_id.clone(),
                     tool_name: tool_result.tool_name.clone(),
                     context: context_text,
                     context_with_attachment_markers,
-                    file_attachment_index,
+                    structured: tool_result.result.structured.clone(),
+                    file_attachment_indices,
                 });
             }
         }
@@ -4295,20 +4288,17 @@ mod tests {
                 stellaclaw_core::session_actor::ToolResultItem {
                     tool_call_id: "call_1".to_string(),
                     tool_name: "file_download_wait".to_string(),
-                    result: stellaclaw_core::session_actor::ToolResultContent {
-                        context: Some(ContextItem {
-                            text: "downloaded".to_string(),
-                        }),
-                        structured: None,
-                        file: Some(FileItem {
-                            uri: format!("file://{}", file_path.display()),
-                            name: Some("result.txt".to_string()),
-                            media_type: Some("text/plain".to_string()),
-                            width: None,
-                            height: None,
-                            state: None,
-                        }),
-                    },
+                    result: stellaclaw_core::session_actor::ToolResultContent::from_text(
+                        "downloaded".to_string(),
+                    )
+                    .with_file(FileItem {
+                        uri: format!("file://{}", file_path.display()),
+                        name: Some("result.txt".to_string()),
+                        media_type: Some("text/plain".to_string()),
+                        width: None,
+                        height: None,
+                        state: None,
+                    }),
                 },
             )],
         );
@@ -4327,12 +4317,13 @@ mod tests {
                 tool_name,
                 context: Some(context),
                 context_with_attachment_markers: Some(context_with_attachment_markers),
-                file_attachment_index: Some(0),
+                file_attachment_indices,
                 ..
             } if tool_call_id == "call_1"
                 && tool_name == "file_download_wait"
                 && context == "downloaded"
                 && context_with_attachment_markers == "downloaded"
+                && file_attachment_indices == &vec![0]
         ));
         assert!(rendered.attachment_errors.is_empty());
         assert_eq!(rendered.attachments.len(), 1);

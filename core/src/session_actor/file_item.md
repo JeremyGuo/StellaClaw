@@ -1,6 +1,6 @@
 # ChatMessage File Payload Standard
 
-`FileItem` is the standard payload for every `ChatMessageItem::File` and every `ToolResultContent.file`. It represents a file or media artifact in persisted conversation history. Provider-specific request payloads, such as `input_image`, `input_file`, multipart uploads, or inline base64, are derived from `FileItem` at request time.
+`FileItem` is the standard payload for every `ChatMessageItem::File` and every entry in `ToolResultContent.files`. It represents a file or media artifact in persisted conversation history. Provider-specific request payloads, such as `input_image`, `input_file`, multipart uploads, or inline base64, are derived from `FileItem` at request time.
 
 Rust definition:
 
@@ -178,7 +178,7 @@ If a frontend sends a `FileItem` directly through REST, it should already refer 
 
 ### Tool Results
 
-Tool output text goes in `ToolResultContent.context`. The primary produced file goes in `ToolResultContent.file`.
+Tool output goes in `ToolResultContent.structured`. Pure text output should be wrapped as a structured `text_result`; JSON output should remain structured JSON. `ToolResultContent.context` and `ToolResultContent.file` are legacy compatibility input only. Produced files go in `ToolResultContent.files`.
 
 ```json
 {
@@ -187,22 +187,27 @@ Tool output text goes in `ToolResultContent.context`. The primary produced file 
     "tool_call_id": "call_1",
     "tool_name": "image_load",
     "result": {
-      "context": {
-        "text": "{\"status\":\"loaded\"}"
+      "structured": {
+        "kind": "json_result",
+        "value": {
+          "status": "loaded"
+        }
       },
-      "file": {
-        "uri": "file:///workdir/conversations/web-main-1/.stellaclaw/output/loaded.png",
-        "name": "loaded.png",
-        "media_type": "image/png",
-        "width": 1024,
-        "height": 768
-      }
+      "files": [
+        {
+          "uri": "file:///workdir/conversations/web-main-1/.stellaclaw/output/loaded.png",
+          "name": "loaded.png",
+          "media_type": "image/png",
+          "width": 1024,
+          "height": 768
+        }
+      ]
     }
   }
 }
 ```
 
-If a tool produces multiple files, choose a primary file for `result.file` and describe or list secondary files in `context` until a stable multi-file schema is introduced.
+If a tool produces multiple files, include every durable output as an entry in `result.files`.
 
 ### Assistant-Generated Files
 

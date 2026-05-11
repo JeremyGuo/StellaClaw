@@ -146,20 +146,25 @@ Runtime result for a previous tool call.
     "tool_call_id": "call_abc",
     "tool_name": "image_generation",
     "result": {
-      "context": {
-        "text": "{\"status\":\"completed\"}"
+      "structured": {
+        "kind": "json_result",
+        "value": {
+          "status": "completed"
+        }
       },
-      "file": {
-        "uri": "file:///workspace/.stellaclaw/output/paris.png",
-        "name": "paris.png",
-        "media_type": "image/png"
-      }
+      "files": [
+        {
+          "uri": "file:///workspace/.stellaclaw/output/paris.png",
+          "name": "paris.png",
+          "media_type": "image/png"
+        }
+      ]
     }
   }
 }
 ```
 
-`result.context` and `result.file` are both optional, but a useful result normally has at least one. If a tool generated an artifact, put the primary artifact in `result.file`.
+`result.structured` and `result.files` are both optional, but a useful result normally has at least one. If a tool generated artifacts, put them in `result.files`.
 
 ## Capability Gates Before Translation
 

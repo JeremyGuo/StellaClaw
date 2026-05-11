@@ -1293,22 +1293,17 @@ impl SessionActor {
             Ok(plan) => {
                 self.current_plan = Some(plan.clone());
                 self.emit(SessionEvent::PlanUpdated { plan: Some(plan) })?;
-                serde_json::json!({"updated": true}).to_string()
+                serde_json::json!({"updated": true})
             }
             Err(error) => serde_json::json!({
                 "updated": false,
                 "error": error,
-            })
-            .to_string(),
+            }),
         };
         Ok(super::ToolResultItem {
             tool_call_id: tool_call.tool_call_id,
             tool_name: tool_call.tool_name,
-            result: ToolResultContent {
-                context: Some(ContextItem { text: result }),
-                structured: None,
-                file: None,
-            },
+            result: ToolResultContent::from_json(result),
         })
     }
 
@@ -1602,10 +1597,11 @@ impl SessionActor {
                 return Vec::new();
             }
         };
-        let Some(context) = response.result.result.context.as_ref() else {
+        let rendered = crate::session_actor::tool_result_text(&response.result);
+        if rendered.trim().is_empty() {
             return Vec::new();
-        };
-        let Ok(search) = serde_json::from_str::<MemorySearchToolResponse>(&context.text) else {
+        }
+        let Ok(search) = serde_json::from_str::<MemorySearchToolResponse>(&rendered) else {
             self.log_info(
                 "compression_memory_parse_failed",
                 serde_json::json!({"scope": scope}),
@@ -2295,13 +2291,7 @@ fn tool_error_result_for_tool_call(
 }
 
 fn tool_error_content(error: &str) -> ToolResultContent {
-    ToolResultContent {
-        context: Some(ContextItem {
-            text: serde_json::json!({ "error": error }).to_string(),
-        }),
-        structured: None,
-        file: None,
-    }
+    ToolResultContent::from_json(serde_json::json!({ "error": error }))
 }
 
 fn concise_error_reason(message: &str) -> String {
@@ -2415,10 +2405,11 @@ fn loaded_skill_names_from_message(message: &ChatMessage) -> Vec<String> {
         if result.tool_name != "skill_load" {
             continue;
         }
-        let Some(context) = result.result.context.as_ref() else {
+        let rendered = crate::session_actor::tool_result_text(result);
+        if rendered.trim().is_empty() {
             continue;
-        };
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&context.text) {
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&rendered) {
             if let Some(name) = value
                 .get("name")
                 .or_else(|| value.get("skill_name"))
@@ -2493,8 +2484,9 @@ fn message_text_for_memory_query(message: &ChatMessage) -> String {
                 parts.push(selection.to_prompt_text());
             }
             ChatMessageItem::ToolResult(tool_result) => {
-                if let Some(context) = tool_result.result.context.as_ref() {
-                    parts.push(context.text.trim().to_string());
+                let rendered = crate::session_actor::tool_result_text(tool_result);
+                if !rendered.trim().is_empty() {
+                    parts.push(rendered.trim().to_string());
                 }
             }
             ChatMessageItem::ToolCall(tool_call) => {
@@ -2903,9 +2895,10 @@ mod tests {
         },
         providers::{Provider, ProviderError},
         session_actor::{
-            builtin_tool_catalog, BuiltinToolCatalogOptions, ChatRole, ContextItem, FileItem,
-            HostToolScope, SessionMailboxKind, TaskPlanItemView, ToolBatchError, ToolBatchHandle,
-            ToolCallItem, ToolResultContent, ToolResultItem, COMPRESSION_MARKER,
+            builtin_tool_catalog, tool_result_text, BuiltinToolCatalogOptions, ChatRole,
+            ContextItem, FileItem, HostToolScope, SessionMailboxKind, TaskPlanItemView,
+            ToolBatchError, ToolBatchHandle, ToolCallItem, ToolResultContent, ToolResultItem,
+            COMPRESSION_MARKER,
         },
         test_support::temp_cwd,
     };
@@ -3115,13 +3108,10 @@ mod tests {
                 vec![ChatMessageItem::ToolResult(ToolResultItem {
                     tool_call_id: "call_1".to_string(),
                     tool_name: "user_tell".to_string(),
-                    result: ToolResultContent {
-                        context: Some(ContextItem {
-                            text: format!("tool batch {} done", handle.batch_id),
-                        }),
-                        structured: None,
-                        file: None,
-                    },
+                    result: ToolResultContent::from_text(format!(
+                        "tool batch {} done",
+                        handle.batch_id
+                    )),
                 })],
             );
             let _ = completion_tx.send(ToolBatchCompletion {
@@ -3156,20 +3146,16 @@ mod tests {
                     vec![ChatMessageItem::ToolResult(ToolResultItem {
                         tool_call_id: "call_1".to_string(),
                         tool_name: "image_load".to_string(),
-                        result: ToolResultContent {
-                            context: Some(ContextItem {
-                                text: "loaded image".to_string(),
-                            }),
-                            structured: None,
-                            file: Some(FileItem {
+                        result: ToolResultContent::from_text("loaded image".to_string()).with_file(
+                            FileItem {
                                 uri: "file:///tmp/test.png".to_string(),
                                 name: Some("test.png".to_string()),
                                 media_type: Some("image/png".to_string()),
                                 width: None,
                                 height: None,
                                 state: None,
-                            }),
-                        },
+                            },
+                        ),
                     })],
                 )),
             });
@@ -3232,13 +3218,7 @@ mod tests {
                             vec![ChatMessageItem::ToolResult(ToolResultItem {
                                 tool_call_id: "call_1".to_string(),
                                 tool_name: "user_tell".to_string(),
-                                result: ToolResultContent {
-                                    context: Some(ContextItem {
-                                        text: "tool result".to_string(),
-                                    }),
-                                    structured: None,
-                                    file: None,
-                                },
+                                result: ToolResultContent::from_text("tool result".to_string()),
                             })],
                         )),
                     });
@@ -3451,13 +3431,7 @@ mod tests {
                 vec![ChatMessageItem::ToolResult(ToolResultItem {
                     tool_call_id: "call_1".to_string(),
                     tool_name: "file_read".to_string(),
-                    result: ToolResultContent {
-                        context: Some(ContextItem {
-                            text: "contents".to_string(),
-                        }),
-                        structured: None,
-                        file: None,
-                    },
+                    result: ToolResultContent::from_text("contents".to_string()),
                 })],
             ),
             text_message(ChatRole::Assistant, "after tool"),
@@ -4784,9 +4758,7 @@ mod tests {
                     item,
                     ChatMessageItem::ToolResult(result)
                         if result.tool_call_id == "call_1"
-                            && result.result.context.as_ref().is_some_and(|context| {
-                                context.text.contains("simulated tool batch failure")
-                            })
+                            && tool_result_text(result).contains("simulated tool batch failure")
                 )
             })
         });
@@ -4869,9 +4841,7 @@ mod tests {
                     item,
                     ChatMessageItem::ToolResult(result)
                         if result.tool_call_id == "call_orphan"
-                            && result.result.context.as_ref().is_some_and(|context| {
-                                context.text.contains("did not receive a tool result")
-                            })
+                            && tool_result_text(result).contains("did not receive a tool result")
                 )
             })
         });

@@ -291,19 +291,17 @@ Provider translations normally map this to native function/tool output protocol 
 
 ```rust
 pub struct ToolResultContent {
-    pub context: Option<ContextItem>,
     pub structured: Option<serde_json::Value>,
-    pub file: Option<FileItem>,
+    pub files: Vec<FileItem>,
 }
 ```
 
 Fields:
 
-- `context`: optional textual tool output.
-- `structured`: optional provider-neutral structured tool output. Use this when the runtime has stable fields such as shell status, output streams, process ids, and truncation metadata. Provider/web translators render it into their target text or UI shape at send time.
-- `file`: optional file/media output.
+- `structured`: provider-neutral structured tool output. New tools must write this field, including pure text results wrapped as `{"kind":"text_result","text":"..."}` and JSON results wrapped as `{"kind":"json_result","value":...}` unless the tool has a more specific stable schema such as `shell_result`.
+- `files`: optional file/media outputs. Each entry must be a standard `FileItem`.
 
-Any combination may be present. Fields are omitted during serialization when absent.
+Either field may be present. Fields are omitted during serialization when absent. Legacy persisted `context` and `file` fields are accepted only by loaders/upgrades and are migrated into `structured` and `files`.
 
 ## Expected Conversions
 
@@ -402,7 +400,8 @@ Text-only tool result:
         "tool_call_id": "call_abc",
         "tool_name": "read_file",
         "result": {
-          "context": {
+          "structured": {
+            "kind": "text_result",
             "text": "file contents..."
           }
         }
@@ -424,13 +423,15 @@ File-only tool result:
         "tool_call_id": "call_abc",
         "tool_name": "image_load",
         "result": {
-          "file": {
-            "uri": "file:///workspace/.stellaclaw/output/loaded.png",
-            "name": "loaded.png",
-            "media_type": "image/png",
-            "width": 1024,
-            "height": 768
-          }
+          "files": [
+            {
+              "uri": "file:///workspace/.stellaclaw/output/loaded.png",
+              "name": "loaded.png",
+              "media_type": "image/png",
+              "width": 1024,
+              "height": 768
+            }
+          ]
         }
       }
     }
@@ -447,14 +448,20 @@ Tool result with both text and file:
     "tool_call_id": "call_abc",
     "tool_name": "image_generation",
     "result": {
-      "context": {
-        "text": "{\"status\":\"completed\",\"generation_id\":\"image_generation_123\"}"
+      "structured": {
+        "kind": "json_result",
+        "value": {
+          "status": "completed",
+          "generation_id": "image_generation_123"
+        }
       },
-      "file": {
-        "uri": "file:///workspace/.stellaclaw/output/generated.png",
-        "name": "generated.png",
-        "media_type": "image/png"
-      }
+      "files": [
+        {
+          "uri": "file:///workspace/.stellaclaw/output/generated.png",
+          "name": "generated.png",
+          "media_type": "image/png"
+        }
+      ]
     }
   }
 }
@@ -464,11 +471,10 @@ Rules:
 
 - `ToolResult.tool_call_id` must match the corresponding `ToolCall.tool_call_id`.
 - `ToolResult.tool_name` should match the original tool name.
-- Put human/model-readable textual output in `result.context.text`.
-- Put the primary output artifact in `result.file`.
-- If a tool produces multiple files, either choose the primary file for `result.file` and mention the rest in `context`, or emit additional messages/items according to the caller's explicit multi-file policy. Do not hide extra files in provider-specific JSON without a stable convention.
-- If the tool failed before producing a file, store the error text in `context`.
-- If the file object exists but cannot be loaded or normalized, use `FileState::Crashed { reason }` on the `FileItem`.
+- Put human/model-readable textual output in `result.structured`, using `text_result`, `json_result`, or a tool-specific stable schema.
+- Put produced artifacts in `result.files`.
+- If the tool failed before producing a file, store a structured error payload.
+- If a file object exists but cannot be loaded or normalized, use `FileState::Crashed { reason }` on that `FileItem`.
 
 Provider translators are responsible for converting `ToolResult` to provider-native tool output messages. If a tool result includes an image, a provider may also append a synthetic user-side image message at request time so a multimodal model can inspect the file. That synthetic message is not part of persisted history.
 
@@ -530,14 +536,16 @@ Codex encrypted reasoning should populate `codex_encrypted_content` so Codex can
         "tool_call_id": "call_1",
         "tool_name": "read_file",
         "result": {
-          "context": { "text": "file loaded" },
-          "file": {
-            "uri": "file:///tmp/demo.png",
-            "name": "demo.png",
-            "media_type": "image/png",
-            "width": 320,
-            "height": 240
-          }
+          "structured": { "kind": "text_result", "text": "file loaded" },
+          "files": [
+            {
+              "uri": "file:///tmp/demo.png",
+              "name": "demo.png",
+              "media_type": "image/png",
+              "width": 320,
+              "height": 240
+            }
+          ]
         }
       }
     }

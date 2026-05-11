@@ -6,7 +6,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use super::{runtime_metadata::RuntimeMetadataState, ChatMessage, ChatMessageItem, SessionInitial};
+use super::{
+    runtime_metadata::RuntimeMetadataState, ChatMessage, ChatMessageItem, SessionInitial,
+    ToolResultContent,
+};
 
 const MAX_PERSISTED_TOOL_CONTEXT_CHARS: usize = 100_000;
 
@@ -111,15 +114,32 @@ fn sanitize_persisted_messages(messages: &mut [ChatMessage]) {
             let ChatMessageItem::ToolResult(tool_result) = item else {
                 continue;
             };
-            let Some(context) = tool_result.result.context.as_mut() else {
-                continue;
-            };
-            let (text, truncated) =
-                truncate_context_text(&context.text, MAX_PERSISTED_TOOL_CONTEXT_CHARS);
-            if truncated {
-                context.text = text;
-            }
+            sanitize_tool_result_content(&mut tool_result.result);
         }
+    }
+}
+
+fn sanitize_tool_result_content(result: &mut ToolResultContent) {
+    result.normalize_legacy_context();
+    let Some(structured) = result.structured.as_mut() else {
+        return;
+    };
+    let Some(kind) = structured.get("kind").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    if kind != "text_result" {
+        return;
+    }
+    let Some(text) = structured
+        .get_mut("text")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let (text, truncated) = truncate_context_text(&text, MAX_PERSISTED_TOOL_CONTEXT_CHARS);
+    if truncated {
+        structured["text"] = serde_json::Value::String(text);
     }
 }
 
@@ -255,13 +275,7 @@ mod tests {
             vec![ChatMessageItem::ToolResult(ToolResultItem {
                 tool_call_id: "call_1".to_string(),
                 tool_name: "any_tool".to_string(),
-                result: ToolResultContent {
-                    context: Some(ContextItem {
-                        text: large_content,
-                    }),
-                    structured: None,
-                    file: None,
-                },
+                result: ToolResultContent::from_text(large_content),
             })],
         );
         let state = SessionActorPersistedState {
@@ -279,7 +293,13 @@ mod tests {
         let ChatMessageItem::ToolResult(result) = &loaded.current_messages[0].data[0] else {
             panic!("expected tool result");
         };
-        let text = &result.result.context.as_ref().expect("context").text;
+        let text = result
+            .result
+            .structured
+            .as_ref()
+            .and_then(|value| value.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .expect("structured text");
 
         assert!(text.contains("chars truncated"));
         assert!(text.len() <= MAX_PERSISTED_TOOL_CONTEXT_CHARS);

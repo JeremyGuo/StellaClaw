@@ -1098,7 +1098,7 @@ export function StructuredItems({ role, items, attachments, fallbackText, onOpen
             key={index}
             kind={item.type === 'tool_result' ? 'result' : 'call'}
             name={item.tool_name || 'tool'}
-            payload={item.arguments || item.context_with_attachment_markers || item.context || item.result || ''}
+            payload={item.arguments || item.structured || item.context_with_attachment_markers || item.context || item.result || ''}
           />
         );
       }

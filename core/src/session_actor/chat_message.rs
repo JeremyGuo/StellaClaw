@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -322,14 +322,105 @@ pub struct ToolResultItem {
     pub result: ToolResultContent,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolResultContent {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub context: Option<ContextItem>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub file: Option<FileItem>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<FileItem>,
+}
+
+impl<'de> Deserialize<'de> for ToolResultContent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RawToolResultContent {
+            #[serde(default)]
+            context: Option<ContextItem>,
+            #[serde(default)]
+            structured: Option<Value>,
+            #[serde(default)]
+            file: Option<FileItem>,
+            #[serde(default)]
+            files: Vec<FileItem>,
+        }
+
+        let raw = RawToolResultContent::deserialize(deserializer)?;
+        let mut structured = raw.structured;
+        if structured.is_none() {
+            if let Some(context) = raw.context {
+                structured = Some(text_tool_result_value(context.text));
+            }
+        }
+
+        let mut files = raw.files;
+        if let Some(file) = raw.file {
+            files.push(file);
+        }
+
+        Ok(Self { structured, files })
+    }
+}
+
+impl ToolResultContent {
+    pub fn from_tool_value(value: Value) -> Self {
+        Self {
+            structured: Some(structured_tool_value(value)),
+            files: Vec::new(),
+        }
+    }
+
+    pub fn from_text(text: impl Into<String>) -> Self {
+        Self {
+            structured: Some(text_tool_result_value(text)),
+            files: Vec::new(),
+        }
+    }
+
+    pub fn from_json(value: Value) -> Self {
+        Self {
+            structured: Some(json_tool_result_value(value)),
+            files: Vec::new(),
+        }
+    }
+
+    pub fn with_file(mut self, file: FileItem) -> Self {
+        self.files.push(file);
+        self
+    }
+
+    pub fn with_files(mut self, files: impl IntoIterator<Item = FileItem>) -> Self {
+        self.files.extend(files);
+        self
+    }
+
+    pub fn normalize_legacy_context(&mut self) {}
+}
+
+pub fn structured_tool_value(value: Value) -> Value {
+    if value.get("kind").and_then(Value::as_str).is_some() {
+        return value;
+    }
+    match value {
+        Value::String(text) => text_tool_result_value(text),
+        other => json_tool_result_value(other),
+    }
+}
+
+fn text_tool_result_value(text: impl Into<String>) -> Value {
+    json!({
+        "kind": "text_result",
+        "text": text.into(),
+    })
+}
+
+fn json_tool_result_value(value: Value) -> Value {
+    json!({
+        "kind": "json_result",
+        "value": value,
+    })
 }
 
 pub fn tool_result_text(tool_result: &ToolResultItem) -> String {
@@ -338,15 +429,15 @@ pub fn tool_result_text(tool_result: &ToolResultItem) -> String {
         if !text.trim().is_empty() {
             parts.push(text);
         }
-    } else if let Some(context) = &tool_result.result.context {
-        if !context.text.trim().is_empty() {
-            parts.push(context.text.clone());
-        }
     }
-    if let Some(file) = &tool_result.result.file {
+    for file in &tool_result.result.files {
         parts.push(file.uri.clone());
     }
     parts.join("\n")
+}
+
+pub fn tool_result_structured_text(tool_result: &ToolResultItem) -> String {
+    structured_tool_result_text(tool_result).unwrap_or_default()
 }
 
 fn structured_tool_result_text(tool_result: &ToolResultItem) -> Option<String> {
@@ -354,7 +445,16 @@ fn structured_tool_result_text(tool_result: &ToolResultItem) -> Option<String> {
     if value.get("kind").and_then(Value::as_str) == Some("shell_result") {
         return Some(shell_structured_result_text(value));
     }
-    serde_json::to_string_pretty(value).ok()
+    match value.get("kind").and_then(Value::as_str) {
+        Some("text_result") => value
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        Some("json_result") => value
+            .get("value")
+            .and_then(|value| serde_json::to_string_pretty(value).ok()),
+        _ => serde_json::to_string_pretty(value).ok(),
+    }
 }
 
 fn shell_structured_result_text(value: &Value) -> String {
@@ -483,20 +583,16 @@ mod tests {
                 ChatMessageItem::ToolResult(ToolResultItem {
                     tool_call_id: "call_1".to_string(),
                     tool_name: "read_file".to_string(),
-                    result: ToolResultContent {
-                        context: Some(ContextItem {
-                            text: "file loaded".to_string(),
-                        }),
-                        structured: None,
-                        file: Some(FileItem {
+                    result: ToolResultContent::from_text("file loaded".to_string()).with_file(
+                        FileItem {
                             uri: "file:///tmp/demo.png".to_string(),
                             name: Some("demo.png".to_string()),
                             media_type: Some("image/png".to_string()),
                             width: Some(320),
                             height: Some(240),
                             state: None,
-                        }),
-                    },
+                        },
+                    ),
                 }),
             ],
         )
@@ -522,7 +618,7 @@ mod tests {
         assert_eq!(json["token_usage"]["cost_usd"]["output"], 0.004);
         assert_eq!(json["data"][1]["type"], "tool_result");
         assert_eq!(
-            json["data"][1]["payload"]["result"]["file"]["media_type"],
+            json["data"][1]["payload"]["result"]["files"][0]["media_type"],
             "image/png"
         );
     }

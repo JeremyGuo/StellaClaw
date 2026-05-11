@@ -3455,11 +3455,7 @@ fn bridge_result(request: &ConversationBridgeRequest, text: String) -> ToolResul
     ToolResultItem {
         tool_call_id: request.tool_call_id.clone(),
         tool_name: request.tool_name.clone(),
-        result: ToolResultContent {
-            context: Some(ContextItem { text }),
-            structured: None,
-            file: None,
-        },
+        result: ToolResultContent::from_text(text),
     }
 }
 

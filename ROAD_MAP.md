@@ -93,7 +93,8 @@ ChannelEvent::Error {
 - `ChatMessage::Reasoning` 当前支持 Codex 专用 encrypted reasoning continuation；token 估算按 Codex 风格把 `codex_encrypted_content` 作为上下文成本估入，但展示层和普通文本路径不暴露密文。
 - `reasoning_effort` 是 conversation 级 override；已有 conversation 的 `session_profile.main_model` 是持久化快照，不会自动跟随全局 config 更新。
 - 每轮 model/tool loop 默认上限是 200 步，主要作为防无限循环兜底，而不是正常工作流限制。
-- 所有工具结果在进入 `ChatMessage::ToolResult` 前必须经过统一输出上限：单个 tool result 的 model-visible `context.text` 不得超过 100,000 字符；超过时返回截断提示和预览，当前不会再自动保存完整未截断结果路径。工具自身可以有更小的业务级 preview/limit，但不能绕过统一上限。
+- 所有工具结果在进入 `ChatMessage::ToolResult` 前必须走 `ToolResultContent.structured`；工具产物文件必须走 `ToolResultContent.files[]`。`context.text` 和旧单文件 `file` 只作为旧历史兼容输入，不再作为新工具结果的持久化目标。纯文本工具结果也要包装成结构化 `text_result`，JSON 结果保留结构化 JSON，provider / Web / 压缩所需文本由统一渲染函数派生。
+- 所有工具结果在进入 `ChatMessage::ToolResult` 前必须经过统一输出上限：单个 tool result 的 model-visible 渲染文本不得超过 100,000 字符；超过时返回结构化截断提示和预览，当前不会再自动保存完整未截断结果路径。工具自身可以有更小的业务级 preview/limit，但不能绕过统一上限。
 - Prompt Protocol 已经落地：文件搜索/编辑、shell、`user_tell`、`update_plan`、memory、subagent 等操作偏好由工具模块声明 `PromptProtocol`，按当前 provider 实际可见工具集合筛选后注入 system prompt；工具未启用或被 provider 过滤时不会泄漏对应 prompt。
 - `ToolDefinition` 已经包含 provider visibility 元数据；同一个过滤后的 `ToolCatalog` 同时决定 system prompt 协议注入、provider request tools 和本地执行白名单，避免 Codex subscription 等 provider 下出现“prompt 看不见但本地仍可执行”的工具。
 - 文件工具 surface 已收敛：`glob`、`ls`、`edit` 不再模型可见；内容搜索使用增强后的 `grep`，路径 pattern 发现走有边界的 `rg --files` shell 命令；`file_read` 使用 `start_line` / `end_line`，定点修改统一走 `apply_patch`。

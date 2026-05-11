@@ -18,12 +18,13 @@ pub use actor::{
     SessionActor, SessionActorError, SessionActorEventSink, SessionActorInbox,
     SessionActorRequestSender, SessionActorStep,
 };
-pub use chat_message::tool_result_text;
 pub use chat_message::{
-    ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, FileState, ReasoningItem,
-    SelectionContext, SelectionLocator, SelectionRect, SelectionReferenceItem, TokenUsage,
-    TokenUsageCost, ToolCallItem, ToolResultContent, ToolResultItem,
+    structured_tool_value, ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem,
+    FileState, ReasoningItem, SelectionContext, SelectionLocator, SelectionRect,
+    SelectionReferenceItem, TokenUsage, TokenUsageCost, ToolCallItem, ToolResultContent,
+    ToolResultItem,
 };
+pub use chat_message::{tool_result_structured_text, tool_result_text};
 pub use compressor::{CompressionError, CompressionReport, SessionCompressor, COMPRESSION_MARKER};
 pub(crate) use media_normalizer::normalize_messages_for_model;
 pub use runtime_metadata::SessionSkillObservation;

@@ -38,7 +38,8 @@
 
 - 修改 conversation history、provider 消息翻译、工具结果、用户附件、assistant 生成文件相关逻辑时，必须遵守 [core/src/session_actor/chat_message.md](core/src/session_actor/chat_message.md) 和 [core/src/session_actor/file_item.md](core/src/session_actor/file_item.md)。
 - `ChatMessage` 是 provider-neutral 的持久化历史；不要把 provider-specific 的 `input_image`、`input_file`、multipart 字段、Responses item 等直接存进 `ChatMessage`。
-- `ChatMessageItem::File` / `ToolResultContent.file` 必须使用标准 `FileItem` payload。用户上传、工具产物、assistant 生成文件优先 materialize 成稳定 `file://` URI；`data:` URL 主要作为 request-time normalization / transport 形态，避免把大 base64 长期写入 JSONL 历史。
+- 新增或修改工具结果时，必须优先写入 `ToolResultContent.structured`，不要把新工具输出写成 `ToolResultContent.context.text`。纯文本结果也应包装成结构化 payload，例如 `{"kind":"text_result","text":"..."}`；JSON 结果使用结构化 JSON；provider / Web / 压缩需要文本时由统一渲染函数派生。
+- `ChatMessageItem::File` / `ToolResultContent.files[]` 必须使用标准 `FileItem` payload。用户上传、工具产物、assistant 生成文件优先 materialize 成稳定 `file://` URI；`data:` URL 主要作为 request-time normalization / transport 形态，避免把大 base64 长期写入 JSONL 历史。
 - 新增写入 `FileItem` 的代码时，应尽量补齐 `name`、精确 `media_type`，图片应尽量补齐 `width` / `height`；文件不可用时保留 `FileItem` 并设置 `FileState::Crashed { reason }`，不要静默丢弃。
 - provider 需要 base64、URL、file id 或 multipart 时，应在发送请求前由 media normalizer / provider translator 从 `FileItem` 派生，不改变持久化的 `ChatMessage` 形态。
 

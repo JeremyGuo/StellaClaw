@@ -849,9 +849,14 @@ fn preserve_tool_messages(messages: &[ChatMessage], requested_ids: &[String]) ->
 }
 
 fn truncate_tool_result_content(mut tool_result: super::ToolResultItem) -> super::ToolResultItem {
-    if let Some(context) = tool_result.result.context.as_mut() {
-        context.text =
-            truncate_text_with_notice(&context.text, MAX_PRESERVED_TOOL_RESULT_TEXT_CHARS);
+    let rendered = tool_result_text(&tool_result);
+    if rendered.chars().count() > MAX_PRESERVED_TOOL_RESULT_TEXT_CHARS {
+        let files = std::mem::take(&mut tool_result.result.files);
+        tool_result.result = ToolResultContent::from_text(truncate_text_with_notice(
+            &rendered,
+            MAX_PRESERVED_TOOL_RESULT_TEXT_CHARS,
+        ))
+        .with_files(files);
     }
     tool_result
 }
@@ -1335,13 +1340,9 @@ mod tests {
                 vec![ChatMessageItem::ToolResult(ToolResultItem {
                     tool_call_id: "call_secret".to_string(),
                     tool_name: "shell_exec".to_string(),
-                    result: ToolResultContent {
-                        context: Some(ContextItem {
-                            text: "secret tool result should be dropped".to_string(),
-                        }),
-                        structured: None,
-                        file: None,
-                    },
+                    result: ToolResultContent::from_text(
+                        "secret tool result should be dropped".to_string(),
+                    ),
                 })],
             ),
             ChatMessage::new(
@@ -1603,13 +1604,7 @@ mod tests {
                 vec![ChatMessageItem::ToolResult(ToolResultItem {
                     tool_call_id: "call_keep".to_string(),
                     tool_name: "file_read".to_string(),
-                    result: ToolResultContent {
-                        context: Some(ContextItem {
-                            text: "memory disabled in config".to_string(),
-                        }),
-                        structured: None,
-                        file: None,
-                    },
+                    result: ToolResultContent::from_text("memory disabled in config".to_string()),
                 })],
             ),
             ChatMessage::new(
@@ -1659,11 +1654,7 @@ mod tests {
             messages[2].data.first(),
             Some(ChatMessageItem::ToolResult(tool_result))
                 if tool_result.tool_call_id == "call_keep"
-                    && tool_result
-                        .result
-                        .context
-                        .as_ref()
-                        .is_some_and(|context| context.text.contains("memory disabled"))
+                    && tool_result_text(tool_result).contains("memory disabled")
         ));
         assert!(!messages
             .iter()
@@ -1748,20 +1739,16 @@ mod tests {
                 vec![ChatMessageItem::ToolResult(ToolResultItem {
                     tool_call_id: "call_1".to_string(),
                     tool_name: "file_read".to_string(),
-                    result: ToolResultContent {
-                        context: Some(ContextItem {
-                            text: "loaded".to_string(),
-                        }),
-                        structured: None,
-                        file: Some(FileItem {
+                    result: ToolResultContent::from_text("loaded".to_string()).with_file(
+                        FileItem {
                             uri: "file:///tmp/report.pdf".to_string(),
                             name: Some("report.pdf".to_string()),
                             media_type: Some("application/pdf".to_string()),
                             width: None,
                             height: None,
                             state: None,
-                        }),
-                    },
+                        },
+                    ),
                 })],
             ),
         ];
@@ -1841,13 +1828,7 @@ mod tests {
                 vec![ChatMessageItem::ToolResult(ToolResultItem {
                     tool_call_id: "call_1".to_string(),
                     tool_name: "shell".to_string(),
-                    result: ToolResultContent {
-                        context: Some(ContextItem {
-                            text: "hi".to_string(),
-                        }),
-                        structured: None,
-                        file: None,
-                    },
+                    result: ToolResultContent::from_text("hi".to_string()),
                 })],
             ),
         ];

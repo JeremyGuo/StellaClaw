@@ -819,18 +819,14 @@ fn estimate_message_tokens(message: &ChatMessage) -> usize {
                     + tool_call.arguments.text.len()
             }
             ChatMessageItem::ToolResult(tool_result) => {
-                let context_len = tool_result
-                    .result
-                    .context
-                    .as_ref()
-                    .map(|context| context.text.len())
-                    .unwrap_or(0);
+                let context_len =
+                    stellaclaw_core::session_actor::tool_result_text(tool_result).len();
                 let file_len = tool_result
                     .result
-                    .file
-                    .as_ref()
+                    .files
+                    .iter()
                     .map(estimate_file_item_chars)
-                    .unwrap_or(0);
+                    .sum::<usize>();
                 tool_result.tool_call_id.len()
                     + tool_result.tool_name.len()
                     + context_len

@@ -684,9 +684,7 @@ fn collect_message_files(message: &ChatMessage) -> Vec<FileItem> {
         match item {
             ChatMessageItem::File(file) => files.push(file.clone()),
             ChatMessageItem::ToolResult(tool_result) => {
-                if let Some(file) = &tool_result.result.file {
-                    files.push(file.clone());
-                }
+                files.extend(tool_result.result.files.iter().cloned());
             }
             ChatMessageItem::Reasoning(_)
             | ChatMessageItem::Context(_)
@@ -1099,12 +1097,7 @@ mod tests {
             vec![ChatMessageItem::ToolResult(ToolResultItem {
                 tool_call_id: "call_1".to_string(),
                 tool_name: "read_file".to_string(),
-                result: ToolResultContent {
-                    context: Some(ContextItem {
-                        text: "loaded".to_string(),
-                    }),
-                    structured: None,
-                    file: Some(FileItem {
+                result: ToolResultContent::from_text("loaded".to_string()).with_file(FileItem {
                         uri: "file:///tmp/out.png".to_string(),
                         name: None,
                         media_type: Some("image/png".to_string()),
@@ -1112,7 +1105,6 @@ mod tests {
                         height: Some(480),
                         state: None,
                     }),
-                },
             })],
         )])
         .expect("template should render");

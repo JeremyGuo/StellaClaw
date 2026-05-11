@@ -301,13 +301,7 @@ mod tests {
         let message = batch.into_result_message(vec![ToolResultItem {
             tool_call_id: "call_1".to_string(),
             tool_name: "read_file".to_string(),
-            result: ToolResultContent {
-                context: Some(ContextItem {
-                    text: "file loaded".to_string(),
-                }),
-                structured: None,
-                file: None,
-            },
+            result: ToolResultContent::from_text("file loaded".to_string()),
         }]);
 
         assert_eq!(message.role, ChatRole::Assistant);

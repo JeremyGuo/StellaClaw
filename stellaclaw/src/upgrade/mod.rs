@@ -13,6 +13,7 @@ mod v0_13;
 mod v0_14;
 mod v0_15;
 mod v0_16;
+mod v0_17;
 mod v0_2;
 mod v0_3;
 mod v0_4;
@@ -38,7 +39,8 @@ pub const WORKDIR_VERSION_0_13: &str = "0.13";
 pub const WORKDIR_VERSION_0_14: &str = "0.14";
 pub const WORKDIR_VERSION_0_15: &str = "0.15";
 pub const WORKDIR_VERSION_0_16: &str = "0.16";
-pub const LATEST_WORKDIR_VERSION: &str = "0.17";
+pub const WORKDIR_VERSION_0_17: &str = "0.17";
+pub const LATEST_WORKDIR_VERSION: &str = "0.18";
 pub const PARTYCLAW_LATEST_WORKDIR_VERSION: &str = "0.39";
 
 const WORKDIR_VERSION_FILE: &str = "STELLA_VERSION";
@@ -57,7 +59,7 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
     let legacy_version_path = workdir.join(LEGACY_WORKDIR_VERSION_FILE);
     let mut current = read_workdir_version(&version_path, &legacy_version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 17] = [
+    let upgraders: [&dyn WorkdirUpgrader; 18] = [
         &v0_1::LegacyUpgrade,
         &v0_1::PartyClawUpgrade,
         &v0_2::ChatMessageReasoningUpgrade,
@@ -75,6 +77,7 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
         &v0_14::StaleSpecialLinkRepairUpgrade,
         &v0_15::MemoryV1DirectoryUpgrade,
         &v0_16::MemoryV1UsageLogUpgrade,
+        &v0_17::ToolResultStructuredContentUpgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -129,6 +132,7 @@ fn read_version_file(version_path: &Path) -> Result<&'static str> {
         WORKDIR_VERSION_0_14 => Ok(WORKDIR_VERSION_0_14),
         WORKDIR_VERSION_0_15 => Ok(WORKDIR_VERSION_0_15),
         WORKDIR_VERSION_0_16 => Ok(WORKDIR_VERSION_0_16),
+        WORKDIR_VERSION_0_17 => Ok(WORKDIR_VERSION_0_17),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }

@@ -253,11 +253,12 @@ pub fn render_chat_message(message: &ChatMessage) -> String {
             }) => parts.push(format!("[tool_call {tool_name}] {}", arguments.text)),
             ChatMessageItem::ToolResult(tool_result) => {
                 let mut line = format!("[tool_result {}]", tool_result.tool_name);
-                if let Some(context) = &tool_result.result.context {
+                let text = stellaclaw_core::session_actor::tool_result_text(tool_result);
+                if !text.trim().is_empty() {
                     line.push('\n');
-                    line.push_str(&context.text);
+                    line.push_str(&text);
                 }
-                if let Some(file) = &tool_result.result.file {
+                for file in &tool_result.result.files {
                     line.push('\n');
                     line.push_str(&render_file_item(file));
                 }

@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use super::{WorkdirUpgrader, LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_16};
+use super::{WorkdirUpgrader, WORKDIR_VERSION_0_16, WORKDIR_VERSION_0_17};
 use crate::config::StellaclawConfig;
 
 pub struct MemoryV1UsageLogUpgrade;
@@ -16,7 +16,7 @@ impl WorkdirUpgrader for MemoryV1UsageLogUpgrade {
     }
 
     fn to_version(&self) -> &'static str {
-        LATEST_WORKDIR_VERSION
+        WORKDIR_VERSION_0_17
     }
 
     fn upgrade(&self, workdir: &Path, _config: &StellaclawConfig) -> Result<()> {

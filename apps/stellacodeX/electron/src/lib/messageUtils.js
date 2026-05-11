@@ -85,7 +85,10 @@ function normalizeChatMessageItem(item, index, renderedByIndex) {
       tool_name: payload.tool_name || 'tool',
       context: rendered?.context || result.context?.text || null,
       context_with_attachment_markers: rendered?.context_with_attachment_markers || result.context?.text || null,
-      file_attachment_index: rendered?.file_attachment_index
+      structured: rendered?.structured || result.structured || null,
+      file_attachment_indices: rendered?.file_attachment_indices || (
+        rendered?.file_attachment_index !== undefined ? [rendered.file_attachment_index] : []
+      )
     };
   }
   return rendered || null;
@@ -138,7 +141,7 @@ export function toolCardsForMessage(message) {
         kind: item.type === 'tool_result' ? 'result' : 'call',
         name: item.tool_name || 'tool',
         payload: item.type === 'tool_result'
-          ? (item.context_with_attachment_markers || item.context || '')
+          ? (item.structured || item.context_with_attachment_markers || item.context || '')
           : (item.arguments || '')
       }));
   }
@@ -182,7 +185,7 @@ export function splitMessageForDisplay(message) {
         kind: item.type === 'tool_result' ? 'result' : 'call',
         name: item.tool_name || 'tool',
         payload: item.type === 'tool_result'
-          ? (item.context_with_attachment_markers || item.context || '')
+          ? (item.structured || item.context_with_attachment_markers || item.context || '')
           : (item.arguments || ''),
         usage
       });
@@ -423,7 +426,7 @@ export function liveActivitiesFromMessages(messages) {
       if (item?.type !== 'tool_call' && item?.type !== 'tool_result') return;
       const name = item.tool_name || 'tool';
       const id = item.tool_call_id || `${messageKey(message, index)}-${index}`;
-      const payload = item.arguments || item.context_with_attachment_markers || item.context || item.result || '';
+      const payload = item.arguments || item.structured || item.context_with_attachment_markers || item.context || item.result || '';
       result.push({
         id: `${item.type}-${id}`,
         title: item.type === 'tool_result' ? '工具已返回' : '调用工具',

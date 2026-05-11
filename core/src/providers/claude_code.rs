@@ -375,16 +375,15 @@ fn claude_tool_result_image_blocks(
         let ChatMessageItem::ToolResult(tool_result) = item else {
             continue;
         };
-        let Some(file) = tool_result.result.file.as_ref() else {
-            continue;
-        };
-        if !is_image_file(file) || file.state.is_some() {
-            continue;
-        }
-        let fake = ChatMessage::new(ChatRole::User, vec![ChatMessageItem::File(file.clone())]);
-        for normalized in normalize_messages_for_model(&[fake], model_config) {
-            for block in claude_content_blocks(&normalized) {
-                blocks.push(block);
+        for file in &tool_result.result.files {
+            if !is_image_file(file) || file.state.is_some() {
+                continue;
+            }
+            let fake = ChatMessage::new(ChatRole::User, vec![ChatMessageItem::File(file.clone())]);
+            for normalized in normalize_messages_for_model(&[fake], model_config) {
+                for block in claude_content_blocks(&normalized) {
+                    blocks.push(block);
+                }
             }
         }
     }

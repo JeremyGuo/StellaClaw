@@ -302,13 +302,7 @@ fn native_load(
             "media_type": file.media_type,
         }),
     };
-    Ok(ToolResultContent {
-        context: Some(ContextItem {
-            text: status.to_string(),
-        }),
-        structured: None,
-        file: Some(file),
-    })
+    Ok(ToolResultContent::from_json(status).with_file(file))
 }
 
 fn analysis_tool(
@@ -526,14 +520,9 @@ fn wait_media_job(
             }
             MediaJobStatus::Failed(error) => {
                 media_jobs().lock().expect("mutex poisoned").remove(job_id);
-                return Ok(ToolResultContent {
-                    context: Some(ContextItem {
-                        text: json!({"status": "failed", id_field: job_id, "error": error})
-                            .to_string(),
-                    }),
-                    structured: None,
-                    file: None,
-                });
+                return Ok(ToolResultContent::from_json(
+                    json!({"status": "failed", id_field: job_id, "error": error}),
+                ));
             }
             MediaJobStatus::Cancelled => {
                 media_jobs().lock().expect("mutex poisoned").remove(job_id);
@@ -598,18 +587,11 @@ fn job_snapshot_result(
     id_field: &str,
     status: &str,
 ) -> ToolResultContent {
-    ToolResultContent {
-        context: Some(ContextItem {
-            text: json!({
-                "tool": tool_name,
-                "status": status,
-                id_field: job_id,
-            })
-            .to_string(),
-        }),
-        structured: None,
-        file: None,
-    }
+    ToolResultContent::from_json(json!({
+        "tool": tool_name,
+        "status": status,
+        id_field: job_id,
+    }))
 }
 
 fn provider_message_to_tool_result(message: ChatMessage) -> ToolResultContent {
@@ -620,26 +602,26 @@ fn provider_message_to_tool_result(message: ChatMessage) -> ToolResultContent {
             ChatMessageItem::Context(context) => text.push(context.text),
             ChatMessageItem::File(item) if file.is_none() => file = Some(item),
             ChatMessageItem::ToolResult(result) => {
-                if let Some(context) = result.result.context {
-                    text.push(context.text);
+                let rendered = crate::session_actor::tool_result_text(&result);
+                if !rendered.trim().is_empty() {
+                    text.push(rendered);
                 }
                 if file.is_none() {
-                    file = result.result.file;
+                    file = result.result.files.into_iter().next();
                 }
             }
             _ => {}
         }
     }
-    ToolResultContent {
-        context: Some(ContextItem {
-            text: if text.is_empty() {
-                json!({"status": "completed"}).to_string()
-            } else {
-                text.join("\n")
-            },
-        }),
-        structured: None,
-        file,
+    let result = if text.is_empty() {
+        ToolResultContent::from_json(json!({"status": "completed"}))
+    } else {
+        ToolResultContent::from_text(text.join("\n"))
+    };
+    if let Some(file) = file {
+        result.with_file(file)
+    } else {
+        result
     }
 }
 
@@ -1010,6 +992,24 @@ mod tests {
 
     static MEDIA_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+    fn text_result_text(result: &ToolResultContent) -> &str {
+        result
+            .structured
+            .as_ref()
+            .and_then(|value| value.get("text"))
+            .and_then(Value::as_str)
+            .expect("text result should contain text")
+    }
+
+    fn json_result_value(result: &ToolResultContent) -> Value {
+        result
+            .structured
+            .as_ref()
+            .and_then(|value| value.get("value"))
+            .cloned()
+            .expect("json result should contain value")
+    }
+
     #[test]
     #[cfg(unix)]
     fn provider_backed_media_job_returns_completed_worker_result() {
@@ -1040,7 +1040,7 @@ mod tests {
         )
         .expect("provider-backed media tool should complete");
 
-        assert_eq!(result.context.unwrap().text, "media ok");
+        assert_eq!(text_result_text(&result), "media ok");
         let usage_log = fs::read_to_string(temp.path().join(TOOL_USAGE_LOG_PATH))
             .expect("tool usage log should be written");
         let usage_record: Value = serde_json::from_str(
@@ -1084,8 +1084,7 @@ mod tests {
             &test_context(temp.path()),
         )
         .expect("empty generation_id should start a new job");
-        let payload: Value =
-            serde_json::from_str(&result.context.unwrap().text).expect("valid json");
+        let payload = json_result_value(&result);
 
         let job_id = payload["generation_id"]
             .as_str()
@@ -1123,8 +1122,7 @@ mod tests {
             &test_context(temp.path()),
         )
         .expect("empty image_id should start a new job");
-        let payload: Value =
-            serde_json::from_str(&result.context.unwrap().text).expect("valid json");
+        let payload = json_result_value(&result);
 
         let job_id = payload["image_id"]
             .as_str()
@@ -1162,8 +1160,7 @@ mod tests {
             &test_context(temp.path()),
         )
         .expect("provider-backed media tool should start");
-        let start_payload: Value =
-            serde_json::from_str(&start_result.context.unwrap().text).expect("valid json");
+        let start_payload = json_result_value(&start_result);
         let job_id = start_payload["image_id"]
             .as_str()
             .expect("image_id should be returned")
@@ -1178,8 +1175,7 @@ mod tests {
             execute_media_tool("image_stop", &stop_arguments, &test_context(temp.path()))
                 .expect("image_stop should run")
                 .expect("image_stop should return result");
-        let stop_payload: Value =
-            serde_json::from_str(&stop_result.context.unwrap().text).expect("valid json");
+        let stop_payload = json_result_value(&stop_result);
 
         assert_eq!(stop_payload["status"], "cancelled");
         wait_until(Duration::from_secs(2), || closed.load(Ordering::SeqCst))
@@ -1214,8 +1210,7 @@ mod tests {
             &test_context(temp.path()),
         )
         .expect("provider-backed media tool should start");
-        let start_payload: Value =
-            serde_json::from_str(&start_result.context.unwrap().text).expect("valid json");
+        let start_payload = json_result_value(&start_result);
         let job_id = start_payload["image_id"]
             .as_str()
             .expect("image_id should be returned")
@@ -1237,8 +1232,7 @@ mod tests {
             &test_context_with_cancel(temp.path(), cancel_token),
         )
         .expect("interrupted wait should return snapshot");
-        let wait_payload: Value =
-            serde_json::from_str(&wait_result.context.unwrap().text).expect("valid json");
+        let wait_payload = json_result_value(&wait_result);
 
         assert_eq!(wait_payload["status"], "interrupted");
         assert_eq!(wait_payload["image_id"], job_id);

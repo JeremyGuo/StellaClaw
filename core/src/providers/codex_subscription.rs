@@ -1677,21 +1677,20 @@ fn append_tool_result_image_messages(
         let ChatMessageItem::ToolResult(tool_result) = item else {
             continue;
         };
-        let Some(file) = tool_result.result.file.as_ref() else {
-            continue;
-        };
-        if !is_image_file(file) || file.state.is_some() {
-            continue;
-        }
-        let fake = ChatMessage::new(ChatRole::User, vec![ChatMessageItem::File(file.clone())]);
-        for normalized in normalize_messages_for_model(&[fake], model_config) {
-            let content = user_responses_content(&normalized)?;
-            if !content.is_empty() {
-                target.push(json!({
-                    "type": "message",
-                    "role": "user",
-                    "content": content,
-                }));
+        for file in &tool_result.result.files {
+            if !is_image_file(file) || file.state.is_some() {
+                continue;
+            }
+            let fake = ChatMessage::new(ChatRole::User, vec![ChatMessageItem::File(file.clone())]);
+            for normalized in normalize_messages_for_model(&[fake], model_config) {
+                let content = user_responses_content(&normalized)?;
+                if !content.is_empty() {
+                    target.push(json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": content,
+                    }));
+                }
             }
         }
     }
@@ -2409,20 +2408,16 @@ mod tests {
             vec![ChatMessageItem::ToolResult(ToolResultItem {
                 tool_call_id: "call_1".to_string(),
                 tool_name: "image_load".to_string(),
-                result: ToolResultContent {
-                    context: Some(ContextItem {
-                        text: "loaded image".to_string(),
-                    }),
-                    structured: None,
-                    file: Some(FileItem {
+                result: ToolResultContent::from_text("loaded image".to_string()).with_file(
+                    FileItem {
                         uri: "data:image/png;base64,QUJD".to_string(),
                         name: Some("loaded.png".to_string()),
                         media_type: Some("image/png".to_string()),
                         width: None,
                         height: None,
                         state: None,
-                    }),
-                },
+                    },
+                ),
             })],
         )];
 
