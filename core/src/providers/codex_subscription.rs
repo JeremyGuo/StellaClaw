@@ -4,7 +4,7 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     path::PathBuf,
     sync::Mutex,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::Engine as _;
@@ -12,8 +12,7 @@ use reqwest::{blocking::Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use tungstenite::{
-    client::IntoClientRequest, connect, http::HeaderValue, stream::MaybeTlsStream, Message,
-    WebSocket,
+    client::IntoClientRequest, http::HeaderValue, stream::MaybeTlsStream, Message, WebSocket,
 };
 use url::Url;
 
@@ -364,8 +363,10 @@ fn connect_codex_websocket(
             .map_err(|error| ProviderError::WebSocket(error.to_string()))?,
     );
 
+    let connect_timeout = Duration::from_secs(model_config.conn_timeout_secs());
     let (mut socket, _) =
         if let Some(proxy_stream) = connect_via_https_proxy(&websocket_url, model_config)? {
+            set_tcp_timeout(&proxy_stream, connect_timeout)?;
             tungstenite::client_tls_with_config(request, proxy_stream, None, None).map_err(
                 |error| match error {
                     tungstenite::HandshakeError::Failure(f) => map_websocket_connect_error(f),
@@ -375,13 +376,66 @@ fn connect_codex_websocket(
                 },
             )?
         } else {
-            connect(request).map_err(map_websocket_connect_error)?
+            connect_direct_websocket(request, &websocket_url, connect_timeout)?
         };
     set_socket_timeout(
         &mut socket,
         Duration::from_secs(model_config.request_timeout_secs()),
     )?;
     Ok(socket)
+}
+
+fn connect_direct_websocket(
+    request: tungstenite::handshake::client::Request,
+    websocket_url: &Url,
+    timeout: Duration,
+) -> Result<
+    (
+        WebSocket<MaybeTlsStream<TcpStream>>,
+        tungstenite::handshake::client::Response,
+    ),
+    ProviderError,
+> {
+    let host = websocket_url
+        .host_str()
+        .ok_or_else(|| ProviderError::WebSocket("websocket url has no host".to_string()))?;
+    let port = websocket_url.port_or_known_default().ok_or_else(|| {
+        ProviderError::WebSocket(format!(
+            "websocket url has no known port for scheme {}",
+            websocket_url.scheme()
+        ))
+    })?;
+    let addr = format!("{host}:{port}");
+    let addrs = addr
+        .to_socket_addrs()
+        .map_err(|error| ProviderError::WebSocket(format!("failed to resolve {addr}: {error}")))?;
+
+    let mut last_error = None;
+    for socket_addr in addrs {
+        match TcpStream::connect_timeout(&socket_addr, timeout) {
+            Ok(stream) => {
+                set_tcp_timeout(&stream, timeout)?;
+                return tungstenite::client_tls_with_config(request, stream, None, None).map_err(
+                    |error| match error {
+                        tungstenite::HandshakeError::Failure(f) => map_websocket_connect_error(f),
+                        tungstenite::HandshakeError::Interrupted(_) => {
+                            ProviderError::WebSocket("websocket handshake interrupted".to_string())
+                        }
+                    },
+                );
+            }
+            Err(error) => {
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(ProviderError::WebSocket(format!(
+        "failed to connect to websocket {addr}: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "no socket addresses resolved".to_string())
+    )))
 }
 
 fn send_response_create(
@@ -404,6 +458,8 @@ fn send_response_create(
         .map_err(|error| ProviderError::WebSocket(error.to_string()))?;
 
     let mut accumulator = StreamAccumulator::default();
+    let progress_timeout = Duration::from_secs(model_config.request_timeout_secs());
+    let mut last_progress = Instant::now();
 
     loop {
         let message = socket
@@ -414,7 +470,11 @@ fn send_response_create(
             Message::Text(text) => {
                 let value =
                     serde_json::from_str::<Value>(&text).map_err(ProviderError::DecodeJson)?;
-                match value.get("type").and_then(Value::as_str) {
+                let event_type = value.get("type").and_then(Value::as_str);
+                if event_type.is_some_and(is_codex_response_progress_event) {
+                    last_progress = Instant::now();
+                }
+                match event_type {
                     Some("response.completed") => {
                         let mut response = value.get("response").cloned().ok_or_else(|| {
                             ProviderError::InvalidResponse(
@@ -492,7 +552,20 @@ fn send_response_create(
             }
             _ => {}
         }
+        if last_progress.elapsed() >= progress_timeout {
+            return Err(ProviderError::WebSocket(format!(
+                "codex websocket response made no progress for {}s",
+                progress_timeout.as_secs()
+            )));
+        }
     }
+}
+
+fn is_codex_response_progress_event(event_type: &str) -> bool {
+    event_type.starts_with("response.")
+        && (event_type.contains(".delta")
+            || event_type.contains(".added")
+            || event_type.contains(".done"))
 }
 
 fn codex_reasoning_payload(model_config: &ModelConfig) -> Option<Value> {
@@ -1996,6 +2069,24 @@ mod tests {
         ));
 
         assert!(!is_websocket_transport_error(&response));
+    }
+
+    #[test]
+    fn codex_response_progress_events_exclude_keepalive_noise() {
+        assert!(is_codex_response_progress_event(
+            "response.output_text.delta"
+        ));
+        assert!(is_codex_response_progress_event(
+            "response.output_item.added"
+        ));
+        assert!(is_codex_response_progress_event(
+            "response.function_call_arguments.done"
+        ));
+
+        assert!(!is_codex_response_progress_event("response.created"));
+        assert!(!is_codex_response_progress_event("response.in_progress"));
+        assert!(!is_codex_response_progress_event("rate_limits.updated"));
+        assert!(!is_codex_response_progress_event("ping"));
     }
 
     #[test]
