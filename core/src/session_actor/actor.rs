@@ -34,7 +34,6 @@ use super::{
     ToolExecutionOp, ToolResultContent,
 };
 
-const DEFAULT_MAX_MODEL_STEPS_PER_TURN: usize = 200;
 const ACTIVE_COMPRESSION_THRESHOLD_RATIO: f64 = 0.9;
 const IDLE_COMPACTION_MIN_RATIO: f64 = 0.3;
 const REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS: usize = 8;
@@ -64,7 +63,6 @@ pub struct SessionActor {
     runtime_metadata_state: RuntimeMetadataState,
     next_turn_id: u64,
     next_batch_id: u64,
-    max_model_steps_per_turn: usize,
     shutdown: bool,
     logger: Option<SessionActorLogger>,
     state_store: Option<SessionStateStore>,
@@ -204,7 +202,6 @@ impl SessionActor {
             runtime_metadata_state: RuntimeMetadataState::default(),
             next_turn_id: 1,
             next_batch_id: 1,
-            max_model_steps_per_turn: DEFAULT_MAX_MODEL_STEPS_PER_TURN,
             shutdown: false,
             logger: None,
             state_store: None,
@@ -254,10 +251,6 @@ impl SessionActor {
     ) -> Self {
         self.conversation_bridge = Some(conversation_bridge);
         self
-    }
-
-    pub fn set_max_model_steps_per_turn(&mut self, max_steps: usize) {
-        self.max_model_steps_per_turn = max_steps.max(1);
     }
 
     pub fn step(&mut self) -> Result<SessionActorStep, SessionActorError> {
@@ -953,7 +946,8 @@ impl SessionActor {
         turn_number: u64,
         start_step_index: usize,
     ) -> Result<(), SessionActorError> {
-        for step_index in start_step_index..self.max_model_steps_per_turn {
+        let mut step_index = start_step_index;
+        loop {
             self.log_info(
                 "provider_request_started",
                 serde_json::json!({
@@ -1106,6 +1100,7 @@ impl SessionActor {
 
             let batch = built_batch.batch;
             if batch.is_empty() {
+                step_index = step_index.saturating_add(1);
                 continue;
             }
             let batch_progress = batch.progress_summary();
@@ -1141,6 +1136,7 @@ impl SessionActor {
                         index: tool_message_index,
                         message: tool_message,
                     })?;
+                    step_index = step_index.saturating_add(1);
                     continue;
                 }
             };
@@ -1156,10 +1152,6 @@ impl SessionActor {
             });
             return Ok(());
         }
-
-        Err(SessionActorError::ModelStepLimitExceeded(
-            self.max_model_steps_per_turn,
-        ))
     }
 
     fn build_tool_batch(
@@ -2061,8 +2053,6 @@ pub enum SessionActorError {
     MissingInitial,
     #[error("session actor exceeded step limit {0}")]
     StepLimitExceeded(usize),
-    #[error("model/tool loop exceeded max model steps {0}")]
-    ModelStepLimitExceeded(usize),
 }
 
 impl SessionActorError {
@@ -2091,7 +2081,6 @@ impl SessionActorError {
                 | Self::Compression(_)
                 | Self::Tool(_)
                 | Self::RuntimeMetadata(_)
-                | Self::ModelStepLimitExceeded(_)
         )
     }
 
@@ -2153,11 +2142,6 @@ impl SessionActorError {
                 "session_actor.loop",
                 "step_limit_exceeded",
                 format!("session actor exceeded step limit {max_steps}"),
-            ),
-            Self::ModelStepLimitExceeded(max_steps) => SessionErrorDetail::new(
-                "session_actor.model_loop",
-                "model_step_limit_exceeded",
-                format!("model/tool loop exceeded max model steps {max_steps}"),
             ),
         }
     }

@@ -3,6 +3,9 @@ version: 1.27.0
 
 # 1.27.0
 
+- 移除单轮 model/tool loop 步数上限：
+  `SessionActor` 不再用固定 200 步限制截断同一个 turn 的模型/工具循环，长链路任务会继续运行直到模型自然完成、外部取消、provider/tool/context 等真实错误发生，避免达到内部兜底上限后需要 `/continue` 手动续跑。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 新增 `stellaclaw setup <config> <workdir> [--systemd [--user]]` 配置向导：
   向导按模型、Tooling、Memory System、Channel、确认创建五个阶段生成当前 `config` schema 的配置文件，并在 TTY 中使用轻量 ANSI 颜色区分阶段、菜单、提示、警告和成功状态；非终端、`NO_COLOR` 或 `TERM=dumb` 时自动退回纯文本。向导会在开始时检查 config 目录、workdir 和可选 systemd unit 目录权限，避免最后保存时才失败；`--dry-run` 会完整跑向导并打印 config / systemd 预览，但不写文件、不创建 workdir、不安装服务。模型阶段支持添加多个 chat model，并按 provider 只暴露对应参数；Codex subscription 会复用 Codex auth.json / `CHATGPT_ACCESS_TOKEN` 约定，并可辅助运行 `codex login --device-auth`。Tooling 阶段解释并支持 `alias:self` 工具模型目标，Brave Search 和 OpenAI image helper 会生成独立工具模型；compression 配置在向导中标为高级 override，默认显示按当前默认模型 context window 90% 计算的压缩阈值和 10% retain 预算，但不写入固定 override。Memory System 阶段说明长期记忆用途，并提示 dedupe / user compaction 应优先选择便宜可靠的 chat 模型，也允许保持本地 fallback。Channel 阶段支持 Web / Telegram 多实例。`--systemd --user` 会写入 user service 并 enable/start，`--systemd` 会写入 system service。本次不改变 `config` schema，不改变 `workdir` schema。
 
