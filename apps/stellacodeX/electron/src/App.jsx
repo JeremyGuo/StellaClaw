@@ -322,6 +322,25 @@ function hasUnreadConversation(conversation) {
   return compareMessageIds(conversation?.last_message_id, conversation?.last_seen_message_id) > 0;
 }
 
+function recentMessagePageParams(conversation, limit = 40, totalOverride = undefined) {
+  const boundedLimit = Math.max(1, Math.min(200, Number(limit) || 40));
+  const overrideTotal = Number(totalOverride);
+  const lastId = Number(conversation?.last_message_id);
+  const messageCount = Number(conversation?.message_count);
+  let total = 0;
+  if (Number.isFinite(overrideTotal) && overrideTotal > 0) {
+    total = overrideTotal;
+  } else if (Number.isFinite(messageCount) && messageCount > 0) {
+    total = messageCount;
+  } else if (Number.isFinite(lastId) && lastId >= 0) {
+    total = lastId + 1;
+  }
+  return {
+    offset: Math.max(0, total - boundedLimit),
+    limit: boundedLimit
+  };
+}
+
 function slashCommandState(value) {
   const command = String(value || '').trim();
   const name = command.split(/\s+/, 1)[0]?.toLowerCase() || '';
@@ -1440,40 +1459,87 @@ function App() {
       }
     };
 
+    const replaceWithRecentMessages = (incoming) => {
+      if (!Array.isArray(incoming) || incoming.length === 0 || disposed || websocketKeyRef.current !== key) return;
+      messagesRef.current = incoming;
+      setMessages(incoming);
+      const latestId = incoming.reduce((max, message) => {
+        const id = Number(message?.id ?? message?.message_id);
+        return Number.isFinite(id) ? Math.max(max, id) : max;
+      }, -1);
+      if (latestId >= 0) {
+        setConversations((current) => current.map((conversation) => (
+          conversation.conversation_id === selected.conversationId
+            ? { ...conversation, last_message_id: String(latestId), message_count: Math.max(Number(conversation.message_count || 0), latestId + 1) }
+            : conversation
+        )));
+        markConversationRead(selected.serverId, selected.conversationId, latestId);
+      }
+      const activity = activityFromMessages(incoming);
+      if (activity) setSessionActivity(activity);
+    };
+
+    const loadInitialMessagePage = async () => {
+      const conversation = conversationsRef.current.find((item) => item.conversation_id === selected.conversationId);
+      const initial = await loadMessages(
+        selected.serverId,
+        selected.conversationId,
+        recentMessagePageParams(conversation)
+      );
+      if (disposed || websocketKeyRef.current !== key) return;
+      setMessages((current) => {
+        const next = current.length ? mergeMessages(current, initial) : initial;
+        messagesRef.current = next;
+        return next;
+      });
+      setMessagesReady(true);
+    };
+
     const reconcileAck = async (ack) => {
       const nextId = String(ack?.next_message_id || '');
       if (!nextId || disposed || websocketKeyRef.current !== key) return;
+      const nextIndex = Number(nextId);
+      if (!Number.isFinite(nextIndex)) return;
       const current = messagesRef.current;
       const lastId = lastMessageId(current);
       if (!lastId) {
-        const currentId = String(ack?.current_message_id || '');
-        if (!currentId) {
+        if (nextIndex <= 0) {
           messagesRef.current = [];
           setMessages([]);
           setMessagesReady(true);
           return;
         }
-        const currentIndex = Math.max(0, Number(currentId) || 0);
-        const limit = 40;
-        const offset = Math.max(0, currentIndex - limit + 1);
-        const initial = await loadMessages(selected.serverId, selected.conversationId, {
-          offset,
-          limit
-        });
+        const initial = await loadMessages(
+          selected.serverId,
+          selected.conversationId,
+          recentMessagePageParams(null, 40, nextIndex)
+        );
         if (!disposed && websocketKeyRef.current === key) {
-          messagesRef.current = initial;
-          setMessages(initial);
+          setMessages((current) => {
+            const next = current.length ? mergeMessages(current, initial) : initial;
+            messagesRef.current = next;
+            return next;
+          });
           setMessagesReady(true);
         }
         return;
       }
-      if (Number(nextId) > Number(lastId) + 1) {
-        const gap = Math.min(200, Number(nextId) - Number(lastId) - 1);
-        const missing = await loadMessages(selected.serverId, selected.conversationId, {
-          offset: Number(lastId) + 1,
-          limit: gap
-        });
-        applyIncomingMessages(missing);
+      const lastIndex = Number(lastId);
+      if (Number.isFinite(lastIndex) && nextIndex > lastIndex + 1) {
+        const gap = nextIndex - lastIndex - 1;
+        const shouldJumpToTail = gap > 200;
+        const params = shouldJumpToTail
+          ? recentMessagePageParams(null, 80, nextIndex)
+          : { offset: lastIndex + 1, limit: gap };
+        const missing = await loadMessages(selected.serverId, selected.conversationId, params);
+        if (shouldJumpToTail) {
+          replaceWithRecentMessages(missing);
+        } else {
+          applyIncomingMessages(missing);
+        }
+        if (!disposed && websocketKeyRef.current === key) {
+          setMessagesReady(true);
+        }
       }
     };
 
@@ -1537,11 +1603,15 @@ function App() {
         });
       } catch {
         if (!disposed) setSessionActivity('实时连接不可用，使用刷新兜底');
-        loadMessages(selected.serverId, selected.conversationId)
+        const conversation = conversationsRef.current.find((item) => item.conversation_id === selected.conversationId);
+        loadMessages(selected.serverId, selected.conversationId, recentMessagePageParams(conversation))
           .then((initial) => {
             if (disposed || websocketKeyRef.current !== key) return;
-            messagesRef.current = initial;
-            setMessages(initial);
+            setMessages((current) => {
+              const next = current.length ? mergeMessages(current, initial) : initial;
+              messagesRef.current = next;
+              return next;
+            });
             setMessagesReady(true);
           })
           .catch(() => {
@@ -1560,6 +1630,12 @@ function App() {
     setMessagesReady(false);
     setSessionActivity('');
     setRunningActivities([]);
+    loadInitialMessagePage().catch(() => {
+      if (!disposed && websocketKeyRef.current === key && messagesRef.current.length === 0) {
+        setMessages([]);
+        setMessagesReady(true);
+      }
+    });
     connect();
 
     return () => {

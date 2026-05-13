@@ -7,7 +7,7 @@ import * as Popover from '@radix-ui/react-popover';
 import { attachmentName, attachmentUrl, fileExtension, isImageAttachment, messageText } from '../lib/fileUtils';
 import { handleExternalLinkClick, isExternalUrl } from '../lib/externalLinks';
 import { formatBytes, formatTokens, modelAlias, modelDisplayName } from '../lib/format';
-import { displayMessages, firstMessageId, firstToolNameForMessage, liveActivitySignature, markerIndexes, messageKey, shouldTypewriterMessage, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
+import { displayMessages, firstMessageId, firstToolNameForMessage, isExecutionMessage, liveActivitySignature, markerIndexes, messageKey, shouldTypewriterMessage, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
 
 const COMMANDS = [
   { command: '/model', label: '切换模型', description: '选择当前 Conversation 使用的模型', options: 'models' },
@@ -108,6 +108,17 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const renderedMessages = useMemo(() => displayMessages(messages), [messages]);
   const activitySignature = useMemo(() => liveActivitySignature(runningActivities || []), [runningActivities]);
   const oldestMessageKey = useMemo(() => firstMessageId(messages) || messages[0]?.id || messages[0]?.index || '', [messages]);
+  const newestMessageKey = useMemo(() => {
+    const message = messages.at(-1);
+    if (!message) return '';
+    return [
+      message.id,
+      message.index,
+      message.message_time,
+      message.preview,
+      message.text
+    ].map((value) => String(value ?? '')).join(':');
+  }, [messages]);
   const modeLabel = typeof mode === 'string' ? mode : mode?.label || '本地';
   const modeTone = typeof mode === 'string' ? '' : mode?.tone || 'local';
   const modeTitle = typeof mode === 'string' ? mode : mode?.title || modeLabel;
@@ -138,6 +149,11 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const newestSeenIndexRef = useRef(-1);
   const currentActivity = (runningActivities || []).at(-1) || null;
   const progressVisible = Boolean(currentActivity);
+  const turnStoppedAfterTool = useMemo(() => {
+    if (!messagesReady || currentActivity || !messages.length) return false;
+    const lastMessage = messages.at(-1);
+    return isExecutionMessage(lastMessage);
+  }, [messages, messagesReady, currentActivity]);
 
   const updateComposerMetrics = () => {
     const node = composerRef.current;
@@ -206,13 +222,18 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       });
     }
     previousCountRef.current = renderedMessages.length;
-  }, [renderedMessages.length, messages.length, activitySignature]);
+  }, [activeMessageScope, renderedMessages.length, messages.length, newestMessageKey, messagesReady, activitySignature]);
 
   useEffect(() => {
+    previousCountRef.current = 0;
+    loadingOlderRef.current = false;
+    prependAdjustRef.current = null;
+    stickToBottomRef.current = true;
     knownMessagesRef.current = new Set();
     typedMessagesRef.current = new Set();
     typewriterHydratedRef.current = false;
     newestSeenIndexRef.current = -1;
+    requestAnimationFrame(scrollToBottom);
     setDraft('');
     setComposerAttachments((current) => {
       current.forEach((attachment) => {
@@ -465,6 +486,14 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
                 )
             ))}
             {currentActivity && <InlineActivityStatus activity={currentActivity} />}
+            {turnStoppedAfterTool && (
+              <div className="turn-continuation-notice">
+                <span>本轮停在工具结果后，没有后续 assistant 消息。</span>
+                <button type="button" onClick={() => onSend?.('/continue')} disabled={sending}>
+                  继续
+                </button>
+              </div>
+            )}
           </>
         )}
       </div>
@@ -1426,16 +1455,48 @@ function parseToolPayload(payload) {
   }
 }
 
+function compactToolSummary(text, max = 180) {
+  const value = String(text || '').replace(/\s+/g, ' ').trim();
+  return value.length > max ? `${value.slice(0, max - 1)}...` : value;
+}
+
+function shellOutputText(data) {
+  const output = data?.output;
+  if (typeof output === 'string') return output;
+  if (output && typeof output === 'object') {
+    if (typeof output.text === 'string') return output.text;
+    if (typeof output.stdout === 'string' || typeof output.stderr === 'string') {
+      return [output.stdout, output.stderr].filter(Boolean).join('\n');
+    }
+  }
+  return [data?.stdout, data?.stderr, data?.text].filter((value) => typeof value === 'string').join('\n');
+}
+
+function shellResultSummary(data) {
+  const text = shellOutputText(data);
+  const lines = String(text || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const interesting = [...lines].reverse().find((line) => (
+    /Training:/.test(line)
+    || /\bstep\s+\d+\b/i.test(line)
+    || /\b(checkpoint|Traceback|RuntimeError|ValueError|CUDA|error)\b/i.test(line)
+  ));
+  return compactToolSummary(interesting || lines.at(-1) || '');
+}
+
 function toolDisplay(kind, name, payload) {
   const data = parseToolPayload(payload);
   const lowerName = String(name || '').toLowerCase();
   const isResult = kind === 'result';
   if (lowerName.includes('shell')) {
     const command = data.command || data.cmd || data.text || '';
+    const outputSummary = isResult ? shellResultSummary(data) : '';
     return {
       title: isResult ? '已运行' : '运行',
       chip: 'shell',
-      summary: command || 'shell command',
+      summary: outputSummary || command || 'shell command',
       detailTitle: 'Shell'
     };
   }
