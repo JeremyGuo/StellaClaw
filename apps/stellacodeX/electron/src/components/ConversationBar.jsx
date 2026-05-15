@@ -1,5 +1,5 @@
 import { Folder, FolderOpen, Plus, Search, Settings } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import * as ContextMenu from '@radix-ui/react-context-menu';
 import { conversationKey, displayConversationName, displayForegroundSessionName, foregroundSessions } from '../lib/api';
 import { formatModel } from '../lib/format';
@@ -28,6 +28,23 @@ function sameStringSet(left, right) {
   return true;
 }
 
+function sameStringArray(left, right) {
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => value === right[index]);
+}
+
+function reorderedIds(ids, sourceId, targetId, position = 'before') {
+  if (!sourceId || !targetId || sourceId === targetId) return ids;
+  const next = [...ids];
+  const sourceIndex = next.indexOf(sourceId);
+  if (sourceIndex < 0 || !next.includes(targetId)) return ids;
+  next.splice(sourceIndex, 1);
+  const targetIndex = next.indexOf(targetId);
+  if (targetIndex < 0) return ids;
+  next.splice(targetIndex + (position === 'after' ? 1 : 0), 0, sourceId);
+  return sameStringArray(ids, next) ? ids : next;
+}
+
 export function ConversationBar({
   serverId,
   sidebarMode,
@@ -54,7 +71,10 @@ export function ConversationBar({
   const [hiddenOpen, setHiddenOpen] = useState(false);
   const [openFolders, setOpenFolders] = useState(() => new Set());
   const [draggingConversationId, setDraggingConversationId] = useState('');
-  const [dropTarget, setDropTarget] = useState({ id: '', position: 'before' });
+  const [previewConversationIds, setPreviewConversationIds] = useState([]);
+  const folderRefs = useRef(new Map());
+  const previousFolderRects = useRef(null);
+  const dragCommittedRef = useRef(false);
   const hiddenIds = useMemo(() => new Set(hiddenConversationIds.map(String)), [hiddenConversationIds]);
   const visibleConversations = useMemo(() => {
     const visible = conversations.filter((conversation) => !hiddenIds.has(conversation.conversation_id));
@@ -67,14 +87,51 @@ export function ConversationBar({
       return (sourceIndex.get(left.conversation_id) || 0) - (sourceIndex.get(right.conversation_id) || 0);
     });
   }, [conversations, conversationOrder, hiddenIds]);
+  const visibleConversationIds = useMemo(
+    () => visibleConversations.map((conversation) => conversation.conversation_id),
+    [visibleConversations]
+  );
+  const displayedConversations = useMemo(() => {
+    if (!previewConversationIds.length) return visibleConversations;
+    const byId = new Map(visibleConversations.map((conversation) => [conversation.conversation_id, conversation]));
+    const ordered = previewConversationIds.map((conversationId) => byId.get(conversationId)).filter(Boolean);
+    const orderedIds = new Set(ordered.map((conversation) => conversation.conversation_id));
+    return ordered.concat(visibleConversations.filter((conversation) => !orderedIds.has(conversation.conversation_id)));
+  }, [previewConversationIds, visibleConversations]);
   const hiddenConversations = useMemo(
     () => conversations.filter((conversation) => hiddenIds.has(conversation.conversation_id)),
     [conversations, hiddenIds]
   );
 
+  useLayoutEffect(() => {
+    const previous = previousFolderRects.current;
+    if (!previous) return;
+    previousFolderRects.current = null;
+    folderRefs.current.forEach((node, conversationId) => {
+      const before = previous.get(conversationId);
+      if (!before) return;
+      const after = node.getBoundingClientRect();
+      const deltaY = before.top - after.top;
+      if (Math.abs(deltaY) < 1) return;
+      node.style.transition = 'none';
+      node.style.transform = `translateY(${deltaY}px)`;
+      node.getBoundingClientRect();
+      window.requestAnimationFrame(() => {
+        node.style.transition = 'transform 170ms cubic-bezier(.2, .8, .2, 1)';
+        node.style.transform = '';
+      });
+    });
+  }, [displayedConversations]);
+
   useEffect(() => {
     setOpenFolders(new Set(openConversationIds.map(String)));
   }, [openConversationIds]);
+
+  useEffect(() => {
+    if (previewConversationIds.length && sameStringArray(previewConversationIds, visibleConversationIds)) {
+      setPreviewConversationIds([]);
+    }
+  }, [previewConversationIds, visibleConversationIds]);
 
   const updateOpenFolders = (updater) => {
     setOpenFolders((current) => {
@@ -93,25 +150,40 @@ export function ConversationBar({
     });
   }, [selected?.conversationId]);
 
-  const moveConversation = (sourceId, targetId, position = 'before') => {
-    if (!sourceId || !targetId || sourceId === targetId) return;
-    const ids = visibleConversations.map((conversation) => conversation.conversation_id);
-    const sourceIndex = ids.indexOf(sourceId);
-    const initialTargetIndex = ids.indexOf(targetId);
-    if (sourceIndex < 0 || initialTargetIndex < 0) return;
-    ids.splice(sourceIndex, 1);
-    const targetIndex = ids.indexOf(targetId);
-    if (targetIndex < 0) return;
-    ids.splice(targetIndex + (position === 'after' ? 1 : 0), 0, sourceId);
-    onConversationOrderChange?.(ids);
+  const setFolderRef = (conversationId) => (node) => {
+    if (node) folderRefs.current.set(conversationId, node);
+    else folderRefs.current.delete(conversationId);
   };
 
-  const updateDropTarget = (event, conversationId) => {
+  const captureFolderRects = () => {
+    const rects = new Map();
+    folderRefs.current.forEach((node, conversationId) => {
+      rects.set(conversationId, node.getBoundingClientRect());
+    });
+    return rects;
+  };
+
+  const animateConversationOrderChange = (updater) => {
+    previousFolderRects.current = captureFolderRects();
+    updater();
+  };
+
+  const previewMoveConversation = (event, conversationId) => {
     if (!draggingConversationId || draggingConversationId === conversationId) return;
     event.preventDefault();
     const rect = event.currentTarget.getBoundingClientRect();
     const position = event.clientY > rect.top + rect.height / 2 ? 'after' : 'before';
-    setDropTarget({ id: conversationId, position });
+    const sourceIds = previewConversationIds.length ? previewConversationIds : visibleConversationIds;
+    const nextIds = reorderedIds(sourceIds, draggingConversationId, conversationId, position);
+    if (nextIds === sourceIds) return;
+    animateConversationOrderChange(() => setPreviewConversationIds(nextIds));
+  };
+
+  const finishDrag = () => {
+    setDraggingConversationId('');
+    if (!dragCommittedRef.current && previewConversationIds.length) {
+      animateConversationOrderChange(() => setPreviewConversationIds([]));
+    }
   };
 
   const renderSession = (conversation, session, hidden = false) => {
@@ -166,39 +238,38 @@ export function ConversationBar({
     const sessions = foregroundSessions(conversation);
     const open = openFolders.has(conversation.conversation_id);
     const dragging = draggingConversationId === conversation.conversation_id;
-    const dropping = dropTarget.id === conversation.conversation_id && draggingConversationId && draggingConversationId !== conversation.conversation_id;
     return (
       <section
-        className={`conversation-folder${dragging ? ' dragging' : ''}${dropping ? ` drop-target drop-${dropTarget.position}` : ''}`}
+        className={`conversation-folder${dragging ? ' dragging' : ''}`}
         key={conversation.conversation_id}
+        ref={hidden ? undefined : setFolderRef(conversation.conversation_id)}
         draggable={!hidden}
         onDragStart={(event) => {
           if (hidden) return;
+          dragCommittedRef.current = false;
           setDraggingConversationId(conversation.conversation_id);
+          setPreviewConversationIds(visibleConversationIds);
           event.dataTransfer.effectAllowed = 'move';
           event.dataTransfer.setData('text/plain', conversation.conversation_id);
         }}
         onDragEnter={(event) => {
           if (hidden) return;
-          updateDropTarget(event, conversation.conversation_id);
+          previewMoveConversation(event, conversation.conversation_id);
         }}
         onDragOver={(event) => {
           if (hidden) return;
-          updateDropTarget(event, conversation.conversation_id);
+          previewMoveConversation(event, conversation.conversation_id);
           event.dataTransfer.dropEffect = 'move';
         }}
         onDrop={(event) => {
           if (hidden) return;
           event.preventDefault();
-          const sourceId = event.dataTransfer.getData('text/plain') || draggingConversationId;
-          moveConversation(sourceId, conversation.conversation_id, dropTarget.position);
+          dragCommittedRef.current = true;
+          const nextIds = previewConversationIds.length ? previewConversationIds : visibleConversationIds;
+          onConversationOrderChange?.(nextIds);
           setDraggingConversationId('');
-          setDropTarget({ id: '', position: 'before' });
         }}
-        onDragEnd={() => {
-          setDraggingConversationId('');
-          setDropTarget({ id: '', position: 'before' });
-        }}
+        onDragEnd={finishDrag}
       >
         <ContextMenu.Root>
           <ContextMenu.Trigger asChild>
@@ -282,7 +353,7 @@ export function ConversationBar({
         {loading && <span className="sidebar-spinner" aria-label="正在刷新" />}
       </div>
       <div className="conversation-list">
-        {visibleConversations.map((conversation) => renderConversation(conversation))}
+        {displayedConversations.map((conversation) => renderConversation(conversation))}
         {hiddenConversations.length > 0 && (
           <section className="conversation-folder">
             <button
