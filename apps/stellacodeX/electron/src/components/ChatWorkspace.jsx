@@ -952,11 +952,27 @@ const MemoToolProcessGroup = memo(ToolProcessGroup);
 
 function toolProcessBlocks(rows) {
   const blocks = [];
+  let pendingCards = [];
+  let pendingId = '';
+  const flushTools = () => {
+    if (!pendingCards.length) return;
+    blocks.push({
+      type: 'tools',
+      id: pendingId || `tools-${blocks.length}`,
+      cards: pendingCards
+    });
+    pendingCards = [];
+    pendingId = '';
+  };
+  const pushNote = (note) => {
+    flushTools();
+    blocks.push(note);
+  };
   rows.forEach((row) => {
     const attachments = row.textMessage ? [...(row.textMessage.attachments || []), ...(row.textMessage.files || [])] : [];
     const text = row.textMessage ? messageText(row.textMessage) : '';
     if (text) {
-      blocks.push({
+      pushNote({
         type: 'note',
         kind: 'text',
         id: `${row.id}-text`,
@@ -967,7 +983,7 @@ function toolProcessBlocks(rows) {
     let renderedCardIndex = 0;
     (row.segments || [{ notes: [], cards: row.toolCards }]).forEach((segment, segmentIndex) => {
       (segment.notes || []).forEach((note, noteIndex) => {
-        blocks.push({
+        pushNote({
           type: 'note',
           kind: note.kind === 'reasoning' ? 'reasoning' : 'text',
           id: `${row.id}-${segmentIndex}-note-${noteIndex}`,
@@ -985,13 +1001,11 @@ function toolProcessBlocks(rows) {
           usage: showRowUsage ? row.usage : null
         };
       });
-      blocks.push({
-        type: 'tools',
-        id: `${row.id}-${segmentIndex}-tools`,
-        cards
-      });
+      if (!pendingId) pendingId = `${row.id}-${segmentIndex}-tools`;
+      pendingCards = pendingCards.concat(cards);
     });
   });
+  flushTools();
   return blocks;
 }
 
