@@ -140,6 +140,13 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const [toolStopNoticeReady, setToolStopNoticeReady] = useState(false);
   const currentActivity = (runningActivities || []).at(-1) || null;
   const progressVisible = Boolean(currentActivity);
+  const sessionRunning = Boolean(processing || currentActivity);
+  const latestToolGroupIndex = useMemo(() => {
+    for (let index = renderedMessages.length - 1; index >= 0; index -= 1) {
+      if (renderedMessages[index]?.type === 'toolGroup') return index;
+    }
+    return -1;
+  }, [renderedMessages]);
   const toolStopNoticeCandidate = useMemo(() => {
     if (!messagesReady || sending || processing || currentActivity || !messages.length) return false;
     const lastMessage = messages.at(-1);
@@ -423,7 +430,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
           <>
             {renderedMessages.map((message, index) => (
               message.type === 'toolGroup'
-                ? <MemoToolProcessGroup key={message.id} group={message} />
+                ? <MemoToolProcessGroup key={message.id} group={message} active={sessionRunning && index === latestToolGroupIndex} />
                 : (
                   <MemoMessageArticle
                     key={messageKey(message, index)}
@@ -1001,7 +1008,7 @@ export function InlineTokenUsage({ usage }) {
   );
 }
 
-export function ToolProcessGroup({ group }) {
+export function ToolProcessGroup({ group, active = false }) {
   const messages = group.messages || [];
   const expandedRows = useMemo(() => messages.map((message, index) => {
     const { textMessage, toolCards, segments } = splitMessageForDisplay(message);
@@ -1014,11 +1021,25 @@ export function ToolProcessGroup({ group }) {
     };
   }), [messages]);
   const blocks = useMemo(() => toolProcessBlocks(expandedRows), [expandedRows]);
+  const activeTail = active && !group.nextMessage;
+  const lastToolBlockIndex = useMemo(() => {
+    for (let index = blocks.length - 1; index >= 0; index -= 1) {
+      if (blocks[index]?.type === 'tools') return index;
+    }
+    return -1;
+  }, [blocks]);
   const complete = useMemo(() => {
     const toolBlocks = blocks.filter((block) => block.type === 'tools');
-    return Boolean(group.nextMessage) || (toolBlocks.length > 0 && toolBlocks.every((block) => toolCardsAreComplete(block.cards)));
-  }, [blocks, group.nextMessage]);
+    return !activeTail && (Boolean(group.nextMessage) || (toolBlocks.length > 0 && toolBlocks.every((block) => toolCardsAreComplete(block.cards))));
+  }, [activeTail, blocks, group.nextMessage]);
   const [open, setOpen] = useState(() => !complete);
+  const wasActiveTailRef = useRef(activeTail);
+  useEffect(() => {
+    if (activeTail && !wasActiveTailRef.current) {
+      setOpen(true);
+    }
+    wasActiveTailRef.current = activeTail;
+  }, [activeTail]);
   const elapsed = useToolRoundElapsed(messages, group.nextMessage, complete);
   const title = toolRoundTitle(elapsed, complete);
   return (
@@ -1030,13 +1051,22 @@ export function ToolProcessGroup({ group }) {
       <div className="tool-round-separator" aria-hidden="true" />
       {open && (
         <div className="tool-process-round-body">
-          {blocks.map((block) => (
-            block.type === 'tools'
-              ? <ToolProcessSegment key={block.id} block={block} complete={complete || toolCardsAreComplete(block.cards)} />
-              : block.kind === 'reasoning'
-                ? <ReasoningNote key={block.id} text={block.text} />
-                : <MarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} />
-          ))}
+          {blocks.map((block, index) => {
+            if (block.type === 'tools') {
+              const cardsComplete = toolCardsAreComplete(block.cards);
+              return (
+                <ToolProcessSegment
+                  key={block.id}
+                  block={block}
+                  complete={complete || cardsComplete}
+                  running={!complete && index === lastToolBlockIndex && (activeTail || !cardsComplete)}
+                />
+              );
+            }
+            return block.kind === 'reasoning'
+              ? <ReasoningNote key={block.id} text={block.text} />
+              : <MarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} />;
+          })}
         </div>
       )}
     </section>
@@ -1046,7 +1076,7 @@ export function ToolProcessGroup({ group }) {
 const MemoToolProcessGroup = memo(ToolProcessGroup);
 
 function useToolRoundElapsed(messages, nextMessage, complete) {
-  const startMsRef = useRef(Date.now());
+  const startMsRef = useRef(toolRoundStartMs(messages));
   const finalElapsedMsRef = useRef(null);
   const wasLiveRef = useRef(!complete);
   const [tickMs, setTickMs] = useState(() => Date.now());
@@ -1070,6 +1100,13 @@ function useToolRoundElapsed(messages, nextMessage, complete) {
     return elapsedMs !== null ? formatElapsedMs(elapsedMs) : '';
   }
   return formatElapsedMs(Math.max(0, tickMs - startMsRef.current));
+}
+
+function toolRoundStartMs(messages) {
+  const times = (messages || [])
+    .map(messageTimeMs)
+    .filter((value) => Number.isFinite(value));
+  return times.length > 0 ? Math.min(...times) : Date.now();
 }
 
 function toolRoundTitle(elapsed, complete) {
@@ -1163,14 +1200,14 @@ function toolProcessBlocks(rows) {
   return blocks;
 }
 
-function ToolProcessSegment({ block, complete }) {
+function ToolProcessSegment({ block, complete, running = false }) {
   const [open, setOpen] = useState(false);
   const toolRows = useMemo(() => mergedToolCards(block.cards), [block.cards]);
   const firstName = useMemo(() => block.cards[0]?.name || 'tool', [block.cards]);
   const summary = useMemo(() => toolGroupSummary(block.cards, firstName), [block.cards, firstName]);
   const title = complete ? summary.doneTitle : summary.runningTitle;
   return (
-    <section className={`tool-process-segment${open ? ' open' : ''}${complete ? '' : ' running'}`}>
+    <section className={`tool-process-segment${open ? ' open' : ''}${running ? ' running' : ''}`}>
       <button className="tool-process-toggle" type="button" onClick={() => setOpen((value) => !value)}>
         <TerminalSquare size={15} strokeWidth={1.9} aria-hidden="true" />
         <span>{title}</span>

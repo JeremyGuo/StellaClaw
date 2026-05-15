@@ -2018,10 +2018,6 @@ button {
   color: var(--text);
 }
 
-.tool-process-segment.running .tool-process-toggle {
-  background: color-mix(in srgb, var(--hover), transparent 70%);
-}
-
 .tool-process-segment.running .tool-process-toggle span {
   background: linear-gradient(
     105deg,
@@ -2089,12 +2085,16 @@ button {
 .tool-note {
   min-width: 0;
   color: var(--text);
-  font-size: 13px;
-  line-height: 1.42;
+  font-size: 1.12em;
+  line-height: 1.54;
 }
 
 .tool-note p {
-  margin-bottom: 4px;
+  margin: 0 0 8px;
+}
+
+.tool-note p:last-child {
+  margin-bottom: 0;
 }
 
 .reasoning-note {
