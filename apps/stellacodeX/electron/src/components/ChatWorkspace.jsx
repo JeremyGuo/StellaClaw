@@ -948,15 +948,18 @@ export function ToolProcessGroup({ group }) {
         <ChevronDown size={15} strokeWidth={1.9} aria-hidden="true" />
       </button>
       {open && (
-        <div className="tool-process-round-body">
-          {blocks.map((block) => (
-            block.type === 'tools'
-              ? <ToolProcessSegment key={block.id} block={block} complete={complete || toolCardsAreComplete(block.cards)} />
-              : block.kind === 'reasoning'
-                ? <ReasoningNote key={block.id} text={block.text} />
-                : <MarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} />
-          ))}
-        </div>
+        <>
+          <div className="tool-round-separator" aria-hidden="true" />
+          <div className="tool-process-round-body">
+            {blocks.map((block) => (
+              block.type === 'tools'
+                ? <ToolProcessSegment key={block.id} block={block} complete={complete || toolCardsAreComplete(block.cards)} />
+                : block.kind === 'reasoning'
+                  ? <ReasoningNote key={block.id} text={block.text} />
+                  : <MarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} />
+            ))}
+          </div>
+        </>
       )}
     </section>
   );
