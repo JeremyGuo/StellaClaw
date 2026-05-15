@@ -137,13 +137,26 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const loadingOlderRef = useRef(false);
   const prependAdjustRef = useRef(null);
   const stickToBottomRef = useRef(true);
+  const [toolStopNoticeReady, setToolStopNoticeReady] = useState(false);
   const currentActivity = (runningActivities || []).at(-1) || null;
   const progressVisible = Boolean(currentActivity);
-  const turnStoppedAfterTool = useMemo(() => {
-    if (!messagesReady || currentActivity || !messages.length) return false;
+  const toolStopNoticeCandidate = useMemo(() => {
+    if (!messagesReady || sending || currentActivity || !messages.length) return false;
     const lastMessage = messages.at(-1);
     return isExecutionMessage(lastMessage);
-  }, [messages, messagesReady, currentActivity]);
+  }, [messages, messagesReady, sending, currentActivity]);
+  const turnStoppedAfterTool = toolStopNoticeCandidate && toolStopNoticeReady;
+
+  useEffect(() => {
+    if (!toolStopNoticeCandidate) {
+      setToolStopNoticeReady(false);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      setToolStopNoticeReady(true);
+    }, 1800);
+    return () => window.clearTimeout(timer);
+  }, [toolStopNoticeCandidate, newestMessageKey]);
 
   const updateComposerMetrics = () => {
     const node = composerRef.current;

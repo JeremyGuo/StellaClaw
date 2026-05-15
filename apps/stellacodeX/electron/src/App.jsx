@@ -681,6 +681,8 @@ function App() {
   const uiSaveTimerRef = useRef(null);
   const readSaveTimersRef = useRef(new Map());
   const selectedSessionId = selectedForegroundSessionId(selected);
+  const selectedServerId = selected?.serverId || '';
+  const selectedConversationId = selected?.conversationId || '';
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -929,15 +931,17 @@ function App() {
     if (!serverId || !conversationId || !seen || messageOrderFromId(seen) === undefined) return;
     const sessionId = foregroundSessionId || 'main';
     const key = conversationKey(serverId, conversationId, sessionId);
-    const nextConversations = conversationsRef.current.map((conversation) => (
-      conversation.conversation_id === conversationId
-        ? patchConversationForegroundSession(conversation, sessionId, {
-          last_seen_message_id: seen
-        })
-        : conversation
-    ));
-    conversationsRef.current = nextConversations;
-    setConversations(nextConversations);
+    setConversations((current) => {
+      const next = current.map((conversation) => (
+        conversation.conversation_id === conversationId
+          ? patchConversationForegroundSession(conversation, sessionId, {
+            last_seen_message_id: seen
+          })
+          : conversation
+      ));
+      conversationsRef.current = next;
+      return next;
+    });
     const existing = readSaveTimersRef.current.get(key);
     if (existing) window.clearTimeout(existing);
     const timer = window.setTimeout(() => {
@@ -1640,11 +1644,11 @@ function App() {
   }, [downloadWorkspaceEntry]);
 
   useEffect(() => {
-    if (!selected) return;
-    const key = conversationKey(selected.serverId, selected.conversationId, selectedSessionId);
+    if (!selectedServerId || !selectedConversationId) return;
+    const key = conversationKey(selectedServerId, selectedConversationId, selectedSessionId);
     if (statuses.has(key)) return;
     let disposed = false;
-    loadStatus(selected.serverId, selected.conversationId)
+    loadStatus(selectedServerId, selectedConversationId)
       .then((status) => {
         if (disposed) return;
         setStatuses((prev) => new Map(prev).set(key, status));
@@ -1653,11 +1657,14 @@ function App() {
     return () => {
       disposed = true;
     };
-  }, [selected, selectedSessionId, statuses]);
+  }, [selectedServerId, selectedConversationId, selectedSessionId, statuses]);
 
   useEffect(() => {
-    if (!selected) return;
-    const key = conversationKey(selected.serverId, selected.conversationId, selectedSessionId);
+    if (!selectedServerId || !selectedConversationId) return;
+    const serverId = selectedServerId;
+    const conversationId = selectedConversationId;
+    const sessionId = selectedSessionId;
+    const key = conversationKey(serverId, conversationId, sessionId);
     let disposed = false;
     let reconnectTimer = null;
 
@@ -1675,6 +1682,27 @@ function App() {
       if (socket && socket.readyState <= WebSocket.OPEN) {
         socket.close();
       }
+    };
+
+    const updateSelectedSessionSummary = (latestMessage, latestId, latestIndex) => {
+      if (!latestId || !Number.isFinite(latestIndex)) return;
+      setConversations((current) => {
+        const next = current.map((conversation) => {
+          if (conversation.conversation_id !== conversationId) return conversation;
+          const session = foregroundSessions(conversation).find((item) => (
+            String(item?.id || 'main') === sessionId
+          ));
+          const currentCount = Number(session?.message_count || conversation?.message_count || 0);
+          return patchConversationForegroundSession(conversation, sessionId, {
+            last_message_id: String(latestId),
+            last_message_time: latestMessage?.message_time || new Date().toISOString(),
+            message_count: Math.max(currentCount, latestIndex + 1)
+          });
+        });
+        conversationsRef.current = next;
+        return next;
+      });
+      markConversationRead(serverId, conversationId, sessionId, latestId);
     };
 
     const applyIncomingMessages = (incoming) => {
@@ -1698,18 +1726,7 @@ function App() {
       ), null);
       const latestId = latestMessage?.id ?? latestMessage?.message_id;
       const latestIndex = latestMessage ? messageIndex(latestMessage) : undefined;
-      if (latestId && Number.isFinite(latestIndex)) {
-        setConversations((current) => current.map((conversation) => (
-          conversation.conversation_id === selected.conversationId
-            ? patchConversationForegroundSession(conversation, selectedSessionId, {
-              last_message_id: String(latestId),
-              last_message_time: latestMessage?.message_time || new Date().toISOString(),
-              message_count: Math.max(Number(activeForegroundSession?.message_count || 0), latestIndex + 1)
-            })
-            : conversation
-        )));
-        markConversationRead(selected.serverId, selected.conversationId, selectedSessionId, latestId);
-      }
+      updateSelectedSessionSummary(latestMessage, latestId, latestIndex);
       const activity = activityFromMessages(incoming);
       if (activity) setSessionActivity(activity);
       if (finalizedActivities.size > 0) {
@@ -1733,18 +1750,7 @@ function App() {
       ), null);
       const latestId = latestMessage?.id ?? latestMessage?.message_id;
       const latestIndex = latestMessage ? messageIndex(latestMessage) : undefined;
-      if (latestId && Number.isFinite(latestIndex)) {
-        setConversations((current) => current.map((conversation) => (
-          conversation.conversation_id === selected.conversationId
-            ? patchConversationForegroundSession(conversation, selectedSessionId, {
-              last_message_id: String(latestId),
-              last_message_time: latestMessage?.message_time || new Date().toISOString(),
-              message_count: Math.max(Number(activeForegroundSession?.message_count || 0), latestIndex + 1)
-            })
-            : conversation
-        )));
-        markConversationRead(selected.serverId, selected.conversationId, selectedSessionId, latestId);
-      }
+      updateSelectedSessionSummary(latestMessage, latestId, latestIndex);
       const activity = activityFromMessages(incoming);
       if (activity) setSessionActivity(activity);
     };
@@ -1852,12 +1858,12 @@ function App() {
     };
 
     const loadInitialMessagePage = async () => {
-      const conversation = conversationsRef.current.find((item) => item.conversation_id === selected.conversationId);
-      const session = foregroundSessions(conversation).find((item) => String(item?.id || 'main') === selectedSessionId) || conversation;
+      const conversation = conversationsRef.current.find((item) => item.conversation_id === conversationId);
+      const session = foregroundSessions(conversation).find((item) => String(item?.id || 'main') === sessionId) || conversation;
       const initial = await loadMessages(
-        selected.serverId,
-        selected.conversationId,
-        { ...recentMessagePageParams(session), foregroundSessionId: selectedSessionId }
+        serverId,
+        conversationId,
+        { ...recentMessagePageParams(session), foregroundSessionId: sessionId }
       );
       if (disposed || websocketKeyRef.current !== key) return;
       setMessages((current) => {
@@ -1881,9 +1887,9 @@ function App() {
           return;
         }
         const initial = await loadMessages(
-          selected.serverId,
-          selected.conversationId,
-          { ...recentMessagePageParams(null, 40, total), foregroundSessionId: selectedSessionId }
+          serverId,
+          conversationId,
+          { ...recentMessagePageParams(null, 40, total), foregroundSessionId: sessionId }
         );
         if (!disposed && websocketKeyRef.current === key) {
           setMessages((current) => {
@@ -1901,9 +1907,9 @@ function App() {
         const params = shouldJumpToTail
           ? recentMessagePageParams(null, 80, total)
           : { offset: lastIndex + 1, limit: gap };
-        const missing = await loadMessages(selected.serverId, selected.conversationId, {
+        const missing = await loadMessages(serverId, conversationId, {
           ...params,
-          foregroundSessionId: selectedSessionId
+          foregroundSessionId: sessionId
         });
         if (shouldJumpToTail) {
           replaceWithRecentMessages(missing);
@@ -1918,9 +1924,9 @@ function App() {
 
     const connect = async () => {
       try {
-        const info = await connectionInfo(selected.serverId);
+        const info = await connectionInfo(serverId);
         if (disposed || websocketKeyRef.current !== key) return;
-        const socket = new WebSocket(websocketUrl(info.baseUrl, info.token, selected.conversationId, selectedSessionId));
+        const socket = new WebSocket(websocketUrl(info.baseUrl, info.token, conversationId, sessionId));
         websocketRef.current = socket;
         socket.addEventListener('message', (event) => {
           let payload;
@@ -1978,11 +1984,11 @@ function App() {
         });
       } catch {
         if (!disposed) setSessionActivity('实时连接不可用，使用刷新兜底');
-        const conversation = conversationsRef.current.find((item) => item.conversation_id === selected.conversationId);
-        const session = foregroundSessions(conversation).find((item) => String(item?.id || 'main') === selectedSessionId) || conversation;
-        loadMessages(selected.serverId, selected.conversationId, {
+        const conversation = conversationsRef.current.find((item) => item.conversation_id === conversationId);
+        const session = foregroundSessions(conversation).find((item) => String(item?.id || 'main') === sessionId) || conversation;
+        loadMessages(serverId, conversationId, {
           ...recentMessagePageParams(session),
-          foregroundSessionId: selectedSessionId
+          foregroundSessionId: sessionId
         })
           .then((initial) => {
             if (disposed || websocketKeyRef.current !== key) return;
@@ -2023,7 +2029,7 @@ function App() {
       if (websocketKeyRef.current === key) websocketKeyRef.current = '';
       closeSocket();
     };
-  }, [selected, selectedSessionId, activeForegroundSession?.message_count, markConversationRead]);
+  }, [selectedServerId, selectedConversationId, selectedSessionId, markConversationRead]);
 
   const toggleSidebar = () => {
     const nextMode = sidebarMode === 'collapsed' ? 'expanded' : 'collapsed';
