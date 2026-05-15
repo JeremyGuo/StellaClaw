@@ -17,6 +17,7 @@ use stellaclaw_core::{model_config::ModelConfig, session_actor::ToolRemoteMode};
 use crate::{
     config::{SandboxConfig, SessionDefaults, SessionProfile},
     conversation_metadata::ConversationMetadata,
+    logger::append_workdir_level_log,
     service_protos::{
         agent_session::{AgentSessionBinding, AgentSessionKind},
         cron as cron_proto,
@@ -544,7 +545,13 @@ impl ConversationKernel {
                 }
                 recv(output_rx) -> output => {
                     match output {
-                        Ok(output) => self.handle_output(output)?,
+                        Ok(output) => {
+                            if let Err(error) = self.handle_output(output) {
+                                self.log_kernel_error("conversation_kernel_failed", &error);
+                                let _ = self.stop_all(format!("conversation kernel failed: {error:#}"));
+                                return Err(error);
+                            }
+                        }
                         Err(_) => {
                             self.stop_all("service output channel closed")?;
                             return Ok(());
@@ -553,6 +560,19 @@ impl ConversationKernel {
                 }
             }
         }
+    }
+
+    fn log_kernel_error(&self, event: &str, error: &anyhow::Error) {
+        let _ = append_workdir_level_log(
+            &self.conversation.workdir,
+            "error",
+            event,
+            serde_json::json!({
+                "conversation_id": &self.conversation.conversation_id,
+                "error": error.to_string(),
+                "error_debug": format!("{error:#}"),
+            }),
+        );
     }
 
     pub fn mount_service(&mut self, addr: ServiceAddr, kind: ServiceKind) -> Result<()> {
@@ -1267,7 +1287,7 @@ fn join_service(handle: ServiceHandle) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::{env, time::SystemTime};
+    use std::{env, fs, thread, time::SystemTime};
 
     use super::*;
     use crate::{
@@ -2746,6 +2766,46 @@ mod tests {
             .expect("cron mounts");
         let handle = kernel.spawn().expect("kernel spawns");
         handle.shutdown("test finished").expect("kernel shuts down");
+    }
+
+    #[test]
+    fn kernel_run_loop_logs_fatal_service_failure() {
+        let mut kernel = test_kernel("fatal_service_failure");
+        let workdir = kernel.conversation.workdir.clone();
+        kernel
+            .mount_service_instance(
+                ServiceAddr::local_path(["failing"]),
+                ServiceKind::Noop {
+                    name: "failing".to_string(),
+                },
+                Box::new(FailingService),
+            )
+            .expect("failing service mounts");
+
+        let handle = kernel.spawn().expect("kernel spawns");
+        thread::sleep(Duration::from_millis(50));
+        let error = handle
+            .shutdown("test finished")
+            .expect_err("kernel should return the service failure");
+        assert!(error.to_string().contains("service local:failing failed"));
+
+        let error_log =
+            fs::read_to_string(workdir.join("logs").join("error.log")).expect("error log exists");
+        assert!(error_log.contains("conversation_kernel_failed"));
+        assert!(error_log.contains("fatal_service_failure"));
+        assert!(error_log.contains("service local:failing failed"));
+    }
+
+    struct FailingService;
+
+    impl ConversationService for FailingService {
+        fn run(self: Box<Self>, ctx: ServiceRunContext) -> Result<()> {
+            ctx.outbox.send(ServiceOutput::Failed(ServiceFailure {
+                addr: ctx.addr.clone(),
+                error: "intentional failure".to_string(),
+            }))?;
+            Ok(())
+        }
     }
 
     fn test_kernel(name: &str) -> ConversationKernel {

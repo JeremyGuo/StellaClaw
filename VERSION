@@ -15,6 +15,9 @@ version: 1.27.0
 - 修复 Web Conversation ingress stale sender：
   当某个 ConversationKernel 或 ChannelService 已经退出但 HostRuntime 仍保留该 conversation 的 main channel ingress sender 时，Web / Electron 再次发送消息会收到 `channel ingress is closed`；HostRuntime 现在会在发送发现 ingress 关闭时记录 warning、移除旧 kernel、重新启动该 conversation 并重试一次请求，避免用户必须重启整个 stellaclaw 服务。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 补齐 workdir 级错误和警告日志：
+  Host logger 现在除继续写 `.stellaclaw/host.log` 外，会把 `warn` 和 `error` 级别日志分别镜像到 `<workdir>/logs/warn.log` 和 `<workdir>/logs/error.log`；ConversationKernel 主循环遇到会导致 kernel 退出的 fatal output / dispatch 错误时，会在返回前写入 `conversation_kernel_failed` 到 `<workdir>/logs/error.log`，包含 conversation id 和完整错误，避免后台线程失败原因丢失。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 升级 Codex reasoning summary 持久化和 provider stream 事件：
   `ReasoningItem.codex_summary` 从单个字符串升级为有序 summary part 数组，保留 Codex reasoning summary 的分段顺序，并新增 workdir `0.19 -> 0.20` upgrade 迁移旧 session history；`ChatMessage` 新增稳定 `message_id`，SessionActor 写入 `all_messages.jsonl` 时同步生成 `messages_index.json`，WebChannel 的消息详情、summary 和 seen 合并开始基于 `message_id` / index 文件定位消息，不再把裸数字行号当作消息 ID；provider stream delta 不再写入历史，最终仍以 completed / done 后生成的完整 `ChatMessage` 为准，同时 core SessionEvent / conversation_new AgentSessionEvent 新增 `Stream*` 流式事件用于 assistant 文本、工具调用参数、reasoning summary delta、reasoning summary part added 和带 `message_id` 的 stream error 实时投影。本次不改变 `config` schema，改变 `workdir` schema 至 `0.20`。
 
