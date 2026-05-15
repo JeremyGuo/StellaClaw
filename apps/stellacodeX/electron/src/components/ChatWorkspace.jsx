@@ -99,7 +99,7 @@ function selectionSummary(selection) {
   return text.length > 28 ? `${text.slice(0, 28)}...` : text || '选区';
 }
 
-export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, runningActivities, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment }) {
+export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, processing = false, runningActivities, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment }) {
   const renderedMessages = useMemo(() => displayMessages(messages), [messages]);
   const activitySignature = useMemo(() => liveActivitySignature(runningActivities || []), [runningActivities]);
   const oldestMessageKey = useMemo(() => firstMessageId(messages) || messages[0]?.id || messages[0]?.index || '', [messages]);
@@ -141,10 +141,10 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const currentActivity = (runningActivities || []).at(-1) || null;
   const progressVisible = Boolean(currentActivity);
   const toolStopNoticeCandidate = useMemo(() => {
-    if (!messagesReady || sending || currentActivity || !messages.length) return false;
+    if (!messagesReady || sending || processing || currentActivity || !messages.length) return false;
     const lastMessage = messages.at(-1);
     return isExecutionMessage(lastMessage);
-  }, [messages, messagesReady, sending, currentActivity]);
+  }, [messages, messagesReady, sending, processing, currentActivity]);
   const turnStoppedAfterTool = toolStopNoticeCandidate && toolStopNoticeReady;
 
   useEffect(() => {

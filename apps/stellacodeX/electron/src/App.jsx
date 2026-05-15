@@ -847,6 +847,8 @@ function App() {
       sandbox_source: activeConversation.sandbox_source,
       remote: activeConversation.remote,
       workspace: activeConversation.workspace,
+      processing_state: activeConversation.processing_state,
+      running: activeConversation.running,
       running_background: activeConversation.running_background,
       total_background: activeConversation.total_background,
       running_subagents: activeConversation.running_subagents,
@@ -867,6 +869,10 @@ function App() {
     () => statusUsageTotals(selectedStatus, selectedKey ? statusDeltas.get(selectedKey) : null),
     [selectedStatus, selectedKey, statusDeltas]
   );
+  const selectedProcessingState = String(selectedConversationStatus?.processing_state || '').trim().toLowerCase();
+  const selectedProcessing = Boolean(selectedConversationStatus?.running)
+    || (selectedProcessingState && selectedProcessingState !== 'idle')
+    || runningActivities.some((activity) => String(activity?.state || 'running').toLowerCase() === 'running');
   const updateReady = updaterStatus?.state === 'downloaded';
 
   const upsertTransfer = useCallback((id, patch) => {
@@ -2398,6 +2404,7 @@ function App() {
           onSend={sendMessage}
           onLoadModels={loadAvailableModels}
           sending={sending}
+          processing={selectedProcessing}
           runningActivities={runningActivities}
           selectionReferences={selectionReferences}
           onRemoveSelectionReference={(id) => setSelectionReferences((current) => current.filter((item) => item.id !== id))}
