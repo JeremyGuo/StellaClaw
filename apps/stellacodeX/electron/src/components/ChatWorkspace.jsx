@@ -1170,7 +1170,7 @@ function ToolProcessSegment({ block, complete }) {
   const summary = useMemo(() => toolGroupSummary(block.cards, firstName), [block.cards, firstName]);
   const title = complete ? summary.doneTitle : summary.runningTitle;
   return (
-    <section className={`tool-process-segment${open ? ' open' : ''}`}>
+    <section className={`tool-process-segment${open ? ' open' : ''}${complete ? '' : ' running'}`}>
       <button className="tool-process-toggle" type="button" onClick={() => setOpen((value) => !value)}>
         <TerminalSquare size={15} strokeWidth={1.9} aria-hidden="true" />
         <span>{title}</span>
