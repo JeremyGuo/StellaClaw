@@ -811,22 +811,20 @@ export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment
       )}
       <MessageBody message={message} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
       {(roleName === 'user' || roleName === 'assistant') && (
-        <MessageActionBar message={message} role={roleName} />
+        <MessageActionBar message={message} role={roleName} usage={usage} />
       )}
       {message.pending && <div className="message-status">正在发送...</div>}
       {message.error && <div className="message-status error">{message.error}</div>}
-      {String(message.role || '').toLowerCase() === 'assistant' && (
-        <TokenUsage usage={usage} />
-      )}
     </article>
   );
 }
 
-function MessageActionBar({ message, role }) {
+function MessageActionBar({ message, role, usage }) {
   const [copied, setCopied] = useState(false);
   const text = messageText(message).trim();
   const replyTime = role === 'assistant' ? formatMessageTime(message?.message_time || message?.time || message?.created_at) : '';
-  if (!text && !replyTime) return null;
+  const showUsage = role === 'assistant' && Number(usage?.total || 0) > 0;
+  if (!text && !replyTime && !showUsage) return null;
   const copyMessage = async () => {
     if (!text) return;
     try {
@@ -845,6 +843,7 @@ function MessageActionBar({ message, role }) {
         </button>
       )}
       {replyTime && <span className="message-reply-time">{replyTime}</span>}
+      {showUsage && <TokenUsage usage={usage} />}
     </div>
   );
 }

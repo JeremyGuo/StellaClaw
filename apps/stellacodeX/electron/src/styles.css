@@ -1107,11 +1107,11 @@ button {
   color: color-mix(in srgb, var(--text), transparent 8%);
 }
 
-.message.assistant:has(.token-usage) {
+.message.assistant:has(> .token-usage) {
   margin-bottom: 24px;
 }
 
-.message.assistant:has(.token-usage) + .message.user {
+.message.assistant:has(> .token-usage) + .message.user {
   margin-top: 0;
 }
 
@@ -1203,9 +1203,8 @@ button {
 
 .message-actions.assistant {
   justify-content: flex-start;
-  height: 0;
-  margin-top: 0;
-  overflow: hidden;
+  height: 24px;
+  margin-top: 9px;
   opacity: 0;
   pointer-events: none;
   transition: opacity 120ms ease;
@@ -1213,8 +1212,6 @@ button {
 
 .message.assistant:hover .message-actions.assistant,
 .message.assistant:focus-within .message-actions.assistant {
-  height: 24px;
-  margin-top: 9px;
   opacity: 1;
   pointer-events: auto;
 }
@@ -1246,6 +1243,10 @@ button {
   font-size: 13px;
   font-weight: 600;
   line-height: 1;
+}
+
+.message-actions .token-usage {
+  margin: 0;
 }
 
 .message-status {
