@@ -1011,6 +1011,7 @@ function toolProcessBlocks(rows) {
 
 function ToolProcessSegment({ block, complete }) {
   const [open, setOpen] = useState(false);
+  const toolRows = useMemo(() => mergedToolCards(block.cards), [block.cards]);
   const firstName = useMemo(() => block.cards[0]?.name || 'tool', [block.cards]);
   const summary = useMemo(() => toolGroupSummary(block.cards, firstName), [block.cards, firstName]);
   const title = complete ? summary.doneTitle : summary.runningTitle;
@@ -1023,19 +1024,62 @@ function ToolProcessSegment({ block, complete }) {
       </button>
       {open && (
         <div className="tool-process-body">
-          {block.cards.map((card) => (
+          {toolRows.map((card) => (
             <ToolInlineCard
               key={card.renderId}
               kind={card.kind}
               name={card.name}
               payload={card.payload}
+              detailPayload={card.detailPayload}
               usage={card.usage}
+              running={card.running}
             />
           ))}
         </div>
       )}
     </section>
   );
+}
+
+function mergedToolCards(cards) {
+  const rows = [];
+  const byId = new Map();
+  cards.forEach((card, index) => {
+    const id = String(card.id || '').trim();
+    if (!id) {
+      rows.push({ order: index, call: card.kind === 'call' ? card : null, result: card.kind === 'result' ? card : null });
+      return;
+    }
+    let row = byId.get(id);
+    if (!row) {
+      row = { order: index, call: null, result: null };
+      byId.set(id, row);
+      rows.push(row);
+    }
+    if (card.kind === 'result') {
+      row.result = card;
+    } else {
+      row.call = card;
+    }
+  });
+  return rows
+    .sort((left, right) => left.order - right.order)
+    .map((row, index) => {
+      const call = row.call;
+      const result = row.result;
+      const displayCard = call || result;
+      const detailCard = result || call;
+      return {
+        renderId: call?.renderId || result?.renderId || `tool-row-${index}`,
+        id: displayCard?.id || detailCard?.id || '',
+        kind: result ? 'result' : 'call',
+        name: displayCard?.name || detailCard?.name || 'tool',
+        payload: displayCard?.payload ?? detailCard?.payload ?? '',
+        detailPayload: detailCard?.payload ?? displayCard?.payload ?? '',
+        usage: result?.usage || call?.usage || null,
+        running: Boolean(call && !result)
+      };
+    });
 }
 
 function toolCardsAreComplete(cards) {
@@ -1936,10 +1980,10 @@ function diffMarker(type) {
   return ' ';
 }
 
-export function ToolInlineCard({ kind, name, payload, usage }) {
+export function ToolInlineCard({ kind, name, payload, detailPayload, usage, running = false }) {
   const display = toolDisplay(kind, name, payload);
   return (
-    <details className={`tool-inline-card ${kind}`}>
+    <details className={`tool-inline-card ${kind}${running ? ' running' : ''}`}>
       <summary>
         <span>{display.title}</span>
         <code>{display.chip}</code>
@@ -1947,7 +1991,7 @@ export function ToolInlineCard({ kind, name, payload, usage }) {
         <InlineTokenUsage usage={usage} />
         <i className="tool-detail-dot" aria-hidden="true" />
       </summary>
-      <ToolDetail title={display.detailTitle} name={name} payload={payload} />
+      <ToolDetail title={display.detailTitle} name={name} payload={detailPayload ?? payload} />
     </details>
   );
 }
