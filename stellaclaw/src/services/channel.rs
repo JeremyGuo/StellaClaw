@@ -140,7 +140,7 @@ fn handle_channel_request(
     pending_status: &mut VecDeque<PendingStatusRequest>,
     pending_terminal: &mut VecDeque<PendingTerminalRequest>,
     pending_kernel_metadata: &mut VecDeque<PendingKernelMetadataRequest>,
-    _source: ServiceAddr,
+    source: ServiceAddr,
     payload: serde_json::Value,
 ) -> Result<()> {
     match decode_request(payload.clone()) {
@@ -347,7 +347,7 @@ fn handle_channel_request(
                         Ok(response) => {
                             handle_status_response(ctx, event_tx, pending_status, response)?;
                         }
-                        Err(_) => match decode_terminal_response(payload) {
+                        Err(_) => match decode_terminal_response(payload.clone()) {
                             Ok(response) => {
                                 handle_terminal_response(
                                     ctx,
@@ -357,12 +357,24 @@ fn handle_channel_request(
                                 )?;
                             }
                             Err(_) => {
-                                ctx.outbox.send(ServiceOutput::Failed(
-                                    crate::conversation_new::ServiceFailure {
-                                        addr: ctx.addr.clone(),
-                                        error: format!("bad channel payload: {error}"),
+                                emit_channel_event(
+                                    event_tx,
+                                    ChannelEvent::Error {
+                                        code: "channel.bad_payload".to_string(),
+                                        message: "Channel received an unsupported payload."
+                                            .to_string(),
+                                        detail: Some(error.to_string()),
                                     },
-                                ))?;
+                                )?;
+                                ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
+                                    addr: ctx.addr.clone(),
+                                    label: "bad_channel_payload".to_string(),
+                                    detail: serde_json::json!({
+                                        "source": source,
+                                        "channel_decode_error": error.to_string(),
+                                        "payload": payload,
+                                    }),
+                                }))?;
                             }
                         },
                     },

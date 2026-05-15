@@ -1654,6 +1654,37 @@ mod tests {
     }
 
     #[test]
+    fn channel_rejects_bad_payload_without_killing_kernel() {
+        let mut kernel = test_kernel("bad_channel_payload");
+        kernel
+            .mount_service(ServiceAddr::channel_id("scratch"), ServiceKind::Channel)
+            .expect("channel mounts");
+
+        kernel
+            .dispatch_call(ServiceCall {
+                source: ServiceAddr::status(),
+                target: ServiceAddr::channel_id("scratch"),
+                payload: serde_json::json!({
+                    "type": "not_a_channel_payload",
+                    "debug": "should not kill kernel",
+                }),
+            })
+            .expect("bad payload reaches channel inbox");
+        kernel
+            .pump_for(Duration::from_millis(50))
+            .expect("bad payload drains without fatal kernel error");
+
+        assert!(kernel.has_service(&ServiceAddr::channel_id("scratch")));
+        assert!(kernel.status_log().iter().any(|status| {
+            status.addr == ServiceAddr::channel_id("scratch")
+                && status.label == "bad_channel_payload"
+                && status.detail["source"] == serde_json::json!(ServiceAddr::status())
+                && status.detail["payload"]["type"] == "not_a_channel_payload"
+        }));
+        kernel.stop_all("test finished").expect("services stop");
+    }
+
+    #[test]
     fn channel_ingress_controls_selected_foreground_session() {
         let mut kernel = test_kernel("channel_foreground_controls");
         let (ingress_tx, ingress_rx) = crossbeam_channel::unbounded();
