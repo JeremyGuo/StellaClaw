@@ -380,43 +380,23 @@ impl ConversationService for AgentSessionService {
                             return Ok(());
                         }
                         Err(error) => {
-                            if let Ok(response) = memory::decode_response(call.payload.clone()) {
-                                handle_memory_response(
-                                    &ctx,
-                                    &mut runner,
-                                    &mut pending_memory_requests,
-                                    response,
-                                )?;
-                            } else if let Ok(response) = skill::decode_response(call.payload.clone()) {
-                                handle_skill_response(
-                                    &ctx,
-                                    &mut runner,
-                                    &mut pending_skill_requests,
-                                    response,
-                                )?;
-                            } else if let Ok(response) = tool_binary::decode_response(call.payload.clone())
+                            if handle_service_response(
+                                &ctx,
+                                &mut runner,
+                                &mut pending_memory_requests,
+                                &mut pending_skill_requests,
+                                &mut pending_tool_binary_requests,
+                                &mut pending_cron_requests,
+                                &mut pending_child_starts,
+                                &mut state,
+                                &call.source,
+                                call.payload.clone(),
+                            )
+                            .with_context(|| {
+                                format!("failed to handle service response from {}", call.source)
+                            })?
                             {
-                                handle_tool_binary_response(
-                                    &ctx,
-                                    &mut runner,
-                                    &mut pending_tool_binary_requests,
-                                    response,
-                                )?;
-                            } else if let Ok(response) = cron::decode_response(call.payload.clone()) {
-                                handle_cron_response(
-                                    &ctx,
-                                    &mut runner,
-                                    &mut pending_cron_requests,
-                                    response,
-                                )?;
-                            } else if let Ok(response) = kernel::decode_response(call.payload) {
-                                handle_kernel_response(
-                                    &ctx,
-                                    &mut runner,
-                                    &mut pending_child_starts,
-                                    &mut state,
-                                    response,
-                                )?;
+                                continue;
                             } else {
                                 state.state = AgentSessionState::Crashed;
                                 state.last_error = Some(error.to_string());
@@ -1046,6 +1026,68 @@ fn parse_task_plan_view(payload: serde_json::Value) -> Result<TaskPlanView, Stri
     Ok(plan)
 }
 
+fn handle_service_response(
+    ctx: &ServiceRunContext,
+    runner: &mut Option<RealAgentSessionRuntime>,
+    pending_memory_requests: &mut VecDeque<ConversationBridgeRequest>,
+    pending_skill_requests: &mut VecDeque<ConversationBridgeRequest>,
+    pending_tool_binary_requests: &mut VecDeque<ConversationBridgeRequest>,
+    pending_cron_requests: &mut VecDeque<ConversationBridgeRequest>,
+    pending_child_starts: &mut VecDeque<PendingChildAgentStart>,
+    state: &mut AgentSessionRuntimeState,
+    source: &ServiceAddr,
+    payload: Value,
+) -> Result<bool> {
+    if source == &ServiceAddr::memory() {
+        let response =
+            memory::decode_response(payload).context("failed to decode memory response")?;
+        handle_memory_response(ctx, runner, pending_memory_requests, response)?;
+        return Ok(true);
+    }
+    if source == &ServiceAddr::skill() {
+        let response =
+            skill::decode_response(payload).context("failed to decode skill response")?;
+        handle_skill_response(ctx, runner, pending_skill_requests, response)?;
+        return Ok(true);
+    }
+    if source == &ServiceAddr::tool_binary() {
+        let response = tool_binary::decode_response(payload)
+            .context("failed to decode tool binary response")?;
+        handle_tool_binary_response(ctx, runner, pending_tool_binary_requests, response)?;
+        return Ok(true);
+    }
+    if source == &ServiceAddr::cron() {
+        let response = cron::decode_response(payload).context("failed to decode cron response")?;
+        handle_cron_response(ctx, runner, pending_cron_requests, response)?;
+        return Ok(true);
+    }
+    if source.is_kernel() {
+        let response =
+            kernel::decode_response(payload).context("failed to decode kernel response")?;
+        handle_kernel_response(ctx, runner, pending_child_starts, state, response)?;
+        return Ok(true);
+    }
+
+    if let Ok(response) = memory::decode_response(payload.clone()) {
+        handle_memory_response(ctx, runner, pending_memory_requests, response)?;
+        Ok(true)
+    } else if let Ok(response) = skill::decode_response(payload.clone()) {
+        handle_skill_response(ctx, runner, pending_skill_requests, response)?;
+        Ok(true)
+    } else if let Ok(response) = tool_binary::decode_response(payload.clone()) {
+        handle_tool_binary_response(ctx, runner, pending_tool_binary_requests, response)?;
+        Ok(true)
+    } else if let Ok(response) = cron::decode_response(payload.clone()) {
+        handle_cron_response(ctx, runner, pending_cron_requests, response)?;
+        Ok(true)
+    } else if let Ok(response) = kernel::decode_response(payload) {
+        handle_kernel_response(ctx, runner, pending_child_starts, state, response)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 fn handle_memory_response(
     ctx: &ServiceRunContext,
     runner: &mut Option<RealAgentSessionRuntime>,
@@ -1159,6 +1201,14 @@ fn handle_cron_response(
             response: serde_json::to_value(&bridge_response)?,
         })?;
     }
+    ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
+        addr: ctx.addr.clone(),
+        label: "cron_bridge_resolved".to_string(),
+        detail: serde_json::json!({
+            "request_id": bridge_response.request_id,
+            "tool_name": bridge_response.tool_name,
+        }),
+    }))?;
     Ok(())
 }
 
@@ -3381,6 +3431,54 @@ mod tests {
             cron::decode_request(call.payload).expect("cron request decodes"),
             CronRequest::RemoveTask { task_id } if task_id == "cron_0001"
         ));
+    }
+
+    #[test]
+    fn accepted_cron_response_routes_by_source_before_payload_shape() {
+        let (ctx, output_rx) = test_run_context("cron_response_dispatch");
+        let mut runner = None;
+        let mut pending_memory_requests = VecDeque::new();
+        let mut pending_skill_requests = VecDeque::new();
+        let mut pending_tool_binary_requests = VecDeque::new();
+        let mut pending_cron_requests = VecDeque::new();
+        let mut pending_child_starts = VecDeque::new();
+        let mut state = AgentSessionRuntimeState::new(
+            AgentSessionKind::Foreground,
+            AgentSessionBinding {
+                event_sink: crate::conversation_new::ServiceAddr::channel_id("scratch"),
+                parent_addr: None,
+            },
+        );
+
+        pending_cron_requests.push_back(ConversationBridgeRequest {
+            request_id: "req_create".to_string(),
+            tool_call_id: "call_create".to_string(),
+            tool_name: "cron_task_create".to_string(),
+            action: "cron_task_create".to_string(),
+            payload: serde_json::json!({}),
+        });
+
+        let handled = handle_service_response(
+            &ctx,
+            &mut runner,
+            &mut pending_memory_requests,
+            &mut pending_skill_requests,
+            &mut pending_tool_binary_requests,
+            &mut pending_cron_requests,
+            &mut pending_child_starts,
+            &mut state,
+            &crate::conversation_new::ServiceAddr::cron(),
+            cron::encode_response(CronResponse::Accepted).expect("cron response encodes"),
+        )
+        .expect("cron response dispatches");
+
+        assert!(handled);
+        assert!(pending_memory_requests.is_empty());
+        assert!(pending_cron_requests.is_empty());
+        assert!(output_rx.try_iter().any(|output| matches!(
+            output,
+            ServiceOutput::Status(ServiceStatusUpdate { label, .. }) if label == "cron_bridge_resolved"
+        )));
     }
 
     #[test]
