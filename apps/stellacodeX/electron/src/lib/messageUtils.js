@@ -408,8 +408,8 @@ export function mergeMessages(current, incoming) {
   return Array.from(byId.values()).sort((left, right) => messageIndex(left) - messageIndex(right));
 }
 
-export function websocketUrl(baseUrl, token, conversationId) {
-  const url = new URL(`/api/conversations/${encodeURIComponent(conversationId)}/foreground/ws`, baseUrl);
+export function websocketUrl(baseUrl, token, conversationId, foregroundSessionId = 'main') {
+  const url = new URL(`/api/conversations/${encodeURIComponent(conversationId)}/foreground_sessions/${encodeURIComponent(foregroundSessionId || 'main')}/ws`, baseUrl);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   url.searchParams.set('token', token || '');
   return url.toString();

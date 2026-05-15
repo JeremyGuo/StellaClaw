@@ -825,6 +825,55 @@ button {
   gap: 4px;
 }
 
+.conversation-row.session-row {
+  min-height: 42px;
+  margin-left: 28px;
+  padding: 7px 8px 7px 10px;
+  border-radius: 8px;
+  grid-template-areas: "title model";
+}
+
+.conversation-row.session-row strong {
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.conversation-row.session-row span {
+  display: none;
+}
+
+.conversation-row.session-row em {
+  max-width: 64px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.conversation-add-session {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  margin-left: 28px;
+  padding: 6px 10px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--faint);
+  text-align: left;
+  cursor: pointer;
+}
+
+.conversation-add-session:hover {
+  background: color-mix(in srgb, var(--hover), transparent 48%);
+  color: var(--muted);
+}
+
+.conversation-add-session span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .conversation-unread-dot {
   position: absolute;
   top: 7px;
@@ -890,6 +939,12 @@ button {
 .sidebar-collapsed .conversation-row {
   min-height: 36px;
   padding: 0;
+}
+
+.sidebar-collapsed .conversation-row.session-row,
+.sidebar-collapsed .conversation-add-session,
+.sidebar-collapsed .conversation-folder-row {
+  display: none;
 }
 
 .sidebar-footer-note {

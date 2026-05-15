@@ -7,8 +7,12 @@ import {
   connectionInfo,
   conversationStreamUrl,
   createConversation,
+  createForegroundSession,
   deleteConversation,
+  deleteForegroundSession,
   displayConversationName,
+  displayForegroundSessionName,
+  foregroundSessions,
   markConversationSeen,
   loadConversations,
   loadMessages,
@@ -17,7 +21,8 @@ import {
   loadWorkspace,
   loadWorkspaceFile,
   postConversationMessage,
-  renameConversation
+  renameConversation,
+  selectedForegroundSessionId
 } from './lib/api';
 import { ConversationBar } from './components/ConversationBar';
 import { WindowChrome } from './components/WindowChrome';
@@ -251,6 +256,31 @@ function mergeConversationSummary(existing, incoming) {
   };
 }
 
+function patchConversationForegroundSession(conversation, sessionId, patch) {
+  const targetSessionId = String(sessionId || 'main');
+  const sessions = foregroundSessions(conversation);
+  let found = false;
+  const nextSessions = sessions.map((session) => {
+    const currentId = String(session?.id || 'main');
+    if (currentId !== targetSessionId) return session;
+    found = true;
+    return { ...session, ...patch, id: currentId };
+  });
+  if (!found) {
+    nextSessions.push({
+      id: targetSessionId,
+      session_id: targetSessionId,
+      is_main: targetSessionId === 'main',
+      ...patch
+    });
+  }
+  return {
+    ...conversation,
+    ...(targetSessionId === 'main' ? patch : {}),
+    foreground_sessions: nextSessions
+  };
+}
+
 function applyConversationStreamEvent(current, payload) {
   const sort = (list) => [...list].sort((left, right) => left.conversation_id.localeCompare(right.conversation_id));
   const upsert = (list, incoming) => {
@@ -307,10 +337,10 @@ function applyConversationStreamEvent(current, payload) {
   }
 
   if (payload.type === 'conversation_seen' && payload.conversation_id && payload.seen) {
+    const foregroundSessionId = payload.foreground_session_id || 'main';
     return current.map((conversation) => (
       conversation.conversation_id === payload.conversation_id
-        ? mergeConversationSummary(conversation, {
-          conversation_id: payload.conversation_id,
+        ? patchConversationForegroundSession(conversation, foregroundSessionId, {
           last_seen_message_id: payload.seen.last_seen_message_id,
           last_seen_at: payload.seen.updated_at
         })
@@ -322,7 +352,9 @@ function applyConversationStreamEvent(current, payload) {
 }
 
 function hasUnreadConversation(conversation) {
-  return compareMessageIds(conversation?.last_message_id, conversation?.last_seen_message_id) > 0;
+  return foregroundSessions(conversation).some((session) => (
+    compareMessageIds(session?.last_message_id, session?.last_seen_message_id) > 0
+  ));
 }
 
 function recentMessagePageParams(conversation, limit = 40, totalOverride = undefined) {
@@ -647,6 +679,7 @@ function App() {
   const restoringUiRef = useRef(false);
   const uiSaveTimerRef = useRef(null);
   const readSaveTimersRef = useRef(new Map());
+  const selectedSessionId = selectedForegroundSessionId(selected);
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -751,7 +784,7 @@ function App() {
 
   useEffect(() => {
     setSelectionReferences([]);
-  }, [selected?.serverId, selected?.conversationId]);
+  }, [selected?.serverId, selected?.conversationId, selectedSessionId]);
 
   useEffect(() => () => {
     revokeFilePreviewUrls(openFilesRef.current);
@@ -789,10 +822,17 @@ function App() {
     () => conversations.find((item) => item.conversation_id === selected?.conversationId) || null,
     [conversations, selected]
   );
+  const activeForegroundSession = useMemo(() => {
+    if (!activeConversation) return null;
+    return foregroundSessions(activeConversation).find((session) => (
+      String(session?.id || 'main') === selectedSessionId
+    )) || foregroundSessions(activeConversation)[0] || null;
+  }, [activeConversation, selectedSessionId]);
   const displayFontSize = clamp(settings?.displayFontSize, MIN_DISPLAY_FONT_SIZE, MAX_DISPLAY_FONT_SIZE) || 12;
   const uiScale = clamp(settings?.uiScale, MIN_UI_SCALE, MAX_UI_SCALE) || 1;
   const terminalFontSize = clamp(displayFontSize + 1, 11, 22) || 13;
-  const selectedKey = selected ? conversationKey(selected.serverId, selected.conversationId) : '';
+  const selectedKey = selected ? conversationKey(selected.serverId, selected.conversationId, selectedSessionId) : '';
+  const selectedConversationUiKey = selected ? conversationKey(selected.serverId, selected.conversationId, 'main') : '';
   const selectedStatus = selected ? statuses.get(selectedKey) : null;
   const selectedConversationStatus = useMemo(() => ({
     ...(selectedStatus || {}),
@@ -882,15 +922,15 @@ function App() {
     });
   }, []);
 
-  const markConversationRead = useCallback((serverId, conversationId, lastMessageId) => {
+  const markConversationRead = useCallback((serverId, conversationId, foregroundSessionId, lastMessageId) => {
     if (!appForegroundRef.current) return;
     const seen = String(lastMessageId || '').trim();
     if (!serverId || !conversationId || !seen || messageOrderFromId(seen) === undefined) return;
-    const key = conversationKey(serverId, conversationId);
+    const sessionId = foregroundSessionId || 'main';
+    const key = conversationKey(serverId, conversationId, sessionId);
     const nextConversations = conversationsRef.current.map((conversation) => (
       conversation.conversation_id === conversationId
-        ? mergeConversationSummary(conversation, {
-          conversation_id: conversationId,
+        ? patchConversationForegroundSession(conversation, sessionId, {
           last_seen_message_id: seen
         })
         : conversation
@@ -901,7 +941,7 @@ function App() {
     if (existing) window.clearTimeout(existing);
     const timer = window.setTimeout(() => {
       readSaveTimersRef.current.delete(key);
-      markConversationSeen(serverId, conversationId, seen).catch(() => {});
+      markConversationSeen(serverId, conversationId, seen, sessionId).catch(() => {});
     }, 180);
     readSaveTimersRef.current.set(key, timer);
   }, []);
@@ -921,7 +961,8 @@ function App() {
       const list = await loadConversations(serverId);
       setConversations(list);
       if (!selectedRef.current && list[0]) {
-        setSelected({ serverId, conversationId: list[0].conversation_id });
+        const sessionId = foregroundSessions(list[0])[0]?.id || 'main';
+        setSelected({ serverId, conversationId: list[0].conversation_id, foregroundSessionId: sessionId });
       }
     } finally {
       setLoading(false);
@@ -955,14 +996,16 @@ function App() {
             && selectedRef.current?.conversationId === payload.conversation_id
           ) {
             const next = nextConversations[0];
-            setSelected(next ? { serverId: activeServerId, conversationId: next.conversation_id } : null);
+            const sessionId = next ? foregroundSessions(next)[0]?.id || 'main' : 'main';
+            setSelected(next ? { serverId: activeServerId, conversationId: next.conversation_id, foregroundSessionId: sessionId } : null);
           }
           if (!selectedRef.current) {
             const fallbackConversation = payload.type === 'conversation_snapshot'
               ? (payload.conversations || [])[0]
               : payload.conversation;
             if (fallbackConversation?.conversation_id) {
-              setSelected({ serverId: activeServerId, conversationId: fallbackConversation.conversation_id });
+              const sessionId = foregroundSessions(fallbackConversation)[0]?.id || 'main';
+              setSelected({ serverId: activeServerId, conversationId: fallbackConversation.conversation_id, foregroundSessionId: sessionId });
             }
           }
           if (payload.type === 'conversation_turn_completed' && payload.conversation_id) {
@@ -999,9 +1042,9 @@ function App() {
 
   useEffect(() => {
     if (!appForeground) return;
-    if (!selectedKey || !activeConversation?.last_message_id) return;
-    markConversationRead(selected.serverId, selected.conversationId, activeConversation.last_message_id);
-  }, [appForeground, selected, selectedKey, activeConversation?.last_message_id, markConversationRead]);
+    if (!selectedKey || !activeForegroundSession?.last_message_id) return;
+    markConversationRead(selected.serverId, selected.conversationId, selectedSessionId, activeForegroundSession.last_message_id);
+  }, [appForeground, selected, selectedKey, selectedSessionId, activeForegroundSession?.last_message_id, markConversationRead]);
 
   const saveSettingsFromDialog = useCallback(async (next) => {
     setSettingsSaving(true);
@@ -1058,7 +1101,8 @@ function App() {
       setConversations((current) => {
         const next = current.filter((item) => item.conversation_id !== conversation.conversation_id);
         if (selected?.conversationId === conversation.conversation_id) {
-          setSelected(next[0] ? { serverId: activeServerId, conversationId: next[0].conversation_id } : null);
+          const sessionId = next[0] ? foregroundSessions(next[0])[0]?.id || 'main' : 'main';
+          setSelected(next[0] ? { serverId: activeServerId, conversationId: next[0].conversation_id, foregroundSessionId: sessionId } : null);
         }
         return next;
       });
@@ -1093,7 +1137,8 @@ function App() {
         item.conversation_id !== conversationId
           && !currentIds.has(item.conversation_id)
       ));
-      setSelected(nextVisible ? { serverId: activeServerId, conversationId: nextVisible.conversation_id } : null);
+      const sessionId = nextVisible ? foregroundSessions(nextVisible)[0]?.id || 'main' : 'main';
+      setSelected(nextVisible ? { serverId: activeServerId, conversationId: nextVisible.conversation_id, foregroundSessionId: sessionId } : null);
     }
     try {
       await saveSettings(nextSettings);
@@ -1115,7 +1160,7 @@ function App() {
       }
       const list = await loadConversations(serverId);
       setConversations(list);
-      setSelected({ serverId, conversationId });
+      setSelected({ serverId, conversationId, foregroundSessionId: 'main' });
       setNewConversationOpen(false);
       setOverviewPanelOpen(false);
       setWorkspacePanelOpen(false);
@@ -1126,6 +1171,53 @@ function App() {
       setCreatingConversation(false);
     }
   }, [creatingConversation, saveSettings, settings]);
+
+  const createConversationForegroundSession = useCallback(async (conversation) => {
+    if (!activeServerId || !conversation) return;
+    const nextName = window.prompt('新对话名称', '');
+    if (nextName === null) return;
+    try {
+      const session = await createForegroundSession(activeServerId, conversation.conversation_id, {
+        nickname: nextName.trim()
+      });
+      const sessionId = session?.id || 'main';
+      const list = await loadConversations(activeServerId);
+      setConversations(list);
+      setSelected({
+        serverId: activeServerId,
+        conversationId: conversation.conversation_id,
+        foregroundSessionId: sessionId
+      });
+    } catch (error) {
+      window.alert(error?.message || '创建对话失败');
+    }
+  }, [activeServerId]);
+
+  const deleteConversationForegroundSession = useCallback(async (conversation, session) => {
+    if (!activeServerId || !conversation || !session || session.is_main) return;
+    const title = displayForegroundSessionName(session, conversation);
+    if (!window.confirm(`删除对话「${title}」？`)) return;
+    const sessionId = session.id || 'main';
+    try {
+      await deleteForegroundSession(activeServerId, conversation.conversation_id, sessionId);
+      const list = await loadConversations(activeServerId);
+      setConversations(list);
+      if (
+        selected?.conversationId === conversation.conversation_id
+        && selectedSessionId === sessionId
+      ) {
+        const refreshedConversation = list.find((item) => item.conversation_id === conversation.conversation_id);
+        const fallback = foregroundSessions(refreshedConversation)[0]?.id || 'main';
+        setSelected(refreshedConversation
+          ? { serverId: activeServerId, conversationId: conversation.conversation_id, foregroundSessionId: fallback }
+          : list[0]
+            ? { serverId: activeServerId, conversationId: list[0].conversation_id, foregroundSessionId: foregroundSessions(list[0])[0]?.id || 'main' }
+            : null);
+      }
+    } catch (error) {
+      window.alert(error?.message || '删除对话失败');
+    }
+  }, [activeServerId, selected?.conversationId, selectedSessionId]);
 
   const fetchWorkspacePath = useCallback(async (path = '', options = {}) => {
     if (!selected) return null;
@@ -1237,7 +1329,7 @@ function App() {
       setConversationLayout(null);
       return undefined;
     }
-    const key = conversationKey(selected.serverId, selected.conversationId);
+    const key = selectedConversationUiKey;
     const savedUi = settings.conversationUi?.[key] || {};
     const savedPanels = savedUi.panels || {};
     const savedLayout = layoutSnapshotFromValues({ ...(settings.layout || {}), ...(savedUi.layout || {}) });
@@ -1329,10 +1421,10 @@ function App() {
     return () => {
       disposed = true;
     };
-  }, [selected?.serverId, selected?.conversationId, settingsReady, loadPdfPreviewIntoTab]);
+  }, [selected?.serverId, selected?.conversationId, selectedConversationUiKey, settingsReady, loadPdfPreviewIntoTab]);
 
   useEffect(() => {
-    if (!selectedKey || !settings || restoringUiRef.current) return;
+    if (!selectedConversationUiKey || !settings || restoringUiRef.current) return;
     const files = openFiles.map(fileTabSnapshot).filter(Boolean);
     const snapshot = {
       panels: {
@@ -1351,9 +1443,9 @@ function App() {
       openFiles: files,
       activeFilePath: files.some((file) => file.path === activeFilePath) ? activeFilePath : ''
     };
-    queueConversationUiSave(selectedKey, snapshot);
+    queueConversationUiSave(selectedConversationUiKey, snapshot);
   }, [
-    selectedKey,
+    selectedConversationUiKey,
     settingsReady,
     overviewPanelOpen,
     workspacePanelOpen,
@@ -1531,7 +1623,7 @@ function App() {
 
   useEffect(() => {
     if (!selected) return;
-    const key = conversationKey(selected.serverId, selected.conversationId);
+    const key = conversationKey(selected.serverId, selected.conversationId, selectedSessionId);
     if (statuses.has(key)) return;
     let disposed = false;
     loadStatus(selected.serverId, selected.conversationId)
@@ -1543,11 +1635,11 @@ function App() {
     return () => {
       disposed = true;
     };
-  }, [selected, statuses]);
+  }, [selected, selectedSessionId, statuses]);
 
   useEffect(() => {
     if (!selected) return;
-    const key = conversationKey(selected.serverId, selected.conversationId);
+    const key = conversationKey(selected.serverId, selected.conversationId, selectedSessionId);
     let disposed = false;
     let reconnectTimer = null;
 
@@ -1591,10 +1683,14 @@ function App() {
       if (latestId && Number.isFinite(latestIndex)) {
         setConversations((current) => current.map((conversation) => (
           conversation.conversation_id === selected.conversationId
-            ? { ...conversation, last_message_id: String(latestId), message_count: Math.max(Number(conversation.message_count || 0), latestIndex + 1) }
+            ? patchConversationForegroundSession(conversation, selectedSessionId, {
+              last_message_id: String(latestId),
+              last_message_time: latestMessage?.message_time || new Date().toISOString(),
+              message_count: Math.max(Number(activeForegroundSession?.message_count || 0), latestIndex + 1)
+            })
             : conversation
         )));
-        markConversationRead(selected.serverId, selected.conversationId, latestId);
+        markConversationRead(selected.serverId, selected.conversationId, selectedSessionId, latestId);
       }
       const activity = activityFromMessages(incoming);
       if (activity) setSessionActivity(activity);
@@ -1622,10 +1718,14 @@ function App() {
       if (latestId && Number.isFinite(latestIndex)) {
         setConversations((current) => current.map((conversation) => (
           conversation.conversation_id === selected.conversationId
-            ? { ...conversation, last_message_id: String(latestId), message_count: Math.max(Number(conversation.message_count || 0), latestIndex + 1) }
+            ? patchConversationForegroundSession(conversation, selectedSessionId, {
+              last_message_id: String(latestId),
+              last_message_time: latestMessage?.message_time || new Date().toISOString(),
+              message_count: Math.max(Number(activeForegroundSession?.message_count || 0), latestIndex + 1)
+            })
             : conversation
         )));
-        markConversationRead(selected.serverId, selected.conversationId, latestId);
+        markConversationRead(selected.serverId, selected.conversationId, selectedSessionId, latestId);
       }
       const activity = activityFromMessages(incoming);
       if (activity) setSessionActivity(activity);
@@ -1735,10 +1835,11 @@ function App() {
 
     const loadInitialMessagePage = async () => {
       const conversation = conversationsRef.current.find((item) => item.conversation_id === selected.conversationId);
+      const session = foregroundSessions(conversation).find((item) => String(item?.id || 'main') === selectedSessionId) || conversation;
       const initial = await loadMessages(
         selected.serverId,
         selected.conversationId,
-        recentMessagePageParams(conversation)
+        { ...recentMessagePageParams(session), foregroundSessionId: selectedSessionId }
       );
       if (disposed || websocketKeyRef.current !== key) return;
       setMessages((current) => {
@@ -1764,7 +1865,7 @@ function App() {
         const initial = await loadMessages(
           selected.serverId,
           selected.conversationId,
-          recentMessagePageParams(null, 40, total)
+          { ...recentMessagePageParams(null, 40, total), foregroundSessionId: selectedSessionId }
         );
         if (!disposed && websocketKeyRef.current === key) {
           setMessages((current) => {
@@ -1782,7 +1883,10 @@ function App() {
         const params = shouldJumpToTail
           ? recentMessagePageParams(null, 80, total)
           : { offset: lastIndex + 1, limit: gap };
-        const missing = await loadMessages(selected.serverId, selected.conversationId, params);
+        const missing = await loadMessages(selected.serverId, selected.conversationId, {
+          ...params,
+          foregroundSessionId: selectedSessionId
+        });
         if (shouldJumpToTail) {
           replaceWithRecentMessages(missing);
         } else {
@@ -1798,7 +1902,7 @@ function App() {
       try {
         const info = await connectionInfo(selected.serverId);
         if (disposed || websocketKeyRef.current !== key) return;
-        const socket = new WebSocket(websocketUrl(info.baseUrl, info.token, selected.conversationId));
+        const socket = new WebSocket(websocketUrl(info.baseUrl, info.token, selected.conversationId, selectedSessionId));
         websocketRef.current = socket;
         socket.addEventListener('message', (event) => {
           let payload;
@@ -1857,7 +1961,11 @@ function App() {
       } catch {
         if (!disposed) setSessionActivity('实时连接不可用，使用刷新兜底');
         const conversation = conversationsRef.current.find((item) => item.conversation_id === selected.conversationId);
-        loadMessages(selected.serverId, selected.conversationId, recentMessagePageParams(conversation))
+        const session = foregroundSessions(conversation).find((item) => String(item?.id || 'main') === selectedSessionId) || conversation;
+        loadMessages(selected.serverId, selected.conversationId, {
+          ...recentMessagePageParams(session),
+          foregroundSessionId: selectedSessionId
+        })
           .then((initial) => {
             if (disposed || websocketKeyRef.current !== key) return;
             setMessages((current) => {
@@ -1897,7 +2005,7 @@ function App() {
       if (websocketKeyRef.current === key) websocketKeyRef.current = '';
       closeSocket();
     };
-  }, [selected, markConversationRead]);
+  }, [selected, selectedSessionId, activeForegroundSession?.message_count, markConversationRead]);
 
   const toggleSidebar = () => {
     const nextMode = sidebarMode === 'collapsed' ? 'expanded' : 'collapsed';
@@ -2040,7 +2148,7 @@ function App() {
 
   const loadOlderMessages = useCallback(async () => {
     if (!selected || loadingOlderRef.current || !hasOlderMessages(messagesRef.current)) return false;
-    const key = conversationKey(selected.serverId, selected.conversationId);
+    const key = conversationKey(selected.serverId, selected.conversationId, selectedSessionId);
     const anchorId = firstMessageId(messagesRef.current);
     if (!anchorId) return false;
     loadingOlderRef.current = true;
@@ -2051,7 +2159,8 @@ function App() {
       const limit = anchorIndex - offset;
       const older = limit > 0 ? await loadMessages(selected.serverId, selected.conversationId, {
         offset,
-        limit
+        limit,
+        foregroundSessionId: selectedSessionId
       }) : [];
       if (websocketKeyRef.current !== key || !older.length) return false;
       setMessages((current) => {
@@ -2063,7 +2172,7 @@ function App() {
     } finally {
       loadingOlderRef.current = false;
     }
-  }, [selected]);
+  }, [selected, selectedSessionId]);
 
   const loadAvailableModels = useCallback(async () => {
     if (!selected?.serverId) return [];
@@ -2075,7 +2184,7 @@ function App() {
     const outgoingFiles = Array.isArray(files) ? files : [];
     const outgoingSelections = Array.isArray(selections) ? selections : [];
     if ((!value && outgoingFiles.length === 0 && outgoingSelections.length === 0) || !selected || sending) return false;
-    const key = conversationKey(selected.serverId, selected.conversationId);
+    const key = conversationKey(selected.serverId, selected.conversationId, selectedSessionId);
     const commandState = outgoingFiles.length > 0
       ? { control: false, name: '', title: '等待响应', detail: '消息已送达，等待模型开始处理' }
       : slashCommandState(value);
@@ -2108,7 +2217,7 @@ function App() {
       return next;
     });
     try {
-      await postConversationMessage(selected.serverId, selected.conversationId, value, activeUserName, outgoingFiles, outgoingSelections);
+      await postConversationMessage(selected.serverId, selected.conversationId, value, activeUserName, outgoingFiles, outgoingSelections, selectedSessionId);
       setSelectionReferences((current) => current.filter((item) => !outgoingSelections.some((sent) => sent.id === item.id)));
       if (websocketKeyRef.current !== key) return false;
       setMessages((current) => {
@@ -2139,7 +2248,8 @@ function App() {
         const offset = previousLastServerIndex !== undefined ? previousLastServerIndex + 1 : 0;
         const incoming = await loadMessages(selected.serverId, selected.conversationId, {
           offset,
-          limit: 80
+          limit: 80,
+          foregroundSessionId: selectedSessionId
         });
         if (websocketKeyRef.current === key) {
           setMessages((current) => {
@@ -2168,7 +2278,7 @@ function App() {
     } finally {
       if (websocketKeyRef.current === key) setSending(false);
     }
-  }, [selected, sending, activeUserName]);
+  }, [selected, selectedSessionId, sending, activeUserName]);
 
   const addSelectionReference = useCallback((selection) => {
     if (!selection?.file_path || !selection?.selected_text) return;
@@ -2180,10 +2290,10 @@ function App() {
   }, []);
 
   const title = activeConversation
-    ? displayConversationName(activeConversation)
+    ? displayForegroundSessionName(activeForegroundSession, activeConversation)
     : 'Stellacode';
   const subtitle = activeConversation
-    ? [activeConversation.nickname || activeConversation.platform_chat_id, formatModel(activeConversation, selectedConversationStatus), sessionActivity].filter(Boolean).join(' · ')
+    ? [displayConversationName(activeConversation), formatModel(activeConversation, selectedConversationStatus), sessionActivity].filter(Boolean).join(' · ')
     : '选择或创建一个 Conversation';
 
   return (
@@ -2239,6 +2349,8 @@ function App() {
         onHide={(conversation) => setConversationHidden(conversation, true)}
         onUnhide={(conversation) => setConversationHidden(conversation, false)}
         onDelete={deleteSelectedConversation}
+        onCreateSession={createConversationForegroundSession}
+        onDeleteSession={deleteConversationForegroundSession}
       />
       {sidebarMode !== 'collapsed' && (
         <button
@@ -2251,7 +2363,7 @@ function App() {
       <main className="content-area">
         <ChatWorkspace
           title={title}
-          conversationKey={selected ? conversationKey(selected.serverId, selected.conversationId) : ''}
+          conversationKey={selectedKey}
           modelSelectionPending={Boolean(activeConversation?.model_selection_pending ?? selectedConversationStatus?.model_selection_pending)}
           messages={messages}
           messagesReady={messagesReady}

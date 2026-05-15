@@ -329,6 +329,7 @@ fn incoming_message_to_channel_ingress(
     }
 
     Ok(ChannelIngress::IncomingMessage {
+        foreground_session_id: None,
         platform_message_id: Some(message.remote_message_id.clone()),
         origin: Some(AgentMessageOrigin::User),
         message: ChatMessage::new(ChatRole::User, items)
@@ -344,13 +345,19 @@ fn control_to_channel_ingress(
 ) -> Result<ChannelIngress> {
     match control {
         ConversationControl::Continue => Ok(ChannelIngress::ContinueForegroundTurn {
+            foreground_session_id: None,
             reason: Some("user requested continue".to_string()),
         }),
         ConversationControl::Cancel => Ok(ChannelIngress::CancelForegroundTurn {
+            foreground_session_id: None,
             reason: Some("user requested cancel".to_string()),
         }),
-        ConversationControl::Compact => Ok(ChannelIngress::CompactForegroundNow),
-        ConversationControl::ShowStatus => Ok(ChannelIngress::QueryForegroundStatus),
+        ConversationControl::Compact => Ok(ChannelIngress::CompactForegroundNow {
+            foreground_session_id: None,
+        }),
+        ConversationControl::ShowStatus => Ok(ChannelIngress::QueryForegroundStatus {
+            foreground_session_id: None,
+        }),
         ConversationControl::SwitchModel { model_name } => {
             if !config.models.contains_key(model_name) {
                 return Err(anyhow!("unknown model alias {model_name}"));
@@ -388,7 +395,9 @@ fn control_to_channel_ingress(
         ConversationControl::ShowModel
         | ConversationControl::ShowReasoning
         | ConversationControl::ShowRemote
-        | ConversationControl::ShowSandbox => Ok(ChannelIngress::QueryForegroundStatus),
+        | ConversationControl::ShowSandbox => Ok(ChannelIngress::QueryForegroundStatus {
+            foreground_session_id: None,
+        }),
         ConversationControl::SetSandbox { .. } => Err(anyhow!(
             "sandbox runtime switching is not exposed through the new channel protocol yet"
         )),
@@ -459,7 +468,7 @@ fn project_channel_event(
     let mut events = Vec::new();
     match event {
         service_protos::channel::ChannelEvent::SessionEvent {
-            session_addr: _,
+            session_addr,
             event,
         } => match event {
             AgentSessionEvent::MessageAppended { index, message } => {
@@ -467,7 +476,7 @@ fn project_channel_event(
                     channel_id: metadata.channel_id.clone(),
                     platform_chat_id: metadata.platform_chat_id.clone(),
                     conversation_id: metadata.conversation_id.clone(),
-                    session_id: metadata.foreground_session_id.clone(),
+                    session_id: service_addr_storage_component(&session_addr),
                     index,
                     message,
                 }));
@@ -488,7 +497,7 @@ fn project_channel_event(
                     channel_id: metadata.channel_id.clone(),
                     platform_chat_id: metadata.platform_chat_id.clone(),
                     conversation_id: metadata.conversation_id.clone(),
-                    session_id: metadata.foreground_session_id.clone(),
+                    session_id: service_addr_storage_component(&session_addr),
                     event: serde_json::to_value(event)?,
                 }));
             }
@@ -579,6 +588,16 @@ fn project_channel_event(
         _ => {}
     }
     Ok(events)
+}
+
+fn service_addr_storage_component(addr: &conversation_new::ServiceAddr) -> String {
+    let scope = match &addr.scope {
+        conversation_new::ServiceScope::Local => "local".to_string(),
+        conversation_new::ServiceScope::Conversation(conversation_id) => {
+            format!("conversation_{conversation_id}")
+        }
+    };
+    format!("{scope}__{}", addr.path.join("__"))
 }
 
 struct Args {

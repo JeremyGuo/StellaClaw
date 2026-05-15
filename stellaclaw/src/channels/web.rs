@@ -88,6 +88,7 @@ pub struct WebChannel {
 #[derive(Clone)]
 struct WebSocketSubscriber {
     conversation_id: String,
+    foreground_session_id: String,
     sender: Sender<Value>,
 }
 
@@ -222,9 +223,25 @@ impl WebChannel {
             ("POST", ["conversations", conversation_id, "seen"]) => {
                 self.mark_conversation_seen(conversation_id, &request.body)
             }
+            ("GET", ["conversations", conversation_id, "foreground_sessions"]) => {
+                self.list_foreground_sessions(conversation_id)
+            }
+            ("POST", ["conversations", conversation_id, "foreground_sessions"]) => {
+                self.create_foreground_session(conversation_id, &request.body)
+            }
+            ("PATCH", ["conversations", conversation_id, "foreground_sessions", session_id]) => {
+                self.update_foreground_session(conversation_id, session_id, &request.body)
+            }
+            ("DELETE", ["conversations", conversation_id, "foreground_sessions", session_id]) => {
+                self.delete_foreground_session(conversation_id, session_id)
+            }
             ("GET", ["conversations", conversation_id, "messages"]) => {
                 self.list_messages(conversation_id, &request.query)
             }
+            (
+                "GET",
+                ["conversations", conversation_id, "foreground_sessions", session_id, "messages"],
+            ) => self.list_foreground_session_messages(conversation_id, session_id, &request.query),
             ("GET", ["conversations", conversation_id, "messages", message_id]) => {
                 self.message_detail(conversation_id, message_id)
             }
@@ -337,6 +354,7 @@ impl WebChannel {
                     .and_then(|states| states.get(&metadata.platform_chat_id).copied())
                     .unwrap_or(ProcessingState::Idle);
                 let message_summary = conversation_message_summary(&self.workdir, &metadata);
+                let foreground_sessions = self.foreground_session_summaries(&metadata);
                 conversations.push(ConversationSummary::from_metadata(
                     &self.workdir,
                     &metadata,
@@ -347,6 +365,7 @@ impl WebChannel {
                     processing_state,
                     message_summary,
                     self.conversation_seen(&metadata.conversation_id),
+                    foreground_sessions,
                 ));
             }
         }
@@ -360,14 +379,26 @@ impl WebChannel {
         body: &[u8],
     ) -> ApiResult<HttpResponse> {
         let state = self.load_web_state(conversation_id)?;
-        let log_path = message_log_path(&self.workdir, &state);
         let request: MarkConversationSeenRequest = parse_json(body)?;
+        let foreground_session_id = request
+            .foreground_session_id
+            .as_deref()
+            .map(normalize_foreground_session_id)
+            .transpose()?
+            .unwrap_or_else(|| default_foreground_session_route_id(&state));
+        let session_metadata = metadata_for_foreground_session(&state, &foreground_session_id);
+        let log_path = message_log_path(&self.workdir, &session_metadata);
+        let seen_key = conversation_seen_key(conversation_id, &foreground_session_id);
         let (seen, snapshot) = {
             let mut seen_states = self
                 .seen_states
                 .lock()
                 .map_err(|_| ApiError::new(500, "conversation seen lock poisoned"))?;
-            let existing = seen_states.get(conversation_id).cloned();
+            let existing = seen_states.get(&seen_key).cloned().or_else(|| {
+                (foreground_session_id == "main")
+                    .then(|| seen_states.get(conversation_id).cloned())
+                    .flatten()
+            });
             let seen = match existing {
                 Some(existing)
                     if compare_message_ids(
@@ -384,7 +415,7 @@ impl WebChannel {
                     updated_at: now_rfc3339(),
                 },
             };
-            seen_states.insert(conversation_id.to_string(), seen.clone());
+            seen_states.insert(seen_key, seen.clone());
             (seen, seen_states.clone())
         };
         self.persist_seen_states(&snapshot)?;
@@ -392,13 +423,146 @@ impl WebChannel {
             "type": "conversation_seen",
             "channel_id": self.id,
             "conversation_id": conversation_id,
+            "foreground_session_id": foreground_session_id,
             "seen": &seen,
         }));
         Ok(json_response(
             200,
             json!({
                 "conversation_id": conversation_id,
+                "foreground_session_id": foreground_session_id,
                 "seen": seen,
+            }),
+        ))
+    }
+
+    fn list_foreground_sessions(&self, conversation_id: &str) -> ApiResult<HttpResponse> {
+        let metadata = self.load_web_state(conversation_id)?;
+        let sessions = self.foreground_session_summaries(&metadata);
+        Ok(json_response(
+            200,
+            json!({
+                "conversation_id": conversation_id,
+                "foreground_sessions": sessions,
+            }),
+        ))
+    }
+
+    fn create_foreground_session(
+        &self,
+        conversation_id: &str,
+        body: &[u8],
+    ) -> ApiResult<HttpResponse> {
+        self.load_web_state(conversation_id)?;
+        let request: CreateForegroundSessionRequest = parse_optional_json(body)?;
+        let requested_id = match request.session_id {
+            Some(session_id) => normalize_foreground_session_id(&session_id)?,
+            None => generated_foreground_session_id(),
+        };
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)
+            .map_err(ApiError::internal)?;
+        let event_rx = self
+            .conversation_runtime
+            .subscribe_main_channel_events(conversation_id)
+            .map_err(ApiError::internal)?;
+        self.conversation_runtime
+            .send_main_channel_ingress(
+                conversation_id,
+                ChannelIngress::CreateForegroundSession {
+                    requested_id: Some(requested_id.clone()),
+                },
+            )
+            .map_err(ApiError::internal)?;
+        wait_agent_session_created(&event_rx, &requested_id)?;
+        if let Some(nickname) = request.nickname {
+            self.update_foreground_session_nickname(
+                conversation_id,
+                &requested_id,
+                Some(nickname),
+            )?;
+        }
+        let metadata = self.load_web_state(conversation_id)?;
+        let sessions = self.foreground_session_summaries(&metadata);
+        let session = sessions
+            .iter()
+            .find(|session| session.id == requested_id)
+            .cloned()
+            .unwrap_or_else(|| self.foreground_session_summary(&metadata, &requested_id));
+        self.publish_conversation_upserted(&metadata);
+        Ok(json_response(
+            201,
+            json!({
+                "conversation_id": conversation_id,
+                "foreground_session": session,
+                "foreground_sessions": sessions,
+            }),
+        ))
+    }
+
+    fn update_foreground_session(
+        &self,
+        conversation_id: &str,
+        session_id: &str,
+        body: &[u8],
+    ) -> ApiResult<HttpResponse> {
+        let session_id = normalize_foreground_session_id(session_id)?;
+        let request: UpdateForegroundSessionRequest = parse_json(body)?;
+        let metadata = self.update_foreground_session_nickname(
+            conversation_id,
+            &session_id,
+            request.nickname,
+        )?;
+        let session = self.foreground_session_summary(&metadata, &session_id);
+        self.publish_conversation_upserted(&metadata);
+        Ok(json_response(
+            200,
+            json!({
+                "conversation_id": conversation_id,
+                "foreground_session": session,
+            }),
+        ))
+    }
+
+    fn delete_foreground_session(
+        &self,
+        conversation_id: &str,
+        session_id: &str,
+    ) -> ApiResult<HttpResponse> {
+        let session_id = normalize_foreground_session_id(session_id)?;
+        if session_id == "main" {
+            return Err(ApiError::new(
+                400,
+                "main foreground session cannot be deleted",
+            ));
+        }
+        self.load_web_state(conversation_id)?;
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)
+            .map_err(ApiError::internal)?;
+        let event_rx = self
+            .conversation_runtime
+            .subscribe_main_channel_events(conversation_id)
+            .map_err(ApiError::internal)?;
+        self.conversation_runtime
+            .send_main_channel_ingress(
+                conversation_id,
+                ChannelIngress::DeleteForegroundSession {
+                    foreground_session_id: Some(session_id.clone()),
+                    reason: Some("web client deleted foreground session".to_string()),
+                },
+            )
+            .map_err(ApiError::internal)?;
+        wait_agent_session_stopped(&event_rx)?;
+        let metadata =
+            self.update_foreground_session_nickname(conversation_id, &session_id, None)?;
+        self.publish_conversation_upserted(&metadata);
+        Ok(json_response(
+            200,
+            json!({
+                "conversation_id": conversation_id,
+                "foreground_session_id": session_id,
+                "deleted": true,
             }),
         ))
     }
@@ -537,6 +701,7 @@ impl WebChannel {
             processing_state,
             conversation_message_summary(&self.workdir, &metadata),
             self.conversation_seen(&metadata.conversation_id),
+            self.foreground_session_summaries(&metadata),
         );
         self.publish_conversation_upserted(&metadata);
         Ok(json_response(
@@ -686,12 +851,7 @@ impl WebChannel {
         session_id: &str,
         body: &[u8],
     ) -> ApiResult<HttpResponse> {
-        if session_id != "main" {
-            return Err(ApiError::new(
-                404,
-                "foreground session is not mounted on this web channel",
-            ));
-        }
+        let session_id = normalize_foreground_session_id(session_id)?;
         let request: SendMessageRequest = parse_json(body)?;
         let remote_message_id = request
             .remote_message_id
@@ -706,7 +866,7 @@ impl WebChannel {
         {
             return self.enqueue_foreground_session_control(
                 conversation_id,
-                session_id,
+                &session_id,
                 remote_message_id,
                 control,
             );
@@ -719,6 +879,7 @@ impl WebChannel {
             .send_main_channel_ingress(
                 conversation_id,
                 crate::service_protos::channel::ChannelIngress::IncomingMessage {
+                    foreground_session_id: Some(session_id.clone()),
                     platform_message_id: Some(remote_message_id.clone()),
                     origin: None,
                     message,
@@ -748,6 +909,7 @@ impl WebChannel {
         control: ConversationControl,
     ) -> ApiResult<HttpResponse> {
         let ingress = self.web_control_to_channel_ingress(&control)?;
+        let ingress = set_ingress_foreground_session(ingress, session_id);
         self.conversation_runtime
             .ensure_conversation_started(conversation_id)
             .map_err(ApiError::internal)?;
@@ -789,17 +951,23 @@ impl WebChannel {
     ) -> ApiResult<ChannelIngress> {
         match control {
             ConversationControl::Continue => Ok(ChannelIngress::ContinueForegroundTurn {
+                foreground_session_id: None,
                 reason: Some("user requested continue".to_string()),
             }),
             ConversationControl::Cancel => Ok(ChannelIngress::CancelForegroundTurn {
+                foreground_session_id: None,
                 reason: Some("user requested cancel".to_string()),
             }),
-            ConversationControl::Compact => Ok(ChannelIngress::CompactForegroundNow),
+            ConversationControl::Compact => Ok(ChannelIngress::CompactForegroundNow {
+                foreground_session_id: None,
+            }),
             ConversationControl::ShowStatus
             | ConversationControl::ShowModel
             | ConversationControl::ShowReasoning
             | ConversationControl::ShowRemote
-            | ConversationControl::ShowSandbox => Ok(ChannelIngress::QueryForegroundStatus),
+            | ConversationControl::ShowSandbox => Ok(ChannelIngress::QueryForegroundStatus {
+                foreground_session_id: None,
+            }),
             ConversationControl::SwitchModel { model_name } => {
                 let Some(model_config) = self.config.models.get(model_name) else {
                     return Err(ApiError::new(
@@ -870,16 +1038,33 @@ impl WebChannel {
         conversation_id: &str,
         query: &HashMap<String, String>,
     ) -> ApiResult<HttpResponse> {
+        let state = self.load_web_state(conversation_id)?;
+        let session_id = default_foreground_session_route_id(&state);
+        self.list_foreground_session_messages(conversation_id, &session_id, query)
+    }
+
+    fn list_foreground_session_messages(
+        &self,
+        conversation_id: &str,
+        session_id: &str,
+        query: &HashMap<String, String>,
+    ) -> ApiResult<HttpResponse> {
         let offset = query_usize(query, "offset", 0);
         let limit = query_usize(query, "limit", 50).min(200);
         let state = self.load_web_state(conversation_id)?;
-        let page = read_message_page(&message_log_path(&self.workdir, &state), offset, limit)
-            .map_err(ApiError::internal)?;
+        let session_id = normalize_foreground_session_id(session_id)?;
+        let session_state = metadata_for_foreground_session(&state, &session_id);
+        let page = read_message_page(
+            &message_log_path(&self.workdir, &session_state),
+            offset,
+            limit,
+        )
+        .map_err(ApiError::internal)?;
         let attachments =
-            WebAttachmentContext::new(&self.workdir, &state, self.cache_manager.clone());
+            WebAttachmentContext::new(&self.workdir, &session_state, self.cache_manager.clone());
         Ok(json_response(
             200,
-            message_page_payload(&state, &attachments, &page, offset, limit),
+            message_page_payload(&session_state, &attachments, &page, offset, limit),
         ))
     }
 
@@ -940,6 +1125,24 @@ impl WebChannel {
                 };
                 write_websocket_handshake(&mut stream, key)?;
                 self.run_foreground_websocket_stream(stream, state)
+            }
+            ["conversations", conversation_id, "foreground_sessions", session_id, "ws"] => {
+                let state = match self.load_web_state(conversation_id) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        write_http_response(&mut stream, json_error(error.status, &error.message))?;
+                        return Ok(());
+                    }
+                };
+                let session_id = match normalize_foreground_session_id(session_id) {
+                    Ok(session_id) => session_id,
+                    Err(error) => {
+                        write_http_response(&mut stream, json_error(error.status, &error.message))?;
+                        return Ok(());
+                    }
+                };
+                write_websocket_handshake(&mut stream, key)?;
+                self.run_foreground_session_websocket_stream(stream, state, session_id)
             }
             ["conversations", conversation_id, "terminals", terminal_id, "stream"] => {
                 if let Err(error) = self.load_web_state(conversation_id) {
@@ -1098,6 +1301,7 @@ impl WebChannel {
             processing_state,
             conversation_message_summary(&self.workdir, metadata),
             self.conversation_seen(&metadata.conversation_id),
+            self.foreground_session_summaries(metadata),
         );
         self.publish_conversation_stream_event(json!({
             "type": "conversation_upserted",
@@ -1173,6 +1377,7 @@ impl WebChannel {
             ProcessingState::Idle,
             message_summary.clone(),
             seen.clone(),
+            self.foreground_session_summaries(&state),
         );
         self.publish_conversation_stream_event(json!({
             "type": "conversation_turn_completed",
@@ -1200,21 +1405,31 @@ impl WebChannel {
 
     fn run_foreground_websocket_stream(
         &self,
+        stream: TcpStream,
+        state: ConversationMetadata,
+    ) -> Result<()> {
+        let session_id = default_foreground_session_route_id(&state);
+        self.run_foreground_session_websocket_stream(stream, state, session_id)
+    }
+
+    fn run_foreground_session_websocket_stream(
+        &self,
         mut stream: TcpStream,
-        mut state: ConversationMetadata,
+        state: ConversationMetadata,
+        session_id: String,
     ) -> Result<()> {
         let conversation_id = state.conversation_id.clone();
-        let mut session_id = state.foreground_session_id.clone();
-        let mut message_summary = conversation_message_summary(&self.workdir, &state);
+        let session_state = metadata_for_foreground_session(&state, &session_id);
+        let message_summary = conversation_message_summary(&self.workdir, &session_state);
         let (event_tx, event_rx) = unbounded();
-        self.register_websocket_subscriber(&state, event_tx);
+        self.register_websocket_subscriber(&session_state, event_tx);
         write_websocket_json(
             &mut stream,
             &websocket_subscription_ack(
-                &state,
+                &session_state,
                 &message_summary,
                 "subscribed",
-                self.active_turn_progress_for_state(&state),
+                self.active_turn_progress_for_state(&session_state),
             ),
         )?;
         let mut last_heartbeat = Instant::now();
@@ -1234,27 +1449,14 @@ impl WebChannel {
                 write_websocket_frame(&mut stream, 0x9, &[])?;
                 last_heartbeat = Instant::now();
             }
-            state = self.load_web_state(&conversation_id).map_err(api_anyhow)?;
-            if state.foreground_session_id != session_id {
-                session_id = state.foreground_session_id.clone();
-                message_summary = conversation_message_summary(&self.workdir, &state);
-                write_websocket_json(
-                    &mut stream,
-                    &websocket_subscription_ack(
-                        &state,
-                        &message_summary,
-                        "session_changed",
-                        self.active_turn_progress_for_state(&state),
-                    ),
-                )?;
-                continue;
-            }
+            let _ = self.load_web_state(&conversation_id).map_err(api_anyhow)?;
         }
     }
 
     fn register_websocket_subscriber(&self, state: &ConversationMetadata, sender: Sender<Value>) {
         let subscriber = WebSocketSubscriber {
             conversation_id: state.conversation_id.clone(),
+            foreground_session_id: state.foreground_session_id.clone(),
             sender,
         };
         self.websocket_subscribers
@@ -1275,6 +1477,11 @@ impl WebChannel {
             return;
         };
         entries.retain(|subscriber| {
+            if let Some(event_session_id) = event.get("session_id").and_then(Value::as_str) {
+                if event_session_id != subscriber.foreground_session_id {
+                    return true;
+                }
+            }
             let event = websocket_event_for_subscriber(&event, platform_chat_id, subscriber);
             subscriber.sender.send(event).is_ok()
         });
@@ -1306,6 +1513,111 @@ impl WebChannel {
             .lock()
             .ok()
             .and_then(|seen| seen.get(conversation_id).cloned())
+    }
+
+    fn foreground_session_seen(
+        &self,
+        conversation_id: &str,
+        foreground_session_id: &str,
+    ) -> Option<ConversationSeen> {
+        self.seen_states.lock().ok().and_then(|seen| {
+            seen.get(&conversation_seen_key(
+                conversation_id,
+                foreground_session_id,
+            ))
+            .cloned()
+            .or_else(|| {
+                (foreground_session_id == "main")
+                    .then(|| seen.get(conversation_id).cloned())
+                    .flatten()
+            })
+        })
+    }
+
+    fn foreground_session_summaries(
+        &self,
+        metadata: &ConversationMetadata,
+    ) -> Vec<WebForegroundSessionSummary> {
+        let mut ids = metadata
+            .session_nicknames
+            .keys()
+            .filter_map(|storage| foreground_route_id_from_storage_id(storage))
+            .collect::<Vec<_>>();
+        ids.push(default_foreground_session_route_id(metadata));
+        ids.push("main".to_string());
+        ids.sort();
+        ids.dedup();
+        let mut sessions = ids
+            .into_iter()
+            .map(|id| self.foreground_session_summary(metadata, &id))
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| {
+            right
+                .last_message_time
+                .cmp(&left.last_message_time)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        if let Some(index) = sessions.iter().position(|session| session.id == "main") {
+            let main = sessions.remove(index);
+            sessions.insert(0, main);
+        }
+        sessions
+    }
+
+    fn foreground_session_summary(
+        &self,
+        metadata: &ConversationMetadata,
+        foreground_session_id: &str,
+    ) -> WebForegroundSessionSummary {
+        let session_metadata = metadata_for_foreground_session(metadata, foreground_session_id);
+        let message_summary = conversation_message_summary(&self.workdir, &session_metadata);
+        let seen = self.foreground_session_seen(&metadata.conversation_id, foreground_session_id);
+        let session_storage_id = foreground_session_storage_id(foreground_session_id);
+        WebForegroundSessionSummary {
+            id: foreground_session_id.to_string(),
+            session_id: session_storage_id.clone(),
+            nickname: metadata
+                .session_nicknames
+                .get(&session_storage_id)
+                .cloned()
+                .filter(|nickname| !nickname.trim().is_empty())
+                .unwrap_or_else(|| default_foreground_session_nickname(foreground_session_id)),
+            message_count: message_summary.message_count,
+            last_message_id: message_summary.last_message_id,
+            last_message_time: message_summary.last_message_time,
+            last_seen_message_id: seen.as_ref().map(|seen| seen.last_seen_message_id.clone()),
+            last_seen_at: seen.map(|seen| seen.updated_at),
+            is_main: foreground_session_id == "main",
+        }
+    }
+
+    fn update_foreground_session_nickname(
+        &self,
+        conversation_id: &str,
+        foreground_session_id: &str,
+        nickname: Option<String>,
+    ) -> ApiResult<ConversationMetadata> {
+        self.load_web_state(conversation_id)?;
+        let mut session_nicknames = std::collections::BTreeMap::new();
+        session_nicknames.insert(
+            foreground_session_storage_id(foreground_session_id),
+            nickname,
+        );
+        match self.kernel_metadata_request(
+            conversation_id,
+            ChannelIngress::UpdateKernelMetadata {
+                request_id: String::new(),
+                patch: KernelMetadataPatch {
+                    session_nicknames,
+                    ..Default::default()
+                },
+            },
+        )? {
+            KernelResponse::MetadataUpdated { metadata } => Ok(metadata),
+            KernelResponse::Metadata { metadata } => Ok(metadata),
+            KernelResponse::Error { message, .. } => Err(ApiError::new(400, message)),
+            _ => Err(ApiError::internal("unexpected kernel metadata response")),
+        }
     }
 
     fn conversation_state_for_platform_chat(
@@ -2158,9 +2470,10 @@ impl WebChannel {
         if metadata.conversation_id != conversation_id {
             return Ok(());
         }
-        if session_id.is_some_and(|session_id| session_id != metadata.foreground_session_id) {
-            return Ok(());
-        }
+        let metadata = match session_id {
+            Some(session_id) => metadata_for_foreground_session_storage(&metadata, session_id),
+            None => metadata,
+        };
         let log_path = message_log_path(&self.workdir, &metadata);
         let total = count_message_lines(&log_path)?;
         let Some(index) = message_index.or_else(|| total.checked_sub(1)) else {
@@ -2284,6 +2597,20 @@ struct UpdateConversationRequest {
     nickname: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct CreateForegroundSessionRequest {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    nickname: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateForegroundSessionRequest {
+    #[serde(default)]
+    nickname: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct SendMessageRequest {
     #[serde(default)]
@@ -2309,6 +2636,8 @@ struct MoveWorkspacePathRequest {
 #[derive(Debug, Deserialize)]
 struct MarkConversationSeenRequest {
     last_seen_message_id: String,
+    #[serde(default)]
+    foreground_session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3037,11 +3366,25 @@ impl WebAttachmentContext {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct WebForegroundSessionSummary {
+    id: String,
+    session_id: String,
+    nickname: String,
+    message_count: usize,
+    last_message_id: Option<String>,
+    last_message_time: Option<String>,
+    last_seen_message_id: Option<String>,
+    last_seen_at: Option<String>,
+    is_main: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct ConversationSummary {
     conversation_id: String,
     nickname: String,
     platform_chat_id: String,
+    foreground_sessions: Vec<WebForegroundSessionSummary>,
     model: String,
     model_selection_pending: bool,
     reasoning: String,
@@ -3113,11 +3456,13 @@ impl ConversationSummary {
         processing_state: ProcessingState,
         message_summary: ConversationMessageSummary,
         seen: Option<ConversationSeen>,
+        foreground_sessions: Vec<WebForegroundSessionSummary>,
     ) -> Self {
         Self {
             conversation_id: metadata.conversation_id.clone(),
             nickname: conversation_nickname(metadata),
             platform_chat_id: metadata.platform_chat_id.clone(),
+            foreground_sessions,
             model: runtime_config
                 .and_then(|config| config.session_profile.as_ref())
                 .or(config.default_profile.as_ref())
@@ -3596,6 +3941,60 @@ fn wait_terminal_response(
     }
 }
 
+fn wait_agent_session_created(
+    event_rx: &crossbeam_channel::Receiver<ServiceChannelEvent>,
+    foreground_session_id: &str,
+) -> ApiResult<()> {
+    let expected = crate::conversation_new::ServiceAddr::agent_foreground_id(foreground_session_id);
+    loop {
+        match event_rx.recv_timeout(WORKSPACE_REQUEST_TIMEOUT) {
+            Ok(ServiceChannelEvent::AgentSessionCreated { addr }) if addr == expected => {
+                return Ok(());
+            }
+            Ok(ServiceChannelEvent::AgentSessionRejected { reason }) => {
+                return Err(ApiError::new(400, reason));
+            }
+            Ok(ServiceChannelEvent::Error { message, .. }) => {
+                return Err(ApiError::new(400, message));
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(ApiError::new(504, "foreground session create timed out"));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(ApiError::internal(
+                    "foreground session event stream disconnected",
+                ));
+            }
+        }
+    }
+}
+
+fn wait_agent_session_stopped(
+    event_rx: &crossbeam_channel::Receiver<ServiceChannelEvent>,
+) -> ApiResult<()> {
+    loop {
+        match event_rx.recv_timeout(WORKSPACE_REQUEST_TIMEOUT) {
+            Ok(ServiceChannelEvent::AgentSessionStopped) => return Ok(()),
+            Ok(ServiceChannelEvent::AgentSessionRejected { reason }) => {
+                return Err(ApiError::new(400, reason));
+            }
+            Ok(ServiceChannelEvent::Error { message, .. }) => {
+                return Err(ApiError::new(400, message));
+            }
+            Ok(_) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(ApiError::new(504, "foreground session delete timed out"));
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(ApiError::internal(
+                    "foreground session event stream disconnected",
+                ));
+            }
+        }
+    }
+}
+
 fn websocket_event_for_subscriber(
     event: &Value,
     platform_chat_id: &str,
@@ -3633,6 +4032,148 @@ fn web_request_id(prefix: &str) -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{prefix}-{}-{nanos}", std::process::id())
+}
+
+fn generated_foreground_session_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    format!("chat-{millis}")
+}
+
+fn normalize_foreground_session_id(value: &str) -> ApiResult<String> {
+    let value = value.trim();
+    let value = value
+        .strip_prefix("local__agent__foreground__")
+        .unwrap_or(value);
+    if value.is_empty() {
+        return Err(ApiError::new(400, "foreground session id is empty"));
+    }
+    if value.len() > 80
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    {
+        return Err(ApiError::new(
+            400,
+            "foreground session id must use ASCII letters, numbers, '-' or '_'",
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn foreground_session_storage_id(foreground_session_id: &str) -> String {
+    if foreground_session_id.starts_with("local__agent__foreground__") {
+        foreground_session_id.to_string()
+    } else {
+        format!("local__agent__foreground__{foreground_session_id}")
+    }
+}
+
+fn foreground_route_id_from_storage_id(storage_id: &str) -> Option<String> {
+    storage_id
+        .strip_prefix("local__agent__foreground__")
+        .map(str::to_string)
+}
+
+fn default_foreground_session_route_id(metadata: &ConversationMetadata) -> String {
+    foreground_route_id_from_storage_id(&metadata.foreground_session_id)
+        .unwrap_or_else(|| "main".to_string())
+}
+
+fn conversation_seen_key(conversation_id: &str, foreground_session_id: &str) -> String {
+    format!(
+        "{conversation_id}:{}",
+        foreground_session_storage_id(foreground_session_id)
+    )
+}
+
+fn metadata_for_foreground_session(
+    metadata: &ConversationMetadata,
+    foreground_session_id: &str,
+) -> ConversationMetadata {
+    metadata_for_foreground_session_storage(
+        metadata,
+        &foreground_session_storage_id(foreground_session_id),
+    )
+}
+
+fn metadata_for_foreground_session_storage(
+    metadata: &ConversationMetadata,
+    foreground_session_storage_id: &str,
+) -> ConversationMetadata {
+    let mut metadata = metadata.clone();
+    metadata.foreground_session_id = foreground_session_storage_id.to_string();
+    metadata
+}
+
+fn set_ingress_foreground_session(
+    ingress: ChannelIngress,
+    foreground_session_id: &str,
+) -> ChannelIngress {
+    let foreground_session_id = Some(foreground_session_id.to_string());
+    match ingress {
+        ChannelIngress::IncomingMessage {
+            platform_message_id,
+            origin,
+            message,
+            metadata,
+            ..
+        } => ChannelIngress::IncomingMessage {
+            foreground_session_id,
+            platform_message_id,
+            origin,
+            message,
+            metadata,
+        },
+        ChannelIngress::QueryForegroundContext {
+            query_id, payload, ..
+        } => ChannelIngress::QueryForegroundContext {
+            foreground_session_id,
+            query_id,
+            payload,
+        },
+        ChannelIngress::QueryForegroundStatus { .. } => ChannelIngress::QueryForegroundStatus {
+            foreground_session_id,
+        },
+        ChannelIngress::CancelForegroundTurn { reason, .. } => {
+            ChannelIngress::CancelForegroundTurn {
+                foreground_session_id,
+                reason,
+            }
+        }
+        ChannelIngress::ContinueForegroundTurn { reason, .. } => {
+            ChannelIngress::ContinueForegroundTurn {
+                foreground_session_id,
+                reason,
+            }
+        }
+        ChannelIngress::CompactForegroundNow { .. } => ChannelIngress::CompactForegroundNow {
+            foreground_session_id,
+        },
+        ChannelIngress::DeleteForegroundSession { reason, .. } => {
+            ChannelIngress::DeleteForegroundSession {
+                foreground_session_id,
+                reason,
+            }
+        }
+        ChannelIngress::ResolveHostCoordination { response, .. } => {
+            ChannelIngress::ResolveHostCoordination {
+                foreground_session_id,
+                response,
+            }
+        }
+        other => other,
+    }
+}
+
+fn default_foreground_session_nickname(foreground_session_id: &str) -> String {
+    if foreground_session_id == "main" {
+        "Main".to_string()
+    } else {
+        foreground_session_id.replace(['-', '_'], " ")
+    }
 }
 
 fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> ApiResult<T> {

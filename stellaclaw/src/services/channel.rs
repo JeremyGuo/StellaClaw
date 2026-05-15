@@ -111,6 +111,7 @@ enum PendingWorkspaceRequest {
         request_id: String,
     },
     IncomingMessage {
+        foreground_session_id: Option<String>,
         platform_message_id: Option<String>,
         origin: AgentMessageOrigin,
         metadata: serde_json::Value,
@@ -383,14 +384,17 @@ fn handle_channel_ingress(
 ) -> Result<()> {
     match ingress {
         ChannelIngress::IncomingMessage {
+            foreground_session_id,
             platform_message_id,
             origin,
             message,
             metadata,
         } => {
             let origin = origin.unwrap_or(AgentMessageOrigin::User);
+            let target = foreground_target(ctx, foreground_session_id.as_deref());
             if message_needs_materialization(&message) {
                 pending_workspace.push_back(PendingWorkspaceRequest::IncomingMessage {
+                    foreground_session_id,
                     platform_message_id,
                     origin,
                     metadata,
@@ -408,6 +412,7 @@ fn handle_channel_ingress(
                 detail: serde_json::json!({
                     "platform_message_id": platform_message_id,
                     "channel_id": channel_id(&ctx.addr),
+                    "foreground_session_id": foreground_session_id,
                     "origin": origin,
                     "role": message.role,
                     "items": message.data.len(),
@@ -417,26 +422,32 @@ fn handle_channel_ingress(
             ctx.outbox
                 .send(ServiceOutput::Call(agent_session::enqueue_message_call(
                     ctx.addr.clone(),
-                    foreground_target(ctx),
+                    target,
                     origin,
                     message,
                     platform_message_id,
                 )?))?;
         }
-        ChannelIngress::QueryForegroundContext { query_id, payload } => {
+        ChannelIngress::QueryForegroundContext {
+            foreground_session_id,
+            query_id,
+            payload,
+        } => {
             ctx.outbox
                 .send(ServiceOutput::Call(agent_session::query_context_call(
                     ctx.addr.clone(),
-                    foreground_target(ctx),
+                    foreground_target(ctx, foreground_session_id.as_deref()),
                     query_id,
                     payload,
                 )?))?;
         }
-        ChannelIngress::QueryForegroundStatus => {
+        ChannelIngress::QueryForegroundStatus {
+            foreground_session_id,
+        } => {
             ctx.outbox
                 .send(ServiceOutput::Call(agent_session::query_status_call(
                     ctx.addr.clone(),
-                    foreground_target(ctx),
+                    foreground_target(ctx, foreground_session_id.as_deref()),
                 )?))?;
         }
         ChannelIngress::CreateForegroundSession { requested_id } => {
@@ -447,42 +458,56 @@ fn handle_channel_ingress(
                     requested_id,
                 )?))?;
         }
-        ChannelIngress::CancelForegroundTurn { reason } => {
+        ChannelIngress::CancelForegroundTurn {
+            foreground_session_id,
+            reason,
+        } => {
             ctx.outbox
                 .send(ServiceOutput::Call(agent_session::cancel_turn_call(
                     ctx.addr.clone(),
-                    foreground_target(ctx),
+                    foreground_target(ctx, foreground_session_id.as_deref()),
                     reason,
                 )?))?;
         }
-        ChannelIngress::ContinueForegroundTurn { reason } => {
+        ChannelIngress::ContinueForegroundTurn {
+            foreground_session_id,
+            reason,
+        } => {
             ctx.outbox
                 .send(ServiceOutput::Call(agent_session::continue_turn_call(
                     ctx.addr.clone(),
-                    foreground_target(ctx),
+                    foreground_target(ctx, foreground_session_id.as_deref()),
                     reason,
                 )?))?;
         }
-        ChannelIngress::CompactForegroundNow => {
+        ChannelIngress::CompactForegroundNow {
+            foreground_session_id,
+        } => {
             ctx.outbox
                 .send(ServiceOutput::Call(agent_session::compact_now_call(
                     ctx.addr.clone(),
-                    foreground_target(ctx),
+                    foreground_target(ctx, foreground_session_id.as_deref()),
                 )?))?;
         }
-        ChannelIngress::DeleteForegroundSession { reason } => {
+        ChannelIngress::DeleteForegroundSession {
+            foreground_session_id,
+            reason,
+        } => {
             ctx.outbox
                 .send(ServiceOutput::Call(agent_session::shutdown_call(
                     ctx.addr.clone(),
-                    foreground_target(ctx),
+                    foreground_target(ctx, foreground_session_id.as_deref()),
                     reason,
                 )?))?;
         }
-        ChannelIngress::ResolveHostCoordination { response } => {
+        ChannelIngress::ResolveHostCoordination {
+            foreground_session_id,
+            response,
+        } => {
             ctx.outbox.send(ServiceOutput::Call(
                 agent_session::resolve_host_coordination_call(
                     ctx.addr.clone(),
-                    foreground_target(ctx),
+                    foreground_target(ctx, foreground_session_id.as_deref()),
                     response,
                 )?,
             ))?;
@@ -666,6 +691,7 @@ fn handle_workspace_response(
             }))?;
         }
         Some(PendingWorkspaceRequest::IncomingMessage {
+            foreground_session_id,
             platform_message_id,
             origin,
             metadata,
@@ -686,6 +712,7 @@ fn handle_workspace_response(
                 detail: serde_json::json!({
                     "platform_message_id": platform_message_id,
                     "channel_id": channel_id(&ctx.addr),
+                    "foreground_session_id": foreground_session_id,
                     "origin": origin,
                     "role": message.role,
                     "items": message.data.len(),
@@ -695,7 +722,7 @@ fn handle_workspace_response(
             ctx.outbox
                 .send(ServiceOutput::Call(agent_session::enqueue_message_call(
                     ctx.addr.clone(),
-                    foreground_target(ctx),
+                    foreground_target(ctx, foreground_session_id.as_deref()),
                     origin,
                     message,
                     platform_message_id,
@@ -764,8 +791,10 @@ fn channel_id(addr: &crate::conversation_new::ServiceAddr) -> &str {
     addr.local_service_id("channel").unwrap_or("main")
 }
 
-fn foreground_target(ctx: &ServiceRunContext) -> ServiceAddr {
-    crate::conversation_new::ServiceAddr::agent_foreground_id(channel_id(&ctx.addr))
+fn foreground_target(ctx: &ServiceRunContext, foreground_session_id: Option<&str>) -> ServiceAddr {
+    crate::conversation_new::ServiceAddr::agent_foreground_id(
+        foreground_session_id.unwrap_or_else(|| channel_id(&ctx.addr)),
+    )
 }
 
 fn emit_channel_event(event_tx: Option<&Sender<ChannelEvent>>, event: ChannelEvent) -> Result<()> {
@@ -781,7 +810,7 @@ fn session_event_belongs_to_channel(
 ) -> bool {
     let channel_id = channel_id(channel_addr);
     if let Some(foreground_id) = local_agent_id(session_addr, "foreground") {
-        return foreground_id == channel_id;
+        return foreground_id == channel_id || channel_id == "main";
     }
     if local_agent_id(session_addr, "subagent").is_some() {
         return true;

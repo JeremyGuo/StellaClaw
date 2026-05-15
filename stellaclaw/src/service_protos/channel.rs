@@ -21,6 +21,8 @@ use crate::service_protos::workspace::{WorkspaceRequest, WorkspaceResponse};
 pub enum ChannelIngress {
     IncomingMessage {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        foreground_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         platform_message_id: Option<String>,
         #[serde(default)]
         origin: Option<AgentMessageOrigin>,
@@ -29,29 +31,45 @@ pub enum ChannelIngress {
         metadata: Value,
     },
     QueryForegroundContext {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        foreground_session_id: Option<String>,
         query_id: String,
         #[serde(default)]
         payload: Value,
     },
-    QueryForegroundStatus,
+    QueryForegroundStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        foreground_session_id: Option<String>,
+    },
     CreateForegroundSession {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         requested_id: Option<String>,
     },
     CancelForegroundTurn {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        foreground_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
     ContinueForegroundTurn {
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        foreground_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
-    CompactForegroundNow,
+    CompactForegroundNow {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        foreground_session_id: Option<String>,
+    },
     DeleteForegroundSession {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        foreground_session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
     ResolveHostCoordination {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        foreground_session_id: Option<String>,
         response: Value,
     },
     UpdateRuntimeConfig {

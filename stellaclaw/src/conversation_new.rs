@@ -1133,13 +1133,6 @@ impl ConversationKernel {
         let binding = self.resolve_agent_session_binding(source, &kind, requested_binding)?;
         let addr = match kind {
             AgentSessionKind::Foreground => {
-                if let (Some(requested_id), Some(channel_id)) =
-                    (id.as_deref(), source.local_service_id("channel"))
-                {
-                    if requested_id != channel_id {
-                        return Err(anyhow!("foreground id must match creator channel id"));
-                    }
-                }
                 let id = id
                     .or_else(|| source.local_service_id("channel").map(str::to_string))
                     .unwrap_or_else(|| "main".to_string());
@@ -1387,6 +1380,7 @@ mod tests {
 
         ingress_tx
             .send(ChannelIngress::IncomingMessage {
+                foreground_session_id: None,
                 platform_message_id: Some("m_1".to_string()),
                 origin: None,
                 message: agent_session::text_message(ChatRole::User, "hello from platform"),
@@ -1434,6 +1428,7 @@ mod tests {
 
         ingress_tx
             .send(ChannelIngress::IncomingMessage {
+                foreground_session_id: None,
                 platform_message_id: Some("m_scratch".to_string()),
                 origin: None,
                 message: agent_session::text_message(ChatRole::User, "route to scratch"),
@@ -1474,6 +1469,7 @@ mod tests {
 
         ingress_tx
             .send(ChannelIngress::IncomingMessage {
+                foreground_session_id: None,
                 platform_message_id: Some("m_structured".to_string()),
                 origin: None,
                 message: agent_session::text_message(ChatRole::User, "structured hello"),
@@ -1517,6 +1513,7 @@ mod tests {
 
         ingress_tx
             .send(ChannelIngress::QueryForegroundContext {
+                foreground_session_id: None,
                 query_id: "q_ctx".to_string(),
                 payload: serde_json::json!({"include_last_message": true}),
             })
@@ -1647,15 +1644,22 @@ mod tests {
             .any(|event| matches!(event, ChannelEvent::AgentSessionCreated { addr } if addr == ServiceAddr::agent_foreground_id("scratch"))));
 
         for ingress in [
-            ChannelIngress::QueryForegroundStatus,
+            ChannelIngress::QueryForegroundStatus {
+                foreground_session_id: None,
+            },
             ChannelIngress::ContinueForegroundTurn {
+                foreground_session_id: None,
                 reason: Some("test continue".to_string()),
             },
-            ChannelIngress::CompactForegroundNow,
+            ChannelIngress::CompactForegroundNow {
+                foreground_session_id: None,
+            },
             ChannelIngress::ResolveHostCoordination {
+                foreground_session_id: None,
                 response: serde_json::json!({"approved": true}),
             },
             ChannelIngress::CancelForegroundTurn {
+                foreground_session_id: None,
                 reason: Some("test cancel".to_string()),
             },
         ] {
@@ -1683,6 +1687,7 @@ mod tests {
 
         ingress_tx
             .send(ChannelIngress::DeleteForegroundSession {
+                foreground_session_id: None,
                 reason: Some("test shutdown".to_string()),
             })
             .expect("shutdown ingress sends");
@@ -1698,8 +1703,8 @@ mod tests {
     }
 
     #[test]
-    fn channel_projects_kernel_errors_to_platform_events() {
-        let mut kernel = test_kernel("channel_kernel_error_event");
+    fn channel_can_create_additional_foreground_session() {
+        let mut kernel = test_kernel("channel_additional_foreground_session");
         let (ingress_tx, ingress_rx) = crossbeam_channel::unbounded();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
         kernel
@@ -1722,14 +1727,11 @@ mod tests {
         assert!(event_rx.try_iter().any(|event| {
             matches!(
                 event,
-                ChannelEvent::Error {
-                    code,
-                    message: _,
-                    detail: _
-                } if code == "permission_denied"
+                ChannelEvent::AgentSessionCreated { addr }
+                    if addr == ServiceAddr::agent_foreground_id("other")
             )
         }));
-        assert!(!kernel.has_service(&ServiceAddr::agent_foreground_id("other")));
+        assert!(kernel.has_service(&ServiceAddr::agent_foreground_id("other")));
         kernel.stop_all("test finished").expect("services stop");
     }
 
@@ -1891,6 +1893,7 @@ mod tests {
 
         ingress_tx
             .send(ChannelIngress::IncomingMessage {
+                foreground_session_id: None,
                 platform_message_id: Some("platform-1".to_string()),
                 origin: None,
                 message: ChatMessage::new(
