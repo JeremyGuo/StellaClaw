@@ -1891,12 +1891,6 @@ button {
   transform: rotate(0deg);
 }
 
-.tool-round-bar {
-  height: 1px;
-  min-width: 0;
-  background: color-mix(in srgb, var(--border), transparent 42%);
-}
-
 .tool-process-round-body {
   display: grid;
   min-width: 0;
@@ -1907,20 +1901,6 @@ button {
   display: grid;
   min-width: 0;
   gap: 7px;
-}
-
-.tool-round-divider {
-  display: flex;
-  min-width: 0;
-  min-height: 16px;
-  align-items: center;
-  gap: 8px;
-}
-
-.tool-round-divider > span {
-  height: 1px;
-  flex: 1 1 auto;
-  background: color-mix(in srgb, var(--border), transparent 42%);
 }
 
 .tool-process-toggle {

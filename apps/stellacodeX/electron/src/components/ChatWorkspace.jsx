@@ -947,7 +947,6 @@ export function ToolProcessGroup({ group }) {
         <span>{title}</span>
         <ChevronDown size={15} strokeWidth={1.9} aria-hidden="true" />
       </button>
-      <div className="tool-round-bar" aria-hidden="true" />
       {open && (
         <div className="tool-process-round-body">
           {blocks.map((block) => (
@@ -1065,9 +1064,6 @@ function ToolProcessSegment({ block, complete }) {
   const title = complete ? summary.doneTitle : summary.runningTitle;
   return (
     <section className={`tool-process-segment${open ? ' open' : ''}`}>
-      <div className="tool-round-divider">
-        <span aria-hidden="true" />
-      </div>
       <button className="tool-process-toggle" type="button" onClick={() => setOpen((value) => !value)}>
         <TerminalSquare size={15} strokeWidth={1.9} aria-hidden="true" />
         <span>{title}</span>
