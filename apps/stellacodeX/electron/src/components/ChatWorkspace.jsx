@@ -1019,7 +1019,8 @@ export function ToolProcessGroup({ group }) {
     return Boolean(group.nextMessage) || (toolBlocks.length > 0 && toolBlocks.every((block) => toolCardsAreComplete(block.cards)));
   }, [blocks, group.nextMessage]);
   const [open, setOpen] = useState(() => !complete);
-  const title = useMemo(() => toolRoundTitle(messages, group.nextMessage, complete), [messages, group.nextMessage, complete]);
+  const elapsed = useToolRoundElapsed(messages, group.nextMessage, complete);
+  const title = toolRoundTitle(elapsed, complete);
   return (
     <section className={`tool-process-group${open ? ' open' : ''}`}>
       <button className="tool-round-toggle" type="button" onClick={() => setOpen((value) => !value)}>
@@ -1044,18 +1045,44 @@ export function ToolProcessGroup({ group }) {
 
 const MemoToolProcessGroup = memo(ToolProcessGroup);
 
-function toolRoundTitle(messages, nextMessage, complete) {
-  const elapsed = toolRoundElapsed(messages, nextMessage);
+function useToolRoundElapsed(messages, nextMessage, complete) {
+  const startMsRef = useRef(Date.now());
+  const finalElapsedMsRef = useRef(null);
+  const wasLiveRef = useRef(!complete);
+  const [tickMs, setTickMs] = useState(() => Date.now());
+
+  if (!complete) {
+    wasLiveRef.current = true;
+  } else if (wasLiveRef.current && finalElapsedMsRef.current === null) {
+    finalElapsedMsRef.current = Math.max(0, Date.now() - startMsRef.current);
+  }
+
+  useEffect(() => {
+    if (complete) return undefined;
+    const timer = window.setInterval(() => {
+      setTickMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [complete]);
+
+  if (complete) {
+    const elapsedMs = finalElapsedMsRef.current ?? toolRoundElapsedMs(messages, nextMessage);
+    return elapsedMs !== null ? formatElapsedMs(elapsedMs) : '';
+  }
+  return formatElapsedMs(Math.max(0, tickMs - startMsRef.current));
+}
+
+function toolRoundTitle(elapsed, complete) {
   if (!complete) return elapsed ? `处理中 ${elapsed}` : '处理中';
   return elapsed ? `已处理 ${elapsed}` : '已处理';
 }
 
-function toolRoundElapsed(messages, nextMessage) {
+function toolRoundElapsedMs(messages, nextMessage) {
   const times = [...(messages || []), nextMessage]
     .map(messageTimeMs)
     .filter((value) => Number.isFinite(value));
-  if (times.length < 2) return '';
-  return formatElapsedMs(Math.max(0, Math.max(...times) - Math.min(...times)));
+  if (times.length < 2) return null;
+  return Math.max(0, Math.max(...times) - Math.min(...times));
 }
 
 function messageTimeMs(message) {

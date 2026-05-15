@@ -1107,10 +1107,6 @@ button {
   margin-top: 18px;
 }
 
-.message.streaming .message-body {
-  color: color-mix(in srgb, var(--text), transparent 8%);
-}
-
 .message.assistant:has(> .token-usage) {
   margin-bottom: 24px;
 }
