@@ -1831,26 +1831,6 @@ button {
   background: color-mix(in srgb, var(--border), transparent 42%);
 }
 
-.round-token-button {
-  display: inline-flex;
-  width: 18px;
-  height: 18px;
-  flex: 0 0 auto;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  border: 0;
-  border-radius: 999px;
-  background: transparent;
-  cursor: pointer;
-  opacity: .86;
-}
-
-.round-token-button:hover {
-  background: color-mix(in srgb, var(--hover), transparent 46%);
-  opacity: 1;
-}
-
 .tool-process-toggle {
   display: flex;
   width: 100%;

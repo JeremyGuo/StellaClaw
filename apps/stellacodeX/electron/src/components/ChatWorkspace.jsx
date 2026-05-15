@@ -922,29 +922,6 @@ export function InlineTokenUsage({ usage }) {
   );
 }
 
-function RoundTokenUsage({ usage }) {
-  if (!Number(usage?.total || 0)) return null;
-  return (
-    <Popover.Root>
-      <Popover.Trigger asChild>
-        <button className="round-token-button" type="button" aria-label="查看本轮工具 Token Usage">
-          <span className="token-dot" aria-hidden="true" />
-        </button>
-      </Popover.Trigger>
-      <Popover.Portal>
-        <Popover.Content className="floating-popover token-popover" side="top" align="end" sideOffset={8}>
-          <div><span>Input</span><strong>{usage.input}</strong></div>
-          <div><span>Output</span><strong>{usage.output}</strong></div>
-          <div><span>Cache Read</span><strong>{usage.cacheRead}</strong></div>
-          <div><span>Cache Write</span><strong>{usage.cacheWrite}</strong></div>
-          <div><span>Total</span><strong>{usage.total}</strong></div>
-          <Popover.Arrow className="floating-popover-arrow" />
-        </Popover.Content>
-      </Popover.Portal>
-    </Popover.Root>
-  );
-}
-
 export function ToolProcessGroup({ group }) {
   const messages = group.messages || [];
   const expandedRows = useMemo(() => messages.map((message, index) => {
@@ -1035,7 +1012,6 @@ function toolProcessBlocks(rows) {
 function ToolProcessSegment({ block, complete }) {
   const [open, setOpen] = useState(false);
   const toolRows = useMemo(() => mergedToolCards(block.cards), [block.cards]);
-  const usage = useMemo(() => sumToolCardUsage(block.cards), [block.cards]);
   const firstName = useMemo(() => block.cards[0]?.name || 'tool', [block.cards]);
   const summary = useMemo(() => toolGroupSummary(block.cards, firstName), [block.cards, firstName]);
   const title = complete ? summary.doneTitle : summary.runningTitle;
@@ -1043,7 +1019,6 @@ function ToolProcessSegment({ block, complete }) {
     <section className={`tool-process-segment${open ? ' open' : ''}`}>
       <div className="tool-round-divider">
         <span aria-hidden="true" />
-        <RoundTokenUsage usage={usage} />
       </div>
       <button className="tool-process-toggle" type="button" onClick={() => setOpen((value) => !value)}>
         <TerminalSquare size={15} strokeWidth={1.9} aria-hidden="true" />
@@ -1060,6 +1035,7 @@ function ToolProcessSegment({ block, complete }) {
               payload={card.payload}
               callPayload={card.callPayload}
               resultPayload={card.resultPayload}
+              usage={card.usage}
               running={card.running}
             />
           ))}
@@ -1109,20 +1085,6 @@ function mergedToolCards(cards) {
         running: Boolean(call && !result)
       };
     });
-}
-
-function sumToolCardUsage(cards) {
-  const total = cards.reduce((acc, card) => {
-    const usage = card?.usage;
-    if (!Number(usage?.total || 0)) return acc;
-    acc.input += Number(usage.input || 0);
-    acc.output += Number(usage.output || 0);
-    acc.cacheRead += Number(usage.cacheRead || 0);
-    acc.cacheWrite += Number(usage.cacheWrite || 0);
-    acc.total += Number(usage.total || 0);
-    return acc;
-  }, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 });
-  return total.total > 0 ? total : null;
 }
 
 function toolCardsAreComplete(cards) {
@@ -2023,7 +1985,7 @@ function diffMarker(type) {
   return ' ';
 }
 
-export function ToolInlineCard({ kind, name, payload, callPayload, resultPayload, running = false }) {
+export function ToolInlineCard({ kind, name, payload, callPayload, resultPayload, usage, running = false }) {
   const display = toolDisplay(kind, name, payload);
   const hasMergedPayload = callPayload !== undefined || resultPayload !== undefined;
   return (
@@ -2032,6 +1994,7 @@ export function ToolInlineCard({ kind, name, payload, callPayload, resultPayload
         <span>{display.title}</span>
         <code>{display.chip}</code>
         <em>{display.summary}</em>
+        <InlineTokenUsage usage={usage} />
         <i className="tool-detail-dot" aria-hidden="true" />
       </summary>
       {hasMergedPayload ? (
