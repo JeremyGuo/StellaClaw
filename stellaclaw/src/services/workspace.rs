@@ -1133,11 +1133,11 @@ fn entry_kind(metadata: &fs::Metadata) -> WorkspaceEntryKind {
     }
 }
 
-fn system_time_ms(value: SystemTime) -> Option<u128> {
+fn system_time_ms(value: SystemTime) -> Option<u64> {
     value
         .duration_since(UNIX_EPOCH)
         .ok()
-        .map(|duration| duration.as_millis())
+        .and_then(|duration| duration.as_millis().try_into().ok())
 }
 
 fn parent_api_path(path: &Path) -> Option<String> {

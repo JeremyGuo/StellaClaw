@@ -1984,6 +1984,64 @@ mod tests {
     }
 
     #[test]
+    fn channel_forwards_workspace_list_responses_to_platform() {
+        let mut kernel = test_kernel("channel_workspace_list_forward");
+        fs::create_dir_all(&kernel.conversation.conversation_root).expect("create workspace root");
+        fs::create_dir_all(kernel.conversation.conversation_root.join(".stellaclaw"))
+            .expect("create overlay root");
+        fs::write(
+            kernel
+                .conversation
+                .conversation_root
+                .join(".stellaclaw/visible.txt"),
+            "hello",
+        )
+        .expect("write workspace file");
+        let (ingress_tx, ingress_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        kernel
+            .mount_service_instance(
+                ServiceAddr::channel_id("scratch"),
+                ServiceKind::Channel,
+                Box::new(ChannelService::with_platform_events(ingress_rx, event_tx)),
+            )
+            .expect("channel mounts");
+        kernel
+            .mount_service(ServiceAddr::workspace(), ServiceKind::Workspace)
+            .expect("workspace mounts");
+
+        ingress_tx
+            .send(ChannelIngress::Workspace {
+                request_id: "list-1".to_string(),
+                request: WorkspaceRequest::List {
+                    path: Some(".stellaclaw".to_string()),
+                    target: WorkspaceTarget::LocalOverlay,
+                    limit: None,
+                },
+            })
+            .expect("workspace ingress sends");
+        kernel
+            .pump_for(Duration::from_millis(150))
+            .expect("workspace request drains");
+
+        let events: Vec<_> = event_rx.try_iter().collect();
+        assert!(
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    ChannelEvent::Workspace {
+                        request_id,
+                        response: WorkspaceResponse::Listing { entries, .. },
+                    } if request_id == "list-1"
+                        && entries.iter().any(|entry| entry.path == ".stellaclaw/visible.txt")
+                )
+            }),
+            "events: {events:?}"
+        );
+        kernel.stop_all("test finished").expect("services stop");
+    }
+
+    #[test]
     fn channel_forwards_terminal_requests_to_terminal_service() {
         let mut kernel = test_kernel("channel_terminal_forward");
         let (ingress_tx, ingress_rx) = crossbeam_channel::unbounded();

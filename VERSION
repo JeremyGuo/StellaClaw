@@ -3,6 +3,9 @@ version: 1.27.0
 
 # 1.27.0
 
+- 修复 Web workspace / file API 的 WorkspaceResponse 分发：
+  ChannelService 发起 WorkspaceService 请求时会把平台 workspace request id 写入 `ServiceCall.request_id`，WorkspaceService 回包后通过 `response_id` 找回对应 pending 请求，不再依赖 FIFO；同时 workspace response 会优先按 `response_id` / workspace 来源走 workspace decoder，避免 `listing` / `file` 响应被当作普通 Channel payload 报 `bad_channel_payload`。`WorkspaceEntry.modified_ms` / file `modified_ms` 从 `u128` 收敛为 JSON 可稳定反序列化的 `u64` 毫秒时间戳，修复线上 workspace listing decode 失败。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 修复 Web workspace / file API 在 Channel 重启后的响应订阅：
   WebChannel 发起 workspace list/read/write/upload/download 请求时仍按 `WebChannel -> ChannelService -> WorkspaceService` 路径走，但现在由 HostRuntime 在发送 Channel ingress 的同时建立事件订阅；如果发现 main Channel ingress 已关闭，会重启 conversation、重新订阅新 Channel 的事件后再重试请求，避免请求已经发到新 Channel、HTTP 却仍等待旧订阅而超时。本次不改变 `config` schema，不改变 `workdir` schema。
 

@@ -1,6 +1,9 @@
 #![allow(dead_code)]
 
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use anyhow::Result;
 use crossbeam_channel::{select, Receiver, Sender};
@@ -86,6 +89,7 @@ impl ConversationService for ChannelService {
                         &mut pending_terminal,
                         &mut pending_kernel_metadata,
                         call.source,
+                        call.response_id,
                         call.payload,
                     )?;
                 }
@@ -112,11 +116,21 @@ enum PendingWorkspaceRequest {
         request_id: String,
     },
     IncomingMessage {
+        request_id: String,
         foreground_session_id: Option<String>,
         platform_message_id: Option<String>,
         origin: AgentMessageOrigin,
         metadata: serde_json::Value,
     },
+}
+
+impl PendingWorkspaceRequest {
+    fn request_id(&self) -> &str {
+        match self {
+            PendingWorkspaceRequest::Platform { request_id }
+            | PendingWorkspaceRequest::IncomingMessage { request_id, .. } => request_id,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -142,8 +156,60 @@ fn handle_channel_request(
     pending_terminal: &mut VecDeque<PendingTerminalRequest>,
     pending_kernel_metadata: &mut VecDeque<PendingKernelMetadataRequest>,
     source: ServiceAddr,
+    response_id: Option<String>,
     payload: serde_json::Value,
 ) -> Result<()> {
+    if response_id.as_deref().is_some_and(|id| {
+        pending_workspace
+            .iter()
+            .any(|pending| pending.request_id() == id)
+    }) || source == ServiceAddr::workspace()
+    {
+        match decode_workspace_response(payload.clone()) {
+            Ok(response) => {
+                handle_workspace_response(
+                    ctx,
+                    event_tx,
+                    pending_workspace,
+                    response_id.as_deref(),
+                    response,
+                )?;
+                return Ok(());
+            }
+            Err(error) if source == ServiceAddr::workspace() => {
+                let detail = serde_json::json!({
+                    "conversation_id": &ctx.conversation.conversation_id,
+                    "channel_addr": &ctx.addr,
+                    "source": &source,
+                    "response_id": &response_id,
+                    "workspace_decode_error": error.to_string(),
+                    "payload": &payload,
+                });
+                let _ = append_workdir_level_log(
+                    &ctx.conversation.workdir,
+                    "warn",
+                    "bad_workspace_payload",
+                    detail.clone(),
+                );
+                emit_channel_event(
+                    event_tx,
+                    ChannelEvent::Error {
+                        code: "channel.bad_workspace_payload".to_string(),
+                        message: "Channel received an unsupported workspace response.".to_string(),
+                        detail: Some(error.to_string()),
+                    },
+                )?;
+                ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
+                    addr: ctx.addr.clone(),
+                    label: "bad_workspace_payload".to_string(),
+                    detail,
+                }))?;
+                return Ok(());
+            }
+            Err(_) => {}
+        }
+    }
+
     match decode_request(payload.clone()) {
         Ok(ChannelRequest::Deliver { delivery }) => {
             let text = delivery.text.clone();
@@ -342,7 +408,13 @@ fn handle_channel_request(
                 }
                 Err(_) => match decode_workspace_response(payload.clone()) {
                     Ok(response) => {
-                        handle_workspace_response(ctx, event_tx, pending_workspace, response)?;
+                        handle_workspace_response(
+                            ctx,
+                            event_tx,
+                            pending_workspace,
+                            response_id.as_deref(),
+                            response,
+                        )?;
                     }
                     Err(_) => match decode_status_response(payload.clone()) {
                         Ok(response) => {
@@ -415,17 +487,21 @@ fn handle_channel_ingress(
             let origin = origin.unwrap_or(AgentMessageOrigin::User);
             let target = foreground_target(ctx, foreground_session_id.as_deref());
             if message_needs_materialization(&message) {
+                let request_id = channel_service_request_id("workspace-materialize");
                 pending_workspace.push_back(PendingWorkspaceRequest::IncomingMessage {
+                    request_id: request_id.clone(),
                     foreground_session_id,
                     platform_message_id,
                     origin,
                     metadata,
                 });
-                ctx.outbox
-                    .send(ServiceOutput::Call(workspace::workspace_call(
+                ctx.outbox.send(ServiceOutput::Call(
+                    workspace::workspace_call(
                         ctx.addr.clone(),
                         WorkspaceRequest::MaterializeMessage { message },
-                    )?))?;
+                    )?
+                    .with_request_id(request_id),
+                ))?;
                 return Ok(());
             }
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
@@ -581,11 +657,9 @@ fn handle_channel_ingress(
                     detail: serde_json::json!({"request_id": request_id}),
                 },
             )?;
-            ctx.outbox
-                .send(ServiceOutput::Call(workspace::workspace_call(
-                    ctx.addr.clone(),
-                    request,
-                )?))?;
+            ctx.outbox.send(ServiceOutput::Call(
+                workspace::workspace_call(ctx.addr.clone(), request)?.with_request_id(request_id),
+            ))?;
         }
         ChannelIngress::Status {
             request_id,
@@ -692,9 +766,10 @@ fn handle_workspace_response(
     ctx: &ServiceRunContext,
     event_tx: Option<&Sender<ChannelEvent>>,
     pending_workspace: &mut VecDeque<PendingWorkspaceRequest>,
+    response_id: Option<&str>,
     response: WorkspaceResponse,
 ) -> Result<()> {
-    match pending_workspace.pop_front() {
+    match pop_pending_workspace(pending_workspace, response_id) {
         Some(PendingWorkspaceRequest::Platform { request_id }) => {
             emit_channel_event(
                 event_tx,
@@ -713,6 +788,7 @@ fn handle_workspace_response(
             }))?;
         }
         Some(PendingWorkspaceRequest::IncomingMessage {
+            request_id,
             foreground_session_id,
             platform_message_id,
             origin,
@@ -732,6 +808,7 @@ fn handle_workspace_response(
                 addr: ctx.addr.clone(),
                 label: "incoming_message_materialized".to_string(),
                 detail: serde_json::json!({
+                    "request_id": request_id,
                     "platform_message_id": platform_message_id,
                     "channel_id": channel_id(&ctx.addr),
                     "foreground_session_id": foreground_session_id,
@@ -768,6 +845,21 @@ fn handle_workspace_response(
         }
     }
     Ok(())
+}
+
+fn pop_pending_workspace(
+    pending_workspace: &mut VecDeque<PendingWorkspaceRequest>,
+    response_id: Option<&str>,
+) -> Option<PendingWorkspaceRequest> {
+    if let Some(response_id) = response_id {
+        if let Some(index) = pending_workspace
+            .iter()
+            .position(|pending| pending.request_id() == response_id)
+        {
+            return pending_workspace.remove(index);
+        }
+    }
+    pending_workspace.pop_front()
 }
 
 fn handle_terminal_response(
@@ -824,6 +916,13 @@ fn emit_channel_event(event_tx: Option<&Sender<ChannelEvent>>, event: ChannelEve
         event_tx.send(event)?;
     }
     Ok(())
+}
+
+static CHANNEL_SERVICE_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn channel_service_request_id(prefix: &str) -> String {
+    let id = CHANNEL_SERVICE_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{id}")
 }
 
 fn session_event_belongs_to_channel(

@@ -39,7 +39,7 @@ pub struct WorkspaceEntry {
     pub path: String,
     pub kind: WorkspaceEntryKind,
     pub size_bytes: Option<u64>,
-    pub modified_ms: Option<u128>,
+    pub modified_ms: Option<u64>,
     pub hidden: bool,
     pub readonly: bool,
 }
@@ -148,7 +148,7 @@ pub enum WorkspaceResponse {
         path: String,
         name: String,
         size_bytes: u64,
-        modified_ms: Option<u128>,
+        modified_ms: Option<u64>,
         offset: u64,
         returned_bytes: usize,
         truncated: bool,
