@@ -520,6 +520,7 @@ function isRoundInterstitialMessage(message) {
 
 function startsToolRound(source, index) {
   const message = source[index];
+  if (isStreamingAssistantMessage(message)) return true;
   if (String(message?.role || '').toLowerCase() !== 'assistant' || isFinalAssistantMessage(message)) return false;
   for (let cursor = index + 1; cursor < source.length; cursor += 1) {
     const current = source[cursor];
@@ -528,4 +529,8 @@ function startsToolRound(source, index) {
     if (!isRoundInterstitialMessage(current)) return false;
   }
   return false;
+}
+
+function isStreamingAssistantMessage(message) {
+  return Boolean(message?._streaming) && String(message?.role || '').toLowerCase() === 'assistant';
 }

@@ -818,7 +818,7 @@ export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment
         </div>
       )}
       <MessageBody message={message} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
-      {(roleName === 'user' || roleName === 'assistant') && (
+      {(roleName === 'user' || (roleName === 'assistant' && !message._streaming)) && (
         <MessageActionBar message={message} role={roleName} usage={usage} />
       )}
       {message.pending && <div className="message-status">正在发送...</div>}
