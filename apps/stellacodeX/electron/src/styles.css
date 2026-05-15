@@ -2130,7 +2130,7 @@ button {
   align-items: center;
   gap: 5px;
   margin-left: auto;
-  color: color-mix(in srgb, var(--faint), transparent 24%);
+  color: color-mix(in srgb, var(--faint), var(--bg) 24%);
   font-size: 11px;
   white-space: nowrap;
 }
