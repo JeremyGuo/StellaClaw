@@ -849,20 +849,51 @@ function MessageActionBar({ message, role, usage }) {
 }
 
 function formatMessageTime(value) {
-  if (!value) return '';
-  const date = new Date(value);
+  const date = parseMessageDate(value);
   if (!Number.isFinite(date.getTime())) return '';
   const now = new Date();
-  const minutes = String(date.getMinutes()).padStart(2, '0');
-  const clock = `${date.getHours()}:${minutes}`;
-  if (
-    date.getFullYear() === now.getFullYear()
-    && date.getMonth() === now.getMonth()
-    && date.getDate() === now.getDate()
-  ) {
-    return clock;
-  }
-  return `${date.getMonth() + 1}/${date.getDate()} ${clock}`;
+  const dateParts = systemDateParts(date);
+  const nowParts = systemDateParts(now);
+  const clock = systemClock(date);
+  if (dateParts.year === nowParts.year && dateParts.month === nowParts.month && dateParts.day === nowParts.day) return clock;
+  return `${dateParts.month}/${dateParts.day} ${clock}`;
+}
+
+function parseMessageDate(value) {
+  if (!value) return new Date(Number.NaN);
+  const raw = String(value).trim();
+  if (!raw) return new Date(Number.NaN);
+  const hasExplicitZone = /(?:z|[+-]\d{2}:?\d{2})$/i.test(raw);
+  const looksLikeDateTime = /^\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}/.test(raw);
+  const normalized = looksLikeDateTime && !hasExplicitZone ? `${raw.replace(' ', 'T')}Z` : raw;
+  return new Date(normalized);
+}
+
+function systemDateParts(date) {
+  const parts = new Intl.DateTimeFormat(undefined, {
+    timeZone: systemTimeZone(),
+    year: 'numeric',
+    month: 'numeric',
+    day: 'numeric'
+  }).formatToParts(date);
+  return {
+    year: Number(parts.find((part) => part.type === 'year')?.value || 0),
+    month: Number(parts.find((part) => part.type === 'month')?.value || 0),
+    day: Number(parts.find((part) => part.type === 'day')?.value || 0)
+  };
+}
+
+function systemClock(date) {
+  return new Intl.DateTimeFormat(undefined, {
+    timeZone: systemTimeZone(),
+    hour: 'numeric',
+    minute: '2-digit',
+    hourCycle: 'h23'
+  }).format(date);
+}
+
+function systemTimeZone() {
+  return Intl.DateTimeFormat().resolvedOptions().timeZone;
 }
 
 function messageArticleClassName(message) {
