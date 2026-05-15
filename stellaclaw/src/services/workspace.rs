@@ -1168,12 +1168,11 @@ fn remote_workspace_request(
         "cwd": cwd,
         "payload": payload,
     });
+    let remote_command = remote_workspace_helper_command();
     let mut child = Command::new("ssh")
         .arg("-T")
         .arg(host)
-        .arg("python3")
-        .arg("-c")
-        .arg(REMOTE_WORKSPACE_SCRIPT)
+        .arg(remote_command)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1217,6 +1216,13 @@ fn remote_workspace_request(
                 .unwrap_or("remote workspace helper failed")
         ))
     }
+}
+
+fn remote_workspace_helper_command() -> String {
+    let encoded_script = general_purpose::STANDARD.encode(REMOTE_WORKSPACE_SCRIPT.as_bytes());
+    format!(
+        "python3 -c 'import base64,sys;exec(base64.b64decode(sys.argv[1]).decode(\"utf-8\"))' {encoded_script}"
+    )
 }
 
 const REMOTE_WORKSPACE_SCRIPT: &str = r#"
@@ -1538,6 +1544,15 @@ mod tests {
         )
         .expect("remote should resolve");
         assert!(matches!(remote, ResolvedWorkspaceTarget::Remote { .. }));
+    }
+
+    #[test]
+    fn remote_workspace_helper_command_shell_quotes_python_script() {
+        let command = remote_workspace_helper_command();
+        assert!(command.starts_with("python3 -c '"));
+        assert!(!command.contains("def entry(path, rel):"));
+        assert!(!command.contains("if op == \"list\":"));
+        assert!(command.contains(&general_purpose::STANDARD.encode(REMOTE_WORKSPACE_SCRIPT)));
     }
 
     #[test]
