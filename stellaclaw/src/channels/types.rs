@@ -186,77 +186,12 @@ pub struct OutgoingProcessing {
     pub state: ProcessingState,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProgressFeedbackFinalState {
-    Done,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnProgressPhase {
-    Thinking,
-    Working,
-    Done,
-    Failed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnProgressPlanItemStatus {
-    Pending,
-    InProgress,
-    Completed,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TurnProgressPlanItem {
-    pub step: String,
-    pub status: TurnProgressPlanItemStatus,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TurnProgressPlan {
-    pub explanation: Option<String>,
-    pub items: Vec<TurnProgressPlanItem>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct TurnProgress {
-    pub phase: TurnProgressPhase,
-    pub model: String,
-    pub activity: String,
-    pub hint: Option<String>,
-    pub plan: Option<TurnProgressPlan>,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct OutgoingProgressFeedback {
-    pub channel_id: String,
-    pub platform_chat_id: String,
-    pub turn_id: String,
-    pub progress: TurnProgress,
-    pub final_state: Option<ProgressFeedbackFinalState>,
-    pub important: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct OutgoingConversationUpdated {
-    pub channel_id: String,
-    pub platform_chat_id: String,
-    pub conversation_id: String,
-}
-
 #[derive(Debug, Clone)]
 pub enum ChannelEvent {
     Delivery(OutgoingDelivery),
     MessageAppended(OutgoingMessageAppended),
     SessionStream(OutgoingSessionStream),
     Processing(OutgoingProcessing),
-    ProgressFeedback(OutgoingProgressFeedback),
-    ConversationUpdated(OutgoingConversationUpdated),
-    Status(OutgoingStatus),
     Error(OutgoingError),
 }
 
@@ -267,9 +202,6 @@ impl ChannelEvent {
             ChannelEvent::MessageAppended(appended) => &appended.channel_id,
             ChannelEvent::SessionStream(stream) => &stream.channel_id,
             ChannelEvent::Processing(processing) => &processing.channel_id,
-            ChannelEvent::ProgressFeedback(feedback) => &feedback.channel_id,
-            ChannelEvent::ConversationUpdated(updated) => &updated.channel_id,
-            ChannelEvent::Status(status) => &status.channel_id,
             ChannelEvent::Error(error) => &error.channel_id,
         }
     }
@@ -280,64 +212,9 @@ impl ChannelEvent {
             ChannelEvent::MessageAppended(appended) => &appended.platform_chat_id,
             ChannelEvent::SessionStream(stream) => &stream.platform_chat_id,
             ChannelEvent::Processing(processing) => &processing.platform_chat_id,
-            ChannelEvent::ProgressFeedback(feedback) => &feedback.platform_chat_id,
-            ChannelEvent::ConversationUpdated(updated) => &updated.platform_chat_id,
-            ChannelEvent::Status(status) => &status.platform_chat_id,
             ChannelEvent::Error(error) => &error.platform_chat_id,
         }
     }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct OutgoingStatus {
-    pub channel_id: String,
-    pub platform_chat_id: String,
-    pub conversation_id: String,
-    pub model: String,
-    pub reasoning: String,
-    pub sandbox: String,
-    pub sandbox_source: String,
-    pub remote: String,
-    pub workspace: String,
-    pub running_background: usize,
-    pub total_background: usize,
-    pub running_subagents: usize,
-    pub total_subagents: usize,
-    pub usage: OutgoingUsageSummary,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct OutgoingUsageSummary {
-    pub foreground: OutgoingUsageTotals,
-    pub background: OutgoingUsageTotals,
-    pub subagents: OutgoingUsageTotals,
-    pub media_tools: OutgoingUsageTotals,
-    pub memory: OutgoingUsageTotals,
-    pub user_memory_compaction: OutgoingUsageTotals,
-    pub user_memory_compaction_daily: Vec<OutgoingDailyUsageTotals>,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct OutgoingDailyUsageTotals {
-    pub date: String,
-    pub usage: OutgoingUsageTotals,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct OutgoingUsageTotals {
-    pub cache_read: u64,
-    pub cache_write: u64,
-    pub uncache_input: u64,
-    pub output: u64,
-    pub cost: OutgoingUsageCost,
-}
-
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct OutgoingUsageCost {
-    pub cache_read: f64,
-    pub cache_write: f64,
-    pub uncache_input: f64,
-    pub output: f64,
 }
 
 #[derive(Debug, Clone)]

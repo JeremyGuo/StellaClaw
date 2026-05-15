@@ -398,8 +398,11 @@ fn control_to_channel_ingress(
         | ConversationControl::ShowSandbox => Ok(ChannelIngress::QueryForegroundStatus {
             foreground_session_id: None,
         }),
-        ConversationControl::SetSandbox { .. } => Err(anyhow!(
-            "sandbox runtime switching is not exposed through the new channel protocol yet"
+        ConversationControl::SetSandbox { mode } => Err(anyhow!(
+            "sandbox runtime switching to {} is not exposed through the new channel protocol yet",
+            mode.as_ref()
+                .map(|mode| format!("{mode:?}"))
+                .unwrap_or_else(|| "default".to_string())
         )),
         ConversationControl::InvalidReasoning { reason }
         | ConversationControl::InvalidRemote { reason }

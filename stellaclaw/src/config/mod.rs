@@ -91,13 +91,6 @@ impl ModelSelection {
             Self::Inline(model) => model.model_name.clone(),
         }
     }
-
-    pub fn alias_name(&self) -> Option<&str> {
-        match self {
-            Self::Alias(alias) => Some(alias),
-            Self::Inline(_) => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

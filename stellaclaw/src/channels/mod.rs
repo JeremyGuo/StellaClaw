@@ -13,14 +13,13 @@ pub(crate) mod web_terminal;
 pub use telegram::TelegramChannel;
 pub use types::{
     ChannelEvent, IncomingDispatch, OutgoingDelivery, OutgoingError, OutgoingMessageAppended,
-    OutgoingProgressFeedback, OutgoingSessionStream, OutgoingStatus, ProcessingState,
+    OutgoingSessionStream, ProcessingState,
 };
 pub use web::WebChannel;
 
 pub trait Channel: Send + Sync {
     fn id(&self) -> &str;
     fn send_delivery(&self, delivery: &OutgoingDelivery) -> Result<()>;
-    fn send_status(&self, status: &OutgoingStatus) -> Result<()>;
     fn send_event(&self, event: &ChannelEvent) -> Result<()> {
         match event {
             ChannelEvent::Delivery(delivery) => self.send_delivery(delivery),
@@ -29,11 +28,6 @@ pub trait Channel: Send + Sync {
             ChannelEvent::Processing(processing) => {
                 self.set_processing(&processing.platform_chat_id, processing.state)
             }
-            ChannelEvent::ProgressFeedback(feedback) => self.update_progress_feedback(feedback),
-            ChannelEvent::ConversationUpdated(updated) => {
-                self.conversation_updated(&updated.platform_chat_id, &updated.conversation_id)
-            }
-            ChannelEvent::Status(status) => self.send_status(status),
             ChannelEvent::Error(error) => self.send_error(error),
         }
     }
@@ -61,16 +55,10 @@ pub trait Channel: Send + Sync {
     fn set_processing(&self, _platform_chat_id: &str, _state: ProcessingState) -> Result<()> {
         Ok(())
     }
-    fn update_progress_feedback(&self, _feedback: &OutgoingProgressFeedback) -> Result<()> {
-        Ok(())
-    }
     fn message_appended(&self, _appended: &OutgoingMessageAppended) -> Result<()> {
         Ok(())
     }
     fn session_stream(&self, _stream: &OutgoingSessionStream) -> Result<()> {
-        Ok(())
-    }
-    fn conversation_updated(&self, _platform_chat_id: &str, _conversation_id: &str) -> Result<()> {
         Ok(())
     }
     fn spawn_ingress(

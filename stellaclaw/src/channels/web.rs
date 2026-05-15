@@ -48,8 +48,7 @@ use super::{
     types::{
         parse_reasoning_control_argument, ConversationControl, IncomingConversationMessage,
         IncomingDispatch, IncomingMessageDispatch, OutgoingAttachment, OutgoingAttachmentKind,
-        OutgoingDelivery, OutgoingError, OutgoingMessageAppended, OutgoingProgressFeedback,
-        OutgoingStatus, ProcessingState, ProgressFeedbackFinalState,
+        OutgoingDelivery, OutgoingError, OutgoingMessageAppended, ProcessingState,
     },
     web_terminal::{TerminalCreateRequest, TerminalResizeRequest},
     Channel,
@@ -80,7 +79,6 @@ pub struct WebChannel {
     websocket_subscribers: Arc<Mutex<HashMap<String, Vec<WebSocketSubscriber>>>>,
     conversation_stream_subscribers: Arc<Mutex<Vec<Sender<Value>>>>,
     processing_states: Arc<Mutex<HashMap<String, ProcessingState>>>,
-    active_turn_progress: Arc<Mutex<HashMap<String, Value>>>,
     seen_states: Arc<Mutex<HashMap<String, ConversationSeen>>>,
 }
 
@@ -123,7 +121,6 @@ impl WebChannel {
             websocket_subscribers: Arc::new(Mutex::new(HashMap::new())),
             conversation_stream_subscribers: Arc::new(Mutex::new(Vec::new())),
             processing_states: Arc::new(Mutex::new(HashMap::new())),
-            active_turn_progress: Arc::new(Mutex::new(HashMap::new())),
             seen_states: Arc::new(Mutex::new(seen_states)),
         }
     }
@@ -737,9 +734,6 @@ impl WebChannel {
         if let Ok(mut subscribers) = self.websocket_subscribers.lock() {
             subscribers.remove(&metadata.platform_chat_id);
         }
-        if let Ok(mut progress) = self.active_turn_progress.lock() {
-            progress.remove(&metadata.platform_chat_id);
-        }
         self.publish_conversation_stream_event(json!({
             "type": "conversation_deleted",
             "channel_id": self.id,
@@ -1001,9 +995,14 @@ impl WebChannel {
                     ..Default::default()
                 },
             }),
-            ConversationControl::SetSandbox { .. } => Err(ApiError::new(
+            ConversationControl::SetSandbox { mode } => Err(ApiError::new(
                 400,
-                "sandbox runtime switching is not exposed through the new channel protocol yet",
+                format!(
+                    "sandbox runtime switching to {} is not exposed through the new channel protocol yet",
+                    mode.as_ref()
+                        .map(|mode| format!("{mode:?}"))
+                        .unwrap_or_else(|| "default".to_string())
+                ),
             )),
             ConversationControl::InvalidReasoning { reason }
             | ConversationControl::InvalidRemote { reason }
@@ -1291,13 +1290,6 @@ impl WebChannel {
         }));
     }
 
-    fn publish_conversation_upserted_for_platform_chat(&self, platform_chat_id: &str) {
-        let Ok(Some(state)) = self.conversation_state_for_platform_chat(platform_chat_id) else {
-            return;
-        };
-        self.publish_conversation_upserted(&state);
-    }
-
     fn publish_conversation_processing(&self, platform_chat_id: &str, state: ProcessingState) {
         let Ok(Some(conversation_state)) =
             self.conversation_state_for_platform_chat(platform_chat_id)
@@ -1320,60 +1312,6 @@ impl WebChannel {
             .lock()
             .expect("conversation stream subscriber registry lock poisoned");
         subscribers.retain(|sender| sender.send(event.clone()).is_ok());
-    }
-
-    fn publish_conversation_turn_completed(
-        &self,
-        platform_chat_id: &str,
-        turn_id: Option<&str>,
-        final_state: Option<ProgressFeedbackFinalState>,
-    ) {
-        let Ok(Some(state)) = self.conversation_state_for_platform_chat(platform_chat_id) else {
-            return;
-        };
-        let message_summary = conversation_message_summary(&self.workdir, &state);
-        let Some(last_message_id) = message_summary.last_message_id.clone() else {
-            return;
-        };
-        let seen = self.conversation_seen(&state.conversation_id);
-        let unread = seen
-            .as_ref()
-            .and_then(|seen| {
-                compare_message_ids(
-                    &message_log_path(&self.workdir, &state),
-                    &last_message_id,
-                    &seen.last_seen_message_id,
-                )
-            })
-            .map(|ordering| ordering.is_gt())
-            .unwrap_or(true);
-        let summary = ConversationSummary::from_metadata(
-            &self.workdir,
-            &state,
-            &self.config,
-            load_conversation_runtime_config(&self.workdir, &state.conversation_id)
-                .ok()
-                .as_ref(),
-            ProcessingState::Idle,
-            message_summary.clone(),
-            seen.clone(),
-            self.foreground_session_summaries(&state),
-        );
-        self.publish_conversation_stream_event(json!({
-            "type": "conversation_turn_completed",
-            "channel_id": self.id,
-            "conversation_id": &state.conversation_id,
-            "platform_chat_id": &state.platform_chat_id,
-            "turn_id": turn_id,
-            "final_state": final_state.map(progress_final_state_name),
-            "message_count": message_summary.message_count,
-            "last_message_id": last_message_id,
-            "last_message_time": message_summary.last_message_time,
-            "last_seen_message_id": seen.as_ref().map(|seen| seen.last_seen_message_id.clone()),
-            "last_seen_at": seen.map(|seen| seen.updated_at),
-            "unread": unread,
-            "conversation": summary,
-        }));
     }
 
     fn websocket_query_authorized(&self, request: &HttpRequest) -> bool {
@@ -1405,12 +1343,7 @@ impl WebChannel {
         self.register_websocket_subscriber(&session_state, event_tx);
         write_websocket_json(
             &mut stream,
-            &websocket_subscription_ack(
-                &session_state,
-                &message_summary,
-                "subscribed",
-                self.active_turn_progress_for_state(&session_state),
-            ),
+            &websocket_subscription_ack(&session_state, &message_summary, "subscribed"),
         )?;
         let mut last_heartbeat = Instant::now();
 
@@ -1471,21 +1404,6 @@ impl WebChannel {
         if remove_key {
             subscribers.remove(platform_chat_id);
         }
-    }
-
-    fn active_turn_progress_for_state(&self, metadata: &ConversationMetadata) -> Option<Value> {
-        let mut value = self
-            .active_turn_progress
-            .lock()
-            .ok()
-            .and_then(|progress| progress.get(&metadata.platform_chat_id).cloned())?;
-        if let Value::Object(map) = &mut value {
-            map.entry("conversation_id".to_string())
-                .or_insert_with(|| Value::String(metadata.conversation_id.clone()));
-            map.entry("platform_chat_id".to_string())
-                .or_insert_with(|| Value::String(metadata.platform_chat_id.clone()));
-        }
-        Some(value)
     }
 
     fn conversation_seen(&self, conversation_id: &str) -> Option<ConversationSeen> {
@@ -2301,19 +2219,6 @@ impl Channel for WebChannel {
         Ok(())
     }
 
-    fn send_status(&self, status: &OutgoingStatus) -> Result<()> {
-        self.logger.info(
-            "web_status_delivery",
-            json!({
-                "channel_id": status.channel_id,
-                "platform_chat_id": status.platform_chat_id,
-                "conversation_id": status.conversation_id,
-            }),
-        );
-        self.publish_conversation_upserted_for_platform_chat(&status.platform_chat_id);
-        Ok(())
-    }
-
     fn send_error(&self, error: &OutgoingError) -> Result<()> {
         self.logger.warn(
             "web_error_delivery",
@@ -2360,49 +2265,6 @@ impl Channel for WebChannel {
             }),
         );
         self.publish_conversation_processing(platform_chat_id, state);
-        Ok(())
-    }
-
-    fn update_progress_feedback(&self, feedback: &OutgoingProgressFeedback) -> Result<()> {
-        self.logger.info(
-            "web_progress",
-            json!({
-                "channel_id": feedback.channel_id,
-                "platform_chat_id": feedback.platform_chat_id,
-                "turn_id": feedback.turn_id,
-                "phase": feedback.progress.phase,
-                "final_state": feedback.final_state.map(|state| format!("{state:?}")),
-            }),
-        );
-        let payload = turn_progress_payload(feedback);
-        if let Ok(mut progress) = self.active_turn_progress.lock() {
-            if feedback.final_state.is_some() {
-                progress.remove(&feedback.platform_chat_id);
-            } else {
-                progress.insert(feedback.platform_chat_id.clone(), payload.clone());
-            }
-        }
-        self.publish_websocket_event(&feedback.platform_chat_id, payload);
-        if feedback.final_state.is_some() {
-            self.publish_conversation_turn_completed(
-                &feedback.platform_chat_id,
-                Some(&feedback.turn_id),
-                feedback.final_state,
-            );
-        }
-        Ok(())
-    }
-
-    fn conversation_updated(&self, platform_chat_id: &str, conversation_id: &str) -> Result<()> {
-        self.logger.info(
-            "web_conversation_updated",
-            json!({
-                "channel_id": self.id,
-                "platform_chat_id": platform_chat_id,
-                "conversation_id": conversation_id,
-            }),
-        );
-        self.publish_conversation_upserted_for_platform_chat(platform_chat_id);
         Ok(())
     }
 
@@ -4256,7 +4118,6 @@ fn websocket_subscription_ack(
     metadata: &ConversationMetadata,
     message_summary: &ConversationMessageSummary,
     reason: &'static str,
-    turn_progress: Option<Value>,
 ) -> Value {
     json!({
         "type": "subscription_ack",
@@ -4266,7 +4127,6 @@ fn websocket_subscription_ack(
         "current_message_id": message_summary.last_message_id.clone(),
         "next_message_index": message_summary.message_count,
         "total": message_summary.message_count,
-        "turn_progress": turn_progress,
     })
 }
 
@@ -4694,29 +4554,6 @@ fn processing_state_name(state: ProcessingState) -> &'static str {
     }
 }
 
-fn turn_progress_payload(feedback: &OutgoingProgressFeedback) -> Value {
-    json!({
-        "type": "turn_progress",
-        "turn_id": &feedback.turn_id,
-        "phase": feedback.progress.phase,
-        "model": &feedback.progress.model,
-        "activity": &feedback.progress.activity,
-        "hint": &feedback.progress.hint,
-        "plan": &feedback.progress.plan,
-        "error": &feedback.progress.error,
-        "progress": &feedback.progress,
-        "final_state": feedback.final_state.map(progress_final_state_name),
-        "important": feedback.important,
-    })
-}
-
-fn progress_final_state_name(state: ProgressFeedbackFinalState) -> &'static str {
-    match state {
-        ProgressFeedbackFinalState::Done => "done",
-        ProgressFeedbackFinalState::Failed => "failed",
-    }
-}
-
 fn file_attachment_kind_name(file: &FileItem) -> &'static str {
     let media_type = file.media_type.as_deref().unwrap_or_default();
     if media_type.starts_with("image/") {
@@ -5090,10 +4927,6 @@ mod tests {
 
     use std::{collections::BTreeMap, fs};
 
-    use crate::channels::types::{
-        TurnProgress, TurnProgressPhase, TurnProgressPlan, TurnProgressPlanItem,
-        TurnProgressPlanItemStatus,
-    };
     use stellaclaw_core::session_actor::{ChatMessageItem, ContextItem, TokenUsageCost};
 
     fn test_workdir(name: &str) -> PathBuf {
@@ -5219,46 +5052,6 @@ mod tests {
             TerminalWebSocketEvent::JsonPing
         ));
         assert!(parse_terminal_websocket_control(r#"{"type":"resize","cols":120}"#).is_err());
-    }
-
-    #[test]
-    fn turn_progress_payload_is_structured() {
-        let feedback = OutgoingProgressFeedback {
-            channel_id: "web-main".to_string(),
-            platform_chat_id: "test-chat".to_string(),
-            turn_id: "turn-1".to_string(),
-            progress: TurnProgress {
-                phase: TurnProgressPhase::Working,
-                model: "gpt-5.5".to_string(),
-                activity: "读取代码".to_string(),
-                hint: Some("发送新消息可打断".to_string()),
-                plan: Some(TurnProgressPlan {
-                    explanation: Some("先确认链路".to_string()),
-                    items: vec![TurnProgressPlanItem {
-                        step: "检查 ChannelEvent".to_string(),
-                        status: TurnProgressPlanItemStatus::InProgress,
-                    }],
-                }),
-                error: None,
-            },
-            final_state: None,
-            important: true,
-        };
-
-        let payload = turn_progress_payload(&feedback);
-
-        assert_eq!(payload["type"], "turn_progress");
-        assert!(payload.get("subscription").is_none());
-        assert_eq!(payload["turn_id"], "turn-1");
-        assert_eq!(payload["phase"], "working");
-        assert_eq!(payload["model"], "gpt-5.5");
-        assert_eq!(payload["activity"], "读取代码");
-        assert_eq!(payload["hint"], "发送新消息可打断");
-        assert_eq!(payload["final_state"], serde_json::Value::Null);
-        assert_eq!(payload["important"], true);
-        assert_eq!(payload["plan"]["items"][0]["status"], "in_progress");
-        assert_eq!(payload["progress"]["phase"], "working");
-        assert!(payload.get("text").is_none());
     }
 
     #[test]
@@ -5442,12 +5235,7 @@ mod tests {
             last_message_id: Some("msg_3".to_string()),
             last_message_time: None,
         };
-        let payload = websocket_subscription_ack(
-            &state,
-            &summary,
-            "subscribed",
-            Some(json!({"type": "turn_progress", "turn_id": "turn-1"})),
-        );
+        let payload = websocket_subscription_ack(&state, &summary, "subscribed");
 
         assert_eq!(payload["type"], "subscription_ack");
         assert!(payload.get("subscription").is_none());
@@ -5456,18 +5244,16 @@ mod tests {
         assert!(payload.get("next_message_id").is_none());
         assert_eq!(payload["next_message_index"], 3);
         assert_eq!(payload["session_id"], "web-main-test-ws-ack.foreground");
-        assert_eq!(payload["turn_progress"]["turn_id"], "turn-1");
 
         let empty = websocket_subscription_ack(
             &state,
             &ConversationMessageSummary::default(),
             "subscribed",
-            None,
         );
         assert!(empty["current_message_id"].is_null());
         assert!(empty.get("next_message_id").is_none());
         assert_eq!(empty["next_message_index"], 0);
-        assert!(empty["turn_progress"].is_null());
+        assert!(empty.get("turn_progress").is_none());
     }
 
     #[test]
