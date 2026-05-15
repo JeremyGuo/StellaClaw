@@ -1,4 +1,4 @@
-import { ChevronDown, ChevronRight, Folder, Plus, Search, Settings } from 'lucide-react';
+import { Folder, FolderOpen, Plus, Search, Settings } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import * as ContextMenu from '@radix-ui/react-context-menu';
 import { conversationKey, displayConversationName, displayForegroundSessionName, foregroundSessions } from '../lib/api';
@@ -203,7 +203,7 @@ export function ConversationBar({
         <ContextMenu.Root>
           <ContextMenu.Trigger asChild>
             <button
-              className="conversation-folder-row"
+              className={`conversation-folder-row${open ? ' open' : ''}`}
               type="button"
               onClick={() => updateOpenFolders((current) => {
                 const next = new Set(current);
@@ -213,8 +213,9 @@ export function ConversationBar({
               })}
               aria-expanded={open}
             >
-              {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-              <Folder size={15} />
+              {open
+                ? <FolderOpen className="conversation-folder-icon" size={16} strokeWidth={1.8} />
+                : <Folder className="conversation-folder-icon" size={16} strokeWidth={1.8} />}
               <span>{displayConversationName(conversation)}</span>
               <span
                 className="conversation-folder-action"
@@ -254,11 +255,11 @@ export function ConversationBar({
             </ContextMenu.Content>
           </ContextMenu.Portal>
         </ContextMenu.Root>
-        {open && (
-          <div className="conversation-folder-list">
+        <div className={`conversation-folder-list${open ? ' open' : ''}`} aria-hidden={!open}>
+          <div className="conversation-folder-list-inner">
             {sessions.map((session) => renderSession(conversation, session, hidden))}
           </div>
-        )}
+        </div>
       </section>
     );
   };
@@ -285,21 +286,22 @@ export function ConversationBar({
         {hiddenConversations.length > 0 && (
           <section className="conversation-folder">
             <button
-              className="conversation-folder-row"
+              className={`conversation-folder-row${hiddenOpen ? ' open' : ''}`}
               type="button"
               onClick={() => setHiddenOpen((value) => !value)}
               aria-expanded={hiddenOpen}
             >
-              {hiddenOpen ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-              <Folder size={14} />
+              {hiddenOpen
+                ? <FolderOpen className="conversation-folder-icon" size={16} strokeWidth={1.8} />
+                : <Folder className="conversation-folder-icon" size={16} strokeWidth={1.8} />}
               <span>已隐藏</span>
               <em>{hiddenConversations.length}</em>
             </button>
-            {hiddenOpen && (
-              <div className="conversation-folder-list">
+            <div className={`conversation-folder-list${hiddenOpen ? ' open' : ''}`} aria-hidden={!hiddenOpen}>
+              <div className="conversation-folder-list-inner">
                 {hiddenConversations.map((conversation) => renderConversation(conversation, true))}
               </div>
-            )}
+            </div>
           </section>
         )}
       </div>

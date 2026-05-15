@@ -811,7 +811,7 @@ button {
 .conversation-folder-row {
   display: grid;
   min-width: 0;
-  grid-template-columns: auto auto minmax(0, 1fr) 24px;
+  grid-template-columns: auto minmax(0, 1fr) 24px;
   align-items: center;
   gap: 7px;
   min-height: 32px;
@@ -822,6 +822,20 @@ button {
   color: var(--muted);
   text-align: left;
   cursor: pointer;
+}
+
+.conversation-folder-icon {
+  color: var(--faint);
+  transition: color 160ms ease, transform 180ms ease;
+}
+
+.conversation-folder-row.open .conversation-folder-icon {
+  color: var(--muted);
+  transform: translateY(-1px) scale(1.04);
+}
+
+.conversation-folder-row:hover .conversation-folder-icon {
+  color: var(--text);
 }
 
 .conversation-folder[draggable="true"] .conversation-folder-row {
@@ -870,7 +884,25 @@ button {
 
 .conversation-folder-list {
   display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transform: translateY(-3px);
+  transition: grid-template-rows 180ms ease, opacity 150ms ease, transform 180ms ease;
+  visibility: hidden;
+}
+
+.conversation-folder-list.open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+  transform: translateY(0);
+  visibility: visible;
+}
+
+.conversation-folder-list-inner {
+  display: grid;
+  min-height: 0;
   gap: 4px;
+  overflow: hidden;
 }
 
 .conversation-row.session-row {
