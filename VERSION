@@ -3,6 +3,9 @@ version: 1.27.0
 
 # 1.27.0
 
+- 修复 Web workspace / file API 在 Channel 重启后的响应订阅：
+  WebChannel 发起 workspace list/read/write/upload/download 请求时仍按 `WebChannel -> ChannelService -> WorkspaceService` 路径走，但现在由 HostRuntime 在发送 Channel ingress 的同时建立事件订阅；如果发现 main Channel ingress 已关闭，会重启 conversation、重新订阅新 Channel 的事件后再重试请求，避免请求已经发到新 Channel、HTTP 却仍等待旧订阅而超时。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 修复 AgentSession bridge 响应分发串服务：
   `ServiceCall` 新增可选 `request_id` / `response_id` correlation 字段；AgentSessionService 发起 memory / skill / tool_binary / cron / kernel bridge 子请求时写入 `request_id` 并记录 pending 请求类型，各服务回复时回填 `response_id`，AgentSessionService 再按 `response_id` 找回原始 pending 请求和协议类型，避免 `{"type":"accepted"}` 这类通用响应被 memory response 误吞，导致 `cron_task_create` 已创建任务但前台 turn 永久卡在 open tool call。本次不改变 `config` schema，不改变 `workdir` schema。
 

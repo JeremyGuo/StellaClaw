@@ -224,6 +224,46 @@ impl ConversationHostRuntime {
         &self,
         conversation_id: &str,
     ) -> Result<Receiver<crate::service_protos::channel::ChannelEvent>> {
+        let (_, rx) = self.main_channel_sender_and_subscription(conversation_id)?;
+        Ok(rx)
+    }
+
+    pub fn send_main_channel_ingress_subscribed(
+        &self,
+        conversation_id: &str,
+        ingress: crate::service_protos::channel::ChannelIngress,
+    ) -> Result<Receiver<crate::service_protos::channel::ChannelEvent>> {
+        self.ensure_conversation_started(conversation_id)?;
+        let (sender, rx) = self.main_channel_sender_and_subscription(conversation_id)?;
+        match sender.send(ingress) {
+            Ok(()) => Ok(rx),
+            Err(crossbeam_channel::SendError(ingress)) => {
+                self.logger.warn(
+                    "conversation_channel_ingress_closed",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "action": "restart_resubscribe_and_retry",
+                    }),
+                );
+                self.restart_conversation(conversation_id, "main channel ingress closed")?;
+                let (sender, rx) = self.main_channel_sender_and_subscription(conversation_id)?;
+                sender.send(ingress).map_err(|_| {
+                    anyhow!(
+                        "conversation {conversation_id} channel ingress is closed after restart"
+                    )
+                })?;
+                Ok(rx)
+            }
+        }
+    }
+
+    fn main_channel_sender_and_subscription(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(
+        Sender<crate::service_protos::channel::ChannelIngress>,
+        Receiver<crate::service_protos::channel::ChannelEvent>,
+    )> {
         let conversations = self
             .conversations
             .lock()
@@ -237,7 +277,7 @@ impl ConversationHostRuntime {
             .lock()
             .map_err(|_| anyhow!("conversation event subscriber lock poisoned"))?
             .push(tx);
-        Ok(rx)
+        Ok((conversation.main_channel_ingress_tx.clone(), rx))
     }
 }
 
@@ -318,7 +358,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        conversation_new::ConversationRuntimeConfig, service_protos::channel::ChannelIngress,
+        conversation_new::ConversationRuntimeConfig,
+        service_protos::channel::{ChannelEvent, ChannelIngress},
     };
 
     #[test]
@@ -361,6 +402,74 @@ mod tests {
                 },
             )
             .expect("closed ingress is restarted and retried");
+        runtime
+            .stop_conversation(conversation_id, "test finished")
+            .expect("conversation stops");
+    }
+
+    #[test]
+    fn subscribed_ingress_resubscribes_after_restart() {
+        let workdir = test_workdir("closed_ingress_subscribed");
+        fs::create_dir_all(&workdir).expect("test workdir can be created");
+        let conversation_id = "web-main-test";
+        let conversation_ref = ConversationRef {
+            conversation_id: conversation_id.to_string(),
+            workdir: workdir.clone(),
+            conversation_root: workdir.join("conversations").join(conversation_id),
+        };
+        let runtime = ConversationHostRuntime {
+            workdir: workdir.clone(),
+            default_runtime_config: ConversationRuntimeConfig::for_conversation(&conversation_ref),
+            logger: Arc::new(
+                StellaclawLogger::open_under(&workdir, "test.log").expect("logger opens"),
+            ),
+            conversations: Mutex::new(HashMap::new()),
+        };
+        runtime
+            .ensure_conversation_started(conversation_id)
+            .expect("conversation starts");
+
+        let (closed_tx, closed_rx) = crossbeam_channel::unbounded();
+        drop(closed_rx);
+        runtime
+            .conversations
+            .lock()
+            .expect("registry lock")
+            .get_mut(conversation_id)
+            .expect("conversation is hosted")
+            .main_channel_ingress_tx = closed_tx;
+
+        let rx = runtime
+            .send_main_channel_ingress_subscribed(
+                conversation_id,
+                ChannelIngress::QueryForegroundStatus {
+                    foreground_session_id: None,
+                },
+            )
+            .expect("closed ingress is restarted and request is resubscribed");
+        let event = ChannelEvent::Status {
+            label: "probe".to_string(),
+            detail: serde_json::json!({}),
+        };
+        let subscriber = {
+            let conversations = runtime.conversations.lock().expect("registry lock");
+            let conversation = conversations
+                .get(conversation_id)
+                .expect("conversation is hosted after restart");
+            let subscriber = conversation
+                .main_channel_event_subscribers
+                .lock()
+                .expect("subscriber lock")
+                .last()
+                .cloned()
+                .expect("new subscriber exists");
+            subscriber
+        };
+        subscriber.send(event).expect("probe event sends");
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Ok(ChannelEvent::Status { label, .. }) if label == "probe"
+        ));
         runtime
             .stop_conversation(conversation_id, "test finished")
             .expect("conversation stops");

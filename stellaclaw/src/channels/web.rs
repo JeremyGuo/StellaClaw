@@ -1990,16 +1990,10 @@ impl WebChannel {
         request: WorkspaceRequest,
     ) -> ApiResult<WorkspaceResponse> {
         self.load_web_state(conversation_id)?;
-        self.conversation_runtime
-            .ensure_conversation_started(conversation_id)
-            .map_err(ApiError::internal)?;
+        let request_id = web_request_id("workspace");
         let event_rx = self
             .conversation_runtime
-            .subscribe_main_channel_events(conversation_id)
-            .map_err(ApiError::internal)?;
-        let request_id = web_request_id("workspace");
-        self.conversation_runtime
-            .send_main_channel_ingress(
+            .send_main_channel_ingress_subscribed(
                 conversation_id,
                 ChannelIngress::Workspace {
                     request_id: request_id.clone(),
