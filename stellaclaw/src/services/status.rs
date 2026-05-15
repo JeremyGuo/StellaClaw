@@ -48,6 +48,7 @@ impl ConversationService for StatusService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(response)?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Ok(StatusRequest::Observe { .. }) => {
@@ -55,6 +56,7 @@ impl ConversationService for StatusService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(StatusResponse::Accepted)?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Err(error) => {
@@ -140,10 +142,7 @@ fn reply(
     source: &crate::conversation_new::ServiceAddr,
     target: &crate::conversation_new::ServiceAddr,
     payload: serde_json::Value,
+    response_id: Option<String>,
 ) -> ServiceCall {
-    ServiceCall {
-        source: source.clone(),
-        target: target.clone(),
-        payload,
-    }
+    ServiceCall::response_to(source.clone(), target.clone(), payload, response_id)
 }

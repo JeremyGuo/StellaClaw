@@ -42,12 +42,12 @@ pub fn apply_call(
     name: impl Into<String>,
     value: Value,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(ControlRequest::Apply {
+        encode_request(ControlRequest::Apply {
             name: name.into(),
             value,
         })?,
-    })
+    ))
 }

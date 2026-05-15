@@ -108,11 +108,11 @@ pub fn decode_response(payload: Value) -> Result<MemoryResponse> {
 }
 
 pub fn memory_call(source: ServiceAddr, request: MemoryRequest) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
-        target: ServiceAddr::memory(),
-        payload: encode_request(request)?,
-    })
+        ServiceAddr::memory(),
+        encode_request(request)?,
+    ))
 }
 
 pub fn search_call(

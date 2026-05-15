@@ -87,6 +87,7 @@ impl ConversationService for CronService {
                                     &ctx.addr,
                                     &call.source,
                                     encode_response(CronResponse::Rejected { reason })?,
+                                    call.request_id.clone(),
                                 )))?;
                                 continue;
                             }
@@ -107,6 +108,7 @@ impl ConversationService for CronService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(CronResponse::Accepted)?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Ok(CronRequest::UpdateTask { task_id, patch }) => {
@@ -117,6 +119,7 @@ impl ConversationService for CronService {
                                         &ctx.addr,
                                         &call.source,
                                         encode_response(CronResponse::Task { task: Some(task) })?,
+                                        call.request_id.clone(),
                                     )))?;
                                 }
                                 Err(reason) => {
@@ -124,6 +127,7 @@ impl ConversationService for CronService {
                                         &ctx.addr,
                                         &call.source,
                                         encode_response(CronResponse::Rejected { reason })?,
+                                        call.request_id.clone(),
                                     )))?;
                                 }
                             }
@@ -136,6 +140,7 @@ impl ConversationService for CronService {
                                         &ctx.addr,
                                         &call.source,
                                         encode_response(CronResponse::Task { task })?,
+                                        call.request_id.clone(),
                                     )))?;
                                 }
                                 Err(reason) => {
@@ -143,6 +148,7 @@ impl ConversationService for CronService {
                                         &ctx.addr,
                                         &call.source,
                                         encode_response(CronResponse::Rejected { reason })?,
+                                        call.request_id.clone(),
                                     )))?;
                                 }
                             }
@@ -164,6 +170,7 @@ impl ConversationService for CronService {
                                     &ctx.addr,
                                     &call.source,
                                     encode_response(CronResponse::Accepted)?,
+                                    call.request_id.clone(),
                                 )))?;
                             }
                         }
@@ -178,6 +185,7 @@ impl ConversationService for CronService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(CronResponse::Tasks { tasks: task_list })?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Ok(CronRequest::GetTaskStatus { task_id, owner }) => {
@@ -197,6 +205,7 @@ impl ConversationService for CronService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(CronResponse::TaskStatus { status })?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Ok(CronRequest::TriggerTaskNow { task_id }) => {
@@ -215,6 +224,7 @@ impl ConversationService for CronService {
                                     encode_response(CronResponse::Rejected {
                                         reason: "unknown task".to_string(),
                                     })?,
+                                    call.request_id.clone(),
                                 )))?;
                                 continue;
                             };
@@ -224,6 +234,7 @@ impl ConversationService for CronService {
                                     &ctx.addr,
                                     &call.source,
                                     encode_response(CronResponse::Rejected { reason })?,
+                                    call.request_id.clone(),
                                 )))?;
                                 continue;
                             }
@@ -233,6 +244,7 @@ impl ConversationService for CronService {
                                     &ctx.addr,
                                     &call.source,
                                     encode_response(CronResponse::Rejected { reason })?,
+                                    call.request_id.clone(),
                                 )))?;
                                 continue;
                             }
@@ -253,6 +265,7 @@ impl ConversationService for CronService {
                                     &ctx.addr,
                                     &call.source,
                                     encode_response(CronResponse::Rejected { reason })?,
+                                    call.request_id.clone(),
                                 )))?;
                                 continue;
                             }
@@ -270,6 +283,7 @@ impl ConversationService for CronService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(CronResponse::Accepted)?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Ok(CronRequest::AgentSessionEvent { session_addr, event }) => {
@@ -765,12 +779,9 @@ fn reply(
     source: &crate::conversation_new::ServiceAddr,
     target: &crate::conversation_new::ServiceAddr,
     payload: serde_json::Value,
+    response_id: Option<String>,
 ) -> ServiceCall {
-    ServiceCall {
-        source: source.clone(),
-        target: target.clone(),
-        payload,
-    }
+    ServiceCall::response_to(source.clone(), target.clone(), payload, response_id)
 }
 
 fn cron_task_message(task: &CronTaskRegistration) -> stellaclaw_core::session_actor::ChatMessage {

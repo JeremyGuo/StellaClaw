@@ -166,11 +166,11 @@ pub fn update_runtime_config_call(
     target: ServiceAddr,
     config: ConversationRuntimeConfig,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(TerminalRequest::UpdateRuntimeConfig { config })?,
-    })
+        encode_request(TerminalRequest::UpdateRuntimeConfig { config })?,
+    ))
 }
 
 pub fn terminal_call(
@@ -178,9 +178,5 @@ pub fn terminal_call(
     target: ServiceAddr,
     request: TerminalRequest,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
-        source,
-        target,
-        payload: encode_request(request)?,
-    })
+    Ok(ServiceCall::new(source, target, encode_request(request)?))
 }

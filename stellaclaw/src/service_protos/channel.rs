@@ -227,11 +227,11 @@ pub fn deliver_call(
     channel: ServiceAddr,
     delivery: ChannelDelivery,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
-        target: channel,
-        payload: encode_request(ChannelRequest::Deliver { delivery })?,
-    })
+        channel,
+        encode_request(ChannelRequest::Deliver { delivery })?,
+    ))
 }
 
 pub fn session_event_call(
@@ -239,14 +239,14 @@ pub fn session_event_call(
     channel: ServiceAddr,
     event: AgentSessionEvent,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
-        source: source.clone(),
-        target: channel,
-        payload: encode_request(ChannelRequest::SessionEvent {
+    Ok(ServiceCall::new(
+        source.clone(),
+        channel,
+        encode_request(ChannelRequest::SessionEvent {
             session_addr: source,
             event,
         })?,
-    })
+    ))
 }
 
 pub fn error_call(
@@ -256,13 +256,13 @@ pub fn error_call(
     message: impl Into<String>,
     detail: Option<String>,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
-        target: channel,
-        payload: encode_request(ChannelRequest::Error {
+        channel,
+        encode_request(ChannelRequest::Error {
             code: code.into(),
             message: message.into(),
             detail,
         })?,
-    })
+    ))
 }

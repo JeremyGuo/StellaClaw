@@ -64,6 +64,7 @@ impl ConversationService for WorkspaceService {
                                 encode_response(WorkspaceResponse::Root {
                                     path: workspace_root(&ctx, &runtime_config),
                                 })?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Ok(WorkspaceRequest::RegisterAttachment { uri }) => {
@@ -71,6 +72,7 @@ impl ConversationService for WorkspaceService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(WorkspaceResponse::AttachmentRegistered { uri })?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Ok(WorkspaceRequest::MaterializeMessage { message }) => {
@@ -79,6 +81,7 @@ impl ConversationService for WorkspaceService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(WorkspaceResponse::MessageMaterialized { message })?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Ok(WorkspaceRequest::MaterializeFiles { files }) => {
@@ -87,6 +90,7 @@ impl ConversationService for WorkspaceService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(WorkspaceResponse::FilesMaterialized { files })?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Ok(WorkspaceRequest::UpdateRuntimeConfig { config }) => {
@@ -109,6 +113,7 @@ impl ConversationService for WorkspaceService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(response)?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Ok(WorkspaceRequest::ReadFile {
@@ -129,6 +134,7 @@ impl ConversationService for WorkspaceService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(response)?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Ok(WorkspaceRequest::WriteFile {
@@ -153,6 +159,7 @@ impl ConversationService for WorkspaceService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(response)?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Ok(WorkspaceRequest::DeletePath { path, target }) => {
@@ -166,6 +173,7 @@ impl ConversationService for WorkspaceService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(response)?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Ok(WorkspaceRequest::MovePath {
@@ -184,6 +192,7 @@ impl ConversationService for WorkspaceService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(response)?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Ok(WorkspaceRequest::UploadArchive {
@@ -204,6 +213,7 @@ impl ConversationService for WorkspaceService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(response)?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Ok(WorkspaceRequest::DownloadArchive { paths, target }) => {
@@ -217,6 +227,7 @@ impl ConversationService for WorkspaceService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(response)?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Err(error) => {
@@ -1411,12 +1422,9 @@ fn reply(
     source: &crate::conversation_new::ServiceAddr,
     target: &crate::conversation_new::ServiceAddr,
     payload: serde_json::Value,
+    response_id: Option<String>,
 ) -> ServiceCall {
-    ServiceCall {
-        source: source.clone(),
-        target: target.clone(),
-        payload,
-    }
+    ServiceCall::response_to(source.clone(), target.clone(), payload, response_id)
 }
 
 #[cfg(test)]

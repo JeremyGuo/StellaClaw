@@ -4,7 +4,7 @@ version: 1.27.0
 # 1.27.0
 
 - 修复 AgentSession bridge 响应分发串服务：
-  AgentSessionService 处理 memory / skill / tool_binary / cron / kernel 等服务响应时改为优先根据 `ServiceCall.source` 选择对应协议，再保留旧的未知来源兼容探测，避免 `{"type":"accepted"}` 这类通用响应被 memory response 误吞，导致 `cron_task_create` 已创建任务但前台 turn 永久卡在 open tool call。本次不改变 `config` schema，不改变 `workdir` schema。
+  `ServiceCall` 新增可选 `request_id` / `response_id` correlation 字段；AgentSessionService 发起 memory / skill / tool_binary / cron / kernel bridge 子请求时写入 `request_id` 并记录 pending 请求类型，各服务回复时回填 `response_id`，AgentSessionService 再按 `response_id` 找回原始 pending 请求和协议类型，避免 `{"type":"accepted"}` 这类通用响应被 memory response 误吞，导致 `cron_task_create` 已创建任务但前台 turn 永久卡在 open tool call。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 补齐 Web / StellaCodeX 多 foreground session 会话支持：
   `ChannelIngress` 的前台消息、状态查询、cancel / continue / compact、host coordination resolve 和删除前台 session 等操作都带上可选 `foreground_session_id`，Web API 新增按 Conversation 管理、列出、创建、重命名、删除 foreground session 以及按 session 拉取消息 / 建立 websocket 的接口；Web seen 状态改为按 foreground session 记录，conversation stream 会返回每个 foreground session 的摘要。StellaCodeX Electron 的 Conversation Bar 改成文件夹 + 子对话结构，发送消息、实时 websocket、消息分页、已读和标题状态都按选中的 foreground session 走，保留 workspace / terminal 的 Conversation 级共享语义。本次不改变 `config` schema，不改变 `workdir` schema。

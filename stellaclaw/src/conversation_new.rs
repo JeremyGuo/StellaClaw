@@ -177,10 +177,53 @@ impl fmt::Display for ServiceAddr {
 pub struct ServiceCall {
     pub source: ServiceAddr,
     pub target: ServiceAddr,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
     pub payload: Value,
 }
 
 impl ServiceCall {
+    pub fn new(source: ServiceAddr, target: ServiceAddr, payload: Value) -> Self {
+        Self {
+            source,
+            target,
+            request_id: None,
+            response_id: None,
+            payload,
+        }
+    }
+
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+
+    pub fn response_to(
+        source: ServiceAddr,
+        target: ServiceAddr,
+        payload: Value,
+        response_id: Option<String>,
+    ) -> Self {
+        Self {
+            source,
+            target,
+            request_id: None,
+            response_id,
+            payload,
+        }
+    }
+
+    pub fn response_to_call(source: ServiceAddr, request: &ServiceCall, payload: Value) -> Self {
+        Self::response_to(
+            source,
+            request.source.clone(),
+            payload,
+            request.request_id.clone(),
+        )
+    }
+
     pub fn channel_target() -> ServiceAddr {
         ServiceAddr::channel()
     }
@@ -968,6 +1011,7 @@ impl ConversationKernel {
     }
 
     fn handle_kernel_call(&mut self, call: ServiceCall) -> Result<()> {
+        let response_id = call.request_id.clone();
         match decode_kernel_request(call.payload) {
             Ok(KernelRequest::CreateAgentSession { kind, id, binding }) => {
                 let source = call.source;
@@ -978,68 +1022,76 @@ impl ConversationKernel {
                             source,
                             "permission_denied",
                             format!("source is not allowed to create this agent session: {error}"),
+                            response_id,
                         );
                     }
                 };
-                self.dispatch_call(ServiceCall {
-                    source: ServiceAddr::kernel(),
-                    target: source,
-                    payload: encode_response(KernelResponse::AgentSessionCreated { addr })?,
-                })
+                self.dispatch_call(ServiceCall::response_to(
+                    ServiceAddr::kernel(),
+                    source,
+                    encode_response(KernelResponse::AgentSessionCreated { addr })?,
+                    response_id,
+                ))
             }
             Ok(KernelRequest::StopService { addr, reason }) => {
                 self.stop_service(
                     &addr,
                     reason.unwrap_or_else(|| "kernel stop request".to_string()),
                 )?;
-                self.dispatch_call(ServiceCall {
-                    source: ServiceAddr::kernel(),
-                    target: call.source,
-                    payload: encode_response(KernelResponse::ServiceStopped { addr })?,
-                })
+                self.dispatch_call(ServiceCall::response_to(
+                    ServiceAddr::kernel(),
+                    call.source,
+                    encode_response(KernelResponse::ServiceStopped { addr })?,
+                    response_id,
+                ))
             }
             Ok(KernelRequest::UpdateRuntimeConfig { patch }) => {
                 self.apply_runtime_config_patch(patch);
                 self.persist_runtime_config()?;
                 let updated_services = self.broadcast_runtime_config_to_services()?;
-                self.dispatch_call(ServiceCall {
-                    source: ServiceAddr::kernel(),
-                    target: call.source,
-                    payload: encode_response(KernelResponse::RuntimeConfigUpdated {
+                self.dispatch_call(ServiceCall::response_to(
+                    ServiceAddr::kernel(),
+                    call.source,
+                    encode_response(KernelResponse::RuntimeConfigUpdated {
                         config: self.runtime_config.clone(),
                         updated_services,
                     })?,
-                })
+                    response_id,
+                ))
             }
-            Ok(KernelRequest::QueryMetadata) => self.dispatch_call(ServiceCall {
-                source: ServiceAddr::kernel(),
-                target: call.source,
-                payload: encode_response(KernelResponse::Metadata {
+            Ok(KernelRequest::QueryMetadata) => self.dispatch_call(ServiceCall::response_to(
+                ServiceAddr::kernel(),
+                call.source,
+                encode_response(KernelResponse::Metadata {
                     metadata: self.metadata.clone(),
                 })?,
-            }),
+                response_id,
+            )),
             Ok(KernelRequest::UpdateMetadata { patch }) => {
                 self.apply_metadata_patch(patch);
                 self.persist_metadata()?;
-                self.dispatch_call(ServiceCall {
-                    source: ServiceAddr::kernel(),
-                    target: call.source,
-                    payload: encode_response(KernelResponse::MetadataUpdated {
+                self.dispatch_call(ServiceCall::response_to(
+                    ServiceAddr::kernel(),
+                    call.source,
+                    encode_response(KernelResponse::MetadataUpdated {
                         metadata: self.metadata.clone(),
                     })?,
-                })
+                    response_id,
+                ))
             }
-            Ok(KernelRequest::ListServices) => self.dispatch_call(ServiceCall {
-                source: ServiceAddr::kernel(),
-                target: call.source,
-                payload: encode_response(KernelResponse::Services {
+            Ok(KernelRequest::ListServices) => self.dispatch_call(ServiceCall::response_to(
+                ServiceAddr::kernel(),
+                call.source,
+                encode_response(KernelResponse::Services {
                     addrs: self.service_addrs(),
                 })?,
-            }),
+                response_id,
+            )),
             Err(error) => self.reply_kernel_error(
                 call.source,
                 "bad_kernel_request",
                 format!("kernel request was not understood: {error}"),
+                response_id,
             ),
         }
     }
@@ -1049,15 +1101,17 @@ impl ConversationKernel {
         target: ServiceAddr,
         code: impl Into<String>,
         message: impl Into<String>,
+        response_id: Option<String>,
     ) -> Result<()> {
-        self.dispatch_call(ServiceCall {
-            source: ServiceAddr::kernel(),
+        self.dispatch_call(ServiceCall::response_to(
+            ServiceAddr::kernel(),
             target,
-            payload: encode_response(KernelResponse::Error {
+            encode_response(KernelResponse::Error {
                 code: code.into(),
                 message: message.into(),
             })?,
-        })
+            response_id,
+        ))
     }
 
     fn apply_runtime_config_patch(&mut self, patch: KernelRuntimeConfigPatch) {
@@ -1662,14 +1716,14 @@ mod tests {
             .expect("channel mounts");
 
         kernel
-            .dispatch_call(ServiceCall {
-                source: ServiceAddr::status(),
-                target: ServiceAddr::channel_id("scratch"),
-                payload: serde_json::json!({
+            .dispatch_call(ServiceCall::new(
+                ServiceAddr::status(),
+                ServiceAddr::channel_id("scratch"),
+                serde_json::json!({
                     "type": "not_a_channel_payload",
                     "debug": "should not kill kernel",
                 }),
-            })
+            ))
             .expect("bad payload reaches channel inbox");
         kernel
             .pump_for(Duration::from_millis(50))

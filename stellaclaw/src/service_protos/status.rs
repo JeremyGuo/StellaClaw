@@ -42,9 +42,5 @@ pub fn status_call(
     target: ServiceAddr,
     request: StatusRequest,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
-        source,
-        target,
-        payload: encode_request(request)?,
-    })
+    Ok(ServiceCall::new(source, target, encode_request(request)?))
 }

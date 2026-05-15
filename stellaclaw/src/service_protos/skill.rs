@@ -79,9 +79,9 @@ pub fn decode_response(payload: Value) -> Result<SkillResponse> {
 }
 
 pub fn skill_call(source: ServiceAddr, request: SkillRequest) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
-        target: ServiceAddr::skill(),
-        payload: encode_request(request)?,
-    })
+        ServiceAddr::skill(),
+        encode_request(request)?,
+    ))
 }

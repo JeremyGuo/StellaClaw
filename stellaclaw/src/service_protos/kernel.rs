@@ -113,15 +113,15 @@ pub fn create_agent_session_call(
     kind: AgentSessionKind,
     id: Option<String>,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
-        target: ServiceAddr::kernel(),
-        payload: encode_request(KernelRequest::CreateAgentSession {
+        ServiceAddr::kernel(),
+        encode_request(KernelRequest::CreateAgentSession {
             kind,
             id,
             binding: None,
         })?,
-    })
+    ))
 }
 
 pub fn create_agent_session_with_binding_call(
@@ -130,15 +130,15 @@ pub fn create_agent_session_with_binding_call(
     id: Option<String>,
     binding: AgentSessionBinding,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
-        target: ServiceAddr::kernel(),
-        payload: encode_request(KernelRequest::CreateAgentSession {
+        ServiceAddr::kernel(),
+        encode_request(KernelRequest::CreateAgentSession {
             kind,
             id,
             binding: Some(binding),
         })?,
-    })
+    ))
 }
 
 pub fn stop_service_call(
@@ -146,39 +146,39 @@ pub fn stop_service_call(
     addr: ServiceAddr,
     reason: Option<String>,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
-        target: ServiceAddr::kernel(),
-        payload: encode_request(KernelRequest::StopService { addr, reason })?,
-    })
+        ServiceAddr::kernel(),
+        encode_request(KernelRequest::StopService { addr, reason })?,
+    ))
 }
 
 pub fn update_runtime_config_call(
     source: ServiceAddr,
     patch: KernelRuntimeConfigPatch,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
-        target: ServiceAddr::kernel(),
-        payload: encode_request(KernelRequest::UpdateRuntimeConfig { patch })?,
-    })
+        ServiceAddr::kernel(),
+        encode_request(KernelRequest::UpdateRuntimeConfig { patch })?,
+    ))
 }
 
 pub fn query_metadata_call(source: ServiceAddr) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
-        target: ServiceAddr::kernel(),
-        payload: encode_request(KernelRequest::QueryMetadata)?,
-    })
+        ServiceAddr::kernel(),
+        encode_request(KernelRequest::QueryMetadata)?,
+    ))
 }
 
 pub fn update_metadata_call(
     source: ServiceAddr,
     patch: KernelMetadataPatch,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
-        target: ServiceAddr::kernel(),
-        payload: encode_request(KernelRequest::UpdateMetadata { patch })?,
-    })
+        ServiceAddr::kernel(),
+        encode_request(KernelRequest::UpdateMetadata { patch })?,
+    ))
 }

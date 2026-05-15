@@ -37,6 +37,7 @@ impl ConversationService for ControlService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(ControlResponse::Accepted)?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Ok(ControlRequest::Query { name }) => {
@@ -47,6 +48,7 @@ impl ConversationService for ControlService {
                                     name,
                                     value: serde_json::Value::Null,
                                 })?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Err(error) => {
@@ -66,10 +68,7 @@ fn reply(
     source: &crate::conversation_new::ServiceAddr,
     target: &crate::conversation_new::ServiceAddr,
     payload: serde_json::Value,
+    response_id: Option<String>,
 ) -> ServiceCall {
-    ServiceCall {
-        source: source.clone(),
-        target: target.clone(),
-        payload,
-    }
+    ServiceCall::response_to(source.clone(), target.clone(), payload, response_id)
 }

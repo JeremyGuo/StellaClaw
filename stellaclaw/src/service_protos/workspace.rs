@@ -207,11 +207,11 @@ pub fn decode_response(payload: Value) -> Result<WorkspaceResponse> {
 }
 
 pub fn workspace_call(source: ServiceAddr, request: WorkspaceRequest) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
-        target: ServiceAddr::workspace(),
-        payload: encode_request(request)?,
-    })
+        ServiceAddr::workspace(),
+        encode_request(request)?,
+    ))
 }
 
 pub fn update_runtime_config_call(
@@ -219,9 +219,9 @@ pub fn update_runtime_config_call(
     target: ServiceAddr,
     config: ConversationRuntimeConfig,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(WorkspaceRequest::UpdateRuntimeConfig { config })?,
-    })
+        encode_request(WorkspaceRequest::UpdateRuntimeConfig { config })?,
+    ))
 }

@@ -53,6 +53,7 @@ impl ConversationService for TerminalService {
                                 &manager,
                                 &mut runtime_config,
                                 call.source,
+                                call.request_id.clone(),
                                 request,
                             ) {
                                 ctx.outbox.send(ServiceOutput::Failed(ServiceFailure {
@@ -69,6 +70,7 @@ impl ConversationService for TerminalService {
                                     code: "bad_terminal_request".to_string(),
                                     message: format!("{error:#}"),
                                 },
+                                call.request_id.clone(),
                             )?;
                         }
                     }
@@ -83,6 +85,7 @@ fn handle_request(
     manager: &TerminalManager,
     runtime_config: &mut ConversationRuntimeConfig,
     source: ServiceAddr,
+    response_id: Option<String>,
     request: TerminalRequest,
 ) -> Result<()> {
     let current_context = terminal_context(ctx, runtime_config);
@@ -97,7 +100,12 @@ fn handle_request(
                     "tool_remote_mode": runtime_config.tool_remote_mode,
                 }),
             }))?;
-            send_response(ctx, &source, TerminalResponse::RuntimeConfigUpdated)
+            send_response(
+                ctx,
+                &source,
+                TerminalResponse::RuntimeConfigUpdated,
+                response_id,
+            )
         }
         TerminalRequest::List => send_response(
             ctx,
@@ -105,20 +113,24 @@ fn handle_request(
             TerminalResponse::Terminals {
                 terminals: manager.list_for_context(&current_context),
             },
+            response_id,
         ),
         TerminalRequest::Get { terminal_id } => reply_terminal(
             ctx,
             &source,
+            response_id,
             manager.get_for_context(&current_context, &terminal_id),
         ),
         TerminalRequest::Create { request } => reply_terminal(
             ctx,
             &source,
+            response_id,
             manager.create_for_context(&current_context, request),
         ),
         TerminalRequest::Terminate { terminal_id } => reply_terminal(
             ctx,
             &source,
+            response_id,
             manager.terminate_for_context(&current_context, &terminal_id),
         ),
         TerminalRequest::Input {
@@ -129,6 +141,7 @@ fn handle_request(
             Ok(bytes) => reply_terminal(
                 ctx,
                 &source,
+                response_id,
                 manager.input_bytes_for_context(&current_context, &terminal_id, &bytes),
             ),
             Err(error) => send_response(
@@ -138,6 +151,7 @@ fn handle_request(
                     code: "invalid_terminal_input".to_string(),
                     message: format!("{error:#}"),
                 },
+                response_id,
             ),
         },
         TerminalRequest::Resize {
@@ -146,6 +160,7 @@ fn handle_request(
         } => reply_terminal(
             ctx,
             &source,
+            response_id,
             manager.resize_for_context(&current_context, &terminal_id, request),
         ),
         TerminalRequest::Replay {
@@ -158,8 +173,9 @@ fn handle_request(
                 TerminalResponse::Replay {
                     replay: replay_snapshot(replay),
                 },
+                response_id,
             ),
-            Err(error) => reply_error(ctx, &source, error),
+            Err(error) => reply_error(ctx, &source, response_id, error),
         },
         TerminalRequest::Attach {
             terminal_id,
@@ -182,9 +198,10 @@ fn handle_request(
                         replay: replay_snapshot(attach.replay),
                         subscriber_id,
                     },
+                    response_id,
                 )
             }
-            Err(error) => reply_error(ctx, &source, error),
+            Err(error) => reply_error(ctx, &source, response_id, error),
         },
         TerminalRequest::Detach {
             terminal_id,
@@ -197,8 +214,9 @@ fn handle_request(
                     terminal_id,
                     subscriber_id,
                 },
+                response_id,
             ),
-            Err(error) => reply_error(ctx, &source, error),
+            Err(error) => reply_error(ctx, &source, response_id, error),
         },
     }
 }
@@ -218,17 +236,24 @@ fn terminal_context(
 fn reply_terminal(
     ctx: &ServiceRunContext,
     target: &ServiceAddr,
+    response_id: Option<String>,
     result: Result<crate::channels::web_terminal::TerminalSummary, WebTerminalError>,
 ) -> Result<()> {
     match result {
-        Ok(terminal) => send_response(ctx, target, TerminalResponse::Terminal { terminal }),
-        Err(error) => reply_error(ctx, target, error),
+        Ok(terminal) => send_response(
+            ctx,
+            target,
+            TerminalResponse::Terminal { terminal },
+            response_id,
+        ),
+        Err(error) => reply_error(ctx, target, response_id, error),
     }
 }
 
 fn reply_error(
     ctx: &ServiceRunContext,
     target: &ServiceAddr,
+    response_id: Option<String>,
     error: WebTerminalError,
 ) -> Result<()> {
     let code = match &error {
@@ -244,6 +269,7 @@ fn reply_error(
             code: code.to_string(),
             message: error.to_string(),
         },
+        response_id,
     )
 }
 
@@ -251,12 +277,15 @@ fn send_response(
     ctx: &ServiceRunContext,
     target: &ServiceAddr,
     response: TerminalResponse,
+    response_id: Option<String>,
 ) -> Result<()> {
-    ctx.outbox.send(ServiceOutput::Call(ServiceCall {
-        source: ctx.addr.clone(),
-        target: target.clone(),
-        payload: encode_response(response)?,
-    }))?;
+    ctx.outbox
+        .send(ServiceOutput::Call(ServiceCall::response_to(
+            ctx.addr.clone(),
+            target.clone(),
+            encode_response(response)?,
+            response_id,
+        )))?;
     Ok(())
 }
 
@@ -280,11 +309,11 @@ fn forward_terminal_output(
                 break;
             };
             if outbox
-                .send(ServiceOutput::Call(ServiceCall {
-                    source: source.clone(),
-                    target: target.clone(),
+                .send(ServiceOutput::Call(ServiceCall::new(
+                    source.clone(),
+                    target.clone(),
                     payload,
-                }))
+                )))
                 .is_err()
             {
                 break;

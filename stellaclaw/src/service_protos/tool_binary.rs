@@ -54,9 +54,9 @@ pub fn decode_response(payload: Value) -> Result<ToolBinaryResponse> {
 }
 
 pub fn tool_binary_call(source: ServiceAddr, request: ToolBinaryRequest) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
-        target: ServiceAddr::tool_binary(),
-        payload: encode_request(request)?,
-    })
+        ServiceAddr::tool_binary(),
+        encode_request(request)?,
+    ))
 }

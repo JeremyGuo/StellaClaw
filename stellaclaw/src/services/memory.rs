@@ -70,6 +70,7 @@ impl ConversationService for MemoryService {
                                 &ctx.addr,
                                 &call.source,
                                 encode_response(response)?,
+                                call.request_id.clone(),
                             )))?;
                         }
                         Err(error) => {
@@ -373,12 +374,13 @@ fn memory_failure_reason(error: &anyhow::Error) -> String {
     }
 }
 
-fn reply(source: &ServiceAddr, target: &ServiceAddr, payload: serde_json::Value) -> ServiceCall {
-    ServiceCall {
-        source: source.clone(),
-        target: target.clone(),
-        payload,
-    }
+fn reply(
+    source: &ServiceAddr,
+    target: &ServiceAddr,
+    payload: serde_json::Value,
+    response_id: Option<String>,
+) -> ServiceCall {
+    ServiceCall::response_to(source.clone(), target.clone(), payload, response_id)
 }
 
 #[cfg(test)]

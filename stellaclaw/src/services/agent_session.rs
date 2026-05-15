@@ -101,6 +101,7 @@ impl ConversationService for AgentSessionService {
         let mut pending_tool_binary_requests = VecDeque::new();
         let mut pending_cron_requests = VecDeque::new();
         let mut pending_child_starts = VecDeque::new();
+        let mut pending_service_responses = BTreeMap::new();
         let mut pending_subagent_joins = VecDeque::new();
         let mut session_event_rx = runner
             .as_ref()
@@ -153,6 +154,7 @@ impl ConversationService for AgentSessionService {
                                 &mut pending_tool_binary_requests,
                                 &mut pending_cron_requests,
                                 &mut pending_child_starts,
+                                &mut pending_service_responses,
                                 &mut pending_subagent_joins,
                                 &mut state,
                                 &mut current_plan,
@@ -388,8 +390,9 @@ impl ConversationService for AgentSessionService {
                                 &mut pending_tool_binary_requests,
                                 &mut pending_cron_requests,
                                 &mut pending_child_starts,
+                                &mut pending_service_responses,
                                 &mut state,
-                                &call.source,
+                                call.response_id.as_deref(),
                                 call.payload.clone(),
                             )
                             .with_context(|| {
@@ -856,6 +859,7 @@ fn handle_core_session_event(
     pending_tool_binary_requests: &mut VecDeque<ConversationBridgeRequest>,
     pending_cron_requests: &mut VecDeque<ConversationBridgeRequest>,
     pending_child_starts: &mut VecDeque<PendingChildAgentStart>,
+    pending_service_responses: &mut BTreeMap<String, PendingServiceResponseKind>,
     pending_subagent_joins: &mut VecDeque<PendingSubagentJoin>,
     state: &mut AgentSessionRuntimeState,
     current_plan: &mut Option<TaskPlanView>,
@@ -873,6 +877,12 @@ fn handle_core_session_event(
         }
         if let Some(call) = memory_bridge_call(ctx, kind, request)? {
             pending_memory_requests.push_back(request.clone());
+            let call = track_service_request(
+                call,
+                request,
+                PendingServiceResponseKind::Memory,
+                pending_service_responses,
+            );
             ctx.outbox.send(ServiceOutput::Call(call))?;
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                 addr: ctx.addr.clone(),
@@ -887,6 +897,12 @@ fn handle_core_session_event(
         }
         if let Some(call) = skill_bridge_call(ctx, request)? {
             pending_skill_requests.push_back(request.clone());
+            let call = track_service_request(
+                call,
+                request,
+                PendingServiceResponseKind::Skill,
+                pending_service_responses,
+            );
             ctx.outbox.send(ServiceOutput::Call(call))?;
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                 addr: ctx.addr.clone(),
@@ -901,6 +917,12 @@ fn handle_core_session_event(
         }
         if let Some(call) = tool_binary_bridge_call(ctx, request)? {
             pending_tool_binary_requests.push_back(request.clone());
+            let call = track_service_request(
+                call,
+                request,
+                PendingServiceResponseKind::ToolBinary,
+                pending_service_responses,
+            );
             ctx.outbox.send(ServiceOutput::Call(call))?;
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                 addr: ctx.addr.clone(),
@@ -915,6 +937,12 @@ fn handle_core_session_event(
         }
         if let Some(call) = cron_bridge_call(ctx, request, state)? {
             pending_cron_requests.push_back(request.clone());
+            let call = track_service_request(
+                call,
+                request,
+                PendingServiceResponseKind::Cron,
+                pending_service_responses,
+            );
             ctx.outbox.send(ServiceOutput::Call(call))?;
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                 addr: ctx.addr.clone(),
@@ -938,6 +966,12 @@ fn handle_core_session_event(
         if let Some(call) =
             child_agent_start_bridge_call(ctx, request, pending_child_starts, state)?
         {
+            let call = track_service_request(
+                call,
+                request,
+                PendingServiceResponseKind::Kernel,
+                pending_service_responses,
+            );
             ctx.outbox.send(ServiceOutput::Call(call))?;
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                 addr: ctx.addr.clone(),
@@ -1026,6 +1060,46 @@ fn parse_task_plan_view(payload: serde_json::Value) -> Result<TaskPlanView, Stri
     Ok(plan)
 }
 
+fn track_service_request(
+    call: ServiceCall,
+    request: &ConversationBridgeRequest,
+    kind: PendingServiceResponseKind,
+    pending_service_responses: &mut BTreeMap<String, PendingServiceResponseKind>,
+) -> ServiceCall {
+    pending_service_responses.insert(request.request_id.clone(), kind);
+    call.with_request_id(request.request_id.clone())
+}
+
+fn pop_pending_bridge_request(
+    pending: &mut VecDeque<ConversationBridgeRequest>,
+    response_id: Option<&str>,
+) -> Option<ConversationBridgeRequest> {
+    if let Some(response_id) = response_id {
+        if let Some(index) = pending
+            .iter()
+            .position(|request| request.request_id == response_id)
+        {
+            return pending.remove(index);
+        }
+    }
+    pending.pop_front()
+}
+
+fn pop_pending_child_start(
+    pending: &mut VecDeque<PendingChildAgentStart>,
+    response_id: Option<&str>,
+) -> Option<PendingChildAgentStart> {
+    if let Some(response_id) = response_id {
+        if let Some(index) = pending
+            .iter()
+            .position(|start| start.request.request_id == response_id)
+        {
+            return pending.remove(index);
+        }
+    }
+    pending.pop_front()
+}
+
 fn handle_service_response(
     ctx: &ServiceRunContext,
     runner: &mut Option<RealAgentSessionRuntime>,
@@ -1034,54 +1108,90 @@ fn handle_service_response(
     pending_tool_binary_requests: &mut VecDeque<ConversationBridgeRequest>,
     pending_cron_requests: &mut VecDeque<ConversationBridgeRequest>,
     pending_child_starts: &mut VecDeque<PendingChildAgentStart>,
+    pending_service_responses: &mut BTreeMap<String, PendingServiceResponseKind>,
     state: &mut AgentSessionRuntimeState,
-    source: &ServiceAddr,
+    response_id: Option<&str>,
     payload: Value,
 ) -> Result<bool> {
-    if source == &ServiceAddr::memory() {
-        let response =
-            memory::decode_response(payload).context("failed to decode memory response")?;
-        handle_memory_response(ctx, runner, pending_memory_requests, response)?;
-        return Ok(true);
-    }
-    if source == &ServiceAddr::skill() {
-        let response =
-            skill::decode_response(payload).context("failed to decode skill response")?;
-        handle_skill_response(ctx, runner, pending_skill_requests, response)?;
-        return Ok(true);
-    }
-    if source == &ServiceAddr::tool_binary() {
-        let response = tool_binary::decode_response(payload)
-            .context("failed to decode tool binary response")?;
-        handle_tool_binary_response(ctx, runner, pending_tool_binary_requests, response)?;
-        return Ok(true);
-    }
-    if source == &ServiceAddr::cron() {
-        let response = cron::decode_response(payload).context("failed to decode cron response")?;
-        handle_cron_response(ctx, runner, pending_cron_requests, response)?;
-        return Ok(true);
-    }
-    if source.is_kernel() {
-        let response =
-            kernel::decode_response(payload).context("failed to decode kernel response")?;
-        handle_kernel_response(ctx, runner, pending_child_starts, state, response)?;
-        return Ok(true);
+    if let Some(response_id) = response_id {
+        if let Some(kind) = pending_service_responses.get(response_id).copied() {
+            match kind {
+                PendingServiceResponseKind::Memory => {
+                    let response = memory::decode_response(payload)
+                        .context("failed to decode memory response")?;
+                    handle_memory_response(
+                        ctx,
+                        runner,
+                        pending_memory_requests,
+                        Some(response_id),
+                        response,
+                    )?;
+                }
+                PendingServiceResponseKind::Skill => {
+                    let response = skill::decode_response(payload)
+                        .context("failed to decode skill response")?;
+                    handle_skill_response(
+                        ctx,
+                        runner,
+                        pending_skill_requests,
+                        Some(response_id),
+                        response,
+                    )?;
+                }
+                PendingServiceResponseKind::ToolBinary => {
+                    let response = tool_binary::decode_response(payload)
+                        .context("failed to decode tool binary response")?;
+                    handle_tool_binary_response(
+                        ctx,
+                        runner,
+                        pending_tool_binary_requests,
+                        Some(response_id),
+                        response,
+                    )?;
+                }
+                PendingServiceResponseKind::Cron => {
+                    let response =
+                        cron::decode_response(payload).context("failed to decode cron response")?;
+                    handle_cron_response(
+                        ctx,
+                        runner,
+                        pending_cron_requests,
+                        Some(response_id),
+                        response,
+                    )?;
+                }
+                PendingServiceResponseKind::Kernel => {
+                    let response = kernel::decode_response(payload)
+                        .context("failed to decode kernel response")?;
+                    handle_kernel_response(
+                        ctx,
+                        runner,
+                        pending_child_starts,
+                        state,
+                        Some(response_id),
+                        response,
+                    )?;
+                }
+            }
+            pending_service_responses.remove(response_id);
+            return Ok(true);
+        }
     }
 
     if let Ok(response) = memory::decode_response(payload.clone()) {
-        handle_memory_response(ctx, runner, pending_memory_requests, response)?;
+        handle_memory_response(ctx, runner, pending_memory_requests, None, response)?;
         Ok(true)
     } else if let Ok(response) = skill::decode_response(payload.clone()) {
-        handle_skill_response(ctx, runner, pending_skill_requests, response)?;
+        handle_skill_response(ctx, runner, pending_skill_requests, None, response)?;
         Ok(true)
     } else if let Ok(response) = tool_binary::decode_response(payload.clone()) {
-        handle_tool_binary_response(ctx, runner, pending_tool_binary_requests, response)?;
+        handle_tool_binary_response(ctx, runner, pending_tool_binary_requests, None, response)?;
         Ok(true)
     } else if let Ok(response) = cron::decode_response(payload.clone()) {
-        handle_cron_response(ctx, runner, pending_cron_requests, response)?;
+        handle_cron_response(ctx, runner, pending_cron_requests, None, response)?;
         Ok(true)
     } else if let Ok(response) = kernel::decode_response(payload) {
-        handle_kernel_response(ctx, runner, pending_child_starts, state, response)?;
+        handle_kernel_response(ctx, runner, pending_child_starts, state, None, response)?;
         Ok(true)
     } else {
         Ok(false)
@@ -1092,9 +1202,10 @@ fn handle_memory_response(
     ctx: &ServiceRunContext,
     runner: &mut Option<RealAgentSessionRuntime>,
     pending_memory_requests: &mut VecDeque<ConversationBridgeRequest>,
+    response_id: Option<&str>,
     response: MemoryResponse,
 ) -> Result<()> {
-    let Some(request) = pending_memory_requests.pop_front() else {
+    let Some(request) = pop_pending_bridge_request(pending_memory_requests, response_id) else {
         ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
             addr: ctx.addr.clone(),
             label: "unexpected_memory_response".to_string(),
@@ -1123,9 +1234,10 @@ fn handle_skill_response(
     ctx: &ServiceRunContext,
     runner: &mut Option<RealAgentSessionRuntime>,
     pending_skill_requests: &mut VecDeque<ConversationBridgeRequest>,
+    response_id: Option<&str>,
     response: SkillResponse,
 ) -> Result<()> {
-    let Some(request) = pending_skill_requests.pop_front() else {
+    let Some(request) = pop_pending_bridge_request(pending_skill_requests, response_id) else {
         ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
             addr: ctx.addr.clone(),
             label: "unexpected_skill_response".to_string(),
@@ -1154,9 +1266,11 @@ fn handle_tool_binary_response(
     ctx: &ServiceRunContext,
     runner: &mut Option<RealAgentSessionRuntime>,
     pending_tool_binary_requests: &mut VecDeque<ConversationBridgeRequest>,
+    response_id: Option<&str>,
     response: ToolBinaryResponse,
 ) -> Result<()> {
-    let Some(request) = pending_tool_binary_requests.pop_front() else {
+    let Some(request) = pop_pending_bridge_request(pending_tool_binary_requests, response_id)
+    else {
         ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
             addr: ctx.addr.clone(),
             label: "unexpected_tool_binary_response".to_string(),
@@ -1185,9 +1299,10 @@ fn handle_cron_response(
     ctx: &ServiceRunContext,
     runner: &mut Option<RealAgentSessionRuntime>,
     pending_cron_requests: &mut VecDeque<ConversationBridgeRequest>,
+    response_id: Option<&str>,
     response: CronResponse,
 ) -> Result<()> {
-    let Some(request) = pending_cron_requests.pop_front() else {
+    let Some(request) = pop_pending_bridge_request(pending_cron_requests, response_id) else {
         ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
             addr: ctx.addr.clone(),
             label: "unexpected_cron_response".to_string(),
@@ -1217,11 +1332,12 @@ fn handle_kernel_response(
     runner: &mut Option<RealAgentSessionRuntime>,
     pending_child_starts: &mut VecDeque<PendingChildAgentStart>,
     state: &mut AgentSessionRuntimeState,
+    response_id: Option<&str>,
     response: KernelResponse,
 ) -> Result<()> {
     match response {
         KernelResponse::AgentSessionCreated { addr } => {
-            let Some(pending) = pending_child_starts.pop_front() else {
+            let Some(pending) = pop_pending_child_start(pending_child_starts, response_id) else {
                 ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                     addr: ctx.addr.clone(),
                     label: "unexpected_agent_session_created".to_string(),
@@ -1282,7 +1398,7 @@ fn handle_kernel_response(
             }))?;
         }
         KernelResponse::Error { code, message } => {
-            let Some(pending) = pending_child_starts.pop_front() else {
+            let Some(pending) = pop_pending_child_start(pending_child_starts, response_id) else {
                 ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                     addr: ctx.addr.clone(),
                     label: "unexpected_kernel_error".to_string(),
@@ -1613,11 +1729,11 @@ fn cron_bridge_call(
         }
         _ => return Ok(None),
     };
-    Ok(Some(ServiceCall {
-        source: ctx.addr.clone(),
-        target: ServiceAddr::cron(),
-        payload: cron::encode_request(cron_request)?,
-    }))
+    Ok(Some(ServiceCall::new(
+        ctx.addr.clone(),
+        ServiceAddr::cron(),
+        cron::encode_request(cron_request)?,
+    )))
 }
 
 fn managed_agent_bridge_response(
@@ -2352,6 +2468,15 @@ struct PendingChildAgentStart {
     kind: AgentSessionKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingServiceResponseKind {
+    Memory,
+    Skill,
+    ToolBinary,
+    Cron,
+    Kernel,
+}
+
 struct PendingSubagentJoin {
     request: ConversationBridgeRequest,
     agent_id: String,
@@ -2675,11 +2800,11 @@ fn reply(
     target: &crate::conversation_new::ServiceAddr,
     response: AgentSessionResponse,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
-        source: source.clone(),
-        target: target.clone(),
-        payload: encode_response(response)?,
-    })
+    Ok(ServiceCall::new(
+        source.clone(),
+        target.clone(),
+        encode_response(response)?,
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3434,7 +3559,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_cron_response_routes_by_source_before_payload_shape() {
+    fn accepted_cron_response_routes_by_response_id_before_payload_shape() {
         let (ctx, output_rx) = test_run_context("cron_response_dispatch");
         let mut runner = None;
         let mut pending_memory_requests = VecDeque::new();
@@ -3442,6 +3567,7 @@ mod tests {
         let mut pending_tool_binary_requests = VecDeque::new();
         let mut pending_cron_requests = VecDeque::new();
         let mut pending_child_starts = VecDeque::new();
+        let mut pending_service_responses = BTreeMap::new();
         let mut state = AgentSessionRuntimeState::new(
             AgentSessionKind::Foreground,
             AgentSessionBinding {
@@ -3457,6 +3583,8 @@ mod tests {
             action: "cron_task_create".to_string(),
             payload: serde_json::json!({}),
         });
+        pending_service_responses
+            .insert("req_create".to_string(), PendingServiceResponseKind::Cron);
 
         let handled = handle_service_response(
             &ctx,
@@ -3466,8 +3594,9 @@ mod tests {
             &mut pending_tool_binary_requests,
             &mut pending_cron_requests,
             &mut pending_child_starts,
+            &mut pending_service_responses,
             &mut state,
-            &crate::conversation_new::ServiceAddr::cron(),
+            Some("req_create"),
             cron::encode_response(CronResponse::Accepted).expect("cron response encodes"),
         )
         .expect("cron response dispatches");
@@ -3475,6 +3604,7 @@ mod tests {
         assert!(handled);
         assert!(pending_memory_requests.is_empty());
         assert!(pending_cron_requests.is_empty());
+        assert!(pending_service_responses.is_empty());
         assert!(output_rx.try_iter().any(|output| matches!(
             output,
             ServiceOutput::Status(ServiceStatusUpdate { label, .. }) if label == "cron_bridge_resolved"
@@ -3648,6 +3778,7 @@ mod tests {
             &mut runner,
             &mut pending,
             &mut state,
+            Some("req_1"),
             KernelResponse::AgentSessionCreated {
                 addr: crate::conversation_new::ServiceAddr::agent_subagent("subagent_0001"),
             },

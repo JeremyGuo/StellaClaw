@@ -168,11 +168,11 @@ pub fn encode_response(response: CronResponse) -> Result<Value> {
 }
 
 pub fn list_tasks_call(source: ServiceAddr, target: ServiceAddr) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(CronRequest::ListTasks { owner: None })?,
-    })
+        encode_request(CronRequest::ListTasks { owner: None })?,
+    ))
 }
 
 pub fn register_task_call(
@@ -180,11 +180,11 @@ pub fn register_task_call(
     target: ServiceAddr,
     task: CronTaskRegistration,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(CronRequest::RegisterTask { task })?,
-    })
+        encode_request(CronRequest::RegisterTask { task })?,
+    ))
 }
 
 pub fn trigger_task_now_call(
@@ -192,13 +192,13 @@ pub fn trigger_task_now_call(
     target: ServiceAddr,
     task_id: impl Into<String>,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(CronRequest::TriggerTaskNow {
+        encode_request(CronRequest::TriggerTaskNow {
             task_id: task_id.into(),
         })?,
-    })
+    ))
 }
 
 pub fn get_task_status_call(
@@ -206,14 +206,14 @@ pub fn get_task_status_call(
     target: ServiceAddr,
     task_id: impl Into<String>,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(CronRequest::GetTaskStatus {
+        encode_request(CronRequest::GetTaskStatus {
             task_id: task_id.into(),
             owner: None,
         })?,
-    })
+    ))
 }
 
 pub fn update_task_call(
@@ -222,14 +222,14 @@ pub fn update_task_call(
     task_id: impl Into<String>,
     patch: CronTaskPatch,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(CronRequest::UpdateTask {
+        encode_request(CronRequest::UpdateTask {
             task_id: task_id.into(),
             patch,
         })?,
-    })
+    ))
 }
 
 pub fn remove_task_call(
@@ -237,13 +237,13 @@ pub fn remove_task_call(
     target: ServiceAddr,
     task_id: impl Into<String>,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(CronRequest::RemoveTask {
+        encode_request(CronRequest::RemoveTask {
             task_id: task_id.into(),
         })?,
-    })
+    ))
 }
 
 pub fn disable_tasks_for_owner_call(
@@ -252,14 +252,14 @@ pub fn disable_tasks_for_owner_call(
     owner: ServiceAddr,
     reason: impl Into<String>,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(CronRequest::DisableTasksForOwner {
+        encode_request(CronRequest::DisableTasksForOwner {
             owner,
             reason: reason.into(),
         })?,
-    })
+    ))
 }
 
 fn default_true() -> bool {
@@ -271,12 +271,12 @@ pub fn agent_session_event_call(
     target: ServiceAddr,
     event: AgentSessionEvent,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
-        source: source.clone(),
+    Ok(ServiceCall::new(
+        source.clone(),
         target,
-        payload: encode_request(CronRequest::AgentSessionEvent {
+        encode_request(CronRequest::AgentSessionEvent {
             session_addr: source,
             event,
         })?,
-    })
+    ))
 }

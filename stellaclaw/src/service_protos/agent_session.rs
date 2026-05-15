@@ -271,23 +271,23 @@ pub fn enqueue_message_call(
     message: ChatMessage,
     ingress_id: Option<String>,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(AgentSessionRequest::EnqueueMessage {
+        encode_request(AgentSessionRequest::EnqueueMessage {
             origin,
             message,
             ingress_id,
         })?,
-    })
+    ))
 }
 
 pub fn query_status_call(source: ServiceAddr, target: ServiceAddr) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(AgentSessionRequest::QueryStatus)?,
-    })
+        encode_request(AgentSessionRequest::QueryStatus)?,
+    ))
 }
 
 pub fn query_context_call(
@@ -296,14 +296,14 @@ pub fn query_context_call(
     query_id: impl Into<String>,
     payload: Value,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(AgentSessionRequest::QueryContext {
+        encode_request(AgentSessionRequest::QueryContext {
             query_id: query_id.into(),
             payload,
         })?,
-    })
+    ))
 }
 
 pub fn cancel_turn_call(
@@ -311,11 +311,11 @@ pub fn cancel_turn_call(
     target: ServiceAddr,
     reason: Option<String>,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(AgentSessionRequest::CancelTurn { reason })?,
-    })
+        encode_request(AgentSessionRequest::CancelTurn { reason })?,
+    ))
 }
 
 pub fn update_launch_config_call(
@@ -323,11 +323,11 @@ pub fn update_launch_config_call(
     target: ServiceAddr,
     launch: AgentSessionLaunchConfig,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(AgentSessionRequest::UpdateLaunchConfig { launch })?,
-    })
+        encode_request(AgentSessionRequest::UpdateLaunchConfig { launch })?,
+    ))
 }
 
 pub fn continue_turn_call(
@@ -335,19 +335,19 @@ pub fn continue_turn_call(
     target: ServiceAddr,
     reason: Option<String>,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(AgentSessionRequest::ContinueTurn { reason })?,
-    })
+        encode_request(AgentSessionRequest::ContinueTurn { reason })?,
+    ))
 }
 
 pub fn compact_now_call(source: ServiceAddr, target: ServiceAddr) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(AgentSessionRequest::CompactNow)?,
-    })
+        encode_request(AgentSessionRequest::CompactNow)?,
+    ))
 }
 
 pub fn resolve_host_coordination_call(
@@ -355,11 +355,11 @@ pub fn resolve_host_coordination_call(
     target: ServiceAddr,
     response: Value,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(AgentSessionRequest::ResolveHostCoordination { response })?,
-    })
+        encode_request(AgentSessionRequest::ResolveHostCoordination { response })?,
+    ))
 }
 
 pub fn child_session_event_call(
@@ -367,14 +367,14 @@ pub fn child_session_event_call(
     target: ServiceAddr,
     event: AgentSessionEvent,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
-        source: source.clone(),
+    Ok(ServiceCall::new(
+        source.clone(),
         target,
-        payload: encode_request(AgentSessionRequest::ChildSessionEvent {
+        encode_request(AgentSessionRequest::ChildSessionEvent {
             session_addr: source,
             event,
         })?,
-    })
+    ))
 }
 
 pub fn shutdown_call(
@@ -382,11 +382,11 @@ pub fn shutdown_call(
     target: ServiceAddr,
     reason: Option<String>,
 ) -> Result<ServiceCall> {
-    Ok(ServiceCall {
+    Ok(ServiceCall::new(
         source,
         target,
-        payload: encode_request(AgentSessionRequest::Shutdown { reason })?,
-    })
+        encode_request(AgentSessionRequest::Shutdown { reason })?,
+    ))
 }
 
 pub fn text_message(role: ChatRole, text: impl Into<String>) -> ChatMessage {
