@@ -244,6 +244,13 @@ fn fnv1a_write(hash: &mut u64, bytes: &[u8]) {
 }
 
 impl ProviderBackend for OpenRouterResponsesProvider {
+    fn system_prompt_for_model(
+        &self,
+        _model_config: &ModelConfig,
+    ) -> Result<Option<String>, ProviderError> {
+        Ok(None)
+    }
+
     fn send(
         &self,
         model_config: &ModelConfig,
@@ -375,6 +382,7 @@ fn responses_value_to_chat_message(
     }
 
     Ok(ChatMessage {
+        message_id: ChatMessage::new_message_id(),
         role: ChatRole::Assistant,
         user_name: None,
         message_time: None,
@@ -689,8 +697,8 @@ mod tests {
                         {
                             "type": "function_call",
                             "call_id": "call_1",
-                            "name": "file_read",
-                            "arguments": "{\"path\":\"README.md\"}"
+                            "name": "shell_exec",
+                            "arguments": "{\"command\":\"cat README.md\"}"
                         }
                     ],
                     "usage": {
@@ -895,7 +903,7 @@ mod tests {
             ChatRole::User,
             vec![ChatMessageItem::ToolResult(ToolResultItem {
                 tool_call_id: "call_1".to_string(),
-                tool_name: "file_read".to_string(),
+                tool_name: "shell_exec".to_string(),
                 result: ToolResultContent::from_text("loaded".to_string()),
             })],
         )];

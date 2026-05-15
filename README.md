@@ -197,8 +197,8 @@ Stellaclaw exposes tools through a dynamic catalog rebuilt from runtime state, m
 | Files, search, visibility | `file_read`, `file_write`, `grep`, `apply_patch`, `shell_make_visible`, `attachment_make_visible` |
 | Fresh-process shell | `shell_exec`, `shell_write_stdin`, `shell_stop` |
 | Web and downloads | `web_fetch`, `web_search`, `file_download_start`, `file_download_progress`, `file_download_wait`, `file_download_cancel` |
-| Media | `image_load`, `pdf_load`, `audio_load`, provider-backed analysis/generation tools |
-| Host coordination | `user_tell`, `update_plan`, subagents, background agents, cron, managed-agent status |
+| Media | `image_view`, `pdf_view`, `audio_view`, provider-backed analysis/generation tools |
+| Host coordination | `update_plan`, subagents, background agents, cron, managed-agent status |
 | Memory | `memory_search`, `memory_write`, `memory_update`, `memory_delete` |
 | Skills | `skill_load`, `skill_create`, `skill_update`, `skill_delete` |
 

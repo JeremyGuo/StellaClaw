@@ -1,6 +1,7 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File},
-    io::Write,
+    io::{Seek, Write},
     path::{Path, PathBuf},
 };
 
@@ -29,6 +30,20 @@ pub(crate) struct SessionActorPersistedState {
 
 pub(crate) struct SessionStateStore {
     dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MessagesIndex {
+    version: u32,
+    message_count: usize,
+    last_message_id: Option<String>,
+    messages: BTreeMap<String, MessageIndexEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MessageIndexEntry {
+    index: usize,
+    byte_offset: u64,
 }
 
 impl SessionStateStore {
@@ -66,13 +81,21 @@ impl SessionStateStore {
             .map_err(|error| format!("failed to serialize session state: {error}"))?;
         fs::write(self.session_json_path(), session_json)
             .map_err(|error| format!("failed to write session.json: {error}"))?;
-        write_messages_jsonl(&self.all_messages_path(), &state.all_messages)?;
+        write_messages_jsonl_with_index(
+            &self.all_messages_path(),
+            &self.messages_index_path(),
+            &state.all_messages,
+        )?;
         write_messages_jsonl(&self.current_messages_path(), &state.current_messages)?;
         Ok(())
     }
 
     pub(crate) fn save_all_messages_jsonl(&self, messages: &[ChatMessage]) -> Result<(), String> {
-        write_messages_jsonl(&self.all_messages_path(), messages)
+        write_messages_jsonl_with_index(
+            &self.all_messages_path(),
+            &self.messages_index_path(),
+            messages,
+        )
     }
 
     fn session_json_path(&self) -> PathBuf {
@@ -85,6 +108,10 @@ impl SessionStateStore {
 
     fn current_messages_path(&self) -> PathBuf {
         self.dir.join("current_messages.jsonl")
+    }
+
+    fn messages_index_path(&self) -> PathBuf {
+        self.dir.join("messages_index.json")
     }
 }
 
@@ -108,8 +135,49 @@ fn write_messages_jsonl(path: &Path, messages: &[ChatMessage]) -> Result<(), Str
         .map_err(|error| format!("failed to flush {}: {error}", path.display()))
 }
 
+fn write_messages_jsonl_with_index(
+    path: &Path,
+    index_path: &Path,
+    messages: &[ChatMessage],
+) -> Result<(), String> {
+    let mut file = File::create(path)
+        .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
+    let mut index = MessagesIndex {
+        version: 1,
+        message_count: messages.len(),
+        last_message_id: messages.last().map(|message| message.message_id.clone()),
+        messages: BTreeMap::new(),
+    };
+    for (message_index, message) in messages.iter().enumerate() {
+        let byte_offset = file
+            .stream_position()
+            .map_err(|error| format!("failed to seek {}: {error}", path.display()))?;
+        if !message.message_id.is_empty() {
+            index.messages.insert(
+                message.message_id.clone(),
+                MessageIndexEntry {
+                    index: message_index,
+                    byte_offset,
+                },
+            );
+        }
+        let line = serde_json::to_string(message)
+            .map_err(|error| format!("failed to serialize message: {error}"))?;
+        writeln!(file, "{line}")
+            .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+    }
+    file.flush()
+        .map_err(|error| format!("failed to flush {}: {error}", path.display()))?;
+    let index_json = serde_json::to_string_pretty(&index)
+        .map_err(|error| format!("failed to serialize messages index: {error}"))?;
+    fs::write(index_path, index_json)
+        .map_err(|error| format!("failed to write {}: {error}", index_path.display()))?;
+    Ok(())
+}
+
 fn sanitize_persisted_messages(messages: &mut [ChatMessage]) {
     for message in messages {
+        message.ensure_message_id();
         for item in &mut message.data {
             let ChatMessageItem::ToolResult(tool_result) = item else {
                 continue;

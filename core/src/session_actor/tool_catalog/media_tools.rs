@@ -74,31 +74,31 @@ pub fn media_tool_definitions(options: &BuiltinToolCatalogOptions) -> Vec<ToolDe
         ));
     }
 
-    if options.enable_native_image_load {
+    if options.enable_native_image_view {
         tools.push(ToolDefinition::new(
-            "image_load",
-            "Load a local image file into the next model request for direct multimodal inspection by the current model. Returns immediately. Do not call image_load more than 3 times in the same assistant tool-call batch; excess image_load calls in that batch will fail. Load more images after inspecting the first batch.",
-            media_load_schema("path", &options.remote_mode),
+            "image_view",
+            "View a local image file in the next model request for direct multimodal inspection by the current model. Returns immediately. Do not call image_view more than 3 times in the same assistant tool-call batch; excess image_view calls in that batch will fail. View more images after inspecting the first batch.",
+            media_view_schema("path", &options.remote_mode),
             ToolExecutionMode::Immediate,
             ToolBackend::Local,
         ));
     }
 
-    if options.enable_native_pdf_load {
+    if options.enable_native_pdf_view {
         tools.push(ToolDefinition::new(
-            "pdf_load",
-            "Load a local PDF file into the next model request for direct inspection by the current model. Returns immediately.",
-            media_load_schema("path", &options.remote_mode),
+            "pdf_view",
+            "View a local PDF file in the next model request for direct inspection by the current model. Returns immediately.",
+            media_view_schema("path", &options.remote_mode),
             ToolExecutionMode::Immediate,
             ToolBackend::Local,
         ));
     }
 
-    if options.enable_native_audio_load {
+    if options.enable_native_audio_view {
         tools.push(ToolDefinition::new(
-            "audio_load",
-            "Load a local audio file into the next model request for direct inspection by the current model. Returns immediately.",
-            media_load_schema("path", &options.remote_mode),
+            "audio_view",
+            "View a local audio file in the next model request for direct inspection by the current model. Returns immediately.",
+            media_view_schema("path", &options.remote_mode),
             ToolExecutionMode::Immediate,
             ToolBackend::Local,
         ));
@@ -208,7 +208,7 @@ fn analysis_tool_definition(
     )
 }
 
-fn media_load_schema(path_field: &'static str, remote_mode: &super::ToolRemoteMode) -> Value {
+fn media_view_schema(path_field: &'static str, remote_mode: &super::ToolRemoteMode) -> Value {
     let mut schema_properties = properties([(path_field, json!({"type": "string"}))]);
     add_remote_property(&mut schema_properties, remote_mode);
     object_schema(schema_properties, &[path_field])
@@ -238,9 +238,9 @@ pub(crate) fn execute_media_tool(
     context: &ToolExecutionContext<'_>,
 ) -> Result<Option<ToolResultContent>, LocalToolError> {
     let result = match tool_name {
-        "image_load" => native_load(arguments, context, "image")?,
-        "pdf_load" => native_load(arguments, context, "pdf")?,
-        "audio_load" => native_load(arguments, context, "audio")?,
+        "image_view" => native_view(arguments, context, "image")?,
+        "pdf_view" => native_view(arguments, context, "pdf")?,
+        "audio_view" => native_view(arguments, context, "audio")?,
         "image_stop" => stop_media_job(arguments, "image_id")?,
         "pdf_stop" => stop_media_job(arguments, "pdf_id")?,
         "audio_stop" => stop_media_job(arguments, "audio_id")?,
@@ -283,7 +283,7 @@ pub(crate) fn execute_provider_backed_media_tool(
     }
 }
 
-fn native_load(
+fn native_view(
     arguments: &Map<String, Value>,
     context: &ToolExecutionContext<'_>,
     media_kind: &str,
@@ -297,7 +297,7 @@ fn native_load(
             "reason": reason,
         }),
         None => json!({
-            "status": "loaded",
+            "status": "viewed",
             "uri": file.uri,
             "media_type": file.media_type,
         }),
@@ -1261,6 +1261,8 @@ mod tests {
             remote_mode: &remote_mode,
             conversation_bridge: None,
             token_estimator: None,
+            search_tool_models: None,
+            provider_backed_tool_models: None,
             cancel_token: ToolCancellationToken::default(),
         };
 
@@ -1301,6 +1303,8 @@ mod tests {
             remote_mode: &REMOTE_MODE,
             conversation_bridge: None,
             token_estimator: None,
+            search_tool_models: None,
+            provider_backed_tool_models: None,
             cancel_token,
         }
     }

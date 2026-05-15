@@ -10,13 +10,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crossbeam_channel::{select, Receiver, Sender};
 use portable_pty::{native_pty_system, Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Map, Value};
 
 use super::{
     schema::{add_remote_property, object_schema, properties},
-    PromptProtocol, ToolBackend, ToolConcurrency, ToolDefinition, ToolExecutionMode,
-    ToolRemoteMode,
+    ToolBackend, ToolConcurrency, ToolDefinition, ToolExecutionMode, ToolRemoteMode,
 };
 use crate::session_actor::tool_binary::ensure_tool_binary;
 use crate::session_actor::tool_runtime::{
@@ -66,6 +66,8 @@ struct ShellSession {
     output: Mutex<HeadTailBuffer>,
     stdout: Mutex<HeadTailBuffer>,
     stderr: Mutex<HeadTailBuffer>,
+    event_tx: Sender<()>,
+    event_rx: Receiver<()>,
     terminal: Mutex<TerminalEmulator>,
     status: Mutex<ShellStatus>,
 }
@@ -324,17 +326,6 @@ pub fn process_tool_definitions(remote_mode: &ToolRemoteMode) -> Vec<ToolDefinit
     ]
 }
 
-pub(crate) fn process_prompt_protocols() -> &'static [PromptProtocol] {
-    PROCESS_PROMPT_PROTOCOLS
-}
-
-const PROCESS_PROMPT_PROTOCOLS: &[PromptProtocol] = &[PromptProtocol {
-    id: "process.shell",
-    priority: 200,
-    required_tools: &["shell_exec", "shell_write_stdin", "shell_stop"],
-    body: "When using shell for commands that dedicated tools do not cover, start a new command with shell_exec.command. Use shell_write_stdin with process_id only to poll or continue an existing process, and shell_stop with process_id to stop one. Positive example: {\"command\":\"cargo check -p stellaclaw_core\"}. Negative example: using process_id to start work, or using cmd instead of command.",
-}];
-
 pub(crate) fn execute_process_tool(
     tool_name: &str,
     arguments: &Map<String, Value>,
@@ -561,6 +552,7 @@ fn spawn_pty_process(
         }
     });
 
+    let (event_tx, event_rx) = crossbeam_channel::bounded(1);
     let session = Arc::new(ShellSession {
         process_id: process_id.clone(),
         command: command_text.to_string(),
@@ -576,6 +568,8 @@ fn spawn_pty_process(
         output: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
         stdout: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
         stderr: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
+        event_tx,
+        event_rx,
         terminal: Mutex::new(TerminalEmulator::new(cols as usize, rows as usize)),
         status: Mutex::new(ShellStatus {
             running: true,
@@ -671,6 +665,7 @@ fn spawn_pipe_process(
     let pid = child.id();
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    let (event_tx, event_rx) = crossbeam_channel::bounded(1);
     let session = Arc::new(ShellSession {
         process_id: process_id.clone(),
         command: command_text.to_string(),
@@ -686,6 +681,8 @@ fn spawn_pipe_process(
         output: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
         stdout: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
         stderr: Mutex::new(HeadTailBuffer::new(SHELL_BUFFER_MAX_BYTES)),
+        event_tx,
+        event_rx,
         terminal: Mutex::new(TerminalEmulator::new(
             SHELL_DEFAULT_COLS as usize,
             SHELL_DEFAULT_ROWS as usize,
@@ -804,6 +801,7 @@ fn push_process_output(session: &ShellSession, stream: ShellOutputStream, bytes:
     if let Ok(mut status) = session.status.lock() {
         status.updated_ms = unix_millis();
     }
+    notify_shell_session(session);
 }
 
 fn mark_process_exited(session: &ShellSession, exit_code: Option<i32>) {
@@ -812,6 +810,11 @@ fn mark_process_exited(session: &ShellSession, exit_code: Option<i32>) {
         status.exit_code = exit_code;
         status.updated_ms = unix_millis();
     }
+    notify_shell_session(session);
+}
+
+fn notify_shell_session(session: &ShellSession) {
+    let _ = session.event_tx.try_send(());
 }
 
 fn stop_process(session: &ShellSession, signal: &str) {
@@ -870,29 +873,61 @@ fn collect_until(
     let deadline = Instant::now() + Duration::from_millis(wait_ms as u64);
     let mut collected = ShellOutputDrain::default();
     let mut exit_code = None;
+    let mut post_exit_deadline = None;
     loop {
         collected.extend(drain_shell_output(session));
 
-        if !session
+        let running = session
             .status
             .lock()
             .map(|status| status.running)
-            .unwrap_or(false)
-        {
-            thread::sleep(Duration::from_millis(50));
-            collected.extend(drain_shell_output(session));
+            .unwrap_or(false);
+        if !running {
             exit_code = session
                 .status
                 .lock()
                 .ok()
                 .and_then(|status| status.exit_code);
-            break;
+            let now = Instant::now();
+            let close_deadline =
+                *post_exit_deadline.get_or_insert_with(|| now + Duration::from_millis(50));
+            let remaining = close_deadline.saturating_duration_since(now);
+            if remaining.is_zero() || cancel_token.is_cancelled() {
+                collected.extend(drain_shell_output(session));
+                break;
+            }
+            let close_timer = crossbeam_channel::after(remaining);
+            select! {
+                recv(session.event_rx) -> _ => {}
+                recv(cancel_token.cancel_rx()) -> _ => {
+                    collected.extend(drain_shell_output(session));
+                    break;
+                }
+                recv(close_timer) -> _ => {
+                    collected.extend(drain_shell_output(session));
+                    break;
+                }
+            }
+            continue;
         }
 
         if Instant::now() >= deadline || cancel_token.is_cancelled() {
             break;
         }
-        thread::sleep(Duration::from_millis(20));
+        let wait_remaining = deadline.saturating_duration_since(Instant::now());
+        if wait_remaining.is_zero() {
+            break;
+        }
+        let wait_timer = crossbeam_channel::after(wait_remaining);
+        select! {
+            recv(session.event_rx) -> _ => {}
+            recv(cancel_token.cancel_rx()) -> _ => {
+                break;
+            }
+            recv(wait_timer) -> _ => {
+                break;
+            }
+        }
     }
 
     let status = session.status.lock().expect("mutex poisoned");
@@ -1992,6 +2027,11 @@ fn unix_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_actor::{
+        ConversationBridge, ConversationBridgeRequest, ConversationBridgeResponse, ToolBatchError,
+        ToolBinaryEnsureResponse, ToolResultContent, ToolResultItem,
+    };
+    use std::{fs, sync::Mutex};
 
     #[test]
     fn terminal_render_keeps_colored_logs_as_plain_text() {
@@ -2093,4 +2133,162 @@ mod tests {
             "{command}"
         );
     }
+
+    #[test]
+    fn shell_exec_ensures_ripgrep_before_each_local_process() {
+        let workspace = test_workspace("shell-rg-local");
+        let managed_dir = workspace.join("managed-bin");
+        fs::create_dir_all(&managed_dir).expect("create managed bin dir");
+        let rg_path = managed_dir.join("rg");
+        fs::write(&rg_path, "#!/bin/sh\nexit 0\n").expect("write fake rg");
+        make_executable(&rg_path);
+
+        let bridge = Arc::new(RecordingToolBinaryBridge::new(
+            managed_dir.display().to_string(),
+            None,
+        ));
+        let bridge_dyn: Arc<dyn ConversationBridge + Send + Sync> = bridge.clone();
+        let remote_mode = ToolRemoteMode::Selectable;
+        let context = test_tool_context(&workspace, &remote_mode, Some(&bridge_dyn));
+        let args = Map::from_iter([
+            (
+                "command".to_string(),
+                Value::String("command -v rg".to_string()),
+            ),
+            ("shell".to_string(), Value::String("/bin/sh".to_string())),
+            ("yield_time_ms".to_string(), Value::Number(250_u64.into())),
+        ]);
+
+        let first = shell_exec(&args, &context).expect("first shell exec");
+        let second = shell_exec(&args, &context).expect("second shell exec");
+
+        assert_eq!(bridge.requests().len(), 2);
+        assert!(shell_stdout_text(&first).contains(&rg_path.display().to_string()));
+        assert!(shell_stdout_text(&second).contains(&rg_path.display().to_string()));
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    #[test]
+    fn managed_rg_path_dir_requests_remote_host_for_remote_shells() {
+        let workspace = test_workspace("shell-rg-remote");
+        let bridge = Arc::new(RecordingToolBinaryBridge::new(
+            "/remote/.cache/stellaclaw/tools/ripgrep".to_string(),
+            Some("/remote/.cache/stellaclaw/tools/ripgrep/rg".to_string()),
+        ));
+        let bridge_dyn: Arc<dyn ConversationBridge + Send + Sync> = bridge.clone();
+        let remote_mode = ToolRemoteMode::Selectable;
+        let context = test_tool_context(&workspace, &remote_mode, Some(&bridge_dyn));
+        let binding = ShellBinding::RemoteSsh {
+            host: "devbox".to_string(),
+            cwd: Some("~/repo".to_string()),
+        };
+
+        let path_dir = managed_rg_path_dir(&context, &binding)
+            .expect("managed rg")
+            .expect("path dir");
+
+        assert_eq!(path_dir, "/remote/.cache/stellaclaw/tools/ripgrep");
+        let requests = bridge.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].payload["tool"], "ripgrep");
+        assert_eq!(requests[0].payload["host"], "devbox");
+
+        let _ = fs::remove_dir_all(workspace);
+    }
+
+    struct RecordingToolBinaryBridge {
+        path_dir: String,
+        remote_path: Option<String>,
+        requests: Mutex<Vec<ConversationBridgeRequest>>,
+    }
+
+    impl RecordingToolBinaryBridge {
+        fn new(path_dir: String, remote_path: Option<String>) -> Self {
+            Self {
+                path_dir,
+                remote_path,
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<ConversationBridgeRequest> {
+            self.requests.lock().expect("requests lock").clone()
+        }
+    }
+
+    impl ConversationBridge for RecordingToolBinaryBridge {
+        fn call(
+            &self,
+            request: ConversationBridgeRequest,
+        ) -> Result<ConversationBridgeResponse, ToolBatchError> {
+            self.requests
+                .lock()
+                .expect("requests lock")
+                .push(request.clone());
+            let response = ToolBinaryEnsureResponse {
+                status: "success".to_string(),
+                tool: "ripgrep".to_string(),
+                version: "test".to_string(),
+                platform: Some("test-platform".to_string()),
+                local_path: Some(format!("{}/rg", self.path_dir)),
+                remote_path: self.remote_path.clone(),
+                path_dir: Some(self.path_dir.clone()),
+            };
+            Ok(ConversationBridgeResponse {
+                request_id: request.request_id,
+                tool_call_id: request.tool_call_id,
+                tool_name: request.tool_name,
+                result: ToolResultItem {
+                    tool_call_id: "tool_binary_ensure".to_string(),
+                    tool_name: "tool_binary_ensure".to_string(),
+                    result: ToolResultContent::from_text(
+                        serde_json::to_string(&response).expect("encode tool response"),
+                    ),
+                },
+            })
+        }
+    }
+
+    fn test_tool_context<'a>(
+        workspace: &'a Path,
+        remote_mode: &'a ToolRemoteMode,
+        bridge: Option<&'a Arc<dyn ConversationBridge + Send + Sync>>,
+    ) -> ToolExecutionContext<'a> {
+        ToolExecutionContext {
+            workspace_root: workspace,
+            data_root: workspace,
+            remote_mode,
+            conversation_bridge: bridge,
+            token_estimator: None,
+            search_tool_models: None,
+            provider_backed_tool_models: None,
+            cancel_token: ToolCancellationToken::default(),
+        }
+    }
+
+    fn test_workspace(name: &str) -> PathBuf {
+        let path = env::temp_dir().join(format!(
+            "stellaclaw-process-tools-{name}-{}-{}",
+            std::process::id(),
+            unix_millis()
+        ));
+        fs::create_dir_all(&path).expect("create test workspace");
+        path
+    }
+
+    fn shell_stdout_text(value: &Value) -> String {
+        value["stdout"]["text"].as_str().unwrap_or("").to_string()
+    }
+
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("chmod");
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable(_path: &Path) {}
 }

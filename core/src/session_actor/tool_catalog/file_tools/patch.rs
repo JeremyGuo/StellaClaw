@@ -56,7 +56,7 @@ fn normalize_local_patch_arguments(
     let patch = string_arg(arguments, "patch")?;
     let format = patch_format(arguments, &patch)?;
     let normalized_patch = match format {
-        PatchFormat::Codex => patch.clone(),
+        PatchFormat::Freeform | PatchFormat::Codex => patch.clone(),
         PatchFormat::Unified => normalize_local_unified_patch_paths(&patch, workspace_root)?,
     };
     if normalized_patch == patch {
@@ -102,7 +102,9 @@ fn fs_tool_local(
     #[cfg(test)]
     if env::var_os(FS_TOOL_PATH_ENV).is_none() {
         return match format {
-            PatchFormat::Codex => apply_codex_patch_local(arguments, context.workspace_root),
+            PatchFormat::Freeform | PatchFormat::Codex => {
+                apply_codex_patch_local(arguments, context.workspace_root, format)
+            }
             PatchFormat::Unified => apply_unified_patch_local(
                 arguments,
                 context.workspace_root,
@@ -139,7 +141,7 @@ fn fs_tool_local(
         FS_TOOL_NAME,
     )?;
     if let Some(result) = parse_fs_tool_json(&output, None) {
-        return Ok(result);
+        return Ok(mark_patch_result_format(result, format));
     }
     Ok(patch_result(output, None, max_output_chars))
 }
@@ -240,7 +242,7 @@ fn fs_tool_remote(
     let remote_command = remote_shell_command(&remote_command);
     let output = run_remote_command_with_stdin(host, &remote_command, patch.as_bytes())?;
     if let Some(result) = parse_fs_tool_json(&output, Some(host)) {
-        return Ok(result);
+        return Ok(mark_patch_result_format(result, format));
     }
     Ok(patch_result(output, Some(host), max_output_chars))
 }
@@ -457,6 +459,7 @@ fn normalize_local_unified_path_token(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PatchFormat {
+    Freeform,
     Codex,
     Unified,
 }
@@ -464,6 +467,15 @@ enum PatchFormat {
 impl PatchFormat {
     fn cli_name(self) -> &'static str {
         match self {
+            PatchFormat::Freeform => "codex",
+            PatchFormat::Codex => "codex",
+            PatchFormat::Unified => "unified",
+        }
+    }
+
+    fn result_name(self) -> &'static str {
+        match self {
+            PatchFormat::Freeform => "freeform",
             PatchFormat::Codex => "codex",
             PatchFormat::Unified => "unified",
         }
@@ -486,12 +498,23 @@ fn patch_format(
                 Ok(PatchFormat::Unified)
             }
         }
+        "freeform" => Ok(PatchFormat::Freeform),
         "codex" => Ok(PatchFormat::Codex),
         "unified" => Ok(PatchFormat::Unified),
         other => Err(LocalToolError::InvalidArguments(format!(
-            "unsupported patch format {other}; expected auto, codex, or unified"
+            "unsupported patch format {other}; expected auto, freeform, codex, or unified"
         ))),
     }
+}
+
+fn mark_patch_result_format(mut result: Value, format: PatchFormat) -> Value {
+    if let Value::Object(object) = &mut result {
+        object.insert(
+            "format".to_string(),
+            Value::String(format.result_name().to_string()),
+        );
+    }
+    result
 }
 
 pub(super) fn ensure_remote_fs_tool(host: &str) -> Result<String, LocalToolError> {
@@ -625,7 +648,7 @@ fn classify_patch_target_paths(
     let mut saw_local = false;
     let mut saw_remote = false;
     match format {
-        PatchFormat::Codex => {
+        PatchFormat::Freeform | PatchFormat::Codex => {
             for op in parse_codex_patch(patch)? {
                 for path in codex_patch_op_paths(&op) {
                     if is_local_special_patch_path(path, workspace_root) {
@@ -1074,13 +1097,15 @@ struct CodexPatchChunk {
 fn apply_codex_patch_local(
     arguments: &Map<String, Value>,
     workspace_root: &Path,
+    format: PatchFormat,
 ) -> Result<Value, LocalToolError> {
     let strip = usize_arg_with_default(arguments, "strip", 0)?;
     let reverse = bool_arg_with_default(arguments, "reverse", false)?;
     if strip != 0 || reverse {
-        return Err(LocalToolError::InvalidArguments(
-            "format=codex does not support strip or reverse".to_string(),
-        ));
+        return Err(LocalToolError::InvalidArguments(format!(
+            "format={} does not support strip or reverse",
+            format.result_name()
+        )));
     }
     let patch = string_arg(arguments, "patch")?;
     let check = bool_arg_with_default(arguments, "check", false)?;
@@ -1100,7 +1125,7 @@ fn apply_codex_patch_local(
     }
 
     let summary = json!({
-        "format": "codex",
+        "format": format.result_name(),
         "applied": true,
         "check": check,
         "files_changed": files_changed.iter().cloned().collect::<Vec<_>>(),

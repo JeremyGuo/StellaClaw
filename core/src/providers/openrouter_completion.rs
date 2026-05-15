@@ -227,6 +227,13 @@ fn should_stream_openrouter_response(
 }
 
 impl ProviderBackend for OpenRouterCompletionProvider {
+    fn system_prompt_for_model(
+        &self,
+        _model_config: &ModelConfig,
+    ) -> Result<Option<String>, ProviderError> {
+        Ok(None)
+    }
+
     fn send(
         &self,
         model_config: &ModelConfig,
@@ -724,6 +731,7 @@ fn convert_openrouter_response(
     let _ = choice.finish_reason;
 
     Ok(ChatMessage {
+        message_id: ChatMessage::new_message_id(),
         role: ChatRole::Assistant,
         user_name: None,
         message_time: None,

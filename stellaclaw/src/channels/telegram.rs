@@ -13,20 +13,16 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use stellaclaw_core::session_actor::{FileItem, FileState};
+use stellaclaw_core::session_actor::{
+    ChatMessage, ChatMessageItem, FileItem, FileState, ToolCallItem,
+};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
-use crate::{
-    conversation::{
-        parse_reasoning_control_argument, render_chat_message, ConversationControl,
-        IncomingConversationMessage,
-    },
-    conversation_id_manager::ConversationIdManager,
-    logger::StellaclawLogger,
-};
+use crate::{conversation_id_manager::ConversationIdManager, logger::StellaclawLogger};
 
 use super::{
     types::{
+        parse_reasoning_control_argument, ConversationControl, IncomingConversationMessage,
         IncomingDispatch, IncomingMessageDispatch, OutgoingAttachment, OutgoingAttachmentKind,
         OutgoingDelivery, OutgoingError, OutgoingOptions, OutgoingProgressFeedback, OutgoingStatus,
         OutgoingUsageSummary, OutgoingUsageTotals, ProcessingState, ProgressFeedbackFinalState,
@@ -1253,6 +1249,50 @@ fn render_status_text(status: &OutgoingStatus) -> String {
         status.total_subagents,
         render_usage_summary(&status.usage),
     )
+}
+
+fn render_chat_message(message: &ChatMessage) -> String {
+    let mut parts = Vec::new();
+    for item in &message.data {
+        match item {
+            ChatMessageItem::Context(context) => parts.push(context.text.clone()),
+            ChatMessageItem::SelectionReference(selection) => {
+                parts.push(selection.to_prompt_text());
+            }
+            ChatMessageItem::File(file) => parts.push(render_file_item(file)),
+            ChatMessageItem::Reasoning(_) => {}
+            ChatMessageItem::ToolCall(ToolCallItem {
+                tool_name,
+                arguments,
+                ..
+            }) => parts.push(format!("[tool_call {tool_name}] {}", arguments.text)),
+            ChatMessageItem::ToolResult(tool_result) => {
+                let mut line = format!("[tool_result {}]", tool_result.tool_name);
+                let text = stellaclaw_core::session_actor::tool_result_text(tool_result);
+                if !text.trim().is_empty() {
+                    line.push('\n');
+                    line.push_str(&text);
+                }
+                for file in &tool_result.result.files {
+                    line.push('\n');
+                    line.push_str(&render_file_item(file));
+                }
+                parts.push(line);
+            }
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        parts.join("\n\n")
+    }
+}
+
+fn render_file_item(file: &FileItem) -> String {
+    match &file.name {
+        Some(name) => format!("[file] {name} ({})", file.uri),
+        None => format!("[file] {}", file.uri),
+    }
 }
 
 fn render_usage_summary(summary: &OutgoingUsageSummary) -> String {
@@ -3073,9 +3113,8 @@ mod tests {
         telegram_text_len, ChatAuthorization, SecurityState, TelegramChannel, TelegramChat,
         TelegramMessage, TelegramMessageEntity, TelegramRenderedText, TelegramUser,
     };
-    use crate::channels::types::{OutgoingOption, OutgoingOptions};
+    use crate::channels::types::{ConversationControl, OutgoingOption, OutgoingOptions};
     use crate::config::SandboxMode;
-    use crate::conversation::ConversationControl;
     use std::{
         collections::{BTreeMap, HashMap},
         path::PathBuf,

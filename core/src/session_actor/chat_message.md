@@ -8,6 +8,7 @@ The Rust definitions live in `core/src/session_actor/chat_message.rs`.
 
 ```rust
 pub struct ChatMessage {
+    pub message_id: String,
     pub role: ChatRole,
     pub user_name: Option<String>,
     pub message_time: Option<String>,
@@ -15,6 +16,10 @@ pub struct ChatMessage {
     pub data: Vec<ChatMessageItem>,
 }
 ```
+
+### `message_id`
+
+Stable provider-neutral local ID for this persisted message. It is generated before a new message is appended and is used by stream events, Web queries, and seen state. Old histories are upgraded by assigning missing IDs.
 
 ### `role`
 
@@ -176,21 +181,26 @@ Model reasoning metadata.
 ```rust
 pub struct ReasoningItem {
     pub text: String,
-    pub codex_summary: Option<String>,
+    pub codex_summary: Vec<ReasoningSummaryPart>,
     pub codex_encrypted_content: Option<String>,
+}
+
+pub struct ReasoningSummaryPart {
+    pub text: String,
 }
 ```
 
 Fields:
 
 - `text`: visible or fallback reasoning text. Empty strings are omitted during serialization.
-- `codex_summary`: optional Codex reasoning summary.
+- `codex_summary`: ordered Codex reasoning summary parts.
 - `codex_encrypted_content`: optional encrypted Codex reasoning payload used for Codex Responses history replay.
 
 Behavior:
 
 - Plain reasoning is often dropped before provider requests.
 - Codex encrypted reasoning is preserved for Codex subscription replay.
+- Codex summary part order is preserved exactly as produced by the provider; callers should not sort or deduplicate it.
 - Reasoning should not be treated as ordinary user/assistant visible text unless a provider explicitly maps it that way.
 
 ### `File`
@@ -421,7 +431,7 @@ File-only tool result:
       "type": "tool_result",
       "payload": {
         "tool_call_id": "call_abc",
-        "tool_name": "image_load",
+        "tool_name": "image_view",
         "result": {
           "files": [
             {

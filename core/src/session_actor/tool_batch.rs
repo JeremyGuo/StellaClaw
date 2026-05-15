@@ -6,8 +6,7 @@ use thiserror::Error;
 use crate::model_config::ModelConfig;
 
 use super::{
-    ChatMessage, ChatMessageItem, ChatRole, ProviderBackedToolKind, SessionSkillObservation,
-    ToolCallItem, ToolConcurrency, ToolResultItem,
+    ChatMessage, ChatMessageItem, ChatRole, ToolCallItem, ToolConcurrency, ToolResultItem,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -28,8 +27,20 @@ pub struct SearchToolModels {
     pub news: Option<ModelConfig>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProviderBackedToolModels {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<ModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdf: Option<ModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<ModelConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_generation: Option<ModelConfig>,
+}
+
 impl ToolBatch {
-    pub fn new(batch_id: impl Into<String>, operations: Vec<ToolExecutionOp>) -> Self {
+    pub fn new(batch_id: impl Into<String>, operations: Vec<ToolBatchItem>) -> Self {
         Self {
             batch_id: batch_id.into(),
             operations: operations.into_iter().map(Into::into).collect(),
@@ -78,69 +89,46 @@ impl ToolBatch {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolBatchOperation {
-    pub operation: ToolExecutionOp,
+    pub item: ToolBatchItem,
     pub concurrency: ToolConcurrency,
 }
 
 impl ToolBatchOperation {
-    pub fn new(operation: ToolExecutionOp, concurrency: ToolConcurrency) -> Self {
-        Self {
-            operation,
-            concurrency,
-        }
+    pub fn new(item: ToolBatchItem, concurrency: ToolConcurrency) -> Self {
+        Self { item, concurrency }
     }
 
     pub fn progress_label(&self) -> String {
-        self.operation.progress_label()
+        self.item.progress_label()
     }
 }
 
-impl From<ToolExecutionOp> for ToolBatchOperation {
-    fn from(operation: ToolExecutionOp) -> Self {
-        let concurrency = operation.default_concurrency();
-        Self {
-            operation,
-            concurrency,
-        }
+impl From<ToolBatchItem> for ToolBatchOperation {
+    fn from(item: ToolBatchItem) -> Self {
+        let concurrency = item.default_concurrency();
+        Self { item, concurrency }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum ToolExecutionOp {
-    LocalTool(ToolCallItem),
+pub enum ToolBatchItem {
+    RegisteredTool(ToolCallItem),
     UnsupportedTool {
         tool_call: ToolCallItem,
         reason: String,
     },
-    SkillLoad {
-        tool_call: ToolCallItem,
-        skill: SessionSkillObservation,
-    },
-    ProviderBacked {
-        tool_call: ToolCallItem,
-        kind: ProviderBackedToolKind,
-        model_config: ModelConfig,
-    },
-    WebSearch {
-        tool_call: ToolCallItem,
-        models: SearchToolModels,
-    },
-    ConversationBridge(ConversationBridgeRequest),
 }
 
-impl ToolExecutionOp {
+impl ToolBatchItem {
     pub fn default_concurrency(&self) -> ToolConcurrency {
         match self {
-            Self::LocalTool(tool_call) => match tool_call.tool_name.as_str() {
-                "file_write"
-                | "apply_patch"
+            Self::RegisteredTool(tool_call) => match tool_call.tool_name.as_str() {
+                "apply_patch"
                 | "shell_make_visible"
                 | "attachment_make_visible"
                 | "shell_exec"
                 | "shell_write_stdin"
                 | "shell_stop"
-                | "file_download_start"
-                | "file_download_cancel"
                 | "image_stop"
                 | "pdf_stop"
                 | "audio_stop"
@@ -148,22 +136,13 @@ impl ToolExecutionOp {
                 _ => ToolConcurrency::Parallel,
             },
             Self::UnsupportedTool { .. } => ToolConcurrency::Parallel,
-            Self::SkillLoad { .. } | Self::ProviderBacked { .. } | Self::WebSearch { .. } => {
-                ToolConcurrency::Parallel
-            }
-            Self::ConversationBridge(_) => ToolConcurrency::Serial,
         }
     }
 
     pub fn progress_label(&self) -> String {
         match self {
-            Self::LocalTool(tool_call)
-            | Self::UnsupportedTool { tool_call, .. }
-            | Self::SkillLoad { tool_call, .. }
-            | Self::ProviderBacked { tool_call, .. }
-            | Self::WebSearch { tool_call, .. } => tool_call_progress_label(tool_call),
-            Self::ConversationBridge(request) => {
-                format!("bridge:{} {}", request.action, request.tool_name)
+            Self::RegisteredTool(tool_call) | Self::UnsupportedTool { tool_call, .. } => {
+                tool_call_progress_label(tool_call)
             }
         }
     }
@@ -289,18 +268,18 @@ mod tests {
     fn builds_result_message_from_tool_results() {
         let batch = ToolBatch::new(
             "batch_1",
-            vec![ToolExecutionOp::LocalTool(ToolCallItem {
+            vec![ToolBatchItem::RegisteredTool(ToolCallItem {
                 tool_call_id: "call_1".to_string(),
-                tool_name: "read_file".to_string(),
+                tool_name: "apply_patch".to_string(),
                 arguments: ContextItem {
-                    text: "{\"path\":\"README.md\"}".to_string(),
+                    text: "{}".to_string(),
                 },
             })],
         );
 
         let message = batch.into_result_message(vec![ToolResultItem {
             tool_call_id: "call_1".to_string(),
-            tool_name: "read_file".to_string(),
+            tool_name: "apply_patch".to_string(),
             result: ToolResultContent::from_text("file loaded".to_string()),
         }]);
 
@@ -317,26 +296,22 @@ mod tests {
     }
 
     #[test]
-    fn supports_conversation_bridge_operations_inside_batch() {
+    fn supports_registered_service_tools_inside_batch() {
         let batch = ToolBatch::new(
             "batch_3",
-            vec![ToolExecutionOp::ConversationBridge(
-                ConversationBridgeRequest {
-                    request_id: "req_1".to_string(),
-                    tool_call_id: "call_2".to_string(),
-                    tool_name: "snapshot_save".to_string(),
-                    action: "snapshot_save".to_string(),
-                    payload: serde_json::json!({
-                        "name": "before-edit"
-                    }),
+            vec![ToolBatchItem::RegisteredTool(ToolCallItem {
+                tool_call_id: "call_2".to_string(),
+                tool_name: "cron_tasks_list".to_string(),
+                arguments: ContextItem {
+                    text: "{}".to_string(),
                 },
-            )],
+            })],
         );
 
         assert_eq!(batch.operations.len(), 1);
         assert!(matches!(
-            &batch.operations[0].operation,
-            ToolExecutionOp::ConversationBridge(_)
+            &batch.operations[0].item,
+            ToolBatchItem::RegisteredTool(_)
         ));
     }
 }

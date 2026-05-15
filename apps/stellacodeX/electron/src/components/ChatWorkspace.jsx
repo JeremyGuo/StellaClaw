@@ -7,7 +7,7 @@ import * as Popover from '@radix-ui/react-popover';
 import { attachmentName, attachmentUrl, fileExtension, isImageAttachment, messageText } from '../lib/fileUtils';
 import { handleExternalLinkClick, isExternalUrl } from '../lib/externalLinks';
 import { formatBytes, formatTokens, modelAlias, modelDisplayName } from '../lib/format';
-import { displayMessages, firstMessageId, firstToolNameForMessage, isExecutionMessage, liveActivitySignature, markerIndexes, messageKey, shouldTypewriterMessage, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
+import { displayMessages, firstMessageId, firstToolNameForMessage, isExecutionMessage, liveActivitySignature, markerIndexes, messageKey, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
 
 const COMMANDS = [
   { command: '/model', label: '切换模型', description: '选择当前 Conversation 使用的模型', options: 'models' },
@@ -27,11 +27,6 @@ const REASONING_EFFORTS = [
   { value: 'xhigh', label: 'XHigh', description: '使用最高 reasoning effort' },
   { value: 'default', label: 'Default', description: '恢复模型默认 reasoning effort' }
 ];
-
-function serverMessageIndex(message) {
-  const index = Number(message?.index ?? message?.id);
-  return Number.isFinite(index) ? index : -1;
-}
 
 function readFileAsBase64(file) {
   return new Promise((resolve, reject) => {
@@ -122,7 +117,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const modeLabel = typeof mode === 'string' ? mode : mode?.label || '本地';
   const modeTone = typeof mode === 'string' ? '' : mode?.tone || 'local';
   const modeTitle = typeof mode === 'string' ? mode : mode?.title || modeLabel;
-  const [typingKeys, setTypingKeys] = useState(() => new Set());
   const [commandPanel, setCommandPanel] = useState('commands');
   const [models, setModels] = useState([]);
   const [modelsLoading, setModelsLoading] = useState(false);
@@ -143,10 +137,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const loadingOlderRef = useRef(false);
   const prependAdjustRef = useRef(null);
   const stickToBottomRef = useRef(true);
-  const knownMessagesRef = useRef(new Set());
-  const typedMessagesRef = useRef(new Set());
-  const typewriterHydratedRef = useRef(false);
-  const newestSeenIndexRef = useRef(-1);
   const currentActivity = (runningActivities || []).at(-1) || null;
   const progressVisible = Boolean(currentActivity);
   const turnStoppedAfterTool = useMemo(() => {
@@ -229,10 +219,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     loadingOlderRef.current = false;
     prependAdjustRef.current = null;
     stickToBottomRef.current = true;
-    knownMessagesRef.current = new Set();
-    typedMessagesRef.current = new Set();
-    typewriterHydratedRef.current = false;
-    newestSeenIndexRef.current = -1;
     requestAnimationFrame(scrollToBottom);
     setDraft('');
     setComposerAttachments((current) => {
@@ -241,7 +227,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       });
       return [];
     });
-    setTypingKeys(new Set());
   }, [activeMessageScope]);
 
   useEffect(() => {
@@ -253,46 +238,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
       if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl);
     });
   }, []);
-
-  useEffect(() => {
-    const known = knownMessagesRef.current;
-    const maxIndex = messages.reduce((max, message) => Math.max(max, serverMessageIndex(message)), -1);
-    if (!messagesReady || !typewriterHydratedRef.current) {
-      messages.forEach((message, index) => {
-        const key = messageKey(message, index);
-        known.add(key);
-        if (shouldTypewriterMessage(message)) {
-          typedMessagesRef.current.add(`${key}:${messageText(message)}`);
-        }
-      });
-      newestSeenIndexRef.current = maxIndex;
-      typewriterHydratedRef.current = Boolean(messagesReady);
-      return;
-    }
-
-    const nextTyping = [];
-    const previousNewestIndex = newestSeenIndexRef.current;
-    messages.forEach((message, index) => {
-      const key = messageKey(message, index);
-      const signature = `${key}:${messageText(message)}`;
-      const isNew = !known.has(key);
-      known.add(key);
-      const isAppendedCurrentMessage = serverMessageIndex(message) > previousNewestIndex;
-      if (isNew && isAppendedCurrentMessage && shouldTypewriterMessage(message) && !typedMessagesRef.current.has(signature)) {
-        typedMessagesRef.current.add(signature);
-        nextTyping.push(key);
-      }
-    });
-    newestSeenIndexRef.current = Math.max(newestSeenIndexRef.current, maxIndex);
-
-    if (nextTyping.length > 0) {
-      setTypingKeys((current) => {
-        const next = new Set(current);
-        nextTyping.forEach((key) => next.add(key));
-        return next;
-      });
-    }
-  }, [messages, activeMessageScope, messagesReady]);
 
   const loadOlderPreservingViewport = async () => {
     const list = scrollRef.current;
@@ -470,18 +415,8 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
                   <MemoMessageArticle
                     key={messageKey(message, index)}
                     message={message}
-                    typewriter={typingKeys.has(messageKey(message, index))}
                     onOpenAttachment={onOpenAttachment}
                     onDownloadAttachment={onDownloadAttachment}
-                    onTypewriterDone={() => {
-                      const key = messageKey(message, index);
-                      setTypingKeys((current) => {
-                        if (!current.has(key)) return current;
-                        const next = new Set(current);
-                        next.delete(key);
-                        return next;
-                      });
-                    }}
                   />
                 )
             ))}
@@ -847,7 +782,7 @@ function planStatusMark(status) {
   return '○';
 }
 
-export function MessageArticle({ message, typewriter = false, onTypewriterDone, onOpenAttachment, onDownloadAttachment }) {
+export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment }) {
   const usage = tokenUsage(message);
   const role = message.user_name || message.role || 'assistant';
   const className = messageArticleClassName(message);
@@ -859,7 +794,7 @@ export function MessageArticle({ message, typewriter = false, onTypewriterDone, 
           <AuxiliaryDots messages={message._auxiliary} />
         )}
       </div>
-      <MessageBody message={message} typewriter={typewriter} onTypewriterDone={onTypewriterDone} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
+      <MessageBody message={message} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
       {message.pending && <div className="message-status">正在发送...</div>}
       {message.error && <div className="message-status error">{message.error}</div>}
       {String(message.role || '').toLowerCase() === 'assistant' && (
@@ -872,6 +807,8 @@ export function MessageArticle({ message, typewriter = false, onTypewriterDone, 
 function messageArticleClassName(message) {
   const classes = ['message', message.role || 'assistant'];
   if (message._forceSeparate) classes.push('force-separate');
+  if (message._streaming) classes.push('streaming');
+  if (message._streamFailed) classes.push('stream-failed');
   const itemList = Array.isArray(message?.items) ? message.items : [];
   if (itemList.some((item) => item?.type === 'selection_reference')) {
     classes.push('has-selection-reference');
@@ -891,9 +828,8 @@ function messageArticleClassName(message) {
 }
 
 const MemoMessageArticle = memo(MessageArticle, (previous, next) => {
-  if (previous.message !== next.message || previous.typewriter !== next.typewriter) return false;
+  if (previous.message !== next.message) return false;
   if (previous.onOpenAttachment !== next.onOpenAttachment || previous.onDownloadAttachment !== next.onDownloadAttachment) return false;
-  if (previous.typewriter || next.typewriter) return previous.onTypewriterDone === next.onTypewriterDone;
   return true;
 });
 
@@ -1058,7 +994,7 @@ function toolCardsAreComplete(cards) {
   return hasResult && (open.size === 0 || cards.at(-1)?.kind === 'result');
 }
 
-export function MessageBody({ message, typewriter = false, onTypewriterDone, onOpenAttachment, onDownloadAttachment }) {
+export function MessageBody({ message, onOpenAttachment, onDownloadAttachment }) {
   const text = messageText(message);
   const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
   const files = Array.isArray(message?.files) ? message.files : [];
@@ -1079,9 +1015,7 @@ export function MessageBody({ message, typewriter = false, onTypewriterDone, onO
   });
   return (
     <div className="message-body">
-      {typewriter && text ? (
-        <TypewriterMarkdown className="message-text" text={text} attachments={allAttachments} onDone={onTypewriterDone} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
-      ) : Array.isArray(message?.items) && message.items.length > 0 ? (
+      {Array.isArray(message?.items) && message.items.length > 0 ? (
         <StructuredItems role={message?.role} items={message.items} attachments={allAttachments} fallbackText={text} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
       ) : text ? (
         <MarkdownContent className="message-text" text={text} attachments={allAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
@@ -1190,49 +1124,6 @@ function ReasoningNote({ text }) {
     <div className="reasoning-note">
       <span>思考</span>
       <MarkdownContent className="reasoning-note-text" text={value} />
-    </div>
-  );
-}
-
-export function TypewriterMarkdown({ text, attachments = [], className = 'message-text', onDone, onOpenAttachment, onDownloadAttachment }) {
-  const value = String(text || '');
-  const [count, setCount] = useState(0);
-  const doneRef = useRef(false);
-
-  useEffect(() => {
-    setCount(0);
-    doneRef.current = false;
-  }, [value]);
-
-  useEffect(() => {
-    if (!value) return undefined;
-    let frame = 0;
-    let cancelled = false;
-    const total = value.length;
-    const step = Math.max(2, Math.ceil(total / 80));
-    const tick = () => {
-      if (cancelled) return;
-      setCount((current) => {
-        const next = Math.min(total, current + step);
-        if (next >= total && !doneRef.current) {
-          doneRef.current = true;
-          window.setTimeout(() => onDone?.(), 80);
-        }
-        return next;
-      });
-      frame = window.setTimeout(tick, 18);
-    };
-    frame = window.setTimeout(tick, 18);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(frame);
-    };
-  }, [value, onDone]);
-
-  return (
-    <div className="typewriter-message">
-      <MarkdownContent className={className} text={value.slice(0, count)} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
-      {count < value.length && <span className="typewriter-caret" aria-hidden="true" />}
     </div>
   );
 }

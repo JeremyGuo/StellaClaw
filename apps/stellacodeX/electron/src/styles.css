@@ -1027,6 +1027,10 @@ button {
   margin-top: 18px;
 }
 
+.message.streaming .message-body {
+  color: color-mix(in srgb, var(--text), transparent 8%);
+}
+
 .message.assistant:has(.token-usage) {
   margin-bottom: 24px;
 }
@@ -1425,33 +1429,6 @@ button {
   background: var(--code-inline-bg);
   font-family: var(--font-mono);
   font-size: 0.92em;
-}
-
-.typewriter-message {
-  position: relative;
-  min-width: 0;
-}
-
-.typewriter-caret {
-  display: inline-block;
-  width: 7px;
-  height: 1.18em;
-  margin-left: 2px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--text), transparent 18%);
-  vertical-align: -0.18em;
-  animation: typewriter-caret-blink 900ms steps(1) infinite;
-}
-
-@keyframes typewriter-caret-blink {
-  0%,
-  45% {
-    opacity: 1;
-  }
-  46%,
-  100% {
-    opacity: 0;
-  }
 }
 
 .message-attachments {

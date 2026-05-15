@@ -14,10 +14,7 @@ use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde::{Deserialize, Serialize};
 use stellaclaw_core::session_actor::ToolRemoteMode;
 
-use crate::{
-    conversation::{ConversationState, WorkdirLayout},
-    workspace::ensure_workspace_for_remote_mode,
-};
+use crate::workspace::ensure_workspace_for_remote_mode;
 
 const DEFAULT_COLS: u16 = 120;
 const DEFAULT_ROWS: u16 = 30;
@@ -35,7 +32,7 @@ const MAX_TERMINALS_TOTAL: usize = 128;
 const TERMINAL_STREAM_CHANNEL_CAPACITY: usize = 256;
 const TERMINAL_STREAM_REPLAY_CHUNK_BYTES: usize = 16 * 1024;
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TerminalCreateRequest {
     #[serde(default)]
     pub shell: Option<String>,
@@ -47,13 +44,13 @@ pub struct TerminalCreateRequest {
     pub rows: Option<u16>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalResizeRequest {
     pub cols: u16,
     pub rows: u16,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalSummary {
     pub terminal_id: String,
     pub conversation_id: String,
@@ -69,14 +66,14 @@ pub struct TerminalSummary {
     pub next_offset: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminalMode {
     Local,
     FixedSsh,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalRemote {
     pub host: String,
     pub cwd: Option<String>,
@@ -115,6 +112,30 @@ pub struct TerminalAttach {
     pub replay: TerminalReplay,
     pub receiver: Receiver<TerminalOutputChunk>,
     pub subscriber_id: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalRuntimeContext {
+    pub workdir: PathBuf,
+    pub conversation_id: String,
+    pub conversation_root: PathBuf,
+    pub tool_remote_mode: ToolRemoteMode,
+}
+
+impl TerminalRuntimeContext {
+    pub fn new(
+        workdir: PathBuf,
+        conversation_id: String,
+        conversation_root: PathBuf,
+        tool_remote_mode: ToolRemoteMode,
+    ) -> Self {
+        Self {
+            workdir,
+            conversation_id,
+            conversation_root,
+            tool_remote_mode,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -216,43 +237,42 @@ impl TerminalManager {
         Self::default()
     }
 
-    pub fn list(&self, state: &ConversationState) -> Vec<TerminalSummary> {
+    pub fn list_for_context(&self, context: &TerminalRuntimeContext) -> Vec<TerminalSummary> {
         let Ok(mut inner) = self.inner.lock() else {
             return Vec::new();
         };
-        reset_stale_terminals(&mut inner, state);
+        reset_stale_terminals(&mut inner, context);
         inner
             .sessions
             .values()
-            .filter(|session| session.conversation_id == state.conversation_id)
+            .filter(|session| session.conversation_id == context.conversation_id)
             .map(|session| session.summary())
             .collect()
     }
 
-    pub fn get(
+    pub fn get_for_context(
         &self,
-        state: &ConversationState,
+        context: &TerminalRuntimeContext,
         terminal_id: &str,
     ) -> Result<TerminalSummary, WebTerminalError> {
-        Ok(self.lookup(state, terminal_id)?.summary())
+        Ok(self.lookup(context, terminal_id)?.summary())
     }
 
-    pub fn create(
+    pub fn create_for_context(
         &self,
-        workdir: &Path,
-        state: &ConversationState,
+        context: &TerminalRuntimeContext,
         request: TerminalCreateRequest,
     ) -> Result<TerminalSummary, WebTerminalError> {
         let cols = clamp_dimension(request.cols.unwrap_or(DEFAULT_COLS), MIN_COLS, MAX_COLS);
         let rows = clamp_dimension(request.rows.unwrap_or(DEFAULT_ROWS), MIN_ROWS, MAX_ROWS);
-        let shell = resolve_shell(request.shell.as_deref(), &state.tool_remote_mode)?;
+        let shell = resolve_shell(request.shell.as_deref(), &context.tool_remote_mode)?;
         let cwd_request = normalize_relative_cwd(request.cwd.as_deref())?;
 
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| WebTerminalError::Internal(anyhow!("terminal manager lock poisoned")))?;
-        reset_stale_terminals(&mut inner, state);
+        reset_stale_terminals(&mut inner, context);
         if inner.sessions.len() >= MAX_TERMINALS_TOTAL {
             return Err(WebTerminalError::LimitExceeded(format!(
                 "web terminal limit exceeded: at most {MAX_TERMINALS_TOTAL} terminals total"
@@ -261,7 +281,7 @@ impl TerminalManager {
         let conversation_count = inner
             .sessions
             .values()
-            .filter(|session| session.conversation_id == state.conversation_id)
+            .filter(|session| session.conversation_id == context.conversation_id)
             .count();
         if conversation_count >= MAX_TERMINALS_PER_CONVERSATION {
             return Err(WebTerminalError::LimitExceeded(format!(
@@ -272,8 +292,7 @@ impl TerminalManager {
         let terminal_id = format!("terminal_{:04}", inner.next_index);
         inner.next_index = inner.next_index.saturating_add(1);
         let session = Arc::new(spawn_terminal_session(
-            workdir,
-            state,
+            context,
             terminal_id.clone(),
             shell,
             cwd_request,
@@ -285,34 +304,24 @@ impl TerminalManager {
     }
 
     #[cfg(test)]
-    pub fn output(
+    pub fn output_for_context(
         &self,
-        state: &ConversationState,
+        context: &TerminalRuntimeContext,
         terminal_id: &str,
         offset: u64,
         limit_bytes: usize,
     ) -> Result<TerminalOutput, WebTerminalError> {
-        let session = self.lookup(state, terminal_id)?;
+        let session = self.lookup(context, terminal_id)?;
         Ok(session.output(offset, limit_bytes))
     }
 
-    #[cfg(test)]
-    pub fn input(
+    pub fn input_bytes_for_context(
         &self,
-        state: &ConversationState,
-        terminal_id: &str,
-        data: &str,
-    ) -> Result<TerminalSummary, WebTerminalError> {
-        self.input_bytes(state, terminal_id, data.as_bytes())
-    }
-
-    pub fn input_bytes(
-        &self,
-        state: &ConversationState,
+        context: &TerminalRuntimeContext,
         terminal_id: &str,
         data: &[u8],
     ) -> Result<TerminalSummary, WebTerminalError> {
-        let session = self.lookup(state, terminal_id)?;
+        let session = self.lookup(context, terminal_id)?;
         if !session.is_running() {
             return Err(WebTerminalError::InvalidRequest(
                 "terminal is not running".to_string(),
@@ -328,13 +337,13 @@ impl TerminalManager {
         Ok(session.summary())
     }
 
-    pub fn resize(
+    pub fn resize_for_context(
         &self,
-        state: &ConversationState,
+        context: &TerminalRuntimeContext,
         terminal_id: &str,
         request: TerminalResizeRequest,
     ) -> Result<TerminalSummary, WebTerminalError> {
-        let session = self.lookup(state, terminal_id)?;
+        let session = self.lookup(context, terminal_id)?;
         let cols = clamp_dimension(request.cols, MIN_COLS, MAX_COLS);
         let rows = clamp_dimension(request.rows, MIN_ROWS, MAX_ROWS);
         session
@@ -357,12 +366,12 @@ impl TerminalManager {
         Ok(session.summary())
     }
 
-    pub fn terminate(
+    pub fn terminate_for_context(
         &self,
-        state: &ConversationState,
+        context: &TerminalRuntimeContext,
         terminal_id: &str,
     ) -> Result<TerminalSummary, WebTerminalError> {
-        let session = self.lookup(state, terminal_id)?;
+        let session = self.lookup(context, terminal_id)?;
         if session.is_running() {
             kill_terminal_session(&session)?;
             session.finish();
@@ -397,64 +406,64 @@ impl TerminalManager {
         terminated
     }
 
-    pub fn replay(
+    pub fn replay_for_context(
         &self,
-        state: &ConversationState,
+        context: &TerminalRuntimeContext,
         terminal_id: &str,
         offset: u64,
     ) -> Result<TerminalReplay, WebTerminalError> {
-        let session = self.lookup(state, terminal_id)?;
+        let session = self.lookup(context, terminal_id)?;
         Ok(session.replay(offset))
     }
 
-    pub fn attach(
+    pub fn attach_for_context(
         &self,
-        state: &ConversationState,
+        context: &TerminalRuntimeContext,
         terminal_id: &str,
         offset: u64,
     ) -> Result<TerminalAttach, WebTerminalError> {
-        let session = self.lookup(state, terminal_id)?;
+        let session = self.lookup(context, terminal_id)?;
         Ok(session.attach(offset))
     }
 
-    pub fn detach(
+    pub fn detach_for_context(
         &self,
-        state: &ConversationState,
+        context: &TerminalRuntimeContext,
         terminal_id: &str,
         subscriber_id: u64,
     ) -> Result<(), WebTerminalError> {
-        let session = self.lookup(state, terminal_id)?;
+        let session = self.lookup(context, terminal_id)?;
         session.detach(subscriber_id);
         Ok(())
     }
 
     fn lookup(
         &self,
-        state: &ConversationState,
+        context: &TerminalRuntimeContext,
         terminal_id: &str,
     ) -> Result<Arc<TerminalSession>, WebTerminalError> {
         let mut inner = self
             .inner
             .lock()
             .map_err(|_| WebTerminalError::Internal(anyhow!("terminal manager lock poisoned")))?;
-        reset_stale_terminals(&mut inner, state);
+        reset_stale_terminals(&mut inner, context);
         let Some(session) = inner.sessions.get(terminal_id) else {
             return Err(WebTerminalError::NotFound);
         };
-        if session.conversation_id != state.conversation_id {
+        if session.conversation_id != context.conversation_id {
             return Err(WebTerminalError::NotFound);
         }
         Ok(session.clone())
     }
 }
 
-fn reset_stale_terminals(inner: &mut TerminalManagerInner, state: &ConversationState) {
-    let runtime_key = terminal_runtime_key(state);
+fn reset_stale_terminals(inner: &mut TerminalManagerInner, context: &TerminalRuntimeContext) {
+    let runtime_key = terminal_runtime_key(context);
     let stale_ids = inner
         .sessions
         .iter()
         .filter(|(_, session)| {
-            session.conversation_id == state.conversation_id && session.runtime_key != runtime_key
+            session.conversation_id == context.conversation_id && session.runtime_key != runtime_key
         })
         .map(|(terminal_id, _)| terminal_id.clone())
         .collect::<Vec<_>>();
@@ -475,8 +484,8 @@ fn kill_terminal_session(session: &TerminalSession) -> Result<(), WebTerminalErr
     Ok(())
 }
 
-fn terminal_runtime_key(state: &ConversationState) -> TerminalRuntimeKey {
-    match &state.tool_remote_mode {
+fn terminal_runtime_key(context: &TerminalRuntimeContext) -> TerminalRuntimeKey {
+    match &context.tool_remote_mode {
         ToolRemoteMode::Selectable => TerminalRuntimeKey::Local,
         ToolRemoteMode::FixedSsh { host, cwd } => TerminalRuntimeKey::FixedSsh {
             host: host.clone(),
@@ -681,8 +690,7 @@ impl OutputBuffer {
 }
 
 fn spawn_terminal_session(
-    workdir: &Path,
-    state: &ConversationState,
+    context: &TerminalRuntimeContext,
     terminal_id: String,
     shell: String,
     cwd_request: Option<String>,
@@ -698,15 +706,14 @@ fn spawn_terminal_session(
         })
         .context("failed to open terminal pty")?;
 
-    let conversation_root = WorkdirLayout::new(workdir).conversation_root(&state.conversation_id);
-    let runtime_key = terminal_runtime_key(state);
-    let (mode, remote, cwd_label, mut command) = match &state.tool_remote_mode {
+    let runtime_key = terminal_runtime_key(context);
+    let (mode, remote, cwd_label, mut command) = match &context.tool_remote_mode {
         ToolRemoteMode::Selectable => {
             let workspace_root = ensure_workspace_for_remote_mode(
-                workdir,
-                &conversation_root,
-                &state.conversation_id,
-                &state.tool_remote_mode,
+                &context.workdir,
+                &context.conversation_root,
+                &context.conversation_id,
+                &context.tool_remote_mode,
             )?;
             let cwd = resolve_local_cwd(&workspace_root, cwd_request.as_deref())?;
             let mut command = CommandBuilder::new(&shell);
@@ -758,7 +765,7 @@ fn spawn_terminal_session(
     let now = unix_millis();
     let session = TerminalSession {
         terminal_id,
-        conversation_id: state.conversation_id.clone(),
+        conversation_id: context.conversation_id.clone(),
         runtime_key,
         mode,
         remote,
@@ -959,12 +966,7 @@ fn unix_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::BTreeMap, fs, thread, time::Duration};
-
-    use crate::{
-        config::{ModelSelection, SessionProfile},
-        conversation::ConversationSessionBinding,
-    };
+    use std::{fs, thread, time::Duration};
 
     fn test_workdir(name: &str) -> PathBuf {
         let path = env::temp_dir().join(format!(
@@ -976,38 +978,29 @@ mod tests {
         path
     }
 
-    fn test_state(conversation_id: &str, tool_remote_mode: ToolRemoteMode) -> ConversationState {
-        ConversationState {
-            version: 1,
-            conversation_id: conversation_id.to_string(),
-            nickname: conversation_id.to_string(),
-            channel_id: "web-main".to_string(),
-            platform_chat_id: "test-chat".to_string(),
-            session_profile: SessionProfile {
-                main_model: ModelSelection::alias("main"),
-            },
-            model_selection_pending: false,
+    fn test_context(
+        workdir: &Path,
+        conversation_id: &str,
+        tool_remote_mode: ToolRemoteMode,
+    ) -> TerminalRuntimeContext {
+        let conversation_root = workdir.join("conversations").join(conversation_id);
+        fs::create_dir_all(&conversation_root).expect("create conversation root");
+        TerminalRuntimeContext::new(
+            workdir.to_path_buf(),
+            conversation_id.to_string(),
+            conversation_root,
             tool_remote_mode,
-            sandbox: None,
-            reasoning_effort: None,
-            session_binding: ConversationSessionBinding {
-                foreground_session_id: format!("{conversation_id}.foreground"),
-                next_background_index: 1,
-                next_subagent_index: 1,
-                background_sessions: BTreeMap::new(),
-                subagent_sessions: BTreeMap::new(),
-            },
-        }
+        )
     }
 
     fn wait_for_output(
         manager: &TerminalManager,
-        state: &ConversationState,
+        context: &TerminalRuntimeContext,
         terminal_id: &str,
         needle: &str,
     ) -> TerminalOutput {
         let mut output = manager
-            .output(state, terminal_id, 0, DEFAULT_OUTPUT_LIMIT_BYTES)
+            .output_for_context(context, terminal_id, 0, DEFAULT_OUTPUT_LIMIT_BYTES)
             .expect("read terminal output");
         for _ in 0..50 {
             if output.data.contains(needle) {
@@ -1015,7 +1008,7 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(20));
             output = manager
-                .output(state, terminal_id, 0, DEFAULT_OUTPUT_LIMIT_BYTES)
+                .output_for_context(context, terminal_id, 0, DEFAULT_OUTPUT_LIMIT_BYTES)
                 .expect("read terminal output");
         }
         output
@@ -1024,15 +1017,16 @@ mod tests {
     #[test]
     fn terminal_create_sets_term_and_keeps_session_across_list() {
         let workdir = test_workdir("term-env");
-        let state = test_state("web-main-test-term-env", ToolRemoteMode::Selectable);
-        fs::create_dir_all(workdir.join("conversations").join(&state.conversation_id))
-            .expect("create conversation root");
+        let context = test_context(
+            &workdir,
+            "web-main-test-term-env",
+            ToolRemoteMode::Selectable,
+        );
         let manager = TerminalManager::new();
 
         let terminal = manager
-            .create(
-                &workdir,
-                &state,
+            .create_for_context(
+                &context,
                 TerminalCreateRequest {
                     shell: Some("/bin/sh".to_string()),
                     cwd: None,
@@ -1045,13 +1039,13 @@ mod tests {
         assert_eq!(terminal.rows, 22);
 
         manager
-            .input(
-                &state,
+            .input_bytes_for_context(
+                &context,
                 &terminal.terminal_id,
-                "printf 'TERM=%s\\n' \"$TERM\"\n",
+                b"printf 'TERM=%s\\n' \"$TERM\"\n",
             )
             .expect("write terminal input");
-        let output = wait_for_output(&manager, &state, &terminal.terminal_id, "xterm-256color");
+        let output = wait_for_output(&manager, &context, &terminal.terminal_id, "xterm-256color");
         assert!(
             output.data.contains("TERM=xterm-256color"),
             "{}",
@@ -1059,25 +1053,26 @@ mod tests {
         );
         assert!(output.next_offset > output.offset);
 
-        let listed = manager.list(&state);
+        let listed = manager.list_for_context(&context);
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].terminal_id, terminal.terminal_id);
 
-        let _ = manager.terminate(&state, &terminal.terminal_id);
+        let _ = manager.terminate_for_context(&context, &terminal.terminal_id);
         let _ = fs::remove_dir_all(workdir);
     }
 
     #[test]
     fn terminal_list_resets_sessions_after_remote_mode_changes() {
         let workdir = test_workdir("remote-reset");
-        let state = test_state("web-main-test-remote-reset", ToolRemoteMode::Selectable);
-        fs::create_dir_all(workdir.join("conversations").join(&state.conversation_id))
-            .expect("create conversation root");
+        let context = test_context(
+            &workdir,
+            "web-main-test-remote-reset",
+            ToolRemoteMode::Selectable,
+        );
         let manager = TerminalManager::new();
         let terminal = manager
-            .create(
-                &workdir,
-                &state,
+            .create_for_context(
+                &context,
                 TerminalCreateRequest {
                     shell: Some("/bin/sh".to_string()),
                     cwd: None,
@@ -1087,16 +1082,17 @@ mod tests {
             )
             .expect("create terminal");
 
-        let remote_state = test_state(
-            &state.conversation_id,
+        let remote_context = test_context(
+            &workdir,
+            &context.conversation_id,
             ToolRemoteMode::FixedSsh {
                 host: "example-host".to_string(),
                 cwd: Some("~/repo".to_string()),
             },
         );
-        assert!(manager.list(&remote_state).is_empty());
+        assert!(manager.list_for_context(&remote_context).is_empty());
         assert!(matches!(
-            manager.get(&remote_state, &terminal.terminal_id),
+            manager.get_for_context(&remote_context, &terminal.terminal_id),
             Err(WebTerminalError::NotFound)
         ));
 
@@ -1106,14 +1102,15 @@ mod tests {
     #[test]
     fn terminal_attach_streams_raw_bytes_and_replays_by_offset() {
         let workdir = test_workdir("stream-attach");
-        let state = test_state("web-main-test-stream-attach", ToolRemoteMode::Selectable);
-        fs::create_dir_all(workdir.join("conversations").join(&state.conversation_id))
-            .expect("create conversation root");
+        let context = test_context(
+            &workdir,
+            "web-main-test-stream-attach",
+            ToolRemoteMode::Selectable,
+        );
         let manager = TerminalManager::new();
         let terminal = manager
-            .create(
-                &workdir,
-                &state,
+            .create_for_context(
+                &context,
                 TerminalCreateRequest {
                     shell: Some("/bin/sh".to_string()),
                     cwd: None,
@@ -1123,13 +1120,13 @@ mod tests {
             )
             .expect("create terminal");
         let attach = manager
-            .attach(&state, &terminal.terminal_id, terminal.next_offset)
+            .attach_for_context(&context, &terminal.terminal_id, terminal.next_offset)
             .expect("attach terminal");
         let subscriber_id = attach.subscriber_id.expect("running subscriber");
 
         manager
-            .input_bytes(
-                &state,
+            .input_bytes_for_context(
+                &context,
                 &terminal.terminal_id,
                 b"printf 'raw-stream-ok\\n'\n",
             )
@@ -1155,7 +1152,7 @@ mod tests {
         );
 
         let replay = manager
-            .replay(&state, &terminal.terminal_id, terminal.next_offset)
+            .replay_for_context(&context, &terminal.terminal_id, terminal.next_offset)
             .expect("replay terminal");
         let replayed = replay
             .chunks
@@ -1171,9 +1168,9 @@ mod tests {
         );
 
         manager
-            .detach(&state, &terminal.terminal_id, subscriber_id)
+            .detach_for_context(&context, &terminal.terminal_id, subscriber_id)
             .expect("detach terminal");
-        let _ = manager.terminate(&state, &terminal.terminal_id);
+        let _ = manager.terminate_for_context(&context, &terminal.terminal_id);
         let _ = fs::remove_dir_all(workdir);
     }
 }

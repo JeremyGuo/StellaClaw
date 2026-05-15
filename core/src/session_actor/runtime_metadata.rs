@@ -11,6 +11,7 @@ use super::ToolRemoteMode;
 
 pub(crate) const IDENTITY_PROMPT_COMPONENT: &str = "identity";
 pub(crate) const REMOTE_ALIASES_PROMPT_COMPONENT: &str = "ssh_remote_aliases";
+pub(crate) const REMOTE_WORKSPACE_PROMPT_COMPONENT: &str = "remote_workspace";
 pub(crate) const SKILLS_METADATA_PROMPT_COMPONENT: &str = "skills_metadata";
 pub(crate) const USER_META_PROMPT_COMPONENT: &str = "user_meta";
 pub(crate) const USER_MEMORY_PROMPT_COMPONENT: &str = "user_memory";
@@ -76,6 +77,7 @@ impl RuntimeMetadataState {
         workspace_root: &Path,
         data_root: &Path,
         remote_aliases_prompt: String,
+        remote_workspace_prompt: String,
         memory_enabled: bool,
     ) -> Result<(), String> {
         let metadata = load_workspace_runtime_metadata(workspace_root, data_root)?;
@@ -119,6 +121,11 @@ impl RuntimeMetadataState {
             REMOTE_ALIASES_PROMPT_COMPONENT,
             remote_aliases_prompt,
         );
+        initialize_component(
+            &mut self.prompt_components,
+            REMOTE_WORKSPACE_PROMPT_COMPONENT,
+            remote_workspace_prompt,
+        );
         Ok(())
     }
 
@@ -127,6 +134,7 @@ impl RuntimeMetadataState {
         workspace_root: &Path,
         data_root: &Path,
         remote_aliases_prompt: String,
+        remote_workspace_prompt: String,
         memory_enabled: bool,
     ) -> Result<Vec<String>, String> {
         let metadata = load_workspace_runtime_metadata(workspace_root, data_root)?;
@@ -165,6 +173,12 @@ impl RuntimeMetadataState {
             remote_aliases_prompt,
             &mut prompt_notices,
         );
+        observe_component(
+            &mut self.prompt_components,
+            REMOTE_WORKSPACE_PROMPT_COMPONENT,
+            remote_workspace_prompt,
+            &mut prompt_notices,
+        );
 
         let skill_notices = self.observe_skill_changes(&metadata.skills);
         let mut rendered = Vec::new();
@@ -179,15 +193,6 @@ impl RuntimeMetadataState {
         Ok(rendered)
     }
 
-    pub(crate) fn skill_observation(&self, skill_name: &str) -> Option<SessionSkillObservation> {
-        let state = self.skill_states.get(skill_name)?;
-        Some(SessionSkillObservation {
-            name: skill_name.to_string(),
-            description: state.description.clone(),
-            content: state.content.clone(),
-        })
-    }
-
     pub(crate) fn mark_loaded_skills(&mut self, skill_names: &[String], turn_number: u64) {
         for skill_name in skill_names {
             self.skill_states
@@ -195,6 +200,10 @@ impl RuntimeMetadataState {
                 .or_default()
                 .last_loaded_turn = Some(turn_number);
         }
+    }
+
+    pub(crate) fn initialize_missing_component(&mut self, key: &str, value: String) {
+        initialize_component(&mut self.prompt_components, key, value);
     }
 
     pub(crate) fn promote_notified_components_to_system_snapshot(&mut self) {
@@ -324,7 +333,7 @@ fn load_user_meta_snapshot(data_root: &Path) -> Result<String, String> {
         fs::read(&path).map_err(|error| format!("failed to read {}: {error}", path.display()))?;
     let hash = prompt_component_hash(&String::from_utf8_lossy(&raw));
     Ok(format!(
-        "Profile metadata file: {USER_META_PATH}\nstatus: present\nbytes: {}\nhash: {hash}\nRead {USER_META_PATH} with file_read when exact profile details are needed.",
+        "Profile metadata file: {USER_META_PATH}\nstatus: present\nbytes: {}\nhash: {hash}\nInspect {USER_META_PATH} with shell_exec when exact profile details are needed.",
         raw.len()
     ))
 }
@@ -657,7 +666,7 @@ fn render_prompt_component_change_notices(notices: &[PromptComponentChangeNotice
                     );
                 } else {
                     sections.push(format!(
-                        "USER.md metadata changed. The full file content is not included in this notice; read .stellaclaw/USER.md with file_read if exact profile details are needed. Refreshed metadata:\n{}",
+                        "USER.md metadata changed. The full file content is not included in this notice; inspect .stellaclaw/USER.md with shell_exec if exact profile details are needed. Refreshed metadata:\n{}",
                         notice.value.trim()
                     ));
                 }
@@ -686,6 +695,19 @@ fn render_prompt_component_change_notices(notices: &[PromptComponentChangeNotice
                     "The available SSH remote alias list changed. Treat this refreshed list as authoritative for remote tool calls in this turn:\n{}",
                     notice.value.trim()
                 ));
+            }
+            REMOTE_WORKSPACE_PROMPT_COMPONENT => {
+                if notice.value.trim().is_empty() {
+                    sections.push(
+                        "Remote workspace instructions are now absent. Ignore earlier remote workspace instruction snapshots."
+                            .to_string(),
+                    );
+                } else {
+                    sections.push(format!(
+                        "Remote workspace instructions changed. Treat this refreshed remote workspace snapshot as authoritative for this turn:\n{}",
+                        notice.value.trim()
+                    ));
+                }
             }
             key => {
                 sections.push(format!(
@@ -928,12 +950,12 @@ mod tests {
 
         let mut state = RuntimeMetadataState::default();
         state
-            .initialize_from_workspace(&root, &root, String::new(), false)
+            .initialize_from_workspace(&root, &root, String::new(), String::new(), false)
             .expect("initial metadata should load");
 
         fs::write(root.join(".stellaclaw/USER.md"), "tier: enterprise").unwrap();
         let notices = state
-            .observe_for_user_turn_from_workspace(&root, &root, String::new(), false)
+            .observe_for_user_turn_from_workspace(&root, &root, String::new(), String::new(), false)
             .expect("changed metadata should load");
         assert_eq!(notices.len(), 1);
         assert!(notices[0].contains("[Runtime Prompt Updates]"));
@@ -942,7 +964,7 @@ mod tests {
         assert!(!notices[0].contains("tier: enterprise"));
 
         assert!(state
-            .observe_for_user_turn_from_workspace(&root, &root, String::new(), false)
+            .observe_for_user_turn_from_workspace(&root, &root, String::new(), String::new(), false)
             .expect("metadata should still load")
             .is_empty());
 
@@ -962,7 +984,7 @@ mod tests {
 
         let mut state = RuntimeMetadataState::default();
         state
-            .initialize_from_workspace(&root, &root, String::new(), true)
+            .initialize_from_workspace(&root, &root, String::new(), String::new(), true)
             .expect("initial metadata should load");
 
         fs::write(
@@ -972,7 +994,7 @@ mod tests {
         )
         .unwrap();
         let notices = state
-            .observe_for_user_turn_from_workspace(&root, &root, String::new(), true)
+            .observe_for_user_turn_from_workspace(&root, &root, String::new(), String::new(), true)
             .expect("changed metadata should load");
 
         assert_eq!(notices.len(), 1);
@@ -996,7 +1018,7 @@ mod tests {
 
         let mut state = RuntimeMetadataState::default();
         state
-            .initialize_from_workspace(&root, &root, String::new(), false)
+            .initialize_from_workspace(&root, &root, String::new(), String::new(), false)
             .expect("initial metadata should load");
         assert!(!state
             .prompt_components
@@ -1008,7 +1030,7 @@ mod tests {
         )
         .unwrap();
         let notices = state
-            .observe_for_user_turn_from_workspace(&root, &root, String::new(), false)
+            .observe_for_user_turn_from_workspace(&root, &root, String::new(), String::new(), false)
             .expect("changed metadata should load");
         assert!(notices.is_empty());
         assert!(!state
@@ -1029,7 +1051,7 @@ mod tests {
 
         let mut state = RuntimeMetadataState::default();
         state
-            .initialize_from_workspace(&root, &root, String::new(), false)
+            .initialize_from_workspace(&root, &root, String::new(), String::new(), false)
             .expect("initial metadata should load");
         state.mark_loaded_skills(&["demo".to_string()], 1);
 
@@ -1039,7 +1061,7 @@ mod tests {
         )
         .unwrap();
         let notices = state
-            .observe_for_user_turn_from_workspace(&root, &root, String::new(), false)
+            .observe_for_user_turn_from_workspace(&root, &root, String::new(), String::new(), false)
             .expect("changed metadata should load");
         assert!(notices
             .iter()

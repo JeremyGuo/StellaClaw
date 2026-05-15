@@ -13,41 +13,82 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+use crossbeam_channel::{Receiver, TryRecvError};
 use serde_json::{Map, Value};
 use thiserror::Error;
 
-use super::{ConversationBridge, TokenEstimator, ToolRemoteMode};
+use super::{
+    ConversationBridge, ProviderBackedToolModels, SearchToolModels, TokenEstimator, ToolRemoteMode,
+};
 
 const REMOTE_STDIN_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Default)]
-pub(super) struct ToolCancellationToken {
+pub(crate) struct ToolCancellationToken {
     state: Arc<ToolCancellationState>,
 }
 
-#[derive(Default)]
 struct ToolCancellationState {
     cancelled: AtomicBool,
+    interrupt_rx: Option<Receiver<()>>,
+}
+
+impl Default for ToolCancellationState {
+    fn default() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            interrupt_rx: None,
+        }
+    }
 }
 
 impl ToolCancellationToken {
+    pub(super) fn from_interrupt_rx(interrupt_rx: Receiver<()>) -> Self {
+        Self {
+            state: Arc::new(ToolCancellationState {
+                cancelled: AtomicBool::new(false),
+                interrupt_rx: Some(interrupt_rx),
+            }),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn cancel(&self) {
         self.state.cancelled.store(true, Ordering::SeqCst);
     }
 
     pub(super) fn is_cancelled(&self) -> bool {
-        self.state.cancelled.load(Ordering::SeqCst)
+        if self.state.cancelled.load(Ordering::SeqCst) {
+            return true;
+        }
+        let Some(interrupt_rx) = &self.state.interrupt_rx else {
+            return false;
+        };
+        match interrupt_rx.try_recv() {
+            Ok(()) | Err(TryRecvError::Disconnected) => {
+                self.state.cancelled.store(true, Ordering::SeqCst);
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+        }
+    }
+
+    pub(super) fn cancel_rx(&self) -> Receiver<()> {
+        self.state
+            .interrupt_rx
+            .clone()
+            .unwrap_or_else(crossbeam_channel::never)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ExecutionTarget {
+pub(crate) enum ExecutionTarget {
     Local,
     RemoteSsh { host: String, cwd: Option<String> },
 }
 
 #[derive(Debug, Error)]
-pub(super) enum LocalToolError {
+pub(crate) enum LocalToolError {
     #[error("tool batch {0} is empty")]
     EmptyBatch(String),
     #[error("invalid tool arguments: {0}")]
@@ -62,12 +103,14 @@ pub(super) enum LocalToolError {
     Bridge(String),
 }
 
-pub(super) struct ToolExecutionContext<'a> {
+pub(crate) struct ToolExecutionContext<'a> {
     pub workspace_root: &'a Path,
     pub data_root: &'a Path,
     pub remote_mode: &'a ToolRemoteMode,
     pub conversation_bridge: Option<&'a Arc<dyn ConversationBridge + Send + Sync>>,
     pub token_estimator: Option<&'a TokenEstimator>,
+    pub search_tool_models: Option<&'a SearchToolModels>,
+    pub provider_backed_tool_models: Option<&'a ProviderBackedToolModels>,
     pub cancel_token: ToolCancellationToken,
 }
 
@@ -229,19 +272,6 @@ pub(super) fn string_arg(
 ) -> Result<String, LocalToolError> {
     arguments
         .get(key)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| LocalToolError::InvalidArguments(format!("missing string argument {key}")))
-}
-
-pub(super) fn string_arg_with_alias(
-    arguments: &Map<String, Value>,
-    key: &str,
-    alias: &str,
-) -> Result<String, LocalToolError> {
-    arguments
-        .get(key)
-        .or_else(|| arguments.get(alias))
         .and_then(Value::as_str)
         .map(ToOwned::to_owned)
         .ok_or_else(|| LocalToolError::InvalidArguments(format!("missing string argument {key}")))

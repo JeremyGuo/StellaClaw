@@ -1,9 +1,8 @@
 use std::{
-    collections::BTreeMap,
     fs,
     net::{TcpStream, ToSocketAddrs},
     path::PathBuf,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -19,8 +18,11 @@ use url::Url;
 use crate::{
     model_config::ModelConfig,
     session_actor::{
-        normalize_messages_for_model, ChatMessage, ChatMessageItem, ChatRole, ContextItem,
-        FileItem, ReasoningItem, ToolCallItem,
+        media_tool_definitions, normalize_messages_for_model, BuiltinBaseTool, ChatMessage,
+        ChatMessageItem, ChatRole, ContextItem, ExtTool, FileItem, LocalToolError, ReasoningItem,
+        ToolBackend, ToolCallContext, ToolCallItem, ToolCatalog, ToolCatalogError, ToolConcurrency,
+        ToolDefinition, ToolEnablementEnv, ToolEntry, ToolExecutionMode, ToolResultContent,
+        ToolSet,
     },
 };
 
@@ -29,18 +31,38 @@ use super::{
         account_id_from_access_token, ensure_request_payload_size, is_image_file, nonce,
         provider_error_kind, provider_error_message, token_usage_from_value,
     },
-    OutputPersistor, ProviderBackend, ProviderError, ProviderRequest,
+    OutputPersistor, ProviderBackend, ProviderError, ProviderRequest, ProviderStreamEvent,
 };
 
 const OPENAI_BETA_RESPONSES_WEBSOCKETS: &str = "responses_websockets=2026-02-06";
 const CHATGPT_REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CHATGPT_REFRESH_TOKEN_URL_OVERRIDE_ENV: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
+const CODEX_MODELS_URL_OVERRIDE_ENV: &str = "STELLACLAW_CODEX_MODELS_URL";
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
+const CODEX_PRAGMATIC_PERSONALITY_PROMPT: &str = r#"# Personality
+
+You are a deeply pragmatic, effective software engineer. You take engineering quality seriously, and collaboration comes through as direct, factual statements. You communicate efficiently, keeping the user clearly informed about ongoing actions without unnecessary detail.
+
+## Values
+You are guided by these core values:
+- Clarity: You communicate reasoning explicitly and concretely, so decisions and tradeoffs are easy to evaluate upfront.
+- Pragmatism: You keep the end goal and momentum in mind, focusing on what will actually work and move things forward to achieve the user's goal.
+- Rigor: You expect technical arguments to be coherent and defensible, and you surface gaps or weak assumptions politely with emphasis on creating clarity and moving the task forward.
+
+## Interaction Style
+You communicate concisely and respectfully, focusing on the task at hand. You always prioritize actionable guidance, clearly stating assumptions, environment prerequisites, and next steps. Unless explicitly asked, you avoid excessively verbose explanations about your work.
+
+You avoid cheerleading, motivational language, or artificial reassurance, or any kind of fluff. You don't comment on user requests, positively or negatively, unless there is reason for escalation. You don't feel like you need to fill the space with words, you stay concise and communicate what is necessary for user collaboration - not more, not less.
+
+## Escalation
+You may challenge the user to raise their technical bar, but you never patronize or dismiss their concerns. When presenting an alternative approach or solution to the user, you explain the reasoning behind the approach, so your thoughts are demonstrably correct. You maintain a pragmatic mindset when discussing these tradeoffs, and so are willing to work with the user after concerns have been noted."#;
 
 pub struct CodexSubscriptionProvider {
     output_persistor: OutputPersistor,
     auth_manager: CodexSubscriptionAuthManager,
     socket: Mutex<Option<WebSocket<MaybeTlsStream<TcpStream>>>>,
+    models_cache: Mutex<Option<CachedCodexModels>>,
     session_id: String,
     installation_id: String,
 }
@@ -48,12 +70,9 @@ pub struct CodexSubscriptionProvider {
 #[derive(Debug, Default)]
 struct StreamAccumulator {
     output_items: Vec<Value>,
-    text_deltas: String,
+    active_output_item_id: Option<String>,
     active_reasoning_item_id: Option<String>,
-    reasoning_summaries: BTreeMap<String, Vec<String>>,
 }
-
-const PENDING_REASONING_SUMMARY_KEY: &str = "__pending_reasoning_summary__";
 
 #[derive(Debug, Default)]
 struct CodexSubscriptionAuthManager {
@@ -68,6 +87,42 @@ struct CodexAuthMaterial {
     is_fedramp_account: bool,
     expires_at: Option<i64>,
     source: CodexAuthSource,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedCodexModels {
+    version: u32,
+    fetched_at_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    etag: Option<String>,
+    models: Vec<CodexModelInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CodexModelsResponse {
+    models: Vec<CodexModelInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CodexModelInfo {
+    #[serde(alias = "id", alias = "model")]
+    slug: String,
+    #[serde(default)]
+    model_messages: Option<CodexModelMessages>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CodexModelMessages {
+    #[serde(default)]
+    instructions_template: Option<String>,
+    #[serde(default)]
+    instructions_variables: Option<CodexModelInstructionsVariables>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CodexModelInstructionsVariables {
+    #[serde(default)]
+    personality_pragmatic: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,17 +154,18 @@ impl CodexSubscriptionProvider {
         &self,
         model_config: &ModelConfig,
         request: &ProviderRequest<'_>,
+        on_stream: &mut dyn FnMut(ProviderStreamEvent),
     ) -> Result<ChatMessage, ProviderError> {
         let auth = self.auth_manager.resolve(model_config)?;
 
         let payload = self.build_payload(model_config, request)?;
 
-        match self.send_with_auth(model_config, payload.clone(), &auth) {
+        match self.send_with_auth(model_config, payload.clone(), &auth, on_stream) {
             Ok(message) => Ok(message),
             Err(error) if is_unauthorized(&error) => {
                 self.clear_socket();
                 let refreshed = self.auth_manager.refresh(model_config, &auth)?;
-                self.send_with_auth(model_config, payload, &refreshed)
+                self.send_with_auth(model_config, payload, &refreshed, on_stream)
             }
             Err(error) => Err(error),
         }
@@ -187,6 +243,7 @@ impl CodexSubscriptionProvider {
         model_config: &ModelConfig,
         payload: Map<String, Value>,
         auth: &CodexAuthMaterial,
+        on_stream: &mut dyn FnMut(ProviderStreamEvent),
     ) -> Result<ChatMessage, ProviderError> {
         let socket = {
             let mut cached = self.socket.lock().expect("mutex poisoned");
@@ -198,6 +255,7 @@ impl CodexSubscriptionProvider {
             payload,
             auth,
             socket,
+            on_stream,
         )?;
         responses_value_to_chat_message(&response, model_config, &self.output_persistor)
     }
@@ -208,6 +266,7 @@ impl CodexSubscriptionProvider {
         payload: Map<String, Value>,
         auth: &CodexAuthMaterial,
         initial_socket: Option<WebSocket<MaybeTlsStream<TcpStream>>>,
+        on_stream: &mut dyn FnMut(ProviderStreamEvent),
     ) -> Result<Value, ProviderError> {
         let mut socket = initial_socket;
         let mut retried_transport_error = false;
@@ -217,7 +276,8 @@ impl CodexSubscriptionProvider {
                 Some(socket) => socket,
                 None => connect_codex_websocket(model_config, auth, &self.session_id)?,
             };
-            let response = send_response_create(&mut active_socket, payload.clone(), model_config);
+            let response =
+                send_response_create(&mut active_socket, payload.clone(), model_config, on_stream);
             if response.is_ok() {
                 let mut cached = self.socket.lock().expect("mutex poisoned");
                 *cached = Some(active_socket);
@@ -238,6 +298,47 @@ impl CodexSubscriptionProvider {
         let mut cached = self.socket.lock().expect("mutex poisoned");
         *cached = None;
     }
+
+    fn codex_models(&self, model_config: &ModelConfig) -> Result<CachedCodexModels, ProviderError> {
+        if let Some(cached) = self.models_cache.lock().expect("mutex poisoned").clone() {
+            return Ok(cached);
+        }
+
+        if let Some(cached) = read_cached_codex_models()? {
+            *self.models_cache.lock().expect("mutex poisoned") = Some(cached.clone());
+            return Ok(cached);
+        }
+
+        let auth = self.auth_manager.resolve(model_config)?;
+        let fetched = match fetch_codex_models(model_config, &auth) {
+            Ok(models) => models,
+            Err(error) if is_unauthorized(&error) => {
+                let refreshed = self.auth_manager.refresh(model_config, &auth)?;
+                fetch_codex_models(model_config, &refreshed)?
+            }
+            Err(error) => return Err(error),
+        };
+        write_cached_codex_models(&fetched)?;
+        *self.models_cache.lock().expect("mutex poisoned") = Some(fetched.clone());
+        Ok(fetched)
+    }
+}
+
+fn render_codex_model_instructions(messages: &CodexModelMessages) -> Option<String> {
+    let template = messages.instructions_template.as_deref()?.trim();
+    if template.is_empty() {
+        return None;
+    }
+
+    let pragmatic = messages
+        .instructions_variables
+        .as_ref()
+        .and_then(|variables| variables.personality_pragmatic.as_deref())
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+        .unwrap_or(CODEX_PRAGMATIC_PERSONALITY_PROMPT);
+
+    Some(template.replace(CODEX_PERSONALITY_PLACEHOLDER, pragmatic))
 }
 
 impl Default for CodexSubscriptionProvider {
@@ -252,6 +353,7 @@ impl Default for CodexSubscriptionProvider {
             output_persistor: OutputPersistor,
             auth_manager: CodexSubscriptionAuthManager::default(),
             socket: Mutex::new(None),
+            models_cache: Mutex::new(None),
             session_id,
             installation_id,
         }
@@ -259,6 +361,31 @@ impl Default for CodexSubscriptionProvider {
 }
 
 impl ProviderBackend for CodexSubscriptionProvider {
+    fn tool_set(&self, _model_config: &ModelConfig) -> Option<Arc<dyn ToolSet>> {
+        Some(Arc::new(CodexSubscriptionToolSet))
+    }
+
+    fn system_prompt_for_model(
+        &self,
+        model_config: &ModelConfig,
+    ) -> Result<Option<String>, ProviderError> {
+        let models = self.codex_models(model_config)?;
+        let model = models
+            .models
+            .iter()
+            .find(|model| model.slug == model_config.model_name)
+            .ok_or_else(|| {
+                ProviderError::InvalidResponse(format!(
+                    "codex models endpoint did not return model {}",
+                    model_config.model_name
+                ))
+            })?;
+        Ok(model
+            .model_messages
+            .as_ref()
+            .and_then(render_codex_model_instructions))
+    }
+
     fn normalize_messages_for_provider(
         &self,
         _model_config: &ModelConfig,
@@ -275,13 +402,325 @@ impl ProviderBackend for CodexSubscriptionProvider {
         model_config: &ModelConfig,
         request: ProviderRequest<'_>,
     ) -> Result<ChatMessage, ProviderError> {
-        self.send_once(model_config, &request)
+        self.send_once(model_config, &request, &mut |_| {})
+    }
+
+    fn send_with_stream(
+        &self,
+        model_config: &ModelConfig,
+        request: ProviderRequest<'_>,
+        on_stream: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> Result<ChatMessage, ProviderError> {
+        self.send_once(model_config, &request, on_stream)
     }
 
     fn before_retry(&self, _model_config: &ModelConfig, error: &ProviderError) {
         if matches!(error, ProviderError::WebSocket(_)) {
             self.clear_socket();
         }
+    }
+}
+
+struct CodexSubscriptionToolSet;
+
+impl ToolSet for CodexSubscriptionToolSet {
+    fn register(
+        &self,
+        catalog: &mut ToolCatalog,
+        env: &ToolEnablementEnv<'_>,
+    ) -> Result<(), ToolCatalogError> {
+        for tool in CODEX_BUILTIN_BASE_TOOLS {
+            add_builtin_base_tool(catalog, env, tool)?;
+        }
+        add_native_image_generation_tool(catalog, env)?;
+        catalog.add_enabled_tool_entry(ToolEntry::Ext(Arc::new(CodexExecCommandTool)), env)?;
+        catalog.add_enabled_tool_entry(ToolEntry::Ext(Arc::new(CodexWriteStdinTool)), env)?;
+        catalog.add_enabled_tool_entry(ToolEntry::Ext(Arc::new(CodexExecStopTool)), env)?;
+        catalog.add_enabled_tool_entry(ToolEntry::Ext(Arc::new(CodexExecMakeVisibleTool)), env)?;
+        catalog.add_enabled_tool_entry(ToolEntry::Ext(Arc::new(CodexApplyPatchTool)), env)?;
+        Ok(())
+    }
+}
+
+const CODEX_BUILTIN_BASE_TOOLS: &[&str] = &[
+    "attachment_make_visible",
+    "web_fetch",
+    "web_search",
+    "image_view",
+    "pdf_view",
+    "audio_view",
+    "image_generation",
+    "skill_load",
+    "skill_create",
+    "skill_update",
+    "skill_delete",
+    "update_plan",
+    "cron_tasks_list",
+    "cron_task_get",
+    "cron_task_create",
+    "cron_task_update",
+    "cron_task_remove",
+    "background_agents_list",
+    "background_agent_start",
+    "terminate",
+    "subagent_start",
+    "subagent_kill",
+    "subagent_join",
+    "memory_search",
+    "memory_write",
+    "memory_update",
+    "memory_delete",
+];
+
+fn add_builtin_base_tool(
+    catalog: &mut ToolCatalog,
+    env: &ToolEnablementEnv<'_>,
+    tool_name: &str,
+) -> Result<(), ToolCatalogError> {
+    let Some(tool) = BuiltinBaseTool::definition(tool_name, env.options) else {
+        return Ok(());
+    };
+    if tool.is_enabled_for_model(env.model_config) {
+        catalog.add(tool)?;
+    }
+    Ok(())
+}
+
+fn add_native_image_generation_tool(
+    catalog: &mut ToolCatalog,
+    env: &ToolEnablementEnv<'_>,
+) -> Result<(), ToolCatalogError> {
+    for tool in media_tool_definitions(env.options) {
+        if tool.name == "image_generation"
+            && matches!(
+                tool.backend,
+                ToolBackend::ProviderNative {
+                    kind: crate::session_actor::ProviderNativeToolKind::ImageGeneration
+                }
+            )
+            && tool.is_enabled_for_model(env.model_config)
+        {
+            catalog.add(tool)?;
+        }
+    }
+    Ok(())
+}
+
+struct CodexExecCommandTool;
+
+impl ExtTool for CodexExecCommandTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "exec_command",
+            "Runs a command in a fresh shell process, returning output or a session id for ongoing interaction.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "cmd": {"type": "string", "description": "Shell command to execute."},
+                    "workdir": {"type": "string", "description": "Optional working directory to run the command in; defaults to the turn cwd."},
+                    "shell": {"type": "string", "description": "Shell binary to launch. Defaults to the user's default shell."},
+                    "login": {"type": "boolean", "description": "Whether to run the shell with -l/-i semantics. Defaults to false."},
+                    "tty": {"type": "boolean", "description": "Whether to allocate a TTY for the command. Defaults to false; set to true to keep stdin writable."},
+                    "yield_time_ms": {"type": "integer", "minimum": 250, "maximum": 30000, "description": "How long to wait in milliseconds for output before yielding."},
+                    "timeout_ms": {"type": "integer", "minimum": 0, "maximum": 86400000},
+                    "max_output_tokens": {"type": "integer", "minimum": 0, "maximum": 50000, "description": "Maximum output tokens to return. Excess output will be truncated."}
+                },
+                "required": ["cmd"],
+                "additionalProperties": false
+            }),
+            ToolExecutionMode::Interruptible,
+            ToolBackend::Local,
+        )
+        .with_concurrency(ToolConcurrency::Serial)
+    }
+
+    fn base_tool_id(&self) -> &'static str {
+        "shell_exec"
+    }
+
+    fn call(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let Value::Object(mut arguments) = args else {
+            return Err(LocalToolError::InvalidArguments(
+                "tool arguments must be a JSON object".to_string(),
+            ));
+        };
+        let command = arguments
+            .remove("cmd")
+            .ok_or_else(|| LocalToolError::InvalidArguments("missing required cmd".to_string()))?;
+        arguments.insert("command".to_string(), command);
+        BuiltinBaseTool::call_local(self.base_tool_id(), ctx, Value::Object(arguments))
+    }
+}
+
+struct CodexWriteStdinTool;
+
+impl ExtTool for CodexWriteStdinTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "write_stdin",
+            "Writes characters to an existing shell session and returns recent output.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "Identifier of the running shell session."},
+                    "chars": {"type": "string", "description": "Bytes to write to stdin; pass an empty string to poll recent output."},
+                    "yield_time_ms": {"type": "integer", "minimum": 250, "maximum": 30000, "description": "How long to wait in milliseconds for output before yielding."},
+                    "max_output_tokens": {"type": "integer", "minimum": 0, "maximum": 50000, "description": "Maximum output tokens to return. Excess output will be truncated."}
+                },
+                "required": ["session_id"],
+                "additionalProperties": false
+            }),
+            ToolExecutionMode::Interruptible,
+            ToolBackend::Local,
+        )
+        .with_concurrency(ToolConcurrency::Serial)
+    }
+
+    fn base_tool_id(&self) -> &'static str {
+        "shell_write_stdin"
+    }
+
+    fn call(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let Value::Object(mut arguments) = args else {
+            return Err(LocalToolError::InvalidArguments(
+                "tool arguments must be a JSON object".to_string(),
+            ));
+        };
+        let session_id = arguments.remove("session_id").ok_or_else(|| {
+            LocalToolError::InvalidArguments("missing required session_id".to_string())
+        })?;
+        arguments.insert("process_id".to_string(), session_id);
+        BuiltinBaseTool::call_local(self.base_tool_id(), ctx, Value::Object(arguments))
+    }
+}
+
+struct CodexExecStopTool;
+
+impl ExtTool for CodexExecStopTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "exec_stop",
+            "Stop a running shell session by session_id. signal defaults to terminate.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "Identifier of the running shell session."},
+                    "signal": {"type": "string", "enum": ["interrupt", "terminate", "kill"]}
+                },
+                "required": ["session_id"],
+                "additionalProperties": false
+            }),
+            ToolExecutionMode::Immediate,
+            ToolBackend::Local,
+        )
+        .with_concurrency(ToolConcurrency::Serial)
+    }
+
+    fn base_tool_id(&self) -> &'static str {
+        "shell_stop"
+    }
+
+    fn call(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let Value::Object(mut arguments) = args else {
+            return Err(LocalToolError::InvalidArguments(
+                "tool arguments must be a JSON object".to_string(),
+            ));
+        };
+        let session_id = arguments.remove("session_id").ok_or_else(|| {
+            LocalToolError::InvalidArguments("missing required session_id".to_string())
+        })?;
+        arguments.insert("process_id".to_string(), session_id);
+        BuiltinBaseTool::call_local(self.base_tool_id(), ctx, Value::Object(arguments))
+    }
+}
+
+struct CodexExecMakeVisibleTool;
+
+impl ExtTool for CodexExecMakeVisibleTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "exec_make_visible",
+            "Copy a local workspace-relative file or directory to the fixed remote workspace so remote exec_command can read it.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "timeout_seconds": {"type": "number"}
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+            ToolExecutionMode::Interruptible,
+            ToolBackend::Local,
+        )
+        .with_concurrency(ToolConcurrency::Serial)
+    }
+
+    fn base_tool_id(&self) -> &'static str {
+        "shell_make_visible"
+    }
+
+    fn call(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        BuiltinBaseTool::call_local(self.base_tool_id(), ctx, args)
+    }
+}
+
+struct CodexApplyPatchTool;
+
+impl ExtTool for CodexApplyPatchTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition::new(
+            "apply_patch",
+            "Apply a Codex-style patch inside the workspace. The patch must use *** Begin Patch / *** End Patch sections.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "patch": {"type": "string"},
+                    "max_output_chars": {"type": "integer", "minimum": 0, "maximum": 1000}
+                },
+                "required": ["patch"],
+                "additionalProperties": false
+            }),
+            ToolExecutionMode::Immediate,
+            ToolBackend::Local,
+        )
+        .with_concurrency(ToolConcurrency::Serial)
+    }
+
+    fn base_tool_id(&self) -> &'static str {
+        "apply_patch"
+    }
+
+    fn call(
+        &self,
+        ctx: &ToolCallContext<'_>,
+        args: Value,
+    ) -> Result<ToolResultContent, LocalToolError> {
+        let Value::Object(mut arguments) = args else {
+            return Err(LocalToolError::InvalidArguments(
+                "tool arguments must be a JSON object".to_string(),
+            ));
+        };
+        arguments
+            .entry("format".to_string())
+            .or_insert_with(|| Value::String("freeform".to_string()));
+        BuiltinBaseTool::call_local(self.base_tool_id(), ctx, Value::Object(arguments))
     }
 }
 
@@ -306,6 +745,7 @@ fn normalize_message_for_codex_provider(message: &ChatMessage) -> Option<ChatMes
         .collect::<Vec<_>>();
 
     (!data.is_empty()).then(|| ChatMessage {
+        message_id: message.message_id.clone(),
         role: message.role.clone(),
         user_name: message.user_name.clone(),
         message_time: message.message_time.clone(),
@@ -442,6 +882,7 @@ fn send_response_create(
     socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
     payload: Map<String, Value>,
     model_config: &ModelConfig,
+    on_stream: &mut dyn FnMut(ProviderStreamEvent),
 ) -> Result<Value, ProviderError> {
     let mut request = Map::new();
     request.insert(
@@ -528,13 +969,39 @@ fn send_response_create(
                         accumulator.record_output_item_added(&value);
                     }
                     Some("response.output_text.delta") => {
-                        accumulator.record_output_text_delta(&value);
+                        if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                            on_stream(ProviderStreamEvent::OutputTextDelta {
+                                item_id: accumulator.active_output_item_id.clone(),
+                                delta: delta.to_string(),
+                            });
+                        }
+                    }
+                    Some("response.custom_tool_call_input.delta") => {
+                        if let Some(event) = provider_tool_call_input_delta_event(&value) {
+                            on_stream(event);
+                        }
                     }
                     Some("response.reasoning_summary_text.delta") => {
-                        accumulator.record_reasoning_summary_text_delta(&value);
+                        if let (Some(delta), Some(summary_index)) = (
+                            value.get("delta").and_then(Value::as_str),
+                            value.get("summary_index").and_then(Value::as_i64),
+                        ) {
+                            on_stream(ProviderStreamEvent::ReasoningSummaryDelta {
+                                item_id: accumulator.active_reasoning_item_id.clone(),
+                                delta: delta.to_string(),
+                                summary_index,
+                            });
+                        }
                     }
                     Some("response.reasoning_summary_part.added") => {
-                        accumulator.record_reasoning_summary_part_added(&value);
+                        if let Some(summary_index) =
+                            value.get("summary_index").and_then(Value::as_i64)
+                        {
+                            on_stream(ProviderStreamEvent::ReasoningSummaryPartAdded {
+                                item_id: accumulator.active_reasoning_item_id.clone(),
+                                summary_index,
+                            });
+                        }
                     }
                     _ => {}
                 }
@@ -566,6 +1033,24 @@ fn is_codex_response_progress_event(event_type: &str) -> bool {
         && (event_type.contains(".delta")
             || event_type.contains(".added")
             || event_type.contains(".done"))
+}
+
+fn provider_tool_call_input_delta_event(event: &Value) -> Option<ProviderStreamEvent> {
+    let delta = event.get("delta").and_then(Value::as_str)?.to_string();
+    let call_id = event
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let item_id = event
+        .get("item_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| call_id.clone())?;
+    Some(ProviderStreamEvent::ToolCallInputDelta {
+        item_id,
+        call_id,
+        delta,
+    })
 }
 
 fn codex_reasoning_payload(model_config: &ModelConfig) -> Option<Value> {
@@ -646,6 +1131,136 @@ fn build_websocket_url(http_url: &str) -> Result<Url, ProviderError> {
         }
     }
     Ok(url)
+}
+
+fn fetch_codex_models(
+    model_config: &ModelConfig,
+    auth: &CodexAuthMaterial,
+) -> Result<CachedCodexModels, ProviderError> {
+    let endpoint = build_codex_models_url(model_config)?;
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(model_config.conn_timeout_secs()))
+        .timeout(Duration::from_secs(model_config.request_timeout_secs()))
+        .build()
+        .map_err(ProviderError::BuildHttpClient)?;
+    let mut request = client
+        .get(endpoint.clone())
+        .header("authorization", format!("Bearer {}", auth.access_token))
+        .header("chatgpt-account-id", auth.account_id.clone())
+        .header("openai-beta", OPENAI_BETA_RESPONSES_WEBSOCKETS)
+        .header("user-agent", "codex-cli")
+        .header("x-client-request-id", nonce("models"))
+        .header("session_id", nonce("models-session"));
+    if auth.is_fedramp_account {
+        request = request.header("x-openai-fedramp", "true");
+    }
+
+    let response = request.send().map_err(ProviderError::request)?;
+    let status = response.status();
+    let etag = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = response.text().map_err(ProviderError::DecodeResponse)?;
+    if !status.is_success() {
+        return Err(ProviderError::HttpStatus {
+            url: endpoint.to_string(),
+            status: status.as_u16(),
+            body,
+        });
+    }
+
+    let response =
+        serde_json::from_str::<CodexModelsResponse>(&body).map_err(ProviderError::DecodeJson)?;
+    Ok(CachedCodexModels {
+        version: 1,
+        fetched_at_ms: now_millis(),
+        etag,
+        models: response.models,
+    })
+}
+
+fn build_codex_models_url(model_config: &ModelConfig) -> Result<Url, ProviderError> {
+    let mut url = if let Ok(override_url) = std::env::var(CODEX_MODELS_URL_OVERRIDE_ENV) {
+        Url::parse(&override_url).map_err(|error| {
+            ProviderError::InvalidResponse(format!(
+                "invalid {CODEX_MODELS_URL_OVERRIDE_ENV}: {error}"
+            ))
+        })?
+    } else {
+        let mut url = Url::parse(&model_config.url).map_err(|error| {
+            ProviderError::InvalidResponse(format!("invalid codex provider url: {error}"))
+        })?;
+        let path = url.path().trim_end_matches('/').to_string();
+        if let Some(prefix) = path.strip_suffix("/responses") {
+            url.set_path(&format!("{prefix}/models"));
+        } else if path.ends_with("/models") {
+            url.set_path(&path);
+        } else {
+            url.set_path("/backend-api/codex/models");
+        }
+        url
+    };
+    url.query_pairs_mut()
+        .append_pair("client_version", env!("CARGO_PKG_VERSION"));
+    Ok(url)
+}
+
+fn read_cached_codex_models() -> Result<Option<CachedCodexModels>, ProviderError> {
+    let cache_file = codex_models_cache_file();
+    if !cache_file.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&cache_file).map_err(|error| {
+        ProviderError::InvalidResponse(format!("failed to read codex models cache: {error}"))
+    })?;
+    let cached =
+        serde_json::from_slice::<CachedCodexModels>(&bytes).map_err(ProviderError::DecodeJson)?;
+    Ok(Some(cached))
+}
+
+fn write_cached_codex_models(cached: &CachedCodexModels) -> Result<(), ProviderError> {
+    let cache_file = codex_models_cache_file();
+    let parent = cache_file.parent().ok_or_else(|| {
+        ProviderError::InvalidResponse("codex models cache path has no parent".to_string())
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        ProviderError::InvalidResponse(format!("failed to create codex cache dir: {error}"))
+    })?;
+    let bytes = serde_json::to_vec_pretty(cached).map_err(|error| {
+        ProviderError::InvalidResponse(format!("failed to serialize codex models cache: {error}"))
+    })?;
+    fs::write(&cache_file, bytes).map_err(|error| {
+        ProviderError::InvalidResponse(format!("failed to write codex models cache: {error}"))
+    })?;
+    Ok(())
+}
+
+fn codex_models_cache_file() -> PathBuf {
+    codex_cache_root().join("models.json")
+}
+
+fn codex_cache_root() -> PathBuf {
+    std::env::var_os("STELLACLAW_CODEX_CACHE_ROOT")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("STELLACLAW_DATA_ROOT")
+                .map(|root| PathBuf::from(root).join(".stellaclaw").join("codex"))
+        })
+        .unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".stellaclaw")
+                .join("codex")
+        })
+}
+
+fn now_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 
 /// Detect `HTTPS_PROXY` / `https_proxy` and establish an HTTP CONNECT tunnel to the
@@ -1189,15 +1804,18 @@ fn is_unauthorized(error: &ProviderError) -> bool {
 impl StreamAccumulator {
     fn record_output_item_done(&mut self, event: &Value) {
         if let Some(item) = event.get("item") {
-            let mut item = item.clone();
+            let item = item.clone();
+            let completed_id = item.get("id").and_then(Value::as_str).map(str::to_string);
             if item.get("type").and_then(Value::as_str) == Some("reasoning") {
                 if let Some(item_id) = item.get("id").and_then(Value::as_str) {
                     self.activate_reasoning_item(item_id);
                 }
-                self.attach_reasoning_summary_to_item(&mut item);
                 self.active_reasoning_item_id = None;
             }
             self.push_unique_item(item);
+            if self.active_output_item_id == completed_id {
+                self.active_output_item_id = None;
+            }
         }
     }
 
@@ -1205,50 +1823,12 @@ impl StreamAccumulator {
         let Some(item) = event.get("item") else {
             return;
         };
-        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
-            return;
-        }
         if let Some(item_id) = item.get("id").and_then(Value::as_str) {
-            self.activate_reasoning_item(item_id);
+            self.active_output_item_id = Some(item_id.to_string());
+            if item.get("type").and_then(Value::as_str) == Some("reasoning") {
+                self.activate_reasoning_item(item_id);
+            }
         }
-    }
-
-    fn record_output_text_delta(&mut self, event: &Value) {
-        if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-            self.text_deltas.push_str(delta);
-        }
-    }
-
-    fn record_reasoning_summary_text_delta(&mut self, event: &Value) {
-        let Some(delta) = event.get("delta").and_then(Value::as_str) else {
-            return;
-        };
-        let Some(summary_index) = event
-            .get("summary_index")
-            .and_then(Value::as_i64)
-            .and_then(|index| usize::try_from(index).ok())
-        else {
-            return;
-        };
-
-        let key = self.current_reasoning_summary_key();
-        let parts = self.reasoning_summaries.entry(key).or_default();
-        ensure_summary_part(parts, summary_index);
-        parts[summary_index].push_str(delta);
-    }
-
-    fn record_reasoning_summary_part_added(&mut self, event: &Value) {
-        let Some(summary_index) = event
-            .get("summary_index")
-            .and_then(Value::as_i64)
-            .and_then(|index| usize::try_from(index).ok())
-        else {
-            return;
-        };
-
-        let key = self.current_reasoning_summary_key();
-        let parts = self.reasoning_summaries.entry(key).or_default();
-        ensure_summary_part(parts, summary_index);
     }
 
     fn push_unique_item(&mut self, item: Value) {
@@ -1269,99 +1849,7 @@ impl StreamAccumulator {
 
     fn activate_reasoning_item(&mut self, item_id: &str) {
         self.active_reasoning_item_id = Some(item_id.to_string());
-        if let Some(pending) = self
-            .reasoning_summaries
-            .remove(PENDING_REASONING_SUMMARY_KEY)
-        {
-            let target = self
-                .reasoning_summaries
-                .entry(item_id.to_string())
-                .or_default();
-            merge_summary_parts(target, pending);
-        }
     }
-
-    fn current_reasoning_summary_key(&self) -> String {
-        self.active_reasoning_item_id
-            .clone()
-            .unwrap_or_else(|| PENDING_REASONING_SUMMARY_KEY.to_string())
-    }
-
-    fn attach_reasoning_summary_to_item(&mut self, item: &mut Value) -> bool {
-        if item.get("type").and_then(Value::as_str) != Some("reasoning") {
-            return false;
-        }
-
-        let item_id = item.get("id").and_then(Value::as_str).map(str::to_string);
-        let summary_parts = item_id
-            .as_deref()
-            .and_then(|id| self.reasoning_summaries.remove(id))
-            .or_else(|| {
-                self.reasoning_summaries
-                    .remove(PENDING_REASONING_SUMMARY_KEY)
-            });
-        let Some(summary_parts) = summary_parts else {
-            return false;
-        };
-        if summary_parts.iter().all(|part| part.is_empty()) {
-            return false;
-        }
-
-        let existing_summary_is_empty = item
-            .get("summary")
-            .and_then(Value::as_array)
-            .is_none_or(|summary| summary.is_empty());
-        if !existing_summary_is_empty {
-            return false;
-        }
-
-        let Some(object) = item.as_object_mut() else {
-            return false;
-        };
-        object.insert(
-            "summary".to_string(),
-            Value::Array(reasoning_summary_parts_payload(summary_parts)),
-        );
-        true
-    }
-
-    fn take_unattached_reasoning_summary_item(&mut self) -> Option<Value> {
-        let (_key, summary_parts) = self
-            .reasoning_summaries
-            .iter()
-            .find(|(_, parts)| parts.iter().any(|part| !part.is_empty()))
-            .map(|(key, parts)| (key.clone(), parts.clone()))?;
-        Some(json!({
-            "type": "reasoning",
-            "summary": reasoning_summary_parts_payload(summary_parts),
-        }))
-    }
-}
-
-fn ensure_summary_part(parts: &mut Vec<String>, summary_index: usize) {
-    if parts.len() <= summary_index {
-        parts.resize_with(summary_index + 1, String::new);
-    }
-}
-
-fn merge_summary_parts(target: &mut Vec<String>, source: Vec<String>) {
-    for (index, part) in source.into_iter().enumerate() {
-        ensure_summary_part(target, index);
-        target[index].push_str(&part);
-    }
-}
-
-fn reasoning_summary_parts_payload(summary_parts: Vec<String>) -> Vec<Value> {
-    summary_parts
-        .into_iter()
-        .filter(|part| !part.is_empty())
-        .map(|text| {
-            json!({
-                "type": "summary_text",
-                "text": text,
-            })
-        })
-        .collect()
 }
 
 fn merge_streamed_response_output(response: &mut Value, mut accumulator: StreamAccumulator) {
@@ -1375,10 +1863,6 @@ fn merge_streamed_response_output(response: &mut Value, mut accumulator: StreamA
         .cloned()
         .unwrap_or_default();
 
-    for item in &mut merged_output {
-        accumulator.attach_reasoning_summary_to_item(item);
-    }
-
     for item in std::mem::take(&mut accumulator.output_items) {
         let item_id = item.get("id").and_then(Value::as_str);
         let already_present = item_id.is_some_and(|item_id| {
@@ -1391,62 +1875,7 @@ fn merge_streamed_response_output(response: &mut Value, mut accumulator: StreamA
         }
     }
 
-    if !output_has_reasoning_summary(&merged_output) {
-        if let Some(reasoning_item) = accumulator.take_unattached_reasoning_summary_item() {
-            merged_output.push(reasoning_item);
-        }
-    }
-
-    if !accumulator.text_deltas.is_empty() && !output_has_assistant_text(&merged_output) {
-        merged_output.push(serde_json::json!({
-            "type": "message",
-            "role": "assistant",
-            "content": [{
-                "type": "output_text",
-                "text": accumulator.text_deltas,
-            }],
-        }));
-    }
-
     response_object.insert("output".to_string(), Value::Array(merged_output));
-}
-
-fn output_has_reasoning_summary(output: &[Value]) -> bool {
-    output.iter().any(|item| {
-        item.get("type").and_then(Value::as_str) == Some("reasoning")
-            && item
-                .get("summary")
-                .and_then(Value::as_array)
-                .is_some_and(|summary| {
-                    summary.iter().any(|part| {
-                        part.get("text")
-                            .and_then(Value::as_str)
-                            .is_some_and(|text| !text.is_empty())
-                            || part.as_str().is_some_and(|text| !text.is_empty())
-                    })
-                })
-    })
-}
-
-fn output_has_assistant_text(output: &[Value]) -> bool {
-    output.iter().any(|item| {
-        item.get("type").and_then(Value::as_str) == Some("message")
-            && item.get("role").and_then(Value::as_str) == Some("assistant")
-            && item
-                .get("content")
-                .and_then(Value::as_array)
-                .is_some_and(|content| {
-                    content.iter().any(|content_item| {
-                        matches!(
-                            content_item.get("type").and_then(Value::as_str),
-                            Some("output_text" | "text" | "refusal")
-                        ) && content_item
-                            .get("text")
-                            .and_then(Value::as_str)
-                            .is_some_and(|text| !text.is_empty())
-                    })
-                })
-    })
 }
 
 fn build_responses_input(
@@ -1547,6 +1976,7 @@ fn responses_value_to_chat_message(
     }
 
     Ok(ChatMessage {
+        message_id: ChatMessage::new_message_id(),
         role: ChatRole::Assistant,
         user_name: None,
         message_time: None,
@@ -1580,17 +2010,19 @@ fn append_codex_reasoning_items(target: &mut Vec<Value>, message: &ChatMessage) 
 }
 
 fn reasoning_summary_payload(reasoning: &ReasoningItem) -> Value {
-    match reasoning
-        .codex_summary
-        .as_deref()
-        .filter(|summary| !summary.is_empty())
-    {
-        Some(summary) => Value::Array(vec![json!({
-            "type": "summary_text",
-            "text": summary,
-        })]),
-        None => Value::Array(Vec::new()),
-    }
+    Value::Array(
+        reasoning
+            .codex_summary
+            .iter()
+            .filter(|part| !part.text.is_empty())
+            .map(|part| {
+                json!({
+                    "type": "summary_text",
+                    "text": part.text,
+                })
+            })
+            .collect(),
+    )
 }
 
 fn user_responses_content(message: &ChatMessage) -> Result<Vec<Value>, ProviderError> {
@@ -1974,7 +2406,7 @@ fn extract_codex_reasoning(item: &Value) -> Option<ReasoningItem> {
         .filter(|content| !content.is_empty())
         .map(str::to_string);
 
-    if summary.is_some() || encrypted_content.is_some() {
+    if !summary.is_empty() || encrypted_content.is_some() {
         return Some(ReasoningItem::codex(summary, encrypted_content, None));
     }
 
@@ -1985,11 +2417,11 @@ fn extract_codex_reasoning(item: &Value) -> Option<ReasoningItem> {
         .map(ReasoningItem::from_text)
 }
 
-fn extract_reasoning_summary(item: &Value) -> Option<String> {
+fn extract_reasoning_summary(item: &Value) -> Vec<crate::session_actor::ReasoningSummaryPart> {
     item.get("summary")
         .and_then(Value::as_array)
-        .and_then(|summary| {
-            let parts = summary
+        .map(|summary| {
+            summary
                 .iter()
                 .filter_map(|part| {
                     part.get("text")
@@ -1997,10 +2429,12 @@ fn extract_reasoning_summary(item: &Value) -> Option<String> {
                         .or_else(|| part.as_str())
                 })
                 .filter(|text| !text.is_empty())
-                .map(str::to_string)
-                .collect::<Vec<_>>();
-            (!parts.is_empty()).then(|| parts.join("\n"))
+                .map(|text| crate::session_actor::ReasoningSummaryPart {
+                    text: text.to_string(),
+                })
+                .collect::<Vec<_>>()
         })
+        .unwrap_or_default()
 }
 
 fn tool_result_text(tool_result: &crate::session_actor::ToolResultItem) -> String {
@@ -2021,7 +2455,9 @@ mod tests {
         MediaInputConfig, MediaInputTransport, ModelCapability, MultimodalInputConfig,
         ProviderType, RetryMode, TokenEstimatorType,
     };
-    use crate::session_actor::{ToolResultContent, ToolResultItem};
+    use crate::session_actor::{
+        SessionInitial, SessionType, ToolCatalog, ToolRemoteMode, ToolResultContent, ToolResultItem,
+    };
     use std::path::PathBuf;
 
     #[test]
@@ -2090,50 +2526,56 @@ mod tests {
     }
 
     #[test]
-    fn merges_stream_delta_when_completed_response_has_no_output() {
+    fn merge_streamed_response_output_ignores_delta_only_state() {
         let mut response = serde_json::json!({"id": "resp_1", "output": []});
-        let accumulator = StreamAccumulator {
-            output_items: Vec::new(),
-            text_deltas: "streamed text".to_string(),
-            ..Default::default()
-        };
+        let accumulator = StreamAccumulator::default();
 
         merge_streamed_response_output(&mut response, accumulator);
 
-        assert_eq!(response["output"][0]["content"][0]["text"], "streamed text");
+        assert!(response["output"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn merges_stream_delta_when_completed_response_has_non_text_output() {
+    fn merge_streamed_response_output_appends_completed_stream_items() {
         let mut response = serde_json::json!({
             "id": "resp_1",
             "output": [{
                 "type": "reasoning",
+                "id": "rs_1",
                 "summary": [],
                 "encrypted_content": "opaque"
             }]
         });
-        let accumulator = StreamAccumulator {
-            output_items: Vec::new(),
-            text_deltas: "streamed final answer".to_string(),
-            ..Default::default()
-        };
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.record_output_item_done(&serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "completed stream item"
+                }]
+            }
+        }));
 
         merge_streamed_response_output(&mut response, accumulator);
 
         assert_eq!(response["output"].as_array().unwrap().len(), 2);
         assert_eq!(
             response["output"][1]["content"][0]["text"],
-            "streamed final answer"
+            "completed stream item"
         );
     }
 
     #[test]
-    fn does_not_duplicate_stream_delta_when_completed_response_has_text_output() {
+    fn merge_streamed_response_output_does_not_duplicate_completed_items() {
         let mut response = serde_json::json!({
             "id": "resp_1",
             "output": [{
                 "type": "message",
+                "id": "msg_1",
                 "role": "assistant",
                 "content": [{
                     "type": "output_text",
@@ -2141,11 +2583,19 @@ mod tests {
                 }]
             }]
         });
-        let accumulator = StreamAccumulator {
-            output_items: Vec::new(),
-            text_deltas: "completed text".to_string(),
-            ..Default::default()
-        };
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.record_output_item_done(&serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "stream item duplicate"
+                }]
+            }
+        }));
 
         merge_streamed_response_output(&mut response, accumulator);
 
@@ -2153,69 +2603,6 @@ mod tests {
         assert_eq!(
             response["output"][0]["content"][0]["text"],
             "completed text"
-        );
-    }
-
-    #[test]
-    fn merges_streamed_reasoning_summary_into_completed_reasoning_item() {
-        let mut response = serde_json::json!({
-            "id": "resp_1",
-            "output": [{
-                "type": "reasoning",
-                "id": "rs_1",
-                "summary": [],
-                "encrypted_content": "opaque"
-            }]
-        });
-        let mut accumulator = StreamAccumulator::default();
-        accumulator.record_output_item_added(&serde_json::json!({
-            "type": "response.output_item.added",
-            "item": {
-                "type": "reasoning",
-                "id": "rs_1",
-                "summary": []
-            }
-        }));
-        accumulator.record_reasoning_summary_text_delta(&serde_json::json!({
-            "type": "response.reasoning_summary_text.delta",
-            "summary_index": 0,
-            "delta": "**Inspecting**\n\nRead files"
-        }));
-        accumulator.record_reasoning_summary_part_added(&serde_json::json!({
-            "type": "response.reasoning_summary_part.added",
-            "summary_index": 1
-        }));
-        accumulator.record_reasoning_summary_text_delta(&serde_json::json!({
-            "type": "response.reasoning_summary_text.delta",
-            "summary_index": 1,
-            "delta": "Ran tests"
-        }));
-
-        merge_streamed_response_output(&mut response, accumulator);
-
-        assert_eq!(
-            response["output"][0]["summary"][0]["text"],
-            "**Inspecting**\n\nRead files"
-        );
-        assert_eq!(response["output"][0]["summary"][1]["text"], "Ran tests");
-    }
-
-    #[test]
-    fn creates_reasoning_item_from_streamed_summary_when_completed_output_omits_it() {
-        let mut response = serde_json::json!({"id": "resp_1", "output": []});
-        let mut accumulator = StreamAccumulator::default();
-        accumulator.record_reasoning_summary_text_delta(&serde_json::json!({
-            "type": "response.reasoning_summary_text.delta",
-            "summary_index": 0,
-            "delta": "Looked through the code."
-        }));
-
-        merge_streamed_response_output(&mut response, accumulator);
-
-        assert_eq!(response["output"][0]["type"], "reasoning");
-        assert_eq!(
-            response["output"][0]["summary"][0]["text"],
-            "Looked through the code."
         );
     }
 
@@ -2498,7 +2885,7 @@ mod tests {
             ChatRole::Assistant,
             vec![ChatMessageItem::ToolResult(ToolResultItem {
                 tool_call_id: "call_1".to_string(),
-                tool_name: "image_load".to_string(),
+                tool_name: "image_view".to_string(),
                 result: ToolResultContent::from_text("loaded image".to_string()).with_file(
                     FileItem {
                         uri: "data:image/png;base64,QUJD".to_string(),
@@ -2536,7 +2923,7 @@ mod tests {
 
         let reasoning = extract_codex_reasoning(&item).expect("encrypted reasoning is retained");
         assert!(reasoning.text.is_empty());
-        assert_eq!(reasoning.codex_summary, None);
+        assert!(reasoning.codex_summary.is_empty());
         assert_eq!(reasoning.codex_encrypted_content.as_deref(), Some("opaque"));
     }
 
@@ -2553,7 +2940,10 @@ mod tests {
         let reasoning = extract_codex_reasoning(&item).expect("summary reasoning is retained");
 
         assert!(reasoning.text.is_empty());
-        assert_eq!(reasoning.codex_summary.as_deref(), Some("Inspected files."));
+        assert_eq!(
+            reasoning.codex_summary_text().as_deref(),
+            Some("Inspected files.")
+        );
         assert_eq!(reasoning.codex_encrypted_content, None);
     }
 
@@ -2563,7 +2953,9 @@ mod tests {
             ChatRole::Assistant,
             vec![
                 ChatMessageItem::Reasoning(ReasoningItem::codex(
-                    Some("checked repository state".to_string()),
+                    vec![crate::session_actor::ReasoningSummaryPart {
+                        text: "checked repository state".to_string(),
+                    }],
                     Some("encrypted-state".to_string()),
                     Some("raw text should not be sent".to_string()),
                 )),
@@ -2593,7 +2985,9 @@ mod tests {
             vec![
                 ChatMessageItem::Reasoning(ReasoningItem::from_text("plain reasoning")),
                 ChatMessageItem::Reasoning(ReasoningItem::codex(
-                    Some("summary".to_string()),
+                    vec![crate::session_actor::ReasoningSummaryPart {
+                        text: "summary".to_string(),
+                    }],
                     Some("encrypted".to_string()),
                     Some("raw text".to_string()),
                 )),
@@ -2609,11 +3003,237 @@ mod tests {
             panic!("expected reasoning item");
         };
         assert!(reasoning.text.is_empty());
-        assert_eq!(reasoning.codex_summary.as_deref(), Some("summary"));
+        assert_eq!(reasoning.codex_summary_text().as_deref(), Some("summary"));
         assert_eq!(
             reasoning.codex_encrypted_content.as_deref(),
             Some("encrypted")
         );
+    }
+
+    #[test]
+    fn codex_provider_system_prompt_injects_pragmatic_personality() {
+        let prompt = render_codex_model_instructions(&CodexModelMessages {
+            instructions_template: Some(
+                "header\n\n{{ personality }}\n\nbase instructions".to_string(),
+            ),
+            instructions_variables: Some(CodexModelInstructionsVariables {
+                personality_pragmatic: Some("remote pragmatic prompt".to_string()),
+            }),
+        })
+        .expect("prompt should render");
+
+        assert_eq!(
+            prompt,
+            "header\n\nremote pragmatic prompt\n\nbase instructions"
+        );
+    }
+
+    #[test]
+    fn codex_provider_system_prompt_uses_local_pragmatic_fallback() {
+        let prompt = render_codex_model_instructions(&CodexModelMessages {
+            instructions_template: Some("header\n\n{{ personality }}".to_string()),
+            instructions_variables: None,
+        })
+        .expect("prompt should render");
+
+        assert!(prompt.contains(CODEX_PRAGMATIC_PERSONALITY_PROMPT));
+        assert!(!prompt.contains(CODEX_PERSONALITY_PLACEHOLDER));
+    }
+
+    #[test]
+    fn codex_provider_system_prompt_fetches_models_and_caches_to_disk() {
+        let mut server = mockito::Server::new();
+        let cache_root =
+            std::env::temp_dir().join(format!("stellaclaw-codex-cache-{}", nonce("test")));
+        let _env = EnvRestore::set_many(&[
+            (
+                "STELLACLAW_CODEX_CACHE_ROOT",
+                Some(cache_root.to_string_lossy().to_string()),
+            ),
+            (
+                CODEX_MODELS_URL_OVERRIDE_ENV,
+                Some(format!("{}/backend-api/codex/models", server.url())),
+            ),
+            (
+                "CHATGPT_ACCESS_TOKEN",
+                Some(fake_jwt(
+                    r#"{"exp":4102444800,"https://api.openai.com/auth":{"chatgpt_account_id":"acc_123"}}"#,
+                )),
+            ),
+            ("CHATGPT_ACCOUNT_ID", Some("acc_123".to_string())),
+            ("CODEX_AUTH_JSON", None),
+            ("CHATGPT_AUTH_JSON", None),
+            (
+                "CODEX_HOME",
+                Some(cache_root.join("codex-home").to_string_lossy().to_string()),
+            ),
+            (
+                "HOME",
+                Some(cache_root.join("home").to_string_lossy().to_string()),
+            ),
+        ]);
+        let config = test_model_config();
+        let mock = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::Any)
+            .match_header(
+                "authorization",
+                mockito::Matcher::Regex("^Bearer ".to_string()),
+            )
+            .match_header("chatgpt-account-id", "acc_123")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("etag", "models-etag-1")
+            .with_body(
+                json!({
+                    "models": [{
+                        "slug": config.model_name,
+                        "model_messages": {
+                            "instructions_template": "provider native prompt"
+                        }
+                    }]
+                })
+                .to_string(),
+            )
+            .create();
+
+        let provider = CodexSubscriptionProvider::new();
+        assert_eq!(
+            provider
+                .system_prompt_for_model(&config)
+                .expect("models fetch should succeed")
+                .as_deref(),
+            Some("provider native prompt")
+        );
+        mock.assert();
+
+        let cache_value = serde_json::from_str::<Value>(
+            &fs::read_to_string(cache_root.join("models.json")).expect("models cache should exist"),
+        )
+        .expect("models cache should parse");
+        assert_eq!(cache_value["etag"], "models-etag-1");
+        assert_eq!(
+            cache_value["models"][0]["model_messages"]["instructions_template"],
+            "provider native prompt"
+        );
+
+        let cached_provider = CodexSubscriptionProvider::new();
+        std::env::set_var(
+            CODEX_MODELS_URL_OVERRIDE_ENV,
+            "http://127.0.0.1:9/unreachable-models",
+        );
+        assert_eq!(
+            cached_provider
+                .system_prompt_for_model(&config)
+                .expect("disk cache should avoid network")
+                .as_deref(),
+            Some("provider native prompt")
+        );
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn codex_provider_system_prompt_returns_error_when_models_fetch_fails() {
+        let mut server = mockito::Server::new();
+        let cache_root =
+            std::env::temp_dir().join(format!("stellaclaw-codex-cache-{}", nonce("test")));
+        let _env = EnvRestore::set_many(&[
+            (
+                "STELLACLAW_CODEX_CACHE_ROOT",
+                Some(cache_root.to_string_lossy().to_string()),
+            ),
+            (
+                CODEX_MODELS_URL_OVERRIDE_ENV,
+                Some(format!("{}/backend-api/codex/models", server.url())),
+            ),
+            (
+                "CHATGPT_ACCESS_TOKEN",
+                Some(fake_jwt(
+                    r#"{"exp":4102444800,"https://api.openai.com/auth":{"chatgpt_account_id":"acc_123"}}"#,
+                )),
+            ),
+            ("CHATGPT_ACCOUNT_ID", Some("acc_123".to_string())),
+            ("CODEX_AUTH_JSON", None),
+            ("CHATGPT_AUTH_JSON", None),
+            (
+                "CODEX_HOME",
+                Some(cache_root.join("codex-home").to_string_lossy().to_string()),
+            ),
+            (
+                "HOME",
+                Some(cache_root.join("home").to_string_lossy().to_string()),
+            ),
+        ]);
+        let config = test_model_config();
+        let mock = server
+            .mock("GET", "/backend-api/codex/models")
+            .match_query(mockito::Matcher::Any)
+            .with_status(500)
+            .with_body("models unavailable")
+            .create();
+
+        let provider = CodexSubscriptionProvider::new();
+        let error = provider
+            .system_prompt_for_model(&config)
+            .expect_err("models fetch failure should surface");
+
+        mock.assert();
+        assert!(matches!(
+            error,
+            ProviderError::HttpStatus { status: 500, .. }
+        ));
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn codex_tool_set_uses_codex_shell_and_patch_facades() {
+        let config = test_model_config();
+        let initial = SessionInitial::new("session_1", SessionType::Foreground);
+        let provider = CodexSubscriptionProvider::new();
+        let tool_set = provider
+            .tool_set(&config)
+            .expect("codex provider should expose a tool set");
+        let catalog = ToolCatalog::from_model_config_and_initial_with_tool_set(
+            &config,
+            &initial,
+            Some(tool_set.as_ref()),
+        )
+        .expect("catalog should build");
+
+        let apply_patch = catalog.get("apply_patch").expect("apply_patch exists");
+        assert!(apply_patch.parameters["properties"].get("patch").is_some());
+        assert!(apply_patch.parameters["properties"].get("format").is_none());
+        assert!(catalog.contains("exec_command"));
+        assert!(catalog.contains("write_stdin"));
+        assert!(catalog.contains("exec_stop"));
+        assert!(catalog.contains("update_plan"));
+        assert!(!catalog.contains("shell_exec"));
+        assert!(!catalog.contains("shell_write_stdin"));
+        assert!(!catalog.contains("shell_stop"));
+    }
+
+    #[test]
+    fn codex_tool_set_keeps_fixed_ssh_visibility_tools() {
+        let config = test_model_config();
+        let mut initial = SessionInitial::new("session_1", SessionType::Foreground);
+        initial.tool_remote_mode = ToolRemoteMode::FixedSsh {
+            host: "gpu-box".to_string(),
+            cwd: None,
+        };
+        let provider = CodexSubscriptionProvider::new();
+        let tool_set = provider
+            .tool_set(&config)
+            .expect("codex provider should expose a tool set");
+        let catalog = ToolCatalog::from_model_config_and_initial_with_tool_set(
+            &config,
+            &initial,
+            Some(tool_set.as_ref()),
+        )
+        .expect("catalog should build");
+
+        assert!(catalog.contains("exec_make_visible"));
+        assert!(!catalog.contains("shell_make_visible"));
+        assert!(catalog.contains("attachment_make_visible"));
     }
 
     fn fake_jwt(payload: &str) -> String {
@@ -2624,6 +3244,37 @@ mod tests {
 
     fn temp_auth_json_path() -> PathBuf {
         std::env::temp_dir().join(format!("stellaclaw-auth-{}.json", nonce("test")))
+    }
+
+    struct EnvRestore {
+        previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvRestore {
+        fn set_many(values: &[(&'static str, Option<String>)]) -> Self {
+            let previous = values
+                .iter()
+                .map(|(name, _)| (*name, std::env::var_os(name)))
+                .collect::<Vec<_>>();
+            for (name, value) in values {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            Self { previous }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (name, value) in self.previous.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
     }
 
     fn test_model_config() -> ModelConfig {

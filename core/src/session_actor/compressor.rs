@@ -664,6 +664,7 @@ fn sanitize_message_for_compression_request(
     }
 
     Some(ChatMessage {
+        message_id: message.message_id.clone(),
         role: message.role.clone(),
         user_name: message.user_name.clone(),
         message_time: message.message_time.clone(),
@@ -690,7 +691,7 @@ Rules:\n\
 - capture the whole task state, not just a chat recap: goals, constraints, decisions, findings, touched files, code patterns, completed work, remaining work, and verification state\n\
 - include critical code snippets or exact symbols only when they are needed to continue safely; otherwise cite file paths, modules, functions, commands, ids, URLs, and conclusions\n\
 - preserve concrete decisions, file paths, commands, errors, ids, URLs, and the current next step\n\
-- active_tasks is required for unfinished external work. Include every still-running or still-waiting handle needed to resume safely, especially shell process_id, download_id, file_download id, subagent id, background agent_id, DSL job id, and any associated command, cwd, remote target, output path, URL, or wait/stop/observe instruction\n\
+- active_tasks is required for unfinished external work. Include every still-running or still-waiting handle needed to resume safely, especially shell process_id, subagent id, background agent_id, and any associated command, cwd, remote target, output path, URL, or wait/stop/observe instruction\n\
 - do not put completed one-off tool calls in active_tasks; only include tasks whose future state can still change or whose handle is needed for recovery\n\
 - redact long secrets; mention that a secret was provided without copying the full value\n\
 - do not invent details\n\
@@ -838,6 +839,7 @@ fn preserve_tool_messages(messages: &[ChatMessage], requested_ids: &[String]) ->
                 return None;
             }
             Some(ChatMessage {
+                message_id: message.message_id.clone(),
                 role: message.role.clone(),
                 user_name: message.user_name.clone(),
                 message_time: message.message_time.clone(),
@@ -1597,7 +1599,7 @@ mod tests {
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
                     tool_call_id: "call_keep".to_string(),
-                    tool_name: "file_read".to_string(),
+                    tool_name: "shell_exec".to_string(),
                     arguments: ContextItem {
                         text: r#"{"file_path":"TODO.md"}"#.to_string(),
                     },
@@ -1607,7 +1609,7 @@ mod tests {
                 ChatRole::User,
                 vec![ChatMessageItem::ToolResult(ToolResultItem {
                     tool_call_id: "call_keep".to_string(),
-                    tool_name: "file_read".to_string(),
+                    tool_name: "shell_exec".to_string(),
                     result: ToolResultContent::from_text("memory disabled in config".to_string()),
                 })],
             ),
@@ -1723,7 +1725,7 @@ mod tests {
                 vec![
                     ChatMessageItem::ToolCall(ToolCallItem {
                         tool_call_id: "call_1".to_string(),
-                        tool_name: "file_read".to_string(),
+                        tool_name: "shell_exec".to_string(),
                         arguments: ContextItem {
                             text: r#"{"file_path":"src/lib.rs"}"#.to_string(),
                         },
@@ -1742,7 +1744,7 @@ mod tests {
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolResult(ToolResultItem {
                     tool_call_id: "call_1".to_string(),
-                    tool_name: "file_read".to_string(),
+                    tool_name: "shell_exec".to_string(),
                     result: ToolResultContent::from_text("loaded".to_string()).with_file(
                         FileItem {
                             uri: "file:///tmp/report.pdf".to_string(),
@@ -1764,10 +1766,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(text.contains("[tool call: file_read id=call_1]"));
+        assert!(text.contains("[tool call: shell_exec id=call_1]"));
         assert!(text.contains(r#"{"file_path":"src/lib.rs"}"#));
         assert!(text.contains("[file omitted during context compression: image.png]"));
-        assert!(text.contains("[tool result: file_read id=call_1]"));
+        assert!(text.contains("[tool result: shell_exec id=call_1]"));
         assert!(text.contains("loaded"));
         assert!(text.contains("[file omitted during context compression: report.pdf]"));
         assert!(sanitized.iter().all(|message| {

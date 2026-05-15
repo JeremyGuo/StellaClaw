@@ -3,9 +3,58 @@ use std::path::PathBuf;
 use crossbeam_channel::Sender;
 use serde::Serialize;
 use serde_json::Value;
-use stellaclaw_core::session_actor::ChatMessage;
+use stellaclaw_core::session_actor::{ChatMessage, FileItem, SelectionReferenceItem};
 
-use crate::conversation::IncomingConversationMessage;
+use crate::config::SandboxMode;
+
+#[derive(Debug, Clone)]
+pub struct IncomingConversationMessage {
+    pub remote_message_id: String,
+    pub user_name: Option<String>,
+    pub message_time: Option<String>,
+    pub text: Option<String>,
+    pub selection_references: Vec<SelectionReferenceItem>,
+    pub files: Vec<FileItem>,
+    pub control: Option<ConversationControl>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConversationControl {
+    Continue,
+    Cancel,
+    Compact,
+    ShowStatus,
+    ShowModel,
+    SwitchModel { model_name: String },
+    ShowReasoning,
+    SetReasoning { effort: Option<String> },
+    InvalidReasoning { reason: String },
+    ShowRemote,
+    SetRemote { host: String, path: String },
+    DisableRemote,
+    InvalidRemote { reason: String },
+    ShowSandbox,
+    SetSandbox { mode: Option<SandboxMode> },
+    InvalidSandbox { reason: String },
+}
+
+pub(crate) fn parse_reasoning_control_argument(argument: &str) -> ConversationControl {
+    let argument = argument.trim();
+    if argument.is_empty() {
+        return ConversationControl::ShowReasoning;
+    }
+    match argument.to_ascii_lowercase().as_str() {
+        "default" | "model" | "model_default" | "model-default" | "global" => {
+            ConversationControl::SetReasoning { effort: None }
+        }
+        "minimal" | "low" | "medium" | "high" | "xhigh" => ConversationControl::SetReasoning {
+            effort: Some(argument.to_ascii_lowercase()),
+        },
+        _ => ConversationControl::InvalidReasoning {
+            reason: format!("未知 reasoning effort `{argument}`。"),
+        },
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum IncomingDispatch {
@@ -74,6 +123,15 @@ pub struct OutgoingMessageAppended {
     pub session_id: String,
     pub index: usize,
     pub message: ChatMessage,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutgoingSessionStream {
+    pub channel_id: String,
+    pub platform_chat_id: String,
+    pub conversation_id: String,
+    pub session_id: String,
+    pub event: Value,
 }
 
 #[allow(dead_code)]
@@ -194,6 +252,7 @@ pub struct OutgoingConversationUpdated {
 pub enum ChannelEvent {
     Delivery(OutgoingDelivery),
     MessageAppended(OutgoingMessageAppended),
+    SessionStream(OutgoingSessionStream),
     Processing(OutgoingProcessing),
     ProgressFeedback(OutgoingProgressFeedback),
     ConversationUpdated(OutgoingConversationUpdated),
@@ -206,6 +265,7 @@ impl ChannelEvent {
         match self {
             ChannelEvent::Delivery(delivery) => &delivery.channel_id,
             ChannelEvent::MessageAppended(appended) => &appended.channel_id,
+            ChannelEvent::SessionStream(stream) => &stream.channel_id,
             ChannelEvent::Processing(processing) => &processing.channel_id,
             ChannelEvent::ProgressFeedback(feedback) => &feedback.channel_id,
             ChannelEvent::ConversationUpdated(updated) => &updated.channel_id,
@@ -218,6 +278,7 @@ impl ChannelEvent {
         match self {
             ChannelEvent::Delivery(delivery) => &delivery.platform_chat_id,
             ChannelEvent::MessageAppended(appended) => &appended.platform_chat_id,
+            ChannelEvent::SessionStream(stream) => &stream.platform_chat_id,
             ChannelEvent::Processing(processing) => &processing.platform_chat_id,
             ChannelEvent::ProgressFeedback(feedback) => &feedback.platform_chat_id,
             ChannelEvent::ConversationUpdated(updated) => &updated.platform_chat_id,

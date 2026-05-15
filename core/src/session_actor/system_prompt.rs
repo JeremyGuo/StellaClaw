@@ -1,61 +1,87 @@
+#[cfg(test)]
 use std::collections::BTreeSet;
 
 use super::{
     runtime_metadata::{
         RuntimeMetadataState, IDENTITY_PROMPT_COMPONENT, REMOTE_ALIASES_PROMPT_COMPONENT,
-        SKILLS_METADATA_PROMPT_COMPONENT, USER_MEMORY_PROMPT_COMPONENT, USER_META_PROMPT_COMPONENT,
+        REMOTE_WORKSPACE_PROMPT_COMPONENT, SKILLS_METADATA_PROMPT_COMPONENT,
+        USER_MEMORY_PROMPT_COMPONENT, USER_META_PROMPT_COMPONENT,
     },
-    tool_catalog::enabled_prompt_protocols,
     SessionInitial, SessionType, ToolRemoteMode,
 };
 
+#[cfg(test)]
 pub(crate) fn system_prompt_for_initial(
     initial: &SessionInitial,
     runtime_metadata_state: &RuntimeMetadataState,
-    enabled_tools: &BTreeSet<String>,
+    _enabled_tools: &BTreeSet<String>,
+) -> String {
+    system_prompt_for_initial_with_common_prompt(initial, runtime_metadata_state, None)
+}
+
+pub(crate) fn system_prompt_for_initial_with_common_prompt(
+    initial: &SessionInitial,
+    runtime_metadata_state: &RuntimeMetadataState,
+    common_prompt_override: Option<&str>,
 ) -> String {
     let session_kind = match initial.session_type {
         SessionType::Foreground => foreground_prompt(),
         SessionType::Background => background_prompt(),
         SessionType::Subagent => subagent_prompt(),
     };
-    let mut sections = vec![common_prompt().to_string()];
-    if let Some(protocols_prompt) = render_prompt_protocols(enabled_tools) {
-        sections.push(protocols_prompt);
-    }
+    let common = match common_prompt_override
+        .map(str::trim)
+        .filter(|prompt| !prompt.is_empty())
+    {
+        Some(prompt) => prompt,
+        None => common_prompt(),
+    };
+    let mut sections = vec![common.to_string()];
     sections.push(session_kind.to_string());
     if let Some(remote_prompt) = remote_prompt(&initial.tool_remote_mode) {
         sections.push(remote_prompt);
     }
-    if let Some(remote_workspace_instructions) = initial
-        .remote_workspace_instructions
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        sections.push(format!(
-            "[Remote Workspace Instructions]\n{}",
-            remote_workspace_instructions
-        ));
-    }
     sections.extend(snapshot_sections(initial, runtime_metadata_state));
-    sections.push(tool_efficiency_prompt(&initial.session_type).to_string());
     sections.join("\n\n")
 }
 
 fn common_prompt() -> &'static str {
     "You are StellaClaw, a pragmatic coding agent. Work in Rust-first codebases with minimal, \
      direct abstractions. Use tools when they materially advance the task. Keep answers concise \
-     and grounded in the current workspace. At the start of tool-using work, briefly acknowledge \
-     the task and give a one-to-two sentence plan before the first tool calls. During longer work, \
+     and grounded in the current workspace. At the start of tool-using work, send a user-visible \
+     preamble that briefly acknowledges the task and gives a one-to-two sentence plan before the first tool calls. During longer work, \
      send short progress updates every 1-3 execution steps, and at minimum within every 6 steps or \
      10 tool calls. Each update should state useful outcome or impact so far plus the next 1-3 \
-     steps or open question when relevant. Avoid headings, status labels, repetitive tics, and \
+     steps or open question when relevant. Treat preambles and progress messages as the normal way \
+     to reply while work is underway; do not use a separate host tool just to tell the user something. Avoid headings, status labels, repetitive tics, and \
      command-by-command log narration. Do not rely on model-internal memory; when prior durable \
      user, conversation, or project facts may matter and are not visible in current context, use an \
-     available long-memory search tool, inspect the repository, or run a narrow verification step. Before using \
-     any library, framework, command, flag, file path, or project capability, verify that it exists \
-     in this repository or local environment instead of assuming it exists. Treat AGENTS.md and similar repository instruction files as scoped rules, not background lore. \
+     available long-memory search tool, inspect the repository, or run a narrow verification step. \
+     When memory tools are available, use memory_write before finishing a turn when you learned a durable fact future turns, agents, compaction recovery, or future conversations would otherwise need to rediscover. Write immediately if the user asks you to remember/save something; if you learn a stable user fact, preference, correction, working style, or recurring expectation; if this conversation establishes goals, constraints, decisions, handoff state, running task/process ids, artifact paths, blockers, or next recovery steps; if you learn stable project, environment, deployment, or data facts, critical file/module responsibilities, architecture constraints, project-specific implementation requirements, or recurring pitfalls. Save scope=user for durable facts about the user, preferences, response style, recurring corrections, work habits, and global expectations; scope=conversation for current goals, constraints, decisions, active handoff, running task/process ids, artifact paths, blockers, next steps, and task-specific assumptions; scope=public for stable cross-conversation project/customer/data/deployment facts, critical file/module notes, architecture constraints, recurring implementation rules, and reusable operational knowledge. Do not save transient command output, one-off progress, guesses, ordinary chat, secrets, credentials, raw tool logs, compacted summaries, or facts already present in visible memory or returned by memory_search. Use memory_search when prior conversation decisions, public project conventions, deployment details, long-running task state, previous blockers, project-specific requirements, or critical module knowledge may matter and are not visible. Use memory_update or memory_delete only after memory_search returns the exact stale, duplicate, incomplete, or wrong entry id. \
+     Check that all the required parameters for each tool call are provided or can reasonably be inferred from context. If there are no relevant tools or there are missing values for required parameters, ask the user to supply these values; otherwise proceed with the tool calls. If the user provides a specific value for a parameter, for example provided in quotes, make sure to use that value exactly. Do not make up values for or ask about optional parameters. If you intend to call multiple tools and there are no dependencies between the calls, make all of the independent calls in the same tool-call batch, same assistant turn; otherwise wait for previous calls to finish first to determine the dependent values. Do not use placeholders or guess missing parameters. Before repository exploration or other read-heavy work, think first about all files, searches, listings, and command outputs you are likely to need, then issue one bounded independent batch. This applies to read, list, search, git inspection, and similar shell commands. Do not read files one-by-one unless the next path truly depends on an earlier result. \
+     Before using any library, framework, command, flag, file path, or project capability, verify that it exists \
+     in this repository or local environment instead of assuming it exists. For repository \
+     exploration, use narrow and bounded shell rg/ripgrep commands such as rg -n '<pattern>' \
+     <dir>, rg --files -g '<pattern>', or rg --files <dir>; shell_exec ensures managed rg when \
+     needed. Use shell commands such as sed, nl, or cat for file contents and line ranges. Keep \
+     shell search scoped to the relevant directory. When using shell for commands that dedicated tools do not cover, start a new command with shell_exec.command. Use shell_write_stdin with process_id only to poll or continue an existing process, and shell_stop with process_id to stop one. Positive example: {\"command\":\"cargo check -p stellaclaw_core\"}. Negative example: using process_id to start work, or using cmd instead of command. \
+     Broad directory listings hide .stellaclaw/. \
+     File tools may access documented .stellaclaw/ paths when needed, but do not create paths \
+     outside documented .stellaclaw workflows. Use apply_patch for targeted edits. For generated \
+     files, complete rewrites, or append-only output, use shell commands through shell_exec. \
+     apply_patch paths must be workspace-relative, and related multi-file edits should be combined \
+     into one patch when practical. After a successful apply_patch, do not re-read changed files \
+     just to verify that the patch applied; the tool reports failure when it does not apply. \
+     Re-read only when you need new context, a follow-up command or formatter may have rewritten \
+     the file, or a verification failure needs inspection. Use update_plan for multi-step, \
+     long-running, or ambiguous work so the user can see the current checklist. If the first \
+     planned step can start immediately, return update_plan in the same tool-call batch as the \
+     next independent tool calls instead of spending a separate model round only updating the plan; \
+     the host applies the plan immediately and continues with the remaining tools. Positive \
+     examples: a refactor across several files, a bug investigation with multiple plausible \
+     causes, or a task that needs several verification steps. Negative examples: a one-line fix, \
+     a single file read, or a straightforward reply that can be finished immediately without a \
+     visible plan. Treat AGENTS.md and similar repository instruction files as scoped rules, not background lore. \
      When you start working in a subdirectory, check whether that subtree has a more local \
      AGENTS.md or similar instruction file before editing there; when rules conflict, \
      follow the more local file. When a user message contains a selected content block, treat it \
@@ -74,17 +100,6 @@ fn common_prompt() -> &'static str {
      directories under .stellaclaw/ outside documented tool workflows."
 }
 
-fn render_prompt_protocols(enabled_tools: &BTreeSet<String>) -> Option<String> {
-    let rendered = enabled_prompt_protocols(enabled_tools)
-        .into_iter()
-        .map(|protocol| protocol.body.trim())
-        .filter(|body| !body.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    (!rendered.is_empty()).then_some(rendered)
-}
-
 fn foreground_prompt() -> &'static str {
     "Session kind: foreground. You are interacting with the user directly. Prefer clear progress, \
      concrete code changes, and a short final summary with verification."
@@ -100,48 +115,11 @@ fn subagent_prompt() -> &'static str {
      report concrete findings or changed files, and avoid taking ownership of unrelated work."
 }
 
-fn tool_efficiency_prompt(session_type: &SessionType) -> &'static str {
-    match session_type {
-        SessionType::Foreground | SessionType::Background => {
-            "Check that all the required parameters for each tool call are provided or can \
-             reasonably be inferred from context. IF there are no relevant tools or there are \
-             missing values for required parameters, ask the user to supply these values; otherwise \
-             proceed with the tool calls. If the user provides a specific value for a parameter \
-             (for example provided in quotes), make sure to use that value EXACTLY. DO NOT make up \
-             values for or ask about optional parameters.\n\n\
-             If you intend to call multiple tools and there are no dependencies between the calls, \
-             make all of the independent calls in the same tool-call batch (same assistant turn), otherwise \
-             you MUST wait for previous calls to finish first to determine the dependent values \
-             (do NOT use placeholders or guess missing parameters). Before repository exploration \
-             or other read-heavy work, think first about all files, searches, listings, and command \
-             outputs you are likely to need, then issue one bounded independent batch. This applies \
-             to read, list, search, git inspection, and similar shell commands. Do not read files \
-             one-by-one unless the next path truly depends on an earlier result."
-        }
-        SessionType::Subagent => {
-            "Check that all the required parameters for each tool call are provided or can \
-             reasonably be inferred from context. IF there are no relevant tools or there are \
-             missing values for required parameters, ask the user to supply these values; otherwise \
-             proceed with the tool calls. If the user provides a specific value for a parameter \
-             (for example provided in quotes), make sure to use that value EXACTLY. DO NOT make up \
-             values for or ask about optional parameters.\n\n\
-             If you intend to call multiple tools and there are no dependencies between the calls, \
-             make all of the independent calls in the same tool-call batch (same assistant turn), otherwise \
-             you MUST wait for previous calls to finish first to determine the dependent values \
-             (do NOT use placeholders or guess missing parameters). Before repository exploration \
-             or other read-heavy work, think first about all files, searches, listings, and command \
-             outputs you are likely to need, then issue one bounded independent batch. This applies \
-             to read, list, search, git inspection, and similar shell commands. Do not read files \
-             one-by-one unless the next path truly depends on an earlier result."
-        }
-    }
-}
-
 fn remote_prompt(remote_mode: &ToolRemoteMode) -> Option<String> {
     match remote_mode {
         ToolRemoteMode::Selectable => Some(
-            "Tool remote mode: selectable. When a tool exposes remote, its value must be an SSH \
-             Host alias from ~/.ssh/config; omit remote for local execution."
+            "When a tool exposes remote, its value must be an SSH Host alias from ~/.ssh/config; \
+             omit remote for local execution."
                 .to_string(),
         ),
         ToolRemoteMode::FixedSsh { .. } => None,
@@ -163,7 +141,7 @@ fn snapshot_sections(
 
     if let Some(user_meta) = runtime_metadata_state.snapshot_value(USER_META_PROMPT_COMPONENT) {
         sections.push(format!(
-            "[User Metadata Snapshot]\nThis is metadata for .stellaclaw/USER.md, not the full file content. Treat it as the canonical profile file status; read .stellaclaw/USER.md with file_read when exact profile details are needed:\n{}",
+            "[User Metadata Snapshot]\nThis is metadata for .stellaclaw/USER.md, not the full file content. Treat it as the canonical profile file status; inspect .stellaclaw/USER.md with shell_exec when exact profile details are needed:\n{}",
             user_meta
         ));
     }
@@ -199,6 +177,15 @@ fn snapshot_sections(
         }
     }
 
+    if let Some(remote_workspace) =
+        runtime_metadata_state.snapshot_value(REMOTE_WORKSPACE_PROMPT_COMPONENT)
+    {
+        sections.push(format!(
+            "[Remote Workspace Snapshot]\nTreat this as the canonical fixed SSH workspace instruction snapshot:\n{}",
+            remote_workspace
+        ));
+    }
+
     sections
 }
 
@@ -227,13 +214,10 @@ mod tests {
 
     fn default_enabled_tools() -> BTreeSet<String> {
         enabled_tools(&[
-            "file_read",
-            "file_write",
             "apply_patch",
             "shell_exec",
             "shell_write_stdin",
             "shell_stop",
-            "user_tell",
             "update_plan",
             "subagent_start",
             "memory_search",
@@ -278,8 +262,10 @@ mod tests {
             &enabled_tools,
         );
 
-        assert!(prompt.contains("briefly acknowledge"));
+        assert!(prompt.contains("user-visible"));
+        assert!(prompt.contains("briefly acknowledges"));
         assert!(prompt.contains("one-to-two sentence plan before the first tool calls"));
+        assert!(prompt.contains("normal way to reply while work is underway"));
         assert!(prompt.contains("within every 6 steps or 10 tool calls"));
         assert!(prompt.contains("Avoid headings, status labels"));
     }
@@ -310,7 +296,7 @@ mod tests {
             &enabled_tools,
         );
 
-        assert!(prompt.contains("use apply_patch for targeted edits"));
+        assert!(prompt.contains("Use apply_patch for targeted edits"));
         assert!(prompt.contains("do not re-read changed files"));
         assert!(prompt.contains("the tool reports failure when it does not apply"));
         assert!(!prompt.contains("old_text"));
@@ -319,9 +305,9 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_omits_protocols_for_disabled_tools() {
+    fn system_prompt_keeps_common_tool_guidance_without_protocol_tools() {
         let state = RuntimeMetadataState::default();
-        let enabled_tools = enabled_tools(&["file_read", "file_write"]);
+        let enabled_tools = enabled_tools(&["shell_exec"]);
         let prompt = system_prompt_for_initial(
             &SessionInitial::new("s1", SessionType::Foreground),
             &state,
@@ -337,30 +323,15 @@ mod tests {
         assert!(prompt.contains(
             "Do not create files or directories under .stellaclaw/ outside documented tool workflows"
         ));
+        assert!(prompt.contains("Use apply_patch for targeted edits"));
+        assert!(prompt.contains("Use update_plan"));
+        assert!(prompt.contains("When memory tools are available"));
+        assert!(prompt.contains("Use memory_update or memory_delete only after memory_search"));
+        assert!(prompt.contains("When using shell for commands"));
+        assert!(prompt.contains("shell_write_stdin with process_id only"));
         assert!(!prompt.contains("only after shell_make_visible"));
-        assert!(!prompt.contains("use apply_patch for targeted edits"));
         assert!(!prompt.contains("Before referencing a file with <attachment>"));
-        assert!(!prompt.contains("When using shell for commands"));
-        assert!(!prompt.contains("user_tell"));
-        assert!(!prompt.contains("Use user_tell only"));
-        assert!(!prompt.contains("Use update_plan"));
         assert!(!prompt.contains("prefer subagent_start"));
-    }
-
-    #[test]
-    fn system_prompt_includes_shell_visibility_protocol_when_enabled() {
-        let state = RuntimeMetadataState::default();
-        let enabled_tools = enabled_tools(&["file_read", "shell_exec", "shell_make_visible"]);
-        let prompt = system_prompt_for_initial(
-            &SessionInitial::new("s1", SessionType::Foreground),
-            &state,
-            &enabled_tools,
-        );
-
-        assert!(
-            prompt.contains("shell_exec can read .stellaclaw/... only after shell_make_visible")
-        );
-        assert!(prompt.contains("treat those copied .stellaclaw files as read-only from shell"));
     }
 
     #[test]
@@ -392,6 +363,7 @@ mod tests {
                 &root,
                 &root,
                 "Available SSH remote aliases from ~/.ssh/config:\n- `old-host`".to_string(),
+                String::new(),
                 initial.memory_enabled,
             )
             .unwrap();
@@ -413,6 +385,7 @@ mod tests {
                 &root,
                 &root,
                 "Available SSH remote aliases from ~/.ssh/config:\n- `new-host`".to_string(),
+                String::new(),
                 initial.memory_enabled,
             )
             .unwrap();
@@ -424,7 +397,7 @@ mod tests {
         let prompt_before_promote = system_prompt_for_initial(&initial, &state, &enabled_tools);
         assert!(prompt_before_promote.contains("identity: old"));
         assert!(prompt_before_promote.contains("Profile metadata file: .stellaclaw/USER.md"));
-        assert!(prompt_before_promote.contains("Read .stellaclaw/USER.md with file_read"));
+        assert!(prompt_before_promote.contains("inspect .stellaclaw/USER.md with shell_exec"));
         assert!(!prompt_before_promote.contains("tier: old"));
         assert!(prompt_before_promote.contains("Prefer concise Chinese answers."));
         assert!(prompt_before_promote.contains("skills: old"));
@@ -461,6 +434,7 @@ mod tests {
                 &root,
                 &root,
                 remote_aliases_prompt_for_mode(&ToolRemoteMode::Selectable),
+                String::new(),
                 initial.memory_enabled,
             )
             .unwrap();
@@ -472,16 +446,18 @@ mod tests {
     }
 
     #[test]
-    fn system_prompt_includes_remote_workspace_instructions() {
-        let mut initial = SessionInitial::new("s1", SessionType::Foreground);
-        initial.remote_workspace_instructions =
-            Some("[Remote AGENTS.md]\nremote rules".to_string());
-        let state = RuntimeMetadataState::default();
+    fn system_prompt_includes_remote_workspace_snapshot() {
+        let initial = SessionInitial::new("s1", SessionType::Foreground);
+        let mut state = RuntimeMetadataState::default();
+        state.initialize_missing_component(
+            REMOTE_WORKSPACE_PROMPT_COMPONENT,
+            "[Remote AGENTS.md]\nremote rules".to_string(),
+        );
 
         let enabled_tools = default_enabled_tools();
         let prompt = system_prompt_for_initial(&initial, &state, &enabled_tools);
 
-        assert!(prompt.contains("[Remote Workspace Instructions]"));
+        assert!(prompt.contains("[Remote Workspace Snapshot]"));
         assert!(prompt.contains("remote rules"));
     }
 }

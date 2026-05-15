@@ -8,12 +8,12 @@ use crate::{conversation_id_manager::ConversationIdManager, logger::StellaclawLo
 pub mod telegram;
 pub mod types;
 pub mod web;
-mod web_terminal;
+pub(crate) mod web_terminal;
 
 pub use telegram::TelegramChannel;
 pub use types::{
     ChannelEvent, IncomingDispatch, OutgoingDelivery, OutgoingError, OutgoingMessageAppended,
-    OutgoingProgressFeedback, OutgoingStatus, ProcessingState,
+    OutgoingProgressFeedback, OutgoingSessionStream, OutgoingStatus, ProcessingState,
 };
 pub use web::WebChannel;
 
@@ -25,6 +25,7 @@ pub trait Channel: Send + Sync {
         match event {
             ChannelEvent::Delivery(delivery) => self.send_delivery(delivery),
             ChannelEvent::MessageAppended(appended) => self.message_appended(appended),
+            ChannelEvent::SessionStream(stream) => self.session_stream(stream),
             ChannelEvent::Processing(processing) => {
                 self.set_processing(&processing.platform_chat_id, processing.state)
             }
@@ -64,6 +65,9 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
     fn message_appended(&self, _appended: &OutgoingMessageAppended) -> Result<()> {
+        Ok(())
+    }
+    fn session_stream(&self, _stream: &OutgoingSessionStream) -> Result<()> {
         Ok(())
     }
     fn conversation_updated(&self, _platform_chat_id: &str, _conversation_id: &str) -> Result<()> {

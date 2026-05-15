@@ -190,6 +190,48 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         plan: Option<TaskPlanView>,
     },
+    StreamAssistantMessageDelta {
+        message_id: String,
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        delta: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_index: Option<usize>,
+    },
+    StreamToolCallDelta {
+        message_id: String,
+        turn_id: String,
+        item_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        delta: String,
+    },
+    StreamReasoningSummaryDelta {
+        message_id: String,
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        summary_index: i64,
+        delta: String,
+    },
+    StreamReasoningSummaryPartAdded {
+        message_id: String,
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        summary_index: i64,
+    },
+    StreamError {
+        message_id: String,
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_index: Option<usize>,
+        error: String,
+        error_detail: SessionErrorDetail,
+    },
     TurnCompleted {
         message: ChatMessage,
     },
@@ -510,9 +552,9 @@ mod tests {
         let request = ConversationBridgeRequest {
             request_id: "req_1".to_string(),
             tool_call_id: "call_1".to_string(),
-            tool_name: "user_tell".to_string(),
-            action: "user_tell".to_string(),
-            payload: serde_json::json!({"text": "working"}),
+            tool_name: "cron_tasks_list".to_string(),
+            action: "cron_tasks_list".to_string(),
+            payload: serde_json::json!({}),
         };
 
         let bridge_thread = thread::spawn(move || bridge.call_session_rpc(request));
@@ -535,10 +577,10 @@ mod tests {
             response: ConversationBridgeResponse {
                 request_id: "req_1".to_string(),
                 tool_call_id: "call_1".to_string(),
-                tool_name: "user_tell".to_string(),
+                tool_name: "cron_tasks_list".to_string(),
                 result: ToolResultItem {
                     tool_call_id: "call_1".to_string(),
-                    tool_name: "user_tell".to_string(),
+                    tool_name: "cron_tasks_list".to_string(),
                     result: ToolResultContent::from_text("sent".to_string()),
                 },
             },

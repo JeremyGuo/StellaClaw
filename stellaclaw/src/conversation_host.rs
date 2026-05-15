@@ -1,0 +1,267 @@
+#![allow(dead_code)]
+
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    thread,
+};
+
+use anyhow::{anyhow, Context, Result};
+use crossbeam_channel::{Receiver, Sender};
+
+use crate::{
+    config::StellaclawConfig,
+    conversation_metadata::{ConversationMetadata, ConversationMetadataStore, WorkdirLayout},
+    conversation_new::{
+        ChannelServiceEndpoint, ConversationKernel, ConversationKernelHandle, ConversationRef,
+        ConversationRuntimeConfig, ServiceAddr, ServiceRefs,
+    },
+    logger::StellaclawLogger,
+    tool_binary_manager::shared_tool_binary_client,
+};
+
+pub struct ConversationHostRuntime {
+    workdir: PathBuf,
+    default_runtime_config: ConversationRuntimeConfig,
+    logger: Arc<StellaclawLogger>,
+    conversations: Mutex<HashMap<String, HostedConversation>>,
+}
+
+pub struct HostedConversation {
+    pub handle: ConversationKernelHandle,
+    pub main_channel_ingress_tx: Sender<crate::service_protos::channel::ChannelIngress>,
+    pub main_channel_event_subscribers:
+        Arc<Mutex<Vec<Sender<crate::service_protos::channel::ChannelEvent>>>>,
+}
+
+impl ConversationHostRuntime {
+    pub fn start_existing(
+        workdir: PathBuf,
+        config: Arc<StellaclawConfig>,
+        agent_server_path: PathBuf,
+        logger: Arc<StellaclawLogger>,
+    ) -> Result<Self> {
+        start_global_services();
+        let default_runtime_config = runtime_config_from_host_defaults(&config, agent_server_path)?;
+        let runtime = Self {
+            workdir,
+            default_runtime_config,
+            logger,
+            conversations: Mutex::new(HashMap::new()),
+        };
+
+        let store = ConversationMetadataStore::new(&runtime.workdir);
+        for metadata_path in store.list_metadata_paths()? {
+            let metadata = read_conversation_metadata(&metadata_path)?;
+            runtime.ensure_conversation_started(&metadata.conversation_id)?;
+        }
+
+        runtime.logger.info(
+            "conversation_kernels_started",
+            serde_json::json!({ "count": runtime.conversation_count() }),
+        );
+        Ok(runtime)
+    }
+
+    pub fn conversation_count(&self) -> usize {
+        self.conversations
+            .lock()
+            .map(|conversations| conversations.len())
+            .unwrap_or(0)
+    }
+
+    pub fn conversation_ids(&self) -> Vec<String> {
+        let Ok(conversations) = self.conversations.lock() else {
+            return Vec::new();
+        };
+        conversations.keys().cloned().collect()
+    }
+
+    pub fn ensure_conversation_started(&self, conversation_id: &str) -> Result<()> {
+        if self
+            .conversations
+            .lock()
+            .map_err(|_| anyhow!("conversation registry lock poisoned"))?
+            .contains_key(conversation_id)
+        {
+            return Ok(());
+        }
+
+        let layout = WorkdirLayout::new(&self.workdir);
+        let conversation_root = layout.conversation_root(conversation_id);
+        let (main_channel_ingress_tx, main_channel_ingress_rx) = crossbeam_channel::unbounded();
+        let (main_channel_event_tx, main_channel_event_rx) = crossbeam_channel::unbounded();
+        let main_channel_event_subscribers = Arc::new(Mutex::new(Vec::new()));
+        spawn_channel_event_fanout(
+            conversation_id.to_string(),
+            main_channel_event_rx,
+            main_channel_event_subscribers.clone(),
+            self.logger.clone(),
+        );
+        let refs = ServiceRefs::default().with_channel_endpoint(
+            ServiceAddr::channel(),
+            ChannelServiceEndpoint {
+                ingress_rx: main_channel_ingress_rx,
+                event_tx: main_channel_event_tx,
+            },
+        );
+        let conversation = ConversationRef {
+            conversation_id: conversation_id.to_string(),
+            workdir: self.workdir.clone(),
+            conversation_root,
+        };
+        let kernel = ConversationKernel::open_or_bootstrap(
+            conversation,
+            refs,
+            self.default_runtime_config.clone(),
+        )
+        .with_context(|| format!("failed to open conversation kernel {conversation_id}"))?;
+        let handle = kernel
+            .spawn()
+            .with_context(|| format!("failed to spawn conversation kernel {conversation_id}"))?;
+
+        self.conversations
+            .lock()
+            .map_err(|_| anyhow!("conversation registry lock poisoned"))?
+            .insert(
+                conversation_id.to_string(),
+                HostedConversation {
+                    handle,
+                    main_channel_ingress_tx,
+                    main_channel_event_subscribers,
+                },
+            );
+        self.logger.info(
+            "conversation_kernel_started",
+            serde_json::json!({ "conversation_id": conversation_id }),
+        );
+        Ok(())
+    }
+
+    pub fn main_channel_ingress(
+        &self,
+        conversation_id: &str,
+    ) -> Option<Sender<crate::service_protos::channel::ChannelIngress>> {
+        self.conversations
+            .lock()
+            .ok()?
+            .get(conversation_id)
+            .map(|conversation| conversation.main_channel_ingress_tx.clone())
+    }
+
+    pub fn send_main_channel_ingress(
+        &self,
+        conversation_id: &str,
+        ingress: crate::service_protos::channel::ChannelIngress,
+    ) -> Result<()> {
+        let sender = self
+            .main_channel_ingress(conversation_id)
+            .ok_or_else(|| anyhow!("unknown conversation {conversation_id}"))?;
+        sender
+            .send(ingress)
+            .map_err(|_| anyhow!("conversation {conversation_id} channel ingress is closed"))
+    }
+
+    pub fn stop_conversation(
+        &self,
+        conversation_id: &str,
+        reason: impl Into<String>,
+    ) -> Result<()> {
+        let conversation = self
+            .conversations
+            .lock()
+            .map_err(|_| anyhow!("conversation registry lock poisoned"))?
+            .remove(conversation_id);
+        let Some(conversation) = conversation else {
+            return Ok(());
+        };
+        conversation.handle.shutdown(reason)
+    }
+
+    pub fn subscribe_main_channel_events(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Receiver<crate::service_protos::channel::ChannelEvent>> {
+        let conversations = self
+            .conversations
+            .lock()
+            .map_err(|_| anyhow!("conversation registry lock poisoned"))?;
+        let conversation = conversations
+            .get(conversation_id)
+            .ok_or_else(|| anyhow!("unknown conversation {conversation_id}"))?;
+        let (tx, rx) = crossbeam_channel::unbounded();
+        conversation
+            .main_channel_event_subscribers
+            .lock()
+            .map_err(|_| anyhow!("conversation event subscriber lock poisoned"))?
+            .push(tx);
+        Ok(rx)
+    }
+}
+
+impl Drop for ConversationHostRuntime {
+    fn drop(&mut self) {
+        let Ok(mut conversations) = self.conversations.lock() else {
+            return;
+        };
+        for (conversation_id, conversation) in conversations.drain() {
+            let _ = conversation.handle.shutdown(format!(
+                "host runtime stopping conversation {conversation_id}"
+            ));
+        }
+    }
+}
+
+fn start_global_services() {
+    let _ = shared_tool_binary_client();
+}
+
+fn spawn_channel_event_fanout(
+    conversation_id: String,
+    event_rx: Receiver<crate::service_protos::channel::ChannelEvent>,
+    subscribers: Arc<Mutex<Vec<Sender<crate::service_protos::channel::ChannelEvent>>>>,
+    logger: Arc<StellaclawLogger>,
+) {
+    thread::Builder::new()
+        .name(format!("conversation-channel-events-{conversation_id}"))
+        .spawn(move || {
+            while let Ok(event) = event_rx.recv() {
+                let Ok(mut subscribers) = subscribers.lock() else {
+                    logger.warn(
+                        "conversation_channel_event_subscriber_lock_poisoned",
+                        serde_json::json!({"conversation_id": conversation_id}),
+                    );
+                    break;
+                };
+                subscribers.retain(|sender| sender.send(event.clone()).is_ok());
+            }
+        })
+        .expect("failed to spawn conversation channel event fanout");
+}
+
+fn runtime_config_from_host_defaults(
+    config: &StellaclawConfig,
+    agent_server_path: PathBuf,
+) -> Result<ConversationRuntimeConfig> {
+    Ok(ConversationRuntimeConfig {
+        agent_server_path: Some(agent_server_path),
+        session_profile: Some(
+            config
+                .initial_session_profile()
+                .map_err(anyhow::Error::msg)?,
+        ),
+        models: config.models.clone(),
+        session_defaults: config.session_defaults.clone(),
+        memory_enabled: config.memory.enabled,
+        tool_remote_mode: stellaclaw_core::session_actor::ToolRemoteMode::Selectable,
+        sandbox: Some(config.sandbox.clone()),
+        reasoning_effort: None,
+    })
+}
+
+fn read_conversation_metadata(path: &std::path::Path) -> Result<ConversationMetadata> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
+}

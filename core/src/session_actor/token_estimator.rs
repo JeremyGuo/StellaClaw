@@ -936,7 +936,7 @@ mod tests {
         let messages = vec![ChatMessage::new(
             ChatRole::Assistant,
             vec![ChatMessageItem::Reasoning(ReasoningItem::codex(
-                None,
+                Vec::new(),
                 Some("a".repeat(1_000)),
                 None,
             ))],

@@ -133,6 +133,13 @@ impl ClaudeCodeProvider {
 }
 
 impl ProviderBackend for ClaudeCodeProvider {
+    fn system_prompt_for_model(
+        &self,
+        _model_config: &ModelConfig,
+    ) -> Result<Option<String>, ProviderError> {
+        Ok(None)
+    }
+
     fn send(
         &self,
         model_config: &ModelConfig,
@@ -282,6 +289,7 @@ fn claude_value_to_chat_message(
     }
 
     Ok(ChatMessage {
+        message_id: ChatMessage::new_message_id(),
         role: ChatRole::Assistant,
         user_name: None,
         message_time: None,
@@ -476,7 +484,7 @@ mod tests {
                     "role": "assistant",
                     "content": [
                         {"type": "text", "text": "need the file"},
-                        {"type": "tool_use", "id": "toolu_1", "name": "file_read", "input": {"path": "README.md"}}
+                        {"type": "tool_use", "id": "toolu_1", "name": "shell_exec", "input": {"command": "cat README.md"}}
                     ],
                     "usage": {
                         "input_tokens": 10,

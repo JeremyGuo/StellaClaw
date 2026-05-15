@@ -3,12 +3,13 @@ import { useMemo, useState } from 'react';
 import * as ContextMenu from '@radix-ui/react-context-menu';
 import { conversationKey, displayConversationName } from '../lib/api';
 import { formatModel } from '../lib/format';
+import { messageOrderFromId } from '../lib/messageUtils';
 
 function hasUnreadMessage(conversation, active) {
   if (active) return false;
-  const lastId = Number(conversation?.last_message_id);
-  if (!Number.isFinite(lastId)) return false;
-  const seenId = Number(conversation?.last_seen_message_id ?? -1);
+  const lastId = messageOrderFromId(conversation?.last_message_id);
+  if (lastId === undefined) return false;
+  const seenId = messageOrderFromId(conversation?.last_seen_message_id) ?? -1;
   return lastId > seenId;
 }
 

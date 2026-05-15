@@ -30,7 +30,7 @@ import { NewConversationDialog } from './components/NewConversationDialog';
 import { SettingsDialog } from './components/SettingsDialog';
 import { clamp, formatBytes, formatModel, statusUsageTotals } from './lib/format';
 import { fileExtension, fileNameFromPath, imageMimeType } from './lib/fileUtils';
-import { activityFromMessages, addUsageTotals, firstMessageId, hasOlderMessages, isFinalAssistantMessage, lastMessageId, lastServerMessageId, liveActivitySignature, mergeMessages, shortText, usageDeltaFromMessages, websocketUrl } from './lib/messageUtils';
+import { activityFromMessages, addUsageTotals, firstMessageId, hasOlderMessages, isFinalAssistantMessage, lastServerMessageIndex, liveActivitySignature, mergeMessages, messageIndex, messageOrderFromId, shortText, usageDeltaFromMessages, websocketUrl } from './lib/messageUtils';
 import { effectiveThemeMode, themeCssVariables } from './lib/theme';
 import { collectDroppedFiles, packFilesToTarGz, uploadPayloadStats } from './lib/uploadArchive';
 import { normalizeWorkspacePath, parentWorkspacePath, workspaceEntryKind, workspaceFileKind } from './lib/workspaceUtils';
@@ -201,21 +201,25 @@ function revokeFilePreviewUrls(files = []) {
 }
 
 function maxMessageId(...values) {
-  let max = -1;
+  let best;
+  let bestOrder = -1;
   for (const value of values) {
-    const number = Number(value);
-    if (Number.isFinite(number)) max = Math.max(max, number);
+    const order = messageOrderFromId(value);
+    if (order !== undefined && order >= bestOrder) {
+      best = String(value);
+      bestOrder = order;
+    }
   }
-  return max >= 0 ? String(max) : undefined;
+  return best;
 }
 
 function compareMessageIds(left, right) {
-  const leftNumber = Number(left);
-  const rightNumber = Number(right);
-  if (!Number.isFinite(leftNumber) && !Number.isFinite(rightNumber)) return 0;
-  if (!Number.isFinite(leftNumber)) return -1;
-  if (!Number.isFinite(rightNumber)) return 1;
-  return leftNumber === rightNumber ? 0 : leftNumber > rightNumber ? 1 : -1;
+  const leftOrder = messageOrderFromId(left);
+  const rightOrder = messageOrderFromId(right);
+  if (leftOrder === undefined && rightOrder === undefined) return 0;
+  if (leftOrder === undefined) return -1;
+  if (rightOrder === undefined) return 1;
+  return leftOrder === rightOrder ? 0 : leftOrder > rightOrder ? 1 : -1;
 }
 
 function mergeConversationSummary(existing, incoming) {
@@ -223,8 +227,7 @@ function mergeConversationSummary(existing, incoming) {
   if (!incoming) return existing;
   const incomingHasNewerMessage = compareMessageIds(incoming.last_message_id, existing.last_message_id) >= 0;
   const seen = maxMessageId(existing.last_seen_message_id, incoming.last_seen_message_id);
-  const incomingSeen = Number(incoming?.last_seen_message_id);
-  const existingSeen = Number(existing?.last_seen_message_id);
+  const incomingSeenIsNewer = compareMessageIds(incoming?.last_seen_message_id, existing?.last_seen_message_id) >= 0;
   const merged = {
     ...existing,
     ...incoming,
@@ -242,7 +245,7 @@ function mergeConversationSummary(existing, incoming) {
   return {
     ...merged,
     last_seen_message_id: seen,
-    last_seen_at: Number.isFinite(incomingSeen) && (!Number.isFinite(existingSeen) || incomingSeen >= existingSeen)
+    last_seen_at: incomingSeenIsNewer
       ? incoming?.last_seen_at
       : existing?.last_seen_at
   };
@@ -325,7 +328,7 @@ function hasUnreadConversation(conversation) {
 function recentMessagePageParams(conversation, limit = 40, totalOverride = undefined) {
   const boundedLimit = Math.max(1, Math.min(200, Number(limit) || 40));
   const overrideTotal = Number(totalOverride);
-  const lastId = Number(conversation?.last_message_id);
+  const lastId = messageOrderFromId(conversation?.last_message_id);
   const messageCount = Number(conversation?.message_count);
   let total = 0;
   if (Number.isFinite(overrideTotal) && overrideTotal > 0) {
@@ -446,6 +449,148 @@ function mergeProgressActivity(current, progress) {
   };
 }
 
+function normalizedStreamEvent(payload) {
+  return payload?.event || payload?.session_event || payload?.stream_event || payload;
+}
+
+function streamEventType(event) {
+  return String(event?.type || event?.event_type || event?.kind || '').toLowerCase();
+}
+
+function streamMessageId(event) {
+  return String(
+    event?.message_id
+    || event?.messageId
+    || event?.stream_id
+    || event?.streamId
+    || event?.item_id
+    || event?.itemId
+    || event?.turn_id
+    || event?.turnId
+    || ''
+  ).trim();
+}
+
+function streamActivityBaseId(event) {
+  return streamMessageId(event) || 'current';
+}
+
+function streamItemId(event) {
+  return String(event?.call_id || event?.callId || event?.item_id || event?.itemId || streamActivityBaseId(event)).trim();
+}
+
+function streamDeltaText(event) {
+  return String(event?.delta ?? event?.text_delta ?? event?.textDelta ?? '');
+}
+
+function streamErrorText(event) {
+  return String(event?.error || event?.message || event?.error_detail || event?.errorDetail || '流式响应失败').trim();
+}
+
+function streamMessageIndexFromEvent(event) {
+  const explicit = Number(event?.message_index ?? event?.messageIndex ?? event?.index);
+  if (Number.isFinite(explicit)) return explicit;
+  return messageOrderFromId(streamMessageId(event));
+}
+
+function appendStreamAssistantDelta(current, event) {
+  const id = streamMessageId(event);
+  const delta = streamDeltaText(event);
+  if (!id || !delta) return current;
+  const position = current.findIndex((message) => String(message?.id ?? message?.message_id ?? '') === id);
+  const now = new Date().toISOString();
+  const buildMessage = (existing = {}) => {
+    const nextText = `${String(existing.text || existing.preview || '')}${delta}`;
+    const index = streamMessageIndexFromEvent(event);
+    return {
+      ...existing,
+      id,
+      message_id: id,
+      index: Number.isFinite(index) ? index : existing.index,
+      role: 'assistant',
+      text: nextText,
+      preview: nextText,
+      content: nextText,
+      text_with_attachment_markers: nextText,
+      items: [
+        {
+          type: 'text',
+          index: 0,
+          text: nextText,
+          text_with_attachment_markers: nextText
+        }
+      ],
+      attachments: existing.attachments || [],
+      attachment_count: existing.attachment_count || 0,
+      message_time: existing.message_time || now,
+      _streaming: true
+    };
+  };
+  if (position < 0) return [...current, buildMessage()];
+  const next = [...current];
+  next[position] = buildMessage(next[position]);
+  return next;
+}
+
+function applyStreamErrorToMessages(current, event) {
+  const id = streamMessageId(event);
+  if (!id) return current;
+  const error = streamErrorText(event);
+  const position = current.findIndex((message) => String(message?.id ?? message?.message_id ?? '') === id);
+  if (position < 0) {
+    const index = streamMessageIndexFromEvent(event);
+    return [
+      ...current,
+      {
+        id,
+        message_id: id,
+        index: Number.isFinite(index) ? index : undefined,
+        role: 'assistant',
+        text: '',
+        preview: '',
+        items: [],
+        attachments: [],
+        attachment_count: 0,
+        message_time: new Date().toISOString(),
+        error,
+        _streaming: false,
+        _streamFailed: true
+      }
+    ];
+  }
+  const next = [...current];
+  next[position] = {
+    ...next[position],
+    _streaming: false,
+    _streamFailed: true,
+    error
+  };
+  return next;
+}
+
+function streamFinalizedActivityIds(messages) {
+  const ids = new Set();
+  for (const message of messages || []) {
+    const id = String(message?.id ?? message?.message_id ?? '').trim();
+    if (id) {
+      ids.add(`stream-assistant-${id}`);
+      ids.add(`stream-reasoning-${id}`);
+      ids.add(`stream-tool-${id}`);
+    }
+    const items = [
+      ...(Array.isArray(message?.items) ? message.items : []),
+      ...(Array.isArray(message?.data) ? message.data : [])
+    ];
+    for (const item of items) {
+      if (item?.type !== 'tool_call' && item?.type !== 'tool_result') continue;
+      const payload = item?.payload && typeof item.payload === 'object' ? item.payload : item;
+      const toolId = String(payload?.tool_call_id || payload?.call_id || payload?.item_id || '').trim();
+      if (toolId) ids.add(`stream-tool-${toolId}`);
+    }
+  }
+  return ids;
+}
+
 function App() {
   const [settings, setSettings] = useState(null);
   const [systemTheme, setSystemTheme] = useState(() => {
@@ -496,6 +641,7 @@ function App() {
   const websocketReconnectRef = useRef(null);
   const websocketKeyRef = useRef('');
   const seenUsageMessagesRef = useRef(new Map());
+  const streamBuffersRef = useRef(new Map());
   const loadingOlderRef = useRef(false);
   const layoutDraftRef = useRef(null);
   const restoringUiRef = useRef(false);
@@ -737,15 +883,15 @@ function App() {
   }, []);
 
   const markConversationRead = useCallback((serverId, conversationId, lastMessageId) => {
-    const seen = Number(lastMessageId);
     if (!appForegroundRef.current) return;
-    if (!serverId || !conversationId || !Number.isFinite(seen)) return;
+    const seen = String(lastMessageId || '').trim();
+    if (!serverId || !conversationId || !seen || messageOrderFromId(seen) === undefined) return;
     const key = conversationKey(serverId, conversationId);
     const nextConversations = conversationsRef.current.map((conversation) => (
       conversation.conversation_id === conversationId
         ? mergeConversationSummary(conversation, {
           conversation_id: conversationId,
-          last_seen_message_id: String(seen)
+          last_seen_message_id: seen
         })
         : conversation
     ));
@@ -1423,6 +1569,7 @@ function App() {
 
     const applyIncomingMessages = (incoming) => {
       if (!Array.isArray(incoming) || incoming.length === 0 || disposed || websocketKeyRef.current !== key) return;
+      const finalizedActivities = streamFinalizedActivityIds(incoming);
       const delta = usageDeltaFromMessages(key, incoming, seenUsageMessagesRef.current);
       if (delta.totalTokens > 0 || delta.cost > 0) {
         setStatusDeltas((current) => {
@@ -1436,20 +1583,24 @@ function App() {
         messagesRef.current = next;
         return next;
       });
-      const latestId = incoming.reduce((max, message) => {
-        const id = Number(message?.id ?? message?.message_id);
-        return Number.isFinite(id) ? Math.max(max, id) : max;
-      }, -1);
-      if (latestId >= 0) {
+      const latestMessage = incoming.reduce((latest, message) => (
+        !latest || messageIndex(message) >= messageIndex(latest) ? message : latest
+      ), null);
+      const latestId = latestMessage?.id ?? latestMessage?.message_id;
+      const latestIndex = latestMessage ? messageIndex(latestMessage) : undefined;
+      if (latestId && Number.isFinite(latestIndex)) {
         setConversations((current) => current.map((conversation) => (
           conversation.conversation_id === selected.conversationId
-            ? { ...conversation, last_message_id: String(latestId), message_count: Math.max(Number(conversation.message_count || 0), latestId + 1) }
+            ? { ...conversation, last_message_id: String(latestId), message_count: Math.max(Number(conversation.message_count || 0), latestIndex + 1) }
             : conversation
         )));
         markConversationRead(selected.serverId, selected.conversationId, latestId);
       }
       const activity = activityFromMessages(incoming);
       if (activity) setSessionActivity(activity);
+      if (finalizedActivities.size > 0) {
+        updateRunningActivities((current) => current.filter((item) => !finalizedActivities.has(item.id)));
+      }
       if (incoming.some((message) => isFinalAssistantMessage(message))) {
         setTimeout(() => {
           if (!disposed && websocketKeyRef.current === key) {
@@ -1463,20 +1614,123 @@ function App() {
       if (!Array.isArray(incoming) || incoming.length === 0 || disposed || websocketKeyRef.current !== key) return;
       messagesRef.current = incoming;
       setMessages(incoming);
-      const latestId = incoming.reduce((max, message) => {
-        const id = Number(message?.id ?? message?.message_id);
-        return Number.isFinite(id) ? Math.max(max, id) : max;
-      }, -1);
-      if (latestId >= 0) {
+      const latestMessage = incoming.reduce((latest, message) => (
+        !latest || messageIndex(message) >= messageIndex(latest) ? message : latest
+      ), null);
+      const latestId = latestMessage?.id ?? latestMessage?.message_id;
+      const latestIndex = latestMessage ? messageIndex(latestMessage) : undefined;
+      if (latestId && Number.isFinite(latestIndex)) {
         setConversations((current) => current.map((conversation) => (
           conversation.conversation_id === selected.conversationId
-            ? { ...conversation, last_message_id: String(latestId), message_count: Math.max(Number(conversation.message_count || 0), latestId + 1) }
+            ? { ...conversation, last_message_id: String(latestId), message_count: Math.max(Number(conversation.message_count || 0), latestIndex + 1) }
             : conversation
         )));
         markConversationRead(selected.serverId, selected.conversationId, latestId);
       }
       const activity = activityFromMessages(incoming);
       if (activity) setSessionActivity(activity);
+    };
+
+    const appendStreamBuffer = (bufferKey, delta) => {
+      if (!delta) return streamBuffersRef.current.get(bufferKey) || '';
+      const next = `${streamBuffersRef.current.get(bufferKey) || ''}${delta}`;
+      streamBuffersRef.current.set(bufferKey, next);
+      return next;
+    };
+
+    const applySessionStream = (rawEvent) => {
+      const event = normalizedStreamEvent(rawEvent);
+      const type = streamEventType(event);
+      if (!type || disposed || websocketKeyRef.current !== key) return;
+      const messageId = streamActivityBaseId(event);
+
+      if (type === 'stream_assistant_message_delta') {
+        const delta = streamDeltaText(event);
+        if (!delta) return;
+        setMessages((current) => {
+          const next = appendStreamAssistantDelta(current, event);
+          messagesRef.current = next;
+          return next;
+        });
+        setSessionActivity('正在回复');
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== `stream-assistant-${messageId}` && item.id !== 'thinking'),
+          mergeProgressActivity(current, {
+            id: `stream-assistant-${messageId}`,
+            title: '正在回复',
+            detail: shortText(delta, 72),
+            state: 'running'
+          })
+        ]);
+        return;
+      }
+
+      if (type === 'stream_reasoning_summary_part_added') {
+        setSessionActivity('思考中');
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== `stream-reasoning-${messageId}` && item.id !== 'thinking'),
+          mergeProgressActivity(current, {
+            id: `stream-reasoning-${messageId}`,
+            title: '思考中',
+            detail: '整理推理摘要',
+            state: 'running'
+          })
+        ]);
+        return;
+      }
+
+      if (type === 'stream_reasoning_summary_delta') {
+        const summaryIndex = event?.summary_index ?? event?.summaryIndex ?? 0;
+        const bufferKey = `${key}:reasoning:${messageId}:${summaryIndex}`;
+        const text = appendStreamBuffer(bufferKey, streamDeltaText(event));
+        setSessionActivity('思考中');
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== `stream-reasoning-${messageId}` && item.id !== 'thinking'),
+          mergeProgressActivity(current, {
+            id: `stream-reasoning-${messageId}`,
+            title: '思考中',
+            detail: shortText(text || '整理推理摘要', 96),
+            state: 'running'
+          })
+        ]);
+        return;
+      }
+
+      if (type === 'stream_tool_call_delta') {
+        const itemId = streamItemId(event);
+        const bufferKey = `${key}:tool:${itemId}`;
+        const text = appendStreamBuffer(bufferKey, streamDeltaText(event));
+        setSessionActivity('准备调用工具');
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== `stream-tool-${itemId}` && item.id !== 'thinking'),
+          mergeProgressActivity(current, {
+            id: `stream-tool-${itemId}`,
+            title: '准备调用工具',
+            detail: shortText(text, 96),
+            state: 'running'
+          })
+        ]);
+        return;
+      }
+
+      if (type === 'stream_error') {
+        const error = streamErrorText(event);
+        setMessages((current) => {
+          const next = applyStreamErrorToMessages(current, event);
+          messagesRef.current = next;
+          return next;
+        });
+        setSessionActivity(error);
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== `stream-assistant-${messageId}` && item.id !== `stream-reasoning-${messageId}` && item.id !== 'thinking'),
+          mergeProgressActivity(current, {
+            id: `stream-error-${messageId}`,
+            title: '响应失败',
+            detail: shortText(error, 96),
+            state: 'failed'
+          })
+        ]);
+      }
     };
 
     const loadInitialMessagePage = async () => {
@@ -1496,14 +1750,12 @@ function App() {
     };
 
     const reconcileAck = async (ack) => {
-      const nextId = String(ack?.next_message_id || '');
-      if (!nextId || disposed || websocketKeyRef.current !== key) return;
-      const nextIndex = Number(nextId);
-      if (!Number.isFinite(nextIndex)) return;
+      const total = Number(ack?.next_message_index ?? ack?.total ?? ack?.next_message_id);
+      if (!Number.isFinite(total) || disposed || websocketKeyRef.current !== key) return;
       const current = messagesRef.current;
-      const lastId = lastMessageId(current);
-      if (!lastId) {
-        if (nextIndex <= 0) {
+      const lastIndex = lastServerMessageIndex(current);
+      if (lastIndex === undefined) {
+        if (total <= 0) {
           messagesRef.current = [];
           setMessages([]);
           setMessagesReady(true);
@@ -1512,7 +1764,7 @@ function App() {
         const initial = await loadMessages(
           selected.serverId,
           selected.conversationId,
-          recentMessagePageParams(null, 40, nextIndex)
+          recentMessagePageParams(null, 40, total)
         );
         if (!disposed && websocketKeyRef.current === key) {
           setMessages((current) => {
@@ -1524,12 +1776,11 @@ function App() {
         }
         return;
       }
-      const lastIndex = Number(lastId);
-      if (Number.isFinite(lastIndex) && nextIndex > lastIndex + 1) {
-        const gap = nextIndex - lastIndex - 1;
+      if (total > lastIndex + 1) {
+        const gap = total - lastIndex - 1;
         const shouldJumpToTail = gap > 200;
         const params = shouldJumpToTail
-          ? recentMessagePageParams(null, 80, nextIndex)
+          ? recentMessagePageParams(null, 80, total)
           : { offset: lastIndex + 1, limit: gap };
         const missing = await loadMessages(selected.serverId, selected.conversationId, params);
         if (shouldJumpToTail) {
@@ -1569,6 +1820,8 @@ function App() {
             reconcileAck(payload).catch(() => {});
           } else if (payload.type === 'messages') {
             applyIncomingMessages(payload.messages || []);
+          } else if (payload.type === 'session_stream' || streamEventType(payload).startsWith('stream_')) {
+            applySessionStream(payload);
           } else if (payload.type === 'turn_progress') {
             const progress = normalizeProgressFeedback(payload);
             setSessionActivity(progress.state === 'done' ? '已完成' : progress.detail || progress.title);
@@ -1626,6 +1879,7 @@ function App() {
     closeSocket();
     websocketKeyRef.current = key;
     messagesRef.current = [];
+    streamBuffersRef.current = new Map();
     setMessages([]);
     setMessagesReady(false);
     setSessionActivity('');
@@ -1791,7 +2045,8 @@ function App() {
     if (!anchorId) return false;
     loadingOlderRef.current = true;
     try {
-      const anchorIndex = Math.max(0, Number(anchorId) || 0);
+      const anchor = messagesRef.current[0];
+      const anchorIndex = Math.max(0, messageIndex(anchor) || 0);
       const offset = Math.max(0, anchorIndex - 40);
       const limit = anchorIndex - offset;
       const older = limit > 0 ? await loadMessages(selected.serverId, selected.conversationId, {
@@ -1824,7 +2079,7 @@ function App() {
     const commandState = outgoingFiles.length > 0
       ? { control: false, name: '', title: '等待响应', detail: '消息已送达，等待模型开始处理' }
       : slashCommandState(value);
-    const previousLastServerId = lastServerMessageId(messagesRef.current);
+    const previousLastServerIndex = lastServerMessageIndex(messagesRef.current);
     const optimistic = {
       id: `local-${Date.now()}`,
       role: 'user',
@@ -1881,7 +2136,7 @@ function App() {
         ]);
       }
       if (!commandState.control) {
-        const offset = previousLastServerId ? Number(previousLastServerId) + 1 : 0;
+        const offset = previousLastServerIndex !== undefined ? previousLastServerIndex + 1 : 0;
         const incoming = await loadMessages(selected.serverId, selected.conversationId, {
           offset,
           limit: 80

@@ -22,8 +22,8 @@ use crate::{
         ModelSelection, SandboxConfig, SandboxMode, SessionProfile, StellaclawConfig,
         ToolModelTarget,
     },
-    conversation::{ConversationSessionBinding, ConversationState},
     conversation_id_manager::ConversationIdManager,
+    conversation_state::{ConversationSessionBinding, ConversationState},
     workspace::ensure_workspace_seed,
 };
 

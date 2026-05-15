@@ -491,11 +491,13 @@ mod tests {
         };
         let messages = vec![ChatMessage::new(
             ChatRole::Assistant,
-            vec![ChatMessageItem::Reasoning(ReasoningItem::codex(
-                Some("summary".to_string()),
-                Some("encrypted".to_string()),
-                Some("raw text".to_string()),
-            ))],
+            vec![ChatMessageItem::Reasoning(
+                ReasoningItem::codex_from_summary_text(
+                    Some("summary".to_string()),
+                    Some("encrypted".to_string()),
+                    Some("raw text".to_string()),
+                ),
+            )],
         )];
 
         let normalized = normalize_messages_for_model(&messages, &config);

@@ -345,17 +345,36 @@ export function stableSignature(value) {
   return JSON.stringify(value ?? null);
 }
 
+export function messageOrderFromId(value) {
+  if (value === undefined || value === null || value === '') return undefined;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return numeric;
+  const match = String(value).match(/^msg_(\d+)(?:_|$)/);
+  if (!match) return undefined;
+  const order = Number(match[1]);
+  return Number.isFinite(order) ? order : undefined;
+}
+
 export function messageIndex(message) {
-  const index = Number(message?.index ?? message?.id);
-  return Number.isFinite(index) ? index : Number.MAX_SAFE_INTEGER;
+  const index = Number(message?.index);
+  if (Number.isFinite(index)) return index;
+  return messageOrderFromId(message?.id ?? message?.message_id) ?? Number.MAX_SAFE_INTEGER;
 }
 
 export function lastMessageId(messages) {
   return messages.length > 0 ? String(messages[messages.length - 1]?.id ?? '') : '';
 }
 
+export function lastServerMessageIndex(messages) {
+  const last = [...messages].reverse().find((message) => {
+    const index = messageIndex(message);
+    return !message?._optimistic && Number.isFinite(index) && index !== Number.MAX_SAFE_INTEGER;
+  });
+  return last ? messageIndex(last) : undefined;
+}
+
 export function lastServerMessageId(messages) {
-  const last = [...messages].reverse().find((message) => !message?._optimistic && Number.isFinite(Number(message?.id)));
+  const last = [...messages].reverse().find((message) => !message?._optimistic && String(message?.id ?? '').trim());
   return last ? String(last.id) : '';
 }
 

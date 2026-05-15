@@ -1,5 +1,7 @@
 use std::{
+    env,
     io::{self, BufRead, Write},
+    path::PathBuf,
     sync::{mpsc, Arc, Mutex},
     thread,
 };
@@ -9,11 +11,12 @@ use serde_json::{json, Value};
 use stellaclaw_core::{
     huggingface::HuggingFaceFileResolver,
     model_config::ModelConfig,
-    providers::{init_global_provider_fork_server, ForkServerProvider},
+    providers::{init_global_provider_fork_server, ForkServerProviderFactory, ProviderFactory},
     session_actor::{
-        ConversationTransport, LocalToolBatchExecutor, SessionActor, SessionActorEventSink,
-        SessionActorInbox, SessionActorStep, SessionErrorDetail, SessionEvent, SessionInitial,
-        SessionRequest, SessionRpcThread, TokenEstimator, ToolCatalog,
+        ConversationTransport, LocalToolBatchExecutor, ProviderBackedToolModels, SearchToolModels,
+        SessionActor, SessionActorEventSink, SessionActorInbox, SessionActorStep,
+        SessionErrorDetail, SessionEvent, SessionInitial, SessionRequest, SessionRpcThread,
+        TokenEstimator, ToolCatalog,
     },
 };
 
@@ -32,6 +35,7 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
+    configure_codex_cache_root()?;
     init_global_provider_fork_server().map_err(|error| error.to_string())?;
 
     let output = Arc::new(JsonRpcOutput::new());
@@ -124,6 +128,22 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn configure_codex_cache_root() -> Result<(), String> {
+    if env::var_os("STELLACLAW_CODEX_CACHE_ROOT").is_some() {
+        return Ok(());
+    }
+    let root = env::var_os("STELLACLAW_DATA_ROOT")
+        .map(|data_root| PathBuf::from(data_root).join(".stellaclaw").join("codex"))
+        .unwrap_or_else(|| {
+            env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".stellaclaw")
+                .join("codex")
+        });
+    env::set_var("STELLACLAW_CODEX_CACHE_ROOT", root);
+    Ok(())
+}
+
 fn initialize(params: Value, output: Arc<JsonRpcOutput>) -> Result<AgentRuntime, String> {
     let params: InitializeParams = serde_json::from_value(params)
         .map_err(|error| format!("invalid initialize params: {error}"))?;
@@ -137,21 +157,41 @@ fn initialize(params: Value, output: Arc<JsonRpcOutput>) -> Result<AgentRuntime,
     let rpc_thread = SessionRpcThread::spawn(Arc::new(sender.clone()), event_sink.clone());
     let bridge = rpc_thread.conversation_bridge();
     let actor_bridge = bridge.clone();
+    let provider = ForkServerProviderFactory
+        .create(params.model_config.clone())
+        .map_err(|error| error.to_string())?;
+    let catalog = ToolCatalog::from_model_config_and_initial_with_tool_set(
+        &params.model_config,
+        &params.initial,
+        provider.tool_set().as_deref(),
+    )
+    .map_err(|error| format!("failed to build tool catalog: {error}"))?;
     let token_estimator = build_tool_token_estimator(&params.model_config);
     let mut local_tool_executor = LocalToolBatchExecutor::new(workspace_root)
         .with_remote_mode(params.initial.tool_remote_mode.clone())
-        .with_conversation_bridge(Arc::new(bridge));
+        .with_conversation_bridge(Arc::new(bridge))
+        .with_search_tool_models(SearchToolModels {
+            web: params.initial.search_tool_model.clone(),
+            image: params.initial.search_image_tool_model.clone(),
+            video: params.initial.search_video_tool_model.clone(),
+            news: params.initial.search_news_tool_model.clone(),
+        })
+        .with_provider_backed_tool_models(ProviderBackedToolModels {
+            image: params.initial.image_tool_model.clone(),
+            pdf: params.initial.pdf_tool_model.clone(),
+            audio: params.initial.audio_tool_model.clone(),
+            image_generation: params
+                .initial
+                .image_generation_tool_model
+                .clone()
+                .or_else(|| Some(params.model_config.clone())),
+        })
+        .with_tool_catalog(catalog.clone());
     if let Some(token_estimator) = token_estimator {
         local_tool_executor = local_tool_executor.with_token_estimator(Arc::new(token_estimator));
     }
     let tool_executor = Arc::new(local_tool_executor);
-    let provider: Arc<dyn stellaclaw_core::providers::Provider + Send + Sync> = Arc::new(
-        ForkServerProvider::global(params.model_config.clone())
-            .map_err(|error| error.to_string())?,
-    );
-    let catalog = ToolCatalog::from_model_config_and_initial(&params.model_config, &params.initial)
-        .map_err(|error| format!("failed to build tool catalog: {error}"))?;
-    let mut actor = SessionActor::new(
+    let mut actor = SessionActor::new_with_provider_session(
         params.model_config,
         provider,
         tool_executor,
