@@ -80,7 +80,7 @@ export async function loadMessages(serverId, conversationId, options = {}) {
 }
 
 export async function postConversationMessage(serverId, conversationId, text, userName = 'workspace-user', files = [], selectionReferences = []) {
-  return api(serverId, `/api/conversations/${conversationId}/messages`, {
+  return api(serverId, `/api/conversations/${conversationId}/foreground_sessions/main/messages`, {
     method: 'POST',
     body: {
       user_name: String(userName || '').trim() || 'workspace-user',

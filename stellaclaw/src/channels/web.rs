@@ -27,7 +27,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     cache::{CacheManager, CachedThumbnail},
-    config::{ModelSelection, SandboxMode, StellaclawConfig},
+    config::{ModelSelection, SandboxMode, SessionProfile, StellaclawConfig},
     conversation_host::ConversationHostRuntime,
     conversation_id_manager::ConversationIdManager,
     conversation_metadata::{ConversationMetadata, ConversationMetadataStore, WorkdirLayout},
@@ -697,6 +697,20 @@ impl WebChannel {
             .remote_message_id
             .clone()
             .unwrap_or_else(generated_message_id);
+        if let Some(control) = request
+            .text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| text.starts_with('/'))
+            .and_then(parse_web_control)
+        {
+            return self.enqueue_foreground_session_control(
+                conversation_id,
+                session_id,
+                remote_message_id,
+                control,
+            );
+        }
         let message = web_send_message_to_chat_message(request)?;
         self.conversation_runtime
             .ensure_conversation_started(conversation_id)
@@ -724,6 +738,131 @@ impl WebChannel {
                 "accepted": true,
             }),
         ))
+    }
+
+    fn enqueue_foreground_session_control(
+        &self,
+        conversation_id: &str,
+        session_id: &str,
+        remote_message_id: String,
+        control: ConversationControl,
+    ) -> ApiResult<HttpResponse> {
+        let ingress = self.web_control_to_channel_ingress(&control)?;
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)
+            .map_err(ApiError::internal)?;
+        self.conversation_runtime
+            .send_main_channel_ingress(conversation_id, ingress)
+            .map_err(ApiError::internal)?;
+        if matches!(control, ConversationControl::SwitchModel { .. }) {
+            let metadata = match self.kernel_metadata_request(
+                conversation_id,
+                ChannelIngress::UpdateKernelMetadata {
+                    request_id: String::new(),
+                    patch: KernelMetadataPatch {
+                        model_selection_pending: Some(false),
+                        ..Default::default()
+                    },
+                },
+            )? {
+                KernelResponse::MetadataUpdated { metadata } => metadata,
+                KernelResponse::Metadata { metadata } => metadata,
+                _ => return Err(ApiError::internal("unexpected kernel metadata response")),
+            };
+            self.publish_conversation_upserted(&metadata);
+        }
+        Ok(json_response(
+            202,
+            json!({
+                "conversation_id": conversation_id,
+                "foreground_session_id": session_id,
+                "remote_message_id": remote_message_id,
+                "accepted": true,
+                "control": true,
+            }),
+        ))
+    }
+
+    fn web_control_to_channel_ingress(
+        &self,
+        control: &ConversationControl,
+    ) -> ApiResult<ChannelIngress> {
+        match control {
+            ConversationControl::Continue => Ok(ChannelIngress::ContinueForegroundTurn {
+                reason: Some("user requested continue".to_string()),
+            }),
+            ConversationControl::Cancel => Ok(ChannelIngress::CancelForegroundTurn {
+                reason: Some("user requested cancel".to_string()),
+            }),
+            ConversationControl::Compact => Ok(ChannelIngress::CompactForegroundNow),
+            ConversationControl::ShowStatus
+            | ConversationControl::ShowModel
+            | ConversationControl::ShowReasoning
+            | ConversationControl::ShowRemote
+            | ConversationControl::ShowSandbox => Ok(ChannelIngress::QueryForegroundStatus),
+            ConversationControl::SwitchModel { model_name } => {
+                let Some(model_config) = self.config.models.get(model_name) else {
+                    return Err(ApiError::new(
+                        400,
+                        format!("unknown model alias {model_name}"),
+                    ));
+                };
+                if !self.config.is_available_agent_model(model_name) {
+                    return Err(ApiError::new(
+                        400,
+                        format!("model {model_name} is not available for agent selection"),
+                    ));
+                }
+                if !model_config.supports(ModelCapability::Chat) {
+                    return Err(ApiError::new(
+                        400,
+                        format!("model {model_name} is not chat-capable"),
+                    ));
+                }
+                Ok(ChannelIngress::UpdateRuntimeConfig {
+                    patch: KernelRuntimeConfigPatch {
+                        session_profile: Some(Some(SessionProfile {
+                            main_model: ModelSelection::alias(model_name.clone()),
+                        })),
+                        ..Default::default()
+                    },
+                })
+            }
+            ConversationControl::SetReasoning { effort } => {
+                Ok(ChannelIngress::UpdateRuntimeConfig {
+                    patch: KernelRuntimeConfigPatch {
+                        reasoning_effort: Some(effort.clone()),
+                        ..Default::default()
+                    },
+                })
+            }
+            ConversationControl::SetRemote { host, path } => {
+                Ok(ChannelIngress::UpdateRuntimeConfig {
+                    patch: KernelRuntimeConfigPatch {
+                        tool_remote_mode: Some(ToolRemoteMode::FixedSsh {
+                            host: host.clone(),
+                            cwd: Some(path.clone()),
+                        }),
+                        ..Default::default()
+                    },
+                })
+            }
+            ConversationControl::DisableRemote => Ok(ChannelIngress::UpdateRuntimeConfig {
+                patch: KernelRuntimeConfigPatch {
+                    tool_remote_mode: Some(ToolRemoteMode::Selectable),
+                    ..Default::default()
+                },
+            }),
+            ConversationControl::SetSandbox { .. } => Err(ApiError::new(
+                400,
+                "sandbox runtime switching is not exposed through the new channel protocol yet",
+            )),
+            ConversationControl::InvalidReasoning { reason }
+            | ConversationControl::InvalidRemote { reason }
+            | ConversationControl::InvalidSandbox { reason } => {
+                Err(ApiError::new(400, reason.clone()))
+            }
+        }
     }
 
     fn list_messages(
