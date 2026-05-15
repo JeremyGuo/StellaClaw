@@ -1839,11 +1839,68 @@ button {
   width: 100%;
   max-width: var(--chat-column-width);
   min-width: 0;
-  gap: 10px;
+  gap: 8px;
   margin: 2px auto 18px;
   color: var(--muted);
   content-visibility: auto;
   contain-intrinsic-size: auto 120px;
+}
+
+.tool-round-toggle {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  min-width: 0;
+  min-height: 28px;
+  align-items: center;
+  gap: 7px;
+  padding: 2px 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.tool-round-toggle:hover {
+  color: var(--text);
+}
+
+.tool-round-toggle span {
+  min-width: 0;
+  overflow: hidden;
+  color: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tool-round-toggle svg {
+  flex: 0 0 auto;
+  color: currentColor;
+  opacity: .8;
+  transform: rotate(-90deg);
+  transition: transform 140ms ease;
+}
+
+.tool-process-group.open > .tool-round-toggle svg {
+  transform: rotate(0deg);
+}
+
+.tool-round-bar {
+  height: 1px;
+  min-width: 0;
+  background: color-mix(in srgb, var(--border), transparent 42%);
+}
+
+.tool-process-round-body {
+  display: grid;
+  min-width: 0;
+  gap: 10px;
 }
 
 .tool-process-segment {

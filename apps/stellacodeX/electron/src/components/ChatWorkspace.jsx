@@ -935,20 +935,67 @@ export function ToolProcessGroup({ group }) {
     };
   }), [messages]);
   const blocks = useMemo(() => toolProcessBlocks(expandedRows), [expandedRows]);
+  const complete = useMemo(() => {
+    const toolBlocks = blocks.filter((block) => block.type === 'tools');
+    return Boolean(group.nextMessage) || (toolBlocks.length > 0 && toolBlocks.every((block) => toolCardsAreComplete(block.cards)));
+  }, [blocks, group.nextMessage]);
+  const [open, setOpen] = useState(() => !complete);
+  const title = useMemo(() => toolRoundTitle(messages, group.nextMessage, complete), [messages, group.nextMessage, complete]);
   return (
-    <div className="tool-process-group">
-      {blocks.map((block) => (
-        block.type === 'tools'
-          ? <ToolProcessSegment key={block.id} block={block} complete={Boolean(group.nextMessage) || toolCardsAreComplete(block.cards)} />
-          : block.kind === 'reasoning'
-            ? <ReasoningNote key={block.id} text={block.text} />
-            : <MarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} />
-      ))}
-    </div>
+    <section className={`tool-process-group${open ? ' open' : ''}`}>
+      <button className="tool-round-toggle" type="button" onClick={() => setOpen((value) => !value)}>
+        <span>{title}</span>
+        <ChevronDown size={15} strokeWidth={1.9} aria-hidden="true" />
+      </button>
+      <div className="tool-round-bar" aria-hidden="true" />
+      {open && (
+        <div className="tool-process-round-body">
+          {blocks.map((block) => (
+            block.type === 'tools'
+              ? <ToolProcessSegment key={block.id} block={block} complete={complete || toolCardsAreComplete(block.cards)} />
+              : block.kind === 'reasoning'
+                ? <ReasoningNote key={block.id} text={block.text} />
+                : <MarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} />
+          ))}
+        </div>
+      )}
+    </section>
   );
 }
 
 const MemoToolProcessGroup = memo(ToolProcessGroup);
+
+function toolRoundTitle(messages, nextMessage, complete) {
+  const elapsed = toolRoundElapsed(messages, nextMessage);
+  if (!complete) return elapsed ? `处理中 ${elapsed}` : '处理中';
+  return elapsed ? `已处理 ${elapsed}` : '已处理';
+}
+
+function toolRoundElapsed(messages, nextMessage) {
+  const times = [...(messages || []), nextMessage]
+    .map(messageTimeMs)
+    .filter((value) => Number.isFinite(value));
+  if (times.length < 2) return '';
+  return formatElapsedMs(Math.max(0, Math.max(...times) - Math.min(...times)));
+}
+
+function messageTimeMs(message) {
+  const value = message?.message_time || message?.created_at || message?.time || '';
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function formatElapsedMs(ms) {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  if (totalSeconds < 60) return `${totalSeconds}s`;
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (minutes < 60) return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes > 0 ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+}
 
 function toolProcessBlocks(rows) {
   const blocks = [];
@@ -1087,22 +1134,22 @@ function mergedToolCards(cards) {
     if (row) usageByMergedRow.set(row, addToolUsage(usageByMergedRow.get(row), usage));
   });
   return orderedRows.map((row, index) => {
-      const call = row.call;
-      const result = row.result;
-      const displayCard = call || result;
-      const detailCard = result || call;
-      return {
-        renderId: call?.renderId || result?.renderId || `tool-row-${index}`,
-        id: displayCard?.id || detailCard?.id || '',
-        kind: result ? 'result' : 'call',
-        name: displayCard?.name || detailCard?.name || 'tool',
-        payload: displayCard?.payload ?? detailCard?.payload ?? '',
-        callPayload: call?.payload,
-        resultPayload: result?.payload,
-        usage: usageByMergedRow.get(row) || null,
-        running: Boolean(call && !result)
-      };
-    });
+    const call = row.call;
+    const result = row.result;
+    const displayCard = call || result;
+    const detailCard = result || call;
+    return {
+      renderId: call?.renderId || result?.renderId || `tool-row-${index}`,
+      id: displayCard?.id || detailCard?.id || '',
+      kind: result ? 'result' : 'call',
+      name: displayCard?.name || detailCard?.name || 'tool',
+      payload: displayCard?.payload ?? detailCard?.payload ?? '',
+      callPayload: call?.payload,
+      resultPayload: result?.payload,
+      usage: usageByMergedRow.get(row) || null,
+      running: Boolean(call && !result)
+    };
+  });
 }
 
 function addToolUsage(left, right) {
