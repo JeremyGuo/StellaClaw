@@ -103,6 +103,7 @@ export function isExecutionMessage(message) {
 }
 
 export function isFinalAssistantMessage(message) {
+  if (message?._streaming) return false;
   if (String(message?.role || '').toLowerCase() !== 'assistant' || isExecutionMessage(message)) return false;
   return Boolean(messageText(message).trim() || messageItems(message).some((item) => item?.type === 'text' && String(item.text || '').trim()));
 }
@@ -489,7 +490,7 @@ export function displayMessages(messages) {
   let forceSeparateNext = false;
   for (let index = 0; index < source.length; index += 1) {
     const message = source[index];
-    if (isExecutionMessage(message)) {
+    if (isExecutionMessage(message) || startsToolRound(source, index)) {
       const group = [];
       let cursor = index;
       while (cursor < source.length) {
@@ -515,4 +516,16 @@ function isRoundInterstitialMessage(message) {
   const role = String(message?.role || '').toLowerCase();
   if (role === 'user') return true;
   return role === 'assistant' && !isFinalAssistantMessage(message);
+}
+
+function startsToolRound(source, index) {
+  const message = source[index];
+  if (String(message?.role || '').toLowerCase() !== 'assistant' || isFinalAssistantMessage(message)) return false;
+  for (let cursor = index + 1; cursor < source.length; cursor += 1) {
+    const current = source[cursor];
+    if (isFinalAssistantMessage(current)) return false;
+    if (isExecutionMessage(current)) return true;
+    if (!isRoundInterstitialMessage(current)) return false;
+  }
+  return false;
 }

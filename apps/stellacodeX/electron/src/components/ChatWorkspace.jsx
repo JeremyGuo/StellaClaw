@@ -139,6 +139,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const stickToBottomRef = useRef(true);
   const [toolStopNoticeReady, setToolStopNoticeReady] = useState(false);
   const currentActivity = (runningActivities || []).at(-1) || null;
+  const inlineActivity = currentActivity?.id === 'waiting-response' ? null : currentActivity;
   const progressVisible = Boolean(currentActivity);
   const sessionRunning = Boolean(processing || currentActivity);
   const latestToolGroupIndex = useMemo(() => {
@@ -440,7 +441,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
                   />
                 )
             ))}
-            {currentActivity && <InlineActivityStatus activity={currentActivity} />}
+            {inlineActivity && <InlineActivityStatus activity={inlineActivity} />}
             {turnStoppedAfterTool && (
               <div className="turn-continuation-notice">
                 <span>本轮停在工具结果后，没有后续 assistant 消息。</span>
@@ -1028,13 +1029,14 @@ export function ToolProcessGroup({ group, active = false }) {
     }
     return -1;
   }, [blocks]);
-  const complete = useMemo(() => {
-    const toolBlocks = blocks.filter((block) => block.type === 'tools');
-    return !activeTail && (isFinalAssistantMessage(group.nextMessage) || (toolBlocks.length > 0 && toolBlocks.every((block) => toolCardsAreComplete(block.cards))));
-  }, [activeTail, blocks, group.nextMessage]);
-  const [open, setOpen] = useState(() => !complete);
-  const wasActiveTailRef = useRef(activeTail);
   const hasFinalMessage = isFinalAssistantMessage(group.nextMessage);
+  const toolsComplete = useMemo(() => {
+    const toolBlocks = blocks.filter((block) => block.type === 'tools');
+    return toolBlocks.length > 0 && toolBlocks.every((block) => toolCardsAreComplete(block.cards));
+  }, [blocks]);
+  const complete = !activeTail && (hasFinalMessage || toolsComplete);
+  const [open, setOpen] = useState(() => !hasFinalMessage);
+  const wasActiveTailRef = useRef(activeTail);
   const hadFinalMessageRef = useRef(hasFinalMessage);
   useEffect(() => {
     if (activeTail && !wasActiveTailRef.current) {
