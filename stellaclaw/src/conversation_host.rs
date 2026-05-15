@@ -158,9 +158,50 @@ impl ConversationHostRuntime {
         let sender = self
             .main_channel_ingress(conversation_id)
             .ok_or_else(|| anyhow!("unknown conversation {conversation_id}"))?;
-        sender
-            .send(ingress)
-            .map_err(|_| anyhow!("conversation {conversation_id} channel ingress is closed"))
+        match sender.send(ingress) {
+            Ok(()) => Ok(()),
+            Err(crossbeam_channel::SendError(ingress)) => {
+                self.logger.warn(
+                    "conversation_channel_ingress_closed",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "action": "restart_and_retry",
+                    }),
+                );
+                self.restart_conversation(conversation_id, "main channel ingress closed")?;
+                let sender = self.main_channel_ingress(conversation_id).ok_or_else(|| {
+                    anyhow!("unknown conversation {conversation_id} after restart")
+                })?;
+                sender.send(ingress).map_err(|_| {
+                    anyhow!(
+                        "conversation {conversation_id} channel ingress is closed after restart"
+                    )
+                })
+            }
+        }
+    }
+
+    fn restart_conversation(&self, conversation_id: &str, reason: &str) -> Result<()> {
+        let conversation = self
+            .conversations
+            .lock()
+            .map_err(|_| anyhow!("conversation registry lock poisoned"))?
+            .remove(conversation_id);
+        if let Some(conversation) = conversation {
+            if let Err(error) = conversation
+                .handle
+                .shutdown(format!("restarting: {reason}"))
+            {
+                self.logger.warn(
+                    "conversation_kernel_shutdown_after_closed_ingress_failed",
+                    serde_json::json!({
+                        "conversation_id": conversation_id,
+                        "error": error.to_string(),
+                    }),
+                );
+            }
+        }
+        self.ensure_conversation_started(conversation_id)
     }
 
     pub fn stop_conversation(
@@ -264,4 +305,72 @@ fn read_conversation_metadata(path: &std::path::Path) -> Result<ConversationMeta
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read {}", path.display()))?;
     serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        collections::HashMap,
+        env, fs,
+        sync::{Arc, Mutex},
+        time::SystemTime,
+    };
+
+    use super::*;
+    use crate::{
+        conversation_new::ConversationRuntimeConfig, service_protos::channel::ChannelIngress,
+    };
+
+    #[test]
+    fn send_main_channel_ingress_restarts_closed_ingress() {
+        let workdir = test_workdir("closed_ingress");
+        fs::create_dir_all(&workdir).expect("test workdir can be created");
+        let conversation_id = "web-main-test";
+        let conversation_ref = ConversationRef {
+            conversation_id: conversation_id.to_string(),
+            workdir: workdir.clone(),
+            conversation_root: workdir.join("conversations").join(conversation_id),
+        };
+        let runtime = ConversationHostRuntime {
+            workdir: workdir.clone(),
+            default_runtime_config: ConversationRuntimeConfig::for_conversation(&conversation_ref),
+            logger: Arc::new(
+                StellaclawLogger::open_under(&workdir, "test.log").expect("logger opens"),
+            ),
+            conversations: Mutex::new(HashMap::new()),
+        };
+        runtime
+            .ensure_conversation_started(conversation_id)
+            .expect("conversation starts");
+
+        let (closed_tx, closed_rx) = crossbeam_channel::unbounded();
+        drop(closed_rx);
+        runtime
+            .conversations
+            .lock()
+            .expect("registry lock")
+            .get_mut(conversation_id)
+            .expect("conversation is hosted")
+            .main_channel_ingress_tx = closed_tx;
+
+        runtime
+            .send_main_channel_ingress(
+                conversation_id,
+                ChannelIngress::QueryForegroundStatus {
+                    foreground_session_id: None,
+                },
+            )
+            .expect("closed ingress is restarted and retried");
+        runtime
+            .stop_conversation(conversation_id, "test finished")
+            .expect("conversation stops");
+    }
+
+    fn test_workdir(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("clock works")
+            .as_nanos();
+        env::temp_dir().join(format!("stellaclaw-host-{name}-{unique}"))
+    }
 }
