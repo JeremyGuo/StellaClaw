@@ -492,8 +492,11 @@ export function displayMessages(messages) {
     if (isExecutionMessage(message)) {
       const group = [];
       let cursor = index;
-      while (cursor < source.length && isExecutionMessage(source[cursor])) {
-        group.push(source[cursor]);
+      while (cursor < source.length) {
+        const current = source[cursor];
+        if (cursor > index && isFinalAssistantMessage(current)) break;
+        if (!isExecutionMessage(current) && !isRoundInterstitialMessage(current)) break;
+        group.push(current);
         cursor += 1;
       }
       const nextMessage = source[cursor];
@@ -506,4 +509,10 @@ export function displayMessages(messages) {
     forceSeparateNext = false;
   }
   return result;
+}
+
+function isRoundInterstitialMessage(message) {
+  const role = String(message?.role || '').toLowerCase();
+  if (role === 'user') return true;
+  return role === 'assistant' && !isFinalAssistantMessage(message);
 }

@@ -7,7 +7,7 @@ import * as Popover from '@radix-ui/react-popover';
 import { attachmentName, attachmentUrl, fileExtension, isImageAttachment, messageText } from '../lib/fileUtils';
 import { handleExternalLinkClick, isExternalUrl } from '../lib/externalLinks';
 import { formatBytes, formatTokens, modelAlias, modelDisplayName } from '../lib/format';
-import { displayMessages, firstMessageId, isExecutionMessage, liveActivitySignature, markerIndexes, messageKey, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
+import { displayMessages, firstMessageId, isExecutionMessage, isFinalAssistantMessage, liveActivitySignature, markerIndexes, messageKey, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
 
 const COMMANDS = [
   { command: '/model', label: '切换模型', description: '选择当前 Conversation 使用的模型', options: 'models' },
@@ -1030,16 +1030,24 @@ export function ToolProcessGroup({ group, active = false }) {
   }, [blocks]);
   const complete = useMemo(() => {
     const toolBlocks = blocks.filter((block) => block.type === 'tools');
-    return !activeTail && (Boolean(group.nextMessage) || (toolBlocks.length > 0 && toolBlocks.every((block) => toolCardsAreComplete(block.cards))));
+    return !activeTail && (isFinalAssistantMessage(group.nextMessage) || (toolBlocks.length > 0 && toolBlocks.every((block) => toolCardsAreComplete(block.cards))));
   }, [activeTail, blocks, group.nextMessage]);
   const [open, setOpen] = useState(() => !complete);
   const wasActiveTailRef = useRef(activeTail);
+  const hasFinalMessage = isFinalAssistantMessage(group.nextMessage);
+  const hadFinalMessageRef = useRef(hasFinalMessage);
   useEffect(() => {
     if (activeTail && !wasActiveTailRef.current) {
       setOpen(true);
     }
     wasActiveTailRef.current = activeTail;
   }, [activeTail]);
+  useEffect(() => {
+    if (!hadFinalMessageRef.current && hasFinalMessage) {
+      setOpen(false);
+    }
+    hadFinalMessageRef.current = hasFinalMessage;
+  }, [hasFinalMessage]);
   const elapsed = useToolRoundElapsed(messages, group.nextMessage, complete);
   const title = toolRoundTitle(elapsed, complete);
   return (

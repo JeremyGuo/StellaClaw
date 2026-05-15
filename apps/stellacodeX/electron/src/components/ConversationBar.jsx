@@ -72,6 +72,8 @@ export function ConversationBar({
   const [openFolders, setOpenFolders] = useState(() => new Set());
   const [draggingConversationId, setDraggingConversationId] = useState('');
   const [previewConversationIds, setPreviewConversationIds] = useState([]);
+  const draggingConversationIdRef = useRef('');
+  const previewConversationIdsRef = useRef([]);
   const folderRefs = useRef(new Map());
   const previousFolderRects = useRef(null);
   const dragCommittedRef = useRef(false);
@@ -129,7 +131,7 @@ export function ConversationBar({
 
   useEffect(() => {
     if (previewConversationIds.length && sameStringArray(previewConversationIds, visibleConversationIds)) {
-      setPreviewConversationIds([]);
+      setPreviewOrder([]);
     }
   }, [previewConversationIds, visibleConversationIds]);
 
@@ -168,21 +170,28 @@ export function ConversationBar({
     updater();
   };
 
+  const setPreviewOrder = (ids) => {
+    previewConversationIdsRef.current = ids;
+    setPreviewConversationIds(ids);
+  };
+
   const previewMoveConversation = (event, conversationId) => {
-    if (!draggingConversationId || draggingConversationId === conversationId) return;
+    const sourceId = draggingConversationIdRef.current || draggingConversationId;
+    if (!sourceId || sourceId === conversationId) return;
     event.preventDefault();
     const rect = event.currentTarget.getBoundingClientRect();
     const position = event.clientY > rect.top + rect.height / 2 ? 'after' : 'before';
-    const sourceIds = previewConversationIds.length ? previewConversationIds : visibleConversationIds;
-    const nextIds = reorderedIds(sourceIds, draggingConversationId, conversationId, position);
+    const sourceIds = previewConversationIdsRef.current.length ? previewConversationIdsRef.current : visibleConversationIds;
+    const nextIds = reorderedIds(sourceIds, sourceId, conversationId, position);
     if (nextIds === sourceIds) return;
-    animateConversationOrderChange(() => setPreviewConversationIds(nextIds));
+    animateConversationOrderChange(() => setPreviewOrder(nextIds));
   };
 
   const finishDrag = () => {
+    draggingConversationIdRef.current = '';
     setDraggingConversationId('');
     if (!dragCommittedRef.current && previewConversationIds.length) {
-      animateConversationOrderChange(() => setPreviewConversationIds([]));
+      animateConversationOrderChange(() => setPreviewOrder([]));
     }
   };
 
@@ -247,8 +256,9 @@ export function ConversationBar({
         onDragStart={(event) => {
           if (hidden) return;
           dragCommittedRef.current = false;
+          draggingConversationIdRef.current = conversation.conversation_id;
           setDraggingConversationId(conversation.conversation_id);
-          setPreviewConversationIds(visibleConversationIds);
+          setPreviewOrder(visibleConversationIds);
           event.dataTransfer.effectAllowed = 'move';
           event.dataTransfer.setData('text/plain', conversation.conversation_id);
         }}
@@ -265,8 +275,9 @@ export function ConversationBar({
           if (hidden) return;
           event.preventDefault();
           dragCommittedRef.current = true;
-          const nextIds = previewConversationIds.length ? previewConversationIds : visibleConversationIds;
+          const nextIds = previewConversationIdsRef.current.length ? previewConversationIdsRef.current : visibleConversationIds;
           onConversationOrderChange?.(nextIds);
+          draggingConversationIdRef.current = '';
           setDraggingConversationId('');
         }}
         onDragEnd={finishDrag}
