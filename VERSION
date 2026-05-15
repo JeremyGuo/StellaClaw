@@ -6,6 +6,9 @@ version: 1.27.0
 - 补齐 Web / StellaCodeX 多 foreground session 会话支持：
   `ChannelIngress` 的前台消息、状态查询、cancel / continue / compact、host coordination resolve 和删除前台 session 等操作都带上可选 `foreground_session_id`，Web API 新增按 Conversation 管理、列出、创建、重命名、删除 foreground session 以及按 session 拉取消息 / 建立 websocket 的接口；Web seen 状态改为按 foreground session 记录，conversation stream 会返回每个 foreground session 的摘要。StellaCodeX Electron 的 Conversation Bar 改成文件夹 + 子对话结构，发送消息、实时 websocket、消息分页、已读和标题状态都按选中的 foreground session 走，保留 workspace / terminal 的 Conversation 级共享语义。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 收敛 WebChannel 的 Conversation metadata 读取边界：
+  WebChannel 列表、按 platform chat 查找和 `load_web_state` 不再直接读取 `ConversationMetadataStore` 中的 JSON 内容，而是通过 `ChannelIngress::QueryKernelMetadata` 交给 ChannelService 向 Kernel 查询当前 `ConversationMetadata`；磁盘 store 只保留为创建 / 删除和已知 conversation id 的持久化边界。ConversationKernel 挂载任意 AgentSession 时会补齐 `session_nicknames` 默认值，确保每个 session 的名字由 Kernel metadata 维护。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 升级 Codex reasoning summary 持久化和 provider stream 事件：
   `ReasoningItem.codex_summary` 从单个字符串升级为有序 summary part 数组，保留 Codex reasoning summary 的分段顺序，并新增 workdir `0.19 -> 0.20` upgrade 迁移旧 session history；`ChatMessage` 新增稳定 `message_id`，SessionActor 写入 `all_messages.jsonl` 时同步生成 `messages_index.json`，WebChannel 的消息详情、summary 和 seen 合并开始基于 `message_id` / index 文件定位消息，不再把裸数字行号当作消息 ID；provider stream delta 不再写入历史，最终仍以 completed / done 后生成的完整 `ChatMessage` 为准，同时 core SessionEvent / conversation_new AgentSessionEvent 新增 `Stream*` 流式事件用于 assistant 文本、工具调用参数、reasoning summary delta、reasoning summary part added 和带 `message_id` 的 stream error 实时投影。本次不改变 `config` schema，改变 `workdir` schema 至 `0.20`。
 

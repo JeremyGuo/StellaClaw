@@ -42,7 +42,6 @@ use crate::{
         },
         workspace::{WorkspaceFileEncoding, WorkspaceRequest, WorkspaceResponse, WorkspaceTarget},
     },
-    workspace::is_sshfs_workspace_entry_name,
 };
 
 use super::{
@@ -316,58 +315,38 @@ impl WebChannel {
 
     fn conversation_summaries(&self) -> ApiResult<Vec<ConversationSummary>> {
         let mut conversations = Vec::new();
-        let store = ConversationMetadataStore::new(&self.workdir);
-        for path in store.list_metadata_paths().map_err(ApiError::internal)? {
-            if path
-                .parent()
-                .and_then(|path| path.file_name())
-                .and_then(|name| name.to_str())
-                .is_some_and(is_sshfs_workspace_entry_name)
-            {
-                continue;
-            }
-            let raw = match fs::read_to_string(&path) {
-                Ok(raw) => raw,
-                Err(error) => {
-                    self.logger.warn(
-                        "web_conversation_list_read_failed",
-                        json!({"path": path.display().to_string(), "error": error.to_string()}),
-                    );
-                    continue;
-                }
-            };
-            let metadata: ConversationMetadata = match serde_json::from_str(&raw) {
+        for conversation_id in self.conversation_runtime.conversation_ids() {
+            let metadata = match self.load_web_state(&conversation_id) {
                 Ok(metadata) => metadata,
+                Err(error) if error.status == 404 => continue,
                 Err(error) => {
                     self.logger.warn(
-                        "web_conversation_list_parse_failed",
-                        json!({"path": path.display().to_string(), "error": error.to_string()}),
+                        "web_conversation_list_metadata_query_failed",
+                        json!({"conversation_id": conversation_id, "error": error.message}),
                     );
                     continue;
                 }
             };
-            if metadata.channel_id == self.id {
-                let processing_state = self
-                    .processing_states
-                    .lock()
+            let processing_state = self
+                .processing_states
+                .lock()
+                .ok()
+                .and_then(|states| states.get(&metadata.platform_chat_id).copied())
+                .unwrap_or(ProcessingState::Idle);
+            let message_summary = conversation_message_summary(&self.workdir, &metadata);
+            let foreground_sessions = self.foreground_session_summaries(&metadata);
+            conversations.push(ConversationSummary::from_metadata(
+                &self.workdir,
+                &metadata,
+                &self.config,
+                load_conversation_runtime_config(&self.workdir, &metadata.conversation_id)
                     .ok()
-                    .and_then(|states| states.get(&metadata.platform_chat_id).copied())
-                    .unwrap_or(ProcessingState::Idle);
-                let message_summary = conversation_message_summary(&self.workdir, &metadata);
-                let foreground_sessions = self.foreground_session_summaries(&metadata);
-                conversations.push(ConversationSummary::from_metadata(
-                    &self.workdir,
-                    &metadata,
-                    &self.config,
-                    load_conversation_runtime_config(&self.workdir, &metadata.conversation_id)
-                        .ok()
-                        .as_ref(),
-                    processing_state,
-                    message_summary,
-                    self.conversation_seen(&metadata.conversation_id),
-                    foreground_sessions,
-                ));
-            }
+                    .as_ref(),
+                processing_state,
+                message_summary,
+                self.conversation_seen(&metadata.conversation_id),
+                foreground_sessions,
+            ));
         }
         conversations.sort_by(|left, right| left.conversation_id.cmp(&right.conversation_id));
         Ok(conversations)
@@ -652,15 +631,16 @@ impl WebChannel {
                 )
                 .map_err(ApiError::internal)?;
         }
+        let metadata = self.load_web_state(&metadata.conversation_id)?;
         self.publish_conversation_upserted(&metadata);
 
         Ok(json_response(
             201,
             json!({
-                "conversation_id": conversation_id,
+                "conversation_id": metadata.conversation_id,
                 "nickname": metadata.nickname,
                 "channel_id": self.id,
-                "platform_chat_id": platform_chat_id,
+                "platform_chat_id": metadata.platform_chat_id,
                 "model_selection_pending": metadata.model_selection_pending,
             }),
         ))
@@ -1624,37 +1604,19 @@ impl WebChannel {
         &self,
         platform_chat_id: &str,
     ) -> ApiResult<Option<ConversationMetadata>> {
-        let store = ConversationMetadataStore::new(&self.workdir);
-        for path in store.list_metadata_paths().map_err(ApiError::internal)? {
-            if path
-                .parent()
-                .and_then(|path| path.file_name())
-                .and_then(|name| name.to_str())
-                .is_some_and(is_sshfs_workspace_entry_name)
-            {
-                continue;
-            }
-            let raw = match fs::read_to_string(&path) {
-                Ok(raw) => raw,
-                Err(error) => {
-                    self.logger.warn(
-                        "web_conversation_state_read_failed",
-                        json!({"path": path.display().to_string(), "error": error.to_string()}),
-                    );
-                    continue;
-                }
-            };
-            let metadata: ConversationMetadata = match serde_json::from_str(&raw) {
+        for conversation_id in self.conversation_runtime.conversation_ids() {
+            let metadata = match self.load_web_state(&conversation_id) {
                 Ok(metadata) => metadata,
+                Err(error) if error.status == 404 => continue,
                 Err(error) => {
                     self.logger.warn(
-                        "web_conversation_state_parse_failed",
-                        json!({"path": path.display().to_string(), "error": error.to_string()}),
+                        "web_conversation_state_metadata_query_failed",
+                        json!({"conversation_id": conversation_id, "error": error.message}),
                     );
                     continue;
                 }
             };
-            if metadata.channel_id == self.id && metadata.platform_chat_id == platform_chat_id {
+            if metadata.platform_chat_id == platform_chat_id {
                 return Ok(Some(metadata));
             }
         }
@@ -2117,10 +2079,7 @@ impl WebChannel {
         conversation_id: &str,
         ingress: ChannelIngress,
     ) -> ApiResult<KernelResponse> {
-        self.load_web_state(conversation_id)?;
-        self.conversation_runtime
-            .ensure_conversation_started(conversation_id)
-            .map_err(ApiError::internal)?;
+        self.ensure_known_conversation_started(conversation_id)?;
         let event_rx = self
             .conversation_runtime
             .subscribe_main_channel_events(conversation_id)
@@ -2160,6 +2119,25 @@ impl WebChannel {
         }
     }
 
+    fn query_kernel_metadata(&self, conversation_id: &str) -> ApiResult<ConversationMetadata> {
+        let response = self.kernel_metadata_request(
+            conversation_id,
+            ChannelIngress::QueryKernelMetadata {
+                request_id: String::new(),
+            },
+        )?;
+        let metadata = match response {
+            KernelResponse::Metadata { metadata }
+            | KernelResponse::MetadataUpdated { metadata } => metadata,
+            KernelResponse::Error { message, .. } => return Err(ApiError::new(400, message)),
+            _ => return Err(ApiError::internal("unexpected kernel metadata response")),
+        };
+        if metadata.channel_id != self.id {
+            return Err(ApiError::new(404, "conversation_not_found"));
+        }
+        Ok(metadata)
+    }
+
     fn terminal_request(
         &self,
         conversation_id: &str,
@@ -2175,10 +2153,7 @@ impl WebChannel {
         &self,
         conversation_id: &str,
     ) -> ApiResult<crossbeam_channel::Receiver<ServiceChannelEvent>> {
-        self.load_web_state(conversation_id)?;
-        self.conversation_runtime
-            .ensure_conversation_started(conversation_id)
-            .map_err(ApiError::internal)?;
+        self.ensure_known_conversation_started(conversation_id)?;
         self.conversation_runtime
             .subscribe_main_channel_events(conversation_id)
             .map_err(ApiError::internal)
@@ -2238,20 +2213,24 @@ impl WebChannel {
     }
 
     fn load_web_state(&self, conversation_id: &str) -> ApiResult<ConversationMetadata> {
+        self.query_kernel_metadata(conversation_id)
+    }
+
+    fn ensure_known_conversation_started(&self, conversation_id: &str) -> ApiResult<()> {
         validate_conversation_id(conversation_id)?;
-        let store = ConversationMetadataStore::new(&self.workdir);
-        if !store
-            .layout()
-            .conversation_metadata_path(conversation_id)
-            .exists()
-        {
+        let already_running = self
+            .conversation_runtime
+            .conversation_ids()
+            .iter()
+            .any(|id| id == conversation_id);
+        let metadata_path =
+            WorkdirLayout::new(&self.workdir).conversation_metadata_path(conversation_id);
+        if !already_running && !metadata_path.exists() {
             return Err(ApiError::new(404, "conversation_not_found"));
         }
-        let metadata = store.load(conversation_id).map_err(ApiError::internal)?;
-        if metadata.channel_id != self.id {
-            return Err(ApiError::new(404, "conversation_not_found"));
-        }
-        Ok(metadata)
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)
+            .map_err(ApiError::internal)
     }
 }
 

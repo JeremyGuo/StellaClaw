@@ -96,10 +96,6 @@ impl ConversationMetadataStore {
         }
     }
 
-    pub(crate) fn layout(&self) -> &WorkdirLayout {
-        &self.layout
-    }
-
     pub(crate) fn ensure_conversation_roots(&self, conversation_id: &str) -> Result<()> {
         let conversation_root = self.layout.conversation_root(conversation_id);
         fs::create_dir_all(&conversation_root)

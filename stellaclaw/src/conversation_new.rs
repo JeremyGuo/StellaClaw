@@ -572,6 +572,7 @@ impl ConversationKernel {
         if self.services.contains_key(&addr) {
             return Err(anyhow!("service already mounted at {addr}"));
         }
+        self.ensure_agent_session_nickname(&addr, &kind)?;
 
         let storage = self.service_storage(&addr);
         fs::create_dir_all(&storage)
@@ -611,6 +612,24 @@ impl ConversationKernel {
         );
         self.persist_manifest()?;
         Ok(())
+    }
+
+    fn ensure_agent_session_nickname(
+        &mut self,
+        addr: &ServiceAddr,
+        kind: &ServiceKind,
+    ) -> Result<()> {
+        if !matches!(kind, ServiceKind::AgentSession { .. }) {
+            return Ok(());
+        }
+        let key = addr.storage_component();
+        if self.metadata.session_nicknames.contains_key(&key) {
+            return Ok(());
+        }
+        self.metadata
+            .session_nicknames
+            .insert(key, default_session_nickname(addr));
+        self.persist_metadata()
     }
 
     pub fn mount_standard_services(&mut self) -> Result<()> {
@@ -1156,11 +1175,6 @@ impl ConversationKernel {
             }
         };
         self.mount_service(addr.clone(), ServiceKind::AgentSession { kind, binding })?;
-        self.metadata
-            .session_nicknames
-            .entry(addr.storage_component())
-            .or_insert_with(|| default_session_nickname(&addr));
-        self.persist_metadata()?;
         Ok(addr)
     }
 
@@ -2704,6 +2718,14 @@ mod tests {
 
         let manifest = kernel.load_manifest().expect("manifest loads");
         assert_eq!(manifest.services.len(), 9);
+        assert_eq!(
+            kernel
+                .metadata()
+                .session_nicknames
+                .get(&ServiceAddr::agent_foreground().storage_component())
+                .map(String::as_str),
+            Some("Main")
+        );
         kernel.stop_all("test finished").expect("services stop");
     }
 
