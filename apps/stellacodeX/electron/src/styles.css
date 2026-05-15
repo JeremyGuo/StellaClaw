@@ -1093,7 +1093,7 @@ button {
   position: relative;
   width: 100%;
   max-width: var(--chat-column-width);
-  margin: 0 auto 24px;
+  margin: 0 auto 22px;
   overflow-wrap: anywhere;
   content-visibility: auto;
   contain-intrinsic-size: auto 180px;
@@ -1129,16 +1129,11 @@ button {
 }
 
 .message.user.media-combo {
-  gap: 8px;
+  gap: 6px;
 }
 
 .message.user .message-role {
-  justify-content: flex-end;
-  max-width: min(620px, 100%);
-  margin: 0 8px 5px 0;
-  color: color-mix(in srgb, var(--muted), transparent 12%);
-  font-size: 11px;
-  line-height: 1.2;
+  display: none;
 }
 
 .message.user .message-body {
@@ -1147,10 +1142,10 @@ button {
   max-width: min(620px, 100%);
   flex-direction: column;
   align-items: flex-end;
-  padding: 13px 16px;
-  border: 1px solid var(--message-user-border);
+  padding: 12px 17px;
+  border: 1px solid color-mix(in srgb, var(--message-user-border), transparent 12%);
   border-radius: 18px;
-  background: var(--message-user-bg);
+  background: color-mix(in srgb, var(--message-user-bg), var(--bg) 8%);
 }
 
 .message.user.media-combo .message-body {
@@ -1189,6 +1184,68 @@ button {
 .message-body {
   min-width: 0;
   line-height: 1.45;
+}
+
+.message-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  color: color-mix(in srgb, var(--muted), var(--bg) 16%);
+}
+
+.message-actions.user {
+  justify-content: flex-end;
+  align-self: flex-end;
+  margin-top: 7px;
+  padding-right: 10px;
+}
+
+.message-actions.assistant {
+  justify-content: flex-start;
+  height: 0;
+  margin-top: 0;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+
+.message.assistant:hover .message-actions.assistant,
+.message.assistant:focus-within .message-actions.assistant {
+  height: 24px;
+  margin-top: 9px;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.message-action-button {
+  display: inline-grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+
+.message-action-button:hover {
+  background: color-mix(in srgb, var(--hover), transparent 46%);
+  color: var(--text);
+}
+
+.message-action-button svg {
+  display: block;
+}
+
+.message-reply-time {
+  color: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
 }
 
 .message-status {

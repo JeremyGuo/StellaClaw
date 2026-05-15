@@ -2,7 +2,7 @@ import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState }
 import ReactMarkdown from 'react-markdown';
 import rehypeHighlight from 'rehype-highlight';
 import remarkGfm from 'remark-gfm';
-import { ChevronDown, Download, FileText, Pin, Plus, Send, TerminalSquare } from 'lucide-react';
+import { ChevronDown, Copy, Download, FileText, Pin, Plus, Send, TerminalSquare } from 'lucide-react';
 import * as Popover from '@radix-ui/react-popover';
 import { attachmentName, attachmentUrl, fileExtension, isImageAttachment, messageText } from '../lib/fileUtils';
 import { handleExternalLinkClick, isExternalUrl } from '../lib/externalLinks';
@@ -799,15 +799,20 @@ export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment
   const usage = tokenUsage(message);
   const role = message.user_name || message.role || 'assistant';
   const className = messageArticleClassName(message);
+  const roleName = String(message.role || '').toLowerCase();
+  const auxiliaryMessages = Array.isArray(message._auxiliary) ? message._auxiliary : [];
   return (
     <article className={className}>
-      <div className="message-role">
-        <span>{role}</span>
-        {Array.isArray(message._auxiliary) && message._auxiliary.length > 0 && (
-          <AuxiliaryDots messages={message._auxiliary} />
-        )}
-      </div>
+      {auxiliaryMessages.length > 0 && (
+        <div className="message-role">
+          <span>{role}</span>
+          <AuxiliaryDots messages={auxiliaryMessages} />
+        </div>
+      )}
       <MessageBody message={message} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
+      {(roleName === 'user' || roleName === 'assistant') && (
+        <MessageActionBar message={message} role={roleName} />
+      )}
       {message.pending && <div className="message-status">正在发送...</div>}
       {message.error && <div className="message-status error">{message.error}</div>}
       {String(message.role || '').toLowerCase() === 'assistant' && (
@@ -815,6 +820,50 @@ export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment
       )}
     </article>
   );
+}
+
+function MessageActionBar({ message, role }) {
+  const [copied, setCopied] = useState(false);
+  const text = messageText(message).trim();
+  const replyTime = role === 'assistant' ? formatMessageTime(message?.message_time || message?.time || message?.created_at) : '';
+  if (!text && !replyTime) return null;
+  const copyMessage = async () => {
+    if (!text) return;
+    try {
+      await navigator.clipboard?.writeText(text);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1200);
+    } catch {
+      setCopied(false);
+    }
+  };
+  return (
+    <div className={`message-actions ${role}`} aria-label="消息操作">
+      {text && (
+        <button className="message-action-button" type="button" onClick={copyMessage} title={copied ? '已复制' : '复制消息'} aria-label={copied ? '已复制' : '复制消息'}>
+          <Copy size={15} strokeWidth={1.8} aria-hidden="true" />
+        </button>
+      )}
+      {replyTime && <span className="message-reply-time">{replyTime}</span>}
+    </div>
+  );
+}
+
+function formatMessageTime(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '';
+  const now = new Date();
+  const minutes = String(date.getMinutes()).padStart(2, '0');
+  const clock = `${date.getHours()}:${minutes}`;
+  if (
+    date.getFullYear() === now.getFullYear()
+    && date.getMonth() === now.getMonth()
+    && date.getDate() === now.getDate()
+  ) {
+    return clock;
+  }
+  return `${date.getMonth() + 1}/${date.getDate()} ${clock}`;
 }
 
 function messageArticleClassName(message) {
@@ -947,19 +996,17 @@ export function ToolProcessGroup({ group }) {
         <span>{title}</span>
         <ChevronDown size={15} strokeWidth={1.9} aria-hidden="true" />
       </button>
+      <div className="tool-round-separator" aria-hidden="true" />
       {open && (
-        <>
-          <div className="tool-round-separator" aria-hidden="true" />
-          <div className="tool-process-round-body">
-            {blocks.map((block) => (
-              block.type === 'tools'
-                ? <ToolProcessSegment key={block.id} block={block} complete={complete || toolCardsAreComplete(block.cards)} />
-                : block.kind === 'reasoning'
-                  ? <ReasoningNote key={block.id} text={block.text} />
-                  : <MarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} />
-            ))}
-          </div>
-        </>
+        <div className="tool-process-round-body">
+          {blocks.map((block) => (
+            block.type === 'tools'
+              ? <ToolProcessSegment key={block.id} block={block} complete={complete || toolCardsAreComplete(block.cards)} />
+              : block.kind === 'reasoning'
+                ? <ReasoningNote key={block.id} text={block.text} />
+                : <MarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} />
+          ))}
+        </div>
       )}
     </section>
   );
