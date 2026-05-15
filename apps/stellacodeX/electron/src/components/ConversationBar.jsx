@@ -36,6 +36,7 @@ export function ConversationBar({
   onUnhide,
   onDelete,
   onCreateSession,
+  onRenameSession,
   onDeleteSession
 }) {
   const [hiddenOpen, setHiddenOpen] = useState(false);
@@ -85,30 +86,18 @@ export function ConversationBar({
           <ContextMenu.Content className="context-menu">
             <ContextMenu.Item
               className="context-menu-item"
-              onSelect={() => onRename?.(conversation)}
+              onSelect={() => onRenameSession?.(conversation, session)}
             >
-              重命名 Conversation
+              重命名 Session
             </ContextMenu.Item>
             {!session?.is_main && (
               <ContextMenu.Item
                 className="context-menu-item danger"
                 onSelect={() => onDeleteSession?.(conversation, session)}
               >
-                删除对话
+                删除 Session
               </ContextMenu.Item>
             )}
-            <ContextMenu.Item
-              className="context-menu-item"
-              onSelect={() => (hidden ? onUnhide?.(conversation) : onHide?.(conversation))}
-            >
-              {hidden ? '取消隐藏' : '隐藏'}
-            </ContextMenu.Item>
-            <ContextMenu.Item
-              className="context-menu-item danger"
-              onSelect={() => onDelete?.(conversation)}
-            >
-              删除
-            </ContextMenu.Item>
           </ContextMenu.Content>
         </ContextMenu.Portal>
       </ContextMenu.Root>
@@ -117,9 +106,7 @@ export function ConversationBar({
 
   const renderConversation = (conversation, hidden = false) => {
     const sessions = foregroundSessions(conversation);
-    const open = openFolders.has(conversation.conversation_id)
-      || selected?.conversationId === conversation.conversation_id
-      || sessions.length <= 5;
+    const open = openFolders.has(conversation.conversation_id);
     const unreadCount = sessions.filter((session) => hasUnreadMessage(session, selected?.conversationId === conversation.conversation_id && (selected?.foregroundSessionId || 'main') === session.id)).length;
     return (
       <section className="conversation-folder" key={conversation.conversation_id}>
@@ -148,7 +135,7 @@ export function ConversationBar({
                 新建对话
               </ContextMenu.Item>
               <ContextMenu.Item className="context-menu-item" onSelect={() => onRename?.(conversation)}>
-                重命名文件夹
+                重命名 Conversation
               </ContextMenu.Item>
               <ContextMenu.Item className="context-menu-item" onSelect={() => (hidden ? onUnhide?.(conversation) : onHide?.(conversation))}>
                 {hidden ? '取消隐藏' : '隐藏'}

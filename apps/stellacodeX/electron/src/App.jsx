@@ -22,6 +22,7 @@ import {
   loadWorkspaceFile,
   postConversationMessage,
   renameConversation,
+  renameForegroundSession,
   selectedForegroundSessionId
 } from './lib/api';
 import { ConversationBar } from './components/ConversationBar';
@@ -1193,6 +1194,23 @@ function App() {
     }
   }, [activeServerId]);
 
+  const renameConversationForegroundSession = useCallback(async (conversation, session) => {
+    if (!activeServerId || !conversation || !session) return;
+    const sessionId = session.id || 'main';
+    const currentName = displayForegroundSessionName(session, conversation);
+    const nextName = window.prompt('重命名 Session', currentName);
+    if (nextName === null) return;
+    const nickname = nextName.trim();
+    if (nickname === currentName) return;
+    try {
+      await renameForegroundSession(activeServerId, conversation.conversation_id, sessionId, nickname);
+      const list = await loadConversations(activeServerId);
+      setConversations(list);
+    } catch (error) {
+      window.alert(error?.message || '重命名 Session 失败');
+    }
+  }, [activeServerId]);
+
   const deleteConversationForegroundSession = useCallback(async (conversation, session) => {
     if (!activeServerId || !conversation || !session || session.is_main) return;
     const title = displayForegroundSessionName(session, conversation);
@@ -2350,6 +2368,7 @@ function App() {
         onUnhide={(conversation) => setConversationHidden(conversation, false)}
         onDelete={deleteSelectedConversation}
         onCreateSession={createConversationForegroundSession}
+        onRenameSession={renameConversationForegroundSession}
         onDeleteSession={deleteConversationForegroundSession}
       />
       {sidebarMode !== 'collapsed' && (
