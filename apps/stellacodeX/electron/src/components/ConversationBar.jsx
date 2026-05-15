@@ -107,7 +107,6 @@ export function ConversationBar({
   const renderConversation = (conversation, hidden = false) => {
     const sessions = foregroundSessions(conversation);
     const open = openFolders.has(conversation.conversation_id);
-    const unreadCount = sessions.filter((session) => hasUnreadMessage(session, selected?.conversationId === conversation.conversation_id && (selected?.foregroundSessionId || 'main') === session.id)).length;
     return (
       <section className="conversation-folder" key={conversation.conversation_id}>
         <ContextMenu.Root>
@@ -126,7 +125,25 @@ export function ConversationBar({
               {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
               <Folder size={15} />
               <span>{displayConversationName(conversation)}</span>
-              <em>{unreadCount > 0 ? unreadCount : sessions.length}</em>
+              <span
+                className="conversation-folder-action"
+                role="button"
+                tabIndex={0}
+                aria-label="新建对话"
+                onClick={(event) => {
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onCreateSession?.(conversation);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key !== 'Enter' && event.key !== ' ') return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  onCreateSession?.(conversation);
+                }}
+              >
+                <Plus size={13} />
+              </span>
             </button>
           </ContextMenu.Trigger>
           <ContextMenu.Portal>
@@ -149,10 +166,6 @@ export function ConversationBar({
         {open && (
           <div className="conversation-folder-list">
             {sessions.map((session) => renderSession(conversation, session, hidden))}
-            <button className="conversation-add-session" type="button" onClick={() => onCreateSession?.(conversation)}>
-              <Plus size={13} />
-              <span>新建对话</span>
-            </button>
           </div>
         )}
       </section>

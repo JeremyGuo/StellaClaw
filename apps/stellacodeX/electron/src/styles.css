@@ -784,7 +784,7 @@ button {
 .conversation-folder-row {
   display: grid;
   min-width: 0;
-  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  grid-template-columns: auto auto minmax(0, 1fr) 24px;
   align-items: center;
   gap: 7px;
   min-height: 32px;
@@ -809,15 +809,28 @@ button {
   font-weight: 600;
 }
 
-.conversation-folder-row em {
-  justify-self: end;
-  min-width: 20px;
-  padding: 1px 6px;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--hover), transparent 34%);
+.conversation-folder-action {
+  display: inline-flex;
+  width: 22px;
+  height: 22px;
+  align-items: center;
+  justify-content: center;
+  border-radius: 7px;
   color: var(--muted);
-  font-style: normal;
-  text-align: center;
+  opacity: 0;
+  transition: background 120ms ease, color 120ms ease, opacity 120ms ease;
+}
+
+.conversation-folder:hover .conversation-folder-action,
+.conversation-folder-row:focus-visible .conversation-folder-action,
+.conversation-folder-action:focus-visible {
+  opacity: 1;
+}
+
+.conversation-folder-action:hover,
+.conversation-folder-action:focus-visible {
+  background: color-mix(in srgb, var(--hover), transparent 28%);
+  color: var(--text);
 }
 
 .conversation-folder-list {
@@ -846,32 +859,6 @@ button {
   max-width: 64px;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.conversation-add-session {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  min-height: 34px;
-  margin-left: 28px;
-  padding: 6px 10px;
-  border: 1px solid transparent;
-  border-radius: 8px;
-  background: transparent;
-  color: var(--faint);
-  text-align: left;
-  cursor: pointer;
-}
-
-.conversation-add-session:hover {
-  background: color-mix(in srgb, var(--hover), transparent 48%);
-  color: var(--muted);
-}
-
-.conversation-add-session span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .conversation-unread-dot {
@@ -942,7 +929,6 @@ button {
 }
 
 .sidebar-collapsed .conversation-row.session-row,
-.sidebar-collapsed .conversation-add-session,
 .sidebar-collapsed .conversation-folder-row {
   display: none;
 }
