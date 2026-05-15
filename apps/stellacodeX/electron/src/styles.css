@@ -2100,23 +2100,6 @@ button {
   white-space: nowrap;
 }
 
-.tool-detail-dot {
-  width: 7px;
-  height: 7px;
-  flex: 0 0 auto;
-  border-radius: 999px;
-  opacity: 0;
-  background: var(--accent);
-  box-shadow: 0 0 0 3px var(--accent-soft);
-  transform: scale(0.8);
-  transition: opacity 120ms ease 2s, transform 120ms ease 2s;
-}
-
-.tool-inline-card > summary:hover .tool-detail-dot {
-  opacity: 1;
-  transform: scale(1);
-}
-
 .tool-detail {
   container-type: inline-size;
   display: grid;

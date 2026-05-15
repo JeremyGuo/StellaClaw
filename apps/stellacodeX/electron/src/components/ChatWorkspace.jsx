@@ -993,12 +993,13 @@ function toolProcessBlocks(rows) {
       });
       if (!segment.cards?.length) return;
       const cards = segment.cards.map((card, cardIndex) => {
-        const showRowUsage = renderedCardIndex === row.toolCards.length - 1;
+        const rowUsage = renderedCardIndex === row.toolCards.length - 1 ? row.usage : null;
         renderedCardIndex += 1;
         return {
           ...card,
           renderId: `${row.id}-${segmentIndex}-card-${cardIndex}`,
-          usage: showRowUsage ? row.usage : null
+          sourceRowId: row.id,
+          sourceRowUsage: rowUsage
         };
       });
       if (!pendingId) pendingId = `${row.id}-${segmentIndex}-tools`;
@@ -1051,24 +1052,41 @@ function mergedToolCards(cards) {
   cards.forEach((card, index) => {
     const id = String(card.id || '').trim();
     if (!id) {
-      rows.push({ order: index, call: card.kind === 'call' ? card : null, result: card.kind === 'result' ? card : null });
+      rows.push({ order: index, call: card.kind === 'call' ? card : null, result: card.kind === 'result' ? card : null, sourceRowIds: new Set([card.sourceRowId].filter(Boolean)) });
       return;
     }
     let row = byId.get(id);
     if (!row) {
-      row = { order: index, call: null, result: null };
+      row = { order: index, call: null, result: null, sourceRowIds: new Set() };
       byId.set(id, row);
       rows.push(row);
     }
+    if (card.sourceRowId) row.sourceRowIds.add(card.sourceRowId);
     if (card.kind === 'result') {
       row.result = card;
     } else {
       row.call = card;
     }
   });
-  return rows
-    .sort((left, right) => left.order - right.order)
-    .map((row, index) => {
+  const orderedRows = rows.sort((left, right) => left.order - right.order);
+  const usageBySourceRow = new Map();
+  cards.forEach((card) => {
+    if (card.sourceRowId && Number(card.sourceRowUsage?.total || 0)) {
+      usageBySourceRow.set(card.sourceRowId, card.sourceRowUsage);
+    }
+  });
+  const lastMergedRowBySource = new Map();
+  orderedRows.forEach((row) => {
+    row.sourceRowIds.forEach((sourceRowId) => {
+      lastMergedRowBySource.set(sourceRowId, row);
+    });
+  });
+  const usageByMergedRow = new Map();
+  usageBySourceRow.forEach((usage, sourceRowId) => {
+    const row = lastMergedRowBySource.get(sourceRowId);
+    if (row) usageByMergedRow.set(row, addToolUsage(usageByMergedRow.get(row), usage));
+  });
+  return orderedRows.map((row, index) => {
       const call = row.call;
       const result = row.result;
       const displayCard = call || result;
@@ -1081,10 +1099,30 @@ function mergedToolCards(cards) {
         payload: displayCard?.payload ?? detailCard?.payload ?? '',
         callPayload: call?.payload,
         resultPayload: result?.payload,
-        usage: result?.usage || call?.usage || null,
+        usage: usageByMergedRow.get(row) || null,
         running: Boolean(call && !result)
       };
     });
+}
+
+function addToolUsage(left, right) {
+  if (!Number(right?.total || 0)) return left || null;
+  if (!left) {
+    return {
+      input: Number(right.input || 0),
+      output: Number(right.output || 0),
+      cacheRead: Number(right.cacheRead || 0),
+      cacheWrite: Number(right.cacheWrite || 0),
+      total: Number(right.total || 0)
+    };
+  }
+  return {
+    input: Number(left.input || 0) + Number(right.input || 0),
+    output: Number(left.output || 0) + Number(right.output || 0),
+    cacheRead: Number(left.cacheRead || 0) + Number(right.cacheRead || 0),
+    cacheWrite: Number(left.cacheWrite || 0) + Number(right.cacheWrite || 0),
+    total: Number(left.total || 0) + Number(right.total || 0)
+  };
 }
 
 function toolCardsAreComplete(cards) {
@@ -1995,7 +2033,6 @@ export function ToolInlineCard({ kind, name, payload, callPayload, resultPayload
         <code>{display.chip}</code>
         <em>{display.summary}</em>
         <InlineTokenUsage usage={usage} />
-        <i className="tool-detail-dot" aria-hidden="true" />
       </summary>
       {hasMergedPayload ? (
         <MergedToolDetail name={name} callPayload={callPayload} resultPayload={resultPayload} />
