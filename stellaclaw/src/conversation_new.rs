@@ -358,6 +358,10 @@ impl ConversationRuntimeConfig {
             self.memory_enabled = true;
             changed = true;
         }
+        if self.sandbox.is_none() && defaults.sandbox.is_some() {
+            self.sandbox = defaults.sandbox;
+            changed = true;
+        }
         changed
     }
 }
@@ -951,7 +955,9 @@ impl ConversationKernel {
             ServiceKind::Cron => Box::new(CronService::new()),
             ServiceKind::Memory => Box::new(MemoryService::new()),
             ServiceKind::Skill => Box::new(SkillService::new()),
-            ServiceKind::ToolBinary => Box::new(ToolBinaryService::new()),
+            ServiceKind::ToolBinary => Box::new(ToolBinaryService::with_sandbox(
+                self.runtime_config.sandbox.clone().unwrap_or_default(),
+            )),
             ServiceKind::Workspace => Box::new(WorkspaceService::new(self.runtime_config.clone())),
             ServiceKind::Terminal => Box::new(TerminalService::new(self.runtime_config.clone())),
             ServiceKind::Control => Box::new(crate::services::control::ControlService::new()),
@@ -1362,6 +1368,27 @@ mod tests {
     use stellaclaw_core::session_actor::{
         ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem,
     };
+
+    #[test]
+    fn runtime_config_merges_missing_sandbox_from_host_defaults() {
+        let current_conversation = conversation_ref("runtime_config_merge_sandbox");
+        let defaults_conversation = conversation_ref("runtime_config_merge_sandbox_defaults");
+        let mut current = ConversationRuntimeConfig::for_conversation(&current_conversation);
+        let mut defaults = ConversationRuntimeConfig::for_conversation(&defaults_conversation);
+        defaults.sandbox = Some(SandboxConfig {
+            mode: crate::config::SandboxMode::Bubblewrap,
+            software_mount_path: "/__software".to_string(),
+            ..SandboxConfig::default()
+        });
+
+        assert!(current.merge_host_defaults(defaults));
+        let sandbox = current.sandbox.expect("sandbox should merge");
+        assert!(matches!(
+            sandbox.mode,
+            crate::config::SandboxMode::Bubblewrap
+        ));
+        assert_eq!(sandbox.software_mount_path, "/__software");
+    }
 
     #[test]
     fn kernel_creates_dynamic_background_agent() {
@@ -2899,15 +2926,16 @@ mod tests {
     }
 
     fn test_kernel(name: &str) -> ConversationKernel {
+        ConversationKernel::new(conversation_ref(name), ServiceRefs::default())
+    }
+
+    fn conversation_ref(name: &str) -> ConversationRef {
         let root = test_root(name);
-        ConversationKernel::new(
-            ConversationRef {
-                conversation_id: name.to_string(),
-                workdir: root.clone(),
-                conversation_root: root,
-            },
-            ServiceRefs::default(),
-        )
+        ConversationRef {
+            conversation_id: name.to_string(),
+            workdir: root.clone(),
+            conversation_root: root,
+        }
     }
 
     fn foreground_agent_kind(id: &str) -> ServiceKind {

@@ -23,8 +23,12 @@ pub struct ToolBinaryService {
 
 impl ToolBinaryService {
     pub fn new() -> Self {
+        Self::with_sandbox(SandboxConfig::default())
+    }
+
+    pub fn with_sandbox(sandbox: SandboxConfig) -> Self {
         Self {
-            sandbox: SandboxConfig::default(),
+            sandbox,
             client: shared_tool_binary_client(),
         }
     }
