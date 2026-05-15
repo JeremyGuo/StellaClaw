@@ -776,9 +776,36 @@ button {
 }
 
 .conversation-folder {
+  position: relative;
   display: grid;
   gap: 4px;
   margin-top: 4px;
+  border-radius: 9px;
+}
+
+.conversation-folder.dragging {
+  opacity: .56;
+}
+
+.conversation-folder.drop-before::before,
+.conversation-folder.drop-after::after {
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  height: 2px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent), transparent 10%);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent), transparent 86%);
+  pointer-events: none;
+}
+
+.conversation-folder.drop-before::before {
+  top: -4px;
+}
+
+.conversation-folder.drop-after::after {
+  bottom: -4px;
 }
 
 .conversation-folder-row {
@@ -795,6 +822,14 @@ button {
   color: var(--muted);
   text-align: left;
   cursor: pointer;
+}
+
+.conversation-folder[draggable="true"] .conversation-folder-row {
+  cursor: grab;
+}
+
+.conversation-folder[draggable="true"] .conversation-folder-row:active {
+  cursor: grabbing;
 }
 
 .conversation-folder-row:hover {
@@ -2095,7 +2130,7 @@ button {
   align-items: center;
   gap: 5px;
   margin-left: auto;
-  color: var(--faint);
+  color: color-mix(in srgb, var(--faint), transparent 24%);
   font-size: 11px;
   white-space: nowrap;
 }

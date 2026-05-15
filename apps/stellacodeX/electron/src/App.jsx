@@ -904,6 +904,7 @@ function App() {
       ...saved,
       layout: next?.layout ? { ...(saved.layout || {}), ...(next.layout || {}) } : saved.layout,
       conversationUi: next?.conversationUi ? { ...(saved.conversationUi || {}), ...(next.conversationUi || {}) } : saved.conversationUi,
+      conversationListUi: next?.conversationListUi ? { ...(saved.conversationListUi || {}), ...(next.conversationListUi || {}) } : saved.conversationListUi,
       hiddenConversations: next?.hiddenConversations
         ? { ...(saved.hiddenConversations || {}), ...(next.hiddenConversations || {}) }
         : saved.hiddenConversations
@@ -1157,6 +1158,24 @@ function App() {
       window.alert(error?.message || '保存隐藏状态失败');
     }
   }, [activeServerId, conversations, saveSettings, selected?.conversationId, settings]);
+
+  const updateConversationListUi = useCallback((patch) => {
+    if (!activeServerId || !settings) return;
+    const currentListUi = settings.conversationListUi?.[activeServerId] || {};
+    const nextServerListUi = {
+      ...currentListUi,
+      ...patch
+    };
+    const nextSettings = {
+      ...settings,
+      conversationListUi: {
+        ...(settings.conversationListUi || {}),
+        [activeServerId]: nextServerListUi
+      }
+    };
+    setSettings(nextSettings);
+    saveSettings(nextSettings).catch(() => {});
+  }, [activeServerId, saveSettings, settings]);
 
   const createNewConversation = useCallback(async ({ serverId, nickname }) => {
     if (!serverId || creatingConversation) return;
@@ -2325,6 +2344,7 @@ function App() {
   const subtitle = activeConversation
     ? [displayConversationName(activeConversation), formatModel(activeConversation, selectedConversationStatus), sessionActivity].filter(Boolean).join(' · ')
     : '选择或创建一个 Conversation';
+  const conversationListUi = settings?.conversationListUi?.[activeServerId] || {};
 
   return (
     <div
@@ -2369,6 +2389,8 @@ function App() {
         sidebarMode={sidebarMode}
         conversations={conversations}
         hiddenConversationIds={settings?.hiddenConversations?.[activeServerId] || []}
+        conversationOrder={conversationListUi.order || []}
+        openConversationIds={conversationListUi.openConversationIds || []}
         statuses={statuses}
         selected={selected}
         loading={loading}
@@ -2379,6 +2401,8 @@ function App() {
         onHide={(conversation) => setConversationHidden(conversation, true)}
         onUnhide={(conversation) => setConversationHidden(conversation, false)}
         onDelete={deleteSelectedConversation}
+        onConversationOrderChange={(order) => updateConversationListUi({ order })}
+        onOpenFoldersChange={(openConversationIds) => updateConversationListUi({ openConversationIds })}
         onCreateSession={createConversationForegroundSession}
         onRenameSession={renameConversationForegroundSession}
         onDeleteSession={deleteConversationForegroundSession}

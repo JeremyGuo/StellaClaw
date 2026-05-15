@@ -20,11 +20,21 @@ function isWorkingConversation(conversation, activeRunning) {
     || Boolean(activeRunning);
 }
 
+function sameStringSet(left, right) {
+  if (left.size !== right.size) return false;
+  for (const value of left) {
+    if (!right.has(value)) return false;
+  }
+  return true;
+}
+
 export function ConversationBar({
   serverId,
   sidebarMode,
   conversations,
   hiddenConversationIds = [],
+  conversationOrder = [],
+  openConversationIds = [],
   statuses,
   selected,
   loading,
@@ -35,26 +45,74 @@ export function ConversationBar({
   onHide,
   onUnhide,
   onDelete,
+  onConversationOrderChange,
+  onOpenFoldersChange,
   onCreateSession,
   onRenameSession,
   onDeleteSession
 }) {
   const [hiddenOpen, setHiddenOpen] = useState(false);
   const [openFolders, setOpenFolders] = useState(() => new Set());
+  const [draggingConversationId, setDraggingConversationId] = useState('');
+  const [dropTarget, setDropTarget] = useState({ id: '', position: 'before' });
   const hiddenIds = useMemo(() => new Set(hiddenConversationIds.map(String)), [hiddenConversationIds]);
-  const visibleConversations = useMemo(
-    () => conversations.filter((conversation) => !hiddenIds.has(conversation.conversation_id)),
-    [conversations, hiddenIds]
-  );
+  const visibleConversations = useMemo(() => {
+    const visible = conversations.filter((conversation) => !hiddenIds.has(conversation.conversation_id));
+    const sourceIndex = new Map(visible.map((conversation, index) => [conversation.conversation_id, index]));
+    const rank = new Map(conversationOrder.map((conversationId, index) => [String(conversationId), index]));
+    return [...visible].sort((left, right) => {
+      const leftRank = rank.has(left.conversation_id) ? rank.get(left.conversation_id) : Number.MAX_SAFE_INTEGER;
+      const rightRank = rank.has(right.conversation_id) ? rank.get(right.conversation_id) : Number.MAX_SAFE_INTEGER;
+      if (leftRank !== rightRank) return leftRank - rightRank;
+      return (sourceIndex.get(left.conversation_id) || 0) - (sourceIndex.get(right.conversation_id) || 0);
+    });
+  }, [conversations, conversationOrder, hiddenIds]);
   const hiddenConversations = useMemo(
     () => conversations.filter((conversation) => hiddenIds.has(conversation.conversation_id)),
     [conversations, hiddenIds]
   );
 
   useEffect(() => {
+    setOpenFolders(new Set(openConversationIds.map(String)));
+  }, [openConversationIds]);
+
+  const updateOpenFolders = (updater) => {
+    setOpenFolders((current) => {
+      const next = updater(current);
+      if (sameStringSet(current, next)) return current;
+      onOpenFoldersChange?.(Array.from(next));
+      return next;
+    });
+  };
+
+  useEffect(() => {
     if (!selected?.conversationId) return;
-    setOpenFolders((current) => new Set(current).add(selected.conversationId));
+    updateOpenFolders((current) => {
+      if (current.has(selected.conversationId)) return current;
+      return new Set(current).add(selected.conversationId);
+    });
   }, [selected?.conversationId]);
+
+  const moveConversation = (sourceId, targetId, position = 'before') => {
+    if (!sourceId || !targetId || sourceId === targetId) return;
+    const ids = visibleConversations.map((conversation) => conversation.conversation_id);
+    const sourceIndex = ids.indexOf(sourceId);
+    const initialTargetIndex = ids.indexOf(targetId);
+    if (sourceIndex < 0 || initialTargetIndex < 0) return;
+    ids.splice(sourceIndex, 1);
+    const targetIndex = ids.indexOf(targetId);
+    if (targetIndex < 0) return;
+    ids.splice(targetIndex + (position === 'after' ? 1 : 0), 0, sourceId);
+    onConversationOrderChange?.(ids);
+  };
+
+  const updateDropTarget = (event, conversationId) => {
+    if (!draggingConversationId || draggingConversationId === conversationId) return;
+    event.preventDefault();
+    const rect = event.currentTarget.getBoundingClientRect();
+    const position = event.clientY > rect.top + rect.height / 2 ? 'after' : 'before';
+    setDropTarget({ id: conversationId, position });
+  };
 
   const renderSession = (conversation, session, hidden = false) => {
     const sessionId = session?.id || 'main';
@@ -107,14 +165,47 @@ export function ConversationBar({
   const renderConversation = (conversation, hidden = false) => {
     const sessions = foregroundSessions(conversation);
     const open = openFolders.has(conversation.conversation_id);
+    const dragging = draggingConversationId === conversation.conversation_id;
+    const dropping = dropTarget.id === conversation.conversation_id && draggingConversationId && draggingConversationId !== conversation.conversation_id;
     return (
-      <section className="conversation-folder" key={conversation.conversation_id}>
+      <section
+        className={`conversation-folder${dragging ? ' dragging' : ''}${dropping ? ` drop-target drop-${dropTarget.position}` : ''}`}
+        key={conversation.conversation_id}
+        draggable={!hidden}
+        onDragStart={(event) => {
+          if (hidden) return;
+          setDraggingConversationId(conversation.conversation_id);
+          event.dataTransfer.effectAllowed = 'move';
+          event.dataTransfer.setData('text/plain', conversation.conversation_id);
+        }}
+        onDragEnter={(event) => {
+          if (hidden) return;
+          updateDropTarget(event, conversation.conversation_id);
+        }}
+        onDragOver={(event) => {
+          if (hidden) return;
+          updateDropTarget(event, conversation.conversation_id);
+          event.dataTransfer.dropEffect = 'move';
+        }}
+        onDrop={(event) => {
+          if (hidden) return;
+          event.preventDefault();
+          const sourceId = event.dataTransfer.getData('text/plain') || draggingConversationId;
+          moveConversation(sourceId, conversation.conversation_id, dropTarget.position);
+          setDraggingConversationId('');
+          setDropTarget({ id: '', position: 'before' });
+        }}
+        onDragEnd={() => {
+          setDraggingConversationId('');
+          setDropTarget({ id: '', position: 'before' });
+        }}
+      >
         <ContextMenu.Root>
           <ContextMenu.Trigger asChild>
             <button
               className="conversation-folder-row"
               type="button"
-              onClick={() => setOpenFolders((current) => {
+              onClick={() => updateOpenFolders((current) => {
                 const next = new Set(current);
                 if (next.has(conversation.conversation_id)) next.delete(conversation.conversation_id);
                 else next.add(conversation.conversation_id);
