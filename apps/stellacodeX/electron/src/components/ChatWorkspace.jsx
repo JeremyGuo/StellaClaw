@@ -7,7 +7,7 @@ import * as Popover from '@radix-ui/react-popover';
 import { attachmentName, attachmentUrl, fileExtension, isImageAttachment, messageText } from '../lib/fileUtils';
 import { handleExternalLinkClick, isExternalUrl } from '../lib/externalLinks';
 import { formatBytes, formatTokens, modelAlias, modelDisplayName } from '../lib/format';
-import { displayMessages, firstMessageId, firstToolNameForMessage, isExecutionMessage, liveActivitySignature, markerIndexes, messageKey, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
+import { displayMessages, firstMessageId, isExecutionMessage, liveActivitySignature, markerIndexes, messageKey, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
 
 const COMMANDS = [
   { command: '/model', label: '切换模型', description: '选择当前 Conversation 使用的模型', options: 'models' },
@@ -923,7 +923,6 @@ export function InlineTokenUsage({ usage }) {
 }
 
 export function ToolProcessGroup({ group }) {
-  const [open, setOpen] = useState(false);
   const messages = group.messages || [];
   const expandedRows = useMemo(() => messages.map((message, index) => {
     const { textMessage, toolCards, segments } = splitMessageForDisplay(message);
@@ -935,61 +934,95 @@ export function ToolProcessGroup({ group }) {
       usage: tokenUsage(message)
     };
   }), [messages]);
-  const cards = useMemo(() => expandedRows.flatMap((row) => row.toolCards), [expandedRows]);
-  const firstName = useMemo(() => firstToolNameForMessage(messages[0]), [messages]);
-  const summary = useMemo(() => toolGroupSummary(cards, messages, firstName), [cards, messages, firstName]);
-  const done = useMemo(() => Boolean(group.nextMessage) || toolCardsAreComplete(cards), [cards, group.nextMessage]);
-  const shouldAutoCollapse = Boolean(group.nextMessage);
-  const elapsed = '';
-  useEffect(() => {
-    setOpen(!shouldAutoCollapse);
-  }, [shouldAutoCollapse]);
+  const blocks = useMemo(() => toolProcessBlocks(expandedRows), [expandedRows]);
   return (
-    <details className="tool-process-group" open={open} onToggle={(event) => setOpen(event.currentTarget.open)}>
-      <summary>
-        <span>{done ? summary.doneTitle : summary.runningTitle}{elapsed}</span>
-      </summary>
-      {open && (
-        <div className="tool-process-body">
-          {expandedRows.map((row) => {
-            const attachments = row.textMessage ? [...(row.textMessage.attachments || []), ...(row.textMessage.files || [])] : [];
-            const text = row.textMessage ? messageText(row.textMessage) : '';
-            let renderedCardIndex = 0;
-            return (
-              <Fragment key={row.id}>
-                {text && <MarkdownContent className="tool-note" text={text} attachments={attachments} />}
-                {(row.segments || [{ notes: [], cards: row.toolCards }]).map((segment, segmentIndex) => (
-                  <Fragment key={`${row.id}-segment-${segmentIndex}`}>
-                    {segment.notes?.map((note, noteIndex) => (
-                      note.kind === 'reasoning'
-                        ? <ReasoningNote key={`${row.id}-${segmentIndex}-note-${noteIndex}`} text={note.text} />
-                        : <MarkdownContent key={`${row.id}-${segmentIndex}-note-${noteIndex}`} className="tool-note" text={note.text} attachments={attachments} />
-                    ))}
-                    {segment.cards.map((card, cardIndex) => {
-                      const showRowUsage = renderedCardIndex === row.toolCards.length - 1;
-                      renderedCardIndex += 1;
-                      return (
-                        <ToolInlineCard
-                          key={`${row.id}-${segmentIndex}-card-${cardIndex}`}
-                          kind={card.kind}
-                          name={card.name}
-                          payload={card.payload}
-                          usage={showRowUsage ? row.usage : null}
-                        />
-                      );
-                    })}
-                  </Fragment>
-                ))}
-              </Fragment>
-            );
-          })}
-        </div>
-      )}
-    </details>
+    <div className="tool-process-group">
+      {blocks.map((block) => (
+        block.type === 'tools'
+          ? <ToolProcessSegment key={block.id} block={block} complete={Boolean(group.nextMessage) || toolCardsAreComplete(block.cards)} />
+          : block.kind === 'reasoning'
+            ? <ReasoningNote key={block.id} text={block.text} />
+            : <MarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} />
+      ))}
+    </div>
   );
 }
 
 const MemoToolProcessGroup = memo(ToolProcessGroup);
+
+function toolProcessBlocks(rows) {
+  const blocks = [];
+  rows.forEach((row) => {
+    const attachments = row.textMessage ? [...(row.textMessage.attachments || []), ...(row.textMessage.files || [])] : [];
+    const text = row.textMessage ? messageText(row.textMessage) : '';
+    if (text) {
+      blocks.push({
+        type: 'note',
+        kind: 'text',
+        id: `${row.id}-text`,
+        text,
+        attachments
+      });
+    }
+    let renderedCardIndex = 0;
+    (row.segments || [{ notes: [], cards: row.toolCards }]).forEach((segment, segmentIndex) => {
+      (segment.notes || []).forEach((note, noteIndex) => {
+        blocks.push({
+          type: 'note',
+          kind: note.kind === 'reasoning' ? 'reasoning' : 'text',
+          id: `${row.id}-${segmentIndex}-note-${noteIndex}`,
+          text: note.text,
+          attachments
+        });
+      });
+      if (!segment.cards?.length) return;
+      const cards = segment.cards.map((card, cardIndex) => {
+        const showRowUsage = renderedCardIndex === row.toolCards.length - 1;
+        renderedCardIndex += 1;
+        return {
+          ...card,
+          renderId: `${row.id}-${segmentIndex}-card-${cardIndex}`,
+          usage: showRowUsage ? row.usage : null
+        };
+      });
+      blocks.push({
+        type: 'tools',
+        id: `${row.id}-${segmentIndex}-tools`,
+        cards
+      });
+    });
+  });
+  return blocks;
+}
+
+function ToolProcessSegment({ block, complete }) {
+  const [open, setOpen] = useState(false);
+  const firstName = useMemo(() => block.cards[0]?.name || 'tool', [block.cards]);
+  const summary = useMemo(() => toolGroupSummary(block.cards, firstName), [block.cards, firstName]);
+  const title = complete ? summary.doneTitle : summary.runningTitle;
+  return (
+    <section className={`tool-process-segment${open ? ' open' : ''}`}>
+      <button className="tool-process-toggle" type="button" onClick={() => setOpen((value) => !value)}>
+        <TerminalSquare size={15} strokeWidth={1.9} aria-hidden="true" />
+        <span>{title}</span>
+        <ChevronDown size={15} strokeWidth={1.9} aria-hidden="true" />
+      </button>
+      {open && (
+        <div className="tool-process-body">
+          {block.cards.map((card) => (
+            <ToolInlineCard
+              key={card.renderId}
+              kind={card.kind}
+              name={card.name}
+              payload={card.payload}
+              usage={card.usage}
+            />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
 
 function toolCardsAreComplete(cards) {
   if (!cards.length) return false;
@@ -1394,14 +1427,32 @@ function toolDisplay(kind, name, payload) {
   const data = parseToolPayload(payload);
   const lowerName = String(name || '').toLowerCase();
   const isResult = kind === 'result';
-  if (lowerName.includes('shell')) {
+  if (lowerName.includes('shell') || lowerName.includes('command') || lowerName.includes('terminal') || lowerName.includes('stdin')) {
     const command = data.command || data.cmd || data.text || '';
     const outputSummary = isResult ? shellResultSummary(data) : '';
     return {
       title: isResult ? '已运行' : '运行',
-      chip: 'shell',
+      chip: name || 'shell',
       summary: outputSummary || command || 'shell command',
       detailTitle: 'Shell'
+    };
+  }
+  if (lowerName.includes('fetch') || lowerName.includes('browser') || lowerName.includes('open_url')) {
+    const url = data.url || data.href || data.uri || data.text || '';
+    return {
+      title: isResult ? '已抓取' : '抓取',
+      chip: name,
+      summary: url || 'Web page',
+      detailTitle: 'Web'
+    };
+  }
+  if (lowerName.includes('image') || lowerName.includes('screenshot')) {
+    const file = data.path || data.file_path || data.file || data.url || '';
+    return {
+      title: isResult ? '已查看' : '查看',
+      chip: name,
+      summary: file || 'Image',
+      detailTitle: 'Image'
     };
   }
   if (lowerName.includes('search') || lowerName.includes('grep') || lowerName === 'rg') {
@@ -1444,66 +1495,76 @@ function toolDisplay(kind, name, payload) {
   };
 }
 
-function compactFileName(path) {
-  return String(path || '').split('/').filter(Boolean).at(-1) || String(path || '');
-}
-
-function diffLabel(data) {
-  const added = data.added ?? data.additions ?? data.lines_added ?? data.bytes_written;
-  const removed = data.removed ?? data.deletions ?? data.lines_removed;
-  if (added === undefined && removed === undefined) return '';
-  return `+${Number(added || 0)} -${Number(removed || 0)}`;
-}
-
-function toolGroupSummary(cards, messages, fallbackName) {
-  const names = cards.map((card) => String(card.name || '').toLowerCase());
-  const editLike = names.some((name) => name.includes('edit') || name.includes('write') || name.includes('patch'));
-  const readLike = names.some((name) => name.includes('read'));
-  const searchLike = names.some((name) => name.includes('search') || name.includes('grep') || name === 'rg');
-  const shellLike = names.some((name) => name.includes('shell'));
-  const fileRows = [];
-  const seen = new Set();
-  cards.forEach((card) => {
-    const data = parseToolPayload(card.payload);
-    const lowerName = String(card.name || '').toLowerCase();
-    const path = data.path || data.file_path || data.file || data.target || '';
-    if (!path) return;
-    const isEdit = lowerName.includes('edit') || lowerName.includes('write') || lowerName.includes('patch');
-    const isRead = lowerName.includes('read');
-    if (!isEdit && !isRead) return;
-    const key = `${isEdit ? 'edit' : 'read'}:${path}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    fileRows.push({
-      action: isEdit ? '已编辑' : '已读取',
-      path: compactFileName(path),
-      diff: isEdit ? diffLabel(data) : ''
-    });
+function toolGroupSummary(cards, fallbackName) {
+  const records = toolOperationRecords(cards);
+  const counts = new Map();
+  records.forEach((card) => {
+    const category = toolCategory(card.name);
+    counts.set(category, (counts.get(category) || 0) + 1);
   });
-  const baseName = editLike ? '文件'
-    : searchLike ? '搜索'
-      : shellLike ? '命令'
-        : readLike ? '文件'
-          : fallbackName || '工具';
-  const doneTitle = editLike && fileRows.length
-    ? '已编辑文件'
-    : searchLike
-      ? '已搜索'
-      : shellLike
-        ? `已运行 ${fallbackName || '命令'}`
-        : `已处理 · ${baseName}`;
-  const runningTitle = editLike && fileRows.length
-    ? '正在编辑文件'
-    : searchLike
-      ? `正在搜索`
-      : shellLike
-        ? `正在运行 ${fallbackName || '命令'}`
-        : `正在处理 · ${baseName}`;
-  return {
-    doneTitle,
-    runningTitle,
-    fileRows
-  };
+  const parts = [
+    toolCountLabel(counts, 'search'),
+    toolCountLabel(counts, 'command'),
+    toolCountLabel(counts, 'edit'),
+    toolCountLabel(counts, 'fetch'),
+    toolCountLabel(counts, 'read'),
+    toolCountLabel(counts, 'image'),
+    toolCountLabel(counts, 'plan'),
+    toolCountLabel(counts, 'memory'),
+    toolCountLabel(counts, 'skill'),
+    toolCountLabel(counts, 'cron'),
+    toolCountLabel(counts, 'agent'),
+    toolCountLabel(counts, 'tool')
+  ].filter(Boolean);
+  const doneTitle = parts.join(' ') || `已处理 ${fallbackName || '工具'}`;
+  const runningTitle = `正在处理 ${fallbackName || '工具'}`;
+  return { doneTitle, runningTitle };
+}
+
+function toolOperationRecords(cards) {
+  const hasCalls = cards.some((card) => card.kind === 'call');
+  const seen = new Set();
+  return cards.filter((card, index) => {
+    if (hasCalls && card.kind !== 'call') return false;
+    const id = String(card.id || '').trim();
+    const key = id || `${card.kind}:${card.name || 'tool'}:${index}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function toolCategory(name) {
+  const lowerName = String(name || '').toLowerCase();
+  if (lowerName.includes('search') || lowerName.includes('grep') || lowerName === 'rg') return 'search';
+  if (lowerName.includes('shell') || lowerName.includes('command') || lowerName.includes('terminal') || lowerName.includes('stdin')) return 'command';
+  if (lowerName.includes('edit') || lowerName.includes('write') || lowerName.includes('patch')) return 'edit';
+  if (lowerName.includes('fetch') || lowerName.includes('browser') || lowerName.includes('open_url')) return 'fetch';
+  if (lowerName.includes('file_read') || lowerName.includes('read')) return 'read';
+  if (lowerName.includes('image') || lowerName.includes('screenshot')) return 'image';
+  if (lowerName.includes('plan')) return 'plan';
+  if (lowerName.includes('memory')) return 'memory';
+  if (lowerName.includes('skill')) return 'skill';
+  if (lowerName.includes('cron') || lowerName.includes('automation')) return 'cron';
+  if (lowerName.includes('agent') || lowerName.includes('subagent')) return 'agent';
+  return 'tool';
+}
+
+function toolCountLabel(counts, category) {
+  const count = counts.get(category) || 0;
+  if (!count) return '';
+  if (category === 'search') return `已探索 ${count} 次搜索`;
+  if (category === 'command') return `已运行 ${count} 条命令`;
+  if (category === 'edit') return `已编辑 ${count} 次`;
+  if (category === 'fetch') return `已抓取 ${count} 个网页`;
+  if (category === 'read') return `已读取 ${count} 个文件`;
+  if (category === 'image') return `已查看 ${count} 张图片`;
+  if (category === 'plan') return count === 1 ? '已更新计划' : `已更新 ${count} 次计划`;
+  if (category === 'memory') return `已访问 ${count} 次记忆`;
+  if (category === 'skill') return `已运行 ${count} 个技能`;
+  if (category === 'cron') return `已处理 ${count} 个定时任务`;
+  if (category === 'agent') return `已运行 ${count} 个代理`;
+  return `已调用 ${count} 个工具`;
 }
 
 function ToolDetail({ title, name, payload }) {
