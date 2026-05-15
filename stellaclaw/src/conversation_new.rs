@@ -1656,6 +1656,7 @@ mod tests {
     #[test]
     fn channel_rejects_bad_payload_without_killing_kernel() {
         let mut kernel = test_kernel("bad_channel_payload");
+        let workdir = kernel.conversation.workdir.clone();
         kernel
             .mount_service(ServiceAddr::channel_id("scratch"), ServiceKind::Channel)
             .expect("channel mounts");
@@ -1681,6 +1682,10 @@ mod tests {
                 && status.detail["source"] == serde_json::json!(ServiceAddr::status())
                 && status.detail["payload"]["type"] == "not_a_channel_payload"
         }));
+        let warn_log =
+            fs::read_to_string(workdir.join("logs").join("warn.log")).expect("warn log exists");
+        assert!(warn_log.contains("bad_channel_payload"));
+        assert!(warn_log.contains("not_a_channel_payload"));
         kernel.stop_all("test finished").expect("services stop");
     }
 

@@ -10,6 +10,7 @@ use crate::{
         ConversationService, ServiceAddr, ServiceOutput, ServiceRunContext, ServiceStatusUpdate,
         ServiceStopped,
     },
+    logger::append_workdir_level_log,
     service_protos::{
         agent_session::{
             self, decode_response as decode_agent_response, AgentMessageOrigin, AgentSessionKind,
@@ -357,6 +358,19 @@ fn handle_channel_request(
                                 )?;
                             }
                             Err(_) => {
+                                let detail = serde_json::json!({
+                                    "conversation_id": &ctx.conversation.conversation_id,
+                                    "channel_addr": &ctx.addr,
+                                    "source": &source,
+                                    "channel_decode_error": error.to_string(),
+                                    "payload": &payload,
+                                });
+                                let _ = append_workdir_level_log(
+                                    &ctx.conversation.workdir,
+                                    "warn",
+                                    "bad_channel_payload",
+                                    detail.clone(),
+                                );
                                 emit_channel_event(
                                     event_tx,
                                     ChannelEvent::Error {
@@ -369,11 +383,7 @@ fn handle_channel_request(
                                 ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                                     addr: ctx.addr.clone(),
                                     label: "bad_channel_payload".to_string(),
-                                    detail: serde_json::json!({
-                                        "source": source,
-                                        "channel_decode_error": error.to_string(),
-                                        "payload": payload,
-                                    }),
+                                    detail,
                                 }))?;
                             }
                         },
