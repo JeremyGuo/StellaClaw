@@ -526,15 +526,40 @@ function streamMessageIndexFromEvent(event) {
   return messageOrderFromId(streamMessageId(event));
 }
 
+function nextStreamMessageIndex(messages) {
+  let last = undefined;
+  let optimisticUsers = 0;
+  for (const message of messages || []) {
+    if (message?._optimistic) {
+      if (String(message?.role || '').toLowerCase() === 'user') optimisticUsers += 1;
+      continue;
+    }
+    if (message?._streaming) continue;
+    const index = messageIndex(message);
+    if (Number.isFinite(index) && index !== Number.MAX_SAFE_INTEGER) {
+      last = last === undefined ? index : Math.max(last, index);
+    }
+  }
+  if (last !== undefined) return last + optimisticUsers + 1;
+  return optimisticUsers > 0 ? optimisticUsers : undefined;
+}
+
 function appendStreamAssistantDelta(current, event) {
   const id = streamMessageId(event);
   const delta = streamDeltaText(event);
   if (!id || !delta) return current;
   const position = current.findIndex((message) => String(message?.id ?? message?.message_id ?? '') === id);
   const now = new Date().toISOString();
+  const fallbackIndex = nextStreamMessageIndex(current);
   const buildMessage = (existing = {}) => {
     const nextText = `${String(existing.text || existing.preview || '')}${delta}`;
-    const index = streamMessageIndexFromEvent(event);
+    const eventIndex = streamMessageIndexFromEvent(event);
+    const existingIndex = Number(existing.index);
+    const index = Number.isFinite(eventIndex)
+      ? eventIndex
+      : Number.isFinite(existingIndex)
+        ? existingIndex
+        : fallbackIndex;
     return {
       ...existing,
       id,

@@ -389,7 +389,14 @@ export function hasOlderMessages(messages) {
 export function mergeMessages(current, incoming) {
   if (!Array.isArray(incoming) || incoming.length === 0) return current;
   const serverEchoes = incoming.filter((message) => String(message?.role || '').toLowerCase() === 'user');
+  const finalizedAssistantIndexes = new Set(
+    incoming
+      .filter((message) => String(message?.role || '').toLowerCase() === 'assistant' && !message?._streaming)
+      .map(messageIndex)
+      .filter((index) => Number.isFinite(index) && index !== Number.MAX_SAFE_INTEGER)
+  );
   const currentWithoutEchoedOptimistic = current.filter((message) => {
+    if (message?._streaming && finalizedAssistantIndexes.has(messageIndex(message))) return false;
     if (!message?._optimistic) return true;
     const text = messageText(message).trim();
     return !serverEchoes.some((incomingMessage) => messageText(incomingMessage).trim() === text);
