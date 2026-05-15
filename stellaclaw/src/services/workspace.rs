@@ -1257,22 +1257,22 @@ def api(path):
     return "/".join(path.parts)
 
 def kind(path):
+    if path.is_symlink():
+        return "symlink"
     if path.is_dir():
         return "directory"
     if path.is_file():
         return "file"
-    if path.is_symlink():
-        return "symlink"
     return "other"
 
 def modified_ms(path):
     try:
-        return int(path.stat().st_mtime * 1000)
+        return int(path.lstat().st_mtime * 1000)
     except Exception:
         return None
 
 def entry(path, rel):
-    stat = path.stat()
+    stat = path.lstat()
     return {
         "name": path.name,
         "path": api(rel),
@@ -1553,6 +1553,57 @@ mod tests {
         assert!(!command.contains("def entry(path, rel):"));
         assert!(!command.contains("if op == \"list\":"));
         assert!(command.contains(&general_purpose::STANDARD.encode(REMOTE_WORKSPACE_SCRIPT)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_workspace_helper_lists_broken_symlinks() {
+        use std::{io::Write as _, os::unix::fs::symlink};
+
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "stellaclaw-remote-workspace-helper-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("root exists");
+        symlink(root.join("missing-target"), root.join("missing-link")).expect("symlink created");
+
+        let request = json!({
+            "cwd": root,
+            "payload": {
+                "op": "list",
+                "path": "",
+                "limit": 20,
+            },
+        });
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(REMOTE_WORKSPACE_SCRIPT)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("python helper starts");
+        child
+            .stdin
+            .as_mut()
+            .expect("stdin")
+            .write_all(serde_json::to_string(&request).unwrap().as_bytes())
+            .expect("request writes");
+        let output = child.wait_with_output().expect("helper exits");
+        assert!(output.status.success());
+        let response: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("response json");
+        assert_eq!(response["ok"], true);
+        assert!(response["payload"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["name"] == "missing-link" && entry["kind"] == "symlink"));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

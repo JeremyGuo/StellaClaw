@@ -4,7 +4,7 @@ version: 1.27.0
 # 1.27.0
 
 - 修复 FixedSSH workspace remote helper 启动：
-  WorkspaceService 不再把整段 Python helper 作为裸 `ssh host python3 -c <script>` 参数发送给远端 shell；现在会把 helper 脚本 base64 编码后作为 shell-safe 参数传给远端 `python3 -c` loader，JSON request 仍通过 stdin 传输，避免 zsh 等远端登录 shell 把 Python 函数体当 shell 语法解析并报 `parse error near ')'`。本次不改变 `config` schema，不改变 `workdir` schema。
+  WorkspaceService 不再把整段 Python helper 作为裸 `ssh host python3 -c <script>` 参数发送给远端 shell；现在会把 helper 脚本 base64 编码后作为 shell-safe 参数传给远端 `python3 -c` loader，JSON request 仍通过 stdin 传输，避免 zsh 等远端登录 shell 把 Python 函数体当 shell 语法解析并报 `parse error near ')'`。远端 listing 也改为用 `lstat` 和 symlink 优先识别，避免断开的远端 symlink 让 workspace list 失败。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 修复 Web workspace / file API 的 WorkspaceResponse 分发：
   ChannelService 发起 WorkspaceService 请求时会把平台 workspace request id 写入 `ServiceCall.request_id`，WorkspaceService 回包后通过 `response_id` 找回对应 pending 请求，不再依赖 FIFO；同时 workspace response 会优先按 `response_id` / workspace 来源走 workspace decoder，避免 `listing` / `file` 响应被当作普通 Channel payload 报 `bad_channel_payload`。`WorkspaceEntry.modified_ms` / file `modified_ms` 从 `u128` 收敛为 JSON 可稳定反序列化的 `u64` 毫秒时间戳，修复线上 workspace listing decode 失败。本次不改变 `config` schema，不改变 `workdir` schema。
