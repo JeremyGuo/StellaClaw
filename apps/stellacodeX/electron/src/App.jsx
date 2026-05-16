@@ -544,15 +544,39 @@ function nextStreamMessageIndex(messages) {
   return optimisticUsers > 0 ? optimisticUsers : undefined;
 }
 
+function appendTextDelta(existingText, delta) {
+  const previous = String(existingText || '');
+  const chunk = String(delta || '');
+  if (!chunk) return previous;
+  if (!previous) return chunk;
+  if (chunk === previous || previous.endsWith(chunk)) return previous;
+  if (chunk.startsWith(previous)) return chunk;
+  const maxOverlap = Math.min(previous.length, chunk.length);
+  for (let length = maxOverlap; length > 0; length -= 1) {
+    if (previous.slice(-length) === chunk.slice(0, length)) {
+      return `${previous}${chunk.slice(length)}`;
+    }
+  }
+  return `${previous}${chunk}`;
+}
+
 function appendStreamAssistantDelta(current, event) {
   const id = streamMessageId(event);
   const delta = streamDeltaText(event);
   if (!id || !delta) return current;
-  const position = current.findIndex((message) => String(message?.id ?? message?.message_id ?? '') === id);
+  const turnId = String(event?.turn_id || event?.turnId || '').trim();
+  const itemId = String(event?.item_id || event?.itemId || '').trim();
+  const position = current.findIndex((message) => {
+    if (String(message?.id ?? message?.message_id ?? '') === id) return true;
+    return Boolean(turnId)
+      && message?._streaming
+      && String(message?._streamTurnId || '').trim() === turnId
+      && String(message?.role || '').toLowerCase() === 'assistant';
+  });
   const now = new Date().toISOString();
   const fallbackIndex = nextStreamMessageIndex(current);
   const buildMessage = (existing = {}) => {
-    const nextText = `${String(existing.text || existing.preview || '')}${delta}`;
+    const nextText = appendTextDelta(existing.text || existing.preview || '', delta);
     const eventIndex = streamMessageIndexFromEvent(event);
     const existingIndex = Number(existing.index);
     const index = Number.isFinite(eventIndex)
@@ -581,6 +605,8 @@ function appendStreamAssistantDelta(current, event) {
       attachments: existing.attachments || [],
       attachment_count: existing.attachment_count || 0,
       message_time: existing.message_time || now,
+      _streamTurnId: turnId || existing._streamTurnId || '',
+      _streamItemId: itemId || existing._streamItemId || '',
       _streaming: true
     };
   };
