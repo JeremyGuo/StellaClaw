@@ -2007,6 +2007,53 @@ function App() {
       }
     };
 
+    const applyChatSnapshotLiveProjection = (snapshot) => {
+      if (!snapshot || disposed || websocketKeyRef.current !== key) return;
+      const provisional = snapshot.current_provisional_assistant_message?.message;
+      if (provisional) {
+        setMessages((current) => {
+          const next = mergeMessages(current, [{ ...provisional, _streaming: true }]);
+          messagesRef.current = next;
+          return next;
+        });
+        setSessionActivity('正在回复');
+      }
+      const toolStates = Array.isArray(snapshot.running_tool_results)
+        ? snapshot.running_tool_results
+        : [];
+      const activities = toolStates
+        .map((state) => state?.tool_result || state?.toolResult || state)
+        .filter(Boolean)
+        .map((toolResult) => {
+          const itemId = String(toolResult.tool_call_id || toolResult.toolCallId || toolResult.tool_name || toolResult.toolName || '').trim();
+          const toolName = String(toolResult.tool_name || toolResult.toolName || '工具').trim();
+          return {
+            id: `stream-tool-result-${itemId || toolName}`,
+            title: `${toolName} 已返回`,
+            detail: toolName,
+            state: 'running'
+          };
+        });
+      if (activities.length > 0) {
+        updateRunningActivities((current) => [
+          ...current.filter((item) => !activities.some((activity) => activity.id === item.id) && item.id !== 'thinking'),
+          ...activities
+        ]);
+        setSessionActivity(activities[activities.length - 1]?.title || '正在处理');
+      } else if (snapshot.current_turn_state && !provisional) {
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== 'thinking'),
+          {
+            id: 'thinking',
+            title: '正在处理',
+            detail: '等待模型响应',
+            state: 'running'
+          }
+        ]);
+        setSessionActivity('正在处理');
+      }
+    };
+
     const connect = async () => {
       try {
         const info = await connectionInfo(serverId);
@@ -2032,6 +2079,9 @@ function App() {
               ]);
             }
             reconcileAck(payload).catch(() => {});
+            if (payloadType === 'chat.snapshot') {
+              applyChatSnapshotLiveProjection(payload);
+            }
           } else if (payloadType === 'chat.message_appended') {
             applyIncomingMessages(payload.message ? [payload.message] : []);
           } else if (payloadType === 'messages') {

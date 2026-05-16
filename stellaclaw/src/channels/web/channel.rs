@@ -60,6 +60,7 @@ pub struct WebChannel {
     processing_states: Arc<Mutex<HashMap<String, ProcessingState>>>,
     seen_states: Arc<Mutex<HashMap<String, ConversationSeen>>>,
     home_seq: Arc<Mutex<u64>>,
+    live_states: Arc<Mutex<HashMap<String, ChatLiveState>>>,
 }
 
 impl WebChannel {
@@ -85,6 +86,7 @@ impl WebChannel {
             processing_states: Arc::new(Mutex::new(HashMap::new())),
             seen_states: Arc::new(Mutex::new(seen_states)),
             home_seq: Arc::new(Mutex::new(0)),
+            live_states: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -573,6 +575,7 @@ impl WebChannel {
                 },
             )
             .map_err(HttpError::internal)?;
+        self.record_user_message_queued(conversation_id, foreground_session_id, &client_message_id);
         self.publish_websocket_event(
             conversation_id,
             foreground_session_id,
@@ -1027,6 +1030,7 @@ impl WebChannel {
             foreground_session_id,
         ))
         .unwrap_or_default();
+        let live = self.chat_live_snapshot(conversation_id, foreground_session_id);
         send_websocket_json(
             &mut stream,
             &json!({
@@ -1039,6 +1043,10 @@ impl WebChannel {
                     message.get("message_id").or_else(|| message.get("id")).and_then(Value::as_str)
                 }),
                 "last_committed_message_index": messages.last().and_then(|message| message.get("index")).and_then(Value::as_u64),
+                "current_turn_state": live.current_turn_state,
+                "current_provisional_assistant_message": live.current_provisional_assistant_message,
+                "running_tool_results": live.running_tool_results,
+                "queued_outbound_messages": live.queued_outbound_messages,
             }),
         )?;
         websocket_event_loop(stream, rx, "chat.heartbeat")
@@ -1284,6 +1292,144 @@ impl WebChannel {
         *seq
     }
 
+    fn chat_live_snapshot(
+        &self,
+        conversation_id: &str,
+        foreground_session_id: &str,
+    ) -> ChatLiveState {
+        self.live_states
+            .lock()
+            .ok()
+            .and_then(|states| {
+                states
+                    .get(&websocket_key(conversation_id, foreground_session_id))
+                    .cloned()
+            })
+            .unwrap_or_default()
+    }
+
+    fn record_user_message_queued(
+        &self,
+        conversation_id: &str,
+        foreground_session_id: &str,
+        client_message_id: &str,
+    ) {
+        let Ok(mut states) = self.live_states.lock() else {
+            return;
+        };
+        let state = states
+            .entry(websocket_key(conversation_id, foreground_session_id))
+            .or_default();
+        if state.queued_outbound_messages.iter().any(|message| {
+            message
+                .get("client_message_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id == client_message_id)
+        }) {
+            return;
+        }
+        state.queued_outbound_messages.push(json!({
+            "client_message_id": client_message_id,
+            "conversation_id": conversation_id,
+            "foreground_session_id": foreground_session_id,
+        }));
+    }
+
+    fn record_message_appended(&self, appended: &OutgoingMessageAppended, message: &Value) {
+        let foreground_session_id = foreground_route_id_from_storage_id(&appended.session_id)
+            .unwrap_or_else(|| appended.session_id.clone());
+        let Ok(mut states) = self.live_states.lock() else {
+            return;
+        };
+        let state = states
+            .entry(websocket_key(
+                &appended.conversation_id,
+                &foreground_session_id,
+            ))
+            .or_default();
+        state.last_committed_message_id = message
+            .get("message_id")
+            .or_else(|| message.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        state.last_committed_message_index = Some(appended.index);
+        if let Some(message_id) = state.last_committed_message_id.as_deref() {
+            state.queued_outbound_messages.retain(|queued| {
+                match queued.get("client_message_id").and_then(Value::as_str) {
+                    Some(id) => id != message_id,
+                    None => true,
+                }
+            });
+            if state
+                .current_provisional_assistant_message
+                .as_ref()
+                .and_then(|provisional| provisional.get("message_id"))
+                .and_then(Value::as_str)
+                .is_some_and(|id| id == message_id)
+            {
+                state.current_provisional_assistant_message = None;
+            }
+        }
+        for tool_call_id in tool_result_call_ids(message) {
+            for tool_state in &mut state.running_tool_results {
+                if tool_state
+                    .get("tool_result")
+                    .and_then(|tool_result| tool_result.get("tool_call_id"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id == tool_call_id)
+                {
+                    if let Value::Object(map) = tool_state {
+                        map.insert("committed".to_string(), json!(true));
+                    }
+                }
+            }
+        }
+    }
+
+    fn record_session_stream(&self, stream: &OutgoingSessionStream, event_type: &str) {
+        let foreground_session_id = foreground_route_id_from_storage_id(&stream.session_id)
+            .unwrap_or_else(|| stream.session_id.clone());
+        let Ok(mut states) = self.live_states.lock() else {
+            return;
+        };
+        let state = states
+            .entry(websocket_key(
+                &stream.conversation_id,
+                &foreground_session_id,
+            ))
+            .or_default();
+        match event_type {
+            "stream_assistant_message_delta" => {
+                state.apply_assistant_delta(&stream.event);
+            }
+            "stream_tool_call_delta"
+            | "stream_reasoning_summary_part_added"
+            | "stream_reasoning_summary_delta" => {
+                state.set_turn_from_event(&stream.event);
+            }
+            "stream_tool_result_done" => {
+                state.apply_tool_result_done(&stream.event);
+            }
+            "stream_error" => {
+                let message_id = stream
+                    .event
+                    .get("message_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                state.current_provisional_assistant_message = state
+                    .current_provisional_assistant_message
+                    .take()
+                    .filter(|message| {
+                        !message
+                            .get("message_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| id == message_id)
+                    });
+            }
+            _ => {}
+        }
+    }
+
     fn authorized(&self, request: &HttpRequest) -> bool {
         request.headers.get("authorization").is_some_and(|value| {
             value == &self.token
@@ -1320,6 +1466,7 @@ impl Channel for WebChannel {
 
     fn message_appended(&self, appended: &OutgoingMessageAppended) -> Result<()> {
         let message = decorate_message(&appended.message, appended.index);
+        self.record_message_appended(appended, &message);
         self.publish_websocket_event(
             &appended.conversation_id,
             &appended.session_id,
@@ -1353,6 +1500,7 @@ impl Channel for WebChannel {
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("stream_event");
+        self.record_session_stream(stream, event_type);
         self.publish_websocket_event(
             &stream.conversation_id,
             &stream.session_id,
@@ -1739,6 +1887,111 @@ struct WebSeenState {
     seen: HashMap<String, ConversationSeen>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct ChatLiveState {
+    current_turn_state: Option<Value>,
+    current_provisional_assistant_message: Option<Value>,
+    running_tool_results: Vec<Value>,
+    queued_outbound_messages: Vec<Value>,
+    last_committed_message_id: Option<String>,
+    last_committed_message_index: Option<usize>,
+}
+
+impl ChatLiveState {
+    fn set_turn_from_event(&mut self, event: &Value) {
+        let Some(turn_id) = event.get("turn_id").and_then(Value::as_str) else {
+            return;
+        };
+        self.current_turn_state = Some(json!({
+            "turn_id": turn_id,
+            "message_id": event.get("message_id").and_then(Value::as_str),
+        }));
+    }
+
+    fn apply_assistant_delta(&mut self, event: &Value) {
+        self.set_turn_from_event(event);
+        let Some(message_id) = event.get("message_id").and_then(Value::as_str) else {
+            return;
+        };
+        let delta = event
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if delta.is_empty() {
+            return;
+        }
+        let turn_id = event
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let existing_text = self
+            .current_provisional_assistant_message
+            .as_ref()
+            .and_then(|provisional| provisional.get("message"))
+            .and_then(|message| message.get("text").or_else(|| message.get("preview")))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let text = append_text_delta(existing_text, delta);
+        let message_index = event.get("message_index").and_then(Value::as_u64);
+        self.current_provisional_assistant_message = Some(json!({
+            "turn_id": turn_id,
+            "message_id": message_id,
+            "message": {
+                "id": message_id,
+                "message_id": message_id,
+                "index": message_index,
+                "role": "assistant",
+                "text": text,
+                "preview": text,
+                "content": text,
+                "text_with_attachment_markers": text,
+                "items": [{
+                    "type": "text",
+                    "index": 0,
+                    "text": text,
+                    "text_with_attachment_markers": text,
+                }],
+                "attachments": [],
+                "attachment_count": 0,
+                "message_time": now_rfc3339(),
+                "_streamTurnId": turn_id,
+                "_streaming": true,
+            },
+        }));
+    }
+
+    fn apply_tool_result_done(&mut self, event: &Value) {
+        let Some(tool_result) = event.get("tool_result").cloned() else {
+            return;
+        };
+        let tool_call_id = tool_result
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let turn_id = event
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let next = json!({
+            "turn_id": turn_id,
+            "tool_result": tool_result,
+            "committed": false,
+        });
+        if let Some(tool_call_id) = tool_call_id {
+            if let Some(existing) = self.running_tool_results.iter_mut().find(|item| {
+                item.get("tool_result")
+                    .and_then(|tool_result| tool_result.get("tool_call_id"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id == tool_call_id)
+            }) {
+                *existing = next;
+                return;
+            }
+        }
+        self.running_tool_results.push(next);
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct ConversationSeen {
     last_seen_message_id: String,
@@ -1845,6 +2098,46 @@ fn message_summary(path: &Path) -> MessageSummary {
             .map(str::to_string);
     }
     summary
+}
+
+fn tool_result_call_ids(message: &Value) -> Vec<&str> {
+    let mut ids = Vec::new();
+    if let Some(items) = message
+        .get("items")
+        .or_else(|| message.get("data"))
+        .and_then(Value::as_array)
+    {
+        for item in items {
+            if item.get("type").and_then(Value::as_str) == Some("tool_result") {
+                if let Some(id) = item.get("tool_call_id").and_then(Value::as_str) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn append_text_delta(existing_text: &str, delta: &str) -> String {
+    if existing_text.is_empty() {
+        return delta.to_string();
+    }
+    if delta.is_empty() || existing_text.ends_with(delta) {
+        return existing_text.to_string();
+    }
+    if delta.starts_with(existing_text) {
+        return delta.to_string();
+    }
+    let max_overlap = existing_text.len().min(delta.len());
+    for length in (1..=max_overlap).rev() {
+        if existing_text.is_char_boundary(existing_text.len() - length)
+            && delta.is_char_boundary(length)
+            && existing_text[existing_text.len() - length..] == delta[..length]
+        {
+            return format!("{}{}", existing_text, &delta[length..]);
+        }
+    }
+    format!("{existing_text}{delta}")
 }
 
 fn wait_agent_session_created(rx: &Receiver<KernelChannelEvent>) -> HttpResult<String> {
