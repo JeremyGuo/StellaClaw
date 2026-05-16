@@ -1,0 +1,1419 @@
+use std::{
+    collections::HashMap,
+    fs,
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose, Engine as _};
+use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use sha1::{Digest, Sha1};
+use stellaclaw_core::session_actor::{
+    ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, SelectionReferenceItem,
+};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
+use crate::{
+    config::StellaclawConfig,
+    conversation_host::ConversationHostRuntime,
+    conversation_id_manager::ConversationIdManager,
+    conversation_metadata::{ConversationMetadata, ConversationMetadataStore, WorkdirLayout},
+    conversation_new::ConversationRuntimeConfig,
+    conversation_new::{ServiceAddr, ServiceScope},
+    logger::StellaclawLogger,
+    service_protos::{
+        agent_session::AgentMessageOrigin,
+        channel::{ChannelEvent as KernelChannelEvent, ChannelIngress},
+    },
+};
+
+use super::protocol::HEARTBEAT_INTERVAL_SECS;
+use crate::channels::{
+    Channel, IncomingDispatch, OutgoingDelivery, OutgoingError, OutgoingMessageAppended,
+    OutgoingSessionStream, ProcessingState,
+};
+
+const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
+const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+const WEBSOCKET_MAX_FRAME_BYTES: usize = 128 * 1024;
+const SEEN_STATE_FILE: &str = "seen_state.json";
+
+pub struct WebChannel {
+    id: String,
+    bind_addr: String,
+    token: String,
+    workdir: PathBuf,
+    config: Arc<StellaclawConfig>,
+    conversation_runtime: Arc<ConversationHostRuntime>,
+    websocket_subscribers: Arc<Mutex<HashMap<String, Vec<Sender<Value>>>>>,
+    conversation_stream_subscribers: Arc<Mutex<Vec<Sender<Value>>>>,
+    processing_states: Arc<Mutex<HashMap<String, ProcessingState>>>,
+    seen_states: Arc<Mutex<HashMap<String, ConversationSeen>>>,
+}
+
+impl WebChannel {
+    pub fn new(
+        id: String,
+        bind_addr: String,
+        token: String,
+        workdir: PathBuf,
+        config: Arc<StellaclawConfig>,
+        conversation_runtime: Arc<ConversationHostRuntime>,
+        _logger: Arc<StellaclawLogger>,
+    ) -> Self {
+        let seen_states = load_seen_state(&workdir, &id).unwrap_or_default().seen;
+        Self {
+            id,
+            bind_addr,
+            token,
+            workdir,
+            config,
+            conversation_runtime,
+            websocket_subscribers: Arc::new(Mutex::new(HashMap::new())),
+            conversation_stream_subscribers: Arc::new(Mutex::new(Vec::new())),
+            processing_states: Arc::new(Mutex::new(HashMap::new())),
+            seen_states: Arc::new(Mutex::new(seen_states)),
+        }
+    }
+
+    fn handle_request(
+        &self,
+        request: HttpRequest,
+        id_manager: Arc<Mutex<ConversationIdManager>>,
+    ) -> HttpResult {
+        if request.method == "OPTIONS" {
+            return Ok(HttpResponse::empty(204));
+        }
+        if request.is_websocket() {
+            return Err(HttpError::upgrade_required());
+        }
+        if !self.authorized(&request) {
+            return Err(HttpError::new(401, "unauthorized"));
+        }
+        let path = split_path(&request.path);
+        match (request.method.as_str(), path.as_slice()) {
+            ("GET", ["api", "health"]) => Ok(HttpResponse::json(200, json!({"ok": true}))),
+            ("GET", ["api", "models"]) => self.list_models(),
+            ("GET", ["api", "conversations"]) => self.list_conversations(&request.query),
+            ("POST", ["api", "conversations"]) => self.create_conversation(&request, id_manager),
+            ("PATCH", ["api", "conversations", conversation_id]) => {
+                self.rename_conversation(conversation_id, &request.body)
+            }
+            ("DELETE", ["api", "conversations", conversation_id]) => {
+                self.delete_conversation(conversation_id)
+            }
+            ("POST", ["api", "conversations", conversation_id, "seen"]) => {
+                self.mark_seen(conversation_id, &request.body)
+            }
+            ("GET", ["api", "conversations", conversation_id, "foreground_sessions"]) => {
+                self.list_foreground_sessions(conversation_id)
+            }
+            ("POST", ["api", "conversations", conversation_id, "foreground_sessions"]) => {
+                self.create_foreground_session(conversation_id, &request.body)
+            }
+            (
+                "PATCH",
+                ["api", "conversations", conversation_id, "foreground_sessions", foreground_session_id],
+            ) => self.rename_foreground_session(
+                conversation_id,
+                foreground_session_id,
+                &request.body,
+            ),
+            (
+                "DELETE",
+                ["api", "conversations", conversation_id, "foreground_sessions", foreground_session_id],
+            ) => self.delete_foreground_session(conversation_id, foreground_session_id),
+            (
+                "GET",
+                ["api", "conversations", conversation_id, "foreground_sessions", foreground_session_id, "messages"],
+            ) => self.list_messages(conversation_id, foreground_session_id, &request.query),
+            (
+                "POST",
+                ["api", "conversations", conversation_id, "foreground_sessions", foreground_session_id, "messages"],
+            ) => self.post_message(conversation_id, foreground_session_id, &request.body),
+            ("GET", ["api", "conversations", conversation_id, "status"]) => {
+                self.status_snapshot(conversation_id)
+            }
+            _ => Err(HttpError::new(404, "not_found")),
+        }
+    }
+
+    fn handle_websocket(
+        self: Arc<Self>,
+        mut stream: TcpStream,
+        request: HttpRequest,
+    ) -> Result<()> {
+        if !self.authorized(&request) {
+            write_response(
+                &mut stream,
+                &HttpResponse::json(401, json!({"error": "unauthorized"})),
+            )?;
+            return Ok(());
+        }
+        let path = split_path(&request.path);
+        match path.as_slice() {
+            ["api", "conversations", "stream"] => self.accept_conversation_stream(stream, &request),
+            ["api", "conversations", conversation_id, "foreground_sessions", foreground_session_id, "ws"] => {
+                self.accept_session_stream(stream, &request, conversation_id, foreground_session_id)
+            }
+            _ => {
+                write_response(
+                    &mut stream,
+                    &HttpResponse::json(404, json!({"error": "not_found"})),
+                )?;
+                Ok(())
+            }
+        }
+    }
+
+    fn list_models(&self) -> HttpResult {
+        let models = self
+            .config
+            .available_agent_models()
+            .into_iter()
+            .map(|(alias, model)| {
+                json!({
+                    "alias": alias,
+                    "name": alias,
+                    "provider": format!("{:?}", model.provider_type),
+                    "display_name": alias,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(HttpResponse::json(
+            200,
+            json!({
+                "default_model": self.config.initial_main_model_name(),
+                "total": models.len(),
+                "models": models,
+            }),
+        ))
+    }
+
+    fn list_conversations(&self, query: &HashMap<String, String>) -> HttpResult {
+        let offset = query_usize(query, "offset", 0);
+        let limit = query_usize(query, "limit", 80).min(200);
+        let mut conversations = self.conversation_summaries()?;
+        conversations.sort_by(|left, right| {
+            left["conversation_id"]
+                .as_str()
+                .unwrap_or_default()
+                .cmp(right["conversation_id"].as_str().unwrap_or_default())
+        });
+        let total = conversations.len();
+        let start = offset.min(total);
+        let end = start.saturating_add(limit).min(total);
+        Ok(HttpResponse::json(
+            200,
+            json!({
+                "channel_id": self.id,
+                "offset": offset,
+                "limit": limit,
+                "total": total,
+                "conversations": &conversations[start..end],
+            }),
+        ))
+    }
+
+    fn create_conversation(
+        &self,
+        request: &HttpRequest,
+        id_manager: Arc<Mutex<ConversationIdManager>>,
+    ) -> HttpResult {
+        let body: CreateConversationRequest = parse_optional_json(&request.body)?;
+        let platform_chat_id = body.platform_chat_id.unwrap_or_else(generated_platform_id);
+        let conversation_id = id_manager
+            .lock()
+            .map_err(|_| HttpError::new(500, "conversation id manager lock poisoned"))?
+            .get_or_create(&self.id, &platform_chat_id)
+            .map_err(|error| HttpError::new(500, error))?;
+        let store = ConversationMetadataStore::new(&self.workdir);
+        let mut metadata = store
+            .load_or_create(&conversation_id, &self.id, &platform_chat_id)
+            .map_err(HttpError::internal)?;
+        if let Some(nickname) = body.nickname.filter(|value| !value.trim().is_empty()) {
+            metadata.nickname = nickname;
+        }
+        store.persist(&metadata).map_err(HttpError::internal)?;
+        self.conversation_runtime
+            .ensure_conversation_started(&conversation_id)
+            .map_err(HttpError::internal)?;
+        let summary = self.conversation_summary(&metadata)?;
+        self.publish_conversation_event(json!({
+            "type": "conversation_upserted",
+            "conversation": summary,
+        }));
+        Ok(HttpResponse::json(
+            201,
+            json!({
+                "conversation_id": conversation_id,
+                "conversation": summary,
+            }),
+        ))
+    }
+
+    fn rename_conversation(&self, conversation_id: &str, body: &[u8]) -> HttpResult {
+        let body: RenameRequest = parse_json(body)?;
+        let store = ConversationMetadataStore::new(&self.workdir);
+        let mut metadata = store
+            .load(conversation_id)
+            .map_err(|_| HttpError::new(404, "conversation_not_found"))?;
+        metadata.nickname = body
+            .nickname
+            .unwrap_or_else(|| metadata.conversation_id.clone());
+        store.persist(&metadata).map_err(HttpError::internal)?;
+        let summary = self.conversation_summary(&metadata)?;
+        self.publish_conversation_event(json!({
+            "type": "conversation_upserted",
+            "conversation": summary,
+        }));
+        Ok(HttpResponse::json(200, json!({"conversation": summary})))
+    }
+
+    fn delete_conversation(&self, conversation_id: &str) -> HttpResult {
+        let _ = self
+            .conversation_runtime
+            .stop_conversation(conversation_id, "web deleted conversation");
+        ConversationMetadataStore::new(&self.workdir)
+            .remove(conversation_id)
+            .map_err(HttpError::internal)?;
+        self.publish_conversation_event(json!({
+            "type": "conversation_deleted",
+            "conversation_id": conversation_id,
+        }));
+        Ok(HttpResponse::json(200, json!({"deleted": true})))
+    }
+
+    fn mark_seen(&self, conversation_id: &str, body: &[u8]) -> HttpResult {
+        let request: MarkSeenRequest = parse_json(body)?;
+        let foreground_session_id = request
+            .foreground_session_id
+            .unwrap_or_else(|| "main".to_string());
+        let seen = ConversationSeen {
+            last_seen_message_id: request.last_seen_message_id,
+            updated_at: now_rfc3339(),
+        };
+        let key = conversation_seen_key(conversation_id, &foreground_session_id);
+        let snapshot = {
+            let mut states = self
+                .seen_states
+                .lock()
+                .map_err(|_| HttpError::new(500, "seen state lock poisoned"))?;
+            states.insert(key, seen.clone());
+            states.clone()
+        };
+        persist_seen_state(&self.workdir, &self.id, &WebSeenState { seen: snapshot })
+            .map_err(HttpError::internal)?;
+        self.publish_conversation_event(json!({
+            "type": "conversation_seen",
+            "conversation_id": conversation_id,
+            "foreground_session_id": foreground_session_id,
+            "seen": seen,
+        }));
+        Ok(HttpResponse::json(200, json!({"seen": seen})))
+    }
+
+    fn list_foreground_sessions(&self, conversation_id: &str) -> HttpResult {
+        let metadata = ConversationMetadataStore::new(&self.workdir)
+            .load(conversation_id)
+            .map_err(|_| HttpError::new(404, "conversation_not_found"))?;
+        Ok(HttpResponse::json(
+            200,
+            json!({
+                "conversation_id": conversation_id,
+                "foreground_sessions": self.foreground_session_summaries(&metadata),
+            }),
+        ))
+    }
+
+    fn create_foreground_session(&self, conversation_id: &str, body: &[u8]) -> HttpResult {
+        let request: CreateForegroundSessionRequest = parse_optional_json(body)?;
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)
+            .map_err(HttpError::internal)?;
+        let rx = self
+            .conversation_runtime
+            .send_main_channel_ingress_subscribed(
+                conversation_id,
+                ChannelIngress::CreateForegroundSession {
+                    requested_id: request.session_id.clone(),
+                },
+            )
+            .map_err(HttpError::internal)?;
+        let storage_id = wait_agent_session_created(&rx).unwrap_or_else(|_| {
+            foreground_session_storage_id(request.session_id.as_deref().unwrap_or("main"))
+        });
+        let route_id =
+            foreground_route_id_from_storage_id(&storage_id).unwrap_or(storage_id.clone());
+        if let Some(nickname) = request.nickname {
+            self.set_session_nickname(conversation_id, &route_id, Some(nickname))?;
+        }
+        let metadata = ConversationMetadataStore::new(&self.workdir)
+            .load(conversation_id)
+            .map_err(HttpError::internal)?;
+        let session = self.foreground_session_summary(&metadata, &route_id);
+        self.publish_conversation_event(json!({
+            "type": "conversation_upserted",
+            "conversation": self.conversation_summary(&metadata)?,
+        }));
+        Ok(HttpResponse::json(
+            201,
+            json!({
+                "conversation_id": conversation_id,
+                "foreground_session": session,
+                "foreground_sessions": self.foreground_session_summaries(&metadata),
+            }),
+        ))
+    }
+
+    fn rename_foreground_session(
+        &self,
+        conversation_id: &str,
+        foreground_session_id: &str,
+        body: &[u8],
+    ) -> HttpResult {
+        let request: RenameRequest = parse_json(body)?;
+        let metadata =
+            self.set_session_nickname(conversation_id, foreground_session_id, request.nickname)?;
+        let session = self.foreground_session_summary(&metadata, foreground_session_id);
+        self.publish_conversation_event(json!({
+            "type": "conversation_upserted",
+            "conversation": self.conversation_summary(&metadata)?,
+        }));
+        Ok(HttpResponse::json(
+            200,
+            json!({"foreground_session": session}),
+        ))
+    }
+
+    fn delete_foreground_session(
+        &self,
+        conversation_id: &str,
+        foreground_session_id: &str,
+    ) -> HttpResult {
+        if foreground_session_id == "main" {
+            return Err(HttpError::new(
+                400,
+                "main foreground session cannot be deleted",
+            ));
+        }
+        self.conversation_runtime
+            .send_main_channel_ingress(
+                conversation_id,
+                ChannelIngress::DeleteForegroundSession {
+                    foreground_session_id: Some(foreground_session_id.to_string()),
+                    reason: Some("web deleted foreground session".to_string()),
+                },
+            )
+            .map_err(HttpError::internal)?;
+        let metadata = self.set_session_nickname(conversation_id, foreground_session_id, None)?;
+        self.publish_conversation_event(json!({
+            "type": "conversation_upserted",
+            "conversation": self.conversation_summary(&metadata)?,
+        }));
+        Ok(HttpResponse::json(
+            200,
+            json!({
+                "conversation_id": conversation_id,
+                "foreground_session_id": foreground_session_id,
+                "deleted": true,
+            }),
+        ))
+    }
+
+    fn list_messages(
+        &self,
+        conversation_id: &str,
+        foreground_session_id: &str,
+        query: &HashMap<String, String>,
+    ) -> HttpResult {
+        let offset = query_usize(query, "offset", 0);
+        let limit = query_usize(query, "limit", 80).min(200);
+        let messages = read_messages(&message_log_path(
+            &self.workdir,
+            conversation_id,
+            foreground_session_id,
+        ))?;
+        let total = messages.len();
+        let start = offset.min(total);
+        let end = start.saturating_add(limit).min(total);
+        Ok(HttpResponse::json(
+            200,
+            json!({
+                "conversation_id": conversation_id,
+                "foreground_session_id": foreground_session_id,
+                "offset": offset,
+                "limit": limit,
+                "total": total,
+                "messages": &messages[start..end],
+            }),
+        ))
+    }
+
+    fn post_message(
+        &self,
+        conversation_id: &str,
+        foreground_session_id: &str,
+        body: &[u8],
+    ) -> HttpResult {
+        let request: PostMessageRequest = parse_json(body)?;
+        let mut items = Vec::new();
+        if let Some(text) = request.text.filter(|text| !text.trim().is_empty()) {
+            items.push(ChatMessageItem::Context(ContextItem { text }));
+        }
+        for selection in request.selection_references {
+            items.push(ChatMessageItem::SelectionReference(selection));
+        }
+        for file in request.files {
+            items.push(ChatMessageItem::File(file));
+        }
+        if items.is_empty() {
+            return Err(HttpError::new(400, "message body is empty"));
+        }
+        let message = ChatMessage::new(ChatRole::User, items)
+            .with_user_name_option(request.user_name)
+            .with_message_time(now_rfc3339());
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)
+            .map_err(HttpError::internal)?;
+        self.conversation_runtime
+            .send_main_channel_ingress(
+                conversation_id,
+                ChannelIngress::IncomingMessage {
+                    foreground_session_id: Some(foreground_session_id.to_string()),
+                    platform_message_id: Some(message.message_id.clone()),
+                    origin: Some(AgentMessageOrigin::User),
+                    message,
+                    metadata: json!({ "source": "web" }),
+                },
+            )
+            .map_err(HttpError::internal)?;
+        Ok(HttpResponse::json(
+            202,
+            json!({
+                "accepted": true,
+                "conversation_id": conversation_id,
+                "foreground_session_id": foreground_session_id,
+            }),
+        ))
+    }
+
+    fn status_snapshot(&self, conversation_id: &str) -> HttpResult {
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)
+            .map_err(HttpError::internal)?;
+        let request_id = generated_request_id("status");
+        let rx = self
+            .conversation_runtime
+            .send_main_channel_ingress_subscribed(
+                conversation_id,
+                ChannelIngress::Status {
+                    request_id: request_id.clone(),
+                    request: crate::service_protos::status::StatusRequest::Snapshot,
+                },
+            )
+            .map_err(HttpError::internal)?;
+        let response = wait_for_event(&rx, Duration::from_secs(10), |event| match event {
+            KernelChannelEvent::StatusSnapshot {
+                request_id: id,
+                response,
+            } if id == request_id => Some(serde_json::to_value(response).ok()?),
+            _ => None,
+        })?;
+        Ok(HttpResponse::json(200, response))
+    }
+
+    fn set_session_nickname(
+        &self,
+        conversation_id: &str,
+        foreground_session_id: &str,
+        nickname: Option<String>,
+    ) -> HttpResult<ConversationMetadata> {
+        let store = ConversationMetadataStore::new(&self.workdir);
+        let mut metadata = store.load(conversation_id).map_err(HttpError::internal)?;
+        let storage_id = foreground_session_storage_id(foreground_session_id);
+        match nickname {
+            Some(nickname) if !nickname.trim().is_empty() => {
+                metadata.session_nicknames.insert(storage_id, nickname);
+            }
+            _ => {
+                metadata.session_nicknames.remove(&storage_id);
+            }
+        }
+        store.persist(&metadata).map_err(HttpError::internal)?;
+        Ok(metadata)
+    }
+
+    fn conversation_summaries(&self) -> HttpResult<Vec<Value>> {
+        let store = ConversationMetadataStore::new(&self.workdir);
+        let mut summaries = Vec::new();
+        for conversation_id in self.conversation_runtime.conversation_ids() {
+            let Ok(metadata) = store.load(&conversation_id) else {
+                continue;
+            };
+            summaries.push(self.conversation_summary(&metadata)?);
+        }
+        Ok(summaries)
+    }
+
+    fn conversation_summary(&self, metadata: &ConversationMetadata) -> HttpResult<Value> {
+        let default_session_id = default_foreground_route_id(metadata);
+        let summary = message_summary(&message_log_path(
+            &self.workdir,
+            &metadata.conversation_id,
+            &default_session_id,
+        ));
+        let processing_state = self
+            .processing_states
+            .lock()
+            .ok()
+            .and_then(|states| states.get(&metadata.platform_chat_id).copied())
+            .unwrap_or(ProcessingState::Idle);
+        let runtime_config = load_runtime_config(&self.workdir, &metadata.conversation_id).ok();
+        Ok(json!({
+            "conversation_id": metadata.conversation_id,
+            "nickname": if metadata.nickname.trim().is_empty() { &metadata.conversation_id } else { &metadata.nickname },
+            "platform_chat_id": metadata.platform_chat_id,
+            "foreground_session_id": metadata.foreground_session_id,
+            "model": conversation_model_label(runtime_config.as_ref(), &self.config),
+            "reasoning": runtime_config.as_ref().and_then(|config| config.reasoning_effort.as_deref()).unwrap_or("model default"),
+            "sandbox": runtime_config.as_ref().and_then(|config| config.sandbox.as_ref()).map(|sandbox| format!("{:?}", sandbox.mode)).unwrap_or_else(|| "default".to_string()),
+            "remote": runtime_config.as_ref().map(|config| format!("{:?}", config.tool_remote_mode)).unwrap_or_else(|| "selectable".to_string()),
+            "workspace": WorkdirLayout::new(&self.workdir).conversation_root(&metadata.conversation_id).display().to_string(),
+            "processing_state": processing_state_name(processing_state),
+            "running": processing_state != ProcessingState::Idle,
+            "message_count": summary.message_count,
+            "last_message_id": summary.last_message_id,
+            "last_message_time": summary.last_message_time,
+            "foreground_sessions": self.foreground_session_summaries(metadata),
+        }))
+    }
+
+    fn foreground_session_summaries(&self, metadata: &ConversationMetadata) -> Vec<Value> {
+        let mut ids = metadata
+            .session_nicknames
+            .keys()
+            .filter_map(|storage| foreground_route_id_from_storage_id(storage))
+            .collect::<Vec<_>>();
+        let default_id = default_foreground_route_id(metadata);
+        if !ids.iter().any(|id| id == &default_id) {
+            ids.push(default_id);
+        }
+        ids.sort();
+        ids.dedup();
+        ids.into_iter()
+            .map(|id| self.foreground_session_summary(metadata, &id))
+            .collect()
+    }
+
+    fn foreground_session_summary(
+        &self,
+        metadata: &ConversationMetadata,
+        foreground_session_id: &str,
+    ) -> Value {
+        let storage_id = foreground_session_storage_id(foreground_session_id);
+        let summary = message_summary(&message_log_path(
+            &self.workdir,
+            &metadata.conversation_id,
+            foreground_session_id,
+        ));
+        let seen = self.seen_states.lock().ok().and_then(|states| {
+            states
+                .get(&conversation_seen_key(
+                    &metadata.conversation_id,
+                    foreground_session_id,
+                ))
+                .cloned()
+        });
+        json!({
+            "id": foreground_session_id,
+            "session_id": storage_id,
+            "nickname": metadata.session_nicknames.get(&storage_id).cloned().unwrap_or_else(|| {
+                if foreground_session_id == "main" {
+                    if metadata.nickname.trim().is_empty() { metadata.conversation_id.clone() } else { metadata.nickname.clone() }
+                } else {
+                    foreground_session_id.to_string()
+                }
+            }),
+            "is_main": foreground_session_id == "main",
+            "message_count": summary.message_count,
+            "last_message_id": summary.last_message_id,
+            "last_message_time": summary.last_message_time,
+            "last_seen_message_id": seen.as_ref().map(|seen| seen.last_seen_message_id.clone()),
+            "last_seen_at": seen.map(|seen| seen.updated_at),
+        })
+    }
+
+    fn accept_conversation_stream(
+        &self,
+        mut stream: TcpStream,
+        request: &HttpRequest,
+    ) -> Result<()> {
+        accept_websocket(&mut stream, request)?;
+        let (tx, rx) = unbounded();
+        self.conversation_stream_subscribers
+            .lock()
+            .map_err(|_| anyhow!("conversation stream subscriber lock poisoned"))?
+            .push(tx);
+        send_websocket_json(
+            &mut stream,
+            &json!({
+                "type": "conversation_snapshot",
+                "conversations": self.conversation_summaries().unwrap_or_default(),
+            }),
+        )?;
+        websocket_event_loop(stream, rx)
+    }
+
+    fn accept_session_stream(
+        &self,
+        mut stream: TcpStream,
+        request: &HttpRequest,
+        conversation_id: &str,
+        foreground_session_id: &str,
+    ) -> Result<()> {
+        accept_websocket(&mut stream, request)?;
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)?;
+        let (tx, rx) = unbounded();
+        self.websocket_subscribers
+            .lock()
+            .map_err(|_| anyhow!("websocket subscriber lock poisoned"))?
+            .entry(websocket_key(conversation_id, foreground_session_id))
+            .or_default()
+            .push(tx);
+        let messages = read_messages(&message_log_path(
+            &self.workdir,
+            conversation_id,
+            foreground_session_id,
+        ))
+        .unwrap_or_default();
+        send_websocket_json(
+            &mut stream,
+            &json!({
+                "type": "subscription_ack",
+                "conversation_id": conversation_id,
+                "foreground_session_id": foreground_session_id,
+                "total": messages.len(),
+                "next_message_index": messages.len(),
+            }),
+        )?;
+        websocket_event_loop(stream, rx)
+    }
+
+    fn publish_websocket_event(&self, conversation_id: &str, session_id: &str, payload: Value) {
+        let key = websocket_key(
+            conversation_id,
+            &foreground_route_id_from_storage_id(session_id)
+                .unwrap_or_else(|| session_id.to_string()),
+        );
+        let Ok(mut subscribers) = self.websocket_subscribers.lock() else {
+            return;
+        };
+        if let Some(list) = subscribers.get_mut(&key) {
+            list.retain(|sender| sender.send(payload.clone()).is_ok());
+        }
+    }
+
+    fn publish_conversation_event(&self, payload: Value) {
+        let Ok(mut subscribers) = self.conversation_stream_subscribers.lock() else {
+            return;
+        };
+        subscribers.retain(|sender| sender.send(payload.clone()).is_ok());
+    }
+
+    fn authorized(&self, request: &HttpRequest) -> bool {
+        request.headers.get("authorization").is_some_and(|value| {
+            value == &self.token
+                || value
+                    .strip_prefix("Bearer ")
+                    .is_some_and(|token| token == self.token)
+        }) || request
+            .query
+            .get("token")
+            .is_some_and(|token| token == &self.token)
+    }
+}
+
+impl Channel for WebChannel {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn send_delivery(&self, delivery: &OutgoingDelivery) -> Result<()> {
+        if delivery.message.is_none() && !delivery.text.trim().is_empty() {
+            self.publish_websocket_event(
+                &delivery.conversation_id,
+                delivery.session_id.as_deref().unwrap_or("main"),
+                json!({
+                    "type": "delivery",
+                    "text": delivery.text,
+                    "conversation_id": delivery.conversation_id,
+                    "session_id": delivery.session_id,
+                }),
+            );
+        }
+        Ok(())
+    }
+
+    fn message_appended(&self, appended: &OutgoingMessageAppended) -> Result<()> {
+        let message = decorate_message(&appended.message, appended.index);
+        self.publish_websocket_event(
+            &appended.conversation_id,
+            &appended.session_id,
+            json!({
+                "type": "messages",
+                "conversation_id": appended.conversation_id,
+                "session_id": appended.session_id,
+                "messages": [message],
+            }),
+        );
+        if let Ok(metadata) =
+            ConversationMetadataStore::new(&self.workdir).load(&appended.conversation_id)
+        {
+            if let Ok(summary) = self.conversation_summary(&metadata) {
+                self.publish_conversation_event(json!({
+                    "type": "conversation_upserted",
+                    "conversation": summary,
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    fn session_stream(&self, stream: &OutgoingSessionStream) -> Result<()> {
+        self.publish_websocket_event(
+            &stream.conversation_id,
+            &stream.session_id,
+            json!({
+                "type": "session_stream",
+                "conversation_id": stream.conversation_id,
+                "session_id": stream.session_id,
+                "event": stream.event,
+            }),
+        );
+        Ok(())
+    }
+
+    fn set_processing(&self, platform_chat_id: &str, state: ProcessingState) -> Result<()> {
+        if let Ok(mut states) = self.processing_states.lock() {
+            states.insert(platform_chat_id.to_string(), state);
+        }
+        Ok(())
+    }
+
+    fn send_error(&self, error: &OutgoingError) -> Result<()> {
+        self.publish_websocket_event(
+            &error.conversation_id,
+            "main",
+            json!({
+                "type": "error",
+                "code": error.code,
+                "message": error.message,
+                "detail": error.detail,
+                "can_continue": error.can_continue,
+            }),
+        );
+        Ok(())
+    }
+
+    fn spawn_ingress(
+        self: Arc<Self>,
+        _dispatch_tx: Sender<IncomingDispatch>,
+        id_manager: Arc<Mutex<ConversationIdManager>>,
+        logger: Arc<StellaclawLogger>,
+    ) where
+        Self: Sized,
+    {
+        thread::spawn(move || {
+            let listener = match TcpListener::bind(&self.bind_addr) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    logger.error(
+                        "web_channel_bind_failed",
+                        json!({"channel_id": self.id, "bind_addr": self.bind_addr, "error": error.to_string()}),
+                    );
+                    return;
+                }
+            };
+            logger.info(
+                "web_channel_listening",
+                json!({"channel_id": self.id, "bind_addr": self.bind_addr}),
+            );
+            for incoming in listener.incoming() {
+                let Ok(stream) = incoming else {
+                    continue;
+                };
+                let channel = self.clone();
+                let id_manager = id_manager.clone();
+                thread::spawn(move || {
+                    if let Err(error) = handle_connection(channel, stream, id_manager) {
+                        eprintln!("stellaclaw web request failed: {error:#}");
+                    }
+                });
+            }
+        });
+    }
+}
+
+fn handle_connection(
+    channel: Arc<WebChannel>,
+    mut stream: TcpStream,
+    id_manager: Arc<Mutex<ConversationIdManager>>,
+) -> Result<()> {
+    let request = read_http_request(&mut stream)?;
+    if request.is_websocket() {
+        return channel.handle_websocket(stream, request);
+    }
+    let response = match channel.handle_request(request, id_manager) {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    };
+    write_response(&mut stream, &response)
+}
+
+#[derive(Debug)]
+struct HttpRequest {
+    method: String,
+    path: String,
+    query: HashMap<String, String>,
+    headers: HashMap<String, String>,
+    body: Vec<u8>,
+}
+
+impl HttpRequest {
+    fn is_websocket(&self) -> bool {
+        self.headers
+            .get("upgrade")
+            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
+    }
+}
+
+#[derive(Debug)]
+struct HttpResponse {
+    status: u16,
+    content_type: String,
+    body: Vec<u8>,
+}
+
+impl HttpResponse {
+    fn json(status: u16, value: Value) -> Self {
+        Self {
+            status,
+            content_type: "application/json; charset=utf-8".to_string(),
+            body: serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec()),
+        }
+    }
+
+    fn empty(status: u16) -> Self {
+        Self {
+            status,
+            content_type: "text/plain; charset=utf-8".to_string(),
+            body: Vec::new(),
+        }
+    }
+}
+
+type HttpResult<T = HttpResponse> = Result<T, HttpError>;
+
+#[derive(Debug)]
+struct HttpError {
+    status: u16,
+    message: String,
+}
+
+impl HttpError {
+    fn new(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn internal(error: impl std::fmt::Display) -> Self {
+        Self::new(500, error.to_string())
+    }
+
+    fn upgrade_required() -> Self {
+        Self::new(426, "upgrade_required")
+    }
+
+    fn into_response(self) -> HttpResponse {
+        HttpResponse::json(self.status, json!({"error": self.message}))
+    }
+}
+
+fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let target = parts.next().unwrap_or("/").to_string();
+    let (path, query) = parse_target(&target);
+    let mut headers = HashMap::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = trimmed.split_once(':') {
+            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+        }
+    }
+    let content_length = headers
+        .get("content-length")
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(0)
+        .min(MAX_HTTP_BODY_BYTES);
+    let mut body = vec![0; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body)?;
+    }
+    Ok(HttpRequest {
+        method,
+        path,
+        query,
+        headers,
+        body,
+    })
+}
+
+fn write_response(stream: &mut TcpStream, response: &HttpResponse) -> Result<()> {
+    write!(
+        stream,
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS\r\nConnection: close\r\n\r\n",
+        response.status,
+        reason_phrase(response.status),
+        response.content_type,
+        response.body.len()
+    )?;
+    stream.write_all(&response.body)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn accept_websocket(stream: &mut TcpStream, request: &HttpRequest) -> Result<()> {
+    let key = request
+        .headers
+        .get("sec-websocket-key")
+        .ok_or_else(|| anyhow!("missing websocket key"))?;
+    let mut hasher = Sha1::new();
+    hasher.update(key.as_bytes());
+    hasher.update(WEBSOCKET_GUID.as_bytes());
+    let accept = general_purpose::STANDARD.encode(hasher.finalize());
+    write!(
+        stream,
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+    )?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn websocket_event_loop(mut stream: TcpStream, rx: Receiver<Value>) -> Result<()> {
+    loop {
+        match rx.recv_timeout(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)) {
+            Ok(value) => send_websocket_json(&mut stream, &value)?,
+            Err(RecvTimeoutError::Timeout) => {
+                send_websocket_json(
+                    &mut stream,
+                    &json!({"type": "heartbeat", "server_time": now_rfc3339()}),
+                )?;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Ok(())
+}
+
+fn send_websocket_json(stream: &mut TcpStream, value: &Value) -> Result<()> {
+    let payload = serde_json::to_vec(value)?;
+    if payload.len() > WEBSOCKET_MAX_FRAME_BYTES {
+        return Ok(());
+    }
+    let mut frame = Vec::with_capacity(payload.len() + 10);
+    frame.push(0x81);
+    if payload.len() < 126 {
+        frame.push(payload.len() as u8);
+    } else if payload.len() <= u16::MAX as usize {
+        frame.push(126);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    } else {
+        frame.push(127);
+        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+    }
+    frame.extend_from_slice(&payload);
+    stream.write_all(&frame)?;
+    stream.flush()?;
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct WebSeenState {
+    #[serde(default)]
+    seen: HashMap<String, ConversationSeen>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ConversationSeen {
+    last_seen_message_id: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CreateConversationRequest {
+    nickname: Option<String>,
+    platform_chat_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct CreateForegroundSessionRequest {
+    session_id: Option<String>,
+    nickname: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RenameRequest {
+    nickname: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MarkSeenRequest {
+    last_seen_message_id: String,
+    foreground_session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PostMessageRequest {
+    text: Option<String>,
+    user_name: Option<String>,
+    #[serde(default)]
+    selection_references: Vec<SelectionReferenceItem>,
+    #[serde(default)]
+    files: Vec<FileItem>,
+}
+
+#[derive(Debug, Default)]
+struct MessageSummary {
+    message_count: usize,
+    last_message_id: Option<String>,
+    last_message_time: Option<String>,
+}
+
+fn read_messages(path: &Path) -> HttpResult<Vec<Value>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(path).map_err(HttpError::internal)?;
+    let reader = BufReader::new(file);
+    let mut messages = Vec::new();
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.map_err(HttpError::internal)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let message: ChatMessage = serde_json::from_str(&line).map_err(HttpError::internal)?;
+        messages.push(decorate_message(&message, index));
+    }
+    Ok(messages)
+}
+
+fn decorate_message(message: &ChatMessage, index: usize) -> Value {
+    let mut value = serde_json::to_value(message).unwrap_or_else(|_| json!({}));
+    if let Value::Object(map) = &mut value {
+        map.insert("index".to_string(), json!(index));
+        if !message.message_id.is_empty() {
+            map.insert("id".to_string(), json!(message.message_id));
+        }
+    }
+    value
+}
+
+fn message_summary(path: &Path) -> MessageSummary {
+    let Ok(messages) = read_messages(path) else {
+        return MessageSummary::default();
+    };
+    let mut summary = MessageSummary {
+        message_count: messages.len(),
+        ..MessageSummary::default()
+    };
+    if let Some(last) = messages.last() {
+        summary.last_message_id = last
+            .get("message_id")
+            .or_else(|| last.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        summary.last_message_time = last
+            .get("message_time")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
+    summary
+}
+
+fn wait_agent_session_created(rx: &Receiver<KernelChannelEvent>) -> HttpResult<String> {
+    wait_for_event(rx, Duration::from_secs(10), |event| match event {
+        KernelChannelEvent::AgentSessionCreated { addr } => {
+            Some(service_addr_storage_component(&addr))
+        }
+        _ => None,
+    })
+}
+
+fn wait_for_event<T>(
+    rx: &Receiver<KernelChannelEvent>,
+    timeout: Duration,
+    mut matcher: impl FnMut(KernelChannelEvent) -> Option<T>,
+) -> HttpResult<T> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(HttpError::new(504, "request timed out"));
+        }
+        match rx.recv_timeout(deadline.saturating_duration_since(now)) {
+            Ok(event) => {
+                if let Some(value) = matcher(event) {
+                    return Ok(value);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => return Err(HttpError::new(504, "request timed out")),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(HttpError::new(503, "conversation event stream closed"));
+            }
+        }
+    }
+}
+
+fn load_seen_state(workdir: &Path, channel_id: &str) -> Result<WebSeenState> {
+    let path = seen_state_path(workdir, channel_id);
+    if !path.exists() {
+        return Ok(WebSeenState::default());
+    }
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn persist_seen_state(workdir: &Path, channel_id: &str, state: &WebSeenState) -> Result<()> {
+    let path = seen_state_path(workdir, channel_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    fs::write(&path, serde_json::to_string_pretty(state)?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn seen_state_path(workdir: &Path, channel_id: &str) -> PathBuf {
+    workdir
+        .join(".stellaclaw")
+        .join("web")
+        .join(channel_id)
+        .join(SEEN_STATE_FILE)
+}
+
+fn load_runtime_config(workdir: &Path, conversation_id: &str) -> Result<ConversationRuntimeConfig> {
+    let path = WorkdirLayout::new(workdir)
+        .conversation_service_root(conversation_id)
+        .join("runtime_config.json");
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn conversation_model_label(
+    runtime_config: Option<&ConversationRuntimeConfig>,
+    config: &StellaclawConfig,
+) -> String {
+    runtime_config
+        .and_then(|runtime_config| runtime_config.session_profile.as_ref())
+        .or(config.default_profile.as_ref())
+        .map(|profile| profile.main_model.display_name(&config.models))
+        .or_else(|| config.initial_main_model_name())
+        .unwrap_or_else(|| "unconfigured".to_string())
+}
+
+fn service_addr_storage_component(addr: &ServiceAddr) -> String {
+    let scope = match &addr.scope {
+        ServiceScope::Local => "local".to_string(),
+        ServiceScope::Conversation(conversation_id) => format!("conversation_{conversation_id}"),
+    };
+    format!("{scope}__{}", addr.path.join("__"))
+}
+
+fn message_log_path(workdir: &Path, conversation_id: &str, foreground_session_id: &str) -> PathBuf {
+    WorkdirLayout::new(workdir)
+        .conversation_root(conversation_id)
+        .join(".stellaclaw")
+        .join("log")
+        .join(sanitize_session_id_for_log_path(
+            &foreground_session_storage_id(foreground_session_id),
+        ))
+        .join("all_messages.jsonl")
+}
+
+fn split_path(path: &str) -> Vec<&str> {
+    path.trim_start_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn parse_target(target: &str) -> (String, HashMap<String, String>) {
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    (path.to_string(), parse_query(query))
+}
+
+fn parse_query(query: &str) -> HashMap<String, String> {
+    query
+        .split('&')
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| {
+            let (key, value) = part.split_once('=').unwrap_or((part, ""));
+            Some((
+                percent_decode(key)?,
+                percent_decode(value).unwrap_or_default(),
+            ))
+        })
+        .collect()
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
+                out.push(u8::from_str_radix(hex, 16).ok()?);
+                index += 3;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> HttpResult<T> {
+    serde_json::from_slice(body).map_err(|error| HttpError::new(400, error.to_string()))
+}
+
+fn parse_optional_json<T: for<'de> Deserialize<'de> + Default>(body: &[u8]) -> HttpResult<T> {
+    if body.is_empty() {
+        return Ok(T::default());
+    }
+    parse_json(body)
+}
+
+fn query_usize(query: &HashMap<String, String>, key: &str, default: usize) -> usize {
+    query
+        .get(key)
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn foreground_session_storage_id(foreground_session_id: &str) -> String {
+    if foreground_session_id.starts_with("local__agent__foreground__") {
+        foreground_session_id.to_string()
+    } else {
+        format!("local__agent__foreground__{foreground_session_id}")
+    }
+}
+
+fn foreground_route_id_from_storage_id(storage_id: &str) -> Option<String> {
+    storage_id
+        .strip_prefix("local__agent__foreground__")
+        .map(str::to_string)
+}
+
+fn default_foreground_route_id(metadata: &ConversationMetadata) -> String {
+    foreground_route_id_from_storage_id(&metadata.foreground_session_id)
+        .unwrap_or_else(|| "main".to_string())
+}
+
+fn conversation_seen_key(conversation_id: &str, foreground_session_id: &str) -> String {
+    format!(
+        "{conversation_id}:{}",
+        foreground_session_storage_id(foreground_session_id)
+    )
+}
+
+fn websocket_key(conversation_id: &str, foreground_session_id: &str) -> String {
+    format!("{conversation_id}:{foreground_session_id}")
+}
+
+fn sanitize_session_id_for_log_path(session_id: &str) -> String {
+    session_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn processing_state_name(state: ProcessingState) -> &'static str {
+    match state {
+        ProcessingState::Idle => "idle",
+        ProcessingState::Typing => "typing",
+    }
+}
+
+fn now_rfc3339() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
+}
+
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn generated_platform_id() -> String {
+    format!("web-{}", unix_millis())
+}
+
+fn generated_request_id(prefix: &str) -> String {
+    format!("{prefix}-{}", unix_millis())
+}
+
+fn reason_phrase(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        426 => "Upgrade Required",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        504 => "Gateway Timeout",
+        _ => "OK",
+    }
+}

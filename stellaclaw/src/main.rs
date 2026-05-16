@@ -1,4 +1,3 @@
-mod cache;
 mod channels;
 mod config;
 mod conversation_host;

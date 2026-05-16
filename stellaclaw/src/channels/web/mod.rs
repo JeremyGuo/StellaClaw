@@ -1,5 +1,5 @@
-mod legacy;
+mod channel;
 pub mod protocol;
 pub mod state;
 
-pub use legacy::WebChannel;
+pub use channel::WebChannel;
