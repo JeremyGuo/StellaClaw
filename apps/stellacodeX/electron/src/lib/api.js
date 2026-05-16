@@ -206,7 +206,7 @@ export async function terminateTerminal(serverId, conversationId, terminalId) {
 export async function terminalStreamUrl(serverId, conversationId, terminalId, offset = 0) {
   const info = await connectionInfo(serverId);
   const url = new URL(
-    `/api/conversations/${encodeURIComponent(conversationId)}/terminals/${encodeURIComponent(terminalId)}/stream`,
+    `/api/conversations/${encodeURIComponent(conversationId)}/terminals/${encodeURIComponent(terminalId)}/ws`,
     info.baseUrl
   );
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
