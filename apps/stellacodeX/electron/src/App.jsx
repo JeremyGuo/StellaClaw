@@ -572,17 +572,24 @@ function appendStreamAssistantDelta(current, event) {
   if (!id || !delta) return current;
   const turnId = String(event?.turn_id || event?.turnId || '').trim();
   const itemId = String(event?.item_id || event?.itemId || '').trim();
-  const position = current.findIndex((message) => {
-    if (String(message?.id ?? message?.message_id ?? '') === id) return true;
-    return Boolean(turnId)
-      && message?._streaming
-      && String(message?._streamTurnId || '').trim() === turnId
-      && String(message?.role || '').toLowerCase() === 'assistant';
-  });
+  const position = current.findIndex((message) => String(message?.id ?? message?.message_id ?? '') === id);
   const now = new Date().toISOString();
   const fallbackIndex = nextStreamMessageIndex(current);
   const buildMessage = (existing = {}) => {
     const nextText = appendTextDelta(existing.text || existing.preview || '', delta);
+    const items = Array.isArray(existing.items) ? [...existing.items] : [];
+    const textIndex = items.findIndex((item) => item?.type === 'text');
+    const textItem = {
+      type: 'text',
+      index: textIndex >= 0 ? items[textIndex].index : items.length,
+      text: nextText,
+      text_with_attachment_markers: nextText
+    };
+    if (textIndex >= 0) {
+      items[textIndex] = { ...items[textIndex], ...textItem };
+    } else {
+      items.push(textItem);
+    }
     const eventIndex = streamMessageIndexFromEvent(event);
     const existingIndex = Number(existing.index);
     const index = Number.isFinite(eventIndex)
@@ -600,14 +607,7 @@ function appendStreamAssistantDelta(current, event) {
       preview: nextText,
       content: nextText,
       text_with_attachment_markers: nextText,
-      items: [
-        {
-          type: 'text',
-          index: 0,
-          text: nextText,
-          text_with_attachment_markers: nextText
-        }
-      ],
+      items,
       attachments: existing.attachments || [],
       attachment_count: existing.attachment_count || 0,
       message_time: existing.message_time || now,
@@ -630,13 +630,7 @@ function appendStreamToolCallDelta(current, event) {
   const itemId = String(event?.item_id || event?.itemId || '').trim();
   const callId = String(event?.call_id || event?.callId || itemId).trim();
   if (!callId) return current;
-  const position = current.findIndex((message) => {
-    if (String(message?.id ?? message?.message_id ?? '') === id) return true;
-    return Boolean(turnId)
-      && message?._streaming
-      && String(message?._streamTurnId || '').trim() === turnId
-      && String(message?.role || '').toLowerCase() === 'assistant';
-  });
+  const position = current.findIndex((message) => String(message?.id ?? message?.message_id ?? '') === id);
   const now = new Date().toISOString();
   const fallbackIndex = nextStreamMessageIndex(current);
   const buildMessage = (existing = {}) => {
@@ -655,6 +649,71 @@ function appendStreamToolCallDelta(current, event) {
         tool_call_id: callId,
         tool_name: label,
         arguments: delta
+      });
+    }
+    const eventIndex = streamMessageIndexFromEvent(event);
+    const existingIndex = Number(existing.index);
+    const index = Number.isFinite(eventIndex)
+      ? eventIndex
+      : Number.isFinite(existingIndex)
+        ? existingIndex
+        : fallbackIndex;
+    return {
+      ...existing,
+      id,
+      message_id: id,
+      index: Number.isFinite(index) ? index : existing.index,
+      role: 'assistant',
+      text: existing.text || existing.preview || '',
+      preview: existing.preview || existing.text || '',
+      content: existing.content || existing.text || existing.preview || '',
+      text_with_attachment_markers: existing.text_with_attachment_markers || existing.text || existing.preview || '',
+      items,
+      attachments: existing.attachments || [],
+      attachment_count: existing.attachment_count || 0,
+      message_time: existing.message_time || now,
+      _streamTurnId: turnId || existing._streamTurnId || '',
+      _streamItemId: itemId || existing._streamItemId || '',
+      _streaming: true
+    };
+  };
+  if (position < 0) return [...current, buildMessage()];
+  const next = [...current];
+  next[position] = buildMessage(next[position]);
+  return next;
+}
+
+function appendStreamReasoningSummary(current, event) {
+  const id = streamMessageId(event);
+  if (!id) return current;
+  const delta = streamDeltaText(event);
+  const turnId = String(event?.turn_id || event?.turnId || '').trim();
+  const itemId = String(event?.item_id || event?.itemId || '').trim();
+  const summaryIndex = Number(event?.summary_index ?? event?.summaryIndex ?? 0);
+  const position = current.findIndex((message) => String(message?.id ?? message?.message_id ?? '') === id);
+  const now = new Date().toISOString();
+  const fallbackIndex = nextStreamMessageIndex(current);
+  const buildMessage = (existing = {}) => {
+    const items = Array.isArray(existing.items) ? [...existing.items] : [];
+    const reasoningIndex = items.findIndex((item) => (
+      item?.type === 'reasoning'
+      && Number(item?._summaryIndex ?? item?.summary_index ?? item?.summaryIndex ?? 0) === summaryIndex
+    ));
+    if (reasoningIndex >= 0) {
+      const text = appendTextDelta(items[reasoningIndex].text || items[reasoningIndex].summary || '', delta);
+      items[reasoningIndex] = {
+        ...items[reasoningIndex],
+        text,
+        summary: text,
+        _summaryIndex: summaryIndex
+      };
+    } else {
+      items.push({
+        type: 'reasoning',
+        index: items.length,
+        text: delta,
+        summary: delta,
+        _summaryIndex: summaryIndex
       });
     }
     const eventIndex = streamMessageIndexFromEvent(event);
@@ -1993,6 +2052,11 @@ function App() {
         const summaryIndex = event?.summary_index ?? event?.summaryIndex ?? 0;
         const bufferKey = `${key}:reasoning:${messageId}:${summaryIndex}`;
         const text = appendStreamBuffer(bufferKey, streamDeltaText(event));
+        setMessages((current) => {
+          const next = appendStreamReasoningSummary(current, event);
+          messagesRef.current = next;
+          return next;
+        });
         setSessionActivity('思考中');
         updateRunningActivities((current) => [
           ...current.filter((item) => item.id !== `stream-reasoning-${messageId}` && item.id !== 'thinking'),

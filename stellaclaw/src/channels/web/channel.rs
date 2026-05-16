@@ -13,7 +13,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sha1::{Digest, Sha1};
 use stellaclaw_core::session_actor::{
     ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, SelectionReferenceItem,
@@ -1536,8 +1536,11 @@ impl WebChannel {
             "stream_tool_call_delta" => {
                 state.apply_tool_call_delta(&stream.event);
             }
-            "stream_reasoning_summary_part_added" | "stream_reasoning_summary_delta" => {
-                state.set_turn_from_event(&stream.event);
+            "stream_reasoning_summary_part_added" => {
+                state.apply_reasoning_summary_part(&stream.event);
+            }
+            "stream_reasoning_summary_delta" => {
+                state.apply_reasoning_summary_delta(&stream.event);
             }
             "stream_tool_result_done" => {
                 state.apply_tool_result_done(&stream.event);
@@ -2047,6 +2050,68 @@ impl ChatLiveState {
         }));
     }
 
+    fn ensure_provisional_message(
+        &mut self,
+        message_id: &str,
+        turn_id: &str,
+        message_index: Option<u64>,
+    ) -> Option<&mut Map<String, Value>> {
+        let needs_new = self
+            .current_provisional_assistant_message
+            .as_ref()
+            .and_then(|provisional| provisional.get("message_id"))
+            .and_then(Value::as_str)
+            .is_none_or(|id| id != message_id);
+        if needs_new {
+            self.current_provisional_assistant_message = Some(json!({
+                "turn_id": turn_id,
+                "message_id": message_id,
+                "message": {
+                    "id": message_id,
+                    "message_id": message_id,
+                    "index": message_index,
+                    "role": "assistant",
+                    "text": "",
+                    "preview": "",
+                    "content": "",
+                    "text_with_attachment_markers": "",
+                    "items": [],
+                    "attachments": [],
+                    "attachment_count": 0,
+                    "message_time": now_rfc3339(),
+                    "_streamTurnId": turn_id,
+                    "_streaming": true,
+                },
+            }));
+        }
+        let provisional = self
+            .current_provisional_assistant_message
+            .as_mut()?
+            .as_object_mut()?;
+        provisional.insert("turn_id".to_string(), json!(turn_id));
+        provisional.insert("message_id".to_string(), json!(message_id));
+        let message = provisional.get_mut("message")?.as_object_mut()?;
+        message.insert("id".to_string(), json!(message_id));
+        message.insert("message_id".to_string(), json!(message_id));
+        message.insert("role".to_string(), json!("assistant"));
+        message.insert("_streamTurnId".to_string(), json!(turn_id));
+        message.insert("_streaming".to_string(), json!(true));
+        if let Some(message_index) = message_index {
+            message.insert("index".to_string(), json!(message_index));
+        }
+        if !message.get("items").is_some_and(Value::is_array) {
+            message.insert("items".to_string(), json!([]));
+        }
+        Some(message)
+    }
+
+    fn message_items_mut(message: &mut Map<String, Value>) -> Option<&mut Vec<Value>> {
+        if !message.get("items").is_some_and(Value::is_array) {
+            message.insert("items".to_string(), json!([]));
+        }
+        message.get_mut("items").and_then(Value::as_array_mut)
+    }
+
     fn apply_assistant_delta(&mut self, event: &Value) {
         self.set_turn_from_event(event);
         let Some(message_id) = event.get("message_id").and_then(Value::as_str) else {
@@ -2063,40 +2128,39 @@ impl ChatLiveState {
             .get("turn_id")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let existing_text = self
-            .current_provisional_assistant_message
-            .as_ref()
-            .and_then(|provisional| provisional.get("message"))
-            .and_then(|message| message.get("text").or_else(|| message.get("preview")))
+        let message_index = event.get("message_index").and_then(Value::as_u64);
+        let Some(message) = self.ensure_provisional_message(message_id, turn_id, message_index)
+        else {
+            return;
+        };
+        let existing_text = message
+            .get("text")
+            .or_else(|| message.get("preview"))
             .and_then(Value::as_str)
             .unwrap_or_default();
         let text = append_text_delta(existing_text, delta);
-        let message_index = event.get("message_index").and_then(Value::as_u64);
-        self.current_provisional_assistant_message = Some(json!({
-            "turn_id": turn_id,
-            "message_id": message_id,
-            "message": {
-                "id": message_id,
-                "message_id": message_id,
-                "index": message_index,
-                "role": "assistant",
-                "text": text,
-                "preview": text,
-                "content": text,
-                "text_with_attachment_markers": text,
-                "items": [{
+        message.insert("text".to_string(), json!(text));
+        message.insert("preview".to_string(), json!(text));
+        message.insert("content".to_string(), json!(text));
+        message.insert("text_with_attachment_markers".to_string(), json!(text));
+        if let Some(items) = Self::message_items_mut(message) {
+            if let Some(item) = items
+                .iter_mut()
+                .find(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+            {
+                if let Value::Object(map) = item {
+                    map.insert("text".to_string(), json!(text));
+                    map.insert("text_with_attachment_markers".to_string(), json!(text));
+                }
+            } else {
+                items.push(json!({
                     "type": "text",
-                    "index": 0,
+                    "index": items.len(),
                     "text": text,
                     "text_with_attachment_markers": text,
-                }],
-                "attachments": [],
-                "attachment_count": 0,
-                "message_time": now_rfc3339(),
-                "_streamTurnId": turn_id,
-                "_streaming": true,
-            },
-        }));
+                }));
+            }
+        }
     }
 
     fn apply_tool_call_delta(&mut self, event: &Value) {
@@ -2124,68 +2188,123 @@ impl ChatLiveState {
             .get("turn_id")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let mut provisional = self
+        let message_index = event.get("message_index").and_then(Value::as_u64);
+        let Some(message) = self.ensure_provisional_message(message_id, turn_id, message_index)
+        else {
+            return;
+        };
+        if let Some(items) = Self::message_items_mut(message) {
+            let next_index = items.len();
+            if let Some(item) = items.iter_mut().find(|item| {
+                item.get("type").and_then(Value::as_str) == Some("tool_call")
+                    && item
+                        .get("tool_call_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id == call_id)
+            }) {
+                if let Value::Object(map) = item {
+                    let existing = map
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    map.insert(
+                        "arguments".to_string(),
+                        json!(append_text_delta(existing, delta)),
+                    );
+                }
+            } else {
+                items.push(json!({
+                    "type": "tool_call",
+                    "index": next_index,
+                    "tool_call_id": call_id,
+                    "tool_name": item_id_if_readable(item_id).unwrap_or("tool"),
+                    "arguments": delta,
+                }));
+            }
+        }
+    }
+
+    fn apply_reasoning_summary_part(&mut self, event: &Value) {
+        self.set_turn_from_event(event);
+    }
+
+    fn apply_reasoning_summary_delta(&mut self, event: &Value) {
+        self.set_turn_from_event(event);
+        let Some(message_id) = event.get("message_id").and_then(Value::as_str) else {
+            return;
+        };
+        let turn_id = event
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let summary_index = event
+            .get("summary_index")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        let delta = event
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if delta.is_empty() {
+            return;
+        }
+        let message_index = event.get("message_index").and_then(Value::as_u64);
+        let Some(message) = self.ensure_provisional_message(message_id, turn_id, message_index)
+        else {
+            return;
+        };
+        let Some(items) = Self::message_items_mut(message) else {
+            return;
+        };
+        if !items.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("reasoning")
+                && item
+                    .get("_summaryIndex")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|index| index == summary_index)
+        }) {
+            items.push(json!({
+                "type": "reasoning",
+                "index": items.len(),
+                "text": "",
+                "summary": "",
+                "_summaryIndex": summary_index,
+            }));
+        }
+        let Some(message) = self
             .current_provisional_assistant_message
-            .take()
-            .unwrap_or_else(|| {
-                json!({
-                    "turn_id": turn_id,
-                    "message_id": message_id,
-                    "message": {
-                        "id": message_id,
-                        "message_id": message_id,
-                        "role": "assistant",
-                        "text": "",
-                        "preview": "",
-                        "content": "",
-                        "text_with_attachment_markers": "",
-                        "items": [],
-                        "attachments": [],
-                        "attachment_count": 0,
-                        "message_time": now_rfc3339(),
-                        "_streamTurnId": turn_id,
-                        "_streaming": true,
-                    },
-                })
-            });
-        if let Some(message) = provisional
-            .get_mut("message")
+            .as_mut()
+            .filter(|provisional| {
+                provisional
+                    .get("message_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id == message_id)
+            })
+            .and_then(|provisional| provisional.get_mut("message"))
             .and_then(Value::as_object_mut)
-        {
-            let items = message
-                .entry("items".to_string())
-                .or_insert_with(|| json!([]));
-            if let Some(items) = items.as_array_mut() {
-                let next_index = items.len();
-                if let Some(item) = items.iter_mut().find(|item| {
-                    item.get("type").and_then(Value::as_str) == Some("tool_call")
-                        && item
-                            .get("tool_call_id")
-                            .and_then(Value::as_str)
-                            .is_some_and(|id| id == call_id)
-                }) {
-                    if let Value::Object(map) = item {
-                        let existing = map
-                            .get("arguments")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        map.insert(
-                            "arguments".to_string(),
-                            json!(append_text_delta(existing, delta)),
-                        );
-                    }
-                } else {
-                    items.push(json!({
-                        "type": "tool_call",
-                        "index": next_index,
-                        "tool_call_id": call_id,
-                        "tool_name": item_id_if_readable(item_id).unwrap_or("tool"),
-                        "arguments": delta,
-                    }));
+        else {
+            return;
+        };
+        if let Some(items) = Self::message_items_mut(message) {
+            if let Some(item) = items.iter_mut().find(|item| {
+                item.get("type").and_then(Value::as_str) == Some("reasoning")
+                    && item
+                        .get("_summaryIndex")
+                        .and_then(Value::as_i64)
+                        .is_some_and(|index| index == summary_index)
+            }) {
+                if let Value::Object(map) = item {
+                    let existing = map
+                        .get("text")
+                        .or_else(|| map.get("summary"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let text = append_text_delta(existing, delta);
+                    map.insert("text".to_string(), json!(text));
+                    map.insert("summary".to_string(), json!(text));
                 }
             }
         }
-        self.current_provisional_assistant_message = Some(provisional);
     }
 
     fn apply_tool_result_done(&mut self, event: &Value) {
