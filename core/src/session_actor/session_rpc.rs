@@ -12,7 +12,7 @@ use crate::model_config::ModelConfig;
 
 use super::{
     ChatMessage, ConversationBridge, ConversationBridgeRequest, ConversationBridgeResponse,
-    ToolBatchError,
+    ToolBatchError, ToolResultItem,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -231,6 +231,11 @@ pub enum SessionEvent {
         message_index: Option<usize>,
         error: String,
         error_detail: SessionErrorDetail,
+    },
+    StreamToolResultDone {
+        turn_id: String,
+        batch_id: String,
+        tool_result: ToolResultItem,
     },
     TurnCompleted {
         message: ChatMessage,

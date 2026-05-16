@@ -495,7 +495,8 @@ fn project_channel_event(
             | AgentSessionEvent::StreamToolCallDelta { .. }
             | AgentSessionEvent::StreamReasoningSummaryDelta { .. }
             | AgentSessionEvent::StreamReasoningSummaryPartAdded { .. }
-            | AgentSessionEvent::StreamError { .. }) => {
+            | AgentSessionEvent::StreamError { .. }
+            | AgentSessionEvent::StreamToolResultDone { .. }) => {
                 events.push(ChannelEvent::SessionStream(OutgoingSessionStream {
                     channel_id: metadata.channel_id.clone(),
                     platform_chat_id: metadata.platform_chat_id.clone(),

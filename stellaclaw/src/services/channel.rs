@@ -1101,6 +1101,23 @@ fn handle_session_event(
                 }),
             }))?;
         }
+        agent_session::AgentSessionEvent::StreamToolResultDone {
+            turn_id,
+            batch_id,
+            tool_result,
+        } => {
+            ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
+                addr: ctx.addr.clone(),
+                label: "stream_tool_result_done".to_string(),
+                detail: serde_json::json!({
+                    "session_addr": session_addr,
+                    "turn_id": turn_id,
+                    "batch_id": batch_id,
+                    "tool_name": tool_result.tool_name,
+                    "tool_call_id": tool_result.tool_call_id,
+                }),
+            }))?;
+        }
         agent_session::AgentSessionEvent::TurnCompleted { message } => {
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                 addr: ctx.addr.clone(),

@@ -44,7 +44,7 @@ use crate::{
     },
 };
 
-use super::{
+use super::super::{
     types::{
         parse_reasoning_control_argument, ConversationControl, IncomingConversationMessage,
         IncomingDispatch, IncomingMessageDispatch, OutgoingAttachment, OutgoingAttachmentKind,

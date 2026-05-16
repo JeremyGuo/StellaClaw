@@ -33,7 +33,7 @@ use super::{
     ConversationBridgeRequest, SessionCompressor, SessionErrorDetail, SessionEvent, SessionInitial,
     SessionMailbox, SessionMailboxKind, SessionRequest, TaskPlanItemStatus, TaskPlanView,
     TokenEstimator, ToolBatch, ToolBatchCompletion, ToolBatchExecutor, ToolBatchItem,
-    ToolBatchOperation, ToolCatalog, ToolResultContent,
+    ToolBatchOperation, ToolBatchProgress, ToolCatalog, ToolResultContent,
 };
 
 const ACTIVE_COMPRESSION_THRESHOLD_RATIO: f64 = 0.9;
@@ -53,10 +53,13 @@ pub struct SessionActor {
     request_rx: Receiver<SessionRequest>,
     tool_completion_tx: Sender<ToolBatchCompletion>,
     tool_completion_rx: Receiver<ToolBatchCompletion>,
+    tool_progress_tx: Sender<ToolBatchProgress>,
+    tool_progress_rx: Receiver<ToolBatchProgress>,
     provider_event_rx: Receiver<ProviderEvent>,
     pending_control: VecDeque<SessionRequest>,
     pending_data: VecDeque<SessionRequest>,
     pending_tool_completions: VecDeque<ToolBatchCompletion>,
+    pending_tool_progress: VecDeque<ToolBatchProgress>,
     pending_provider_events: VecDeque<ProviderEvent>,
     event_sink: Arc<dyn SessionActorEventSink>,
     tool_catalog: ToolCatalog,
@@ -146,6 +149,8 @@ pub struct SessionActorInbox {
     request_rx: Receiver<SessionRequest>,
     tool_completion_tx: Sender<ToolBatchCompletion>,
     tool_completion_rx: Receiver<ToolBatchCompletion>,
+    tool_progress_tx: Sender<ToolBatchProgress>,
+    tool_progress_rx: Receiver<ToolBatchProgress>,
 }
 
 #[derive(Clone)]
@@ -157,11 +162,14 @@ impl SessionActorInbox {
     pub fn channel() -> (Self, SessionActorRequestSender) {
         let (request_tx, request_rx) = crossbeam_channel::unbounded();
         let (tool_completion_tx, tool_completion_rx) = crossbeam_channel::unbounded();
+        let (tool_progress_tx, tool_progress_rx) = crossbeam_channel::unbounded();
         (
             Self {
                 request_rx,
                 tool_completion_tx,
                 tool_completion_rx,
+                tool_progress_tx,
+                tool_progress_rx,
             },
             SessionActorRequestSender { request_tx },
         )
@@ -226,10 +234,13 @@ impl SessionActor {
             request_rx: inbox.request_rx,
             tool_completion_tx: inbox.tool_completion_tx,
             tool_completion_rx: inbox.tool_completion_rx,
+            tool_progress_tx: inbox.tool_progress_tx,
+            tool_progress_rx: inbox.tool_progress_rx,
             provider_event_rx,
             pending_control: VecDeque::new(),
             pending_data: VecDeque::new(),
             pending_tool_completions: VecDeque::new(),
+            pending_tool_progress: VecDeque::new(),
             pending_provider_events: VecDeque::new(),
             event_sink,
             tool_catalog,
@@ -325,6 +336,10 @@ impl SessionActor {
                     let completion = completion.map_err(|_| SessionActorError::Tool("tool completion channel disconnected".to_string()))?;
                     self.pending_tool_completions.push_back(completion);
                 }
+                recv(self.tool_progress_rx) -> progress => {
+                    let progress = progress.map_err(|_| SessionActorError::Tool("tool progress channel disconnected".to_string()))?;
+                    self.pending_tool_progress.push_back(progress);
+                }
                 recv(self.provider_event_rx) -> event => {
                     let event = event.map_err(|_| {
                         SessionActorError::from_provider_error(ProviderError::Subprocess(
@@ -349,6 +364,10 @@ impl SessionActor {
                 recv(self.tool_completion_rx) -> completion => {
                     let completion = completion.map_err(|_| SessionActorError::Tool("tool completion channel disconnected".to_string()))?;
                     self.pending_tool_completions.push_back(completion);
+                }
+                recv(self.tool_progress_rx) -> progress => {
+                    let progress = progress.map_err(|_| SessionActorError::Tool("tool progress channel disconnected".to_string()))?;
+                    self.pending_tool_progress.push_back(progress);
                 }
                 recv(self.provider_event_rx) -> event => {
                     let event = event.map_err(|_| {
@@ -404,6 +423,9 @@ impl SessionActor {
                     "newer user message arrived".to_string(),
                 )?;
             }
+            if !self.pending_tool_progress.is_empty() {
+                return self.handle_ready_tool_progress();
+            }
             return self.handle_ready_tool_completion();
         }
 
@@ -439,6 +461,9 @@ impl SessionActor {
         while let Ok(completion) = self.tool_completion_rx.try_recv() {
             self.pending_tool_completions.push_back(completion);
         }
+        while let Ok(progress) = self.tool_progress_rx.try_recv() {
+            self.pending_tool_progress.push_back(progress);
+        }
         while let Ok(event) = self.provider_event_rx.try_recv() {
             self.pending_provider_events.push_back(event);
         }
@@ -460,6 +485,7 @@ impl SessionActor {
             || (self.active_provider_request.is_some() && !self.pending_provider_events.is_empty())
             || (self.active_provider_request.is_some() && self.has_pending_user_message())
             || (self.active_provider_request.is_none() && !self.pending_provider_events.is_empty())
+            || (self.active_tool_batch.is_some() && !self.pending_tool_progress.is_empty())
             || (self.active_tool_batch.is_some() && !self.pending_tool_completions.is_empty())
             || (self.active_tool_batch.is_some() && self.has_pending_user_message_interrupt())
     }
@@ -925,6 +951,7 @@ impl SessionActor {
             "pending_data_len": self.pending_data.len(),
             "pending_provider_event_len": self.pending_provider_events.len(),
             "pending_tool_completion_len": self.pending_tool_completions.len(),
+            "pending_tool_progress_len": self.pending_tool_progress.len(),
             "active_provider_request": self.active_provider_request.as_ref().map(|active| serde_json::json!({
                 "turn_id": active.turn_id,
                 "request_id": active.request_id,
@@ -1307,10 +1334,11 @@ impl SessionActor {
         })?;
 
         let operations = batch.operations.clone();
-        let handle = match self
-            .tool_executor
-            .start(batch, self.tool_completion_tx.clone())
-        {
+        let handle = match self.tool_executor.start(
+            batch,
+            self.tool_completion_tx.clone(),
+            self.tool_progress_tx.clone(),
+        ) {
             Ok(handle) => handle,
             Err(error) => {
                 let mut tool_message = tool_error_message_for_operations(
@@ -1351,6 +1379,7 @@ impl SessionActor {
         turn_id: &str,
         event: ProviderStreamEvent,
     ) -> Result<(), SessionActorError> {
+        let model_message_index = self.history.len();
         match event {
             ProviderStreamEvent::KeepAlive | ProviderStreamEvent::RawJson { .. } => {}
             ProviderStreamEvent::OutputTextDelta { item_id, delta } => {
@@ -1359,7 +1388,7 @@ impl SessionActor {
                     turn_id: turn_id.to_string(),
                     item_id,
                     delta,
-                    message_index: None,
+                    message_index: Some(model_message_index),
                 })?;
             }
             ProviderStreamEvent::ToolCallInputDelta {
@@ -1624,6 +1653,32 @@ impl SessionActor {
                 })
             }
         }
+    }
+
+    fn handle_ready_tool_progress(&mut self) -> Result<SessionActorStep, SessionActorError> {
+        let Some(active) = self.active_tool_batch.as_ref() else {
+            self.pending_tool_progress.clear();
+            return Ok(SessionActorStep::Idle);
+        };
+        let Some(progress) = self.pending_tool_progress.pop_front() else {
+            return Ok(SessionActorStep::WaitingToolBatch);
+        };
+        if progress.batch_id != active.handle.batch_id {
+            self.log_warn(
+                "stale_tool_batch_progress_ignored",
+                serde_json::json!({
+                    "batch_id": progress.batch_id,
+                    "active_batch_id": active.handle.batch_id,
+                }),
+            );
+            return Ok(SessionActorStep::WaitingToolBatch);
+        }
+        self.emit(SessionEvent::StreamToolResultDone {
+            turn_id: active.turn_id.clone(),
+            batch_id: progress.batch_id,
+            tool_result: progress.result,
+        })?;
+        Ok(SessionActorStep::WaitingToolBatch)
     }
 
     fn handle_ready_tool_completion(&mut self) -> Result<SessionActorStep, SessionActorError> {
@@ -2085,6 +2140,7 @@ impl SessionActor {
             || !self.pending_data.is_empty()
             || !self.pending_provider_events.is_empty()
             || !self.pending_tool_completions.is_empty()
+            || !self.pending_tool_progress.is_empty()
             || self.last_completed_turn_number <= self.last_idle_compaction_turn_number
             || count_unclosed_tool_calls(&self.history) > 0
         {
@@ -3073,6 +3129,17 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "error": error,
             "error_detail": error_detail,
         }),
+        SessionEvent::StreamToolResultDone {
+            turn_id,
+            batch_id,
+            tool_result,
+        } => serde_json::json!({
+            "event": "stream_tool_result_done",
+            "turn_id": turn_id,
+            "batch_id": batch_id,
+            "tool_name": tool_result.tool_name,
+            "tool_call_id": tool_result.tool_call_id,
+        }),
         SessionEvent::TurnCompleted { message } => serde_json::json!({
             "event": "turn_completed",
             "message_items": message.data.len(),
@@ -3469,6 +3536,7 @@ mod tests {
             &self,
             batch: ToolBatch,
             completion_tx: Sender<ToolBatchCompletion>,
+            _progress_tx: Sender<ToolBatchProgress>,
         ) -> Result<ToolBatchHandle, ToolBatchError> {
             let handle = ToolBatchHandle::new(batch.batch_id.clone());
             let results = batch
@@ -3509,6 +3577,58 @@ mod tests {
         }
     }
 
+    struct ProgressEchoToolExecutor;
+
+    impl ToolBatchExecutor for ProgressEchoToolExecutor {
+        fn start(
+            &self,
+            batch: ToolBatch,
+            completion_tx: Sender<ToolBatchCompletion>,
+            progress_tx: Sender<ToolBatchProgress>,
+        ) -> Result<ToolBatchHandle, ToolBatchError> {
+            let handle = ToolBatchHandle::new(batch.batch_id.clone());
+            let results: Vec<ChatMessageItem> = batch
+                .operations
+                .iter()
+                .map(|operation| {
+                    let (tool_call_id, tool_name) = match &operation.item {
+                        ToolBatchItem::RegisteredTool(tool_call)
+                        | ToolBatchItem::UnsupportedTool { tool_call, .. } => {
+                            (tool_call.tool_call_id.clone(), tool_call.tool_name.clone())
+                        }
+                    };
+                    let result = ToolResultItem {
+                        tool_call_id,
+                        tool_name,
+                        result: ToolResultContent::from_text(format!(
+                            "tool batch {} done",
+                            handle.batch_id
+                        )),
+                    };
+                    let _ = progress_tx.send(ToolBatchProgress {
+                        batch_id: handle.batch_id.clone(),
+                        result: result.clone(),
+                    });
+                    ChatMessageItem::ToolResult(result)
+                })
+                .collect();
+            let message = ChatMessage::new(ChatRole::Assistant, results);
+            let _ = completion_tx.send(ToolBatchCompletion {
+                batch_id: handle.batch_id.clone(),
+                result: Ok(message),
+            });
+            Ok(handle)
+        }
+
+        fn interrupt(&self, _handle: &ToolBatchHandle) -> Result<(), ToolBatchError> {
+            Ok(())
+        }
+
+        fn finish(&self, _batch_id: &str) -> Result<(), ToolBatchError> {
+            Ok(())
+        }
+    }
+
     struct MediaFileToolExecutor;
 
     impl ToolBatchExecutor for MediaFileToolExecutor {
@@ -3516,6 +3636,7 @@ mod tests {
             &self,
             batch: ToolBatch,
             completion_tx: Sender<ToolBatchCompletion>,
+            _progress_tx: Sender<ToolBatchProgress>,
         ) -> Result<ToolBatchHandle, ToolBatchError> {
             let handle = ToolBatchHandle::new(batch.batch_id);
             let _ = completion_tx.send(ToolBatchCompletion {
@@ -3579,6 +3700,7 @@ mod tests {
             &self,
             batch: ToolBatch,
             completion_tx: Sender<ToolBatchCompletion>,
+            _progress_tx: Sender<ToolBatchProgress>,
         ) -> Result<ToolBatchHandle, ToolBatchError> {
             let handle = ToolBatchHandle::new(batch.batch_id);
             if let Some(started_tx) = self.started_tx.lock().unwrap().take() {
@@ -3625,6 +3747,7 @@ mod tests {
             &self,
             batch: ToolBatch,
             completion_tx: Sender<ToolBatchCompletion>,
+            _progress_tx: Sender<ToolBatchProgress>,
         ) -> Result<ToolBatchHandle, ToolBatchError> {
             let handle = ToolBatchHandle::new(batch.batch_id);
             let _ = completion_tx.send(ToolBatchCompletion {
@@ -4434,6 +4557,91 @@ mod tests {
             batches[0].operations[0].item,
             ToolBatchItem::RegisteredTool(_)
         ));
+    }
+
+    #[test]
+    fn tool_results_emit_stream_event_before_durable_message() {
+        let _cwd = temp_cwd("actor-tool-result-stream-event");
+        let (inbox, mailbox) = test_inbox();
+        let session_id = test_session_id("session_tool_result_stream_event");
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial {
+                initial: SessionInitial::new(session_id, super::super::SessionType::Foreground),
+            },
+        );
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "run tool".to_string(),
+                    })],
+                ),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "cron_tasks_list".to_string(),
+                    arguments: ContextItem {
+                        text: r#"{}"#.to_string(),
+                    },
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "done".to_string(),
+                })],
+            ),
+        ]));
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions {
+            host_tool_scope: Some(HostToolScope::MainForeground),
+            ..BuiltinToolCatalogOptions::default()
+        })
+        .unwrap();
+        let mut actor = SessionActor::new(
+            test_model_config(),
+            provider,
+            Arc::new(ProgressEchoToolExecutor),
+            inbox,
+            events.clone(),
+            catalog,
+        );
+
+        actor.run_until_idle(8).expect("actor should run");
+
+        let captured = events.events.lock().unwrap();
+        let progress_index = captured
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    SessionEvent::StreamToolResultDone { tool_result, .. }
+                        if tool_result.tool_call_id == "call_1"
+                )
+            })
+            .expect("tool result stream event should be emitted");
+        let durable_index = captured
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    SessionEvent::MessageAppended { message, .. }
+                        if message.data.iter().any(|item| matches!(
+                            item,
+                            ChatMessageItem::ToolResult(result)
+                                if result.tool_call_id == "call_1"
+                        ))
+                )
+            })
+            .expect("durable tool result message should be emitted");
+        assert!(progress_index < durable_index);
     }
 
     #[test]

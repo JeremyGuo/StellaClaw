@@ -42,7 +42,7 @@ pub use token_estimator::{
 pub use tool_batch::{
     ConversationBridge, ConversationBridgeRequest, ConversationBridgeResponse,
     ProviderBackedToolModels, SearchToolModels, ToolBatch, ToolBatchCompletion, ToolBatchError,
-    ToolBatchExecutor, ToolBatchHandle, ToolBatchItem, ToolBatchOperation,
+    ToolBatchExecutor, ToolBatchHandle, ToolBatchItem, ToolBatchOperation, ToolBatchProgress,
 };
 pub use tool_binary::{ToolBinaryEnsureRequest, ToolBinaryEnsureResponse};
 pub use tool_catalog::{

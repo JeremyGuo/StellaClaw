@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use stellaclaw_core::session_actor::{
     ChatMessage, ChatMessageItem, ChatRole, ContextItem, SessionErrorDetail, TaskPlanView,
+    ToolResultItem,
 };
 
 use crate::conversation_new::{AgentSessionLaunchConfig, ServiceAddr, ServiceCall};
@@ -167,6 +168,11 @@ pub enum AgentSessionEvent {
         message_index: Option<usize>,
         error: String,
         error_detail: SessionErrorDetail,
+    },
+    StreamToolResultDone {
+        turn_id: String,
+        batch_id: String,
+        tool_result: ToolResultItem,
     },
     TurnCompleted {
         message: ChatMessage,

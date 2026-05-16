@@ -225,6 +225,7 @@ pub trait ToolBatchExecutor {
         &self,
         batch: ToolBatch,
         completion_tx: Sender<ToolBatchCompletion>,
+        progress_tx: Sender<ToolBatchProgress>,
     ) -> Result<ToolBatchHandle, ToolBatchError>;
 
     fn interrupt(&self, handle: &ToolBatchHandle) -> Result<(), ToolBatchError>;
@@ -236,6 +237,12 @@ pub trait ToolBatchExecutor {
 pub struct ToolBatchCompletion {
     pub batch_id: String,
     pub result: Result<ChatMessage, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolBatchProgress {
+    pub batch_id: String,
+    pub result: ToolResultItem,
 }
 
 pub trait ConversationBridge {

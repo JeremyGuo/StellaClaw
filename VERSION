@@ -1,7 +1,10 @@
-version: 1.27.0
+version: 1.28.0
 ---
 
-# 1.27.0
+# 1.28.0
+
+- 新增 Web stream 协议重写骨架和工具结果流式事件：
+  WebChannel 目录拆分为 `channels/web/{legacy,protocol,state}.rs`，保留旧入口兼容当前运行链路，同时新增 home / chat / terminal websocket snapshot、30s heartbeat 和 live foreground session projection 的 typed protocol/state 基础；core `LocalToolBatchExecutor` 在每个独立工具完成时发送 `ToolBatchProgress`，`SessionActor` 会先投影 `StreamToolResultDone` live 事件，再等待完整 tool batch 落盘为 durable `MessageAppended`，该事件已贯通到 AgentSession / Channel stream，并补充顺序单测。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 清理旧 Channel 层状态 / 进度事件死代码：
   删除不再由新 `conversation_new` service-tree 生产的旧 `ChannelEvent::ProgressFeedback`、`ConversationUpdated` 和 `Status` 事件，以及对应的 Web / Telegram 进度消息缓存、状态文本渲染和旧 token usage 汇总结构；Web 状态查询继续走 `ChannelIngress::QueryForegroundStatus` / StatusService，前台实时渲染继续走 session stream typed events，避免旧兼容分支和新消息 API 并存。本次不改变 `config` schema，不改变 `workdir` schema。

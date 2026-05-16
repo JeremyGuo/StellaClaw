@@ -2683,6 +2683,15 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
             error,
             error_detail,
         },
+        CoreSessionEvent::StreamToolResultDone {
+            turn_id,
+            batch_id,
+            tool_result,
+        } => AgentSessionEvent::StreamToolResultDone {
+            turn_id,
+            batch_id,
+            tool_result,
+        },
         CoreSessionEvent::TurnCompleted { message } => AgentSessionEvent::TurnCompleted { message },
         CoreSessionEvent::TurnFailed {
             error,

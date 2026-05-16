@@ -20,8 +20,8 @@ use super::{
     },
     ChatMessage, ConversationBridge, ProviderBackedToolModels, SearchToolModels, TokenEstimator,
     ToolBatch, ToolBatchCompletion, ToolBatchError, ToolBatchExecutor, ToolBatchHandle,
-    ToolBatchItem, ToolBatchOperation, ToolConcurrency, ToolRemoteMode, ToolResultContent,
-    ToolResultItem,
+    ToolBatchItem, ToolBatchOperation, ToolBatchProgress, ToolConcurrency, ToolRemoteMode,
+    ToolResultContent, ToolResultItem,
 };
 
 const MAX_TOOL_RESULT_CONTEXT_CHARS: usize = 100_000;
@@ -99,6 +99,7 @@ impl LocalToolBatchExecutor {
         &self,
         batch: ToolBatch,
         completion_tx: Sender<ToolBatchCompletion>,
+        progress_tx: Sender<ToolBatchProgress>,
     ) -> (Sender<()>, JoinHandle<()>) {
         let batch_id = batch.batch_id.clone();
         let (interrupt_tx, interrupt_rx) = crossbeam_channel::bounded(1);
@@ -113,6 +114,7 @@ impl LocalToolBatchExecutor {
             tool_catalog: self.tool_catalog.clone(),
             interrupt_rx,
             operation_lock: Arc::new(RwLock::new(())),
+            progress_tx,
         };
         let join_handle = thread::spawn(move || {
             let result = runner
@@ -173,6 +175,7 @@ struct ToolBatchRunner {
     tool_catalog: Option<ToolCatalog>,
     interrupt_rx: Receiver<()>,
     operation_lock: Arc<RwLock<()>>,
+    progress_tx: Sender<ToolBatchProgress>,
 }
 
 impl ToolBatchRunner {
@@ -185,19 +188,29 @@ impl ToolBatchRunner {
         let mut index = 0;
         while index < batch.operations.len() {
             if self.interrupt_rx.try_recv().is_ok() {
-                results.extend(interrupted_results(&batch.operations[index..]));
+                let interrupted = interrupted_results(&batch.operations[index..]);
+                self.emit_progress_results(&batch.batch_id, &interrupted);
+                results.extend(interrupted);
                 break;
             }
 
             if batch.operations[index].concurrency == ToolConcurrency::Serial {
                 match self.execute_operation_interruptibly(batch.operations[index].clone()) {
-                    OperationOutcome::Completed(result) => results.push(result),
+                    OperationOutcome::Completed(result) => {
+                        self.emit_progress_result(&batch.batch_id, &result);
+                        results.push(result);
+                    }
                     OperationOutcome::ToolError(error) => {
-                        results.push(tool_error_result(&batch.operations[index], error));
+                        let result = tool_error_result(&batch.operations[index], error);
+                        self.emit_progress_result(&batch.batch_id, &result);
+                        results.push(result);
                     }
                     OperationOutcome::Interrupted(result) => {
+                        self.emit_progress_result(&batch.batch_id, &result);
                         results.push(result);
-                        results.extend(interrupted_results(&batch.operations[index + 1..]));
+                        let interrupted = interrupted_results(&batch.operations[index + 1..]);
+                        self.emit_progress_results(&batch.batch_id, &interrupted);
+                        results.extend(interrupted);
                         break;
                     }
                 }
@@ -206,17 +219,34 @@ impl ToolBatchRunner {
             }
 
             let parallel_end = next_serial_operation_index(&batch.operations, index);
-            let outcome = self
-                .execute_parallel_operations_interruptibly(&batch.operations[index..parallel_end]);
+            let outcome = self.execute_parallel_operations_interruptibly(
+                &batch.batch_id,
+                &batch.operations[index..parallel_end],
+            );
             results.extend(outcome.results);
             if outcome.interrupted {
-                results.extend(interrupted_results(&batch.operations[parallel_end..]));
+                let interrupted = interrupted_results(&batch.operations[parallel_end..]);
+                self.emit_progress_results(&batch.batch_id, &interrupted);
+                results.extend(interrupted);
                 break;
             }
             index = parallel_end;
         }
 
         Ok(batch.into_result_message(results))
+    }
+
+    fn emit_progress_result(&self, batch_id: &str, result: &ToolResultItem) {
+        let _ = self.progress_tx.send(ToolBatchProgress {
+            batch_id: batch_id.to_string(),
+            result: result.clone(),
+        });
+    }
+
+    fn emit_progress_results(&self, batch_id: &str, results: &[ToolResultItem]) {
+        for result in results {
+            self.emit_progress_result(batch_id, result);
+        }
     }
 
     fn execute_operation_interruptibly(&self, scheduled: ToolBatchOperation) -> OperationOutcome {
@@ -252,6 +282,7 @@ impl ToolBatchRunner {
 
     fn execute_parallel_operations_interruptibly(
         &self,
+        batch_id: &str,
         operations: &[ToolBatchOperation],
     ) -> ParallelSegmentOutcome {
         let (result_tx, result_rx) = crossbeam_channel::unbounded();
@@ -295,6 +326,9 @@ impl ToolBatchRunner {
                         result_index,
                         result,
                     );
+                    if let Some(result) = results[result_index].as_ref() {
+                        self.emit_progress_result(batch_id, result);
+                    }
                     completed += 1;
                 }
                 recv(self.interrupt_rx) -> _ => {
@@ -307,6 +341,9 @@ impl ToolBatchRunner {
                             result_index,
                             result,
                         );
+                        if let Some(result) = results[result_index].as_ref() {
+                            self.emit_progress_result(batch_id, result);
+                        }
                         completed += 1;
                     }
                     for sender in interrupt_txs.iter_mut().filter_map(Option::take) {
@@ -322,6 +359,9 @@ impl ToolBatchRunner {
                                     result_index,
                                     result,
                                 );
+                                if let Some(result) = results[result_index].as_ref() {
+                                    self.emit_progress_result(batch_id, result);
+                                }
                                 completed += 1;
                             }
                             Err(_) => {
@@ -627,6 +667,7 @@ impl ToolBatchExecutor for LocalToolBatchExecutor {
         &self,
         batch: ToolBatch,
         completion_tx: Sender<ToolBatchCompletion>,
+        progress_tx: Sender<ToolBatchProgress>,
     ) -> Result<ToolBatchHandle, ToolBatchError> {
         if batch.is_empty() {
             return Err(ToolBatchError::EmptyBatch(batch.batch_id));
@@ -640,7 +681,8 @@ impl ToolBatchExecutor for LocalToolBatchExecutor {
                 handle.batch_id
             )));
         }
-        let (interrupt_tx, join_handle) = self.spawn_batch_worker(batch, completion_tx);
+        let (interrupt_tx, join_handle) =
+            self.spawn_batch_worker(batch, completion_tx, progress_tx);
         running_batches.insert(
             handle.batch_id.clone(),
             RunningToolBatch {
@@ -858,8 +900,9 @@ mod tests {
 
     fn start_and_wait(executor: &LocalToolBatchExecutor, batch: ToolBatch) -> ChatMessage {
         let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+        let (progress_tx, _progress_rx) = crossbeam_channel::unbounded();
         let handle = executor
-            .start(batch, completion_tx)
+            .start(batch, completion_tx, progress_tx)
             .expect("batch should start");
         let completion = completion_rx
             .recv_timeout(Duration::from_secs(2))
@@ -1529,8 +1572,9 @@ mod tests {
             )],
         );
         let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+        let (progress_tx, _progress_rx) = crossbeam_channel::unbounded();
         let handle = executor
-            .start(batch, completion_tx)
+            .start(batch, completion_tx, progress_tx)
             .expect("batch should start");
 
         thread::sleep(Duration::from_millis(50));
@@ -1777,8 +1821,9 @@ mod tests {
         );
 
         let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+        let (progress_tx, _progress_rx) = crossbeam_channel::unbounded();
         let handle = executor
-            .start(batch, completion_tx)
+            .start(batch, completion_tx, progress_tx)
             .expect("batch should start");
         let first = request_rx
             .recv_timeout(Duration::from_secs(1))
@@ -1877,8 +1922,9 @@ mod tests {
         );
 
         let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+        let (progress_tx, _progress_rx) = crossbeam_channel::unbounded();
         let handle = executor
-            .start(batch, completion_tx)
+            .start(batch, completion_tx, progress_tx)
             .expect("batch should start");
         let request = request_rx
             .recv_timeout(Duration::from_secs(1))
@@ -1932,8 +1978,9 @@ mod tests {
         );
 
         let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+        let (progress_tx, _progress_rx) = crossbeam_channel::unbounded();
         let handle = executor
-            .start(batch, completion_tx)
+            .start(batch, completion_tx, progress_tx)
             .expect("batch should start");
         request_rx
             .recv_timeout(Duration::from_secs(1))
