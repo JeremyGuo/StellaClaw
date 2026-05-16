@@ -483,19 +483,12 @@ fn project_channel_event(
                     message,
                 }));
             }
-            AgentSessionEvent::TurnStarted { .. } => {
+            event @ AgentSessionEvent::TurnStarted { .. } => {
                 events.push(ChannelEvent::Processing(OutgoingProcessing {
                     channel_id: metadata.channel_id.clone(),
                     platform_chat_id: metadata.platform_chat_id.clone(),
                     state: ProcessingState::Typing,
                 }));
-            }
-            event @ (AgentSessionEvent::StreamAssistantMessageDelta { .. }
-            | AgentSessionEvent::StreamToolCallDelta { .. }
-            | AgentSessionEvent::StreamReasoningSummaryDelta { .. }
-            | AgentSessionEvent::StreamReasoningSummaryPartAdded { .. }
-            | AgentSessionEvent::StreamError { .. }
-            | AgentSessionEvent::StreamToolResultDone { .. }) => {
                 events.push(ChannelEvent::SessionStream(OutgoingSessionStream {
                     channel_id: metadata.channel_id.clone(),
                     platform_chat_id: metadata.platform_chat_id.clone(),
@@ -504,11 +497,33 @@ fn project_channel_event(
                     event: serde_json::to_value(event)?,
                 }));
             }
-            AgentSessionEvent::TurnCompleted { .. } => {
+            event @ (AgentSessionEvent::StreamAssistantMessageDelta { .. }
+            | AgentSessionEvent::StreamToolCallDelta { .. }
+            | AgentSessionEvent::StreamReasoningSummaryDelta { .. }
+            | AgentSessionEvent::StreamReasoningSummaryPartAdded { .. }
+            | AgentSessionEvent::StreamError { .. }
+            | AgentSessionEvent::StreamToolResultDone { .. }
+            | AgentSessionEvent::PlanUpdated { .. }) => {
+                events.push(ChannelEvent::SessionStream(OutgoingSessionStream {
+                    channel_id: metadata.channel_id.clone(),
+                    platform_chat_id: metadata.platform_chat_id.clone(),
+                    conversation_id: metadata.conversation_id.clone(),
+                    session_id: service_addr_storage_component(&session_addr),
+                    event: serde_json::to_value(event)?,
+                }));
+            }
+            event @ AgentSessionEvent::TurnCompleted { .. } => {
                 events.push(ChannelEvent::Processing(OutgoingProcessing {
                     channel_id: metadata.channel_id.clone(),
                     platform_chat_id: metadata.platform_chat_id.clone(),
                     state: ProcessingState::Idle,
+                }));
+                events.push(ChannelEvent::SessionStream(OutgoingSessionStream {
+                    channel_id: metadata.channel_id.clone(),
+                    platform_chat_id: metadata.platform_chat_id.clone(),
+                    conversation_id: metadata.conversation_id.clone(),
+                    session_id: service_addr_storage_component(&session_addr),
+                    event: serde_json::to_value(event)?,
                 }));
             }
             AgentSessionEvent::TurnFailed {

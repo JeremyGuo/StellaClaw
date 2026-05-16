@@ -1399,6 +1399,21 @@ impl WebChannel {
             ))
             .or_default();
         match event_type {
+            "turn_started" => {
+                state.current_turn_state =
+                    stream
+                        .event
+                        .get("turn_id")
+                        .and_then(Value::as_str)
+                        .map(|turn_id| {
+                            json!({
+                                "turn_id": turn_id,
+                                "message_id": Value::Null,
+                            })
+                        });
+                state.current_provisional_assistant_message = None;
+                state.running_tool_results.clear();
+            }
             "stream_assistant_message_delta" => {
                 state.apply_assistant_delta(&stream.event);
             }
@@ -1425,6 +1440,12 @@ impl WebChannel {
                             .and_then(Value::as_str)
                             .is_some_and(|id| id == message_id)
                     });
+            }
+            "turn_completed" => {
+                state.current_turn_state = None;
+                state.current_provisional_assistant_message = None;
+                state.running_tool_results.clear();
+                state.queued_outbound_messages.clear();
             }
             _ => {}
         }
@@ -1501,11 +1522,12 @@ impl Channel for WebChannel {
             .and_then(Value::as_str)
             .unwrap_or("stream_event");
         self.record_session_stream(stream, event_type);
+        let public_type = public_chat_stream_type(event_type);
         self.publish_websocket_event(
             &stream.conversation_id,
             &stream.session_id,
             json!({
-                "type": format!("chat.{event_type}"),
+                "type": public_type,
                 "conversation_id": stream.conversation_id,
                 "session_id": stream.session_id,
                 "event": stream.event,
@@ -2356,6 +2378,16 @@ fn conversation_seen_key(conversation_id: &str, foreground_session_id: &str) -> 
 
 fn websocket_key(conversation_id: &str, foreground_session_id: &str) -> String {
     format!("{conversation_id}:{foreground_session_id}")
+}
+
+fn public_chat_stream_type(event_type: &str) -> String {
+    let suffix = match event_type {
+        "turn_started" => "stream_turn_start",
+        "turn_completed" => "stream_turn_done",
+        "plan_updated" => "plan_updated",
+        other => other,
+    };
+    format!("chat.{suffix}")
 }
 
 fn sanitize_session_id_for_log_path(session_id: &str) -> String {

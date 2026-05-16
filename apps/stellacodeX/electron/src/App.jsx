@@ -1853,6 +1853,40 @@ function App() {
       if (!type || disposed || websocketKeyRef.current !== key) return;
       const messageId = streamActivityBaseId(event);
 
+      if (type === 'turn_started' || type === 'stream_turn_start') {
+        setSessionActivity('正在处理');
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== 'thinking'),
+          {
+            id: 'thinking',
+            title: '正在处理',
+            detail: '等待模型响应',
+            state: 'running'
+          }
+        ]);
+        return;
+      }
+
+      if (type === 'turn_completed' || type === 'stream_turn_done') {
+        setSessionActivity('已完成');
+        setTimeout(() => {
+          if (!disposed && websocketKeyRef.current === key) {
+            setRunningActivities([]);
+          }
+        }, 700);
+        return;
+      }
+
+      if (type === 'plan_updated') {
+        const progress = normalizeProgressFeedback({ type: 'turn_progress', progress: event });
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== progress.id && item.id !== 'thinking'),
+          mergeProgressActivity(current, progress)
+        ]);
+        setSessionActivity(progress.detail || progress.title || '已更新计划');
+        return;
+      }
+
       if (type === 'stream_assistant_message_delta') {
         const delta = streamDeltaText(event);
         if (!delta) return;
@@ -2088,6 +2122,7 @@ function App() {
             applyIncomingMessages(payload.messages || []);
           } else if (
             payloadType.startsWith('chat.stream_')
+            || payloadType === 'chat.plan_updated'
             || payloadType === 'session_stream'
             || streamEventType(payload).startsWith('stream_')
           ) {
