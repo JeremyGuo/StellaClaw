@@ -822,6 +822,7 @@ export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment
         <MessageActionBar message={message} role={roleName} usage={usage} />
       )}
       {message.pending && <div className="message-status">正在发送...</div>}
+      {!message.pending && message.queued && <div className="message-status">已排队</div>}
       {message.error && <div className="message-status error">{message.error}</div>}
     </article>
   );

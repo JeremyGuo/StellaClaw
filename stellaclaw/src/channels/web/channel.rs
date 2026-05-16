@@ -581,10 +581,16 @@ impl WebChannel {
         if items.is_empty() {
             return Err(HttpError::new(400, "message body is empty"));
         }
+        let client_message_id = request
+            .client_message_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let message = ChatMessage::new(ChatRole::User, items)
             .with_user_name_option(request.user_name)
             .with_message_time(now_rfc3339());
-        let client_message_id = message.message_id.clone();
+        let client_message_id = client_message_id.unwrap_or_else(|| message.message_id.clone());
         self.conversation_runtime
             .ensure_conversation_started(conversation_id)
             .map_err(HttpError::internal)?;
@@ -596,7 +602,10 @@ impl WebChannel {
                     platform_message_id: Some(message.message_id.clone()),
                     origin: Some(AgentMessageOrigin::User),
                     message,
-                    metadata: json!({ "source": "web" }),
+                    metadata: json!({
+                        "source": "web",
+                        "client_message_id": client_message_id,
+                    }),
                 },
             )
             .map_err(HttpError::internal)?;
@@ -617,6 +626,7 @@ impl WebChannel {
                 "accepted": true,
                 "conversation_id": conversation_id,
                 "foreground_session_id": foreground_session_id,
+                "client_message_id": client_message_id,
             }),
         ))
     }
@@ -1484,6 +1494,16 @@ impl WebChannel {
                 .is_some_and(|id| id == message_id)
             {
                 state.current_provisional_assistant_message = None;
+            }
+        }
+        if appended.message.role == ChatRole::User {
+            if let Some(index) = state.queued_outbound_messages.iter().position(|queued| {
+                queued
+                    .get("conversation_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id == appended.conversation_id)
+            }) {
+                state.queued_outbound_messages.remove(index);
             }
         }
         for tool_call_id in tool_result_call_ids(message) {
@@ -2370,6 +2390,7 @@ struct MarkSeenRequest {
 
 #[derive(Debug, Deserialize, Default)]
 struct PostMessageRequest {
+    client_message_id: Option<String>,
     text: Option<String>,
     user_name: Option<String>,
     #[serde(default)]

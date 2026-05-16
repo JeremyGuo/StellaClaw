@@ -748,6 +748,22 @@ function appendStreamReasoningSummary(current, event) {
   return next;
 }
 
+function markQueuedUserMessage(current, clientMessageId) {
+  const id = String(clientMessageId || '').trim();
+  if (!id) return current;
+  let changed = false;
+  const next = current.map((message) => {
+    if (String(message?.id ?? message?.message_id ?? '') !== id) return message;
+    changed = true;
+    return {
+      ...message,
+      pending: false,
+      queued: true
+    };
+  });
+  return changed ? next : current;
+}
+
 function applyStreamErrorToMessages(current, event) {
   const id = streamMessageId(event);
   if (!id) return current;
@@ -2208,6 +2224,19 @@ function App() {
       const toolStates = Array.isArray(snapshot.running_tool_results)
         ? snapshot.running_tool_results
         : [];
+      const queuedMessages = Array.isArray(snapshot.queued_outbound_messages)
+        ? snapshot.queued_outbound_messages
+        : [];
+      if (queuedMessages.length > 0) {
+        setMessages((current) => {
+          let next = current;
+          queuedMessages.forEach((queued) => {
+            next = markQueuedUserMessage(next, queued?.client_message_id || queued?.clientMessageId);
+          });
+          messagesRef.current = next;
+          return next;
+        });
+      }
       const activities = toolStates
         .map((state) => state?.tool_result || state?.toolResult || state)
         .filter(Boolean)
@@ -2269,6 +2298,13 @@ function App() {
             if (payloadType === 'chat.snapshot') {
               applyChatSnapshotLiveProjection(payload);
             }
+          } else if (payloadType === 'chat.user_message_queued') {
+            setMessages((current) => {
+              const next = markQueuedUserMessage(current, payload.client_message_id || payload.clientMessageId);
+              messagesRef.current = next;
+              return next;
+            });
+            setSessionActivity('消息已排队');
           } else if (payloadType === 'chat.message_appended') {
             applyIncomingMessages(payload.message ? [payload.message] : []);
           } else if (payloadType === 'messages') {
@@ -2571,7 +2607,7 @@ function App() {
       return next;
     });
     try {
-      await postConversationMessage(selected.serverId, selected.conversationId, value, activeUserName, outgoingFiles, outgoingSelections, selectedSessionId);
+      await postConversationMessage(selected.serverId, selected.conversationId, value, activeUserName, outgoingFiles, outgoingSelections, selectedSessionId, optimistic.id);
       setSelectionReferences((current) => current.filter((item) => !outgoingSelections.some((sent) => sent.id === item.id)));
       if (websocketKeyRef.current !== key) return false;
       setMessages((current) => {

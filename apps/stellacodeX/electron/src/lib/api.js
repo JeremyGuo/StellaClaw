@@ -145,10 +145,11 @@ export async function loadMessages(serverId, conversationId, options = {}) {
   return response.data?.messages || [];
 }
 
-export async function postConversationMessage(serverId, conversationId, text, userName = 'workspace-user', files = [], selectionReferences = [], foregroundSessionId = 'main') {
+export async function postConversationMessage(serverId, conversationId, text, userName = 'workspace-user', files = [], selectionReferences = [], foregroundSessionId = 'main', clientMessageId = '') {
   return api(serverId, `/api/conversations/${conversationId}/foreground_sessions/${encodeURIComponent(foregroundSessionId || 'main')}/messages`, {
     method: 'POST',
     body: {
+      client_message_id: String(clientMessageId || '').trim() || undefined,
       user_name: String(userName || '').trim() || 'workspace-user',
       text,
       selection_references: Array.isArray(selectionReferences) && selectionReferences.length > 0 ? selectionReferences : undefined,
