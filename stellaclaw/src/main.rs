@@ -543,10 +543,23 @@ fn project_channel_event(
                     scope: OutgoingErrorScope::Runtime,
                     severity: OutgoingErrorSeverity::Error,
                     code: "agent_session_failed".to_string(),
-                    message: error,
-                    detail: Some(serde_json::to_value(error_detail)?),
+                    message: error.clone(),
+                    detail: Some(serde_json::to_value(&error_detail)?),
                     can_continue,
                     suggested_action: None,
+                }));
+                events.push(ChannelEvent::SessionStream(OutgoingSessionStream {
+                    channel_id: metadata.channel_id.clone(),
+                    platform_chat_id: metadata.platform_chat_id.clone(),
+                    conversation_id: metadata.conversation_id.clone(),
+                    session_id: service_addr_storage_component(&session_addr),
+                    event: serde_json::json!({
+                        "type": "stream_error",
+                        "error": error,
+                        "error_detail": error_detail,
+                        "can_continue": can_continue,
+                        "scope": "turn_failed",
+                    }),
                 }));
             }
             AgentSessionEvent::RuntimeCrashed {

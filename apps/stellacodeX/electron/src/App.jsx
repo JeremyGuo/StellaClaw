@@ -766,8 +766,16 @@ function markQueuedUserMessage(current, clientMessageId) {
 
 function applyStreamErrorToMessages(current, event) {
   const id = streamMessageId(event);
-  if (!id) return current;
   const error = streamErrorText(event);
+  if (!id) {
+    let changed = false;
+    const next = current.filter((message) => {
+      const remove = message?._streaming && String(message?.role || '').toLowerCase() === 'assistant';
+      if (remove) changed = true;
+      return !remove;
+    });
+    return changed ? next : current;
+  }
   const position = current.findIndex((message) => String(message?.id ?? message?.message_id ?? '') === id);
   if (position < 0) {
     const index = streamMessageIndexFromEvent(event);

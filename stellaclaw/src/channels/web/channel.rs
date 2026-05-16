@@ -1571,15 +1571,21 @@ impl WebChannel {
                     .get("message_id")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                state.current_provisional_assistant_message = state
-                    .current_provisional_assistant_message
-                    .take()
-                    .filter(|message| {
-                        !message
-                            .get("message_id")
-                            .and_then(Value::as_str)
-                            .is_some_and(|id| id == message_id)
-                    });
+                if message_id.is_empty() {
+                    state.current_provisional_assistant_message = None;
+                } else {
+                    state.current_provisional_assistant_message = state
+                        .current_provisional_assistant_message
+                        .take()
+                        .filter(|message| {
+                            !message
+                                .get("message_id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| id == message_id)
+                        });
+                }
+                state.current_turn_state = None;
+                state.running_tool_results.clear();
             }
             "turn_completed" => {
                 state.current_turn_state = None;
