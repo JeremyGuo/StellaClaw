@@ -21,6 +21,7 @@ use stellaclaw_core::session_actor::{
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
+    channels::web_terminal::{TerminalCreateRequest, TerminalResizeRequest},
     config::StellaclawConfig,
     conversation_host::ConversationHostRuntime,
     conversation_id_manager::ConversationIdManager,
@@ -31,6 +32,8 @@ use crate::{
     service_protos::{
         agent_session::AgentMessageOrigin,
         channel::{ChannelEvent as KernelChannelEvent, ChannelIngress},
+        terminal::{TerminalDataEncoding, TerminalRequest, TerminalResponse},
+        workspace::{WorkspaceRequest, WorkspaceResponse, WorkspaceTarget},
     },
 };
 
@@ -141,6 +144,21 @@ impl WebChannel {
             ("GET", ["api", "conversations", conversation_id, "status"]) => {
                 self.status_snapshot(conversation_id)
             }
+            ("GET", ["api", "conversations", conversation_id, "workspace"]) => {
+                self.list_workspace(conversation_id, &request.query)
+            }
+            ("GET", ["api", "conversations", conversation_id, "workspace", "file"]) => {
+                self.read_workspace_file(conversation_id, &request.query)
+            }
+            ("GET", ["api", "conversations", conversation_id, "terminals"]) => {
+                self.list_terminals(conversation_id)
+            }
+            ("POST", ["api", "conversations", conversation_id, "terminals"]) => {
+                self.create_terminal(conversation_id, &request.body)
+            }
+            ("DELETE", ["api", "conversations", conversation_id, "terminals", terminal_id]) => {
+                self.terminate_terminal(conversation_id, terminal_id)
+            }
             _ => Err(HttpError::new(404, "not_found")),
         }
     }
@@ -159,9 +177,12 @@ impl WebChannel {
         }
         let path = split_path(&request.path);
         match path.as_slice() {
-            ["api", "conversations", "stream"] => self.accept_conversation_stream(stream, &request),
+            ["api", "ws", "home"] => self.accept_home_stream(stream, &request),
             ["api", "conversations", conversation_id, "foreground_sessions", foreground_session_id, "ws"] => {
                 self.accept_session_stream(stream, &request, conversation_id, foreground_session_id)
+            }
+            ["api", "conversations", conversation_id, "terminals", terminal_id, "stream"] => {
+                self.accept_terminal_stream(stream, &request, conversation_id, terminal_id)
             }
             _ => {
                 write_response(
@@ -247,7 +268,7 @@ impl WebChannel {
             .map_err(HttpError::internal)?;
         let summary = self.conversation_summary(&metadata)?;
         self.publish_conversation_event(json!({
-            "type": "conversation_upserted",
+            "type": "home.conversation_upserted",
             "conversation": summary,
         }));
         Ok(HttpResponse::json(
@@ -271,7 +292,7 @@ impl WebChannel {
         store.persist(&metadata).map_err(HttpError::internal)?;
         let summary = self.conversation_summary(&metadata)?;
         self.publish_conversation_event(json!({
-            "type": "conversation_upserted",
+            "type": "home.conversation_upserted",
             "conversation": summary,
         }));
         Ok(HttpResponse::json(200, json!({"conversation": summary})))
@@ -285,7 +306,7 @@ impl WebChannel {
             .remove(conversation_id)
             .map_err(HttpError::internal)?;
         self.publish_conversation_event(json!({
-            "type": "conversation_deleted",
+            "type": "home.conversation_deleted",
             "conversation_id": conversation_id,
         }));
         Ok(HttpResponse::json(200, json!({"deleted": true})))
@@ -312,7 +333,7 @@ impl WebChannel {
         persist_seen_state(&self.workdir, &self.id, &WebSeenState { seen: snapshot })
             .map_err(HttpError::internal)?;
         self.publish_conversation_event(json!({
-            "type": "conversation_seen",
+            "type": "home.foreground_session_seen_state_updated",
             "conversation_id": conversation_id,
             "foreground_session_id": foreground_session_id,
             "seen": seen,
@@ -360,7 +381,7 @@ impl WebChannel {
             .map_err(HttpError::internal)?;
         let session = self.foreground_session_summary(&metadata, &route_id);
         self.publish_conversation_event(json!({
-            "type": "conversation_upserted",
+            "type": "home.conversation_upserted",
             "conversation": self.conversation_summary(&metadata)?,
         }));
         Ok(HttpResponse::json(
@@ -384,7 +405,7 @@ impl WebChannel {
             self.set_session_nickname(conversation_id, foreground_session_id, request.nickname)?;
         let session = self.foreground_session_summary(&metadata, foreground_session_id);
         self.publish_conversation_event(json!({
-            "type": "conversation_upserted",
+            "type": "home.conversation_upserted",
             "conversation": self.conversation_summary(&metadata)?,
         }));
         Ok(HttpResponse::json(
@@ -415,7 +436,7 @@ impl WebChannel {
             .map_err(HttpError::internal)?;
         let metadata = self.set_session_nickname(conversation_id, foreground_session_id, None)?;
         self.publish_conversation_event(json!({
-            "type": "conversation_upserted",
+            "type": "home.conversation_upserted",
             "conversation": self.conversation_summary(&metadata)?,
         }));
         Ok(HttpResponse::json(
@@ -528,6 +549,133 @@ impl WebChannel {
             _ => None,
         })?;
         Ok(HttpResponse::json(200, response))
+    }
+
+    fn list_workspace(&self, conversation_id: &str, query: &HashMap<String, String>) -> HttpResult {
+        let path = query.get("path").filter(|path| !path.is_empty()).cloned();
+        let limit = query.get("limit").and_then(|value| value.parse().ok());
+        self.workspace_response(
+            conversation_id,
+            WorkspaceRequest::List {
+                path,
+                target: WorkspaceTarget::Auto,
+                limit,
+            },
+        )
+    }
+
+    fn read_workspace_file(
+        &self,
+        conversation_id: &str,
+        query: &HashMap<String, String>,
+    ) -> HttpResult {
+        let path = query
+            .get("path")
+            .filter(|path| !path.is_empty())
+            .cloned()
+            .ok_or_else(|| HttpError::new(400, "path is required"))?;
+        self.workspace_response(
+            conversation_id,
+            WorkspaceRequest::ReadFile {
+                path,
+                target: WorkspaceTarget::Auto,
+                offset: query_u64(query, "offset"),
+                limit_bytes: query
+                    .get("limit_bytes")
+                    .and_then(|value| value.parse().ok()),
+            },
+        )
+    }
+
+    fn workspace_response(&self, conversation_id: &str, request: WorkspaceRequest) -> HttpResult {
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)
+            .map_err(HttpError::internal)?;
+        let request_id = generated_request_id("workspace");
+        let rx = self
+            .conversation_runtime
+            .send_main_channel_ingress_subscribed(
+                conversation_id,
+                ChannelIngress::Workspace {
+                    request_id: request_id.clone(),
+                    request,
+                },
+            )
+            .map_err(HttpError::internal)?;
+        let response = wait_for_event(&rx, Duration::from_secs(30), |event| match event {
+            KernelChannelEvent::Workspace {
+                request_id: id,
+                response,
+            } if id == request_id => Some(response),
+            _ => None,
+        })?;
+        let status = if matches!(response, WorkspaceResponse::Error { .. }) {
+            400
+        } else {
+            200
+        };
+        Ok(HttpResponse::json(
+            status,
+            serde_json::to_value(response).map_err(HttpError::internal)?,
+        ))
+    }
+
+    fn list_terminals(&self, conversation_id: &str) -> HttpResult {
+        self.terminal_response(conversation_id, TerminalRequest::List)
+            .and_then(|response| match response {
+                TerminalResponse::Terminals { terminals } => {
+                    Ok(HttpResponse::json(200, json!({ "terminals": terminals })))
+                }
+                TerminalResponse::Error { message, .. } => Err(HttpError::new(400, message)),
+                other => Ok(HttpResponse::json(
+                    200,
+                    serde_json::to_value(other).map_err(HttpError::internal)?,
+                )),
+            })
+    }
+
+    fn create_terminal(&self, conversation_id: &str, body: &[u8]) -> HttpResult {
+        let request: TerminalCreateRequest = parse_optional_json(body)?;
+        self.terminal_response(conversation_id, TerminalRequest::Create { request })
+            .and_then(terminal_http_response)
+    }
+
+    fn terminate_terminal(&self, conversation_id: &str, terminal_id: &str) -> HttpResult {
+        self.terminal_response(
+            conversation_id,
+            TerminalRequest::Terminate {
+                terminal_id: terminal_id.to_string(),
+            },
+        )
+        .and_then(terminal_http_response)
+    }
+
+    fn terminal_response(
+        &self,
+        conversation_id: &str,
+        request: TerminalRequest,
+    ) -> HttpResult<TerminalResponse> {
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)
+            .map_err(HttpError::internal)?;
+        let request_id = generated_request_id("terminal");
+        let rx = self
+            .conversation_runtime
+            .send_main_channel_ingress_subscribed(
+                conversation_id,
+                ChannelIngress::Terminal {
+                    request_id: request_id.clone(),
+                    request,
+                },
+            )
+            .map_err(HttpError::internal)?;
+        wait_for_event(&rx, Duration::from_secs(30), |event| match event {
+            KernelChannelEvent::Terminal {
+                request_id: Some(id),
+                response,
+            } if id == request_id => Some(response),
+            _ => None,
+        })
     }
 
     fn set_session_nickname(
@@ -651,11 +799,7 @@ impl WebChannel {
         })
     }
 
-    fn accept_conversation_stream(
-        &self,
-        mut stream: TcpStream,
-        request: &HttpRequest,
-    ) -> Result<()> {
+    fn accept_home_stream(&self, mut stream: TcpStream, request: &HttpRequest) -> Result<()> {
         accept_websocket(&mut stream, request)?;
         let (tx, rx) = unbounded();
         self.conversation_stream_subscribers
@@ -665,8 +809,9 @@ impl WebChannel {
         send_websocket_json(
             &mut stream,
             &json!({
-                "type": "conversation_snapshot",
+                "type": "home.snapshot",
                 "conversations": self.conversation_summaries().unwrap_or_default(),
+                "server_time": now_rfc3339(),
             }),
         )?;
         websocket_event_loop(stream, rx)
@@ -698,14 +843,205 @@ impl WebChannel {
         send_websocket_json(
             &mut stream,
             &json!({
-                "type": "subscription_ack",
+                "type": "chat.snapshot",
                 "conversation_id": conversation_id,
                 "foreground_session_id": foreground_session_id,
                 "total": messages.len(),
                 "next_message_index": messages.len(),
+                "last_committed_message_id": messages.last().and_then(|message| {
+                    message.get("message_id").or_else(|| message.get("id")).and_then(Value::as_str)
+                }),
             }),
         )?;
         websocket_event_loop(stream, rx)
+    }
+
+    fn accept_terminal_stream(
+        &self,
+        mut stream: TcpStream,
+        request: &HttpRequest,
+        conversation_id: &str,
+        terminal_id: &str,
+    ) -> Result<()> {
+        accept_websocket(&mut stream, request)?;
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)?;
+        let offset = query_u64(&request.query, "offset").unwrap_or(0);
+        let request_id = generated_request_id("terminal-attach");
+        let rx = self
+            .conversation_runtime
+            .send_main_channel_ingress_subscribed(
+                conversation_id,
+                ChannelIngress::Terminal {
+                    request_id: request_id.clone(),
+                    request: TerminalRequest::Attach {
+                        terminal_id: terminal_id.to_string(),
+                        offset,
+                    },
+                },
+            )
+            .map_err(|error| anyhow!("{error:#}"))?;
+        let attached = wait_for_event(&rx, Duration::from_secs(30), |event| match event {
+            KernelChannelEvent::Terminal {
+                request_id: Some(id),
+                response,
+            } if id == request_id => Some(response),
+            _ => None,
+        })
+        .map_err(|error| anyhow!("{}", error.message))?;
+        let (replay, subscriber_id) = match attached {
+            TerminalResponse::Attached {
+                replay,
+                subscriber_id,
+            } => (replay, subscriber_id),
+            TerminalResponse::Error { message, .. } => {
+                send_websocket_json(&mut stream, &json!({"type": "error", "message": message}))?;
+                return Ok(());
+            }
+            other => {
+                send_websocket_json(
+                    &mut stream,
+                    &json!({"type": "error", "message": format!("unexpected terminal response: {other:?}")}),
+                )?;
+                return Ok(());
+            }
+        };
+
+        send_websocket_json(
+            &mut stream,
+            &json!({
+                "type": "attached",
+                "terminal_id": replay.terminal_id,
+                "requested_offset": replay.requested_offset,
+                "replay_start_offset": replay.replay_start_offset,
+                "buffer_start_offset": replay.buffer_start_offset,
+                "next_offset": replay.next_offset,
+                "dropped_bytes": replay.dropped_bytes,
+                "running": replay.running,
+            }),
+        )?;
+        if replay.dropped_bytes > 0 {
+            send_websocket_json(
+                &mut stream,
+                &json!({
+                    "type": "dropped",
+                    "buffer_start_offset": replay.buffer_start_offset,
+                    "dropped_bytes": replay.dropped_bytes,
+                }),
+            )?;
+        }
+        for chunk in replay.chunks {
+            if let Ok(bytes) = chunk.encoding.decode(&chunk.data) {
+                send_websocket_binary(&mut stream, &bytes)?;
+            }
+        }
+
+        let read_stream = stream.try_clone()?;
+        let runtime = self.conversation_runtime.clone();
+        let conversation_id_for_reader = conversation_id.to_string();
+        let terminal_id_for_reader = terminal_id.to_string();
+        thread::spawn(move || {
+            let mut read_stream = read_stream;
+            while let Ok(frame) = read_client_websocket_frame(&mut read_stream) {
+                match frame {
+                    ClientWebSocketFrame::Binary(bytes) if !bytes.is_empty() => {
+                        let _ = runtime.send_main_channel_ingress(
+                            &conversation_id_for_reader,
+                            ChannelIngress::Terminal {
+                                request_id: generated_request_id("terminal-input"),
+                                request: TerminalRequest::Input {
+                                    terminal_id: terminal_id_for_reader.clone(),
+                                    encoding: TerminalDataEncoding::Base64,
+                                    data: general_purpose::STANDARD.encode(bytes),
+                                },
+                            },
+                        );
+                    }
+                    ClientWebSocketFrame::Text(text) => {
+                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                            handle_terminal_control_frame(
+                                &runtime,
+                                &conversation_id_for_reader,
+                                &terminal_id_for_reader,
+                                value,
+                            );
+                        }
+                    }
+                    ClientWebSocketFrame::Close => break,
+                    _ => {}
+                }
+            }
+            if let Some(subscriber_id) = subscriber_id {
+                let _ = runtime.send_main_channel_ingress(
+                    &conversation_id_for_reader,
+                    ChannelIngress::Terminal {
+                        request_id: generated_request_id("terminal-detach"),
+                        request: TerminalRequest::Detach {
+                            terminal_id: terminal_id_for_reader,
+                            subscriber_id,
+                        },
+                    },
+                );
+            }
+        });
+
+        loop {
+            match rx.recv_timeout(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)) {
+                Ok(KernelChannelEvent::Terminal { response, .. }) => match response {
+                    TerminalResponse::Output {
+                        terminal_id: output_terminal_id,
+                        subscriber_id: output_subscriber_id,
+                        encoding,
+                        data,
+                    } if output_terminal_id == terminal_id
+                        && output_subscriber_id == subscriber_id =>
+                    {
+                        if let Ok(bytes) = encoding.decode(&data) {
+                            send_websocket_binary(&mut stream, &bytes)?;
+                        }
+                    }
+                    TerminalResponse::Detached {
+                        terminal_id: detached_terminal_id,
+                        subscriber_id: detached_subscriber_id,
+                    } if detached_terminal_id == terminal_id
+                        && Some(detached_subscriber_id) == subscriber_id =>
+                    {
+                        send_websocket_json(
+                            &mut stream,
+                            &json!({"type": "detached", "terminal_id": terminal_id}),
+                        )?;
+                        break;
+                    }
+                    TerminalResponse::Terminal { terminal }
+                        if terminal.terminal_id == terminal_id =>
+                    {
+                        if !terminal.running {
+                            send_websocket_json(
+                                &mut stream,
+                                &json!({"type": "exit", "terminal_id": terminal_id}),
+                            )?;
+                            break;
+                        }
+                    }
+                    TerminalResponse::Error { message, .. } => {
+                        send_websocket_json(
+                            &mut stream,
+                            &json!({"type": "error", "message": message}),
+                        )?;
+                    }
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    send_websocket_json(
+                        &mut stream,
+                        &json!({"type": "heartbeat", "server_time": now_rfc3339()}),
+                    )?;
+                }
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        Ok(())
     }
 
     fn publish_websocket_event(&self, conversation_id: &str, session_id: &str, payload: Value) {
@@ -769,10 +1105,10 @@ impl Channel for WebChannel {
             &appended.conversation_id,
             &appended.session_id,
             json!({
-                "type": "messages",
+                "type": "chat.message_appended",
                 "conversation_id": appended.conversation_id,
                 "session_id": appended.session_id,
-                "messages": [message],
+                "message": message,
             }),
         );
         if let Ok(metadata) =
@@ -780,7 +1116,7 @@ impl Channel for WebChannel {
         {
             if let Ok(summary) = self.conversation_summary(&metadata) {
                 self.publish_conversation_event(json!({
-                    "type": "conversation_upserted",
+                    "type": "home.conversation_upserted",
                     "conversation": summary,
                 }));
             }
@@ -789,11 +1125,16 @@ impl Channel for WebChannel {
     }
 
     fn session_stream(&self, stream: &OutgoingSessionStream) -> Result<()> {
+        let event_type = stream
+            .event
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("stream_event");
         self.publish_websocket_event(
             &stream.conversation_id,
             &stream.session_id,
             json!({
-                "type": "session_stream",
+                "type": format!("chat.{event_type}"),
                 "conversation_id": stream.conversation_id,
                 "session_id": stream.session_id,
                 "event": stream.event,
@@ -1037,11 +1378,19 @@ fn websocket_event_loop(mut stream: TcpStream, rx: Receiver<Value>) -> Result<()
 
 fn send_websocket_json(stream: &mut TcpStream, value: &Value) -> Result<()> {
     let payload = serde_json::to_vec(value)?;
+    send_websocket_frame(stream, 0x1, &payload)
+}
+
+fn send_websocket_binary(stream: &mut TcpStream, payload: &[u8]) -> Result<()> {
+    send_websocket_frame(stream, 0x2, payload)
+}
+
+fn send_websocket_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> Result<()> {
     if payload.len() > WEBSOCKET_MAX_FRAME_BYTES {
         return Ok(());
     }
     let mut frame = Vec::with_capacity(payload.len() + 10);
-    frame.push(0x81);
+    frame.push(0x80 | (opcode & 0x0f));
     if payload.len() < 126 {
         frame.push(payload.len() as u8);
     } else if payload.len() <= u16::MAX as usize {
@@ -1055,6 +1404,110 @@ fn send_websocket_json(stream: &mut TcpStream, value: &Value) -> Result<()> {
     stream.write_all(&frame)?;
     stream.flush()?;
     Ok(())
+}
+
+enum ClientWebSocketFrame {
+    Text(String),
+    Binary(Vec<u8>),
+    Close,
+    Other,
+}
+
+fn read_client_websocket_frame(stream: &mut TcpStream) -> Result<ClientWebSocketFrame> {
+    let mut header = [0_u8; 2];
+    stream.read_exact(&mut header)?;
+    let opcode = header[0] & 0x0f;
+    let masked = header[1] & 0x80 != 0;
+    let mut len = u64::from(header[1] & 0x7f);
+    if len == 126 {
+        let mut extended = [0_u8; 2];
+        stream.read_exact(&mut extended)?;
+        len = u64::from(u16::from_be_bytes(extended));
+    } else if len == 127 {
+        let mut extended = [0_u8; 8];
+        stream.read_exact(&mut extended)?;
+        len = u64::from_be_bytes(extended);
+    }
+    if len as usize > WEBSOCKET_MAX_FRAME_BYTES {
+        return Err(anyhow!("websocket frame too large"));
+    }
+    let mut mask = [0_u8; 4];
+    if masked {
+        stream.read_exact(&mut mask)?;
+    }
+    let mut payload = vec![0_u8; len as usize];
+    if len > 0 {
+        stream.read_exact(&mut payload)?;
+    }
+    if masked {
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % 4];
+        }
+    }
+    match opcode {
+        0x1 => Ok(ClientWebSocketFrame::Text(String::from_utf8(payload)?)),
+        0x2 => Ok(ClientWebSocketFrame::Binary(payload)),
+        0x8 => Ok(ClientWebSocketFrame::Close),
+        _ => Ok(ClientWebSocketFrame::Other),
+    }
+}
+
+fn handle_terminal_control_frame(
+    runtime: &ConversationHostRuntime,
+    conversation_id: &str,
+    terminal_id: &str,
+    value: Value,
+) {
+    match value.get("type").and_then(Value::as_str) {
+        Some("resize") => {
+            let cols = value
+                .get("cols")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(120);
+            let rows = value
+                .get("rows")
+                .and_then(Value::as_u64)
+                .and_then(|value| u16::try_from(value).ok())
+                .unwrap_or(30);
+            let _ = runtime.send_main_channel_ingress(
+                conversation_id,
+                ChannelIngress::Terminal {
+                    request_id: generated_request_id("terminal-resize"),
+                    request: TerminalRequest::Resize {
+                        terminal_id: terminal_id.to_string(),
+                        request: TerminalResizeRequest { cols, rows },
+                    },
+                },
+            );
+        }
+        Some("input") => {
+            let data = value
+                .get("data")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if data.is_empty() {
+                return;
+            }
+            let encoding = match value.get("encoding").and_then(Value::as_str) {
+                Some("base64") => TerminalDataEncoding::Base64,
+                _ => TerminalDataEncoding::Utf8,
+            };
+            let _ = runtime.send_main_channel_ingress(
+                conversation_id,
+                ChannelIngress::Terminal {
+                    request_id: generated_request_id("terminal-input"),
+                    request: TerminalRequest::Input {
+                        terminal_id: terminal_id.to_string(),
+                        encoding,
+                        data,
+                    },
+                },
+            );
+        }
+        _ => {}
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1323,11 +1776,29 @@ fn parse_optional_json<T: for<'de> Deserialize<'de> + Default>(body: &[u8]) -> H
     parse_json(body)
 }
 
+fn terminal_http_response(response: TerminalResponse) -> HttpResult {
+    match response {
+        TerminalResponse::Terminal { terminal } => Ok(HttpResponse::json(
+            200,
+            serde_json::to_value(terminal).map_err(HttpError::internal)?,
+        )),
+        TerminalResponse::Error { message, .. } => Err(HttpError::new(400, message)),
+        other => Ok(HttpResponse::json(
+            200,
+            serde_json::to_value(other).map_err(HttpError::internal)?,
+        )),
+    }
+}
+
 fn query_usize(query: &HashMap<String, String>, key: &str, default: usize) -> usize {
     query
         .get(key)
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
+}
+
+fn query_u64(query: &HashMap<String, String>, key: &str) -> Option<u64> {
+    query.get(key).and_then(|value| value.parse::<u64>().ok())
 }
 
 fn foreground_session_storage_id(foreground_session_id: &str) -> String {

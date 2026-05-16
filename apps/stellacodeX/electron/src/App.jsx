@@ -283,6 +283,8 @@ function patchConversationForegroundSession(conversation, sessionId, patch) {
 }
 
 function applyConversationStreamEvent(current, payload) {
+  const type = String(payload?.type || '');
+  const eventType = type.startsWith('home.') ? type.slice('home.'.length) : type;
   const sort = (list) => [...list].sort((left, right) => left.conversation_id.localeCompare(right.conversation_id));
   const upsert = (list, incoming) => {
     if (!incoming?.conversation_id) return list;
@@ -295,21 +297,21 @@ function applyConversationStreamEvent(current, payload) {
     ));
   };
 
-  if (payload.type === 'conversation_snapshot') {
+  if (eventType === 'snapshot' || eventType === 'conversation_snapshot') {
     const existingById = new Map(current.map((conversation) => [conversation.conversation_id, conversation]));
     return (payload.conversations || [])
       .map((conversation) => mergeConversationSummary(existingById.get(conversation.conversation_id), conversation));
   }
 
-  if (payload.type === 'conversation_upserted') {
+  if (eventType === 'conversation_upserted') {
     return upsert(current, payload.conversation);
   }
 
-  if (payload.type === 'conversation_deleted' && payload.conversation_id) {
+  if (eventType === 'conversation_deleted' && payload.conversation_id) {
     return current.filter((conversation) => conversation.conversation_id !== payload.conversation_id);
   }
 
-  if (payload.type === 'conversation_processing' && payload.conversation_id) {
+  if (eventType === 'conversation_processing' && payload.conversation_id) {
     return current.map((conversation) => (
       conversation.conversation_id === payload.conversation_id
         ? {
@@ -321,7 +323,7 @@ function applyConversationStreamEvent(current, payload) {
     ));
   }
 
-  if (payload.type === 'conversation_turn_completed' && payload.conversation_id) {
+  if (eventType === 'conversation_turn_completed' && payload.conversation_id) {
     const incoming = {
       ...(payload.conversation || {}),
       conversation_id: payload.conversation_id,
@@ -337,7 +339,11 @@ function applyConversationStreamEvent(current, payload) {
     return upsert(current, incoming);
   }
 
-  if (payload.type === 'conversation_seen' && payload.conversation_id && payload.seen) {
+  if (
+    (eventType === 'conversation_seen' || eventType === 'foreground_session_seen_state_updated')
+    && payload.conversation_id
+    && payload.seen
+  ) {
     const foregroundSessionId = payload.foreground_session_id || 'main';
     return current.map((conversation) => (
       conversation.conversation_id === payload.conversation_id
@@ -1053,8 +1059,11 @@ function App() {
           const nextConversations = applyConversationStreamEvent(conversationsRef.current, payload);
           conversationsRef.current = nextConversations;
           setConversations(nextConversations);
+          const homeType = String(payload?.type || '').startsWith('home.')
+            ? String(payload.type).slice('home.'.length)
+            : String(payload?.type || '');
           if (
-            payload.type === 'conversation_deleted'
+            homeType === 'conversation_deleted'
             && selectedRef.current?.serverId === activeServerId
             && selectedRef.current?.conversationId === payload.conversation_id
           ) {
@@ -1063,7 +1072,7 @@ function App() {
             setSelected(next ? { serverId: activeServerId, conversationId: next.conversation_id, foregroundSessionId: sessionId } : null);
           }
           if (!selectedRef.current) {
-            const fallbackConversation = payload.type === 'conversation_snapshot'
+            const fallbackConversation = (homeType === 'snapshot' || homeType === 'conversation_snapshot')
               ? (payload.conversations || [])[0]
               : payload.conversation;
             if (fallbackConversation?.conversation_id) {
@@ -1071,7 +1080,7 @@ function App() {
               setSelected({ serverId: activeServerId, conversationId: fallbackConversation.conversation_id, foregroundSessionId: sessionId });
             }
           }
-          if (payload.type === 'conversation_turn_completed' && payload.conversation_id) {
+          if (homeType === 'conversation_turn_completed' && payload.conversation_id) {
             const completed = nextConversations.find((conversation) => conversation.conversation_id === payload.conversation_id);
             const selectedConversation = selectedRef.current;
             const isActive = selectedConversation?.serverId === activeServerId
@@ -2011,7 +2020,8 @@ function App() {
           } catch {
             return;
           }
-          if (payload.type === 'subscription_ack') {
+          const payloadType = String(payload?.type || '');
+          if (payloadType === 'chat.snapshot' || payloadType === 'subscription_ack') {
             setSessionActivity(payload.reason === 'session_changed' ? 'Session 已切换' : '实时连接已同步');
             if (payload.turn_progress) {
               const progress = normalizeProgressFeedback(payload.turn_progress);
@@ -2022,11 +2032,17 @@ function App() {
               ]);
             }
             reconcileAck(payload).catch(() => {});
-          } else if (payload.type === 'messages') {
+          } else if (payloadType === 'chat.message_appended') {
+            applyIncomingMessages(payload.message ? [payload.message] : []);
+          } else if (payloadType === 'messages') {
             applyIncomingMessages(payload.messages || []);
-          } else if (payload.type === 'session_stream' || streamEventType(payload).startsWith('stream_')) {
+          } else if (
+            payloadType.startsWith('chat.stream_')
+            || payloadType === 'session_stream'
+            || streamEventType(payload).startsWith('stream_')
+          ) {
             applySessionStream(payload);
-          } else if (payload.type === 'turn_progress') {
+          } else if (payloadType === 'turn_progress') {
             const progress = normalizeProgressFeedback(payload);
             setSessionActivity(progress.state === 'done' ? '已完成' : progress.detail || progress.title);
             if (progress.state === 'done' || progress.state === 'failed') {
@@ -2045,7 +2061,7 @@ function App() {
                 mergeProgressActivity(current, progress)
               ]);
             }
-          } else if (payload.type === 'error') {
+          } else if (payloadType === 'error') {
             setSessionActivity(payload.message || payload.error || '实时连接错误');
           }
         });

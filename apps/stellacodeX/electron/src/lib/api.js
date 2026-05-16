@@ -71,7 +71,7 @@ export async function markConversationSeen(serverId, conversationId, lastSeenMes
 
 export async function conversationStreamUrl(serverId) {
   const info = await connectionInfo(serverId);
-  const url = new URL('/api/conversations/stream', info.baseUrl);
+  const url = new URL('/api/ws/home', info.baseUrl);
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   url.searchParams.set('token', info.token || '');
   return url.toString();
