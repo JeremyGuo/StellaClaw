@@ -17,12 +17,13 @@ use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
 use stellaclaw_core::session_actor::{
     ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, SelectionReferenceItem,
+    ToolRemoteMode,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     channels::web_terminal::{TerminalCreateRequest, TerminalResizeRequest},
-    config::StellaclawConfig,
+    config::{ModelSelection, SessionProfile, StellaclawConfig},
     conversation_host::ConversationHostRuntime,
     conversation_id_manager::ConversationIdManager,
     conversation_metadata::{ConversationMetadata, ConversationMetadataStore, WorkdirLayout},
@@ -32,6 +33,7 @@ use crate::{
     service_protos::{
         agent_session::AgentMessageOrigin,
         channel::{ChannelEvent as KernelChannelEvent, ChannelIngress},
+        kernel::KernelRuntimeConfigPatch,
         terminal::{TerminalDataEncoding, TerminalRequest, TerminalResponse},
         workspace::{WorkspaceFileEncoding, WorkspaceRequest, WorkspaceResponse, WorkspaceTarget},
     },
@@ -543,6 +545,29 @@ impl WebChannel {
         body: &[u8],
     ) -> HttpResult {
         let request: PostMessageRequest = parse_json(body)?;
+        if request.selection_references.is_empty() && request.files.is_empty() {
+            if let Some(text) = request.text.as_deref() {
+                if let Some(ingress) =
+                    self.control_ingress_from_text(text, foreground_session_id)?
+                {
+                    self.conversation_runtime
+                        .ensure_conversation_started(conversation_id)
+                        .map_err(HttpError::internal)?;
+                    self.conversation_runtime
+                        .send_main_channel_ingress(conversation_id, ingress)
+                        .map_err(HttpError::internal)?;
+                    return Ok(HttpResponse::json(
+                        202,
+                        json!({
+                            "accepted": true,
+                            "control": true,
+                            "conversation_id": conversation_id,
+                            "foreground_session_id": foreground_session_id,
+                        }),
+                    ));
+                }
+            }
+        }
         let mut items = Vec::new();
         if let Some(text) = request.text.filter(|text| !text.trim().is_empty()) {
             items.push(ChatMessageItem::Context(ContextItem { text }));
@@ -594,6 +619,97 @@ impl WebChannel {
                 "foreground_session_id": foreground_session_id,
             }),
         ))
+    }
+
+    fn control_ingress_from_text(
+        &self,
+        text: &str,
+        foreground_session_id: &str,
+    ) -> HttpResult<Option<ChannelIngress>> {
+        let Some((command, argument)) = parse_web_control_command(text) else {
+            return Ok(None);
+        };
+        let foreground_session_id = Some(foreground_session_id.to_string());
+        let ingress = match command {
+            "/continue" if argument.is_empty() => ChannelIngress::ContinueForegroundTurn {
+                foreground_session_id,
+                reason: Some("web requested continue".to_string()),
+            },
+            "/cancel" if argument.is_empty() => ChannelIngress::CancelForegroundTurn {
+                foreground_session_id,
+                reason: Some("web requested cancel".to_string()),
+            },
+            "/compact" if argument.is_empty() => ChannelIngress::CompactForegroundNow {
+                foreground_session_id,
+            },
+            "/status" if argument.is_empty() => ChannelIngress::QueryForegroundStatus {
+                foreground_session_id,
+            },
+            "/model" if argument.is_empty() => ChannelIngress::QueryForegroundStatus {
+                foreground_session_id,
+            },
+            "/model" => {
+                if !self.config.models.contains_key(argument) {
+                    return Err(HttpError::new(
+                        400,
+                        format!("unknown model alias {argument}"),
+                    ));
+                }
+                ChannelIngress::UpdateRuntimeConfig {
+                    patch: KernelRuntimeConfigPatch {
+                        session_profile: Some(Some(SessionProfile {
+                            main_model: ModelSelection::alias(argument.to_string()),
+                        })),
+                        ..Default::default()
+                    },
+                }
+            }
+            "/reasoning" => {
+                let effort = parse_reasoning_effort_argument(argument)?;
+                ChannelIngress::UpdateRuntimeConfig {
+                    patch: KernelRuntimeConfigPatch {
+                        reasoning_effort: Some(effort),
+                        ..Default::default()
+                    },
+                }
+            }
+            "/remote" if argument.is_empty() => ChannelIngress::QueryForegroundStatus {
+                foreground_session_id,
+            },
+            "/remote" if matches!(argument, "off" | "disable" | "disabled" | "local") => {
+                ChannelIngress::UpdateRuntimeConfig {
+                    patch: KernelRuntimeConfigPatch {
+                        tool_remote_mode: Some(ToolRemoteMode::Selectable),
+                        ..Default::default()
+                    },
+                }
+            }
+            "/remote" => {
+                let mut parts = argument.split_whitespace();
+                let host = parts.next().unwrap_or_default();
+                let path = parts.next().unwrap_or_default();
+                if host.is_empty() || path.is_empty() || parts.next().is_some() {
+                    return Err(HttpError::new(400, "usage: /remote <host> <path>"));
+                }
+                ChannelIngress::UpdateRuntimeConfig {
+                    patch: KernelRuntimeConfigPatch {
+                        tool_remote_mode: Some(ToolRemoteMode::FixedSsh {
+                            host: host.to_string(),
+                            cwd: Some(path.to_string()),
+                        }),
+                        ..Default::default()
+                    },
+                }
+            }
+            "/sandbox" => {
+                return Err(HttpError::new(
+                    400,
+                    "sandbox runtime switching is not exposed through web yet",
+                ));
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(ingress))
     }
 
     fn status_snapshot(&self, conversation_id: &str) -> HttpResult {
@@ -2323,6 +2439,31 @@ fn parse_optional_json<T: for<'de> Deserialize<'de> + Default>(body: &[u8]) -> H
         return Ok(T::default());
     }
     parse_json(body)
+}
+
+fn parse_web_control_command(text: &str) -> Option<(&str, &str)> {
+    let trimmed = text.trim();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let command = parts.next()?.split('@').next()?.trim();
+    let argument = parts.next().unwrap_or_default().trim();
+    Some((command, argument))
+}
+
+fn parse_reasoning_effort_argument(argument: &str) -> HttpResult<Option<String>> {
+    match argument.trim().to_ascii_lowercase().as_str() {
+        "" | "show" => Ok(None),
+        "default" | "model" | "model_default" | "model-default" | "global" => Ok(None),
+        "minimal" | "low" | "medium" | "high" | "xhigh" => {
+            Ok(Some(argument.trim().to_ascii_lowercase()))
+        }
+        other => Err(HttpError::new(
+            400,
+            format!("unknown reasoning effort {other}"),
+        )),
+    }
 }
 
 fn terminal_http_response(response: TerminalResponse) -> HttpResult {
