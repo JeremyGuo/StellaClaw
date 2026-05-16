@@ -622,6 +622,73 @@ function appendStreamAssistantDelta(current, event) {
   return next;
 }
 
+function appendStreamToolCallDelta(current, event) {
+  const id = streamMessageId(event);
+  const delta = streamDeltaText(event);
+  if (!id || !delta) return current;
+  const turnId = String(event?.turn_id || event?.turnId || '').trim();
+  const itemId = String(event?.item_id || event?.itemId || '').trim();
+  const callId = String(event?.call_id || event?.callId || itemId).trim();
+  if (!callId) return current;
+  const position = current.findIndex((message) => {
+    if (String(message?.id ?? message?.message_id ?? '') === id) return true;
+    return Boolean(turnId)
+      && message?._streaming
+      && String(message?._streamTurnId || '').trim() === turnId
+      && String(message?.role || '').toLowerCase() === 'assistant';
+  });
+  const now = new Date().toISOString();
+  const fallbackIndex = nextStreamMessageIndex(current);
+  const buildMessage = (existing = {}) => {
+    const items = Array.isArray(existing.items) ? [...existing.items] : [];
+    const itemIndex = items.findIndex((item) => item?.type === 'tool_call' && String(item?.tool_call_id || '') === callId);
+    const label = itemId && !/^item_|^fc_|^call_/.test(itemId) ? itemId : 'tool';
+    if (itemIndex >= 0) {
+      items[itemIndex] = {
+        ...items[itemIndex],
+        arguments: appendTextDelta(items[itemIndex].arguments || '', delta)
+      };
+    } else {
+      items.push({
+        type: 'tool_call',
+        index: items.length,
+        tool_call_id: callId,
+        tool_name: label,
+        arguments: delta
+      });
+    }
+    const eventIndex = streamMessageIndexFromEvent(event);
+    const existingIndex = Number(existing.index);
+    const index = Number.isFinite(eventIndex)
+      ? eventIndex
+      : Number.isFinite(existingIndex)
+        ? existingIndex
+        : fallbackIndex;
+    return {
+      ...existing,
+      id,
+      message_id: id,
+      index: Number.isFinite(index) ? index : existing.index,
+      role: 'assistant',
+      text: existing.text || existing.preview || '',
+      preview: existing.preview || existing.text || '',
+      content: existing.content || existing.text || existing.preview || '',
+      text_with_attachment_markers: existing.text_with_attachment_markers || existing.text || existing.preview || '',
+      items,
+      attachments: existing.attachments || [],
+      attachment_count: existing.attachment_count || 0,
+      message_time: existing.message_time || now,
+      _streamTurnId: turnId || existing._streamTurnId || '',
+      _streamItemId: itemId || existing._streamItemId || '',
+      _streaming: true
+    };
+  };
+  if (position < 0) return [...current, buildMessage()];
+  const next = [...current];
+  next[position] = buildMessage(next[position]);
+  return next;
+}
+
 function applyStreamErrorToMessages(current, event) {
   const id = streamMessageId(event);
   if (!id) return current;
@@ -1943,6 +2010,11 @@ function App() {
         const itemId = streamItemId(event);
         const bufferKey = `${key}:tool:${itemId}`;
         const text = appendStreamBuffer(bufferKey, streamDeltaText(event));
+        setMessages((current) => {
+          const next = appendStreamToolCallDelta(current, event);
+          messagesRef.current = next;
+          return next;
+        });
         setSessionActivity('准备调用工具');
         updateRunningActivities((current) => [
           ...current.filter((item) => item.id !== `stream-tool-${itemId}` && item.id !== 'thinking'),
@@ -1950,6 +2022,23 @@ function App() {
             id: `stream-tool-${itemId}`,
             title: '准备调用工具',
             detail: shortText(text, 96),
+            state: 'running'
+          })
+        ]);
+        return;
+      }
+
+      if (type === 'stream_tool_result_done') {
+        const toolResult = event?.tool_result || event?.toolResult || {};
+        const itemId = String(toolResult.tool_call_id || toolResult.toolCallId || event?.batch_id || event?.batchId || streamItemId(event)).trim();
+        const toolName = String(toolResult.tool_name || toolResult.toolName || '工具').trim();
+        setSessionActivity(`${toolName} 已返回`);
+        updateRunningActivities((current) => [
+          ...current.filter((item) => item.id !== `stream-tool-${itemId}` && item.id !== `stream-tool-result-${itemId}` && item.id !== 'thinking'),
+          mergeProgressActivity(current, {
+            id: `stream-tool-result-${itemId || toolName}`,
+            title: `${toolName} 已返回`,
+            detail: toolName,
             state: 'running'
           })
         ]);

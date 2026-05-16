@@ -1533,9 +1533,10 @@ impl WebChannel {
             "stream_assistant_message_delta" => {
                 state.apply_assistant_delta(&stream.event);
             }
-            "stream_tool_call_delta"
-            | "stream_reasoning_summary_part_added"
-            | "stream_reasoning_summary_delta" => {
+            "stream_tool_call_delta" => {
+                state.apply_tool_call_delta(&stream.event);
+            }
+            "stream_reasoning_summary_part_added" | "stream_reasoning_summary_delta" => {
                 state.set_turn_from_event(&stream.event);
             }
             "stream_tool_result_done" => {
@@ -2098,6 +2099,95 @@ impl ChatLiveState {
         }));
     }
 
+    fn apply_tool_call_delta(&mut self, event: &Value) {
+        self.set_turn_from_event(event);
+        let Some(message_id) = event.get("message_id").and_then(Value::as_str) else {
+            return;
+        };
+        let item_id = event
+            .get("item_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let call_id = event
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(item_id);
+        if call_id.is_empty() {
+            return;
+        }
+        let delta = event
+            .get("delta")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let turn_id = event
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let mut provisional = self
+            .current_provisional_assistant_message
+            .take()
+            .unwrap_or_else(|| {
+                json!({
+                    "turn_id": turn_id,
+                    "message_id": message_id,
+                    "message": {
+                        "id": message_id,
+                        "message_id": message_id,
+                        "role": "assistant",
+                        "text": "",
+                        "preview": "",
+                        "content": "",
+                        "text_with_attachment_markers": "",
+                        "items": [],
+                        "attachments": [],
+                        "attachment_count": 0,
+                        "message_time": now_rfc3339(),
+                        "_streamTurnId": turn_id,
+                        "_streaming": true,
+                    },
+                })
+            });
+        if let Some(message) = provisional
+            .get_mut("message")
+            .and_then(Value::as_object_mut)
+        {
+            let items = message
+                .entry("items".to_string())
+                .or_insert_with(|| json!([]));
+            if let Some(items) = items.as_array_mut() {
+                let next_index = items.len();
+                if let Some(item) = items.iter_mut().find(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("tool_call")
+                        && item
+                            .get("tool_call_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| id == call_id)
+                }) {
+                    if let Value::Object(map) = item {
+                        let existing = map
+                            .get("arguments")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        map.insert(
+                            "arguments".to_string(),
+                            json!(append_text_delta(existing, delta)),
+                        );
+                    }
+                } else {
+                    items.push(json!({
+                        "type": "tool_call",
+                        "index": next_index,
+                        "tool_call_id": call_id,
+                        "tool_name": item_id_if_readable(item_id).unwrap_or("tool"),
+                        "arguments": delta,
+                    }));
+                }
+            }
+        }
+        self.current_provisional_assistant_message = Some(provisional);
+    }
+
     fn apply_tool_result_done(&mut self, event: &Value) {
         let Some(tool_result) = event.get("tool_result").cloned() else {
             return;
@@ -2276,6 +2366,18 @@ fn append_text_delta(existing_text: &str, delta: &str) -> String {
         }
     }
     format!("{existing_text}{delta}")
+}
+
+fn item_id_if_readable(item_id: &str) -> Option<&str> {
+    let trimmed = item_id.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("item_")
+        || trimmed.starts_with("fc_")
+        || trimmed.starts_with("call_")
+    {
+        return None;
+    }
+    Some(trimmed)
 }
 
 fn wait_agent_session_created(rx: &Receiver<KernelChannelEvent>) -> HttpResult<String> {
