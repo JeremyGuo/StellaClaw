@@ -339,6 +339,23 @@ function applyConversationStreamEvent(current, payload) {
     return upsert(current, incoming);
   }
 
+  if (eventType === 'foreground_session_state_updated' && payload.conversation_id) {
+    const foregroundSessionId = payload.foreground_session_id || 'main';
+    const state = String(payload.state || 'idle').toLowerCase();
+    const running = state === 'running' || state === 'queued';
+    return current.map((conversation) => (
+      conversation.conversation_id === payload.conversation_id
+        ? patchConversationForegroundSession(conversation, foregroundSessionId, {
+          state,
+          active_turn_id: payload.active_turn_id || payload.activeTurnId || null,
+          last_error: payload.last_error || payload.lastError || null,
+          processing_state: state,
+          running
+        })
+        : conversation
+    ));
+  }
+
   if (
     (eventType === 'conversation_seen' || eventType === 'foreground_session_seen_state_updated')
     && payload.conversation_id

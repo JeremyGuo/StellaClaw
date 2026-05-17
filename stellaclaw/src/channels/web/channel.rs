@@ -610,6 +610,7 @@ impl WebChannel {
             )
             .map_err(HttpError::internal)?;
         self.record_user_message_queued(conversation_id, foreground_session_id, &client_message_id);
+        self.publish_foreground_session_state_event(conversation_id, foreground_session_id);
         self.publish_websocket_event(
             conversation_id,
             foreground_session_id,
@@ -1083,6 +1084,7 @@ impl WebChannel {
                 ))
                 .cloned()
         });
+        let live = self.chat_live_snapshot(&metadata.conversation_id, foreground_session_id);
         json!({
             "id": foreground_session_id,
             "foreground_session_id": foreground_session_id,
@@ -1101,7 +1103,8 @@ impl WebChannel {
                     foreground_session_id.to_string()
                 }
             }),
-            "state": "idle",
+            "state": live.summary_state(),
+            "active_turn_id": live.active_turn_id(),
             "is_main": foreground_session_id == "main",
             "message_count": summary.message_count,
             "last_message_id": summary.last_message_id.clone(),
@@ -1406,6 +1409,22 @@ impl WebChannel {
         subscribers.retain(|sender| sender.send(payload.clone()).is_ok());
     }
 
+    fn publish_foreground_session_state_event(
+        &self,
+        conversation_id: &str,
+        foreground_session_id: &str,
+    ) {
+        let live = self.chat_live_snapshot(conversation_id, foreground_session_id);
+        self.publish_conversation_event(json!({
+            "type": "home.foreground_session_state_updated",
+            "conversation_id": conversation_id,
+            "foreground_session_id": foreground_session_id,
+            "state": live.summary_state(),
+            "active_turn_id": live.active_turn_id(),
+            "last_error": live.last_error,
+        }));
+    }
+
     fn current_home_seq(&self) -> u64 {
         self.home_seq.lock().map(|seq| *seq).unwrap_or(0)
     }
@@ -1459,6 +1478,7 @@ impl WebChannel {
             "conversation_id": conversation_id,
             "foreground_session_id": foreground_session_id,
         }));
+        state.last_error = None;
     }
 
     fn record_message_appended(&self, appended: &OutgoingMessageAppended, message: &Value) {
@@ -1536,6 +1556,7 @@ impl WebChannel {
             .or_default();
         match event_type {
             "turn_started" => {
+                state.last_error = None;
                 state.current_turn_state =
                     stream
                         .event
@@ -1586,12 +1607,18 @@ impl WebChannel {
                 }
                 state.current_turn_state = None;
                 state.running_tool_results.clear();
+                state.last_error = stream
+                    .event
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
             }
             "turn_completed" => {
                 state.current_turn_state = None;
                 state.current_provisional_assistant_message = None;
                 state.running_tool_results.clear();
                 state.queued_outbound_messages.clear();
+                state.last_error = None;
             }
             _ => {}
         }
@@ -1634,6 +1661,8 @@ impl Channel for WebChannel {
     fn message_appended(&self, appended: &OutgoingMessageAppended) -> Result<()> {
         let message = decorate_message(&appended.message, appended.index);
         self.record_message_appended(appended, &message);
+        let foreground_session_id = foreground_route_id_from_storage_id(&appended.session_id)
+            .unwrap_or_else(|| appended.session_id.clone());
         self.publish_websocket_event(
             &appended.conversation_id,
             &appended.session_id,
@@ -1641,12 +1670,15 @@ impl Channel for WebChannel {
                 "type": "chat.message_appended",
                 "conversation_id": appended.conversation_id,
                 "session_id": appended.session_id,
-                "foreground_session_id": foreground_route_id_from_storage_id(&appended.session_id)
-                    .unwrap_or_else(|| appended.session_id.clone()),
+                "foreground_session_id": foreground_session_id,
                 "message_index": appended.index,
                 "message_id": appended.message.message_id,
                 "message": message,
             }),
+        );
+        self.publish_foreground_session_state_event(
+            &appended.conversation_id,
+            &foreground_session_id,
         );
         if let Ok(metadata) =
             ConversationMetadataStore::new(&self.workdir).load(&appended.conversation_id)
@@ -1668,6 +1700,16 @@ impl Channel for WebChannel {
             .and_then(Value::as_str)
             .unwrap_or("stream_event");
         self.record_session_stream(stream, event_type);
+        if matches!(
+            event_type,
+            "turn_started" | "turn_completed" | "stream_error"
+        ) {
+            self.publish_foreground_session_state_event(
+                &stream.conversation_id,
+                &foreground_route_id_from_storage_id(&stream.session_id)
+                    .unwrap_or_else(|| stream.session_id.clone()),
+            );
+        }
         let public_type = public_chat_stream_type(event_type);
         self.publish_websocket_event(
             &stream.conversation_id,
@@ -2063,9 +2105,30 @@ struct ChatLiveState {
     queued_outbound_messages: Vec<Value>,
     last_committed_message_id: Option<String>,
     last_committed_message_index: Option<usize>,
+    last_error: Option<String>,
 }
 
 impl ChatLiveState {
+    fn summary_state(&self) -> &'static str {
+        if self.current_turn_state.is_some() {
+            "running"
+        } else if !self.queued_outbound_messages.is_empty() {
+            "queued"
+        } else if self.last_error.is_some() {
+            "failed"
+        } else {
+            "idle"
+        }
+    }
+
+    fn active_turn_id(&self) -> Option<String> {
+        self.current_turn_state
+            .as_ref()
+            .and_then(|turn| turn.get("turn_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
     fn set_turn_from_event(&mut self, event: &Value) {
         let Some(turn_id) = event.get("turn_id").and_then(Value::as_str) else {
             return;
