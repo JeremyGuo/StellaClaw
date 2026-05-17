@@ -390,6 +390,14 @@ export function hasOlderMessages(messages) {
 export function mergeMessages(current, incoming) {
   if (!Array.isArray(incoming) || incoming.length === 0) return current;
   const serverEchoes = incoming.filter((message) => String(message?.role || '').toLowerCase() === 'user');
+  const committedToolResultIds = new Set(
+    incoming.flatMap((message) => (
+      messageItems(message)
+        .filter((item) => item?.type === 'tool_result')
+        .map((item) => String(item.tool_call_id || '').trim())
+        .filter(Boolean)
+    ))
+  );
   const finalizedAssistantIndexes = new Set(
     incoming
       .filter((message) => String(message?.role || '').toLowerCase() === 'assistant' && !message?._streaming)
@@ -398,6 +406,12 @@ export function mergeMessages(current, incoming) {
   );
   const currentWithoutEchoedOptimistic = current.filter((message) => {
     if (message?._streaming && finalizedAssistantIndexes.has(messageIndex(message))) return false;
+    if (
+      message?._liveToolResult
+      && committedToolResultIds.has(String(message?._liveToolCallId || '').trim())
+    ) {
+      return false;
+    }
     if (!message?._optimistic) return true;
     const text = messageText(message).trim();
     return !serverEchoes.some((incomingMessage) => messageText(incomingMessage).trim() === text);

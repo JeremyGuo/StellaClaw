@@ -748,6 +748,62 @@ function appendStreamReasoningSummary(current, event) {
   return next;
 }
 
+function liveToolResultMessage(event, existingMessages = []) {
+  const toolResult = event?.tool_result || event?.toolResult || event;
+  if (!toolResult || typeof toolResult !== 'object') return null;
+  const turnId = String(event?.turn_id || event?.turnId || '').trim();
+  const toolCallId = String(toolResult.tool_call_id || toolResult.toolCallId || event?.tool_call_id || event?.toolCallId || '').trim();
+  const toolName = String(toolResult.tool_name || toolResult.toolName || 'tool').trim() || 'tool';
+  if (!toolCallId && !toolName) return null;
+  const result = toolResult.result || {};
+  const id = `live-tool-result-${turnId || 'turn'}-${toolCallId || toolName}`;
+  return {
+    id,
+    message_id: id,
+    index: nextStreamMessageIndex(existingMessages),
+    role: 'assistant',
+    text: '',
+    preview: '',
+    content: '',
+    text_with_attachment_markers: '',
+    items: [{
+      type: 'tool_result',
+      index: 0,
+      tool_call_id: toolCallId,
+      tool_name: toolName,
+      context: result.context?.text || null,
+      context_with_attachment_markers: result.context?.text || null,
+      structured: result.structured || null,
+      files: Array.isArray(result.files) ? result.files : []
+    }],
+    attachments: Array.isArray(result.files) ? result.files : [],
+    attachment_count: Array.isArray(result.files) ? result.files.length : 0,
+    message_time: new Date().toISOString(),
+    _streamTurnId: turnId,
+    _streaming: true,
+    _liveToolResult: true,
+    _liveToolCallId: toolCallId
+  };
+}
+
+function appendStreamToolResultDone(current, event) {
+  const message = liveToolResultMessage(event, current);
+  if (!message) return current;
+  const existingIndex = current.findIndex((item) => (
+    item?._liveToolResult
+    && String(item?._liveToolCallId || '') === String(message._liveToolCallId || '')
+    && String(item?._streamTurnId || '') === String(message._streamTurnId || '')
+  ));
+  if (existingIndex < 0) return [...current, message];
+  const next = [...current];
+  next[existingIndex] = {
+    ...next[existingIndex],
+    ...message,
+    index: next[existingIndex].index
+  };
+  return next;
+}
+
 function markQueuedUserMessage(current, clientMessageId) {
   const id = String(clientMessageId || '').trim();
   if (!id) return current;
@@ -2120,6 +2176,11 @@ function App() {
         const toolResult = event?.tool_result || event?.toolResult || {};
         const itemId = String(toolResult.tool_call_id || toolResult.toolCallId || event?.batch_id || event?.batchId || streamItemId(event)).trim();
         const toolName = String(toolResult.tool_name || toolResult.toolName || '工具').trim();
+        setMessages((current) => {
+          const next = appendStreamToolResultDone(current, event);
+          messagesRef.current = next;
+          return next;
+        });
         setSessionActivity(`${toolName} 已返回`);
         updateRunningActivities((current) => [
           ...current.filter((item) => item.id !== `stream-tool-${itemId}` && item.id !== `stream-tool-result-${itemId}` && item.id !== 'thinking'),
@@ -2246,6 +2307,7 @@ function App() {
         });
       }
       const activities = toolStates
+        .filter((state) => !state?.committed)
         .map((state) => state?.tool_result || state?.toolResult || state)
         .filter(Boolean)
         .map((toolResult) => {
@@ -2259,6 +2321,18 @@ function App() {
           };
         });
       if (activities.length > 0) {
+        setMessages((current) => {
+          let next = current;
+          toolStates.forEach((state) => {
+            if (state?.committed) return;
+            next = appendStreamToolResultDone(next, {
+              turn_id: state?.turn_id || state?.turnId || snapshot.current_turn_state?.turn_id,
+              tool_result: state?.tool_result || state?.toolResult || state
+            });
+          });
+          messagesRef.current = next;
+          return next;
+        });
         updateRunningActivities((current) => [
           ...current.filter((item) => !activities.some((activity) => activity.id === item.id) && item.id !== 'thinking'),
           ...activities
