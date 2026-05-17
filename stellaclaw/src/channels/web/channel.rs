@@ -1012,6 +1012,11 @@ impl Channel for WebChannel {
         Ok(())
     }
 
+    fn home_event(&self, payload: &Value) -> Result<()> {
+        self.main.publish_home(payload.clone());
+        Ok(())
+    }
+
     fn set_processing(&self, platform_chat_id: &str, state: ProcessingState) -> Result<()> {
         self.main.set_processing(platform_chat_id, state);
         Ok(())

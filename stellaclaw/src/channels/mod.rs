@@ -21,6 +21,7 @@ pub trait Channel: Send + Sync {
     fn send_delivery(&self, delivery: &OutgoingDelivery) -> Result<()>;
     fn send_event(&self, event: &ChannelEvent) -> Result<()> {
         match event {
+            ChannelEvent::Home(home) => self.home_event(&home.payload),
             ChannelEvent::MessageAppended(appended) => self.message_appended(appended),
             ChannelEvent::SessionStream(stream) => self.session_stream(stream),
             ChannelEvent::Processing(processing) => {
@@ -57,6 +58,9 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
     fn session_stream(&self, _stream: &OutgoingSessionStream) -> Result<()> {
+        Ok(())
+    }
+    fn home_event(&self, _payload: &serde_json::Value) -> Result<()> {
         Ok(())
     }
     fn spawn_ingress(

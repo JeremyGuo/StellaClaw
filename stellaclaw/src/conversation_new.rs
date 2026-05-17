@@ -1987,6 +1987,50 @@ mod tests {
     }
 
     #[test]
+    fn channel_ingress_projects_runtime_config_updates() {
+        let mut kernel = test_kernel("channel_runtime_config_update_event");
+        let (ingress_tx, ingress_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        kernel
+            .mount_service_instance(
+                ServiceAddr::channel_id("scratch"),
+                ServiceKind::Channel,
+                Box::new(ChannelService::with_platform_events(ingress_rx, event_tx)),
+            )
+            .expect("channel mounts");
+
+        ingress_tx
+            .send(ChannelIngress::UpdateRuntimeConfig {
+                patch: kernel::KernelRuntimeConfigPatch {
+                    memory_enabled: Some(true),
+                    ..Default::default()
+                },
+            })
+            .expect("runtime config update sends");
+        kernel
+            .pump_for(Duration::from_millis(100))
+            .expect("runtime config update drains");
+
+        let event = event_rx
+            .try_iter()
+            .find(|event| matches!(event, ChannelEvent::KernelRuntimeConfig { .. }))
+            .expect("runtime config update event emitted");
+        let ChannelEvent::KernelRuntimeConfig {
+            request_id,
+            response,
+        } = event
+        else {
+            panic!("expected runtime config event");
+        };
+        assert!(request_id.is_empty());
+        let kernel::KernelResponse::RuntimeConfigUpdated { config, .. } = response else {
+            panic!("expected runtime config updated response");
+        };
+        assert!(config.memory_enabled);
+        kernel.stop_all("test finished").expect("services stop");
+    }
+
+    #[test]
     fn channel_forwards_workspace_requests_to_workspace_service() {
         let mut kernel = test_kernel("channel_workspace_forward");
         let (ingress_tx, ingress_rx) = crossbeam_channel::unbounded();

@@ -15,6 +15,9 @@ version: 1.28.0
 - 收敛 Web metadata / runtime config 查询边界：
   Kernel 协议新增只读 `QueryRuntimeConfig`，ChannelService 新增对应 `ChannelIngress::QueryRuntimeConfig` 和 typed `KernelRuntimeConfig` event；WebChannel 的 conversation list、conversation rename、foreground session list/create/rename/delete、message append summary 和 status summary 不再直接读取或修改 conversation metadata / runtime config 文件，而是通过 `WebChannel -> ChannelService -> Kernel` 查询或更新。新建 conversation 的初始 metadata 写入和删除 conversation 的目录移除仍保留在 Host/Web REST 生命周期边界。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 补齐 home websocket 的 metadata / runtime config 动态事件：
+  通用 ChannelEvent 新增 Web 专用 home event 投影；Kernel metadata 更新会投影为 `home.conversation_updated`，携带 conversation name、foreground session id、model selection pending 和 session nickname patch；runtime config 更新会同步投影为 `home.conversation_updated`，携带 model、reasoning、sandbox、remote 和精简 runtime_config patch，避免前端必须靠 REST 回读才能看到模型 / 推理强度 / remote / sandbox 变化。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 修复 FixedSSH workspace remote helper 启动：
   WorkspaceService 不再把整段 Python helper 作为裸 `ssh host python3 -c <script>` 参数发送给远端 shell；现在会把 helper 脚本 base64 编码后作为 shell-safe 参数传给远端 `python3 -c` loader，JSON request 仍通过 stdin 传输，避免 zsh 等远端登录 shell 把 Python 函数体当 shell 语法解析并报 `parse error near ')'`。远端 listing 也改为用 `lstat` 和 symlink 优先识别，避免断开的远端 symlink 让 workspace list 失败。本次不改变 `config` schema，不改变 `workdir` schema。
 

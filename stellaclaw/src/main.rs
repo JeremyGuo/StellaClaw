@@ -29,7 +29,8 @@ use channels::{
     types::{
         ChannelEvent, ConversationControl, IncomingConversationMessage, IncomingDispatch,
         OutgoingDispatch, OutgoingError, OutgoingErrorScope, OutgoingErrorSeverity,
-        OutgoingMessageAppended, OutgoingProcessing, OutgoingSessionStream, ProcessingState,
+        OutgoingHomeEvent, OutgoingMessageAppended, OutgoingProcessing, OutgoingSessionStream,
+        ProcessingState,
     },
     Channel, TelegramChannel, WebChannel,
 };
@@ -43,7 +44,7 @@ use sandbox::bubblewrap_support_error;
 use service_protos::{
     agent_session::{AgentMessageOrigin, AgentSessionEvent},
     channel::ChannelIngress,
-    kernel::KernelRuntimeConfigPatch,
+    kernel::{KernelResponse, KernelRuntimeConfigPatch},
 };
 use services::skill_sync::push_configured_skill_sync_on_startup;
 use stellaclaw_core::session_actor::{
@@ -166,11 +167,13 @@ fn run() -> Result<()> {
 
     let bridge_runtime = conversation_host_runtime.clone();
     let bridge_workdir = args.workdir.clone();
+    let bridge_config = config.clone();
     let bridge_outgoing_tx = outgoing_tx.clone();
     let bridge_logger = logger.clone();
     thread::spawn(move || {
         run_conversation_event_bridge(
             bridge_workdir,
+            bridge_config,
             bridge_runtime,
             bridge_outgoing_tx,
             bridge_logger,
@@ -411,6 +414,7 @@ fn control_to_channel_ingress(
 
 fn run_conversation_event_bridge(
     workdir: PathBuf,
+    config: Arc<StellaclawConfig>,
     conversation_runtime: Arc<ConversationHostRuntime>,
     outgoing_tx: Sender<OutgoingDispatch>,
     logger: Arc<StellaclawLogger>,
@@ -439,7 +443,7 @@ fn run_conversation_event_bridge(
                 continue;
             };
             for event in rx.try_iter() {
-                match project_channel_event(&workdir, &conversation_id, event) {
+                match project_channel_event(&workdir, &config, &conversation_id, event) {
                     Ok(events) => {
                         for event in events {
                             let _ = outgoing_tx.send(OutgoingDispatch::Event(event));
@@ -463,6 +467,7 @@ fn run_conversation_event_bridge(
 
 fn project_channel_event(
     workdir: &PathBuf,
+    config: &StellaclawConfig,
     conversation_id: &str,
     event: service_protos::channel::ChannelEvent,
 ) -> Result<Vec<ChannelEvent>> {
@@ -640,9 +645,78 @@ fn project_channel_event(
                 suggested_action: None,
             }));
         }
+        service_protos::channel::ChannelEvent::KernelMetadata {
+            response: KernelResponse::MetadataUpdated { metadata },
+            ..
+        } => {
+            events.push(ChannelEvent::Home(OutgoingHomeEvent {
+                channel_id: metadata.channel_id.clone(),
+                platform_chat_id: metadata.platform_chat_id.clone(),
+                payload: serde_json::json!({
+                    "type": "home.conversation_updated",
+                    "conversation_id": metadata.conversation_id,
+                    "patch": {
+                        "conversation_name": if metadata.nickname.trim().is_empty() { metadata.conversation_id.clone() } else { metadata.nickname.clone() },
+                        "nickname": if metadata.nickname.trim().is_empty() { metadata.conversation_id.clone() } else { metadata.nickname.clone() },
+                        "foreground_session_id": metadata.foreground_session_id,
+                        "model_selection_pending": metadata.model_selection_pending,
+                        "session_nicknames": metadata.session_nicknames,
+                    },
+                }),
+            }));
+        }
+        service_protos::channel::ChannelEvent::KernelRuntimeConfig {
+            response:
+                KernelResponse::RuntimeConfigUpdated {
+                    config: runtime_config,
+                    ..
+                },
+            ..
+        } => {
+            events.push(ChannelEvent::Home(OutgoingHomeEvent {
+                channel_id: metadata.channel_id.clone(),
+                platform_chat_id: metadata.platform_chat_id.clone(),
+                payload: serde_json::json!({
+                    "type": "home.conversation_updated",
+                    "conversation_id": metadata.conversation_id,
+                    "patch": runtime_config_home_patch(&runtime_config, config),
+                }),
+            }));
+        }
         _ => {}
     }
     Ok(events)
+}
+
+fn runtime_config_home_patch(
+    runtime_config: &conversation_new::ConversationRuntimeConfig,
+    config: &StellaclawConfig,
+) -> serde_json::Value {
+    serde_json::json!({
+        "model": runtime_config
+            .session_profile
+            .as_ref()
+            .map(|profile| profile.main_model.display_name(&config.models))
+            .unwrap_or_else(|| "unconfigured".to_string()),
+        "reasoning": runtime_config
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or("model default"),
+        "sandbox": runtime_config
+            .sandbox
+            .as_ref()
+            .map(|sandbox| format!("{:?}", sandbox.mode))
+            .unwrap_or_else(|| "default".to_string()),
+        "remote": format!("{:?}", runtime_config.tool_remote_mode),
+        "runtime_config": {
+            "agent_server_configured": runtime_config.agent_server_path.is_some(),
+            "has_session_profile": runtime_config.session_profile.is_some(),
+            "memory_enabled": runtime_config.memory_enabled,
+            "tool_remote_mode": runtime_config.tool_remote_mode,
+            "has_sandbox_override": runtime_config.sandbox.is_some(),
+            "reasoning_effort": runtime_config.reasoning_effort,
+        },
+    })
 }
 
 fn service_addr_storage_component(addr: &conversation_new::ServiceAddr) -> String {

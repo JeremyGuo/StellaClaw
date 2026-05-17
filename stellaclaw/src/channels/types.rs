@@ -188,7 +188,15 @@ pub struct OutgoingProcessing {
 }
 
 #[derive(Debug, Clone)]
+pub struct OutgoingHomeEvent {
+    pub channel_id: String,
+    pub platform_chat_id: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone)]
 pub enum ChannelEvent {
+    Home(OutgoingHomeEvent),
     MessageAppended(OutgoingMessageAppended),
     SessionStream(OutgoingSessionStream),
     Processing(OutgoingProcessing),
@@ -198,6 +206,7 @@ pub enum ChannelEvent {
 impl ChannelEvent {
     pub fn channel_id(&self) -> &str {
         match self {
+            ChannelEvent::Home(home) => &home.channel_id,
             ChannelEvent::MessageAppended(appended) => &appended.channel_id,
             ChannelEvent::SessionStream(stream) => &stream.channel_id,
             ChannelEvent::Processing(processing) => &processing.channel_id,
@@ -207,6 +216,7 @@ impl ChannelEvent {
 
     pub fn platform_chat_id(&self) -> &str {
         match self {
+            ChannelEvent::Home(home) => &home.platform_chat_id,
             ChannelEvent::MessageAppended(appended) => &appended.platform_chat_id,
             ChannelEvent::SessionStream(stream) => &stream.platform_chat_id,
             ChannelEvent::Processing(processing) => &processing.platform_chat_id,

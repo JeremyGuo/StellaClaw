@@ -400,6 +400,16 @@ fn handle_channel_request(
                     config,
                     updated_services,
                 }) => {
+                    emit_channel_event(
+                        event_tx,
+                        ChannelEvent::KernelRuntimeConfig {
+                            request_id: String::new(),
+                            response: KernelResponse::RuntimeConfigUpdated {
+                                config: config.clone(),
+                                updated_services: updated_services.clone(),
+                            },
+                        },
+                    )?;
                     let detail = serde_json::json!({
                         "agent_server_configured": config.agent_server_path.is_some(),
                         "has_session_profile": config.session_profile.is_some(),
