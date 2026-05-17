@@ -104,7 +104,13 @@ impl WebChannel {
         match (request.method.as_str(), path.as_slice()) {
             ("GET", ["api", "health"]) => Ok(HttpResponse::json(200, json!({"ok": true}))),
             ("GET", ["api", "models"]) => self.list_models(),
-            ("GET", ["api", "conversations"]) => self.list_conversations(&request.query),
+            ("GET", ["api", "debug", "conversations"]) => self.list_conversations(&request.query),
+            ("GET", ["api", "debug", "conversations", conversation_id, "foreground_sessions"]) => {
+                self.list_foreground_sessions(conversation_id)
+            }
+            ("GET", ["api", "debug", "conversations", conversation_id, "status"]) => {
+                self.status_snapshot(conversation_id)
+            }
             ("POST", ["api", "conversations"]) => self.create_conversation(&request, id_manager),
             ("PATCH", ["api", "conversations", conversation_id]) => {
                 self.rename_conversation(conversation_id, &request.body)
@@ -114,9 +120,6 @@ impl WebChannel {
             }
             ("POST", ["api", "conversations", conversation_id, "seen"]) => {
                 self.mark_seen(conversation_id, &request.body)
-            }
-            ("GET", ["api", "conversations", conversation_id, "foreground_sessions"]) => {
-                self.list_foreground_sessions(conversation_id)
             }
             ("POST", ["api", "conversations", conversation_id, "foreground_sessions"]) => {
                 self.create_foreground_session(conversation_id, &request.body)
@@ -145,9 +148,6 @@ impl WebChannel {
                 "POST",
                 ["api", "conversations", conversation_id, "foreground_sessions", foreground_session_id, "messages"],
             ) => self.post_message(conversation_id, foreground_session_id, &request.body),
-            ("GET", ["api", "conversations", conversation_id, "status"]) => {
-                self.status_snapshot(conversation_id)
-            }
             ("GET", ["api", "conversations", conversation_id, "workspace"]) => {
                 self.list_workspace(conversation_id, &request.query)
             }

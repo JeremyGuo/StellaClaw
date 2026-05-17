@@ -15,6 +15,9 @@ version: 1.28.0
 - 收口 Web stream / home 事件协议：
   WebChannel 的 home / chat snapshot、conversation/session mutation、message append、stream error 和 session stream 投影开始统一通过 `channels/web/protocol.rs` 的固定 builder 生成，避免事件名和字段形态散落在多个 `json!` 调用中；foreground session 创建、重命名、删除分别投影为 `home.foreground_session_upserted`、`home.foreground_session_updated` 和 `home.foreground_session_deleted`，不再用整包 conversation upsert 伪装 session mutation。WebChannelMain 会按 `message_id + in_message_index` 校验 stream 连续性，发现缺口时立即撤销当前 provisional message 并发送 `chat.stream_error`；最终 durable assistant message 到达时会对比已累积的 stream 文本 / tool call 参数 / reasoning summary，不一致时先报告 `stream_commit_mismatch`，再让 durable `chat.message_appended` 替换页面内容。SessionActor 对新用户消息抢占 active provider stream 增加 200ms 活跃保护，最近仍有 provider stream delta 到达时不会立刻 abort，只有超过 grace window 后才用 `superseded_by_user_message` 取消。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 收敛 Web 读取接口到 websocket snapshot：
+  Conversation list、foreground session list 和 conversation status snapshot 不再保留在正式 REST 路径；首页和 session 列表初始化应通过 `GET /api/ws/home` 的 `home.snapshot`，后续通过 `home.*` 增量事件更新。为了调试保留只读入口，但统一移动到 `/api/debug/conversations`、`/api/debug/conversations/{conversation_id}/foreground_sessions` 和 `/api/debug/conversations/{conversation_id}/status`；create / rename / delete 等 mutation REST 继续保留。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 收敛用户消息生命周期和旧 delivery/progress 投影：
   ChannelService 收到平台输入后会先发 `UserMessageQueued`，AgentSessionService 在开始处理用户消息和用户消息落盘后分别投影 `UserMessageStarted` / `UserMessageCommitted`，Web chat stream 对应新增 `chat.user_message_queued`、`chat.user_message_started` 和 `chat.user_message_committed` typed events；同时删除旧 Channel `Deliver` request / `Delivery` event、`chat.delivery` 投影和 AgentSession 层 `Progress` 事件，计划更新只走 `PlanUpdated`，普通进度文本不再伪装成协议消息。本次不改变 `config` schema，不改变 `workdir` schema。
 
