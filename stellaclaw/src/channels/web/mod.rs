@@ -1,8 +1,10 @@
 mod channel;
+mod control;
+mod history;
 mod http;
+mod ids;
 mod main;
 pub mod protocol;
-pub mod state;
 mod terminal;
 mod time_utils;
 mod websocket;

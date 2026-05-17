@@ -14,7 +14,10 @@ use crate::channels::{
     OutgoingError, OutgoingMessageAppended, OutgoingSessionStream, ProcessingState,
 };
 
-use super::time_utils::now_rfc3339;
+use super::{
+    ids::{foreground_route_id_from_storage_id, foreground_session_storage_id},
+    time_utils::now_rfc3339,
+};
 
 const SEEN_STATE_FILE: &str = "seen_state.json";
 
@@ -1019,20 +1022,6 @@ fn conversation_seen_key(conversation_id: &str, foreground_session_id: &str) -> 
         "{conversation_id}:{}",
         foreground_session_storage_id(foreground_session_id)
     )
-}
-
-fn foreground_session_storage_id(foreground_session_id: &str) -> String {
-    if foreground_session_id.starts_with("local__agent__foreground__") {
-        foreground_session_id.to_string()
-    } else {
-        format!("local__agent__foreground__{foreground_session_id}")
-    }
-}
-
-fn foreground_route_id_from_storage_id(storage_id: &str) -> Option<String> {
-    storage_id
-        .strip_prefix("local__agent__foreground__")
-        .map(str::to_string)
 }
 
 fn tool_result_call_ids(message: &Value) -> Vec<&str> {

@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
     fs,
-    io::{BufRead, BufReader},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -15,28 +14,31 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use stellaclaw_core::session_actor::{
     ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, SelectionReferenceItem,
-    ToolRemoteMode,
 };
 
 use crate::{
-    config::{ModelSelection, SessionProfile, StellaclawConfig},
+    config::StellaclawConfig,
     conversation_host::ConversationHostRuntime,
     conversation_id_manager::ConversationIdManager,
     conversation_metadata::{ConversationMetadata, ConversationMetadataStore, WorkdirLayout},
     conversation_new::ConversationRuntimeConfig,
-    conversation_new::{ServiceAddr, ServiceScope},
     logger::StellaclawLogger,
     service_protos::{
         agent_session::AgentMessageOrigin,
         channel::{ChannelEvent as KernelChannelEvent, ChannelIngress},
-        kernel::KernelRuntimeConfigPatch,
     },
 };
 
 use super::{
+    control::control_ingress_from_text,
+    history::{decorate_message, message_log_path, message_summary, read_messages},
     http::{
         parse_json, parse_optional_json, query_usize, read_http_request, split_path,
         write_response, HttpError, HttpRequest, HttpResponse, HttpResult,
+    },
+    ids::{
+        default_foreground_route_id, foreground_route_id_from_storage_id,
+        foreground_session_storage_id, processing_state_name, service_addr_storage_component,
     },
     main::{load_seen_state, ChatLiveState, ConversationSeen, WebChannelMainHandle},
     time_utils::{generated_platform_id, generated_request_id, now_rfc3339},
@@ -525,7 +527,7 @@ impl WebChannel {
         if request.selection_references.is_empty() && request.files.is_empty() {
             if let Some(text) = request.text.as_deref() {
                 if let Some(ingress) =
-                    self.control_ingress_from_text(text, foreground_session_id)?
+                    control_ingress_from_text(&self.config, text, foreground_session_id)?
                 {
                     self.conversation_runtime
                         .ensure_conversation_started(conversation_id)
@@ -596,97 +598,6 @@ impl WebChannel {
                 "client_message_id": client_message_id,
             }),
         ))
-    }
-
-    fn control_ingress_from_text(
-        &self,
-        text: &str,
-        foreground_session_id: &str,
-    ) -> HttpResult<Option<ChannelIngress>> {
-        let Some((command, argument)) = parse_web_control_command(text) else {
-            return Ok(None);
-        };
-        let foreground_session_id = Some(foreground_session_id.to_string());
-        let ingress = match command {
-            "/continue" if argument.is_empty() => ChannelIngress::ContinueForegroundTurn {
-                foreground_session_id,
-                reason: Some("web requested continue".to_string()),
-            },
-            "/cancel" if argument.is_empty() => ChannelIngress::CancelForegroundTurn {
-                foreground_session_id,
-                reason: Some("web requested cancel".to_string()),
-            },
-            "/compact" if argument.is_empty() => ChannelIngress::CompactForegroundNow {
-                foreground_session_id,
-            },
-            "/status" if argument.is_empty() => ChannelIngress::QueryForegroundStatus {
-                foreground_session_id,
-            },
-            "/model" if argument.is_empty() => ChannelIngress::QueryForegroundStatus {
-                foreground_session_id,
-            },
-            "/model" => {
-                if !self.config.models.contains_key(argument) {
-                    return Err(HttpError::new(
-                        400,
-                        format!("unknown model alias {argument}"),
-                    ));
-                }
-                ChannelIngress::UpdateRuntimeConfig {
-                    patch: KernelRuntimeConfigPatch {
-                        session_profile: Some(Some(SessionProfile {
-                            main_model: ModelSelection::alias(argument.to_string()),
-                        })),
-                        ..Default::default()
-                    },
-                }
-            }
-            "/reasoning" => {
-                let effort = parse_reasoning_effort_argument(argument)?;
-                ChannelIngress::UpdateRuntimeConfig {
-                    patch: KernelRuntimeConfigPatch {
-                        reasoning_effort: Some(effort),
-                        ..Default::default()
-                    },
-                }
-            }
-            "/remote" if argument.is_empty() => ChannelIngress::QueryForegroundStatus {
-                foreground_session_id,
-            },
-            "/remote" if matches!(argument, "off" | "disable" | "disabled" | "local") => {
-                ChannelIngress::UpdateRuntimeConfig {
-                    patch: KernelRuntimeConfigPatch {
-                        tool_remote_mode: Some(ToolRemoteMode::Selectable),
-                        ..Default::default()
-                    },
-                }
-            }
-            "/remote" => {
-                let mut parts = argument.split_whitespace();
-                let host = parts.next().unwrap_or_default();
-                let path = parts.next().unwrap_or_default();
-                if host.is_empty() || path.is_empty() || parts.next().is_some() {
-                    return Err(HttpError::new(400, "usage: /remote <host> <path>"));
-                }
-                ChannelIngress::UpdateRuntimeConfig {
-                    patch: KernelRuntimeConfigPatch {
-                        tool_remote_mode: Some(ToolRemoteMode::FixedSsh {
-                            host: host.to_string(),
-                            cwd: Some(path.to_string()),
-                        }),
-                        ..Default::default()
-                    },
-                }
-            }
-            "/sandbox" => {
-                return Err(HttpError::new(
-                    400,
-                    "sandbox runtime switching is not exposed through web yet",
-                ));
-            }
-            _ => return Ok(None),
-        };
-        Ok(Some(ingress))
     }
 
     fn status_snapshot(&self, conversation_id: &str) -> HttpResult {
@@ -1079,69 +990,6 @@ pub(super) struct MoveWorkspacePathRequest {
     pub(super) new_path: String,
 }
 
-#[derive(Debug, Default)]
-struct MessageSummary {
-    message_count: usize,
-    last_message_id: Option<String>,
-    last_message_index: Option<usize>,
-    last_message_time: Option<String>,
-}
-
-fn read_messages(path: &Path) -> HttpResult<Vec<Value>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let file = fs::File::open(path).map_err(HttpError::internal)?;
-    let reader = BufReader::new(file);
-    let mut messages = Vec::new();
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.map_err(HttpError::internal)?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let message: ChatMessage = serde_json::from_str(&line).map_err(HttpError::internal)?;
-        messages.push(decorate_message(&message, index));
-    }
-    Ok(messages)
-}
-
-fn decorate_message(message: &ChatMessage, index: usize) -> Value {
-    let mut value = serde_json::to_value(message).unwrap_or_else(|_| json!({}));
-    if let Value::Object(map) = &mut value {
-        map.insert("index".to_string(), json!(index));
-        if !message.message_id.is_empty() {
-            map.insert("id".to_string(), json!(message.message_id));
-        }
-    }
-    value
-}
-
-fn message_summary(path: &Path) -> MessageSummary {
-    let Ok(messages) = read_messages(path) else {
-        return MessageSummary::default();
-    };
-    let mut summary = MessageSummary {
-        message_count: messages.len(),
-        ..MessageSummary::default()
-    };
-    if let Some(last) = messages.last() {
-        summary.last_message_index = last
-            .get("index")
-            .and_then(Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok());
-        summary.last_message_id = last
-            .get("message_id")
-            .or_else(|| last.get("id"))
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        summary.last_message_time = last
-            .get("message_time")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-    }
-    summary
-}
-
 fn wait_agent_session_created(rx: &Receiver<KernelChannelEvent>) -> HttpResult<String> {
     wait_for_event(rx, Duration::from_secs(10), |event| match event {
         KernelChannelEvent::AgentSessionCreated { addr } => {
@@ -1195,87 +1043,4 @@ fn conversation_model_label(
         .map(|profile| profile.main_model.display_name(&config.models))
         .or_else(|| config.initial_main_model_name())
         .unwrap_or_else(|| "unconfigured".to_string())
-}
-
-fn service_addr_storage_component(addr: &ServiceAddr) -> String {
-    let scope = match &addr.scope {
-        ServiceScope::Local => "local".to_string(),
-        ServiceScope::Conversation(conversation_id) => format!("conversation_{conversation_id}"),
-    };
-    format!("{scope}__{}", addr.path.join("__"))
-}
-
-fn message_log_path(workdir: &Path, conversation_id: &str, foreground_session_id: &str) -> PathBuf {
-    WorkdirLayout::new(workdir)
-        .conversation_root(conversation_id)
-        .join(".stellaclaw")
-        .join("log")
-        .join(sanitize_session_id_for_log_path(
-            &foreground_session_storage_id(foreground_session_id),
-        ))
-        .join("all_messages.jsonl")
-}
-
-fn parse_web_control_command(text: &str) -> Option<(&str, &str)> {
-    let trimmed = text.trim();
-    if !trimmed.starts_with('/') {
-        return None;
-    }
-    let mut parts = trimmed.splitn(2, char::is_whitespace);
-    let command = parts.next()?.split('@').next()?.trim();
-    let argument = parts.next().unwrap_or_default().trim();
-    Some((command, argument))
-}
-
-fn parse_reasoning_effort_argument(argument: &str) -> HttpResult<Option<String>> {
-    match argument.trim().to_ascii_lowercase().as_str() {
-        "" | "show" => Ok(None),
-        "default" | "model" | "model_default" | "model-default" | "global" => Ok(None),
-        "minimal" | "low" | "medium" | "high" | "xhigh" => {
-            Ok(Some(argument.trim().to_ascii_lowercase()))
-        }
-        other => Err(HttpError::new(
-            400,
-            format!("unknown reasoning effort {other}"),
-        )),
-    }
-}
-
-fn foreground_session_storage_id(foreground_session_id: &str) -> String {
-    if foreground_session_id.starts_with("local__agent__foreground__") {
-        foreground_session_id.to_string()
-    } else {
-        format!("local__agent__foreground__{foreground_session_id}")
-    }
-}
-
-fn foreground_route_id_from_storage_id(storage_id: &str) -> Option<String> {
-    storage_id
-        .strip_prefix("local__agent__foreground__")
-        .map(str::to_string)
-}
-
-fn default_foreground_route_id(metadata: &ConversationMetadata) -> String {
-    foreground_route_id_from_storage_id(&metadata.foreground_session_id)
-        .unwrap_or_else(|| "main".to_string())
-}
-
-fn sanitize_session_id_for_log_path(session_id: &str) -> String {
-    session_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-fn processing_state_name(state: ProcessingState) -> &'static str {
-    match state {
-        ProcessingState::Idle => "idle",
-        ProcessingState::Typing => "typing",
-    }
 }
