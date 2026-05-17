@@ -1021,10 +1021,6 @@ button {
   scroll-padding-top: calc(var(--topbar-height) + 18px);
 }
 
-.message-scroll > :first-child:not(.empty-chat):not(.model-gate) {
-  margin-top: auto;
-}
-
 .empty-chat {
   display: grid;
   min-height: 60%;

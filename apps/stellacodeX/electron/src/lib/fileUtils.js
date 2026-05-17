@@ -5,22 +5,41 @@ export function messageText(message) {
   if (typeof message?.preview === 'string' && message.preview.trim()) return message.preview;
   if (typeof message?.text === 'string' && message.text.trim()) return message.text;
   if (typeof message?.content === 'string' && message.content.trim()) return message.content;
-  if (Array.isArray(message?.items)) {
-    const text = message.items
-      .map((item) => {
-        if (typeof item === 'string') return item;
-        if (typeof item?.text === 'string') return item.text;
-        if (typeof item?.content === 'string') return item.content;
-        if (item?.type === 'selection_reference') {
-          const selection = item.selection || item.payload || item;
-          return `[selection] ${selection.file_path || selection.fileName || ''}`;
-        }
-        if (item?.type === 'file') return `[file] ${item.name || item.path || ''}`;
-        return '';
-      })
-      .filter(Boolean)
-      .join('\n');
+  const items = Array.isArray(message?.items) && message.items.length > 0
+    ? message.items
+    : Array.isArray(message?.data)
+      ? message.data
+      : [];
+  if (items.length > 0) {
+    const text = items.map(itemText).filter(Boolean).join('\n');
     if (text.trim()) return text;
+  }
+  return '';
+}
+
+function itemText(item) {
+  if (typeof item === 'string') return item;
+  if (!item || typeof item !== 'object') return '';
+  const payload = item.payload && typeof item.payload === 'object' ? item.payload : {};
+  if (typeof item.text === 'string') return item.text;
+  if (typeof item.text_with_attachment_markers === 'string') return item.text_with_attachment_markers;
+  if (typeof item.content === 'string') return item.content;
+  if (typeof payload.text === 'string') return payload.text;
+  if (item.type === 'reasoning') {
+    const summary = Array.isArray(payload.codex_summary)
+      ? payload.codex_summary.map((part) => (typeof part === 'string' ? part : part?.text || '')).filter(Boolean).join('\n')
+      : typeof payload.codex_summary === 'string'
+        ? payload.codex_summary
+        : '';
+    return payload.text || item.summary || summary;
+  }
+  if (item.type === 'selection_reference') {
+    const selection = item.selection || payload || item;
+    return `[selection] ${selection.file_path || selection.fileName || ''}`;
+  }
+  if (item.type === 'file') {
+    const file = item.file || payload || item;
+    return `[file] ${file.name || file.path || file.uri || ''}`;
   }
   return '';
 }

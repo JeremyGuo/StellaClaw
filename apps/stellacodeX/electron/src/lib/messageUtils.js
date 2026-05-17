@@ -65,7 +65,7 @@ function normalizeChatMessageItem(item, index, renderedByIndex) {
         };
   }
   if (item.type === 'file') {
-    return rendered?.type === 'file' ? rendered : { type: 'file', index, file: payload };
+    return rendered?.type === 'file' ? rendered : normalizeFileMessageItem(payload, index);
   }
   if (item.type === 'tool_call') {
     return {
@@ -94,6 +94,30 @@ function normalizeChatMessageItem(item, index, renderedByIndex) {
   return rendered || null;
 }
 
+function normalizeFileMessageItem(payload, index) {
+  const uri = String(payload.uri || payload.file_uri || payload.url || '').trim();
+  const path = String(payload.path || filePathFromUri(uri) || '').trim();
+  const name = String(payload.name || payload.filename || path.split(/[\\/]/).filter(Boolean).pop() || uri.split('/').filter(Boolean).pop() || 'file').trim();
+  return {
+    type: 'file',
+    index,
+    ...payload,
+    name,
+    path,
+    uri,
+    file: payload
+  };
+}
+
+function filePathFromUri(uri) {
+  if (!String(uri || '').startsWith('file://')) return '';
+  try {
+    return decodeURIComponent(new URL(uri).pathname);
+  } catch {
+    return '';
+  }
+}
+
 export function hasToolItems(message) {
   return messageItems(message).some((item) => item?.type === 'tool_call' || item?.type === 'tool_result');
 }
@@ -106,6 +130,25 @@ export function isFinalAssistantMessage(message) {
   if (message?._streaming) return false;
   if (String(message?.role || '').toLowerCase() !== 'assistant' || isExecutionMessage(message)) return false;
   return Boolean(messageText(message).trim() || messageItems(message).some((item) => item?.type === 'text' && String(item.text || '').trim()));
+}
+
+function hasVisibleMessageContent(message) {
+  if (!message) return false;
+  if (message?._streamFailed || message?.error) return true;
+  if (messageText(message).trim()) return true;
+  if (Number(message?.attachment_count || 0) > 0) return true;
+  if ((Array.isArray(message?.attachments) && message.attachments.length > 0)
+    || (Array.isArray(message?.files) && message.files.length > 0)) {
+    return true;
+  }
+  return messageItems(message).some((item) => {
+    if (!item) return false;
+    if (item.type === 'text') return Boolean(String(item.text || item.text_with_attachment_markers || item.content || '').trim());
+    if (item.type === 'reasoning') return Boolean(String(item.text || item.summary || '').trim());
+    if (item.type === 'tool_call' || item.type === 'tool_result') return true;
+    if (item.type === 'file' || item.type === 'selection_reference') return true;
+    return false;
+  });
 }
 
 export function shouldTypewriterMessage(message) {
@@ -575,7 +618,7 @@ export function attachAuxiliaryMessages(messages) {
 }
 
 export function displayMessages(messages) {
-  const source = attachAuxiliaryMessages(messages);
+  const source = attachAuxiliaryMessages(messages).filter(hasVisibleMessageContent);
   const result = [];
   let forceSeparateNext = false;
   for (let index = 0; index < source.length; index += 1) {

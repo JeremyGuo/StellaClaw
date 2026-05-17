@@ -7,7 +7,7 @@ import * as Popover from '@radix-ui/react-popover';
 import { attachmentName, attachmentUrl, fileExtension, isImageAttachment, messageText } from '../lib/fileUtils';
 import { handleExternalLinkClick, isExternalUrl } from '../lib/externalLinks';
 import { formatBytes, formatTokens, modelAlias, modelDisplayName } from '../lib/format';
-import { displayMessages, firstMessageId, isExecutionMessage, isFinalAssistantMessage, liveActivitySignature, markerIndexes, messageKey, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
+import { displayMessages, firstMessageId, isExecutionMessage, isFinalAssistantMessage, liveActivitySignature, markerIndexes, messageItems, messageKey, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
 
 const COMMANDS = [
   { command: '/model', label: '切换模型', description: '选择当前 Conversation 使用的模型', options: 'models' },
@@ -1341,6 +1341,7 @@ function toolCardsAreComplete(cards) {
 
 export function MessageBody({ message, onOpenAttachment, onDownloadAttachment }) {
   const text = messageText(message);
+  const structuredItems = messageItems(message);
   const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
   const files = Array.isArray(message?.files) ? message.files : [];
   const allAttachments = [...attachments, ...files];
@@ -1360,13 +1361,11 @@ export function MessageBody({ message, onOpenAttachment, onDownloadAttachment })
   });
   return (
     <div className="message-body">
-      {Array.isArray(message?.items) && message.items.length > 0 ? (
-        <StructuredItems role={message?.role} items={message.items} attachments={allAttachments} fallbackText={text} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
+      {structuredItems.length > 0 ? (
+        <StructuredItems role={message?.role} items={structuredItems} attachments={allAttachments} fallbackText={text} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
       ) : text ? (
         <MarkdownContent className="message-text" text={text} attachments={allAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />
-      ) : trailingAttachments.length > 0 ? null : (
-        <div className="message-text muted">空消息</div>
-      )}
+      ) : null}
       {trailingAttachments.length > 0 && <AttachmentList attachments={trailingAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} />}
       {Number(message?.attachment_count || 0) > 0 && allAttachments.length === 0 && (
         <div className="message-attachments muted">正在加载附件...</div>
@@ -1475,7 +1474,7 @@ function ReasoningNote({ text }) {
 
 export function MarkdownContent({ text, attachments = [], className = 'markdown-content', onOpenAttachment, onDownloadAttachment }) {
   const value = String(text || '');
-  if (!value.trim()) return <span className="message-empty">空消息</span>;
+  if (!value.trim()) return null;
   const parts = [];
   const pattern = /(\[\[attachment:(\d+)]]|\[tool_(call|result)\s+([^\]\n]+)\]\s*([\s\S]*?)(?=\n\[tool_(?:call|result)\s+|$))/g;
   let cursor = 0;
