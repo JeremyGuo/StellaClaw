@@ -6,11 +6,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    channels::web_terminal::{
+    conversation_new::{ConversationRuntimeConfig, ServiceAddr, ServiceCall},
+    services::terminal_runtime::{
         TerminalCreateRequest, TerminalOutputChunk, TerminalReplay, TerminalResizeRequest,
         TerminalSummary,
     },
-    conversation_new::{ConversationRuntimeConfig, ServiceAddr, ServiceCall},
 };
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

@@ -139,14 +139,14 @@ impl TerminalRuntimeContext {
 }
 
 #[derive(Debug)]
-pub enum WebTerminalError {
+pub enum TerminalRuntimeError {
     InvalidRequest(String),
     NotFound,
     LimitExceeded(String),
     Internal(anyhow::Error),
 }
 
-impl std::fmt::Display for WebTerminalError {
+impl std::fmt::Display for TerminalRuntimeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidRequest(message) | Self::LimitExceeded(message) => {
@@ -158,9 +158,9 @@ impl std::fmt::Display for WebTerminalError {
     }
 }
 
-impl std::error::Error for WebTerminalError {}
+impl std::error::Error for TerminalRuntimeError {}
 
-impl From<anyhow::Error> for WebTerminalError {
+impl From<anyhow::Error> for TerminalRuntimeError {
     fn from(error: anyhow::Error) -> Self {
         Self::Internal(error)
     }
@@ -254,7 +254,7 @@ impl TerminalManager {
         &self,
         context: &TerminalRuntimeContext,
         terminal_id: &str,
-    ) -> Result<TerminalSummary, WebTerminalError> {
+    ) -> Result<TerminalSummary, TerminalRuntimeError> {
         Ok(self.lookup(context, terminal_id)?.summary())
     }
 
@@ -262,19 +262,18 @@ impl TerminalManager {
         &self,
         context: &TerminalRuntimeContext,
         request: TerminalCreateRequest,
-    ) -> Result<TerminalSummary, WebTerminalError> {
+    ) -> Result<TerminalSummary, TerminalRuntimeError> {
         let cols = clamp_dimension(request.cols.unwrap_or(DEFAULT_COLS), MIN_COLS, MAX_COLS);
         let rows = clamp_dimension(request.rows.unwrap_or(DEFAULT_ROWS), MIN_ROWS, MAX_ROWS);
         let shell = resolve_shell(request.shell.as_deref(), &context.tool_remote_mode)?;
         let cwd_request = normalize_relative_cwd(request.cwd.as_deref())?;
 
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| WebTerminalError::Internal(anyhow!("terminal manager lock poisoned")))?;
+        let mut inner = self.inner.lock().map_err(|_| {
+            TerminalRuntimeError::Internal(anyhow!("terminal manager lock poisoned"))
+        })?;
         reset_stale_terminals(&mut inner, context);
         if inner.sessions.len() >= MAX_TERMINALS_TOTAL {
-            return Err(WebTerminalError::LimitExceeded(format!(
+            return Err(TerminalRuntimeError::LimitExceeded(format!(
                 "web terminal limit exceeded: at most {MAX_TERMINALS_TOTAL} terminals total"
             )));
         }
@@ -284,7 +283,7 @@ impl TerminalManager {
             .filter(|session| session.conversation_id == context.conversation_id)
             .count();
         if conversation_count >= MAX_TERMINALS_PER_CONVERSATION {
-            return Err(WebTerminalError::LimitExceeded(format!(
+            return Err(TerminalRuntimeError::LimitExceeded(format!(
                 "web terminal limit exceeded: at most {MAX_TERMINALS_PER_CONVERSATION} terminals per conversation"
             )));
         }
@@ -310,7 +309,7 @@ impl TerminalManager {
         terminal_id: &str,
         offset: u64,
         limit_bytes: usize,
-    ) -> Result<TerminalOutput, WebTerminalError> {
+    ) -> Result<TerminalOutput, TerminalRuntimeError> {
         let session = self.lookup(context, terminal_id)?;
         Ok(session.output(offset, limit_bytes))
     }
@@ -320,17 +319,17 @@ impl TerminalManager {
         context: &TerminalRuntimeContext,
         terminal_id: &str,
         data: &[u8],
-    ) -> Result<TerminalSummary, WebTerminalError> {
+    ) -> Result<TerminalSummary, TerminalRuntimeError> {
         let session = self.lookup(context, terminal_id)?;
         if !session.is_running() {
-            return Err(WebTerminalError::InvalidRequest(
+            return Err(TerminalRuntimeError::InvalidRequest(
                 "terminal is not running".to_string(),
             ));
         }
         session
             .writer
             .lock()
-            .map_err(|_| WebTerminalError::Internal(anyhow!("terminal writer lock poisoned")))?
+            .map_err(|_| TerminalRuntimeError::Internal(anyhow!("terminal writer lock poisoned")))?
             .write_all(data)
             .context("failed to write terminal input")?;
         session.touch();
@@ -342,14 +341,14 @@ impl TerminalManager {
         context: &TerminalRuntimeContext,
         terminal_id: &str,
         request: TerminalResizeRequest,
-    ) -> Result<TerminalSummary, WebTerminalError> {
+    ) -> Result<TerminalSummary, TerminalRuntimeError> {
         let session = self.lookup(context, terminal_id)?;
         let cols = clamp_dimension(request.cols, MIN_COLS, MAX_COLS);
         let rows = clamp_dimension(request.rows, MIN_ROWS, MAX_ROWS);
         session
             .master
             .lock()
-            .map_err(|_| WebTerminalError::Internal(anyhow!("terminal master lock poisoned")))?
+            .map_err(|_| TerminalRuntimeError::Internal(anyhow!("terminal master lock poisoned")))?
             .resize(PtySize {
                 rows,
                 cols,
@@ -357,11 +356,9 @@ impl TerminalManager {
                 pixel_height: 0,
             })
             .context("failed to resize terminal")?;
-        *session
-            .size
-            .lock()
-            .map_err(|_| WebTerminalError::Internal(anyhow!("terminal size lock poisoned")))? =
-            TerminalSize { cols, rows };
+        *session.size.lock().map_err(|_| {
+            TerminalRuntimeError::Internal(anyhow!("terminal size lock poisoned"))
+        })? = TerminalSize { cols, rows };
         session.touch();
         Ok(session.summary())
     }
@@ -370,7 +367,7 @@ impl TerminalManager {
         &self,
         context: &TerminalRuntimeContext,
         terminal_id: &str,
-    ) -> Result<TerminalSummary, WebTerminalError> {
+    ) -> Result<TerminalSummary, TerminalRuntimeError> {
         let session = self.lookup(context, terminal_id)?;
         if session.is_running() {
             kill_terminal_session(&session)?;
@@ -411,7 +408,7 @@ impl TerminalManager {
         context: &TerminalRuntimeContext,
         terminal_id: &str,
         offset: u64,
-    ) -> Result<TerminalReplay, WebTerminalError> {
+    ) -> Result<TerminalReplay, TerminalRuntimeError> {
         let session = self.lookup(context, terminal_id)?;
         Ok(session.replay(offset))
     }
@@ -421,7 +418,7 @@ impl TerminalManager {
         context: &TerminalRuntimeContext,
         terminal_id: &str,
         offset: u64,
-    ) -> Result<TerminalAttach, WebTerminalError> {
+    ) -> Result<TerminalAttach, TerminalRuntimeError> {
         let session = self.lookup(context, terminal_id)?;
         Ok(session.attach(offset))
     }
@@ -431,7 +428,7 @@ impl TerminalManager {
         context: &TerminalRuntimeContext,
         terminal_id: &str,
         subscriber_id: u64,
-    ) -> Result<(), WebTerminalError> {
+    ) -> Result<(), TerminalRuntimeError> {
         let session = self.lookup(context, terminal_id)?;
         session.detach(subscriber_id);
         Ok(())
@@ -441,17 +438,16 @@ impl TerminalManager {
         &self,
         context: &TerminalRuntimeContext,
         terminal_id: &str,
-    ) -> Result<Arc<TerminalSession>, WebTerminalError> {
-        let mut inner = self
-            .inner
-            .lock()
-            .map_err(|_| WebTerminalError::Internal(anyhow!("terminal manager lock poisoned")))?;
+    ) -> Result<Arc<TerminalSession>, TerminalRuntimeError> {
+        let mut inner = self.inner.lock().map_err(|_| {
+            TerminalRuntimeError::Internal(anyhow!("terminal manager lock poisoned"))
+        })?;
         reset_stale_terminals(&mut inner, context);
         let Some(session) = inner.sessions.get(terminal_id) else {
-            return Err(WebTerminalError::NotFound);
+            return Err(TerminalRuntimeError::NotFound);
         };
         if session.conversation_id != context.conversation_id {
-            return Err(WebTerminalError::NotFound);
+            return Err(TerminalRuntimeError::NotFound);
         }
         Ok(session.clone())
     }
@@ -475,11 +471,11 @@ fn reset_stale_terminals(inner: &mut TerminalManagerInner, context: &TerminalRun
     }
 }
 
-fn kill_terminal_session(session: &TerminalSession) -> Result<(), WebTerminalError> {
+fn kill_terminal_session(session: &TerminalSession) -> Result<(), TerminalRuntimeError> {
     let _ = session
         .child
         .lock()
-        .map_err(|_| WebTerminalError::Internal(anyhow!("terminal child lock poisoned")))?
+        .map_err(|_| TerminalRuntimeError::Internal(anyhow!("terminal child lock poisoned")))?
         .kill();
     Ok(())
 }
@@ -695,7 +691,7 @@ fn spawn_terminal_session(
     shell: String,
     cwd_request: Option<String>,
     size: TerminalSize,
-) -> Result<TerminalSession, WebTerminalError> {
+) -> Result<TerminalSession, TerminalRuntimeError> {
     let pty_system = native_pty_system();
     let pair = pty_system
         .openpty(PtySize {
@@ -842,7 +838,7 @@ fn spawn_terminal_session(
 fn resolve_shell(
     requested: Option<&str>,
     remote_mode: &ToolRemoteMode,
-) -> Result<String, WebTerminalError> {
+) -> Result<String, TerminalRuntimeError> {
     let Some(shell) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(match remote_mode {
             ToolRemoteMode::Selectable => env::var("SHELL")
@@ -853,7 +849,7 @@ fn resolve_shell(
         });
     };
     if !valid_shell_name(shell) {
-        return Err(WebTerminalError::InvalidRequest(
+        return Err(TerminalRuntimeError::InvalidRequest(
             "terminal shell must be a simple path or command name".to_string(),
         ));
     }
@@ -867,13 +863,13 @@ fn valid_shell_name(shell: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '_' | '-' | '.' | '+'))
 }
 
-fn normalize_relative_cwd(value: Option<&str>) -> Result<Option<String>, WebTerminalError> {
+fn normalize_relative_cwd(value: Option<&str>) -> Result<Option<String>, TerminalRuntimeError> {
     let Some(raw) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
     let path = Path::new(raw);
     if path.is_absolute() {
-        return Err(WebTerminalError::InvalidRequest(
+        return Err(TerminalRuntimeError::InvalidRequest(
             "terminal cwd must be relative to the conversation workspace".to_string(),
         ));
     }
@@ -883,12 +879,12 @@ fn normalize_relative_cwd(value: Option<&str>) -> Result<Option<String>, WebTerm
             Component::CurDir => {}
             Component::Normal(value) => normalized.push(value),
             Component::ParentDir => {
-                return Err(WebTerminalError::InvalidRequest(
+                return Err(TerminalRuntimeError::InvalidRequest(
                     "terminal cwd must not contain parent components".to_string(),
                 ));
             }
             Component::RootDir | Component::Prefix(_) => {
-                return Err(WebTerminalError::InvalidRequest(
+                return Err(TerminalRuntimeError::InvalidRequest(
                     "terminal cwd must be relative to the conversation workspace".to_string(),
                 ));
             }
@@ -908,18 +904,18 @@ fn normalize_relative_cwd(value: Option<&str>) -> Result<Option<String>, WebTerm
 fn resolve_local_cwd(
     workspace_root: &Path,
     relative: Option<&str>,
-) -> Result<PathBuf, WebTerminalError> {
+) -> Result<PathBuf, TerminalRuntimeError> {
     let cwd = relative
         .map(|relative| workspace_root.join(relative))
         .unwrap_or_else(|| workspace_root.to_path_buf());
     if !cwd.exists() {
-        return Err(WebTerminalError::InvalidRequest(format!(
+        return Err(TerminalRuntimeError::InvalidRequest(format!(
             "terminal cwd does not exist: {}",
             cwd.display()
         )));
     }
     if !cwd.is_dir() {
-        return Err(WebTerminalError::InvalidRequest(format!(
+        return Err(TerminalRuntimeError::InvalidRequest(format!(
             "terminal cwd is not a directory: {}",
             cwd.display()
         )));
@@ -1093,7 +1089,7 @@ mod tests {
         assert!(manager.list_for_context(&remote_context).is_empty());
         assert!(matches!(
             manager.get_for_context(&remote_context, &terminal.terminal_id),
-            Err(WebTerminalError::NotFound)
+            Err(TerminalRuntimeError::NotFound)
         ));
 
         let _ = fs::remove_dir_all(workdir);

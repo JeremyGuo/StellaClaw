@@ -8,7 +8,6 @@ use crate::{conversation_id_manager::ConversationIdManager, logger::StellaclawLo
 pub mod telegram;
 pub mod types;
 pub mod web;
-pub(crate) mod web_terminal;
 
 pub use telegram::TelegramChannel;
 pub use types::{

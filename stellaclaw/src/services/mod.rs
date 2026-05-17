@@ -10,5 +10,6 @@ pub mod skill;
 pub mod skill_sync;
 pub mod status;
 pub mod terminal;
+pub mod terminal_runtime;
 pub mod tool_binary;
 pub mod workspace;

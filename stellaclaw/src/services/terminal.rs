@@ -4,7 +4,6 @@ use anyhow::Result;
 use crossbeam_channel::select;
 
 use crate::{
-    channels::web_terminal::{TerminalManager, TerminalRuntimeContext, WebTerminalError},
     conversation_new::{
         ConversationRuntimeConfig, ConversationService, ServiceAddr, ServiceCall, ServiceFailure,
         ServiceOutput, ServiceRunContext, ServiceStatusUpdate, ServiceStopped,
@@ -13,6 +12,7 @@ use crate::{
         chunk_snapshot, decode_request, encode_response, replay_snapshot, TerminalRequest,
         TerminalResponse,
     },
+    services::terminal_runtime::{TerminalManager, TerminalRuntimeContext, TerminalRuntimeError},
 };
 
 pub struct TerminalService {
@@ -237,7 +237,7 @@ fn reply_terminal(
     ctx: &ServiceRunContext,
     target: &ServiceAddr,
     response_id: Option<String>,
-    result: Result<crate::channels::web_terminal::TerminalSummary, WebTerminalError>,
+    result: Result<crate::services::terminal_runtime::TerminalSummary, TerminalRuntimeError>,
 ) -> Result<()> {
     match result {
         Ok(terminal) => send_response(
@@ -254,13 +254,13 @@ fn reply_error(
     ctx: &ServiceRunContext,
     target: &ServiceAddr,
     response_id: Option<String>,
-    error: WebTerminalError,
+    error: TerminalRuntimeError,
 ) -> Result<()> {
     let code = match &error {
-        WebTerminalError::InvalidRequest(_) => "invalid_terminal_request",
-        WebTerminalError::NotFound => "terminal_not_found",
-        WebTerminalError::LimitExceeded(_) => "terminal_limit_exceeded",
-        WebTerminalError::Internal(_) => "terminal_internal_error",
+        TerminalRuntimeError::InvalidRequest(_) => "invalid_terminal_request",
+        TerminalRuntimeError::NotFound => "terminal_not_found",
+        TerminalRuntimeError::LimitExceeded(_) => "terminal_limit_exceeded",
+        TerminalRuntimeError::Internal(_) => "terminal_internal_error",
     };
     send_response(
         ctx,
@@ -295,7 +295,7 @@ fn forward_terminal_output(
     outbox: crossbeam_channel::Sender<ServiceOutput>,
     terminal_id: String,
     subscriber_id: Option<u64>,
-    receiver: crossbeam_channel::Receiver<crate::channels::web_terminal::TerminalOutputChunk>,
+    receiver: crossbeam_channel::Receiver<crate::services::terminal_runtime::TerminalOutputChunk>,
 ) {
     std::thread::spawn(move || {
         while let Ok(chunk) = receiver.recv() {

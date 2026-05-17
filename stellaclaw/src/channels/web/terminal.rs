@@ -6,12 +6,12 @@ use crossbeam_channel::RecvTimeoutError;
 use serde_json::{json, Value};
 
 use crate::{
-    channels::web_terminal::{TerminalCreateRequest, TerminalResizeRequest},
     conversation_host::ConversationHostRuntime,
     service_protos::{
         channel::{ChannelEvent as KernelChannelEvent, ChannelIngress},
         terminal::{TerminalDataEncoding, TerminalRequest, TerminalResponse},
     },
+    services::terminal_runtime::{TerminalCreateRequest, TerminalResizeRequest},
 };
 
 use super::{

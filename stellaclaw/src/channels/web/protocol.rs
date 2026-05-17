@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use stellaclaw_core::session_actor::{ChatMessage, ToolResultItem};
+use stellaclaw_core::session_actor::{
+    ChatMessage, SessionErrorDetail, TaskPlanView, ToolResultItem,
+};
 
 use crate::service_protos::agent_session::AgentSessionState;
 
@@ -213,7 +215,92 @@ pub enum ChatEvent {
         conversation_id: String,
         foreground_session_id: String,
         turn_id: String,
+        batch_id: String,
         tool_result: ToolResultItem,
+    },
+    #[serde(rename = "chat.stream_turn_start")]
+    StreamTurnStart {
+        conversation_id: String,
+        foreground_session_id: String,
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<TaskPlanView>,
+    },
+    #[serde(rename = "chat.stream_assistant_message_delta")]
+    StreamAssistantMessageDelta {
+        conversation_id: String,
+        foreground_session_id: String,
+        message_id: String,
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        delta: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_index: Option<usize>,
+    },
+    #[serde(rename = "chat.stream_tool_call_delta")]
+    StreamToolCallDelta {
+        conversation_id: String,
+        foreground_session_id: String,
+        message_id: String,
+        turn_id: String,
+        item_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        call_id: Option<String>,
+        delta: String,
+    },
+    #[serde(rename = "chat.stream_reasoning_summary_part_added")]
+    StreamReasoningSummaryPartAdded {
+        conversation_id: String,
+        foreground_session_id: String,
+        message_id: String,
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        summary_index: i64,
+    },
+    #[serde(rename = "chat.stream_reasoning_summary_delta")]
+    StreamReasoningSummaryDelta {
+        conversation_id: String,
+        foreground_session_id: String,
+        message_id: String,
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        summary_index: i64,
+        delta: String,
+    },
+    #[serde(rename = "chat.stream_error")]
+    StreamError {
+        conversation_id: String,
+        foreground_session_id: String,
+        message_id: String,
+        turn_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_index: Option<usize>,
+        error: String,
+        error_detail: SessionErrorDetail,
+    },
+    #[serde(rename = "chat.stream_turn_done")]
+    StreamTurnDone {
+        conversation_id: String,
+        foreground_session_id: String,
+        message: ChatMessage,
+    },
+    #[serde(rename = "chat.plan_updated")]
+    PlanUpdated {
+        conversation_id: String,
+        foreground_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        plan: Option<TaskPlanView>,
+    },
+    #[serde(rename = "chat.delivery")]
+    Delivery {
+        conversation_id: String,
+        foreground_session_id: String,
+        text: String,
     },
     #[serde(rename = "chat.heartbeat")]
     Heartbeat(WebHeartbeat),
