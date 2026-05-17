@@ -120,25 +120,6 @@ impl WebChannelMainHandle {
         let _ = self.tx.send(WebMainCommand::PublishHome { payload });
     }
 
-    pub(super) fn publish_chat(&self, conversation_id: &str, session_id: &str, payload: Value) {
-        let _ = self.tx.send(WebMainCommand::PublishChat {
-            key: WebSessionKey::from_storage_session_id(conversation_id, session_id),
-            payload,
-        });
-    }
-
-    pub(super) fn user_message_queued(
-        &self,
-        conversation_id: &str,
-        foreground_session_id: &str,
-        client_message_id: &str,
-    ) {
-        let _ = self.tx.send(WebMainCommand::UserMessageQueued {
-            key: WebSessionKey::new(conversation_id, foreground_session_id),
-            client_message_id: client_message_id.to_string(),
-        });
-    }
-
     pub(super) fn message_appended(
         &self,
         appended: OutgoingMessageAppended,
@@ -209,14 +190,6 @@ enum WebMainCommand {
     },
     PublishHome {
         payload: Value,
-    },
-    PublishChat {
-        key: WebSessionKey,
-        payload: Value,
-    },
-    UserMessageQueued {
-        key: WebSessionKey,
-        client_message_id: String,
     },
     MessageAppended {
         appended: OutgoingMessageAppended,
@@ -309,13 +282,6 @@ impl WebChannelMain {
             WebMainCommand::PublishHome { payload } => {
                 self.publish_home(payload);
             }
-            WebMainCommand::PublishChat { key, payload } => {
-                self.publish_chat(&key, payload);
-            }
-            WebMainCommand::UserMessageQueued {
-                key,
-                client_message_id,
-            } => self.user_message_queued(key, client_message_id),
             WebMainCommand::MessageAppended {
                 appended,
                 decorated_message,
@@ -398,33 +364,6 @@ impl WebChannelMain {
         }));
     }
 
-    fn user_message_queued(&mut self, key: WebSessionKey, client_message_id: String) {
-        let state = self.live_states.entry(key.clone()).or_default();
-        if !state.queued_outbound_messages.iter().any(|message| {
-            message
-                .get("client_message_id")
-                .and_then(Value::as_str)
-                .is_some_and(|id| id == client_message_id)
-        }) {
-            state.queued_outbound_messages.push(json!({
-                "client_message_id": client_message_id,
-                "conversation_id": key.conversation_id,
-                "foreground_session_id": key.foreground_session_id,
-            }));
-        }
-        state.last_error = None;
-        self.publish_foreground_session_state_event(&key);
-        self.publish_chat(
-            &key,
-            json!({
-                "type": "chat.user_message_queued",
-                "client_message_id": client_message_id,
-                "conversation_id": key.conversation_id,
-                "foreground_session_id": key.foreground_session_id,
-            }),
-        );
-    }
-
     fn message_appended(
         &mut self,
         appended: OutgoingMessageAppended,
@@ -473,7 +412,12 @@ impl WebChannelMain {
         }
         if matches!(
             event_type.as_str(),
-            "turn_started" | "turn_completed" | "stream_error"
+            "user_message_queued"
+                | "user_message_started"
+                | "user_message_committed"
+                | "turn_started"
+                | "turn_completed"
+                | "stream_error"
         ) {
             self.publish_foreground_session_state_event(&key);
         }
@@ -606,6 +550,55 @@ impl ChatLiveState {
 
     fn record_session_stream(&mut self, event: &Value, event_type: &str) {
         match event_type {
+            "user_message_queued" => {
+                let client_message_id = event
+                    .get("client_message_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let message_id = event
+                    .get("message_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                if let Some(dedupe_id) = client_message_id.as_deref().or(message_id.as_deref()) {
+                    let is_queued = self.queued_outbound_messages.iter().any(|message| {
+                        message
+                            .get("client_message_id")
+                            .and_then(Value::as_str)
+                            .or_else(|| message.get("message_id").and_then(Value::as_str))
+                            .is_some_and(|id| id == dedupe_id)
+                    });
+                    if !is_queued {
+                        self.queued_outbound_messages.push(json!({
+                            "client_message_id": client_message_id,
+                            "message_id": message_id,
+                        }));
+                    }
+                }
+                self.last_error = None;
+            }
+            "user_message_started" => {
+                self.last_error = None;
+            }
+            "user_message_committed" => {
+                let message_id = event.get("message_id").and_then(Value::as_str).or_else(|| {
+                    event
+                        .get("message")
+                        .and_then(|message| message.get("message_id"))
+                        .and_then(Value::as_str)
+                });
+                if let Some(message_id) = message_id {
+                    self.queued_outbound_messages.retain(|queued| {
+                        let queued_message_id = queued.get("message_id").and_then(Value::as_str);
+                        let queued_client_message_id =
+                            queued.get("client_message_id").and_then(Value::as_str);
+                        queued_message_id != Some(message_id)
+                            && queued_client_message_id != Some(message_id)
+                    });
+                } else {
+                    self.queued_outbound_messages.clear();
+                }
+                self.last_error = None;
+            }
             "turn_started" => {
                 self.last_error = None;
                 self.current_turn_state =
@@ -1005,6 +998,19 @@ fn public_chat_stream_payload(
         "foreground_session_id".to_string(),
         json!(foreground_session_id),
     );
+    if event_type == "user_message_committed" {
+        if let Some(index) = payload.get("index").cloned() {
+            payload.insert("message_index".to_string(), index);
+        }
+        if let Some(message_id) = payload
+            .get("message")
+            .and_then(|message| message.get("message_id"))
+            .cloned()
+        {
+            payload.insert("message_id".to_string(), message_id);
+        }
+        payload.insert("committed".to_string(), json!(true));
+    }
     if !payload.contains_key("next_message_id") {
         if let Some(message_id) = payload.get("message_id").cloned() {
             payload.insert("next_message_id".to_string(), message_id);

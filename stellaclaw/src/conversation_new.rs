@@ -1469,9 +1469,11 @@ mod tests {
             .pump_for(Duration::from_millis(100))
             .expect("outputs drain");
 
-        assert!(kernel.status_log().iter().any(
-            |status| status.addr == ServiceAddr::channel() && status.label == "delivered_text"
-        ));
+        assert!(kernel.status_log().iter().any(|status| {
+            status.addr == ServiceAddr::channel()
+                && status.label == "processing"
+                && status.detail["active"] == serde_json::json!(false)
+        }));
         kernel.stop_all("test finished").expect("services stop");
     }
 
@@ -1511,9 +1513,11 @@ mod tests {
             .iter()
             .any(|status| status.addr == ServiceAddr::channel()
                 && status.label == "incoming_message"));
-        assert!(kernel.status_log().iter().any(
-            |status| status.addr == ServiceAddr::channel() && status.label == "delivered_text"
-        ));
+        assert!(kernel.status_log().iter().any(|status| {
+            status.addr == ServiceAddr::channel()
+                && status.label == "processing"
+                && status.detail["active"] == serde_json::json!(false)
+        }));
         kernel.stop_all("test finished").expect("services stop");
     }
 
@@ -1782,7 +1786,6 @@ mod tests {
                 Box::new(ChannelService::with_platform_events(ingress_rx, event_tx)),
             )
             .expect("channel mounts");
-
         ingress_tx
             .send(ChannelIngress::CreateForegroundSession { requested_id: None })
             .expect("create ingress sends");
@@ -2235,9 +2238,9 @@ mod tests {
     }
 
     #[test]
-    fn channel_emits_platform_delivery_events() {
+    fn channel_emits_user_message_queued_events() {
         let mut kernel = test_kernel("channel_platform_events");
-        let (_ingress_tx, ingress_rx) = crossbeam_channel::unbounded();
+        let (ingress_tx, ingress_rx) = crossbeam_channel::unbounded();
         let (event_tx, event_rx) = crossbeam_channel::unbounded();
         kernel
             .mount_service_instance(
@@ -2246,27 +2249,48 @@ mod tests {
                 Box::new(ChannelService::with_platform_events(ingress_rx, event_tx)),
             )
             .expect("channel mounts");
-
         kernel
-            .dispatch_call(
-                channel::deliver_text_call(
-                    ServiceAddr::agent_foreground_id("scratch"),
-                    ServiceAddr::channel_id("scratch"),
-                    "hello platform",
-                )
-                .expect("delivery call encodes"),
+            .mount_service(
+                ServiceAddr::agent_foreground_id("scratch"),
+                ServiceKind::Noop {
+                    name: "foreground scratch".to_string(),
+                },
             )
-            .expect("channel receives delivery");
+            .expect("noop agent mounts");
+
+        ingress_tx
+            .send(ChannelIngress::IncomingMessage {
+                foreground_session_id: Some("scratch".to_string()),
+                platform_message_id: Some("platform-message-1".to_string()),
+                origin: Some(crate::service_protos::agent_session::AgentMessageOrigin::User),
+                message: stellaclaw_core::session_actor::ChatMessage::new(
+                    stellaclaw_core::session_actor::ChatRole::User,
+                    vec![stellaclaw_core::session_actor::ChatMessageItem::Context(
+                        stellaclaw_core::session_actor::ContextItem {
+                            text: "hello platform".to_string(),
+                        },
+                    )],
+                ),
+                metadata: serde_json::json!({"client_message_id": "client-message-1"}),
+            })
+            .expect("ingress sends");
         kernel
             .pump_for(Duration::from_millis(50))
             .expect("outputs drain");
 
         let event = event_rx.try_recv().expect("platform event emitted");
-        let ChannelEvent::Delivery { text, delivery } = event else {
-            panic!("expected delivery event");
+        let ChannelEvent::UserMessageQueued {
+            session_addr,
+            platform_message_id,
+            metadata,
+            ..
+        } = event
+        else {
+            panic!("expected user message queued event");
         };
-        assert_eq!(text, "hello platform");
-        assert_eq!(delivery.text, "hello platform");
+        assert_eq!(session_addr, ServiceAddr::agent_foreground_id("scratch"));
+        assert_eq!(platform_message_id.as_deref(), Some("platform-message-1"));
+        assert_eq!(metadata["client_message_id"], "client-message-1");
         kernel.stop_all("test finished").expect("services stop");
     }
 

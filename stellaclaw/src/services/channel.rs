@@ -19,7 +19,7 @@ use crate::{
             self, decode_response as decode_agent_response, AgentMessageOrigin, AgentSessionKind,
             AgentSessionResponse,
         },
-        channel::{decode_request, ChannelDelivery, ChannelEvent, ChannelIngress, ChannelRequest},
+        channel::{decode_request, ChannelEvent, ChannelIngress, ChannelRequest},
         kernel::{self, decode_response as decode_kernel_response, KernelResponse},
         status::{self, decode_response as decode_status_response, StatusResponse},
         terminal::{self, decode_response as decode_terminal_response, TerminalResponse},
@@ -211,27 +211,6 @@ fn handle_channel_request(
     }
 
     match decode_request(payload.clone()) {
-        Ok(ChannelRequest::Deliver { delivery }) => {
-            let text = delivery.text.clone();
-            let chars = text.chars().count();
-            emit_channel_event(
-                event_tx,
-                ChannelEvent::Delivery {
-                    delivery: delivery.clone(),
-                    text,
-                },
-            )?;
-            ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
-                addr: ctx.addr.clone(),
-                label: "delivered_text".to_string(),
-                detail: serde_json::json!({
-                    "session_addr": delivery.session_addr,
-                    "chars": chars,
-                    "attachments": delivery.attachments.len(),
-                    "has_message": delivery.message.is_some(),
-                }),
-            }))?;
-        }
         Ok(ChannelRequest::SessionEvent {
             session_addr,
             event,
@@ -523,6 +502,15 @@ fn handle_channel_ingress(
         } => {
             let origin = origin.unwrap_or(AgentMessageOrigin::User);
             let target = foreground_target(ctx, foreground_session_id.as_deref());
+            emit_channel_event(
+                event_tx,
+                ChannelEvent::UserMessageQueued {
+                    session_addr: target.clone(),
+                    platform_message_id: platform_message_id.clone(),
+                    message: message.clone(),
+                    metadata: metadata.clone(),
+                },
+            )?;
             if message_needs_materialization(&message) {
                 let request_id = channel_service_request_id("workspace-materialize");
                 pending_workspace.push_back(PendingWorkspaceRequest::IncomingMessage {
@@ -1063,6 +1051,35 @@ fn handle_session_event(
                 }),
             }))?;
         }
+        agent_session::AgentSessionEvent::UserMessageStarted {
+            origin,
+            ingress_id,
+            message,
+        } => {
+            ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
+                addr: ctx.addr.clone(),
+                label: "user_message_started".to_string(),
+                detail: serde_json::json!({
+                    "session_addr": session_addr,
+                    "origin": origin,
+                    "ingress_id": ingress_id,
+                    "message_id": message.message_id,
+                    "items": message.data.len(),
+                }),
+            }))?;
+        }
+        agent_session::AgentSessionEvent::UserMessageCommitted { index, message } => {
+            ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
+                addr: ctx.addr.clone(),
+                label: "user_message_committed".to_string(),
+                detail: serde_json::json!({
+                    "session_addr": session_addr,
+                    "index": index,
+                    "message_id": message.message_id,
+                    "items": message.data.len(),
+                }),
+            }))?;
+        }
         agent_session::AgentSessionEvent::TurnStarted { turn_id, plan } => {
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                 addr: ctx.addr.clone(),
@@ -1071,17 +1088,6 @@ fn handle_session_event(
                     "session_addr": session_addr,
                     "active": true,
                     "turn_id": turn_id,
-                    "plan": plan,
-                }),
-            }))?;
-        }
-        agent_session::AgentSessionEvent::Progress { message, plan } => {
-            ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
-                addr: ctx.addr.clone(),
-                label: "progress_feedback".to_string(),
-                detail: serde_json::json!({
-                    "session_addr": session_addr,
-                    "message": message,
                     "plan": plan,
                 }),
             }))?;
@@ -1184,35 +1190,13 @@ fn handle_session_event(
                 }),
             }))?;
         }
-        agent_session::AgentSessionEvent::TurnCompleted { message } => {
+        agent_session::AgentSessionEvent::TurnCompleted { .. } => {
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                 addr: ctx.addr.clone(),
                 label: "processing".to_string(),
                 detail: serde_json::json!({
                     "session_addr": session_addr,
                     "active": false,
-                }),
-            }))?;
-            emit_channel_event(
-                event_tx,
-                ChannelEvent::Delivery {
-                    delivery: ChannelDelivery {
-                        session_addr: Some(session_addr.clone()),
-                        message: Some(message),
-                        text: String::new(),
-                        attachments: Vec::new(),
-                        options: None,
-                    },
-                    text: String::new(),
-                },
-            )?;
-            ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
-                addr: ctx.addr.clone(),
-                label: "delivered_text".to_string(),
-                detail: serde_json::json!({
-                    "session_addr": session_addr,
-                    "chars": 0,
-                    "has_message": true,
                 }),
             }))?;
         }

@@ -28,8 +28,7 @@ use crate::{
             AgentSessionMessageHistory, AgentSessionMessageRecord, AgentSessionRequest,
             AgentSessionResponse, AgentSessionState, AgentSessionStatus,
         },
-        channel::{self, ChannelDelivery},
-        cron,
+        channel, cron,
         cron::{
             CronRequest, CronResponse, CronSchedule, CronTaskOutputPolicy, CronTaskPatch,
             CronTaskPayload, CronTaskRegistration,
@@ -206,6 +205,17 @@ impl ConversationService for AgentSessionService {
                                         "runner": "agent_server",
                                     }),
                                 }))?;
+                                if matches!(origin, AgentMessageOrigin::User) {
+                                    emit_session_event(
+                                        &ctx,
+                                        &event_sink,
+                                        AgentSessionEvent::UserMessageStarted {
+                                            origin: origin.clone(),
+                                            ingress_id: ingress_id.clone(),
+                                            message: message.clone(),
+                                        },
+                                    )?;
+                                }
                                 runner.send(AgentSessionRequest::EnqueueMessage {
                                     origin,
                                     message,
@@ -861,11 +871,32 @@ fn handle_skeleton_enqueue(
             "runner": "skeleton",
         }),
     }))?;
+    if matches!(origin, AgentMessageOrigin::User) {
+        emit_session_event(
+            ctx,
+            event_sink,
+            AgentSessionEvent::UserMessageStarted {
+                origin: origin.clone(),
+                ingress_id: ingress_id.clone(),
+                message: message.clone(),
+            },
+        )?;
+    }
     emit_session_event(
         ctx,
         event_sink,
-        AgentSessionEvent::MessageAppended { index, message },
+        AgentSessionEvent::MessageAppended {
+            index,
+            message: message.clone(),
+        },
     )?;
+    if matches!(origin, AgentMessageOrigin::User) {
+        emit_session_event(
+            ctx,
+            event_sink,
+            AgentSessionEvent::UserMessageCommitted { index, message },
+        )?;
+    }
     if should_start_turn(kind, &origin) {
         let turn_id = format!("turn_{}", state.message_count);
         state.state = AgentSessionState::Running;
@@ -1045,7 +1076,32 @@ fn handle_core_session_event(
     }
     apply_core_session_event(state, current_plan, event);
     state.persist(&ctx.storage)?;
-    emit_session_event(ctx, event_sink, from_core_session_event(event.clone()))
+    match event {
+        CoreSessionEvent::Progress {
+            plan: Some(plan), ..
+        } => emit_session_event(
+            ctx,
+            event_sink,
+            AgentSessionEvent::PlanUpdated {
+                plan: Some(plan.clone()),
+            },
+        ),
+        CoreSessionEvent::Progress { .. } => Ok(()),
+        CoreSessionEvent::MessageAppended { index, message }
+            if matches!(message.role, ChatRole::User) =>
+        {
+            emit_session_event(ctx, event_sink, from_core_session_event(event.clone()))?;
+            emit_session_event(
+                ctx,
+                event_sink,
+                AgentSessionEvent::UserMessageCommitted {
+                    index: *index,
+                    message: message.clone(),
+                },
+            )
+        }
+        _ => emit_session_event(ctx, event_sink, from_core_session_event(event.clone())),
+    }
 }
 
 fn update_plan_bridge_response(
@@ -1551,24 +1607,6 @@ fn handle_child_session_event(
     if handled {
         state.persist(&ctx.storage)?;
         if let Some(message) = completed_background_message {
-            if state
-                .binding
-                .event_sink
-                .local_service_id("channel")
-                .is_some()
-            {
-                ctx.outbox.send(ServiceOutput::Call(channel::deliver_call(
-                    ctx.addr.clone(),
-                    state.binding.event_sink.clone(),
-                    ChannelDelivery {
-                        session_addr: Some(ctx.addr.clone()),
-                        message: Some(message.clone()),
-                        text: String::new(),
-                        attachments: Vec::new(),
-                        options: None,
-                    },
-                )?))?;
-            }
             ctx.outbox
                 .send(ServiceOutput::Call(agent_session::enqueue_message_call(
                     ctx.addr.clone(),
@@ -2664,9 +2702,7 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
         CoreSessionEvent::TurnStarted { turn_id, plan } => {
             AgentSessionEvent::TurnStarted { turn_id, plan }
         }
-        CoreSessionEvent::Progress { message, plan } => {
-            AgentSessionEvent::Progress { message, plan }
-        }
+        CoreSessionEvent::Progress { .. } => AgentSessionEvent::PlanUpdated { plan: None },
         CoreSessionEvent::PlanUpdated { plan } => AgentSessionEvent::PlanUpdated { plan },
         CoreSessionEvent::StreamAssistantMessageDelta {
             message_id,
@@ -4135,13 +4171,6 @@ mod tests {
             ChildAgentRuntimeStatus::Completed
         );
         let outputs = output_rx.try_iter().collect::<Vec<_>>();
-        assert!(outputs.iter().any(|output| {
-            matches!(
-                output,
-                ServiceOutput::Call(ServiceCall { target, .. })
-                    if target == &crate::conversation_new::ServiceAddr::channel_id("scratch")
-            )
-        }));
         assert!(outputs.iter().any(|output| {
             matches!(
                 output,

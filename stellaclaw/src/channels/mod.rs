@@ -21,7 +21,6 @@ pub trait Channel: Send + Sync {
     fn send_delivery(&self, delivery: &OutgoingDelivery) -> Result<()>;
     fn send_event(&self, event: &ChannelEvent) -> Result<()> {
         match event {
-            ChannelEvent::Delivery(delivery) => self.send_delivery(delivery),
             ChannelEvent::MessageAppended(appended) => self.message_appended(appended),
             ChannelEvent::SessionStream(stream) => self.session_stream(stream),
             ChannelEvent::Processing(processing) => {

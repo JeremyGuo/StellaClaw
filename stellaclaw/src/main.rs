@@ -473,6 +473,16 @@ fn project_channel_event(
             session_addr,
             event,
         } => match event {
+            event @ (AgentSessionEvent::UserMessageStarted { .. }
+            | AgentSessionEvent::UserMessageCommitted { .. }) => {
+                events.push(ChannelEvent::SessionStream(OutgoingSessionStream {
+                    channel_id: metadata.channel_id.clone(),
+                    platform_chat_id: metadata.platform_chat_id.clone(),
+                    conversation_id: metadata.conversation_id.clone(),
+                    session_id: service_addr_storage_component(&session_addr),
+                    event: serde_json::to_value(event)?,
+                }));
+            }
             AgentSessionEvent::MessageAppended { index, message } => {
                 events.push(ChannelEvent::MessageAppended(OutgoingMessageAppended {
                     channel_id: metadata.channel_id.clone(),
@@ -586,16 +596,30 @@ fn project_channel_event(
             }
             _ => {}
         },
-        service_protos::channel::ChannelEvent::Delivery { delivery, text } => {
-            events.push(ChannelEvent::Delivery(channels::types::OutgoingDelivery {
+        service_protos::channel::ChannelEvent::UserMessageQueued {
+            session_addr,
+            platform_message_id,
+            message,
+            metadata: event_metadata,
+        } => {
+            let client_message_id = event_metadata
+                .get("client_message_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .or(platform_message_id)
+                .filter(|id| !id.trim().is_empty())
+                .unwrap_or_else(|| message.message_id.clone());
+            events.push(ChannelEvent::SessionStream(OutgoingSessionStream {
                 channel_id: metadata.channel_id.clone(),
                 platform_chat_id: metadata.platform_chat_id.clone(),
                 conversation_id: metadata.conversation_id.clone(),
-                session_id: delivery.session_addr.map(|addr| addr.to_string()),
-                message: delivery.message,
-                text,
-                attachments: Vec::new(),
-                options: None,
+                session_id: service_addr_storage_component(&session_addr),
+                event: serde_json::json!({
+                    "type": "user_message_queued",
+                    "client_message_id": client_message_id,
+                    "message_id": message.message_id,
+                    "message": message,
+                }),
             }));
         }
         service_protos::channel::ChannelEvent::Error {

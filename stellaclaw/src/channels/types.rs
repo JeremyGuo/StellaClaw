@@ -103,6 +103,7 @@ pub struct OutgoingOptions {
     pub options: Vec<OutgoingOption>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct OutgoingDelivery {
     pub channel_id: String,
@@ -188,7 +189,6 @@ pub struct OutgoingProcessing {
 
 #[derive(Debug, Clone)]
 pub enum ChannelEvent {
-    Delivery(OutgoingDelivery),
     MessageAppended(OutgoingMessageAppended),
     SessionStream(OutgoingSessionStream),
     Processing(OutgoingProcessing),
@@ -198,7 +198,6 @@ pub enum ChannelEvent {
 impl ChannelEvent {
     pub fn channel_id(&self) -> &str {
         match self {
-            ChannelEvent::Delivery(delivery) => &delivery.channel_id,
             ChannelEvent::MessageAppended(appended) => &appended.channel_id,
             ChannelEvent::SessionStream(stream) => &stream.channel_id,
             ChannelEvent::Processing(processing) => &processing.channel_id,
@@ -208,7 +207,6 @@ impl ChannelEvent {
 
     pub fn platform_chat_id(&self) -> &str {
         match self {
-            ChannelEvent::Delivery(delivery) => &delivery.platform_chat_id,
             ChannelEvent::MessageAppended(appended) => &appended.platform_chat_id,
             ChannelEvent::SessionStream(stream) => &stream.platform_chat_id,
             ChannelEvent::Processing(processing) => &processing.platform_chat_id,

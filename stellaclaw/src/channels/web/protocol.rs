@@ -6,7 +6,7 @@ use stellaclaw_core::session_actor::{
     ChatMessage, SessionErrorDetail, TaskPlanView, ToolResultItem,
 };
 
-use crate::service_protos::agent_session::AgentSessionState;
+use crate::service_protos::agent_session::{AgentMessageOrigin, AgentSessionState};
 
 pub const HOME_WS_PATH: &str = "/api/ws/home";
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 30;
@@ -199,6 +199,28 @@ pub enum ChatEvent {
         client_message_id: String,
         conversation_id: String,
         foreground_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<ChatMessage>,
+    },
+    #[serde(rename = "chat.user_message_started")]
+    UserMessageStarted {
+        conversation_id: String,
+        foreground_session_id: String,
+        origin: AgentMessageOrigin,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ingress_id: Option<String>,
+        message: ChatMessage,
+    },
+    #[serde(rename = "chat.user_message_committed")]
+    UserMessageCommitted {
+        conversation_id: String,
+        foreground_session_id: String,
+        message_index: usize,
+        message_id: String,
+        committed: bool,
+        message: ChatMessage,
     },
     #[serde(rename = "chat.message_appended")]
     MessageAppended {
@@ -306,12 +328,6 @@ pub enum ChatEvent {
         foreground_session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         plan: Option<TaskPlanView>,
-    },
-    #[serde(rename = "chat.delivery")]
-    Delivery {
-        conversation_id: String,
-        foreground_session_id: String,
-        text: String,
     },
     #[serde(rename = "chat.heartbeat")]
     Heartbeat(WebHeartbeat),

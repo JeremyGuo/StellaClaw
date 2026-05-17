@@ -111,25 +111,8 @@ pub enum ChannelIngress {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ChannelDelivery {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_addr: Option<ServiceAddr>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub message: Option<ChatMessage>,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub text: String,
-    #[serde(default)]
-    pub attachments: Vec<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub options: Option<Value>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChannelRequest {
-    Deliver {
-        delivery: ChannelDelivery,
-    },
     SessionEvent {
         session_addr: ServiceAddr,
         event: AgentSessionEvent,
@@ -160,9 +143,13 @@ pub enum ChannelEvent {
     AgentSessionRejected {
         reason: String,
     },
-    Delivery {
-        delivery: ChannelDelivery,
-        text: String,
+    UserMessageQueued {
+        session_addr: ServiceAddr,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        platform_message_id: Option<String>,
+        message: ChatMessage,
+        #[serde(default)]
+        metadata: Value,
     },
     SessionEvent {
         session_addr: ServiceAddr,
@@ -224,36 +211,6 @@ pub fn decode_request(payload: Value) -> Result<ChannelRequest> {
 
 pub fn encode_response(response: ChannelResponse) -> Result<Value> {
     serde_json::to_value(response).context("failed to encode channel response")
-}
-
-pub fn deliver_text_call(
-    source: ServiceAddr,
-    channel: ServiceAddr,
-    text: impl Into<String>,
-) -> Result<ServiceCall> {
-    deliver_call(
-        source,
-        channel,
-        ChannelDelivery {
-            session_addr: None,
-            message: None,
-            text: text.into(),
-            attachments: Vec::new(),
-            options: None,
-        },
-    )
-}
-
-pub fn deliver_call(
-    source: ServiceAddr,
-    channel: ServiceAddr,
-    delivery: ChannelDelivery,
-) -> Result<ServiceCall> {
-    Ok(ServiceCall::new(
-        source,
-        channel,
-        encode_request(ChannelRequest::Deliver { delivery })?,
-    ))
 }
 
 pub fn session_event_call(

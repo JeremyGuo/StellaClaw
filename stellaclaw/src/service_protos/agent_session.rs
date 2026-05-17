@@ -136,17 +136,22 @@ pub enum AgentSessionRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentSessionEvent {
+    UserMessageStarted {
+        origin: AgentMessageOrigin,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ingress_id: Option<String>,
+        message: ChatMessage,
+    },
+    UserMessageCommitted {
+        index: usize,
+        message: ChatMessage,
+    },
     MessageAppended {
         index: usize,
         message: ChatMessage,
     },
     TurnStarted {
         turn_id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        plan: Option<TaskPlanView>,
-    },
-    Progress {
-        message: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         plan: Option<TaskPlanView>,
     },

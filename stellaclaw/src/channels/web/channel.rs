@@ -653,7 +653,6 @@ impl WebChannel {
                 },
             )
             .map_err(HttpError::internal)?;
-        self.record_user_message_queued(conversation_id, foreground_session_id, &client_message_id);
         Ok(HttpResponse::json(
             202,
             json!({
@@ -865,10 +864,6 @@ impl WebChannel {
         websocket_event_loop(stream, rx, "chat.heartbeat")
     }
 
-    fn publish_websocket_event(&self, conversation_id: &str, session_id: &str, payload: Value) {
-        self.main.publish_chat(conversation_id, session_id, payload);
-    }
-
     fn publish_conversation_event(&self, payload: Value) {
         self.main.publish_home(payload);
     }
@@ -879,16 +874,6 @@ impl WebChannel {
         foreground_session_id: &str,
     ) -> ChatLiveState {
         self.main.live_state(conversation_id, foreground_session_id)
-    }
-
-    fn record_user_message_queued(
-        &self,
-        conversation_id: &str,
-        foreground_session_id: &str,
-        client_message_id: &str,
-    ) {
-        self.main
-            .user_message_queued(conversation_id, foreground_session_id, client_message_id);
     }
 
     fn authorized(&self, request: &HttpRequest) -> bool {
@@ -910,18 +895,7 @@ impl Channel for WebChannel {
     }
 
     fn send_delivery(&self, delivery: &OutgoingDelivery) -> Result<()> {
-        if delivery.message.is_none() && !delivery.text.trim().is_empty() {
-            self.publish_websocket_event(
-                &delivery.conversation_id,
-                delivery.session_id.as_deref().unwrap_or("main"),
-                json!({
-                    "type": "chat.delivery",
-                    "text": delivery.text,
-                    "conversation_id": delivery.conversation_id,
-                    "foreground_session_id": delivery.session_id.as_deref().and_then(foreground_route_id_from_storage_id).or_else(|| delivery.session_id.clone()).unwrap_or_else(|| "main".to_string()),
-                }),
-            );
-        }
+        let _ = delivery;
         Ok(())
     }
 
