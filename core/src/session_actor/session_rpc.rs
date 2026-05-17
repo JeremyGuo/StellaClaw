@@ -193,6 +193,7 @@ pub enum SessionEvent {
     StreamAssistantMessageDelta {
         message_id: String,
         turn_id: String,
+        in_message_index: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
         delta: String,
@@ -202,6 +203,7 @@ pub enum SessionEvent {
     StreamToolCallDelta {
         message_id: String,
         turn_id: String,
+        in_message_index: u64,
         item_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
@@ -210,6 +212,7 @@ pub enum SessionEvent {
     StreamReasoningSummaryDelta {
         message_id: String,
         turn_id: String,
+        in_message_index: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
         summary_index: i64,
@@ -218,6 +221,7 @@ pub enum SessionEvent {
     StreamReasoningSummaryPartAdded {
         message_id: String,
         turn_id: String,
+        in_message_index: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
         summary_index: i64,
@@ -225,6 +229,7 @@ pub enum SessionEvent {
     StreamError {
         message_id: String,
         turn_id: String,
+        in_message_index: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

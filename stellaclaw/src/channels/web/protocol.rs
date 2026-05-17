@@ -206,6 +206,7 @@ pub enum ChatEvent {
         foreground_session_id: String,
         message_index: usize,
         message_id: String,
+        committed: bool,
         message: ChatMessage,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn_id: Option<String>,
@@ -231,7 +232,9 @@ pub enum ChatEvent {
         conversation_id: String,
         foreground_session_id: String,
         message_id: String,
+        next_message_id: String,
         turn_id: String,
+        in_message_index: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
         delta: String,
@@ -243,7 +246,9 @@ pub enum ChatEvent {
         conversation_id: String,
         foreground_session_id: String,
         message_id: String,
+        next_message_id: String,
         turn_id: String,
+        in_message_index: u64,
         item_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
@@ -254,7 +259,9 @@ pub enum ChatEvent {
         conversation_id: String,
         foreground_session_id: String,
         message_id: String,
+        next_message_id: String,
         turn_id: String,
+        in_message_index: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
         summary_index: i64,
@@ -264,7 +271,9 @@ pub enum ChatEvent {
         conversation_id: String,
         foreground_session_id: String,
         message_id: String,
+        next_message_id: String,
         turn_id: String,
+        in_message_index: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
         summary_index: i64,
@@ -275,7 +284,9 @@ pub enum ChatEvent {
         conversation_id: String,
         foreground_session_id: String,
         message_id: String,
+        next_message_id: String,
         turn_id: String,
+        in_message_index: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

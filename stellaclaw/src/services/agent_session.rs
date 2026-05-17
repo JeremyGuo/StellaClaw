@@ -2621,12 +2621,14 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
         CoreSessionEvent::StreamAssistantMessageDelta {
             message_id,
             turn_id,
+            in_message_index,
             item_id,
             delta,
             message_index,
         } => AgentSessionEvent::StreamAssistantMessageDelta {
             message_id,
             turn_id,
+            in_message_index,
             item_id,
             delta,
             message_index,
@@ -2634,12 +2636,14 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
         CoreSessionEvent::StreamToolCallDelta {
             message_id,
             turn_id,
+            in_message_index,
             item_id,
             call_id,
             delta,
         } => AgentSessionEvent::StreamToolCallDelta {
             message_id,
             turn_id,
+            in_message_index,
             item_id,
             call_id,
             delta,
@@ -2647,12 +2651,14 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
         CoreSessionEvent::StreamReasoningSummaryDelta {
             message_id,
             turn_id,
+            in_message_index,
             item_id,
             summary_index,
             delta,
         } => AgentSessionEvent::StreamReasoningSummaryDelta {
             message_id,
             turn_id,
+            in_message_index,
             item_id,
             summary_index,
             delta,
@@ -2660,17 +2666,20 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
         CoreSessionEvent::StreamReasoningSummaryPartAdded {
             message_id,
             turn_id,
+            in_message_index,
             item_id,
             summary_index,
         } => AgentSessionEvent::StreamReasoningSummaryPartAdded {
             message_id,
             turn_id,
+            in_message_index,
             item_id,
             summary_index,
         },
         CoreSessionEvent::StreamError {
             message_id,
             turn_id,
+            in_message_index,
             item_id,
             message_index,
             error,
@@ -2678,6 +2687,7 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
         } => AgentSessionEvent::StreamError {
             message_id,
             turn_id,
+            in_message_index,
             item_id,
             message_index,
             error,

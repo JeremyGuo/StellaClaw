@@ -130,6 +130,7 @@ pub enum AgentSessionEvent {
     StreamAssistantMessageDelta {
         message_id: String,
         turn_id: String,
+        in_message_index: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
         delta: String,
@@ -139,6 +140,7 @@ pub enum AgentSessionEvent {
     StreamToolCallDelta {
         message_id: String,
         turn_id: String,
+        in_message_index: u64,
         item_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call_id: Option<String>,
@@ -147,6 +149,7 @@ pub enum AgentSessionEvent {
     StreamReasoningSummaryDelta {
         message_id: String,
         turn_id: String,
+        in_message_index: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
         summary_index: i64,
@@ -155,6 +158,7 @@ pub enum AgentSessionEvent {
     StreamReasoningSummaryPartAdded {
         message_id: String,
         turn_id: String,
+        in_message_index: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
         summary_index: i64,
@@ -162,6 +166,7 @@ pub enum AgentSessionEvent {
     StreamError {
         message_id: String,
         turn_id: String,
+        in_message_index: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         item_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]

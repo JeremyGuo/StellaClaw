@@ -105,6 +105,7 @@ struct ActiveProviderRequest {
     step_index: usize,
     request_too_large_attempts: usize,
     started_at_ms: u128,
+    next_stream_event_index: u64,
 }
 
 struct BuiltToolBatch {
@@ -769,6 +770,7 @@ impl SessionActor {
         self.emit(SessionEvent::StreamError {
             message_id: active.message_id.clone(),
             turn_id: active.turn_id.clone(),
+            in_message_index: active.next_stream_event_index,
             item_id: None,
             message_index: None,
             error: reason.clone(),
@@ -1243,6 +1245,7 @@ impl SessionActor {
                 step_index,
                 request_too_large_attempts,
                 started_at_ms: current_time_millis(),
+                next_stream_event_index: 0,
             });
             return Ok(());
         }
@@ -1377,6 +1380,7 @@ impl SessionActor {
         &mut self,
         message_id: &str,
         turn_id: &str,
+        in_message_index: u64,
         event: ProviderStreamEvent,
     ) -> Result<(), SessionActorError> {
         let model_message_index = self.history.len();
@@ -1386,6 +1390,7 @@ impl SessionActor {
                 self.emit(SessionEvent::StreamAssistantMessageDelta {
                     message_id: message_id.to_string(),
                     turn_id: turn_id.to_string(),
+                    in_message_index,
                     item_id,
                     delta,
                     message_index: Some(model_message_index),
@@ -1399,6 +1404,7 @@ impl SessionActor {
                 self.emit(SessionEvent::StreamToolCallDelta {
                     message_id: message_id.to_string(),
                     turn_id: turn_id.to_string(),
+                    in_message_index,
                     item_id,
                     call_id,
                     delta,
@@ -1412,6 +1418,7 @@ impl SessionActor {
                 self.emit(SessionEvent::StreamReasoningSummaryDelta {
                     message_id: message_id.to_string(),
                     turn_id: turn_id.to_string(),
+                    in_message_index,
                     item_id,
                     summary_index,
                     delta,
@@ -1424,6 +1431,7 @@ impl SessionActor {
                 self.emit(SessionEvent::StreamReasoningSummaryPartAdded {
                     message_id: message_id.to_string(),
                     turn_id: turn_id.to_string(),
+                    in_message_index,
                     item_id,
                     summary_index,
                 })?;
@@ -1541,7 +1549,11 @@ impl SessionActor {
     }
 
     fn handle_ready_provider_event(&mut self) -> Result<SessionActorStep, SessionActorError> {
-        let Some(active) = self.active_provider_request.as_ref() else {
+        let Some(active_request_id) = self
+            .active_provider_request
+            .as_ref()
+            .map(|active| active.request_id.clone())
+        else {
             return Ok(SessionActorStep::Idle);
         };
         let Some(event) = self.pending_provider_events.pop_front() else {
@@ -1549,10 +1561,21 @@ impl SessionActor {
         };
         match event {
             ProviderEvent::Stream { request_id, event } => {
-                if request_id == active.request_id {
+                if request_id == active_request_id && provider_stream_event_is_renderable(&event) {
+                    let Some(active) = self.active_provider_request.as_mut() else {
+                        return Ok(SessionActorStep::Idle);
+                    };
                     let turn_id = active.turn_id.clone();
                     let message_id = active.message_id.clone();
-                    self.emit_provider_stream_event(&message_id, &turn_id, event)?;
+                    let in_message_index = active.next_stream_event_index;
+                    active.next_stream_event_index =
+                        active.next_stream_event_index.saturating_add(1);
+                    self.emit_provider_stream_event(
+                        &message_id,
+                        &turn_id,
+                        in_message_index,
+                        event,
+                    )?;
                 }
                 Ok(SessionActorStep::WaitingProviderRequest)
             }
@@ -1563,7 +1586,10 @@ impl SessionActor {
                 delay_ms,
                 error,
             } => {
-                if request_id == active.request_id {
+                if request_id == active_request_id {
+                    let Some(active) = self.active_provider_request.as_ref() else {
+                        return Ok(SessionActorStep::Idle);
+                    };
                     self.log_info(
                         "provider_request_retrying",
                         serde_json::json!({
@@ -1579,12 +1605,12 @@ impl SessionActor {
                 Ok(SessionActorStep::WaitingProviderRequest)
             }
             ProviderEvent::Result { request_id, result } => {
-                if request_id != active.request_id {
+                if request_id != active_request_id {
                     self.log_warn(
                         "stale_provider_request_completion_ignored",
                         serde_json::json!({
                             "request_id": request_id,
-                            "active_request_id": active.request_id,
+                            "active_request_id": active_request_id,
                         }),
                     );
                     return Ok(SessionActorStep::WaitingProviderRequest);
@@ -1628,6 +1654,7 @@ impl SessionActor {
                         self.emit(SessionEvent::StreamError {
                             message_id: active.message_id.clone(),
                             turn_id: active.turn_id.clone(),
+                            in_message_index: active.next_stream_event_index,
                             item_id: None,
                             message_index: None,
                             error: error_text.clone(),
@@ -3031,6 +3058,16 @@ fn session_request_kind(request: &SessionRequest) -> &'static str {
     }
 }
 
+fn provider_stream_event_is_renderable(event: &ProviderStreamEvent) -> bool {
+    matches!(
+        event,
+        ProviderStreamEvent::OutputTextDelta { .. }
+            | ProviderStreamEvent::ToolCallInputDelta { .. }
+            | ProviderStreamEvent::ReasoningSummaryDelta { .. }
+            | ProviderStreamEvent::ReasoningSummaryPartAdded { .. }
+    )
+}
+
 fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
     match event {
         SessionEvent::MessageAppended { index, message } => serde_json::json!({
@@ -3062,6 +3099,7 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
         SessionEvent::StreamAssistantMessageDelta {
             message_id,
             turn_id,
+            in_message_index,
             item_id,
             delta,
             message_index,
@@ -3069,6 +3107,7 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "event": "stream_assistant_message_delta",
             "message_id": message_id,
             "turn_id": turn_id,
+            "in_message_index": in_message_index,
             "item_id": item_id,
             "message_index": message_index,
             "chars": delta.chars().count(),
@@ -3076,6 +3115,7 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
         SessionEvent::StreamToolCallDelta {
             message_id,
             turn_id,
+            in_message_index,
             item_id,
             call_id,
             delta,
@@ -3083,6 +3123,7 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "event": "stream_tool_call_delta",
             "message_id": message_id,
             "turn_id": turn_id,
+            "in_message_index": in_message_index,
             "item_id": item_id,
             "call_id": call_id,
             "chars": delta.chars().count(),
@@ -3090,6 +3131,7 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
         SessionEvent::StreamReasoningSummaryDelta {
             message_id,
             turn_id,
+            in_message_index,
             item_id,
             summary_index,
             delta,
@@ -3097,6 +3139,7 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "event": "stream_reasoning_summary_delta",
             "message_id": message_id,
             "turn_id": turn_id,
+            "in_message_index": in_message_index,
             "item_id": item_id,
             "summary_index": summary_index,
             "chars": delta.chars().count(),
@@ -3104,18 +3147,21 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
         SessionEvent::StreamReasoningSummaryPartAdded {
             message_id,
             turn_id,
+            in_message_index,
             item_id,
             summary_index,
         } => serde_json::json!({
             "event": "stream_reasoning_summary_part_added",
             "message_id": message_id,
             "turn_id": turn_id,
+            "in_message_index": in_message_index,
             "item_id": item_id,
             "summary_index": summary_index,
         }),
         SessionEvent::StreamError {
             message_id,
             turn_id,
+            in_message_index,
             item_id,
             message_index,
             error,
@@ -3124,6 +3170,7 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "event": "stream_error",
             "message_id": message_id,
             "turn_id": turn_id,
+            "in_message_index": in_message_index,
             "item_id": item_id,
             "message_index": message_index,
             "error": error,

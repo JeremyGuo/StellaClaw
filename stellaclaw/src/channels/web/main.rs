@@ -445,6 +445,7 @@ impl WebChannelMain {
                 "foreground_session_id": key.foreground_session_id,
                 "message_index": appended.index,
                 "message_id": appended.message.message_id,
+                "committed": true,
                 "message": decorated_message,
             }),
         );
@@ -1004,6 +1005,11 @@ fn public_chat_stream_payload(
         "foreground_session_id".to_string(),
         json!(foreground_session_id),
     );
+    if !payload.contains_key("next_message_id") {
+        if let Some(message_id) = payload.get("message_id").cloned() {
+            payload.insert("next_message_id".to_string(), message_id);
+        }
+    }
     Value::Object(payload)
 }
 
@@ -1092,6 +1098,7 @@ mod tests {
                 "type": "stream_assistant_message_delta",
                 "message_id": "msg-1",
                 "turn_id": "turn-1",
+                "in_message_index": 0,
                 "delta": "hello",
             }),
         );
@@ -1116,6 +1123,18 @@ mod tests {
         assert_eq!(
             payload.get("delta").and_then(|value| value.as_str()),
             Some("hello")
+        );
+        assert_eq!(
+            payload
+                .get("next_message_id")
+                .and_then(|value| value.as_str()),
+            Some("msg-1")
+        );
+        assert_eq!(
+            payload
+                .get("in_message_index")
+                .and_then(|value| value.as_u64()),
+            Some(0)
         );
     }
 
