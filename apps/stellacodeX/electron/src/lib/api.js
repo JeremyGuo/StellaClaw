@@ -2,6 +2,77 @@ export function conversationKey(serverId, conversationId, foregroundSessionId = 
   return `${serverId}:${conversationId}:${foregroundSessionId || 'main'}`;
 }
 
+export function normalizeForegroundSessionSummary(session = {}, conversation = {}) {
+  const id = String(session.id || session.foreground_session_id || session.session_id || 'main')
+    .replace(/^local__agent__foreground__/, '') || 'main';
+  const lastMessageId = session.last_message_id || session.last_committed_message_id || null;
+  const lastMessageIndex = Number(session.last_message_index ?? session.last_committed_message_index);
+  const messageCount = Number(session.message_count);
+  const state = String(session.state || session.processing_state || 'idle').toLowerCase();
+  return {
+    ...session,
+    id,
+    foreground_session_id: id,
+    session_id: session.session_id || `local__agent__foreground__${id}`,
+    nickname: session.nickname || session.session_name || (id === 'main' ? displayConversationName(conversation) : id),
+    session_name: session.session_name || session.nickname || (id === 'main' ? displayConversationName(conversation) : id),
+    is_main: session.is_main ?? id === 'main',
+    state,
+    processing_state: state,
+    running: session.running ?? (state === 'running' || state === 'queued'),
+    message_count: Number.isFinite(messageCount)
+      ? messageCount
+      : Number.isFinite(lastMessageIndex)
+        ? lastMessageIndex + 1
+        : 0,
+    last_message_id: lastMessageId,
+    last_message_time: session.last_message_time || session.last_activity_at || session.updated_at || null,
+    last_committed_message_id: session.last_committed_message_id || lastMessageId,
+    last_committed_message_index: Number.isFinite(lastMessageIndex) ? lastMessageIndex : null,
+    last_seen_message_id: session.last_seen_message_id || null,
+    last_seen_at: session.last_seen_at || null
+  };
+}
+
+export function normalizeConversationSummary(conversation = {}) {
+  const normalized = {
+    ...conversation,
+    nickname: conversation.nickname || conversation.conversation_name || conversation.platform_chat_id || conversation.conversation_id,
+    conversation_name: conversation.conversation_name || conversation.nickname || conversation.platform_chat_id || conversation.conversation_id,
+    last_message_id: conversation.last_message_id || conversation.last_committed_message_id || null,
+    last_message_time: conversation.last_message_time || conversation.updated_at || conversation.last_activity_at || null,
+    last_committed_message_id: conversation.last_committed_message_id || conversation.last_message_id || null,
+    last_committed_message_index: conversation.last_committed_message_index ?? conversation.last_message_index ?? null
+  };
+  const lastIndex = Number(normalized.last_committed_message_index);
+  const count = Number(conversation.message_count);
+  normalized.message_count = Number.isFinite(count)
+    ? count
+    : Number.isFinite(lastIndex)
+      ? lastIndex + 1
+      : 0;
+  normalized.foreground_sessions = (Array.isArray(conversation.foreground_sessions)
+    ? conversation.foreground_sessions
+    : []
+  ).map((session) => normalizeForegroundSessionSummary(session, normalized));
+  if (!normalized.foreground_sessions.length) {
+    normalized.foreground_sessions = [normalizeForegroundSessionSummary({
+      id: 'main',
+      foreground_session_id: normalized.foreground_session_id || 'main',
+      nickname: normalized.nickname,
+      message_count: normalized.message_count,
+      last_message_id: normalized.last_message_id,
+      last_message_time: normalized.last_message_time,
+      last_committed_message_id: normalized.last_committed_message_id,
+      last_committed_message_index: normalized.last_committed_message_index,
+      last_seen_message_id: normalized.last_seen_message_id,
+      last_seen_at: normalized.last_seen_at,
+      is_main: true
+    }, normalized)];
+  }
+  return normalized;
+}
+
 export function displayConversationName(conversation) {
   return (
     (conversation.nickname || '').trim()
@@ -14,7 +85,7 @@ export function foregroundSessions(conversation) {
   const sessions = Array.isArray(conversation?.foreground_sessions)
     ? conversation.foreground_sessions
     : [];
-  if (sessions.length > 0) return sessions;
+  if (sessions.length > 0) return sessions.map((session) => normalizeForegroundSessionSummary(session, conversation));
   return [{
     id: 'main',
     session_id: conversation?.foreground_session_id || 'local__agent__foreground__main',
@@ -54,8 +125,8 @@ export async function connectionInfo(serverId) {
 }
 
 export async function loadConversations(serverId) {
-  const response = await api(serverId, '/api/conversations?limit=80');
-  return response.data?.conversations || [];
+  const snapshot = await loadHomeSnapshot(serverId);
+  return snapshot.conversations || [];
 }
 
 export async function markConversationSeen(serverId, conversationId, lastSeenMessageId, foregroundSessionId = 'main') {
@@ -75,6 +146,49 @@ export async function conversationStreamUrl(serverId) {
   url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
   url.searchParams.set('token', info.token || '');
   return url.toString();
+}
+
+export async function loadHomeSnapshot(serverId, timeoutMs = 5000) {
+  const url = await conversationStreamUrl(serverId);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const socket = new WebSocket(url);
+    const timeout = window.setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        socket.close();
+      } catch {}
+      reject(new Error('Home snapshot timeout'));
+    }, timeoutMs);
+    const finish = (result, error) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeout);
+      try {
+        socket.close();
+      } catch {}
+      if (error) reject(error);
+      else resolve(result);
+    };
+    socket.addEventListener('message', (event) => {
+      let payload;
+      try {
+        payload = JSON.parse(event.data);
+      } catch {
+        return;
+      }
+      if (payload?.type !== 'home.snapshot') return;
+      finish({
+        ...payload,
+        conversations: (payload.conversations || []).map(normalizeConversationSummary)
+      });
+    });
+    socket.addEventListener('error', () => finish(null, new Error('Home snapshot websocket failed')));
+    socket.addEventListener('close', () => {
+      if (!settled) finish(null, new Error('Home snapshot websocket closed'));
+    });
+  });
 }
 
 export async function createConversation(serverId, options = {}) {
@@ -103,8 +217,9 @@ export async function deleteConversation(serverId, conversationId) {
 }
 
 export async function loadForegroundSessions(serverId, conversationId) {
-  const response = await api(serverId, `/api/conversations/${conversationId}/foreground_sessions`);
-  return response.data?.foreground_sessions || [];
+  const snapshot = await loadHomeSnapshot(serverId);
+  const conversation = snapshot.conversations.find((item) => item.conversation_id === conversationId);
+  return foregroundSessions(conversation);
 }
 
 export async function createForegroundSession(serverId, conversationId, options = {}) {
@@ -159,8 +274,9 @@ export async function postConversationMessage(serverId, conversationId, text, us
 }
 
 export async function loadStatus(serverId, conversationId) {
-  const response = await api(serverId, `/api/conversations/${conversationId}/status`);
-  return response.data;
+  const snapshot = await loadHomeSnapshot(serverId);
+  const conversation = snapshot.conversations.find((item) => item.conversation_id === conversationId);
+  return conversation || {};
 }
 
 export async function loadModels(serverId) {

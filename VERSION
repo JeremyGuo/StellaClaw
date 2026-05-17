@@ -1,5 +1,10 @@
-version: 1.28.1
+version: 1.28.2
 ---
+
+# 1.28.2
+
+- 适配 StellaCodeX Electron 到新的 WebChannel 协议：
+  Conversation / foreground session 初始化改为通过 `home.snapshot` websocket 获取，不再依赖已删除的 conversation list、foreground session list 和 status REST 读接口；前端会归一化 `conversation_name`、`session_name`、`last_committed_message_*` 和 foreground session state 字段，并处理 `home.foreground_session_*` 增量事件。Chat websocket 新增处理 `chat.user_message_started` / `chat.user_message_committed`，stream tool result 会优先合并回当前 provisional assistant 消息，避免工具结果单独渲染成空消息。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.28.1
 

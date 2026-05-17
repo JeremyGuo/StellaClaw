@@ -17,9 +17,10 @@ import {
   loadConversations,
   loadMessages,
   loadModels,
-  loadStatus,
   loadWorkspace,
   loadWorkspaceFile,
+  normalizeConversationSummary,
+  normalizeForegroundSessionSummary,
   postConversationMessage,
   renameConversation,
   renameForegroundSession,
@@ -229,8 +230,10 @@ function compareMessageIds(left, right) {
 }
 
 function mergeConversationSummary(existing, incoming) {
+  incoming = normalizeConversationSummary(incoming);
   if (!existing) return incoming;
   if (!incoming) return existing;
+  existing = normalizeConversationSummary(existing);
   const incomingHasNewerMessage = compareMessageIds(incoming.last_message_id, existing.last_message_id) >= 0;
   const seen = maxMessageId(existing.last_seen_message_id, incoming.last_seen_message_id);
   const incomingSeenIsNewer = compareMessageIds(incoming?.last_seen_message_id, existing?.last_seen_message_id) >= 0;
@@ -265,15 +268,15 @@ function patchConversationForegroundSession(conversation, sessionId, patch) {
     const currentId = String(session?.id || 'main');
     if (currentId !== targetSessionId) return session;
     found = true;
-    return { ...session, ...patch, id: currentId };
+    return normalizeForegroundSessionSummary({ ...session, ...patch, id: currentId }, conversation);
   });
   if (!found) {
-    nextSessions.push({
+    nextSessions.push(normalizeForegroundSessionSummary({
       id: targetSessionId,
       session_id: targetSessionId,
       is_main: targetSessionId === 'main',
       ...patch
-    });
+    }, conversation));
   }
   return {
     ...conversation,
@@ -305,6 +308,50 @@ function applyConversationStreamEvent(current, payload) {
 
   if (eventType === 'conversation_upserted') {
     return upsert(current, payload.conversation);
+  }
+
+  if (eventType === 'conversation_updated' && payload.conversation_id) {
+    return current.map((conversation) => (
+      conversation.conversation_id === payload.conversation_id
+        ? normalizeConversationSummary({
+          ...conversation,
+          ...(payload.patch || {}),
+          conversation_id: payload.conversation_id
+        })
+        : conversation
+    ));
+  }
+
+  if (eventType === 'foreground_session_upserted' && payload.conversation_id && payload.foreground_session) {
+    const session = payload.foreground_session;
+    const sessionId = session.id || session.foreground_session_id || 'main';
+    return current.map((conversation) => (
+      conversation.conversation_id === payload.conversation_id
+        ? patchConversationForegroundSession(conversation, sessionId, session)
+        : conversation
+    ));
+  }
+
+  if (eventType === 'foreground_session_updated' && payload.conversation_id) {
+    const foregroundSessionId = payload.foreground_session_id || payload.session_id || 'main';
+    const patch = payload.patch?.foreground_session || payload.patch || {};
+    return current.map((conversation) => (
+      conversation.conversation_id === payload.conversation_id
+        ? patchConversationForegroundSession(conversation, foregroundSessionId, patch)
+        : conversation
+    ));
+  }
+
+  if (eventType === 'foreground_session_deleted' && payload.conversation_id) {
+    const foregroundSessionId = String(payload.foreground_session_id || 'main');
+    return current.map((conversation) => {
+      if (conversation.conversation_id !== payload.conversation_id) return conversation;
+      return {
+        ...conversation,
+        foreground_sessions: foregroundSessions(conversation)
+          .filter((session) => String(session?.id || 'main') !== foregroundSessionId)
+      };
+    });
   }
 
   if (eventType === 'conversation_deleted' && payload.conversation_id) {
@@ -803,7 +850,55 @@ function liveToolResultMessage(event, existingMessages = []) {
   };
 }
 
+function appendToolResultToStreamingMessage(current, event) {
+  const toolResult = event?.tool_result || event?.toolResult || event;
+  if (!toolResult || typeof toolResult !== 'object') return null;
+  const turnId = String(event?.turn_id || event?.turnId || '').trim();
+  const toolCallId = String(toolResult.tool_call_id || toolResult.toolCallId || event?.tool_call_id || event?.toolCallId || '').trim();
+  const toolName = String(toolResult.tool_name || toolResult.toolName || 'tool').trim() || 'tool';
+  if (!toolCallId && !toolName) return null;
+  const position = current.findIndex((message) => (
+    message?._streaming
+    && String(message?.role || '').toLowerCase() === 'assistant'
+    && (!turnId || String(message?._streamTurnId || '') === turnId)
+  ));
+  if (position < 0) return null;
+  const result = toolResult.result || {};
+  const next = [...current];
+  const message = next[position];
+  const items = Array.isArray(message.items) ? [...message.items] : [];
+  const existingIndex = items.findIndex((item) => (
+    item?.type === 'tool_result'
+    && String(item?.tool_call_id || '') === toolCallId
+  ));
+  const item = {
+    type: 'tool_result',
+    index: existingIndex >= 0 ? items[existingIndex].index : items.length,
+    tool_call_id: toolCallId,
+    tool_name: toolName,
+    context: result.context?.text || null,
+    context_with_attachment_markers: result.context?.text || null,
+    structured: result.structured || null,
+    files: Array.isArray(result.files) ? result.files : []
+  };
+  if (existingIndex >= 0) items[existingIndex] = { ...items[existingIndex], ...item };
+  else items.push(item);
+  const resultFiles = existingIndex >= 0 ? [] : (Array.isArray(result.files) ? result.files : []);
+  next[position] = {
+    ...message,
+    items,
+    attachments: [
+      ...(Array.isArray(message.attachments) ? message.attachments : []),
+      ...resultFiles
+    ],
+    attachment_count: Number(message.attachment_count || 0) + resultFiles.length
+  };
+  return next;
+}
+
 function appendStreamToolResultDone(current, event) {
+  const merged = appendToolResultToStreamingMessage(current, event);
+  if (merged) return merged;
   const message = liveToolResultMessage(event, current);
   if (!message) return current;
   const existingIndex = current.findIndex((item) => (
@@ -1953,22 +2048,6 @@ function App() {
 
   useEffect(() => {
     if (!selectedServerId || !selectedConversationId) return;
-    const key = conversationKey(selectedServerId, selectedConversationId, selectedSessionId);
-    if (statuses.has(key)) return;
-    let disposed = false;
-    loadStatus(selectedServerId, selectedConversationId)
-      .then((status) => {
-        if (disposed) return;
-        setStatuses((prev) => new Map(prev).set(key, status));
-      })
-      .catch(() => {});
-    return () => {
-      disposed = true;
-    };
-  }, [selectedServerId, selectedConversationId, selectedSessionId, statuses]);
-
-  useEffect(() => {
-    if (!selectedServerId || !selectedConversationId) return;
     const serverId = selectedServerId;
     const conversationId = selectedConversationId;
     const sessionId = selectedSessionId;
@@ -2394,11 +2473,18 @@ function App() {
             applyChatSnapshotLiveProjection(payload);
           } else if (payloadType === 'chat.user_message_queued') {
             setMessages((current) => {
-              const next = markQueuedUserMessage(current, payload.client_message_id || payload.clientMessageId);
+              let next = markQueuedUserMessage(current, payload.client_message_id || payload.clientMessageId);
+              if (payload.message) next = mergeMessages(next, [{ ...payload.message, queued: true }]);
               messagesRef.current = next;
               return next;
             });
             setSessionActivity('消息已排队');
+          } else if (payloadType === 'chat.user_message_started') {
+            if (payload.message) applyIncomingMessages([{ ...payload.message, queued: false }]);
+            setSessionActivity('开始处理');
+          } else if (payloadType === 'chat.user_message_committed') {
+            applyIncomingMessages(payload.message ? [payload.message] : []);
+            setSessionActivity('用户消息已落盘');
           } else if (payloadType === 'chat.message_appended') {
             applyIncomingMessages(payload.message ? [payload.message] : []);
           } else if (
