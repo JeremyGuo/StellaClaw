@@ -1,28 +1,24 @@
 use std::{
     collections::HashMap,
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use anyhow::{anyhow, Context, Result};
-use base64::{engine::general_purpose, Engine as _};
 use crossbeam_channel::{unbounded, Receiver, RecvTimeoutError, Sender};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use sha1::{Digest, Sha1};
 use stellaclaw_core::session_actor::{
     ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, SelectionReferenceItem,
     ToolRemoteMode,
 };
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
-    channels::web_terminal::{TerminalCreateRequest, TerminalResizeRequest},
     config::{ModelSelection, SessionProfile, StellaclawConfig},
     conversation_host::ConversationHostRuntime,
     conversation_id_manager::ConversationIdManager,
@@ -34,35 +30,37 @@ use crate::{
         agent_session::AgentMessageOrigin,
         channel::{ChannelEvent as KernelChannelEvent, ChannelIngress},
         kernel::KernelRuntimeConfigPatch,
-        terminal::{TerminalDataEncoding, TerminalRequest, TerminalResponse},
-        workspace::{WorkspaceFileEncoding, WorkspaceRequest, WorkspaceResponse, WorkspaceTarget},
     },
 };
 
-use super::protocol::HEARTBEAT_INTERVAL_SECS;
+use super::{
+    http::{
+        parse_json, parse_optional_json, query_usize, read_http_request, split_path,
+        write_response, HttpError, HttpRequest, HttpResponse, HttpResult,
+    },
+    time_utils::{generated_platform_id, generated_request_id, now_rfc3339},
+    websocket::{accept_websocket, send_websocket_json, websocket_event_loop},
+};
 use crate::channels::{
     Channel, IncomingDispatch, OutgoingDelivery, OutgoingError, OutgoingMessageAppended,
     OutgoingSessionStream, ProcessingState,
 };
 
-const MAX_HTTP_BODY_BYTES: usize = 32 * 1024 * 1024;
-const WEBSOCKET_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-const WEBSOCKET_MAX_FRAME_BYTES: usize = 128 * 1024;
 const SEEN_STATE_FILE: &str = "seen_state.json";
 
 pub struct WebChannel {
-    id: String,
-    bind_addr: String,
-    token: String,
-    workdir: PathBuf,
-    config: Arc<StellaclawConfig>,
-    conversation_runtime: Arc<ConversationHostRuntime>,
-    websocket_subscribers: Arc<Mutex<HashMap<String, Vec<Sender<Value>>>>>,
-    conversation_stream_subscribers: Arc<Mutex<Vec<Sender<Value>>>>,
-    processing_states: Arc<Mutex<HashMap<String, ProcessingState>>>,
-    seen_states: Arc<Mutex<HashMap<String, ConversationSeen>>>,
-    home_seq: Arc<Mutex<u64>>,
-    live_states: Arc<Mutex<HashMap<String, ChatLiveState>>>,
+    pub(super) id: String,
+    pub(super) bind_addr: String,
+    pub(super) token: String,
+    pub(super) workdir: PathBuf,
+    pub(super) config: Arc<StellaclawConfig>,
+    pub(super) conversation_runtime: Arc<ConversationHostRuntime>,
+    pub(super) websocket_subscribers: Arc<Mutex<HashMap<String, Vec<Sender<Value>>>>>,
+    pub(super) conversation_stream_subscribers: Arc<Mutex<Vec<Sender<Value>>>>,
+    pub(super) processing_states: Arc<Mutex<HashMap<String, ProcessingState>>>,
+    pub(super) seen_states: Arc<Mutex<HashMap<String, ConversationSeen>>>,
+    pub(super) home_seq: Arc<Mutex<u64>>,
+    pub(super) live_states: Arc<Mutex<HashMap<String, ChatLiveState>>>,
 }
 
 impl WebChannel {
@@ -748,236 +746,6 @@ impl WebChannel {
         Ok(HttpResponse::json(200, response))
     }
 
-    fn list_workspace(&self, conversation_id: &str, query: &HashMap<String, String>) -> HttpResult {
-        let path = query.get("path").filter(|path| !path.is_empty()).cloned();
-        let limit = query.get("limit").and_then(|value| value.parse().ok());
-        self.workspace_response(
-            conversation_id,
-            WorkspaceRequest::List {
-                path,
-                target: WorkspaceTarget::Auto,
-                limit,
-            },
-        )
-    }
-
-    fn read_workspace_file(
-        &self,
-        conversation_id: &str,
-        query: &HashMap<String, String>,
-    ) -> HttpResult {
-        let path = query
-            .get("path")
-            .filter(|path| !path.is_empty())
-            .cloned()
-            .ok_or_else(|| HttpError::new(400, "path is required"))?;
-        self.workspace_response(
-            conversation_id,
-            WorkspaceRequest::ReadFile {
-                path,
-                target: WorkspaceTarget::Auto,
-                offset: query_u64(query, "offset"),
-                limit_bytes: query
-                    .get("limit_bytes")
-                    .and_then(|value| value.parse().ok()),
-            },
-        )
-    }
-
-    fn delete_workspace_path(
-        &self,
-        conversation_id: &str,
-        query: &HashMap<String, String>,
-    ) -> HttpResult {
-        let path = query
-            .get("path")
-            .filter(|path| !path.is_empty())
-            .cloned()
-            .ok_or_else(|| HttpError::new(400, "path is required"))?;
-        self.workspace_response(
-            conversation_id,
-            WorkspaceRequest::DeletePath {
-                path,
-                target: WorkspaceTarget::Auto,
-            },
-        )
-    }
-
-    fn move_workspace_path(&self, conversation_id: &str, body: &[u8]) -> HttpResult {
-        let request: MoveWorkspacePathRequest = parse_json(body)?;
-        self.workspace_response(
-            conversation_id,
-            WorkspaceRequest::MovePath {
-                from_path: request.path,
-                to_path: request.new_path,
-                target: WorkspaceTarget::Auto,
-            },
-        )
-    }
-
-    fn upload_workspace_archive(
-        &self,
-        conversation_id: &str,
-        query: &HashMap<String, String>,
-        body: &[u8],
-    ) -> HttpResult {
-        let dir_path = query.get("path").cloned().unwrap_or_default();
-        self.workspace_response(
-            conversation_id,
-            WorkspaceRequest::UploadArchive {
-                dir_path,
-                target: WorkspaceTarget::Auto,
-                encoding: WorkspaceFileEncoding::Base64,
-                data: general_purpose::STANDARD.encode(body),
-            },
-        )
-    }
-
-    fn download_workspace_archive(
-        &self,
-        conversation_id: &str,
-        query: &HashMap<String, String>,
-    ) -> HttpResult {
-        let path = query
-            .get("path")
-            .filter(|path| !path.is_empty())
-            .cloned()
-            .ok_or_else(|| HttpError::new(400, "path is required"))?;
-        let response = self.workspace_response_value(
-            conversation_id,
-            WorkspaceRequest::DownloadArchive {
-                paths: vec![path],
-                target: WorkspaceTarget::Auto,
-            },
-        )?;
-        let WorkspaceResponse::ArchiveDownloaded { encoding, data, .. } = response else {
-            return Err(HttpError::new(
-                500,
-                "workspace service returned unexpected download response",
-            ));
-        };
-        let body = match encoding {
-            WorkspaceFileEncoding::Base64 => general_purpose::STANDARD
-                .decode(data)
-                .map_err(HttpError::internal)?,
-            WorkspaceFileEncoding::Utf8 => data.into_bytes(),
-        };
-        Ok(HttpResponse {
-            status: 200,
-            content_type: "application/gzip".to_string(),
-            body,
-        })
-    }
-
-    fn workspace_response(&self, conversation_id: &str, request: WorkspaceRequest) -> HttpResult {
-        let response = self.workspace_response_value(conversation_id, request)?;
-        let status = if matches!(response, WorkspaceResponse::Error { .. }) {
-            400
-        } else {
-            200
-        };
-        Ok(HttpResponse::json(
-            status,
-            serde_json::to_value(response).map_err(HttpError::internal)?,
-        ))
-    }
-
-    fn workspace_response_value(
-        &self,
-        conversation_id: &str,
-        request: WorkspaceRequest,
-    ) -> HttpResult<WorkspaceResponse> {
-        self.conversation_runtime
-            .ensure_conversation_started(conversation_id)
-            .map_err(HttpError::internal)?;
-        let request_id = generated_request_id("workspace");
-        let rx = self
-            .conversation_runtime
-            .send_main_channel_ingress_subscribed(
-                conversation_id,
-                ChannelIngress::Workspace {
-                    request_id: request_id.clone(),
-                    request,
-                },
-            )
-            .map_err(HttpError::internal)?;
-        wait_for_event(&rx, Duration::from_secs(30), |event| match event {
-            KernelChannelEvent::Workspace {
-                request_id: id,
-                response,
-            } if id == request_id => Some(response),
-            _ => None,
-        })
-    }
-
-    fn list_terminals(&self, conversation_id: &str) -> HttpResult {
-        self.terminal_response(conversation_id, TerminalRequest::List)
-            .and_then(|response| match response {
-                TerminalResponse::Terminals { terminals } => {
-                    Ok(HttpResponse::json(200, json!({ "terminals": terminals })))
-                }
-                TerminalResponse::Error { message, .. } => Err(HttpError::new(400, message)),
-                other => Ok(HttpResponse::json(
-                    200,
-                    serde_json::to_value(other).map_err(HttpError::internal)?,
-                )),
-            })
-    }
-
-    fn create_terminal(&self, conversation_id: &str, body: &[u8]) -> HttpResult {
-        let request: TerminalCreateRequest = parse_optional_json(body)?;
-        self.terminal_response(conversation_id, TerminalRequest::Create { request })
-            .and_then(terminal_http_response)
-    }
-
-    fn get_terminal(&self, conversation_id: &str, terminal_id: &str) -> HttpResult {
-        self.terminal_response(
-            conversation_id,
-            TerminalRequest::Get {
-                terminal_id: terminal_id.to_string(),
-            },
-        )
-        .and_then(terminal_http_response)
-    }
-
-    fn terminate_terminal(&self, conversation_id: &str, terminal_id: &str) -> HttpResult {
-        self.terminal_response(
-            conversation_id,
-            TerminalRequest::Terminate {
-                terminal_id: terminal_id.to_string(),
-            },
-        )
-        .and_then(terminal_http_response)
-    }
-
-    fn terminal_response(
-        &self,
-        conversation_id: &str,
-        request: TerminalRequest,
-    ) -> HttpResult<TerminalResponse> {
-        self.conversation_runtime
-            .ensure_conversation_started(conversation_id)
-            .map_err(HttpError::internal)?;
-        let request_id = generated_request_id("terminal");
-        let rx = self
-            .conversation_runtime
-            .send_main_channel_ingress_subscribed(
-                conversation_id,
-                ChannelIngress::Terminal {
-                    request_id: request_id.clone(),
-                    request,
-                },
-            )
-            .map_err(HttpError::internal)?;
-        wait_for_event(&rx, Duration::from_secs(30), |event| match event {
-            KernelChannelEvent::Terminal {
-                request_id: Some(id),
-                response,
-            } if id == request_id => Some(response),
-            _ => None,
-        })
-    }
-
     fn set_session_nickname(
         &self,
         conversation_id: &str,
@@ -1179,209 +947,6 @@ impl WebChannel {
             }),
         )?;
         websocket_event_loop(stream, rx, "chat.heartbeat")
-    }
-
-    fn accept_terminal_stream(
-        &self,
-        mut stream: TcpStream,
-        request: &HttpRequest,
-        conversation_id: &str,
-        terminal_id: &str,
-    ) -> Result<()> {
-        accept_websocket(&mut stream, request)?;
-        self.conversation_runtime
-            .ensure_conversation_started(conversation_id)?;
-        let offset = query_u64(&request.query, "offset").unwrap_or(0);
-        let request_id = generated_request_id("terminal-attach");
-        let rx = self
-            .conversation_runtime
-            .send_main_channel_ingress_subscribed(
-                conversation_id,
-                ChannelIngress::Terminal {
-                    request_id: request_id.clone(),
-                    request: TerminalRequest::Attach {
-                        terminal_id: terminal_id.to_string(),
-                        offset,
-                    },
-                },
-            )
-            .map_err(|error| anyhow!("{error:#}"))?;
-        let attached = wait_for_event(&rx, Duration::from_secs(30), |event| match event {
-            KernelChannelEvent::Terminal {
-                request_id: Some(id),
-                response,
-            } if id == request_id => Some(response),
-            _ => None,
-        })
-        .map_err(|error| anyhow!("{}", error.message))?;
-        let (replay, subscriber_id) = match attached {
-            TerminalResponse::Attached {
-                replay,
-                subscriber_id,
-            } => (replay, subscriber_id),
-            TerminalResponse::Error { message, .. } => {
-                send_websocket_json(
-                    &mut stream,
-                    &json!({"type": "terminal.error", "message": message}),
-                )?;
-                return Ok(());
-            }
-            other => {
-                send_websocket_json(
-                    &mut stream,
-                    &json!({"type": "terminal.error", "message": format!("unexpected terminal response: {other:?}")}),
-                )?;
-                return Ok(());
-            }
-        };
-
-        send_websocket_json(
-            &mut stream,
-            &json!({
-                "type": "terminal.snapshot",
-                "terminal_id": replay.terminal_id,
-                "requested_offset": replay.requested_offset,
-                "replay_start_offset": replay.replay_start_offset,
-                "buffer_start_offset": replay.buffer_start_offset,
-                "next_offset": replay.next_offset,
-                "dropped_bytes": replay.dropped_bytes,
-                "running": replay.running,
-            }),
-        )?;
-        if replay.dropped_bytes > 0 {
-            send_websocket_json(
-                &mut stream,
-                &json!({
-                    "type": "terminal.dropped",
-                    "buffer_start_offset": replay.buffer_start_offset,
-                    "dropped_bytes": replay.dropped_bytes,
-                }),
-            )?;
-        }
-        for chunk in replay.chunks {
-            send_websocket_json(
-                &mut stream,
-                &json!({
-                    "type": "terminal.output",
-                    "terminal_id": terminal_id,
-                    "encoding": chunk.encoding,
-                    "data": chunk.data,
-                }),
-            )?;
-        }
-
-        let read_stream = stream.try_clone()?;
-        let runtime = self.conversation_runtime.clone();
-        let conversation_id_for_reader = conversation_id.to_string();
-        let terminal_id_for_reader = terminal_id.to_string();
-        thread::spawn(move || {
-            let mut read_stream = read_stream;
-            while let Ok(frame) = read_client_websocket_frame(&mut read_stream) {
-                match frame {
-                    ClientWebSocketFrame::Binary(bytes) if !bytes.is_empty() => {
-                        let _ = runtime.send_main_channel_ingress(
-                            &conversation_id_for_reader,
-                            ChannelIngress::Terminal {
-                                request_id: generated_request_id("terminal-input"),
-                                request: TerminalRequest::Input {
-                                    terminal_id: terminal_id_for_reader.clone(),
-                                    encoding: TerminalDataEncoding::Base64,
-                                    data: general_purpose::STANDARD.encode(bytes),
-                                },
-                            },
-                        );
-                    }
-                    ClientWebSocketFrame::Text(text) => {
-                        if let Ok(value) = serde_json::from_str::<Value>(&text) {
-                            handle_terminal_control_frame(
-                                &runtime,
-                                &conversation_id_for_reader,
-                                &terminal_id_for_reader,
-                                value,
-                            );
-                        }
-                    }
-                    ClientWebSocketFrame::Close => break,
-                    _ => {}
-                }
-            }
-            if let Some(subscriber_id) = subscriber_id {
-                let _ = runtime.send_main_channel_ingress(
-                    &conversation_id_for_reader,
-                    ChannelIngress::Terminal {
-                        request_id: generated_request_id("terminal-detach"),
-                        request: TerminalRequest::Detach {
-                            terminal_id: terminal_id_for_reader,
-                            subscriber_id,
-                        },
-                    },
-                );
-            }
-        });
-
-        loop {
-            match rx.recv_timeout(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)) {
-                Ok(KernelChannelEvent::Terminal { response, .. }) => match response {
-                    TerminalResponse::Output {
-                        terminal_id: output_terminal_id,
-                        subscriber_id: output_subscriber_id,
-                        encoding,
-                        data,
-                    } if output_terminal_id == terminal_id
-                        && output_subscriber_id == subscriber_id =>
-                    {
-                        send_websocket_json(
-                            &mut stream,
-                            &json!({
-                                "type": "terminal.output",
-                                "terminal_id": terminal_id,
-                                "encoding": encoding,
-                                "data": data,
-                            }),
-                        )?;
-                    }
-                    TerminalResponse::Detached {
-                        terminal_id: detached_terminal_id,
-                        subscriber_id: detached_subscriber_id,
-                    } if detached_terminal_id == terminal_id
-                        && Some(detached_subscriber_id) == subscriber_id =>
-                    {
-                        send_websocket_json(
-                            &mut stream,
-                            &json!({"type": "terminal.closed", "terminal_id": terminal_id}),
-                        )?;
-                        break;
-                    }
-                    TerminalResponse::Terminal { terminal }
-                        if terminal.terminal_id == terminal_id =>
-                    {
-                        if !terminal.running {
-                            send_websocket_json(
-                                &mut stream,
-                                &json!({"type": "terminal.closed", "terminal_id": terminal_id}),
-                            )?;
-                            break;
-                        }
-                    }
-                    TerminalResponse::Error { message, .. } => {
-                        send_websocket_json(
-                            &mut stream,
-                            &json!({"type": "terminal.error", "message": message}),
-                        )?;
-                    }
-                    _ => {}
-                },
-                Ok(_) => {}
-                Err(RecvTimeoutError::Timeout) => {
-                    send_websocket_json(
-                        &mut stream,
-                        &json!({"type": "terminal.heartbeat", "server_time": now_rfc3339()}),
-                    )?;
-                }
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-        }
-        Ok(())
     }
 
     fn publish_websocket_event(&self, conversation_id: &str, session_id: &str, payload: Value) {
@@ -1801,296 +1366,6 @@ fn handle_connection(
     write_response(&mut stream, &response)
 }
 
-#[derive(Debug)]
-struct HttpRequest {
-    method: String,
-    path: String,
-    query: HashMap<String, String>,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
-}
-
-impl HttpRequest {
-    fn is_websocket(&self) -> bool {
-        self.headers
-            .get("upgrade")
-            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
-    }
-}
-
-#[derive(Debug)]
-struct HttpResponse {
-    status: u16,
-    content_type: String,
-    body: Vec<u8>,
-}
-
-impl HttpResponse {
-    fn json(status: u16, value: Value) -> Self {
-        Self {
-            status,
-            content_type: "application/json; charset=utf-8".to_string(),
-            body: serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec()),
-        }
-    }
-
-    fn empty(status: u16) -> Self {
-        Self {
-            status,
-            content_type: "text/plain; charset=utf-8".to_string(),
-            body: Vec::new(),
-        }
-    }
-}
-
-type HttpResult<T = HttpResponse> = Result<T, HttpError>;
-
-#[derive(Debug)]
-struct HttpError {
-    status: u16,
-    message: String,
-}
-
-impl HttpError {
-    fn new(status: u16, message: impl Into<String>) -> Self {
-        Self {
-            status,
-            message: message.into(),
-        }
-    }
-
-    fn internal(error: impl std::fmt::Display) -> Self {
-        Self::new(500, error.to_string())
-    }
-
-    fn upgrade_required() -> Self {
-        Self::new(426, "upgrade_required")
-    }
-
-    fn into_response(self) -> HttpResponse {
-        HttpResponse::json(self.status, json!({"error": self.message}))
-    }
-}
-
-fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest> {
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_string();
-    let target = parts.next().unwrap_or("/").to_string();
-    let (path, query) = parse_target(&target);
-    let mut headers = HashMap::new();
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = trimmed.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
-        }
-    }
-    let content_length = headers
-        .get("content-length")
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(0)
-        .min(MAX_HTTP_BODY_BYTES);
-    let mut body = vec![0; content_length];
-    if content_length > 0 {
-        reader.read_exact(&mut body)?;
-    }
-    Ok(HttpRequest {
-        method,
-        path,
-        query,
-        headers,
-        body,
-    })
-}
-
-fn write_response(stream: &mut TcpStream, response: &HttpResponse) -> Result<()> {
-    write!(
-        stream,
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Authorization, Content-Type\r\nAccess-Control-Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS\r\nConnection: close\r\n\r\n",
-        response.status,
-        reason_phrase(response.status),
-        response.content_type,
-        response.body.len()
-    )?;
-    stream.write_all(&response.body)?;
-    stream.flush()?;
-    Ok(())
-}
-
-fn accept_websocket(stream: &mut TcpStream, request: &HttpRequest) -> Result<()> {
-    let key = request
-        .headers
-        .get("sec-websocket-key")
-        .ok_or_else(|| anyhow!("missing websocket key"))?;
-    let mut hasher = Sha1::new();
-    hasher.update(key.as_bytes());
-    hasher.update(WEBSOCKET_GUID.as_bytes());
-    let accept = general_purpose::STANDARD.encode(hasher.finalize());
-    write!(
-        stream,
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
-    )?;
-    stream.flush()?;
-    Ok(())
-}
-
-fn websocket_event_loop(
-    mut stream: TcpStream,
-    rx: Receiver<Value>,
-    heartbeat_type: &'static str,
-) -> Result<()> {
-    loop {
-        match rx.recv_timeout(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)) {
-            Ok(value) => send_websocket_json(&mut stream, &value)?,
-            Err(RecvTimeoutError::Timeout) => {
-                send_websocket_json(
-                    &mut stream,
-                    &json!({"type": heartbeat_type, "server_time": now_rfc3339()}),
-                )?;
-            }
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    Ok(())
-}
-
-fn send_websocket_json(stream: &mut TcpStream, value: &Value) -> Result<()> {
-    let payload = serde_json::to_vec(value)?;
-    send_websocket_frame(stream, 0x1, &payload)
-}
-
-fn send_websocket_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> Result<()> {
-    if payload.len() > WEBSOCKET_MAX_FRAME_BYTES {
-        return Ok(());
-    }
-    let mut frame = Vec::with_capacity(payload.len() + 10);
-    frame.push(0x80 | (opcode & 0x0f));
-    if payload.len() < 126 {
-        frame.push(payload.len() as u8);
-    } else if payload.len() <= u16::MAX as usize {
-        frame.push(126);
-        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    } else {
-        frame.push(127);
-        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-    }
-    frame.extend_from_slice(&payload);
-    stream.write_all(&frame)?;
-    stream.flush()?;
-    Ok(())
-}
-
-enum ClientWebSocketFrame {
-    Text(String),
-    Binary(Vec<u8>),
-    Close,
-    Other,
-}
-
-fn read_client_websocket_frame(stream: &mut TcpStream) -> Result<ClientWebSocketFrame> {
-    let mut header = [0_u8; 2];
-    stream.read_exact(&mut header)?;
-    let opcode = header[0] & 0x0f;
-    let masked = header[1] & 0x80 != 0;
-    let mut len = u64::from(header[1] & 0x7f);
-    if len == 126 {
-        let mut extended = [0_u8; 2];
-        stream.read_exact(&mut extended)?;
-        len = u64::from(u16::from_be_bytes(extended));
-    } else if len == 127 {
-        let mut extended = [0_u8; 8];
-        stream.read_exact(&mut extended)?;
-        len = u64::from_be_bytes(extended);
-    }
-    if len as usize > WEBSOCKET_MAX_FRAME_BYTES {
-        return Err(anyhow!("websocket frame too large"));
-    }
-    let mut mask = [0_u8; 4];
-    if masked {
-        stream.read_exact(&mut mask)?;
-    }
-    let mut payload = vec![0_u8; len as usize];
-    if len > 0 {
-        stream.read_exact(&mut payload)?;
-    }
-    if masked {
-        for (index, byte) in payload.iter_mut().enumerate() {
-            *byte ^= mask[index % 4];
-        }
-    }
-    match opcode {
-        0x1 => Ok(ClientWebSocketFrame::Text(String::from_utf8(payload)?)),
-        0x2 => Ok(ClientWebSocketFrame::Binary(payload)),
-        0x8 => Ok(ClientWebSocketFrame::Close),
-        _ => Ok(ClientWebSocketFrame::Other),
-    }
-}
-
-fn handle_terminal_control_frame(
-    runtime: &ConversationHostRuntime,
-    conversation_id: &str,
-    terminal_id: &str,
-    value: Value,
-) {
-    match value.get("type").and_then(Value::as_str) {
-        Some("resize") => {
-            let cols = value
-                .get("cols")
-                .and_then(Value::as_u64)
-                .and_then(|value| u16::try_from(value).ok())
-                .unwrap_or(120);
-            let rows = value
-                .get("rows")
-                .and_then(Value::as_u64)
-                .and_then(|value| u16::try_from(value).ok())
-                .unwrap_or(30);
-            let _ = runtime.send_main_channel_ingress(
-                conversation_id,
-                ChannelIngress::Terminal {
-                    request_id: generated_request_id("terminal-resize"),
-                    request: TerminalRequest::Resize {
-                        terminal_id: terminal_id.to_string(),
-                        request: TerminalResizeRequest { cols, rows },
-                    },
-                },
-            );
-        }
-        Some("input") => {
-            let data = value
-                .get("data")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            if data.is_empty() {
-                return;
-            }
-            let encoding = match value.get("encoding").and_then(Value::as_str) {
-                Some("base64") => TerminalDataEncoding::Base64,
-                _ => TerminalDataEncoding::Utf8,
-            };
-            let _ = runtime.send_main_channel_ingress(
-                conversation_id,
-                ChannelIngress::Terminal {
-                    request_id: generated_request_id("terminal-input"),
-                    request: TerminalRequest::Input {
-                        terminal_id: terminal_id.to_string(),
-                        encoding,
-                        data,
-                    },
-                },
-            );
-        }
-        _ => {}
-    }
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct WebSeenState {
     #[serde(default)]
@@ -2098,7 +1373,7 @@ struct WebSeenState {
 }
 
 #[derive(Debug, Clone, Default)]
-struct ChatLiveState {
+pub(super) struct ChatLiveState {
     current_turn_state: Option<Value>,
     current_provisional_assistant_message: Option<Value>,
     running_tool_results: Vec<Value>,
@@ -2429,7 +1704,7 @@ impl ChatLiveState {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct ConversationSeen {
+pub(super) struct ConversationSeen {
     last_seen_message_id: String,
     updated_at: String,
 }
@@ -2469,9 +1744,9 @@ struct PostMessageRequest {
 }
 
 #[derive(Debug, Deserialize)]
-struct MoveWorkspacePathRequest {
-    path: String,
-    new_path: String,
+pub(super) struct MoveWorkspacePathRequest {
+    pub(super) path: String,
+    pub(super) new_path: String,
 }
 
 #[derive(Debug, Default)]
@@ -2598,7 +1873,7 @@ fn wait_agent_session_created(rx: &Receiver<KernelChannelEvent>) -> HttpResult<S
     })
 }
 
-fn wait_for_event<T>(
+pub(super) fn wait_for_event<T>(
     rx: &Receiver<KernelChannelEvent>,
     timeout: Duration,
     mut matcher: impl FnMut(KernelChannelEvent) -> Option<T>,
@@ -2691,67 +1966,6 @@ fn message_log_path(workdir: &Path, conversation_id: &str, foreground_session_id
         .join("all_messages.jsonl")
 }
 
-fn split_path(path: &str) -> Vec<&str> {
-    path.trim_start_matches('/')
-        .split('/')
-        .filter(|part| !part.is_empty())
-        .collect()
-}
-
-fn parse_target(target: &str) -> (String, HashMap<String, String>) {
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    (path.to_string(), parse_query(query))
-}
-
-fn parse_query(query: &str) -> HashMap<String, String> {
-    query
-        .split('&')
-        .filter(|part| !part.is_empty())
-        .filter_map(|part| {
-            let (key, value) = part.split_once('=').unwrap_or((part, ""));
-            Some((
-                percent_decode(key)?,
-                percent_decode(value).unwrap_or_default(),
-            ))
-        })
-        .collect()
-}
-
-fn percent_decode(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                out.push(b' ');
-                index += 1;
-            }
-            b'%' if index + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok()?;
-                out.push(u8::from_str_radix(hex, 16).ok()?);
-                index += 3;
-            }
-            byte => {
-                out.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8(out).ok()
-}
-
-fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> HttpResult<T> {
-    serde_json::from_slice(body).map_err(|error| HttpError::new(400, error.to_string()))
-}
-
-fn parse_optional_json<T: for<'de> Deserialize<'de> + Default>(body: &[u8]) -> HttpResult<T> {
-    if body.is_empty() {
-        return Ok(T::default());
-    }
-    parse_json(body)
-}
-
 fn parse_web_control_command(text: &str) -> Option<(&str, &str)> {
     let trimmed = text.trim();
     if !trimmed.starts_with('/') {
@@ -2775,31 +1989,6 @@ fn parse_reasoning_effort_argument(argument: &str) -> HttpResult<Option<String>>
             format!("unknown reasoning effort {other}"),
         )),
     }
-}
-
-fn terminal_http_response(response: TerminalResponse) -> HttpResult {
-    match response {
-        TerminalResponse::Terminal { terminal } => Ok(HttpResponse::json(
-            200,
-            serde_json::to_value(terminal).map_err(HttpError::internal)?,
-        )),
-        TerminalResponse::Error { message, .. } => Err(HttpError::new(400, message)),
-        other => Ok(HttpResponse::json(
-            200,
-            serde_json::to_value(other).map_err(HttpError::internal)?,
-        )),
-    }
-}
-
-fn query_usize(query: &HashMap<String, String>, key: &str, default: usize) -> usize {
-    query
-        .get(key)
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(default)
-}
-
-fn query_u64(query: &HashMap<String, String>, key: &str) -> Option<u64> {
-    query.get(key).and_then(|value| value.parse::<u64>().ok())
 }
 
 fn foreground_session_storage_id(foreground_session_id: &str) -> String {
@@ -2859,43 +2048,5 @@ fn processing_state_name(state: ProcessingState) -> &'static str {
     match state {
         ProcessingState::Idle => "idle",
         ProcessingState::Typing => "typing",
-    }
-}
-
-fn now_rfc3339() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
-}
-
-fn unix_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
-        .unwrap_or(0)
-}
-
-fn generated_platform_id() -> String {
-    format!("web-{}", unix_millis())
-}
-
-fn generated_request_id(prefix: &str) -> String {
-    format!("{prefix}-{}", unix_millis())
-}
-
-fn reason_phrase(status: u16) -> &'static str {
-    match status {
-        200 => "OK",
-        201 => "Created",
-        202 => "Accepted",
-        204 => "No Content",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        426 => "Upgrade Required",
-        500 => "Internal Server Error",
-        503 => "Service Unavailable",
-        504 => "Gateway Timeout",
-        _ => "OK",
     }
 }

@@ -2388,20 +2388,10 @@ function App() {
             return;
           }
           const payloadType = String(payload?.type || '');
-          if (payloadType === 'chat.snapshot' || payloadType === 'subscription_ack') {
+          if (payloadType === 'chat.snapshot') {
             setSessionActivity(payload.reason === 'session_changed' ? 'Session 已切换' : '实时连接已同步');
-            if (payload.turn_progress) {
-              const progress = normalizeProgressFeedback(payload.turn_progress);
-              setSessionActivity(progress.state === 'done' ? '已完成' : progress.detail || progress.title);
-              updateRunningActivities((current) => [
-                ...current.filter((item) => item.id !== progress.id && item.id !== 'thinking'),
-                mergeProgressActivity(current, progress)
-              ]);
-            }
             reconcileAck(payload).catch(() => {});
-            if (payloadType === 'chat.snapshot') {
-              applyChatSnapshotLiveProjection(payload);
-            }
+            applyChatSnapshotLiveProjection(payload);
           } else if (payloadType === 'chat.user_message_queued') {
             setMessages((current) => {
               const next = markQueuedUserMessage(current, payload.client_message_id || payload.clientMessageId);
@@ -2411,34 +2401,11 @@ function App() {
             setSessionActivity('消息已排队');
           } else if (payloadType === 'chat.message_appended') {
             applyIncomingMessages(payload.message ? [payload.message] : []);
-          } else if (payloadType === 'messages') {
-            applyIncomingMessages(payload.messages || []);
           } else if (
             payloadType.startsWith('chat.stream_')
             || payloadType === 'chat.plan_updated'
-            || payloadType === 'session_stream'
-            || streamEventType(payload).startsWith('stream_')
           ) {
             applySessionStream(payload);
-          } else if (payloadType === 'turn_progress') {
-            const progress = normalizeProgressFeedback(payload);
-            setSessionActivity(progress.state === 'done' ? '已完成' : progress.detail || progress.title);
-            if (progress.state === 'done' || progress.state === 'failed') {
-              updateRunningActivities((current) => [
-                ...current.filter((item) => item.id !== progress.id && item.id !== 'thinking'),
-                mergeProgressActivity(current, progress)
-              ]);
-              setTimeout(() => {
-                if (!disposed && websocketKeyRef.current === key) {
-                  setRunningActivities([]);
-                }
-              }, 900);
-            } else {
-              updateRunningActivities((current) => [
-                ...current.filter((item) => item.id !== progress.id && item.id !== 'thinking'),
-                mergeProgressActivity(current, progress)
-              ]);
-            }
           } else if (payloadType === 'error') {
             setSessionActivity(payload.message || payload.error || '实时连接错误');
           }
