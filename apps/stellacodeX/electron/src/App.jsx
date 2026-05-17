@@ -36,7 +36,7 @@ import { NewConversationDialog } from './components/NewConversationDialog';
 import { SettingsDialog } from './components/SettingsDialog';
 import { clamp, formatBytes, formatModel, statusUsageTotals } from './lib/format';
 import { fileExtension, fileNameFromPath, imageMimeType } from './lib/fileUtils';
-import { activityFromMessages, addUsageTotals, firstMessageId, hasOlderMessages, isFinalAssistantMessage, lastServerMessageIndex, liveActivitySignature, mergeMessages, messageIndex, messageOrderFromId, shortText, usageDeltaFromMessages, websocketUrl } from './lib/messageUtils';
+import { activityFromMessages, addUsageTotals, committedMessageProtocolMismatches, firstMessageId, hasOlderMessages, isFinalAssistantMessage, lastServerMessageIndex, liveActivitySignature, mergeMessages, messageIndex, messageOrderFromId, shortText, usageDeltaFromMessages, websocketUrl } from './lib/messageUtils';
 import { effectiveThemeMode, themeCssVariables } from './lib/theme';
 import { collectDroppedFiles, packFilesToTarGz, uploadPayloadStats } from './lib/uploadArchive';
 import { normalizeWorkspacePath, parentWorkspacePath, workspaceEntryKind, workspaceFileKind } from './lib/workspaceUtils';
@@ -1998,6 +1998,11 @@ function App() {
 
     const applyIncomingMessages = (incoming) => {
       if (!Array.isArray(incoming) || incoming.length === 0 || disposed || websocketKeyRef.current !== key) return;
+      const protocolMismatches = committedMessageProtocolMismatches(messagesRef.current, incoming);
+      if (protocolMismatches.length > 0) {
+        console.warn('stream provisional message differed from durable commit', protocolMismatches);
+        setSessionActivity('流式消息和落盘消息不一致，已使用落盘消息');
+      }
       const finalizedActivities = streamFinalizedActivityIds(incoming);
       const delta = usageDeltaFromMessages(key, incoming, seenUsageMessagesRef.current);
       if (delta.totalTokens > 0 || delta.cost > 0) {

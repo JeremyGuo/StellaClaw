@@ -346,6 +346,82 @@ export function stableSignature(value) {
   return JSON.stringify(value ?? null);
 }
 
+function canonicalMessageForCommitCompare(message) {
+  const items = messageItems(message)
+    .filter((item) => ['reasoning', 'text', 'tool_call', 'tool_result'].includes(item?.type))
+    .map((item) => {
+      if (item.type === 'reasoning') {
+        return {
+          type: 'reasoning',
+          text: String(item.text || item.summary || '').trim()
+        };
+      }
+      if (item.type === 'text') {
+        return {
+          type: 'text',
+          text: String(item.text_with_attachment_markers || item.text || item.content || '').trim()
+        };
+      }
+      if (item.type === 'tool_call') {
+        return {
+          type: 'tool_call',
+          tool_call_id: String(item.tool_call_id || '').trim(),
+          tool_name: String(item.tool_name || '').trim(),
+          arguments: String(item.arguments || '').trim()
+        };
+      }
+      return {
+        type: 'tool_result',
+        tool_call_id: String(item.tool_call_id || '').trim(),
+        tool_name: String(item.tool_name || '').trim(),
+        result: item.structured ?? item.context_with_attachment_markers ?? item.context ?? null
+      };
+    })
+    .filter((item) => stableSignature(item) !== stableSignature({ type: item.type, text: '' }));
+  return {
+    role: String(message?.role || '').toLowerCase(),
+    text: messageText(message).trim(),
+    items
+  };
+}
+
+function canonicalMessageHasContent(canonical) {
+  return Boolean(canonical.text || canonical.items.length > 0);
+}
+
+export function committedMessageProtocolMismatches(current, incoming) {
+  if (!Array.isArray(current) || !Array.isArray(incoming)) return [];
+  const mismatches = [];
+  for (const durable of incoming) {
+    if (durable?._streaming) continue;
+    const durableId = String(durable?.id ?? durable?.message_id ?? '').trim();
+    const durableIndex = messageIndex(durable);
+    const provisional = current.find((message) => {
+      if (!message?._streaming || message?._liveToolResult) return false;
+      if (String(message?.role || '').toLowerCase() !== 'assistant') return false;
+      const id = String(message?.id ?? message?.message_id ?? '').trim();
+      if (durableId && id === durableId) return true;
+      const index = messageIndex(message);
+      return Number.isFinite(index)
+        && Number.isFinite(durableIndex)
+        && index !== Number.MAX_SAFE_INTEGER
+        && durableIndex !== Number.MAX_SAFE_INTEGER
+        && index === durableIndex;
+    });
+    if (!provisional) continue;
+    const provisionalCanonical = canonicalMessageForCommitCompare(provisional);
+    if (!canonicalMessageHasContent(provisionalCanonical)) continue;
+    const durableCanonical = canonicalMessageForCommitCompare(durable);
+    if (stableSignature(provisionalCanonical) !== stableSignature(durableCanonical)) {
+      mismatches.push({
+        message_id: durableId || String(durable?.message_id || ''),
+        index: Number.isFinite(durableIndex) && durableIndex !== Number.MAX_SAFE_INTEGER ? durableIndex : undefined
+      });
+    }
+  }
+  return mismatches;
+}
+
 export function messageOrderFromId(value) {
   if (value === undefined || value === null || value === '') return undefined;
   const numeric = Number(value);
