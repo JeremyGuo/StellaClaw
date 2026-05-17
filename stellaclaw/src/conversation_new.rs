@@ -1051,6 +1051,14 @@ impl ConversationKernel {
                     response_id,
                 ))
             }
+            Ok(KernelRequest::QueryRuntimeConfig) => self.dispatch_call(ServiceCall::response_to(
+                ServiceAddr::kernel(),
+                call.source,
+                encode_response(KernelResponse::RuntimeConfig {
+                    config: self.runtime_config.clone(),
+                })?,
+                response_id,
+            )),
             Ok(KernelRequest::UpdateRuntimeConfig { patch }) => {
                 self.apply_runtime_config_patch(patch);
                 self.persist_runtime_config()?;
@@ -1933,6 +1941,48 @@ mod tests {
             .expect("runtime config should reload");
         assert!(loaded.memory_enabled);
         assert_eq!(loaded.reasoning_effort.as_deref(), Some("high"));
+        kernel.stop_all("test finished").expect("services stop");
+    }
+
+    #[test]
+    fn channel_ingress_queries_kernel_runtime_config() {
+        let mut kernel = test_kernel("channel_runtime_config_query");
+        kernel.runtime_config.memory_enabled = true;
+        let (ingress_tx, ingress_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        kernel
+            .mount_service_instance(
+                ServiceAddr::channel_id("scratch"),
+                ServiceKind::Channel,
+                Box::new(ChannelService::with_platform_events(ingress_rx, event_tx)),
+            )
+            .expect("channel mounts");
+
+        ingress_tx
+            .send(ChannelIngress::QueryRuntimeConfig {
+                request_id: "runtime-query-1".to_string(),
+            })
+            .expect("runtime config query sends");
+        kernel
+            .pump_for(Duration::from_millis(100))
+            .expect("runtime config query drains");
+
+        let event = event_rx
+            .try_iter()
+            .find(|event| matches!(event, ChannelEvent::KernelRuntimeConfig { .. }))
+            .expect("runtime config event emitted");
+        let ChannelEvent::KernelRuntimeConfig {
+            request_id,
+            response,
+        } = event
+        else {
+            panic!("expected runtime config event");
+        };
+        assert_eq!(request_id, "runtime-query-1");
+        let kernel::KernelResponse::RuntimeConfig { config } = response else {
+            panic!("expected runtime config response");
+        };
+        assert!(config.memory_enabled);
         kernel.stop_all("test finished").expect("services stop");
     }
 

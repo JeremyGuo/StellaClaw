@@ -53,6 +53,7 @@ pub enum KernelRequest {
         addr: ServiceAddr,
         reason: Option<String>,
     },
+    QueryRuntimeConfig,
     UpdateRuntimeConfig {
         patch: KernelRuntimeConfigPatch,
     },
@@ -71,6 +72,9 @@ pub enum KernelResponse {
     },
     ServiceStopped {
         addr: ServiceAddr,
+    },
+    RuntimeConfig {
+        config: ConversationRuntimeConfig,
     },
     RuntimeConfigUpdated {
         config: ConversationRuntimeConfig,
@@ -161,6 +165,14 @@ pub fn update_runtime_config_call(
         source,
         ServiceAddr::kernel(),
         encode_request(KernelRequest::UpdateRuntimeConfig { patch })?,
+    ))
+}
+
+pub fn query_runtime_config_call(source: ServiceAddr) -> Result<ServiceCall> {
+    Ok(ServiceCall::new(
+        source,
+        ServiceAddr::kernel(),
+        encode_request(KernelRequest::QueryRuntimeConfig)?,
     ))
 }
 

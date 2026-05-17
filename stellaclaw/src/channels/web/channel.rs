@@ -1,14 +1,13 @@
 use std::{
     collections::HashMap,
-    fs,
     net::{TcpListener, TcpStream},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, Mutex},
     thread,
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -26,6 +25,7 @@ use crate::{
     service_protos::{
         agent_session::AgentMessageOrigin,
         channel::{ChannelEvent as KernelChannelEvent, ChannelIngress},
+        kernel::{KernelMetadataPatch, KernelResponse},
     },
 };
 
@@ -284,6 +284,9 @@ impl WebChannel {
         self.conversation_runtime
             .ensure_conversation_started(&conversation_id)
             .map_err(HttpError::internal)?;
+        let metadata = self
+            .query_conversation_metadata(&conversation_id)
+            .unwrap_or(metadata);
         let summary = self.conversation_summary(&metadata)?;
         self.publish_conversation_event(json!({
             "type": "home.conversation_upserted",
@@ -300,14 +303,13 @@ impl WebChannel {
 
     fn rename_conversation(&self, conversation_id: &str, body: &[u8]) -> HttpResult {
         let body: RenameRequest = parse_json(body)?;
-        let store = ConversationMetadataStore::new(&self.workdir);
-        let mut metadata = store
-            .load(conversation_id)
-            .map_err(|_| HttpError::new(404, "conversation_not_found"))?;
-        metadata.nickname = body
-            .nickname
-            .unwrap_or_else(|| metadata.conversation_id.clone());
-        store.persist(&metadata).map_err(HttpError::internal)?;
+        let metadata = self.update_conversation_metadata(
+            conversation_id,
+            KernelMetadataPatch {
+                conversation_nickname: Some(body.nickname.unwrap_or_default()),
+                ..Default::default()
+            },
+        )?;
         let summary = self.conversation_summary(&metadata)?;
         self.publish_conversation_event(json!({
             "type": "home.conversation_upserted",
@@ -346,9 +348,7 @@ impl WebChannel {
     }
 
     fn list_foreground_sessions(&self, conversation_id: &str) -> HttpResult {
-        let metadata = ConversationMetadataStore::new(&self.workdir)
-            .load(conversation_id)
-            .map_err(|_| HttpError::new(404, "conversation_not_found"))?;
+        let metadata = self.query_conversation_metadata(conversation_id)?;
         Ok(HttpResponse::json(
             200,
             json!({
@@ -377,12 +377,11 @@ impl WebChannel {
         });
         let route_id =
             foreground_route_id_from_storage_id(&storage_id).unwrap_or(storage_id.clone());
-        if let Some(nickname) = request.nickname {
-            self.set_session_nickname(conversation_id, &route_id, Some(nickname))?;
-        }
-        let metadata = ConversationMetadataStore::new(&self.workdir)
-            .load(conversation_id)
-            .map_err(HttpError::internal)?;
+        let metadata = if let Some(nickname) = request.nickname {
+            self.set_session_nickname(conversation_id, &route_id, Some(nickname))?
+        } else {
+            self.query_conversation_metadata(conversation_id)?
+        };
         let session = self.foreground_session_summary(&metadata, &route_id);
         self.publish_conversation_event(json!({
             "type": "home.conversation_upserted",
@@ -695,26 +694,124 @@ impl WebChannel {
         foreground_session_id: &str,
         nickname: Option<String>,
     ) -> HttpResult<ConversationMetadata> {
-        let store = ConversationMetadataStore::new(&self.workdir);
-        let mut metadata = store.load(conversation_id).map_err(HttpError::internal)?;
         let storage_id = foreground_session_storage_id(foreground_session_id);
-        match nickname {
-            Some(nickname) if !nickname.trim().is_empty() => {
-                metadata.session_nicknames.insert(storage_id, nickname);
-            }
-            _ => {
-                metadata.session_nicknames.remove(&storage_id);
-            }
-        }
-        store.persist(&metadata).map_err(HttpError::internal)?;
-        Ok(metadata)
+        self.update_conversation_metadata(
+            conversation_id,
+            KernelMetadataPatch {
+                session_nicknames: std::collections::BTreeMap::from([(storage_id, nickname)]),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn query_conversation_metadata(
+        &self,
+        conversation_id: &str,
+    ) -> HttpResult<ConversationMetadata> {
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)
+            .map_err(|_| HttpError::new(404, "conversation_not_found"))?;
+        let request_id = generated_request_id("kernel-metadata");
+        let rx = self
+            .conversation_runtime
+            .send_main_channel_ingress_subscribed(
+                conversation_id,
+                ChannelIngress::QueryKernelMetadata {
+                    request_id: request_id.clone(),
+                },
+            )
+            .map_err(HttpError::internal)?;
+        let result = wait_for_event(&rx, Duration::from_secs(10), |event| match event {
+            KernelChannelEvent::KernelMetadata {
+                request_id: id,
+                response: KernelResponse::Metadata { metadata },
+            } if id == request_id => Some(Ok(metadata)),
+            KernelChannelEvent::KernelMetadata {
+                request_id: id,
+                response: KernelResponse::MetadataUpdated { metadata },
+            } if id == request_id => Some(Ok(metadata)),
+            KernelChannelEvent::KernelMetadata {
+                request_id: id,
+                response: KernelResponse::Error { code, message },
+            } if id == request_id => Some(Err(HttpError::new(500, format!("{code}: {message}")))),
+            _ => None,
+        })?;
+        result
+    }
+
+    fn update_conversation_metadata(
+        &self,
+        conversation_id: &str,
+        patch: KernelMetadataPatch,
+    ) -> HttpResult<ConversationMetadata> {
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)
+            .map_err(|_| HttpError::new(404, "conversation_not_found"))?;
+        let request_id = generated_request_id("kernel-metadata-update");
+        let rx = self
+            .conversation_runtime
+            .send_main_channel_ingress_subscribed(
+                conversation_id,
+                ChannelIngress::UpdateKernelMetadata {
+                    request_id: request_id.clone(),
+                    patch,
+                },
+            )
+            .map_err(HttpError::internal)?;
+        let result = wait_for_event(&rx, Duration::from_secs(10), |event| match event {
+            KernelChannelEvent::KernelMetadata {
+                request_id: id,
+                response: KernelResponse::MetadataUpdated { metadata },
+            } if id == request_id => Some(Ok(metadata)),
+            KernelChannelEvent::KernelMetadata {
+                request_id: id,
+                response: KernelResponse::Metadata { metadata },
+            } if id == request_id => Some(Ok(metadata)),
+            KernelChannelEvent::KernelMetadata {
+                request_id: id,
+                response: KernelResponse::Error { code, message },
+            } if id == request_id => Some(Err(HttpError::new(500, format!("{code}: {message}")))),
+            _ => None,
+        })?;
+        result
+    }
+
+    fn query_runtime_config(&self, conversation_id: &str) -> HttpResult<ConversationRuntimeConfig> {
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)
+            .map_err(|_| HttpError::new(404, "conversation_not_found"))?;
+        let request_id = generated_request_id("runtime-config");
+        let rx = self
+            .conversation_runtime
+            .send_main_channel_ingress_subscribed(
+                conversation_id,
+                ChannelIngress::QueryRuntimeConfig {
+                    request_id: request_id.clone(),
+                },
+            )
+            .map_err(HttpError::internal)?;
+        let result = wait_for_event(&rx, Duration::from_secs(10), |event| match event {
+            KernelChannelEvent::KernelRuntimeConfig {
+                request_id: id,
+                response: KernelResponse::RuntimeConfig { config },
+            } if id == request_id => Some(Ok(config)),
+            KernelChannelEvent::KernelRuntimeConfig {
+                request_id: id,
+                response: KernelResponse::RuntimeConfigUpdated { config, .. },
+            } if id == request_id => Some(Ok(config)),
+            KernelChannelEvent::KernelRuntimeConfig {
+                request_id: id,
+                response: KernelResponse::Error { code, message },
+            } if id == request_id => Some(Err(HttpError::new(500, format!("{code}: {message}")))),
+            _ => None,
+        })?;
+        result
     }
 
     fn conversation_summaries(&self) -> HttpResult<Vec<Value>> {
-        let store = ConversationMetadataStore::new(&self.workdir);
         let mut summaries = Vec::new();
         for conversation_id in self.conversation_runtime.conversation_ids() {
-            let Ok(metadata) = store.load(&conversation_id) else {
+            let Ok(metadata) = self.query_conversation_metadata(&conversation_id) else {
                 continue;
             };
             summaries.push(self.conversation_summary(&metadata)?);
@@ -728,7 +825,7 @@ impl WebChannel {
             .query_message_summary(&metadata.conversation_id, &default_session_id)
             .unwrap_or_default();
         let processing_state = self.main.processing_state(&metadata.platform_chat_id);
-        let runtime_config = load_runtime_config(&self.workdir, &metadata.conversation_id).ok();
+        let runtime_config = self.query_runtime_config(&metadata.conversation_id).ok();
         Ok(json!({
             "conversation_id": metadata.conversation_id,
             "conversation_name": if metadata.nickname.trim().is_empty() { &metadata.conversation_id } else { &metadata.nickname },
@@ -901,8 +998,8 @@ impl Channel for WebChannel {
 
     fn message_appended(&self, appended: &OutgoingMessageAppended) -> Result<()> {
         let message = decorate_message(&appended.message, appended.index);
-        let conversation_summary = ConversationMetadataStore::new(&self.workdir)
-            .load(&appended.conversation_id)
+        let conversation_summary = self
+            .query_conversation_metadata(&appended.conversation_id)
             .ok()
             .and_then(|metadata| self.conversation_summary(&metadata).ok());
         self.main
@@ -1052,15 +1149,6 @@ pub(super) fn wait_for_event<T>(
             }
         }
     }
-}
-
-fn load_runtime_config(workdir: &Path, conversation_id: &str) -> Result<ConversationRuntimeConfig> {
-    let path = WorkdirLayout::new(workdir)
-        .conversation_service_root(conversation_id)
-        .join("runtime_config.json");
-    let raw =
-        fs::read_to_string(&path).with_context(|| format!("failed to read {}", path.display()))?;
-    serde_json::from_str(&raw).with_context(|| format!("failed to parse {}", path.display()))
 }
 
 fn conversation_model_label(

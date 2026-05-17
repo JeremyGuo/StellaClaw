@@ -89,6 +89,9 @@ pub enum ChannelIngress {
     UpdateRuntimeConfig {
         patch: KernelRuntimeConfigPatch,
     },
+    QueryRuntimeConfig {
+        request_id: String,
+    },
     QueryKernelMetadata {
         request_id: String,
     },
@@ -185,6 +188,10 @@ pub enum ChannelEvent {
     StatusSnapshot {
         request_id: String,
         response: StatusResponse,
+    },
+    KernelRuntimeConfig {
+        request_id: String,
+        response: KernelResponse,
     },
     KernelMetadata {
         request_id: String,

@@ -12,6 +12,9 @@ version: 1.28.0
 - 收敛用户消息生命周期和旧 delivery/progress 投影：
   ChannelService 收到平台输入后会先发 `UserMessageQueued`，AgentSessionService 在开始处理用户消息和用户消息落盘后分别投影 `UserMessageStarted` / `UserMessageCommitted`，Web chat stream 对应新增 `chat.user_message_queued`、`chat.user_message_started` 和 `chat.user_message_committed` typed events；同时删除旧 Channel `Deliver` request / `Delivery` event、`chat.delivery` 投影和 AgentSession 层 `Progress` 事件，计划更新只走 `PlanUpdated`，普通进度文本不再伪装成协议消息。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 收敛 Web metadata / runtime config 查询边界：
+  Kernel 协议新增只读 `QueryRuntimeConfig`，ChannelService 新增对应 `ChannelIngress::QueryRuntimeConfig` 和 typed `KernelRuntimeConfig` event；WebChannel 的 conversation list、conversation rename、foreground session list/create/rename/delete、message append summary 和 status summary 不再直接读取或修改 conversation metadata / runtime config 文件，而是通过 `WebChannel -> ChannelService -> Kernel` 查询或更新。新建 conversation 的初始 metadata 写入和删除 conversation 的目录移除仍保留在 Host/Web REST 生命周期边界。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 修复 FixedSSH workspace remote helper 启动：
   WorkspaceService 不再把整段 Python helper 作为裸 `ssh host python3 -c <script>` 参数发送给远端 shell；现在会把 helper 脚本 base64 编码后作为 shell-safe 参数传给远端 `python3 -c` loader，JSON request 仍通过 stdin 传输，避免 zsh 等远端登录 shell 把 Python 函数体当 shell 语法解析并报 `parse error near ')'`。远端 listing 也改为用 `lstat` 和 symlink 优先识别，避免断开的远端 symlink 让 workspace list 失败。本次不改变 `config` schema，不改变 `workdir` schema。
 

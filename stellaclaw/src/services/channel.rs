@@ -68,6 +68,7 @@ impl ConversationService for ChannelService {
         let mut pending_workspace = VecDeque::new();
         let mut pending_status = VecDeque::new();
         let mut pending_terminal = VecDeque::new();
+        let mut pending_kernel_runtime_config = VecDeque::new();
         let mut pending_kernel_metadata = VecDeque::new();
         loop {
             select! {
@@ -87,6 +88,7 @@ impl ConversationService for ChannelService {
                         &mut pending_workspace,
                         &mut pending_status,
                         &mut pending_terminal,
+                        &mut pending_kernel_runtime_config,
                         &mut pending_kernel_metadata,
                         call.source,
                         call.response_id,
@@ -101,6 +103,7 @@ impl ConversationService for ChannelService {
                         &mut pending_workspace,
                         &mut pending_status,
                         &mut pending_terminal,
+                        &mut pending_kernel_runtime_config,
                         &mut pending_kernel_metadata,
                         ingress,
                     )?;
@@ -144,6 +147,11 @@ struct PendingStatusRequest {
 }
 
 #[derive(Debug)]
+struct PendingKernelRuntimeConfigRequest {
+    request_id: String,
+}
+
+#[derive(Debug)]
 struct PendingKernelMetadataRequest {
     request_id: String,
 }
@@ -154,6 +162,7 @@ fn handle_channel_request(
     pending_workspace: &mut VecDeque<PendingWorkspaceRequest>,
     pending_status: &mut VecDeque<PendingStatusRequest>,
     pending_terminal: &mut VecDeque<PendingTerminalRequest>,
+    pending_kernel_runtime_config: &mut VecDeque<PendingKernelRuntimeConfigRequest>,
     pending_kernel_metadata: &mut VecDeque<PendingKernelMetadataRequest>,
     source: ServiceAddr,
     response_id: Option<String>,
@@ -379,6 +388,14 @@ fn handle_channel_request(
                         }),
                     }))?;
                 }
+                Ok(response @ KernelResponse::RuntimeConfig { .. }) => {
+                    handle_kernel_runtime_config_response(
+                        ctx,
+                        event_tx,
+                        pending_kernel_runtime_config,
+                        response,
+                    )?;
+                }
                 Ok(KernelResponse::RuntimeConfigUpdated {
                     config,
                     updated_services,
@@ -489,6 +506,7 @@ fn handle_channel_ingress(
     pending_workspace: &mut VecDeque<PendingWorkspaceRequest>,
     pending_status: &mut VecDeque<PendingStatusRequest>,
     pending_terminal: &mut VecDeque<PendingTerminalRequest>,
+    pending_kernel_runtime_config: &mut VecDeque<PendingKernelRuntimeConfigRequest>,
     pending_kernel_metadata: &mut VecDeque<PendingKernelMetadataRequest>,
     ingress: ChannelIngress,
 ) -> Result<()> {
@@ -678,6 +696,15 @@ fn handle_channel_ingress(
                     patch,
                 )?))?;
         }
+        ChannelIngress::QueryRuntimeConfig { request_id } => {
+            pending_kernel_runtime_config.push_back(PendingKernelRuntimeConfigRequest {
+                request_id: request_id.clone(),
+            });
+            ctx.outbox
+                .send(ServiceOutput::Call(kernel::query_runtime_config_call(
+                    ctx.addr.clone(),
+                )?))?;
+        }
         ChannelIngress::QueryKernelMetadata { request_id } => {
             pending_kernel_metadata.push_back(PendingKernelMetadataRequest {
                 request_id: request_id.clone(),
@@ -780,6 +807,34 @@ fn handle_kernel_metadata_response(
     ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
         addr: ctx.addr.clone(),
         label: "kernel_metadata_response".to_string(),
+        detail: serde_json::json!({
+            "request_id": request_id,
+            "response": response,
+        }),
+    }))?;
+    Ok(())
+}
+
+fn handle_kernel_runtime_config_response(
+    ctx: &ServiceRunContext,
+    event_tx: Option<&Sender<ChannelEvent>>,
+    pending_kernel_runtime_config: &mut VecDeque<PendingKernelRuntimeConfigRequest>,
+    response: KernelResponse,
+) -> Result<()> {
+    let request_id = pending_kernel_runtime_config
+        .pop_front()
+        .map(|pending| pending.request_id)
+        .unwrap_or_default();
+    emit_channel_event(
+        event_tx,
+        ChannelEvent::KernelRuntimeConfig {
+            request_id: request_id.clone(),
+            response: response.clone(),
+        },
+    )?;
+    ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
+        addr: ctx.addr.clone(),
+        label: "kernel_runtime_config_response".to_string(),
         detail: serde_json::json!({
             "request_id": request_id,
             "response": response,
