@@ -589,7 +589,6 @@ fn standard_service_specs() -> Vec<(ServiceAddr, ServiceKind)> {
         (ServiceAddr::tool_binary(), ServiceKind::ToolBinary),
         (ServiceAddr::workspace(), ServiceKind::Workspace),
         (ServiceAddr::terminal(), ServiceKind::Terminal),
-        (ServiceAddr::status(), ServiceKind::Status),
     ]
 }
 
@@ -738,7 +737,7 @@ mod tests {
         let manifest: Value =
             serde_json::from_str(&fs::read_to_string(service_root.join("manifest.json")).unwrap())
                 .unwrap();
-        assert_eq!(manifest["services"].as_array().unwrap().len(), 9);
+        assert_eq!(manifest["services"].as_array().unwrap().len(), 8);
         assert_eq!(manifest["next_background_id"], 7);
         assert_eq!(manifest["next_subagent_id"], 3);
 

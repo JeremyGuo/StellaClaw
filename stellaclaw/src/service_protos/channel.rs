@@ -13,7 +13,6 @@ use crate::service_protos::agent_session::{
 use crate::service_protos::kernel::{
     KernelMetadataPatch, KernelResponse, KernelRuntimeConfigPatch,
 };
-use crate::service_protos::status::{StatusRequest, StatusResponse};
 use crate::service_protos::terminal::{TerminalRequest, TerminalResponse};
 use crate::service_protos::workspace::{WorkspaceRequest, WorkspaceResponse};
 
@@ -103,10 +102,6 @@ pub enum ChannelIngress {
         request_id: String,
         request: WorkspaceRequest,
     },
-    Status {
-        request_id: String,
-        request: StatusRequest,
-    },
     Terminal {
         request_id: String,
         request: TerminalRequest,
@@ -184,10 +179,6 @@ pub enum ChannelEvent {
     Workspace {
         request_id: String,
         response: WorkspaceResponse,
-    },
-    StatusSnapshot {
-        request_id: String,
-        response: StatusResponse,
     },
     KernelRuntimeConfig {
         request_id: String,

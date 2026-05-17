@@ -29,8 +29,8 @@ use crate::{
     },
     services::{
         agent_session::AgentSessionService, channel::ChannelService, cron::CronService,
-        memory::MemoryService, noop::NoopService, skill::SkillService, status::StatusService,
-        terminal::TerminalService, tool_binary::ToolBinaryService, workspace::WorkspaceService,
+        memory::MemoryService, noop::NoopService, skill::SkillService, terminal::TerminalService,
+        tool_binary::ToolBinaryService, workspace::WorkspaceService,
     },
 };
 
@@ -126,10 +126,6 @@ impl ServiceAddr {
 
     pub fn control() -> Self {
         Self::local_path(["control"])
-    }
-
-    pub fn status() -> Self {
-        Self::local_path(["status"])
     }
 
     pub fn is_kernel(&self) -> bool {
@@ -408,7 +404,6 @@ pub enum ServiceKind {
     Workspace,
     Terminal,
     Control,
-    Status,
     Noop {
         name: String,
     },
@@ -718,7 +713,6 @@ impl ConversationKernel {
             (ServiceAddr::tool_binary(), ServiceKind::ToolBinary),
             (ServiceAddr::workspace(), ServiceKind::Workspace),
             (ServiceAddr::terminal(), ServiceKind::Terminal),
-            (ServiceAddr::status(), ServiceKind::Status),
         ];
         for (addr, kind) in services {
             if !self.has_service(&addr) {
@@ -961,7 +955,6 @@ impl ConversationKernel {
             ServiceKind::Workspace => Box::new(WorkspaceService::new(self.runtime_config.clone())),
             ServiceKind::Terminal => Box::new(TerminalService::new(self.runtime_config.clone())),
             ServiceKind::Control => Box::new(crate::services::control::ControlService::new()),
-            ServiceKind::Status => Box::new(StatusService::new()),
             ServiceKind::Noop { name } => Box::new(NoopService::new(name.clone())),
         }
     }
@@ -1756,7 +1749,7 @@ mod tests {
 
         kernel
             .dispatch_call(ServiceCall::new(
-                ServiceAddr::status(),
+                ServiceAddr::local_path(["bad_payload_source"]),
                 ServiceAddr::channel_id("scratch"),
                 serde_json::json!({
                     "type": "not_a_channel_payload",
@@ -1772,7 +1765,8 @@ mod tests {
         assert!(kernel.status_log().iter().any(|status| {
             status.addr == ServiceAddr::channel_id("scratch")
                 && status.label == "bad_channel_payload"
-                && status.detail["source"] == serde_json::json!(ServiceAddr::status())
+                && status.detail["source"]
+                    == serde_json::json!(ServiceAddr::local_path(["bad_payload_source"]))
                 && status.detail["payload"]["type"] == "not_a_channel_payload"
         }));
         let warn_log =
@@ -3024,13 +3018,12 @@ mod tests {
             ServiceAddr::tool_binary(),
             ServiceAddr::workspace(),
             ServiceAddr::terminal(),
-            ServiceAddr::status(),
         ] {
             assert!(kernel.has_service(&addr), "{addr} should be mounted");
         }
 
         let manifest = kernel.load_manifest().expect("manifest loads");
-        assert_eq!(manifest.services.len(), 9);
+        assert_eq!(manifest.services.len(), 8);
         assert_eq!(
             kernel
                 .metadata()

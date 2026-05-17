@@ -1,5 +1,10 @@
-version: 1.28.0
+version: 1.28.1
 ---
+
+# 1.28.1
+
+- 删除 Web debug 读接口和旧 StatusService 链路：
+  移除 `/api/debug/conversations`、`/api/debug/conversations/{conversation_id}/foreground_sessions` 和 `/api/debug/conversations/{conversation_id}/status`，Web 读取初始化只保留 home / chat websocket snapshot 与 message history/detail REST 边界；同时删除 `ChannelIngress::Status` / `StatusSnapshot`、StatusService 和 status service protocol，不再保留旧兼容壳。新增 workdir `0.21 -> 0.22` upgrade，从旧 service manifest 中移除 status service entry 和 `local__status` 存储目录。本次不改变 `config` schema，改变 `workdir` schema 至 `0.22`。
 
 # 1.28.0
 

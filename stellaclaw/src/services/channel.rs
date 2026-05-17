@@ -21,7 +21,6 @@ use crate::{
         },
         channel::{decode_request, ChannelEvent, ChannelIngress, ChannelRequest},
         kernel::{self, decode_response as decode_kernel_response, KernelResponse},
-        status::{self, decode_response as decode_status_response, StatusResponse},
         terminal::{self, decode_response as decode_terminal_response, TerminalResponse},
         workspace::{
             self, decode_response as decode_workspace_response, WorkspaceRequest, WorkspaceResponse,
@@ -66,7 +65,6 @@ impl ConversationService for ChannelService {
         let ingress_rx = self.ingress_rx.clone();
         let event_tx = self.event_tx.clone();
         let mut pending_workspace = VecDeque::new();
-        let mut pending_status = VecDeque::new();
         let mut pending_terminal = VecDeque::new();
         let mut pending_kernel_runtime_config = VecDeque::new();
         let mut pending_kernel_metadata = VecDeque::new();
@@ -86,7 +84,6 @@ impl ConversationService for ChannelService {
                         &ctx,
                         event_tx.as_ref(),
                         &mut pending_workspace,
-                        &mut pending_status,
                         &mut pending_terminal,
                         &mut pending_kernel_runtime_config,
                         &mut pending_kernel_metadata,
@@ -101,7 +98,6 @@ impl ConversationService for ChannelService {
                         &ctx,
                         event_tx.as_ref(),
                         &mut pending_workspace,
-                        &mut pending_status,
                         &mut pending_terminal,
                         &mut pending_kernel_runtime_config,
                         &mut pending_kernel_metadata,
@@ -142,11 +138,6 @@ struct PendingTerminalRequest {
 }
 
 #[derive(Debug)]
-struct PendingStatusRequest {
-    request_id: String,
-}
-
-#[derive(Debug)]
 struct PendingKernelRuntimeConfigRequest {
     request_id: String,
 }
@@ -160,7 +151,6 @@ fn handle_channel_request(
     ctx: &ServiceRunContext,
     event_tx: Option<&Sender<ChannelEvent>>,
     pending_workspace: &mut VecDeque<PendingWorkspaceRequest>,
-    pending_status: &mut VecDeque<PendingStatusRequest>,
     pending_terminal: &mut VecDeque<PendingTerminalRequest>,
     pending_kernel_runtime_config: &mut VecDeque<PendingKernelRuntimeConfigRequest>,
     pending_kernel_metadata: &mut VecDeque<PendingKernelMetadataRequest>,
@@ -459,49 +449,38 @@ fn handle_channel_request(
                             response,
                         )?;
                     }
-                    Err(_) => match decode_status_response(payload.clone()) {
+                    Err(_) => match decode_terminal_response(payload.clone()) {
                         Ok(response) => {
-                            handle_status_response(ctx, event_tx, pending_status, response)?;
+                            handle_terminal_response(ctx, event_tx, pending_terminal, response)?;
                         }
-                        Err(_) => match decode_terminal_response(payload.clone()) {
-                            Ok(response) => {
-                                handle_terminal_response(
-                                    ctx,
-                                    event_tx,
-                                    pending_terminal,
-                                    response,
-                                )?;
-                            }
-                            Err(_) => {
-                                let detail = serde_json::json!({
-                                    "conversation_id": &ctx.conversation.conversation_id,
-                                    "channel_addr": &ctx.addr,
-                                    "source": &source,
-                                    "channel_decode_error": error.to_string(),
-                                    "payload": &payload,
-                                });
-                                let _ = append_workdir_level_log(
-                                    &ctx.conversation.workdir,
-                                    "warn",
-                                    "bad_channel_payload",
-                                    detail.clone(),
-                                );
-                                emit_channel_event(
-                                    event_tx,
-                                    ChannelEvent::Error {
-                                        code: "channel.bad_payload".to_string(),
-                                        message: "Channel received an unsupported payload."
-                                            .to_string(),
-                                        detail: Some(error.to_string()),
-                                    },
-                                )?;
-                                ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
-                                    addr: ctx.addr.clone(),
-                                    label: "bad_channel_payload".to_string(),
-                                    detail,
-                                }))?;
-                            }
-                        },
+                        Err(_) => {
+                            let detail = serde_json::json!({
+                                "conversation_id": &ctx.conversation.conversation_id,
+                                "channel_addr": &ctx.addr,
+                                "source": &source,
+                                "channel_decode_error": error.to_string(),
+                                "payload": &payload,
+                            });
+                            let _ = append_workdir_level_log(
+                                &ctx.conversation.workdir,
+                                "warn",
+                                "bad_channel_payload",
+                                detail.clone(),
+                            );
+                            emit_channel_event(
+                                event_tx,
+                                ChannelEvent::Error {
+                                    code: "channel.bad_payload".to_string(),
+                                    message: "Channel received an unsupported payload.".to_string(),
+                                    detail: Some(error.to_string()),
+                                },
+                            )?;
+                            ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
+                                addr: ctx.addr.clone(),
+                                label: "bad_channel_payload".to_string(),
+                                detail,
+                            }))?;
+                        }
                     },
                 },
             },
@@ -514,7 +493,6 @@ fn handle_channel_ingress(
     ctx: &ServiceRunContext,
     event_tx: Option<&Sender<ChannelEvent>>,
     pending_workspace: &mut VecDeque<PendingWorkspaceRequest>,
-    pending_status: &mut VecDeque<PendingStatusRequest>,
     pending_terminal: &mut VecDeque<PendingTerminalRequest>,
     pending_kernel_runtime_config: &mut VecDeque<PendingKernelRuntimeConfigRequest>,
     pending_kernel_metadata: &mut VecDeque<PendingKernelMetadataRequest>,
@@ -752,26 +730,6 @@ fn handle_channel_ingress(
                 workspace::workspace_call(ctx.addr.clone(), request)?.with_request_id(request_id),
             ))?;
         }
-        ChannelIngress::Status {
-            request_id,
-            request,
-        } => {
-            pending_status.push_back(PendingStatusRequest {
-                request_id: request_id.clone(),
-            });
-            emit_channel_event(
-                event_tx,
-                ChannelEvent::Status {
-                    label: "status_request_forwarded".to_string(),
-                    detail: serde_json::json!({"request_id": request_id}),
-                },
-            )?;
-            ctx.outbox.send(ServiceOutput::Call(status::status_call(
-                ctx.addr.clone(),
-                ServiceAddr::status(),
-                request,
-            )?))?;
-        }
         ChannelIngress::Terminal {
             request_id,
             request,
@@ -845,34 +803,6 @@ fn handle_kernel_runtime_config_response(
     ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
         addr: ctx.addr.clone(),
         label: "kernel_runtime_config_response".to_string(),
-        detail: serde_json::json!({
-            "request_id": request_id,
-            "response": response,
-        }),
-    }))?;
-    Ok(())
-}
-
-fn handle_status_response(
-    ctx: &ServiceRunContext,
-    event_tx: Option<&Sender<ChannelEvent>>,
-    pending_status: &mut VecDeque<PendingStatusRequest>,
-    response: StatusResponse,
-) -> Result<()> {
-    let request_id = pending_status
-        .pop_front()
-        .map(|pending| pending.request_id)
-        .unwrap_or_default();
-    emit_channel_event(
-        event_tx,
-        ChannelEvent::StatusSnapshot {
-            request_id: request_id.clone(),
-            response: response.clone(),
-        },
-    )?;
-    ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
-        addr: ctx.addr.clone(),
-        label: "status_response".to_string(),
         detail: serde_json::json!({
             "request_id": request_id,
             "response": response,

@@ -104,13 +104,6 @@ impl WebChannel {
         match (request.method.as_str(), path.as_slice()) {
             ("GET", ["api", "health"]) => Ok(HttpResponse::json(200, json!({"ok": true}))),
             ("GET", ["api", "models"]) => self.list_models(),
-            ("GET", ["api", "debug", "conversations"]) => self.list_conversations(&request.query),
-            ("GET", ["api", "debug", "conversations", conversation_id, "foreground_sessions"]) => {
-                self.list_foreground_sessions(conversation_id)
-            }
-            ("GET", ["api", "debug", "conversations", conversation_id, "status"]) => {
-                self.status_snapshot(conversation_id)
-            }
             ("POST", ["api", "conversations"]) => self.create_conversation(&request, id_manager),
             ("PATCH", ["api", "conversations", conversation_id]) => {
                 self.rename_conversation(conversation_id, &request.body)
@@ -237,31 +230,6 @@ impl WebChannel {
         ))
     }
 
-    fn list_conversations(&self, query: &HashMap<String, String>) -> HttpResult {
-        let offset = query_usize(query, "offset", 0);
-        let limit = query_usize(query, "limit", 80).min(200);
-        let mut conversations = self.conversation_summaries()?;
-        conversations.sort_by(|left, right| {
-            left["conversation_id"]
-                .as_str()
-                .unwrap_or_default()
-                .cmp(right["conversation_id"].as_str().unwrap_or_default())
-        });
-        let total = conversations.len();
-        let start = offset.min(total);
-        let end = start.saturating_add(limit).min(total);
-        Ok(HttpResponse::json(
-            200,
-            json!({
-                "channel_id": self.id,
-                "offset": offset,
-                "limit": limit,
-                "total": total,
-                "conversations": &conversations[start..end],
-            }),
-        ))
-    }
-
     fn create_conversation(
         &self,
         request: &HttpRequest,
@@ -337,17 +305,6 @@ impl WebChannel {
             .update_seen(conversation_id, &foreground_session_id, seen.clone())
             .map_err(HttpError::internal)?;
         Ok(HttpResponse::json(200, json!({"seen": seen})))
-    }
-
-    fn list_foreground_sessions(&self, conversation_id: &str) -> HttpResult {
-        let metadata = self.query_conversation_metadata(conversation_id)?;
-        Ok(HttpResponse::json(
-            200,
-            json!({
-                "conversation_id": conversation_id,
-                "foreground_sessions": self.foreground_session_summaries(&metadata),
-            }),
-        ))
     }
 
     fn create_foreground_session(&self, conversation_id: &str, body: &[u8]) -> HttpResult {
@@ -659,31 +616,6 @@ impl WebChannel {
                 "client_message_id": client_message_id,
             }),
         ))
-    }
-
-    fn status_snapshot(&self, conversation_id: &str) -> HttpResult {
-        self.conversation_runtime
-            .ensure_conversation_started(conversation_id)
-            .map_err(HttpError::internal)?;
-        let request_id = generated_request_id("status");
-        let rx = self
-            .conversation_runtime
-            .send_main_channel_ingress_subscribed(
-                conversation_id,
-                ChannelIngress::Status {
-                    request_id: request_id.clone(),
-                    request: crate::service_protos::status::StatusRequest::Snapshot,
-                },
-            )
-            .map_err(HttpError::internal)?;
-        let response = wait_for_event(&rx, Duration::from_secs(10), |event| match event {
-            KernelChannelEvent::StatusSnapshot {
-                request_id: id,
-                response,
-            } if id == request_id => Some(serde_json::to_value(response).ok()?),
-            _ => None,
-        })?;
-        Ok(HttpResponse::json(200, response))
     }
 
     fn set_session_nickname(

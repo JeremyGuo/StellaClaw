@@ -2,7 +2,7 @@ use std::{fs, path::Path};
 
 use anyhow::{Context, Result};
 
-use super::{WorkdirUpgrader, LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_20};
+use super::{WorkdirUpgrader, WORKDIR_VERSION_0_20, WORKDIR_VERSION_0_21};
 use crate::config::StellaclawConfig;
 
 pub struct WebSeenStateUpgrade;
@@ -13,7 +13,7 @@ impl WorkdirUpgrader for WebSeenStateUpgrade {
     }
 
     fn to_version(&self) -> &'static str {
-        LATEST_WORKDIR_VERSION
+        WORKDIR_VERSION_0_21
     }
 
     fn upgrade(&self, workdir: &Path, _config: &StellaclawConfig) -> Result<()> {
