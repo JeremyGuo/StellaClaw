@@ -1888,6 +1888,11 @@ impl SessionActor {
         };
 
         self.all_messages.push(message.clone());
+        if append_phase_should_defer_compression(phase) {
+            self.history.push(message);
+            self.persist_state_if_history_closed(phase)?;
+            return Ok(index);
+        }
         let system_prompt = self.system_prompt_for_current_initial()?;
         if compressor
             .would_compress_with_next(&self.history, &message)
@@ -2997,6 +3002,10 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 
 fn compression_error_is_request_too_large(error: &CompressionError) -> bool {
     request_too_large_text(&error.to_string())
+}
+
+fn append_phase_should_defer_compression(phase: &str) -> bool {
+    phase.starts_with("tool_result")
 }
 
 fn request_too_large_prune_start(messages: &[ChatMessage]) -> Option<usize> {

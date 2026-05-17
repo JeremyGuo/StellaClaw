@@ -20,6 +20,10 @@ function isWorkingConversation(conversation, activeRunning) {
     || Boolean(activeRunning);
 }
 
+function deferContextMenuAction(action) {
+  window.setTimeout(() => action?.(), 0);
+}
+
 function sameStringSet(left, right) {
   if (left.size !== right.size) return false;
   for (const value of left) {
@@ -197,6 +201,7 @@ export function ConversationBar({
 
   const renderSession = (conversation, session, hidden = false) => {
     const sessionId = session?.id || 'main';
+    const canDeleteSession = sessionId !== 'main';
     const key = conversationKey(serverId, conversation.conversation_id, sessionId);
     const active = selected?.conversationId === conversation.conversation_id
       && (selected?.foregroundSessionId || 'main') === sessionId;
@@ -225,18 +230,19 @@ export function ConversationBar({
           <ContextMenu.Content className="context-menu">
             <ContextMenu.Item
               className="context-menu-item"
-              onSelect={() => onRenameSession?.(conversation, session)}
+              onSelect={() => deferContextMenuAction(() => onRenameSession?.(conversation, session))}
             >
               重命名 Session
             </ContextMenu.Item>
-            {!session?.is_main && (
-              <ContextMenu.Item
-                className="context-menu-item danger"
-                onSelect={() => onDeleteSession?.(conversation, session)}
-              >
-                删除 Session
-              </ContextMenu.Item>
-            )}
+            <ContextMenu.Item
+              className="context-menu-item danger"
+              disabled={!canDeleteSession}
+              onSelect={() => {
+                if (canDeleteSession) deferContextMenuAction(() => onDeleteSession?.(conversation, session));
+              }}
+            >
+              {canDeleteSession ? '删除 Session' : 'Main Session 不能删除'}
+            </ContextMenu.Item>
           </ContextMenu.Content>
         </ContextMenu.Portal>
       </ContextMenu.Root>
@@ -322,16 +328,16 @@ export function ConversationBar({
           </ContextMenu.Trigger>
           <ContextMenu.Portal>
             <ContextMenu.Content className="context-menu">
-              <ContextMenu.Item className="context-menu-item" onSelect={() => onCreateSession?.(conversation)}>
+              <ContextMenu.Item className="context-menu-item" onSelect={() => deferContextMenuAction(() => onCreateSession?.(conversation))}>
                 新建对话
               </ContextMenu.Item>
-              <ContextMenu.Item className="context-menu-item" onSelect={() => onRename?.(conversation)}>
+              <ContextMenu.Item className="context-menu-item" onSelect={() => deferContextMenuAction(() => onRename?.(conversation))}>
                 重命名 Conversation
               </ContextMenu.Item>
-              <ContextMenu.Item className="context-menu-item" onSelect={() => (hidden ? onUnhide?.(conversation) : onHide?.(conversation))}>
+              <ContextMenu.Item className="context-menu-item" onSelect={() => deferContextMenuAction(() => (hidden ? onUnhide?.(conversation) : onHide?.(conversation)))}>
                 {hidden ? '取消隐藏' : '隐藏'}
               </ContextMenu.Item>
-              <ContextMenu.Item className="context-menu-item danger" onSelect={() => onDelete?.(conversation)}>
+              <ContextMenu.Item className="context-menu-item danger" onSelect={() => deferContextMenuAction(() => onDelete?.(conversation))}>
                 删除 Conversation
               </ContextMenu.Item>
             </ContextMenu.Content>

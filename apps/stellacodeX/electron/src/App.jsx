@@ -34,13 +34,14 @@ import { WorkspacePanel } from './components/WorkspacePanel';
 import { FilePreviewPanel } from './components/FilePreviewPanel';
 import { TerminalDock } from './components/TerminalDock';
 import { NewConversationDialog } from './components/NewConversationDialog';
+import { RenameConversationDialog } from './components/RenameConversationDialog';
 import { SettingsDialog } from './components/SettingsDialog';
 import { clamp, formatBytes, formatModel, statusUsageTotals } from './lib/format';
-import { fileExtension, fileNameFromPath, imageMimeType } from './lib/fileUtils';
+import { attachmentName, fileExtension, fileNameFromPath, imageMimeType } from './lib/fileUtils';
 import { activityFromMessages, addUsageTotals, committedMessageProtocolMismatches, firstMessageId, hasOlderMessages, isFinalAssistantMessage, lastServerMessageIndex, liveActivitySignature, mergeMessages, messageIndex, messageOrderFromId, shortText, usageDeltaFromMessages, websocketUrl } from './lib/messageUtils';
 import { effectiveThemeMode, themeCssVariables } from './lib/theme';
 import { collectDroppedFiles, packFilesToTarGz, uploadPayloadStats } from './lib/uploadArchive';
-import { normalizeWorkspacePath, parentWorkspacePath, workspaceEntryKind, workspaceFileKind } from './lib/workspaceUtils';
+import { normalizeWorkspacePath, parentWorkspacePath, workspaceDisplayRoot, workspaceEntryKind, workspaceFileKind } from './lib/workspaceUtils';
 
 const SIDEBAR_EXPANDED = 286;
 const SIDEBAR_COLLAPSED = 0;
@@ -52,10 +53,79 @@ const TERMINAL_LIST_MIN = 180;
 const TERMINAL_LIST_MAX = 360;
 const MAX_UPLOAD_COMPRESSED_BYTES = 10 * 1024 * 1024;
 const PDF_PREVIEW_MAX_BYTES = 50 * 1024 * 1024;
+const MESSAGE_IMAGE_PREVIEW_MAX_BYTES = 20 * 1024 * 1024;
 const MIN_DISPLAY_FONT_SIZE = 11;
 const MAX_DISPLAY_FONT_SIZE = 18;
 const MIN_UI_SCALE = 0.8;
 const MAX_UI_SCALE = 1.4;
+const MESSAGE_CACHE_LIMIT = 240;
+const LOCAL_CACHE_MAX_BYTES = 1_500_000;
+const LOCAL_CACHE_PREFIX = 'stellacode.cache.v1';
+
+function localCacheKey(kind, parts) {
+  return `${LOCAL_CACHE_PREFIX}:${kind}:${parts.map((part) => encodeURIComponent(String(part ?? ''))).join(':')}`;
+}
+
+function readLocalCache(kind, parts) {
+  if (typeof window === 'undefined' || !window.localStorage) return null;
+  try {
+    const raw = window.localStorage.getItem(localCacheKey(kind, parts));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    return parsed?.value ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function writeLocalCache(kind, parts, value) {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    const raw = JSON.stringify({ saved_at: Date.now(), value });
+    if (raw.length > LOCAL_CACHE_MAX_BYTES) return;
+    window.localStorage.setItem(localCacheKey(kind, parts), raw);
+  } catch {
+    // Cache writes are opportunistic.
+  }
+}
+
+function removeLocalCache(kind, parts) {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    window.localStorage.removeItem(localCacheKey(kind, parts));
+  } catch {
+    // Cache invalidation is best-effort.
+  }
+}
+
+function durableMessagesForCache(messages) {
+  return (Array.isArray(messages) ? messages : [])
+    .filter((message) => (
+      message
+      && !message._streaming
+      && !message._optimistic
+      && !message.pending
+      && !message.queued
+      && !message._userMessageStarted
+    ))
+    .sort((left, right) => messageIndex(left) - messageIndex(right))
+    .slice(-MESSAGE_CACHE_LIMIT);
+}
+
+function readMessageCache(serverId, conversationId, foregroundSessionId) {
+  return readLocalCache('messages', [serverId, conversationId, foregroundSessionId || 'main']) || [];
+}
+
+function writeMessageCache(serverId, conversationId, foregroundSessionId, messages) {
+  const durable = durableMessagesForCache(messages);
+  if (durable.length > 0) {
+    writeLocalCache('messages', [serverId, conversationId, foregroundSessionId || 'main'], durable);
+  }
+}
+
+function removeMessageCache(serverId, conversationId, foregroundSessionId) {
+  removeLocalCache('messages', [serverId, conversationId, foregroundSessionId || 'main']);
+}
 
 function setPxVariable(element, name, value) {
   if (!Number.isFinite(value)) return;
@@ -100,6 +170,97 @@ function safeDecodeUriComponent(value) {
   } catch {
     return value;
   }
+}
+
+function filePathFromFileUri(value) {
+  const raw = String(value || '').trim();
+  if (!/^file:/i.test(raw)) return '';
+  try {
+    return decodeURIComponent(new URL(raw).pathname);
+  } catch {
+    return '';
+  }
+}
+
+function normalizeAbsolutePath(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  return raw.replace(/\\/g, '/').replace(/\/+$/, '');
+}
+
+function isAbsolutePath(value) {
+  const raw = String(value || '').trim();
+  return raw.startsWith('/') || /^[A-Za-z]:[\\/]/.test(raw);
+}
+
+function pathRelativeToRoot(path, root) {
+  const absolutePath = normalizeAbsolutePath(path);
+  const absoluteRoot = normalizeAbsolutePath(root);
+  if (!absolutePath || !absoluteRoot) return '';
+  if (absolutePath === absoluteRoot) return '';
+  const prefix = `${absoluteRoot}/`;
+  if (!absolutePath.startsWith(prefix)) return '';
+  return normalizeWorkspacePath(absolutePath.slice(prefix.length));
+}
+
+function localAttachmentPath(attachment, rawUrl = '') {
+  const uriPath = filePathFromFileUri(rawUrl)
+    || filePathFromFileUri(attachment?.uri)
+    || filePathFromFileUri(attachment?.file_uri)
+    || filePathFromFileUri(attachment?.url);
+  if (uriPath) return uriPath;
+  return String(attachment?.path || attachment?.file_path || attachment?.src || '').trim();
+}
+
+function attachmentWorkspacePath(attachment, rawUrl, workspaceRoots = []) {
+  const explicit = String(
+    attachment?.workspace_path
+    || attachment?.relative_path
+    || attachment?.workspace_relative_path
+    || ''
+  ).trim();
+  if (explicit) return normalizeWorkspacePath(explicit);
+  const path = localAttachmentPath(attachment, rawUrl);
+  if (!path) return '';
+  if (!isAbsolutePath(path) && !/^file:/i.test(path) && !/^[a-z][a-z0-9+.-]*:/i.test(path)) {
+    return normalizeWorkspacePath(path);
+  }
+  for (const root of workspaceRoots) {
+    const relative = pathRelativeToRoot(path, root);
+    if (relative) return relative;
+  }
+  return '';
+}
+
+function conversationFileTargetFromPath(value) {
+  const path = normalizeAbsolutePath(value);
+  const match = path.match(/(?:^|\/)conversations\/([^/]+)\/(.+)$/);
+  if (!match) return null;
+  const conversationId = match[1];
+  const relativePath = normalizeWorkspacePath(match[2]);
+  if (!conversationId || !relativePath) return null;
+  return { conversationId, path: relativePath };
+}
+
+function attachmentConversationFileTarget(attachment, rawUrl, fallbackConversationId, workspaceRoots = []) {
+  const absoluteTarget = conversationFileTargetFromPath(localAttachmentPath(attachment, rawUrl));
+  if (absoluteTarget) return absoluteTarget;
+  const path = attachmentWorkspacePath(attachment, rawUrl, workspaceRoots);
+  if (!path || !fallbackConversationId) return null;
+  return { conversationId: fallbackConversationId, path };
+}
+
+function attachmentCacheKey(serverId, conversationId, path, attachment, rawUrl = '') {
+  return [
+    serverId,
+    conversationId,
+    path,
+    rawUrl,
+    attachment?.uri,
+    attachment?.file_uri,
+    attachment?.path,
+    attachment?.name
+  ].map((value) => String(value || '')).join('|');
 }
 
 function applyChromeMetrics(metrics) {
@@ -630,13 +791,24 @@ function appendTextDelta(existingText, delta) {
   return `${previous}${chunk}`;
 }
 
+function findStreamingMessagePosition(current, id, turnId) {
+  const messageId = String(id || '').trim();
+  const streamTurnId = String(turnId || '').trim();
+  return current.findIndex((message) => {
+    if (!message?._streaming || String(message?.role || '').toLowerCase() !== 'assistant') return false;
+    const existingId = String(message?.id ?? message?.message_id ?? '').trim();
+    if (messageId && existingId === messageId) return true;
+    return Boolean(streamTurnId && String(message?._streamTurnId || '') === streamTurnId);
+  });
+}
+
 function appendStreamAssistantDelta(current, event) {
   const id = streamMessageId(event);
   const delta = streamDeltaText(event);
   if (!id || !delta) return current;
   const turnId = String(event?.turn_id || event?.turnId || '').trim();
   const itemId = String(event?.item_id || event?.itemId || '').trim();
-  const position = current.findIndex((message) => String(message?.id ?? message?.message_id ?? '') === id);
+  const position = findStreamingMessagePosition(current, id, turnId);
   const now = new Date().toISOString();
   const fallbackIndex = nextStreamMessageIndex(current);
   const buildMessage = (existing = {}) => {
@@ -694,7 +866,7 @@ function appendStreamToolCallDelta(current, event) {
   const itemId = String(event?.item_id || event?.itemId || '').trim();
   const callId = String(event?.call_id || event?.callId || itemId).trim();
   if (!callId) return current;
-  const position = current.findIndex((message) => String(message?.id ?? message?.message_id ?? '') === id);
+  const position = findStreamingMessagePosition(current, id, turnId);
   const now = new Date().toISOString();
   const fallbackIndex = nextStreamMessageIndex(current);
   const buildMessage = (existing = {}) => {
@@ -754,7 +926,7 @@ function appendStreamReasoningSummary(current, event) {
   const turnId = String(event?.turn_id || event?.turnId || '').trim();
   const itemId = String(event?.item_id || event?.itemId || '').trim();
   const summaryIndex = Number(event?.summary_index ?? event?.summaryIndex ?? 0);
-  const position = current.findIndex((message) => String(message?.id ?? message?.message_id ?? '') === id);
+  const position = findStreamingMessagePosition(current, id, turnId);
   const now = new Date().toISOString();
   const fallbackIndex = nextStreamMessageIndex(current);
   const buildMessage = (existing = {}) => {
@@ -1032,6 +1204,8 @@ function App() {
   const [conversationLayout, setConversationLayout] = useState(null);
   const [newConversationOpen, setNewConversationOpen] = useState(false);
   const [creatingConversation, setCreatingConversation] = useState(false);
+  const [renamingConversation, setRenamingConversation] = useState(null);
+  const [renamingConversationSaving, setRenamingConversationSaving] = useState(false);
   const [openFiles, setOpenFiles] = useState([]);
   const [activeFilePath, setActiveFilePath] = useState('');
   const [selectionReferences, setSelectionReferences] = useState([]);
@@ -1050,6 +1224,8 @@ function App() {
   const websocketKeyRef = useRef('');
   const seenUsageMessagesRef = useRef(new Map());
   const streamBuffersRef = useRef(new Map());
+  const attachmentImageUrlCacheRef = useRef(new Map());
+  const workspaceResourceCacheRef = useRef(new Map());
   const loadingOlderRef = useRef(false);
   const layoutDraftRef = useRef(null);
   const restoringUiRef = useRef(false);
@@ -1240,6 +1416,77 @@ function App() {
     () => composerModeInfo(selectedConversationStatus),
     [selectedConversationStatus]
   );
+  const messageAttachmentWorkspaceRoots = useMemo(() => {
+    const rootListing = workspaceListings.get('');
+    return Array.from(new Set([
+      workspaceDisplayRoot(rootListing, selectedConversationStatus),
+      rootListing?.workspace_root,
+      rootListing?.remote?.cwd,
+      selectedConversationStatus?.workspace,
+      activeConversation?.workspace
+    ].map(normalizeAbsolutePath).filter(Boolean)));
+  }, [workspaceListings, selectedConversationStatus, activeConversation?.workspace]);
+  const readWorkspaceResourceCache = useCallback((kind, parts) => {
+    const key = localCacheKey(kind, parts);
+    if (workspaceResourceCacheRef.current.has(key)) {
+      return workspaceResourceCacheRef.current.get(key);
+    }
+    const cached = readLocalCache(kind, parts);
+    if (cached !== null) {
+      workspaceResourceCacheRef.current.set(key, cached);
+    }
+    return cached;
+  }, []);
+  const writeWorkspaceResourceCache = useCallback((kind, parts, value) => {
+    const key = localCacheKey(kind, parts);
+    workspaceResourceCacheRef.current.set(key, value);
+    writeLocalCache(kind, parts, value);
+  }, []);
+  const removeWorkspaceResourceCache = useCallback((kind, parts) => {
+    const key = localCacheKey(kind, parts);
+    workspaceResourceCacheRef.current.delete(key);
+    removeLocalCache(kind, parts);
+  }, []);
+  const loadWorkspaceFileCached = useCallback(async (serverId, conversationId, path, limitBytes, options = {}) => {
+    const normalized = normalizeWorkspacePath(path);
+    const parts = [serverId, conversationId, normalized, limitBytes || 'full'];
+    if (!options.force) {
+      const cached = readWorkspaceResourceCache('workspace-file', parts);
+      if (cached) return cached;
+    }
+    const loaded = await loadWorkspaceFile(serverId, conversationId, normalized, limitBytes);
+    writeWorkspaceResourceCache('workspace-file', parts, loaded);
+    return loaded;
+  }, [readWorkspaceResourceCache, writeWorkspaceResourceCache]);
+  const resolveMessageAttachmentUrl = useCallback(async (attachment, rawUrl = '') => {
+    const serverId = selected?.serverId || '';
+    const conversationId = selected?.conversationId || '';
+    if (!serverId || !conversationId) return rawUrl || '';
+    const target = attachmentConversationFileTarget(attachment, rawUrl, conversationId, messageAttachmentWorkspaceRoots);
+    if (!target) return rawUrl || '';
+    const key = attachmentCacheKey(serverId, target.conversationId, target.path, attachment, rawUrl);
+    if (attachmentImageUrlCacheRef.current.has(key)) {
+      return attachmentImageUrlCacheRef.current.get(key);
+    }
+    try {
+      const file = await loadWorkspaceFileCached(serverId, target.conversationId, target.path, MESSAGE_IMAGE_PREVIEW_MAX_BYTES);
+      const dataUrl = workspaceFileImageDataUrl(target.path || attachmentName(attachment), file);
+      if (dataUrl) {
+        attachmentImageUrlCacheRef.current.set(key, dataUrl);
+        return dataUrl;
+      }
+    } catch {
+      return rawUrl || '';
+    }
+    return rawUrl || '';
+  }, [selected?.serverId, selected?.conversationId, messageAttachmentWorkspaceRoots, loadWorkspaceFileCached]);
+  const messageAttachmentWorkspaceTarget = useCallback((attachment, rawUrl = '') => (
+    attachmentConversationFileTarget(attachment, rawUrl, selected?.conversationId || '', messageAttachmentWorkspaceRoots)
+  ), [messageAttachmentWorkspaceRoots, selected?.conversationId]);
+  const messageAttachmentWorkspacePath = useCallback((attachment) => (
+    messageAttachmentWorkspaceTarget(attachment)?.path
+    || String(attachment?.path || '').trim()
+  ), [messageAttachmentWorkspaceTarget]);
   const selectedUsage = useMemo(
     () => statusUsageTotals(selectedStatus, selectedKey ? statusDeltas.get(selectedKey) : null),
     [selectedStatus, selectedKey, statusDeltas]
@@ -1463,24 +1710,34 @@ function App() {
     });
   }, [refreshConversations]);
 
-  const renameSelectedConversation = useCallback(async (conversation) => {
+  const openRenameConversationDialog = useCallback((conversation) => {
+    if (!conversation) return;
+    setRenamingConversation(conversation);
+  }, []);
+
+  const renameSelectedConversation = useCallback(async (conversation, nickname) => {
     if (!activeServerId || !conversation) return;
     const currentName = displayConversationName(conversation);
-    const nextName = window.prompt('重命名 Conversation', currentName);
-    if (nextName === null) return;
-    const nickname = nextName.trim();
-    if (!nickname || nickname === currentName) return;
+    const nextName = String(nickname || '').trim();
+    if (!nextName || nextName === currentName) {
+      setRenamingConversation(null);
+      return;
+    }
+    setRenamingConversationSaving(true);
     try {
-      const updated = await renameConversation(activeServerId, conversation.conversation_id, nickname);
+      const updated = await renameConversation(activeServerId, conversation.conversation_id, nextName);
       setConversations((current) => current.map((item) => (
         item.conversation_id === conversation.conversation_id
-          ? { ...item, ...(updated || {}), nickname }
+          ? { ...item, ...(updated || {}), nickname: nextName }
           : item
       )));
+      setRenamingConversation(null);
     } catch (error) {
       window.alert(error?.message || '重命名失败');
+    } finally {
+      setRenamingConversationSaving(false);
     }
-  }, [activeServerId, settings]);
+  }, [activeServerId]);
 
   const deleteSelectedConversation = useCallback(async (conversation) => {
     if (!activeServerId || !conversation || !settings) return;
@@ -1650,10 +1907,21 @@ function App() {
     if (!options.force && workspaceListings.has(normalized)) {
       return workspaceListings.get(normalized);
     }
+    const cacheParts = [selected.serverId, selected.conversationId, normalized, 500];
+    if (!options.force) {
+      const cached = readWorkspaceResourceCache('workspace-listing', cacheParts);
+      if (cached) {
+        setWorkspaceListings((current) => (
+          current.has(normalized) ? current : new Map(current).set(normalized, cached)
+        ));
+        return cached;
+      }
+    }
     setWorkspaceError('');
     setWorkspaceLoading((current) => new Set(current).add(normalized));
     try {
       const listing = await loadWorkspace(selected.serverId, selected.conversationId, normalized, 500);
+      writeWorkspaceResourceCache('workspace-listing', cacheParts, listing);
       setWorkspaceListings((current) => new Map(current).set(normalized, listing));
       return listing;
     } catch (error) {
@@ -1666,13 +1934,15 @@ function App() {
         return next;
       });
     }
-  }, [selected, workspaceListings]);
+  }, [selected, workspaceListings, readWorkspaceResourceCache, writeWorkspaceResourceCache]);
 
   const loadPdfPreviewIntoTab = useCallback(async (entry, options = {}) => {
     if (!selected || !entry) return;
     const path = normalizeWorkspacePath(entry.path);
     const serverId = selected.serverId;
-    const conversationId = selected.conversationId;
+    const selectedConversationId = selected.conversationId;
+    const conversationId = String(entry.conversationId || entry.conversation_id || selectedConversationId || '').trim();
+    if (!conversationId) return;
     if (!options.keepExistingPreview) {
       setOpenFiles((current) => current.map((item) => (
         item.path === path ? { ...item, loading: true, error: '' } : item
@@ -1692,7 +1962,7 @@ function App() {
       const pdfUrl = URL.createObjectURL(blob);
       if (
         selectedRef.current?.serverId !== serverId
-        || selectedRef.current?.conversationId !== conversationId
+        || selectedRef.current?.conversationId !== selectedConversationId
       ) {
         URL.revokeObjectURL(pdfUrl);
         return;
@@ -1727,7 +1997,7 @@ function App() {
     } catch (error) {
       if (
         selectedRef.current?.serverId !== serverId
-        || selectedRef.current?.conversationId !== conversationId
+        || selectedRef.current?.conversationId !== selectedConversationId
       ) {
         return;
       }
@@ -1789,10 +2059,16 @@ function App() {
     queueMicrotask(() => {
       restoringUiRef.current = false;
     });
+    const rootCacheParts = [selected.serverId, selected.conversationId, '', 500];
+    const cachedRootListing = readWorkspaceResourceCache('workspace-listing', rootCacheParts);
+    if (cachedRootListing) {
+      setWorkspaceListings((current) => new Map(current).set('', cachedRootListing));
+    }
     setWorkspaceLoading((current) => new Set(current).add(''));
     loadWorkspace(selected.serverId, selected.conversationId, '', 500)
       .then((listing) => {
         if (disposed) return;
+        writeWorkspaceResourceCache('workspace-listing', rootCacheParts, listing);
         setWorkspaceListings((current) => new Map(current).set('', listing));
       })
       .catch((error) => {
@@ -1815,7 +2091,7 @@ function App() {
         loadPdfPreviewIntoTab(file);
         return;
       }
-      loadWorkspaceFile(selected.serverId, selected.conversationId, file.path)
+      loadWorkspaceFileCached(selected.serverId, selected.conversationId, file.path)
         .then((loaded) => {
           if (disposed) return;
           const kind = workspaceFileKind(file.path);
@@ -1846,7 +2122,7 @@ function App() {
     return () => {
       disposed = true;
     };
-  }, [selected?.serverId, selected?.conversationId, selectedConversationUiKey, settingsReady, loadPdfPreviewIntoTab]);
+  }, [selected?.serverId, selected?.conversationId, selectedConversationUiKey, settingsReady, loadPdfPreviewIntoTab, readWorkspaceResourceCache, writeWorkspaceResourceCache, loadWorkspaceFileCached]);
 
   useEffect(() => {
     if (!selectedConversationUiKey || !settings || restoringUiRef.current) return;
@@ -1903,6 +2179,8 @@ function App() {
   const openWorkspaceFile = useCallback(async (entry) => {
     if (!selected || !entry) return;
     const path = normalizeWorkspacePath(entry.path);
+    const conversationId = String(entry.conversationId || entry.conversation_id || selected.conversationId || '').trim();
+    if (!conversationId) return;
     setPreviewPanelOpen(true);
     setActiveFilePath(path);
     setOpenFiles((current) => {
@@ -1932,7 +2210,7 @@ function App() {
       return;
     }
     try {
-      const file = await loadWorkspaceFile(selected.serverId, selected.conversationId, path);
+      const file = await loadWorkspaceFileCached(selected.serverId, conversationId, path);
       const kind = workspaceFileKind(path);
       const data = kind === 'image'
         ? workspaceFileImageDataUrl(path, file)
@@ -1955,16 +2233,16 @@ function App() {
         item.path === path ? { ...item, loading: false, error: error?.message || '读取文件失败' } : item
       )));
     }
-  }, [selected, loadPdfPreviewIntoTab]);
+  }, [selected, loadPdfPreviewIntoTab, loadWorkspaceFileCached]);
 
   const resolveMarkdownAsset = useCallback(async (markdownPath, rawSrc) => {
     const source = String(rawSrc || '').trim();
     if (!source || /^(?:https?:|data:|blob:|file:)/i.test(source)) return source;
     const path = resolveWorkspaceAssetPath(markdownPath, source);
     if (!selected || !path || workspaceFileKind(path) !== 'image') return source;
-    const file = await loadWorkspaceFile(selected.serverId, selected.conversationId, path);
+    const file = await loadWorkspaceFileCached(selected.serverId, selected.conversationId, path);
     return workspaceFileImageDataUrl(path, file) || source;
-  }, [selected]);
+  }, [selected, loadWorkspaceFileCached]);
 
   const uploadWorkspaceItems = useCallback(async (targetPath, dataTransferItems) => {
     if (!selected || !dataTransferItems?.length) return;
@@ -1990,6 +2268,10 @@ function App() {
         path: target,
         data: archive
       });
+      removeWorkspaceResourceCache('workspace-listing', [selected.serverId, selected.conversationId, target, 500]);
+      removeWorkspaceResourceCache('workspace-listing', [selected.serverId, selected.conversationId, parentWorkspacePath(target), 500]);
+      removeWorkspaceResourceCache('workspace-file', [selected.serverId, selected.conversationId, target, 'full']);
+      removeWorkspaceResourceCache('workspace-file', [selected.serverId, selected.conversationId, target, MESSAGE_IMAGE_PREVIEW_MAX_BYTES]);
       setWorkspaceListings((current) => {
         const next = new Map(current);
         next.delete(target);
@@ -2001,18 +2283,20 @@ function App() {
     } catch (error) {
       finishTransfer(id, { state: 'failed', detail: error?.message || '上传失败' });
     }
-  }, [selected, upsertTransfer, finishTransfer, fetchWorkspacePath]);
+  }, [selected, upsertTransfer, finishTransfer, fetchWorkspacePath, removeWorkspaceResourceCache]);
 
   const downloadWorkspaceEntry = useCallback(async (entry) => {
     if (!selected || !entry) return;
     const id = `download-${Date.now()}`;
     const path = normalizeWorkspacePath(entry.path);
+    const conversationId = String(entry.conversationId || entry.conversation_id || selected.conversationId || '').trim();
+    if (!conversationId) return;
     const kind = workspaceEntryKind(entry) === 'directory' ? 'directory' : 'file';
     try {
       upsertTransfer(id, { type: 'download', title: kind === 'file' ? '下载文件' : '下载文件夹', detail: entry.name || path, state: 'running' });
       const result = await window.stellacode2.downloadWorkspace({
         serverId: selected.serverId,
-        conversationId: selected.conversationId,
+        conversationId,
         path,
         kind,
         suggestedName: entry.name || fileNameFromPath(path)
@@ -2027,24 +2311,30 @@ function App() {
   }, [selected, upsertTransfer, finishTransfer]);
 
   const openMessageAttachment = useCallback((attachment) => {
-    if (!attachment?.path) return;
+    const target = messageAttachmentWorkspaceTarget(attachment);
+    const path = target?.path || messageAttachmentWorkspacePath(attachment);
+    if (!path || !target?.conversationId) return;
     openWorkspaceFile({
       ...attachment,
-      path: attachment.path,
-      name: attachment.name || fileNameFromPath(attachment.path),
+      path,
+      conversationId: target.conversationId,
+      name: attachment.name || fileNameFromPath(path),
       type: attachment.kind
     }).catch(() => {});
-  }, [openWorkspaceFile]);
+  }, [messageAttachmentWorkspacePath, messageAttachmentWorkspaceTarget, openWorkspaceFile]);
 
   const downloadMessageAttachment = useCallback((attachment) => {
-    if (!attachment?.path) return;
+    const target = messageAttachmentWorkspaceTarget(attachment);
+    const path = target?.path || messageAttachmentWorkspacePath(attachment);
+    if (!path || !target?.conversationId) return;
     downloadWorkspaceEntry({
       ...attachment,
-      path: attachment.path,
-      name: attachment.name || fileNameFromPath(attachment.path),
+      path,
+      conversationId: target.conversationId,
+      name: attachment.name || fileNameFromPath(path),
       type: attachment.kind
     }).catch(() => {});
-  }, [downloadWorkspaceEntry]);
+  }, [downloadWorkspaceEntry, messageAttachmentWorkspacePath, messageAttachmentWorkspaceTarget]);
 
   useEffect(() => {
     if (!selectedServerId || !selectedConversationId) return;
@@ -2069,6 +2359,14 @@ function App() {
       if (socket && socket.readyState <= WebSocket.OPEN) {
         socket.close();
       }
+    };
+
+    const cacheMessages = (next) => {
+      writeMessageCache(serverId, conversationId, sessionId, next);
+    };
+
+    const clearMessageCache = () => {
+      removeMessageCache(serverId, conversationId, sessionId);
     };
 
     const updateSelectedSessionSummary = (latestMessage, latestId, latestIndex) => {
@@ -2111,6 +2409,7 @@ function App() {
       setMessages((current) => {
         const next = mergeMessages(current, incoming);
         messagesRef.current = next;
+        cacheMessages(next);
         return next;
       });
       const latestMessage = incoming.reduce((latest, message) => (
@@ -2136,6 +2435,7 @@ function App() {
     const replaceWithRecentMessages = (incoming) => {
       if (!Array.isArray(incoming) || incoming.length === 0 || disposed || websocketKeyRef.current !== key) return;
       messagesRef.current = incoming;
+      cacheMessages(incoming);
       setMessages(incoming);
       const latestMessage = incoming.reduce((latest, message) => (
         !latest || messageIndex(message) >= messageIndex(latest) ? message : latest
@@ -2327,6 +2627,7 @@ function App() {
       setMessages((current) => {
         const next = current.length ? mergeMessages(current, initial) : initial;
         messagesRef.current = next;
+        cacheMessages(next);
         return next;
       });
       setMessagesReady(true);
@@ -2340,6 +2641,7 @@ function App() {
       if (lastIndex === undefined) {
         if (total <= 0) {
           messagesRef.current = [];
+          clearMessageCache();
           setMessages([]);
           setMessagesReady(true);
           return;
@@ -2353,6 +2655,7 @@ function App() {
           setMessages((current) => {
             const next = current.length ? mergeMessages(current, initial) : initial;
             messagesRef.current = next;
+            cacheMessages(next);
             return next;
           });
           setMessagesReady(true);
@@ -2384,8 +2687,16 @@ function App() {
       if (!snapshot || disposed || websocketKeyRef.current !== key) return;
       const provisional = snapshot.current_provisional_assistant_message?.message;
       if (provisional) {
+        const turnId = String(snapshot.current_turn_state?.turn_id || snapshot.current_turn_state?.turnId || '').trim();
+        const projected = {
+          ...provisional,
+          id: provisional.id || provisional.message_id || provisional.messageId || turnId || undefined,
+          message_id: provisional.message_id || provisional.messageId || provisional.id || turnId || undefined,
+          _streamTurnId: turnId || provisional._streamTurnId || '',
+          _streaming: true
+        };
         setMessages((current) => {
-          const next = mergeMessages(current, [{ ...provisional, _streaming: true }]);
+          const next = mergeMessages(current, [projected]);
           messagesRef.current = next;
           return next;
         });
@@ -2473,14 +2784,12 @@ function App() {
             applyChatSnapshotLiveProjection(payload);
           } else if (payloadType === 'chat.user_message_queued') {
             setMessages((current) => {
-              let next = markQueuedUserMessage(current, payload.client_message_id || payload.clientMessageId);
-              if (payload.message) next = mergeMessages(next, [{ ...payload.message, queued: true }]);
+              const next = markQueuedUserMessage(current, payload.client_message_id || payload.clientMessageId);
               messagesRef.current = next;
               return next;
             });
             setSessionActivity('消息已排队');
           } else if (payloadType === 'chat.user_message_started') {
-            if (payload.message) applyIncomingMessages([{ ...payload.message, queued: false }]);
             setSessionActivity('开始处理');
           } else if (payloadType === 'chat.user_message_committed') {
             applyIncomingMessages(payload.message ? [payload.message] : []);
@@ -2518,6 +2827,7 @@ function App() {
             setMessages((current) => {
               const next = current.length ? mergeMessages(current, initial) : initial;
               messagesRef.current = next;
+              cacheMessages(next);
               return next;
             });
             setMessagesReady(true);
@@ -2533,10 +2843,11 @@ function App() {
 
     closeSocket();
     websocketKeyRef.current = key;
-    messagesRef.current = [];
+    const cachedMessages = readMessageCache(serverId, conversationId, sessionId);
+    messagesRef.current = cachedMessages;
     streamBuffersRef.current = new Map();
-    setMessages([]);
-    setMessagesReady(false);
+    setMessages(cachedMessages);
+    setMessagesReady(cachedMessages.length > 0);
     setSessionActivity('');
     setRunningActivities([]);
     loadInitialMessagePage().catch(() => {
@@ -2713,6 +3024,7 @@ function App() {
       setMessages((current) => {
         const next = mergeMessages(current, older);
         messagesRef.current = next;
+        writeMessageCache(selected.serverId, selected.conversationId, selectedSessionId, next);
         return next;
       });
       return true;
@@ -2802,6 +3114,7 @@ function App() {
           setMessages((current) => {
             const next = mergeMessages(current, incoming);
             messagesRef.current = next;
+            writeMessageCache(selected.serverId, selected.conversationId, selectedSessionId, next);
             return next;
           });
         }
@@ -2895,7 +3208,7 @@ function App() {
         activeRunning={runningActivities.length > 0}
         onSelect={setSelected}
         onOpenSettings={() => setSettingsOpen(true)}
-        onRename={renameSelectedConversation}
+        onRename={openRenameConversationDialog}
         onHide={(conversation) => setConversationHidden(conversation, true)}
         onUnhide={(conversation) => setConversationHidden(conversation, false)}
         onDelete={deleteSelectedConversation}
@@ -2932,6 +3245,7 @@ function App() {
           onRemoveSelectionReference={(id) => setSelectionReferences((current) => current.filter((item) => item.id !== id))}
           onOpenAttachment={openMessageAttachment}
           onDownloadAttachment={downloadMessageAttachment}
+          onResolveAttachmentUrl={resolveMessageAttachmentUrl}
         />
       </main>
       <OverviewPanel
@@ -3018,6 +3332,15 @@ function App() {
         creating={creatingConversation}
         onOpenChange={setNewConversationOpen}
         onCreate={createNewConversation}
+      />
+      <RenameConversationDialog
+        open={Boolean(renamingConversation)}
+        conversation={renamingConversation}
+        saving={renamingConversationSaving}
+        onOpenChange={(open) => {
+          if (!open && !renamingConversationSaving) setRenamingConversation(null);
+        }}
+        onRename={renameSelectedConversation}
       />
       <SettingsDialog
         open={settingsOpen}

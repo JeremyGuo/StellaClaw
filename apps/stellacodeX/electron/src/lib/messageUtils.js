@@ -509,6 +509,11 @@ export function hasOlderMessages(messages) {
 export function mergeMessages(current, incoming) {
   if (!Array.isArray(incoming) || incoming.length === 0) return current;
   const serverEchoes = incoming.filter((message) => String(message?.role || '').toLowerCase() === 'user');
+  const durableAssistantEchoes = incoming.filter((message) => (
+    String(message?.role || '').toLowerCase() === 'assistant'
+    && !message?._streaming
+    && messageText(message).trim()
+  ));
   const committedToolResultIds = new Set(
     incoming.flatMap((message) => (
       messageItems(message)
@@ -524,14 +529,22 @@ export function mergeMessages(current, incoming) {
       .filter((index) => Number.isFinite(index) && index !== Number.MAX_SAFE_INTEGER)
   );
   const currentWithoutEchoedOptimistic = current.filter((message) => {
-    if (message?._streaming && finalizedAssistantIndexes.has(messageIndex(message))) return false;
+    if (
+      message?._streaming
+      && String(message?.role || '').toLowerCase() === 'assistant'
+      && (
+        finalizedAssistantIndexes.has(messageIndex(message))
+        || durableAssistantEchoes.some((incomingMessage) => messageText(incomingMessage).trim() === messageText(message).trim())
+      )
+    ) return false;
     if (
       message?._liveToolResult
       && committedToolResultIds.has(String(message?._liveToolCallId || '').trim())
     ) {
       return false;
     }
-    if (!message?._optimistic) return true;
+    if (!message?._optimistic && !message?.queued && !message?.pending && !message?._userMessageStarted) return true;
+    if (String(message?.role || '').toLowerCase() !== 'user') return true;
     const text = messageText(message).trim();
     return !serverEchoes.some((incomingMessage) => messageText(incomingMessage).trim() === text);
   });
@@ -539,14 +552,123 @@ export function mergeMessages(current, incoming) {
   let changed = currentWithoutEchoedOptimistic.length !== current.length;
   for (const message of incoming) {
     const id = String(message.id ?? messageKey(message, byId.size));
-    const existing = byId.get(id);
+    const existingKey = existingMessageKey(byId, message, id);
+    const existing = byId.get(existingKey);
     if (!existing || stableSignature(existing) !== stableSignature(message)) {
+      if (existingKey !== id) byId.delete(existingKey);
       byId.set(id, message);
       changed = true;
     }
   }
-  if (!changed) return current;
-  return Array.from(byId.values()).sort((left, right) => messageIndex(left) - messageIndex(right));
+  const merged = dedupeMergedMessages(Array.from(byId.values()).sort((left, right) => messageIndex(left) - messageIndex(right)));
+  if (!changed && merged.length === current.length) return current;
+  return merged;
+}
+
+function existingMessageKey(byId, incoming, fallbackId) {
+  if (byId.has(fallbackId)) return fallbackId;
+  const incomingRole = String(incoming?.role || '').toLowerCase();
+  const incomingIndex = messageIndex(incoming);
+  if (Number.isFinite(incomingIndex) && incomingIndex !== Number.MAX_SAFE_INTEGER) {
+    for (const [key, message] of byId.entries()) {
+      if (String(message?.role || '').toLowerCase() === incomingRole && messageIndex(message) === incomingIndex) {
+        return key;
+      }
+    }
+  }
+  if (incomingRole === 'assistant' && incoming?._streaming) {
+    const incomingTurnId = messageStreamTurnId(incoming);
+    if (incomingTurnId) {
+      for (const [key, message] of byId.entries()) {
+        if (
+          String(message?.role || '').toLowerCase() === 'assistant'
+          && message?._streaming
+          && messageStreamTurnId(message) === incomingTurnId
+        ) {
+          return key;
+        }
+      }
+    }
+  }
+  const incomingText = messageText(incoming).trim();
+  if (incomingText) {
+    const incomingClientId = messageClientId(incoming);
+    for (const [key, message] of byId.entries()) {
+      const sameRole = String(message?.role || '').toLowerCase() === incomingRole;
+      if (!sameRole || messageText(message).trim() !== incomingText) continue;
+      const sameClient = incomingClientId && incomingClientId === messageClientId(message);
+      const provisional = isProvisionalMessage(message) || isProvisionalMessage(incoming);
+      const sameUserWithoutDurablePosition = incomingRole === 'user'
+        && (sameClient || provisional || !hasDurablePosition(message) || !hasDurablePosition(incoming));
+      if (provisional || sameUserWithoutDurablePosition) return key;
+    }
+  }
+  return fallbackId;
+}
+
+function messageClientId(message) {
+  return String(
+    message?.client_message_id
+    || message?.clientMessageId
+    || message?._clientMessageId
+    || ''
+  ).trim();
+}
+
+function isProvisionalMessage(message) {
+  return Boolean(message?._streaming || message?._optimistic || message?.queued || message?.pending || message?._userMessageStarted);
+}
+
+function messageStreamTurnId(message) {
+  return String(message?._streamTurnId || message?.turn_id || message?.turnId || '').trim();
+}
+
+function hasDurablePosition(message) {
+  const index = messageIndex(message);
+  return Number.isFinite(index) && index !== Number.MAX_SAFE_INTEGER;
+}
+
+function dedupeMergedMessages(messages) {
+  const result = [];
+  for (const message of messages) {
+    const role = String(message?.role || '').toLowerCase();
+    const text = messageText(message).trim();
+    const index = messageIndex(message);
+    const duplicateIndex = result.findIndex((existing) => {
+      if (String(existing?.role || '').toLowerCase() !== role) return false;
+      const existingIndex = messageIndex(existing);
+      if (
+        Number.isFinite(index)
+        && Number.isFinite(existingIndex)
+        && index !== Number.MAX_SAFE_INTEGER
+        && existingIndex !== Number.MAX_SAFE_INTEGER
+        && index === existingIndex
+      ) return true;
+      if (!text || messageText(existing).trim() !== text) return false;
+      const currentProvisional = isProvisionalMessage(message);
+      const existingProvisional = isProvisionalMessage(existing);
+      if (currentProvisional || existingProvisional) return true;
+      if (role !== 'user') return false;
+      const currentClientId = messageClientId(message);
+      const existingClientId = messageClientId(existing);
+      if (currentClientId && currentClientId === existingClientId) return true;
+      return !hasDurablePosition(message) || !hasDurablePosition(existing);
+    });
+    if (duplicateIndex < 0) {
+      result.push(message);
+      continue;
+    }
+    const existing = result[duplicateIndex];
+    const existingProvisional = isProvisionalMessage(existing);
+    const currentProvisional = isProvisionalMessage(message);
+    if (
+      (existingProvisional && !currentProvisional)
+      || (!hasDurablePosition(existing) && hasDurablePosition(message))
+    ) {
+      result[duplicateIndex] = message;
+    }
+  }
+  return result;
 }
 
 export function websocketUrl(baseUrl, token, conversationId, foregroundSessionId = 'main') {
@@ -653,7 +775,7 @@ function isRoundInterstitialMessage(message) {
 
 function startsToolRound(source, index) {
   const message = source[index];
-  if (isStreamingAssistantMessage(message)) return true;
+  if (isStreamingAssistantMessage(message)) return hasAssistantProcessItems(message);
   if (String(message?.role || '').toLowerCase() !== 'assistant' || isFinalAssistantMessage(message)) return false;
   for (let cursor = index + 1; cursor < source.length; cursor += 1) {
     const current = source[cursor];
@@ -666,4 +788,8 @@ function startsToolRound(source, index) {
 
 function isStreamingAssistantMessage(message) {
   return Boolean(message?._streaming) && String(message?.role || '').toLowerCase() === 'assistant';
+}
+
+function hasAssistantProcessItems(message) {
+  return messageItems(message).some((item) => item?.type === 'reasoning' || item?.type === 'tool_call' || item?.type === 'tool_result');
 }

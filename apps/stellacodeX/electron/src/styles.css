@@ -1019,6 +1019,22 @@ button {
   overflow-y: auto;
   padding: calc(var(--topbar-height) + 18px) max(24px, calc((100% - 920px) / 2)) calc(var(--composer-wrap-height, 156px) + var(--progress-height, 0px) + 18px);
   scroll-padding-top: calc(var(--topbar-height) + 18px);
+  --response-spacer-height: 0px;
+}
+
+.response-spacer {
+  flex: 0 0 auto;
+  height: var(--response-spacer-height, 0px);
+  pointer-events: none;
+  transition: height 160ms ease;
+}
+
+.message-stream-content {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  flex: 0 0 auto;
+  flex-direction: column;
 }
 
 .empty-chat {
@@ -1144,6 +1160,16 @@ button {
   background: color-mix(in srgb, var(--message-user-bg), var(--bg) 8%);
 }
 
+.message.user.pending .message-body,
+.message.user.queued .message-body {
+  border-color: color-mix(in srgb, var(--accent), var(--message-user-border) 52%);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent), transparent 82%);
+}
+
+.message.user.pending .message-body {
+  background: color-mix(in srgb, var(--message-user-bg), var(--bg) 8%);
+}
+
 .message.user.media-combo .message-body {
   gap: 8px;
 }
@@ -1245,10 +1271,61 @@ button {
   margin: 0;
 }
 
+.pending-assistant-placeholder {
+  display: flex;
+  width: 100%;
+  max-width: var(--chat-column-width);
+  min-width: 0;
+  margin: -2px auto 22px;
+  align-items: center;
+  color: var(--muted);
+  content-visibility: visible;
+}
+
+.pending-assistant-placeholder.compact {
+  max-width: 100%;
+  margin: 4px 0 2px;
+  padding: 1px 2px;
+}
+
+.pending-assistant-placeholder.compact span {
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.pending-assistant-placeholder span {
+  display: inline-block;
+  min-width: 0;
+  overflow: hidden;
+  background: linear-gradient(
+    100deg,
+    var(--muted) 0%,
+    var(--muted) 44%,
+    color-mix(in srgb, var(--text), transparent 8%) 50%,
+    var(--muted) 56%,
+    var(--muted) 100%
+  );
+  background-size: 300% 100%;
+  background-repeat: no-repeat;
+  background-position: 100% 0;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  font-size: 14px;
+  font-weight: 650;
+  line-height: 1.45;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  animation: text-shimmer 2.6s linear infinite;
+}
+
 .message-status {
   margin-top: 8px;
-  color: var(--faint);
-  font-size: 11px;
+  padding-right: 10px;
+  color: color-mix(in srgb, var(--accent), var(--faint) 48%);
+  font-size: 11.5px;
+  font-weight: 650;
 }
 
 .message-status.error {
@@ -1888,6 +1965,38 @@ button {
   filter: brightness(1.18);
 }
 
+.assistant-turn {
+  display: grid;
+  width: 100%;
+  max-width: var(--chat-column-width);
+  min-width: 0;
+  margin: 0 auto 22px;
+  gap: 8px;
+}
+
+.assistant-turn > .tool-process-group,
+.assistant-turn > .message {
+  max-width: 100%;
+  margin-left: 0;
+  margin-right: 0;
+}
+
+.assistant-turn > .message {
+  margin-bottom: 0;
+}
+
+.assistant-turn > .message.force-separate {
+  margin-top: 0;
+}
+
+.assistant-turn.complete > .tool-process-group {
+  margin-bottom: 2px;
+}
+
+.assistant-turn.active > .tool-process-group {
+  content-visibility: visible;
+}
+
 .tool-process-group {
   display: grid;
   width: 100%;
@@ -1902,7 +2011,7 @@ button {
 
 .tool-round-toggle {
   display: inline-flex;
-  width: fit-content;
+  width: min(100%, fit-content);
   max-width: 100%;
   min-width: 0;
   min-height: 28px;
@@ -1933,6 +2042,18 @@ button {
   white-space: nowrap;
 }
 
+.tool-round-toggle em {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--faint);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 600;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .tool-round-toggle svg {
   flex: 0 0 auto;
   color: currentColor;
@@ -1943,6 +2064,29 @@ button {
 
 .tool-process-group.open > .tool-round-toggle svg {
   transform: rotate(0deg);
+}
+
+.tool-round-compact {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: -2px;
+}
+
+.tool-round-compact code {
+  max-width: 180px;
+  overflow: hidden;
+  padding: 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--border), transparent 38%);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--panel), transparent 20%);
+  color: var(--faint);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .tool-round-separator {
@@ -2016,18 +2160,21 @@ button {
 
 .tool-process-segment.running .tool-process-toggle span {
   background: linear-gradient(
-    105deg,
+    100deg,
     var(--muted) 0%,
-    var(--muted) 38%,
+    var(--muted) 44%,
     color-mix(in srgb, var(--text), transparent 10%) 50%,
-    var(--muted) 62%,
+    var(--muted) 56%,
     var(--muted) 100%
   );
-  background-size: 220% 100%;
+  background-size: 300% 100%;
+  background-repeat: no-repeat;
+  background-position: 100% 0;
   background-clip: text;
   -webkit-background-clip: text;
   color: transparent;
-  animation: tool-text-shimmer 1.35s ease-in-out infinite;
+  -webkit-text-fill-color: transparent;
+  animation: text-shimmer 2.6s linear infinite;
 }
 
 .tool-process-body {
@@ -2105,6 +2252,80 @@ button {
   animation: live-activity-enter 180ms ease-out both;
 }
 
+.reasoning-note.collapsible {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 5px;
+  padding: 2px 0;
+}
+
+.reasoning-note.collapsible > button {
+  display: flex;
+  min-width: 0;
+  min-height: 27px;
+  align-items: center;
+  gap: 8px;
+  padding: 1px 2px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.reasoning-note.collapsible > button:hover {
+  background: color-mix(in srgb, var(--hover), transparent 72%);
+}
+
+.reasoning-note.collapsible > button > span {
+  flex: 0 0 auto;
+  color: var(--faint);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.reasoning-note.collapsible > button > em {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 600;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reasoning-note.collapsible > button > svg {
+  flex: 0 0 auto;
+  color: var(--faint);
+  transition: transform 140ms ease;
+}
+
+.reasoning-note.collapsible.open > button > svg {
+  transform: rotate(180deg);
+}
+
+.reasoning-note.collapsible.live > button > em {
+  background: linear-gradient(
+    100deg,
+    var(--muted) 0%,
+    var(--muted) 44%,
+    color-mix(in srgb, var(--text), transparent 10%) 50%,
+    var(--muted) 56%,
+    var(--muted) 100%
+  );
+  background-size: 300% 100%;
+  background-repeat: no-repeat;
+  background-position: 100% 0;
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  -webkit-text-fill-color: transparent;
+  animation: text-shimmer 2.6s linear infinite;
+}
+
 .reasoning-note > span {
   color: var(--faint);
   font-size: 11px;
@@ -2177,24 +2398,6 @@ button {
   color: #6ee7a7;
 }
 
-.tool-inline-card.running > summary::after {
-  content: "";
-  position: absolute;
-  inset: 0;
-  z-index: 0;
-  background: linear-gradient(
-    105deg,
-    transparent 0%,
-    transparent 34%,
-    color-mix(in srgb, var(--text), transparent 88%) 48%,
-    transparent 62%,
-    transparent 100%
-  );
-  background-size: 220% 100%;
-  animation: tool-row-shimmer 1.35s ease-in-out infinite;
-  pointer-events: none;
-}
-
 .tool-inline-card summary span {
   flex: 0 0 auto;
   color: var(--muted);
@@ -2233,18 +2436,21 @@ button {
 
 .tool-inline-card.running summary em {
   background: linear-gradient(
-    105deg,
+    100deg,
     var(--muted) 0%,
-    var(--muted) 38%,
+    var(--muted) 44%,
     color-mix(in srgb, var(--text), transparent 12%) 50%,
-    var(--muted) 62%,
+    var(--muted) 56%,
     var(--muted) 100%
   );
-  background-size: 220% 100%;
+  background-size: 300% 100%;
+  background-repeat: no-repeat;
+  background-position: 100% 0;
   background-clip: text;
   -webkit-background-clip: text;
   color: transparent;
-  animation: tool-text-shimmer 1.35s ease-in-out infinite;
+  -webkit-text-fill-color: transparent;
+  animation: text-shimmer 2.6s linear infinite;
 }
 
 .tool-token-usage {
@@ -2341,21 +2547,12 @@ button {
   word-break: break-word;
 }
 
-@keyframes tool-row-shimmer {
-  from {
-    background-position: 140% 0;
+@keyframes text-shimmer {
+  0% {
+    background-position: 100% 0;
   }
-  to {
-    background-position: -80% 0;
-  }
-}
-
-@keyframes tool-text-shimmer {
-  from {
-    background-position: 140% 0;
-  }
-  to {
-    background-position: -80% 0;
+  100% {
+    background-position: 0% 0;
   }
 }
 
@@ -5031,6 +5228,14 @@ button {
   width: min(460px, calc(100vw - 40px));
 }
 
+.rename-conversation-dialog {
+  width: min(420px, calc(100vw - 40px));
+  border-color: color-mix(in srgb, var(--border), transparent 18%);
+  border-radius: 16px;
+  background: color-mix(in srgb, var(--panel-2), var(--panel) 18%);
+  box-shadow: 0 22px 68px rgba(0, 0, 0, 0.42);
+}
+
 .dialog-titlebar {
   display: flex;
   align-items: flex-start;
@@ -5040,14 +5245,51 @@ button {
   border-bottom: 1px solid var(--border);
 }
 
+.rename-dialog-titlebar {
+  align-items: center;
+  padding: 18px 18px 10px;
+  border-bottom: 0;
+}
+
+.rename-dialog-heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+}
+
+.rename-dialog-mark {
+  display: inline-grid;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--accent), transparent 55%);
+  border-radius: 10px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent), transparent 88%);
+  font-size: 14px;
+  font-weight: 800;
+}
+
 .dialog-titlebar h2 {
   margin: 0;
   font-size: 16px;
 }
 
+.rename-dialog-titlebar h2 {
+  font-size: 15px;
+  letter-spacing: 0;
+}
+
 .dialog-titlebar p {
   margin: 5px 0 0;
   color: var(--muted);
+}
+
+.rename-dialog-titlebar p {
+  margin-top: 3px;
+  font-size: 12px;
 }
 
 .dialog-close {
@@ -5073,6 +5315,11 @@ button {
   padding: 18px 20px 20px;
 }
 
+.rename-dialog-form {
+  gap: 16px;
+  padding: 10px 18px 18px;
+}
+
 .form-field {
   display: grid;
   min-width: 0;
@@ -5088,6 +5335,11 @@ button {
   font-size: 11px;
 }
 
+.rename-dialog-field span {
+  font-size: 11px;
+  font-weight: 700;
+}
+
 .form-field input,
 .form-field select {
   width: 100%;
@@ -5101,9 +5353,24 @@ button {
   background: color-mix(in srgb, var(--panel), transparent 4%);
 }
 
+.rename-dialog-field input {
+  height: 42px;
+  padding: 0 13px;
+  border-color: color-mix(in srgb, var(--border), transparent 8%);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--panel), var(--panel-2) 18%);
+  font-size: 15px;
+  font-weight: 650;
+}
+
 .form-field input:focus,
 .form-field select:focus {
   border-color: color-mix(in srgb, var(--accent), transparent 40%);
+}
+
+.rename-dialog-field input:focus {
+  border-color: color-mix(in srgb, var(--accent), transparent 20%);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent), transparent 82%);
 }
 
 .server-preview {
@@ -5128,6 +5395,18 @@ button {
   gap: 8px;
   padding: 14px 20px;
   border-top: 1px solid var(--border);
+}
+
+.rename-dialog-actions {
+  padding: 2px 0 0;
+  border-top: 0;
+}
+
+.rename-dialog-actions .primary-button,
+.rename-dialog-actions .secondary-button {
+  min-height: 34px;
+  padding: 0 15px;
+  border-radius: 11px;
 }
 
 .primary-button,

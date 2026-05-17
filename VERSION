@@ -1,5 +1,22 @@
-version: 1.28.2
+version: 1.28.3
 ---
+
+# 1.28.3
+
+- 修复 SessionActor 工具结果落盘被同步压缩阻塞：
+  `tool_result` / `tool_result_repair` 追加到 durable history 时不再在同一同步路径触发 context compression，避免工具已经完成但工具结果尚未 `MessageAppended` 时，压缩请求、memory context lookup 或 provider summary 阻塞整轮状态推进，表现为前端一直停在某个工具执行中。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 StellaCodeX Electron final 消息图片附件渲染：
+  Durable `FileItem` 中的 `file://` / 本地路径图片不再直接作为 `<img src>` 使用；Electron 会按当前 Conversation workspace root 映射成 workspace 相对路径，通过现有 workspace file API 拉取图片内容并缓存为 data URL 后展示，避免历史 final assistant 消息里的图片附件显示为破图。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 StellaCodeX Electron 右键菜单重命名入口：
+  Conversation 重命名改为应用内 Dialog，不再依赖右键菜单选中事件里触发原生 `window.prompt`，避免 ContextMenu 关闭 / 焦点恢复和浏览器用户激活策略导致点击“重命名 Conversation”没有任何输入框；Session 右键菜单中的 prompt / confirm 类操作也会在菜单关闭后的下一轮事件循环触发。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 修复 StellaCodeX Electron 用户消息重复和附件源 Conversation 解析：
+  `chat.user_message_queued` / `chat.user_message_started` 不再把同一条用户消息再次插入消息列表，只更新本地 pending / queued 状态，落盘后的 durable 用户消息会替换临时消息；消息合并逻辑会按 durable index、client message id 和临时状态清理用户消息回声，避免发送后出现两份或多份用户气泡。chat snapshot 里的 provisional assistant message 和后续 stream delta 会按 turn id / message id 合并到同一条流式消息，避免切换 / 重连后同一段 assistant 文本临时显示两份。历史 final 消息附件若携带跨 Conversation 的绝对 `file://` 路径，预览、打开和下载都会解析路径中的源 Conversation id 再调用 workspace file API，避免使用当前 Conversation id 访问不存在的文件。本次不改变 `config` schema，不改变 `workdir` schema。
+
+- 优化 StellaCodeX Electron 发送和流式回复显示：
+  用户消息刚发送时会保留 pending/queued 可见状态和轻量高光，等待响应状态不再被隐藏；assistant streaming 文本和工具 round 中间文本会在前端按当前 delta 缓冲做平滑打字机显示，后端仍按原始 `chat.stream_assistant_message_delta` 逐事件转发，不改变 stream 协议。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.28.2
 
