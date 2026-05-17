@@ -31,7 +31,7 @@ use crate::{
 
 use super::{
     control::control_ingress_from_text,
-    history::{decorate_message, message_log_path, message_summary, read_messages},
+    history::{decorate_message, MessageSummary},
     http::{
         parse_json, parse_optional_json, query_usize, read_http_request, split_path,
         write_response, HttpError, HttpRequest, HttpResponse, HttpResult,
@@ -541,6 +541,47 @@ impl WebChannel {
         ))
     }
 
+    fn query_message_summary(
+        &self,
+        conversation_id: &str,
+        foreground_session_id: &str,
+    ) -> HttpResult<MessageSummary> {
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)
+            .map_err(HttpError::internal)?;
+        let request_id = generated_request_id("message-summary");
+        let rx = self
+            .conversation_runtime
+            .send_main_channel_ingress_subscribed(
+                conversation_id,
+                ChannelIngress::QueryMessageHistory {
+                    foreground_session_id: Some(foreground_session_id.to_string()),
+                    request_id: request_id.clone(),
+                    offset: 0,
+                    limit: 0,
+                },
+            )
+            .map_err(HttpError::internal)?;
+        let history = wait_for_event(&rx, Duration::from_secs(10), |event| match event {
+            KernelChannelEvent::MessageHistory { history } if history.request_id == request_id => {
+                Some(history)
+            }
+            _ => None,
+        })?;
+        Ok(MessageSummary {
+            message_count: history.total,
+            last_message_id: history
+                .last_message
+                .as_ref()
+                .map(|record| record.message.message_id.clone())
+                .filter(|id| !id.is_empty()),
+            last_message_index: history.last_message.as_ref().map(|record| record.index),
+            last_message_time: history
+                .last_message
+                .and_then(|record| record.message.message_time),
+        })
+    }
+
     fn post_message(
         &self,
         conversation_id: &str,
@@ -684,11 +725,9 @@ impl WebChannel {
 
     fn conversation_summary(&self, metadata: &ConversationMetadata) -> HttpResult<Value> {
         let default_session_id = default_foreground_route_id(metadata);
-        let summary = message_summary(&message_log_path(
-            &self.workdir,
-            &metadata.conversation_id,
-            &default_session_id,
-        ));
+        let summary = self
+            .query_message_summary(&metadata.conversation_id, &default_session_id)
+            .unwrap_or_default();
         let processing_state = self.main.processing_state(&metadata.platform_chat_id);
         let runtime_config = load_runtime_config(&self.workdir, &metadata.conversation_id).ok();
         Ok(json!({
@@ -737,11 +776,9 @@ impl WebChannel {
         foreground_session_id: &str,
     ) -> Value {
         let storage_id = foreground_session_storage_id(foreground_session_id);
-        let summary = message_summary(&message_log_path(
-            &self.workdir,
-            &metadata.conversation_id,
-            foreground_session_id,
-        ));
+        let summary = self
+            .query_message_summary(&metadata.conversation_id, foreground_session_id)
+            .unwrap_or_default();
         let seen = self
             .main
             .seen_state(&metadata.conversation_id, foreground_session_id);
@@ -806,24 +843,19 @@ impl WebChannel {
         let (rx, live) = self
             .main
             .subscribe_chat(conversation_id, foreground_session_id)?;
-        let messages = read_messages(&message_log_path(
-            &self.workdir,
-            conversation_id,
-            foreground_session_id,
-        ))
-        .unwrap_or_default();
+        let summary = self
+            .query_message_summary(conversation_id, foreground_session_id)
+            .unwrap_or_default();
         send_websocket_json(
             &mut stream,
             &json!({
                 "type": "chat.snapshot",
                 "conversation_id": conversation_id,
                 "foreground_session_id": foreground_session_id,
-                "total": messages.len(),
-                "next_message_index": messages.len(),
-                "last_committed_message_id": messages.last().and_then(|message| {
-                    message.get("message_id").or_else(|| message.get("id")).and_then(Value::as_str)
-                }),
-                "last_committed_message_index": messages.last().and_then(|message| message.get("index")).and_then(Value::as_u64),
+                "total": summary.message_count,
+                "next_message_index": summary.message_count,
+                "last_committed_message_id": summary.last_message_id,
+                "last_committed_message_index": summary.last_message_index,
                 "current_turn_state": live.current_turn_state,
                 "current_provisional_assistant_message": live.current_provisional_assistant_message,
                 "running_tool_results": live.running_tool_results,
