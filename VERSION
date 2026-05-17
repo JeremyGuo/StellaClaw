@@ -9,6 +9,9 @@ version: 1.28.0
 - 清理旧 Channel 层状态 / 进度事件死代码：
   删除不再由新 `conversation_new` service-tree 生产的旧 `ChannelEvent::ProgressFeedback`、`ConversationUpdated` 和 `Status` 事件，以及对应的 Web / Telegram 进度消息缓存、状态文本渲染和旧 token usage 汇总结构；Web 状态查询继续走 `ChannelIngress::QueryForegroundStatus` / StatusService，前台实时渲染继续走 session stream typed events，避免旧兼容分支和新消息 API 并存。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 清理旧 Channel delivery 壳和冗余 warning：
+  删除旧 `OutgoingDelivery` / `OutgoingAttachment` 输出结构、通用 `Channel::send_delivery` trait 方法和已无生产方的 `DeleteConversation` ingress variant；Telegram 改为直接从 durable `message_appended` 渲染 assistant 消息，Web 继续按 typed message / session / home events 投影。同时删除旧 delivery 清理后暴露出的 dead code warning，包括未使用的 caption 常量、`OutgoingOptions.prompt`、`is_available_agent_model`、`ConversationIdManager::remove_mapping` 和 `WorkdirLayout::runtime_shared_root`。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 收敛用户消息生命周期和旧 delivery/progress 投影：
   ChannelService 收到平台输入后会先发 `UserMessageQueued`，AgentSessionService 在开始处理用户消息和用户消息落盘后分别投影 `UserMessageStarted` / `UserMessageCommitted`，Web chat stream 对应新增 `chat.user_message_queued`、`chat.user_message_started` 和 `chat.user_message_committed` typed events；同时删除旧 Channel `Deliver` request / `Delivery` event、`chat.delivery` 投影和 AgentSession 层 `Progress` 事件，计划更新只走 `PlanUpdated`，普通进度文本不再伪装成协议消息。本次不改变 `config` schema，不改变 `workdir` schema。
 

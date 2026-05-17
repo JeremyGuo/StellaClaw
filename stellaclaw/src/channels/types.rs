@@ -1,6 +1,3 @@
-use std::path::PathBuf;
-
-use crossbeam_channel::Sender;
 use serde::Serialize;
 use serde_json::Value;
 use stellaclaw_core::session_actor::{ChatMessage, FileItem, SelectionReferenceItem};
@@ -59,12 +56,6 @@ pub(crate) fn parse_reasoning_control_argument(argument: &str) -> ConversationCo
 #[derive(Debug, Clone)]
 pub enum IncomingDispatch {
     Message(IncomingMessageDispatch),
-    DeleteConversation {
-        channel_id: String,
-        platform_chat_id: String,
-        conversation_id: String,
-        response_tx: Sender<Result<(), String>>,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -86,12 +77,6 @@ pub enum OutgoingAttachmentKind {
 }
 
 #[derive(Debug, Clone)]
-pub struct OutgoingAttachment {
-    pub path: PathBuf,
-    pub kind: OutgoingAttachmentKind,
-}
-
-#[derive(Debug, Clone)]
 pub struct OutgoingOption {
     pub label: String,
     pub value: String,
@@ -99,21 +84,7 @@ pub struct OutgoingOption {
 
 #[derive(Debug, Clone)]
 pub struct OutgoingOptions {
-    pub prompt: String,
     pub options: Vec<OutgoingOption>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct OutgoingDelivery {
-    pub channel_id: String,
-    pub platform_chat_id: String,
-    pub conversation_id: String,
-    pub session_id: Option<String>,
-    pub message: Option<ChatMessage>,
-    pub text: String,
-    pub attachments: Vec<OutgoingAttachment>,
-    pub options: Option<OutgoingOptions>,
 }
 
 #[derive(Debug, Clone)]

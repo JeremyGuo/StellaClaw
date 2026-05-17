@@ -254,25 +254,6 @@ fn run_channel_ingress_loop(
                     );
                 }
             }
-            IncomingDispatch::DeleteConversation {
-                channel_id,
-                platform_chat_id,
-                conversation_id,
-                response_tx,
-            } => {
-                let result = conversation_runtime
-                    .stop_conversation(&conversation_id, "conversation deleted")
-                    .map_err(|error| format!("{error:#}"));
-                logger.info(
-                    "conversation_shutdown_for_delete",
-                    serde_json::json!({
-                        "conversation_id": conversation_id,
-                        "channel_id": channel_id,
-                        "platform_chat_id": platform_chat_id,
-                    }),
-                );
-                let _ = response_tx.send(result);
-            }
         }
     }
     Ok(())

@@ -387,12 +387,6 @@ impl StellaclawConfig {
         self.models.get(name).cloned()
     }
 
-    pub fn is_available_agent_model(&self, name: &str) -> bool {
-        self.available_agent_models()
-            .iter()
-            .any(|(alias, _model)| alias.as_str() == name)
-    }
-
     pub fn available_agent_models(&self) -> Vec<(&String, &ModelConfig)> {
         if self.available_agent_models.is_empty() {
             return self

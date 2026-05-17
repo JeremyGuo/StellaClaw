@@ -45,8 +45,8 @@ use super::{
     websocket::{accept_websocket, send_websocket_json, websocket_event_loop},
 };
 use crate::channels::{
-    Channel, IncomingDispatch, OutgoingDelivery, OutgoingError, OutgoingMessageAppended,
-    OutgoingSessionStream, ProcessingState,
+    Channel, IncomingDispatch, OutgoingError, OutgoingMessageAppended, OutgoingSessionStream,
+    ProcessingState,
 };
 
 pub struct WebChannel {
@@ -989,11 +989,6 @@ impl WebChannel {
 impl Channel for WebChannel {
     fn id(&self) -> &str {
         &self.id
-    }
-
-    fn send_delivery(&self, delivery: &OutgoingDelivery) -> Result<()> {
-        let _ = delivery;
-        Ok(())
     }
 
     fn message_appended(&self, appended: &OutgoingMessageAppended) -> Result<()> {

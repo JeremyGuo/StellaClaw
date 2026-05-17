@@ -14,7 +14,7 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use stellaclaw_core::session_actor::{
-    ChatMessage, ChatMessageItem, FileItem, FileState, ToolCallItem,
+    ChatMessage, ChatMessageItem, ChatRole, FileItem, FileState, ToolCallItem,
 };
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -23,8 +23,8 @@ use crate::{conversation_id_manager::ConversationIdManager, logger::StellaclawLo
 use super::{
     types::{
         parse_reasoning_control_argument, ConversationControl, IncomingConversationMessage,
-        IncomingDispatch, IncomingMessageDispatch, OutgoingAttachment, OutgoingAttachmentKind,
-        OutgoingDelivery, OutgoingError, OutgoingOptions, ProcessingState,
+        IncomingDispatch, IncomingMessageDispatch, OutgoingAttachmentKind, OutgoingError,
+        OutgoingMessageAppended, OutgoingOptions, ProcessingState,
     },
     Channel,
 };
@@ -67,7 +67,6 @@ pub struct TelegramChannel {
 
 impl TelegramChannel {
     const MAX_MESSAGE_CHARS: usize = 4096;
-    const MAX_CAPTION_CHARS: usize = 1024;
 
     pub fn new(
         id: String,
@@ -581,88 +580,6 @@ impl TelegramChannel {
         Ok(())
     }
 
-    fn send_attachment(
-        &self,
-        platform_chat_id: &str,
-        attachment: &OutgoingAttachment,
-        caption: Option<&str>,
-    ) -> Result<()> {
-        let chat_id = platform_chat_id.to_string();
-        let bytes = fs::read(&attachment.path)
-            .with_context(|| format!("failed to read {}", attachment.path.display()))?;
-        let file_name = attachment
-            .path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or("attachment.bin")
-            .to_string();
-        let part = reqwest::blocking::multipart::Part::bytes(bytes).file_name(file_name);
-        let field = match attachment.kind {
-            OutgoingAttachmentKind::Image => "photo",
-            OutgoingAttachmentKind::Audio => "audio",
-            OutgoingAttachmentKind::Voice => "voice",
-            OutgoingAttachmentKind::Video => "video",
-            OutgoingAttachmentKind::Animation => "animation",
-            OutgoingAttachmentKind::Document => "document",
-        };
-        let method = match attachment.kind {
-            OutgoingAttachmentKind::Image => "sendPhoto",
-            OutgoingAttachmentKind::Audio => "sendAudio",
-            OutgoingAttachmentKind::Voice => "sendVoice",
-            OutgoingAttachmentKind::Video => "sendVideo",
-            OutgoingAttachmentKind::Animation => "sendAnimation",
-            OutgoingAttachmentKind::Document => "sendDocument",
-        };
-        let mut trailing_text_chunks = Vec::new();
-        let form = reqwest::blocking::multipart::Form::new()
-            .text("chat_id", chat_id.clone())
-            .part(field.to_string(), part);
-        let form = if let Some(caption) = caption.filter(|value| !value.trim().is_empty()) {
-            let mut rendered =
-                render_markdown_chunks_to_telegram_entities(caption, Self::MAX_CAPTION_CHARS)
-                    .into_iter();
-            let first = rendered.next().unwrap_or_else(|| TelegramRenderedText {
-                text: String::new(),
-                entities: Vec::new(),
-            });
-            trailing_text_chunks = rendered.collect();
-            let mut form = form.text("caption", first.text);
-            if !first.entities.is_empty() {
-                form = form.text(
-                    "caption_entities",
-                    serde_json::to_string(&first.entities)
-                        .context("failed to encode telegram caption entities")?,
-                );
-            }
-            form
-        } else {
-            form
-        };
-        let response = self
-            .client
-            .post(self.method_url(method))
-            .multipart(form)
-            .send()
-            .with_context(|| format!("telegram API call {method} failed"))?;
-        let envelope = response
-            .json::<TelegramEnvelope<serde_json::Value>>()
-            .with_context(|| format!("telegram API {method} returned invalid JSON"))?;
-        if !envelope.ok {
-            return Err(anyhow!(
-                "telegram API {} failed: {}",
-                method,
-                envelope
-                    .description
-                    .unwrap_or_else(|| "unknown".to_string())
-            ));
-        }
-        for chunk in trailing_text_chunks {
-            let payload = build_send_text_payload(&chat_id, chunk, None)?;
-            let _: serde_json::Value = self.call_api("sendMessage", &payload)?;
-        }
-        Ok(())
-    }
-
     fn save_security_state(&self) -> Result<()> {
         let security = self
             .security
@@ -817,35 +734,6 @@ impl Channel for TelegramChannel {
         Ok(())
     }
 
-    fn send_delivery(&self, delivery: &OutgoingDelivery) -> Result<()> {
-        let options = delivery.options.as_ref();
-        let rendered_message = delivery.message.as_ref().map(render_chat_message);
-        let text = if !delivery.text.trim().is_empty() {
-            delivery.text.as_str()
-        } else if let Some(rendered) = rendered_message
-            .as_deref()
-            .filter(|text| !text.trim().is_empty())
-        {
-            rendered
-        } else if let Some(options) = options {
-            options.prompt.as_str()
-        } else {
-            ""
-        };
-        if !text.trim().is_empty() && (delivery.attachments.is_empty() || options.is_some()) {
-            self.send_text(&delivery.platform_chat_id, text, options)?;
-        }
-        let mut attachment_caption = (!text.trim().is_empty() && options.is_none()).then_some(text);
-        for attachment in &delivery.attachments {
-            self.send_attachment(
-                &delivery.platform_chat_id,
-                attachment,
-                attachment_caption.take(),
-            )?;
-        }
-        Ok(())
-    }
-
     fn send_error(&self, error: &OutgoingError) -> Result<()> {
         let mut text = error.message.clone();
         if let Some(action) = error
@@ -857,6 +745,17 @@ impl Channel for TelegramChannel {
             text.push_str(action);
         }
         self.send_text(&error.platform_chat_id, &text, None)
+    }
+
+    fn message_appended(&self, appended: &OutgoingMessageAppended) -> Result<()> {
+        if appended.message.role != ChatRole::Assistant {
+            return Ok(());
+        }
+        let text = render_chat_message(&appended.message);
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        self.send_text(&appended.platform_chat_id, &text, None)
     }
 
     fn spawn_ingress(
@@ -2971,7 +2870,6 @@ mod tests {
                 }],
             },
             Some(&OutgoingOptions {
-                prompt: "Choose".to_string(),
                 options: vec![
                     OutgoingOption {
                         label: "One".to_string(),

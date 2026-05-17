@@ -41,10 +41,6 @@ impl WorkdirLayout {
         self.workdir.join("rundir")
     }
 
-    pub(crate) fn runtime_shared_root(&self) -> PathBuf {
-        self.runtime_root().join("shared")
-    }
-
     pub(crate) fn runtime_skill_root(&self) -> PathBuf {
         self.runtime_root().join(".stellaclaw").join("skill")
     }
