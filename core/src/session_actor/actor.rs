@@ -286,15 +286,32 @@ impl SessionActor {
             Some(initial) => initial,
             None => return Ok(None),
         };
+        let started_at = Instant::now();
+        self.log_info(
+            "system_prompt_build_started",
+            serde_json::json!({
+                "provider_type": &self.model_config.provider_type,
+                "model_name": &self.model_config.model_name,
+            }),
+        );
         let provider_common_prompt = self
             .provider
             .system_prompt_for_model(&self.model_config)
             .map_err(SessionActorError::from_provider_error)?;
-        Ok(Some(system_prompt_for_initial_with_common_prompt(
+        let system_prompt = system_prompt_for_initial_with_common_prompt(
             initial,
             &self.runtime_metadata_state,
             provider_common_prompt.as_deref(),
-        )))
+        );
+        self.log_info(
+            "system_prompt_build_completed",
+            serde_json::json!({
+                "elapsed_ms": started_at.elapsed().as_millis(),
+                "provider_common_prompt": provider_common_prompt.is_some(),
+                "system_prompt_chars": system_prompt.len(),
+            }),
+        );
+        Ok(Some(system_prompt))
     }
 
     fn provider_enabled_tool_names(&self) -> BTreeSet<String> {
@@ -1804,13 +1821,72 @@ impl SessionActor {
                 "result_items": tool_message.data.len(),
             }),
         );
-        self.mark_loaded_skills_from_message(&tool_message, active.turn_number)?;
+        let mark_started_at = Instant::now();
+        self.log_info(
+            "tool_result_mark_skills_started",
+            serde_json::json!({
+                "turn_id": &active.turn_id,
+                "batch_id": &active.handle.batch_id,
+                "turn_number": active.turn_number,
+                "result_items": tool_message.data.len(),
+            }),
+        );
+        let marked_skill_count =
+            self.mark_loaded_skills_from_message(&tool_message, active.turn_number)?;
+        self.log_info(
+            "tool_result_mark_skills_completed",
+            serde_json::json!({
+                "turn_id": &active.turn_id,
+                "batch_id": &active.handle.batch_id,
+                "marked_skill_count": marked_skill_count,
+                "elapsed_ms": mark_started_at.elapsed().as_millis(),
+            }),
+        );
+        let append_started_at = Instant::now();
+        self.log_info(
+            "tool_result_append_started",
+            serde_json::json!({
+                "turn_id": &active.turn_id,
+                "batch_id": &active.handle.batch_id,
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+            }),
+        );
         let tool_message_index =
             self.append_history_message("tool_result", tool_message.clone())?;
+        self.log_info(
+            "tool_result_append_completed",
+            serde_json::json!({
+                "turn_id": &active.turn_id,
+                "batch_id": &active.handle.batch_id,
+                "message_index": tool_message_index,
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+                "elapsed_ms": append_started_at.elapsed().as_millis(),
+            }),
+        );
+        let emit_started_at = Instant::now();
+        self.log_info(
+            "tool_result_emit_started",
+            serde_json::json!({
+                "turn_id": &active.turn_id,
+                "batch_id": &active.handle.batch_id,
+                "message_index": tool_message_index,
+            }),
+        );
         self.emit(SessionEvent::MessageAppended {
             index: tool_message_index,
             message: tool_message,
         })?;
+        self.log_info(
+            "tool_result_emit_completed",
+            serde_json::json!({
+                "turn_id": &active.turn_id,
+                "batch_id": &active.handle.batch_id,
+                "message_index": tool_message_index,
+                "elapsed_ms": emit_started_at.elapsed().as_millis(),
+            }),
+        );
         if active.interrupt == Some(ToolBatchInterrupt::SupersededByUserMessage) {
             self.log_info(
                 "tool_batch_superseded_by_user_message",
@@ -1876,30 +1952,111 @@ impl SessionActor {
         phase: &str,
         mut message: ChatMessage,
     ) -> Result<usize, SessionActorError> {
+        let append_started_at = Instant::now();
         let index = self.all_messages.len();
         if !message_id_has_all_messages_index(&message.message_id) {
             message.message_id = message_id_for_all_messages_index(index);
         }
+        self.log_info(
+            "append_history_message_started",
+            serde_json::json!({
+                "phase": phase,
+                "index": index,
+                "message_role": message.role,
+                "message_items": message.data.len(),
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+                "has_compressor": self.compressor.is_some(),
+            }),
+        );
         let Some(compressor) = self.compressor.clone() else {
             self.all_messages.push(message.clone());
             self.history.push(message);
             self.persist_state_if_history_closed(phase)?;
+            self.log_info(
+                "append_history_message_completed",
+                serde_json::json!({
+                    "phase": phase,
+                    "index": index,
+                    "mode": "no_compressor",
+                    "history_len": self.history.len(),
+                    "all_messages_len": self.all_messages.len(),
+                    "elapsed_ms": append_started_at.elapsed().as_millis(),
+                }),
+            );
             return Ok(index);
         };
 
         self.all_messages.push(message.clone());
         if append_phase_should_defer_compression(phase) {
+            self.log_info(
+                "append_history_message_compression_deferred",
+                serde_json::json!({
+                    "phase": phase,
+                    "index": index,
+                    "history_len": self.history.len(),
+                    "all_messages_len": self.all_messages.len(),
+                }),
+            );
             self.history.push(message);
             self.persist_state_if_history_closed(phase)?;
+            self.log_info(
+                "append_history_message_completed",
+                serde_json::json!({
+                    "phase": phase,
+                    "index": index,
+                    "mode": "compression_deferred",
+                    "history_len": self.history.len(),
+                    "all_messages_len": self.all_messages.len(),
+                    "elapsed_ms": append_started_at.elapsed().as_millis(),
+                }),
+            );
             return Ok(index);
         }
+        let system_prompt_started_at = Instant::now();
+        self.log_info(
+            "append_history_system_prompt_started",
+            serde_json::json!({
+                "phase": phase,
+                "index": index,
+            }),
+        );
         let system_prompt = self.system_prompt_for_current_initial()?;
-        if compressor
+        self.log_info(
+            "append_history_system_prompt_completed",
+            serde_json::json!({
+                "phase": phase,
+                "index": index,
+                "has_system_prompt": system_prompt.is_some(),
+                "elapsed_ms": system_prompt_started_at.elapsed().as_millis(),
+            }),
+        );
+        let would_compress_started_at = Instant::now();
+        let would_compress = compressor
             .would_compress_with_next(&self.history, &message)
-            .unwrap_or(false)
-        {
+            .unwrap_or(false);
+        self.log_info(
+            "append_history_would_compress_checked",
+            serde_json::json!({
+                "phase": phase,
+                "index": index,
+                "would_compress": would_compress,
+                "elapsed_ms": would_compress_started_at.elapsed().as_millis(),
+            }),
+        );
+        if would_compress {
             self.flush_all_messages_before_compression(phase)?;
         }
+        let compression_started_at = Instant::now();
+        self.log_info(
+            "append_history_compression_append_started",
+            serde_json::json!({
+                "phase": phase,
+                "index": index,
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+            }),
+        );
         let report = {
             let mut request_too_large_attempts = 0usize;
             loop {
@@ -1940,12 +2097,34 @@ impl SessionActor {
                 }
             }
         };
+        self.log_info(
+            "append_history_compression_append_completed",
+            serde_json::json!({
+                "phase": phase,
+                "index": index,
+                "compressed": report.compressed,
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+                "elapsed_ms": compression_started_at.elapsed().as_millis(),
+            }),
+        );
         self.log_compression_report(phase, &report);
         if report.compressed {
             self.runtime_metadata_state
                 .promote_notified_components_to_system_snapshot();
         }
         self.persist_state_if_history_closed(phase)?;
+        self.log_info(
+            "append_history_message_completed",
+            serde_json::json!({
+                "phase": phase,
+                "index": index,
+                "mode": "compression_checked",
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+                "elapsed_ms": append_started_at.elapsed().as_millis(),
+            }),
+        );
         Ok(index)
     }
 
@@ -2083,14 +2262,15 @@ impl SessionActor {
         &mut self,
         message: &ChatMessage,
         turn_number: u64,
-    ) -> Result<(), SessionActorError> {
+    ) -> Result<usize, SessionActorError> {
         let skill_names = loaded_skill_names_from_message(message);
         if skill_names.is_empty() {
-            return Ok(());
+            return Ok(0);
         }
+        let marked_skill_count = skill_names.len();
         self.runtime_metadata_state
             .mark_loaded_skills(&skill_names, turn_number);
-        Ok(())
+        Ok(marked_skill_count)
     }
 
     fn restore_persisted_state(
@@ -2183,7 +2363,42 @@ impl SessionActor {
             );
             return Ok(());
         }
-        self.persist_state()
+        let started_at = Instant::now();
+        self.log_info(
+            "session_state_persist_started",
+            serde_json::json!({
+                "phase": phase,
+                "history_len": self.history.len(),
+                "all_messages_len": self.all_messages.len(),
+            }),
+        );
+        match self.persist_state() {
+            Ok(()) => {
+                self.log_info(
+                    "session_state_persist_completed",
+                    serde_json::json!({
+                        "phase": phase,
+                        "history_len": self.history.len(),
+                        "all_messages_len": self.all_messages.len(),
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                    }),
+                );
+                Ok(())
+            }
+            Err(error) => {
+                self.log_error(
+                    "session_state_persist_failed",
+                    serde_json::json!({
+                        "phase": phase,
+                        "history_len": self.history.len(),
+                        "all_messages_len": self.all_messages.len(),
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                        "error": error.to_string(),
+                    }),
+                );
+                Err(error)
+            }
+        }
     }
 
     fn log_compression_report(&self, phase: &str, report: &CompressionReport) {
