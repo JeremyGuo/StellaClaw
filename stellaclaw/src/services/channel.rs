@@ -312,6 +312,43 @@ fn handle_channel_request(
                     }),
                 }))?;
             }
+            Ok(AgentSessionResponse::MessageHistory { history }) => {
+                emit_channel_event(
+                    event_tx,
+                    ChannelEvent::MessageHistory {
+                        history: history.clone(),
+                    },
+                )?;
+                ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
+                    addr: ctx.addr.clone(),
+                    label: "message_history".to_string(),
+                    detail: serde_json::json!({
+                        "request_id": history.request_id,
+                        "offset": history.offset,
+                        "limit": history.limit,
+                        "total": history.total,
+                        "messages": history.messages.len(),
+                        "has_last_message": history.last_message.is_some(),
+                    }),
+                }))?;
+            }
+            Ok(AgentSessionResponse::MessageDetail { request_id, record }) => {
+                emit_channel_event(
+                    event_tx,
+                    ChannelEvent::MessageDetail {
+                        request_id: request_id.clone(),
+                        record: record.clone(),
+                    },
+                )?;
+                ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
+                    addr: ctx.addr.clone(),
+                    label: "message_detail".to_string(),
+                    detail: serde_json::json!({
+                        "request_id": request_id,
+                        "found": record.is_some(),
+                    }),
+                }))?;
+            }
             Ok(AgentSessionResponse::Stopped) => {
                 emit_channel_event(event_tx, ChannelEvent::AgentSessionStopped)?;
                 ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
@@ -547,6 +584,35 @@ fn handle_channel_ingress(
                     ctx.addr.clone(),
                     foreground_target(ctx, foreground_session_id.as_deref()),
                 )?))?;
+        }
+        ChannelIngress::QueryMessageHistory {
+            foreground_session_id,
+            request_id,
+            offset,
+            limit,
+        } => {
+            ctx.outbox
+                .send(ServiceOutput::Call(agent_session::query_messages_call(
+                    ctx.addr.clone(),
+                    foreground_target(ctx, foreground_session_id.as_deref()),
+                    request_id,
+                    offset,
+                    limit,
+                )?))?;
+        }
+        ChannelIngress::QueryMessageDetail {
+            foreground_session_id,
+            request_id,
+            message_id,
+        } => {
+            ctx.outbox.send(ServiceOutput::Call(
+                agent_session::query_message_detail_call(
+                    ctx.addr.clone(),
+                    foreground_target(ctx, foreground_session_id.as_deref()),
+                    request_id,
+                    message_id,
+                )?,
+            ))?;
         }
         ChannelIngress::CreateForegroundSession { requested_id } => {
             ctx.outbox

@@ -461,23 +461,42 @@ impl WebChannel {
     ) -> HttpResult {
         let offset = query_usize(query, "offset", 0);
         let limit = query_usize(query, "limit", 80).min(200);
-        let messages = read_messages(&message_log_path(
-            &self.workdir,
-            conversation_id,
-            foreground_session_id,
-        ))?;
-        let total = messages.len();
-        let start = offset.min(total);
-        let end = start.saturating_add(limit).min(total);
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)
+            .map_err(HttpError::internal)?;
+        let request_id = generated_request_id("messages");
+        let rx = self
+            .conversation_runtime
+            .send_main_channel_ingress_subscribed(
+                conversation_id,
+                ChannelIngress::QueryMessageHistory {
+                    foreground_session_id: Some(foreground_session_id.to_string()),
+                    request_id: request_id.clone(),
+                    offset,
+                    limit,
+                },
+            )
+            .map_err(HttpError::internal)?;
+        let history = wait_for_event(&rx, Duration::from_secs(10), |event| match event {
+            KernelChannelEvent::MessageHistory { history } if history.request_id == request_id => {
+                Some(history)
+            }
+            _ => None,
+        })?;
+        let messages = history
+            .messages
+            .iter()
+            .map(|record| decorate_message(&record.message, record.index))
+            .collect::<Vec<_>>();
         Ok(HttpResponse::json(
             200,
             json!({
                 "conversation_id": conversation_id,
                 "foreground_session_id": foreground_session_id,
-                "offset": offset,
-                "limit": limit,
-                "total": total,
-                "messages": &messages[start..end],
+                "offset": history.offset,
+                "limit": history.limit,
+                "total": history.total,
+                "messages": messages,
             }),
         ))
     }
@@ -488,25 +507,30 @@ impl WebChannel {
         foreground_session_id: &str,
         message_id: &str,
     ) -> HttpResult {
-        let messages = read_messages(&message_log_path(
-            &self.workdir,
-            conversation_id,
-            foreground_session_id,
-        ))?;
-        let message = messages
-            .into_iter()
-            .find(|message| {
-                message
-                    .get("message_id")
-                    .or_else(|| message.get("id"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| id == message_id)
-                    || message
-                        .get("index")
-                        .and_then(Value::as_u64)
-                        .is_some_and(|index| index.to_string() == message_id)
-            })
-            .ok_or_else(|| HttpError::new(404, "message_not_found"))?;
+        self.conversation_runtime
+            .ensure_conversation_started(conversation_id)
+            .map_err(HttpError::internal)?;
+        let request_id = generated_request_id("message-detail");
+        let rx = self
+            .conversation_runtime
+            .send_main_channel_ingress_subscribed(
+                conversation_id,
+                ChannelIngress::QueryMessageDetail {
+                    foreground_session_id: Some(foreground_session_id.to_string()),
+                    request_id: request_id.clone(),
+                    message_id: message_id.to_string(),
+                },
+            )
+            .map_err(HttpError::internal)?;
+        let record = wait_for_event(&rx, Duration::from_secs(10), |event| match event {
+            KernelChannelEvent::MessageDetail {
+                request_id: id,
+                record,
+            } if id == request_id => Some(record),
+            _ => None,
+        })?
+        .ok_or_else(|| HttpError::new(404, "message_not_found"))?;
+        let message = decorate_message(&record.message, record.index);
         Ok(HttpResponse::json(
             200,
             json!({

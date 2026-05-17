@@ -67,6 +67,24 @@ pub struct AgentSessionContext {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSessionMessageRecord {
+    pub index: usize,
+    pub message: ChatMessage,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSessionMessageHistory {
+    pub request_id: String,
+    pub offset: usize,
+    pub limit: usize,
+    pub total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message: Option<AgentSessionMessageRecord>,
+    #[serde(default)]
+    pub messages: Vec<AgentSessionMessageRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentSessionRequest {
     EnqueueMessage {
@@ -95,6 +113,15 @@ pub enum AgentSessionRequest {
         query_id: String,
         #[serde(default)]
         payload: Value,
+    },
+    QueryMessages {
+        request_id: String,
+        offset: usize,
+        limit: usize,
+    },
+    QueryMessageDetail {
+        request_id: String,
+        message_id: String,
     },
     QueryStatus,
     UpdateLaunchConfig {
@@ -230,6 +257,14 @@ pub enum AgentSessionResponse {
         query_id: String,
         context: AgentSessionContext,
     },
+    MessageHistory {
+        history: AgentSessionMessageHistory,
+    },
+    MessageDetail {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record: Option<AgentSessionMessageRecord>,
+    },
     Stopped,
     Rejected {
         reason: String,
@@ -315,6 +350,44 @@ pub fn query_context_call(
             payload,
         })?,
     ))
+}
+
+pub fn query_messages_call(
+    source: ServiceAddr,
+    target: ServiceAddr,
+    request_id: impl Into<String>,
+    offset: usize,
+    limit: usize,
+) -> Result<ServiceCall> {
+    let request_id = request_id.into();
+    Ok(ServiceCall::new(
+        source,
+        target,
+        encode_request(AgentSessionRequest::QueryMessages {
+            request_id: request_id.clone(),
+            offset,
+            limit,
+        })?,
+    )
+    .with_request_id(request_id))
+}
+
+pub fn query_message_detail_call(
+    source: ServiceAddr,
+    target: ServiceAddr,
+    request_id: impl Into<String>,
+    message_id: impl Into<String>,
+) -> Result<ServiceCall> {
+    let request_id = request_id.into();
+    Ok(ServiceCall::new(
+        source,
+        target,
+        encode_request(AgentSessionRequest::QueryMessageDetail {
+            request_id: request_id.clone(),
+            message_id: message_id.into(),
+        })?,
+    )
+    .with_request_id(request_id))
 }
 
 pub fn cancel_turn_call(

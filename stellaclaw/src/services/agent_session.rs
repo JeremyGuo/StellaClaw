@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     fs,
+    io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::Command,
     thread::{self, JoinHandle},
@@ -24,7 +25,8 @@ use crate::{
         agent_session::{
             self, decode_request, encode_response, text_message, AgentMessageOrigin,
             AgentSessionBinding, AgentSessionContext, AgentSessionEvent, AgentSessionKind,
-            AgentSessionRequest, AgentSessionResponse, AgentSessionState, AgentSessionStatus,
+            AgentSessionMessageHistory, AgentSessionMessageRecord, AgentSessionRequest,
+            AgentSessionResponse, AgentSessionState, AgentSessionStatus,
         },
         channel::{self, ChannelDelivery},
         cron,
@@ -331,6 +333,50 @@ impl ConversationService for AgentSessionService {
                                     context: state.context(&launch, pending_launch.as_ref(), current_plan.clone()),
                                 },
                             )?))?;
+                        }
+                        Ok(AgentSessionRequest::QueryMessages {
+                            request_id,
+                            offset,
+                            limit,
+                        }) => {
+                            let history = read_agent_session_history(
+                                &launch.conversation_root,
+                                &launch.session_id,
+                                request_id,
+                                offset,
+                                limit,
+                            )?;
+                            ctx.outbox.send(ServiceOutput::Call(
+                                crate::conversation_new::ServiceCall::response_to(
+                                    ctx.addr.clone(),
+                                    call.source,
+                                    encode_response(AgentSessionResponse::MessageHistory {
+                                        history,
+                                    })?,
+                                    call.request_id.clone(),
+                                ),
+                            ))?;
+                        }
+                        Ok(AgentSessionRequest::QueryMessageDetail {
+                            request_id,
+                            message_id,
+                        }) => {
+                            let record = read_agent_session_message_detail(
+                                &launch.conversation_root,
+                                &launch.session_id,
+                                &message_id,
+                            )?;
+                            ctx.outbox.send(ServiceOutput::Call(
+                                crate::conversation_new::ServiceCall::response_to(
+                                    ctx.addr.clone(),
+                                    call.source,
+                                    encode_response(AgentSessionResponse::MessageDetail {
+                                        request_id,
+                                        record,
+                                    })?,
+                                    call.request_id.clone(),
+                                ),
+                            ))?;
                         }
                         Ok(AgentSessionRequest::QueryStatus) => {
                             ctx.outbox.send(ServiceOutput::Call(reply(
@@ -2598,6 +2644,10 @@ fn to_core_session_request(request: AgentSessionRequest) -> Result<CoreSessionRe
         AgentSessionRequest::QueryContext { query_id, payload } => {
             Ok(CoreSessionRequest::QuerySessionView { query_id, payload })
         }
+        AgentSessionRequest::QueryMessages { .. }
+        | AgentSessionRequest::QueryMessageDetail { .. } => {
+            Err("message history queries are handled by service".to_string())
+        }
         AgentSessionRequest::QueryStatus => Err("query_status is handled by service".to_string()),
         AgentSessionRequest::UpdateLaunchConfig { .. } => {
             Err("update_launch_config is handled by service".to_string())
@@ -2824,6 +2874,178 @@ fn reply(
         target.clone(),
         encode_response(response)?,
     ))
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionMessagesIndex {
+    messages: BTreeMap<String, SessionMessageIndexEntry>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionMessageIndexEntry {
+    index: usize,
+    byte_offset: u64,
+}
+
+fn read_agent_session_history(
+    conversation_root: &Path,
+    session_id: &str,
+    request_id: String,
+    offset: usize,
+    limit: usize,
+) -> Result<AgentSessionMessageHistory> {
+    let path = session_all_messages_path(conversation_root, session_id);
+    if !path.exists() {
+        return Ok(AgentSessionMessageHistory {
+            request_id,
+            offset,
+            limit,
+            total: 0,
+            last_message: None,
+            messages: Vec::new(),
+        });
+    }
+    let file =
+        fs::File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut total = 0usize;
+    let mut messages = Vec::new();
+    let mut last_message = None;
+    let end = offset.saturating_add(limit.min(500));
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("failed to read {}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let message: ChatMessage = serde_json::from_str(&line)
+            .with_context(|| format!("failed to parse message {index} in {}", path.display()))?;
+        let record = AgentSessionMessageRecord { index, message };
+        if index >= offset && index < end {
+            messages.push(record.clone());
+        }
+        last_message = Some(record);
+        total = index.saturating_add(1);
+    }
+    Ok(AgentSessionMessageHistory {
+        request_id,
+        offset,
+        limit,
+        total,
+        last_message,
+        messages,
+    })
+}
+
+fn read_agent_session_message_detail(
+    conversation_root: &Path,
+    session_id: &str,
+    message_id: &str,
+) -> Result<Option<AgentSessionMessageRecord>> {
+    let path = session_all_messages_path(conversation_root, session_id);
+    if !path.exists() {
+        return Ok(None);
+    }
+    if let Some(record) = read_agent_session_message_detail_from_index(
+        conversation_root,
+        session_id,
+        message_id,
+        &path,
+    )? {
+        return Ok(Some(record));
+    }
+    read_agent_session_message_detail_by_scan(&path, message_id)
+}
+
+fn read_agent_session_message_detail_from_index(
+    conversation_root: &Path,
+    session_id: &str,
+    message_id: &str,
+    messages_path: &Path,
+) -> Result<Option<AgentSessionMessageRecord>> {
+    let index_path = session_messages_index_path(conversation_root, session_id);
+    if !index_path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&index_path)
+        .with_context(|| format!("failed to read {}", index_path.display()))?;
+    let index: SessionMessagesIndex = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse {}", index_path.display()))?;
+    let Some(entry) = index.messages.get(message_id) else {
+        return Ok(None);
+    };
+    let mut file = fs::File::open(messages_path)
+        .with_context(|| format!("failed to open {}", messages_path.display()))?;
+    file.seek(SeekFrom::Start(entry.byte_offset))
+        .with_context(|| format!("failed to seek {}", messages_path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .with_context(|| format!("failed to read {}", messages_path.display()))?;
+    if line.trim().is_empty() {
+        return Ok(None);
+    }
+    let message: ChatMessage = serde_json::from_str(&line).with_context(|| {
+        format!(
+            "failed to parse message {} in {}",
+            entry.index,
+            messages_path.display()
+        )
+    })?;
+    Ok(Some(AgentSessionMessageRecord {
+        index: entry.index,
+        message,
+    }))
+}
+
+fn read_agent_session_message_detail_by_scan(
+    path: &Path,
+    message_id: &str,
+) -> Result<Option<AgentSessionMessageRecord>> {
+    let requested_index = message_id.parse::<usize>().ok();
+    let file =
+        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let reader = BufReader::new(file);
+    for (index, line) in reader.lines().enumerate() {
+        let line = line.with_context(|| format!("failed to read {}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let message: ChatMessage = serde_json::from_str(&line)
+            .with_context(|| format!("failed to parse message {index} in {}", path.display()))?;
+        if message.message_id == message_id || requested_index.is_some_and(|value| value == index) {
+            return Ok(Some(AgentSessionMessageRecord { index, message }));
+        }
+    }
+    Ok(None)
+}
+
+fn session_all_messages_path(conversation_root: &Path, session_id: &str) -> PathBuf {
+    session_log_dir(conversation_root, session_id).join("all_messages.jsonl")
+}
+
+fn session_messages_index_path(conversation_root: &Path, session_id: &str) -> PathBuf {
+    session_log_dir(conversation_root, session_id).join("messages_index.json")
+}
+
+fn session_log_dir(conversation_root: &Path, session_id: &str) -> PathBuf {
+    conversation_root
+        .join(".stellaclaw")
+        .join("log")
+        .join(sanitize_session_id_for_log_path(session_id))
+}
+
+fn sanitize_session_id_for_log_path(session_id: &str) -> String {
+    session_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

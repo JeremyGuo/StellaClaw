@@ -7,7 +7,8 @@ use stellaclaw_core::session_actor::ChatMessage;
 
 use crate::conversation_new::{ServiceAddr, ServiceCall};
 use crate::service_protos::agent_session::{
-    AgentMessageOrigin, AgentSessionContext, AgentSessionEvent, AgentSessionStatus,
+    AgentMessageOrigin, AgentSessionContext, AgentSessionEvent, AgentSessionMessageHistory,
+    AgentSessionMessageRecord, AgentSessionStatus,
 };
 use crate::service_protos::kernel::{
     KernelMetadataPatch, KernelResponse, KernelRuntimeConfigPatch,
@@ -40,6 +41,19 @@ pub enum ChannelIngress {
     QueryForegroundStatus {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         foreground_session_id: Option<String>,
+    },
+    QueryMessageHistory {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        foreground_session_id: Option<String>,
+        request_id: String,
+        offset: usize,
+        limit: usize,
+    },
+    QueryMessageDetail {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        foreground_session_id: Option<String>,
+        request_id: String,
+        message_id: String,
     },
     CreateForegroundSession {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -160,6 +174,14 @@ pub enum ChannelEvent {
     },
     AgentSessionStatus {
         status: AgentSessionStatus,
+    },
+    MessageHistory {
+        history: AgentSessionMessageHistory,
+    },
+    MessageDetail {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record: Option<AgentSessionMessageRecord>,
     },
     AgentSessionCreated {
         addr: ServiceAddr,
