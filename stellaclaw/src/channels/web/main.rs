@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use stellaclaw_core::session_actor::{ChatMessage, ChatMessageItem, ChatRole};
 
 use crate::channels::{
     OutgoingError, OutgoingMessageAppended, OutgoingSessionStream, ProcessingState,
@@ -16,6 +17,7 @@ use crate::channels::{
 
 use super::{
     ids::{foreground_route_id_from_storage_id, foreground_session_storage_id},
+    protocol,
     time_utils::now_rfc3339,
 };
 
@@ -310,28 +312,28 @@ impl WebChannelMain {
                     },
                 );
                 if result.is_ok() {
-                    self.publish_home(json!({
-                        "type": "home.foreground_session_seen_state_updated",
-                        "conversation_id": conversation_id,
-                        "foreground_session_id": foreground_session_id,
-                        "last_seen_message_id": seen.last_seen_message_id,
-                        "last_seen_at": seen.updated_at,
-                    }));
+                    self.publish_home(protocol::home_foreground_session_seen_state_updated(
+                        &conversation_id,
+                        &foreground_session_id,
+                        &seen.last_seen_message_id,
+                        &seen.updated_at,
+                    ));
                 }
                 let _ = reply_tx.send(result);
             }
             WebMainCommand::SendError { error } => {
                 self.publish_chat(
                     &WebSessionKey::new(&error.conversation_id, "main"),
-                    json!({
-                        "type": "chat.stream_error",
-                        "conversation_id": error.conversation_id,
-                        "foreground_session_id": "main",
-                        "code": error.code,
-                        "error": error.message,
-                        "detail": error.detail,
-                        "can_continue": error.can_continue,
-                    }),
+                    protocol::chat_stream_error(
+                        &error.conversation_id,
+                        "main",
+                        "",
+                        "",
+                        "",
+                        0,
+                        &error.code,
+                        &error.message,
+                    ),
                 );
             }
         }
@@ -354,14 +356,13 @@ impl WebChannelMain {
 
     fn publish_foreground_session_state_event(&mut self, key: &WebSessionKey) {
         let live = self.live_states.get(key).cloned().unwrap_or_default();
-        self.publish_home(json!({
-            "type": "home.foreground_session_state_updated",
-            "conversation_id": key.conversation_id,
-            "foreground_session_id": key.foreground_session_id,
-            "state": live.summary_state(),
-            "active_turn_id": live.active_turn_id(),
-            "last_error": live.last_error,
-        }));
+        self.publish_home(protocol::home_foreground_session_state_updated(
+            &key.conversation_id,
+            &key.foreground_session_id,
+            live.summary_state(),
+            live.active_turn_id(),
+            live.last_error,
+        ));
     }
 
     fn message_appended(
@@ -372,28 +373,42 @@ impl WebChannelMain {
     ) {
         let key =
             WebSessionKey::from_storage_session_id(&appended.conversation_id, &appended.session_id);
+        let consistency_error = {
+            let state = self.live_states.entry(key.clone()).or_default();
+            state.commit_consistency_error(&appended.message)
+        };
+        if let Some(error) = consistency_error {
+            self.publish_chat(
+                &key,
+                protocol::chat_stream_error(
+                    &appended.conversation_id,
+                    &key.foreground_session_id,
+                    &appended.message.message_id,
+                    &appended.message.message_id,
+                    error.turn_id.as_deref().unwrap_or_default(),
+                    error.expected_index.unwrap_or_default(),
+                    "stream_commit_mismatch",
+                    &error.reason,
+                ),
+            );
+        }
         {
             let state = self.live_states.entry(key.clone()).or_default();
             state.record_message_appended(&appended, &decorated_message);
         }
         self.publish_chat(
             &key,
-            json!({
-                "type": "chat.message_appended",
-                "conversation_id": appended.conversation_id,
-                "foreground_session_id": key.foreground_session_id,
-                "message_index": appended.index,
-                "message_id": appended.message.message_id,
-                "committed": true,
-                "message": decorated_message,
-            }),
+            protocol::chat_message_appended(
+                &appended.conversation_id,
+                &key.foreground_session_id,
+                appended.index,
+                &appended.message.message_id,
+                decorated_message,
+            ),
         );
         self.publish_foreground_session_state_event(&key);
         if let Some(conversation) = conversation_summary {
-            self.publish_home(json!({
-                "type": "home.conversation_upserted",
-                "conversation": conversation,
-            }));
+            self.publish_home(protocol::home_conversation_upserted(conversation));
         }
     }
 
@@ -406,6 +421,26 @@ impl WebChannelMain {
             .and_then(Value::as_str)
             .unwrap_or("stream_event")
             .to_string();
+        if let Some(error) = {
+            let state = self.live_states.entry(key.clone()).or_default();
+            state.validate_stream_event(&stream.event, &event_type)
+        } {
+            self.publish_chat(
+                &key,
+                protocol::chat_stream_error(
+                    &stream.conversation_id,
+                    &key.foreground_session_id,
+                    error.message_id.as_deref().unwrap_or_default(),
+                    error.message_id.as_deref().unwrap_or_default(),
+                    error.turn_id.as_deref().unwrap_or_default(),
+                    error.received_index.unwrap_or_default(),
+                    "non_contiguous_stream_event",
+                    &error.reason,
+                ),
+            );
+            self.publish_foreground_session_state_event(&key);
+            return;
+        }
         {
             let state = self.live_states.entry(key.clone()).or_default();
             state.record_session_stream(&stream.event, &event_type);
@@ -421,7 +456,7 @@ impl WebChannelMain {
         ) {
             self.publish_foreground_session_state_event(&key);
         }
-        let payload = public_chat_stream_payload(
+        let payload = protocol::public_chat_stream_payload(
             &stream.conversation_id,
             &key.foreground_session_id,
             &event_type,
@@ -475,6 +510,21 @@ pub(super) struct ChatLiveState {
     pub(super) last_committed_message_id: Option<String>,
     pub(super) last_committed_message_index: Option<usize>,
     pub(super) last_error: Option<String>,
+    stream_next_indices: HashMap<String, u64>,
+    invalid_stream_messages: HashSet<String>,
+}
+
+struct StreamValidationError {
+    message_id: Option<String>,
+    turn_id: Option<String>,
+    received_index: Option<u64>,
+    reason: String,
+}
+
+struct StreamConsistencyError {
+    turn_id: Option<String>,
+    expected_index: Option<u64>,
+    reason: String,
 }
 
 impl ChatLiveState {
@@ -496,6 +546,101 @@ impl ChatLiveState {
             .and_then(|turn| turn.get("turn_id"))
             .and_then(Value::as_str)
             .map(str::to_string)
+    }
+
+    fn validate_stream_event(
+        &mut self,
+        event: &Value,
+        event_type: &str,
+    ) -> Option<StreamValidationError> {
+        if event_type == "stream_error" {
+            return None;
+        }
+        let Some(message_id) = event.get("message_id").and_then(Value::as_str) else {
+            return None;
+        };
+        let Some(received_index) = event.get("in_message_index").and_then(Value::as_u64) else {
+            return None;
+        };
+        let turn_id = event
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if self.invalid_stream_messages.contains(message_id) {
+            return Some(StreamValidationError {
+                message_id: Some(message_id.to_string()),
+                turn_id,
+                received_index: Some(received_index),
+                reason: "stream message was already marked invalid".to_string(),
+            });
+        }
+        let expected = self
+            .stream_next_indices
+            .get(message_id)
+            .copied()
+            .unwrap_or(0);
+        if received_index != expected {
+            self.invalid_stream_messages.insert(message_id.to_string());
+            self.current_provisional_assistant_message = self
+                .current_provisional_assistant_message
+                .take()
+                .filter(|message| {
+                    !message
+                        .get("message_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id == message_id)
+                });
+            return Some(StreamValidationError {
+                message_id: Some(message_id.to_string()),
+                turn_id,
+                received_index: Some(received_index),
+                reason: format!(
+                    "non-contiguous stream event for {message_id}: expected index {expected}, received {received_index}"
+                ),
+            });
+        }
+        self.stream_next_indices
+            .insert(message_id.to_string(), expected.saturating_add(1));
+        None
+    }
+
+    fn commit_consistency_error(&self, message: &ChatMessage) -> Option<StreamConsistencyError> {
+        if message.role != ChatRole::Assistant || message.message_id.is_empty() {
+            return None;
+        }
+        let provisional =
+            self.current_provisional_assistant_message
+                .as_ref()
+                .filter(|provisional| {
+                    provisional
+                        .get("message_id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| id == message.message_id)
+                })?;
+        if !provisional_has_stream_content(provisional) {
+            return None;
+        }
+        let Some(provisional_message) = provisional.get("message") else {
+            return None;
+        };
+        let expected = self.stream_next_indices.get(&message.message_id).copied();
+        let turn_id = provisional
+            .get("turn_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let provisional_fingerprint = stream_message_fingerprint(provisional_message);
+        let committed_fingerprint = committed_message_fingerprint(message);
+        if provisional_fingerprint == committed_fingerprint {
+            return None;
+        }
+        Some(StreamConsistencyError {
+            turn_id,
+            expected_index: expected,
+            reason: format!(
+                "stream provisional message {} did not match committed assistant message",
+                message.message_id
+            ),
+        })
     }
 
     fn record_message_appended(&mut self, appended: &OutgoingMessageAppended, message: &Value) {
@@ -521,6 +666,8 @@ impl ChatLiveState {
             {
                 self.current_provisional_assistant_message = None;
             }
+            self.stream_next_indices.remove(message_id);
+            self.invalid_stream_messages.remove(message_id);
         }
         if appended.message.role == stellaclaw_core::session_actor::ChatRole::User {
             if let Some(index) = self.queued_outbound_messages.iter().position(|queued| {
@@ -610,6 +757,8 @@ impl ChatLiveState {
                     });
                 self.current_provisional_assistant_message = None;
                 self.running_tool_results.clear();
+                self.stream_next_indices.clear();
+                self.invalid_stream_messages.clear();
             }
             "stream_assistant_message_delta" => self.apply_assistant_delta(event),
             "stream_tool_call_delta" => self.apply_tool_call_delta(event),
@@ -636,6 +785,10 @@ impl ChatLiveState {
                 }
                 self.current_turn_state = None;
                 self.running_tool_results.clear();
+                if !message_id.is_empty() {
+                    self.stream_next_indices.remove(message_id);
+                    self.invalid_stream_messages.insert(message_id.to_string());
+                }
                 self.last_error = event
                     .get("error")
                     .and_then(Value::as_str)
@@ -645,6 +798,8 @@ impl ChatLiveState {
                 self.current_turn_state = None;
                 self.current_provisional_assistant_message = None;
                 self.running_tool_results.clear();
+                self.stream_next_indices.clear();
+                self.invalid_stream_messages.clear();
                 self.queued_outbound_messages.clear();
                 self.last_error = None;
             }
@@ -951,6 +1106,122 @@ impl ChatLiveState {
     }
 }
 
+fn provisional_has_stream_content(provisional: &Value) -> bool {
+    let Some(message) = provisional.get("message") else {
+        return false;
+    };
+    message
+        .get("text")
+        .and_then(Value::as_str)
+        .is_some_and(|text| !text.is_empty())
+        || message
+            .get("items")
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty())
+}
+
+fn stream_message_fingerprint(message: &Value) -> Value {
+    let text = message
+        .get("text")
+        .or_else(|| message.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut tool_calls = Vec::new();
+    let mut reasoning = Vec::new();
+    if let Some(items) = message.get("items").and_then(Value::as_array) {
+        for item in items {
+            match item.get("type").and_then(Value::as_str) {
+                Some("tool_call") => {
+                    tool_calls.push(json!({
+                        "tool_call_id": item.get("tool_call_id").and_then(Value::as_str).unwrap_or_default(),
+                        "tool_name": item.get("tool_name").and_then(Value::as_str).unwrap_or_default(),
+                        "arguments": item.get("arguments").and_then(Value::as_str).unwrap_or_default(),
+                    }));
+                }
+                Some("reasoning") => {
+                    reasoning.push(json!({
+                        "summary_index": item.get("_summaryIndex").and_then(Value::as_i64).unwrap_or_default(),
+                        "text": item.get("text").or_else(|| item.get("summary")).and_then(Value::as_str).unwrap_or_default(),
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+    sort_fingerprint_items(&mut tool_calls, "tool_call_id");
+    sort_fingerprint_items(&mut reasoning, "summary_index");
+    json!({
+        "text": text,
+        "tool_calls": tool_calls,
+        "reasoning": reasoning,
+    })
+}
+
+fn committed_message_fingerprint(message: &ChatMessage) -> Value {
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    let mut reasoning = Vec::new();
+    for item in &message.data {
+        match item {
+            ChatMessageItem::Context(context) => text.push_str(&context.text),
+            ChatMessageItem::ToolCall(tool) => tool_calls.push(json!({
+                "tool_call_id": tool.tool_call_id,
+                "tool_name": tool.tool_name,
+                "arguments": tool.arguments.text,
+            })),
+            ChatMessageItem::Reasoning(reasoning_item) => {
+                if reasoning_item.codex_summary.is_empty() {
+                    if !reasoning_item.text.is_empty() {
+                        reasoning.push(json!({
+                            "summary_index": reasoning.len() as i64,
+                            "text": reasoning_item.text,
+                        }));
+                    }
+                } else {
+                    for part in &reasoning_item.codex_summary {
+                        reasoning.push(json!({
+                            "summary_index": reasoning.len() as i64,
+                            "text": part.text,
+                        }));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    sort_fingerprint_items(&mut tool_calls, "tool_call_id");
+    sort_fingerprint_items(&mut reasoning, "summary_index");
+    json!({
+        "text": text,
+        "tool_calls": tool_calls,
+        "reasoning": reasoning,
+    })
+}
+
+fn sort_fingerprint_items(items: &mut [Value], key: &str) {
+    items.sort_by(|left, right| {
+        let left_key = left
+            .get(key)
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string())
+            })
+            .unwrap_or_default();
+        let right_key = right
+            .get(key)
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string())
+            })
+            .unwrap_or_default();
+        left_key.cmp(&right_key)
+    });
+}
+
 pub(super) fn load_seen_state(workdir: &Path, channel_id: &str) -> Result<WebSeenState> {
     let path = seen_state_path(workdir, channel_id);
     if !path.exists() {
@@ -977,56 +1248,6 @@ fn seen_state_path(workdir: &Path, channel_id: &str) -> PathBuf {
         .join("web")
         .join(channel_id)
         .join(SEEN_STATE_FILE)
-}
-
-fn public_chat_stream_payload(
-    conversation_id: &str,
-    foreground_session_id: &str,
-    event_type: &str,
-    event: &Value,
-) -> Value {
-    let mut payload = match event {
-        Value::Object(map) => map.clone(),
-        _ => Map::new(),
-    };
-    payload.insert(
-        "type".to_string(),
-        json!(public_chat_stream_type(event_type)),
-    );
-    payload.insert("conversation_id".to_string(), json!(conversation_id));
-    payload.insert(
-        "foreground_session_id".to_string(),
-        json!(foreground_session_id),
-    );
-    if event_type == "user_message_committed" {
-        if let Some(index) = payload.get("index").cloned() {
-            payload.insert("message_index".to_string(), index);
-        }
-        if let Some(message_id) = payload
-            .get("message")
-            .and_then(|message| message.get("message_id"))
-            .cloned()
-        {
-            payload.insert("message_id".to_string(), message_id);
-        }
-        payload.insert("committed".to_string(), json!(true));
-    }
-    if !payload.contains_key("next_message_id") {
-        if let Some(message_id) = payload.get("message_id").cloned() {
-            payload.insert("next_message_id".to_string(), message_id);
-        }
-    }
-    Value::Object(payload)
-}
-
-fn public_chat_stream_type(event_type: &str) -> String {
-    let suffix = match event_type {
-        "turn_started" => "stream_turn_start",
-        "turn_completed" => "stream_turn_done",
-        "plan_updated" => "plan_updated",
-        other => other,
-    };
-    format!("chat.{suffix}")
 }
 
 fn conversation_seen_key(conversation_id: &str, foreground_session_id: &str) -> String {
@@ -1091,8 +1312,9 @@ fn item_id_if_readable(item_id: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use stellaclaw_core::session_actor::{ChatMessage, ChatMessageItem, ChatRole, ContextItem};
 
-    use super::public_chat_stream_payload;
+    use super::{protocol::public_chat_stream_payload, ChatLiveState};
 
     #[test]
     fn stream_payload_is_flat_typed_chat_event() {
@@ -1167,5 +1389,84 @@ mod tests {
             done.get("type").and_then(|value| value.as_str()),
             Some("chat.stream_turn_done")
         );
+    }
+
+    #[test]
+    fn live_state_rejects_non_contiguous_stream_index() {
+        let mut state = ChatLiveState::default();
+        let first = json!({
+            "type": "stream_assistant_message_delta",
+            "message_id": "msg-1",
+            "turn_id": "turn-1",
+            "in_message_index": 0,
+            "delta": "hello",
+        });
+        assert!(state
+            .validate_stream_event(&first, "stream_assistant_message_delta")
+            .is_none());
+        state.record_session_stream(&first, "stream_assistant_message_delta");
+
+        let skipped = json!({
+            "type": "stream_assistant_message_delta",
+            "message_id": "msg-1",
+            "turn_id": "turn-1",
+            "in_message_index": 2,
+            "delta": " world",
+        });
+        let error = state
+            .validate_stream_event(&skipped, "stream_assistant_message_delta")
+            .expect("gap should invalidate stream");
+        assert!(error.reason.contains("expected index 1"));
+        assert!(state.current_provisional_assistant_message.is_none());
+    }
+
+    #[test]
+    fn live_state_accepts_matching_committed_assistant_message() {
+        let mut state = ChatLiveState::default();
+        let stream = json!({
+            "type": "stream_assistant_message_delta",
+            "message_id": "msg-1",
+            "turn_id": "turn-1",
+            "in_message_index": 0,
+            "delta": "hello",
+        });
+        assert!(state
+            .validate_stream_event(&stream, "stream_assistant_message_delta")
+            .is_none());
+        state.record_session_stream(&stream, "stream_assistant_message_delta");
+
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "hello".to_string(),
+            })],
+        )
+        .with_message_id("msg-1");
+        assert!(state.commit_consistency_error(&message).is_none());
+    }
+
+    #[test]
+    fn live_state_reports_committed_assistant_mismatch() {
+        let mut state = ChatLiveState::default();
+        let stream = json!({
+            "type": "stream_assistant_message_delta",
+            "message_id": "msg-1",
+            "turn_id": "turn-1",
+            "in_message_index": 0,
+            "delta": "hello",
+        });
+        assert!(state
+            .validate_stream_event(&stream, "stream_assistant_message_delta")
+            .is_none());
+        state.record_session_stream(&stream, "stream_assistant_message_delta");
+
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "goodbye".to_string(),
+            })],
+        )
+        .with_message_id("msg-1");
+        assert!(state.commit_consistency_error(&message).is_some());
     }
 }

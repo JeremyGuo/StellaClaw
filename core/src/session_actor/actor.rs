@@ -44,6 +44,7 @@ const SESSION_PLAN_CONTEXT_MARKER: &str = "[StellaClaw Current Task Plan]";
 const COMPRESSION_MEMORY_SCOPE_CANDIDATE_LIMIT: usize = 20;
 const COMPRESSION_MEMORY_CONTEXT_MAX_TOKENS: u64 = 4_000;
 const COMPRESSION_MEMORY_ENTRY_MAX_CHARS: usize = 640;
+const PROVIDER_SUPERSEDE_GRACE: Duration = Duration::from_millis(200);
 
 pub struct SessionActor {
     model_config: ModelConfig,
@@ -106,6 +107,7 @@ struct ActiveProviderRequest {
     request_too_large_attempts: usize,
     started_at_ms: u128,
     next_stream_event_index: u64,
+    last_activity_at: Instant,
 }
 
 struct BuiltToolBatch {
@@ -321,6 +323,34 @@ impl SessionActor {
             return self.process_ready_step();
         }
 
+        if let Some(delay) = self.provider_supersede_grace_remaining() {
+            let grace_timer = crossbeam_channel::after(delay);
+            select! {
+                recv(self.request_rx) -> request => {
+                    let request = request.map_err(|_| SessionActorError::Mailbox("session actor request channel closed".to_string()))?;
+                    self.enqueue_request(request);
+                }
+                recv(self.tool_completion_rx) -> completion => {
+                    let completion = completion.map_err(|_| SessionActorError::Tool("tool completion channel disconnected".to_string()))?;
+                    self.pending_tool_completions.push_back(completion);
+                }
+                recv(self.tool_progress_rx) -> progress => {
+                    let progress = progress.map_err(|_| SessionActorError::Tool("tool progress channel disconnected".to_string()))?;
+                    self.pending_tool_progress.push_back(progress);
+                }
+                recv(self.provider_event_rx) -> event => {
+                    let event = event.map_err(|_| {
+                        SessionActorError::from_provider_error(ProviderError::Subprocess(
+                            "provider event channel disconnected".to_string(),
+                        ))
+                    })?;
+                    self.pending_provider_events.push_back(event);
+                }
+                recv(grace_timer) -> _ => {}
+            }
+            return self.process_ready_step();
+        }
+
         if let Some(delay) = self.idle_compaction_delay() {
             if delay.is_zero() {
                 if self.try_run_idle_compaction()? {
@@ -406,10 +436,14 @@ impl SessionActor {
                 return self.handle_ready_provider_event();
             }
             if self.has_pending_user_message() {
-                self.cancel_active_provider_request(
-                    "superseded_by_user_message".to_string(),
-                    false,
-                )?;
+                if self.provider_supersede_grace_remaining().is_none() {
+                    self.cancel_active_provider_request(
+                        "superseded_by_user_message".to_string(),
+                        false,
+                    )?;
+                } else {
+                    return Ok(SessionActorStep::WaitingProviderRequest);
+                }
             } else {
                 return self.handle_ready_provider_event();
             }
@@ -484,7 +518,9 @@ impl SessionActor {
                 && self.active_provider_request.is_none()
                 && self.active_tool_batch.is_none())
             || (self.active_provider_request.is_some() && !self.pending_provider_events.is_empty())
-            || (self.active_provider_request.is_some() && self.has_pending_user_message())
+            || (self.active_provider_request.is_some()
+                && self.has_pending_user_message()
+                && self.provider_supersede_grace_remaining().is_none())
             || (self.active_provider_request.is_none() && !self.pending_provider_events.is_empty())
             || (self.active_tool_batch.is_some() && !self.pending_tool_progress.is_empty())
             || (self.active_tool_batch.is_some() && !self.pending_tool_completions.is_empty())
@@ -844,6 +880,15 @@ impl SessionActor {
         self.pending_data
             .iter()
             .any(|request| matches!(request, SessionRequest::EnqueueUserMessage { .. }))
+    }
+
+    fn provider_supersede_grace_remaining(&self) -> Option<Duration> {
+        if !self.has_pending_user_message() {
+            return None;
+        }
+        let active = self.active_provider_request.as_ref()?;
+        let elapsed = active.last_activity_at.elapsed();
+        (elapsed < PROVIDER_SUPERSEDE_GRACE).then_some(PROVIDER_SUPERSEDE_GRACE - elapsed)
     }
 
     fn discard_stale_provider_events(&mut self) {
@@ -1236,7 +1281,8 @@ impl SessionActor {
             self.provider
                 .start(request_id.clone(), request)
                 .map_err(SessionActorError::from_provider_error)?;
-            self.last_provider_request_started_at = Some(Instant::now());
+            let now = Instant::now();
+            self.last_provider_request_started_at = Some(now);
             self.active_provider_request = Some(ActiveProviderRequest {
                 request_id,
                 message_id,
@@ -1246,6 +1292,7 @@ impl SessionActor {
                 request_too_large_attempts,
                 started_at_ms: current_time_millis(),
                 next_stream_event_index: 0,
+                last_activity_at: now,
             });
             return Ok(());
         }
@@ -1570,6 +1617,7 @@ impl SessionActor {
                     let in_message_index = active.next_stream_event_index;
                     active.next_stream_event_index =
                         active.next_stream_event_index.saturating_add(1);
+                    active.last_activity_at = Instant::now();
                     self.emit_provider_stream_event(
                         &message_id,
                         &turn_id,

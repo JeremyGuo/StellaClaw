@@ -41,6 +41,7 @@ use super::{
         foreground_session_storage_id, processing_state_name, service_addr_storage_component,
     },
     main::{load_seen_state, ChatLiveState, ConversationSeen, WebChannelMainHandle},
+    protocol,
     time_utils::{generated_platform_id, generated_request_id, now_rfc3339},
     websocket::{accept_websocket, send_websocket_json, websocket_event_loop},
 };
@@ -288,10 +289,7 @@ impl WebChannel {
             .query_conversation_metadata(&conversation_id)
             .unwrap_or(metadata);
         let summary = self.conversation_summary(&metadata)?;
-        self.publish_conversation_event(json!({
-            "type": "home.conversation_upserted",
-            "conversation": summary,
-        }));
+        self.publish_conversation_event(protocol::home_conversation_upserted(summary.clone()));
         Ok(HttpResponse::json(
             201,
             json!({
@@ -311,10 +309,7 @@ impl WebChannel {
             },
         )?;
         let summary = self.conversation_summary(&metadata)?;
-        self.publish_conversation_event(json!({
-            "type": "home.conversation_upserted",
-            "conversation": summary,
-        }));
+        self.publish_conversation_event(protocol::home_conversation_upserted(summary.clone()));
         Ok(HttpResponse::json(200, json!({"conversation": summary})))
     }
 
@@ -325,10 +320,7 @@ impl WebChannel {
         ConversationMetadataStore::new(&self.workdir)
             .remove(conversation_id)
             .map_err(HttpError::internal)?;
-        self.publish_conversation_event(json!({
-            "type": "home.conversation_deleted",
-            "conversation_id": conversation_id,
-        }));
+        self.publish_conversation_event(protocol::home_conversation_deleted(conversation_id));
         Ok(HttpResponse::json(200, json!({"deleted": true})))
     }
 
@@ -383,10 +375,10 @@ impl WebChannel {
             self.query_conversation_metadata(conversation_id)?
         };
         let session = self.foreground_session_summary(&metadata, &route_id);
-        self.publish_conversation_event(json!({
-            "type": "home.conversation_upserted",
-            "conversation": self.conversation_summary(&metadata)?,
-        }));
+        self.publish_conversation_event(protocol::home_foreground_session_upserted(
+            conversation_id,
+            session.clone(),
+        ));
         Ok(HttpResponse::json(
             201,
             json!({
@@ -407,10 +399,15 @@ impl WebChannel {
         let metadata =
             self.set_session_nickname(conversation_id, foreground_session_id, request.nickname)?;
         let session = self.foreground_session_summary(&metadata, foreground_session_id);
-        self.publish_conversation_event(json!({
-            "type": "home.conversation_upserted",
-            "conversation": self.conversation_summary(&metadata)?,
-        }));
+        let patch = json!({
+            "session_name": session.get("session_name").cloned().unwrap_or(Value::Null),
+            "nickname": session.get("nickname").cloned().unwrap_or(Value::Null),
+        });
+        self.publish_conversation_event(protocol::home_foreground_session_updated(
+            conversation_id,
+            foreground_session_id,
+            patch,
+        ));
         Ok(HttpResponse::json(
             200,
             json!({"foreground_session": session}),
@@ -438,10 +435,11 @@ impl WebChannel {
             )
             .map_err(HttpError::internal)?;
         let metadata = self.set_session_nickname(conversation_id, foreground_session_id, None)?;
-        self.publish_conversation_event(json!({
-            "type": "home.conversation_upserted",
-            "conversation": self.conversation_summary(&metadata)?,
-        }));
+        let _ = metadata;
+        self.publish_conversation_event(protocol::home_foreground_session_deleted(
+            conversation_id,
+            foreground_session_id,
+        ));
         Ok(HttpResponse::json(
             200,
             json!({
@@ -916,12 +914,11 @@ impl WebChannel {
         let (rx, seq) = self.main.subscribe_home()?;
         send_websocket_json(
             &mut stream,
-            &json!({
-                "type": "home.snapshot",
-                "seq": seq,
-                "conversations": self.conversation_summaries().unwrap_or_default(),
-                "server_time": now_rfc3339(),
-            }),
+            &protocol::home_snapshot(
+                seq,
+                self.conversation_summaries().unwrap_or_default(),
+                now_rfc3339(),
+            ),
         )?;
         websocket_event_loop(stream, rx, "home.heartbeat")
     }
@@ -944,19 +941,17 @@ impl WebChannel {
             .unwrap_or_default();
         send_websocket_json(
             &mut stream,
-            &json!({
-                "type": "chat.snapshot",
-                "conversation_id": conversation_id,
-                "foreground_session_id": foreground_session_id,
-                "total": summary.message_count,
-                "next_message_index": summary.message_count,
-                "last_committed_message_id": summary.last_message_id,
-                "last_committed_message_index": summary.last_message_index,
-                "current_turn_state": live.current_turn_state,
-                "current_provisional_assistant_message": live.current_provisional_assistant_message,
-                "running_tool_results": live.running_tool_results,
-                "queued_outbound_messages": live.queued_outbound_messages,
-            }),
+            &protocol::chat_snapshot(
+                conversation_id,
+                foreground_session_id,
+                summary.message_count,
+                summary.last_message_id,
+                summary.last_message_index,
+                live.current_turn_state,
+                live.current_provisional_assistant_message,
+                live.running_tool_results,
+                live.queued_outbound_messages,
+            ),
         )?;
         websocket_event_loop(stream, rx, "chat.heartbeat")
     }

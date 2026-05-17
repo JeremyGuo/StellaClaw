@@ -2,7 +2,7 @@
 
 ## Stream 协议与抢占
 
-- [ ] 新用户消息抢占 active provider stream 时增加短暂活跃保护：维护最近 provider stream/progress 活动时间；收到 pending user message 后，如果当前 provider 在最近约 200ms 内仍有事件返回，则先不 abort，只有超过 grace window 没有任何 stream/progress 后才用 `superseded_by_user_message` 取消当前 provider request。该机制用于避免正在稳定流式输出的回答被用户下一条消息立即切断。
+- [x] 新用户消息抢占 active provider stream 时增加短暂活跃保护：维护最近 provider stream/progress 活动时间；收到 pending user message 后，如果当前 provider 在最近约 200ms 内仍有事件返回，则先不 abort，只有超过 grace window 没有任何 stream/progress 后才用 `superseded_by_user_message` 取消当前 provider request。该机制用于避免正在稳定流式输出的回答被用户下一条消息立即切断。
 
 ## Remote Tool Bootstrap
 

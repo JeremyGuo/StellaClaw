@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 use stellaclaw_core::session_actor::{
     ChatMessage, SessionErrorDetail, TaskPlanView, ToolResultItem,
 };
@@ -10,6 +10,214 @@ use crate::service_protos::agent_session::{AgentMessageOrigin, AgentSessionState
 
 pub const HOME_WS_PATH: &str = "/api/ws/home";
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 30;
+
+pub fn home_snapshot(seq: u64, conversations: Vec<Value>, server_time: String) -> Value {
+    json!({
+        "type": "home.snapshot",
+        "seq": seq,
+        "server_time": server_time,
+        "conversations": conversations,
+    })
+}
+
+pub fn home_conversation_upserted(conversation: Value) -> Value {
+    json!({
+        "type": "home.conversation_upserted",
+        "conversation": conversation,
+    })
+}
+
+pub fn home_conversation_deleted(conversation_id: &str) -> Value {
+    json!({
+        "type": "home.conversation_deleted",
+        "conversation_id": conversation_id,
+    })
+}
+
+pub fn home_foreground_session_upserted(conversation_id: &str, foreground_session: Value) -> Value {
+    json!({
+        "type": "home.foreground_session_upserted",
+        "conversation_id": conversation_id,
+        "foreground_session": foreground_session,
+    })
+}
+
+pub fn home_foreground_session_updated(
+    conversation_id: &str,
+    foreground_session_id: &str,
+    patch: Value,
+) -> Value {
+    json!({
+        "type": "home.foreground_session_updated",
+        "conversation_id": conversation_id,
+        "foreground_session_id": foreground_session_id,
+        "patch": patch,
+    })
+}
+
+pub fn home_foreground_session_deleted(
+    conversation_id: &str,
+    foreground_session_id: &str,
+) -> Value {
+    json!({
+        "type": "home.foreground_session_deleted",
+        "conversation_id": conversation_id,
+        "foreground_session_id": foreground_session_id,
+    })
+}
+
+pub fn home_foreground_session_state_updated(
+    conversation_id: &str,
+    foreground_session_id: &str,
+    state: &str,
+    active_turn_id: Option<String>,
+    last_error: Option<String>,
+) -> Value {
+    json!({
+        "type": "home.foreground_session_state_updated",
+        "conversation_id": conversation_id,
+        "foreground_session_id": foreground_session_id,
+        "state": state,
+        "active_turn_id": active_turn_id,
+        "last_error": last_error,
+    })
+}
+
+pub fn home_foreground_session_seen_state_updated(
+    conversation_id: &str,
+    foreground_session_id: &str,
+    last_seen_message_id: &str,
+    last_seen_at: &str,
+) -> Value {
+    json!({
+        "type": "home.foreground_session_seen_state_updated",
+        "conversation_id": conversation_id,
+        "foreground_session_id": foreground_session_id,
+        "last_seen_message_id": last_seen_message_id,
+        "last_seen_at": last_seen_at,
+    })
+}
+
+pub fn chat_snapshot(
+    conversation_id: &str,
+    foreground_session_id: &str,
+    total: usize,
+    last_committed_message_id: Option<String>,
+    last_committed_message_index: Option<usize>,
+    current_turn_state: Option<Value>,
+    current_provisional_assistant_message: Option<Value>,
+    running_tool_results: Vec<Value>,
+    queued_outbound_messages: Vec<Value>,
+) -> Value {
+    json!({
+        "type": "chat.snapshot",
+        "conversation_id": conversation_id,
+        "foreground_session_id": foreground_session_id,
+        "total": total,
+        "next_message_index": total,
+        "last_committed_message_id": last_committed_message_id,
+        "last_committed_message_index": last_committed_message_index,
+        "current_turn_state": current_turn_state,
+        "current_provisional_assistant_message": current_provisional_assistant_message,
+        "running_tool_results": running_tool_results,
+        "queued_outbound_messages": queued_outbound_messages,
+    })
+}
+
+pub fn chat_message_appended(
+    conversation_id: &str,
+    foreground_session_id: &str,
+    message_index: usize,
+    message_id: &str,
+    message: Value,
+) -> Value {
+    json!({
+        "type": "chat.message_appended",
+        "conversation_id": conversation_id,
+        "foreground_session_id": foreground_session_id,
+        "message_index": message_index,
+        "message_id": message_id,
+        "committed": true,
+        "message": message,
+    })
+}
+
+pub fn chat_stream_error(
+    conversation_id: &str,
+    foreground_session_id: &str,
+    message_id: &str,
+    next_message_id: &str,
+    turn_id: &str,
+    in_message_index: u64,
+    error: &str,
+    reason: &str,
+) -> Value {
+    json!({
+        "type": "chat.stream_error",
+        "conversation_id": conversation_id,
+        "foreground_session_id": foreground_session_id,
+        "message_id": message_id,
+        "next_message_id": next_message_id,
+        "turn_id": turn_id,
+        "in_message_index": in_message_index,
+        "error": error,
+        "error_detail": {
+            "module": "web_channel",
+            "kind": error,
+            "reason": reason,
+        },
+    })
+}
+
+pub fn public_chat_stream_payload(
+    conversation_id: &str,
+    foreground_session_id: &str,
+    event_type: &str,
+    event: &Value,
+) -> Value {
+    let mut payload = match event {
+        Value::Object(map) => map.clone(),
+        _ => Map::new(),
+    };
+    payload.insert(
+        "type".to_string(),
+        json!(public_chat_stream_type(event_type)),
+    );
+    payload.insert("conversation_id".to_string(), json!(conversation_id));
+    payload.insert(
+        "foreground_session_id".to_string(),
+        json!(foreground_session_id),
+    );
+    if event_type == "user_message_committed" {
+        if let Some(index) = payload.get("index").cloned() {
+            payload.insert("message_index".to_string(), index);
+        }
+        if let Some(message_id) = payload
+            .get("message")
+            .and_then(|message| message.get("message_id"))
+            .cloned()
+        {
+            payload.insert("message_id".to_string(), message_id);
+        }
+        payload.insert("committed".to_string(), json!(true));
+    }
+    if !payload.contains_key("next_message_id") {
+        if let Some(message_id) = payload.get("message_id").cloned() {
+            payload.insert("next_message_id".to_string(), message_id);
+        }
+    }
+    Value::Object(payload)
+}
+
+fn public_chat_stream_type(event_type: &str) -> String {
+    let suffix = match event_type {
+        "turn_started" => "stream_turn_start",
+        "turn_completed" => "stream_turn_done",
+        "plan_updated" => "plan_updated",
+        other => other,
+    };
+    format!("chat.{suffix}")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebHeartbeat {
