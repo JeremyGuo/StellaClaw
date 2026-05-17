@@ -24,10 +24,11 @@ const AGENT_SERVER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct AgentServerClient {
     child: Child,
-    stdin: Mutex<ChildStdin>,
+    write_tx: crossbeam_channel::Sender<AgentServerWriteCommand>,
     pending: Arc<Mutex<HashMap<u64, mpsc::Sender<Result<Value, String>>>>>,
     next_id: AtomicU64,
     reader_handle: Option<thread::JoinHandle<()>>,
+    writer_handle: Option<thread::JoinHandle<()>>,
 }
 
 impl AgentServerClient {
@@ -56,15 +57,18 @@ impl AgentServerClient {
             .ok_or_else(|| "agent_server stdout was not piped".to_string())?;
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, event_rx) = mpsc::channel();
+        let (write_tx, write_rx) = crossbeam_channel::unbounded();
+        let writer_handle = Some(spawn_writer_thread(stdin, pending.clone(), write_rx));
         let reader_handle = Some(spawn_reader_thread(stdout, pending.clone(), event_tx));
 
         Ok((
             Self {
                 child,
-                stdin: Mutex::new(stdin),
+                write_tx,
                 pending,
                 next_id: AtomicU64::new(1),
                 reader_handle,
+                writer_handle,
             },
             event_rx,
         ))
@@ -86,20 +90,38 @@ impl AgentServerClient {
     }
 
     pub fn send_session_request(&self, request: &SessionRequest) -> Result<(), String> {
-        self.request(
+        self.notify(
             "session_request",
             serde_json::to_value(request).map_err(|error| error.to_string())?,
         )
-        .map(|_| ())
     }
 
     pub fn shutdown(mut self) -> Result<(), String> {
         let _ = self.request("shutdown", json!({}));
         let _ = self.child.wait();
+        let _ = self.write_tx.send(AgentServerWriteCommand::Shutdown);
+        if let Some(handle) = self.writer_handle.take() {
+            let _ = handle.join();
+        }
         if let Some(handle) = self.reader_handle.take() {
             let _ = handle.join();
         }
         Ok(())
+    }
+
+    fn notify(&self, method: &str, params: Value) -> Result<(), String> {
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        });
+        self.write_tx
+            .send(AgentServerWriteCommand::Write {
+                id: None,
+                payload,
+                response_tx: None,
+            })
+            .map_err(|_| "agent_server writer stopped".to_string())
     }
 
     fn request(&self, method: &str, params: Value) -> Result<Value, String> {
@@ -108,28 +130,25 @@ impl AgentServerClient {
         self.pending
             .lock()
             .map_err(|_| "pending request lock poisoned".to_string())?
-            .insert(id, response_tx);
-
+            .insert(id, response_tx.clone());
         let payload = json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": method,
             "params": params,
         });
-        {
-            let mut stdin = self
-                .stdin
-                .lock()
-                .map_err(|_| "agent_server stdin lock poisoned".to_string())?;
-            serde_json::to_writer(&mut *stdin, &payload)
-                .map_err(|error| format!("failed to encode request: {error}"))?;
-            stdin
-                .write_all(b"\n")
-                .map_err(|error| format!("failed to write request: {error}"))?;
-            stdin
-                .flush()
-                .map_err(|error| format!("failed to flush request: {error}"))?;
-        }
+        self.write_tx
+            .send(AgentServerWriteCommand::Write {
+                id: Some(id),
+                payload,
+                response_tx: Some(response_tx),
+            })
+            .map_err(|_| {
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.remove(&id);
+                }
+                "agent_server writer stopped".to_string()
+            })?;
 
         match response_rx.recv_timeout(AGENT_SERVER_REQUEST_TIMEOUT) {
             Ok(result) => result,
@@ -147,6 +166,61 @@ impl AgentServerClient {
             }
         }
     }
+}
+
+enum AgentServerWriteCommand {
+    Write {
+        id: Option<u64>,
+        payload: Value,
+        response_tx: Option<mpsc::Sender<Result<Value, String>>>,
+    },
+    Shutdown,
+}
+
+fn spawn_writer_thread(
+    mut stdin: ChildStdin,
+    pending: Arc<Mutex<HashMap<u64, mpsc::Sender<Result<Value, String>>>>>,
+    command_rx: crossbeam_channel::Receiver<AgentServerWriteCommand>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || loop {
+        crossbeam_channel::select! {
+            recv(command_rx) -> command => {
+                let Ok(command) = command else {
+                    break;
+                };
+                match command {
+                    AgentServerWriteCommand::Write {
+                        id,
+                        payload,
+                        response_tx,
+                    } => {
+                        if let Err(error) = write_json_line(&mut stdin, &payload) {
+                            if let Some(id) = id {
+                                if let Ok(mut pending) = pending.lock() {
+                                    pending.remove(&id);
+                                }
+                            }
+                            if let Some(response_tx) = response_tx {
+                                let _ = response_tx.send(Err(error));
+                            }
+                        }
+                    }
+                    AgentServerWriteCommand::Shutdown => break,
+                }
+            }
+        }
+    })
+}
+
+fn write_json_line(writer: &mut impl Write, value: &Value) -> Result<(), String> {
+    serde_json::to_writer(&mut *writer, value)
+        .map_err(|error| format!("failed to encode request: {error}"))?;
+    writer
+        .write_all(b"\n")
+        .map_err(|error| format!("failed to write request: {error}"))?;
+    writer
+        .flush()
+        .map_err(|error| format!("failed to flush request: {error}"))
 }
 
 fn spawn_reader_thread(

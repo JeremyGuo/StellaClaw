@@ -6,6 +6,7 @@ use std::{
     io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::Command,
+    sync::atomic::{AtomicU64, Ordering},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -97,10 +98,10 @@ impl ConversationService for AgentSessionService {
         let mut runner = start_real_session(&launch, &self.kind)?;
         let mut pending_launch: Option<AgentSessionLaunchConfig> = None;
         let mut current_plan: Option<TaskPlanView> = None;
-        let mut pending_memory_requests = VecDeque::new();
-        let mut pending_skill_requests = VecDeque::new();
-        let mut pending_tool_binary_requests = VecDeque::new();
-        let mut pending_cron_requests = VecDeque::new();
+        let mut pending_memory_requests: VecDeque<PendingBridgeRequest> = VecDeque::new();
+        let mut pending_skill_requests: VecDeque<PendingBridgeRequest> = VecDeque::new();
+        let mut pending_tool_binary_requests: VecDeque<PendingBridgeRequest> = VecDeque::new();
+        let mut pending_cron_requests: VecDeque<PendingBridgeRequest> = VecDeque::new();
         let mut pending_child_starts = VecDeque::new();
         let mut pending_service_responses = BTreeMap::new();
         let mut pending_subagent_joins = VecDeque::new();
@@ -931,10 +932,10 @@ fn handle_core_session_event(
     event_sink: &crate::conversation_new::ServiceAddr,
     kind: &AgentSessionKind,
     runner: &mut Option<RealAgentSessionRuntime>,
-    pending_memory_requests: &mut VecDeque<ConversationBridgeRequest>,
-    pending_skill_requests: &mut VecDeque<ConversationBridgeRequest>,
-    pending_tool_binary_requests: &mut VecDeque<ConversationBridgeRequest>,
-    pending_cron_requests: &mut VecDeque<ConversationBridgeRequest>,
+    pending_memory_requests: &mut VecDeque<PendingBridgeRequest>,
+    pending_skill_requests: &mut VecDeque<PendingBridgeRequest>,
+    pending_tool_binary_requests: &mut VecDeque<PendingBridgeRequest>,
+    pending_cron_requests: &mut VecDeque<PendingBridgeRequest>,
     pending_child_starts: &mut VecDeque<PendingChildAgentStart>,
     pending_service_responses: &mut BTreeMap<String, PendingServiceResponseKind>,
     pending_subagent_joins: &mut VecDeque<PendingSubagentJoin>,
@@ -952,14 +953,22 @@ fn handle_core_session_event(
             }
             return Ok(());
         }
+        if let Some(response) = terminate_bridge_response(ctx, kind, request, state)? {
+            if let Some(runner) = runner.as_mut() {
+                runner.send(AgentSessionRequest::ResolveHostCoordination {
+                    response: serde_json::to_value(&response)?,
+                })?;
+            }
+            return Ok(());
+        }
         if let Some(call) = memory_bridge_call(ctx, kind, request)? {
-            pending_memory_requests.push_back(request.clone());
-            let call = track_service_request(
+            let (call, pending) = track_service_request(
                 call,
                 request,
                 PendingServiceResponseKind::Memory,
                 pending_service_responses,
             );
+            pending_memory_requests.push_back(pending);
             ctx.outbox.send(ServiceOutput::Call(call))?;
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                 addr: ctx.addr.clone(),
@@ -973,13 +982,13 @@ fn handle_core_session_event(
             return Ok(());
         }
         if let Some(call) = skill_bridge_call(ctx, request)? {
-            pending_skill_requests.push_back(request.clone());
-            let call = track_service_request(
+            let (call, pending) = track_service_request(
                 call,
                 request,
                 PendingServiceResponseKind::Skill,
                 pending_service_responses,
             );
+            pending_skill_requests.push_back(pending);
             ctx.outbox.send(ServiceOutput::Call(call))?;
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                 addr: ctx.addr.clone(),
@@ -993,13 +1002,13 @@ fn handle_core_session_event(
             return Ok(());
         }
         if let Some(call) = tool_binary_bridge_call(ctx, request)? {
-            pending_tool_binary_requests.push_back(request.clone());
-            let call = track_service_request(
+            let (call, pending) = track_service_request(
                 call,
                 request,
                 PendingServiceResponseKind::ToolBinary,
                 pending_service_responses,
             );
+            pending_tool_binary_requests.push_back(pending);
             ctx.outbox.send(ServiceOutput::Call(call))?;
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                 addr: ctx.addr.clone(),
@@ -1013,13 +1022,13 @@ fn handle_core_session_event(
             return Ok(());
         }
         if let Some(call) = cron_bridge_call(ctx, request, state)? {
-            pending_cron_requests.push_back(request.clone());
-            let call = track_service_request(
+            let (call, pending) = track_service_request(
                 call,
                 request,
                 PendingServiceResponseKind::Cron,
                 pending_service_responses,
             );
+            pending_cron_requests.push_back(pending);
             ctx.outbox.send(ServiceOutput::Call(call))?;
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                 addr: ctx.addr.clone(),
@@ -1040,15 +1049,14 @@ fn handle_core_session_event(
             }
             return Ok(());
         }
-        if let Some(call) =
-            child_agent_start_bridge_call(ctx, request, pending_child_starts, state)?
-        {
-            let call = track_service_request(
+        if let Some((call, pending)) = child_agent_start_bridge_call(ctx, request, state)? {
+            let (call, pending) = track_child_start_request(
                 call,
-                request,
+                pending,
                 PendingServiceResponseKind::Kernel,
                 pending_service_responses,
             );
+            pending_child_starts.push_back(pending);
             ctx.outbox.send(ServiceOutput::Call(call))?;
             ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
                 addr: ctx.addr.clone(),
@@ -1162,29 +1170,104 @@ fn parse_task_plan_view(payload: serde_json::Value) -> Result<TaskPlanView, Stri
     Ok(plan)
 }
 
+fn terminate_bridge_response(
+    ctx: &ServiceRunContext,
+    kind: &AgentSessionKind,
+    request: &ConversationBridgeRequest,
+    state: &AgentSessionRuntimeState,
+) -> Result<Option<ConversationBridgeResponse>> {
+    if request.action != "terminate" {
+        return Ok(None);
+    }
+    if *kind != AgentSessionKind::Background {
+        return Ok(Some(bridge_json_response(
+            request.clone(),
+            serde_json::json!({
+                "status": "failure",
+                "reason": "terminate is only available to background agents",
+            }),
+        )));
+    }
+    let Some(parent_addr) = state.binding.parent_addr.clone() else {
+        return Ok(Some(bridge_json_response(
+            request.clone(),
+            serde_json::json!({
+                "status": "failure",
+                "reason": "background agent has no parent session",
+            }),
+        )));
+    };
+    let reason = "background_agent_terminate".to_string();
+    ctx.outbox.send(ServiceOutput::Call(
+        agent_session::child_session_event_call(
+            ctx.addr.clone(),
+            parent_addr,
+            AgentSessionEvent::Terminated {
+                reason: Some(reason.clone()),
+            },
+        )?,
+    ))?;
+    ctx.outbox
+        .send(ServiceOutput::Call(agent_session::shutdown_call(
+            ctx.addr.clone(),
+            ctx.addr.clone(),
+            Some(reason),
+        )?))?;
+    Ok(Some(bridge_json_response(
+        request.clone(),
+        serde_json::json!({"status": "terminating"}),
+    )))
+}
+
+static NEXT_AGENT_SESSION_SERVICE_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_agent_session_service_request_id(kind: PendingServiceResponseKind) -> String {
+    let index = NEXT_AGENT_SESSION_SERVICE_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    format!("agent_session_{}_{index}", kind.label())
+}
+
 fn track_service_request(
     call: ServiceCall,
     request: &ConversationBridgeRequest,
     kind: PendingServiceResponseKind,
     pending_service_responses: &mut BTreeMap<String, PendingServiceResponseKind>,
-) -> ServiceCall {
-    pending_service_responses.insert(request.request_id.clone(), kind);
-    call.with_request_id(request.request_id.clone())
+) -> (ServiceCall, PendingBridgeRequest) {
+    let service_request_id = next_agent_session_service_request_id(kind);
+    pending_service_responses.insert(service_request_id.clone(), kind);
+    (
+        call.with_request_id(service_request_id.clone()),
+        PendingBridgeRequest {
+            service_request_id,
+            request: request.clone(),
+        },
+    )
+}
+
+fn track_child_start_request(
+    call: ServiceCall,
+    mut pending: PendingChildAgentStart,
+    kind: PendingServiceResponseKind,
+    pending_service_responses: &mut BTreeMap<String, PendingServiceResponseKind>,
+) -> (ServiceCall, PendingChildAgentStart) {
+    let service_request_id = next_agent_session_service_request_id(kind);
+    pending_service_responses.insert(service_request_id.clone(), kind);
+    pending.service_request_id = service_request_id.clone();
+    (call.with_request_id(service_request_id), pending)
 }
 
 fn pop_pending_bridge_request(
-    pending: &mut VecDeque<ConversationBridgeRequest>,
+    pending: &mut VecDeque<PendingBridgeRequest>,
     response_id: Option<&str>,
 ) -> Option<ConversationBridgeRequest> {
     if let Some(response_id) = response_id {
         if let Some(index) = pending
             .iter()
-            .position(|request| request.request_id == response_id)
+            .position(|request| request.service_request_id == response_id)
         {
-            return pending.remove(index);
+            return pending.remove(index).map(|pending| pending.request);
         }
     }
-    pending.pop_front()
+    pending.pop_front().map(|pending| pending.request)
 }
 
 fn pop_pending_child_start(
@@ -1194,7 +1277,7 @@ fn pop_pending_child_start(
     if let Some(response_id) = response_id {
         if let Some(index) = pending
             .iter()
-            .position(|start| start.request.request_id == response_id)
+            .position(|start| start.service_request_id == response_id)
         {
             return pending.remove(index);
         }
@@ -1205,10 +1288,10 @@ fn pop_pending_child_start(
 fn handle_service_response(
     ctx: &ServiceRunContext,
     runner: &mut Option<RealAgentSessionRuntime>,
-    pending_memory_requests: &mut VecDeque<ConversationBridgeRequest>,
-    pending_skill_requests: &mut VecDeque<ConversationBridgeRequest>,
-    pending_tool_binary_requests: &mut VecDeque<ConversationBridgeRequest>,
-    pending_cron_requests: &mut VecDeque<ConversationBridgeRequest>,
+    pending_memory_requests: &mut VecDeque<PendingBridgeRequest>,
+    pending_skill_requests: &mut VecDeque<PendingBridgeRequest>,
+    pending_tool_binary_requests: &mut VecDeque<PendingBridgeRequest>,
+    pending_cron_requests: &mut VecDeque<PendingBridgeRequest>,
     pending_child_starts: &mut VecDeque<PendingChildAgentStart>,
     pending_service_responses: &mut BTreeMap<String, PendingServiceResponseKind>,
     state: &mut AgentSessionRuntimeState,
@@ -1303,7 +1386,7 @@ fn handle_service_response(
 fn handle_memory_response(
     ctx: &ServiceRunContext,
     runner: &mut Option<RealAgentSessionRuntime>,
-    pending_memory_requests: &mut VecDeque<ConversationBridgeRequest>,
+    pending_memory_requests: &mut VecDeque<PendingBridgeRequest>,
     response_id: Option<&str>,
     response: MemoryResponse,
 ) -> Result<()> {
@@ -1335,7 +1418,7 @@ fn handle_memory_response(
 fn handle_skill_response(
     ctx: &ServiceRunContext,
     runner: &mut Option<RealAgentSessionRuntime>,
-    pending_skill_requests: &mut VecDeque<ConversationBridgeRequest>,
+    pending_skill_requests: &mut VecDeque<PendingBridgeRequest>,
     response_id: Option<&str>,
     response: SkillResponse,
 ) -> Result<()> {
@@ -1367,7 +1450,7 @@ fn handle_skill_response(
 fn handle_tool_binary_response(
     ctx: &ServiceRunContext,
     runner: &mut Option<RealAgentSessionRuntime>,
-    pending_tool_binary_requests: &mut VecDeque<ConversationBridgeRequest>,
+    pending_tool_binary_requests: &mut VecDeque<PendingBridgeRequest>,
     response_id: Option<&str>,
     response: ToolBinaryResponse,
 ) -> Result<()> {
@@ -1400,7 +1483,7 @@ fn handle_tool_binary_response(
 fn handle_cron_response(
     ctx: &ServiceRunContext,
     runner: &mut Option<RealAgentSessionRuntime>,
-    pending_cron_requests: &mut VecDeque<ConversationBridgeRequest>,
+    pending_cron_requests: &mut VecDeque<PendingBridgeRequest>,
     response_id: Option<&str>,
     response: CronResponse,
 ) -> Result<()> {
@@ -1543,6 +1626,7 @@ fn handle_child_session_event(
 ) -> Result<()> {
     let mut completed_background_message = None;
     let mut failed_background_error = None;
+    let mut terminal_child_shutdown = None;
     let mut handled = false;
     if let Some(record) = state
         .subagents
@@ -1555,20 +1639,39 @@ fn handle_child_session_event(
                 record.last_message = Some(message);
             }
             AgentSessionEvent::TurnStarted { .. } => {
-                record.status = ChildAgentRuntimeStatus::Running;
-                record.last_error = None;
+                if record.status == ChildAgentRuntimeStatus::Running {
+                    record.last_error = None;
+                }
             }
             AgentSessionEvent::TurnCompleted { message } => {
-                record.status = ChildAgentRuntimeStatus::Completed;
-                record.last_message = Some(message);
+                if record.status == ChildAgentRuntimeStatus::Running {
+                    record.status = ChildAgentRuntimeStatus::Completed;
+                    record.last_message = Some(message);
+                    terminal_child_shutdown =
+                        Some((record.addr.clone(), "subagent_completed".to_string()));
+                }
             }
             AgentSessionEvent::TurnFailed { error, .. } => {
-                record.status = ChildAgentRuntimeStatus::Failed;
-                record.last_error = Some(error);
+                if record.status == ChildAgentRuntimeStatus::Running {
+                    record.status = ChildAgentRuntimeStatus::Failed;
+                    record.last_error = Some(error);
+                    terminal_child_shutdown =
+                        Some((record.addr.clone(), "subagent_failed".to_string()));
+                }
             }
             AgentSessionEvent::RuntimeCrashed { error, .. } => {
-                record.status = ChildAgentRuntimeStatus::Failed;
-                record.last_error = Some(error);
+                if record.status == ChildAgentRuntimeStatus::Running {
+                    record.status = ChildAgentRuntimeStatus::Failed;
+                    record.last_error = Some(error);
+                    terminal_child_shutdown =
+                        Some((record.addr.clone(), "subagent_crashed".to_string()));
+                }
+            }
+            AgentSessionEvent::Terminated { reason } => {
+                if record.status == ChildAgentRuntimeStatus::Running {
+                    record.status = ChildAgentRuntimeStatus::Killed;
+                    record.last_error = reason;
+                }
             }
             _ => {}
         }
@@ -1583,23 +1686,44 @@ fn handle_child_session_event(
                 record.last_message = Some(message);
             }
             AgentSessionEvent::TurnStarted { .. } => {
-                record.status = ChildAgentRuntimeStatus::Running;
-                record.last_error = None;
+                if record.status == ChildAgentRuntimeStatus::Running {
+                    record.last_error = None;
+                }
             }
             AgentSessionEvent::TurnCompleted { message } => {
-                record.status = ChildAgentRuntimeStatus::Completed;
-                record.last_message = Some(message.clone());
-                completed_background_message = Some(message);
+                if record.status == ChildAgentRuntimeStatus::Running {
+                    record.status = ChildAgentRuntimeStatus::Completed;
+                    record.last_message = Some(message.clone());
+                    completed_background_message = Some(message);
+                    terminal_child_shutdown = Some((
+                        record.addr.clone(),
+                        "background_agent_completed".to_string(),
+                    ));
+                }
             }
             AgentSessionEvent::TurnFailed { error, .. } => {
-                record.status = ChildAgentRuntimeStatus::Failed;
-                record.last_error = Some(error.clone());
-                failed_background_error = Some(error);
+                if record.status == ChildAgentRuntimeStatus::Running {
+                    record.status = ChildAgentRuntimeStatus::Failed;
+                    record.last_error = Some(error.clone());
+                    failed_background_error = Some(error);
+                    terminal_child_shutdown =
+                        Some((record.addr.clone(), "background_agent_failed".to_string()));
+                }
             }
             AgentSessionEvent::RuntimeCrashed { error, .. } => {
-                record.status = ChildAgentRuntimeStatus::Failed;
-                record.last_error = Some(error.clone());
-                failed_background_error = Some(error);
+                if record.status == ChildAgentRuntimeStatus::Running {
+                    record.status = ChildAgentRuntimeStatus::Failed;
+                    record.last_error = Some(error.clone());
+                    failed_background_error = Some(error);
+                    terminal_child_shutdown =
+                        Some((record.addr.clone(), "background_agent_crashed".to_string()));
+                }
+            }
+            AgentSessionEvent::Terminated { reason } => {
+                if record.status == ChildAgentRuntimeStatus::Running {
+                    record.status = ChildAgentRuntimeStatus::Killed;
+                    record.last_error = reason;
+                }
             }
             _ => {}
         }
@@ -1633,6 +1757,14 @@ fn handle_child_session_event(
             }
         }
         resolve_ready_subagent_joins(ctx, runner, pending_subagent_joins, state)?;
+        if let Some((addr, reason)) = terminal_child_shutdown {
+            ctx.outbox
+                .send(ServiceOutput::Call(agent_session::shutdown_call(
+                    ctx.addr.clone(),
+                    addr,
+                    Some(reason),
+                )?))?;
+        }
     } else {
         ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
             addr: ctx.addr.clone(),
@@ -1839,9 +1971,8 @@ fn managed_agent_bridge_response(
 fn child_agent_start_bridge_call(
     ctx: &ServiceRunContext,
     request: &ConversationBridgeRequest,
-    pending_child_starts: &mut VecDeque<PendingChildAgentStart>,
     state: &mut AgentSessionRuntimeState,
-) -> Result<Option<ServiceCall>> {
+) -> Result<Option<(ServiceCall, PendingChildAgentStart)>> {
     let (kind, task, agent_id) = match request.action.as_str() {
         "subagent_start" => {
             let payload: LegacySubagentStartPayload =
@@ -1878,13 +2009,14 @@ fn child_agent_start_bridge_call(
         _ => return Ok(None),
     };
     state.persist(&ctx.storage)?;
-    pending_child_starts.push_back(PendingChildAgentStart {
+    let pending = PendingChildAgentStart {
+        service_request_id: String::new(),
         request: request.clone(),
         agent_id: agent_id.clone(),
         task: task.clone(),
         kind: kind.clone(),
-    });
-    Ok(Some(kernel::create_agent_session_with_binding_call(
+    };
+    let call = kernel::create_agent_session_with_binding_call(
         ctx.addr.clone(),
         kind,
         Some(agent_id),
@@ -1892,7 +2024,8 @@ fn child_agent_start_bridge_call(
             event_sink: ctx.addr.clone(),
             parent_addr: Some(ctx.addr.clone()),
         },
-    )?))
+    )?;
+    Ok(Some((call, pending)))
 }
 
 fn subagent_control_bridge_response(
@@ -1916,6 +2049,19 @@ fn subagent_control_bridge_response(
                     }),
                 )));
             };
+            if record.status != ChildAgentRuntimeStatus::Running {
+                return Ok(Some(bridge_json_response(
+                    request.clone(),
+                    serde_json::json!({
+                        "status": "failure",
+                        "reason": format!(
+                            "subagent {} is already {}",
+                            payload.agent_id,
+                            child_agent_status_label(record.status)
+                        ),
+                    }),
+                )));
+            }
             record.status = ChildAgentRuntimeStatus::Killed;
             let addr = record.addr.clone();
             state.persist(&ctx.storage)?;
@@ -2193,6 +2339,15 @@ fn child_agent_payload(record: &ChildAgentRuntimeRecord) -> serde_json::Value {
         "last_message": record.last_message,
         "last_error": record.last_error,
     })
+}
+
+fn child_agent_status_label(status: ChildAgentRuntimeStatus) -> &'static str {
+    match status {
+        ChildAgentRuntimeStatus::Running => "running",
+        ChildAgentRuntimeStatus::Completed => "completed",
+        ChildAgentRuntimeStatus::Failed => "failed",
+        ChildAgentRuntimeStatus::Killed => "killed",
+    }
 }
 
 fn background_result_message(mut message: ChatMessage) -> ChatMessage {
@@ -2546,6 +2701,7 @@ fn cron_expression(
 }
 
 struct PendingChildAgentStart {
+    service_request_id: String,
     request: ConversationBridgeRequest,
     agent_id: String,
     task: String,
@@ -2559,6 +2715,23 @@ enum PendingServiceResponseKind {
     ToolBinary,
     Cron,
     Kernel,
+}
+
+impl PendingServiceResponseKind {
+    fn label(self) -> &'static str {
+        match self {
+            PendingServiceResponseKind::Memory => "memory",
+            PendingServiceResponseKind::Skill => "skill",
+            PendingServiceResponseKind::ToolBinary => "tool_binary",
+            PendingServiceResponseKind::Cron => "cron",
+            PendingServiceResponseKind::Kernel => "kernel",
+        }
+    }
+}
+
+struct PendingBridgeRequest {
+    service_request_id: String,
+    request: ConversationBridgeRequest,
 }
 
 struct PendingSubagentJoin {
@@ -3853,15 +4026,18 @@ mod tests {
             },
         );
 
-        pending_cron_requests.push_back(ConversationBridgeRequest {
-            request_id: "req_create".to_string(),
-            tool_call_id: "call_create".to_string(),
-            tool_name: "cron_task_create".to_string(),
-            action: "cron_task_create".to_string(),
-            payload: serde_json::json!({}),
+        pending_cron_requests.push_back(PendingBridgeRequest {
+            service_request_id: "svc_create".to_string(),
+            request: ConversationBridgeRequest {
+                request_id: "req_create".to_string(),
+                tool_call_id: "call_create".to_string(),
+                tool_name: "cron_task_create".to_string(),
+                action: "cron_task_create".to_string(),
+                payload: serde_json::json!({}),
+            },
         });
         pending_service_responses
-            .insert("req_create".to_string(), PendingServiceResponseKind::Cron);
+            .insert("svc_create".to_string(), PendingServiceResponseKind::Cron);
 
         let handled = handle_service_response(
             &ctx,
@@ -3873,7 +4049,7 @@ mod tests {
             &mut pending_child_starts,
             &mut pending_service_responses,
             &mut state,
-            Some("req_create"),
+            Some("svc_create"),
             cron::encode_response(CronResponse::Accepted).expect("cron response encodes"),
         )
         .expect("cron response dispatches");
@@ -3952,7 +4128,6 @@ mod tests {
                 parent_addr: None,
             },
         );
-        let mut pending = VecDeque::new();
         let request = ConversationBridgeRequest {
             request_id: "req_1".to_string(),
             tool_call_id: "call_1".to_string(),
@@ -3963,7 +4138,7 @@ mod tests {
             }),
         };
 
-        let call = child_agent_start_bridge_call(&ctx, &request, &mut pending, &mut state)
+        let (call, pending) = child_agent_start_bridge_call(&ctx, &request, &mut state)
             .expect("bridge request parses")
             .expect("subagent start should route");
 
@@ -3980,7 +4155,7 @@ mod tests {
                 }),
             } if id == "subagent_0001" && event_sink == ctx.addr && parent == ctx.addr
         ));
-        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.agent_id, "subagent_0001");
         assert_eq!(state.next_subagent_index, 2);
     }
 
@@ -3994,7 +4169,6 @@ mod tests {
                 parent_addr: None,
             },
         );
-        let mut pending = VecDeque::new();
         let request = ConversationBridgeRequest {
             request_id: "req_1".to_string(),
             tool_call_id: "call_1".to_string(),
@@ -4005,7 +4179,7 @@ mod tests {
             }),
         };
 
-        let call = child_agent_start_bridge_call(&ctx, &request, &mut pending, &mut state)
+        let (call, pending) = child_agent_start_bridge_call(&ctx, &request, &mut state)
             .expect("bridge request parses")
             .expect("background start should route");
 
@@ -4022,7 +4196,7 @@ mod tests {
                 }),
             } if id == "background_0001" && event_sink == ctx.addr && parent == ctx.addr
         ));
-        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.agent_id, "background_0001");
         assert_eq!(state.next_background_index, 2);
     }
 
@@ -4037,6 +4211,7 @@ mod tests {
             },
         );
         let mut pending = VecDeque::from([PendingChildAgentStart {
+            service_request_id: "svc_1".to_string(),
             request: ConversationBridgeRequest {
                 request_id: "req_1".to_string(),
                 tool_call_id: "call_1".to_string(),
@@ -4055,7 +4230,7 @@ mod tests {
             &mut runner,
             &mut pending,
             &mut state,
-            Some("req_1"),
+            Some("svc_1"),
             KernelResponse::AgentSessionCreated {
                 addr: crate::conversation_new::ServiceAddr::agent_subagent("subagent_0001"),
             },
@@ -4082,7 +4257,7 @@ mod tests {
 
     #[test]
     fn child_turn_completed_resolves_join_payload() {
-        let (ctx, _output_rx) = test_run_context("subagent_join_completed");
+        let (ctx, output_rx) = test_run_context("subagent_join_completed");
         let subagent_addr = crate::conversation_new::ServiceAddr::agent_subagent("subagent_0001");
         let mut state = AgentSessionRuntimeState::new(
             AgentSessionKind::Foreground,
@@ -4110,7 +4285,7 @@ mod tests {
             &mut runner,
             &mut joins,
             &mut state,
-            subagent_addr,
+            subagent_addr.clone(),
             AgentSessionEvent::TurnCompleted {
                 message: text_message(ChatRole::Assistant, "done"),
             },
@@ -4122,6 +4297,18 @@ mod tests {
         assert_eq!(payload["agent_id"], "subagent_0001");
         assert_eq!(payload["message"]["role"], "assistant");
         assert_eq!(payload["message"]["data"][0]["payload"]["text"], "done");
+        assert!(output_rx.try_iter().any(|output| {
+            matches!(
+                output,
+                ServiceOutput::Call(ServiceCall { target, payload, .. })
+                    if target == subagent_addr
+                        && matches!(
+                            agent_session::decode_request(payload.clone()),
+                            Ok(AgentSessionRequest::Shutdown { reason })
+                                if reason.as_deref() == Some("subagent_completed")
+                        )
+            )
+        }));
     }
 
     #[test]
@@ -4155,7 +4342,7 @@ mod tests {
             &mut runner,
             &mut joins,
             &mut state,
-            background_addr,
+            background_addr.clone(),
             AgentSessionEvent::TurnCompleted {
                 message: text_message(ChatRole::Assistant, "build passed"),
             },
@@ -4176,6 +4363,18 @@ mod tests {
                 output,
                 ServiceOutput::Call(ServiceCall { target, .. })
                     if target == &ctx.addr
+            )
+        }));
+        assert!(outputs.iter().any(|output| {
+            matches!(
+                output,
+                ServiceOutput::Call(ServiceCall { target, payload, .. })
+                    if target == &background_addr
+                        && matches!(
+                            agent_session::decode_request(payload.clone()),
+                            Ok(AgentSessionRequest::Shutdown { reason })
+                                if reason.as_deref() == Some("background_agent_completed")
+                        )
             )
         }));
     }
@@ -4233,6 +4432,128 @@ mod tests {
                 }),
             Some("cancelled")
         );
+    }
+
+    #[test]
+    fn subagent_kill_rejects_already_terminal_agent_without_shutdown() {
+        let (ctx, output_rx) = test_run_context("subagent_kill_terminal");
+        let mut runner = None;
+        let mut joins = VecDeque::new();
+        let mut state = AgentSessionRuntimeState::new(
+            AgentSessionKind::Foreground,
+            AgentSessionBinding {
+                event_sink: crate::conversation_new::ServiceAddr::channel_id("scratch"),
+                parent_addr: None,
+            },
+        );
+        state.subagents.insert(
+            "subagent_0001".to_string(),
+            ChildAgentRuntimeRecord {
+                agent_id: "subagent_0001".to_string(),
+                addr: ServiceAddr::agent_subagent("subagent_0001"),
+                status: ChildAgentRuntimeStatus::Completed,
+                task: "inspect".to_string(),
+                last_message: Some(text_message(ChatRole::Assistant, "done")),
+                last_error: None,
+            },
+        );
+        let request = ConversationBridgeRequest {
+            request_id: "req_1".to_string(),
+            tool_call_id: "call_1".to_string(),
+            tool_name: "subagent_kill".to_string(),
+            action: "subagent_kill".to_string(),
+            payload: serde_json::json!({ "agent_id": "subagent_0001" }),
+        };
+
+        let response =
+            subagent_control_bridge_response(&ctx, &mut runner, &request, &mut state, &mut joins)
+                .expect("kill handled")
+                .expect("kill should return a bridge result");
+
+        assert_eq!(
+            response
+                .result
+                .result
+                .structured
+                .as_ref()
+                .and_then(|value| {
+                    value
+                        .get("value")
+                        .and_then(|value| value.get("status"))
+                        .and_then(serde_json::Value::as_str)
+                }),
+            Some("failure")
+        );
+        assert!(output_rx.try_iter().all(|output| !matches!(
+            output,
+            ServiceOutput::Call(ServiceCall { target, .. })
+                if target == ServiceAddr::agent_subagent("subagent_0001")
+        )));
+    }
+
+    #[test]
+    fn repeated_terminal_child_events_shutdown_child_once() {
+        let (ctx, output_rx) = test_run_context("subagent_terminal_once");
+        let subagent_addr = ServiceAddr::agent_subagent("subagent_0001");
+        let mut state = AgentSessionRuntimeState::new(
+            AgentSessionKind::Foreground,
+            AgentSessionBinding {
+                event_sink: ServiceAddr::channel_id("scratch"),
+                parent_addr: None,
+            },
+        );
+        state.subagents.insert(
+            "subagent_0001".to_string(),
+            ChildAgentRuntimeRecord {
+                agent_id: "subagent_0001".to_string(),
+                addr: subagent_addr.clone(),
+                status: ChildAgentRuntimeStatus::Running,
+                task: "inspect".to_string(),
+                last_message: None,
+                last_error: None,
+            },
+        );
+        let mut runner = None;
+        let mut joins = VecDeque::new();
+
+        handle_child_session_event(
+            &ctx,
+            &mut runner,
+            &mut joins,
+            &mut state,
+            subagent_addr.clone(),
+            AgentSessionEvent::TurnCompleted {
+                message: text_message(ChatRole::Assistant, "done"),
+            },
+        )
+        .expect("first terminal event handled");
+        handle_child_session_event(
+            &ctx,
+            &mut runner,
+            &mut joins,
+            &mut state,
+            subagent_addr.clone(),
+            AgentSessionEvent::TurnCompleted {
+                message: text_message(ChatRole::Assistant, "done again"),
+            },
+        )
+        .expect("second terminal event handled");
+
+        let shutdown_count = output_rx
+            .try_iter()
+            .filter(|output| {
+                matches!(
+                    output,
+                    ServiceOutput::Call(ServiceCall { target, payload, .. })
+                        if target == &subagent_addr
+                            && matches!(
+                                agent_session::decode_request(payload.clone()),
+                                Ok(AgentSessionRequest::Shutdown { .. })
+                            )
+                )
+            })
+            .count();
+        assert_eq!(shutdown_count, 1);
     }
 
     fn test_run_context(

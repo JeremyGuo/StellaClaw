@@ -219,6 +219,10 @@ pub enum AgentSessionEvent {
         error_detail: SessionErrorDetail,
         can_continue: bool,
     },
+    Terminated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     HostCoordinationRequested {
         request: Value,
     },

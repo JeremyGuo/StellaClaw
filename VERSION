@@ -1,7 +1,10 @@
-version: 1.28.5
+version: 1.28.6
 ---
 
-# 1.28.5
+# 1.28.6
+
+- 修复 AgentSession bridge 工具控制路径潜在阻塞：
+  `AgentSessionService` 向 `agent_server` 投递普通 session request 时不再同步等待 JSON-RPC ack，而是通过专用 writer thread 发送 notification，避免 background agent / subagent 的 host coordination resolve、child session event、cancel 等事件在 service 主 `select!` 循环里被 30s request timeout 阻塞；AgentSessionService 转发 memory / skill / tool_binary / cron / kernel 请求时改用内部 service request id 做 pending correlation；`subagent_join` 的 cancel 路径在 cancel ack 后不再阻塞等待原 join response，未即时返回时直接生成 interrupted 工具结果；background agent / subagent 的生命周期仍由父 AgentSessionService 管理，父 session 在 child completed / failed / crashed 终态保存结果并向 child service 发送 shutdown，`subagent_kill` 对已终态 child 直接返回 failure 且不会重复 shutdown；background `terminate` 会先通知父 session 标记 killed，再关闭自身 runner；Kernel service runner 会在 service run 返回错误时投影 `ServiceOutput::Failed`，且 `StopService` 对不存在服务返回 `service_not_found`。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 升级本地 `web_fetch` 工具：
   响应体读取改为先按 `max_bytes` 硬上限截断，再做文本/HTML/二进制分类，避免大响应在 `max_chars` 截断前被完整读入内存；HTML auto 模式会提取 title、description、链接和更接近 Markdown 的可读正文，二进制响应默认返回 metadata 而不是乱码正文；结果新增 content length、redirect、截断原因、选定响应头和 bytes read 等结构化字段，同时保留旧的 `body` / `truncated` 字段。本次不改变 `config` schema，不改变 `workdir` schema。

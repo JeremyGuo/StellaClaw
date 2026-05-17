@@ -1304,6 +1304,16 @@ fn handle_session_event(
                 }),
             }))?;
         }
+        agent_session::AgentSessionEvent::Terminated { reason } => {
+            ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
+                addr: ctx.addr.clone(),
+                label: "session_terminated".to_string(),
+                detail: serde_json::json!({
+                    "session_addr": session_addr,
+                    "reason": reason,
+                }),
+            }))?;
+        }
     }
     Ok(())
 }

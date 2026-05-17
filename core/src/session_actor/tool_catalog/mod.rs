@@ -330,10 +330,13 @@ fn cancel_subagent_join_bridge_request(
             cancel_result
                 .map_err(|_| LocalToolError::Bridge("conversation bridge cancel stopped".to_string()))?
                 .map_err(LocalToolError::Bridge)?;
-            result_rx
-                .recv()
-                .map_err(|_| LocalToolError::Bridge("conversation bridge stopped after cancel".to_string()))?
-                .map_err(LocalToolError::Bridge)
+            if let Ok(result) = result_rx.try_recv() {
+                return result.map_err(LocalToolError::Bridge);
+            }
+            Ok(ToolResultContent::from_json(json!({
+                "status": "interrupted",
+                "reason": "subagent_join_cancelled",
+            })))
         }
     }
 }

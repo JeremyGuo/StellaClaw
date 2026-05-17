@@ -642,6 +642,8 @@ impl ConversationKernel {
 
         let (inbox_tx, inbox_rx) = crossbeam_channel::unbounded();
         let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+        let service_addr = addr.clone();
+        let service_outbox = self.output_tx.clone();
         let ctx = ServiceRunContext {
             addr: addr.clone(),
             conversation: self.conversation.clone(),
@@ -653,7 +655,15 @@ impl ConversationKernel {
         };
         let join = thread::Builder::new()
             .name(format!("conversation-service-{addr}"))
-            .spawn(move || service.run(ctx))
+            .spawn(move || {
+                if let Err(error) = service.run(ctx) {
+                    let _ = service_outbox.send(ServiceOutput::Failed(ServiceFailure {
+                        addr: service_addr,
+                        error: format!("{error:#}"),
+                    }));
+                }
+                Ok(())
+            })
             .context("failed to spawn conversation service")?;
 
         self.spawn_log.push(ServiceSpawnRecord {
@@ -1033,6 +1043,17 @@ impl ConversationKernel {
                 ))
             }
             Ok(KernelRequest::StopService { addr, reason }) => {
+                if !self.has_service(&addr) {
+                    return self.dispatch_call(ServiceCall::response_to(
+                        ServiceAddr::kernel(),
+                        call.source,
+                        encode_response(KernelResponse::Error {
+                            code: "service_not_found".to_string(),
+                            message: format!("service {addr} is not running"),
+                        })?,
+                        response_id,
+                    ));
+                }
                 self.stop_service(
                     &addr,
                     reason.unwrap_or_else(|| "kernel stop request".to_string()),
