@@ -1340,6 +1340,7 @@ function App() {
   const websocketRef = useRef(null);
   const websocketReconnectRef = useRef(null);
   const websocketKeyRef = useRef('');
+  const websocketGenerationRef = useRef(0);
   const seenUsageMessagesRef = useRef(new Map());
   const streamBuffersRef = useRef(new Map());
   const streamNextIndicesRef = useRef(new Map());
@@ -3096,10 +3097,15 @@ function App() {
     const connect = async () => {
       try {
         const info = await connectionInfo(serverId);
-        if (disposed || websocketKeyRef.current !== key) return;
+        if (disposed || websocketKeyRef.current !== key || websocketGenerationRef.current !== websocketGeneration) return;
         const socket = new WebSocket(websocketUrl(info.baseUrl, info.token, conversationId, sessionId));
+        if (disposed || websocketKeyRef.current !== key || websocketGenerationRef.current !== websocketGeneration) {
+          socket.close();
+          return;
+        }
         websocketRef.current = socket;
         socket.addEventListener('message', (event) => {
+          if (disposed || websocketKeyRef.current !== key || websocketGenerationRef.current !== websocketGeneration) return;
           let payload;
           try {
             payload = JSON.parse(event.data);
@@ -3141,16 +3147,16 @@ function App() {
           }
         });
         socket.addEventListener('close', () => {
-          if (disposed || websocketKeyRef.current !== key) return;
+          if (disposed || websocketKeyRef.current !== key || websocketGenerationRef.current !== websocketGeneration) return;
           reconnectTimer = setTimeout(connect, 2000);
           websocketReconnectRef.current = reconnectTimer;
           setSessionActivity('实时连接异常，正在重连');
         });
         socket.addEventListener('error', () => {
-          if (!disposed) setSessionActivity('实时连接异常');
+          if (!disposed && websocketKeyRef.current === key && websocketGenerationRef.current === websocketGeneration) setSessionActivity('实时连接异常');
         });
       } catch {
-        if (!disposed) setSessionActivity('实时连接不可用，使用刷新兜底');
+        if (!disposed && websocketKeyRef.current === key && websocketGenerationRef.current === websocketGeneration) setSessionActivity('实时连接不可用，使用刷新兜底');
         const conversation = conversationsRef.current.find((item) => item.conversation_id === conversationId);
         const session = foregroundSessions(conversation).find((item) => String(item?.id || 'main') === sessionId) || conversation;
         loadMessages(serverId, conversationId, {
@@ -3178,6 +3184,8 @@ function App() {
 
     closeSocket();
     websocketKeyRef.current = key;
+    const websocketGeneration = websocketGenerationRef.current + 1;
+    websocketGenerationRef.current = websocketGeneration;
     const cachedMessages = readMessageCache(serverId, conversationId, sessionId);
     messagesRef.current = cachedMessages;
     streamBuffersRef.current = new Map();
@@ -3197,7 +3205,7 @@ function App() {
 
     return () => {
       disposed = true;
-      if (websocketKeyRef.current === key) websocketKeyRef.current = '';
+      if (websocketKeyRef.current === key && websocketGenerationRef.current === websocketGeneration) websocketKeyRef.current = '';
       closeSocket();
     };
   }, [selectedServerId, selectedConversationId, selectedSessionId, markConversationRead]);
