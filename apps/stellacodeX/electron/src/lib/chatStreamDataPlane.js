@@ -13,18 +13,23 @@ export function streamMessageId(event) {
   return String(
     event?.message_id
     || event?.messageId
+    || event?.next_message_id
+    || event?.nextMessageId
     || event?.stream_id
     || event?.streamId
-    || event?.item_id
-    || event?.itemId
-    || event?.turn_id
-    || event?.turnId
     || ''
   ).trim();
 }
 
 export function streamActivityBaseId(event) {
-  return streamMessageId(event) || 'current';
+  return String(
+    streamMessageId(event)
+    || event?.item_id
+    || event?.itemId
+    || event?.turn_id
+    || event?.turnId
+    || 'current'
+  ).trim();
 }
 
 export function streamItemId(event) {
@@ -69,23 +74,41 @@ export function createStreamBufferStore() {
 
 export function createStreamIndexTracker(scopeKey) {
   const nextIndices = new Map();
+  const invalidStreams = new Set();
   const scopedMessageId = (event) => {
     const messageId = streamMessageId(event);
     return messageId ? `${scopeKey}:${messageId}` : '';
   };
   return {
-    accept(event, onGap) {
+    accept(event, onGap, expectedFromState) {
       const scopedId = scopedMessageId(event);
       const index = streamEventIndex(event);
       if (!scopedId || index === undefined) return true;
+      if (invalidStreams.has(scopedId)) return false;
       const expected = nextIndices.get(scopedId);
       if (expected === undefined) {
+        const stateExpected = Number(expectedFromState);
+        if (Number.isFinite(stateExpected)) {
+          if (index < stateExpected) return false;
+          if (index > stateExpected) {
+            invalidStreams.add(scopedId);
+            if (typeof onGap === 'function') onGap(stateExpected, index);
+            return false;
+          }
+          nextIndices.set(scopedId, index + 1);
+          return true;
+        }
+        if (index > 0) {
+          invalidStreams.add(scopedId);
+          if (typeof onGap === 'function') onGap(0, index);
+          return false;
+        }
         nextIndices.set(scopedId, index + 1);
         return true;
       }
       if (index < expected) return false;
       if (index > expected) {
-        nextIndices.set(scopedId, index + 1);
+        invalidStreams.add(scopedId);
         if (typeof onGap === 'function') onGap(expected, index);
         return false;
       }
@@ -94,10 +117,14 @@ export function createStreamIndexTracker(scopeKey) {
     },
     clearForEvent(event) {
       const scopedId = scopedMessageId(event);
-      if (scopedId) nextIndices.delete(scopedId);
+      if (scopedId) {
+        nextIndices.delete(scopedId);
+        invalidStreams.delete(scopedId);
+      }
     },
     reset() {
       nextIndices.clear();
+      invalidStreams.clear();
     }
   };
 }
@@ -139,28 +166,128 @@ function appendTextDelta(existingText, delta) {
   return `${previous}${chunk}`;
 }
 
-function findStreamingMessagePosition(current, id, turnId) {
+function findStreamingMessagePositions(current, id, turnId) {
   const messageId = String(id || '').trim();
   const streamTurnId = String(turnId || '').trim();
-  return current.findIndex((message) => {
+  const positions = [];
+  current.forEach((message, index) => {
     if (!message?._streaming || String(message?.role || '').toLowerCase() !== 'assistant') return false;
     const existingId = String(message?.id ?? message?.message_id ?? '').trim();
-    if (messageId && existingId === messageId) return true;
-    return Boolean(streamTurnId && String(message?._streamTurnId || '') === streamTurnId);
+    if (messageId && existingId === messageId) {
+      positions.push(index);
+      return;
+    }
+    if (!messageId && streamTurnId && String(message?._streamTurnId || '') === streamTurnId) {
+      positions.push(index);
+    }
   });
+  return positions;
 }
 
-export function appendStreamAssistantDelta(current, event) {
+function streamingMessageId(message) {
+  return String(message?.id ?? message?.message_id ?? '').trim();
+}
+
+function sameStreamingMessagePositions(current, position) {
+  const message = current[position];
+  const messageId = streamingMessageId(message);
+  if (!messageId) return [position];
+  return current
+    .map((currentMessage, index) => (
+      currentMessage?._streaming
+      && String(currentMessage?.role || '').toLowerCase() === 'assistant'
+      && streamingMessageId(currentMessage) === messageId
+        ? index
+        : -1
+    ))
+    .filter((index) => index >= 0);
+}
+
+function toolCallIdentityValues(value) {
+  if (!value || typeof value !== 'object') return [];
+  return [
+    value.tool_call_id,
+    value.toolCallId,
+    value.call_id,
+    value.callId,
+    value.item_id,
+    value.itemId,
+    value._item_id,
+    value._streamItemId
+  ]
+    .map((item) => String(item || '').trim())
+    .filter(Boolean);
+}
+
+function toolCallMatches(item, targetIds) {
+  if (!targetIds.size) return false;
+  const itemIds = toolCallIdentityValues(item);
+  return itemIds.some((id) => targetIds.has(id));
+}
+
+function findStreamingToolResultPosition(current, turnId, toolCallId, toolName) {
+  const streamTurnId = String(turnId || '').trim();
+  const targetIds = new Set(toolCallIdentityValues({
+    tool_call_id: toolCallId,
+    call_id: toolCallId,
+    item_id: toolCallId
+  }));
+  const toolLabel = String(toolName || '').trim();
+  const candidates = [];
+  current.forEach((message, index) => {
+    if (!message?._streaming || String(message?.role || '').toLowerCase() !== 'assistant') return;
+    if (streamTurnId && String(message?._streamTurnId || '') !== streamTurnId) return;
+    candidates.push(index);
+  });
+  const exact = candidates.find((index) => {
+    const items = Array.isArray(current[index]?.items) ? current[index].items : [];
+    return items.some((item) => item?.type === 'tool_call' && toolCallMatches(item, targetIds));
+  });
+  if (exact !== undefined) return exact;
+  let nameMatch;
+  for (let i = candidates.length - 1; i >= 0; i -= 1) {
+    const index = candidates[i];
+    const items = Array.isArray(current[index]?.items) ? current[index].items : [];
+    if (toolLabel && items.some((item) => (
+      item?.type === 'tool_call'
+      && String(item?.tool_name || item?.toolName || '').trim() === toolLabel
+    ))) {
+      nameMatch = index;
+      break;
+    }
+  }
+  if (nameMatch !== undefined) return nameMatch;
+  return candidates.length ? candidates[candidates.length - 1] : -1;
+}
+
+function upsertStreamingMessage(current, id, turnId, buildMessage) {
+  const positions = findStreamingMessagePositions(current, id, turnId);
+  if (!positions.length) return [...current, buildMessage()];
+  const selectedPositions = new Set(positions);
+  const insertAt = positions[0];
+  const base = current[positions[positions.length - 1]] || {};
+  const nextMessage = buildMessage(base);
+  const next = [];
+  current.forEach((message, index) => {
+    if (index === insertAt) {
+      next.push(nextMessage);
+    } else if (!selectedPositions.has(index)) {
+      next.push(message);
+    }
+  });
+  return next;
+}
+
+export function appendStreamAssistantDelta(current, event, fullText) {
   const id = streamMessageId(event);
   const delta = streamDeltaText(event);
   if (!id || !delta) return current;
   const turnId = String(event?.turn_id || event?.turnId || '').trim();
   const itemId = String(event?.item_id || event?.itemId || '').trim();
-  const position = findStreamingMessagePosition(current, id, turnId);
   const now = new Date().toISOString();
   const fallbackIndex = nextStreamMessageIndex(current);
   const buildMessage = (existing = {}) => {
-    const nextText = appendTextDelta(existing.text || existing.preview || '', delta);
+    const nextText = String(fullText || '') || appendTextDelta(existing.text || existing.content || existing.text_with_attachment_markers || existing.preview || '', delta);
     const items = Array.isArray(existing.items) ? [...existing.items] : [];
     const textIndex = items.findIndex((item) => item?.type === 'text');
     const textItem = {
@@ -195,15 +322,13 @@ export function appendStreamAssistantDelta(current, event) {
       attachments: existing.attachments || [],
       attachment_count: existing.attachment_count || 0,
       message_time: existing.message_time || now,
+      _lastStreamEventIndex: streamEventIndex(event) ?? existing._lastStreamEventIndex,
       _streamTurnId: turnId || existing._streamTurnId || '',
       _streamItemId: itemId || existing._streamItemId || '',
       _streaming: true
     };
   };
-  if (position < 0) return [...current, buildMessage()];
-  const next = [...current];
-  next[position] = buildMessage(next[position]);
-  return next;
+  return upsertStreamingMessage(current, id, turnId, buildMessage);
 }
 
 export function appendStreamToolCallDelta(current, event) {
@@ -214,7 +339,6 @@ export function appendStreamToolCallDelta(current, event) {
   const itemId = String(event?.item_id || event?.itemId || '').trim();
   const callId = String(event?.call_id || event?.callId || itemId).trim();
   if (!callId) return current;
-  const position = findStreamingMessagePosition(current, id, turnId);
   const now = new Date().toISOString();
   const fallbackIndex = nextStreamMessageIndex(current);
   const buildMessage = (existing = {}) => {
@@ -258,15 +382,13 @@ export function appendStreamToolCallDelta(current, event) {
       attachments: existing.attachments || [],
       attachment_count: existing.attachment_count || 0,
       message_time: existing.message_time || now,
+      _lastStreamEventIndex: streamEventIndex(event) ?? existing._lastStreamEventIndex,
       _streamTurnId: turnId || existing._streamTurnId || '',
       _streamItemId: itemId || existing._streamItemId || '',
       _streaming: true
     };
   };
-  if (position < 0) return [...current, buildMessage()];
-  const next = [...current];
-  next[position] = buildMessage(next[position]);
-  return next;
+  return upsertStreamingMessage(current, id, turnId, buildMessage);
 }
 
 export function appendStreamReasoningSummary(current, event) {
@@ -276,7 +398,6 @@ export function appendStreamReasoningSummary(current, event) {
   const turnId = String(event?.turn_id || event?.turnId || '').trim();
   const itemId = String(event?.item_id || event?.itemId || '').trim();
   const summaryIndex = Number(event?.summary_index ?? event?.summaryIndex ?? 0);
-  const position = findStreamingMessagePosition(current, id, turnId);
   const now = new Date().toISOString();
   const fallbackIndex = nextStreamMessageIndex(current);
   const buildMessage = (existing = {}) => {
@@ -323,15 +444,13 @@ export function appendStreamReasoningSummary(current, event) {
       attachments: existing.attachments || [],
       attachment_count: existing.attachment_count || 0,
       message_time: existing.message_time || now,
+      _lastStreamEventIndex: streamEventIndex(event) ?? existing._lastStreamEventIndex,
       _streamTurnId: turnId || existing._streamTurnId || '',
       _streamItemId: itemId || existing._streamItemId || '',
       _streaming: true
     };
   };
-  if (position < 0) return [...current, buildMessage()];
-  const next = [...current];
-  next[position] = buildMessage(next[position]);
-  return next;
+  return upsertStreamingMessage(current, id, turnId, buildMessage);
 }
 
 function liveToolResultMessage(event, existingMessages = []) {
@@ -365,6 +484,7 @@ function liveToolResultMessage(event, existingMessages = []) {
     attachments: Array.isArray(result.files) ? result.files : [],
     attachment_count: Array.isArray(result.files) ? result.files.length : 0,
     message_time: new Date().toISOString(),
+    _lastStreamEventIndex: streamEventIndex(event),
     _streamTurnId: turnId,
     _streaming: true,
     _liveToolResult: true,
@@ -379,15 +499,11 @@ function appendToolResultToStreamingMessage(current, event) {
   const toolCallId = String(toolResult.tool_call_id || toolResult.toolCallId || event?.tool_call_id || event?.toolCallId || '').trim();
   const toolName = String(toolResult.tool_name || toolResult.toolName || 'tool').trim() || 'tool';
   if (!toolCallId && !toolName) return null;
-  const position = current.findIndex((message) => (
-    message?._streaming
-    && String(message?.role || '').toLowerCase() === 'assistant'
-    && (!turnId || String(message?._streamTurnId || '') === turnId)
-  ));
+  const position = findStreamingToolResultPosition(current, turnId, toolCallId, toolName);
   if (position < 0) return null;
   const result = toolResult.result || {};
-  const next = [...current];
-  const message = next[position];
+  const positions = sameStreamingMessagePositions(current, position);
+  const message = current[position] || {};
   const items = Array.isArray(message.items) ? [...message.items] : [];
   const existingIndex = items.findIndex((item) => (
     item?.type === 'tool_result'
@@ -406,7 +522,7 @@ function appendToolResultToStreamingMessage(current, event) {
   if (existingIndex >= 0) items[existingIndex] = { ...items[existingIndex], ...item };
   else items.push(item);
   const resultFiles = existingIndex >= 0 ? [] : (Array.isArray(result.files) ? result.files : []);
-  next[position] = {
+  const updatedMessage = {
     ...message,
     items,
     attachments: [
@@ -415,6 +531,19 @@ function appendToolResultToStreamingMessage(current, event) {
     ],
     attachment_count: Number(message.attachment_count || 0) + resultFiles.length
   };
+  const resultEventIndex = streamEventIndex(event);
+  if (resultEventIndex !== undefined) {
+    updatedMessage._lastStreamEventIndex = resultEventIndex;
+  }
+  const selectedPositions = new Set(positions);
+  const next = [];
+  current.forEach((currentMessage, index) => {
+    if (index === position) {
+      next.push(updatedMessage);
+    } else if (!selectedPositions.has(index)) {
+      next.push(currentMessage);
+    }
+  });
   return next;
 }
 
@@ -555,13 +684,17 @@ export function streamTurnCompletedPatch(currentMessages, event) {
   };
 }
 
-export function streamAssistantDeltaPatch(currentMessages, event) {
+export function streamAssistantDeltaPatch(currentMessages, event, scopeKey, streamBuffers) {
   const delta = streamDeltaText(event);
   if (!delta) return null;
   const messageId = streamActivityBaseId(event);
+  const bufferKey = `${scopeKey}:assistant:${messageId}`;
+  const text = streamBuffers?.append
+    ? streamBuffers.append(bufferKey, delta)
+    : undefined;
   return {
     chatState: { state: 'running', currentTurnState: event },
-    messages: appendStreamAssistantDelta(currentMessages, event),
+    messages: appendStreamAssistantDelta(currentMessages, event, text),
     activity: '正在回复',
     runningActivity: {
       id: `stream-assistant-${messageId}`,

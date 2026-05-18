@@ -2,9 +2,9 @@ export function messageText(message) {
   if (typeof message === 'string') return message;
   if (typeof message?.text_with_attachment_markers === 'string' && message.text_with_attachment_markers.trim()) return message.text_with_attachment_markers;
   if (typeof message?.rendered_text === 'string' && message.rendered_text.trim()) return message.rendered_text;
-  if (typeof message?.preview === 'string' && message.preview.trim()) return message.preview;
   if (typeof message?.text === 'string' && message.text.trim()) return message.text;
   if (typeof message?.content === 'string' && message.content.trim()) return message.content;
+  if (typeof message?.preview === 'string' && message.preview.trim()) return message.preview;
   const items = Array.isArray(message?.items) && message.items.length > 0
     ? message.items
     : Array.isArray(message?.data)

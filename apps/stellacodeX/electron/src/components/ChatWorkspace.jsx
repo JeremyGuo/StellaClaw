@@ -7,7 +7,8 @@ import * as Popover from '@radix-ui/react-popover';
 import { attachmentName, attachmentUrl, fileExtension, isImageAttachment, messageText } from '../lib/fileUtils';
 import { handleExternalLinkClick, isExternalUrl } from '../lib/externalLinks';
 import { formatBytes, formatTokens, modelAlias, modelDisplayName } from '../lib/format';
-import { displayMessages, firstMessageId, isExecutionMessage, isFinalAssistantMessage, liveActivitySignature, markerIndexes, messageItems, messageKey, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
+import { firstMessageId, isExecutionMessage, isFinalAssistantMessage, liveActivitySignature, markerIndexes, messageItems, messageKey, splitMessageForDisplay, tokenUsage, toolCardsForMessage } from '../lib/messageUtils';
+import { buildChatRenderModel, chatRenderEntryKey } from './chat/renderModel';
 
 const COMMANDS = [
   { command: '/model', label: '切换模型', description: '选择当前 Conversation 使用的模型', options: 'models' },
@@ -104,10 +105,23 @@ function selectionSummary(selection) {
 }
 
 export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, processing = false, runningActivities, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
-  const renderedMessages = useMemo(() => displayMessages(messages), [messages]);
-  const renderEntries = useMemo(() => assistantTurnEntries(renderedMessages), [renderedMessages]);
+  const currentActivity = (runningActivities || []).at(-1) || null;
+  const renderModel = useMemo(() => buildChatRenderModel({
+    messages,
+    currentActivity,
+    sending,
+    processing,
+    modelSelectionPending
+  }), [messages, currentActivity, sending, processing, modelSelectionPending]);
+  const {
+    renderedMessages,
+    renderEntries,
+    entryKeys,
+    latestAssistantTurnIndex,
+    pendingAssistantVisible,
+    responseSpacerVisible
+  } = renderModel;
   const activitySignature = useMemo(() => liveActivitySignature(runningActivities || []), [runningActivities]);
-  const entryKeys = useMemo(() => renderEntries.map((entry, index) => entryKey(entry, index)), [renderEntries]);
   const oldestMessageKey = useMemo(() => firstMessageId(messages) || messages[0]?.id || messages[0]?.index || '', [messages]);
   const newestMessageKey = useMemo(() => {
     const message = messages.at(-1);
@@ -148,18 +162,9 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const [toolStopNoticeReady, setToolStopNoticeReady] = useState(false);
   const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: 0 });
   const [virtualHeightVersion, setVirtualHeightVersion] = useState(0);
-  const currentActivity = (runningActivities || []).at(-1) || null;
   const inlineActivity = shouldShowInlineActivity(currentActivity) ? currentActivity : null;
   const progressVisible = Boolean(currentActivity);
   const sessionRunning = Boolean(processing || currentActivity);
-  const pendingAssistantVisible = shouldShowPendingAssistant(renderEntries, currentActivity, sending, processing);
-  const responseSpacerVisible = Boolean(pendingAssistantVisible && renderedMessages.length > 0 && !modelSelectionPending);
-  const latestAssistantTurnIndex = useMemo(() => {
-    for (let index = renderEntries.length - 1; index >= 0; index -= 1) {
-      if (renderEntries[index]?.type === 'assistantTurn') return index;
-    }
-    return -1;
-  }, [renderEntries]);
   const virtualWindow = useMemo(() => virtualWindowForEntries({
     entries: renderEntries,
     keys: entryKeys,
@@ -781,11 +786,6 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   );
 }
 
-function entryKey(entry, index) {
-  if (entry?.type === 'assistantTurn') return entry.id || `assistant-turn-${index}`;
-  return messageKey(entry?.message, index);
-}
-
 function virtualWindowForEntries({ entries, keys, heightCache, viewport, activeIndex }) {
   const count = entries.length;
   if (count <= VIRTUALIZE_ENTRY_THRESHOLD) {
@@ -795,7 +795,7 @@ function virtualWindowForEntries({ entries, keys, heightCache, viewport, activeI
       end: Math.max(0, count - 1),
       topPadding: 0,
       bottomPadding: 0,
-      items: entries.map((entry, index) => ({ entry, index, key: keys[index] || entryKey(entry, index) }))
+      items: entries.map((entry, index) => ({ entry, index, key: keys[index] || chatRenderEntryKey(entry, index) }))
     };
   }
   const heights = keys.map((key) => heightCache.get(key) || VIRTUAL_ENTRY_ESTIMATE);
@@ -822,34 +822,9 @@ function virtualWindowForEntries({ entries, keys, heightCache, viewport, activeI
     bottomPadding: Math.max(0, offsets[count] - offsets[end + 1]),
     items: entries.slice(start, end + 1).map((entry, offset) => {
       const index = start + offset;
-      return { entry, index, key: keys[index] || entryKey(entry, index) };
+      return { entry, index, key: keys[index] || chatRenderEntryKey(entry, index) };
     })
   };
-}
-
-function shouldShowPendingAssistant(entries, currentActivity, sending, processing) {
-  const state = String(currentActivity?.state || '').toLowerCase();
-  const activityId = String(currentActivity?.id || '').trim();
-  const active = Boolean(sending || processing || (currentActivity && state !== 'done' && state !== 'failed'));
-  if (!active) return false;
-  if (activityId.startsWith('stream-assistant-') || activityId.startsWith('stream-reasoning-') || activityId.startsWith('stream-tool-')) return false;
-  const lastUserIndex = findLastEntryIndex(entries, (entry) => (
-    entry?.type === 'message' && String(entry.message?.role || '').toLowerCase() === 'user'
-  ));
-  if (lastUserIndex < 0) return false;
-  const hasAssistantAfterUser = entries.slice(lastUserIndex + 1).some((entry) => {
-    if (entry?.type === 'assistantTurn') return true;
-    if (entry?.type !== 'message') return false;
-    return String(entry.message?.role || '').toLowerCase() === 'assistant';
-  });
-  return !hasAssistantAfterUser;
-}
-
-function findLastEntryIndex(entries, predicate) {
-  for (let index = entries.length - 1; index >= 0; index -= 1) {
-    if (predicate(entries[index])) return index;
-  }
-  return -1;
 }
 
 function PendingAssistantPlaceholder({ compact = false, label = '正在思考' }) {
@@ -858,27 +833,6 @@ function PendingAssistantPlaceholder({ compact = false, label = '正在思考' }
       <span>{label}</span>
     </div>
   );
-}
-
-function assistantTurnEntries(renderedMessages) {
-  const entries = [];
-  for (let index = 0; index < renderedMessages.length; index += 1) {
-    const message = renderedMessages[index];
-    if (message?.type !== 'toolGroup') {
-      entries.push({ type: 'message', id: messageKey(message, index), message });
-      continue;
-    }
-    const nextMessage = renderedMessages[index + 1];
-    const finalMessage = isFinalAssistantMessage(nextMessage) ? nextMessage : null;
-    entries.push({
-      type: 'assistantTurn',
-      id: `turn-${message.id || messageKey(message.messages?.[0], index)}`,
-      processGroup: message,
-      finalMessage
-    });
-    if (finalMessage) index += 1;
-  }
-  return entries;
 }
 
 function ModelSelectionGate({ models, loading, error, onReload, onChoose }) {
@@ -1350,7 +1304,7 @@ export function ToolProcessGroup({ group, active = false }) {
             }
             return block.kind === 'reasoning'
               ? <ReasoningNote key={block.id} text={block.text} collapsible defaultOpen={!complete && activeTail} live={!complete && activeTail} />
-              : <MarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} typewriter={!complete && activeTail} />;
+              : <MarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} plain={!complete && activeTail} />;
           })}
           {waitingForNextItem && <PendingAssistantPlaceholder compact label="正在思考" />}
         </div>
@@ -1474,7 +1428,9 @@ function toolProcessBlocks(rows) {
   rows.forEach((row) => {
     const attachments = row.textMessage ? [...(row.textMessage.attachments || []), ...(row.textMessage.files || [])] : [];
     const text = row.textMessage ? messageText(row.textMessage) : '';
-    if (text) {
+    const segments = row.segments || [{ notes: [], cards: row.toolCards }];
+    const hasSegmentNotes = segments.some((segment) => Array.isArray(segment?.notes) && segment.notes.length > 0);
+    if (text && !hasSegmentNotes) {
       pushNote({
         type: 'note',
         kind: 'text',
@@ -1484,7 +1440,7 @@ function toolProcessBlocks(rows) {
       });
     }
     let renderedCardIndex = 0;
-    (row.segments || [{ notes: [], cards: row.toolCards }]).forEach((segment, segmentIndex) => {
+    segments.forEach((segment, segmentIndex) => {
       (segment.notes || []).forEach((note, noteIndex) => {
         pushNote({
           type: 'note',
@@ -1662,10 +1618,10 @@ function toolCardsAreComplete(cards) {
 export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
   const text = messageText(message);
   const structuredItems = messageItems(message);
+  const plainStreaming = Boolean(message?._streaming && String(message?.role || '').toLowerCase() === 'assistant');
   const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
   const files = Array.isArray(message?.files) ? message.files : [];
   const allAttachments = [...attachments, ...files];
-  const typewriter = Boolean(message?._streaming && String(message?.role || '').toLowerCase() === 'assistant');
   const inlineIndexes = markerIndexes(text);
   const structuredAttachmentIndexes = new Set(
     structuredItems
@@ -1691,9 +1647,9 @@ export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, o
   return (
     <div className="message-body">
       {structuredItems.length > 0 ? (
-        <StructuredItems role={message?.role} items={structuredItems} attachments={allAttachments} fallbackText={text} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} typewriter={typewriter} />
+        <StructuredItems role={message?.role} items={structuredItems} attachments={allAttachments} fallbackText={text} plain={plainStreaming} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />
       ) : text ? (
-        <MarkdownContent className="message-text" text={text} attachments={allAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} typewriter={typewriter} />
+        <MarkdownContent className="message-text" text={text} attachments={allAttachments} plain={plainStreaming} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />
       ) : null}
       {trailingAttachments.length > 0 && <AttachmentList attachments={trailingAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />}
       {Number(message?.attachment_count || 0) > 0 && allAttachments.length === 0 && (
@@ -1724,7 +1680,7 @@ function attachmentIdentity(attachment) {
   ).trim();
 }
 
-export function StructuredItems({ role, items, attachments, fallbackText, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, typewriter = false }) {
+export function StructuredItems({ role, items, attachments, fallbackText, plain = false, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
   const orderedItems = orderedStructuredItems(items, role);
   const hasTextItem = orderedItems.some(({ item }) => typeof item === 'string' || item?.type === 'text');
   const hasSelectionReference = orderedItems.some(({ item }) => item?.type === 'selection_reference');
@@ -1732,10 +1688,10 @@ export function StructuredItems({ role, items, attachments, fallbackText, onOpen
   const rendered = orderedItems
     .map(({ item, index }) => {
       if (typeof item === 'string') {
-        return <MarkdownContent key={index} className="message-text" text={item} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} typewriter={typewriter} />;
+        return <MarkdownContent key={index} className="message-text" text={item} attachments={attachments} plain={plain} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />;
       }
       if (item?.type === 'text') {
-        return <MarkdownContent key={index} className="message-text" text={item.text_with_attachment_markers || item.text || item.content || ''} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} typewriter={typewriter} />;
+        return <MarkdownContent key={index} className="message-text" text={item.text_with_attachment_markers || item.text || item.content || ''} attachments={attachments} plain={plain} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />;
       }
       if (item?.type === 'file') {
         return <AttachmentCard key={index} attachment={attachments[item.attachment_index] || item} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />;
@@ -1766,16 +1722,16 @@ export function StructuredItems({ role, items, attachments, fallbackText, onOpen
         className="message-text"
         text={fallbackText}
         attachments={attachments}
+        plain={plain}
         onOpenAttachment={onOpenAttachment}
         onDownloadAttachment={onDownloadAttachment}
         onResolveAttachmentUrl={onResolveAttachmentUrl}
         onOpenLocalLink={onOpenLocalLink}
-        typewriter={typewriter}
       />
     );
   }
   if (rendered.length) return <>{rendered}</>;
-  return <MarkdownContent className="message-text" text={fallbackText} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} typewriter={typewriter} />;
+  return <MarkdownContent className="message-text" text={fallbackText} attachments={attachments} plain={plain} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />;
 }
 
 function orderedStructuredItems(items, role) {
@@ -1826,14 +1782,14 @@ function ReasoningNote({ text, collapsible = false, defaultOpen = true, live = f
           <em>{open ? '收起' : shortReasoningSummary(value)}</em>
           <ChevronDown size={14} strokeWidth={1.9} aria-hidden="true" />
         </button>
-        {open && <MarkdownContent className="reasoning-note-text" text={value} />}
+        {open && <MarkdownContent className="reasoning-note-text" text={value} plain={live} />}
       </div>
     );
   }
   return (
     <div className="reasoning-note">
       <span>思考</span>
-      <MarkdownContent className="reasoning-note-text" text={value} />
+      <MarkdownContent className="reasoning-note-text" text={value} plain={live} />
     </div>
   );
 }
@@ -1844,9 +1800,16 @@ function shortReasoningSummary(value) {
   return text.length > 72 ? `${text.slice(0, 72)}...` : text;
 }
 
-export function MarkdownContent({ text, attachments = [], className = 'markdown-content', onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, typewriter = false }) {
-  const value = useTypewriterText(String(text || ''), typewriter);
+export function MarkdownContent({ text, attachments = [], className = 'markdown-content', plain = false, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
+  const value = String(text || '');
   if (!value.trim()) return null;
+  if (plain) {
+    return (
+      <div className={`${className} plain-stream-text`}>
+        <PlainTextBlock text={value} />
+      </div>
+    );
+  }
   const parts = [];
   const pattern = /(\[\[attachment:(\d+)]]|\[tool_(call|result)\s+([^\]\n]+)\]\s*([\s\S]*?)(?=\n\[tool_(?:call|result)\s+|$))/g;
   let cursor = 0;
@@ -1880,46 +1843,25 @@ export function MarkdownContent({ text, attachments = [], className = 'markdown-
   return <div className={className}>{parts.length ? parts : <MarkdownBlock text={value} onOpenLocalLink={onOpenLocalLink} />}</div>;
 }
 
-function useTypewriterText(text, enabled) {
-  const target = String(text || '');
-  const targetRef = useRef(target);
-  const displayedRef = useRef(enabled ? '' : target);
-  const [displayed, setDisplayed] = useState(displayedRef.current);
-
+function PlainTextBlock({ text }) {
+  const value = String(text || '');
+  const previousRef = useRef('');
+  const previous = previousRef.current;
+  const canAnimateAppend = previous && value.length > previous.length && value.startsWith(previous);
+  const stableText = canAnimateAppend ? previous : '';
+  const appendedText = canAnimateAppend ? value.slice(previous.length) : value;
   useEffect(() => {
-    targetRef.current = target;
-    if (!enabled) {
-      displayedRef.current = target;
-      setDisplayed(target);
-      return;
-    }
-    if (!target.startsWith(displayedRef.current)) {
-      displayedRef.current = '';
-      setDisplayed('');
-    }
-  }, [target, enabled]);
-
-  useEffect(() => {
-    if (!enabled) return undefined;
-    const timer = window.setInterval(() => {
-      const current = displayedRef.current;
-      const nextTarget = targetRef.current;
-      if (current === nextTarget) return;
-      if (!nextTarget.startsWith(current)) {
-        displayedRef.current = nextTarget;
-        setDisplayed(nextTarget);
-        return;
-      }
-      const remaining = nextTarget.slice(current.length);
-      const step = Math.max(1, Math.min(10, Math.ceil(remaining.length / 5)));
-      const next = current + remaining.slice(0, step);
-      displayedRef.current = next;
-      setDisplayed(next);
-    }, 24);
-    return () => window.clearInterval(timer);
-  }, [enabled]);
-
-  return enabled ? displayed : target;
+    previousRef.current = value;
+  }, [value]);
+  if (!canAnimateAppend) {
+    return <span className="stream-text-fade" key={value.length}>{value}</span>;
+  }
+  return (
+    <>
+      <span>{stableText}</span>
+      <span className="stream-text-fade" key={value.length}>{appendedText}</span>
+    </>
+  );
 }
 
 export function MarkdownBlock({ text, onOpenLocalLink }) {

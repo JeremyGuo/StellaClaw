@@ -1,5 +1,8 @@
-import { Download, FileSearch, Folder, MessageSquarePlus, Monitor, PanelLeft, TerminalSquare, Upload } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import { Copy, Download, FileSearch, Folder, MessageSquarePlus, Monitor, PanelLeft, ScrollText, TerminalSquare, Trash2, Upload } from 'lucide-react';
 import * as Popover from '@radix-ui/react-popover';
+import { clearChatProtocolDiagnostics, readChatProtocolDiagnostics } from '../lib/chatProtocolDiagnostics';
+import { chatRawRenderSnapshot, chatRenderOverviewText } from '../lib/chatRenderDiagnostics';
 
 export function WindowChrome({
   title,
@@ -11,6 +14,7 @@ export function WindowChrome({
   overviewPanelOpen,
   workspacePanelOpen,
   previewPanelOpen,
+  rawRenderMessages = [],
   updateReady = false,
   onToggleOverview,
   onToggleWorkspace,
@@ -43,6 +47,7 @@ export function WindowChrome({
             Update
           </button>
         )}
+        <ProtocolLogButton rawRenderMessages={rawRenderMessages} />
         <TransferButton transfers={transfers} />
         <button className="chrome-button" type="button" onClick={onToggleTerminal} title="终端">
           <TerminalSquare size={18} />
@@ -59,6 +64,216 @@ export function WindowChrome({
       </div>
     </header>
   );
+}
+
+function ProtocolLogButton({ rawRenderMessages = [] }) {
+  const [open, setOpen] = useState(false);
+  const [records, setRecords] = useState(() => readChatProtocolDiagnostics());
+  const [panel, setPanel] = useState('logs');
+  const [filters, setFilters] = useState(() => ({
+    stream: false,
+    append_stream_to_ui: true,
+    replace_ui_element: true
+  }));
+  const [copyState, setCopyState] = useState('');
+  const latest = records.at(-1);
+  const visibleRecords = useMemo(() => records.filter((record) => logRecordVisible(record, filters)).slice(-220).reverse(), [records, filters]);
+  const rawRenderSnapshot = useMemo(() => chatRawRenderSnapshot(rawRenderMessages), [rawRenderMessages]);
+
+  useEffect(() => {
+    const onRecord = (event) => {
+      setRecords((current) => [...current, event.detail].slice(-600));
+    };
+    const onClear = () => setRecords([]);
+    window.addEventListener('stellacode:protocol-log', onRecord);
+    window.addEventListener('stellacode:protocol-log-cleared', onClear);
+    return () => {
+      window.removeEventListener('stellacode:protocol-log', onRecord);
+      window.removeEventListener('stellacode:protocol-log-cleared', onClear);
+    };
+  }, []);
+
+  useEffect(() => {
+    window.__stellacodeProtocolLogOpen = open;
+    return () => {
+      window.__stellacodeProtocolLogOpen = false;
+    };
+  }, [open]);
+
+  const copyLogs = async () => {
+    try {
+      const payload = panel === 'raw'
+        ? rawRenderSnapshot
+        : visibleRecords.slice().reverse();
+      await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
+      setCopyState('已复制');
+      setTimeout(() => setCopyState(''), 1200);
+    } catch {
+      setCopyState('复制失败');
+      setTimeout(() => setCopyState(''), 1600);
+    }
+  };
+
+  return (
+    <Popover.Root open={open} onOpenChange={setOpen}>
+      <Popover.Trigger asChild>
+        <button className={`chrome-button protocol-log-button${records.length > 0 ? ' active' : ''}`} type="button" title="全局日志">
+          <ScrollText size={17} />
+          <span>LOG</span>
+        </button>
+      </Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content className="protocol-log-popover" align="end" sideOffset={8}>
+          <div className="protocol-log-header">
+            <div>
+              <strong>全局日志</strong>
+              <span>
+                {panel === 'raw'
+                  ? `Raw ${rawRenderSnapshot.counts.raw_messages}/${rawRenderSnapshot.counts.display_messages}/${rawRenderSnapshot.counts.render_entries}`
+                  : records.length ? `${visibleRecords.length}/${records.length} 条 · 最新 ${shortLogTime(latest?.time)}` : '暂无日志'}
+              </span>
+            </div>
+            <div className="protocol-log-actions">
+              {copyState && <em>{copyState}</em>}
+              <button type="button" onClick={copyLogs} title="复制日志">
+                <Copy size={14} />
+              </button>
+              <button type="button" onClick={clearChatProtocolDiagnostics} title="清空日志">
+                <Trash2 size={14} />
+              </button>
+            </div>
+          </div>
+          <div className="protocol-log-tabs" aria-label="日志面板">
+            <ProtocolLogFilterButton label="Events" active={panel === 'logs'} onClick={() => setPanel('logs')} />
+            <ProtocolLogFilterButton label="Raw Render" active={panel === 'raw'} onClick={() => setPanel('raw')} />
+          </div>
+          {panel === 'logs' ? (
+            <>
+              <div className="protocol-log-filters" aria-label="日志类型筛选">
+                <ProtocolLogFilterButton label="Stream" active={filters.stream} onClick={() => setFilters((current) => ({ ...current, stream: !current.stream }))} />
+                <ProtocolLogFilterButton label="Append Stream to UI" active={filters.append_stream_to_ui} onClick={() => setFilters((current) => ({ ...current, append_stream_to_ui: !current.append_stream_to_ui }))} />
+                <ProtocolLogFilterButton label="Replace UI element" active={filters.replace_ui_element} onClick={() => setFilters((current) => ({ ...current, replace_ui_element: !current.replace_ui_element }))} />
+              </div>
+              <div className="protocol-log-list">
+                {visibleRecords.length === 0 && <div className="protocol-log-empty">没有记录到前端协议日志</div>}
+                {visibleRecords.map((record, index) => (
+                  <ProtocolLogRow record={record} key={`${record.time || 'log'}-${index}`} />
+                ))}
+              </div>
+            </>
+          ) : (
+            <RawRenderPanel snapshot={rawRenderSnapshot} />
+          )}
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
+  );
+}
+
+function RawRenderPanel({ snapshot }) {
+  const overviewText = chatRenderOverviewText(snapshot);
+  return (
+    <div className="protocol-log-list raw-render-list">
+      <details className="protocol-log-row raw-render-overview" open>
+        <summary>
+          <span>{shortLogTime(snapshot.generated_at)}</span>
+          <strong>overview</strong>
+          <em>compact text summary</em>
+        </summary>
+        <pre>{overviewText}</pre>
+      </details>
+      <details className="protocol-log-row" open>
+        <summary>
+          <span>{shortLogTime(snapshot.generated_at)}</span>
+          <strong>raw messages</strong>
+          <em>{snapshot.counts.raw_messages} items</em>
+        </summary>
+        <pre>{JSON.stringify(snapshot.raw_messages.slice(-6), null, 2)}</pre>
+      </details>
+      <details className="protocol-log-row">
+        <summary>
+          <span>{shortLogTime(snapshot.generated_at)}</span>
+          <strong>displayMessages</strong>
+          <em>{snapshot.counts.display_messages} items</em>
+        </summary>
+        <pre>{JSON.stringify(snapshot.display_messages.slice(-6), null, 2)}</pre>
+      </details>
+      <details className="protocol-log-row">
+        <summary>
+          <span>{shortLogTime(snapshot.generated_at)}</span>
+          <strong>renderEntries</strong>
+          <em>{snapshot.counts.render_entries} items</em>
+        </summary>
+        <pre>{JSON.stringify(snapshot.render_entries.slice(-6), null, 2)}</pre>
+      </details>
+    </div>
+  );
+}
+
+function ProtocolLogFilterButton({ label, active, onClick }) {
+  return (
+    <button className={active ? 'active' : ''} type="button" onClick={onClick}>
+      {label}
+    </button>
+  );
+}
+
+function logRecordVisible(record, filters) {
+  const category = logRecordCategory(record);
+  if (!category) return true;
+  return Boolean(filters[category]);
+}
+
+function logRecordCategory(record) {
+  const explicit = String(record?.category || '').trim();
+  if (explicit) return explicit;
+  const kind = String(record?.kind || '');
+  if (kind === 'chat.stream') return 'stream';
+  if (kind === 'chat.append_stream_to_ui') return 'append_stream_to_ui';
+  if (kind === 'chat.replace_ui_element' || kind === 'chat.message_arrived') return 'replace_ui_element';
+  if (kind.includes('stream_update')) return 'append_stream_to_ui';
+  return '';
+}
+
+function ProtocolLogRow({ record }) {
+  const kind = String(record?.kind || 'log');
+  const severity = kind.includes('mismatch') || kind.includes('gap') || kind.includes('error')
+    ? 'error'
+    : kind.includes('warning')
+      ? 'warning'
+      : kind.includes('stream_')
+        ? 'stream'
+        : 'info';
+  return (
+    <details className={`protocol-log-row ${severity}`}>
+      <summary>
+        <span>{shortLogTime(record?.time)}</span>
+        <strong>{kind}</strong>
+        <em>{logRecordSummary(record)}</em>
+      </summary>
+      <pre>{JSON.stringify(record, null, 2)}</pre>
+    </details>
+  );
+}
+
+function logRecordSummary(record) {
+  if (record?.action) {
+    const delta = record.delta ? ` · ${record.delta}` : '';
+    const message = record.incoming?.[0]?.text || record.afterTail?.at(-1)?.text || '';
+    return `${record.action}${delta || (message ? ` · ${message}` : '')}`;
+  }
+  const payload = record?.payload || record?.event || record?.projection || record?.mismatches;
+  if (payload?.type) return String(payload.type);
+  if (Array.isArray(payload)) return `${payload.length} items`;
+  if (record?.scopeKey) return String(record.scopeKey);
+  return '';
+}
+
+function shortLogTime(value) {
+  if (!value) return '--:--:--';
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '--:--:--';
+  return date.toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
 function TransferButton({ transfers }) {

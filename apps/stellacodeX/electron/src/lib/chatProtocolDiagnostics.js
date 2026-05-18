@@ -1,21 +1,64 @@
 import { messageIndex } from './messageUtils';
 import { messageText } from './fileUtils';
 
-const STORAGE_KEY = 'stellacode.chatProtocolDiagnostics.v1';
-const MAX_RECORDS = 600;
+const STORAGE_KEY = 'stellacode.chatProtocolDiagnostics.v3';
+const VERBOSE_KEY = 'stellacode.chatProtocolDiagnostics.verbose';
+const MAX_RECORDS = 300;
 
 export function recordChatProtocolDiagnostic(kind, details = {}) {
+  if (!shouldRecordChatProtocolDiagnostic(kind, details?.category)) return;
   const record = {
     time: new Date().toISOString(),
     kind,
     ...sanitize(details)
   };
   writeLocalRecord(record);
+  emitDiagnosticsEvent(record);
   if (typeof window !== 'undefined' && window.stellacode2?.appendProtocolLog) {
     window.stellacode2.appendProtocolLog(record).catch(() => {});
   }
   if (kind.includes('mismatch') || kind.includes('warning') || kind.includes('gap')) {
     console.warn(`[chat-protocol] ${kind}`, record);
+  }
+}
+
+export function shouldRecordChatProtocolDiagnostic(kind, category = '') {
+  const value = String(kind || '');
+  if (
+    value.includes('mismatch')
+    || value.includes('warning')
+    || value.includes('gap')
+    || value.includes('error')
+    || String(category || '').includes('error')
+  ) {
+    return true;
+  }
+  if (typeof window === 'undefined') return false;
+  if (window.__stellacodeProtocolLogOpen) return true;
+  try {
+    return window.localStorage?.getItem(VERBOSE_KEY) === '1';
+  } catch {
+    return false;
+  }
+}
+
+export function readChatProtocolDiagnostics() {
+  if (typeof window === 'undefined' || !window.localStorage) return [];
+  try {
+    const records = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || '[]');
+    return Array.isArray(records) ? records : [];
+  } catch {
+    return [];
+  }
+}
+
+export function clearChatProtocolDiagnostics() {
+  if (typeof window === 'undefined' || !window.localStorage) return;
+  try {
+    window.localStorage.removeItem(STORAGE_KEY);
+    window.dispatchEvent(new CustomEvent('stellacode:protocol-log-cleared'));
+  } catch {
+    // Diagnostics must never affect chat rendering.
   }
 }
 
@@ -138,6 +181,15 @@ function writeLocalRecord(record) {
     const current = JSON.parse(window.localStorage.getItem(STORAGE_KEY) || '[]');
     const next = [...(Array.isArray(current) ? current : []), record].slice(-MAX_RECORDS);
     window.localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+  } catch {
+    // Diagnostics must never affect chat rendering.
+  }
+}
+
+function emitDiagnosticsEvent(record) {
+  if (typeof window === 'undefined') return;
+  try {
+    window.dispatchEvent(new CustomEvent('stellacode:protocol-log', { detail: record }));
   } catch {
     // Diagnostics must never affect chat rendering.
   }

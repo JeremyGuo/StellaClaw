@@ -1,5 +1,40 @@
-version: 1.29.4
+version: 1.29.5
 ---
+
+# 1.29.5
+
+- 修复 Codex subscription tool call stream/durable 不一致：
+  当 Codex websocket 只发送 `response.function_call_arguments.delta`，但 `response.completed.output` 未包含对应 `function_call` item 时，provider 会从已流出的 tool call delta 合成最终 `function_call` output item，再交给 SessionActor 落盘；避免前端 provisional assistant 已显示工具调用、durable `MessageAppended` 却只有文本，从而触发 `stream_commit_mismatch`。本次不改变 `config` schema，不改变 `workdir` schema。
+- 补齐 StellaCodeX Electron stream 文本淡入：
+  参考 Codex VSCode 扩展 markdown 渲染中的短 opacity fade，plain streaming 文本会把稳定前缀和最新追加 suffix 分开渲染，只对新增 suffix 做 180ms 淡入；不做位移、不重新解析 Markdown，降低 RAF 分帧后文本出现过硬的问题。本次不改变 `config` schema，不改变 `workdir` schema。
+- 优化 StellaCodeX Electron stream 渲染性能：
+  `chatStreamFrameQueue` 不再把同一帧收到的大块 delta 整块写入 UI，而是按 Codex VSCode 扩展的节奏以小块 `requestAnimationFrame` drain，durable 边界仍一次性 drain 保证一致性；高频 stream 文本帧只更新消息正文，activity / running activity 做低频节流；全局 LOG 关闭时不再记录普通 stream / UI append 事件到 localStorage 和本地日志，只保留 mismatch / gap / warning / error，避免诊断日志本身拖慢流式动画。本次不改变 `config` schema，不改变 `workdir` schema。
+- 对齐 Codex VSCode 扩展的 stream 渲染节奏：
+  StellaCodeX Electron 新增 `chatStreamFrameQueue`，assistant / reasoning / tool call delta 先在 `requestAnimationFrame` 队列中按 stream key 合并，再落到当前消息状态；收到 durable message、snapshot/history refresh、tool result、turn done 或 stream error 前会强制 drain 队列，避免调试窗口改变渲染时序时才不缺字。本次不改变 `config` schema，不改变 `workdir` schema。
+- 简化 StellaCodeX Electron stream 文本渲染：
+  前端不再对 streaming assistant 文本和工具 round 中间文本做额外打字机缓冲；每个 websocket delta 更新当前累积文本后会直接渲染，只保留消息块首次出现时的轻量淡入效果，避免协议流式效果和本地二次动画叠加导致重复打字机观感。本次不改变 `config` schema，不改变 `workdir` schema。
+- 修复前端 provisional stream 重复投影：
+  StellaCodeX Electron 在处理 assistant / reasoning / tool call stream patch 和通用消息合并时只按稳定 `message_id` 收敛同一条 provisional assistant，缺少 message id 的老事件才退回 `turn_id`；tool result 只挂到含有匹配 tool call 的 provisional message，找不到精确 id 时才挂到同 turn 最新工具消息；落盘历史中的 `context` 文本项会先规范成和 stream 相同的 `text` 项再进入工具 round 分组，避免同一 turn 内多条 assistant provisional 被错误合并，或同一段文本在 stream / commit 附近走两套渲染路径导致显示两份、出现中间文本顺序跳变、commit 后才收敛。本次不改变 `config` schema，不改变 `workdir` schema。
+- 增加 StellaCodeX Electron 全局协议日志面板：
+  右上角新增 `LOG` popover，记录完整落盘消息到达和 stream 增量应用两类主线事件，并保留 commit mismatch / stream index gap 等异常事件；日志内容压缩为消息 id、index、delta 长度、文本摘要和前端动作说明，支持按 `Stream`、`Append Stream to UI`、`Replace UI element` 三类筛选、复制和清空，方便定位前端 stream 渲染异常。本次不改变 `config` schema，不改变 `workdir` schema。
+- 修复 streaming assistant Markdown 中间态渲染抖动：
+  `_streaming` assistant、live reasoning 和 active tool note 的临时文本改为 plain text 渲染，等 durable/final 消息落盘后再走 Markdown/GFM/highlight 渲染，避免 Markdown 增量解析过程中 AST 边界变化导致 UI 看起来重复、缺字或稍后才收敛。本次不改变 `config` schema，不改变 `workdir` schema。
+- 收紧前端 stream 顺序校验：
+  `in_message_index` 的第一条可渲染事件必须从 0 开始，除非本地已经有同一 `message_id` 的 provisional 消息并记录了上一个 index；否则前端会撤销当前临时消息并记录 `chat.stream_index_gap`，避免 socket 重连、snapshot 缺少 live base 或 tracker 被异常 reset 后从中间 delta 开始拼接，造成稳定缺字、重复显示并在 durable commit 后才收敛。本次不改变 `config` schema，不改变 `workdir` schema。
+- 修复 live tool round 中 streaming assistant 文本投影：
+  工具执行中的 `_streaming` assistant message 如果同时有顶层累积文本和 `items[]` 内的 text/tool/reasoning 项，前端渲染时以顶层文本作为唯一 assistant text 来源，`items[]` 只用于工具和推理结构；避免 `items[]` 内旧 text item 或多 text item 分片导致工具调用前的 assistant 文本稳定缺字或重复。本次不改变 `config` schema，不改变 `workdir` schema。
+- 增加 Raw Render 诊断面板：
+  StellaCodeX Electron 的 LOG popover 新增 `Raw Render` tab，同步显示当前 raw `messages`、`displayMessages` 和最终 `renderEntries` 三层渲染投影摘要，并支持复制当前面板 JSON，用于定位 stream 文本是在数据面、display 投影还是最终 render entry 中出现缺字/重复。本次不改变 `config` schema，不改变 `workdir` schema。
+- 抽离 Chat 渲染投影模型：
+  将 `messages -> displayMessages -> renderEntries`、entry key、最新 assistant turn 和 pending assistant 判断收敛到 `components/chat/renderModel.js`，`ChatWorkspace` 和 Raw Render 诊断面板共用同一套纯函数，避免真实 UI 与诊断面板各自维护分组逻辑导致排查 stream 文本缺字/重复时出现分叉。本次不改变 `config` schema，不改变 `workdir` schema。
+- 简化 Raw Render 诊断展示：
+  `Raw Render` tab 默认先显示三层渲染管线的 compact overview，每行只保留索引、角色、stream/final/exec 标记、文本长度、item/tool 计数和文本摘要；完整 raw/display/render JSON 改为次级折叠项且只展示尾部若干条，复制按钮仍复制完整 snapshot，便于直接看出哪一层开始缺字或重复。本次不改变 `config` schema，不改变 `workdir` schema。
+- 修复工具 round 内 assistant note 重复渲染：
+  `ToolProcessGroup` 对同一条 structured assistant message 不再同时渲染 `textMessage` 和 `segments.notes` 两份文本；当 split 后已经有 segment note 时，只渲染 segment note，避免同一个 `assistantTurn` 内出现 render entry 唯一但画面文本重复。本次不改变 `config` schema，不改变 `workdir` schema。
+- 修复消息正文误用 preview：
+  前端 `messageText()` 和 streaming assistant 顶层正文选择顺序改为优先使用 `text_with_attachment_markers`、`rendered_text`、`text`、`content`，最后才 fallback 到 `preview`；`preview` 仅作为无正文时的兜底摘要，避免后端携带短 preview 时聊天正文显示缺字或被摘要替代。本次不改变 `config` schema，不改变 `workdir` schema。
+- 稳定 assistant stream 文本累积：
+  `stream_assistant_message_delta` 和 reasoning/tool delta 一样使用独立 stream buffer 累积完整正文，再写回 `_streaming` assistant message；不再依赖当前 React message 对象里的 `text` / `preview` 作为下一段 delta 的基准，避免快速 tool/assistant 事件交错或额外渲染时序差异导致正文回退成短文本。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.29.4
 

@@ -22,7 +22,11 @@ export function isAuxiliaryUserMessage(message) {
 export function messageItems(message) {
   const renderedItems = Array.isArray(message?.items) ? message.items : [];
   const rawItems = Array.isArray(message?.data) ? message.data : [];
-  if (!rawItems.length) return renderedItems;
+  if (!rawItems.length) {
+    return renderedItems
+      .map((item, index) => normalizeRenderedMessageItem(item, index))
+      .filter(Boolean);
+  }
   const renderedByIndex = new Map(
     renderedItems
       .filter((item) => item?.index !== undefined)
@@ -31,6 +35,20 @@ export function messageItems(message) {
   return rawItems
     .map((item, index) => normalizeChatMessageItem(item, index, renderedByIndex))
     .filter(Boolean);
+}
+
+function normalizeRenderedMessageItem(item, index) {
+  if (!item || typeof item !== 'object') return item;
+  if (item.type !== 'context') return item;
+  const payload = item.payload && typeof item.payload === 'object' ? item.payload : {};
+  const text = item.text_with_attachment_markers || item.text || item.content || payload.text || '';
+  return {
+    ...item,
+    type: 'text',
+    index: item.index ?? index,
+    text,
+    text_with_attachment_markers: text
+  };
 }
 
 function normalizeChatMessageItem(item, index, renderedByIndex) {
@@ -201,7 +219,7 @@ export function firstToolNameForMessage(message) {
 
 export function splitMessageForDisplay(message) {
   const usage = tokenUsage(message);
-  const items = messageItems(message);
+  const items = streamingAssistantDisplayItems(message, messageItems(message));
   if (items.length > 0) {
     const segments = [];
     let pendingNotes = [];
@@ -274,9 +292,82 @@ export function splitMessageForDisplay(message) {
   return { textMessage, toolCards, segments: [{ notes: [], cards: toolCards }] };
 }
 
+function streamingAssistantDisplayItems(message, items) {
+  if (
+    !message?._streaming
+    || String(message?.role || '').toLowerCase() !== 'assistant'
+    || !Array.isArray(items)
+    || items.length === 0
+  ) {
+    return items;
+  }
+  const text = topLevelMessageText(message).trim();
+  if (!text) return items;
+  const firstTextIndex = items.findIndex((item) => item?.type === 'text');
+  const firstProcessIndex = items.findIndex((item) => (
+    item?.type === 'reasoning'
+    || item?.type === 'tool_call'
+    || item?.type === 'tool_result'
+  ));
+  const insertAt = firstTextIndex >= 0
+    ? firstTextIndex
+    : firstProcessIndex >= 0
+      ? firstProcessIndex
+      : items.length;
+  const result = [];
+  let inserted = false;
+  items.forEach((item, index) => {
+    if (item?.type === 'text') {
+      if (!inserted) {
+        result.push({
+          ...item,
+          index: item.index ?? index,
+          text,
+          text_with_attachment_markers: text,
+          content: text
+        });
+        inserted = true;
+      }
+      return;
+    }
+    if (!inserted && index >= insertAt) {
+      result.push({
+        type: 'text',
+        index: insertAt,
+        text,
+        text_with_attachment_markers: text,
+        content: text
+      });
+      inserted = true;
+    }
+    result.push(item);
+  });
+  if (!inserted) {
+    result.push({
+      type: 'text',
+      index: insertAt,
+      text,
+      text_with_attachment_markers: text,
+      content: text
+    });
+  }
+  return result;
+}
+
+function topLevelMessageText(message) {
+  return String(
+    message?.text_with_attachment_markers
+    || message?.rendered_text
+    || message?.text
+    || message?.content
+    || message?.preview
+    || ''
+  );
+}
+
 export function tokenUsage(message) {
   const usage = message?.token_usage || message?.usage || message?.response_usage || {};
-  const input = Number(usage.input || usage.input_tokens || usage.prompt_tokens || 0);
+  const input = Number(usage.uncache_input || usage.input || usage.input_tokens || usage.prompt_tokens || 0);
   const output = Number(usage.output || usage.output_tokens || usage.completion_tokens || 0);
   const cacheRead = Number(usage.cache_read || usage.cache_read_tokens || 0);
   const cacheWrite = Number(usage.cache_write || usage.cache_write_tokens || 0);
@@ -598,6 +689,8 @@ function existingMessageKey(byId, incoming, fallbackId) {
     }
   }
   if (incomingRole === 'assistant' && incoming?._streaming) {
+    const incomingId = String(incoming?.id ?? incoming?.message_id ?? '').trim();
+    if (incomingId) return fallbackId;
     const incomingTurnId = messageStreamTurnId(incoming);
     if (incomingTurnId) {
       for (const [key, message] of byId.entries()) {
