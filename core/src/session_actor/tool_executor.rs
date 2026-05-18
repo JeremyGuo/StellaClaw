@@ -1376,6 +1376,7 @@ mod tests {
     fn shell_exec_expands_tilde_workdir_locally() {
         let workspace = temp_workspace();
         let home = std::env::var("HOME").expect("HOME should be set");
+        fs::create_dir_all(&home).expect("test HOME should be a directory");
         let executor = test_executor(&workspace);
         let message = start_and_wait(
             &executor,

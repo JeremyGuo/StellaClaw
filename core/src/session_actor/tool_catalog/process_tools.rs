@@ -2090,6 +2090,7 @@ mod tests {
     #[test]
     fn local_workdir_expands_home_tilde() {
         let home = env::var("HOME").expect("HOME should be set in tests");
+        fs::create_dir_all(&home).expect("test HOME should be a directory");
         let workspace = Path::new("/tmp/stellaclaw-workspace");
         let args = Map::from_iter([("workdir".to_string(), Value::String("~".to_string()))]);
 

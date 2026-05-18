@@ -2934,6 +2934,7 @@ mod tests {
 
     #[test]
     fn refresh_material_posts_to_oauth_endpoint_and_updates_tokens() {
+        let _env_guard = test_env_lock();
         let mut server = mockito::Server::new();
         let new_access = fake_jwt(
             r#"{"exp":4102444800,"https://api.openai.com/auth":{"chatgpt_account_id":"acc_123"}}"#,
@@ -3364,6 +3365,7 @@ mod tests {
 
     #[test]
     fn codex_provider_system_prompt_fetches_models_and_caches_to_disk() {
+        let _env_guard = test_env_lock();
         let mut server = mockito::Server::new();
         let cache_root =
             std::env::temp_dir().join(format!("stellaclaw-codex-cache-{}", nonce("test")));
@@ -3456,6 +3458,7 @@ mod tests {
 
     #[test]
     fn codex_provider_system_prompt_returns_error_when_models_fetch_fails() {
+        let _env_guard = test_env_lock();
         let mut server = mockito::Server::new();
         let cache_root =
             std::env::temp_dir().join(format!("stellaclaw-codex-cache-{}", nonce("test")));
@@ -3566,6 +3569,12 @@ mod tests {
 
     fn temp_auth_json_path() -> PathBuf {
         std::env::temp_dir().join(format!("stellaclaw-auth-{}.json", nonce("test")))
+    }
+
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_ENV_LOCK.lock().expect("test env mutex poisoned")
     }
 
     struct EnvRestore {

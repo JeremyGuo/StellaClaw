@@ -21,6 +21,9 @@ version: 1.29.0
 - 修复最终 assistant 消息落盘后 live turn 未结束：
   SessionActor 在无工具调用的最终 assistant 消息 durable append 后会先发出 `TurnCompleted`，再清理当前 plan；plan 清理或其持久化失败只记录 `clear_current_plan_after_turn_completed_failed`，不再阻断完成事件，避免 WebChannel snapshot 在重新进入 Session 时仍保留上一轮 `running_tool_results`。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 修复 core 测试环境隔离：
+  Codex subscription models / token refresh 相关单测会串行化修改全局认证环境变量，shell `~` workdir 单测会确保测试 HOME 目录存在，避免并发测试时临时 HOME 和 mock models URL 互相污染导致假失败。本次不改变 `config` schema，不改变 `workdir` schema。
+
 # 1.28.3
 
 - 修复 SessionActor 工具结果落盘被同步压缩阻塞：
