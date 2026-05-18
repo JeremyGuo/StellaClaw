@@ -843,6 +843,11 @@ function streamDeltaText(event) {
   return String(event?.delta ?? event?.text_delta ?? event?.textDelta ?? '');
 }
 
+function streamEventIndex(event) {
+  const index = Number(event?.in_message_index ?? event?.inMessageIndex);
+  return Number.isFinite(index) && index >= 0 ? index : undefined;
+}
+
 function streamErrorText(event) {
   return String(event?.error || event?.message || event?.error_detail || event?.errorDetail || '流式响应失败').trim();
 }
@@ -889,16 +894,6 @@ function nextStreamMessageIndex(messages) {
 function appendTextDelta(existingText, delta) {
   const previous = String(existingText || '');
   const chunk = String(delta || '');
-  if (!chunk) return previous;
-  if (!previous) return chunk;
-  if (chunk === previous || previous.endsWith(chunk)) return previous;
-  if (chunk.startsWith(previous)) return chunk;
-  const maxOverlap = Math.min(previous.length, chunk.length);
-  for (let length = maxOverlap; length > 0; length -= 1) {
-    if (previous.slice(-length) === chunk.slice(0, length)) {
-      return `${previous}${chunk.slice(length)}`;
-    }
-  }
   return `${previous}${chunk}`;
 }
 
@@ -983,10 +978,12 @@ function appendStreamToolCallDelta(current, event) {
   const buildMessage = (existing = {}) => {
     const items = Array.isArray(existing.items) ? [...existing.items] : [];
     const itemIndex = items.findIndex((item) => item?.type === 'tool_call' && String(item?.tool_call_id || '') === callId);
-    const label = itemId && !/^item_|^fc_|^call_/.test(itemId) ? itemId : 'tool';
+    const label = String(event?.tool_name || event?.toolName || '').trim()
+      || (itemId && !/^item_|^fc_|^call_/.test(itemId) ? itemId : 'tool');
     if (itemIndex >= 0) {
       items[itemIndex] = {
         ...items[itemIndex],
+        tool_name: label,
         arguments: appendTextDelta(items[itemIndex].arguments || '', delta)
       };
     } else {
@@ -1345,6 +1342,7 @@ function App() {
   const websocketKeyRef = useRef('');
   const seenUsageMessagesRef = useRef(new Map());
   const streamBuffersRef = useRef(new Map());
+  const streamNextIndicesRef = useRef(new Map());
   const attachmentImageUrlCacheRef = useRef(new Map());
   const workspaceResourceCacheRef = useRef(new Map());
   const loadingOlderRef = useRef(false);
@@ -2704,6 +2702,40 @@ function App() {
       return next;
     };
 
+    const acceptStreamEvent = (event) => {
+      const messageId = streamMessageId(event);
+      const index = streamEventIndex(event);
+      if (!messageId || index === undefined) return true;
+      const scopedId = `${key}:${messageId}`;
+      const expected = streamNextIndicesRef.current.get(scopedId);
+      if (expected === undefined) {
+        streamNextIndicesRef.current.set(scopedId, index + 1);
+        return true;
+      }
+      if (index < expected) return false;
+      if (index > expected) {
+        streamNextIndicesRef.current.set(scopedId, index + 1);
+        setMessages((current) => {
+          const next = applyStreamErrorToMessages(current, {
+            ...event,
+            error: `non-contiguous stream event: expected index ${expected}, received ${index}`
+          });
+          messagesRef.current = next;
+          return next;
+        });
+        setSessionActivity('流式消息不连续，已撤销当前临时消息');
+        return false;
+      }
+      streamNextIndicesRef.current.set(scopedId, expected + 1);
+      return true;
+    };
+
+    const clearStreamTrackingForEvent = (event) => {
+      const messageId = streamMessageId(event);
+      if (!messageId) return;
+      streamNextIndicesRef.current.delete(`${key}:${messageId}`);
+    };
+
     const applySessionStream = (rawEvent) => {
       const event = normalizedStreamEvent(rawEvent);
       const type = streamEventType(event);
@@ -2717,6 +2749,7 @@ function App() {
       );
 
       if (type === 'turn_started' || type === 'stream_turn_start') {
+        streamNextIndicesRef.current = new Map();
         setChatSessionState(scopedChatState({
           state: 'running',
           currentTurnState: event,
@@ -2736,6 +2769,7 @@ function App() {
       }
 
       if (type === 'turn_completed' || type === 'stream_turn_done') {
+        streamNextIndicesRef.current = new Map();
         setChatSessionState(scopedChatState({ state: 'idle' }));
         setSessionActivity('已完成');
         const turnId = String(event?.turn_id || event?.turnId || '').trim();
@@ -2767,6 +2801,7 @@ function App() {
       }
 
       if (type === 'stream_assistant_message_delta') {
+        if (!acceptStreamEvent(event)) return;
         setChatSessionState((current) => keepOrSetRunningState(current, event));
         const delta = streamDeltaText(event);
         if (!delta) return;
@@ -2789,6 +2824,7 @@ function App() {
       }
 
       if (type === 'stream_reasoning_summary_part_added') {
+        if (!acceptStreamEvent(event)) return;
         setChatSessionState((current) => keepOrSetRunningState(current, event));
         setSessionActivity('思考中');
         updateRunningActivities((current) => [
@@ -2804,6 +2840,7 @@ function App() {
       }
 
       if (type === 'stream_reasoning_summary_delta') {
+        if (!acceptStreamEvent(event)) return;
         setChatSessionState((current) => keepOrSetRunningState(current, event));
         const summaryIndex = event?.summary_index ?? event?.summaryIndex ?? 0;
         const bufferKey = `${key}:reasoning:${messageId}:${summaryIndex}`;
@@ -2827,6 +2864,7 @@ function App() {
       }
 
       if (type === 'stream_tool_call_delta') {
+        if (!acceptStreamEvent(event)) return;
         setChatSessionState((current) => keepOrSetRunningState(current, event));
         const itemId = streamItemId(event);
         const bufferKey = `${key}:tool:${itemId}`;
@@ -2850,6 +2888,7 @@ function App() {
       }
 
       if (type === 'stream_tool_result_done') {
+        if (!acceptStreamEvent(event)) return;
         setChatSessionState((current) => keepOrSetRunningState(current, event));
         const toolResult = event?.tool_result || event?.toolResult || {};
         const itemId = String(toolResult.tool_call_id || toolResult.toolCallId || event?.batch_id || event?.batchId || streamItemId(event)).trim();
@@ -2873,6 +2912,7 @@ function App() {
       }
 
       if (type === 'stream_error') {
+        clearStreamTrackingForEvent(event);
         setChatSessionState(scopedChatState({ state: 'failed', lastError: streamErrorText(event) }));
         const error = streamErrorText(event);
         setMessages((current) => {
@@ -3141,6 +3181,7 @@ function App() {
     const cachedMessages = readMessageCache(serverId, conversationId, sessionId);
     messagesRef.current = cachedMessages;
     streamBuffersRef.current = new Map();
+    streamNextIndicesRef.current = new Map();
     setMessages(cachedMessages);
     setMessagesReady(cachedMessages.length > 0);
     setSessionActivity('');

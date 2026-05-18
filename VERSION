@@ -24,6 +24,9 @@ version: 1.29.0
 - 修复 Web stream tool call 一致性误报和超上下文恢复路径：
   `stream_tool_call_delta` 补充 `tool_name` 并由 Codex Responses output item 元数据填充，WebChannel 累积 provisional tool call 时不再把工具名临时写成 `tool`，避免中间 assistant+tool_call 消息落盘时误报 `stream_commit_mismatch`。WebChannel 对 assistant/tool/reasoning delta 改为按协议顺序直接追加，不再做前端式重叠去重，避免重复字符片段被误删。Provider preflight 发现请求超过模型上下文时改为先做 context compaction 并重试，不再直接执行带数据丢失的 history prune；WebSocket 单帧上限从 128 KiB 提高到 16 MiB，避免较大的 tool call/result 事件导致前端反复断连。本次不改变 `config` schema，不改变 `workdir` schema。
 
+- 修复 Web stream 重复渲染和 provider request-too-large 结果兜底：
+  StellaCodeX Electron 会按 `message_id + in_message_index` 追踪当前流式消息，重复到达的 stream event 会被忽略，非连续到达会撤销当前临时消息并提示错误；前端 tool call provisional 也会使用后端下发的 `tool_name`，避免本地 commit 校验仍把 `exec_command` 误判成 `tool`。SessionActor 在 provider 已经发出请求后收到 request-too-large 错误时也改为执行 context compaction 后重试，并发出 `CompactCompleted` 事件，不再走旧的 history prune 兜底路径。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 修复 core 测试环境隔离：
   Codex subscription models / token refresh 相关单测会串行化修改全局认证环境变量，shell `~` workdir 单测会确保测试 HOME 目录存在，避免并发测试时临时 HOME 和 mock models URL 互相污染导致假失败。本次不改变 `config` schema，不改变 `workdir` schema。
 

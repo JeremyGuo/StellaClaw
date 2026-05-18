@@ -1718,7 +1718,7 @@ impl SessionActor {
                                 < REQUEST_TOO_LARGE_PRUNE_MAX_ATTEMPTS =>
                     {
                         let next_attempt = active.request_too_large_attempts.saturating_add(1);
-                        if self.prune_history_after_request_too_large(
+                        if self.compact_history_after_request_too_large(
                             "provider_request",
                             Some(&active.turn_id),
                             Some(active.step_index),
@@ -2713,6 +2713,14 @@ impl SessionActor {
                         .promote_notified_components_to_system_snapshot();
                     self.persist_state_if_history_closed("request_too_large_compaction")?;
                 }
+                self.emit(SessionEvent::CompactCompleted {
+                    compressed: report.compressed,
+                    estimated_tokens_before: report.estimated_tokens_before,
+                    estimated_tokens_after: report.estimated_tokens_after,
+                    threshold_tokens: report.threshold_tokens,
+                    retained_message_count: report.retained_message_count,
+                    compressed_message_count: report.compressed_message_count,
+                })?;
                 Ok(report.compressed)
             }
             Err(error) => {
@@ -3934,6 +3942,14 @@ mod tests {
                     body: r#"{"error":{"type":"request_too_large","message":"Request exceeds the maximum size"}}"#.to_string(),
                 });
             }
+            if *calls == 2 {
+                return Ok(ChatMessage::new(
+                    ChatRole::Assistant,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: compression_response("compressed after provider request too large"),
+                    })],
+                ));
+            }
             Ok(ChatMessage::new(
                 ChatRole::Assistant,
                 vec![ChatMessageItem::Context(ContextItem {
@@ -4728,17 +4744,18 @@ mod tests {
     }
 
     #[test]
-    fn request_too_large_provider_error_prunes_history_and_retries() {
+    fn request_too_large_provider_error_compacts_history_and_retries() {
         let _cwd = temp_cwd("actor-request-too-large-retry");
         let (inbox, mailbox) = test_inbox();
+        let mut initial = SessionInitial::new(
+            test_session_id("session_request_too_large"),
+            super::super::SessionType::Foreground,
+        );
+        initial.compression_threshold_tokens = Some(32);
+        initial.compression_retain_recent_tokens = Some(4);
         mailbox.append(
             SessionMailboxKind::Control,
-            SessionRequest::Initial {
-                initial: SessionInitial::new(
-                    test_session_id("session_request_too_large"),
-                    super::super::SessionType::Foreground,
-                ),
-            },
+            SessionRequest::Initial { initial },
         );
         let events = Arc::new(MemoryEventSink::default());
         let provider = Arc::new(RequestTooLargeThenOkProvider::new());
@@ -4768,17 +4785,16 @@ mod tests {
             .expect("request too large should start provider request");
         actor
             .run_until_idle(4)
-            .expect("request too large should recover by pruning history");
+            .expect("request too large should recover by compacting history");
 
-        assert_eq!(*provider.calls.lock().unwrap(), 2);
-        assert_eq!(
-            provider.seen_message_counts.lock().unwrap().as_slice(),
-            &[6, 3]
-        );
-        assert_eq!(actor.history().len(), 4);
+        assert_eq!(*provider.calls.lock().unwrap(), 3);
+        assert!(actor
+            .history()
+            .iter()
+            .any(|message| matches!(message.data.first(), Some(ChatMessageItem::Compaction(_)))));
         assert!(events.events.lock().unwrap().iter().any(|event| matches!(
             event,
-            SessionEvent::Progress { message, .. } if message.contains("数据丢失")
+            SessionEvent::CompactCompleted { compressed, .. } if *compressed
         )));
         assert!(matches!(
             events.events.lock().unwrap().last(),
@@ -4787,23 +4803,27 @@ mod tests {
     }
 
     #[test]
-    fn preflight_prunes_when_estimate_already_exceeds_context() {
+    fn preflight_compacts_when_estimate_already_exceeds_context() {
         let _cwd = temp_cwd("actor-request-too-large-preflight");
         let (inbox, mailbox) = test_inbox();
+        let mut initial = SessionInitial::new(
+            test_session_id("session_preflight_too_large"),
+            super::super::SessionType::Foreground,
+        );
+        initial.compression_threshold_tokens = Some(1_000);
+        initial.compression_retain_recent_tokens = Some(1);
         mailbox.append(
             SessionMailboxKind::Control,
-            SessionRequest::Initial {
-                initial: SessionInitial::new(
-                    test_session_id("session_preflight_too_large"),
-                    super::super::SessionType::Foreground,
-                ),
-            },
+            SessionRequest::Initial { initial },
         );
         let events = Arc::new(MemoryEventSink::default());
-        let provider = Arc::new(ScriptedProvider::new(vec![text_message(
-            ChatRole::Assistant,
-            "recovered after preflight prune",
-        )]));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            text_message(
+                ChatRole::Assistant,
+                &compression_response("compressed before preflight retry"),
+            ),
+            text_message(ChatRole::Assistant, "recovered after preflight compact"),
+        ]));
         let tools = Arc::new(EchoToolExecutor::new());
         let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
         let mut model_config = test_model_config();
@@ -4849,14 +4869,15 @@ mod tests {
             .expect("oversized local estimate should start provider request");
         actor
             .run_until_idle(4)
-            .expect("oversized local estimate should recover by pruning history before send");
+            .expect("oversized local estimate should recover by compacting history before send");
 
         let seen_requests = provider.seen_requests.lock().unwrap();
-        assert_eq!(seen_requests.len(), 1);
-        assert_eq!(seen_requests[0].message_count, 1);
+        assert_eq!(seen_requests.len(), 2);
+        assert_eq!(seen_requests[0].message_count, 3);
+        assert!(seen_requests[1].message_count < seen_requests[0].message_count);
         assert!(events.events.lock().unwrap().iter().any(|event| matches!(
             event,
-            SessionEvent::Progress { message, .. } if message.contains("数据丢失")
+            SessionEvent::CompactCompleted { compressed, .. } if *compressed
         )));
     }
 
