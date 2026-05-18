@@ -184,6 +184,15 @@ function findStreamingMessagePositions(current, id, turnId) {
   return positions;
 }
 
+function hasCommittedMessage(current, id) {
+  const messageId = String(id || '').trim();
+  if (!messageId) return false;
+  return (current || []).some((message) => (
+    !message?._streaming
+    && String(message?.id ?? message?.message_id ?? '').trim() === messageId
+  ));
+}
+
 function streamingMessageId(message) {
   return String(message?.id ?? message?.message_id ?? '').trim();
 }
@@ -282,6 +291,7 @@ export function appendStreamAssistantDelta(current, event, fullText) {
   const id = streamMessageId(event);
   const delta = streamDeltaText(event);
   if (!id || !delta) return current;
+  if (hasCommittedMessage(current, id)) return current;
   const turnId = String(event?.turn_id || event?.turnId || '').trim();
   const itemId = String(event?.item_id || event?.itemId || '').trim();
   const now = new Date().toISOString();
@@ -335,6 +345,7 @@ export function appendStreamToolCallDelta(current, event) {
   const id = streamMessageId(event);
   const delta = streamDeltaText(event);
   if (!id || !delta) return current;
+  if (hasCommittedMessage(current, id)) return current;
   const turnId = String(event?.turn_id || event?.turnId || '').trim();
   const itemId = String(event?.item_id || event?.itemId || '').trim();
   const callId = String(event?.call_id || event?.callId || itemId).trim();
@@ -394,6 +405,7 @@ export function appendStreamToolCallDelta(current, event) {
 export function appendStreamReasoningSummary(current, event) {
   const id = streamMessageId(event);
   if (!id) return current;
+  if (hasCommittedMessage(current, id)) return current;
   const delta = streamDeltaText(event);
   const turnId = String(event?.turn_id || event?.turnId || '').trim();
   const itemId = String(event?.item_id || event?.itemId || '').trim();

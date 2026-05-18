@@ -1,7 +1,10 @@
-version: 1.29.5
+version: 1.29.6
 ---
 
-# 1.29.5
+# 1.29.6
+
+- 修复 StellaCodeX Electron late stream delta 重新生成临时消息：
+  如果 durable `message_appended` 或历史补拉已经把同一 `message_id` 固定为非 streaming 消息，后续迟到的 assistant / reasoning / tool-call stream delta 会被忽略，不再重新 append 一个 `_streaming` assistant 导致 final 后又出现挂起工具或重复文本；stream/durable commit 比较同时把 `item_id=fc_*` 与 `tool_call_id=call_*` 都纳入工具调用身份，并允许同工具名、同消息位置的参数前缀收敛，mismatch 诊断会输出 compare 版本和 canonical 对象。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 放宽工具调用参数 commit 边界比较：
   StellaCodeX Electron 在比较 provisional stream 与 durable assistant message 时，工具调用参数允许 provisional 是 durable 的前缀；role、assistant 文本、工具 id/name、其它 item 仍严格比对。这样 durable commit 作为最终收敛边界到达时，不会因为前端渲染队列或事件处理尚未把最后几段 tool-call 参数落到 UI state 而误报 `chat.stream_commit_mismatch`，但参数内容发生分叉仍会报错。本次不改变 `config` schema，不改变 `workdir` schema。
@@ -11,6 +14,11 @@ version: 1.29.5
   前端 durable/provisional 提交比较会优先使用工具调用的 provider item id，再退回 tool call id；调试摘要也统一通过 `messageItems()` 读取 `data` 中的落盘结构，避免 Codex durable 消息同时携带 `item_id=fc_*` 和 `tool_call_id=call_*` 时被误判为 stream/durable 不一致。本次不改变 `config` schema，不改变 `workdir` schema。
 - 收敛 WebChannel stream 细粒度日志开关：
   WebChannel 默认只记录 turn start/done、stream error、stream index invalid 和 commit mismatch 等边界/异常日志；高频 assistant/tool/reasoning delta 只有设置 `STELLACLAW_WEB_STREAM_DEBUG=1` 时才写详细日志，便于复现 stream 协议问题时临时打开，平时避免刷日志。本次不改变 `config` schema，不改变 `workdir` schema。
+
+# 1.29.5
+
+- 修复 Codex subscription tool call stream/durable 不一致：
+  当 Codex websocket 只发送 `response.function_call_arguments.delta`，但 `response.completed.output` 未包含对应 `function_call` item 时，provider 会从已流出的 tool call delta 合成最终 `function_call` output item，再交给 SessionActor 落盘；避免前端 provisional assistant 已显示工具调用、durable `MessageAppended` 却只有文本，从而触发 `stream_commit_mismatch`。本次不改变 `config` schema，不改变 `workdir` schema。
 - 补齐 StellaCodeX Electron stream 文本淡入：
   参考 Codex VSCode 扩展 markdown 渲染中的短 opacity fade，plain streaming 文本会把稳定前缀和最新追加 suffix 分开渲染，只对新增 suffix 做 180ms 淡入；不做位移、不重新解析 Markdown，降低 RAF 分帧后文本出现过硬的问题。本次不改变 `config` schema，不改变 `workdir` schema。
 - 优化 StellaCodeX Electron stream 渲染性能：

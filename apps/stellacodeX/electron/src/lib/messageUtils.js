@@ -482,6 +482,27 @@ export function stableSignature(value) {
   return JSON.stringify(value ?? null);
 }
 
+const COMMIT_COMPARE_VERSION = 'tool-call-prefix-v2';
+
+function compactStringForDiagnostic(value, limit = 180) {
+  const text = String(value || '');
+  if (text.length <= limit) return text;
+  return `${text.slice(0, Math.floor(limit / 2))}...${text.slice(-Math.floor(limit / 2))}`;
+}
+
+function canonicalToolIds(item) {
+  return [
+    item.item_id,
+    item._item_id,
+    item.tool_call_id,
+    item.call_id,
+    item.toolCallId,
+    item.itemId
+  ]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean);
+}
+
 function canonicalMessageForCommitCompare(message) {
   const items = messageItems(message)
     .filter((item) => ['reasoning', 'text', 'tool_call', 'tool_result'].includes(item?.type))
@@ -501,14 +522,14 @@ function canonicalMessageForCommitCompare(message) {
       if (item.type === 'tool_call') {
         return {
           type: 'tool_call',
-          tool_id: String(item.item_id || item._item_id || item.tool_call_id || item.call_id || '').trim(),
+          tool_ids: canonicalToolIds(item),
           tool_name: String(item.tool_name || '').trim(),
           arguments: String(item.arguments || '').trim()
         };
       }
       return {
         type: 'tool_result',
-        tool_id: String(item.item_id || item._item_id || item.tool_call_id || item.call_id || '').trim(),
+        tool_ids: canonicalToolIds(item),
         tool_name: String(item.tool_name || '').trim(),
         result: item.structured ?? item.context_with_attachment_markers ?? item.context ?? null
       };
@@ -525,6 +546,33 @@ function canonicalMessageHasContent(canonical) {
   return Boolean(canonical.text || canonical.items.length > 0);
 }
 
+function idSetsOverlap(leftIds = [], rightIds = []) {
+  const right = new Set(rightIds.filter(Boolean));
+  return leftIds.some((id) => right.has(id));
+}
+
+function toolCallArgumentsCompatible(leftArguments, rightArguments) {
+  const left = String(leftArguments || '');
+  const right = String(rightArguments || '');
+  return left === right || right.startsWith(left) || left.startsWith(right);
+}
+
+function canonicalToolCallCompatible(left, right) {
+  if (left.tool_name !== right.tool_name) return false;
+  if (!toolCallArgumentsCompatible(left.arguments, right.arguments)) return false;
+
+  const leftIds = Array.isArray(left.tool_ids) ? left.tool_ids : [];
+  const rightIds = Array.isArray(right.tool_ids) ? right.tool_ids : [];
+  if (!leftIds.length || !rightIds.length) return true;
+  if (idSetsOverlap(leftIds, rightIds)) return true;
+
+  // During Responses streaming the provisional item may only know fc_* while
+  // the durable message may expose call_* first. Same message position, same
+  // tool name, and compatible arguments are enough to treat this as the same
+  // tool call for commit comparison.
+  return true;
+}
+
 function canonicalCommitCompatible(provisional, durable) {
   if (stableSignature(provisional) === stableSignature(durable)) return true;
   if (!provisional || !durable) return false;
@@ -534,16 +582,27 @@ function canonicalCommitCompatible(provisional, durable) {
   return provisional.items.every((left, index) => {
     const right = durable.items[index];
     if (!left || !right || left.type !== right.type) return false;
-    if (left.type !== 'tool_call') return stableSignature(left) === stableSignature(right);
-    return (
-      left.tool_id === right.tool_id
-      && left.tool_name === right.tool_name
-      && String(right.arguments || '').startsWith(String(left.arguments || ''))
-    );
+    if (left.type === 'tool_call') return canonicalToolCallCompatible(left, right);
+    return stableSignature(left) === stableSignature(right);
   });
 }
 
-export function committedMessageProtocolMismatches(current, incoming) {
+function canonicalForDiagnostic(canonical) {
+  if (!canonical) return null;
+  return {
+    ...canonical,
+    items: (canonical.items || []).map((item) => {
+      if (item?.type !== 'tool_call') return item;
+      return {
+        ...item,
+        arguments_len: String(item.arguments || '').length,
+        arguments: compactStringForDiagnostic(item.arguments)
+      };
+    })
+  };
+}
+
+export function committedMessageProtocolMismatchDetails(current, incoming) {
   if (!Array.isArray(current) || !Array.isArray(incoming)) return [];
   const mismatches = [];
   for (const durable of incoming) {
@@ -568,12 +627,19 @@ export function committedMessageProtocolMismatches(current, incoming) {
     const durableCanonical = canonicalMessageForCommitCompare(durable);
     if (!canonicalCommitCompatible(provisionalCanonical, durableCanonical)) {
       mismatches.push({
+        compare_version: COMMIT_COMPARE_VERSION,
         message_id: durableId || String(durable?.message_id || ''),
-        index: Number.isFinite(durableIndex) && durableIndex !== Number.MAX_SAFE_INTEGER ? durableIndex : undefined
+        index: Number.isFinite(durableIndex) && durableIndex !== Number.MAX_SAFE_INTEGER ? durableIndex : undefined,
+        provisional: canonicalForDiagnostic(provisionalCanonical),
+        durable: canonicalForDiagnostic(durableCanonical)
       });
     }
   }
   return mismatches;
+}
+
+export function committedMessageProtocolMismatches(current, incoming) {
+  return committedMessageProtocolMismatchDetails(current, incoming);
 }
 
 export function messageOrderFromId(value) {
