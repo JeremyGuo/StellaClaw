@@ -152,6 +152,7 @@ fn read_version_file(version_path: &Path) -> Result<&'static str> {
         WORKDIR_VERSION_0_19 => Ok(WORKDIR_VERSION_0_19),
         WORKDIR_VERSION_0_20 => Ok(WORKDIR_VERSION_0_20),
         WORKDIR_VERSION_0_21 => Ok(WORKDIR_VERSION_0_21),
+        WORKDIR_VERSION_0_22 => Ok(WORKDIR_VERSION_0_22),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }
@@ -219,6 +220,30 @@ mod tests {
             serde_json::from_str(&compaction_status).unwrap();
         assert_eq!(compaction_status["state"], "idle");
         assert_eq!(compaction_status["attempts"], 0);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn upgrade_chain_accepts_v0_22_workdirs() {
+        let root = std::env::temp_dir().join(format!(
+            "stellaclaw-upgrade-chain-v0_22-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(
+            root.join(WORKDIR_VERSION_FILE),
+            format!("{WORKDIR_VERSION_0_22}\n"),
+        )
+        .unwrap();
+
+        let upgraded = upgrade_workdir(&root, &test_config()).unwrap();
+
+        assert!(upgraded);
+        assert_eq!(
+            fs::read_to_string(root.join(WORKDIR_VERSION_FILE)).unwrap(),
+            format!("{LATEST_WORKDIR_VERSION}\n")
+        );
         let _ = fs::remove_dir_all(root);
     }
 
