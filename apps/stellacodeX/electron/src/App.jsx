@@ -38,7 +38,7 @@ import { ConversationPropertiesDialog } from './components/ConversationPropertie
 import { SettingsDialog } from './components/SettingsDialog';
 import { clamp, formatBytes, formatModel, statusUsageTotals } from './lib/format';
 import { attachmentName, fileExtension, fileNameFromPath, imageMimeType } from './lib/fileUtils';
-import { activityFromMessages, addUsageTotals, committedMessageProtocolMismatches, firstMessageId, hasOlderMessages, isFinalAssistantMessage, lastServerMessageIndex, liveActivitySignature, mergeMessages, messageIndex, messageOrderFromId, shortText, usageDeltaFromMessages } from './lib/messageUtils';
+import { addUsageTotals, firstMessageId, hasOlderMessages, lastServerMessageIndex, liveActivitySignature, mergeMessages, messageIndex, messageOrderFromId, shortText } from './lib/messageUtils';
 import {
   appendStreamAssistantDelta,
   appendStreamReasoningSummary,
@@ -54,10 +54,10 @@ import {
   streamDeltaText,
   streamErrorText,
   streamEventType,
-  streamFinalizedActivityIds,
   streamItemId
 } from './lib/chatStreamDataPlane';
 import { startChatSocketClient } from './lib/chatSocketClient';
+import { chatAckHistoryPlan, chatSnapshotProjection, incomingMessagesPatch, recentMessagesPatch } from './lib/chatMessagePlane';
 import { readMessageCache, removeMessageCache, writeMessageCache } from './lib/chatMessageCache';
 import { chatSessionStateIsActive, chatSnapshotState, isActiveSessionState, mergeProgressActivity, normalizeProgressFeedback, recentMessagePageParams } from './lib/chatSessionState';
 import { localCacheKey, readLocalCache, removeLocalCache, writeLocalCache } from './lib/localCache';
@@ -1972,38 +1972,28 @@ function App() {
 
     const applyIncomingMessages = (incoming) => {
       if (!Array.isArray(incoming) || incoming.length === 0 || disposed || websocketKeyRef.current !== key) return;
-      const protocolMismatches = committedMessageProtocolMismatches(messagesRef.current, incoming);
-      if (protocolMismatches.length > 0) {
-        console.warn('stream provisional message differed from durable commit', protocolMismatches);
+      const patch = incomingMessagesPatch(messagesRef.current, incoming, key, seenUsageMessagesRef.current);
+      if (!patch) return;
+      if (patch.protocolMismatches.length > 0) {
+        console.warn('stream provisional message differed from durable commit', patch.protocolMismatches);
         setSessionActivity('流式消息和落盘消息不一致，已使用落盘消息');
       }
-      const finalizedActivities = streamFinalizedActivityIds(incoming);
-      const delta = usageDeltaFromMessages(key, incoming, seenUsageMessagesRef.current);
-      if (delta.totalTokens > 0 || delta.cost > 0) {
+      if (patch.usageDelta.totalTokens > 0 || patch.usageDelta.cost > 0) {
         setStatusDeltas((current) => {
           const next = new Map(current);
-          next.set(key, addUsageTotals(next.get(key), delta));
+          next.set(key, addUsageTotals(next.get(key), patch.usageDelta));
           return next;
         });
       }
-      setMessages((current) => {
-        const next = mergeMessages(current, incoming);
-        messagesRef.current = next;
-        cacheMessages(next);
-        return next;
-      });
-      const latestMessage = incoming.reduce((latest, message) => (
-        !latest || messageIndex(message) >= messageIndex(latest) ? message : latest
-      ), null);
-      const latestId = latestMessage?.id ?? latestMessage?.message_id;
-      const latestIndex = latestMessage ? messageIndex(latestMessage) : undefined;
-      updateSelectedSessionSummary(latestMessage, latestId, latestIndex);
-      const activity = activityFromMessages(incoming);
-      if (activity) setSessionActivity(activity);
-      if (finalizedActivities.size > 0) {
-        updateRunningActivities((current) => current.filter((item) => !finalizedActivities.has(item.id)));
+      messagesRef.current = patch.messages;
+      cacheMessages(patch.messages);
+      setMessages(patch.messages);
+      updateSelectedSessionSummary(patch.latestMessage, patch.latestId, patch.latestIndex);
+      if (patch.activity) setSessionActivity(patch.activity);
+      if (patch.finalizedActivities.size > 0) {
+        updateRunningActivities((current) => current.filter((item) => !patch.finalizedActivities.has(item.id)));
       }
-      if (incoming.some((message) => isFinalAssistantMessage(message))) {
+      if (patch.hasFinalAssistant) {
         setTimeout(() => {
           if (!disposed && websocketKeyRef.current === key) {
             setRunningActivities([]);
@@ -2014,17 +2004,13 @@ function App() {
 
     const replaceWithRecentMessages = (incoming) => {
       if (!Array.isArray(incoming) || incoming.length === 0 || disposed || websocketKeyRef.current !== key) return;
-      messagesRef.current = incoming;
-      cacheMessages(incoming);
-      setMessages(incoming);
-      const latestMessage = incoming.reduce((latest, message) => (
-        !latest || messageIndex(message) >= messageIndex(latest) ? message : latest
-      ), null);
-      const latestId = latestMessage?.id ?? latestMessage?.message_id;
-      const latestIndex = latestMessage ? messageIndex(latestMessage) : undefined;
-      updateSelectedSessionSummary(latestMessage, latestId, latestIndex);
-      const activity = activityFromMessages(incoming);
-      if (activity) setSessionActivity(activity);
+      const patch = recentMessagesPatch(incoming);
+      if (!patch) return;
+      messagesRef.current = patch.messages;
+      cacheMessages(patch.messages);
+      setMessages(patch.messages);
+      updateSelectedSessionSummary(patch.latestMessage, patch.latestId, patch.latestIndex);
+      if (patch.activity) setSessionActivity(patch.activity);
     };
 
     const streamBuffers = createStreamBufferStore();
@@ -2262,145 +2248,48 @@ function App() {
     };
 
     const reconcileAck = async (ack) => {
-      const total = Number(ack?.next_message_index ?? ack?.total ?? ack?.next_message_id);
-      if (!Number.isFinite(total) || disposed || websocketKeyRef.current !== key) return;
-      const current = messagesRef.current;
-      const lastIndex = lastServerMessageIndex(current);
-      if (lastIndex === undefined) {
-        if (total <= 0) {
-          messagesRef.current = [];
-          clearMessageCache();
-          setMessages([]);
-          setMessagesReady(true);
-          return;
-        }
-        const initial = await loadMessages(
-          serverId,
-          conversationId,
-          { ...recentMessagePageParams(null, 40, total), foregroundSessionId: sessionId }
-        );
-        if (!disposed && websocketKeyRef.current === key) {
-          setMessages((current) => {
-            const next = current.length ? mergeMessages(current, initial) : initial;
-            messagesRef.current = next;
-            cacheMessages(next);
-            return next;
-          });
-          setMessagesReady(true);
-        }
+      const plan = chatAckHistoryPlan(messagesRef.current, ack);
+      if (plan.kind === 'none' || disposed || websocketKeyRef.current !== key) return;
+      if (plan.kind === 'clear') {
+        messagesRef.current = [];
+        clearMessageCache();
+        setMessages([]);
+        setMessagesReady(true);
         return;
       }
-      if (total > lastIndex + 1) {
-        const gap = total - lastIndex - 1;
-        const shouldJumpToTail = gap > 200;
-        const params = shouldJumpToTail
-          ? recentMessagePageParams(null, 80, total)
-          : { offset: lastIndex + 1, limit: gap };
-        const missing = await loadMessages(serverId, conversationId, {
-          ...params,
-          foregroundSessionId: sessionId
-        });
-        if (shouldJumpToTail) {
-          replaceWithRecentMessages(missing);
-        } else {
-          applyIncomingMessages(missing);
-        }
-        if (!disposed && websocketKeyRef.current === key) {
-          setMessagesReady(true);
-        }
+      const missing = await loadMessages(serverId, conversationId, {
+        ...plan.params,
+        foregroundSessionId: sessionId
+      });
+      if (plan.replace) {
+        replaceWithRecentMessages(missing);
+      } else {
+        applyIncomingMessages(missing);
+      }
+      if (!disposed && websocketKeyRef.current === key) {
+        setMessagesReady(true);
       }
     };
 
     const applyChatSnapshotLiveProjection = (snapshot) => {
       if (!snapshot || disposed || websocketKeyRef.current !== key) return;
-      const snapshotState = chatSnapshotState(snapshot);
-      const provisional = snapshot.current_provisional_assistant_message?.message;
-      if (provisional) {
-        const turnId = String(snapshot.current_turn_state?.turn_id || snapshot.current_turn_state?.turnId || '').trim();
-        const projected = {
-          ...provisional,
-          id: provisional.id || provisional.message_id || provisional.messageId || turnId || undefined,
-          message_id: provisional.message_id || provisional.messageId || provisional.id || turnId || undefined,
-          _streamTurnId: turnId || provisional._streamTurnId || '',
-          _streaming: true
-        };
-        setMessages((current) => {
-          const next = mergeMessages(current, [projected]);
-          messagesRef.current = next;
-          return next;
-        });
-        setSessionActivity('正在回复');
+      const projection = chatSnapshotProjection(messagesRef.current, snapshot);
+      if (!projection) return;
+      if (projection.changed) {
+        messagesRef.current = projection.messages;
+        if (projection.shouldCache) cacheMessages(projection.messages);
+        setMessages(projection.messages);
       }
-      const toolStates = Array.isArray(snapshot.running_tool_results)
-        ? snapshot.running_tool_results
-        : [];
-      const queuedMessages = Array.isArray(snapshot.queued_outbound_messages)
-        ? snapshot.queued_outbound_messages
-        : [];
-      if (queuedMessages.length > 0) {
-        setMessages((current) => {
-          let next = current;
-          queuedMessages.forEach((queued) => {
-            next = markQueuedUserMessage(next, queued?.client_message_id || queued?.clientMessageId);
-          });
-          messagesRef.current = next;
-          return next;
-        });
+      if (projection.runningActivities?.length > 0) {
+        updateRunningActivities((current) => [
+          ...current.filter((item) => !projection.runningActivities.some((activity) => activity.id === item.id) && item.id !== 'thinking'),
+          ...projection.runningActivities
+        ]);
       }
-      const activities = toolStates
-        .filter((state) => !state?.committed)
-        .map((state) => state?.tool_result || state?.toolResult || state)
-        .filter(Boolean)
-        .map((toolResult) => {
-          const itemId = String(toolResult.tool_call_id || toolResult.toolCallId || toolResult.tool_name || toolResult.toolName || '').trim();
-          const toolName = String(toolResult.tool_name || toolResult.toolName || '工具').trim();
-          return {
-            id: `stream-tool-result-${itemId || toolName}`,
-            title: `${toolName} 已返回`,
-            detail: toolName,
-            state: 'running'
-          };
-        });
-      if (activities.length > 0) {
-        setMessages((current) => {
-          let next = current;
-          toolStates.forEach((state) => {
-            if (state?.committed) return;
-            next = appendStreamToolResultDone(next, {
-              turn_id: state?.turn_id || state?.turnId || snapshot.current_turn_state?.turn_id,
-              tool_result: state?.tool_result || state?.toolResult || state
-            });
-          });
-          messagesRef.current = next;
-          return next;
-        });
-        updateRunningActivities((current) => [
-          ...current.filter((item) => !activities.some((activity) => activity.id === item.id) && item.id !== 'thinking'),
-          ...activities
-        ]);
-        setSessionActivity(activities[activities.length - 1]?.title || '正在处理');
-      } else if (snapshotState.state === 'running' && !provisional) {
-        updateRunningActivities((current) => [
-          ...current.filter((item) => item.id !== 'thinking'),
-          {
-            id: 'thinking',
-            title: '正在处理',
-            detail: '等待模型响应',
-            state: 'running'
-          }
-        ]);
-        setSessionActivity('正在处理');
-      } else if (snapshotState.state === 'idle') {
-        setMessages((current) => {
-          const next = removeStreamingMessagesForTurn(current);
-          if (next !== current) {
-            messagesRef.current = next;
-            cacheMessages(next);
-          }
-          return next;
-        });
+      if (projection.clearRunningActivities) {
         setRunningActivities([]);
       }
+      if (projection.activity) setSessionActivity(projection.activity);
     };
 
     const applyChatSocketPayload = (payload) => {
