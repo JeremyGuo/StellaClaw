@@ -684,6 +684,7 @@ fn base_model(
         token_max_context,
         max_tokens: 0,
         cache_timeout: 300,
+        idle_timeout_compact_enabled: true,
         conn_timeout: 2,
         request_timeout: 600,
         max_request_size: default_max_request_size(),

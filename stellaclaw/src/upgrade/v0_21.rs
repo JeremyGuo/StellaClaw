@@ -3,7 +3,7 @@ use std::{fs, path::Path};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use super::{WorkdirUpgrader, LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_21};
+use super::{WorkdirUpgrader, WORKDIR_VERSION_0_21, WORKDIR_VERSION_0_22};
 use crate::config::StellaclawConfig;
 
 pub struct RemoveStatusServiceUpgrade;
@@ -14,7 +14,7 @@ impl WorkdirUpgrader for RemoveStatusServiceUpgrade {
     }
 
     fn to_version(&self) -> &'static str {
-        LATEST_WORKDIR_VERSION
+        WORKDIR_VERSION_0_22
     }
 
     fn upgrade(&self, workdir: &Path, _config: &StellaclawConfig) -> Result<()> {

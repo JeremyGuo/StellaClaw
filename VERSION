@@ -1,7 +1,10 @@
-version: 1.28.6
+version: 1.29.0
 ---
 
-# 1.28.6
+# 1.29.0
+
+- 新增 Conversation 级 idle timeout compact 覆盖开关：
+  `ModelConfig` 新增 `idle_timeout_compact_enabled` 作为每个模型的系统默认值，默认 `true`；Conversation runtime config 新增可选 `idle_timeout_compact_enabled`，`null` 表示继承当前模型默认值，`true` / `false` 表示覆盖。AgentSession 启动时会把最终生效值写入 `SessionInitial`，SessionActor 的 idle timeout compaction 会按该值决定是否运行；Web / Telegram 控制命令新增 `/idle_compact` / `/idle_timeout_compact`，支持 `on`、`off`、`default`，Web conversation summary 同步返回 override 和 effective 状态。本次改变 `config` schema 至 `0.13`，改变 `workdir` schema 至 `0.23`。
 
 - 修复 AgentSession bridge 工具控制路径潜在阻塞：
   `AgentSessionService` 向 `agent_server` 投递普通 session request 时不再同步等待 JSON-RPC ack，而是通过专用 writer thread 发送 notification，避免 background agent / subagent 的 host coordination resolve、child session event、cancel 等事件在 service 主 `select!` 循环里被 30s request timeout 阻塞；AgentSessionService 转发 memory / skill / tool_binary / cron / kernel 请求时改用内部 service request id 做 pending correlation；`subagent_join` 的 cancel 路径在 cancel ack 后不再阻塞等待原 join response，未即时返回时直接生成 interrupted 工具结果；background agent / subagent 的生命周期仍由父 AgentSessionService 管理，父 session 在 child completed / failed / crashed 终态保存结果并向 child service 发送 shutdown，`subagent_kill` 对已终态 child 直接返回 failure 且不会重复 shutdown；background `terminate` 会先通知父 session 标记 killed，再关闭自身 runner；Kernel service runner 会在 service run 返回错误时投影 `ServiceOutput::Failed`，且 `StopService` 对不存在服务返回 `service_not_found`。本次不改变 `config` schema，不改变 `workdir` schema。

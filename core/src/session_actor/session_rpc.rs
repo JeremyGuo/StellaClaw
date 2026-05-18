@@ -40,6 +40,10 @@ impl Default for ToolRemoteMode {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionInitial {
     pub session_id: String,
@@ -50,6 +54,8 @@ pub struct SessionInitial {
     pub compression_threshold_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression_retain_recent_tokens: Option<u64>,
+    #[serde(default = "default_true")]
+    pub idle_timeout_compact_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_tool_model: Option<ModelConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -80,6 +86,7 @@ impl SessionInitial {
             tool_remote_mode: ToolRemoteMode::Selectable,
             compression_threshold_tokens: None,
             compression_retain_recent_tokens: None,
+            idle_timeout_compact_enabled: true,
             image_tool_model: None,
             pdf_tool_model: None,
             audio_tool_model: None,

@@ -764,6 +764,8 @@ impl WebChannel {
             "foreground_session_id": metadata.foreground_session_id,
             "model": conversation_model_label(runtime_config.as_ref(), &self.config),
             "reasoning": runtime_config.as_ref().and_then(|config| config.reasoning_effort.as_deref()).unwrap_or("model default"),
+            "idle_timeout_compact_enabled": conversation_idle_timeout_compact_enabled(runtime_config.as_ref(), &self.config),
+            "idle_timeout_compact_override": runtime_config.as_ref().and_then(|config| config.idle_timeout_compact_enabled),
             "sandbox": runtime_config.as_ref().and_then(|config| config.sandbox.as_ref()).map(|sandbox| format!("{:?}", sandbox.mode)).unwrap_or_else(|| "default".to_string()),
             "remote": runtime_config.as_ref().map(|config| format!("{:?}", config.tool_remote_mode)).unwrap_or_else(|| "selectable".to_string()),
             "workspace": WorkdirLayout::new(&self.workdir).conversation_root(&metadata.conversation_id).display().to_string(),
@@ -1076,6 +1078,24 @@ pub(super) fn wait_for_event<T>(
             }
         }
     }
+}
+
+fn conversation_idle_timeout_compact_enabled(
+    runtime_config: Option<&ConversationRuntimeConfig>,
+    config: &StellaclawConfig,
+) -> bool {
+    if let Some(override_value) =
+        runtime_config.and_then(|runtime_config| runtime_config.idle_timeout_compact_enabled)
+    {
+        return override_value;
+    }
+    runtime_config
+        .and_then(|runtime_config| runtime_config.session_profile.as_ref())
+        .or(config.default_profile.as_ref())
+        .and_then(|profile| profile.main_model.resolve(&config.models))
+        .or_else(|| config.initial_main_model())
+        .map(|model| model.idle_timeout_compact_enabled)
+        .unwrap_or(true)
 }
 
 fn conversation_model_label(

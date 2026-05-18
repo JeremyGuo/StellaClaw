@@ -2496,6 +2496,7 @@ mod tests {
             token_max_context: 8192,
             max_tokens: 1024,
             cache_timeout: 0,
+            idle_timeout_compact_enabled: true,
             conn_timeout: 1,
             request_timeout: 1,
             max_request_size: 1024 * 1024,

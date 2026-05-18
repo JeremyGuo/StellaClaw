@@ -26,6 +26,9 @@ pub enum ConversationControl {
     ShowReasoning,
     SetReasoning { effort: Option<String> },
     InvalidReasoning { reason: String },
+    ShowIdleTimeoutCompact,
+    SetIdleTimeoutCompact { enabled: Option<bool> },
+    InvalidIdleTimeoutCompact { reason: String },
     ShowRemote,
     SetRemote { host: String, path: String },
     DisableRemote,
@@ -33,6 +36,31 @@ pub enum ConversationControl {
     ShowSandbox,
     SetSandbox { mode: Option<SandboxMode> },
     InvalidSandbox { reason: String },
+}
+
+pub(crate) fn parse_idle_timeout_compact_control_argument(argument: &str) -> ConversationControl {
+    let argument = argument.trim();
+    if argument.is_empty() {
+        return ConversationControl::ShowIdleTimeoutCompact;
+    }
+    match argument.to_ascii_lowercase().as_str() {
+        "default" | "model" | "model_default" | "model-default" | "inherit" => {
+            ConversationControl::SetIdleTimeoutCompact { enabled: None }
+        }
+        "on" | "enable" | "enabled" | "true" | "yes" => {
+            ConversationControl::SetIdleTimeoutCompact {
+                enabled: Some(true),
+            }
+        }
+        "off" | "disable" | "disabled" | "false" | "no" => {
+            ConversationControl::SetIdleTimeoutCompact {
+                enabled: Some(false),
+            }
+        }
+        _ => ConversationControl::InvalidIdleTimeoutCompact {
+            reason: format!("未知 idle timeout compact 设置 `{argument}`。"),
+        },
+    }
 }
 
 pub(crate) fn parse_reasoning_control_argument(argument: &str) -> ConversationControl {

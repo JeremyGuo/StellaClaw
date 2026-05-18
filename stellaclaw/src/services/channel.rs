@@ -408,6 +408,7 @@ fn handle_channel_request(
                         "tool_remote_mode": config.tool_remote_mode,
                         "has_sandbox_override": config.sandbox.is_some(),
                         "reasoning_effort": config.reasoning_effort,
+                        "idle_timeout_compact_enabled": config.idle_timeout_compact_enabled,
                         "updated_services": updated_services,
                     });
                     emit_channel_event(

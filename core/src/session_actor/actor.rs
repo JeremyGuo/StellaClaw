@@ -2426,7 +2426,10 @@ impl SessionActor {
     }
 
     fn idle_compaction_delay(&self) -> Option<Duration> {
-        self.initial.as_ref()?;
+        let initial = self.initial.as_ref()?;
+        if !initial.idle_timeout_compact_enabled {
+            return None;
+        }
         self.compressor.as_ref()?;
         if self.shutdown
             || self.active_provider_request.is_some()
@@ -4104,6 +4107,7 @@ mod tests {
             token_max_context: 128_000,
             max_tokens: 0,
             cache_timeout: 300,
+            idle_timeout_compact_enabled: true,
             conn_timeout: 10,
             request_timeout: 600,
             max_request_size: 30 * 1024 * 1024,
@@ -6289,6 +6293,67 @@ mod tests {
         assert!(message_text_for_test(&actor.history()[0]).contains(COMPRESSION_MARKER));
         assert!(message_text_for_test(&actor.history()[0]).contains("summary"));
         assert_eq!(provider.seen_requests.lock().unwrap().len(), 2);
+
+        fs::remove_dir_all(tokenizer_dir).expect("tokenizer dir should be removed");
+    }
+
+    #[test]
+    fn idle_compaction_respects_session_initial_switch() {
+        let _cwd = temp_cwd("actor-idle-compression-disabled");
+        let (inbox, mailbox) = test_inbox();
+        let mut initial = SessionInitial::new(
+            test_session_id("session_idle_compression_disabled"),
+            super::super::SessionType::Foreground,
+        );
+        initial.compression_threshold_tokens = Some(1_000);
+        initial.compression_retain_recent_tokens = Some(12);
+        initial.idle_timeout_compact_enabled = false;
+        mailbox.append(
+            SessionMailboxKind::Control,
+            SessionRequest::Initial { initial },
+        );
+        mailbox.append(
+            SessionMailboxKind::Data,
+            SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "old ".repeat(50),
+                    })],
+                ),
+            },
+        );
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: "first final".to_string(),
+                })],
+            ),
+            ChatMessage::new(
+                ChatRole::Assistant,
+                vec![ChatMessageItem::Context(ContextItem {
+                    text: compression_response("summary"),
+                })],
+            ),
+        ]));
+        let tools = Arc::new(EchoToolExecutor::new());
+        let catalog = builtin_tool_catalog(BuiltinToolCatalogOptions::default()).unwrap();
+        let (mut model_config, tokenizer_dir) = test_model_config_with_tokenizer();
+        model_config.token_max_context = 64;
+        model_config.cache_timeout = 300;
+        let mut actor = SessionActor::new(model_config, provider, tools, inbox, events, catalog);
+
+        actor.run_until_idle(4).expect("actor should run");
+        actor.last_provider_request_started_at = Some(Instant::now() - Duration::from_secs(271));
+        actor.last_agent_returned_at = Some(Instant::now());
+        let compacted = actor
+            .try_run_idle_compaction()
+            .expect("idle compaction should not fail");
+
+        assert!(!compacted);
+        assert!(!message_text_for_test(&actor.history()[0]).contains(COMPRESSION_MARKER));
 
         fs::remove_dir_all(tokenizer_dir).expect("tokenizer dir should be removed");
     }

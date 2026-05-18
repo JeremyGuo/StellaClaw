@@ -22,9 +22,10 @@ use crate::{conversation_id_manager::ConversationIdManager, logger::StellaclawLo
 
 use super::{
     types::{
-        parse_reasoning_control_argument, ConversationControl, IncomingConversationMessage,
-        IncomingDispatch, IncomingMessageDispatch, OutgoingAttachmentKind, OutgoingError,
-        OutgoingMessageAppended, OutgoingOptions, ProcessingState,
+        parse_idle_timeout_compact_control_argument, parse_reasoning_control_argument,
+        ConversationControl, IncomingConversationMessage, IncomingDispatch,
+        IncomingMessageDispatch, OutgoingAttachmentKind, OutgoingError, OutgoingMessageAppended,
+        OutgoingOptions, ProcessingState,
     },
     Channel,
 };
@@ -992,6 +993,9 @@ fn parse_conversation_control(text: &str) -> Option<ConversationControl> {
             model_name: argument.to_string(),
         }),
         "/reasoning" => Some(parse_reasoning_control_argument(argument)),
+        "/idle_compact" | "/idle_timeout_compact" => {
+            Some(parse_idle_timeout_compact_control_argument(argument))
+        }
         "/remote" if argument.is_empty() => Some(ConversationControl::ShowRemote),
         "/remote" if argument.eq_ignore_ascii_case("off") => {
             Some(ConversationControl::DisableRemote)

@@ -28,6 +28,8 @@ pub struct KernelRuntimeConfigPatch {
     pub sandbox: Option<Option<crate::config::SandboxConfig>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_timeout_compact_enabled: Option<Option<bool>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

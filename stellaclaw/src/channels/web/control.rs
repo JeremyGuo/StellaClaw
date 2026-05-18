@@ -58,6 +58,21 @@ pub(super) fn control_ingress_from_text(
                 },
             }
         }
+        "/idle_compact" | "/idle_timeout_compact" => {
+            let enabled = parse_idle_timeout_compact_argument(argument)?;
+            if argument.trim().is_empty() {
+                ChannelIngress::QueryForegroundStatus {
+                    foreground_session_id,
+                }
+            } else {
+                ChannelIngress::UpdateRuntimeConfig {
+                    patch: KernelRuntimeConfigPatch {
+                        idle_timeout_compact_enabled: Some(enabled),
+                        ..Default::default()
+                    },
+                }
+            }
+        }
         "/remote" if argument.is_empty() => ChannelIngress::QueryForegroundStatus {
             foreground_session_id,
         },
@@ -106,6 +121,19 @@ fn parse_web_control_command(text: &str) -> Option<(&str, &str)> {
     let command = parts.next()?.split('@').next()?.trim();
     let argument = parts.next().unwrap_or_default().trim();
     Some((command, argument))
+}
+
+fn parse_idle_timeout_compact_argument(argument: &str) -> HttpResult<Option<bool>> {
+    match argument.trim().to_ascii_lowercase().as_str() {
+        "" => Ok(None),
+        "default" | "model" | "model_default" | "model-default" | "inherit" => Ok(None),
+        "on" | "enable" | "enabled" | "true" | "yes" => Ok(Some(true)),
+        "off" | "disable" | "disabled" | "false" | "no" => Ok(Some(false)),
+        other => Err(HttpError::new(
+            400,
+            format!("unknown idle timeout compact setting {other}"),
+        )),
+    }
 }
 
 fn parse_reasoning_effort_argument(argument: &str) -> HttpResult<Option<String>> {

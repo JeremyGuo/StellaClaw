@@ -63,6 +63,7 @@ pub struct AgentSessionLaunchConfig {
     pub tool_remote_mode: ToolRemoteMode,
     pub sandbox: Option<SandboxConfig>,
     pub reasoning_effort: Option<String>,
+    pub idle_timeout_compact_enabled: Option<bool>,
 }
 
 pub struct AgentSessionService {
@@ -586,6 +587,9 @@ fn start_real_session(
     initial.memory_enabled = launch.memory_enabled;
 
     let effective_model = effective_model_config(&model_config, launch.reasoning_effort.as_deref());
+    initial.idle_timeout_compact_enabled = launch
+        .idle_timeout_compact_enabled
+        .unwrap_or(effective_model.idle_timeout_compact_enabled);
     initial.image_tool_model = resolve_tool_model_target(
         "image_tool_model",
         launch.session_defaults.image_tool_model.as_ref(),
@@ -3387,6 +3391,7 @@ fn launch_metadata(
         "tool_remote_mode": &launch.tool_remote_mode,
         "has_sandbox_override": launch.sandbox.is_some(),
         "reasoning_effort": &launch.reasoning_effort,
+        "idle_timeout_compact_enabled": launch.idle_timeout_compact_enabled,
         "session_defaults": {
             "compression_threshold_tokens": launch.session_defaults.compression_threshold_tokens,
             "compression_retain_recent_tokens": launch.session_defaults.compression_retain_recent_tokens,
@@ -4605,6 +4610,7 @@ mod tests {
             tool_remote_mode: ToolRemoteMode::Selectable,
             sandbox: None,
             reasoning_effort: None,
+            idle_timeout_compact_enabled: None,
         }
     }
 
@@ -4618,6 +4624,7 @@ mod tests {
             token_max_context: 128_000,
             max_tokens: 0,
             cache_timeout: 0,
+            idle_timeout_compact_enabled: true,
             conn_timeout: 30,
             request_timeout: 600,
             max_request_size: 30 * 1024 * 1024,

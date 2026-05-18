@@ -338,6 +338,7 @@ fn runtime_config_from_host_defaults(
         tool_remote_mode: stellaclaw_core::session_actor::ToolRemoteMode::Selectable,
         sandbox: Some(config.sandbox.clone()),
         reasoning_effort: None,
+        idle_timeout_compact_enabled: None,
     })
 }
 

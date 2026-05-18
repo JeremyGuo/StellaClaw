@@ -19,6 +19,7 @@ mod v0_19;
 mod v0_2;
 mod v0_20;
 mod v0_21;
+mod v0_22;
 mod v0_3;
 mod v0_4;
 mod v0_5;
@@ -48,7 +49,8 @@ pub const WORKDIR_VERSION_0_18: &str = "0.18";
 pub const WORKDIR_VERSION_0_19: &str = "0.19";
 pub const WORKDIR_VERSION_0_20: &str = "0.20";
 pub const WORKDIR_VERSION_0_21: &str = "0.21";
-pub const LATEST_WORKDIR_VERSION: &str = "0.22";
+pub const WORKDIR_VERSION_0_22: &str = "0.22";
+pub const LATEST_WORKDIR_VERSION: &str = "0.23";
 pub const PARTYCLAW_LATEST_WORKDIR_VERSION: &str = "0.39";
 
 const WORKDIR_VERSION_FILE: &str = "STELLA_VERSION";
@@ -67,7 +69,7 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
     let legacy_version_path = workdir.join(LEGACY_WORKDIR_VERSION_FILE);
     let mut current = read_workdir_version(&version_path, &legacy_version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 22] = [
+    let upgraders: [&dyn WorkdirUpgrader; 23] = [
         &v0_1::LegacyUpgrade,
         &v0_1::PartyClawUpgrade,
         &v0_2::ChatMessageReasoningUpgrade,
@@ -90,6 +92,7 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
         &v0_19::ReasoningSummaryPartsUpgrade,
         &v0_20::WebSeenStateUpgrade,
         &v0_21::RemoveStatusServiceUpgrade,
+        &v0_22::RuntimeConfigIdleCompactUpgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
