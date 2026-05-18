@@ -155,6 +155,29 @@ function settingsPath() {
   return path.join(app.getPath('userData'), SETTINGS_FILE);
 }
 
+function protocolLogPath() {
+  return path.join(app.getPath('userData'), 'logs', 'chat-protocol.jsonl');
+}
+
+async function appendProtocolLog(_event, payload) {
+  const filePath = protocolLogPath();
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const record = {
+    received_at: new Date().toISOString(),
+    ...(payload && typeof payload === 'object' ? payload : { value: payload })
+  };
+  await fs.appendFile(filePath, `${JSON.stringify(record)}\n`, 'utf8');
+  return { path: filePath };
+}
+
+async function revealProtocolLog() {
+  const filePath = protocolLogPath();
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.appendFile(filePath, '', 'utf8');
+  shell.showItemInFolder(filePath);
+  return { path: filePath };
+}
+
 function normalizeSettings(value) {
   const fallback = defaultSettings();
   const servers = Array.isArray(value?.servers) ? value.servers : fallback.servers;
@@ -998,6 +1021,9 @@ app.whenReady().then(() => {
   ipcMain.handle('app:versionInfo', appVersionInfo);
   ipcMain.handle('app:setZoomFactor', setRendererZoomFactor);
   ipcMain.handle('app:openExternal', openExternalUrl);
+  ipcMain.handle('diagnostics:appendProtocolLog', appendProtocolLog);
+  ipcMain.handle('diagnostics:protocolLogPath', () => protocolLogPath());
+  ipcMain.handle('diagnostics:revealProtocolLog', revealProtocolLog);
   ipcMain.handle('server:request', requestServer);
   ipcMain.handle('server:connectionInfo', serverConnectionInfo);
   ipcMain.handle('binary:gzip', gzipBinary);

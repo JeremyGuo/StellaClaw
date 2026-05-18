@@ -58,6 +58,12 @@ import {
 import { startChatSocketClient } from './lib/chatSocketClient';
 import { chatAckHistoryPlan, chatSnapshotProjection, incomingMessagesPatch, recentMessagesPatch } from './lib/chatMessagePlane';
 import { readMessageCache, removeMessageCache, writeMessageCache } from './lib/chatMessageCache';
+import {
+  recordChatProtocolDiagnostic,
+  summarizeMessagesTail,
+  summarizePayload,
+  summarizeStreamingAssistants
+} from './lib/chatProtocolDiagnostics';
 import { chatSessionStateIsActive, chatSnapshotState, isActiveSessionState, mergeProgressActivity, normalizeProgressFeedback, recentMessagePageParams } from './lib/chatSessionState';
 import { localCacheKey, readLocalCache, removeLocalCache, writeLocalCache } from './lib/localCache';
 import { effectiveThemeMode, themeCssVariables } from './lib/theme';
@@ -1953,6 +1959,27 @@ function App() {
       removeMessageCache(serverId, conversationId, sessionId);
     };
 
+    const recordProtocol = (kind, details = {}) => {
+      recordChatProtocolDiagnostic(kind, {
+        scopeKey: key,
+        serverId,
+        conversationId,
+        foregroundSessionId: sessionId,
+        ...details
+      });
+    };
+
+    const recordDuplicateStreamingAssistants = (source, nextMessages, extra = {}) => {
+      const streamingAssistants = summarizeStreamingAssistants(nextMessages);
+      if (streamingAssistants.length <= 1) return;
+      recordProtocol('chat.duplicate_streaming_assistants', {
+        source,
+        streamingAssistants,
+        messagesTail: summarizeMessagesTail(nextMessages, 12),
+        ...extra
+      });
+    };
+
     const updateSelectedSessionSummary = (latestMessage, latestId, latestIndex) => {
       if (!latestId || !Number.isFinite(latestIndex)) return;
       setConversations((current) => {
@@ -1979,6 +2006,12 @@ function App() {
       const patch = incomingMessagesPatch(messagesRef.current, incoming, key, seenUsageMessagesRef.current);
       if (!patch) return;
       if (patch.protocolMismatches.length > 0) {
+        recordProtocol('chat.stream_commit_mismatch', {
+          mismatches: patch.protocolMismatches,
+          incoming: summarizeMessagesTail(incoming, 12),
+          beforeTail: summarizeMessagesTail(messagesRef.current, 12),
+          afterTail: summarizeMessagesTail(patch.messages, 12)
+        });
         console.warn('stream provisional message differed from durable commit', patch.protocolMismatches);
         setSessionActivity('流式消息和落盘消息不一致，已使用落盘消息');
       }
@@ -1992,6 +2025,9 @@ function App() {
       messagesRef.current = patch.messages;
       cacheMessages(patch.messages);
       setMessages(patch.messages);
+      recordDuplicateStreamingAssistants('incoming_messages', patch.messages, {
+        incoming: summarizeMessagesTail(incoming, 12)
+      });
       updateSelectedSessionSummary(patch.latestMessage, patch.latestId, patch.latestIndex);
       if (patch.activity) setSessionActivity(patch.activity);
       if (patch.finalizedActivities.size > 0) {
@@ -2022,6 +2058,12 @@ function App() {
 
     const acceptStreamEvent = (event) => {
       return streamTracker.accept(event, (expected, received) => {
+        recordProtocol('chat.stream_index_gap', {
+          expected,
+          received,
+          event: summarizePayload({ type: streamEventType(event), event }),
+          messagesTail: summarizeMessagesTail(messagesRef.current, 12)
+        });
         setMessages((current) => {
           const next = applyStreamErrorToMessages(current, {
             ...event,
@@ -2069,6 +2111,12 @@ function App() {
               && nextTurnId
               && previousTurnId !== nextTurnId
             ) {
+              recordProtocol('chat.turn_start_overlap_warning', {
+                previousTurnId,
+                nextTurnId,
+                event: summarizePayload({ type, event }),
+                messagesTail: summarizeMessagesTail(messagesRef.current, 12)
+              });
               console.warn('chat protocol warning: stream_turn_start received before previous turn completed', {
                 scopeKey: key,
                 previousTurnId,
@@ -2088,6 +2136,9 @@ function App() {
           messagesRef.current = patch.messages;
           if (patch.shouldCache) cacheMessages(patch.messages);
           setMessages(patch.messages);
+          recordDuplicateStreamingAssistants('stream_patch', patch.messages, {
+            event: summarizePayload({ type, event })
+          });
         }
         if (patch.activity) setSessionActivity(patch.activity);
         if (patch.runningActivity) {
@@ -2207,12 +2258,37 @@ function App() {
 
     const applyChatSnapshotLiveProjection = (snapshot) => {
       if (!snapshot || disposed || websocketKeyRef.current !== key) return;
+      const beforeTail = summarizeMessagesTail(messagesRef.current, 12);
       const projection = chatSnapshotProjection(messagesRef.current, snapshot);
       if (!projection) return;
       if (projection.changed) {
         messagesRef.current = projection.messages;
         if (projection.shouldCache) cacheMessages(projection.messages);
         setMessages(projection.messages);
+        recordDuplicateStreamingAssistants('snapshot_projection', projection.messages, {
+          snapshot: summarizePayload(snapshot),
+          beforeTail,
+          afterTail: summarizeMessagesTail(projection.messages, 12)
+        });
+      }
+      if (
+        projection.changed
+        || projection.runningActivities?.length > 0
+        || projection.clearRunningActivities
+      ) {
+        recordProtocol('chat.snapshot_projection', {
+          projection: {
+            changed: projection.changed,
+            shouldCache: projection.shouldCache,
+            clearRunningActivities: projection.clearRunningActivities,
+            activity: projection.activity,
+            runningActivityCount: projection.runningActivities?.length || 0,
+            snapshotState: projection.snapshotState
+          },
+          snapshot: summarizePayload(snapshot),
+          beforeTail,
+          afterTail: summarizeMessagesTail(projection.messages, 12)
+        });
       }
       if (projection.runningActivities?.length > 0) {
         updateRunningActivities((current) => [
@@ -2229,6 +2305,10 @@ function App() {
     const applyChatSocketPayload = (payload) => {
       if (disposed || websocketKeyRef.current !== key) return;
       const payloadType = String(payload?.type || '');
+      recordProtocol('chat.socket_payload', {
+        payload: summarizePayload(payload),
+        messagesTail: summarizeMessagesTail(messagesRef.current, 8)
+      });
       if (payloadType === 'chat.snapshot') {
         const snapshotState = chatSnapshotState(payload);
         setChatSessionState({ scopeKey: key, ...snapshotState });
