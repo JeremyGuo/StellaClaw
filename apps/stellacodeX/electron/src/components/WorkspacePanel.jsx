@@ -2,6 +2,7 @@ import { Fragment, useState } from 'react';
 import { ChevronDown, ChevronRight, Download, FileText, Folder, Trash2 } from 'lucide-react';
 import * as ContextMenu from '@radix-ui/react-context-menu';
 import { formatBytes } from '../lib/format';
+import { fileNameFromPath } from '../lib/fileUtils';
 import { normalizeWorkspacePath, workspaceAbsolutePath, workspaceDisplayRoot, workspaceEntryIcon, workspaceEntryKind } from '../lib/workspaceUtils';
 
 export function WorkspacePanel({ open, selected, listings, expanded, loading, error, status, activeFilePath, onToggleDirectory, onOpenFile, onUpload, onDownload }) {
@@ -38,6 +39,7 @@ export function WorkspacePanel({ open, selected, listings, expanded, loading, er
     const kind = workspaceEntryKind(entry);
     const isDirectory = kind === 'directory';
     const path = normalizeWorkspacePath(entry.path);
+    const name = entry.name || fileNameFromPath(path) || path || 'workspace';
     const isExpanded = expanded.has(path);
     const listing = listings.get(path);
     const children = listing?.entries || [];
@@ -64,7 +66,7 @@ export function WorkspacePanel({ open, selected, listings, expanded, loading, er
             >
               <span className="tree-chevron">{isDirectory ? (isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />) : null}</span>
               {workspaceEntryIcon(entry)}
-              <span className="file-tree-name" title={entry.name}>{entry.name}</span>
+              <span className="file-tree-name" title={name}>{name}</span>
               {!isDirectory && <small className="file-tree-size">{formatBytes(entry.size_bytes)}</small>}
             </button>
           </ContextMenu.Trigger>

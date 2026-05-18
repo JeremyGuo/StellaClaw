@@ -34,7 +34,8 @@ import { WorkspacePanel } from './components/WorkspacePanel';
 import { FilePreviewPanel } from './components/FilePreviewPanel';
 import { TerminalDock } from './components/TerminalDock';
 import { NewConversationDialog } from './components/NewConversationDialog';
-import { RenameConversationDialog } from './components/RenameConversationDialog';
+import { RenameConversationDialog, RenameSessionDialog } from './components/RenameConversationDialog';
+import { ConversationPropertiesDialog } from './components/ConversationPropertiesDialog';
 import { SettingsDialog } from './components/SettingsDialog';
 import { clamp, formatBytes, formatModel, statusUsageTotals } from './lib/format';
 import { attachmentName, fileExtension, fileNameFromPath, imageMimeType } from './lib/fileUtils';
@@ -242,6 +243,39 @@ function conversationFileTargetFromPath(value) {
   return { conversationId, path: relativePath };
 }
 
+function workspaceTargetFromLocalLink(rawHref, fallbackConversationId, workspaceRoots = []) {
+  const raw = String(rawHref || '').trim();
+  if (!raw || raw.startsWith('#') || /^(?:https?:|mailto:|data:|blob:|javascript:)/i.test(raw)) {
+    return null;
+  }
+  const withoutHash = raw.split('#', 1)[0];
+  const withoutQuery = withoutHash.split('?', 1)[0];
+  const decoded = safeDecodeUriComponent(withoutQuery);
+  const localPath = filePathFromFileUri(decoded) || decoded;
+  if (!localPath) return null;
+  const explicitDirectory = /\/$/.test(localPath);
+  const absoluteTarget = conversationFileTargetFromPath(localPath);
+  if (absoluteTarget) {
+    return { ...absoluteTarget, explicitDirectory };
+  }
+  if (isAbsolutePath(localPath)) {
+    for (const root of workspaceRoots) {
+      if (normalizeAbsolutePath(localPath) === normalizeAbsolutePath(root)) {
+        return { conversationId: fallbackConversationId, path: '', explicitDirectory: true };
+      }
+      const relative = pathRelativeToRoot(localPath, root);
+      if (relative) {
+        return { conversationId: fallbackConversationId, path: relative, explicitDirectory };
+      }
+    }
+    return null;
+  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(localPath)) return null;
+  const path = normalizeWorkspacePath(localPath);
+  if (!path || !fallbackConversationId) return null;
+  return { conversationId: fallbackConversationId, path, explicitDirectory };
+}
+
 function attachmentConversationFileTarget(attachment, rawUrl, fallbackConversationId, workspaceRoots = []) {
   const absoluteTarget = conversationFileTargetFromPath(localAttachmentPath(attachment, rawUrl));
   if (absoluteTarget) return absoluteTarget;
@@ -446,6 +480,27 @@ function patchConversationForegroundSession(conversation, sessionId, patch) {
   };
 }
 
+function nextForegroundSessionName(conversation) {
+  const existingNames = new Set(
+    foregroundSessions(conversation)
+      .map((session) => displayForegroundSessionName(session, conversation).trim())
+      .filter(Boolean)
+  );
+  let index = Math.max(2, existingNames.size + 1);
+  while (existingNames.has(`Session ${index}`)) index += 1;
+  return `Session ${index}`;
+}
+
+function createLocalForegroundSessionId(conversation) {
+  const existingIds = new Set(foregroundSessions(conversation).map((session) => String(session?.id || 'main')));
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const suffix = Math.random().toString(36).slice(2, 8);
+    const id = `session_${Date.now().toString(36)}_${suffix}`;
+    if (!existingIds.has(id)) return id;
+  }
+  return `session_${Date.now().toString(36)}`;
+}
+
 function applyConversationStreamEvent(current, payload) {
   const type = String(payload?.type || '');
   const eventType = type.startsWith('home.') ? type.slice('home.'.length) : type;
@@ -620,6 +675,9 @@ function slashCommandState(value) {
   if (name === '/reasoning') {
     return { control: true, name, title: '切换推理强度', detail: 'reasoning effort 命令已发送' };
   }
+  if (name === '/idle_compact' || name === '/idle_timeout_compact') {
+    return { control: true, name, title: '切换空闲压缩', detail: 'idle compact 命令已发送' };
+  }
   if (name === '/cancel') {
     return { control: true, name, title: '取消执行', detail: '取消命令已发送' };
   }
@@ -630,6 +688,14 @@ function slashCommandState(value) {
     return { control: true, name, title: '读取状态', detail: '状态命令已发送' };
   }
   return { control: false, name, title: '等待响应', detail: '消息已送达，等待模型开始处理' };
+}
+
+function controlCommandActivity(command) {
+  const name = String(command || '').trim().split(/\s+/, 1)[0]?.toLowerCase() || '';
+  if (name === '/model') return '模型切换命令已发送';
+  if (name === '/reasoning') return 'Reasoning 命令已发送';
+  if (name === '/idle_compact' || name === '/idle_timeout_compact') return '空闲压缩设置命令已发送';
+  return 'Conversation 设置命令已发送';
 }
 
 function normalizePlan(rawPlan) {
@@ -672,6 +738,35 @@ function normalizePlanStatus(status) {
   if (status === 'in_progress' || status === 'running' || status === 'active') return 'in_progress';
   if (status === 'pending' || status === 'todo') return 'pending';
   return '';
+}
+
+function isActiveSessionState(value) {
+  return ['running', 'queued', 'processing', 'in_progress', 'active'].includes(
+    String(value || '').trim().toLowerCase()
+  );
+}
+
+function chatSnapshotState(snapshot) {
+  const currentTurnState = snapshot?.current_turn_state || snapshot?.currentTurnState || null;
+  const queued = Array.isArray(snapshot?.queued_outbound_messages)
+    ? snapshot.queued_outbound_messages
+    : Array.isArray(snapshot?.queuedOutboundMessages)
+      ? snapshot.queuedOutboundMessages
+      : [];
+  const state = currentTurnState
+    ? 'running'
+    : queued.length > 0
+      ? 'queued'
+      : 'idle';
+  return {
+    state,
+    currentTurnState,
+    activeTurnId: String(currentTurnState?.turn_id || currentTurnState?.turnId || '').trim()
+  };
+}
+
+function chatSessionStateIsActive(state) {
+  return isActiveSessionState(state?.state);
 }
 
 function normalizeProgressFeedback(payload) {
@@ -718,7 +813,8 @@ function normalizedStreamEvent(payload) {
 }
 
 function streamEventType(event) {
-  return String(event?.type || event?.event_type || event?.kind || '').toLowerCase();
+  const raw = String(event?.type || event?.event_type || event?.kind || '').toLowerCase();
+  return raw.startsWith('chat.') ? raw.slice('chat.'.length) : raw;
 }
 
 function streamMessageId(event) {
@@ -752,9 +848,24 @@ function streamErrorText(event) {
 }
 
 function streamMessageIndexFromEvent(event) {
+  const fromMessageId = messageOrderFromId(streamMessageId(event));
+  if (Number.isFinite(fromMessageId)) return fromMessageId;
   const explicit = Number(event?.message_index ?? event?.messageIndex ?? event?.index);
   if (Number.isFinite(explicit)) return explicit;
-  return messageOrderFromId(streamMessageId(event));
+  return undefined;
+}
+
+function removeStreamingMessagesForTurn(current, turnId = '') {
+  const scopedTurnId = String(turnId || '').trim();
+  let changed = false;
+  const next = current.filter((message) => {
+    if (!message?._streaming || String(message?.role || '').toLowerCase() !== 'assistant') return true;
+    const messageTurnId = String(message?._streamTurnId || message?.turn_id || message?.turnId || '').trim();
+    const remove = scopedTurnId ? messageTurnId === scopedTurnId : true;
+    if (remove) changed = true;
+    return !remove;
+  });
+  return changed ? next : current;
 }
 
 function nextStreamMessageIndex(messages) {
@@ -1187,6 +1298,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [sending, setSending] = useState(false);
   const [sessionActivity, setSessionActivity] = useState('');
+  const [chatSessionState, setChatSessionState] = useState({ state: 'idle' });
   const [runningActivities, setRunningActivities] = useState([]);
   const [overviewPanelOpen, setOverviewPanelOpen] = useState(false);
   const [workspacePanelOpen, setWorkspacePanelOpen] = useState(false);
@@ -1206,6 +1318,13 @@ function App() {
   const [creatingConversation, setCreatingConversation] = useState(false);
   const [renamingConversation, setRenamingConversation] = useState(null);
   const [renamingConversationSaving, setRenamingConversationSaving] = useState(false);
+  const [renamingSession, setRenamingSession] = useState(null);
+  const [renamingSessionSaving, setRenamingSessionSaving] = useState(false);
+  const [propertiesConversation, setPropertiesConversation] = useState(null);
+  const [propertiesModels, setPropertiesModels] = useState([]);
+  const [propertiesModelsLoading, setPropertiesModelsLoading] = useState(false);
+  const [propertiesModelsError, setPropertiesModelsError] = useState('');
+  const [propertiesApplying, setPropertiesApplying] = useState(false);
   const [openFiles, setOpenFiles] = useState([]);
   const [activeFilePath, setActiveFilePath] = useState('');
   const [selectionReferences, setSelectionReferences] = useState([]);
@@ -1218,6 +1337,8 @@ function App() {
   const conversationsRef = useRef([]);
   const openFilesRef = useRef([]);
   const appForegroundRef = useRef(appForeground);
+  const settingsRef = useRef(null);
+  const settingsSaveSeqRef = useRef(0);
   const selectedRef = useRef(null);
   const websocketRef = useRef(null);
   const websocketReconnectRef = useRef(null);
@@ -1246,6 +1367,10 @@ function App() {
   useEffect(() => {
     appForegroundRef.current = appForeground;
   }, [appForeground]);
+
+  useEffect(() => {
+    settingsRef.current = settings;
+  }, [settings]);
 
   useLayoutEffect(() => {
     applyChromeMetrics(window.stellacode2?.chromeMetrics?.());
@@ -1376,6 +1501,11 @@ function App() {
     () => conversations.find((item) => item.conversation_id === selected?.conversationId) || null,
     [conversations, selected]
   );
+  const propertiesConversationCurrent = useMemo(() => (
+    propertiesConversation
+      ? conversations.find((item) => item.conversation_id === propertiesConversation.conversation_id) || propertiesConversation
+      : null
+  ), [conversations, propertiesConversation]);
   const activeForegroundSession = useMemo(() => {
     if (!activeConversation) return null;
     return foregroundSessions(activeConversation).find((session) => (
@@ -1388,6 +1518,9 @@ function App() {
   const selectedKey = selected ? conversationKey(selected.serverId, selected.conversationId, selectedSessionId) : '';
   const selectedConversationUiKey = selected ? conversationKey(selected.serverId, selected.conversationId, 'main') : '';
   const selectedStatus = selected ? statuses.get(selectedKey) : null;
+  const selectedChatSessionState = chatSessionState.scopeKey === selectedKey
+    ? chatSessionState
+    : { state: 'idle' };
   const selectedConversationStatus = useMemo(() => ({
     ...(selectedStatus || {}),
     ...(activeConversation ? {
@@ -1398,14 +1531,14 @@ function App() {
       sandbox_source: activeConversation.sandbox_source,
       remote: activeConversation.remote,
       workspace: activeConversation.workspace,
-      processing_state: activeConversation.processing_state,
-      running: activeConversation.running,
+      processing_state: selectedChatSessionState.state || 'idle',
+      running: chatSessionStateIsActive(selectedChatSessionState),
       running_background: activeConversation.running_background,
       total_background: activeConversation.total_background,
       running_subagents: activeConversation.running_subagents,
       total_subagents: activeConversation.total_subagents
     } : {})
-  }), [selectedStatus, activeConversation]);
+  }), [selectedStatus, activeConversation, selectedChatSessionState]);
   const activeServer = useMemo(
     () => (settings?.servers || []).find((server) => server.id === activeServerId) || null,
     [settings?.servers, activeServerId]
@@ -1450,12 +1583,15 @@ function App() {
   const loadWorkspaceFileCached = useCallback(async (serverId, conversationId, path, limitBytes, options = {}) => {
     const normalized = normalizeWorkspacePath(path);
     const parts = [serverId, conversationId, normalized, limitBytes || 'full'];
-    if (!options.force) {
+    const useCache = options.cache !== false;
+    if (useCache && !options.force) {
       const cached = readWorkspaceResourceCache('workspace-file', parts);
       if (cached) return cached;
     }
     const loaded = await loadWorkspaceFile(serverId, conversationId, normalized, limitBytes);
-    writeWorkspaceResourceCache('workspace-file', parts, loaded);
+    if (useCache) {
+      writeWorkspaceResourceCache('workspace-file', parts, loaded);
+    }
     return loaded;
   }, [readWorkspaceResourceCache, writeWorkspaceResourceCache]);
   const resolveMessageAttachmentUrl = useCallback(async (attachment, rawUrl = '') => {
@@ -1493,8 +1629,7 @@ function App() {
   );
   const selectedProcessingState = String(selectedConversationStatus?.processing_state || '').trim().toLowerCase();
   const selectedProcessing = Boolean(selectedConversationStatus?.running)
-    || (selectedProcessingState && selectedProcessingState !== 'idle')
-    || runningActivities.some((activity) => String(activity?.state || 'running').toLowerCase() === 'running');
+    || isActiveSessionState(selectedProcessingState);
   const updateReady = updaterStatus?.state === 'downloaded';
 
   const upsertTransfer = useCallback((id, patch) => {
@@ -1521,17 +1656,32 @@ function App() {
   }, []);
 
   const saveSettings = useCallback(async (next) => {
-    const saved = await window.stellacode2.saveSettings(next);
+    const base = settingsRef.current || {};
+    const request = {
+      ...base,
+      ...(next || {}),
+      layout: next?.layout ? { ...(base.layout || {}), ...(next.layout || {}) } : base.layout,
+      conversationUi: next?.conversationUi ? { ...(base.conversationUi || {}), ...(next.conversationUi || {}) } : base.conversationUi,
+      conversationListUi: next?.conversationListUi ? { ...(base.conversationListUi || {}), ...(next.conversationListUi || {}) } : base.conversationListUi,
+      hiddenConversations: next?.hiddenConversations ?? base.hiddenConversations
+    };
+    const seq = settingsSaveSeqRef.current + 1;
+    settingsSaveSeqRef.current = seq;
+    const saved = await window.stellacode2.saveSettings(request);
     const merged = {
       ...saved,
-      layout: next?.layout ? { ...(saved.layout || {}), ...(next.layout || {}) } : saved.layout,
-      conversationUi: next?.conversationUi ? { ...(saved.conversationUi || {}), ...(next.conversationUi || {}) } : saved.conversationUi,
-      conversationListUi: next?.conversationListUi ? { ...(saved.conversationListUi || {}), ...(next.conversationListUi || {}) } : saved.conversationListUi,
-      hiddenConversations: next?.hiddenConversations
-        ? { ...(saved.hiddenConversations || {}), ...(next.hiddenConversations || {}) }
-        : saved.hiddenConversations
+      layout: request.layout ? { ...(saved.layout || {}), ...(request.layout || {}) } : saved.layout,
+      conversationUi: request.conversationUi ? { ...(saved.conversationUi || {}), ...(request.conversationUi || {}) } : saved.conversationUi,
+      conversationListUi: request.conversationListUi ? { ...(saved.conversationListUi || {}), ...(request.conversationListUi || {}) } : saved.conversationListUi,
+      hiddenConversations: request.hiddenConversations ?? saved.hiddenConversations
     };
+    if (settingsSaveSeqRef.current !== seq) {
+      const latest = settingsRef.current;
+      if (latest) window.stellacode2.saveSettings(latest).catch(() => {});
+      return latest || merged;
+    }
     setSettings(merged);
+    settingsRef.current = merged;
     return merged;
   }, []);
 
@@ -1548,7 +1698,7 @@ function App() {
       };
       window.clearTimeout(uiSaveTimerRef.current);
       uiSaveTimerRef.current = window.setTimeout(() => {
-        window.stellacode2.saveSettings(next).catch(() => {});
+        window.stellacode2.saveSettings(settingsRef.current || next).catch(() => {});
       }, 260);
       return next;
     });
@@ -1839,39 +1989,56 @@ function App() {
 
   const createConversationForegroundSession = useCallback(async (conversation) => {
     if (!activeServerId || !conversation) return;
-    const nextName = window.prompt('新对话名称', '');
-    if (nextName === null) return;
+    const sessionId = createLocalForegroundSessionId(conversation);
+    const nickname = nextForegroundSessionName(conversation);
     try {
       const session = await createForegroundSession(activeServerId, conversation.conversation_id, {
-        nickname: nextName.trim()
+        sessionId,
+        nickname
       });
-      const sessionId = session?.id || 'main';
+      const createdSessionId = session?.id || sessionId;
       const list = await loadConversations(activeServerId);
       setConversations(list);
       setSelected({
         serverId: activeServerId,
         conversationId: conversation.conversation_id,
-        foregroundSessionId: sessionId
+        foregroundSessionId: createdSessionId
+      });
+      updateConversationListUi({
+        openConversationIds: Array.from(new Set([
+          ...((settings?.conversationListUi?.[activeServerId]?.openConversationIds) || []),
+          conversation.conversation_id
+        ]))
       });
     } catch (error) {
       window.alert(error?.message || '创建对话失败');
     }
-  }, [activeServerId]);
+  }, [activeServerId, settings, updateConversationListUi]);
 
   const renameConversationForegroundSession = useCallback(async (conversation, session) => {
     if (!activeServerId || !conversation || !session) return;
+    setRenamingSession({ conversation, session });
+  }, [activeServerId]);
+
+  const renameSelectedForegroundSession = useCallback(async (conversation, session, nickname) => {
+    if (!activeServerId || !conversation || !session) return;
     const sessionId = session.id || 'main';
-    const currentName = displayForegroundSessionName(session, conversation);
-    const nextName = window.prompt('重命名 Session', currentName);
-    if (nextName === null) return;
-    const nickname = nextName.trim();
-    if (nickname === currentName) return;
+    const currentName = displayForegroundSessionName(session, conversation).trim();
+    const nextName = String(nickname || '').trim();
+    if (!nextName || nextName === currentName) {
+      setRenamingSession(null);
+      return;
+    }
+    setRenamingSessionSaving(true);
     try {
-      await renameForegroundSession(activeServerId, conversation.conversation_id, sessionId, nickname);
+      await renameForegroundSession(activeServerId, conversation.conversation_id, sessionId, nextName);
       const list = await loadConversations(activeServerId);
       setConversations(list);
+      setRenamingSession(null);
     } catch (error) {
       window.alert(error?.message || '重命名 Session 失败');
+    } finally {
+      setRenamingSessionSaving(false);
     }
   }, [activeServerId]);
 
@@ -1987,6 +2154,7 @@ function App() {
               pdf_url: pdfUrl,
               pdf_buffer: preview.data,
               preview_size: preview.size,
+              loaded_at: Date.now(),
               scroll_hint: options.scrollHint || item.scroll_hint,
               loading: false,
               error: ''
@@ -2091,7 +2259,7 @@ function App() {
         loadPdfPreviewIntoTab(file);
         return;
       }
-      loadWorkspaceFileCached(selected.serverId, selected.conversationId, file.path)
+      loadWorkspaceFileCached(selected.serverId, selected.conversationId, file.path, undefined, { force: true, cache: false })
         .then((loaded) => {
           if (disposed) return;
           const kind = workspaceFileKind(file.path);
@@ -2107,6 +2275,7 @@ function App() {
                 language: fileExtension(file.path),
                 content: loaded?.encoding === 'utf8' ? loaded.data || '' : '',
                 data_url: kind === 'image' ? data : '',
+                loaded_at: Date.now(),
                 loading: false
               }
               : item
@@ -2176,20 +2345,66 @@ function App() {
     });
   }, [fetchWorkspacePath]);
 
-  const openWorkspaceFile = useCallback(async (entry) => {
+  const openWorkspaceFile = useCallback(async (entry, options = {}) => {
     if (!selected || !entry) return;
     const path = normalizeWorkspacePath(entry.path);
     const conversationId = String(entry.conversationId || entry.conversation_id || selected.conversationId || '').trim();
     if (!conversationId) return;
     setPreviewPanelOpen(true);
     setActiveFilePath(path);
+    const entryKind = workspaceEntryKind(entry);
+    if (entryKind === 'directory') {
+      setOpenFiles((current) => {
+        if (current.some((item) => item.path === path)) {
+          return current.map((item) => (
+            item.path === path && !options.keepExistingPreview
+              ? { ...item, loading: true, error: '' }
+              : item
+          ));
+        }
+        return [...current, {
+          ...entry,
+          path,
+          name: entry.name || fileNameFromPath(path) || 'workspace',
+          kind: 'directory',
+          loading: true,
+          error: ''
+        }];
+      });
+      try {
+        const listing = await loadWorkspace(selected.serverId, conversationId, path, 500);
+        setWorkspaceListings((current) => new Map(current).set(path, listing));
+        setOpenFiles((current) => current.map((item) => (
+          item.path === path
+            ? {
+              ...item,
+              ...entry,
+              path,
+              name: entry.name || fileNameFromPath(path) || 'workspace',
+              kind: 'directory',
+              listing,
+              entries: Array.isArray(listing?.entries) ? listing.entries : [],
+              loaded_at: Date.now(),
+              loading: false,
+              error: ''
+            }
+            : item
+        )));
+      } catch (error) {
+        setOpenFiles((current) => current.map((item) => (
+          item.path === path ? { ...item, loading: false, error: error?.message || '读取目录失败' } : item
+        )));
+        if (options.throwOnError) throw error;
+      }
+      return;
+    }
     setOpenFiles((current) => {
       if (current.some((item) => item.path === path)) return current;
       return [...current, { ...entry, path, kind: workspaceFileKind(entry), loading: true }];
     });
     const initialKind = workspaceFileKind(path);
     if (initialKind === 'pdf') {
-      await loadPdfPreviewIntoTab({ ...entry, path });
+      await loadPdfPreviewIntoTab({ ...entry, path }, { keepExistingPreview: options.keepExistingPreview });
       return;
     }
     if (initialKind === 'presentation') {
@@ -2210,7 +2425,7 @@ function App() {
       return;
     }
     try {
-      const file = await loadWorkspaceFileCached(selected.serverId, conversationId, path);
+      const file = await loadWorkspaceFileCached(selected.serverId, conversationId, path, undefined, { force: true, cache: false });
       const kind = workspaceFileKind(path);
       const data = kind === 'image'
         ? workspaceFileImageDataUrl(path, file)
@@ -2224,6 +2439,7 @@ function App() {
             language: fileExtension(path),
             content: file?.encoding === 'utf8' ? file.data || '' : '',
             data_url: kind === 'image' ? data : '',
+            loaded_at: Date.now(),
             loading: false
           }
           : item
@@ -2232,15 +2448,49 @@ function App() {
       setOpenFiles((current) => current.map((item) => (
         item.path === path ? { ...item, loading: false, error: error?.message || '读取文件失败' } : item
       )));
+      if (options.throwOnError) throw error;
     }
   }, [selected, loadPdfPreviewIntoTab, loadWorkspaceFileCached]);
+
+  const openWorkspacePathTarget = useCallback(async (target) => {
+    if (!selected || target?.path === undefined || target?.path === null) return;
+    const path = normalizeWorkspacePath(target.path);
+    const conversationId = String(target.conversationId || selected.conversationId || '').trim();
+    if (!conversationId) return;
+    const name = fileNameFromPath(path) || 'workspace';
+    const shouldTryDirectory = Boolean(target.explicitDirectory) || !fileExtension(path);
+    if (shouldTryDirectory) {
+      try {
+        await openWorkspaceFile({ path, name, kind: 'directory', conversationId }, { throwOnError: true });
+        return;
+      } catch (error) {
+        if (target.explicitDirectory) throw error;
+      }
+    }
+    await openWorkspaceFile({ path, name, conversationId }, { throwOnError: true });
+  }, [selected, openWorkspaceFile]);
+
+  const openChatLocalLink = useCallback((href) => {
+    if (!selected) return false;
+    const target = workspaceTargetFromLocalLink(href, selected.conversationId, messageAttachmentWorkspaceRoots);
+    if (target?.path === undefined || target?.path === null) return false;
+    openWorkspacePathTarget(target).catch((error) => {
+      window.alert(error?.message || '打开本地链接失败');
+    });
+    return true;
+  }, [selected, messageAttachmentWorkspaceRoots, openWorkspacePathTarget]);
+
+  const refreshWorkspacePreviewFile = useCallback((file) => {
+    if (!file || file.path === undefined || file.path === null) return Promise.resolve();
+    return openWorkspaceFile(file, { keepExistingPreview: true });
+  }, [openWorkspaceFile]);
 
   const resolveMarkdownAsset = useCallback(async (markdownPath, rawSrc) => {
     const source = String(rawSrc || '').trim();
     if (!source || /^(?:https?:|data:|blob:|file:)/i.test(source)) return source;
     const path = resolveWorkspaceAssetPath(markdownPath, source);
     if (!selected || !path || workspaceFileKind(path) !== 'image') return source;
-    const file = await loadWorkspaceFileCached(selected.serverId, selected.conversationId, path);
+    const file = await loadWorkspaceFileCached(selected.serverId, selected.conversationId, path, undefined, { force: true, cache: false });
     return workspaceFileImageDataUrl(path, file) || source;
   }, [selected, loadWorkspaceFileCached]);
 
@@ -2459,8 +2709,19 @@ function App() {
       const type = streamEventType(event);
       if (!type || disposed || websocketKeyRef.current !== key) return;
       const messageId = streamActivityBaseId(event);
+      const scopedChatState = (state) => ({ scopeKey: key, ...state });
+      const keepOrSetRunningState = (current, eventPayload) => (
+        chatSessionStateIsActive(current) && current.scopeKey === key
+          ? current
+          : scopedChatState({ state: 'running', currentTurnState: eventPayload })
+      );
 
       if (type === 'turn_started' || type === 'stream_turn_start') {
+        setChatSessionState(scopedChatState({
+          state: 'running',
+          currentTurnState: event,
+          activeTurnId: String(event?.turn_id || event?.turnId || '').trim()
+        }));
         setSessionActivity('正在处理');
         updateRunningActivities((current) => [
           ...current.filter((item) => item.id !== 'thinking'),
@@ -2475,7 +2736,17 @@ function App() {
       }
 
       if (type === 'turn_completed' || type === 'stream_turn_done') {
+        setChatSessionState(scopedChatState({ state: 'idle' }));
         setSessionActivity('已完成');
+        const turnId = String(event?.turn_id || event?.turnId || '').trim();
+        setMessages((current) => {
+          const next = removeStreamingMessagesForTurn(current, turnId);
+          if (next !== current) {
+            messagesRef.current = next;
+            cacheMessages(next);
+          }
+          return next;
+        });
         setTimeout(() => {
           if (!disposed && websocketKeyRef.current === key) {
             setRunningActivities([]);
@@ -2485,6 +2756,7 @@ function App() {
       }
 
       if (type === 'plan_updated') {
+        setChatSessionState((current) => keepOrSetRunningState(current, event));
         const progress = normalizeProgressFeedback({ type: 'turn_progress', progress: event });
         updateRunningActivities((current) => [
           ...current.filter((item) => item.id !== progress.id && item.id !== 'thinking'),
@@ -2495,6 +2767,7 @@ function App() {
       }
 
       if (type === 'stream_assistant_message_delta') {
+        setChatSessionState((current) => keepOrSetRunningState(current, event));
         const delta = streamDeltaText(event);
         if (!delta) return;
         setMessages((current) => {
@@ -2516,6 +2789,7 @@ function App() {
       }
 
       if (type === 'stream_reasoning_summary_part_added') {
+        setChatSessionState((current) => keepOrSetRunningState(current, event));
         setSessionActivity('思考中');
         updateRunningActivities((current) => [
           ...current.filter((item) => item.id !== `stream-reasoning-${messageId}` && item.id !== 'thinking'),
@@ -2530,6 +2804,7 @@ function App() {
       }
 
       if (type === 'stream_reasoning_summary_delta') {
+        setChatSessionState((current) => keepOrSetRunningState(current, event));
         const summaryIndex = event?.summary_index ?? event?.summaryIndex ?? 0;
         const bufferKey = `${key}:reasoning:${messageId}:${summaryIndex}`;
         const text = appendStreamBuffer(bufferKey, streamDeltaText(event));
@@ -2552,6 +2827,7 @@ function App() {
       }
 
       if (type === 'stream_tool_call_delta') {
+        setChatSessionState((current) => keepOrSetRunningState(current, event));
         const itemId = streamItemId(event);
         const bufferKey = `${key}:tool:${itemId}`;
         const text = appendStreamBuffer(bufferKey, streamDeltaText(event));
@@ -2574,6 +2850,7 @@ function App() {
       }
 
       if (type === 'stream_tool_result_done') {
+        setChatSessionState((current) => keepOrSetRunningState(current, event));
         const toolResult = event?.tool_result || event?.toolResult || {};
         const itemId = String(toolResult.tool_call_id || toolResult.toolCallId || event?.batch_id || event?.batchId || streamItemId(event)).trim();
         const toolName = String(toolResult.tool_name || toolResult.toolName || '工具').trim();
@@ -2596,6 +2873,7 @@ function App() {
       }
 
       if (type === 'stream_error') {
+        setChatSessionState(scopedChatState({ state: 'failed', lastError: streamErrorText(event) }));
         const error = streamErrorText(event);
         setMessages((current) => {
           const next = applyStreamErrorToMessages(current, event);
@@ -2685,6 +2963,7 @@ function App() {
 
     const applyChatSnapshotLiveProjection = (snapshot) => {
       if (!snapshot || disposed || websocketKeyRef.current !== key) return;
+      const snapshotState = chatSnapshotState(snapshot);
       const provisional = snapshot.current_provisional_assistant_message?.message;
       if (provisional) {
         const turnId = String(snapshot.current_turn_state?.turn_id || snapshot.current_turn_state?.turnId || '').trim();
@@ -2750,7 +3029,7 @@ function App() {
           ...activities
         ]);
         setSessionActivity(activities[activities.length - 1]?.title || '正在处理');
-      } else if (snapshot.current_turn_state && !provisional) {
+      } else if (snapshotState.state === 'running' && !provisional) {
         updateRunningActivities((current) => [
           ...current.filter((item) => item.id !== 'thinking'),
           {
@@ -2761,6 +3040,16 @@ function App() {
           }
         ]);
         setSessionActivity('正在处理');
+      } else if (snapshotState.state === 'idle') {
+        setMessages((current) => {
+          const next = removeStreamingMessagesForTurn(current);
+          if (next !== current) {
+            messagesRef.current = next;
+            cacheMessages(next);
+          }
+          return next;
+        });
+        setRunningActivities([]);
       }
     };
 
@@ -2779,10 +3068,13 @@ function App() {
           }
           const payloadType = String(payload?.type || '');
           if (payloadType === 'chat.snapshot') {
+            const snapshotState = chatSnapshotState(payload);
+            setChatSessionState({ scopeKey: key, ...snapshotState });
             setSessionActivity(payload.reason === 'session_changed' ? 'Session 已切换' : '实时连接已同步');
             reconcileAck(payload).catch(() => {});
             applyChatSnapshotLiveProjection(payload);
           } else if (payloadType === 'chat.user_message_queued') {
+            setChatSessionState({ scopeKey: key, state: 'queued' });
             setMessages((current) => {
               const next = markQueuedUserMessage(current, payload.client_message_id || payload.clientMessageId);
               messagesRef.current = next;
@@ -2790,8 +3082,10 @@ function App() {
             });
             setSessionActivity('消息已排队');
           } else if (payloadType === 'chat.user_message_started') {
+            setChatSessionState((current) => chatSessionStateIsActive(current) && current.scopeKey === key ? current : { scopeKey: key, state: 'queued' });
             setSessionActivity('开始处理');
           } else if (payloadType === 'chat.user_message_committed') {
+            setChatSessionState((current) => chatSessionStateIsActive(current) && current.scopeKey === key ? current : { scopeKey: key, state: 'queued' });
             applyIncomingMessages(payload.message ? [payload.message] : []);
             setSessionActivity('用户消息已落盘');
           } else if (payloadType === 'chat.message_appended') {
@@ -2802,6 +3096,7 @@ function App() {
           ) {
             applySessionStream(payload);
           } else if (payloadType === 'error') {
+            setChatSessionState({ scopeKey: key, state: 'failed', lastError: payload.message || payload.error || '实时连接错误' });
             setSessionActivity(payload.message || payload.error || '实时连接错误');
           }
         });
@@ -2849,6 +3144,7 @@ function App() {
     setMessages(cachedMessages);
     setMessagesReady(cachedMessages.length > 0);
     setSessionActivity('');
+    setChatSessionState({ scopeKey: key, state: 'idle' });
     setRunningActivities([]);
     loadInitialMessagePage().catch(() => {
       if (!disposed && websocketKeyRef.current === key && messagesRef.current.length === 0) {
@@ -3038,6 +3334,61 @@ function App() {
     return loadModels(selected.serverId);
   }, [selected?.serverId]);
 
+  const loadPropertiesModels = useCallback(async () => {
+    if (!activeServerId) return [];
+    setPropertiesModelsLoading(true);
+    setPropertiesModelsError('');
+    try {
+      const nextModels = await loadModels(activeServerId);
+      setPropertiesModels(Array.isArray(nextModels) ? nextModels : []);
+      return nextModels;
+    } catch (error) {
+      setPropertiesModels([]);
+      setPropertiesModelsError(error?.message || '无法读取模型列表');
+      return [];
+    } finally {
+      setPropertiesModelsLoading(false);
+    }
+  }, [activeServerId]);
+
+  const postConversationControlCommand = useCallback(async (conversation, command) => {
+    if (!activeServerId || !conversation || !command) return;
+    const targetSessionId = selected?.conversationId === conversation.conversation_id
+      ? selectedSessionId
+      : foregroundSessions(conversation).find((session) => session?.is_main)?.id || foregroundSessions(conversation)[0]?.id || 'main';
+    setPropertiesApplying(true);
+    try {
+      await postConversationMessage(activeServerId, conversation.conversation_id, command, activeUserName, [], [], targetSessionId);
+      const list = await loadConversations(activeServerId);
+      setConversations(list);
+      if (selected?.conversationId === conversation.conversation_id) {
+        setSessionActivity(controlCommandActivity(command));
+      }
+    } catch (error) {
+      window.alert(error?.message || '更新 Conversation 设置失败');
+    } finally {
+      setPropertiesApplying(false);
+    }
+  }, [activeServerId, activeUserName, selected?.conversationId, selectedSessionId]);
+
+  const switchConversationModel = useCallback((conversation, model) => {
+    const alias = String(model || '').trim();
+    if (!alias) return;
+    postConversationControlCommand(conversation, `/model ${alias}`);
+  }, [postConversationControlCommand]);
+
+  const switchConversationReasoning = useCallback((conversation, effort) => {
+    const value = String(effort || '').trim();
+    if (!value) return;
+    postConversationControlCommand(conversation, `/reasoning ${value}`);
+  }, [postConversationControlCommand]);
+
+  const switchConversationIdleCompact = useCallback((conversation, value) => {
+    const normalized = String(value || '').trim();
+    if (!normalized) return;
+    postConversationControlCommand(conversation, `/idle_compact ${normalized}`);
+  }, [postConversationControlCommand]);
+
   const sendMessage = useCallback(async (text, files = [], selections = []) => {
     const value = String(text || '').trim();
     const outgoingFiles = Array.isArray(files) ? files : [];
@@ -3205,10 +3556,11 @@ function App() {
         statuses={statuses}
         selected={selected}
         loading={loading}
-        activeRunning={runningActivities.length > 0}
+        activeRunningKey={runningActivities.length > 0 && chatSessionStateIsActive(chatSessionState) ? chatSessionState.scopeKey || '' : ''}
         onSelect={setSelected}
         onOpenSettings={() => setSettingsOpen(true)}
         onRename={openRenameConversationDialog}
+        onOpenProperties={(conversation) => setPropertiesConversation(conversation)}
         onHide={(conversation) => setConversationHidden(conversation, true)}
         onUnhide={(conversation) => setConversationHidden(conversation, false)}
         onDelete={deleteSelectedConversation}
@@ -3246,6 +3598,7 @@ function App() {
           onOpenAttachment={openMessageAttachment}
           onDownloadAttachment={downloadMessageAttachment}
           onResolveAttachmentUrl={resolveMessageAttachmentUrl}
+          onOpenLocalLink={openChatLocalLink}
         />
       </main>
       <OverviewPanel
@@ -3276,9 +3629,11 @@ function App() {
         activeFilePath={activeFilePath}
         onSelectFile={setActiveFilePath}
         onDownloadFile={downloadWorkspaceEntry}
+        onRefreshFile={refreshWorkspacePreviewFile}
         onRefreshPdfPreview={refreshPdfPreview}
         onResolveMarkdownAsset={resolveMarkdownAsset}
         onCreateSelectionReference={addSelectionReference}
+        onOpenFile={openWorkspaceFile}
         onCloseFile={(path) => {
           setOpenFiles((items) => {
             revokeFilePreviewUrls(items.filter((item) => item.path === path));
@@ -3341,6 +3696,32 @@ function App() {
           if (!open && !renamingConversationSaving) setRenamingConversation(null);
         }}
         onRename={renameSelectedConversation}
+      />
+      <RenameSessionDialog
+        open={Boolean(renamingSession)}
+        conversation={renamingSession?.conversation || null}
+        session={renamingSession?.session || null}
+        saving={renamingSessionSaving}
+        onOpenChange={(open) => {
+          if (!open && !renamingSessionSaving) setRenamingSession(null);
+        }}
+        onRename={renameSelectedForegroundSession}
+      />
+      <ConversationPropertiesDialog
+        open={Boolean(propertiesConversationCurrent)}
+        conversation={propertiesConversationCurrent}
+        status={propertiesConversationCurrent ? statuses.get(conversationKey(activeServerId, propertiesConversationCurrent.conversation_id, 'main')) : null}
+        models={propertiesModels}
+        modelsLoading={propertiesModelsLoading}
+        modelsError={propertiesModelsError}
+        applying={propertiesApplying}
+        onOpenChange={(open) => {
+          if (!open && !propertiesApplying) setPropertiesConversation(null);
+        }}
+        onLoadModels={loadPropertiesModels}
+        onSwitchModel={switchConversationModel}
+        onSwitchReasoning={switchConversationReasoning}
+        onSwitchIdleCompact={switchConversationIdleCompact}
       />
       <SettingsDialog
         open={settingsOpen}

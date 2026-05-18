@@ -28,6 +28,10 @@ const REASONING_EFFORTS = [
   { value: 'default', label: 'Default', description: '恢复模型默认 reasoning effort' }
 ];
 
+const VIRTUALIZE_ENTRY_THRESHOLD = 80;
+const VIRTUAL_ENTRY_ESTIMATE = 150;
+const VIRTUAL_OVERSCAN_PX = 1100;
+
 function readFileAsBase64(file) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -99,10 +103,11 @@ function selectionSummary(selection) {
   return text.length > 28 ? `${text.slice(0, 28)}...` : text || '选区';
 }
 
-export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, processing = false, runningActivities, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl }) {
+export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelectionPending = false, messages, messagesReady, mode, hasOlder, onLoadOlder, onSend, onLoadModels, sending, processing = false, runningActivities, selectionReferences = [], onRemoveSelectionReference, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
   const renderedMessages = useMemo(() => displayMessages(messages), [messages]);
   const renderEntries = useMemo(() => assistantTurnEntries(renderedMessages), [renderedMessages]);
   const activitySignature = useMemo(() => liveActivitySignature(runningActivities || []), [runningActivities]);
+  const entryKeys = useMemo(() => renderEntries.map((entry, index) => entryKey(entry, index)), [renderEntries]);
   const oldestMessageKey = useMemo(() => firstMessageId(messages) || messages[0]?.id || messages[0]?.index || '', [messages]);
   const newestMessageKey = useMemo(() => {
     const message = messages.at(-1);
@@ -135,11 +140,14 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const suppressNextEnterRef = useRef(false);
   const scrollRef = useRef(null);
   const contentRef = useRef(null);
+  const virtualHeightsRef = useRef(new Map());
   const previousCountRef = useRef(0);
   const loadingOlderRef = useRef(false);
   const prependAdjustRef = useRef(null);
   const stickToBottomRef = useRef(true);
   const [toolStopNoticeReady, setToolStopNoticeReady] = useState(false);
+  const [viewport, setViewport] = useState({ scrollTop: 0, clientHeight: 0 });
+  const [virtualHeightVersion, setVirtualHeightVersion] = useState(0);
   const currentActivity = (runningActivities || []).at(-1) || null;
   const inlineActivity = shouldShowInlineActivity(currentActivity) ? currentActivity : null;
   const progressVisible = Boolean(currentActivity);
@@ -152,6 +160,14 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     }
     return -1;
   }, [renderEntries]);
+  const virtualWindow = useMemo(() => virtualWindowForEntries({
+    entries: renderEntries,
+    keys: entryKeys,
+    heightCache: virtualHeightsRef.current,
+    heightVersion: virtualHeightVersion,
+    viewport,
+    activeIndex: latestAssistantTurnIndex
+  }), [renderEntries, entryKeys, virtualHeightVersion, viewport, latestAssistantTurnIndex]);
   const toolStopNoticeCandidate = useMemo(() => {
     if (!messagesReady || sending || processing || currentActivity || !messages.length) return false;
     const lastMessage = messages.at(-1);
@@ -191,7 +207,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     const root = list.closest('.chat-workspace');
     const composerHeight = root?.querySelector('.composer-wrap')?.getBoundingClientRect().height || 0;
     const usableHeight = Math.max(160, list.clientHeight - composerHeight);
-    const height = Math.round(Math.min(180, Math.max(72, usableHeight * 0.18)));
+    const height = Math.round(Math.min(48, Math.max(12, usableHeight * 0.05)));
     list.style.setProperty('--response-spacer-height', `${height}px`);
   }
 
@@ -224,6 +240,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     if (!list) return undefined;
     const observer = new ResizeObserver(() => {
       updateResponseSpacerMetrics();
+      syncViewport();
       if (stickToBottomRef.current) requestAnimationFrame(scrollToBottom);
     });
     observer.observe(list);
@@ -231,6 +248,41 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     if (composer) observer.observe(composer);
     return () => observer.disconnect();
   }, [responseSpacerVisible, activeMessageScope, renderEntries.length]);
+
+  useLayoutEffect(() => {
+    const content = contentRef.current;
+    if (!content || !virtualWindow.virtualized) return undefined;
+    let frame = 0;
+    const measure = () => {
+      frame = 0;
+      let changed = false;
+      content.querySelectorAll('[data-virtual-key]').forEach((node) => {
+        const key = node.getAttribute('data-virtual-key');
+        if (!key) return;
+        const height = Math.ceil(node.getBoundingClientRect().height);
+        if (!Number.isFinite(height) || height <= 0) return;
+        if (Math.abs((virtualHeightsRef.current.get(key) || 0) - height) > 1) {
+          virtualHeightsRef.current.set(key, height);
+          changed = true;
+        }
+      });
+      if (changed) {
+        setVirtualHeightVersion((value) => value + 1);
+        if (stickToBottomRef.current) requestAnimationFrame(scrollToBottom);
+      }
+    };
+    const scheduleMeasure = () => {
+      if (frame) return;
+      frame = requestAnimationFrame(measure);
+    };
+    scheduleMeasure();
+    const observer = new ResizeObserver(scheduleMeasure);
+    content.querySelectorAll('[data-virtual-key]').forEach((node) => observer.observe(node));
+    return () => {
+      if (frame) cancelAnimationFrame(frame);
+      observer.disconnect();
+    };
+  }, [virtualWindow.virtualized, virtualWindow.start, virtualWindow.end, activeMessageScope, newestMessageKey, activitySignature]);
 
   useLayoutEffect(() => {
     const textarea = textareaRef.current;
@@ -258,6 +310,20 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     list.scrollTop = Math.max(0, list.scrollHeight - list.clientHeight);
   };
 
+  const syncViewport = () => {
+    const list = scrollRef.current;
+    if (!list) return;
+    const next = {
+      scrollTop: list.scrollTop,
+      clientHeight: list.clientHeight
+    };
+    setViewport((current) => (
+      Math.abs(current.scrollTop - next.scrollTop) < 1 && Math.abs(current.clientHeight - next.clientHeight) < 1
+        ? current
+        : next
+    ));
+  };
+
   useLayoutEffect(() => {
     const list = scrollRef.current;
     if (!list) return;
@@ -280,6 +346,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
     loadingOlderRef.current = false;
     prependAdjustRef.current = null;
     stickToBottomRef.current = true;
+    setViewport({ scrollTop: 0, clientHeight: scrollRef.current?.clientHeight || 0 });
     requestAnimationFrame(scrollToBottom);
     setDraft('');
     setComposerAttachments((current) => {
@@ -343,6 +410,7 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   const handleScroll = () => {
     const list = scrollRef.current;
     if (!list) return;
+    syncViewport();
     stickToBottomRef.current = list.scrollHeight - list.scrollTop - list.clientHeight < 80;
     if (list.scrollTop <= 96) {
       loadOlderPreservingViewport();
@@ -469,28 +537,36 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
           </div>
         ) : (
           <div className="message-stream-content" ref={contentRef}>
-            {renderEntries.map((entry, index) => (
-              entry.type === 'assistantTurn'
-                ? (
-                  <MemoAssistantTurn
-                    key={entry.id}
-                    entry={entry}
-                    active={sessionRunning && index === latestAssistantTurnIndex}
-                    onOpenAttachment={onOpenAttachment}
-                    onDownloadAttachment={onDownloadAttachment}
-                    onResolveAttachmentUrl={onResolveAttachmentUrl}
-                  />
-                )
-                : (
-                  <MemoMessageArticle
-                    key={messageKey(entry.message, index)}
-                    message={entry.message}
-                    onOpenAttachment={onOpenAttachment}
-                    onDownloadAttachment={onDownloadAttachment}
-                    onResolveAttachmentUrl={onResolveAttachmentUrl}
-                  />
-                )
+            {virtualWindow.virtualized && virtualWindow.topPadding > 0 && (
+              <div className="virtual-transcript-spacer" style={{ height: `${virtualWindow.topPadding}px` }} aria-hidden="true" />
+            )}
+            {virtualWindow.items.map(({ entry, index, key }) => (
+              <div className="virtual-entry" key={key} data-virtual-key={key}>
+                {entry.type === 'assistantTurn'
+                  ? (
+                    <MemoAssistantTurn
+                      entry={entry}
+                      active={sessionRunning && index === latestAssistantTurnIndex}
+                      onOpenAttachment={onOpenAttachment}
+                      onDownloadAttachment={onDownloadAttachment}
+                      onResolveAttachmentUrl={onResolveAttachmentUrl}
+                      onOpenLocalLink={onOpenLocalLink}
+                    />
+                  )
+                  : (
+                    <MemoMessageArticle
+                      message={entry.message}
+                      onOpenAttachment={onOpenAttachment}
+                      onDownloadAttachment={onDownloadAttachment}
+                      onResolveAttachmentUrl={onResolveAttachmentUrl}
+                      onOpenLocalLink={onOpenLocalLink}
+                    />
+                  )}
+              </div>
             ))}
+            {virtualWindow.virtualized && virtualWindow.bottomPadding > 0 && (
+              <div className="virtual-transcript-spacer" style={{ height: `${virtualWindow.bottomPadding}px` }} aria-hidden="true" />
+            )}
             {pendingAssistantVisible && <PendingAssistantPlaceholder />}
             {inlineActivity && <InlineActivityStatus activity={inlineActivity} />}
             {turnStoppedAfterTool && (
@@ -705,6 +781,52 @@ export function ChatWorkspace({ conversationKey: activeMessageScope, modelSelect
   );
 }
 
+function entryKey(entry, index) {
+  if (entry?.type === 'assistantTurn') return entry.id || `assistant-turn-${index}`;
+  return messageKey(entry?.message, index);
+}
+
+function virtualWindowForEntries({ entries, keys, heightCache, viewport, activeIndex }) {
+  const count = entries.length;
+  if (count <= VIRTUALIZE_ENTRY_THRESHOLD) {
+    return {
+      virtualized: false,
+      start: 0,
+      end: Math.max(0, count - 1),
+      topPadding: 0,
+      bottomPadding: 0,
+      items: entries.map((entry, index) => ({ entry, index, key: keys[index] || entryKey(entry, index) }))
+    };
+  }
+  const heights = keys.map((key) => heightCache.get(key) || VIRTUAL_ENTRY_ESTIMATE);
+  const offsets = new Array(count + 1);
+  offsets[0] = 0;
+  for (let index = 0; index < count; index += 1) {
+    offsets[index + 1] = offsets[index] + heights[index];
+  }
+  const top = Math.max(0, Number(viewport.scrollTop || 0) - VIRTUAL_OVERSCAN_PX);
+  const bottom = Math.max(top, Number(viewport.scrollTop || 0) + Number(viewport.clientHeight || 0) + VIRTUAL_OVERSCAN_PX);
+  let start = 0;
+  while (start < count - 1 && offsets[start + 1] < top) start += 1;
+  let end = start;
+  while (end < count - 1 && offsets[end] < bottom) end += 1;
+  if (Number.isFinite(activeIndex) && activeIndex >= 0) {
+    start = Math.min(start, Math.max(0, activeIndex - 2));
+    end = Math.max(end, Math.min(count - 1, activeIndex + 2));
+  }
+  return {
+    virtualized: true,
+    start,
+    end,
+    topPadding: offsets[start],
+    bottomPadding: Math.max(0, offsets[count] - offsets[end + 1]),
+    items: entries.slice(start, end + 1).map((entry, offset) => {
+      const index = start + offset;
+      return { entry, index, key: keys[index] || entryKey(entry, index) };
+    })
+  };
+}
+
 function shouldShowPendingAssistant(entries, currentActivity, sending, processing) {
   const state = String(currentActivity?.state || '').toLowerCase();
   const activityId = String(currentActivity?.id || '').trim();
@@ -916,7 +1038,7 @@ function planStatusMark(status) {
   return '○';
 }
 
-export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl }) {
+export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
   const usage = tokenUsage(message);
   const role = message.user_name || message.role || 'assistant';
   const className = messageArticleClassName(message);
@@ -930,7 +1052,7 @@ export function MessageArticle({ message, onOpenAttachment, onDownloadAttachment
           <AuxiliaryDots messages={auxiliaryMessages} />
         </div>
       )}
-      <MessageBody message={message} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />
+      <MessageBody message={message} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} />
       {(roleName === 'user' || (roleName === 'assistant' && !message._streaming)) && (
         <MessageActionBar message={message} role={roleName} usage={usage} />
       )}
@@ -1049,6 +1171,7 @@ const MemoMessageArticle = memo(MessageArticle, (previous, next) => {
     previous.onOpenAttachment !== next.onOpenAttachment
     || previous.onDownloadAttachment !== next.onDownloadAttachment
     || previous.onResolveAttachmentUrl !== next.onResolveAttachmentUrl
+    || previous.onOpenLocalLink !== next.onOpenLocalLink
   ) return false;
   return true;
 });
@@ -1129,7 +1252,7 @@ export function InlineTokenUsage({ usage }) {
   );
 }
 
-export function AssistantTurn({ entry, active = false, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl }) {
+export function AssistantTurn({ entry, active = false, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
   const finalMessage = entry.finalMessage;
   const complete = isFinalAssistantMessage(finalMessage);
   return (
@@ -1141,6 +1264,7 @@ export function AssistantTurn({ entry, active = false, onOpenAttachment, onDownl
           onOpenAttachment={onOpenAttachment}
           onDownloadAttachment={onDownloadAttachment}
           onResolveAttachmentUrl={onResolveAttachmentUrl}
+          onOpenLocalLink={onOpenLocalLink}
         />
       )}
     </section>
@@ -1228,7 +1352,7 @@ export function ToolProcessGroup({ group, active = false }) {
               ? <ReasoningNote key={block.id} text={block.text} collapsible defaultOpen={!complete && activeTail} live={!complete && activeTail} />
               : <MarkdownContent key={block.id} className="tool-note" text={block.text} attachments={block.attachments} typewriter={!complete && activeTail} />;
           })}
-          {waitingForNextItem && <PendingAssistantPlaceholder compact label="正在整理工具结果" />}
+          {waitingForNextItem && <PendingAssistantPlaceholder compact label="正在思考" />}
         </div>
       )}
     </section>
@@ -1535,7 +1659,7 @@ function toolCardsAreComplete(cards) {
   return hasResult && (open.size === 0 || cards.at(-1)?.kind === 'result');
 }
 
-export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl }) {
+export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink }) {
   const text = messageText(message);
   const structuredItems = messageItems(message);
   const attachments = Array.isArray(message?.attachments) ? message.attachments : [];
@@ -1544,24 +1668,32 @@ export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, o
   const typewriter = Boolean(message?._streaming && String(message?.role || '').toLowerCase() === 'assistant');
   const inlineIndexes = markerIndexes(text);
   const structuredAttachmentIndexes = new Set(
-    (Array.isArray(message?.items) ? message.items : [])
+    structuredItems
       .filter((item) => item?.type === 'file' && item.attachment_index !== undefined)
       .map((item) => Number(item.attachment_index))
       .filter((index) => Number.isFinite(index))
   );
+  const structuredAttachmentKeys = new Set(
+    structuredItems
+      .filter((item) => item?.type === 'file')
+      .map(attachmentIdentity)
+      .filter(Boolean)
+  );
   const trailingAttachments = allAttachments.filter((attachment, index) => {
     const attachmentIndex = Number(attachment?.index);
+    const key = attachmentIdentity(attachment);
     return !inlineIndexes.has(index)
       && !inlineIndexes.has(attachmentIndex)
       && !structuredAttachmentIndexes.has(index)
-      && !structuredAttachmentIndexes.has(attachmentIndex);
+      && !structuredAttachmentIndexes.has(attachmentIndex)
+      && !(key && structuredAttachmentKeys.has(key));
   });
   return (
     <div className="message-body">
       {structuredItems.length > 0 ? (
-        <StructuredItems role={message?.role} items={structuredItems} attachments={allAttachments} fallbackText={text} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} typewriter={typewriter} />
+        <StructuredItems role={message?.role} items={structuredItems} attachments={allAttachments} fallbackText={text} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} typewriter={typewriter} />
       ) : text ? (
-        <MarkdownContent className="message-text" text={text} attachments={allAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} typewriter={typewriter} />
+        <MarkdownContent className="message-text" text={text} attachments={allAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} typewriter={typewriter} />
       ) : null}
       {trailingAttachments.length > 0 && <AttachmentList attachments={trailingAttachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />}
       {Number(message?.attachment_count || 0) > 0 && allAttachments.length === 0 && (
@@ -1574,7 +1706,25 @@ export function MessageBody({ message, onOpenAttachment, onDownloadAttachment, o
   );
 }
 
-export function StructuredItems({ role, items, attachments, fallbackText, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, typewriter = false }) {
+function attachmentIdentity(attachment) {
+  if (!attachment || typeof attachment !== 'object') return '';
+  const file = attachment.file && typeof attachment.file === 'object' ? attachment.file : {};
+  return String(
+    attachment.uri
+    || attachment.file_uri
+    || attachment.url
+    || attachment.path
+    || file.uri
+    || file.file_uri
+    || file.url
+    || file.path
+    || attachment.name
+    || attachment.filename
+    || ''
+  ).trim();
+}
+
+export function StructuredItems({ role, items, attachments, fallbackText, onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, typewriter = false }) {
   const orderedItems = orderedStructuredItems(items, role);
   const hasTextItem = orderedItems.some(({ item }) => typeof item === 'string' || item?.type === 'text');
   const hasSelectionReference = orderedItems.some(({ item }) => item?.type === 'selection_reference');
@@ -1582,10 +1732,10 @@ export function StructuredItems({ role, items, attachments, fallbackText, onOpen
   const rendered = orderedItems
     .map(({ item, index }) => {
       if (typeof item === 'string') {
-        return <MarkdownContent key={index} className="message-text" text={item} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} typewriter={typewriter} />;
+        return <MarkdownContent key={index} className="message-text" text={item} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} typewriter={typewriter} />;
       }
       if (item?.type === 'text') {
-        return <MarkdownContent key={index} className="message-text" text={item.text_with_attachment_markers || item.text || item.content || ''} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} typewriter={typewriter} />;
+        return <MarkdownContent key={index} className="message-text" text={item.text_with_attachment_markers || item.text || item.content || ''} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} typewriter={typewriter} />;
       }
       if (item?.type === 'file') {
         return <AttachmentCard key={index} attachment={attachments[item.attachment_index] || item} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} />;
@@ -1619,12 +1769,13 @@ export function StructuredItems({ role, items, attachments, fallbackText, onOpen
         onOpenAttachment={onOpenAttachment}
         onDownloadAttachment={onDownloadAttachment}
         onResolveAttachmentUrl={onResolveAttachmentUrl}
+        onOpenLocalLink={onOpenLocalLink}
         typewriter={typewriter}
       />
     );
   }
   if (rendered.length) return <>{rendered}</>;
-  return <MarkdownContent className="message-text" text={fallbackText} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} typewriter={typewriter} />;
+  return <MarkdownContent className="message-text" text={fallbackText} attachments={attachments} onOpenAttachment={onOpenAttachment} onDownloadAttachment={onDownloadAttachment} onResolveAttachmentUrl={onResolveAttachmentUrl} onOpenLocalLink={onOpenLocalLink} typewriter={typewriter} />;
 }
 
 function orderedStructuredItems(items, role) {
@@ -1693,7 +1844,7 @@ function shortReasoningSummary(value) {
   return text.length > 72 ? `${text.slice(0, 72)}...` : text;
 }
 
-export function MarkdownContent({ text, attachments = [], className = 'markdown-content', onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, typewriter = false }) {
+export function MarkdownContent({ text, attachments = [], className = 'markdown-content', onOpenAttachment, onDownloadAttachment, onResolveAttachmentUrl, onOpenLocalLink, typewriter = false }) {
   const value = useTypewriterText(String(text || ''), typewriter);
   if (!value.trim()) return null;
   const parts = [];
@@ -1703,7 +1854,7 @@ export function MarkdownContent({ text, attachments = [], className = 'markdown-
   while ((match = pattern.exec(value)) !== null) {
     const before = value.slice(cursor, match.index);
     if (before.trim()) {
-      parts.push(<MarkdownBlock key={`text-${cursor}`} text={before} />);
+      parts.push(<MarkdownBlock key={`text-${cursor}`} text={before} onOpenLocalLink={onOpenLocalLink} />);
     }
     if (match[2] !== undefined) {
       const attachment = attachments[Number(match[2])];
@@ -1724,9 +1875,9 @@ export function MarkdownContent({ text, attachments = [], className = 'markdown-
   }
   const rest = value.slice(cursor);
   if (rest.trim()) {
-    parts.push(<MarkdownBlock key={`text-${cursor}`} text={rest} />);
+    parts.push(<MarkdownBlock key={`text-${cursor}`} text={rest} onOpenLocalLink={onOpenLocalLink} />);
   }
-  return <div className={className}>{parts.length ? parts : <MarkdownBlock text={value} />}</div>;
+  return <div className={className}>{parts.length ? parts : <MarkdownBlock text={value} onOpenLocalLink={onOpenLocalLink} />}</div>;
 }
 
 function useTypewriterText(text, enabled) {
@@ -1771,20 +1922,33 @@ function useTypewriterText(text, enabled) {
   return enabled ? displayed : target;
 }
 
-export function MarkdownBlock({ text }) {
+export function MarkdownBlock({ text, onOpenLocalLink }) {
   return (
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       rehypePlugins={[rehypeHighlight]}
       components={{
-        a: ({ node, ...props }) => (
-          <a
-            {...props}
-            target={isExternalUrl(props.href) ? '_blank' : undefined}
-            rel={isExternalUrl(props.href) ? 'noreferrer' : undefined}
-            onClick={(event) => handleExternalLinkClick(event, props.href)}
-          />
-        ),
+        a: ({ node, ...props }) => {
+          const href = String(props.href || '');
+          const external = isExternalUrl(href);
+          return (
+            <a
+              {...props}
+              target={external ? '_blank' : undefined}
+              rel={external ? 'noreferrer' : undefined}
+              onClick={(event) => {
+                if (external) {
+                  handleExternalLinkClick(event, href);
+                  return;
+                }
+                if (onOpenLocalLink?.(href)) {
+                  event.preventDefault();
+                  event.stopPropagation();
+                }
+              }}
+            />
+          );
+        },
         img: ({ node, ...props }) => <img {...props} className="message-inline-image" loading="lazy" alt={props.alt || ''} />
       }}
     >

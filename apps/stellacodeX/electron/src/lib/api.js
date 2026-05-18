@@ -74,6 +74,7 @@ export function normalizeConversationSummary(conversation = {}) {
 }
 
 export function displayConversationName(conversation) {
+  if (!conversation) return '';
   return (
     (conversation.nickname || '').trim()
     || conversation.platform_chat_id
@@ -82,6 +83,7 @@ export function displayConversationName(conversation) {
 }
 
 export function foregroundSessions(conversation) {
+  if (!conversation) return [];
   const sessions = Array.isArray(conversation?.foreground_sessions)
     ? conversation.foreground_sessions
     : [];

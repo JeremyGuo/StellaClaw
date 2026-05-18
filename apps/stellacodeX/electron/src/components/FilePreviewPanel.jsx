@@ -8,7 +8,7 @@ import hljs from 'highlight.js';
 import mammoth from 'mammoth/mammoth.browser';
 import { renderAsync as renderDocxAsync } from 'docx-preview';
 import embedPdfiumWasmUrl from '@embedpdf/pdfium/pdfium.wasm?url';
-import { Bug, Code2, Download, Eye, FileText, Info, Printer, RefreshCw, X } from 'lucide-react';
+import { Bug, Code2, Download, Eye, FileText, Folder, Info, Printer, RefreshCw, X } from 'lucide-react';
 import stellacodeMark from '../assets/stellacode-mark.svg';
 import { handleExternalLinkClick, isExternalUrl } from '../lib/externalLinks';
 import { fileExtension, fileNameFromPath, imageMimeType, isHtmlFile, isImageFile, isMarkdownFile, isPdfFile, isPresentationFile, isWordFile } from '../lib/fileUtils';
@@ -104,7 +104,7 @@ function buildPdfSelectionIndexFromRuntime(runtime) {
   return selectionPages.length > 0 ? PdfSelectionIndex.fromPages(selectionPages) : null;
 }
 
-export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile, onCloseFile, onDownloadFile, onRefreshPdfPreview, onResolveMarkdownAsset, onCreateSelectionReference }) {
+export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile, onCloseFile, onDownloadFile, onRefreshFile, onRefreshPdfPreview, onResolveMarkdownAsset, onCreateSelectionReference, onOpenFile }) {
   const activeFile = openFiles.find((file) => file.path === activeFilePath) || null;
   const [selectionMenu, setSelectionMenu] = useState(null);
 
@@ -164,11 +164,11 @@ export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile
                 }
               }}
             >
-              <span>{file.name}</span>
+              <span>{file.name || fileNameFromPath(file.path) || 'workspace'}</span>
               <button
                 className="editor-tab-close"
                 type="button"
-                aria-label={`关闭 ${file.name}`}
+                aria-label={`关闭 ${file.name || fileNameFromPath(file.path) || 'workspace'}`}
                 onClick={(event) => {
                   event.stopPropagation();
                   onCloseFile(file.path);
@@ -189,12 +189,24 @@ export function FilePreviewPanel({ open, openFiles, activeFilePath, onSelectFile
           ) : activeFile?.error ? (
             <div className="panel-placeholder">{activeFile.error}</div>
           ) : activeFile ? (
-            <PreviewErrorBoundary resetKey={activeFile.path}>
-              <FilePreview file={activeFile} onDownloadFile={onDownloadFile} onRefreshPdfPreview={onRefreshPdfPreview} onResolveMarkdownAsset={onResolveMarkdownAsset} onSelectionContextMenu={openSelectionMenu} />
+            <PreviewErrorBoundary resetKey={`${activeFile.path}:${activeFile.preview_size || activeFile.loaded_at || ''}`}>
+              <FilePreview file={activeFile} onDownloadFile={onDownloadFile} onRefreshPdfPreview={onRefreshPdfPreview} onResolveMarkdownAsset={onResolveMarkdownAsset} onSelectionContextMenu={openSelectionMenu} onOpenFile={onOpenFile} />
             </PreviewErrorBoundary>
           ) : (
             <div className="panel-placeholder">打开一个文件查看预览</div>
           )}
+          {activeFile ? (
+            <button
+              className="preview-refresh-button"
+              type="button"
+              title="刷新预览"
+              aria-label="刷新预览"
+              disabled={Boolean(activeFile.loading)}
+              onClick={() => onRefreshFile?.(activeFile)}
+            >
+              <RefreshCw size={16} />
+            </button>
+          ) : null}
         </div>
         {selectionMenu && createPortal(
           <div
@@ -243,10 +255,13 @@ class PreviewErrorBoundary extends Component {
   }
 }
 
-function FilePreview({ file, onDownloadFile, onRefreshPdfPreview, onResolveMarkdownAsset, onSelectionContextMenu }) {
+function FilePreview({ file, onDownloadFile, onRefreshPdfPreview, onResolveMarkdownAsset, onSelectionContextMenu, onOpenFile }) {
   const name = file.name || fileNameFromPath(file.path);
   const ext = fileExtension(name);
   const source = file.content || file.data || '';
+  if (file.kind === 'directory') {
+    return <DirectoryPreview file={file} onOpenFile={onOpenFile} />;
+  }
   if (file.kind === 'pdf' || isPdfFile(name)) {
     if (file.pdf_url) {
       return <PdfPreview file={file} name={name} onDownloadFile={onDownloadFile} onRefreshPdfPreview={onRefreshPdfPreview} onSelectionContextMenu={onSelectionContextMenu} />;
@@ -340,6 +355,65 @@ function FilePreview({ file, onDownloadFile, onRefreshPdfPreview, onResolveMarkd
   return (
     <CodePreview file={file} code={source} language={file.language || ext} onSelectionContextMenu={onSelectionContextMenu} />
   );
+}
+
+function DirectoryPreview({ file, onOpenFile }) {
+  const entries = Array.isArray(file.entries)
+    ? file.entries
+    : Array.isArray(file.listing?.entries)
+      ? file.listing.entries
+      : [];
+  const path = file.path || '';
+  return (
+    <div className="directory-preview">
+      <div className="directory-preview-header">
+        <Folder size={28} />
+        <div>
+          <strong>{file.name || fileNameFromPath(path) || 'workspace'}</strong>
+          <span>{path || 'workspace root'}</span>
+        </div>
+      </div>
+      {entries.length ? (
+        <div className="directory-preview-list">
+          {entries.map((entry, index) => {
+            const entryPath = entry.path || joinPreviewPath(path, entry.name);
+            const kind = String(entry.kind || '').toLowerCase();
+            return (
+              <button
+                key={`${entryPath}-${index}`}
+                className="directory-preview-row"
+                type="button"
+                onClick={() => onOpenFile?.({ ...entry, path: entryPath })}
+              >
+                {kind === 'directory' ? <Folder size={15} /> : <FileText size={15} />}
+                <span>{entry.name || fileNameFromPath(entryPath) || entryPath}</span>
+                <em>{kind === 'directory' ? '目录' : (entry.size_bytes || entry.size) ? formatPreviewBytes(entry.size_bytes || entry.size) : '文件'}</em>
+              </button>
+            );
+          })}
+        </div>
+      ) : (
+        <div className="panel-placeholder">目录为空</div>
+      )}
+    </div>
+  );
+}
+
+function joinPreviewPath(root, name) {
+  const base = String(root || '').replace(/\/+$/, '');
+  const child = String(name || '').replace(/^\/+/, '');
+  if (!base) return child;
+  return child ? `${base}/${child}` : base;
+}
+
+function formatPreviewBytes(value) {
+  const bytes = Number(value || 0);
+  if (!Number.isFinite(bytes) || bytes <= 0) return '文件';
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(kb >= 10 ? 0 : 1)} KB`;
+  const mb = kb / 1024;
+  return `${mb.toFixed(mb >= 10 ? 0 : 1)} MB`;
 }
 
 function BinaryPreview({ file, icon, title, message, actionLabel, onDownloadFile }) {

@@ -38,6 +38,7 @@
   --accent: #339cff;
   --accent-soft: rgba(51, 156, 255, 0.18);
   --orange: #ee9b57;
+  --text-shimmer-highlight: rgba(255, 255, 255, 0.96);
   --shadow: 0 26px 70px rgba(0, 0, 0, 0.38);
 }
 
@@ -1037,6 +1038,20 @@ button {
   flex-direction: column;
 }
 
+.virtual-entry {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  flex: 0 0 auto;
+  flex-direction: column;
+}
+
+.virtual-transcript-spacer {
+  flex: 0 0 auto;
+  min-height: 0;
+  pointer-events: none;
+}
+
 .empty-chat {
   display: grid;
   min-height: 60%;
@@ -1142,6 +1157,22 @@ button {
 
 .message.user.media-combo {
   gap: 6px;
+}
+
+.message.user:has(+ .pending-assistant-placeholder) {
+  margin-bottom: 10px;
+}
+
+.message.user:has(+ .pending-assistant-placeholder) .message-actions.user {
+  margin-top: 4px;
+}
+
+.virtual-entry:has(> .message.user):has(+ .pending-assistant-placeholder) > .message.user {
+  margin-bottom: 10px;
+}
+
+.virtual-entry:has(> .message.user):has(+ .pending-assistant-placeholder) .message-actions.user {
+  margin-top: 4px;
 }
 
 .message.user .message-role {
@@ -1276,7 +1307,7 @@ button {
   width: 100%;
   max-width: var(--chat-column-width);
   min-width: 0;
-  margin: -2px auto 22px;
+  margin: 0 auto 12px;
   align-items: center;
   color: var(--muted);
   content-visibility: visible;
@@ -1288,11 +1319,6 @@ button {
   padding: 1px 2px;
 }
 
-.pending-assistant-placeholder.compact span {
-  font-size: 12px;
-  font-weight: 650;
-}
-
 .pending-assistant-placeholder span {
   display: inline-block;
   min-width: 0;
@@ -1301,7 +1327,7 @@ button {
     100deg,
     var(--muted) 0%,
     var(--muted) 44%,
-    color-mix(in srgb, var(--text), transparent 8%) 50%,
+    var(--text-shimmer-highlight) 50%,
     var(--muted) 56%,
     var(--muted) 100%
   );
@@ -1534,7 +1560,8 @@ button {
 .markdown-preview pre,
 .file-code-view {
   margin: 9px 0;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: 10px;
   background: var(--code-bg);
@@ -1548,6 +1575,9 @@ button {
   font-family: var(--font-mono);
   font-size: 0.92em;
   line-height: 1.5;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .message-text pre code.hljs {
@@ -1642,13 +1672,14 @@ button {
   display: grid;
   justify-items: start;
   gap: 8px;
-  margin-top: 10px;
+  margin-top: 16px;
 }
 
 .message.user .message-attachments {
   justify-items: end;
   width: fit-content;
   max-width: 100%;
+  margin-top: 12px;
 }
 
 .message.user .message-attachment {
@@ -2163,7 +2194,7 @@ button {
     100deg,
     var(--muted) 0%,
     var(--muted) 44%,
-    color-mix(in srgb, var(--text), transparent 10%) 50%,
+    var(--text-shimmer-highlight) 50%,
     var(--muted) 56%,
     var(--muted) 100%
   );
@@ -2312,7 +2343,7 @@ button {
     100deg,
     var(--muted) 0%,
     var(--muted) 44%,
-    color-mix(in srgb, var(--text), transparent 10%) 50%,
+    var(--text-shimmer-highlight) 50%,
     var(--muted) 56%,
     var(--muted) 100%
   );
@@ -2439,7 +2470,7 @@ button {
     100deg,
     var(--muted) 0%,
     var(--muted) 44%,
-    color-mix(in srgb, var(--text), transparent 12%) 50%,
+    var(--text-shimmer-highlight) 50%,
     var(--muted) 56%,
     var(--muted) 100%
   );
@@ -3998,10 +4029,41 @@ button {
 }
 
 .preview-surface {
+  position: relative;
   min-width: 0;
   min-height: 0;
   overflow: auto;
-  background: color-mix(in srgb, var(--panel), #000 8%);
+  background: var(--bg);
+}
+
+.preview-refresh-button {
+  position: sticky;
+  bottom: 14px;
+  left: calc(100% - 48px);
+  z-index: 8;
+  display: grid;
+  width: 34px;
+  height: 34px;
+  margin: -48px 14px 14px auto;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--border-strong), transparent 20%);
+  border-radius: 999px;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--bg), transparent 7%);
+  box-shadow: 0 10px 26px color-mix(in srgb, #000, transparent 76%);
+  backdrop-filter: blur(10px);
+  cursor: pointer;
+}
+
+.preview-refresh-button:hover {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--accent), var(--border) 40%);
+  box-shadow: 0 12px 30px color-mix(in srgb, var(--accent), transparent 82%);
+}
+
+.preview-refresh-button:disabled {
+  opacity: 0.55;
+  cursor: default;
 }
 
 .overview-panel-body {
@@ -4250,7 +4312,14 @@ button {
 }
 
 .markdown-preview {
-  padding: 14px;
+  margin: 16px;
+  padding: 18px 20px;
+  border: 1px solid color-mix(in srgb, var(--border), transparent 42%);
+  border-radius: 10px;
+  background: var(--bg);
+  box-shadow:
+    18px 0 26px -24px color-mix(in srgb, #000, transparent 46%),
+    0 20px 46px -34px color-mix(in srgb, #000, transparent 34%);
   color: var(--text);
   font-size: 1.12em;
   line-height: 1.56;
@@ -4273,9 +4342,10 @@ button {
   padding: 10px;
   border: 1px solid color-mix(in srgb, var(--border), transparent 16%);
   border-radius: 8px;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.035), rgba(255, 255, 255, 0.012)),
-    color-mix(in srgb, var(--panel-2), transparent 18%);
+  background: var(--bg);
+  box-shadow:
+    12px 0 22px -22px color-mix(in srgb, #000, transparent 42%),
+    0 12px 30px -28px color-mix(in srgb, #000, transparent 32%);
 }
 
 .markdown-metadata-row {
@@ -4286,7 +4356,7 @@ button {
   gap: 8px;
   padding: 5px 7px;
   border-radius: 6px;
-  background: rgba(255, 255, 255, 0.035);
+  background: transparent;
 }
 
 .markdown-metadata-row span {
@@ -4315,6 +4385,91 @@ button {
   border-bottom: 1px solid var(--border);
   font-family: var(--font-mono);
   font-size: 11px;
+}
+
+.directory-preview {
+  min-height: 100%;
+  padding: 18px;
+  color: var(--text);
+}
+
+.directory-preview-header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 0 18px;
+  border-bottom: 1px solid color-mix(in srgb, var(--border), transparent 25%);
+}
+
+.directory-preview-header svg {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+
+.directory-preview-header div {
+  min-width: 0;
+}
+
+.directory-preview-header strong,
+.directory-preview-header span {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.directory-preview-header strong {
+  font-size: 14px;
+}
+
+.directory-preview-header span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.directory-preview-list {
+  display: grid;
+  gap: 2px;
+  padding-top: 10px;
+}
+
+.directory-preview-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  min-width: 0;
+  height: 32px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.directory-preview-row:hover {
+  color: var(--text);
+  background: var(--hover);
+}
+
+.directory-preview-row span {
+  min-width: 0;
+  overflow: hidden;
+  color: currentColor;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.directory-preview-row em {
+  color: var(--faint);
+  font-size: 10.5px;
+  font-style: normal;
 }
 
 .file-image-preview {
@@ -5461,6 +5616,112 @@ button {
 
 .settings-dialog {
   grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.conversation-properties-dialog {
+  width: min(640px, calc(100vw - 40px));
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
+.conversation-properties-body {
+  display: grid;
+  min-height: 0;
+  gap: 14px;
+  overflow: auto;
+  padding: 16px 18px 18px;
+}
+
+.properties-section {
+  display: grid;
+  gap: 10px;
+}
+
+.properties-section h3 {
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.properties-grid {
+  display: grid;
+  grid-template-columns: 126px minmax(0, 1fr);
+  gap: 8px 12px;
+  margin: 0;
+}
+
+.properties-grid dt {
+  color: var(--muted);
+}
+
+.properties-grid dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.properties-session-list {
+  display: grid;
+  gap: 6px;
+}
+
+.properties-session-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 10px;
+  align-items: center;
+  min-height: 32px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--panel), transparent 10%);
+}
+
+.properties-session-row strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.properties-session-row span,
+.properties-session-row em {
+  color: var(--muted);
+  font-style: normal;
+  white-space: nowrap;
+}
+
+.properties-action-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.properties-action-row select {
+  width: 100%;
+  min-width: 0;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  outline: 0;
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel), transparent 4%);
+}
+
+.properties-error {
+  margin: 0;
+  color: #ff8a70;
+}
+
+.properties-help {
+  margin: -2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
 }
 
 .settings-layout {

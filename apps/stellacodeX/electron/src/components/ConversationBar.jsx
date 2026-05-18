@@ -1,5 +1,5 @@
 import { Folder, FolderOpen, Plus, Search, Settings } from 'lucide-react';
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import * as ContextMenu from '@radix-ui/react-context-menu';
 import { conversationKey, displayConversationName, displayForegroundSessionName, foregroundSessions } from '../lib/api';
 import { formatModel } from '../lib/format';
@@ -13,15 +13,33 @@ function hasUnreadMessage(session, active) {
   return lastId > seenId;
 }
 
-function isWorkingConversation(conversation, activeRunning) {
-  const processingState = String(conversation?.processing_state || '').trim().toLowerCase();
-  return Boolean(conversation?.running)
-    || (processingState && processingState !== 'idle')
+function isActiveSessionState(value) {
+  return ['running', 'queued', 'processing', 'in_progress', 'active'].includes(
+    String(value || '').trim().toLowerCase()
+  );
+}
+
+function isWorkingSession(session, status, activeRunning) {
+  const processingState = String(
+    session?.processing_state
+    || session?.state
+    || status?.processing_state
+    || status?.state
+    || ''
+  ).trim().toLowerCase();
+  return Boolean(session?.running || status?.running)
+    || isActiveSessionState(processingState)
     || Boolean(activeRunning);
 }
 
 function deferContextMenuAction(action) {
   window.setTimeout(() => action?.(), 0);
+}
+
+function sameSelection(left, right) {
+  return String(left?.serverId || '') === String(right?.serverId || '')
+    && String(left?.conversationId || '') === String(right?.conversationId || '')
+    && String(left?.foregroundSessionId || 'main') === String(right?.foregroundSessionId || 'main');
 }
 
 function sameStringSet(left, right) {
@@ -59,10 +77,11 @@ export function ConversationBar({
   statuses,
   selected,
   loading,
-  activeRunning,
+  activeRunningKey,
   onSelect,
   onOpenSettings,
   onRename,
+  onOpenProperties,
   onHide,
   onUnhide,
   onDelete,
@@ -76,11 +95,14 @@ export function ConversationBar({
   const [openFolders, setOpenFolders] = useState(() => new Set());
   const [draggingConversationId, setDraggingConversationId] = useState('');
   const [previewConversationIds, setPreviewConversationIds] = useState([]);
+  const [visualSelected, setVisualSelected] = useState(selected);
   const draggingConversationIdRef = useRef('');
   const previewConversationIdsRef = useRef([]);
   const folderRefs = useRef(new Map());
   const previousFolderRects = useRef(null);
   const dragCommittedRef = useRef(false);
+  const pendingSelectFrameRef = useRef(0);
+  const pendingSelectTimerRef = useRef(0);
   const hiddenIds = useMemo(() => new Set(hiddenConversationIds.map(String)), [hiddenConversationIds]);
   const visibleConversations = useMemo(() => {
     const visible = conversations.filter((conversation) => !hiddenIds.has(conversation.conversation_id));
@@ -134,6 +156,15 @@ export function ConversationBar({
   }, [openConversationIds]);
 
   useEffect(() => {
+    setVisualSelected((current) => (sameSelection(current, selected) ? current : selected));
+  }, [selected]);
+
+  useEffect(() => () => {
+    if (pendingSelectFrameRef.current) window.cancelAnimationFrame(pendingSelectFrameRef.current);
+    if (pendingSelectTimerRef.current) window.clearTimeout(pendingSelectTimerRef.current);
+  }, []);
+
+  useEffect(() => {
     if (previewConversationIds.length && sameStringArray(previewConversationIds, visibleConversationIds)) {
       setPreviewOrder([]);
     }
@@ -179,6 +210,25 @@ export function ConversationBar({
     setPreviewConversationIds(ids);
   };
 
+  const selectSession = useCallback((target) => {
+    setVisualSelected((current) => (sameSelection(current, target) ? current : target));
+    if (pendingSelectFrameRef.current) {
+      window.cancelAnimationFrame(pendingSelectFrameRef.current);
+      pendingSelectFrameRef.current = 0;
+    }
+    if (pendingSelectTimerRef.current) {
+      window.clearTimeout(pendingSelectTimerRef.current);
+      pendingSelectTimerRef.current = 0;
+    }
+    pendingSelectFrameRef.current = window.requestAnimationFrame(() => {
+      pendingSelectFrameRef.current = 0;
+      pendingSelectTimerRef.current = window.setTimeout(() => {
+        pendingSelectTimerRef.current = 0;
+        onSelect?.(target);
+      }, 0);
+    });
+  }, [onSelect]);
+
   const previewMoveConversation = (event, conversationId) => {
     const sourceId = draggingConversationIdRef.current || draggingConversationId;
     if (!sourceId || sourceId === conversationId) return;
@@ -191,10 +241,21 @@ export function ConversationBar({
     animateConversationOrderChange(() => setPreviewOrder(nextIds));
   };
 
+  const commitConversationOrder = (ids) => {
+    if (!ids.length || sameStringArray(ids, visibleConversationIds)) return false;
+    onConversationOrderChange?.(ids);
+    return true;
+  };
+
   const finishDrag = () => {
+    const previewIds = previewConversationIdsRef.current;
+    if (!dragCommittedRef.current) {
+      commitConversationOrder(previewIds);
+    }
     draggingConversationIdRef.current = '';
     setDraggingConversationId('');
-    if (!dragCommittedRef.current && previewConversationIds.length) {
+    dragCommittedRef.current = false;
+    if (previewIds.length) {
       animateConversationOrderChange(() => setPreviewOrder([]));
     }
   };
@@ -203,19 +264,24 @@ export function ConversationBar({
     const sessionId = session?.id || 'main';
     const canDeleteSession = sessionId !== 'main';
     const key = conversationKey(serverId, conversation.conversation_id, sessionId);
-    const active = selected?.conversationId === conversation.conversation_id
-      && (selected?.foregroundSessionId || 'main') === sessionId;
-    const status = statuses.get(key) || statuses.get(conversationKey(serverId, conversation.conversation_id, 'main'));
+    const active = visualSelected?.conversationId === conversation.conversation_id
+      && (visualSelected?.foregroundSessionId || 'main') === sessionId;
+    const sessionStatus = statuses.get(key);
+    const status = sessionStatus || (sessionId === 'main' ? statuses.get(conversationKey(serverId, conversation.conversation_id, 'main')) : null);
     const unread = hasUnreadMessage(session, active);
-    const working = isWorkingConversation(conversation, active && activeRunning);
+    const working = isWorkingSession(session, sessionStatus, activeRunningKey === key);
     const title = displayForegroundSessionName(session, conversation);
+    const selectionTarget = { serverId, conversationId: conversation.conversation_id, foregroundSessionId: sessionId };
     return (
       <ContextMenu.Root key={`${conversation.conversation_id}:${sessionId}`}>
         <ContextMenu.Trigger asChild>
           <button
             className={`conversation-row session-row${active ? ' active' : ''}${unread ? ' unread' : ''}${working ? ' working' : ''}${hidden ? ' hidden' : ''}`}
             type="button"
-            onClick={() => onSelect({ serverId, conversationId: conversation.conversation_id, foregroundSessionId: sessionId })}
+            onPointerDown={(event) => {
+              if (event.button === 0) setVisualSelected(selectionTarget);
+            }}
+            onClick={() => selectSession(selectionTarget)}
           >
             {unread && <i className="conversation-unread-dot" aria-label="有新消息" />}
             <strong>{title}</strong>
@@ -282,9 +348,12 @@ export function ConversationBar({
           event.preventDefault();
           dragCommittedRef.current = true;
           const nextIds = previewConversationIdsRef.current.length ? previewConversationIdsRef.current : visibleConversationIds;
-          onConversationOrderChange?.(nextIds);
+          commitConversationOrder(nextIds);
           draggingConversationIdRef.current = '';
           setDraggingConversationId('');
+          if (previewConversationIdsRef.current.length) {
+            animateConversationOrderChange(() => setPreviewOrder([]));
+          }
         }}
         onDragEnd={finishDrag}
       >
@@ -330,6 +399,9 @@ export function ConversationBar({
             <ContextMenu.Content className="context-menu">
               <ContextMenu.Item className="context-menu-item" onSelect={() => deferContextMenuAction(() => onCreateSession?.(conversation))}>
                 新建对话
+              </ContextMenu.Item>
+              <ContextMenu.Item className="context-menu-item" onSelect={() => deferContextMenuAction(() => onOpenProperties?.(conversation))}>
+                查看属性
               </ContextMenu.Item>
               <ContextMenu.Item className="context-menu-item" onSelect={() => deferContextMenuAction(() => onRename?.(conversation))}>
                 重命名 Conversation
@@ -393,7 +465,7 @@ export function ConversationBar({
           </section>
         )}
       </div>
-      <div className="sidebar-footer-note">{sidebarMode === 'collapsed' ? '' : 'stellacodex'}</div>
+      <div className="sidebar-footer-note">{sidebarMode === 'collapsed' ? '' : 'StellaCodeX'}</div>
     </aside>
   );
 }

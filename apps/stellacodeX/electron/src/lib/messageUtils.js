@@ -514,6 +514,15 @@ export function mergeMessages(current, incoming) {
     && !message?._streaming
     && messageText(message).trim()
   ));
+  const durableAssistantIds = new Set(
+    incoming
+      .filter((message) => (
+        String(message?.role || '').toLowerCase() === 'assistant'
+        && !message?._streaming
+      ))
+      .map((message) => String(message?.id ?? message?.message_id ?? '').trim())
+      .filter(Boolean)
+  );
   const committedToolResultIds = new Set(
     incoming.flatMap((message) => (
       messageItems(message)
@@ -533,7 +542,11 @@ export function mergeMessages(current, incoming) {
       message?._streaming
       && String(message?.role || '').toLowerCase() === 'assistant'
       && (
-        finalizedAssistantIndexes.has(messageIndex(message))
+        durableAssistantIds.has(String(message?.id ?? message?.message_id ?? '').trim())
+        || durableAssistantIds.has(String(message?.message_id ?? message?.id ?? '').trim())
+        || committedToolResultIds.has(String(message?._liveToolCallId || '').trim())
+        || committedToolResultIds.has(String(message?._streamItemId || '').trim())
+        || finalizedAssistantIndexes.has(messageIndex(message))
         || durableAssistantEchoes.some((incomingMessage) => messageText(incomingMessage).trim() === messageText(message).trim())
       )
     ) return false;
@@ -545,8 +558,7 @@ export function mergeMessages(current, incoming) {
     }
     if (!message?._optimistic && !message?.queued && !message?.pending && !message?._userMessageStarted) return true;
     if (String(message?.role || '').toLowerCase() !== 'user') return true;
-    const text = messageText(message).trim();
-    return !serverEchoes.some((incomingMessage) => messageText(incomingMessage).trim() === text);
+    return !serverEchoes.some((incomingMessage) => isUserMessageEcho(message, incomingMessage));
   });
   const byId = new Map(currentWithoutEchoedOptimistic.map((message) => [String(message.id ?? messageKey(message, 0)), message]));
   let changed = currentWithoutEchoedOptimistic.length !== current.length;
@@ -574,6 +586,15 @@ function existingMessageKey(byId, incoming, fallbackId) {
       if (String(message?.role || '').toLowerCase() === incomingRole && messageIndex(message) === incomingIndex) {
         return key;
       }
+    }
+  }
+  if (incomingRole === 'user') {
+    const incomingClientId = messageClientId(incoming);
+    const incomingIsProvisional = isProvisionalMessage(incoming);
+    for (const [key, message] of byId.entries()) {
+      if (String(message?.role || '').toLowerCase() !== 'user') continue;
+      if (incomingClientId && incomingClientId === messageClientId(message)) return key;
+      if ((incomingIsProvisional || isProvisionalMessage(message)) && isUserMessageEcho(message, incoming)) return key;
     }
   }
   if (incomingRole === 'assistant' && incoming?._streaming) {
@@ -604,6 +625,69 @@ function existingMessageKey(byId, incoming, fallbackId) {
     }
   }
   return fallbackId;
+}
+
+function isUserMessageEcho(current, incoming) {
+  if (String(current?.role || '').toLowerCase() !== 'user') return false;
+  if (String(incoming?.role || '').toLowerCase() !== 'user') return false;
+  const currentClientId = messageClientId(current);
+  const incomingClientId = messageClientId(incoming);
+  if (currentClientId && incomingClientId && currentClientId === incomingClientId) return true;
+  const currentText = userVisibleText(current);
+  const incomingText = userVisibleText(incoming);
+  if (currentText !== incomingText) return false;
+  const currentFiles = messageAttachmentSignature(current);
+  const incomingFiles = messageAttachmentSignature(incoming);
+  if (currentFiles || incomingFiles) return Boolean(currentFiles && incomingFiles && currentFiles === incomingFiles);
+  return Boolean(currentText);
+}
+
+function userVisibleText(message) {
+  const direct = String(message?.text || message?.preview || message?.content || '').trim();
+  if (direct) return direct;
+  return String(messageText(message) || '').trim();
+}
+
+function messageAttachmentSignature(message) {
+  const keys = [];
+  const collect = (value) => {
+    const key = attachmentSignature(value);
+    if (key) keys.push(key);
+  };
+  (Array.isArray(message?.attachments) ? message.attachments : []).forEach(collect);
+  (Array.isArray(message?.files) ? message.files : []).forEach(collect);
+  messageItems(message)
+    .filter((item) => item?.type === 'file')
+    .forEach(collect);
+  return Array.from(new Set(keys)).sort().join('|');
+}
+
+function attachmentSignature(value) {
+  if (!value || typeof value !== 'object') return '';
+  const payload = value.payload && typeof value.payload === 'object' ? value.payload : {};
+  const file = value.file && typeof value.file === 'object' ? value.file : {};
+  const uri = String(
+    value.uri
+    || value.file_uri
+    || value.url
+    || value.path
+    || file.uri
+    || file.file_uri
+    || file.url
+    || file.path
+    || payload.uri
+    || payload.file_uri
+    || payload.url
+    || payload.path
+    || ''
+  ).trim();
+  if (uri) return uri;
+  const name = String(value.name || value.filename || file.name || file.filename || payload.name || payload.filename || '').trim();
+  const mediaType = String(value.media_type || value.mime_type || value.mime || file.media_type || file.mime_type || payload.media_type || payload.mime_type || '').trim();
+  const size = String(value.size_bytes || value.size || file.size_bytes || file.size || payload.size_bytes || payload.size || '').trim();
+  const width = String(value.width || file.width || payload.width || '').trim();
+  const height = String(value.height || file.height || payload.height || '').trim();
+  return [name, mediaType, size, width, height].filter(Boolean).join(':');
 }
 
 function messageClientId(message) {
@@ -769,7 +853,7 @@ export function displayMessages(messages) {
 
 function isRoundInterstitialMessage(message) {
   const role = String(message?.role || '').toLowerCase();
-  if (role === 'user') return true;
+  if (role === 'user') return false;
   return role === 'assistant' && !isFinalAssistantMessage(message);
 }
 
