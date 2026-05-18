@@ -161,6 +161,33 @@ pub fn decode_response(payload: Value) -> Result<TerminalResponse> {
     serde_json::from_value(payload).context("failed to decode terminal response")
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_terminal_summary_payload() {
+        let payload = serde_json::json!({
+            "type": "terminal",
+            "terminal": {
+                "terminal_id": "terminal_0000",
+                "conversation_id": "web-main-000016",
+                "mode": "fixed_ssh",
+                "remote": { "host": "cpu001", "cwd": "/home/guojunyi/" },
+                "shell": "${SHELL:-sh}",
+                "cwd": "/home/guojunyi/",
+                "cols": 120,
+                "rows": 30,
+                "running": true,
+                "created_ms": 1779133185061u64,
+                "updated_ms": 1779133185061u64,
+                "next_offset": 0,
+            }
+        });
+        decode_response(payload).expect("terminal payload decodes");
+    }
+}
+
 pub fn update_runtime_config_call(
     source: ServiceAddr,
     target: ServiceAddr,

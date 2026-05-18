@@ -4,7 +4,7 @@ version: 1.29.6
 # 1.29.6
 
 - 修复 Web Terminal 响应路由和 Session 级前端布局状态：
-  ChannelService 向 TerminalService 转发请求时会携带 `request_id`，并优先按 Terminal `response_id` 精确匹配响应；Kernel 返回的 terminal 请求错误也会回到对应 Web Terminal 请求，不再让 REST 调用一直等到 30s 超时。StellaCodeX Electron 的右侧面板开关、面板宽度、打开文件和当前预览文件改为按 foreground session 持久化，避免同一 Conversation 下不同 Session 互相覆盖窗口状态。本次不改变 `config` schema，不改变 `workdir` schema。
+  Terminal summary 的 `created_ms` / `updated_ms` 改为 JSON 可往返的 `u64` 毫秒，避免 TerminalService 已通过 ServiceChannel 返回 `terminal` / `terminals` payload 后，ChannelService 因 `serde_json` 不支持反序列化 `u128` 而记录 `bad_terminal_payload` 并让 Web 请求等到 30s 超时。ChannelService 向 TerminalService 转发请求时会携带 `request_id`，并优先按 Terminal `response_id` 精确匹配响应；Kernel 返回的 terminal 请求错误也会回到对应 Web Terminal 请求。StellaCodeX Electron 的右侧面板开关、面板宽度、打开文件和当前预览文件改为按 foreground session 持久化，避免同一 Conversation 下不同 Session 互相覆盖窗口状态。本次不改变 `config` schema，不改变 `workdir` schema。
 
 - 修复 StellaCodeX Electron late stream delta 重新生成临时消息：
   如果 durable `message_appended` 或历史补拉已经把同一 `message_id` 固定为非 streaming 消息，后续迟到的 assistant / reasoning / tool-call stream delta 会被忽略，不再重新 append 一个 `_streaming` assistant 导致 final 后又出现挂起工具或重复文本；stream/durable commit 比较同时把 `item_id=fc_*` 与 `tool_call_id=call_*` 都纳入工具调用身份，并允许同工具名、同消息位置的参数前缀收敛，mismatch 诊断会输出 compare 版本和 canonical 对象。本次不改变 `config` schema，不改变 `workdir` schema。

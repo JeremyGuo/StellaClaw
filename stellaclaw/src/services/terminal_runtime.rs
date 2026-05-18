@@ -61,8 +61,8 @@ pub struct TerminalSummary {
     pub cols: u16,
     pub rows: u16,
     pub running: bool,
-    pub created_ms: u128,
-    pub updated_ms: u128,
+    pub created_ms: u64,
+    pub updated_ms: u64,
     pub next_offset: u64,
 }
 
@@ -209,8 +209,8 @@ struct TerminalSize {
 #[derive(Debug)]
 struct TerminalStatus {
     running: bool,
-    created_ms: u128,
-    updated_ms: u128,
+    created_ms: u64,
+    updated_ms: u64,
 }
 
 #[derive(Debug, Default)]
@@ -952,10 +952,10 @@ fn clamp_dimension(value: u16, min: u16, max: u16) -> u16 {
     value.clamp(min, max)
 }
 
-fn unix_millis() -> u128 {
+fn unix_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
+        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
         .unwrap_or_default()
 }
 
