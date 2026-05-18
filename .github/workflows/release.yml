@@ -34,23 +34,13 @@ jobs:
           tag="v${version}"
           python3 scripts/version_info.py notes > RELEASE_NOTES.md
 
-          if git rev-parse HEAD^ >/dev/null 2>&1; then
-            if git diff --quiet HEAD^ HEAD -- VERSION; then
-              version_changed=false
-            else
-              version_changed=true
-            fi
-          else
-            version_changed=true
-          fi
-
           if git ls-remote --exit-code --tags origin "refs/tags/${tag}" >/dev/null 2>&1; then
             tag_exists=true
           else
             tag_exists=false
           fi
 
-          if [[ "${version_changed}" == "true" && "${tag_exists}" == "false" ]]; then
+          if [[ "${tag_exists}" == "false" ]]; then
             should_release=true
           else
             should_release=false
@@ -123,6 +113,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare.outputs.head_sha }}
+          submodules: recursive
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -130,6 +121,12 @@ jobs:
           node-version: '20'
           cache: 'npm'
           cache-dependency-path: apps/stellacodeX/electron/package-lock.json
+
+      - name: Setup pnpm for embed-pdf submodule
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.4.0
+          run_install: false
 
       - name: Install dependencies
         run: npm ci
