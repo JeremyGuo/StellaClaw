@@ -13,6 +13,7 @@ use std::{
         Arc,
     },
     thread,
+    time::Duration,
 };
 
 use crossbeam_channel::{select, Receiver};
@@ -27,6 +28,11 @@ pub use super::ToolRemoteMode;
 use super::{
     ConversationBridge, ConversationBridgeRequest, SessionInitial, SessionType, ToolResultContent,
 };
+
+#[cfg(not(test))]
+const BRIDGE_CANCEL_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const BRIDGE_CANCEL_GRACE_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub(crate) use file_tools::execute_file_tool;
 pub use file_tools::file_tool_definitions;
@@ -336,6 +342,12 @@ fn cancel_subagent_join_bridge_request(
             Ok(ToolResultContent::from_json(json!({
                 "status": "interrupted",
                 "reason": "subagent_join_cancelled",
+            })))
+        }
+        recv(crossbeam_channel::after(BRIDGE_CANCEL_GRACE_TIMEOUT)) -> _ => {
+            Ok(ToolResultContent::from_json(json!({
+                "status": "interrupted",
+                "reason": "subagent_join_cancel_timeout",
             })))
         }
     }

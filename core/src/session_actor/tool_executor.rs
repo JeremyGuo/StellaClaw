@@ -3,6 +3,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
     thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use crossbeam_channel::{select, Receiver, Sender};
@@ -26,6 +27,10 @@ use super::{
 
 const MAX_TOOL_RESULT_CONTEXT_CHARS: usize = 100_000;
 const DEFAULT_TRUNCATED_TOOL_RESULT_PREVIEW_CHARS: usize = 80_000;
+#[cfg(not(test))]
+const TOOL_INTERRUPT_GRACE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const TOOL_INTERRUPT_GRACE_TIMEOUT: Duration = Duration::from_millis(100);
 
 pub struct LocalToolBatchExecutor {
     workspace_root: PathBuf,
@@ -256,6 +261,7 @@ impl ToolBatchRunner {
             operation_interrupt_rx,
         ));
         let operation_lock = self.operation_lock.clone();
+        let interrupted_operation = scheduled.clone();
         let join_handle = thread::spawn(move || {
             let result = execute_scheduled_operation(runner, scheduled, operation_lock);
             let _ = result_tx.send(result);
@@ -271,9 +277,18 @@ impl ToolBatchRunner {
                         return finish_received_operation_result(result, join_handle);
                     }
                     let _ = operation_interrupt_tx.send(());
-                    return match result_rx.recv() {
+                    return match result_rx.recv_timeout(TOOL_INTERRUPT_GRACE_TIMEOUT) {
                         Ok(result) => finish_received_operation_result(result, join_handle).into_interrupted(),
-                        Err(_) => finish_disconnected_operation(join_handle).into_interrupted(),
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            finish_disconnected_operation(join_handle).into_interrupted()
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                            drop(join_handle);
+                            OperationOutcome::Interrupted(tool_error_result(
+                                &interrupted_operation,
+                                "tool interrupt timed out; detached running operation".to_string(),
+                            ))
+                        }
                     };
                 }
             }
@@ -349,8 +364,18 @@ impl ToolBatchRunner {
                     for sender in interrupt_txs.iter_mut().filter_map(Option::take) {
                         let _ = sender.send(());
                     }
+                    let deadline = Instant::now() + TOOL_INTERRUPT_GRACE_TIMEOUT;
                     while completed < operations.len() {
-                        match result_rx.recv() {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() {
+                            collect_timed_out_parallel_results(
+                                operations,
+                                &mut join_handles,
+                                &mut results,
+                            );
+                            break;
+                        }
+                        match result_rx.recv_timeout(remaining) {
                             Ok((result_index, result)) => {
                                 collect_parallel_result(
                                     operations,
@@ -364,8 +389,16 @@ impl ToolBatchRunner {
                                 }
                                 completed += 1;
                             }
-                            Err(_) => {
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
                                 collect_disconnected_parallel_results(
+                                    operations,
+                                    &mut join_handles,
+                                    &mut results,
+                                );
+                                break;
+                            }
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                                collect_timed_out_parallel_results(
                                     operations,
                                     &mut join_handles,
                                     &mut results,
@@ -480,6 +513,23 @@ fn collect_disconnected_parallel_results(
             None => tool_error_result(&operations[index], "tool stopped".to_string()),
         };
         results[index] = Some(result);
+    }
+}
+
+fn collect_timed_out_parallel_results(
+    operations: &[ToolBatchOperation],
+    join_handles: &mut [Option<JoinHandle<()>>],
+    results: &mut [Option<ToolResultItem>],
+) {
+    for index in 0..operations.len() {
+        if results[index].is_some() {
+            continue;
+        }
+        let _ = join_handles[index].take();
+        results[index] = Some(tool_error_result(
+            &operations[index],
+            "tool interrupt timed out; detached running operation".to_string(),
+        ));
     }
 }
 
@@ -2007,5 +2057,60 @@ mod tests {
 
         assert_eq!(message.data.len(), 1);
         assert!(result_text(&message, 0).contains("\"status\": \"interrupted\""));
+    }
+
+    #[test]
+    fn interrupt_does_not_hang_when_subagent_join_cancel_bridge_blocks() {
+        let workspace = temp_workspace();
+        let (request_tx, request_rx) = mpsc::channel();
+        let (response_tx, response_rx) = mpsc::channel();
+        let bridge = Arc::new(BlockingBridge {
+            request_tx,
+            response_rx: Mutex::new(response_rx),
+        });
+        let executor = LocalToolBatchExecutor::new(&workspace)
+            .with_conversation_bridge(bridge)
+            .with_tool_catalog(bridge_catalog(&["subagent_join"]));
+        let batch = ToolBatch::new(
+            "batch_blocking_cancel_interrupt",
+            vec![registered_tool_call(
+                "call_bridge",
+                "subagent_join",
+                json!({"agent_id": "subagent_1", "timeout_seconds": 30}),
+            )],
+        );
+
+        let (completion_tx, completion_rx) = crossbeam_channel::unbounded();
+        let (progress_tx, _progress_rx) = crossbeam_channel::unbounded();
+        let handle = executor
+            .start(batch, completion_tx, progress_tx)
+            .expect("batch should start");
+        request_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("bridge request should be running asynchronously");
+
+        executor
+            .interrupt(&handle)
+            .expect("interrupt should mark batch cancelled");
+        let cancel_request = request_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancel bridge request should be sent");
+        assert_eq!(cancel_request.action, "subagent_join_cancel");
+
+        let wait_started = Instant::now();
+        let completion = completion_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("blocking cancel should not stall batch completion");
+        assert!(wait_started.elapsed() < Duration::from_secs(1));
+        executor
+            .finish(&completion.batch_id)
+            .expect("interrupted bridge batch should finish");
+        let message = completion.result.expect("interrupted bridge batch result");
+        assert_eq!(message.data.len(), 1);
+        assert!(
+            result_text(&message, 0).contains("subagent_join_cancel_timeout")
+                || result_text(&message, 0).contains("tool interrupt timed out")
+        );
+        drop(response_tx);
     }
 }
