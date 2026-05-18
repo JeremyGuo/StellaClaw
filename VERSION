@@ -1,5 +1,12 @@
-version: 1.29.1
+version: 1.29.2
 ---
+
+# 1.29.2
+
+- 增加 WebChannel stream 协议诊断日志：
+  WebChannelMain 会在 chat websocket snapshot 订阅、stream event 接收/记录、stream index invalid 和 stream commit mismatch 时记录当前 live state、message id、turn id、in-message index、provisional 文本长度和 committed 文本摘要，便于定位前端看到半截 stream / `stream_commit_mismatch` 时后端是否存在生命周期或顺序状态异常。本次不改变 `config` schema，不改变 `workdir` schema。
+- 修复 Codex websocket tool call stream 缺失：
+  当 Codex Responses websocket 没有发送 `response.function_call_arguments.delta`，但在 `response.output_item.done` 中返回完整 `function_call.arguments` 时，provider 会补发一次 `ToolCallInputDelta`，保证 WebChannel provisional assistant message 能包含完整 tool call，避免带工具调用的 assistant message 落盘时触发 `stream_commit_mismatch`。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.29.1
 

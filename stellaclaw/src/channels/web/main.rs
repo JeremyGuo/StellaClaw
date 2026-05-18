@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
+    sync::Arc,
     thread,
     time::Duration,
 };
@@ -10,6 +11,8 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use stellaclaw_core::session_actor::{ChatMessage, ChatMessageItem, ChatRole};
+
+use crate::logger::StellaclawLogger;
 
 use crate::channels::{
     OutgoingError, OutgoingMessageAppended, OutgoingSessionStream, ProcessingState,
@@ -29,10 +32,15 @@ pub(super) struct WebChannelMainHandle {
 }
 
 impl WebChannelMainHandle {
-    pub(super) fn start(channel_id: String, workdir: PathBuf, seen: WebSeenState) -> Self {
+    pub(super) fn start(
+        channel_id: String,
+        workdir: PathBuf,
+        seen: WebSeenState,
+        logger: Arc<StellaclawLogger>,
+    ) -> Self {
         let (tx, rx) = unbounded();
         thread::spawn(move || {
-            let mut state = WebChannelMain::new(channel_id, workdir, seen);
+            let mut state = WebChannelMain::new(channel_id, workdir, seen, logger);
             state.run(rx);
         });
         Self { tx }
@@ -220,6 +228,7 @@ enum WebMainCommand {
 struct WebChannelMain {
     channel_id: String,
     workdir: PathBuf,
+    logger: Arc<StellaclawLogger>,
     home_seq: u64,
     home_subscribers: Vec<Sender<Value>>,
     chat_subscribers: HashMap<WebSessionKey, Vec<Sender<Value>>>,
@@ -229,10 +238,16 @@ struct WebChannelMain {
 }
 
 impl WebChannelMain {
-    fn new(channel_id: String, workdir: PathBuf, seen: WebSeenState) -> Self {
+    fn new(
+        channel_id: String,
+        workdir: PathBuf,
+        seen: WebSeenState,
+        logger: Arc<StellaclawLogger>,
+    ) -> Self {
         Self {
             channel_id,
             workdir,
+            logger,
             home_seq: 0,
             home_subscribers: Vec::new(),
             chat_subscribers: HashMap::new(),
@@ -262,6 +277,15 @@ impl WebChannelMain {
                     .or_default()
                     .push(tx);
                 let state = self.live_states.get(&key).cloned().unwrap_or_default();
+                self.logger.info(
+                    "web_chat_subscribe_snapshot",
+                    json!({
+                        "channel_id": self.channel_id,
+                        "conversation_id": key.conversation_id,
+                        "foreground_session_id": key.foreground_session_id,
+                        "live_state": state.diagnostic_summary(None),
+                    }),
+                );
                 let _ = reply_tx.send((rx, state));
             }
             WebMainCommand::GetLiveState { key, reply_tx } => {
@@ -378,6 +402,23 @@ impl WebChannelMain {
             state.commit_consistency_error(&appended.message)
         };
         if let Some(error) = consistency_error {
+            let state = self.live_states.get(&key).cloned().unwrap_or_default();
+            self.logger.warn(
+                "web_chat_stream_commit_mismatch",
+                json!({
+                    "channel_id": self.channel_id,
+                    "conversation_id": appended.conversation_id,
+                    "foreground_session_id": key.foreground_session_id,
+                    "session_id": appended.session_id,
+                    "message_id": appended.message.message_id,
+                    "message_index": appended.index,
+                    "turn_id": error.turn_id,
+                    "expected_index": error.expected_index,
+                    "reason": error.reason,
+                    "committed": committed_message_diagnostic(&appended.message),
+                    "live_state": state.diagnostic_summary(Some(&appended.message.message_id)),
+                }),
+            );
             self.publish_chat(
                 &key,
                 protocol::chat_stream_error(
@@ -421,10 +462,42 @@ impl WebChannelMain {
             .and_then(Value::as_str)
             .unwrap_or("stream_event")
             .to_string();
+        let before_diagnostic = {
+            let state = self.live_states.entry(key.clone()).or_default();
+            state.stream_event_diagnostic(&stream.event, &event_type)
+        };
+        if should_log_chat_stream_event(&event_type, &stream.event) {
+            self.logger.info(
+                "web_chat_stream_event_received",
+                json!({
+                    "channel_id": self.channel_id,
+                    "conversation_id": stream.conversation_id,
+                    "foreground_session_id": key.foreground_session_id,
+                    "session_id": stream.session_id,
+                    "event_type": event_type,
+                    "diagnostic": before_diagnostic,
+                }),
+            );
+        }
         if let Some(error) = {
             let state = self.live_states.entry(key.clone()).or_default();
             state.validate_stream_event(&stream.event, &event_type)
         } {
+            self.logger.warn(
+                "web_chat_stream_event_invalid",
+                json!({
+                    "channel_id": self.channel_id,
+                    "conversation_id": stream.conversation_id,
+                    "foreground_session_id": key.foreground_session_id,
+                    "session_id": stream.session_id,
+                    "event_type": event_type,
+                    "message_id": error.message_id,
+                    "turn_id": error.turn_id,
+                    "received_index": error.received_index,
+                    "reason": error.reason,
+                    "before": before_diagnostic,
+                }),
+            );
             self.publish_chat(
                 &key,
                 protocol::chat_stream_error(
@@ -444,6 +517,22 @@ impl WebChannelMain {
         {
             let state = self.live_states.entry(key.clone()).or_default();
             state.record_session_stream(&stream.event, &event_type);
+        }
+        if should_log_chat_stream_event(&event_type, &stream.event) {
+            let state = self.live_states.get(&key).cloned().unwrap_or_default();
+            self.logger.info(
+                "web_chat_stream_event_recorded",
+                json!({
+                    "channel_id": self.channel_id,
+                    "conversation_id": stream.conversation_id,
+                    "foreground_session_id": key.foreground_session_id,
+                    "session_id": stream.session_id,
+                    "event_type": event_type,
+                    "live_state": state.diagnostic_summary(
+                        stream.event.get("message_id").and_then(Value::as_str)
+                    ),
+                }),
+            );
         }
         if matches!(
             event_type.as_str(),
@@ -546,6 +635,86 @@ impl ChatLiveState {
             .and_then(|turn| turn.get("turn_id"))
             .and_then(Value::as_str)
             .map(str::to_string)
+    }
+
+    fn diagnostic_summary(&self, focus_message_id: Option<&str>) -> Value {
+        let provisional_message = self
+            .current_provisional_assistant_message
+            .as_ref()
+            .and_then(|provisional| provisional.get("message"));
+        let provisional_message_id = provisional_message
+            .and_then(|message| {
+                message
+                    .get("message_id")
+                    .or_else(|| message.get("id"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or_default();
+        let focus_expected_index = focus_message_id
+            .and_then(|message_id| self.stream_next_indices.get(message_id).copied());
+        let tracked_stream_indices = self
+            .stream_next_indices
+            .iter()
+            .map(|(message_id, next_index)| {
+                json!({
+                    "message_id": message_id,
+                    "next_index": next_index,
+                })
+            })
+            .collect::<Vec<_>>();
+        let invalid_stream_messages = self
+            .invalid_stream_messages
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        json!({
+            "state": self.summary_state(),
+            "active_turn_id": self.active_turn_id(),
+            "focus_message_id": focus_message_id,
+            "focus_expected_index": focus_expected_index,
+            "has_current_turn": self.current_turn_state.is_some(),
+            "has_provisional": provisional_message.is_some(),
+            "provisional_message_id": provisional_message_id,
+            "provisional_text_len": provisional_message.map(message_text_len).unwrap_or(0),
+            "provisional_preview": provisional_message.map(message_text_preview).unwrap_or_default(),
+            "running_tool_result_count": self.running_tool_results.len(),
+            "queued_outbound_count": self.queued_outbound_messages.len(),
+            "tracked_stream_indices": tracked_stream_indices,
+            "invalid_stream_messages": invalid_stream_messages,
+            "last_error": self.last_error.clone(),
+        })
+    }
+
+    fn stream_event_diagnostic(&self, event: &Value, event_type: &str) -> Value {
+        let message_id = event.get("message_id").and_then(Value::as_str);
+        let received_index = event.get("in_message_index").and_then(Value::as_u64);
+        let expected_index = message_id
+            .and_then(|message_id| self.stream_next_indices.get(message_id).copied())
+            .unwrap_or(0);
+        let provisional_message_id = self
+            .current_provisional_assistant_message
+            .as_ref()
+            .and_then(|provisional| provisional.get("message"))
+            .and_then(|message| {
+                message
+                    .get("message_id")
+                    .or_else(|| message.get("id"))
+                    .and_then(Value::as_str)
+            });
+        json!({
+            "event_type": event_type,
+            "message_id": message_id,
+            "turn_id": event.get("turn_id").and_then(Value::as_str),
+            "received_index": received_index,
+            "expected_index": expected_index,
+            "delta_len": event.get("delta").and_then(Value::as_str).map(str::len).unwrap_or(0),
+            "tool_call_id": event.get("call_id").or_else(|| event.get("item_id")).and_then(Value::as_str),
+            "tool_name": event.get("tool_name").and_then(Value::as_str),
+            "has_matching_provisional": message_id.is_some()
+                && provisional_message_id.is_some()
+                && message_id == provisional_message_id,
+            "live_state": self.diagnostic_summary(message_id),
+        })
     }
 
     fn validate_stream_event(
@@ -1284,6 +1453,68 @@ fn tool_result_call_ids(message: &Value) -> Vec<&str> {
 
 fn append_text_delta(existing_text: &str, delta: &str) -> String {
     format!("{existing_text}{delta}")
+}
+
+fn should_log_chat_stream_event(event_type: &str, event: &Value) -> bool {
+    matches!(
+        event_type,
+        "turn_started"
+            | "turn_completed"
+            | "stream_error"
+            | "stream_assistant_message_delta"
+            | "stream_tool_call_delta"
+            | "stream_reasoning_summary_part_added"
+            | "stream_reasoning_summary_delta"
+            | "stream_tool_result_done"
+    ) || event
+        .get("in_message_index")
+        .and_then(Value::as_u64)
+        .is_some()
+}
+
+fn message_text(message: &Value) -> &str {
+    message
+        .get("text")
+        .or_else(|| message.get("preview"))
+        .or_else(|| message.get("content"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+}
+
+fn message_text_len(message: &Value) -> usize {
+    message_text(message).len()
+}
+
+fn message_text_preview(message: &Value) -> String {
+    let text = message_text(message);
+    text.chars().take(120).collect()
+}
+
+fn committed_message_text(message: &ChatMessage) -> String {
+    let mut text = String::new();
+    for item in &message.data {
+        if let ChatMessageItem::Context(context) = item {
+            text.push_str(&context.text);
+        }
+    }
+    text
+}
+
+fn committed_message_diagnostic(message: &ChatMessage) -> Value {
+    let text = committed_message_text(message);
+    let role = match message.role {
+        ChatRole::User => "user",
+        ChatRole::Assistant => "assistant",
+        ChatRole::Compaction => "compaction",
+    };
+    json!({
+        "role": role,
+        "message_id": message.message_id,
+        "message_time": message.message_time.clone(),
+        "text_len": text.len(),
+        "preview": text.chars().take(120).collect::<String>(),
+        "item_count": message.data.len(),
+    })
 }
 
 fn item_id_if_readable(item_id: &str) -> Option<&str> {

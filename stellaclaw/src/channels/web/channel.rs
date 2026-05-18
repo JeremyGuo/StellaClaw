@@ -68,12 +68,13 @@ impl WebChannel {
         workdir: PathBuf,
         config: Arc<StellaclawConfig>,
         conversation_runtime: Arc<ConversationHostRuntime>,
-        _logger: Arc<StellaclawLogger>,
+        logger: Arc<StellaclawLogger>,
     ) -> Self {
         let main = WebChannelMainHandle::start(
             id.clone(),
             workdir.clone(),
             load_seen_state(&workdir, &id).unwrap_or_default(),
+            logger,
         );
         Self {
             id,

@@ -73,6 +73,7 @@ struct StreamAccumulator {
     output_items: Vec<Value>,
     active_output_item_id: Option<String>,
     active_reasoning_item_id: Option<String>,
+    streamed_tool_inputs: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -1100,7 +1101,12 @@ fn send_response_create(
                         return Err(ProviderError::WebSocket(error));
                     }
                     Some("response.output_item.done") => {
+                        let completed_tool_call_event =
+                            accumulator.completed_tool_call_stream_event(&value);
                         accumulator.record_output_item_done(&value);
+                        if let Some(event) = completed_tool_call_event {
+                            on_stream(event);
+                        }
                     }
                     Some("response.output_item.added") => {
                         accumulator.record_output_item_added(&value);
@@ -1120,6 +1126,7 @@ fn send_response_create(
                         if let Some(event) =
                             provider_tool_call_input_delta_event(&value, &accumulator)
                         {
+                            accumulator.record_streamed_tool_input(&event);
                             on_stream(event);
                         }
                     }
@@ -2094,6 +2101,47 @@ impl StreamAccumulator {
         })
     }
 
+    fn record_streamed_tool_input(&mut self, event: &ProviderStreamEvent) {
+        let ProviderStreamEvent::ToolCallInputDelta {
+            item_id, call_id, ..
+        } = event
+        else {
+            return;
+        };
+        let key = tool_input_stream_key(item_id, call_id.as_deref());
+        if !self.streamed_tool_inputs.iter().any(|existing| existing == &key) {
+            self.streamed_tool_inputs.push(key);
+        }
+    }
+
+    fn completed_tool_call_stream_event(&mut self, event: &Value) -> Option<ProviderStreamEvent> {
+        let item = event.get("item")?;
+        if item.get("type").and_then(Value::as_str) != Some("function_call") {
+            return None;
+        }
+        let item_id = item.get("id").and_then(Value::as_str)?.to_string();
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let key = tool_input_stream_key(&item_id, call_id.as_deref());
+        if self.streamed_tool_inputs.iter().any(|existing| existing == &key) {
+            return None;
+        }
+        self.streamed_tool_inputs.push(key);
+        let tool_name = item.get("name").and_then(Value::as_str).map(str::to_string);
+        let delta = item
+            .get("arguments")
+            .map(value_to_arguments_string)
+            .unwrap_or_else(|| "{}".to_string());
+        Some(ProviderStreamEvent::ToolCallInputDelta {
+            item_id,
+            call_id,
+            tool_name,
+            delta,
+        })
+    }
+
     fn push_unique_item(&mut self, item: Value) {
         let new_id = item.get("id").and_then(Value::as_str);
         if let Some(new_id) = new_id {
@@ -2113,6 +2161,13 @@ impl StreamAccumulator {
     fn activate_reasoning_item(&mut self, item_id: &str) {
         self.active_reasoning_item_id = Some(item_id.to_string());
     }
+}
+
+fn tool_input_stream_key(item_id: &str, call_id: Option<&str>) -> String {
+    call_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(item_id)
+        .to_string()
 }
 
 fn merge_streamed_response_output(response: &mut Value, mut accumulator: StreamAccumulator) {
@@ -2866,6 +2921,63 @@ mod tests {
         assert_eq!(call_id, None);
         assert_eq!(tool_name.as_deref(), Some("exec_command"));
         assert_eq!(delta, "{\"cmd\"");
+    }
+
+    #[test]
+    fn completed_function_call_emits_tool_input_when_argument_deltas_were_absent() {
+        let mut accumulator = StreamAccumulator::default();
+
+        let event = accumulator
+            .completed_tool_call_stream_event(&serde_json::json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "id": "fc_1",
+                    "call_id": "call_1",
+                    "name": "apply_patch",
+                    "arguments": {"patch": "*** Begin Patch\n*** End Patch\n"}
+                }
+            }))
+            .expect("completed function call should be renderable");
+
+        let ProviderStreamEvent::ToolCallInputDelta {
+            item_id,
+            call_id,
+            tool_name,
+            delta,
+        } = event
+        else {
+            panic!("expected tool call input delta event");
+        };
+        assert_eq!(item_id, "fc_1");
+        assert_eq!(call_id.as_deref(), Some("call_1"));
+        assert_eq!(tool_name.as_deref(), Some("apply_patch"));
+        assert!(delta.contains("Begin Patch"));
+    }
+
+    #[test]
+    fn completed_function_call_does_not_duplicate_streamed_argument_delta() {
+        let mut accumulator = StreamAccumulator::default();
+        let streamed = ProviderStreamEvent::ToolCallInputDelta {
+            item_id: "fc_1".to_string(),
+            call_id: Some("call_1".to_string()),
+            tool_name: Some("apply_patch".to_string()),
+            delta: "{\"patch\"".to_string(),
+        };
+        accumulator.record_streamed_tool_input(&streamed);
+
+        let event = accumulator.completed_tool_call_stream_event(&serde_json::json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "apply_patch",
+                "arguments": {"patch": "*** Begin Patch\n*** End Patch\n"}
+            }
+        }));
+
+        assert!(event.is_none());
     }
 
     #[test]
