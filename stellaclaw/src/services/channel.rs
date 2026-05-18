@@ -137,6 +137,12 @@ struct PendingTerminalRequest {
     request_id: String,
 }
 
+impl PendingTerminalRequest {
+    fn request_id(&self) -> &str {
+        &self.request_id
+    }
+}
+
 #[derive(Debug)]
 struct PendingKernelRuntimeConfigRequest {
     request_id: String,
@@ -158,6 +164,57 @@ fn handle_channel_request(
     response_id: Option<String>,
     payload: serde_json::Value,
 ) -> Result<()> {
+    if response_id.as_deref().is_some_and(|id| {
+        pending_terminal
+            .iter()
+            .any(|pending| pending.request_id() == id)
+    }) || source == ServiceAddr::terminal()
+    {
+        match decode_terminal_response(payload.clone()) {
+            Ok(response) => {
+                handle_terminal_response(
+                    ctx,
+                    event_tx,
+                    pending_terminal,
+                    response_id.as_deref(),
+                    response,
+                )?;
+                return Ok(());
+            }
+            Err(error) if source == ServiceAddr::terminal() => {
+                let detail = serde_json::json!({
+                    "conversation_id": &ctx.conversation.conversation_id,
+                    "channel_addr": &ctx.addr,
+                    "source": &source,
+                    "response_id": &response_id,
+                    "terminal_decode_error": error.to_string(),
+                    "payload": &payload,
+                });
+                let _ = append_workdir_level_log(
+                    &ctx.conversation.workdir,
+                    "warn",
+                    "bad_terminal_payload",
+                    detail.clone(),
+                );
+                emit_channel_event(
+                    event_tx,
+                    ChannelEvent::Error {
+                        code: "channel.bad_terminal_payload".to_string(),
+                        message: "Channel received an unsupported terminal response.".to_string(),
+                        detail: Some(error.to_string()),
+                    },
+                )?;
+                ctx.outbox.send(ServiceOutput::Status(ServiceStatusUpdate {
+                    addr: ctx.addr.clone(),
+                    label: "bad_terminal_payload".to_string(),
+                    detail,
+                }))?;
+                return Ok(());
+            }
+            Err(_) => {}
+        }
+    }
+
     if response_id.as_deref().is_some_and(|id| {
         pending_workspace
             .iter()
@@ -452,7 +509,13 @@ fn handle_channel_request(
                     }
                     Err(_) => match decode_terminal_response(payload.clone()) {
                         Ok(response) => {
-                            handle_terminal_response(ctx, event_tx, pending_terminal, response)?;
+                            handle_terminal_response(
+                                ctx,
+                                event_tx,
+                                pending_terminal,
+                                response_id.as_deref(),
+                                response,
+                            )?;
                         }
                         Err(_) => {
                             let detail = serde_json::json!({
@@ -745,12 +808,10 @@ fn handle_channel_ingress(
                     detail: serde_json::json!({"request_id": request_id}),
                 },
             )?;
-            ctx.outbox
-                .send(ServiceOutput::Call(terminal::terminal_call(
-                    ctx.addr.clone(),
-                    ServiceAddr::terminal(),
-                    request,
-                )?))?;
+            ctx.outbox.send(ServiceOutput::Call(
+                terminal::terminal_call(ctx.addr.clone(), ServiceAddr::terminal(), request)?
+                    .with_request_id(request_id),
+            ))?;
         }
     }
     Ok(())
@@ -912,17 +973,31 @@ fn pop_pending_workspace(
     pending_workspace.pop_front()
 }
 
+fn pop_pending_terminal(
+    pending_terminal: &mut VecDeque<PendingTerminalRequest>,
+    response_id: Option<&str>,
+) -> Option<PendingTerminalRequest> {
+    if let Some(response_id) = response_id {
+        if let Some(index) = pending_terminal
+            .iter()
+            .position(|pending| pending.request_id() == response_id)
+        {
+            return pending_terminal.remove(index);
+        }
+    }
+    pending_terminal.pop_front()
+}
+
 fn handle_terminal_response(
     ctx: &ServiceRunContext,
     event_tx: Option<&Sender<ChannelEvent>>,
     pending_terminal: &mut VecDeque<PendingTerminalRequest>,
+    response_id: Option<&str>,
     response: TerminalResponse,
 ) -> Result<()> {
     let request_id = match &response {
         TerminalResponse::Output { .. } => None,
-        _ => pending_terminal
-            .pop_front()
-            .map(|pending| pending.request_id),
+        _ => pop_pending_terminal(pending_terminal, response_id).map(|pending| pending.request_id),
     };
     emit_channel_event(
         event_tx,

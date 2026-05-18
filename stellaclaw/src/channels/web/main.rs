@@ -1484,7 +1484,10 @@ fn append_text_delta(existing_text: &str, delta: &str) -> String {
 }
 
 fn should_log_chat_stream_event(event_type: &str, _event: &Value) -> bool {
-    if matches!(event_type, "turn_started" | "turn_completed" | "stream_error") {
+    if matches!(
+        event_type,
+        "turn_started" | "turn_completed" | "stream_error"
+    ) {
         return true;
     }
     if !web_stream_debug_enabled() {

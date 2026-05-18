@@ -746,6 +746,19 @@ impl ConversationKernel {
             return self.handle_kernel_call(call);
         }
         let Some(handle) = self.services.get(&call.target) else {
+            if let Some(response_id) = call.request_id.clone() {
+                if !call.source.is_kernel() && self.has_service(&call.source) {
+                    return self.dispatch_call(ServiceCall::response_to(
+                        ServiceAddr::kernel(),
+                        call.source.clone(),
+                        encode_response(KernelResponse::Error {
+                            code: "service_not_found".to_string(),
+                            message: format!("service {} is not running", call.target),
+                        })?,
+                        Some(response_id),
+                    ));
+                }
+            }
             return Err(anyhow!("unknown service target {}", call.target));
         };
         handle
@@ -2201,6 +2214,41 @@ mod tests {
                     request_id: Some(request_id),
                     response: TerminalResponse::Terminals { terminals },
                 } if request_id == "term-list-1" && terminals.is_empty()
+            )
+        }));
+        kernel.stop_all("test finished").expect("services stop");
+    }
+
+    #[test]
+    fn channel_returns_terminal_error_when_terminal_service_missing() {
+        let mut kernel = test_kernel("channel_terminal_missing");
+        let (ingress_tx, ingress_rx) = crossbeam_channel::unbounded();
+        let (event_tx, event_rx) = crossbeam_channel::unbounded();
+        kernel
+            .mount_service_instance(
+                ServiceAddr::channel_id("scratch"),
+                ServiceKind::Channel,
+                Box::new(ChannelService::with_platform_events(ingress_rx, event_tx)),
+            )
+            .expect("channel mounts");
+
+        ingress_tx
+            .send(ChannelIngress::Terminal {
+                request_id: "term-list-missing".to_string(),
+                request: TerminalRequest::List,
+            })
+            .expect("terminal ingress sends");
+        kernel
+            .pump_for(Duration::from_millis(150))
+            .expect("terminal request drains");
+
+        assert!(event_rx.try_iter().any(|event| {
+            matches!(
+                event,
+                ChannelEvent::Terminal {
+                    request_id: Some(request_id),
+                    response: TerminalResponse::Error { .. },
+                } if request_id == "term-list-missing"
             )
         }));
         kernel.stop_all("test finished").expect("services stop");

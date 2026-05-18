@@ -941,7 +941,8 @@ function App() {
   const uiScale = clamp(settings?.uiScale, MIN_UI_SCALE, MAX_UI_SCALE) || 1;
   const terminalFontSize = clamp(displayFontSize + 1, 11, 22) || 13;
   const selectedKey = selected ? conversationKey(selected.serverId, selected.conversationId, selectedSessionId) : '';
-  const selectedConversationUiKey = selected ? conversationKey(selected.serverId, selected.conversationId, 'main') : '';
+  const selectedConversationUiKey = selectedKey;
+  const legacyConversationUiKey = selected ? conversationKey(selected.serverId, selected.conversationId, 'main') : '';
   const selectedStatus = selected ? statuses.get(selectedKey) : null;
   const selectedChatSessionState = chatSessionState.scopeKey === selectedKey
     ? chatSessionState
@@ -1618,7 +1619,9 @@ function App() {
       return undefined;
     }
     const key = selectedConversationUiKey;
-    const savedUi = settings.conversationUi?.[key] || {};
+    const savedUi = settings.conversationUi?.[key]
+      || (key !== legacyConversationUiKey ? settings.conversationUi?.[legacyConversationUiKey] : null)
+      || {};
     const savedPanels = savedUi.panels || {};
     const savedLayout = layoutSnapshotFromValues({ ...(settings.layout || {}), ...(savedUi.layout || {}) });
     const savedFiles = Array.isArray(savedUi.openFiles)
@@ -1716,7 +1719,7 @@ function App() {
     return () => {
       disposed = true;
     };
-  }, [selected?.serverId, selected?.conversationId, selectedConversationUiKey, settingsReady, loadPdfPreviewIntoTab, readWorkspaceResourceCache, writeWorkspaceResourceCache, loadWorkspaceFileCached]);
+  }, [selected?.serverId, selected?.conversationId, selectedSessionId, selectedConversationUiKey, legacyConversationUiKey, settingsReady, loadPdfPreviewIntoTab, readWorkspaceResourceCache, writeWorkspaceResourceCache, loadWorkspaceFileCached]);
 
   useEffect(() => {
     if (!selectedConversationUiKey || !settings || restoringUiRef.current) return;
