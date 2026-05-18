@@ -682,6 +682,7 @@ function App() {
       : document.visibilityState === 'visible' && document.hasFocus()
   ));
   const messagesRef = useRef([]);
+  const chatSessionStateRef = useRef({ state: 'idle' });
   const conversationsRef = useRef([]);
   const openFilesRef = useRef([]);
   const appForegroundRef = useRef(appForeground);
@@ -704,6 +705,10 @@ function App() {
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  useEffect(() => {
+    chatSessionStateRef.current = chatSessionState;
+  }, [chatSessionState]);
 
   useEffect(() => {
     conversationsRef.current = conversations;
@@ -2034,6 +2039,13 @@ function App() {
       const type = streamEventType(event);
       if (!type || disposed || websocketKeyRef.current !== key) return;
       const scopedChatState = (state) => ({ scopeKey: key, ...state });
+      const turnIdFromState = (state) => String(
+        state?.activeTurnId
+        || state?.active_turn_id
+        || state?.currentTurnState?.turn_id
+        || state?.currentTurnState?.turnId
+        || ''
+      ).trim();
       const keepOrSetRunningState = (current, eventPayload) => (
         chatSessionStateIsActive(current) && current.scopeKey === key
           ? current
@@ -2046,11 +2058,31 @@ function App() {
           streamBuffers.reset();
         }
         if (patch.chatState) {
-          setChatSessionState((current) => (
-            patch.chatState.state === 'running' && !patch.forceChatState
+          const previousState = chatSessionStateRef.current;
+          if (patch.forceChatState && patch.chatState.state === 'running') {
+            const previousTurnId = turnIdFromState(previousState);
+            const nextTurnId = turnIdFromState(patch.chatState);
+            if (
+              previousState?.scopeKey === key
+              && chatSessionStateIsActive(previousState)
+              && previousTurnId
+              && nextTurnId
+              && previousTurnId !== nextTurnId
+            ) {
+              console.warn('chat protocol warning: stream_turn_start received before previous turn completed', {
+                scopeKey: key,
+                previousTurnId,
+                nextTurnId
+              });
+            }
+          }
+          setChatSessionState((current) => {
+            const nextState = patch.chatState.state === 'running' && !patch.forceChatState
               ? keepOrSetRunningState(current, patch.chatState.currentTurnState || event)
-              : scopedChatState(patch.chatState)
-          ));
+              : scopedChatState(patch.chatState);
+            chatSessionStateRef.current = nextState;
+            return nextState;
+          });
         }
         if (patch.messages) {
           messagesRef.current = patch.messages;
