@@ -1108,6 +1108,10 @@ impl ChatLiveState {
             .get("item_id")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        let explicit_call_id = event
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty());
         let call_id = event
             .get("call_id")
             .and_then(Value::as_str)
@@ -1138,11 +1142,16 @@ impl ChatLiveState {
         if let Some(items) = Self::message_items_mut(message) {
             let next_index = items.len();
             if let Some(item) = items.iter_mut().find(|item| {
-                item.get("type").and_then(Value::as_str) == Some("tool_call")
-                    && item
-                        .get("tool_call_id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| id == call_id)
+                if item.get("type").and_then(Value::as_str) != Some("tool_call") {
+                    return false;
+                }
+                let existing_call_id = item.get("tool_call_id").and_then(Value::as_str);
+                let existing_item_id = item.get("_item_id").and_then(Value::as_str);
+                existing_call_id.is_some_and(|id| id == call_id)
+                    || (!item_id.is_empty() && existing_item_id.is_some_and(|id| id == item_id))
+                    || explicit_call_id.is_some()
+                        && !item_id.is_empty()
+                        && existing_call_id.is_some_and(|id| id == item_id)
             }) {
                 if let Value::Object(map) = item {
                     let existing = map
@@ -1153,6 +1162,12 @@ impl ChatLiveState {
                         "arguments".to_string(),
                         json!(append_text_delta(existing, delta)),
                     );
+                    if let Some(call_id) = explicit_call_id {
+                        map.insert("tool_call_id".to_string(), json!(call_id));
+                    }
+                    if !item_id.is_empty() {
+                        map.insert("_item_id".to_string(), json!(item_id));
+                    }
                     map.insert("tool_name".to_string(), json!(tool_name));
                 }
             } else {
@@ -1160,6 +1175,7 @@ impl ChatLiveState {
                     "type": "tool_call",
                     "index": next_index,
                     "tool_call_id": call_id,
+                    "_item_id": item_id,
                     "tool_name": tool_name,
                     "arguments": delta,
                 }));
@@ -1532,7 +1548,9 @@ fn item_id_if_readable(item_id: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
-    use stellaclaw_core::session_actor::{ChatMessage, ChatMessageItem, ChatRole, ContextItem};
+    use stellaclaw_core::session_actor::{
+        ChatMessage, ChatMessageItem, ChatRole, ContextItem, ToolCallItem,
+    };
 
     use super::{protocol::public_chat_stream_payload, ChatLiveState};
 
@@ -1659,6 +1677,52 @@ mod tests {
             ChatRole::Assistant,
             vec![ChatMessageItem::Context(ContextItem {
                 text: "hello".to_string(),
+            })],
+        )
+        .with_message_id("msg-1");
+        assert!(state.commit_consistency_error(&message).is_none());
+    }
+
+    #[test]
+    fn live_state_updates_tool_call_id_alias_from_completed_metadata() {
+        let mut state = ChatLiveState::default();
+        let first = json!({
+            "type": "stream_tool_call_delta",
+            "message_id": "msg-1",
+            "turn_id": "turn-1",
+            "in_message_index": 0,
+            "item_id": "fc_1",
+            "tool_name": "apply_patch",
+            "delta": "{\"patch\"",
+        });
+        assert!(state
+            .validate_stream_event(&first, "stream_tool_call_delta")
+            .is_none());
+        state.record_session_stream(&first, "stream_tool_call_delta");
+
+        let metadata = json!({
+            "type": "stream_tool_call_delta",
+            "message_id": "msg-1",
+            "turn_id": "turn-1",
+            "in_message_index": 1,
+            "item_id": "fc_1",
+            "call_id": "call_1",
+            "tool_name": "apply_patch",
+            "delta": "",
+        });
+        assert!(state
+            .validate_stream_event(&metadata, "stream_tool_call_delta")
+            .is_none());
+        state.record_session_stream(&metadata, "stream_tool_call_delta");
+
+        let message = ChatMessage::new(
+            ChatRole::Assistant,
+            vec![ChatMessageItem::ToolCall(ToolCallItem {
+                tool_call_id: "call_1".to_string(),
+                tool_name: "apply_patch".to_string(),
+                arguments: ContextItem {
+                    text: "{\"patch\"".to_string(),
+                },
             })],
         )
         .with_message_id("msg-1");

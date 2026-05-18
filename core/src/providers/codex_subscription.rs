@@ -2157,11 +2157,36 @@ impl StreamAccumulator {
             .map(str::to_string)
             .or_else(|| call_id.clone())?;
         let keys = tool_input_stream_keys(&item_id, call_id.as_deref());
-        if keys.iter().any(|key| {
+        let has_streamed_alias = keys.iter().any(|key| {
             self.streamed_tool_inputs
                 .iter()
                 .any(|existing| existing == key)
-        }) {
+        });
+        let missing_alias = keys.iter().any(|key| {
+            !self
+                .streamed_tool_inputs
+                .iter()
+                .any(|existing| existing == key)
+        });
+        if has_streamed_alias {
+            for key in keys {
+                if !self
+                    .streamed_tool_inputs
+                    .iter()
+                    .any(|existing| existing == &key)
+                {
+                    self.streamed_tool_inputs.push(key);
+                }
+            }
+            if call_id.is_some() && missing_alias {
+                let tool_name = item.get("name").and_then(Value::as_str).map(str::to_string);
+                return Some(ProviderStreamEvent::ToolCallInputDelta {
+                    item_id,
+                    call_id,
+                    tool_name,
+                    delta: String::new(),
+                });
+            }
             return None;
         }
         self.streamed_tool_inputs.extend(keys);
@@ -3045,7 +3070,19 @@ mod tests {
             }]
         }));
 
-        assert!(events.is_empty());
+        assert_eq!(events.len(), 1);
+        let ProviderStreamEvent::ToolCallInputDelta {
+            item_id,
+            call_id,
+            delta,
+            ..
+        } = &events[0]
+        else {
+            panic!("expected tool call input delta event");
+        };
+        assert_eq!(item_id, "fc_1");
+        assert_eq!(call_id.as_deref(), Some("call_1"));
+        assert!(delta.is_empty());
     }
 
     #[test]
