@@ -307,6 +307,7 @@ fn claude_content_blocks(message: &ChatMessage) -> Vec<Value> {
     for item in &message.data {
         match item {
             ChatMessageItem::Reasoning(_)
+            | ChatMessageItem::Compaction(_)
             | ChatMessageItem::ToolCall(_)
             | ChatMessageItem::ToolResult(_) => {}
             ChatMessageItem::Context(context) => {

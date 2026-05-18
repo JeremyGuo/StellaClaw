@@ -398,6 +398,14 @@ fn user_responses_content(message: &ChatMessage) -> Vec<Value> {
     for item in &message.data {
         match item {
             ChatMessageItem::Reasoning(_) | ChatMessageItem::ToolResult(_) => {}
+            ChatMessageItem::Compaction(compaction) => {
+                if let Some(text) = compaction.generic_summary_text() {
+                    content.push(json!({
+                        "type": "input_text",
+                        "text": text,
+                    }));
+                }
+            }
             ChatMessageItem::Context(context) => {
                 content.push(json!({
                     "type": "input_text",
@@ -436,6 +444,14 @@ fn assistant_responses_content(message: &ChatMessage) -> Vec<Value> {
                     "type": "output_text",
                     "text": context.text,
                 }));
+            }
+            ChatMessageItem::Compaction(compaction) => {
+                if let Some(text) = compaction.generic_summary_text() {
+                    content.push(json!({
+                        "type": "output_text",
+                        "text": text,
+                    }));
+                }
             }
             ChatMessageItem::SelectionReference(selection) => {
                 content.push(json!({

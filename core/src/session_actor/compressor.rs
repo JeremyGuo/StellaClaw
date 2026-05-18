@@ -8,7 +8,7 @@ use crate::{
 };
 
 use super::{
-    ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem, TokenEstimator,
+    ChatMessage, ChatMessageItem, ChatRole, CompactionItem, ContextItem, FileItem, TokenEstimator,
     TokenEstimatorError, ToolDefinition, ToolResultContent,
 };
 
@@ -392,7 +392,9 @@ impl SessionCompressor {
             replacement_messages: {
                 let mut messages = vec![ChatMessage::new(
                     ChatRole::Compaction,
-                    vec![ChatMessageItem::Context(ContextItem { text: summary_text })],
+                    vec![ChatMessageItem::Compaction(
+                        CompactionItem::generic_summary(summary_text),
+                    )],
                 )];
                 messages.extend(preserved_tool_messages);
                 messages
@@ -588,6 +590,13 @@ fn sanitize_message_for_compression_request(
             ChatMessageItem::Reasoning(_) => {}
             ChatMessageItem::Context(context) => {
                 data.push(ChatMessageItem::Context(context.clone()))
+            }
+            ChatMessageItem::Compaction(compaction) => {
+                if let Some(text) = compaction.generic_summary_text() {
+                    data.push(ChatMessageItem::Context(ContextItem {
+                        text: text.to_string(),
+                    }));
+                }
             }
             ChatMessageItem::SelectionReference(selection) => {
                 data.push(ChatMessageItem::Context(ContextItem {
@@ -903,6 +912,13 @@ fn message_text(message: &ChatMessage) -> String {
             ChatMessageItem::Context(context) => {
                 if !context.text.trim().is_empty() {
                     parts.push(context.text.clone());
+                }
+            }
+            ChatMessageItem::Compaction(compaction) => {
+                if let Some(text) = compaction.generic_summary_text() {
+                    if !text.trim().is_empty() {
+                        parts.push(text.to_string());
+                    }
                 }
             }
             ChatMessageItem::SelectionReference(selection) => {

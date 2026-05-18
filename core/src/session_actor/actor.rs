@@ -3129,6 +3129,11 @@ fn message_text_for_memory_query(message: &ChatMessage) -> String {
     for item in &message.data {
         match item {
             ChatMessageItem::Context(context) => parts.push(context.text.trim().to_string()),
+            ChatMessageItem::Compaction(compaction) => {
+                if let Some(text) = compaction.generic_summary_text() {
+                    parts.push(text.trim().to_string());
+                }
+            }
             ChatMessageItem::SelectionReference(selection) => {
                 parts.push(selection.to_prompt_text());
             }
@@ -6376,6 +6381,7 @@ mod tests {
             .iter()
             .filter_map(|item| match item {
                 ChatMessageItem::Context(context) => Some(context.text.as_str()),
+                ChatMessageItem::Compaction(compaction) => compaction.generic_summary_text(),
                 _ => None,
             })
             .collect::<Vec<_>>()

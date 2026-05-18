@@ -933,6 +933,11 @@ fn render_chat_message(message: &ChatMessage) -> String {
     for item in &message.data {
         match item {
             ChatMessageItem::Context(context) => parts.push(context.text.clone()),
+            ChatMessageItem::Compaction(compaction) => {
+                if let Some(text) = compaction.generic_summary_text() {
+                    parts.push(text.to_string());
+                }
+            }
             ChatMessageItem::SelectionReference(selection) => {
                 parts.push(selection.to_prompt_text());
             }

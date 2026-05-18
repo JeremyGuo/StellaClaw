@@ -31,7 +31,7 @@ use thiserror::Error;
 
 use crate::{
     model_config::{ModelConfig, ProviderType, RetryMode},
-    session_actor::{ChatMessage, ToolDefinition, ToolSet},
+    session_actor::{ChatMessage, ChatMessageItem, ChatRole, ContextItem, ToolDefinition, ToolSet},
 };
 
 pub use brave_search::BraveSearchProvider;
@@ -80,11 +80,7 @@ pub trait Provider {
     }
 
     fn normalize_messages_for_provider(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
-        messages
-            .iter()
-            .filter(|message| !matches!(message.role, crate::session_actor::ChatRole::Compaction))
-            .cloned()
-            .collect()
+        normalize_compaction_for_generic_provider(messages)
     }
 
     fn tool_set(&self) -> Option<Arc<dyn ToolSet>> {
@@ -135,11 +131,7 @@ pub(crate) trait ProviderBackend: Send + Sync {
         _model_config: &ModelConfig,
         messages: &[ChatMessage],
     ) -> Vec<ChatMessage> {
-        messages
-            .iter()
-            .filter(|message| !matches!(message.role, crate::session_actor::ChatRole::Compaction))
-            .cloned()
-            .collect()
+        normalize_compaction_for_generic_provider(messages)
     }
 
     fn tool_set(&self, _model_config: &ModelConfig) -> Option<Arc<dyn ToolSet>> {
@@ -347,6 +339,40 @@ fn provider_backend_from_model_config(
         ProviderType::BraveSearchVideo => Box::new(BraveSearchVideoProvider::new()),
         ProviderType::BraveSearchNews => Box::new(BraveSearchNewsProvider::new()),
     }
+}
+
+fn normalize_compaction_for_generic_provider(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    messages
+        .iter()
+        .filter_map(|message| {
+            if message.role != ChatRole::Compaction {
+                return Some(message.clone());
+            }
+            let data = message
+                .data
+                .iter()
+                .filter_map(|item| match item {
+                    ChatMessageItem::Compaction(compaction) => compaction
+                        .generic_summary_text()
+                        .filter(|text| !text.trim().is_empty())
+                        .map(|text| {
+                            ChatMessageItem::Context(ContextItem {
+                                text: text.to_string(),
+                            })
+                        }),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (!data.is_empty()).then(|| ChatMessage {
+                message_id: message.message_id.clone(),
+                role: ChatRole::User,
+                user_name: message.user_name.clone(),
+                message_time: message.message_time.clone(),
+                token_usage: message.token_usage.clone(),
+                data,
+            })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]

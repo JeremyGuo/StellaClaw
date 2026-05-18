@@ -570,6 +570,11 @@ fn render_message_content(message: &ChatMessage) -> String {
             ChatMessageItem::Context(context) => {
                 sections.push(context.text.clone());
             }
+            ChatMessageItem::Compaction(compaction) => {
+                if let Some(text) = compaction.generic_summary_text() {
+                    sections.push(text.to_string());
+                }
+            }
             ChatMessageItem::SelectionReference(selection) => {
                 sections.push(selection.to_prompt_text());
             }
@@ -598,6 +603,7 @@ fn render_openai_message_content(message: &ChatMessage) -> String {
     for item in &message.data {
         match item {
             ChatMessageItem::Reasoning(_)
+            | ChatMessageItem::Compaction(_)
             | ChatMessageItem::File(_)
             | ChatMessageItem::ToolCall(_) => {}
             ChatMessageItem::Context(context) => {
@@ -687,6 +693,7 @@ fn collect_message_files(message: &ChatMessage) -> Vec<FileItem> {
                 files.extend(tool_result.result.files.iter().cloned());
             }
             ChatMessageItem::Reasoning(_)
+            | ChatMessageItem::Compaction(_)
             | ChatMessageItem::Context(_)
             | ChatMessageItem::SelectionReference(_)
             | ChatMessageItem::ToolCall(_) => {}

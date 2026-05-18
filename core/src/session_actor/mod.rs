@@ -19,10 +19,10 @@ pub use actor::{
     SessionActorRequestSender, SessionActorStep,
 };
 pub use chat_message::{
-    structured_tool_value, ChatMessage, ChatMessageItem, ChatRole, ContextItem, FileItem,
-    FileState, ReasoningItem, ReasoningSummaryPart, SelectionContext, SelectionLocator,
-    SelectionRect, SelectionReferenceItem, TokenUsage, TokenUsageCost, ToolCallItem,
-    ToolResultContent, ToolResultItem,
+    structured_tool_value, ChatMessage, ChatMessageItem, ChatRole, CompactionItem, CompactionKind,
+    ContextItem, FileItem, FileState, ReasoningItem, ReasoningSummaryPart, SelectionContext,
+    SelectionLocator, SelectionRect, SelectionReferenceItem, TokenUsage, TokenUsageCost,
+    ToolCallItem, ToolResultContent, ToolResultItem,
 };
 pub use chat_message::{tool_result_structured_text, tool_result_text};
 pub use compressor::{CompressionError, CompressionReport, SessionCompressor, COMPRESSION_MARKER};

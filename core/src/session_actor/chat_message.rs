@@ -2,6 +2,8 @@ use serde::de::Error as DeError;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 
+use crate::model_config::ProviderType;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatRole {
@@ -104,10 +106,62 @@ impl ChatMessage {
 pub enum ChatMessageItem {
     Reasoning(ReasoningItem),
     Context(ContextItem),
+    Compaction(CompactionItem),
     SelectionReference(SelectionReferenceItem),
     File(FileItem),
     ToolCall(ToolCallItem),
     ToolResult(ToolResultItem),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionKind {
+    GenericSummary,
+    ProviderBuiltin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CompactionItem {
+    pub kind: CompactionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_type: Option<ProviderType>,
+    pub payload: Value,
+}
+
+impl CompactionItem {
+    pub fn generic_summary(text: impl Into<String>) -> Self {
+        Self {
+            kind: CompactionKind::GenericSummary,
+            provider_type: None,
+            payload: json!({ "text": text.into() }),
+        }
+    }
+
+    pub fn provider_builtin(provider_type: ProviderType, payload: Value) -> Self {
+        Self {
+            kind: CompactionKind::ProviderBuiltin,
+            provider_type: Some(provider_type),
+            payload,
+        }
+    }
+
+    pub fn generic_summary_text(&self) -> Option<&str> {
+        if self.kind != CompactionKind::GenericSummary {
+            return None;
+        }
+        self.payload.get("text").and_then(Value::as_str)
+    }
+
+    pub fn codex_encrypted_content(&self) -> Option<&str> {
+        if self.kind != CompactionKind::ProviderBuiltin
+            || self.provider_type.as_ref() != Some(&ProviderType::CodexSubscription)
+        {
+            return None;
+        }
+        self.payload
+            .get("encrypted_content")
+            .and_then(Value::as_str)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

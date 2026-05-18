@@ -20,6 +20,7 @@ mod v0_2;
 mod v0_20;
 mod v0_21;
 mod v0_22;
+mod v0_23;
 mod v0_3;
 mod v0_4;
 mod v0_5;
@@ -50,7 +51,8 @@ pub const WORKDIR_VERSION_0_19: &str = "0.19";
 pub const WORKDIR_VERSION_0_20: &str = "0.20";
 pub const WORKDIR_VERSION_0_21: &str = "0.21";
 pub const WORKDIR_VERSION_0_22: &str = "0.22";
-pub const LATEST_WORKDIR_VERSION: &str = "0.23";
+pub const WORKDIR_VERSION_0_23: &str = "0.23";
+pub const LATEST_WORKDIR_VERSION: &str = "0.24";
 pub const PARTYCLAW_LATEST_WORKDIR_VERSION: &str = "0.39";
 
 const WORKDIR_VERSION_FILE: &str = "STELLA_VERSION";
@@ -69,7 +71,7 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
     let legacy_version_path = workdir.join(LEGACY_WORKDIR_VERSION_FILE);
     let mut current = read_workdir_version(&version_path, &legacy_version_path)?;
     let mut upgraded = false;
-    let upgraders: [&dyn WorkdirUpgrader; 23] = [
+    let upgraders: [&dyn WorkdirUpgrader; 24] = [
         &v0_1::LegacyUpgrade,
         &v0_1::PartyClawUpgrade,
         &v0_2::ChatMessageReasoningUpgrade,
@@ -93,6 +95,7 @@ pub fn upgrade_workdir(workdir: &Path, config: &StellaclawConfig) -> Result<bool
         &v0_20::WebSeenStateUpgrade,
         &v0_21::RemoveStatusServiceUpgrade,
         &v0_22::RuntimeConfigIdleCompactUpgrade,
+        &v0_23::ChatMessageCompactionItemUpgrade,
     ];
 
     while current != LATEST_WORKDIR_VERSION {
@@ -153,6 +156,7 @@ fn read_version_file(version_path: &Path) -> Result<&'static str> {
         WORKDIR_VERSION_0_20 => Ok(WORKDIR_VERSION_0_20),
         WORKDIR_VERSION_0_21 => Ok(WORKDIR_VERSION_0_21),
         WORKDIR_VERSION_0_22 => Ok(WORKDIR_VERSION_0_22),
+        WORKDIR_VERSION_0_23 => Ok(WORKDIR_VERSION_0_23),
         LATEST_WORKDIR_VERSION => Ok(LATEST_WORKDIR_VERSION),
         other => Err(anyhow!("unsupported workdir version '{}'", other)),
     }

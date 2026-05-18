@@ -40,8 +40,8 @@ Serialized as lowercase snake case:
 `ChatRole::Compaction` has special request behavior:
 
 - Codex subscription may replay opaque encrypted compaction payloads as Responses `compaction` items.
-- Providers without matching support should filter it before context estimation and request translation.
-- Generic summary compaction may store human-readable summary text in `ContextItem`; provider translators are still responsible for deciding whether that text is usable for the target provider.
+- Providers without matching support should ignore provider-specific builtin payloads before context estimation and request translation.
+- Generic summary compaction stores human-readable summary text in `ChatMessageItem::Compaction`; default provider normalization materializes that summary as ordinary user-side context.
 - It should not be rendered as an ordinary chat message unless a debug or inspection UI intentionally exposes compacted context.
 
 ### `user_name`
@@ -118,6 +118,7 @@ USD cost values corresponding to the token buckets above.
 pub enum ChatMessageItem {
     Reasoning(ReasoningItem),
     Context(ContextItem),
+    Compaction(CompactionItem),
     SelectionReference(SelectionReferenceItem),
     File(FileItem),
     ToolCall(ToolCallItem),
@@ -150,6 +151,30 @@ Typical uses:
 - fallback text when media cannot be sent directly to a model
 
 `text` may contain structured strings such as JSON, XML-like tool-call fallbacks, or system-generated metadata blocks.
+
+### `Compaction`
+
+Structured compacted-history payload.
+
+```rust
+pub enum CompactionKind {
+    GenericSummary,
+    ProviderBuiltin,
+}
+
+pub struct CompactionItem {
+    pub kind: CompactionKind,
+    pub provider_type: Option<ProviderType>,
+    pub payload: serde_json::Value,
+}
+```
+
+Uses:
+
+- `generic_summary`: provider-neutral summary text stored as `{"text": "..."}`. Providers that do not support a specialized compact format should materialize this as user-side context.
+- `provider_builtin`: provider-specific compact state. Codex subscription stores Responses compact state as `provider_type = CodexSubscription` with `{"encrypted_content": "..."}` and replays it as a Responses `compaction` item.
+
+Provider-specific builtin compaction must not be sent to a different provider. Generic summary compaction is portable.
 
 ### `SelectionReference`
 

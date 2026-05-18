@@ -2,18 +2,18 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use super::{WorkdirUpgrader, WORKDIR_VERSION_0_22, WORKDIR_VERSION_0_23};
+use super::{WorkdirUpgrader, LATEST_WORKDIR_VERSION, WORKDIR_VERSION_0_23};
 use crate::config::StellaclawConfig;
 
-pub struct RuntimeConfigIdleCompactUpgrade;
+pub struct ChatMessageCompactionItemUpgrade;
 
-impl WorkdirUpgrader for RuntimeConfigIdleCompactUpgrade {
+impl WorkdirUpgrader for ChatMessageCompactionItemUpgrade {
     fn from_version(&self) -> &'static str {
-        WORKDIR_VERSION_0_22
+        WORKDIR_VERSION_0_23
     }
 
     fn to_version(&self) -> &'static str {
-        WORKDIR_VERSION_0_23
+        LATEST_WORKDIR_VERSION
     }
 
     fn upgrade(&self, _workdir: &Path, _config: &StellaclawConfig) -> Result<()> {

@@ -16,13 +16,13 @@ use tungstenite::{
 use url::Url;
 
 use crate::{
-    model_config::ModelConfig,
+    model_config::{ModelConfig, ProviderType},
     session_actor::{
         media_tool_definitions, normalize_messages_for_model, BuiltinBaseTool, ChatMessage,
-        ChatMessageItem, ChatRole, ContextItem, ExtTool, FileItem, LocalToolError, ReasoningItem,
-        ToolBackend, ToolCallContext, ToolCallItem, ToolCatalog, ToolCatalogError, ToolConcurrency,
-        ToolDefinition, ToolEnablementEnv, ToolEntry, ToolExecutionMode, ToolResultContent,
-        ToolSet,
+        ChatMessageItem, ChatRole, CompactionItem, ContextItem, ExtTool, FileItem, LocalToolError,
+        ReasoningItem, ToolBackend, ToolCallContext, ToolCallItem, ToolCatalog, ToolCatalogError,
+        ToolConcurrency, ToolDefinition, ToolEnablementEnv, ToolEntry, ToolExecutionMode,
+        ToolResultContent, ToolSet,
     },
 };
 
@@ -275,7 +275,12 @@ impl CodexSubscriptionProvider {
         loop {
             let mut active_socket = match socket.take() {
                 Some(socket) => socket,
-                None => connect_codex_websocket(model_config, auth, &self.session_id)?,
+                None => connect_codex_websocket(
+                    model_config,
+                    auth,
+                    &self.session_id,
+                    &self.installation_id,
+                )?,
             };
             let response =
                 send_response_create(&mut active_socket, payload.clone(), model_config, on_stream);
@@ -380,8 +385,9 @@ impl CodexSubscriptionProvider {
             .header("authorization", format!("Bearer {}", auth.access_token))
             .header("chatgpt-account-id", auth.account_id.clone())
             .header("openai-beta", OPENAI_BETA_RESPONSES_WEBSOCKETS)
-            .header("user-agent", "codex-cli")
+            .header("user-agent", "stellaclaw")
             .header("x-client-request-id", nonce("compact"))
+            .header("x-codex-installation-id", self.installation_id.clone())
             .header("session_id", self.session_id.clone())
             .header("x-codex-window-id", format!("{}:0", self.session_id))
             .json(&Value::Object(payload));
@@ -414,11 +420,11 @@ impl CodexSubscriptionProvider {
         }
 
         let auth = self.auth_manager.resolve(model_config)?;
-        let fetched = match fetch_codex_models(model_config, &auth) {
+        let fetched = match fetch_codex_models(model_config, &auth, &self.installation_id) {
             Ok(models) => models,
             Err(error) if is_unauthorized(&error) => {
                 let refreshed = self.auth_manager.refresh(model_config, &auth)?;
-                fetch_codex_models(model_config, &refreshed)?
+                fetch_codex_models(model_config, &refreshed, &self.installation_id)?
             }
             Err(error) => return Err(error),
         };
@@ -856,6 +862,15 @@ fn normalize_message_for_codex_provider(message: &ChatMessage) -> Option<ChatMes
                         None,
                     ))
                 }),
+            ChatMessageItem::Compaction(compaction) => {
+                if compaction.generic_summary_text().is_some()
+                    || compaction.codex_encrypted_content().is_some()
+                {
+                    Some(item.clone())
+                } else {
+                    None
+                }
+            }
             _ => Some(item.clone()),
         })
         .collect::<Vec<_>>();
@@ -874,6 +889,7 @@ fn connect_codex_websocket(
     model_config: &ModelConfig,
     auth: &CodexAuthMaterial,
     session_id: &str,
+    installation_id: &str,
 ) -> Result<WebSocket<MaybeTlsStream<TcpStream>>, ProviderError> {
     let websocket_url = build_websocket_url(&model_config.url)?;
     let mut request = websocket_url
@@ -902,7 +918,7 @@ fn connect_codex_websocket(
     );
     request
         .headers_mut()
-        .insert("user-agent", HeaderValue::from_static("codex-cli"));
+        .insert("user-agent", HeaderValue::from_static("stellaclaw"));
     request.headers_mut().insert(
         "x-client-request-id",
         HeaderValue::from_str(session_id)
@@ -916,6 +932,11 @@ fn connect_codex_websocket(
     request.headers_mut().insert(
         "x-codex-window-id",
         HeaderValue::from_str(&format!("{session_id}:0"))
+            .map_err(|error| ProviderError::WebSocket(error.to_string()))?,
+    );
+    request.headers_mut().insert(
+        "x-codex-installation-id",
+        HeaderValue::from_str(installation_id)
             .map_err(|error| ProviderError::WebSocket(error.to_string()))?,
     );
 
@@ -1252,6 +1273,7 @@ fn build_websocket_url(http_url: &str) -> Result<Url, ProviderError> {
 fn fetch_codex_models(
     model_config: &ModelConfig,
     auth: &CodexAuthMaterial,
+    installation_id: &str,
 ) -> Result<CachedCodexModels, ProviderError> {
     let endpoint = build_codex_models_url(model_config)?;
     let client = Client::builder()
@@ -1264,8 +1286,9 @@ fn fetch_codex_models(
         .header("authorization", format!("Bearer {}", auth.access_token))
         .header("chatgpt-account-id", auth.account_id.clone())
         .header("openai-beta", OPENAI_BETA_RESPONSES_WEBSOCKETS)
-        .header("user-agent", "codex-cli")
+        .header("user-agent", "stellaclaw")
         .header("x-client-request-id", nonce("models"))
+        .header("x-codex-installation-id", installation_id)
         .header("session_id", nonce("models-session"));
     if auth.is_fedramp_account {
         request = request.header("x-openai-fedramp", "true");
@@ -1361,9 +1384,12 @@ fn compact_response_value_to_chat_messages(
                 {
                     messages.push(ChatMessage::new(
                         ChatRole::Compaction,
-                        vec![ChatMessageItem::Context(ContextItem {
-                            text: encrypted_content.to_string(),
-                        })],
+                        vec![ChatMessageItem::Compaction(
+                            CompactionItem::provider_builtin(
+                                ProviderType::CodexSubscription,
+                                json!({ "encrypted_content": encrypted_content }),
+                            ),
+                        )],
                     ));
                 }
             }
@@ -1373,9 +1399,12 @@ fn compact_response_value_to_chat_messages(
                 {
                     messages.push(ChatMessage::new(
                         ChatRole::Compaction,
-                        vec![ChatMessageItem::Context(ContextItem {
-                            text: encrypted_content.to_string(),
-                        })],
+                        vec![ChatMessageItem::Compaction(
+                            CompactionItem::provider_builtin(
+                                ProviderType::CodexSubscription,
+                                json!({ "encrypted_content": encrypted_content }),
+                            ),
+                        )],
                     ));
                 }
             }
@@ -2100,11 +2129,25 @@ fn build_responses_input(
             }
             ChatRole::Compaction => {
                 for item in &message.data {
-                    if let ChatMessageItem::Context(context) = item {
-                        if !context.text.trim().is_empty() {
+                    let ChatMessageItem::Compaction(compaction) = item else {
+                        continue;
+                    };
+                    if let Some(encrypted_content) = compaction.codex_encrypted_content() {
+                        if !encrypted_content.trim().is_empty() {
                             input.push(json!({
                                 "type": "compaction",
-                                "encrypted_content": context.text,
+                                "encrypted_content": encrypted_content,
+                            }));
+                        }
+                    } else if let Some(summary) = compaction.generic_summary_text() {
+                        if !summary.trim().is_empty() {
+                            input.push(json!({
+                                "type": "message",
+                                "role": "user",
+                                "content": [{
+                                    "type": "input_text",
+                                    "text": summary,
+                                }],
                             }));
                         }
                     }
@@ -2243,6 +2286,14 @@ fn user_responses_content(message: &ChatMessage) -> Result<Vec<Value>, ProviderE
     for item in &message.data {
         match item {
             ChatMessageItem::Reasoning(_) | ChatMessageItem::ToolResult(_) => {}
+            ChatMessageItem::Compaction(compaction) => {
+                if let Some(text) = compaction.generic_summary_text() {
+                    content.push(json!({
+                        "type": "input_text",
+                        "text": text,
+                    }));
+                }
+            }
             ChatMessageItem::Context(context) => {
                 content.push(json!({
                     "type": "input_text",
@@ -2285,6 +2336,14 @@ fn append_assistant_response_items(
                     "type": "output_text",
                     "text": context.text,
                 }));
+            }
+            ChatMessageItem::Compaction(compaction) => {
+                if let Some(text) = compaction.generic_summary_text() {
+                    content.push(json!({
+                        "type": "output_text",
+                        "text": text,
+                    }));
+                }
             }
             ChatMessageItem::SelectionReference(selection) => {
                 content.push(json!({
@@ -3044,9 +3103,12 @@ mod tests {
     fn compaction_message_replays_as_responses_compaction_item() {
         let messages = vec![ChatMessage::new(
             ChatRole::Compaction,
-            vec![ChatMessageItem::Context(ContextItem {
-                text: "encrypted-compact-state".to_string(),
-            })],
+            vec![ChatMessageItem::Compaction(
+                CompactionItem::provider_builtin(
+                    ProviderType::CodexSubscription,
+                    json!({ "encrypted_content": "encrypted-compact-state" }),
+                ),
+            )],
         )];
 
         let input =
@@ -3083,7 +3145,8 @@ mod tests {
         assert_eq!(messages[1].role, ChatRole::User);
         assert!(matches!(
             messages[0].data.first(),
-            Some(ChatMessageItem::Context(ContextItem { text })) if text == "encrypted-compact-state"
+            Some(ChatMessageItem::Compaction(compaction))
+                if compaction.codex_encrypted_content() == Some("encrypted-compact-state")
         ));
     }
 

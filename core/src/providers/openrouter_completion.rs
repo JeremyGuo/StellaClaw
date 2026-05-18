@@ -602,6 +602,11 @@ fn collect_visible_text_segments(message: &ChatMessage) -> Vec<String> {
         match item {
             ChatMessageItem::Reasoning(_) => {}
             ChatMessageItem::Context(context) => segments.push(context.text.clone()),
+            ChatMessageItem::Compaction(compaction) => {
+                if let Some(text) = compaction.generic_summary_text() {
+                    segments.push(text.to_string());
+                }
+            }
             ChatMessageItem::SelectionReference(selection) => {
                 segments.push(selection.to_prompt_text());
             }
