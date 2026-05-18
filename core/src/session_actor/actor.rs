@@ -31,9 +31,10 @@ use super::{
     system_prompt_for_initial_with_common_prompt, ChatMessage, ChatMessageItem, ChatRole,
     CompressionError, CompressionReport, ContextItem, ConversationBridge,
     ConversationBridgeRequest, SessionCompressor, SessionErrorDetail, SessionEvent, SessionInitial,
-    SessionMailbox, SessionMailboxKind, SessionRequest, TaskPlanItemStatus, TaskPlanView,
-    TokenEstimator, ToolBatch, ToolBatchCompletion, ToolBatchExecutor, ToolBatchItem,
-    ToolBatchOperation, ToolBatchProgress, ToolCatalog, ToolResultContent,
+    SessionMailbox, SessionMailboxKind, SessionMessageHistory, SessionMessageRecord,
+    SessionRequest, TaskPlanItemStatus, TaskPlanView, TokenEstimator, ToolBatch,
+    ToolBatchCompletion, ToolBatchExecutor, ToolBatchItem, ToolBatchOperation, ToolBatchProgress,
+    ToolCatalog, ToolResultContent,
 };
 
 const ACTIVE_COMPRESSION_THRESHOLD_RATIO: f64 = 0.9;
@@ -700,6 +701,15 @@ impl SessionActor {
             SessionRequest::QuerySessionView { query_id, payload } => {
                 self.handle_query_session_view(query_id, payload)
             }
+            SessionRequest::QueryMessageHistory {
+                request_id,
+                offset,
+                limit,
+            } => self.handle_query_message_history(request_id, offset, limit),
+            SessionRequest::QueryMessageDetail {
+                request_id,
+                message_id,
+            } => self.handle_query_message_detail(request_id, message_id),
             other => self.emit(SessionEvent::ControlRejected {
                 reason: "control command is not implemented by SessionActor yet".to_string(),
                 payload: serde_json::to_value(other)
@@ -936,6 +946,63 @@ impl SessionActor {
             query_id,
             payload: self.session_view_payload(payload),
         })
+    }
+
+    fn handle_query_message_history(
+        &self,
+        request_id: String,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(), SessionActorError> {
+        let total = self.all_messages.len();
+        let start = offset.min(total);
+        let end = start.saturating_add(limit.min(500)).min(total);
+        let messages = self.all_messages[start..end]
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(relative_index, message)| SessionMessageRecord {
+                index: start + relative_index,
+                message,
+            })
+            .collect::<Vec<_>>();
+        let last_message = self
+            .all_messages
+            .last()
+            .cloned()
+            .map(|message| SessionMessageRecord {
+                index: total.saturating_sub(1),
+                message,
+            });
+        self.emit(SessionEvent::MessageHistoryResult {
+            history: SessionMessageHistory {
+                request_id,
+                offset,
+                limit,
+                total,
+                last_message,
+                messages,
+            },
+        })
+    }
+
+    fn handle_query_message_detail(
+        &self,
+        request_id: String,
+        message_id: String,
+    ) -> Result<(), SessionActorError> {
+        let requested_index = message_id.parse::<usize>().ok();
+        let record = self
+            .all_messages
+            .iter()
+            .cloned()
+            .enumerate()
+            .find(|(index, message)| {
+                message.message_id == message_id
+                    || requested_index.is_some_and(|value| value == *index)
+            })
+            .map(|(index, message)| SessionMessageRecord { index, message });
+        self.emit(SessionEvent::MessageDetailResult { request_id, record })
     }
 
     fn session_view_payload(&self, payload: serde_json::Value) -> serde_json::Value {
@@ -3481,6 +3548,8 @@ fn session_request_kind(request: &SessionRequest) -> &'static str {
         SessionRequest::CompactNow => "compact_now",
         SessionRequest::ResolveHostCoordination { .. } => "resolve_host_coordination",
         SessionRequest::QuerySessionView { .. } => "query_session_view",
+        SessionRequest::QueryMessageHistory { .. } => "query_message_history",
+        SessionRequest::QueryMessageDetail { .. } => "query_message_detail",
         SessionRequest::Shutdown => "shutdown",
     }
 }
@@ -3647,6 +3716,19 @@ fn session_event_summary(event: &SessionEvent) -> serde_json::Value {
             "event": "session_view_result",
             "query_id": query_id,
             "payload": payload,
+        }),
+        SessionEvent::MessageHistoryResult { history } => serde_json::json!({
+            "event": "message_history_result",
+            "request_id": history.request_id,
+            "offset": history.offset,
+            "limit": history.limit,
+            "total": history.total,
+            "messages": history.messages.len(),
+        }),
+        SessionEvent::MessageDetailResult { request_id, record } => serde_json::json!({
+            "event": "message_detail_result",
+            "request_id": request_id,
+            "found": record.is_some(),
         }),
         SessionEvent::CompactCompleted {
             compressed,

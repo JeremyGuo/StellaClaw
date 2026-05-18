@@ -135,6 +135,15 @@ pub enum SessionRequest {
         query_id: String,
         payload: Value,
     },
+    QueryMessageHistory {
+        request_id: String,
+        offset: usize,
+        limit: usize,
+    },
+    QueryMessageDetail {
+        request_id: String,
+        message_id: String,
+    },
     Shutdown,
 }
 
@@ -149,9 +158,29 @@ impl SessionRequest {
             | SessionRequest::CompactNow
             | SessionRequest::ResolveHostCoordination { .. }
             | SessionRequest::QuerySessionView { .. }
+            | SessionRequest::QueryMessageHistory { .. }
+            | SessionRequest::QueryMessageDetail { .. }
             | SessionRequest::Shutdown => SessionMailboxKind::Control,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionMessageRecord {
+    pub index: usize,
+    pub message: ChatMessage,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionMessageHistory {
+    pub request_id: String,
+    pub offset: usize,
+    pub limit: usize,
+    pub total: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message: Option<SessionMessageRecord>,
+    #[serde(default)]
+    pub messages: Vec<SessionMessageRecord>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,6 +297,14 @@ pub enum SessionEvent {
     SessionViewResult {
         query_id: String,
         payload: Value,
+    },
+    MessageHistoryResult {
+        history: SessionMessageHistory,
+    },
+    MessageDetailResult {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record: Option<SessionMessageRecord>,
     },
     CompactCompleted {
         compressed: bool,

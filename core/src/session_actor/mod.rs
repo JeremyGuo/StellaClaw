@@ -30,9 +30,9 @@ pub(crate) use media_normalizer::normalize_messages_for_model;
 pub use runtime_metadata::SessionSkillObservation;
 pub use session_rpc::{
     ConversationTransport, SessionErrorDetail, SessionEvent, SessionInitial, SessionMailbox,
-    SessionMailboxKind, SessionRequest, SessionRpcConversationBridge, SessionRpcError,
-    SessionRpcThread, SessionType, TaskPlanItemStatus, TaskPlanItemView, TaskPlanView,
-    ToolRemoteMode,
+    SessionMailboxKind, SessionMessageHistory, SessionMessageRecord, SessionRequest,
+    SessionRpcConversationBridge, SessionRpcError, SessionRpcThread, SessionType,
+    TaskPlanItemStatus, TaskPlanItemView, TaskPlanView, ToolRemoteMode,
 };
 pub(crate) use system_prompt::system_prompt_for_initial_with_common_prompt;
 pub use token_estimator::{

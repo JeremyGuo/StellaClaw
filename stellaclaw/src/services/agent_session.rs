@@ -3,7 +3,6 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     fs,
-    io::{BufRead, BufReader, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::Command,
     sync::atomic::{AtomicU64, Ordering},
@@ -45,9 +44,9 @@ use crate::{
 use stellaclaw_core::model_config::{ModelCapability, ModelConfig};
 use stellaclaw_core::session_actor::{
     ChatMessage, ChatRole, ConversationBridgeRequest, ConversationBridgeResponse,
-    SessionErrorDetail, SessionEvent as CoreSessionEvent, SessionInitial,
-    SessionRequest as CoreSessionRequest, SessionType, TaskPlanItemStatus, TaskPlanView,
-    ToolRemoteMode, ToolResultContent, ToolResultItem,
+    SessionErrorDetail, SessionEvent as CoreSessionEvent, SessionInitial, SessionMessageHistory,
+    SessionMessageRecord, SessionRequest as CoreSessionRequest, SessionType, TaskPlanItemStatus,
+    TaskPlanView, ToolRemoteMode, ToolResultContent, ToolResultItem,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +105,7 @@ impl ConversationService for AgentSessionService {
         let mut pending_child_starts = VecDeque::new();
         let mut pending_service_responses = BTreeMap::new();
         let mut pending_subagent_joins = VecDeque::new();
+        let mut pending_message_queries: BTreeMap<String, PendingMessageQuery> = BTreeMap::new();
         let mut session_event_rx = runner
             .as_ref()
             .map(|runner| runner.events.clone())
@@ -147,6 +147,13 @@ impl ConversationService for AgentSessionService {
                 recv(session_event_rx) -> event => {
                     match event {
                         Ok(event) => {
+                            if handle_message_query_result(
+                                &ctx,
+                                &mut pending_message_queries,
+                                &event,
+                            )? {
+                                continue;
+                            }
                             handle_core_session_event(
                                 &ctx,
                                 &event_sink,
@@ -351,44 +358,58 @@ impl ConversationService for AgentSessionService {
                             offset,
                             limit,
                         }) => {
-                            let history = read_agent_session_history(
-                                &launch.conversation_root,
-                                &launch.session_id,
-                                request_id,
-                                offset,
-                                limit,
-                            )?;
-                            ctx.outbox.send(ServiceOutput::Call(
-                                crate::conversation_new::ServiceCall::response_to(
-                                    ctx.addr.clone(),
-                                    call.source,
-                                    encode_response(AgentSessionResponse::MessageHistory {
-                                        history,
-                                    })?,
-                                    call.request_id.clone(),
-                                ),
-                            ))?;
+                            if let Some(runner) = runner.as_mut() {
+                                runner.send(AgentSessionRequest::QueryMessages {
+                                    request_id: request_id.clone(),
+                                    offset,
+                                    limit,
+                                })?;
+                                pending_message_queries.insert(
+                                    request_id,
+                                    PendingMessageQuery::from_call(&call),
+                                );
+                            } else {
+                                let history =
+                                    skeleton_message_history(&state, request_id, offset, limit);
+                                ctx.outbox.send(ServiceOutput::Call(
+                                    crate::conversation_new::ServiceCall::response_to(
+                                        ctx.addr.clone(),
+                                        call.source,
+                                        encode_response(AgentSessionResponse::MessageHistory {
+                                            history,
+                                        })?,
+                                        call.request_id.clone(),
+                                    ),
+                                ))?;
+                            }
                         }
                         Ok(AgentSessionRequest::QueryMessageDetail {
                             request_id,
                             message_id,
                         }) => {
-                            let record = read_agent_session_message_detail(
-                                &launch.conversation_root,
-                                &launch.session_id,
-                                &message_id,
-                            )?;
-                            ctx.outbox.send(ServiceOutput::Call(
-                                crate::conversation_new::ServiceCall::response_to(
-                                    ctx.addr.clone(),
-                                    call.source,
-                                    encode_response(AgentSessionResponse::MessageDetail {
-                                        request_id,
-                                        record,
-                                    })?,
-                                    call.request_id.clone(),
-                                ),
-                            ))?;
+                            if let Some(runner) = runner.as_mut() {
+                                runner.send(AgentSessionRequest::QueryMessageDetail {
+                                    request_id: request_id.clone(),
+                                    message_id,
+                                })?;
+                                pending_message_queries.insert(
+                                    request_id,
+                                    PendingMessageQuery::from_call(&call),
+                                );
+                            } else {
+                                let record = skeleton_message_detail(&state, &message_id);
+                                ctx.outbox.send(ServiceOutput::Call(
+                                    crate::conversation_new::ServiceCall::response_to(
+                                        ctx.addr.clone(),
+                                        call.source,
+                                        encode_response(AgentSessionResponse::MessageDetail {
+                                            request_id,
+                                            record,
+                                        })?,
+                                        call.request_id.clone(),
+                                    ),
+                                ))?;
+                            }
                         }
                         Ok(AgentSessionRequest::QueryStatus) => {
                             ctx.outbox.send(ServiceOutput::Call(reply(
@@ -1114,6 +1135,118 @@ fn handle_core_session_event(
         }
         _ => emit_session_event(ctx, event_sink, from_core_session_event(event.clone())),
     }
+}
+
+fn handle_message_query_result(
+    ctx: &ServiceRunContext,
+    pending_message_queries: &mut BTreeMap<String, PendingMessageQuery>,
+    event: &CoreSessionEvent,
+) -> Result<bool> {
+    match event {
+        CoreSessionEvent::MessageHistoryResult { history } => {
+            let Some(pending) = pending_message_queries.remove(&history.request_id) else {
+                return Ok(false);
+            };
+            ctx.outbox
+                .send(ServiceOutput::Call(ServiceCall::response_to(
+                    ctx.addr.clone(),
+                    pending.source,
+                    encode_response(AgentSessionResponse::MessageHistory {
+                        history: agent_message_history_from_core(history.clone()),
+                    })?,
+                    pending.response_id,
+                )))?;
+            Ok(true)
+        }
+        CoreSessionEvent::MessageDetailResult { request_id, record } => {
+            let Some(pending) = pending_message_queries.remove(request_id) else {
+                return Ok(false);
+            };
+            ctx.outbox
+                .send(ServiceOutput::Call(ServiceCall::response_to(
+                    ctx.addr.clone(),
+                    pending.source,
+                    encode_response(AgentSessionResponse::MessageDetail {
+                        request_id: request_id.clone(),
+                        record: record.clone().map(agent_message_record_from_core),
+                    })?,
+                    pending.response_id,
+                )))?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn agent_message_history_from_core(history: SessionMessageHistory) -> AgentSessionMessageHistory {
+    AgentSessionMessageHistory {
+        request_id: history.request_id,
+        offset: history.offset,
+        limit: history.limit,
+        total: history.total,
+        last_message: history.last_message.map(agent_message_record_from_core),
+        messages: history
+            .messages
+            .into_iter()
+            .map(agent_message_record_from_core)
+            .collect(),
+    }
+}
+
+fn agent_message_record_from_core(record: SessionMessageRecord) -> AgentSessionMessageRecord {
+    AgentSessionMessageRecord {
+        index: record.index,
+        message: record.message,
+    }
+}
+
+fn skeleton_message_history(
+    state: &AgentSessionRuntimeState,
+    request_id: String,
+    offset: usize,
+    limit: usize,
+) -> AgentSessionMessageHistory {
+    let last_message = state
+        .last_message
+        .as_ref()
+        .map(|message| AgentSessionMessageRecord {
+            index: state.message_count.saturating_sub(1),
+            message: message.clone(),
+        });
+    let messages = last_message
+        .as_ref()
+        .filter(|record| {
+            let end = offset.saturating_add(limit.min(500));
+            record.index >= offset && record.index < end
+        })
+        .cloned()
+        .into_iter()
+        .collect();
+    AgentSessionMessageHistory {
+        request_id,
+        offset,
+        limit,
+        total: state.message_count,
+        last_message,
+        messages,
+    }
+}
+
+fn skeleton_message_detail(
+    state: &AgentSessionRuntimeState,
+    message_id: &str,
+) -> Option<AgentSessionMessageRecord> {
+    let last_index = state.message_count.saturating_sub(1);
+    state
+        .last_message
+        .as_ref()
+        .filter(|message| {
+            message.message_id == message_id || message_id.parse::<usize>().ok() == Some(last_index)
+        })
+        .map(|message| AgentSessionMessageRecord {
+            index: last_index,
+            message: message.clone(),
+        })
 }
 
 fn update_plan_bridge_response(
@@ -2738,6 +2871,20 @@ struct PendingBridgeRequest {
     request: ConversationBridgeRequest,
 }
 
+struct PendingMessageQuery {
+    source: ServiceAddr,
+    response_id: Option<String>,
+}
+
+impl PendingMessageQuery {
+    fn from_call(call: &ServiceCall) -> Self {
+        Self {
+            source: call.source.clone(),
+            response_id: call.request_id.clone(),
+        }
+    }
+}
+
 struct PendingSubagentJoin {
     request: ConversationBridgeRequest,
     agent_id: String,
@@ -2859,10 +3006,22 @@ fn to_core_session_request(request: AgentSessionRequest) -> Result<CoreSessionRe
         AgentSessionRequest::QueryContext { query_id, payload } => {
             Ok(CoreSessionRequest::QuerySessionView { query_id, payload })
         }
-        AgentSessionRequest::QueryMessages { .. }
-        | AgentSessionRequest::QueryMessageDetail { .. } => {
-            Err("message history queries are handled by service".to_string())
-        }
+        AgentSessionRequest::QueryMessages {
+            request_id,
+            offset,
+            limit,
+        } => Ok(CoreSessionRequest::QueryMessageHistory {
+            request_id,
+            offset,
+            limit,
+        }),
+        AgentSessionRequest::QueryMessageDetail {
+            request_id,
+            message_id,
+        } => Ok(CoreSessionRequest::QueryMessageDetail {
+            request_id,
+            message_id,
+        }),
         AgentSessionRequest::QueryStatus => Err("query_status is handled by service".to_string()),
         AgentSessionRequest::UpdateLaunchConfig { .. } => {
             Err("update_launch_config is handled by service".to_string())
@@ -2992,6 +3151,25 @@ fn from_core_session_event(event: CoreSessionEvent) -> AgentSessionEvent {
         CoreSessionEvent::SessionViewResult { query_id, payload } => {
             AgentSessionEvent::SessionViewResult { query_id, payload }
         }
+        CoreSessionEvent::MessageHistoryResult { history } => {
+            AgentSessionEvent::SessionViewResult {
+                query_id: history.request_id.clone(),
+                payload: serde_json::json!({
+                    "type": "message_history",
+                    "history": history,
+                }),
+            }
+        }
+        CoreSessionEvent::MessageDetailResult { request_id, record } => {
+            AgentSessionEvent::SessionViewResult {
+                query_id: request_id.clone(),
+                payload: serde_json::json!({
+                    "type": "message_detail_result",
+                    "request_id": request_id,
+                    "record": record,
+                }),
+            }
+        }
         CoreSessionEvent::CompactCompleted {
             compressed,
             estimated_tokens_before,
@@ -3089,178 +3267,6 @@ fn reply(
         target.clone(),
         encode_response(response)?,
     ))
-}
-
-#[derive(Debug, Deserialize)]
-struct SessionMessagesIndex {
-    messages: BTreeMap<String, SessionMessageIndexEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SessionMessageIndexEntry {
-    index: usize,
-    byte_offset: u64,
-}
-
-fn read_agent_session_history(
-    conversation_root: &Path,
-    session_id: &str,
-    request_id: String,
-    offset: usize,
-    limit: usize,
-) -> Result<AgentSessionMessageHistory> {
-    let path = session_all_messages_path(conversation_root, session_id);
-    if !path.exists() {
-        return Ok(AgentSessionMessageHistory {
-            request_id,
-            offset,
-            limit,
-            total: 0,
-            last_message: None,
-            messages: Vec::new(),
-        });
-    }
-    let file =
-        fs::File::open(&path).with_context(|| format!("failed to open {}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut total = 0usize;
-    let mut messages = Vec::new();
-    let mut last_message = None;
-    let end = offset.saturating_add(limit.min(500));
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("failed to read {}", path.display()))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let message: ChatMessage = serde_json::from_str(&line)
-            .with_context(|| format!("failed to parse message {index} in {}", path.display()))?;
-        let record = AgentSessionMessageRecord { index, message };
-        if index >= offset && index < end {
-            messages.push(record.clone());
-        }
-        last_message = Some(record);
-        total = index.saturating_add(1);
-    }
-    Ok(AgentSessionMessageHistory {
-        request_id,
-        offset,
-        limit,
-        total,
-        last_message,
-        messages,
-    })
-}
-
-fn read_agent_session_message_detail(
-    conversation_root: &Path,
-    session_id: &str,
-    message_id: &str,
-) -> Result<Option<AgentSessionMessageRecord>> {
-    let path = session_all_messages_path(conversation_root, session_id);
-    if !path.exists() {
-        return Ok(None);
-    }
-    if let Some(record) = read_agent_session_message_detail_from_index(
-        conversation_root,
-        session_id,
-        message_id,
-        &path,
-    )? {
-        return Ok(Some(record));
-    }
-    read_agent_session_message_detail_by_scan(&path, message_id)
-}
-
-fn read_agent_session_message_detail_from_index(
-    conversation_root: &Path,
-    session_id: &str,
-    message_id: &str,
-    messages_path: &Path,
-) -> Result<Option<AgentSessionMessageRecord>> {
-    let index_path = session_messages_index_path(conversation_root, session_id);
-    if !index_path.exists() {
-        return Ok(None);
-    }
-    let raw = fs::read_to_string(&index_path)
-        .with_context(|| format!("failed to read {}", index_path.display()))?;
-    let index: SessionMessagesIndex = serde_json::from_str(&raw)
-        .with_context(|| format!("failed to parse {}", index_path.display()))?;
-    let Some(entry) = index.messages.get(message_id) else {
-        return Ok(None);
-    };
-    let mut file = fs::File::open(messages_path)
-        .with_context(|| format!("failed to open {}", messages_path.display()))?;
-    file.seek(SeekFrom::Start(entry.byte_offset))
-        .with_context(|| format!("failed to seek {}", messages_path.display()))?;
-    let mut reader = BufReader::new(file);
-    let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .with_context(|| format!("failed to read {}", messages_path.display()))?;
-    if line.trim().is_empty() {
-        return Ok(None);
-    }
-    let message: ChatMessage = serde_json::from_str(&line).with_context(|| {
-        format!(
-            "failed to parse message {} in {}",
-            entry.index,
-            messages_path.display()
-        )
-    })?;
-    Ok(Some(AgentSessionMessageRecord {
-        index: entry.index,
-        message,
-    }))
-}
-
-fn read_agent_session_message_detail_by_scan(
-    path: &Path,
-    message_id: &str,
-) -> Result<Option<AgentSessionMessageRecord>> {
-    let requested_index = message_id.parse::<usize>().ok();
-    let file =
-        fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
-    let reader = BufReader::new(file);
-    for (index, line) in reader.lines().enumerate() {
-        let line = line.with_context(|| format!("failed to read {}", path.display()))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let message: ChatMessage = serde_json::from_str(&line)
-            .with_context(|| format!("failed to parse message {index} in {}", path.display()))?;
-        if message.message_id == message_id || requested_index.is_some_and(|value| value == index) {
-            return Ok(Some(AgentSessionMessageRecord { index, message }));
-        }
-    }
-    Ok(None)
-}
-
-fn session_all_messages_path(conversation_root: &Path, session_id: &str) -> PathBuf {
-    session_log_dir(conversation_root, session_id).join("all_messages.jsonl")
-}
-
-fn session_messages_index_path(conversation_root: &Path, session_id: &str) -> PathBuf {
-    session_log_dir(conversation_root, session_id).join("messages_index.json")
-}
-
-fn session_log_dir(conversation_root: &Path, session_id: &str) -> PathBuf {
-    conversation_root
-        .join(".stellaclaw")
-        .join("log")
-        .join(sanitize_session_id_for_log_path(session_id))
-}
-
-fn sanitize_session_id_for_log_path(session_id: &str) -> String {
-    session_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

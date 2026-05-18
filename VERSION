@@ -1,5 +1,10 @@
-version: 1.29.0
+version: 1.29.1
 ---
+
+# 1.29.1
+
+- 修复 Web message history/detail 查询读取半写 JSONL 的竞态：
+  `AgentSessionService` 不再直接读取 `all_messages.jsonl` / `messages_index.json` 响应 Web history、summary 和 message detail 查询；相关请求会转发到 `agent_server` 内的 `SessionActor` control path，由负责维护和落盘 session history 的 actor 基于内存中的 `all_messages` 返回 typed response，避免查询路径读到正在写入的半截 JSONL 并触发 conversation kernel 重启。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.29.0
 
