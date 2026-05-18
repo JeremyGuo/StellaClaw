@@ -909,7 +909,11 @@ impl SessionActor {
         }
         let active = self.active_provider_request.as_ref()?;
         let elapsed = active.last_activity_at.elapsed();
-        (elapsed < PROVIDER_SUPERSEDE_GRACE).then_some(PROVIDER_SUPERSEDE_GRACE - elapsed)
+        if elapsed >= PROVIDER_SUPERSEDE_GRACE {
+            None
+        } else {
+            Some(PROVIDER_SUPERSEDE_GRACE.saturating_sub(elapsed))
+        }
     }
 
     fn discard_stale_provider_events(&mut self) {
@@ -5685,6 +5689,42 @@ mod tests {
         assert!(progress
             .iter()
             .all(|message| !message.contains("newer user message")));
+    }
+
+    #[test]
+    fn provider_supersede_grace_after_window_does_not_underflow() {
+        let _cwd = temp_cwd("actor-provider-supersede-grace-underflow");
+        let (inbox, _mailbox) = test_inbox();
+        let events = Arc::new(MemoryEventSink::default());
+        let provider = Arc::new(ScriptedProvider::new(vec![]));
+        let tools = Arc::new(EchoToolExecutor::new());
+        let catalog = ToolCatalog::new();
+        let mut actor =
+            SessionActor::new(test_model_config(), provider, tools, inbox, events, catalog);
+        actor.active_provider_request = Some(ActiveProviderRequest {
+            request_id: "request_1".to_string(),
+            message_id: "message_1".to_string(),
+            turn_id: "turn_1".to_string(),
+            turn_number: 1,
+            step_index: 0,
+            request_too_large_attempts: 0,
+            started_at_ms: 0,
+            next_stream_event_index: 0,
+            last_activity_at: Instant::now() - PROVIDER_SUPERSEDE_GRACE - Duration::from_millis(1),
+        });
+        actor
+            .pending_data
+            .push_back(SessionRequest::EnqueueUserMessage {
+                message: ChatMessage::new(
+                    ChatRole::User,
+                    vec![ChatMessageItem::Context(ContextItem {
+                        text: "interrupt after grace".to_string(),
+                    })],
+                ),
+            });
+
+        assert_eq!(actor.provider_supersede_grace_remaining(), None);
+        assert!(actor.has_ready_work());
     }
 
     #[test]
