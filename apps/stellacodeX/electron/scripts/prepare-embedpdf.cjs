@@ -13,6 +13,8 @@ const requiredFiles = [
   'packages/pdfium/dist/pdfium.wasm'
 ].map((file) => path.resolve(embedPdfRoot, file));
 
+const pnpmCommand = process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm';
+
 function run(command, args, options = {}) {
   childProcess.execFileSync(command, args, {
     cwd: embedPdfRoot,
@@ -35,10 +37,10 @@ if (hasRequiredBuild() && process.env.STELLA_REBUILD_EMBEDPDF !== '1') {
 }
 
 if (!fs.existsSync(path.join(embedPdfRoot, 'node_modules'))) {
-  run('pnpm', ['install']);
+  run(pnpmCommand, ['install']);
 }
 
-run('pnpm', ['--filter', '@embedpdf/build', 'build']);
-run('pnpm', ['--filter', '@embedpdf/fonts-*', 'build']);
-run('pnpm', ['--filter', '@embedpdf/models', '--filter', '@embedpdf/pdfium', 'build']);
-run('pnpm', ['--filter', '@embedpdf/engines', 'build:base']);
+run(pnpmCommand, ['--filter', '@embedpdf/build', 'build']);
+run(pnpmCommand, ['--filter', '@embedpdf/fonts-*', 'build']);
+run(pnpmCommand, ['--filter', '@embedpdf/models', '--filter', '@embedpdf/pdfium', 'build']);
+run(pnpmCommand, ['--filter', '@embedpdf/engines', 'build:base']);
