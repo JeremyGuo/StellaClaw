@@ -276,6 +276,7 @@ mod tests {
         let batch = ToolBatch::new(
             "batch_1",
             vec![ToolBatchItem::RegisteredTool(ToolCallItem {
+                item_id: None,
                 tool_call_id: "call_1".to_string(),
                 tool_name: "apply_patch".to_string(),
                 arguments: ContextItem {
@@ -307,6 +308,7 @@ mod tests {
         let batch = ToolBatch::new(
             "batch_3",
             vec![ToolBatchItem::RegisteredTool(ToolCallItem {
+                item_id: None,
                 tool_call_id: "call_2".to_string(),
                 tool_name: "cron_tasks_list".to_string(),
                 arguments: ContextItem {

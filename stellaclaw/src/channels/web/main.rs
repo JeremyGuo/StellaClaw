@@ -1146,7 +1146,10 @@ impl ChatLiveState {
                     return false;
                 }
                 let existing_call_id = item.get("tool_call_id").and_then(Value::as_str);
-                let existing_item_id = item.get("_item_id").and_then(Value::as_str);
+                let existing_item_id = item
+                    .get("item_id")
+                    .or_else(|| item.get("_item_id"))
+                    .and_then(Value::as_str);
                 existing_call_id.is_some_and(|id| id == call_id)
                     || (!item_id.is_empty() && existing_item_id.is_some_and(|id| id == item_id))
                     || explicit_call_id.is_some()
@@ -1166,7 +1169,7 @@ impl ChatLiveState {
                         map.insert("tool_call_id".to_string(), json!(call_id));
                     }
                     if !item_id.is_empty() {
-                        map.insert("_item_id".to_string(), json!(item_id));
+                        map.insert("item_id".to_string(), json!(item_id));
                     }
                     map.insert("tool_name".to_string(), json!(tool_name));
                 }
@@ -1175,7 +1178,7 @@ impl ChatLiveState {
                     "type": "tool_call",
                     "index": next_index,
                     "tool_call_id": call_id,
-                    "_item_id": item_id,
+                    "item_id": item_id,
                     "tool_name": tool_name,
                     "arguments": delta,
                 }));
@@ -1324,8 +1327,14 @@ fn stream_message_fingerprint(message: &Value) -> Value {
         for item in items {
             match item.get("type").and_then(Value::as_str) {
                 Some("tool_call") => {
+                    let tool_id = item
+                        .get("item_id")
+                        .or_else(|| item.get("_item_id"))
+                        .or_else(|| item.get("tool_call_id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
                     tool_calls.push(json!({
-                        "tool_call_id": item.get("tool_call_id").and_then(Value::as_str).unwrap_or_default(),
+                        "tool_id": tool_id,
                         "tool_name": item.get("tool_name").and_then(Value::as_str).unwrap_or_default(),
                         "arguments": item.get("arguments").and_then(Value::as_str).unwrap_or_default(),
                     }));
@@ -1340,7 +1349,7 @@ fn stream_message_fingerprint(message: &Value) -> Value {
             }
         }
     }
-    sort_fingerprint_items(&mut tool_calls, "tool_call_id");
+    sort_fingerprint_items(&mut tool_calls, "tool_id");
     sort_fingerprint_items(&mut reasoning, "summary_index");
     json!({
         "text": text,
@@ -1356,11 +1365,14 @@ fn committed_message_fingerprint(message: &ChatMessage) -> Value {
     for item in &message.data {
         match item {
             ChatMessageItem::Context(context) => text.push_str(&context.text),
-            ChatMessageItem::ToolCall(tool) => tool_calls.push(json!({
-                "tool_call_id": tool.tool_call_id,
-                "tool_name": tool.tool_name,
-                "arguments": tool.arguments.text,
-            })),
+            ChatMessageItem::ToolCall(tool) => {
+                let tool_id = tool.item_id.as_deref().unwrap_or(&tool.tool_call_id);
+                tool_calls.push(json!({
+                    "tool_id": tool_id,
+                    "tool_name": tool.tool_name,
+                    "arguments": tool.arguments.text,
+                }));
+            }
             ChatMessageItem::Reasoning(reasoning_item) => {
                 if reasoning_item.codex_summary.is_empty() {
                     if !reasoning_item.text.is_empty() {
@@ -1381,7 +1393,7 @@ fn committed_message_fingerprint(message: &ChatMessage) -> Value {
             _ => {}
         }
     }
-    sort_fingerprint_items(&mut tool_calls, "tool_call_id");
+    sort_fingerprint_items(&mut tool_calls, "tool_id");
     sort_fingerprint_items(&mut reasoning, "summary_index");
     json!({
         "text": text,
@@ -1684,7 +1696,7 @@ mod tests {
     }
 
     #[test]
-    fn live_state_updates_tool_call_id_alias_from_completed_metadata() {
+    fn live_state_matches_streamed_tool_item_id_to_committed_call_id() {
         let mut state = ChatLiveState::default();
         let first = json!({
             "type": "stream_tool_call_delta",
@@ -1700,24 +1712,10 @@ mod tests {
             .is_none());
         state.record_session_stream(&first, "stream_tool_call_delta");
 
-        let metadata = json!({
-            "type": "stream_tool_call_delta",
-            "message_id": "msg-1",
-            "turn_id": "turn-1",
-            "in_message_index": 1,
-            "item_id": "fc_1",
-            "call_id": "call_1",
-            "tool_name": "apply_patch",
-            "delta": "",
-        });
-        assert!(state
-            .validate_stream_event(&metadata, "stream_tool_call_delta")
-            .is_none());
-        state.record_session_stream(&metadata, "stream_tool_call_delta");
-
         let message = ChatMessage::new(
             ChatRole::Assistant,
             vec![ChatMessageItem::ToolCall(ToolCallItem {
+                item_id: Some("fc_1".to_string()),
                 tool_call_id: "call_1".to_string(),
                 tool_name: "apply_patch".to_string(),
                 arguments: ContextItem {

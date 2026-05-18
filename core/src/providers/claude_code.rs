@@ -282,6 +282,7 @@ fn claude_value_to_chat_message(
                     .map(value_to_arguments_string)
                     .unwrap_or_else(|| "{}".to_string());
                 data.push(ChatMessageItem::ToolCall(ToolCallItem {
+                    item_id: None,
                     tool_call_id: call_id.to_string(),
                     tool_name: name.to_string(),
                     arguments: ContextItem { text: arguments },

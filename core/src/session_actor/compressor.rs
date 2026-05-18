@@ -1258,6 +1258,7 @@ mod tests {
             ChatMessage::new(
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    item_id: None,
                     tool_call_id: "call_keep".to_string(),
                     tool_name: "shell_exec".to_string(),
                     arguments: ContextItem {
@@ -1384,6 +1385,7 @@ mod tests {
                 ChatRole::Assistant,
                 vec![
                     ChatMessageItem::ToolCall(ToolCallItem {
+                        item_id: None,
                         tool_call_id: "call_1".to_string(),
                         tool_name: "shell_exec".to_string(),
                         arguments: ContextItem {
@@ -1482,6 +1484,7 @@ mod tests {
             ChatMessage::new(
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    item_id: None,
                     tool_call_id: "call_1".to_string(),
                     tool_name: "shell".to_string(),
                     arguments: ContextItem {

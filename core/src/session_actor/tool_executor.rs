@@ -778,6 +778,7 @@ mod tests {
 
     fn tool_call(name: &str, arguments: Value) -> ToolBatchItem {
         ToolBatchItem::RegisteredTool(ToolCallItem {
+            item_id: None,
             tool_call_id: "call_1".to_string(),
             tool_name: name.to_string(),
             arguments: ContextItem {
@@ -806,6 +807,7 @@ mod tests {
 
     fn registered_tool_call(call_id: &str, name: &str, arguments: Value) -> ToolBatchItem {
         ToolBatchItem::RegisteredTool(ToolCallItem {
+            item_id: None,
             tool_call_id: call_id.to_string(),
             tool_name: name.to_string(),
             arguments: ContextItem {
@@ -969,6 +971,7 @@ mod tests {
         let batch = ToolBatch::new(
             "batch_ext",
             vec![ToolBatchItem::RegisteredTool(ToolCallItem {
+                item_id: None,
                 tool_call_id: "call_ext".to_string(),
                 tool_name: "provider_shell_echo".to_string(),
                 arguments: ContextItem {

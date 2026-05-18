@@ -2162,12 +2162,6 @@ impl StreamAccumulator {
                 .iter()
                 .any(|existing| existing == key)
         });
-        let missing_alias = keys.iter().any(|key| {
-            !self
-                .streamed_tool_inputs
-                .iter()
-                .any(|existing| existing == key)
-        });
         if has_streamed_alias {
             for key in keys {
                 if !self
@@ -2177,15 +2171,6 @@ impl StreamAccumulator {
                 {
                     self.streamed_tool_inputs.push(key);
                 }
-            }
-            if call_id.is_some() && missing_alias {
-                let tool_name = item.get("name").and_then(Value::as_str).map(str::to_string);
-                return Some(ProviderStreamEvent::ToolCallInputDelta {
-                    item_id,
-                    call_id,
-                    tool_name,
-                    delta: String::new(),
-                });
             }
             return None;
         }
@@ -2372,7 +2357,9 @@ fn responses_value_to_chat_message(
                     .get("arguments")
                     .map(value_to_arguments_string)
                     .unwrap_or_else(|| "{}".to_string());
+                let item_id = item.get("id").and_then(Value::as_str).map(str::to_string);
                 data.push(ChatMessageItem::ToolCall(ToolCallItem {
+                    item_id,
                     tool_call_id: call_id.to_string(),
                     tool_name: name.to_string(),
                     arguments: ContextItem { text: arguments },
@@ -2527,12 +2514,16 @@ fn append_assistant_response_items(
             }
             ChatMessageItem::ToolCall(tool_call) => {
                 append_assistant_message_if_needed(target, &mut content);
-                target.push(json!({
+                let mut item = json!({
                     "type": "function_call",
                     "name": tool_call.tool_name,
                     "arguments": tool_call.arguments.text,
                     "call_id": tool_call.tool_call_id,
-                }));
+                });
+                if let Some(item_id) = tool_call.item_id.as_deref() {
+                    item["id"] = json!(item_id);
+                }
+                target.push(item);
             }
             ChatMessageItem::Reasoning(_) | ChatMessageItem::ToolResult(_) => {}
         }
@@ -3070,19 +3061,7 @@ mod tests {
             }]
         }));
 
-        assert_eq!(events.len(), 1);
-        let ProviderStreamEvent::ToolCallInputDelta {
-            item_id,
-            call_id,
-            delta,
-            ..
-        } = &events[0]
-        else {
-            panic!("expected tool call input delta event");
-        };
-        assert_eq!(item_id, "fc_1");
-        assert_eq!(call_id.as_deref(), Some("call_1"));
-        assert!(delta.is_empty());
+        assert!(events.is_empty());
     }
 
     #[test]

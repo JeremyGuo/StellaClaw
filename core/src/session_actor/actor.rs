@@ -4488,6 +4488,7 @@ mod tests {
             ChatMessage::new(
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    item_id: None,
                     tool_call_id: "call_1".to_string(),
                     tool_name: "shell_exec".to_string(),
                     arguments: ContextItem {
@@ -5091,6 +5092,7 @@ mod tests {
             ChatMessage::new(
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    item_id: None,
                     tool_call_id: "call_1".to_string(),
                     tool_name: "cron_tasks_list".to_string(),
                     arguments: ContextItem {
@@ -5158,6 +5160,7 @@ mod tests {
             ChatMessage::new(
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    item_id: None,
                     tool_call_id: "call_1".to_string(),
                     tool_name: "cron_tasks_list".to_string(),
                     arguments: ContextItem {
@@ -5248,6 +5251,7 @@ mod tests {
                 ChatMessage::new(
                     ChatRole::Assistant,
                     vec![ChatMessageItem::ToolCall(ToolCallItem {
+                        item_id: None,
                         tool_call_id: "call_1".to_string(),
                         tool_name: "not_a_catalog_tool".to_string(),
                         arguments: ContextItem {
@@ -5317,6 +5321,7 @@ mod tests {
             ChatMessage::new(
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    item_id: None,
                     tool_call_id: "call_1".to_string(),
                     tool_name: "image_view".to_string(),
                     arguments: ContextItem {
@@ -5684,6 +5689,7 @@ mod tests {
             ChatMessage::new(
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    item_id: None,
                     tool_call_id: "call_1".to_string(),
                     tool_name: "cron_tasks_list".to_string(),
                     arguments: ContextItem {
@@ -5803,6 +5809,7 @@ mod tests {
             ChatMessage::new(
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    item_id: None,
                     tool_call_id: "call_1".to_string(),
                     tool_name: "cron_tasks_list".to_string(),
                     arguments: ContextItem {
@@ -5982,6 +5989,7 @@ mod tests {
             ChatMessage::new(
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    item_id: None,
                     tool_call_id: "call_1".to_string(),
                     tool_name: "cron_tasks_list".to_string(),
                     arguments: ContextItem {
@@ -6084,6 +6092,7 @@ mod tests {
         actor.history.push(ChatMessage::new(
             ChatRole::Assistant,
             vec![ChatMessageItem::ToolCall(ToolCallItem {
+                item_id: None,
                 tool_call_id: "call_orphan".to_string(),
                 tool_name: "cron_tasks_list".to_string(),
                 arguments: ContextItem {
@@ -6148,6 +6157,7 @@ mod tests {
             ChatMessage::new(
                 ChatRole::Assistant,
                 vec![ChatMessageItem::ToolCall(ToolCallItem {
+                    item_id: None,
                     tool_call_id: "call_plan".to_string(),
                     tool_name: "update_plan".to_string(),
                     arguments: ContextItem {

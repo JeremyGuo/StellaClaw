@@ -467,6 +467,8 @@ pub enum FileState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
     pub tool_call_id: String,
     pub tool_name: String,
     pub arguments: ContextItem,

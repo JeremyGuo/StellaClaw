@@ -1,5 +1,10 @@
-version: 1.29.3
+version: 1.29.4
 ---
+
+# 1.29.4
+
+- 修复 Codex websocket 工具调用 ID 别名提交校验：
+  WebChannel 不再依赖额外空参数增量把 `fc_*` 对齐到 `call_*`；`ToolCallItem` 新增可选 `item_id` 字段，durable assistant tool call 会同时保存 provider output item id 和 tool call id，stream/durable commit 校验按 `item_id` 对齐，工具执行和 ToolResult 继续按 `tool_call_id` 对齐。本次不改变 `config` schema，改变 `workdir` schema 至 `0.25`。
 
 # 1.29.3
 
@@ -7,8 +12,6 @@ version: 1.29.3
   Codex subscription provider 会在最终 response 落盘前扫描完整 `output`，对没有通过 `response.function_call_arguments.delta` 或 `response.output_item.done` 流出的 `function_call.arguments` 补发一次 `ToolCallInputDelta`，避免 `apply_patch` 等工具调用只出现在 durable assistant message 中、但 provisional stream message 缺少 tool call。本次不改变 `config` schema，不改变 `workdir` schema。
 - 修复 Codex websocket 工具调用参数重复补发：
   Codex 的 `response.function_call_arguments.delta` 可能只携带 `item_id`，而最终 `response.completed.output` 同一 `function_call` 同时携带 `item_id` 和 `call_id`；provider 现在会把两者作为同一工具输入流的别名记录，避免 completed fallback 把已经流过的参数再次补发，从而造成同一 streaming assistant message 内出现两份 tool call input 并触发 `stream_commit_mismatch`。本次不改变 `config` schema，不改变 `workdir` schema。
-- 修复 Codex websocket 工具调用 ID 别名提交校验：
-  当工具参数 delta 已经按 `item_id` 流出、最终 completed item 才给出 `call_id` 时，provider 会发送一个空参数增量作为元数据更新；WebChannel 会用 `_item_id` 匹配并把 provisional tool call 切换到最终 `call_id`，避免 provisional 使用 `fc_*`、durable message 使用 `call_*` 时误报 `stream_commit_mismatch`。本次不改变 `config` schema，不改变 `workdir` schema。
 
 # 1.29.2
 

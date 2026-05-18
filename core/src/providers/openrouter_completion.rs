@@ -705,6 +705,7 @@ fn convert_openrouter_response(
 
     for tool_call in choice.message.tool_calls {
         data.push(ChatMessageItem::ToolCall(ToolCallItem {
+            item_id: None,
             tool_call_id: tool_call.id,
             tool_name: tool_call.function.name,
             arguments: ContextItem {
