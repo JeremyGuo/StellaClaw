@@ -1,4 +1,4 @@
-import { messageIndex, messageOrderFromId } from './messageUtils';
+import { messageIndex, messageOrderFromId, shortText } from './messageUtils';
 
 export function normalizedStreamEvent(payload) {
   return payload?.event || payload?.session_event || payload?.stream_event || payload;
@@ -519,4 +519,143 @@ export function streamFinalizedActivityIds(messages) {
     }
   }
   return ids;
+}
+
+export function streamTurnStartedPatch(event) {
+  return {
+    resetStreamState: true,
+    chatState: {
+      state: 'running',
+      currentTurnState: event,
+      activeTurnId: String(event?.turn_id || event?.turnId || '').trim()
+    },
+    forceChatState: true,
+    activity: '正在处理',
+    runningActivity: {
+      id: 'thinking',
+      title: '正在处理',
+      detail: '等待模型响应',
+      state: 'running'
+    },
+    removeActivityIds: ['thinking']
+  };
+}
+
+export function streamTurnCompletedPatch(currentMessages, event) {
+  const turnId = String(event?.turn_id || event?.turnId || '').trim();
+  const messages = removeStreamingMessagesForTurn(currentMessages, turnId);
+  return {
+    resetStreamState: true,
+    chatState: { state: 'idle' },
+    activity: '已完成',
+    messages,
+    messagesChanged: messages !== currentMessages,
+    shouldCache: messages !== currentMessages,
+    clearRunningActivitiesDelay: 700
+  };
+}
+
+export function streamAssistantDeltaPatch(currentMessages, event) {
+  const delta = streamDeltaText(event);
+  if (!delta) return null;
+  const messageId = streamActivityBaseId(event);
+  return {
+    chatState: { state: 'running', currentTurnState: event },
+    messages: appendStreamAssistantDelta(currentMessages, event),
+    activity: '正在回复',
+    runningActivity: {
+      id: `stream-assistant-${messageId}`,
+      title: '正在回复',
+      detail: shortText(delta, 72),
+      state: 'running'
+    },
+    removeActivityIds: [`stream-assistant-${messageId}`, 'thinking']
+  };
+}
+
+export function streamReasoningPartPatch(event) {
+  const messageId = streamActivityBaseId(event);
+  return {
+    chatState: { state: 'running', currentTurnState: event },
+    activity: '思考中',
+    runningActivity: {
+      id: `stream-reasoning-${messageId}`,
+      title: '思考中',
+      detail: '整理推理摘要',
+      state: 'running'
+    },
+    removeActivityIds: [`stream-reasoning-${messageId}`, 'thinking']
+  };
+}
+
+export function streamReasoningDeltaPatch(currentMessages, event, scopeKey, streamBuffers) {
+  const messageId = streamActivityBaseId(event);
+  const summaryIndex = event?.summary_index ?? event?.summaryIndex ?? 0;
+  const bufferKey = `${scopeKey}:reasoning:${messageId}:${summaryIndex}`;
+  const text = streamBuffers.append(bufferKey, streamDeltaText(event));
+  return {
+    chatState: { state: 'running', currentTurnState: event },
+    messages: appendStreamReasoningSummary(currentMessages, event),
+    activity: '思考中',
+    runningActivity: {
+      id: `stream-reasoning-${messageId}`,
+      title: '思考中',
+      detail: shortText(text || '整理推理摘要', 96),
+      state: 'running'
+    },
+    removeActivityIds: [`stream-reasoning-${messageId}`, 'thinking']
+  };
+}
+
+export function streamToolCallDeltaPatch(currentMessages, event, scopeKey, streamBuffers) {
+  const itemId = streamItemId(event);
+  const bufferKey = `${scopeKey}:tool:${itemId}`;
+  const text = streamBuffers.append(bufferKey, streamDeltaText(event));
+  return {
+    chatState: { state: 'running', currentTurnState: event },
+    messages: appendStreamToolCallDelta(currentMessages, event),
+    activity: '准备调用工具',
+    runningActivity: {
+      id: `stream-tool-${itemId}`,
+      title: '准备调用工具',
+      detail: shortText(text, 96),
+      state: 'running'
+    },
+    removeActivityIds: [`stream-tool-${itemId}`, 'thinking']
+  };
+}
+
+export function streamToolResultDonePatch(currentMessages, event) {
+  const toolResult = event?.tool_result || event?.toolResult || {};
+  const itemId = String(toolResult.tool_call_id || toolResult.toolCallId || event?.batch_id || event?.batchId || streamItemId(event)).trim();
+  const toolName = String(toolResult.tool_name || toolResult.toolName || '工具').trim();
+  return {
+    chatState: { state: 'running', currentTurnState: event },
+    messages: appendStreamToolResultDone(currentMessages, event),
+    activity: `${toolName} 已返回`,
+    runningActivity: {
+      id: `stream-tool-result-${itemId || toolName}`,
+      title: `${toolName} 已返回`,
+      detail: toolName,
+      state: 'running'
+    },
+    removeActivityIds: [`stream-tool-${itemId}`, `stream-tool-result-${itemId}`, 'thinking']
+  };
+}
+
+export function streamErrorPatch(currentMessages, event) {
+  const messageId = streamActivityBaseId(event);
+  const error = streamErrorText(event);
+  return {
+    chatState: { state: 'failed', lastError: error },
+    messages: applyStreamErrorToMessages(currentMessages, event),
+    activity: error,
+    runningActivity: {
+      id: `stream-error-${messageId}`,
+      title: '响应失败',
+      detail: shortText(error, 96),
+      state: 'failed'
+    },
+    removeActivityIds: [`stream-assistant-${messageId}`, `stream-reasoning-${messageId}`, 'thinking']
+  };
 }

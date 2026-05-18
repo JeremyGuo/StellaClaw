@@ -40,21 +40,20 @@ import { clamp, formatBytes, formatModel, statusUsageTotals } from './lib/format
 import { attachmentName, fileExtension, fileNameFromPath, imageMimeType } from './lib/fileUtils';
 import { addUsageTotals, firstMessageId, hasOlderMessages, lastServerMessageIndex, liveActivitySignature, mergeMessages, messageIndex, messageOrderFromId, shortText } from './lib/messageUtils';
 import {
-  appendStreamAssistantDelta,
-  appendStreamReasoningSummary,
-  appendStreamToolCallDelta,
-  appendStreamToolResultDone,
   applyStreamErrorToMessages,
   createStreamBufferStore,
   createStreamIndexTracker,
   markQueuedUserMessage,
   normalizedStreamEvent,
-  removeStreamingMessagesForTurn,
-  streamActivityBaseId,
-  streamDeltaText,
-  streamErrorText,
+  streamAssistantDeltaPatch,
+  streamErrorPatch,
   streamEventType,
-  streamItemId
+  streamReasoningDeltaPatch,
+  streamReasoningPartPatch,
+  streamToolCallDeltaPatch,
+  streamToolResultDonePatch,
+  streamTurnCompletedPatch,
+  streamTurnStartedPatch
 } from './lib/chatStreamDataPlane';
 import { startChatSocketClient } from './lib/chatSocketClient';
 import { chatAckHistoryPlan, chatSnapshotProjection, incomingMessagesPatch, recentMessagesPatch } from './lib/chatMessagePlane';
@@ -2034,54 +2033,54 @@ function App() {
       const event = normalizedStreamEvent(rawEvent);
       const type = streamEventType(event);
       if (!type || disposed || websocketKeyRef.current !== key) return;
-      const messageId = streamActivityBaseId(event);
       const scopedChatState = (state) => ({ scopeKey: key, ...state });
       const keepOrSetRunningState = (current, eventPayload) => (
         chatSessionStateIsActive(current) && current.scopeKey === key
           ? current
           : scopedChatState({ state: 'running', currentTurnState: eventPayload })
       );
+      const applyPatch = (patch) => {
+        if (!patch) return;
+        if (patch.resetStreamState) {
+          streamTracker.reset();
+          streamBuffers.reset();
+        }
+        if (patch.chatState) {
+          setChatSessionState((current) => (
+            patch.chatState.state === 'running' && !patch.forceChatState
+              ? keepOrSetRunningState(current, patch.chatState.currentTurnState || event)
+              : scopedChatState(patch.chatState)
+          ));
+        }
+        if (patch.messages) {
+          messagesRef.current = patch.messages;
+          if (patch.shouldCache) cacheMessages(patch.messages);
+          setMessages(patch.messages);
+        }
+        if (patch.activity) setSessionActivity(patch.activity);
+        if (patch.runningActivity) {
+          const removeIds = new Set(patch.removeActivityIds || []);
+          updateRunningActivities((current) => [
+            ...current.filter((item) => !removeIds.has(item.id)),
+            mergeProgressActivity(current, patch.runningActivity)
+          ]);
+        }
+        if (patch.clearRunningActivitiesDelay) {
+          setTimeout(() => {
+            if (!disposed && websocketKeyRef.current === key) {
+              setRunningActivities([]);
+            }
+          }, patch.clearRunningActivitiesDelay);
+        }
+      };
 
       if (type === 'turn_started' || type === 'stream_turn_start') {
-        streamTracker.reset();
-        streamBuffers.reset();
-        setChatSessionState(scopedChatState({
-          state: 'running',
-          currentTurnState: event,
-          activeTurnId: String(event?.turn_id || event?.turnId || '').trim()
-        }));
-        setSessionActivity('正在处理');
-        updateRunningActivities((current) => [
-          ...current.filter((item) => item.id !== 'thinking'),
-          {
-            id: 'thinking',
-            title: '正在处理',
-            detail: '等待模型响应',
-            state: 'running'
-          }
-        ]);
+        applyPatch(streamTurnStartedPatch(event));
         return;
       }
 
       if (type === 'turn_completed' || type === 'stream_turn_done') {
-        streamTracker.reset();
-        streamBuffers.reset();
-        setChatSessionState(scopedChatState({ state: 'idle' }));
-        setSessionActivity('已完成');
-        const turnId = String(event?.turn_id || event?.turnId || '').trim();
-        setMessages((current) => {
-          const next = removeStreamingMessagesForTurn(current, turnId);
-          if (next !== current) {
-            messagesRef.current = next;
-            cacheMessages(next);
-          }
-          return next;
-        });
-        setTimeout(() => {
-          if (!disposed && websocketKeyRef.current === key) {
-            setRunningActivities([]);
-          }
-        }, 700);
+        applyPatch(streamTurnCompletedPatch(messagesRef.current, event));
         return;
       }
 
@@ -2098,134 +2097,37 @@ function App() {
 
       if (type === 'stream_assistant_message_delta') {
         if (!acceptStreamEvent(event)) return;
-        setChatSessionState((current) => keepOrSetRunningState(current, event));
-        const delta = streamDeltaText(event);
-        if (!delta) return;
-        setMessages((current) => {
-          const next = appendStreamAssistantDelta(current, event);
-          messagesRef.current = next;
-          return next;
-        });
-        setSessionActivity('正在回复');
-        updateRunningActivities((current) => [
-          ...current.filter((item) => item.id !== `stream-assistant-${messageId}` && item.id !== 'thinking'),
-          mergeProgressActivity(current, {
-            id: `stream-assistant-${messageId}`,
-            title: '正在回复',
-            detail: shortText(delta, 72),
-            state: 'running'
-          })
-        ]);
+        applyPatch(streamAssistantDeltaPatch(messagesRef.current, event));
         return;
       }
 
       if (type === 'stream_reasoning_summary_part_added') {
         if (!acceptStreamEvent(event)) return;
-        setChatSessionState((current) => keepOrSetRunningState(current, event));
-        setSessionActivity('思考中');
-        updateRunningActivities((current) => [
-          ...current.filter((item) => item.id !== `stream-reasoning-${messageId}` && item.id !== 'thinking'),
-          mergeProgressActivity(current, {
-            id: `stream-reasoning-${messageId}`,
-            title: '思考中',
-            detail: '整理推理摘要',
-            state: 'running'
-          })
-        ]);
+        applyPatch(streamReasoningPartPatch(event));
         return;
       }
 
       if (type === 'stream_reasoning_summary_delta') {
         if (!acceptStreamEvent(event)) return;
-        setChatSessionState((current) => keepOrSetRunningState(current, event));
-        const summaryIndex = event?.summary_index ?? event?.summaryIndex ?? 0;
-        const bufferKey = `${key}:reasoning:${messageId}:${summaryIndex}`;
-        const text = streamBuffers.append(bufferKey, streamDeltaText(event));
-        setMessages((current) => {
-          const next = appendStreamReasoningSummary(current, event);
-          messagesRef.current = next;
-          return next;
-        });
-        setSessionActivity('思考中');
-        updateRunningActivities((current) => [
-          ...current.filter((item) => item.id !== `stream-reasoning-${messageId}` && item.id !== 'thinking'),
-          mergeProgressActivity(current, {
-            id: `stream-reasoning-${messageId}`,
-            title: '思考中',
-            detail: shortText(text || '整理推理摘要', 96),
-            state: 'running'
-          })
-        ]);
+        applyPatch(streamReasoningDeltaPatch(messagesRef.current, event, key, streamBuffers));
         return;
       }
 
       if (type === 'stream_tool_call_delta') {
         if (!acceptStreamEvent(event)) return;
-        setChatSessionState((current) => keepOrSetRunningState(current, event));
-        const itemId = streamItemId(event);
-        const bufferKey = `${key}:tool:${itemId}`;
-        const text = streamBuffers.append(bufferKey, streamDeltaText(event));
-        setMessages((current) => {
-          const next = appendStreamToolCallDelta(current, event);
-          messagesRef.current = next;
-          return next;
-        });
-        setSessionActivity('准备调用工具');
-        updateRunningActivities((current) => [
-          ...current.filter((item) => item.id !== `stream-tool-${itemId}` && item.id !== 'thinking'),
-          mergeProgressActivity(current, {
-            id: `stream-tool-${itemId}`,
-            title: '准备调用工具',
-            detail: shortText(text, 96),
-            state: 'running'
-          })
-        ]);
+        applyPatch(streamToolCallDeltaPatch(messagesRef.current, event, key, streamBuffers));
         return;
       }
 
       if (type === 'stream_tool_result_done') {
         if (!acceptStreamEvent(event)) return;
-        setChatSessionState((current) => keepOrSetRunningState(current, event));
-        const toolResult = event?.tool_result || event?.toolResult || {};
-        const itemId = String(toolResult.tool_call_id || toolResult.toolCallId || event?.batch_id || event?.batchId || streamItemId(event)).trim();
-        const toolName = String(toolResult.tool_name || toolResult.toolName || '工具').trim();
-        setMessages((current) => {
-          const next = appendStreamToolResultDone(current, event);
-          messagesRef.current = next;
-          return next;
-        });
-        setSessionActivity(`${toolName} 已返回`);
-        updateRunningActivities((current) => [
-          ...current.filter((item) => item.id !== `stream-tool-${itemId}` && item.id !== `stream-tool-result-${itemId}` && item.id !== 'thinking'),
-          mergeProgressActivity(current, {
-            id: `stream-tool-result-${itemId || toolName}`,
-            title: `${toolName} 已返回`,
-            detail: toolName,
-            state: 'running'
-          })
-        ]);
+        applyPatch(streamToolResultDonePatch(messagesRef.current, event));
         return;
       }
 
       if (type === 'stream_error') {
         streamTracker.clearForEvent(event);
-        setChatSessionState(scopedChatState({ state: 'failed', lastError: streamErrorText(event) }));
-        const error = streamErrorText(event);
-        setMessages((current) => {
-          const next = applyStreamErrorToMessages(current, event);
-          messagesRef.current = next;
-          return next;
-        });
-        setSessionActivity(error);
-        updateRunningActivities((current) => [
-          ...current.filter((item) => item.id !== `stream-assistant-${messageId}` && item.id !== `stream-reasoning-${messageId}` && item.id !== 'thinking'),
-          mergeProgressActivity(current, {
-            id: `stream-error-${messageId}`,
-            title: '响应失败',
-            detail: shortText(error, 96),
-            state: 'failed'
-          })
-        ]);
+        applyPatch(streamErrorPatch(messagesRef.current, event));
       }
     };
 
