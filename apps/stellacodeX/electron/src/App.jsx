@@ -2362,7 +2362,11 @@ function App() {
 
       if (type === 'stream_tool_call_delta') {
         if (!acceptStreamEvent(event)) return;
-        streamFrameQueue?.enqueue('tool', event);
+        applyStreamPatch(
+          streamToolCallDeltaPatch(messagesRef.current, event, key, streamBuffers),
+          event,
+          type
+        );
         return;
       }
 

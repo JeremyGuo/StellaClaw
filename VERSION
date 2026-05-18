@@ -3,6 +3,8 @@ version: 1.29.5
 
 # 1.29.5
 
+- 修复工具调用流式参数在 commit 边界误报 mismatch：
+  StellaCodeX Electron 不再把 `stream_tool_call_delta` 放入视觉 RAF 帧队列，而是作为协议状态立即合并到 provisional message；assistant/reasoning 文本仍保留帧队列。避免工具参数被 UI 动画节流后，durable `message_appended` 到达时前端拿半截工具参数和落盘消息比较，触发 `chat.stream_commit_mismatch` 误报。本次不改变 `config` schema，不改变 `workdir` schema。
 - 修复 StellaCodeX Electron stream commit mismatch 误报：
   前端 durable/provisional 提交比较会优先使用工具调用的 provider item id，再退回 tool call id；调试摘要也统一通过 `messageItems()` 读取 `data` 中的落盘结构，避免 Codex durable 消息同时携带 `item_id=fc_*` 和 `tool_call_id=call_*` 时被误判为 stream/durable 不一致。本次不改变 `config` schema，不改变 `workdir` schema。
 - 收敛 WebChannel stream 细粒度日志开关：
