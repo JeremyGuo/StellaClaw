@@ -31,7 +31,8 @@ use super::{
         account_id_from_access_token, ensure_request_payload_size, is_image_file, nonce,
         provider_error_kind, provider_error_message, token_usage_from_value,
     },
-    OutputPersistor, ProviderBackend, ProviderError, ProviderRequest, ProviderStreamEvent,
+    OutputPersistor, ProviderBackend, ProviderCompactionMode, ProviderError, ProviderRequest,
+    ProviderStreamEvent,
 };
 
 const OPENAI_BETA_RESPONSES_WEBSOCKETS: &str = "responses_websockets=2026-02-06";
@@ -299,6 +300,109 @@ impl CodexSubscriptionProvider {
         *cached = None;
     }
 
+    fn compact_history_once(
+        &self,
+        model_config: &ModelConfig,
+        request: &ProviderRequest<'_>,
+    ) -> Result<Vec<ChatMessage>, ProviderError> {
+        let auth = self.auth_manager.resolve(model_config)?;
+        let payload = self.build_compact_payload(model_config, request)?;
+        match self.send_compact_with_auth(model_config, payload.clone(), &auth) {
+            Ok(messages) => Ok(messages),
+            Err(error) if is_unauthorized(&error) => {
+                let refreshed = self.auth_manager.refresh(model_config, &auth)?;
+                self.send_compact_with_auth(model_config, payload, &refreshed)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn build_compact_payload(
+        &self,
+        model_config: &ModelConfig,
+        request: &ProviderRequest<'_>,
+    ) -> Result<Map<String, Value>, ProviderError> {
+        let mut payload = Map::new();
+        payload.insert(
+            "model".to_string(),
+            Value::String(model_config.model_name.clone()),
+        );
+        payload.insert(
+            "input".to_string(),
+            Value::Array(build_responses_input(request.messages, model_config)?),
+        );
+        if let Some(system_prompt) = request.system_prompt {
+            if !system_prompt.trim().is_empty() {
+                payload.insert(
+                    "instructions".to_string(),
+                    Value::String(system_prompt.to_string()),
+                );
+            }
+        }
+        payload.insert(
+            "tools".to_string(),
+            Value::Array(
+                request
+                    .tools
+                    .iter()
+                    .map(|tool| tool.responses_tool_schema())
+                    .collect(),
+            ),
+        );
+        payload.insert("parallel_tool_calls".to_string(), Value::Bool(true));
+        if let Some(reasoning) = codex_reasoning_payload(model_config) {
+            payload.insert("reasoning".to_string(), reasoning);
+        }
+        if let Some(service_tier) = codex_service_tier_payload(model_config) {
+            payload.insert("service_tier".to_string(), Value::String(service_tier));
+        }
+        payload.insert(
+            "prompt_cache_key".to_string(),
+            Value::String(self.session_id.clone()),
+        );
+        Ok(payload)
+    }
+
+    fn send_compact_with_auth(
+        &self,
+        model_config: &ModelConfig,
+        payload: Map<String, Value>,
+        auth: &CodexAuthMaterial,
+    ) -> Result<Vec<ChatMessage>, ProviderError> {
+        let endpoint = build_codex_compact_url(model_config)?;
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(model_config.conn_timeout_secs()))
+            .timeout(Duration::from_secs(model_config.request_timeout_secs()))
+            .build()
+            .map_err(ProviderError::BuildHttpClient)?;
+        let mut request = client
+            .post(endpoint.clone())
+            .header("authorization", format!("Bearer {}", auth.access_token))
+            .header("chatgpt-account-id", auth.account_id.clone())
+            .header("openai-beta", OPENAI_BETA_RESPONSES_WEBSOCKETS)
+            .header("user-agent", "codex-cli")
+            .header("x-client-request-id", nonce("compact"))
+            .header("session_id", self.session_id.clone())
+            .header("x-codex-window-id", format!("{}:0", self.session_id))
+            .json(&Value::Object(payload));
+        if auth.is_fedramp_account {
+            request = request.header("x-openai-fedramp", "true");
+        }
+
+        let response = request.send().map_err(ProviderError::request)?;
+        let status = response.status();
+        let body = response.text().map_err(ProviderError::DecodeResponse)?;
+        if !status.is_success() {
+            return Err(ProviderError::HttpStatus {
+                url: endpoint.to_string(),
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let value: Value = serde_json::from_str(&body).map_err(ProviderError::DecodeJson)?;
+        compact_response_value_to_chat_messages(&value)
+    }
+
     fn codex_models(&self, model_config: &ModelConfig) -> Result<CachedCodexModels, ProviderError> {
         if let Some(cached) = self.models_cache.lock().expect("mutex poisoned").clone() {
             return Ok(cached);
@@ -361,6 +465,18 @@ impl Default for CodexSubscriptionProvider {
 }
 
 impl ProviderBackend for CodexSubscriptionProvider {
+    fn compaction_mode(&self, _model_config: &ModelConfig) -> ProviderCompactionMode {
+        ProviderCompactionMode::Builtin
+    }
+
+    fn compact_history(
+        &self,
+        model_config: &ModelConfig,
+        request: ProviderRequest<'_>,
+    ) -> Result<Option<Vec<ChatMessage>>, ProviderError> {
+        self.compact_history_once(model_config, &request).map(Some)
+    }
+
     fn tool_set(&self, _model_config: &ModelConfig) -> Option<Arc<dyn ToolSet>> {
         Some(Arc::new(CodexSubscriptionToolSet))
     }
@@ -1207,6 +1323,90 @@ fn build_codex_models_url(model_config: &ModelConfig) -> Result<Url, ProviderErr
     Ok(url)
 }
 
+fn build_codex_compact_url(model_config: &ModelConfig) -> Result<Url, ProviderError> {
+    let mut url = Url::parse(&model_config.url).map_err(|error| {
+        ProviderError::InvalidResponse(format!("invalid codex provider url: {error}"))
+    })?;
+    let path = url.path().trim_end_matches('/').to_string();
+    if path.ends_with("/responses") {
+        url.set_path(&format!("{path}/compact"));
+    } else if path.ends_with("/responses/compact") {
+        url.set_path(&path);
+    } else {
+        url.set_path("/backend-api/codex/responses/compact");
+    }
+    Ok(url)
+}
+
+fn compact_response_value_to_chat_messages(
+    value: &Value,
+) -> Result<Vec<ChatMessage>, ProviderError> {
+    let output = value
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ProviderError::InvalidResponse("compact response missing output array".to_string())
+        })?;
+    let mut messages = Vec::new();
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                if let Some(message) = compact_message_item_to_chat_message(item) {
+                    messages.push(message);
+                }
+            }
+            Some("compaction") | Some("compaction_summary") => {
+                if let Some(encrypted_content) =
+                    item.get("encrypted_content").and_then(Value::as_str)
+                {
+                    messages.push(ChatMessage::new(
+                        ChatRole::Compaction,
+                        vec![ChatMessageItem::Context(ContextItem {
+                            text: encrypted_content.to_string(),
+                        })],
+                    ));
+                }
+            }
+            Some("context_compaction") => {
+                if let Some(encrypted_content) =
+                    item.get("encrypted_content").and_then(Value::as_str)
+                {
+                    messages.push(ChatMessage::new(
+                        ChatRole::Compaction,
+                        vec![ChatMessageItem::Context(ContextItem {
+                            text: encrypted_content.to_string(),
+                        })],
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(messages)
+}
+
+fn compact_message_item_to_chat_message(item: &Value) -> Option<ChatMessage> {
+    let role = match item.get("role").and_then(Value::as_str)? {
+        "user" => ChatRole::User,
+        "assistant" => ChatRole::Assistant,
+        _ => return None,
+    };
+    let mut data = Vec::new();
+    for content in item.get("content").and_then(Value::as_array)? {
+        match content.get("type").and_then(Value::as_str) {
+            Some("input_text") | Some("output_text") | Some("text") => {
+                if let Some(text) = content.get("text").and_then(Value::as_str) {
+                    data.push(ChatMessageItem::Context(ContextItem {
+                        text: text.to_string(),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+    (!data.is_empty()).then(|| ChatMessage::new(role, data))
+}
+
 fn read_cached_codex_models() -> Result<Option<CachedCodexModels>, ProviderError> {
     let cache_file = codex_models_cache_file();
     if !cache_file.exists() {
@@ -1897,6 +2097,18 @@ fn build_responses_input(
                 }
                 append_responses_tool_outputs(&mut input, message);
                 append_tool_result_image_messages(&mut input, message, model_config)?;
+            }
+            ChatRole::Compaction => {
+                for item in &message.data {
+                    if let ChatMessageItem::Context(context) = item {
+                        if !context.text.trim().is_empty() {
+                            input.push(json!({
+                                "type": "compaction",
+                                "encrypted_content": context.text,
+                            }));
+                        }
+                    }
+                }
             }
             ChatRole::Assistant => {
                 append_codex_reasoning_items(&mut input, message);
@@ -2826,6 +3038,53 @@ mod tests {
         assert!(payload.get("file_url").is_none());
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn compaction_message_replays_as_responses_compaction_item() {
+        let messages = vec![ChatMessage::new(
+            ChatRole::Compaction,
+            vec![ChatMessageItem::Context(ContextItem {
+                text: "encrypted-compact-state".to_string(),
+            })],
+        )];
+
+        let input =
+            build_responses_input(&messages, &test_model_config()).expect("input should build");
+
+        assert_eq!(input.len(), 1);
+        assert_eq!(input[0]["type"], "compaction");
+        assert_eq!(input[0]["encrypted_content"], "encrypted-compact-state");
+    }
+
+    #[test]
+    fn compact_response_maps_opaque_item_to_compaction_message() {
+        let response = serde_json::json!({
+            "output": [
+                {
+                    "type": "compaction",
+                    "encrypted_content": "encrypted-compact-state"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        { "type": "input_text", "text": "recent user request" }
+                    ]
+                }
+            ]
+        });
+
+        let messages = compact_response_value_to_chat_messages(&response)
+            .expect("compact response should parse");
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, ChatRole::Compaction);
+        assert_eq!(messages[1].role, ChatRole::User);
+        assert!(matches!(
+            messages[0].data.first(),
+            Some(ChatMessageItem::Context(ContextItem { text })) if text == "encrypted-compact-state"
+        ));
     }
 
     #[test]

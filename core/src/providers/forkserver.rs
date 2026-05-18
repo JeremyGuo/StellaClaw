@@ -62,6 +62,8 @@ mod unix_impl {
         pid: libc::pid_t,
         writer: Mutex<UnixStream>,
         pending: Arc<Mutex<HashMap<String, mpsc::Sender<Result<ChatMessage, ProviderError>>>>>,
+        pending_compact:
+            Arc<Mutex<HashMap<String, mpsc::Sender<Result<Vec<ChatMessage>, ProviderError>>>>>,
         event_routes: Arc<Mutex<HashMap<String, Sender<ProviderForkServerEvent>>>>,
         next_request_id: AtomicU64,
         next_worker_id: AtomicU64,
@@ -95,13 +97,20 @@ mod unix_impl {
                 ProviderError::Subprocess(format!("failed to clone forkserver stream: {error}"))
             })?;
             let pending = Arc::new(Mutex::new(HashMap::new()));
+            let pending_compact = Arc::new(Mutex::new(HashMap::new()));
             let event_routes = Arc::new(Mutex::new(HashMap::new()));
-            spawn_parent_event_reader(reader, pending.clone(), event_routes.clone());
+            spawn_parent_event_reader(
+                reader,
+                pending.clone(),
+                pending_compact.clone(),
+                event_routes.clone(),
+            );
 
             Ok(Self {
                 pid,
                 writer: Mutex::new(parent_stream),
                 pending,
+                pending_compact,
                 event_routes,
                 next_request_id: AtomicU64::new(1),
                 next_worker_id: AtomicU64::new(1),
@@ -185,6 +194,40 @@ mod unix_impl {
                 return Err(error);
             }
             Ok(ProviderRequestAbortHandle { request_id })
+        }
+
+        pub fn compact_on_worker(
+            &self,
+            worker_id: String,
+            request: ProviderRequestOwned,
+        ) -> Result<ProviderCompactHandle, ProviderError> {
+            let request_id = format!(
+                "provider_compact_{}_{}",
+                process::id(),
+                self.next_request_id.fetch_add(1, Ordering::SeqCst)
+            );
+            let (result_tx, result_rx) = mpsc::channel();
+            self.pending_compact
+                .lock()
+                .expect("mutex poisoned")
+                .insert(request_id.clone(), result_tx);
+
+            if let Err(error) = self.send_command(ForkServerCommand::CompactOnWorker {
+                request_id: request_id.clone(),
+                worker_id,
+                request,
+            }) {
+                self.pending_compact
+                    .lock()
+                    .expect("mutex poisoned")
+                    .remove(&request_id);
+                return Err(error);
+            }
+
+            Ok(ProviderCompactHandle {
+                request_id,
+                result_rx,
+            })
         }
 
         pub fn start(
@@ -280,6 +323,23 @@ mod unix_impl {
         }
     }
 
+    #[derive(Debug)]
+    pub struct ProviderCompactHandle {
+        request_id: String,
+        result_rx: mpsc::Receiver<Result<Vec<ChatMessage>, ProviderError>>,
+    }
+
+    impl ProviderCompactHandle {
+        pub fn wait(self) -> Result<Vec<ChatMessage>, ProviderError> {
+            self.result_rx.recv().map_err(|_| {
+                ProviderError::Subprocess(format!(
+                    "provider compact request {} disconnected",
+                    self.request_id
+                ))
+            })?
+        }
+    }
+
     #[derive(Debug, Clone)]
     pub struct ProviderRequestAbortHandle {
         request_id: String,
@@ -316,6 +376,11 @@ mod unix_impl {
             worker_id: String,
             request: ProviderRequestOwned,
         },
+        CompactOnWorker {
+            request_id: String,
+            worker_id: String,
+            request: ProviderRequestOwned,
+        },
         Cancel {
             request_id: String,
         },
@@ -336,12 +401,20 @@ mod unix_impl {
             request_id: String,
             result: Result<ChatMessage, ProviderErrorReport>,
         },
+        Compacted {
+            request_id: String,
+            result: Result<Vec<ChatMessage>, ProviderErrorReport>,
+        },
     }
 
     #[derive(Debug, Serialize, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     enum ProviderWorkerCommand {
         Start {
+            request_id: String,
+            request: ProviderRequestOwned,
+        },
+        Compact {
             request_id: String,
             request: ProviderRequestOwned,
         },
@@ -359,6 +432,10 @@ mod unix_impl {
             request_id: String,
             result: Result<ChatMessage, ProviderErrorReport>,
         },
+        Compacted {
+            request_id: String,
+            result: Result<Vec<ChatMessage>, ProviderErrorReport>,
+        },
     }
 
     #[derive(Debug)]
@@ -375,6 +452,9 @@ mod unix_impl {
     fn spawn_parent_event_reader(
         reader: UnixStream,
         pending: Arc<Mutex<HashMap<String, mpsc::Sender<Result<ChatMessage, ProviderError>>>>>,
+        pending_compact: Arc<
+            Mutex<HashMap<String, mpsc::Sender<Result<Vec<ChatMessage>, ProviderError>>>>,
+        >,
         event_routes: Arc<Mutex<HashMap<String, Sender<ProviderForkServerEvent>>>>,
     ) {
         thread::spawn(move || {
@@ -412,15 +492,30 @@ mod unix_impl {
                                 });
                             }
                         }
+                        Ok(ForkServerEvent::Compacted { request_id, result }) => {
+                            let result = result.map_err(ProviderErrorReport::into_provider_error);
+                            if let Some(sender) = pending_compact
+                                .lock()
+                                .expect("mutex poisoned")
+                                .remove(&request_id)
+                            {
+                                let _ = sender.send(result);
+                            }
+                        }
                         Err(error) => {
                             let message = format!("failed to decode forkserver event: {error}");
                             fail_all_pending(&pending, message.clone());
+                            fail_all_compact_pending(&pending_compact, message.clone());
                             fail_all_event_routes(&event_routes, message);
                         }
                     },
                     Err(error) => {
                         fail_all_pending(
                             &pending,
+                            format!("failed to read forkserver event: {error}"),
+                        );
+                        fail_all_compact_pending(
+                            &pending_compact,
                             format!("failed to read forkserver event: {error}"),
                         );
                         fail_all_event_routes(
@@ -433,12 +528,28 @@ mod unix_impl {
             }
 
             fail_all_pending(&pending, "provider request runtime closed".to_string());
+            fail_all_compact_pending(
+                &pending_compact,
+                "provider request runtime closed".to_string(),
+            );
             fail_all_event_routes(&event_routes, "provider request runtime closed".to_string());
         });
     }
 
     fn fail_all_pending(
         pending: &Arc<Mutex<HashMap<String, mpsc::Sender<Result<ChatMessage, ProviderError>>>>>,
+        error: String,
+    ) {
+        let mut pending = pending.lock().expect("mutex poisoned");
+        for (_, sender) in pending.drain() {
+            let _ = sender.send(Err(ProviderError::Subprocess(error.clone())));
+        }
+    }
+
+    fn fail_all_compact_pending(
+        pending: &Arc<
+            Mutex<HashMap<String, mpsc::Sender<Result<Vec<ChatMessage>, ProviderError>>>>,
+        >,
         error: String,
     ) {
         let mut pending = pending.lock().expect("mutex poisoned");
@@ -558,6 +669,11 @@ mod unix_impl {
                 worker_id,
                 request,
             } => start_request_on_worker(request_id, &worker_id, request, stream, workers),
+            ForkServerCommand::CompactOnWorker {
+                request_id,
+                worker_id,
+                request,
+            } => compact_on_worker(request_id, &worker_id, request, stream, workers),
             ForkServerCommand::Cancel { request_id } => {
                 cancel_worker_request(&request_id, stream, workers);
             }
@@ -686,6 +802,62 @@ mod unix_impl {
         worker.active_request_id = Some(request_id);
     }
 
+    fn compact_on_worker(
+        request_id: String,
+        worker_id: &str,
+        request: ProviderRequestOwned,
+        stream: &mut UnixStream,
+        workers: &mut [ProviderWorkerProcess],
+    ) {
+        let Some(worker) = workers
+            .iter_mut()
+            .find(|worker| worker.worker_id == worker_id)
+        else {
+            let _ = write_event(
+                stream,
+                ForkServerEvent::Compacted {
+                    request_id,
+                    result: Err(subprocess_report(format!(
+                        "unknown provider worker {worker_id}"
+                    ))),
+                },
+            );
+            return;
+        };
+
+        if let Some(active_request_id) = &worker.active_request_id {
+            let _ = write_event(
+                stream,
+                ForkServerEvent::Compacted {
+                    request_id,
+                    result: Err(subprocess_report(format!(
+                        "provider worker {worker_id} is busy with {active_request_id}"
+                    ))),
+                },
+            );
+            return;
+        }
+
+        let command = ProviderWorkerCommand::Compact {
+            request_id: request_id.clone(),
+            request,
+        };
+        if let Err(error) = write_fd_json_line(worker.command_fd, &command) {
+            let _ = write_event(
+                stream,
+                ForkServerEvent::Compacted {
+                    request_id,
+                    result: Err(subprocess_report(format!(
+                        "failed to write provider worker compact command: {error}"
+                    ))),
+                },
+            );
+            return;
+        }
+
+        worker.active_request_id = Some(request_id);
+    }
+
     fn cancel_worker_request(
         request_id: &str,
         stream: &mut UnixStream,
@@ -740,6 +912,10 @@ mod unix_impl {
                 worker.active_request_id = None;
                 ForkServerEvent::Completed { request_id, result }
             }
+            Ok(ProviderWorkerEvent::Compacted { request_id, result }) => {
+                worker.active_request_id = None;
+                ForkServerEvent::Compacted { request_id, result }
+            }
             Err(error) => {
                 let request_id = worker
                     .active_request_id
@@ -777,9 +953,19 @@ mod unix_impl {
             let _ = write_event(
                 stream,
                 ForkServerEvent::Completed {
-                    request_id,
+                    request_id: request_id.clone(),
                     result: Err(subprocess_report(format!(
                         "provider worker {} exited before completing request",
+                        worker.worker_id
+                    ))),
+                },
+            );
+            let _ = write_event(
+                stream,
+                ForkServerEvent::Compacted {
+                    request_id,
+                    result: Err(subprocess_report(format!(
+                        "provider worker {} exited before completing compact request",
                         worker.worker_id
                     ))),
                 },
@@ -862,6 +1048,25 @@ mod unix_impl {
                     );
                 }
                 ProviderWorkerCommand::Shutdown => break,
+                ProviderWorkerCommand::Compact {
+                    request_id,
+                    request,
+                } => {
+                    let result = provider
+                        .compact_history(request.as_provider_request())
+                        .and_then(|messages| {
+                            messages.ok_or_else(|| {
+                                ProviderError::InvalidResponse(
+                                    "provider does not support builtin compaction".to_string(),
+                                )
+                            })
+                        })
+                        .map_err(ProviderErrorReport::from_provider_error);
+                    let _ = write_worker_event(
+                        &mut writer,
+                        ProviderWorkerEvent::Compacted { request_id, result },
+                    );
+                }
             }
         }
     }

@@ -3,6 +3,9 @@ version: 1.29.0
 
 # 1.29.0
 
+- 重构 SessionActor context compaction 的 Provider 边界：
+  `ChatRole` 新增 `Compaction`，压缩结果不再伪装成普通 assistant 消息；Provider trait 新增 compaction mode 和 builtin compact 入口，非 Codex provider 默认过滤 `Compaction` 消息，避免把 provider 专用压缩块计入上下文或发送给不支持的模型。Codex subscription provider 新增 builtin `/responses/compact` 调用路径，按当前 Responses input 翻译、system instructions、工具 schema、reasoning、service tier 和 prompt cache key 构造 compact 请求，并把返回的 `compaction` / `context_compaction` item materialize 为 `ChatRole::Compaction`。通用 summary compact 仍保留为 fallback，但移除 cybersecurity policy retry/reduction fallback；summary 输出现在也写入 `Compaction` role。本次不改变 `config` schema，不改变 `workdir` schema。
+
 - 新增 Conversation 级 idle timeout compact 覆盖开关：
   `ModelConfig` 新增 `idle_timeout_compact_enabled` 作为每个模型的系统默认值，默认 `true`；Conversation runtime config 新增可选 `idle_timeout_compact_enabled`，`null` 表示继承当前模型默认值，`true` / `false` 表示覆盖。AgentSession 启动时会把最终生效值写入 `SessionInitial`，SessionActor 的 idle timeout compaction 会按该值决定是否运行；Web / Telegram 控制命令新增 `/idle_compact` / `/idle_timeout_compact`，支持 `on`、`off`、`default`，Web conversation summary 同步返回 override 和 effective 状态。本次改变 `config` schema 至 `0.13`，改变 `workdir` schema 至 `0.23`。
 

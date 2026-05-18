@@ -17,7 +17,7 @@ use std::{
     error::Error as StdError,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        mpsc, Arc,
     },
     thread,
     time::Duration,
@@ -80,11 +80,26 @@ pub trait Provider {
     }
 
     fn normalize_messages_for_provider(&self, messages: &[ChatMessage]) -> Vec<ChatMessage> {
-        messages.to_vec()
+        messages
+            .iter()
+            .filter(|message| !matches!(message.role, crate::session_actor::ChatRole::Compaction))
+            .cloned()
+            .collect()
     }
 
     fn tool_set(&self) -> Option<Arc<dyn ToolSet>> {
         None
+    }
+
+    fn compaction_mode(&self) -> ProviderCompactionMode {
+        ProviderCompactionMode::Summary
+    }
+
+    fn compact_history(
+        &self,
+        _request: ProviderRequest<'_>,
+    ) -> Result<Option<Vec<ChatMessage>>, ProviderError> {
+        Ok(None)
     }
 
     fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError>;
@@ -120,11 +135,27 @@ pub(crate) trait ProviderBackend: Send + Sync {
         _model_config: &ModelConfig,
         messages: &[ChatMessage],
     ) -> Vec<ChatMessage> {
-        messages.to_vec()
+        messages
+            .iter()
+            .filter(|message| !matches!(message.role, crate::session_actor::ChatRole::Compaction))
+            .cloned()
+            .collect()
     }
 
     fn tool_set(&self, _model_config: &ModelConfig) -> Option<Arc<dyn ToolSet>> {
         None
+    }
+
+    fn compaction_mode(&self, _model_config: &ModelConfig) -> ProviderCompactionMode {
+        ProviderCompactionMode::Summary
+    }
+
+    fn compact_history(
+        &self,
+        _model_config: &ModelConfig,
+        _request: ProviderRequest<'_>,
+    ) -> Result<Option<Vec<ChatMessage>>, ProviderError> {
+        Ok(None)
     }
 
     fn send(
@@ -175,6 +206,17 @@ impl Provider for ModelBoundProvider {
         self.backend.tool_set(&self.model_config)
     }
 
+    fn compaction_mode(&self) -> ProviderCompactionMode {
+        self.backend.compaction_mode(&self.model_config)
+    }
+
+    fn compact_history(
+        &self,
+        request: ProviderRequest<'_>,
+    ) -> Result<Option<Vec<ChatMessage>>, ProviderError> {
+        self.backend.compact_history(&self.model_config, request)
+    }
+
     fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
         self.backend.send(&self.model_config, request)
     }
@@ -198,6 +240,13 @@ pub struct ProviderRetryEvent<'a> {
     pub max_retries: u64,
     pub delay: Duration,
     pub error: &'a ProviderError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderCompactionMode {
+    Builtin,
+    Summary,
+    SummaryWithMemory,
 }
 
 pub fn send_provider_request_with_retry<F>(
@@ -412,6 +461,10 @@ enum ProviderCommand {
         request_id: String,
         request: ProviderRequestOwned,
     },
+    Compact {
+        request: ProviderRequestOwned,
+        response_tx: mpsc::Sender<Result<Option<Vec<ChatMessage>>, ProviderError>>,
+    },
     Abort,
     Shutdown,
 }
@@ -511,7 +564,10 @@ impl ProviderSession {
             ProviderSessionKind::Direct { provider } => {
                 provider.normalize_messages_for_provider(messages)
             }
-            ProviderSessionKind::ForkServer { .. } => messages.to_vec(),
+            ProviderSessionKind::ForkServer { model_config, .. } => {
+                provider_backend_from_model_config(model_config)
+                    .normalize_messages_for_provider(model_config, messages)
+            }
         }
     }
 
@@ -570,6 +626,31 @@ impl Provider for ProviderSession {
 
     fn tool_set(&self) -> Option<Arc<dyn ToolSet>> {
         ProviderSession::tool_set(self)
+    }
+
+    fn compaction_mode(&self) -> ProviderCompactionMode {
+        match &self.kind {
+            ProviderSessionKind::Direct { provider } => provider.compaction_mode(),
+            ProviderSessionKind::ForkServer { model_config, .. } => {
+                provider_backend_from_model_config(model_config).compaction_mode(model_config)
+            }
+        }
+    }
+
+    fn compact_history(
+        &self,
+        request: ProviderRequest<'_>,
+    ) -> Result<Option<Vec<ChatMessage>>, ProviderError> {
+        let (response_tx, response_rx) = mpsc::channel();
+        self.command_tx
+            .send(ProviderCommand::Compact {
+                request: ProviderRequestOwned::from_provider_request(&request),
+                response_tx,
+            })
+            .map_err(|_| ProviderError::Subprocess("provider session stopped".to_string()))?;
+        response_rx.recv().map_err(|_| {
+            ProviderError::Subprocess("provider compact request disconnected".to_string())
+        })?
     }
 
     fn send(&self, request: ProviderRequest<'_>) -> Result<ChatMessage, ProviderError> {
@@ -668,6 +749,16 @@ fn direct_provider_session_loop(
                             }
                         }
                     }
+                    ProviderCommand::Compact { request, response_tx } => {
+                        let result = if active.is_some() {
+                            Err(ProviderError::Subprocess(
+                                "provider session is busy".to_string(),
+                            ))
+                        } else {
+                            provider.compact_history(request.as_provider_request())
+                        };
+                        let _ = response_tx.send(result);
+                    }
                     ProviderCommand::Abort => {
                         if let Some(active_request) = active.take() {
                             active_request.cancel();
@@ -750,6 +841,21 @@ fn fork_server_provider_session_loop(
                             }
                         }
                     }
+                    ProviderCommand::Compact { request, response_tx } => {
+                        let result = if active.is_some() {
+                            Err(ProviderError::Subprocess(
+                                "provider session is busy".to_string(),
+                            ))
+                        } else {
+                            compact_on_fork_server_worker(
+                                &model_config,
+                                &fork_server,
+                                &mut worker,
+                                request,
+                            )
+                        };
+                        let _ = response_tx.send(result);
+                    }
                     ProviderCommand::Abort => {
                         if let Some(active_request) = active.take() {
                             active_request.cancel();
@@ -816,6 +922,35 @@ fn fork_server_provider_session_loop(
             }
         }
     }
+}
+
+#[cfg(unix)]
+fn compact_on_fork_server_worker(
+    model_config: &ModelConfig,
+    fork_server: &ProviderRequestForkServer,
+    worker: &mut Option<ProviderWorkerBinding>,
+    request: ProviderRequestOwned,
+) -> Result<Option<Vec<ChatMessage>>, ProviderError> {
+    if provider_backend_from_model_config(model_config).compaction_mode(model_config)
+        != ProviderCompactionMode::Builtin
+    {
+        return Ok(None);
+    }
+    let worker_id = ensure_fork_server_worker(model_config, fork_server, worker)?;
+    fork_server
+        .compact_on_worker(worker_id, request)
+        .and_then(|handle| handle.wait().map(Some))
+}
+
+#[cfg(not(unix))]
+fn compact_on_fork_server_worker(
+    model_config: &ModelConfig,
+    _fork_server: &ProviderRequestForkServer,
+    _worker: &mut Option<ProviderWorkerBinding>,
+    request: ProviderRequestOwned,
+) -> Result<Option<Vec<ChatMessage>>, ProviderError> {
+    provider_backend_from_model_config(model_config)
+        .compact_history(model_config, request.as_provider_request())
 }
 
 #[derive(Debug, Clone)]

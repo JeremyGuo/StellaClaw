@@ -157,6 +157,9 @@ fn build_claude_messages(
     let mut converted = Vec::new();
 
     for message in messages {
+        if matches!(message.role, ChatRole::Compaction) {
+            continue;
+        }
         let mut content = claude_content_blocks(message);
 
         if matches!(message.role, ChatRole::Assistant) {
@@ -417,6 +420,7 @@ fn role_as_str(role: &ChatRole) -> &'static str {
     match role {
         ChatRole::User => "user",
         ChatRole::Assistant => "assistant",
+        ChatRole::Compaction => "user",
     }
 }
 

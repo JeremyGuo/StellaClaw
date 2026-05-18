@@ -734,12 +734,16 @@ impl SessionActor {
         let system_prompt = self.system_prompt_for_current_initial()?;
         let compression_context = self.compression_memory_context(&self.history, None);
 
-        let report = match compressor.compact_now(
+        let report = match compressor.compact_now_with_tools(
             &mut self.history,
             self.provider.as_ref(),
             &self.model_config,
             system_prompt.as_deref(),
             compression_context.as_deref(),
+            self.tool_catalog
+                .iter()
+                .map(|(_, tool)| tool)
+                .collect::<Vec<_>>(),
         ) {
             Ok(report) => report,
             Err(error) => {
@@ -2062,13 +2066,17 @@ impl SessionActor {
             loop {
                 let compression_context =
                     self.compression_memory_context_for_append(&compressor, &message);
-                match compressor.append_with_compression(
+                match compressor.append_with_compression_with_tools(
                     &mut self.history,
                     message.clone(),
                     self.provider.as_ref(),
                     &self.model_config,
                     system_prompt.as_deref(),
                     compression_context.as_deref(),
+                    self.tool_catalog
+                        .iter()
+                        .map(|(_, tool)| tool)
+                        .collect::<Vec<_>>(),
                 ) {
                     Ok(report) => break report,
                     Err(error)
@@ -2484,13 +2492,17 @@ impl SessionActor {
             } else {
                 None
             };
-            match compressor.compact_if_needed_with_threshold(
+            match compressor.compact_if_needed_with_threshold_and_tools(
                 &mut self.history,
                 self.provider.as_ref(),
                 &self.model_config,
                 system_prompt.as_deref(),
                 threshold_tokens,
                 compression_context.as_deref(),
+                self.tool_catalog
+                    .iter()
+                    .map(|(_, tool)| tool)
+                    .collect::<Vec<_>>(),
             ) {
                 Ok(report) => break Ok(report),
                 Err(error)

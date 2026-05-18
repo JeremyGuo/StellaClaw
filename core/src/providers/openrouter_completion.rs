@@ -280,6 +280,9 @@ impl OpenRouterRequestMessage {
     }
 
     fn from_chat_message(message: &ChatMessage) -> Vec<Self> {
+        if matches!(message.role, ChatRole::Compaction) {
+            return Vec::new();
+        }
         let text_segments = collect_visible_text_segments(message);
         let image_files = collect_image_files(message);
         let tool_calls = collect_request_tool_calls(message);
@@ -672,6 +675,7 @@ fn openrouter_role(role: &ChatRole) -> &'static str {
     match role {
         ChatRole::User => "user",
         ChatRole::Assistant => "assistant",
+        ChatRole::Compaction => "user",
     }
 }
 

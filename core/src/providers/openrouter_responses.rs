@@ -265,6 +265,7 @@ fn build_responses_input(messages: &[ChatMessage], model_config: &ModelConfig) -
 
     for message in messages {
         match message.role {
+            ChatRole::Compaction => {}
             ChatRole::User => {
                 let content = user_responses_content(message);
                 if !content.is_empty() {

@@ -27,13 +27,22 @@ The side that authored the message.
 
 - `ChatRole::User`: external user input, runtime notices, or synthetic user-side context inserted by the system.
 - `ChatRole::Assistant`: model output, including final text, reasoning, tool calls, tool results recorded during assistant turns, and assistant-generated files.
+- `ChatRole::Compaction`: synthetic compacted-history block produced by a provider or by the generic summary compactor. It is provider-neutral persistence, not a visible user/assistant turn. Providers decide whether to materialize it, pass it through as an opaque provider-specific item, or drop it entirely.
 
 Serialized as lowercase snake case:
 
 ```json
 { "role": "user" }
 { "role": "assistant" }
+{ "role": "compaction" }
 ```
+
+`ChatRole::Compaction` has special request behavior:
+
+- Codex subscription may replay opaque encrypted compaction payloads as Responses `compaction` items.
+- Providers without matching support should filter it before context estimation and request translation.
+- Generic summary compaction may store human-readable summary text in `ContextItem`; provider translators are still responsible for deciding whether that text is usable for the target provider.
+- It should not be rendered as an ordinary chat message unless a debug or inspection UI intentionally exposes compacted context.
 
 ### `user_name`
 

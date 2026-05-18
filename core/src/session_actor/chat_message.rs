@@ -7,6 +7,7 @@ use serde_json::{json, Value};
 pub enum ChatRole {
     User,
     Assistant,
+    Compaction,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

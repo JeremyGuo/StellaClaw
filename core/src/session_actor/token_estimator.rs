@@ -730,6 +730,7 @@ fn role_name(role: &ChatRole) -> &'static str {
     match role {
         ChatRole::User => "user",
         ChatRole::Assistant => "assistant",
+        ChatRole::Compaction => "compaction",
     }
 }
 
