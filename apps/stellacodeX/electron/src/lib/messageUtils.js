@@ -525,6 +525,24 @@ function canonicalMessageHasContent(canonical) {
   return Boolean(canonical.text || canonical.items.length > 0);
 }
 
+function canonicalCommitCompatible(provisional, durable) {
+  if (stableSignature(provisional) === stableSignature(durable)) return true;
+  if (!provisional || !durable) return false;
+  if (provisional.role !== durable.role || provisional.text !== durable.text) return false;
+  if (!Array.isArray(provisional.items) || !Array.isArray(durable.items)) return false;
+  if (provisional.items.length !== durable.items.length) return false;
+  return provisional.items.every((left, index) => {
+    const right = durable.items[index];
+    if (!left || !right || left.type !== right.type) return false;
+    if (left.type !== 'tool_call') return stableSignature(left) === stableSignature(right);
+    return (
+      left.tool_id === right.tool_id
+      && left.tool_name === right.tool_name
+      && String(right.arguments || '').startsWith(String(left.arguments || ''))
+    );
+  });
+}
+
 export function committedMessageProtocolMismatches(current, incoming) {
   if (!Array.isArray(current) || !Array.isArray(incoming)) return [];
   const mismatches = [];
@@ -548,7 +566,7 @@ export function committedMessageProtocolMismatches(current, incoming) {
     const provisionalCanonical = canonicalMessageForCommitCompare(provisional);
     if (!canonicalMessageHasContent(provisionalCanonical)) continue;
     const durableCanonical = canonicalMessageForCommitCompare(durable);
-    if (stableSignature(provisionalCanonical) !== stableSignature(durableCanonical)) {
+    if (!canonicalCommitCompatible(provisionalCanonical, durableCanonical)) {
       mismatches.push({
         message_id: durableId || String(durable?.message_id || ''),
         index: Number.isFinite(durableIndex) && durableIndex !== Number.MAX_SAFE_INTEGER ? durableIndex : undefined

@@ -3,6 +3,8 @@ version: 1.29.5
 
 # 1.29.5
 
+- 放宽工具调用参数 commit 边界比较：
+  StellaCodeX Electron 在比较 provisional stream 与 durable assistant message 时，工具调用参数允许 provisional 是 durable 的前缀；role、assistant 文本、工具 id/name、其它 item 仍严格比对。这样 durable commit 作为最终收敛边界到达时，不会因为前端渲染队列或事件处理尚未把最后几段 tool-call 参数落到 UI state 而误报 `chat.stream_commit_mismatch`，但参数内容发生分叉仍会报错。本次不改变 `config` schema，不改变 `workdir` schema。
 - 修复工具调用流式参数在 commit 边界误报 mismatch：
   StellaCodeX Electron 不再把 `stream_tool_call_delta` 放入视觉 RAF 帧队列，而是作为协议状态立即合并到 provisional message；assistant/reasoning 文本仍保留帧队列。避免工具参数被 UI 动画节流后，durable `message_appended` 到达时前端拿半截工具参数和落盘消息比较，触发 `chat.stream_commit_mismatch` 误报。本次不改变 `config` schema，不改变 `workdir` schema。
 - 修复 StellaCodeX Electron stream commit mismatch 误报：
