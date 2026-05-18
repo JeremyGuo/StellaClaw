@@ -886,6 +886,9 @@ fn fork_server_provider_session_loop(
                     ProviderCommand::Abort => {
                         if let Some(active_request) = active.take() {
                             active_request.cancel();
+                            // Fork-server cancel kills and removes the worker that owned the
+                            // request, so this session must not reuse the cached worker id.
+                            worker = None;
                             let _ = event_tx.send(ProviderEvent::Result {
                                 request_id: active_request.request_id,
                                 result: Err(ProviderError::Subprocess(
