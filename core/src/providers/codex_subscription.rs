@@ -1113,7 +1113,10 @@ fn send_response_create(
                             });
                         }
                     }
-                    Some("response.custom_tool_call_input.delta") => {
+                    Some(
+                        "response.custom_tool_call_input.delta"
+                        | "response.function_call_arguments.delta",
+                    ) => {
                         if let Some(event) =
                             provider_tool_call_input_delta_event(&value, &accumulator)
                         {
@@ -2825,6 +2828,44 @@ mod tests {
         assert!(!is_codex_response_progress_event("response.in_progress"));
         assert!(!is_codex_response_progress_event("rate_limits.updated"));
         assert!(!is_codex_response_progress_event("ping"));
+    }
+
+    #[test]
+    fn function_call_argument_delta_uses_accumulated_tool_metadata() {
+        let mut accumulator = StreamAccumulator::default();
+        accumulator.record_output_item_added(&serde_json::json!({
+            "type": "response.output_item.added",
+            "item": {
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "exec_command"
+            }
+        }));
+
+        let event = provider_tool_call_input_delta_event(
+            &serde_json::json!({
+                "type": "response.function_call_arguments.delta",
+                "item_id": "fc_1",
+                "delta": "{\"cmd\""
+            }),
+            &accumulator,
+        )
+        .expect("function call argument delta should be renderable");
+
+        let ProviderStreamEvent::ToolCallInputDelta {
+            item_id,
+            call_id,
+            tool_name,
+            delta,
+        } = event
+        else {
+            panic!("expected tool call input delta event");
+        };
+        assert_eq!(item_id, "fc_1");
+        assert_eq!(call_id, None);
+        assert_eq!(tool_name.as_deref(), Some("exec_command"));
+        assert_eq!(delta, "{\"cmd\"");
     }
 
     #[test]
